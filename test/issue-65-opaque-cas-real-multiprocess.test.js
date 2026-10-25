@@ -4,7 +4,6 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
 const { fork } = require("node:child_process");
@@ -18,6 +17,8 @@ const { createZk1OpaqueCatalogIndependentFloorHttpsClient } =
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 
 const b64 = (v) => Buffer.from(v).toString("base64url");
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
@@ -51,8 +52,7 @@ function child(mode, configPath, fixturePath) {
 test("external opaque catalog CAS: real mTLS processes, atomic competition, signer proof, replay, restart, uncertain ACK and rollback", {
   timeout: 75000,
 }, async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-opaque-remote-cas-"));
-  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  const dir = privateAuthorityDirectory("zk1-opaque-remote-cas-");
   generateNativeFixtureCertificates(dir, { caSubject: "Opaque Catalog CAS Fixture",
     servers: ["server", "floor"], clients: ["client", "foreign"] });
   const authorityKeys = crypto.generateKeyPairSync("ed25519");

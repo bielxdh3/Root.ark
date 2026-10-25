@@ -4,7 +4,6 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const { OpaqueCheckpointV2Authority } =
@@ -13,13 +12,14 @@ const { Zk1OpaqueCatalogCheckpointV2Stage } =
   require("../src/services/zk1OpaqueCatalogCheckpointV2Stage");
 const { createZk1OpaqueCatalogIndependentFloorHttpsClient } =
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 
 const hash = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const signingKeys = () => crypto.generateKeyPairSync("ed25519");
 
 test("v2 authority and stage reject swapped DB, absent and forged guards without mutation", (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-readonly-"));
-  if (process.platform !== "win32") fs.chmodSync(root, 0o700);
+  const root = privateAuthorityDirectory("zk65-v2-readonly-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: Buffer.from("readonly-preflight"),
@@ -63,6 +63,7 @@ test("v2 authority and stage reject swapped DB, absent and forged guards without
     }, "checkpoint_stage_no_rewrite", "checkpoint_stages"],
   ];
   for (const [name, Type, opts, guardedTrigger, guardedTable] of configs) {
+    t.diagnostic(`strict authority SQLite preflight ${name}`);
     const filename = path.join(root, name + ".sqlite");
     const open = (bootstrapNew, options = opts, file = filename) =>
       new Type(file, { ...options, bootstrapNew });
@@ -137,14 +138,25 @@ test("v2 authority and stage reject swapped DB, absent and forged guards without
     const alias = path.join(root, name + "-alias");
     fs.mkdirSync(real, { mode: 0o700 });
     fs.copyFileSync(filename, path.join(real, "database.sqlite"));
+    let aliasCreated = false;
     try {
       fs.symlinkSync(real, alias, process.platform === "win32" ? "junction" : "dir");
+      aliasCreated = true;
       const expectedHash = hash(path.join(real, "database.sqlite"));
       assert.throws(() => open(false, opts, path.join(alias, "database.sqlite")));
       assert.equal(hash(path.join(real, "database.sqlite")), expectedHash);
     } catch (error) {
       if (!["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) throw error;
       t.diagnostic(name + ": junction unavailable: " + error.code);
+    } finally {
+      // Windows authority ACL preflight scans the entire staging tree. Leaving
+      // our deliberately hostile junction installed would (correctly) reject
+      // every subsequent fixture, not just the attempted alias access.
+      if (aliasCreated) {
+        assert.equal(fs.lstatSync(alias).isSymbolicLink(), true);
+        if (process.platform === "win32") fs.rmdirSync(alias);
+        else fs.unlinkSync(alias);
+      }
     }
     t.diagnostic(name + ": wrong identity, forged/missing trigger, ancestor symlink and restart passed");
   }
