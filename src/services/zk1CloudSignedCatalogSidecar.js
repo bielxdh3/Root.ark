@@ -161,10 +161,17 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
 }
 async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   minimumMatchingProviders = 2, providerDomainPinset, deadlineMs, abortSignal,
-  deadline, expectedCatalogSha256 } = {}) {
+  deadline, expectedCatalogSha256, observationOnly = false } = {}) {
   if (!Array.isArray(readers) || readers.length < 2 || readers.length > 3
     || !Number.isSafeInteger(minimumMatchingProviders)
     || minimumMatchingProviders < 2 || minimumMatchingProviders > readers.length) deny();
+  // Sequential remote GETs and async provider identity probes CANNOT establish
+  // a coherent cross-provider principal snapshot. Until an independently
+  // pinned atomic lease/fence exists, the only supported successful result is
+  // explicitly opted-in, NON-AUTHORIZING signed-wire observation. In strict
+  // mode finish all owned GETs before failing closed; no partial IO is left
+  // in flight and no false current-authority quorum can escape.
+  if (typeof observationOnly !== "boolean") deny();
   // Optional externally retained commitment to the exact published sidecar.
   // A quorum of two providers alone can agree on an old but well-formed blob.
   const expectedDigest = expectedCatalogSha256 === undefined ? null
@@ -238,10 +245,16 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   }
   pinnedDomains(providerDomainPinset, scope, pinned);
   limit.assertActive();
+  // No ordering of separate awaited identity checks proves that the first
+  // principal stayed valid during the last provider's check. A full strict
+  // success requires a future independently verified shared authority fence.
+  if (!observationOnly) deny();
   return Object.freeze({ signedCatalog: eligible[0][0].parsed,
     providers: Object.freeze(eligible[0].map((item) => item.provider)),
     matchingCount: eligible[0].length, remoteDurabilityProven: false,
-    signaturesVerifiedBySidecar: false });
+    signaturesVerifiedBySidecar: false, authorizesIo: false,
+    observationalOnly: true, coherentProviderIdentityQuorumProven: false,
+    crossProviderAtomicFenceProven: false });
   } finally { if (!deadline) limit.close(); }
 }
 
@@ -251,7 +264,7 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
 // Signatures, cloud fsync, and live protected IO are verified elsewhere.
 async function verifyPublishedSignedCatalogSidecars({ scope, operationId, signedCatalog,
   readers, minimumMatchingProviders = 2, providerDomainPinset, deadlineMs,
-  abortSignal } = {}) {
+  abortSignal, observationOnly = false } = {}) {
   try {
     // Capture the exact expected wire before any provider await, so callers
     // cannot swap a mutable input after the first read and authorize a replay.
@@ -259,12 +272,14 @@ async function verifyPublishedSignedCatalogSidecars({ scope, operationId, signed
     const digest = crypto.createHash("sha256").update(expected).digest();
     const result = await recoverSignedCatalogSidecar({ scope, operationId,
       readers, minimumMatchingProviders, providerDomainPinset, deadlineMs,
-      abortSignal, expectedCatalogSha256: digest });
-    return Object.freeze({ status: "SIGNED_CATALOG_EXACT_REMOTE_REREAD",
+      abortSignal, expectedCatalogSha256: digest, observationOnly });
+    return Object.freeze({ status: "SIGNED_CATALOG_EXACT_REMOTE_REREAD_OBSERVATION",
       catalogSha256: Buffer.from(digest), matchingCount: result.matchingCount,
       providers: result.providers, readbackMatched: true,
       authorizesIo: false, signaturesVerifiedBySidecar: false,
-      remoteDurabilityProven: false, providerPhysicalIndependenceProven: false });
+      observationalOnly: true, coherentProviderIdentityQuorumProven: false,
+      crossProviderAtomicFenceProven: false, remoteDurabilityProven: false,
+      providerPhysicalIndependenceProven: false });
   } catch (_) { deny(); }
 }
 

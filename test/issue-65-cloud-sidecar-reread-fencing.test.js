@@ -92,7 +92,8 @@ function durableFixture(directory) {
   const publication = { scope, operationId, signedCatalog, writers,
     providerDomainPinset: pinset };
   const verification = { scope, operationId, signedCatalog, readers,
-    providerDomainPinset: pinset, minimumMatchingProviders: 2, deadlineMs: 3000 };
+    providerDomainPinset: pinset, minimumMatchingProviders: 2, deadlineMs: 3000,
+    observationOnly: true };
   return { directory, scope, operationId, signedCatalog, pinset,
     targets, readers, identities, publication, verification };
 }
@@ -105,10 +106,13 @@ test("readback is bound to the exact sidecar across process restart, provider co
   assert.equal(ack.status, "SIGNED_CATALOG_PUT_ACK_NONAUTHORITATIVE");
   assert.equal(ack.remoteDurabilityProven, false);
   const verified = await verifyPublishedSignedCatalogSidecars(fixture.verification);
-  assert.equal(verified.status, "SIGNED_CATALOG_EXACT_REMOTE_REREAD");
+  assert.equal(verified.status, "SIGNED_CATALOG_EXACT_REMOTE_REREAD_OBSERVATION");
   assert.equal(verified.readbackMatched, true);
   assert.equal(verified.remoteDurabilityProven, false);
   assert.equal(verified.authorizesIo, false);
+  assert.equal(verified.observationalOnly, true);
+  assert.equal(verified.coherentProviderIdentityQuorumProven, false);
+  assert.equal(verified.crossProviderAtomicFenceProven, false);
   assert.equal(verified.matchingCount, 2);
 
   const childInput = {
@@ -171,7 +175,37 @@ test("recovery refuses a provider whose pinned principal changes while another p
   };
   await assert.rejects(recoverSignedCatalogSidecar({ scope: fixture.scope,
     operationId: fixture.operationId, readers: fixture.readers,
-    providerDomainPinset: fixture.pinset, deadlineMs: 3000 }),
+    providerDomainPinset: fixture.pinset, deadlineMs: 3000,
+    observationOnly: true }),
   /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
   "first provider must remain in its pinned principal through quorum completion");
+});
+
+test("late principal change during final probe is observational only; strict quorum fails closed", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-final-probe-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const drive = fixture.readers[1].cloudReader;
+  const original = drive.resolveInventoryContext;
+  let driveChecks = 0;
+  drive.resolveInventoryContext = async () => {
+    driveChecks++;
+    if (driveChecks === 3) fixture.identities.s3 = sha("rotated-during-final-drive-check");
+    return original();
+  };
+  await assert.rejects(verifyPublishedSignedCatalogSidecars({ ...fixture.verification,
+    observationOnly: false }),
+    /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+    "no cross-provider atomic identity lease exists: a strict current-authority claim must fail");
+  assert.equal(driveChecks, 3, "exercise the actual final Drive identity probe");
+  assert.notEqual(fixture.identities.s3, fixture.readers[0].expectedContext);
+  fixture.identities.s3 = fixture.readers[0].expectedContext;
+  driveChecks = 0;
+  const observed = await verifyPublishedSignedCatalogSidecars(fixture.verification);
+  assert.equal(driveChecks, 3);
+  assert.equal(observed.observationalOnly, true);
+  assert.equal(observed.coherentProviderIdentityQuorumProven, false);
+  assert.equal(observed.crossProviderAtomicFenceProven, false);
+  assert.equal(observed.authorizesIo, false);
 });

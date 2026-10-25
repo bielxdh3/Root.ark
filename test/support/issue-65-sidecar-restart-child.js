@@ -53,9 +53,11 @@ async function main() {
   }));
   const result = await verifyPublishedSignedCatalogSidecars({ scope,
     operationId: Buffer.from(wire.operationId, "base64url"), signedCatalog,
-    readers, providerDomainPinset, minimumMatchingProviders: 2, deadlineMs: 3000 });
+    readers, providerDomainPinset, minimumMatchingProviders: 2, deadlineMs: 3000,
+    observationOnly: true });
   assert.equal(result.remoteDurabilityProven, false);
   assert.equal(result.authorizesIo, false);
+  assert.equal(result.coherentProviderIdentityQuorumProven, false);
   process.stdout.write(JSON.stringify({ matchingCount: result.matchingCount }));
 }
 

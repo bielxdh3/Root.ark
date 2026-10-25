@@ -674,11 +674,12 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const verifiedSidecarReadback = await verifyPublishedSignedCatalogSidecars({
     scope, operationId: operation.operation_id, signedCatalog,
     readers: catalogReaders, minimumMatchingProviders: 2, providerDomainPinset,
-    deadlineMs: 5000 });
-  assert.equal(verifiedSidecarReadback.status, "SIGNED_CATALOG_EXACT_REMOTE_REREAD");
+    deadlineMs: 5000, observationOnly: true });
+  assert.equal(verifiedSidecarReadback.status, "SIGNED_CATALOG_EXACT_REMOTE_REREAD_OBSERVATION");
   assert.equal(verifiedSidecarReadback.readbackMatched, true);
   assert.equal(verifiedSidecarReadback.authorizesIo, false);
   assert.equal(verifiedSidecarReadback.remoteDurabilityProven, false);
+  assert.equal(verifiedSidecarReadback.coherentProviderIdentityQuorumProven, false);
   const remoteRecovery = { scope, operation, catalogReaders,
     readers, minimumMatchingProviders: 2, minimumMatchingCatalogProviders: 2 };
 
@@ -688,8 +689,9 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       async download() { thirdCalled++; return new Promise(() => {}); } } };
     const restored = await recoverSignedCatalogSidecar({ scope,
       operationId: operation.operation_id, readers: [catalogReaders[0], catalogReaders[1], slow],
-      providerDomainPinset, deadlineMs: 500 });
+      providerDomainPinset, deadlineMs: 500, observationOnly: true });
     assert.equal(restored.matchingCount, 2);
+    assert.equal(restored.coherentProviderIdentityQuorumProven, false);
     assert.equal(thirdCalled, 0);
   });
   await t.test("signed catalog quorum recovers a real shorter-than-cap WebDAV sidecar when S3 is unavailable", async () => {
@@ -704,7 +706,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     const restored = await recoverSignedCatalogSidecar({ scope,
       operationId: operation.operation_id,
       readers: [unavailableS3, catalogReaders[1], catalogReaders[2]],
-      providerDomainPinset, deadlineMs: 5000 });
+      providerDomainPinset, deadlineMs: 5000, observationOnly: true });
     assert.equal(firstCalled, 1);
     assert.equal(restored.matchingCount, 2);
   });
@@ -719,7 +721,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       } } };
     await assert.rejects(recoverSignedCatalogSidecar({ scope,
       operationId: operation.operation_id, readers: [slow, catalogReaders[1]],
-      providerDomainPinset, deadlineMs: 100 }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/);
+      providerDomainPinset, deadlineMs: 100,
+      observationOnly: true }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/);
     assert.equal(aborted, true);
   });
   const sidecar = zk1CatalogSidecarAddress(scope, operation.operation_id);

@@ -430,7 +430,11 @@ class Zk1MultiproviderCiphertextRestore {
       const recovered = await recoverSignedCatalogSidecar({ scope,
         operationId: fixed.operation_id, readers: catalogReaders,
         minimumMatchingProviders: minimumMatchingCatalogProviders,
-        providerDomainPinset: this.#providerDomains, deadline: limit });
+        providerDomainPinset: this.#providerDomains, deadline: limit,
+        // Cloud observations are never an IO authority or simultaneous
+        // provider identity fence. The signed bytes are independently checked
+        // against immutable Ed25519 inventory and owner-root history below.
+        observationOnly: true });
       const verified = await this.restoreExact({ scope, operation: fixed,
         ...recovered.signedCatalog,
         // Fail closed if the previous proof was merely replayed as JSON;
