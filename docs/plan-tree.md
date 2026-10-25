@@ -471,6 +471,29 @@ an independent monotonic witness, proof of external admission, or physical
 PostgreSQL attestation. Independent Sync v2 admission receipts bound to the
 ZK1 physical inventory/CAS/FLOOR authority remain an acceptance blocker.
 
+Sync v2 to ZK1 physical-binding prototype (2026-10-24, isolated development):
+`sync-client/rootark-sync-zk1-physical-binding.js` deterministically binds
+the FULL canonical signed and encrypted Sync v2 envelope bytes (not a
+server-provided flag) to a scoped ZK1 inventory operation, including
+domain-separated 128-bit operation/object IDs, epoch/revision and SHA-256 of
+the exact bytes to be physically stored as opaque ciphertext. Its opt-in
+`physicalWriteRequest` prepares the existing bridge's exact gate request with
+bounded 1 MiB ciphertext chunks and an authenticated chunk root, but requires
+fresh, currently non-revoked client Ed25519 authorization before returning
+any candidate write. It verifies
+real Ed25519 client authorization and the existing independently pinned
+inventory + physical PostgreSQL readback signatures, rejecting a different
+valid signed envelope with the same operation ID. This is **pure
+cryptographic interface validation**, tested with signed PG-proof-shaped
+fixtures, **not a completed PostgreSQL write/attestation integration**. The
+normal sync server and clients do not yet produce or consume this composite;
+the PG ciphertext writer must be proven to store exactly those canonical
+envelope bytes before it can be used normatively. The result explicitly does
+NOT prove when the server originally admitted an expired operation, an
+independently anchored monotonic floor, remote durability, or IO authority.
+Only explicit `epoch-N` key epochs are interoperable with this prototype;
+other epoch names fail closed rather than inventing a numeric mapping.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 
