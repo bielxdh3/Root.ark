@@ -36,12 +36,30 @@ bootstrap or restart if the provider is absent/unavailable.
 
 Before **every** ISSUE and RECOVER (including their last SQLite transaction),
 the witness reloads the operator's current committed floor and requires EXACT
-equality with its locally verified signed recovery head. During RECOVER, after
-the immutable SQLite FULL transaction commits, it advances the externally
-held floor via a monotonic CAS and independently re-reads the result BEFORE
-returning the new signed evidence. If the external CAS is unavailable,
-ambiguous, ahead, behind, or does not acknowledge a durable write, there is no
-HTTP success response or authority to start another historical admission.
+equality with its locally verified signed recovery head. During RECOVER, the
+first SQLite FULL transaction **atomically** consumes the recovery nonce,
+advances the signed chain and persists `PENDING` ACK state inside the witness-
+Ed25519-signed recovery head. The witness then advances external custody via
+monotonic CAS and independently re-reads its committed result. **Only explicit
+CAS `true` plus matching external read** permit a *second* `BEGIN IMMEDIATE` /
+WAL `synchronous=FULL` transaction to sign `READY` on that same recovery head.
+Immediately before signing in the second FULL transaction, the witness reads
+the **last trusted-device revocation policy** again and checks the originally
+verified PG Ed25519 proof age against the then-current clock (30-second bound).
+Revocation or physical-proof expiry while an external CAS blocks leaves the
+already-consumed nonce and signed `PENDING` marker in durable quarantine, even
+if the external CAS itself succeeded. Old device proof expiry alone is not a
+replacement for live revocation: this historical flow explicitly permits an
+expired original envelope only when the trusted-device policy remains valid.
+A success response is impossible before that second durable commit. Missing,
+old or mismatched ACK state fails closed: the recovery signature domain and
+persistent issuer identity are versioned; old databases cannot become READY.
+
+External CAS failure, ambiguous/lost ACK, mismatched external state, or a
+crash before the second FULL transaction leaves the witness-signed `PENDING`
+marker. It quarantines ALL historical ISSUE/RECOVER in this process and after
+restart, **even if external custody eventually matches SQLite**. Equal heads
+are not proof of the original ACK. No caller/launcher-controlled clear API exists.
 There is deliberately no fallback to `trustedRecoveryNonceHead`, old
 owner/PG floors, a local signed SQLite head, writer/client metadata or JSON.
 
@@ -50,13 +68,12 @@ independent durability domains and CANNOT be made atomic by this protocol.
 If SQLite is ahead (crash before external CAS), startup and all historical
 operations fail closed. If external custody is ahead (CAS committed but SQLite
 rolled back), startup also fails closed. If external CAS succeeds but its ACK
-is lost, recovery is denied; after restart the original spent nonce remains
-unusable. Reconciliation is **manual and separately authorized**: the operator
-must independently inspect the witness's original signed recovery chain and
-the external monotonic record, then advance only a proven predecessor to its
-successor. The launcher NEVER self-promotes SQLite or silently rewinds the
-external floor. In particular, a historical SQLite snapshot signed by the
-same witness key is NOT sufficient authority if external head moved forward.
+is lost, the nonce remains spent and the signed marker remains PENDING.
+Reconciliation is **manual, separately authorized and requires a separately
+reviewed recovery/migration procedure**: merely matching the heads is NOT
+enough, and there is no automatic clear or in-process override. The launcher
+NEVER self-promotes SQLite or rewinds external custody. A historical SQLite
+snapshot signed by the witness key cannot override the off-host anchor.
 The older optional `trustedRecoveryNonceHead` is only an additional static
 minimum; it cannot replace the live externally loaded head.
 

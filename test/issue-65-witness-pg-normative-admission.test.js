@@ -698,25 +698,201 @@ test("strict CAS witness floor refuses signed status advance without independent
   externalPending.setFailurePhase(null);
   assert.equal(externalPending.authority.compareAndAdvance(
     independentlyPinnedRecoveryHead, reconciled), true);
-  pendingWitness = new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions);
+  // The external head eventually matching is NOT evidence the lost CAS ACK
+  // was observed by this witness. Signed pending state survives independently.
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "local-ahead pending marker remains quarantined after head-only reconciliation");
+  const ackLostPath = path.join(directory, "witness-external-ack-lost.sqlite");
+  fs.copyFileSync(historicalFilename, ackLostPath);
+  const externalAckLost = createExternalRecoveryHeadFixture(
+    path.join(directory, "separate-operator-ack-lost-head.sqlite"),
+    independentlyPinnedRecoveryHead);
+  externalAuthorities.push(externalAckLost);
+  const ackLostOptions = {
+    ...pinnedRestart, trustedRecoveryNonceAuthority: externalAckLost.authority,
+  };
+  pendingWitness = new Zk1WitnessCasAnchorFloor(ackLostPath, ackLostOptions);
+  assert.deepEqual((await pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: committedOnlyNonce,
+  })).admission, issued.admission,
+  "confirmed durable external CAS and second FULL transition permit ordinary recovery");
+  const confirmedSql = new Database(ackLostPath, { readonly: true, fileMustExist: true });
+  try {
+    const ready = confirmedSql.prepare(
+      "SELECT ack_phase,ack_previous_hash FROM witness_cas_sync_historical_recovery_head WHERE id=1"
+    ).get();
+    assert.deepEqual(ready, { ack_phase: "READY", ack_previous_hash: "0".repeat(64) },
+      "only a second FULL transaction after a confirmed CAS and fresh external read clears quarantine");
+  } finally { confirmedSql.close(); }
   await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
     ...recoveryInput, nonce: committedOnlyNonce,
   }), /WITNESS_CAS_FLOOR_DENIED/,
-  "after owner-approved reconciliation, an unacknowledged challenge remains forever spent");
+  "an unacknowledged challenge remains forever spent");
+  const preAckLostHead = pendingWitness.historicalRecoveryNonceHead();
   const acknowledgedExternallyButLost = random(32);
-  externalPending.setFailurePhase("after");
+  externalAckLost.setFailurePhase("after");
   await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
     ...recoveryInput, nonce: acknowledgedExternallyButLost,
   }), /WITNESS_CAS_FLOOR_DENIED/,
   "lost external CAS acknowledgment must not return HTTP recovery evidence");
-  pendingWitness.close();
-  externalPending.setFailurePhase(null);
-  pendingWitness = new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions);
-  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
-    ...recoveryInput, nonce: acknowledgedExternallyButLost,
+  externalAckLost.setFailurePhase(null);
+  assert.equal(pendingWitness.supportsClientHistoricalNonce, false,
+    "even if CAS committed, a lost ACK must quarantine same-process historical ISSUE/RECOVER");
+  await assert.rejects(pendingWitness.issueSyncHistoricalAdmission({
+    ...issueInput, nonce: random(32),
   }), /WITNESS_CAS_FLOOR_DENIED/,
-  "external CAS actually committed, so the no-ACK nonce is spent after restart");
+  "a fresh ISSUE must not bypass ambiguous recovery ACK in the same process");
+  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: random(32),
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "a fresh RECOVER must not bypass ambiguous recovery ACK in the same process");
+  const ackLostSql = new Database(ackLostPath, { readonly: true, fileMustExist: true });
+  try {
+    const signedQuarantine = ackLostSql.prepare(
+      "SELECT ack_phase,ack_previous_hash FROM witness_cas_sync_historical_recovery_head WHERE id=1"
+    ).get();
+    assert.equal(signedQuarantine.ack_phase, "PENDING");
+    assert.equal(signedQuarantine.ack_previous_hash, preAckLostHead.lastHash);
+  } finally { ackLostSql.close(); }
   pendingWitness.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(ackLostPath, ackLostOptions),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "even though durable external CAS equals local head, ACK-lost quarantine survives restart");
+  const forgedReadyPath = path.join(directory, "witness-pending-ack-forged-ready.sqlite");
+  const snapshotPending = new Database(ackLostPath, { readonly: true, fileMustExist: true });
+  try { await snapshotPending.backup(forgedReadyPath); }
+  finally { snapshotPending.close(); }
+  const forgedReadyDb = new Database(forgedReadyPath);
+  try {
+    // A SQL editor with no witness private key cannot convert a signed
+    // ambiguous CAS into a completed acknowledgment.
+    forgedReadyDb.prepare("UPDATE witness_cas_sync_historical_recovery_head"
+      + " SET ack_phase='READY',ack_previous_hash=? WHERE id=1")
+      .run("0".repeat(64));
+  } finally { forgedReadyDb.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(forgedReadyPath, ackLostOptions),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "forged READY without witness Ed25519 signature fails closed on restart");
+  const legacyRecoveryPath = path.join(directory, "witness-legacy-recovery-head-schema.sqlite");
+  const beforeUpgrade = new Database(historicalFilename, { readonly: true, fileMustExist: true });
+  try { await beforeUpgrade.backup(legacyRecoveryPath); }
+  finally { beforeUpgrade.close(); }
+  const oldSchema = new Database(legacyRecoveryPath);
+  try {
+    oldSchema.exec("ALTER TABLE witness_cas_sync_historical_recovery_head"
+      + " RENAME TO witness_cas_sync_historical_recovery_head_new");
+    oldSchema.exec("CREATE TABLE witness_cas_sync_historical_recovery_head ("
+      + "id INTEGER PRIMARY KEY CHECK(id=1),sequence INTEGER NOT NULL,"
+      + "last_hash TEXT NOT NULL,signature BLOB NOT NULL)");
+    oldSchema.exec("INSERT INTO witness_cas_sync_historical_recovery_head"
+      + " SELECT id,sequence,last_hash,signature FROM"
+      + " witness_cas_sync_historical_recovery_head_new");
+    oldSchema.exec("DROP TABLE witness_cas_sync_historical_recovery_head_new");
+  } finally { oldSchema.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(legacyRecoveryPath, pinnedRestart),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "old recovery schema without witness-signed ACK phase cannot be upgraded implicitly");
+  // Failure AFTER external CAS returns true but BEFORE the second FULL
+  // transaction durably signs READY must quarantine, not infer success from
+  // the external head already matching local nonce history.
+  const failedClearPath = path.join(directory, "witness-recovery-second-full-failed.sqlite");
+  const originalSql = new Database(historicalFilename, { readonly: true, fileMustExist: true });
+  try { await originalSql.backup(failedClearPath); }
+  finally { originalSql.close(); }
+  const failedClearExternal = createExternalRecoveryHeadFixture(
+    path.join(directory, "separate-operator-second-full-failed.sqlite"),
+    independentlyPinnedRecoveryHead);
+  externalAuthorities.push(failedClearExternal);
+  const failedClearOpts = { ...pinnedRestart,
+    trustedRecoveryNonceAuthority: failedClearExternal.authority };
+  const failedClearWitness = new Zk1WitnessCasAnchorFloor(failedClearPath, failedClearOpts);
+  const prepareBeforeInjection = Database.prototype.prepare;
+  try {
+    Database.prototype.prepare = function (sql, ...other) {
+      if (typeof sql === "string" && sql.includes("SET ack_phase='READY'")) {
+        throw Error("TEST_SECOND_FULL_UNAVAILABLE");
+      }
+      return prepareBeforeInjection.call(this, sql, ...other);
+    };
+    await assert.rejects(failedClearWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: random(32),
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "successful external CAS cannot bypass failed FULL-ready persistence");
+  } finally { Database.prototype.prepare = prepareBeforeInjection; }
+  const afterFailedClear = failedClearExternal.read();
+  assert.equal(afterFailedClear.sequence, independentlyPinnedRecoveryHead.sequence + 1);
+  assert.equal(failedClearWitness.supportsClientHistoricalNonce, false);
+  failedClearWitness.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(failedClearPath, failedClearOpts),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "failed second FULL transaction must keep signed PENDING quarantine after restart");
+  // Reviewer26 P2: an independently durable external CAS may take long enough
+  // for the device to be revoked or the verified PG attestation to expire.
+  // The LAST READY signature must not reuse pre-CAS policy/time checks.
+  const simulatePostCasDrift = async (label, afterExternalCas) => {
+    const isolatedPath = path.join(directory, `witness-post-cas-${label}.sqlite`);
+    const source = new Database(historicalFilename, { readonly: true, fileMustExist: true });
+    try { await source.backup(isolatedPath); }
+    finally { source.close(); }
+    const remote = createExternalRecoveryHeadFixture(
+      path.join(directory, `operator-post-cas-${label}.sqlite`),
+      independentlyPinnedRecoveryHead);
+    externalAuthorities.push(remote);
+    const authority = {
+      loadHead: remote.authority.loadHead,
+      compareAndAdvance(expected, next) {
+        const accepted = remote.authority.compareAndAdvance(expected, next);
+        if (accepted) afterExternalCas();
+        return accepted;
+      },
+    };
+    const options = { ...pinnedRestart, trustedRecoveryNonceAuthority: authority };
+    const instance = new Zk1WitnessCasAnchorFloor(isolatedPath, options);
+    let claimed;
+    try {
+      await assert.rejects(instance.recoverSyncHistoricalAdmission({
+        ...recoveryInput, nonce: random(32),
+      }), /WITNESS_CAS_FLOOR_DENIED/,
+      `post-CAS ${label} cannot sign READY using stale policy/physical evidence`);
+      claimed = remote.read();
+      assert.equal(claimed.sequence, independentlyPinnedRecoveryHead.sequence + 1,
+        `post-CAS ${label} happens only AFTER durable external advancement`);
+      assert.equal(instance.supportsClientHistoricalNonce, false,
+        `post-CAS ${label} must remain quarantined in-process`);
+    } finally { instance.close(); }
+    const sql = new Database(isolatedPath, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(sql.prepare("SELECT ack_phase FROM"
+        + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
+      "PENDING", `post-CAS ${label} retains signed PENDING`);
+    } finally { sql.close(); }
+    assert.throws(() => new Zk1WitnessCasAnchorFloor(isolatedPath, options),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      `post-CAS ${label} remains fail-closed after restart even if policy/time recovers`);
+  };
+  try {
+    await simulatePostCasDrift("revoked", () => {
+      trustedDeviceRevocations = ["device-a"];
+    });
+  } finally { trustedDeviceRevocations = []; }
+  const clockBeforeSlowCas = Date.now;
+  try {
+    await simulatePostCasDrift("expired-physical", () => {
+      // Deterministic synchronous CAS latency >30s without sleeping or
+      // changing the bound envelope's still-valid device expiration.
+      Date.now = () => clockBeforeSlowCas() + 45_000;
+    });
+  } finally { Date.now = clockBeforeSlowCas; }
+  try {
+    await simulatePostCasDrift("revoked-and-slow", () => {
+      trustedDeviceRevocations = ["device-a"];
+      Date.now = () => clockBeforeSlowCas() + 45_000;
+    });
+  } finally {
+    trustedDeviceRevocations = [];
+    Date.now = clockBeforeSlowCas;
+  }
   assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot, {
     ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
       sequence: 1, lastHash: admittedFloor.lastHash,

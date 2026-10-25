@@ -22,7 +22,9 @@ const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-fl
 // Existing v2 floors need an explicit external-owner-approved migration.
 const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v3\0", "ascii");
 const HISTORICAL_SYNC_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
-const RECOVERY_LEDGER_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v1\0");
+// v2 signs the recovery ACK quarantine phase alongside the consumed-nonce
+// head. Old v1 databases cannot silently opt into a READY state.
+const RECOVERY_LEDGER_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v2\0");
 // No TTL deletion is safe until an externally anchored compaction protocol
 // proves every retired challenge is still permanently non-replayable.
 const MAX_RECOVERY_CHALLENGES = 4096;
@@ -181,6 +183,8 @@ class Zk1WitnessCasAnchorFloor {
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   #recoveryHead = Object.freeze({ sequence: 0, lastHash: ZERO });
+  #recoveryAckPhase = "READY";
+  #recoveryAckPreviousHash = ZERO;
   #pinnedRecoveryHead;
   #externalRecoveryAuthority;
   #trustedSyncDevicePolicyProvider;
@@ -308,7 +312,8 @@ class Zk1WitnessCasAnchorFloor {
           normativePhysicalAdmissionDigest: this.#attestedAdmission.policyDigest(),
           physicalFenceSchema: "operation-id-v3-original-pg-attestor",
         } : {}),
-        ...(this.#historicalEnabled ? { historicalSyncAdmissionIssuer: true } : {}),
+        ...(this.#historicalEnabled ? { historicalSyncAdmissionIssuer: true,
+          recoveryAckQuarantineSchema: "signed-pending-full-v1" } : {}),
       });
       if (exists) {
         const row = db.prepare("SELECT identity FROM witness_cas_floor_identity WHERE id=1").get();
@@ -372,14 +377,17 @@ class Zk1WitnessCasAnchorFloor {
               id INTEGER PRIMARY KEY CHECK(id=1),
               sequence INTEGER NOT NULL CHECK(sequence>=0 AND sequence<=4096),
               last_hash TEXT NOT NULL,
+              ack_phase TEXT NOT NULL CHECK(ack_phase IN ('READY','PENDING')),
+              ack_previous_hash TEXT NOT NULL,
               signature BLOB NOT NULL CHECK(length(signature)=64));`);
         }
         db.prepare("INSERT INTO witness_cas_floor_identity VALUES(1,?)").run(this.#identity);
         if (this.#historicalEnabled) {
           const initial = { sequence: 0, lastHash: ZERO };
           db.prepare("INSERT INTO witness_cas_sync_historical_recovery_head"
-            + " (id,sequence,last_hash,signature) VALUES(1,?,?,?)").run(
-              0, ZERO, this.#signRecoveryHead(initial));
+            + " (id,sequence,last_hash,ack_phase,ack_previous_hash,signature)"
+            + " VALUES(1,?,?,?,?,?)").run(
+              0, ZERO, "READY", ZERO, this.#signRecoveryHead(initial, "READY", ZERO));
         }
       }
       const state = db.prepare("SELECT sequence,hash FROM witness_cas_floor_event ORDER BY sequence DESC LIMIT 1").get();
@@ -787,10 +795,10 @@ class Zk1WitnessCasAnchorFloor {
     // an ENTIRE previously valid signed SQLite replay ledger snapshot.
     return Object.freeze({ ...this.#recoveryHead });
   }
-  #recoveryHeadMessage({ sequence, lastHash }) {
+  #recoveryHeadMessage({ sequence, lastHash }, ackPhase, ackPreviousHash) {
     return Buffer.concat([RECOVERY_LEDGER_DOMAIN, Buffer.from(JSON.stringify([
       this.#witnessId.toString("base64url"), this.#statusId.toString("base64url"),
-      sequence, lastHash,
+      sequence, lastHash, ackPhase, ackPreviousHash,
     ]))]);
   }
   #readExternallyCommittedRecoveryHead() {
@@ -810,6 +818,10 @@ class Zk1WitnessCasAnchorFloor {
     return Object.freeze({ sequence: head.sequence, lastHash: head.lastHash });
   }
   #assertExternalRecoveryHead() {
+    // Even if an external CAS committed after its ACK was lost, equal heads
+    // cannot substitute for the witness's own missing confirmation. The
+    // durable witness-signed PENDING phase is a mandatory quarantine.
+    if (this.#recoveryAckPhase !== "READY") fail();
     const external = this.#readExternallyCommittedRecoveryHead();
     if (external.sequence !== this.#recoveryHead.sequence
       || external.lastHash !== this.#recoveryHead.lastHash) fail();
@@ -826,10 +838,48 @@ class Zk1WitnessCasAnchorFloor {
     // Only explicit durable CAS acknowledgment is accepted. Re-read from
     // external custody *after* the CAS, before any HTTP success response.
     if (acknowledged !== true) fail();
-    this.#assertExternalRecoveryHead();
+    const committed = this.#readExternallyCommittedRecoveryHead();
+    if (committed.sequence !== next.sequence || committed.lastHash !== next.lastHash) fail();
   }
-  #signRecoveryHead(head) {
-    return crypto.sign(null, this.#recoveryHeadMessage(head), this.#witness);
+  #signRecoveryHead(head, phase, previousHash) {
+    if (!["READY", "PENDING"].includes(phase) || !validHex(previousHash)
+      || (phase === "READY" && previousHash !== ZERO)) fail();
+    return crypto.sign(null, this.#recoveryHeadMessage(head, phase, previousHash), this.#witness);
+  }
+  #finishConfirmedRecoveryAck(head, previousHash, {
+    originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt,
+  }) {
+    if (this.#recoveryAckPhase !== "PENDING"
+      || this.#recoveryAckPreviousHash !== previousHash) fail();
+    // This is the ONLY transition to READY. No public reconciliation/clear
+    // method exists: ambiguous CAS results must remain quarantined.
+    this.#db.transaction(() => {
+      this.#assertHistoricalIntegrity();
+      const external = this.#readExternallyCommittedRecoveryHead();
+      if (external.sequence !== head.sequence || external.lastHash !== head.lastHash) fail();
+      // The external CAS can block while the owner revokes a trusted device,
+      // or until the independently signed PG proof is no longer fresh.
+      // This last synchronous owner-policy read and time sample are inside
+      // the SECOND FULL transaction, immediately before signing READY.
+      if (JSON.stringify(snapshotLocalDevicePolicy(
+        this.#trustedSyncDevicePolicyProvider())) !== originalPolicySnapshot) fail();
+      const atReady = Date.now();
+      if (!Number.isSafeInteger(atReady) || atReady < minimumCompletedAt
+        || !Number.isSafeInteger(physicalIssuedAt)
+        || Math.abs(Math.floor(atReady / 1000) - physicalIssuedAt) > 30) fail();
+      const cleared = this.#db.prepare(
+        "UPDATE witness_cas_sync_historical_recovery_head"
+        + " SET ack_phase='READY',ack_previous_hash=?,signature=?"
+        + " WHERE id=1 AND sequence=? AND last_hash=?"
+        + " AND ack_phase='PENDING' AND ack_previous_hash=?").run(
+          ZERO, this.#signRecoveryHead(head, "READY", ZERO),
+          head.sequence, head.lastHash, previousHash);
+      if (cleared.changes !== 1) fail();
+    }).immediate();
+    // SQLite WAL synchronous=FULL commits READY before the in-memory mirror
+    // changes or a success response can be returned.
+    this.#recoveryAckPhase = "READY";
+    this.#recoveryAckPreviousHash = ZERO;
   }
   #assertHistoricalNonceIntegrity(db) {
     const schema = new Set(db.prepare(
@@ -885,14 +935,22 @@ class Zk1WitnessCasAnchorFloor {
       previous = row.hash;
     }
     const stored = db.prepare(
-      "SELECT sequence,last_hash,signature FROM"
+      "SELECT sequence,last_hash,ack_phase,ack_previous_hash,signature FROM"
       + " witness_cas_sync_historical_recovery_head WHERE id=1").get();
     if (!stored || stored.sequence !== recent.length
       || stored.last_hash !== previous
+      || !["READY", "PENDING"].includes(stored.ack_phase)
+      || !validHex(stored.ack_previous_hash)
+      || (stored.ack_phase === "READY" && stored.ack_previous_hash !== ZERO)
+      || (stored.ack_phase === "PENDING"
+        && (stored.sequence < 1
+          || stored.ack_previous_hash !== (recent.length > 1
+            ? recent[recent.length - 2].hash : ZERO)))
       || !Buffer.isBuffer(stored.signature) || stored.signature.length !== 64
       || !crypto.verify(null, this.#recoveryHeadMessage({
         sequence: stored.sequence, lastHash: stored.last_hash,
-      }), crypto.createPublicKey(this.#witness), stored.signature)) fail();
+      }, stored.ack_phase, stored.ack_previous_hash),
+      crypto.createPublicKey(this.#witness), stored.signature)) fail();
     const pinned = { sequence: stored.sequence, lastHash: stored.last_hash };
     if (this.#pinnedRecoveryHead
       && (pinned.sequence < this.#pinnedRecoveryHead.sequence
@@ -902,9 +960,13 @@ class Zk1WitnessCasAnchorFloor {
             !== this.#pinnedRecoveryHead.lastHash))) fail();
     if (this.#db === db) {
       if (this.#recoveryHead.sequence !== pinned.sequence
-        || this.#recoveryHead.lastHash !== pinned.lastHash) fail();
+        || this.#recoveryHead.lastHash !== pinned.lastHash
+        || this.#recoveryAckPhase !== stored.ack_phase
+        || this.#recoveryAckPreviousHash !== stored.ack_previous_hash) fail();
     } else {
       this.#recoveryHead = Object.freeze(pinned);
+      this.#recoveryAckPhase = stored.ack_phase;
+      this.#recoveryAckPreviousHash = stored.ack_previous_hash;
     }
     const overlap = db.prepare(
       "SELECT 1 FROM witness_cas_sync_historical_issue_nonce i"
@@ -1129,10 +1191,13 @@ class Zk1WitnessCasAnchorFloor {
         const nextHead = { sequence: row.sequence, lastHash: hash };
         const advance = this.#db.prepare(
           "UPDATE witness_cas_sync_historical_recovery_head"
-          + " SET sequence=?,last_hash=?,signature=?"
-          + " WHERE id=1 AND sequence=? AND last_hash=?").run(
-            nextHead.sequence, nextHead.lastHash, this.#signRecoveryHead(nextHead),
-            this.#recoveryHead.sequence, this.#recoveryHead.lastHash);
+          + " SET sequence=?,last_hash=?,ack_phase='PENDING',"
+          + "ack_previous_hash=?,signature=?"
+          + " WHERE id=1 AND sequence=? AND last_hash=?"
+          + " AND ack_phase='READY' AND ack_previous_hash=?").run(
+            nextHead.sequence, nextHead.lastHash, this.#recoveryHead.lastHash,
+            this.#signRecoveryHead(nextHead, "PENDING", this.#recoveryHead.lastHash),
+            this.#recoveryHead.sequence, this.#recoveryHead.lastHash, ZERO);
         if (advance.changes !== 1) fail();
         const afterInsert = Date.now();
         if (!Number.isSafeInteger(afterInsert) || afterInsert < commitAtMs
@@ -1141,11 +1206,21 @@ class Zk1WitnessCasAnchorFloor {
       }).immediate();
       const previousExternal = this.#recoveryHead;
       this.#recoveryHead = committedHead;
+      this.#recoveryAckPhase = "PENDING";
+      this.#recoveryAckPreviousHash = previousExternal.lastHash;
       // Crash point: FULL SQLite has committed but the independent CAS may
       // not yet have committed. A missed/ambiguous external ACK denies this
       // request and all future historical operations until the operator
       // reconciles both durable stores. NEVER infer authority from SQLite.
       this.#commitExternalRecoveryHead(previousExternal, committedHead);
+      // Explicit successful CAS+independent readback is followed by a SECOND
+      // WAL synchronous=FULL transaction. Any exception/crash prior to that
+      // durable READY signature leaves PENDING, including after process restart.
+      this.#finishConfirmedRecoveryAck(committedHead, previousExternal.lastHash, {
+        originalPolicySnapshot: policySnapshot,
+        physicalIssuedAt: composite.physicalIssuedAt,
+        minimumCompletedAt: completed,
+      });
       return Object.freeze({
         admission, freshFloor: floor,
         physicalAttestation: Buffer.from(composite.physicalAttestation),
