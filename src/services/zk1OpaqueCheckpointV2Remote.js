@@ -36,9 +36,17 @@ const PREFIX = "Root.ark/zk-1/opaque-checkpoint-remote/";
 const INTENT_DOMAIN = Buffer.from(PREFIX + "intent/v2\0");
 const APPROVAL_DOMAIN = Buffer.from(PREFIX + "owner-approval/v2\0");
 const RECEIPT_DOMAIN = Buffer.from(PREFIX + "receipt/v2\0");
+const LEGACY_MIGRATION_DOMAIN = Buffer.from(
+  "Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0");
 const ROLE_CAS = "CAS";
 const ROLE_FLOOR = "FLOOR";
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
+const LEGACY_MIGRATION_FIELDS = ["type", ...SCOPE, "legacy_base_digest",
+  "legacy_base_checkpoint", "legacy_sequence", "legacy_head_digest",
+  "legacy_checkpoint_digest", "legacy_operation_id", "full_archive_root",
+  "full_archive_checkpoint", "cas_signer_fp", "floor_signer_fp",
+  "owner_revision", "owner_digest", "owner_epoch", "nonce",
+  "issued_at", "expires_at"];
 const INTENT_FIELDS = ["type", ...SCOPE, "operation_id", "checkpoint_bytes",
   "checkpoint_signature", "records", "previous_sequence",
   "previous_digest", "previous_checkpoint_digest", "owner_approval",
@@ -143,6 +151,31 @@ const STRICT_ROLLOVER_SCHEMA = `CREATE TABLE strict_rollover (
     BEGIN SELECT RAISE(ABORT,'STRICT_ROLLOVER_LOCKED'); END;
   CREATE TRIGGER strict_rollover_immutable_delete BEFORE DELETE ON strict_rollover
     BEGIN SELECT RAISE(ABORT,'STRICT_ROLLOVER_LOCKED'); END;`;
+// One-way, local PHASE-1 migration barrier. This does NOT reanchor old signed
+// 129+ receipts or authorize any new writes. In particular the FULL archive
+// checkpoint is deliberately distinct from immutable config.base_checkpoint.
+const LEGACY_MIGRATION_STAGE_SCHEMA = `CREATE TABLE legacy_archive_migration_stage (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    legacy_sequence INTEGER NOT NULL CHECK(legacy_sequence BETWEEN 128 AND 1000000),
+    legacy_head_digest BLOB NOT NULL CHECK(length(legacy_head_digest)=32),
+    legacy_checkpoint_digest BLOB NOT NULL CHECK(length(legacy_checkpoint_digest)=32),
+    legacy_operation_id BLOB NOT NULL CHECK(length(legacy_operation_id)=32),
+    full_archive_root BLOB NOT NULL CHECK(length(full_archive_root)=32),
+    full_archive_checkpoint BLOB NOT NULL CHECK(length(full_archive_checkpoint)=32),
+    owner_consent BLOB NOT NULL,
+    owner_signature BLOB NOT NULL CHECK(length(owner_signature)=64));
+  CREATE TRIGGER legacy_archive_stage_immutable_update
+    BEFORE UPDATE ON legacy_archive_migration_stage
+    BEGIN SELECT RAISE(ABORT,'LEGACY_MIGRATION_LOCKED'); END;
+  CREATE TRIGGER legacy_archive_stage_immutable_delete
+    BEFORE DELETE ON legacy_archive_migration_stage
+    BEGIN SELECT RAISE(ABORT,'LEGACY_MIGRATION_LOCKED'); END;
+  CREATE TRIGGER legacy_archive_stage_block_transition_insert
+    BEFORE INSERT ON transitions
+    BEGIN SELECT RAISE(ABORT,'LEGACY_MIGRATION_PENDING'); END;
+  CREATE TRIGGER legacy_archive_stage_block_transition_update
+    BEFORE UPDATE ON transitions
+    BEGIN SELECT RAISE(ABORT,'LEGACY_MIGRATION_PENDING'); END;`;
 
 function fail(code = "ZK_CHECKPOINT_V2_UNAVAILABLE") {
   const error = new Error(code); error.code = code; throw error;
@@ -164,6 +197,12 @@ function num(value, min, max = Number.MAX_SAFE_INTEGER) {
   return value;
 }
 function same(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, b); }
+function canonical32(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) fail();
+  const valueBytes = Buffer.from(value, "base64url");
+  if (valueBytes.length !== 32 || valueBytes.toString("base64url") !== value) fail();
+  return valueBytes;
+}
 function hash(...parts) {
   const h = crypto.createHash("sha256");
   for (const part of parts) h.update(part);
@@ -538,7 +577,69 @@ class OpaqueCheckpointV2Authority {
       || !same(bytes(rows[0].archive_root, 32), pinned.archiveRoot)
       || !same(bytes(rows[0].archive_checkpoint, 32), pinned.checkpoint)) fail();
   }
+  #legacyMigrationStage() {
+    const db = this.#db, s = this.#settings;
+    const schema = new Set(db.prepare("SELECT name FROM sqlite_master"
+      + " WHERE type IN ('table','trigger')").all().map((row) => row.name));
+    const table = schema.has("legacy_archive_migration_stage");
+    const triggers = ["legacy_archive_stage_immutable_update",
+      "legacy_archive_stage_immutable_delete",
+      "legacy_archive_stage_block_transition_insert",
+      "legacy_archive_stage_block_transition_update"];
+    if (!table) {
+      if (triggers.some((name) => schema.has(name))) fail();
+      return null;
+    }
+    // Name-only checks permit replacing a deny trigger with a same-name
+    // no-op. Verify the exact application-authored SQL for every write fence.
+    const canonicalSql = (sql) => sql.trim().replace(/;$/, "").replace(/\s+/g, " ");
+    const expectedTable = LEGACY_MIGRATION_STAGE_SCHEMA.split("CREATE TRIGGER")[0];
+    const getDdl = db.prepare("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?");
+    const storedTable = getDdl.get("legacy_archive_migration_stage");
+    if (storedTable?.type !== "table"
+      || canonicalSql(storedTable.sql) !== canonicalSql(expectedTable)) fail();
+    const definitions = [...LEGACY_MIGRATION_STAGE_SCHEMA.matchAll(
+      /CREATE TRIGGER (legacy_archive_stage_[a-z_]+)\s+BEFORE (?:INSERT|UPDATE|DELETE) ON ([a-z_]+)[\s\S]*?END;/g)];
+    if (definitions.length !== triggers.length) fail();
+    for (const [name, target] of definitions.map((match) => [match[1], match[2]])) {
+      const current = getDdl.get(name);
+      const expected = definitions.find((match) => match[1] === name);
+      if (!triggers.includes(name) || current?.type !== "trigger"
+        || current.tbl_name !== target
+        || canonicalSql(current.sql) !== canonicalSql(expected[0])) fail();
+    }
+    const rows = db.prepare("SELECT * FROM legacy_archive_migration_stage").all();
+    if (rows.length !== 1 || rows[0].id !== 1) fail();
+    const row = rows[0];
+    const latest = db.prepare("SELECT sequence,final_digest,checkpoint_digest,"
+      + "operation_id,state FROM transitions ORDER BY sequence DESC LIMIT 1").get();
+    if ((latest?.sequence || 128) !== row.legacy_sequence
+      || (latest?.state || "FINALIZED") !== "FINALIZED"
+      || !same(latest?.final_digest || s.baseDigest, bytes(row.legacy_head_digest, 32))
+      || !same(latest?.checkpoint_digest || s.baseCheckpoint,
+        bytes(row.legacy_checkpoint_digest, 32))
+      || !same(latest?.operation_id || ZERO, bytes(row.legacy_operation_id, 32))) fail();
+    const consent = JSON.parse(bytes(row.owner_consent, 1, 4096).toString("utf8"));
+    exact(consent, LEGACY_MIGRATION_FIELDS);
+    if (consent.type !== "rootark-opaque-checkpoint-v2-legacy-archive-migration/v1"
+      || !SCOPE.every((field) => consent[field] === s.scope[field].toString("base64url"))
+      || !same(canonical32(consent.legacy_base_digest), s.baseDigest)
+      || !same(canonical32(consent.legacy_base_checkpoint), s.baseCheckpoint)
+      || !same(canonical32(consent.cas_signer_fp), s.casFp)
+      || !same(canonical32(consent.floor_signer_fp), s.floorFp)
+      || !same(canonical32(consent.legacy_head_digest), bytes(row.legacy_head_digest, 32))
+      || !same(canonical32(consent.legacy_checkpoint_digest), bytes(row.legacy_checkpoint_digest, 32))
+      || !same(canonical32(consent.legacy_operation_id), bytes(row.legacy_operation_id, 32))
+      || !same(canonical32(consent.full_archive_root), bytes(row.full_archive_root, 32))
+      || !same(canonical32(consent.full_archive_checkpoint), bytes(row.full_archive_checkpoint, 32))
+      || consent.legacy_sequence !== row.legacy_sequence
+      || !crypto.verify(null, Buffer.concat([LEGACY_MIGRATION_DOMAIN,
+        row.owner_consent]), s.ownerKey, bytes(row.owner_signature, 64))) fail();
+    return row;
+  }
   async #verifyStrictAdmission() {
+    if (this.#legacyMigrationStage())
+      fail("ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING");
     // A newly provisioned STRICT authority binds this obligation in its
     // immutable SQLite identity. Existing legacy V2 authorities are not
     // retroactively upgraded by guessing an archive or repinning their head.
@@ -584,6 +685,121 @@ class OpaqueCheckpointV2Authority {
       try { await this.#verifyStrictAdmission(); }
       catch (error) { this.#strictRollover.proof = old; throw error; }
       return Object.freeze({ renewed: true, v2WriteAuthorized: false });
+    });
+  }
+  // Operator-local PHASE-1 only: both authorities MUST independently stage
+  // this exact owner consent while the signed legacy head is still unchanged.
+  // Until a separately reviewed dual-authority protocol exists, this is a
+  // PERMANENT write quarantine, never an implicit V2 epoch activation.
+  async stageLegacyArchiveMigration({ fullV1ArchiveRollover, ownerConsent,
+    ownerSignature, peerClient } = {}) {
+    return this.#serial(async () => {
+      if (this.#strictRollover || this.#legacyMigrationStage()
+        || !fullV1ArchiveRollover || !pinnedV2Clients.has(peerClient)
+        || peerClient.role === this.role) fail("ZK_CHECKPOINT_V2_LEGACY_MIGRATION_DENIED");
+      const s = this.#settings;
+      const proof = fullV1ArchiveRollover;
+      if (!same(fp(key(proof.ownerKey)), fp(s.ownerKey))
+        || !same(fp(key(proof.checkpointKey)), s.checkpointFp)
+        || !same(fp(key(proof.v2CasKey)), s.casFp)
+        || !same(fp(key(proof.v2FloorKey)), s.floorFp)
+        || !same(canonical32(proof.handoff.v1_digest), s.baseDigest)
+        || !SCOPE.every((field) =>
+          same(bytes(proof.scope[field], s.scope[field].length), s.scope[field]))) fail();
+      const { verifyRolloverPreflight } = require("./zk1OpaqueCatalogV1RolloverPreflight");
+      const inspected = await verifyRolloverPreflight(proof);
+      if (inspected.sequence !== 128 || inspected.archivesRetained !== 128
+        || inspected.v2WriteAuthorized !== false
+        || !same(canonical32(inspected.digest), s.baseDigest)) fail();
+      const nonce = crypto.randomBytes(32);
+      const observed = bytes(await s.ownerTrust.freshWitnessHead({
+        scope: s.scope, nonce }), 1, 8192);
+      await inspectVerifiedWitnessFreshHeadV1({ raw: observed, nonce,
+        scope: s.scope, pinned: s.ownerTrust.pinnedWitness,
+        minimumHead: s.ownerTrust.minimumHead });
+      const witness = await z.decodeDeterministic(observed);
+      const ownRows = await this.#history();
+      const last = ownRows.at(-1);
+      if (last && last.state !== "FINALIZED") fail("ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING");
+      if (last) {
+        const priorIntent = await z.decodeDeterministic(bytes(last.intent, 1, MAX_WIRE));
+        const signedHead = await z.decodeDeterministic(
+          bytes(priorIntent.records?.[0]?.header, 1, 16384));
+        // Owner approval cannot recast a newer legacy V2 epoch as a prior
+        // epoch, even when that older owner signed a complete V1 archive.
+        if (!Number.isSafeInteger(signedHead.epoch)
+          || signedHead.epoch > proof.ownerHead.epoch) fail();
+      }
+      const snapshot = {
+        sequence: last?.sequence || 128,
+        head: last?.final_digest || s.baseDigest,
+        checkpoint: last?.checkpoint_digest || s.baseCheckpoint,
+        operation: last?.operation_id || ZERO,
+      };
+      if (!same(fp(key(peerClient.publicKey)),
+        this.role === ROLE_CAS ? s.floorFp : s.casFp)) fail();
+      const peer = await peerClient.head();
+      if (peer.state !== (last ? "FINALIZED" : "V1_BASELINE")
+        || peer.sequence !== snapshot.sequence
+        || !same(bytes(peer.head_digest || peer.headDigest, 32), snapshot.head)
+        || !same(bytes(peer.checkpoint_digest || peer.checkpointDigest, 32), snapshot.checkpoint)
+        || (last && !same(bytes(peer.operation_id, 32), snapshot.operation))) fail();
+      exact(ownerConsent, LEGACY_MIGRATION_FIELDS);
+      const consent = Buffer.from(JSON.stringify(ownerConsent));
+      const signature = bytes(ownerSignature, 64);
+      const now = Math.floor(Date.now() / 1000);
+      for (const field of SCOPE)
+        if (ownerConsent[field] !== s.scope[field].toString("base64url")) fail();
+      if (ownerConsent.type !== "rootark-opaque-checkpoint-v2-legacy-archive-migration/v1"
+        || !same(canonical32(ownerConsent.legacy_base_digest), s.baseDigest)
+        || !same(canonical32(ownerConsent.legacy_base_checkpoint), s.baseCheckpoint)
+        || ownerConsent.legacy_sequence !== snapshot.sequence
+        || !same(canonical32(ownerConsent.legacy_head_digest), snapshot.head)
+        || !same(canonical32(ownerConsent.legacy_checkpoint_digest), snapshot.checkpoint)
+        || !same(canonical32(ownerConsent.legacy_operation_id), snapshot.operation)
+        || !same(canonical32(ownerConsent.full_archive_root), canonical32(inspected.archiveRoot))
+        || !same(canonical32(ownerConsent.full_archive_checkpoint),
+          canonical32(inspected.checkpointDigest))
+        || !same(canonical32(ownerConsent.cas_signer_fp), s.casFp)
+        || !same(canonical32(ownerConsent.floor_signer_fp), s.floorFp)
+        || ownerConsent.owner_revision !== proof.ownerHead.revision
+        || !same(canonical32(ownerConsent.owner_digest), bytes(proof.ownerHead.digest, 32))
+        || ownerConsent.owner_epoch !== proof.ownerHead.epoch
+        || witness.current_revision !== ownerConsent.owner_revision
+        || !same(bytes(witness.current_manifest_digest, 32),
+          canonical32(ownerConsent.owner_digest))
+        || !Number.isSafeInteger(ownerConsent.issued_at)
+        || !Number.isSafeInteger(ownerConsent.expires_at)
+        || ownerConsent.issued_at > now + 30 || ownerConsent.expires_at < now
+        || ownerConsent.issued_at < 1
+        || ownerConsent.expires_at <= ownerConsent.issued_at
+        || ownerConsent.expires_at - ownerConsent.issued_at > 300
+        || !crypto.verify(null, Buffer.concat([LEGACY_MIGRATION_DOMAIN, consent]),
+          s.ownerKey, signature)) fail();
+      canonical32(ownerConsent.nonce);
+      // Fence competing processes that use this SAME SQLite DB, including an
+      // older binary without awareness of the staged state, by SQLite triggers.
+      this.#db.transaction(() => {
+        if (this.#legacyMigrationStage()) fail();
+        const count = this.#db.prepare("SELECT COUNT(*) AS n FROM transitions").get().n;
+        const current = this.#db.prepare(
+          "SELECT sequence,final_digest,checkpoint_digest,operation_id,state"
+          + " FROM transitions ORDER BY sequence DESC LIMIT 1").get();
+        if (count !== ownRows.length || (current?.sequence || 128) !== snapshot.sequence
+          || (current?.state || "FINALIZED") !== "FINALIZED"
+          || (current && (!same(current.final_digest, snapshot.head)
+            || !same(current.checkpoint_digest, snapshot.checkpoint)
+            || !same(current.operation_id, snapshot.operation)))) fail();
+        this.#db.exec(LEGACY_MIGRATION_STAGE_SCHEMA);
+        this.#db.prepare("INSERT INTO legacy_archive_migration_stage"
+          + " VALUES(1,?,?,?,?,?,?,?,?)").run(snapshot.sequence, snapshot.head,
+          snapshot.checkpoint, snapshot.operation,
+          canonical32(inspected.archiveRoot), canonical32(inspected.checkpointDigest),
+          consent, signature);
+      }).immediate();
+      return Object.freeze({ state: "LEGACY_ARCHIVE_MIGRATION_STAGED_READ_ONLY",
+        legacySequence: snapshot.sequence, v2WriteAuthorized: false,
+        independentlyReconciledAcrossAuthorities: false });
     });
   }
   get role() { return this.#settings.role; }

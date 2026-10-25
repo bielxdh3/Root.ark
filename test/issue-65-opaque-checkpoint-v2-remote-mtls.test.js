@@ -18,6 +18,8 @@ const ownerManifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const { createAuthenticatedOpaqueCatalogArchiveV2 } =
   require("../src/crypto/rootark-zk1-opaque-catalog-checkpoint-v2");
+const { OWNER_DOMAIN: V1_ARCHIVE_HANDOFF_DOMAIN } =
+  require("../src/services/zk1OpaqueCatalogV1RolloverPreflight");
 const { Zk1OpaqueCatalogCasLedger } =
   require("../src/services/zk1OpaqueCatalogCasLedger");
 const { createZk1OpaqueCatalogCasHttpsServer } =
@@ -173,6 +175,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   // Real durable v1 monotonic history to absolute 128, not a forged bootstrap.
   let previousDigest = Buffer.alloc(32);
   let lastHead;
+  const completeV1Archive = [];
   for (let seq = 1; seq <= 128; seq++) {
     const header = { type: "rootark-zk1-opaque-catalog/v1", ...scope,
       sequence: seq, previous_digest: previousDigest,
@@ -188,6 +191,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
       nonce: crypto.randomBytes(32) });
     previousDigest = digest;
     lastHead = { header: head, signature, sequence: seq, page_bodies: [] };
+    completeV1Archive.push(lastHead);
   }
   assert.equal(floorLedger.inspect().sequence, 128);
   console.error("STAGE: v1-128 committed");
@@ -354,6 +358,115 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
         assert.equal((await casClient.head()).sequence, 130);
         assert.equal((await floorClient.head()).sequence, 130);
         assert.equal((await recipient.read()).sequence, 130);
+        // Legacy #129/#130 remain signed by their ORIGINAL one-head-only V1
+        // predecessor. Stage a distinct FULL-128 archive without replacing
+        // those immutable receipts or authorizing another V2 write.
+        const fullArchive = await createAuthenticatedOpaqueCatalogArchiveV2({
+          scope, records: completeV1Archive, previousSequence: 0,
+          previousDigest: Buffer.alloc(32), previousCheckpointDigest: Buffer.alloc(32),
+          resolveCatalogSigner: async () => signerA,
+          checkpointPrivateKey: checkpoint.privateKey, issuedAt: now(),
+        });
+        assert.notDeepEqual(fullArchive.checkpointDigest, oldCheckpoint);
+        const archiveBody = await z.decodeDeterministic(fullArchive.checkpointBytes);
+        const currentOwnerHead = { revision: Number(state.headManifest.revision),
+          digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest),
+          epoch: Number(state.headManifest.current_epoch) };
+        const handoffBody = {
+          type: 'rootark-zk1-opaque-v1-v2-owner-rollover-handoff/v1',
+          ...Object.fromEntries(Object.entries(scope).map(([name, value]) =>
+            [name, encoded(value)])),
+          v1_sequence: 128, v1_digest: encoded(oldDigest),
+          v1_archive_root: encoded(archiveBody.archive_root),
+          v1_archive_checkpoint: encoded(fullArchive.checkpointDigest),
+          v2_cas_spki_sha256: encoded(fp(v2CasKeys.publicKey)),
+          v2_floor_spki_sha256: encoded(fp(v2FloorKeys.publicKey)),
+          v2_checkpoint_spki_sha256: encoded(fp(checkpoint.publicKey)),
+          owner_revision: currentOwnerHead.revision,
+          owner_digest: encoded(currentOwnerHead.digest),
+          owner_epoch: currentOwnerHead.epoch, next_epoch: currentOwnerHead.epoch,
+          nonce: encoded(crypto.randomBytes(32)), issued_at: now() - 1,
+          expires_at: now() + 180,
+        };
+        const fullProof = {
+          scope, records128: completeV1Archive,
+          archiveCheckpointBytes: fullArchive.checkpointBytes,
+          archiveCheckpointSignature: fullArchive.checkpointSignature,
+          v2PredecessorCheckpointPin: encoded(fullArchive.checkpointDigest),
+          checkpointKey: checkpoint.publicKey,
+          resolveCatalogSigner: async () => signerA,
+          v1CasClient: v1Cas, v1FloorClient: v1Floor,
+          v1CasKey: v1CasKeys.publicKey, v1FloorKey: v1FloorKeys.publicKey,
+          v2CasKey: v2CasKeys.publicKey, v2FloorKey: v2FloorKeys.publicKey,
+          v2CheckpointKey: checkpoint.publicKey,
+          ownerKey: owner.publicKey, ownerHead: currentOwnerHead,
+          handoff: handoffBody,
+          ownerSignature: crypto.sign(null, Buffer.concat([V1_ARCHIVE_HANDOFF_DOMAIN,
+            Buffer.from(JSON.stringify(handoffBody))]), owner.privateKey),
+          independentSpkiPins: {
+            v1Cas: encoded(fp(v1CasKeys.publicKey)),
+            v1Floor: encoded(fp(v1FloorKeys.publicKey)),
+            v2Cas: encoded(fp(v2CasKeys.publicKey)),
+            v2Floor: encoded(fp(v2FloorKeys.publicKey)),
+            archiveCheckpoint: encoded(fp(checkpoint.publicKey)),
+            v2Checkpoint: encoded(fp(checkpoint.publicKey)),
+            owner: encoded(fp(owner.publicKey)),
+          },
+        };
+        const legacyHead = await casClient.head();
+        assert.equal(legacyHead.sequence, 130);
+        const consent = {
+          type: 'rootark-opaque-checkpoint-v2-legacy-archive-migration/v1',
+          ...Object.fromEntries(Object.entries(scope).map(([name, value]) =>
+            [name, encoded(value)])),
+          legacy_base_digest: encoded(oldDigest),
+          legacy_base_checkpoint: encoded(oldCheckpoint),
+          legacy_sequence: legacyHead.sequence,
+          legacy_head_digest: encoded(legacyHead.head_digest),
+          legacy_checkpoint_digest: encoded(legacyHead.checkpoint_digest),
+          legacy_operation_id: encoded(legacyHead.operation_id),
+          full_archive_root: handoffBody.v1_archive_root,
+          full_archive_checkpoint: encoded(fullArchive.checkpointDigest),
+          cas_signer_fp: encoded(fp(v2CasKeys.publicKey)),
+          floor_signer_fp: encoded(fp(v2FloorKeys.publicKey)),
+          owner_revision: currentOwnerHead.revision,
+          owner_digest: encoded(currentOwnerHead.digest),
+          owner_epoch: currentOwnerHead.epoch,
+          nonce: encoded(crypto.randomBytes(32)),
+          issued_at: now(), expires_at: now() + 180,
+        };
+        const migrationArgs = {
+          fullV1ArchiveRollover: fullProof, ownerConsent: consent,
+          ownerSignature: crypto.sign(null, Buffer.concat([Buffer.from(
+            'Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0'),
+            Buffer.from(JSON.stringify(consent))]), owner.privateKey),
+        };
+        await assert.rejects(caFloor.stageLegacyArchiveMigration({
+          ...migrationArgs, fullV1ArchiveRollover: null, peerClient: casClient,
+        }), /ZK_CHECKPOINT_V2_/);
+        const ownerSignedRollback = { ...consent, legacy_sequence: 129 };
+        await assert.rejects(caFloor.stageLegacyArchiveMigration({
+          ...migrationArgs, ownerConsent: ownerSignedRollback,
+          ownerSignature: crypto.sign(null, Buffer.concat([Buffer.from(
+            'Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0'),
+            Buffer.from(JSON.stringify(ownerSignedRollback))]), owner.privateKey),
+          peerClient: casClient,
+        }), /ZK_CHECKPOINT_V2_/,
+        'even a genuinely owner-signed stale 129 head cannot roll back committed 130');
+        const floorStage = await caFloor.stageLegacyArchiveMigration({
+          ...migrationArgs, peerClient: casClient });
+        assert.equal(floorStage.legacySequence, 130);
+        assert.equal(floorStage.v2WriteAuthorized, false);
+        assert.equal((await recipient.read()).sequence, 130,
+          'crash after only FLOOR stage must preserve already signed 129+ read');
+        await assert.rejects(floorClient.prepare(signedCanary[1].raw),
+          /ZK_CHECKPOINT_V2_ACK_UNCERTAIN/,
+        'direct legacy mTLS cannot admit a new write while FLOOR is staged');
+        const casStage = await caCas.stageLegacyArchiveMigration({
+          ...migrationArgs, peerClient: floorClient });
+        assert.equal(casStage.legacySequence, 130);
+        assert.equal((await recipient.read()).sequence, 130,
+          'both stage rows must preserve intact signed old 129+ history');
       } finally { recipient.close(); }
     } finally {
       for (const server of endpoints)

@@ -2,6 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const Database = require("better-sqlite3");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
@@ -291,14 +292,15 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
   const fullCheckpoint = Buffer.from(options.archiveCheckpointBytes);
   const fullDigest = digest(Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0"),
     fullCheckpoint, options.archiveCheckpointSignature);
-  async function withAuthorities(baseCheckpoint, action, enforceAuthorityProof = false) {
+  async function withAuthorities(baseCheckpoint, action, enforceAuthorityProof = false,
+    signedOwnerWitness = false) {
     const trust = { genesisDigest: crypto.randomBytes(32),
       pinnedWitness: { publicKey: pair().publicKey, keyId: crypto.randomBytes(16) },
       minimumHead: { revision: 8, digest: options.ownerHead.digest, epoch: 4 },
       freshWitnessHead: async () => { throw new Error("NO_OWNER_WRITE_PROOF"); } };
     let liveOwnerDigest = options.ownerHead.digest;
     let liveOwnerRevision = 8;
-    if (enforceAuthorityProof) {
+    if (enforceAuthorityProof || signedOwnerWitness) {
       const witness = pair(), keyId = crypto.randomBytes(16);
       trust.pinnedWitness = { publicKey: witness.publicKey, keyId };
       trust.minimumHead = { revision: 8, witnessSequence: 8,
@@ -529,7 +531,7 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     checkpointPrivateKey: checkpoint.privateKey,
     issuedAt: Math.floor(Date.now() / 1000) });
   assert.notDeepEqual(oneHeadOnly.checkpointDigest, fullDigest);
-  await withAuthorities(oneHeadOnly.checkpointDigest, async (casClient, floorClient, trust) => {
+  await withAuthorities(oneHeadOnly.checkpointDigest, async (casClient, floorClient, trust, context) => {
     const guarded = createOpaqueCheckpointV2Coordinator({
       casClient, floorClient, trustedScope: options.scope,
       expectedV1Digest: options.stateDigest, expectedV1Checkpoint: fullDigest,
@@ -560,5 +562,114 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     } finally { local.close(); }
     assert.equal((await casClient.head()).state, "V1_BASELINE");
     assert.equal((await floorClient.head()).state, "V1_BASELINE");
-  });
+    const legacyCasHead = await casClient.head();
+    const legacyFloorHead = await floorClient.head();
+    assert.equal(legacyCasHead.sequence, legacyFloorHead.sequence);
+    // Separate owner approval must name BOTH non-equivalent checkpoint roots.
+    const statement = {
+      type: 'rootark-opaque-checkpoint-v2-legacy-archive-migration/v1',
+      ...Object.fromEntries(Object.entries(options.scope).map(([name, value]) =>
+        [name, b64(value)])),
+      legacy_base_digest: b64(options.stateDigest),
+      legacy_base_checkpoint: b64(oneHeadOnly.checkpointDigest),
+      legacy_sequence: 128,
+      legacy_head_digest: b64(options.stateDigest),
+      legacy_checkpoint_digest: b64(oneHeadOnly.checkpointDigest),
+      legacy_operation_id: b64(Buffer.alloc(32)),
+      full_archive_root: options.handoff.v1_archive_root,
+      full_archive_checkpoint: b64(fullDigest),
+      cas_signer_fp: b64(id(v2Cas.publicKey)),
+      floor_signer_fp: b64(id(v2Floor.publicKey)),
+      owner_revision: options.ownerHead.revision,
+      owner_digest: b64(options.ownerHead.digest),
+      owner_epoch: options.ownerHead.epoch,
+      nonce: b64(crypto.randomBytes(32)),
+      issued_at: Math.floor(Date.now() / 1000),
+      expires_at: Math.floor(Date.now() / 1000) + 180,
+    };
+    const signedConsent = crypto.sign(null, Buffer.concat([Buffer.from(
+      'Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0'),
+      Buffer.from(JSON.stringify(statement))]), owner.privateKey);
+    const fullProof = { ...options, v1CasClient, v1FloorClient };
+    const floorArgs = { fullV1ArchiveRollover: fullProof, ownerConsent: statement,
+      ownerSignature: signedConsent, peerClient: casClient };
+    await assert.rejects(context.floor.stageLegacyArchiveMigration({
+      ...floorArgs, fullV1ArchiveRollover: null,
+    }), /ZK_CHECKPOINT_V2_/, 'missing full128 archive cannot stage a legacy migration');
+    await assert.rejects(context.floor.stageLegacyArchiveMigration({
+      ...floorArgs, ownerSignature: crypto.randomBytes(64),
+    }), /ZK_CHECKPOINT_V2_/, 'foreign owner consent must not stage');
+    await assert.rejects(context.floor.stageLegacyArchiveMigration({
+      ...floorArgs, ownerConsent: { ...statement,
+        legacy_base_checkpoint: statement.full_archive_checkpoint },
+    }), /ZK_CHECKPOINT_V2_/, 'legacy predecessor cannot be silently replaced by full128');
+    const stagedFloor = await context.floor.stageLegacyArchiveMigration(floorArgs);
+    assert.equal(stagedFloor.state, 'LEGACY_ARCHIVE_MIGRATION_STAGED_READ_ONLY');
+    assert.equal(stagedFloor.v2WriteAuthorized, false);
+    assert.notEqual(statement.legacy_base_checkpoint, statement.full_archive_checkpoint);
+    await assert.rejects(context.floor.prepare(Buffer.from([0xa0]), crypto.randomBytes(32)),
+      { code: 'ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING' });
+    const stagedCas = await context.cas.stageLegacyArchiveMigration({
+      ...floorArgs, peerClient: floorClient });
+    assert.equal(stagedCas.state, stagedFloor.state);
+    await assert.rejects(context.cas.commit(Buffer.from([0xa0]), Buffer.alloc(64),
+      crypto.randomBytes(32)), { code: 'ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING' });
+    await assert.rejects(floorClient.prepare(Buffer.from([0xa0])),
+      /ZK_CHECKPOINT_V2_ACK_UNCERTAIN/, 'direct mTLS cannot downgrade staged FLOOR');
+    const sql = new Database(context.floorDb);
+    try {
+      assert.throws(() => sql.exec('DELETE FROM legacy_archive_migration_stage'),
+        /LEGACY_MIGRATION_LOCKED/, 'migration marker is immutable');
+      assert.throws(() => sql.exec('UPDATE legacy_archive_migration_stage SET id=1'),
+        /LEGACY_MIGRATION_LOCKED/, 'migration marker cannot be silently repinned');
+      assert.throws(() => sql.exec(`INSERT INTO transitions
+        (sequence,intent_hash,operation_id,checkpoint_digest,final_digest,intent,
+          signer_spki,state) VALUES(129,zeroblob(32),zeroblob(32),zeroblob(32),
+          zeroblob(32),x'00',zeroblob(44),'PREPARED')`),
+        /LEGACY_MIGRATION_PENDING/,
+      'even an older writer process must be fenced by native SQLite trigger');
+    } finally { sql.close(); }
+    const savedHead = await floorClient.head();
+    context.floor.close();
+    const restartedFloor = new OpaqueCheckpointV2Authority(context.floorDb, {
+      role: 'FLOOR', bootstrapNew: false, scope: options.scope,
+      signingPrivateKey: v2Floor.privateKey,
+      casSignerPublicKey: v2Cas.publicKey,
+      floorSignerPublicKey: v2Floor.publicKey,
+      checkpointPublicKey: options.checkpointKey, ownerPublicKey: options.ownerKey,
+      ownerTrust: trust, baseDigest: options.stateDigest,
+      baseCheckpoint: oneHeadOnly.checkpointDigest,
+    });
+    try {
+      assert.equal((await restartedFloor.head(crypto.randomBytes(32))).sequence,
+        savedHead.sequence, 'old signed V2 history stays available after restart');
+      await assert.rejects(restartedFloor.prepare(Buffer.from([0xa0]),
+        crypto.randomBytes(32)),
+      { code: 'ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING' },
+      'operator cannot restart without migration argument and resume legacy writes');
+    } finally { restartedFloor.close(); }
+    const tampered = path.join(folder, 'staged-fence-forged-trigger.sqlite');
+    fs.copyFileSync(context.floorDb, tampered);
+    const editor = new Database(tampered);
+    try {
+      editor.exec(`DROP TRIGGER legacy_archive_stage_block_transition_insert;
+        CREATE TRIGGER legacy_archive_stage_block_transition_insert
+        BEFORE INSERT ON transitions BEGIN SELECT 1; END;`);
+    } finally { editor.close(); }
+    const forged = new OpaqueCheckpointV2Authority(tampered, {
+      role: 'FLOOR', bootstrapNew: false, scope: options.scope,
+      signingPrivateKey: v2Floor.privateKey,
+      casSignerPublicKey: v2Cas.publicKey,
+      floorSignerPublicKey: v2Floor.publicKey,
+      checkpointPublicKey: options.checkpointKey, ownerPublicKey: options.ownerKey,
+      ownerTrust: trust, baseDigest: options.stateDigest,
+      baseCheckpoint: oneHeadOnly.checkpointDigest,
+    });
+    try {
+      await assert.rejects(forged.prepare(Buffer.from([0xa0]),
+        crypto.randomBytes(32)), { code: 'ZK_CHECKPOINT_V2_UNAVAILABLE' },
+      'a same-name but no-op SQLite write fence must fail closed');
+    } finally { forged.close(); }
+    assert.equal((await casClient.head()).state, 'V1_BASELINE');
+  }, false, true);
 });
