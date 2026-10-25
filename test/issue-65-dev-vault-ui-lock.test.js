@@ -70,6 +70,33 @@ function harness({ objects = [], decryptFile, uploadCase = null, legacyCase = nu
     },
     canSaveDeviceKey: () => true,
   };
+  // These focused memory-lock tests do not mutate IndexedDB. Provide a
+  // deterministic, empty transactionally completed fence store for the new
+  // fail-closed cross-tab revocation preflight.
+  const indexedDB = { open() {
+    const request = { result: {
+      objectStoreNames: { contains: () => true },
+      transaction() {
+        const tx = {
+          objectStore() {
+            return { get() {
+              const item = {};
+              queueMicrotask(() => {
+                item.result = undefined;
+                item.onsuccess?.();
+                queueMicrotask(() => tx.oncomplete?.());
+              });
+              return item;
+            } };
+          },
+        };
+        return tx;
+      },
+      close() {},
+    } };
+    queueMicrotask(() => request.onsuccess?.());
+    return request;
+  } };
   const sandbox = {
     window: {
       RootarkApi: api, RootarkDevVaultCrypto: fileCrypto,
@@ -82,9 +109,9 @@ function harness({ objects = [], decryptFile, uploadCase = null, legacyCase = nu
           return { name, mediaType: "text/plain", data: legacySource };
         },
       },
-      RootarkDevVaultEmergency: pending, crypto: crypto.webcrypto,
+      RootarkDevVaultEmergency: pending, crypto: crypto.webcrypto, indexedDB,
     },
-    document, crypto: crypto.webcrypto,
+    document, crypto: crypto.webcrypto, indexedDB,
     URL: { createObjectURL() { downloads += 1; return "blob:synthetic"; },
       revokeObjectURL() {} },
     Blob, setTimeout: () => 0, confirm: () => true, btoa, atob,
@@ -102,7 +129,7 @@ function harness({ objects = [], decryptFile, uploadCase = null, legacyCase = nu
     downloads: () => downloads };
 }
 const settle = async () => {
-  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  for (let i = 0; i < 120; i += 1) await Promise.resolve();
 };
 
 test("locking during emergency restore clears secrets and cannot re-unlock", async () => {

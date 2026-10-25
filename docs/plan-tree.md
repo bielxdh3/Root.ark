@@ -1,5 +1,26 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: development browser vault cross-tab revocation (2026-10-25)
+
+The **experimental** `/zk-dev` browser vault uses an IndexedDB v3 per-account
+`{epoch, nonce}` fence. "Forget this browser" atomically deletes stored
+content keys, trusted-device escrow and pending recovery requests, and commits
+the next fence in the same readwrite transaction. Open tabs verify the fence
+before releasing decrypted content or a trusted-device approval, and before
+restoring, storing or exporting key material. BroadcastChannel and `storage`
+events are advisory wakeups only; stale/replayed messages do not choose the
+authoritative epoch. Focus/page restore and foreground operations resample
+IndexedDB even after a sender tab closes. A real Edge multi-tab test covers
+revocation during an in-flight read and during paused trusted-device approval,
+closing the revoker tab and replaying old notifications.
+
+This is local browser-session invalidation. It cannot revoke already exported
+recovery secrets, prevent same-origin script/profile compromise, enforce a
+server-authoritative device policy or protect against coherent IndexedDB
+rollback/deletion across a full browser restart. A tab terminated **before**
+its revocation transaction commits also cannot guarantee another tab was
+invalidated. No independent witness, zk-1 epoch policy or production GO follows.
+
 ## Issue #65: current-device revocation at strict historical Sync read (2026-10-25)
 
 Strict Sync v2 now requires an operator-injected, independently maintained

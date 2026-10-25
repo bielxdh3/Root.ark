@@ -78,7 +78,7 @@ const NORMAL_SESSION_UI_PROBE = `(async () => {
   await until(()=>el("status")?.textContent.includes("Cofre acessível"));
   window.confirm=()=>true;
   const db=await new Promise((resolve,reject)=>{
-    const req=indexedDB.open("rootark-opaque-dev-vault-key-v1",2);
+    const req=indexedDB.open("rootark-opaque-dev-vault-key-v1",3);
     req.onsuccess=()=>resolve(req.result); req.onerror=()=>reject(req.error);
   });
   const read=store=>new Promise((resolve,reject)=>{
@@ -382,7 +382,7 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
       fs.createReadStream(path.join(ROOT,"public/zk-dev-vault.html")).pipe(res);
     } else if (req.url === "/client/rootark-api.js") {
       res.setHeader("Content-Type", "application/javascript");
-      res.end('window.__testAccount="alice";window.RootarkApi={get:async url=>url.endsWith("/session")?{username:window.__testAccount,activeKeyId:null}:{objects:[]}};');
+      res.end('window.__testAccount="alice";window.RootarkApi={get:async url=>url.endsWith("/session")?{username:window.__testAccount,activeKeyId:null}:url.endsWith("/objects")?{objects:window.__objects||[]}:{objects:[]}};');
     } else if (SCRIPTS.has(req.url)) {
       res.setHeader("Content-Type", "application/javascript");
       fs.createReadStream(SCRIPTS.get(req.url)).pipe(res);
@@ -444,6 +444,146 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     assert.equal(ui.exceptionDetails, undefined,
       JSON.stringify(ui.exceptionDetails || ui.result));
     assert.equal(ui.result?.value, "NORMAL_SESSION_DEVICE_PENDING_UI_PASS");
+    // Keep two real same-origin Edge tabs open. The second tab removes the
+    // persisted key while the first has an in-flight ciphertext read.
+    await client.send("Page.navigate", { url: origin + "/ui" });
+    const otherTarget = await client.send("Target.createTarget", { url: origin + "/ui" });
+    const otherTab = await waitFor(async () => {
+      const list = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
+      return list.find((item) => item.id === otherTarget.targetId)?.webSocketDebuggerUrl;
+    });
+    const tab2 = await connectDevTools(otherTab);
+    try {
+      const evaluate = async (tab, expression) => {
+        const response = await tab.send("Runtime.evaluate", {
+          expression, awaitPromise: true, returnByValue: true,
+        });
+        assert.equal(response.exceptionDetails, undefined,
+          JSON.stringify(response.exceptionDetails || response.result));
+        return response.result?.value;
+      };
+      const ready = '(async()=>{for(let i=0;i<200;i++){if(document.getElementById("status")?.textContent.includes("Cofre acessível"))return true;await new Promise(r=>setTimeout(r,20))}throw Error("UI_NOT_READY")})()';
+      await Promise.all([evaluate(client, ready), evaluate(tab2, ready)]);
+      const prepared = `(async()=>{
+        const el=id=>document.getElementById(id);
+        window.confirm=()=>true;
+        el("recovery").value="${"A".repeat(43)}";
+        el("import").click();
+        for(let i=0;i<200;i++){
+          if(el("status").textContent.includes("Chave importada"))return true;
+          await new Promise(r=>setTimeout(r,20));
+        }
+        throw Error("IMPORT_FAILED:"+el("status").textContent);
+      })()`;
+      await Promise.all([evaluate(client, prepared), evaluate(tab2, prepared)]);
+      assert.equal(await evaluate(client, `(async()=>{
+        const id="${"A".repeat(22)}";
+        window.__objects=[{id,revision:1}];
+        document.getElementById("refresh").click();
+        const key=await RootarkDevVaultCrypto.importRecoveryKey("${"A".repeat(43)}");
+        const keyId=await RootarkDevVaultCrypto.keyCommitment("${"A".repeat(43)}","alice");
+        const envelope=await RootarkDevVaultCrypto.encryptFile({key,id,username:"alice",name:"secret.txt",mediaType:"text/plain",data:new TextEncoder().encode("private")});
+        for(let i=0;i<200;i++){
+          if(document.getElementById("objects").querySelector("button"))break;
+          await new Promise(r=>setTimeout(r,20));
+        }
+        const get=RootarkApi.get;
+        RootarkApi.get=async url=>url.includes("/objects/")?await new Promise(resolve=>{
+          window.__finishObjectRead=()=>resolve({id,keyId,envelope});
+        }):get(url);
+        window.__downloads=0;
+        const create=URL.createObjectURL.bind(URL);
+        URL.createObjectURL=(...args)=>{window.__downloads++;return create(...args)};
+        document.getElementById("objects").querySelector("button").click();
+        for(let i=0;i<200;i++){
+          if(window.__finishObjectRead)return true;
+          await new Promise(r=>setTimeout(r,20));
+        }
+        throw Error("DECRYPT_NOT_PENDING");
+      })()`), true);
+      await evaluate(tab2, `(async()=>{
+        document.getElementById("forget-device").click();
+        for(let i=0;i<200;i++){
+          if(document.getElementById("status").textContent.includes("foi removida"))return true;
+          await new Promise(r=>setTimeout(r,20));
+        }
+        throw Error("FORGET_NOT_COMMITTED:"+document.getElementById("status").textContent);
+      })()`);
+      await client.send("Target.closeTarget", { targetId: otherTarget.targetId });
+      assert.equal(await evaluate(client, `(async()=>{
+        window.__finishObjectRead();
+        await new Promise(r=>setTimeout(r,150));
+        if(window.__downloads)throw Error("REVOKED_PLAINTEXT_DOWNLOADED");
+        if(!document.getElementById("status").textContent.includes("outra aba"))throw Error("OTHER_TAB_KEY_NOT_LOCKED:"+document.getElementById("status").textContent);
+        return true;
+      })()`), true);
+      assert.equal(await evaluate(client, `(async()=>{
+        const el=id=>document.getElementById(id);
+        el("recovery").value="${"A".repeat(43)}";
+        el("import").click();
+        for(let i=0;i<200;i++){
+          if(el("status").textContent.includes("Chave importada"))break;
+          await new Promise(r=>setTimeout(r,20));
+        }
+        if(!el("status").textContent.includes("Chave importada"))throw Error("REIMPORT_FAILED");
+        // Replayed advisory events must never override a newer persisted epoch.
+        window.dispatchEvent(new StorageEvent("storage",{
+          key:"rootark-dev-vault-fence-v1",newValue:"old-message"}));
+        new BroadcastChannel("rootark-dev-vault-fence-v1").postMessage({epoch:0});
+        await new Promise(r=>setTimeout(r,200));
+        return el("status").textContent.includes("Chave importada");
+      })()`), true);
+      // The approver must also reject an already-read trusted escrow record
+      // if another tab revokes it while the request JSON is still being read.
+      assert.equal(await evaluate(client, `(async()=>{
+        const el=id=>document.getElementById(id);
+        el("emergency-recovery-key").value="${"A".repeat(43)}";
+        el("device-enroll").click();
+        for(let i=0;i<200;i++){
+          if(el("status").textContent.includes("Navegador confiável autorizado"))break;
+          await new Promise(r=>setTimeout(r,20));
+        }
+        if(!el("status").textContent.includes("Navegador confiável autorizado"))
+          throw Error("TRUSTED_ENROLL_FAILED:"+el("status").textContent);
+        const pending=await RootarkDevVaultTrustedDevice.createRecoveryRequest({username:"alice"});
+        el("device-confirm-code").value=await RootarkDevVaultTrustedDevice.requestFingerprint({username:"alice",request:pending.request});
+        Object.defineProperty(el("device-request-file"),"files",{configurable:true,
+          value:[{size:150,text:()=>new Promise(resolve=>{window.__finishApprovalRead=resolve})}]});
+        el("device-approve").click();
+        for(let i=0;i<200;i++){
+          if(window.__finishApprovalRead){window.__pendingApprovalJson=JSON.stringify(pending.request);return true}
+          await new Promise(r=>setTimeout(r,20));
+        }
+        throw Error("APPROVAL_NOT_PENDING");
+      })()`), true);
+      const thirdTarget = await client.send("Target.createTarget", { url: origin + "/ui" });
+      const thirdUrl = await waitFor(async () => {
+        const list = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
+        return list.find((item) => item.id === thirdTarget.targetId)?.webSocketDebuggerUrl;
+      });
+      const tab3 = await connectDevTools(thirdUrl);
+      try {
+        await evaluate(tab3, ready);
+        await evaluate(tab3, `(async()=>{
+          window.confirm=()=>true;
+          document.getElementById("forget-device").click();
+          for(let i=0;i<200;i++){
+            if(document.getElementById("status").textContent.includes("foi removida"))return true;
+            await new Promise(r=>setTimeout(r,20));
+          }
+          throw Error("APPROVAL_RACE_REVOCATION_NOT_COMMITTED");
+        })()`);
+        await client.send("Target.closeTarget", { targetId: thirdTarget.targetId });
+        assert.equal(await evaluate(client, `(async()=>{
+          window.__finishApprovalRead(window.__pendingApprovalJson);
+          await new Promise(r=>setTimeout(r,200));
+          if(window.__downloads!==0)throw Error("REVOKED_APPROVAL_ANSWER_EXPORTED");
+          if(!document.getElementById("status").textContent.includes("outra aba"))
+            throw Error("REVOKED_APPROVAL_DID_NOT_LOCK:"+document.getElementById("status").textContent);
+          return true;
+        })()`), true);
+      } finally { tab3.socket.close(); }
+    } finally { tab2.socket.close(); }
   } finally {
     client?.socket.close();
     // Only the unique test-owned browser process/tree is terminated.

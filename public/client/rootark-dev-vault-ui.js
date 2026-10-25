@@ -8,8 +8,12 @@
   const emergency = window.RootarkDevVaultEmergency;
   const trustedDevice = window.RootarkDevVaultTrustedDevice;
   const $ = (id) => document.getElementById(id);
-  const state = { username: null, key: null, keyId: null, busy: false, lockGeneration: 0 };
+  const state = { username: null, key: null, keyId: null, busy: false,
+    lockGeneration: 0, fence: null };
   const path = "/zk-dev/v1";
+  const FENCE_SIGNAL = "rootark-dev-vault-fence-v1";
+  const EMPTY_FENCE = Object.freeze({ epoch: 0, nonce: "" });
+  let signalPending = false;
   const status = (message) => { $("status").textContent = message; };
   function clearEmergencySecrets() {
     $("emergency-password").value = "";
@@ -25,6 +29,97 @@
     state.keyId = null;
     clearEmergencySecrets();
   }
+  function cancelled() {
+    const error = new Error("Local vault lock cancelled pending operation");
+    error.code = "DEV_VAULT_CANCELLED";
+    return error;
+  }
+  function checkedFence(record) {
+    if (record === undefined) return EMPTY_FENCE;
+    if (!record || typeof record !== "object" || Array.isArray(record)
+      || Object.keys(record).length !== 2
+      || !Number.isSafeInteger(record.epoch) || record.epoch < 1
+      || !/^[A-Za-z0-9_-]{22}$/.test(record.nonce)) {
+      throw new Error("Invalid local vault revocation fence");
+    }
+    return record;
+  }
+  function sameFence(left, right) {
+    return Boolean(left && right && left.epoch === right.epoch
+      && left.nonce === right.nonce);
+  }
+  async function readFence(username) {
+    const db = await openLocalDatabase();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction("fences", "readonly");
+        const request = tx.objectStore("fences").get(username);
+        let fence;
+        request.onsuccess = () => {
+          try { fence = checkedFence(request.result); } catch (error) {
+            reject(error);
+          }
+        };
+        tx.oncomplete = () => resolve(fence);
+        tx.onerror = () => reject(tx.error || new Error("Local fence unavailable"));
+        tx.onabort = () => reject(tx.error || new Error("Local fence aborted"));
+      });
+    } finally { db.close(); }
+  }
+  function handleForeignLock() {
+    invalidateLocalKey();
+    $("recovery").value = "";
+    $("recovery").type = "password";
+    $("file").value = "";
+    status("Chave bloqueada por alteração em outra aba. Importe novamente após conferir a autorização.");
+  }
+  async function assertCurrentFence(generation = state.lockGeneration) {
+    assertNotRelocked(generation);
+    if (!state.fence) throw cancelled();
+    let current;
+    try { current = await readFence(state.username); } catch (error) {
+      handleForeignLock();
+      state.fence = null;
+      throw cancelled();
+    }
+    if (!sameFence(current, state.fence)) {
+      handleForeignLock();
+      state.fence = current;
+      throw cancelled();
+    }
+    assertNotRelocked(generation);
+  }
+  async function observeForeignFence() {
+    if (!state.username || !state.fence) return;
+    try { await assertCurrentFence(); } catch (_) { /* fail closed in assertCurrentFence */ }
+  }
+  function scheduleFenceObservation() {
+    if (signalPending) return;
+    signalPending = true;
+    Promise.resolve().then(async () => {
+      try { await observeForeignFence(); } finally { signalPending = false; }
+    });
+  }
+  // Broadcasts are only hints. A replayed or fabricated message cannot
+  // change the current epoch: IndexedDB is always read before invalidation.
+  if (typeof window.BroadcastChannel === "function") {
+    const channel = new window.BroadcastChannel(FENCE_SIGNAL);
+    channel.onmessage = scheduleFenceObservation;
+    state.channel = channel;
+  }
+  window.addEventListener?.("storage", (event) => {
+    if (event.key === FENCE_SIGNAL) scheduleFenceObservation();
+  });
+  window.addEventListener?.("focus", scheduleFenceObservation);
+  window.addEventListener?.("pageshow", scheduleFenceObservation);
+  document.addEventListener?.("visibilitychange", () => {
+    if (document.visibilityState === "visible") scheduleFenceObservation();
+  });
+  function broadcastFence() {
+    // No account identifier or key crosses the channel or localStorage.
+    try { window.localStorage?.setItem(FENCE_SIGNAL, objectId()); } catch (_) {}
+    try { state.channel?.postMessage({ type: "changed" }); } catch (_) {}
+  }
   function assertNotRelocked(generation) {
     if (generation !== state.lockGeneration || !state.username) {
       const error = new Error("Local vault lock cancelled pending operation");
@@ -35,6 +130,7 @@
   function lockForAccountChange() {
     invalidateLocalKey();
     state.username = null;
+    state.fence = null;
     $("recovery").value = "";
     $("recovery").type = "password";
     $("file").value = "";
@@ -77,6 +173,7 @@
       error.payload = { error: "VAULT_ACCOUNT_CHANGED" };
       throw error;
     }
+    await assertCurrentFence();
     return current.username;
   }
   async function requireMatchingVaultKey(keyId) {
@@ -98,6 +195,7 @@
       error.payload = { error: "VAULT_KEY_MISMATCH" };
       throw error;
     }
+    await assertCurrentFence();
     return account;
   }
   function requireKey() {
@@ -119,7 +217,8 @@
   async function openLocalDatabase() {
     if (!window.indexedDB) throw new Error("Local device storage unavailable");
     return new Promise((resolve, reject) => {
-      const pending = indexedDB.open("rootark-opaque-dev-vault-key-v1", 2);
+      const pending = indexedDB.open("rootark-opaque-dev-vault-key-v1", 3);
+      let blocked = false;
       pending.onupgradeneeded = () => {
         if (!pending.result.objectStoreNames.contains("keys"))
           pending.result.createObjectStore("keys");
@@ -127,8 +226,17 @@
           pending.result.createObjectStore("trusted");
         if (!pending.result.objectStoreNames.contains("pending"))
           pending.result.createObjectStore("pending");
+        if (!pending.result.objectStoreNames.contains("fences"))
+          pending.result.createObjectStore("fences");
       };
-      pending.onsuccess = () => resolve(pending.result);
+      pending.onsuccess = () => {
+        if (blocked) pending.result.close();
+        else resolve(pending.result);
+      };
+      pending.onblocked = () => {
+        blocked = true;
+        reject(new Error("Local vault database upgrade blocked by another tab"));
+      };
       pending.onerror = () => reject(pending.error);
     });
   }
@@ -136,13 +244,26 @@
     const username = state.username;
     const db = await openLocalDatabase();
     try {
-      assertNotRelocked(generation);
-      return await new Promise((resolve, reject) => {
-        const tx = db.transaction("keys", action === "load" ? "readonly" : "readwrite");
+      await assertCurrentFence(generation);
+      const result = await new Promise((resolve, reject) => {
+        const tx = db.transaction(["keys", "fences"],
+          action === "load" ? "readonly" : "readwrite");
         const store = tx.objectStore("keys");
         let result = null;
         let policyError = null;
-        if (action === "save") {
+        const guard = tx.objectStore("fences").get(username);
+        guard.onsuccess = () => {
+          try {
+            if (!sameFence(checkedFence(guard.result), state.fence)
+              || generation !== state.lockGeneration || username !== state.username) {
+              throw cancelled();
+            }
+          } catch (error) { policyError = error; tx.abort(); return; }
+          if (action !== "save") {
+            const req = action === "load" ? store.get(username) : store.delete(username);
+            req.onsuccess = () => { result = req.result; };
+            return;
+          }
           // The get/conditional put occur inside one IndexedDB readwrite
           // transaction. No other tab can insert a different key between
           // the check and the write for this object store.
@@ -163,14 +284,13 @@
             }
             store.put(key, username);
           };
-        } else {
-          const req = action === "load" ? store.get(username) : store.delete(username);
-          req.onsuccess = () => { result = req.result; };
-        }
+        };
         tx.oncomplete = () => resolve(result);
         tx.onerror = () => reject(policyError || tx.error || new Error("Local key store unavailable"));
         tx.onabort = () => reject(policyError || tx.error || new Error("Local key store aborted"));
       });
+      await assertCurrentFence(generation);
+      return result;
     } finally { db.close(); }
   }
   async function localDeviceRecord(kind, action, value, generation = state.lockGeneration) {
@@ -178,18 +298,31 @@
     const username = state.username;
     const db = await openLocalDatabase();
     try {
-      assertNotRelocked(generation);
-      return await new Promise((resolve, reject) => {
-        const tx = db.transaction(kind, action === "load" ? "readonly" : "readwrite");
+      await assertCurrentFence(generation);
+      const result = await new Promise((resolve, reject) => {
+        const tx = db.transaction([kind, "fences"],
+          action === "load" ? "readonly" : "readwrite");
         const store = tx.objectStore(kind);
         let result = null;
-        let cancelled = null;
-        if (action === "save" || action === "delete-if-current") {
+        let policyError = null;
+        const guard = tx.objectStore("fences").get(username);
+        guard.onsuccess = () => {
+          try {
+            if (!sameFence(checkedFence(guard.result), state.fence)
+              || generation !== state.lockGeneration || username !== state.username) {
+              throw cancelled();
+            }
+          } catch (error) { policyError = error; tx.abort(); return; }
+          if (action !== "save" && action !== "delete-if-current") {
+            const request = action === "load" ? store.get(username)
+              : store.delete(username);
+            request.onsuccess = () => { result = request.result; };
+            return;
+          }
           const check = store.get(username);
           check.onsuccess = () => {
             if (generation !== state.lockGeneration || username !== state.username) {
-              cancelled = new Error("Local operation cancelled");
-              cancelled.code = "DEV_VAULT_CANCELLED";
+              policyError = cancelled();
               tx.abort();
             } else if (action === "delete-if-current") {
               // Another tab may have replaced the pending ECDH request since
@@ -202,28 +335,56 @@
                 || saved.publicKey !== expected.publicKey
                 || !Object.is(saved.createdAt, expected.createdAt)
                 || !Object.is(saved.expiresAt, expected.expiresAt)) {
-                cancelled = new Error("Local recovery request changed");
-                cancelled.code = "DEV_VAULT_CANCELLED";
+                policyError = cancelled();
                 tx.abort();
               } else {
                 store.delete(username);
               }
             } else if (check.result) {
-              cancelled = new Error("Local trusted device record already exists");
+              policyError = new Error("Local trusted device record already exists");
               tx.abort();
             } else {
               store.put(value, username);
             }
           };
-        } else {
-          const request = action === "load" ? store.get(username)
-            : store.delete(username);
-          request.onsuccess = () => { result = request.result; };
-        }
+        };
         tx.oncomplete = () => resolve(result);
-        tx.onerror = () => reject(cancelled || tx.error || new Error("IndexedDB unavailable"));
-        tx.onabort = () => reject(cancelled || tx.error || new Error("IndexedDB operation aborted"));
+        tx.onerror = () => reject(policyError || tx.error || new Error("IndexedDB unavailable"));
+        tx.onabort = () => reject(policyError || tx.error || new Error("IndexedDB operation aborted"));
       });
+      await assertCurrentFence(generation);
+      return result;
+    } finally { db.close(); }
+  }
+  async function forgetLocalDevice(generation) {
+    await assertCurrentFence(generation);
+    const username = state.username;
+    const oldFence = state.fence;
+    if (oldFence.epoch >= Number.MAX_SAFE_INTEGER) throw cancelled();
+    const nextFence = { epoch: oldFence.epoch + 1, nonce: objectId() };
+    const db = await openLocalDatabase();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(["keys", "trusted", "pending", "fences"], "readwrite");
+        let failed = null;
+        const guard = tx.objectStore("fences").get(username);
+        guard.onsuccess = () => {
+          try {
+            if (!sameFence(checkedFence(guard.result), oldFence)
+              || generation !== state.lockGeneration || username !== state.username) {
+              throw cancelled();
+            }
+            for (const kind of ["keys", "trusted", "pending"])
+              tx.objectStore(kind).delete(username);
+            tx.objectStore("fences").put(nextFence, username);
+          } catch (error) { failed = error; tx.abort(); }
+        };
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(failed || tx.error || new Error("Cannot revoke local vault"));
+        tx.onabort = () => reject(failed || tx.error || new Error("Cannot revoke local vault"));
+      });
+      state.fence = nextFence;
+      broadcastFence();
     } finally { db.close(); }
   }
   function downloadJson(filename, payload) {
@@ -278,6 +439,7 @@
         const key = requireKey();
         const record = await api.get(path + "/objects/" + encodeURIComponent(item.id));
         await requireCurrentAccount();
+        await assertCurrentFence(generation);
         if (record.keyId !== state.keyId) {
           const error = new Error("Key differs from stored document");
           error.status = 409;
@@ -287,22 +449,25 @@
         const opened = await cryptoFile.decryptFile({
           key, id: record.id, username: account, envelope: record.envelope,
         });
-        // A user may explicitly lock the vault while decrypt is pending.
-        // Never complete that download with a previously captured key.
-        assertNotRelocked(generation);
-        const blob = new Blob([opened.data], {
-          type: opened.mediaType || "application/octet-stream",
-        });
-        const url = URL.createObjectURL(blob);
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = opened.name;
-        anchor.hidden = true;
-        document.body.append(anchor);
-        anchor.click();
-        anchor.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 5_000);
-        status("Arquivo descriptografado localmente. Nenhum conteúdo claro foi enviado ao servidor.");
+        try {
+          // Never download with a key invalidated while decryption was pending.
+          await assertCurrentFence(generation);
+          const blob = new Blob([opened.data], {
+            type: opened.mediaType || "application/octet-stream",
+          });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = url;
+          anchor.download = opened.name;
+          anchor.hidden = true;
+          document.body.append(anchor);
+          anchor.click();
+          anchor.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 5_000);
+          status("Arquivo descriptografado localmente. Nenhum conteúdo claro foi enviado ao servidor.");
+        } finally {
+          opened.data?.fill?.(0);
+        }
       }));
       const erase = document.createElement("button");
       erase.type = "button";
@@ -330,6 +495,7 @@
     try {
       const session = await api.get(path + "/session");
       state.username = session.username;
+      state.fence = await readFence(state.username);
       $("account").textContent = "Conta autenticada: " + state.username;
       await refresh();
       if (trustedDevice) {
@@ -366,7 +532,7 @@
     const created = await cryptoFile.generateRecoveryKey();
     const keyId = await cryptoFile.keyCommitment(created.recoveryKey, account);
     await requireMatchingVaultKey(keyId);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     state.key = created.key;
     state.keyId = keyId;
     $("recovery").value = created.recoveryKey;
@@ -383,7 +549,7 @@
     await requireMatchingVaultKey(keyId);
     const importedKey = await cryptoFile.importRecoveryKey(raw);
     await requireMatchingVaultKey(keyId);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     state.key = importedKey;
     state.keyId = keyId;
     $("recovery").value = "";
@@ -398,7 +564,7 @@
     const key = requireKey();
     const keyId = state.keyId;
     await requireMatchingVaultKey(keyId);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     // Do not silently replace a stored key, even if the remote list was empty
     // at the last check; another device can add a file between two requests.
     const previous = await localKey("load");
@@ -411,7 +577,7 @@
       throw error;
     }
     await localKey("save", { key, keyId }, generation);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     status("Chave não exportável salva no IndexedDB deste navegador. Preserve também sua recuperação independente.");
   }));
   $("restore-browser").addEventListener("click", () => run(async () => {
@@ -424,7 +590,7 @@
       throw new Error("Saved local key unavailable");
     }
     await requireMatchingVaultKey(saved.keyId);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     state.key = saved.key;
     state.keyId = saved.keyId;
     status("Chave local reaberta. Tente descriptografar um arquivo.");
@@ -433,9 +599,7 @@
     await requireCurrentAccount();
     if (!confirm("Remover TODAS as chaves, aprovações e solicitações de recuperação salvas neste navegador? Garanta sua recuperação independente.")) return;
     invalidateLocalKey();
-    await localKey("delete");
-    await localDeviceRecord("trusted", "delete");
-    await localDeviceRecord("pending", "delete");
+    await forgetLocalDevice(state.lockGeneration);
     $("device-request-code").textContent = "Nenhuma solicitação pendente";
     $("recovery").value = "";
     status("A chave deste navegador foi removida. Arquivos remotos não foram excluídos.");
@@ -458,7 +622,7 @@
         key, id, username: account, name, mediaType, data: original,
       });
       await requireMatchingVaultKey(keyId);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       await api.post(path + "/objects", { account, id, envelope, keyId });
       let valid = false;
       try {
@@ -468,7 +632,7 @@
           key, username: account, id, keyId, expectedEnvelope: envelope,
           original, name, mediaType, record: stored,
         });
-        assertNotRelocked(generation);
+        await assertCurrentFence(generation);
         valid = true;
       } catch (error) {
         if (error?.code === "DEV_VAULT_CANCELLED") throw error;
@@ -508,11 +672,11 @@
       name: selectedName, folderId: selectedFolder,
     });
     try {
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       await persistVerifiedCopy({
         name: source.name, mediaType: source.mediaType, original: source.data,
       });
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       status("Cópia legada cifrada e verificada. O arquivo ORIGINAL continua intacto. Não o exclua até concluir uma migração zk-1 aprovada.");
     } finally { source.data.fill(0); }
   }));
@@ -537,7 +701,7 @@
         username: account, recoveryKey, password: passwordInput.value,
       });
       await requireMatchingVaultKey(keyId);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       const blob = new Blob([JSON.stringify(pkg)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       try {
@@ -574,7 +738,7 @@
       await requireMatchingVaultKey(keyId);
       const restoredKey = await cryptoFile.importRecoveryKey(raw);
       await requireMatchingVaultKey(keyId);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       state.key = restoredKey;
       state.keyId = keyId;
       status("Chave restaurada localmente pelo pacote protegido por senha.");
@@ -602,8 +766,9 @@
         username, recoveryKey: raw, keyId,
       });
       await requireMatchingVaultKey(keyId);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       await localDeviceRecord("trusted", "save", record, generation);
+      await assertCurrentFence(generation);
       status("Navegador confiável autorizado localmente. Proteja o perfil do navegador e mantenha sua chave de emergência.");
     } finally { field.value = ""; }
   }));
@@ -622,13 +787,13 @@
     }
     const pending = await trustedDevice.createRecoveryRequest({ username });
     await requireCurrentAccount();
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     await localDeviceRecord("pending", "save", pending, generation);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     $("device-request-code").textContent = await trustedDevice.requestFingerprint({
       username, request: pending.request,
     });
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     downloadJson("rootark-device-request-dev-v1.json", pending.request);
     status("Solicitação gerada. Anote o código criptográfico exibido acima no navegador solicitante. Envie o JSON ao dispositivo confiável.");
   }));
@@ -644,7 +809,7 @@
     if (!confirm("Cancelar esta solicitação? Uma resposta já recebida não poderá mais ser usada neste navegador.")) return;
     await requireCurrentAccount();
     await localDeviceRecord("pending", "delete-if-current", pending, generation);
-    assertNotRelocked(generation);
+    await assertCurrentFence(generation);
     $("device-request-code").textContent = "Nenhuma solicitação pendente";
     $("device-response-file").value = "";
     status("Solicitação cancelada neste navegador. Chaves e autorizações locais preservadas.");
@@ -662,11 +827,13 @@
     const input = $("device-request-file");
     try {
       const request = await readSmallJson(input);
+      await assertCurrentFence(generation);
       if (request?.username !== username || typeof request.requestId !== "string"
         || !/^[A-Za-z0-9_-]{22}$/.test(request.requestId)) {
         throw new Error("Invalid recovery request");
       }
       const requiredCode = await trustedDevice.requestFingerprint({ username, request });
+      await assertCurrentFence(generation);
       const typedCode = $("device-confirm-code").value.trim();
       if (!trustedDevice.confirmRequestFingerprint(typedCode, requiredCode)) {
         status("CÓDIGO NÃO CONFERE: solicitação adulterada ou código incorreto. A recuperação foi bloqueada.");
@@ -677,7 +844,7 @@
         username, record, request,
       });
       await requireMatchingVaultKey(record.keyId);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       downloadJson("rootark-device-answer-dev-v1.json", response);
       status("Resposta protegida criada. Entregue-a somente ao navegador que gerou a solicitação.");
     } finally {
@@ -705,9 +872,9 @@
       await requireMatchingVaultKey(computed);
       const recoveredKey = await cryptoFile.importRecoveryKey(result.recoveryKey);
       await requireMatchingVaultKey(computed);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       await localDeviceRecord("pending", "delete-if-current", pending, generation);
-      assertNotRelocked(generation);
+      await assertCurrentFence(generation);
       $("device-request-code").textContent = "Nenhuma solicitação pendente";
       state.key = recoveredKey;
       state.keyId = computed;
