@@ -2388,7 +2388,7 @@
               expectedMetadata: bundle.metadata,
               independentlyPinnedCiphertextRoot: from64(field("root").value.trim()),
               independentlyPinnedSourceChunkRoot: from64(field("persisted-source-root").value.trim()),
-              ownerSignerKeyId: from64(field("owner-signer").value.trim()),
+              ownerSignerKeyId: signerIdFrom64(field("owner-signer").value.trim()),
               ownerDeviceId: field("owner-device").value.trim(),
               ownerRootCheckpoint: checkpoint,
               readChunk: async ({ index }) => {

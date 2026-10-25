@@ -733,6 +733,8 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     "function", "real Edge must load the persisted recovery bridge as a browser UMD");
   assert.equal(await evaluate("!!document.querySelector('[data-zk1-action=restore-persisted]')"),
     true, "the real workspace must expose the opt-in persisted restore action");
+  assert.match(workspaceSource, /ownerSignerKeyId:\s*signerIdFrom64\(field\("owner-signer"\)\.value\.trim\(\)\)/,
+    "the REAL Edge workspace must pass a genuine 16-byte owner signer id, not a 32-byte digest decoder");
   await click("restore-persisted");
   await untilStatus("Operação recusada");
   assert.equal((await downloads()).length, 0,

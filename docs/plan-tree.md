@@ -246,6 +246,29 @@ and concurrent independent disk writes; the bounded stage took approximately
 2,000-chunk flows were verified locally on Node 22/24 with the unchanged
 socket timeout; this local result does not establish hosted CI completion.
 
+## Issue #65 / PR #228: real Edge positive persisted restore signer-id repair (2026-10-25)
+
+Independent review of standalone commit `07e6f43` found an unconditional
+browser UI denial: `restore-persisted` decoded the **16-byte / 22-character**
+owner `signer_key_id` with `from64`, which only accepts a 32-byte digest.
+The existing strict `signerIdFrom64` decoder is now used at that call site;
+neither the owner trust source nor the signed checkpoint contract changed.
+
+TDD RED reproduced the failed real Edge workspace contract, followed by a
+real Edge witnessed-V2 **GREEN** with the original signed owner approval,
+independent mTLS CAS/witness peers, authenticated Express/SQLite protected PUT,
+two local ciphertext chunks, distinct owner-pinned native and portable roots,
+and two fresh device-signed protected GETs bracketing local HKDF/AES-GCM
+decryption. Edge's intercepted local download bytes match the original
+plaintext and no plaintext, filename or holder secret is sent on the HTTP
+content route. An incorrect owner SPKI or native root denies before GET;
+revoking the actual disposable mTLS witness after reading the second local
+chunk forces the second GET to deny, with **zero new plaintext downloads**.
+The browser's fixed script allowlist includes both persisted modules. This
+is DEV-only; a successful signed GET does not establish external physical
+durability, production restore authorization or custody of the independent
+pins. PR #228 remains **DRAFT / NO-GO for production**.
+
 ## Issue #65 / PR #228: browser persisted-chunk opt-in with real protected readback (2026-10-25)
 
 The development authenticated files workspace now has an explicit opt-in

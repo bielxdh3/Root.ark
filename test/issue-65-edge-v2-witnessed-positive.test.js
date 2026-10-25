@@ -27,6 +27,8 @@ const commitment = require("../src/crypto/rootark-zk1-offline-commitment-receipt
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
+const nativeChunks = require("../public/client/rootark-zk1-ciphertext-chunk-root");
+const persistedChunks = require("../public/client/rootark-zk1-persisted-portable-chunk-recovery");
 const protectedHttp = require("../public/client/rootark-zk1-protected-http-client");
 const committedApproval = require("../public/client/rootark-zk1-v2-committed-approval");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
@@ -80,7 +82,7 @@ function certificates(dir) {
     clientKey: read("headreader.key"), clientCert: read("headreader.pem") } };
 }
 
-async function createTlsAuthorities(t, dir, state, getHead, signer) {
+async function createTlsAuthorities(t, dir, state, getHead, signer, isWitnessOpen = () => true) {
   const certs = certificates(dir);
   const expected = Object.fromEntries(scopeNames.map((k) => [k, b64(state.scope[k])]));
   const entries = [state.baseManifest, ...await Promise.all(state.transitions.map(
@@ -134,15 +136,19 @@ async function createTlsAuthorities(t, dir, state, getHead, signer) {
         current_revision: head.revision,
         current_manifest_digest: await v2.recoveryManifestDigestV2(head),
         witness_sequence: head.revision, observed_at: time(),
-        status: "committed", pending_reservation_id: null };
+        status: isWitnessOpen() ? "committed" : "pending",
+        pending_reservation_id: isWitnessOpen() ? null : crypto.randomBytes(16) };
       return { receiptBase64: b64(await z.encodeDeterministic({ ...unsigned,
         signature: crypto.sign(null, Buffer.concat([
           Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0"),
           Buffer.from(await z.encodeDeterministic(unsigned))]), signer.key.privateKey) })),
       authority: "WITNESS_ENGINE_ONLY" };
     }
-    if (url === "/v1/admission/start") return { admissionId: b64(crypto.randomBytes(16)),
-      proceed: true, authority: "WITNESS_IO_GATE_LOCAL_V1" };
+    if (url === "/v1/admission/start") {
+      if (!isWitnessOpen()) throw Error("witness revoked during recovery");
+      return { admissionId: b64(crypto.randomBytes(16)),
+        proceed: true, authority: "WITNESS_IO_GATE_LOCAL_V1" };
+    }
     if (url === "/v1/admission/finish") return {
       status: "completed", authority: "WITNESS_IO_GATE_LOCAL_V1" };
     throw Error("path");
@@ -323,7 +329,9 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
     trustedPriorCommitment: priorReceipt, nowSeconds: at });
 
   let head = former;
-  const peers = await createTlsAuthorities(t, dir, state, () => head, signer);
+  let witnessOpen = true;
+  const peers = await createTlsAuthorities(t, dir, state, () => head, signer,
+    () => witnessOpen);
   const genesis = await v2.recoveryManifestDigestV2(state.baseManifest);
   const signedHistory = createZk1SignedHistoryCasProofProvider({
     casClient: peers.casClient, trustedScope: state.scope, trustedGenesisDigest: genesis,
@@ -344,6 +352,9 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
   let signedGets = 0;
   let signedPuts = 0;
   let accidentalSecretWire = false;
+  let persistedSecretForWire = null;
+  let persistedPlaintextForWire = null;
+  const persistedFilename = "owner-persisted-two-chunks.txt";
   const plaintext = Buffer.from("Actual Edge authenticated V2 owner-only local restored plaintext");
   const filename = "owner-private-edge-v2.txt";
   app.use((req, _res, next) => {
@@ -353,7 +364,10 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
       let data = "";
       req.on("data", (part) => {
         data += part;
-        if (data.includes(filename) || data.includes(plaintext.toString("utf8"))) {
+        if (data.includes(filename) || data.includes(plaintext.toString("utf8"))
+          || data.includes(persistedFilename)
+          || (persistedPlaintextForWire && data.includes(persistedPlaintextForWire))
+          || (persistedSecretForWire && data.includes(persistedSecretForWire))) {
           accidentalSecretWire = true;
         }
       });
@@ -367,6 +381,12 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
   registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     requirePermission: createRequirePermission(),
     resolveTrustedScope: (user) => user?.username === "owner" ? state.scope : null });
+  // Fixture-only real-server witness revocation triggered after the first
+  // signed GET, while Edge is reading the second persisted ciphertext chunk.
+  app.post("/edge-v2/revoke-fixture-witness", authenticate, (_req, res) => {
+    witnessOpen = false;
+    res.sendStatus(204);
+  });
   const allowed = new Set(["rootark-api", "rootark-zk1-authenticated-workspace",
     ...[ "rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-root",
       "rootark-zk1-ciphertext-download-integrity", "rootark-zk1-owner-signed-checkpoint",
@@ -374,6 +394,7 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
       "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
       "rootark-zk1-normal-browser-content", "rootark-zk1-owner-inventory-trust-head",
       "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
+      "rootark-zk1-persisted-portable-chunk-recovery", "rootark-zk1-persisted-browser-recovery",
       "rootark-zk1-recoverable-pending-journal",
       "rootark-zk1-recoverable-workspace", "rootark-dev-vault-migration",
       "rootark-zk1-legacy-transition-receipt",
@@ -572,6 +593,128 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
   assert.deepEqual(Buffer.from(recovered.data, "base64url"), plaintext);
   assert.ok(signedGets > 0, "authenticated V2 server actually received signed GET");
   assert.equal(accidentalSecretWire, false, "no filename or plaintext reached protected HTTP");
+
+  // REAL Edge positive persisted restore through the SAME workspace button,
+  // genuine committed owner approval, distinct owner-signed native 2-chunk
+  // root and portable envelope root, and current authenticated V2 GET route.
+  stage = "edge-persisted-positive";
+  const persistedMetadata = { ...scope, object_id: b64(crypto.randomBytes(16)),
+    version_id: b64(crypto.randomBytes(16)), parent_version_id: null,
+    epoch: current.epoch, kind: "file" };
+  const persistedPlaintext = Buffer.from("REAL Edge independently pinned persisted 2-chunk recovery plaintext");
+  const persistedSecret = portable.generateRecoverySecret();
+  persistedPlaintextForWire = persistedPlaintext.toString("utf8");
+  persistedSecretForWire = b64(persistedSecret);
+  const persistedBundle = await portable.sealForUserHeldSecret({
+    recoverySecret: persistedSecret, metadata: persistedMetadata, objectRevision: 1,
+    name: persistedFilename, mediaType: "text/plain", data: persistedPlaintext });
+  const ciphertext = Buffer.from(persistedBundle.ciphertextBase64, "base64url");
+  const twoChunks = [ciphertext.subarray(0, 31), ciphertext.subarray(31)];
+  assert.ok(twoChunks.every((part) => part.length > 0));
+  const nativeRoot = await nativeChunks.computeCiphertextRoot(twoChunks);
+  assert.notDeepEqual(Buffer.from(nativeRoot), Buffer.from(persistedBundle.ciphertextRoot, "base64url"));
+  const persistedInventory = await persistedChunks.createSignedPersistedPortableChunkInventory({
+    bundle: persistedBundle, ownerSigningKey: ownerSigner,
+    ownerPublicKey: ownerKey, independentOwnerSpkiSha256: ownerSpki,
+    ownerHead: { revision: current.revision, digest: currentDigest, epoch: current.epoch },
+    chunks: twoChunks, assertLive: () => undefined });
+  const persistedOwnerRoot = await ownerRoots.signOwnerCiphertextRootCheckpoint({
+    scope, signerKey: ownerSigner, signerKeyId: signerId,
+    deviceId: ownerDeviceId, manifestRevision: current.revision,
+    manifestDigest: currentDigest, manifestEpoch: current.epoch,
+    objectId: persistedMetadata.object_id, objectRevision: 1,
+    ciphertextEpoch: persistedMetadata.epoch, ciphertextRoot: nativeRoot,
+    issuedAt: time() });
+  const currentDeviceSigner = await subtle.importKey("pkcs8", targetPrivateDer,
+    "Ed25519", false, ["sign"]);
+  const persistedPut = await protectedHttp.signProtectedContentOperation({
+    signerKey: currentDeviceSigner, scope, deviceId: request.device_id,
+    operation: "put", objectId: persistedMetadata.object_id,
+    expectedObjectRevision: null, manifestRevision: current.revision,
+    manifestDigest: currentDigest, epoch: current.epoch, nowSeconds: time(),
+    ciphertext });
+  assert.equal((await protectedHttp.postProtectedCiphertextPut({
+    origin: origin + "/", request: persistedPut,
+    fetchImpl: fetchAuthenticated })).revision, 1);
+  const persistedFiles = { private: b64(targetPrivateDer), secret: b64(persistedSecret),
+    bundle: b64(JSON.stringify(persistedBundle)),
+    "owner-root": b64(JSON.stringify(persistedOwnerRoot)),
+    "persisted-inventory": b64(JSON.stringify(persistedInventory)) };
+  const persistedValues = { root: persistedBundle.ciphertextRoot,
+    "persisted-source-root": b64(nativeRoot) };
+  const supplyPersisted = async (alteredValues = {}) => {
+    // Restore all independent owner pins after each adversarial attempt;
+    // otherwise the next race could be denied prematurely by an old bad pin.
+    await edge.inputs(persistedFiles,
+      { ...commonValues, ...persistedValues, ...alteredValues });
+    await edge.evalJs(`(()=>{const parts=${JSON.stringify(twoChunks.map(b64))};
+      const dt=new DataTransfer();for(let i=0;i<parts.length;i++){
+        const raw=atob(parts[i].replace(/-/g,'+').replace(/_/g,'/')+
+          '='.repeat((4-parts[i].length%4)%4));
+        dt.items.add(new File([Uint8Array.from(raw,c=>c.charCodeAt(0))],
+          'native-part-'+i+'.bin'));
+      }
+      document.querySelector('[data-zk1-field="persisted-chunks"]').files=dt.files;
+      document.querySelector('[data-zk1-field="persisted-opt-in"]').checked=true;})()`);
+  };
+  const beforePersistedGets = signedGets;
+  const beforePersistedDownloads = (await edge.downloads()).length;
+  await supplyPersisted();
+  await edge.click("restore-persisted");
+  await edge.statusIncludes("DEV: inventário Ed25519");
+  const output = (await edge.downloads()).slice(beforePersistedDownloads);
+  assert.equal(output.length, 1, "real Edge must release exactly one owner-authenticated plaintext file");
+  assert.equal(output[0].name, persistedFilename);
+  assert.deepEqual(Buffer.from(output[0].data, "base64url"), persistedPlaintext);
+  assert.equal(signedGets - beforePersistedGets, 2,
+    "two freshly signed protected GETs must bracket the local two-chunk decrypt");
+  assert.equal(accidentalSecretWire, false, "plaintext/secret never enters the signed HTTP request");
+
+  // An incorrect independent source root or owner SPKI is rejected before
+  // network; no fallback to the portable envelope as an ersatz native root.
+  stage = "edge-persisted-wrong-pins";
+  for (const altered of [{ "persisted-source-root": persistedBundle.ciphertextRoot },
+    { "owner-spki": b64(crypto.randomBytes(32)) }]) {
+    const priorGets = signedGets, priorDownloads = (await edge.downloads()).length;
+    await supplyPersisted(altered);
+    await edge.click("restore-persisted");
+    await edge.statusIncludes("Operação recusada");
+    assert.equal(signedGets, priorGets, "incorrect external pin must not reach protected GET");
+    assert.equal((await edge.downloads()).length, priorDownloads,
+      "incorrect external pin must release no plaintext");
+  }
+
+  // Complete first protected GET, then let Edge read the *second* local chunk.
+  // It flips the independently pinned real mTLS witness's admission status;
+  // the freshly signed second GET MUST deny and no Blob download may occur.
+  stage = "edge-persisted-witness-revoked-after-first-get";
+  await supplyPersisted();
+  await edge.evalJs(`window.__nativeArrayBuffer=File.prototype.arrayBuffer;
+    window.__revokeOnSecondChunk=true;
+    File.prototype.arrayBuffer=async function(){
+      const bytes=await window.__nativeArrayBuffer.call(this);
+      if(this.name==='native-part-1.bin'&&window.__revokeOnSecondChunk){
+        window.__revokeOnSecondChunk=false;
+        const result=await fetch('/edge-v2/revoke-fixture-witness',{method:'POST',
+          headers:{'X-CSRF-Token':'edge-v2-session'}});
+        if(!result.ok)throw Error('WITNESS_REVOKE_UNAVAILABLE');
+      }
+      return bytes;
+    };`);
+  try {
+    const priorGets = signedGets, priorDownloads = (await edge.downloads()).length;
+    await edge.click("restore-persisted");
+    await edge.statusIncludes("Operação recusada");
+    assert.equal(witnessOpen, false, "real fixture witness was revoked after first signed GET");
+    assert.equal(signedGets - priorGets, 2,
+      "the second signed GET must reach the real server and be denied by its witness");
+    assert.equal((await edge.downloads()).length, priorDownloads,
+      "witness revocation after decrypt must prevent plaintext download");
+  } finally {
+    await edge.evalJs("File.prototype.arrayBuffer=window.__nativeArrayBuffer");
+    witnessOpen = true;
+    persistedSecret.fill(0);
+  }
 
   // A page reload destroys all WeakMap brands. Genuine imported evidence must
   // be reverified in the fresh JS realm; a serialized 'verified:true' cannot substitute.
