@@ -262,6 +262,7 @@ class Zk1WitnessCasPhysicalAdmission {
         || !Number.isSafeInteger(offset) || offset < 0
         || offset >= chain.length || !same(chain[offset], receipt)
         || proof.inventoryReceipt.sequence > checked.sequence) deny();
+      if (process.hrtime.bigint() - chainStartMonotonic > MAX_CHAIN_ELAPSED_NS) deny();
       return Object.freeze({ ownerBound: true, physicallyCommitted: true,
         localReadbackConfirmed: true, externallyDurable: false,
         operationId: Buffer.from(proof.physicalReadback.operationId),

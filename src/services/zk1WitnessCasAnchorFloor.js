@@ -548,6 +548,8 @@ class Zk1WitnessCasAnchorFloor {
   }
   async #advanceAttestedSerial(captured, evidence) {
     if (this.#closed) fail();
+    const admissionStart = process.hrtime.bigint();
+    const maxAdmissionNs = 300_000_000_000n;
     this.head();
     const pendingHeads = new Map(this.#inventoryHeads);
     const verifiedPhysical = new Map();
@@ -561,6 +563,7 @@ class Zk1WitnessCasAnchorFloor {
           line: record.line, lastHash: record.lastHash,
           status: record.status, scope: record.scope,
         }, evidence[i], pendingHeads.get(record.scope));
+        if (process.hrtime.bigint() - admissionStart > maxAdmissionNs) fail();
         if (record.status === "committed") {
           if (!verified.physicallyCommitted || !verified.localReadbackConfirmed
             || !Buffer.isBuffer(verified.operationId)
@@ -583,9 +586,12 @@ class Zk1WitnessCasAnchorFloor {
         verifiedPhysical.set(record.sequence, verified);
       } catch (_) { fail(); }
     }
-    return this.#advanceCaptured(captured, verifiedPhysical, pendingHeads);
+    if (process.hrtime.bigint() - admissionStart > maxAdmissionNs) fail();
+    return this.#advanceCaptured(captured, verifiedPhysical, pendingHeads,
+      admissionStart);
   }
-  #advanceCaptured(captured, verifiedPhysical = null, pendingHeads = null) {
+  #advanceCaptured(captured, verifiedPhysical = null, pendingHeads = null,
+    admissionStart = null) {
     const priorSequence = this.#trustedFloor.sequence;
     if (Boolean(verifiedPhysical) !== Boolean(this.#attestedAdmission)) fail();
     const insertedFences = [];
@@ -627,6 +633,10 @@ class Zk1WitnessCasAnchorFloor {
         insert.run(item.sequence, item.line, item.lastHash, item.previousHash);
         previous = { sequence: item.sequence, lastHash: item.lastHash };
       }
+      // This check still runs inside the SQLite transaction. A long pause
+      // while inserting fences must roll it back, not commit stale evidence.
+      if (admissionStart !== null
+        && process.hrtime.bigint() - admissionStart > 300_000_000_000n) fail();
       return Object.freeze({ ...previous });
     }).immediate();
     for (const item of captured) {
