@@ -28,7 +28,10 @@ test("expired historical device proof remains readable but cannot authorize a ne
     revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "historical.txt" },
     plaintext: Buffer.from("ciphertext-only"), fileKey: crypto.randomBytes(32) });
   operation.authorization = await createAuthorizationProof(operation, {
-    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 5000,
+    // Strict Windows ACL/bootstrap verification can outlast a 5-second test
+    // proof. Exercise actual expiry with the explicit clock advance below,
+    // not with incidental fixture setup latency.
+    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 120_000,
   });
   assert.equal(validateOperation(operation).operationId, operation.operationId);
   // Signed records require an owner-controlled atomic device registry even
