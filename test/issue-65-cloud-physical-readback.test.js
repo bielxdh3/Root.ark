@@ -185,6 +185,54 @@ test("cloud verifier rejects a remote adapter that tries to publish a linked loc
   } finally { fs.rmSync(disposable, { recursive: true, force: true }); }
 });
 
+test("cloud ciphertext readback never allocates beyond pinned size if the downloaded inode grows after fstat", async () => {
+  const f = fixture("s3");
+  const context = "a".repeat(64);
+  let destination;
+  const reader = {
+    status: () => ({ provider: "s3" }), enabled: () => true,
+    resolveInventoryContext: async () => context,
+    key: (folder, name, area) => `rootark/${area}/${folder}/${name}`,
+    download: async (_folder, _name, file) => {
+      destination = file;
+      fs.writeFileSync(file, f.original, { flag: "wx", mode: 0o600 });
+      return true;
+    },
+  };
+  const verifier = new Zk1CloudCiphertextReadbackVerifier({ cloudReader: reader,
+    expectedProvider: "s3", expectedReaderContext: context });
+  const originalStat = fs.fstatSync;
+  const originalReadFile = fs.readFileSync;
+  let injected = false;
+  let bytesReadUnbounded = 0;
+  // A malicious or broken provider-side adapter can retain the destination
+  // name and append after the verifier opened and size-checked its inode.
+  // The verifier must not allocate/read the extra bytes before rejecting it.
+  try {
+    fs.fstatSync = function (fd, options) {
+      const stat = originalStat.call(fs, fd, options);
+      if (!injected && destination && stat.isFile()
+        && stat.size === BigInt(f.original.length)) {
+        injected = true;
+        fs.appendFileSync(destination, Buffer.alloc(64 * 1024, 0x66));
+      }
+      return stat;
+    };
+    fs.readFileSync = function (file, ...options) {
+      const data = originalReadFile.call(fs, file, ...options);
+      if (Number.isInteger(file)) bytesReadUnbounded = data.length;
+      return data;
+    };
+    await assert.rejects(verifier.verifyExact(f.input), /ZK_CLOUD_READBACK_UNAVAILABLE/);
+    assert.equal(injected, true, "simulated writer must race the verifier's fstat");
+    assert.ok(bytesReadUnbounded <= f.original.length,
+      "untrusted growth may never cause a read/allocation beyond the exact signed ciphertext size");
+  } finally {
+    fs.fstatSync = originalStat;
+    fs.readFileSync = originalReadFile;
+  }
+});
+
 test("bounded S3 readback never substitutes a file raced into the destination after GET", async () => {
   const disposable = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-race-"));
   const destination = path.join(disposable, "ciphertext.ct");

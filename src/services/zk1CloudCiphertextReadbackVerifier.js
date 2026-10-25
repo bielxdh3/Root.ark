@@ -159,14 +159,27 @@ class Zk1CloudCiphertextReadbackVerifier {
         const opened = fs.fstatSync(fd, { bigint: true });
         if (!opened.isFile() || opened.size !== BigInt(total) || opened.nlink !== 1n
           || opened.dev !== stat.dev || opened.ino !== stat.ino) fail();
-        contents = fs.readFileSync(fd);
+        // A size/identity check does not constrain readFileSync(fd): another
+        // writer can extend the inode between fstat and the read, causing an
+        // unbounded allocation before the post-read check rejects it. Never
+        // read more than the previously pinned ciphertext byte budget.
+        contents = Buffer.alloc(total);
+        let offset = 0;
+        while (offset < total) {
+          const count = fs.readSync(fd, contents, offset,
+            Math.min(64 * 1024, total - offset), offset);
+          if (count <= 0 || count > total - offset) fail();
+          offset += count;
+        }
         const after = fs.fstatSync(fd, { bigint: true });
         const named = fs.lstatSync(destination, { bigint: true });
         if (contents.length !== total || after.size !== opened.size
           || after.mtimeNs !== opened.mtimeNs || after.ino !== opened.ino
           || after.dev !== opened.dev || after.nlink !== 1n
           || named.ino !== opened.ino || named.dev !== opened.dev
-          || named.nlink !== 1n || named.isSymbolicLink()) fail();
+          || named.nlink !== 1n || named.isSymbolicLink()
+          || named.size !== opened.size
+          || named.mtimeNs !== opened.mtimeNs) fail();
       } finally { fs.closeSync(fd); }
       const chunks = [];
       let offset = 0;
