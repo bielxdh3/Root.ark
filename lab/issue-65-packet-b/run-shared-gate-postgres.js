@@ -126,7 +126,10 @@ async function main() {
     + "@127.0.0.1:" + match[1] + "/gatefixture";
   // Use the Node executable that launched this runner (Node 22 is required
   // for the release reference), not a different node.exe found on PATH.
-  run(process.execPath, ["--test", "--test-reporter=spec",
+  const focusedHistoricalE2e = process.argv.includes("--historical-e2e-only");
+  const tests = focusedHistoricalE2e ? [
+    "test/issue-65-real-pg-w2-historical-sync-e2e.test.js",
+  ] : [
     "test/issue-65-shared-gate-postgres.test.js",
     "test/issue-65-gate-runtime-role.test.js",
     "test/issue-65-gate-stop-hidden-role.test.js",
@@ -140,7 +143,12 @@ async function main() {
     "test/issue-65-multi-host-pinned-stop-postgres.test.js",
     "test/issue-65-strict-stop-operator-postgres.test.js",
     "test/issue-65-supervised-pg-writer-lab.test.js",
-    "test/issue-65-shared-gate-real-witness.test.js"],
+    "test/issue-65-shared-gate-real-witness.test.js",
+    "test/issue-65-real-pg-w2-historical-sync-e2e.test.js",
+  ];
+  run(process.execPath, ["--test",
+    ...(focusedHistoricalE2e ? ["--test-force-exit"] : []),
+    "--test-reporter=spec", ...tests],
   { env: { ...process.env, ROOTARK_ZK1_TEST_PG_URL: uri,
     ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUri,
     ROOTARK_ZK1_ATTESTOR_PG_URL: attestorUri,
