@@ -38,7 +38,7 @@ const { verifyCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { Zk1WitnessCasPhysicalAdmission } =
   require("../src/services/zk1WitnessCasPhysicalAdmission");
-const { Zk1WitnessCasAnchorFloor } =
+const { Zk1WitnessCasAnchorFloor, verifyFreshWitnessCasFloor } =
   require("../src/services/zk1WitnessCasAnchorFloor");
 const { Zk1CasTerminalAnchor } =
   require("../src/services/zk1CasTerminalAnchor");
@@ -207,12 +207,34 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
     trustedMinimumInventoryHead: minimumHead,
     trustedMinimumInventorySnapshot: minimumSnapshot,
   });
-  const floor = new Zk1WitnessCasAnchorFloor(path.join(dir, "witness-floor.sqlite"), {
+  const floorPath = path.join(dir, "witness-floor.sqlite");
+  let floor = new Zk1WitnessCasAnchorFloor(floorPath, {
     bootstrapNew: true, witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission });
   t.after(() => floor.close());
-  assert.equal((await floor.advanceAttested({ records: [record], evidence: [evidence] })).sequence, 1,
+  const witnessed = await floor.advanceAttested({ records: [record], evidence: [evidence] });
+  assert.equal(witnessed.sequence, 1,
     "independently challenged real PG readback must precede witness floor advance");
+  const witnessNonce = crypto.randomBytes(32);
+  const checkedFloor = verifyFreshWitnessCasFloor({
+    signed: floor.freshHead({ nonce: witnessNonce }), nonce: witnessNonce,
+    pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
+  });
+  floor.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(floorPath, {
+    bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "restart cannot trust the on-disk SQLite floor as its own rollback oracle");
+  floor = new Zk1WitnessCasAnchorFloor(floorPath, {
+    bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+    trustedMinimumHead: { ...witnessed,
+      physicalFenceDigest: checkedFloor.physicalFenceDigest },
+  });
+  assert.deepEqual(floor.head(), witnessed);
   await drainZk1ContentInventoryHttpsServer(server);
   await f.restart();
   reader = await startInventory();
