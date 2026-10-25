@@ -21,6 +21,31 @@ local runtime invariant. No hosted two-administrator independent witness,
 provider durability, cross-service atomicity or production GO is claimed.
 PR #228 remains DRAFT / NO-GO.
 
+## Issue #65 / PR #228: Windows hosted 2,000-chunk assembly latency (2026-10-25)
+
+The hosted Windows Node 22 gate on `16dfd12` reported a socket timeout on
+the **final** chunk of 2,000 while the server was still running. The final
+request is uniquely responsible for joining 2,000 on-disk `.part` files.
+Its prior implementation serialized 2,000 independent `fs.createReadStream`
+open/read/close cycles, multiplying intermittent Windows filesystem/AV latency
+into a single 30-second idle-socket boundary. This is the identified local
+amplification mechanism; the exact hosted machine bottleneck remains unproven
+without server-side stage traces from that run.
+
+The assembler now opens up to 16 part descriptors in parallel and streams their
+contents **sequentially** into an exclusively created destination. Only bounded
+stream buffers are retained; each descriptor is closed before release, and
+missing/hardlinked parts, I/O failures and a preexisting destination fail
+closed without overwriting or deleting an existing payload. Storage quota,
+required part count, the request's existing deadline, scanning, encryption,
+and durable handoff rules are unchanged. A disposable Windows Node 22/24
+fixture validates exact 2,000-byte ordering under synthetic 7ms/open latency
+and concurrent independent disk writes; the bounded stage took approximately
+1.8–2.0 seconds, with 16 peak concurrent opens. Tests also cover two full
+8 MiB parts, absent parts and intact destination preservation. Full HTTP
+2,000-chunk flows were verified locally on Node 22/24 with the unchanged
+socket timeout; this local result does not establish hosted CI completion.
+
 ## Issue #65 / PR #228: development browser vault cross-tab revocation (2026-10-25)
 
 The **experimental** `/zk-dev` browser vault uses an IndexedDB v3 per-account

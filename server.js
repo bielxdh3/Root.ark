@@ -44,6 +44,7 @@ const {
   createChunkUploadQuota,
   parseChunkUploadQuotaConfig,
 } = require("./services/chunkUploadQuota");
+const { assembleChunkedUpload } = require("./services/chunkUploadAssembler");
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
@@ -9227,33 +9228,6 @@ function hasAllChunks(sessionDir, totalChunks) {
     }
   }
   return received === totalChunks;
-}
-
-async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
-  fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
-  const output = fs.createWriteStream(destinationPath);
-
-  try {
-    for (let index = 0; index < totalChunks; index += 1) {
-      const chunkPath = path.join(sessionDir, `${index}.part`);
-      await new Promise((resolve, reject) => {
-        const input = fs.createReadStream(chunkPath);
-        input.on("error", reject);
-        input.on("end", resolve);
-        input.pipe(output, { end: false });
-      });
-    }
-
-    await new Promise((resolve, reject) => {
-      output.on("finish", resolve);
-      output.on("error", reject);
-      output.end();
-    });
-  } catch (error) {
-    output.destroy();
-    fs.rmSync(destinationPath, { force: true });
-    throw error;
-  }
 }
 
 app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimit, prepareUploadFolder, reserveChunkUploadBeforeMulter, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
