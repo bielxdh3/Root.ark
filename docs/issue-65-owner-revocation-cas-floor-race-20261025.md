@@ -148,24 +148,45 @@ An opt-in witness-side reservation precursor now exists in
 `test/issue-65-witness-catalog-fence-partial.test.js`. This is **NOT** the
 missing cross-host revocation fence:
 
-- Only a **newly bootstrapped** witness SQLite explicitly configured with a
-  distinct `catalogFloorPublicKey` creates the new pinned
+- Only a **newly bootstrapped** witness SQLite explicitly configured with
+  both `catalogFloorPublicKey` and a **distinct, independently provisioned**
+  `catalogPolicyPublicKey` creates the new pinned
   `witness_catalog_identity`, immutable `witness_catalog_admission` and
   immutable `witness_catalog_terminal` tables. There is no automatic
-  migration of existing witness files. An already opted-in database must
-  reopen with the exact original FLOOR public key or fail closed. The
+  migration of existing witness files, **including the older W20 FLOOR-only
+  schema**; a pre-W25 catalog database cannot be automatically authorized.
+  An already opted-in W25 database must reopen with the exact original FLOOR
+  **and independent policy** public keys or fail closed. The
   persisted identity and immutability trigger targets are checked on restart.
-- `beginCatalogAdmission` verifies the committed witness revision/digest
+- `beginCatalogAdmission` now requires a domain-separated Ed25519 policy grant
+  verified under that pinned external policy key, binding the exact scope,
+  operation, committed owner revision/digest, signer device, epoch, sequence,
+  catalog digest, CAS key fingerprint, authenticated-transport principal,
+  expiry, issuance time and a 32-byte nonce. Unauthenticated/mismatched/stale
+  grants cannot insert an ACTIVE row; used nonces are unique per scope and
+  permanently retained. This method does **not** authenticate the caller's
+  transport, discover device membership, independently prove epoch or issue
+  the external grant. Only the real independent policy authority, when
+  implemented and audited, may make that authorization decision. With no
+  independently provisioned policy key the opt-in gate fails closed.
+- After that independent external-policy grant check, `beginCatalogAdmission`
+  verifies the committed witness revision/digest
   and no pending owner/quiescence transition. The **same** witness SQLite
   `BEGIN IMMEDIATE` as owner reservation commits a FULL-durable, signer
   device + owner revision/digest + epoch + operation ID + catalog
   sequence/digest + CAS fingerprint + principal + expiry-bound signed grant.
   While active it blocks owner `reserve`, and `prepareQuiesce` cannot
   report DRAINED.
-- Identical START replays are idempotent, without extending deadline or
-  changing the grant. Expiry/restart never silently erases an ACTIVE record:
-  owner revocation remains blocked. This intentionally risks an indefinite
-  halt until independently proven completion or audited recovery exists.
+- Identical START replays are idempotent only with the same externally signed
+  policy grant, without extending deadline or changing authorization. Once
+  a terminal is durably stored, exact-byte FINISH replay remains idempotent
+  across revocation/owner HEAD advance, restart and expiry, without creating
+  any fresh authority; a different terminal is denied. Expiry/restart never
+  silently erases an unresolved ACTIVE record: owner revocation remains
+  blocked. A legitimately policy-authorized but unresolved operation can still
+  halt revocation indefinitely until independent audited reconciliation exists.
+  This is a deliberate safety stop; granting automatic timeout release
+  without physical CAS evidence would reintroduce the race.
 - `completeCatalogAdmission` only accepts a new token-specific Ed25519
   FLOOR terminal signature pinned to admission ID, operation ID, owner
   revision/digest, device, epoch, catalog head, nonce and expiry. A generic

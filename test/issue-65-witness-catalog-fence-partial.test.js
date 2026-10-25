@@ -14,6 +14,7 @@ const STATUS = Buffer.from("Root.ark/zk-1/recovery-cas-status/v1\0");
 const FLOOR = Buffer.from("Root.ark/zk-1/opaque-catalog-witness-terminal/v1\0");
 const LEGACY_FLOOR = Buffer.from("Root.ark/zk-1/opaque-catalog-independent-floor/v1\0");
 const CATALOG = Buffer.from("Root.ark/zk-1/recovery-witness-catalog-admission/v1\0");
+const POLICY = Buffer.from("Root.ark/zk-1/recovery-witness-catalog-policy-grant/v1\0");
 
 async function fixture(t, { catalogEnabled = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-witness-catalog-"));
@@ -26,6 +27,7 @@ async function fixture(t, { catalogEnabled = true } = {}) {
   const witness = crypto.generateKeyPairSync("ed25519");
   const status = crypto.generateKeyPairSync("ed25519");
   const floor = crypto.generateKeyPairSync("ed25519");
+  const policy = crypto.generateKeyPairSync("ed25519");
   const keyId = crypto.randomBytes(16);
   const statusId = crypto.randomBytes(16);
   const scope = { account_id: crypto.randomBytes(16), compartment_id: Buffer.from("catalog"),
@@ -35,6 +37,7 @@ async function fixture(t, { catalogEnabled = true } = {}) {
   const options = { witnessPrivateKey: witness.privateKey, witnessKeyId: keyId,
     statusPinned: { publicKey: status.publicKey, keyId: statusId },
     catalogFloorPublicKey: catalogEnabled ? floor.publicKey : null,
+    catalogPolicyPublicKey: catalogEnabled ? policy.publicKey : null,
     nowSeconds: () => clock,
     statusProvider: { async getTerminalProof({ query, nonce }) {
       const unsigned = { type: "rootark-recovery-cas-status/v1",
@@ -68,6 +71,20 @@ async function fixture(t, { catalogEnabled = true } = {}) {
     epoch: 1, sequence: 1, catalogDigest: crypto.randomBytes(32),
     floorCasSignerFingerprint: crypto.randomBytes(32),
     expiresAt: 950, principal: "AB:".repeat(31) + "AB" };
+  const signPolicy = async (request, changes = {}) => {
+    const body = { type: "rootark-recovery-witness-catalog-policy-grant/v1",
+      ...request.scope, operation_id: request.operationId,
+      owner_revision: request.ownerRevision, owner_digest: request.ownerDigest,
+      signer_device_id: request.signerDeviceId, epoch: request.epoch,
+      sequence: request.sequence, catalog_digest: request.catalogDigest,
+      cas_signer_spki_sha256: request.floorCasSignerFingerprint,
+      expires_at: request.expiresAt, principal: request.principal,
+      nonce: crypto.randomBytes(32), issued_at: clock, ...changes };
+    const signature = crypto.sign(null, Buffer.concat([POLICY,
+      Buffer.from(await z.encodeDeterministic(body))]), policy.privateKey);
+    return Buffer.from(await z.encodeDeterministic({ ...body, signature }));
+  };
+  input.policyGrant = await signPolicy(input);
   const signFloor = async (admitted, changes = {}) => {
     const body = { type: "rootark-zk1-opaque-catalog-witness-terminal/v1",
       ...scope, cas_signer_spki_sha256: input.floorCasSignerFingerprint,
@@ -80,7 +97,7 @@ async function fixture(t, { catalogEnabled = true } = {}) {
       Buffer.from(await z.encodeDeterministic(body))]), floor.privateKey);
     return Buffer.from(await z.encodeDeterministic({ ...body, signature }));
   };
-  return { ledger, open, file, options, input, next, floor, witness, keyId, signFloor,
+  return { ledger, open, file, options, input, next, floor, policy, signPolicy, witness, keyId, signFloor,
     setClock(v) { clock = v; } };
 }
 
@@ -139,8 +156,87 @@ test("opted-in FULL witness catalog admission blocks owner revoke before floor f
   assert.deepEqual(await restarted.completeCatalogAdmission(completed), { status: "completed" });
   assert.deepEqual(await restarted.prepareQuiesce(f.next), { status: "DRAINED", activeCount: 0 });
   await restarted.reserve(f.next);
-  await assert.rejects(restarted.beginCatalogAdmission({ ...f.input,
+  await restarted.resolve({ scope: f.input.scope });
+  assert.equal(restarted.db.prepare("SELECT revision FROM witness_scope").get().revision, 2,
+    "the old owner HEAD must have advanced before replaying the FLOOR FINISH");
+  // FLOOR finished durably, but the ACK to its original principal was lost.
+  // Owner revocation can subsequently advance and the identical FINISH must
+  // remain replayable without reviving any catalog admission or grant.
+  f.setClock(951);
+  assert.deepEqual(await restarted.completeCatalogAdmission(completed), { status: "completed" });
+  restarted.close();
+  const afterOwnerAdvance = f.open();
+  assert.deepEqual(await afterOwnerAdvance.completeCatalogAdmission(completed),
+    { status: "completed" }, "restart and expiry cannot erase an already durable terminal");
+  await assert.rejects(afterOwnerAdvance.completeCatalogAdmission({
+    ...completed, floorProof: await f.signFloor(admission, { observed_at: 951 }),
+  }), /WITNESS_CATALOG_DENIED/, "a new correctly signed terminal cannot replace the stored one");
+  await assert.rejects(afterOwnerAdvance.beginCatalogAdmission({ ...f.input,
     operationId: crypto.randomBytes(16) }), /WITNESS_CATALOG_DENIED/);
+});
+
+test("an untrusted START without independent signed policy authorization cannot block owner revocation", async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(f.ledger.beginCatalogAdmission({
+    ...f.input, policyGrant: Buffer.from([0xa0]),
+  }), /WITNESS_CATALOG_DENIED/);
+  assert.equal(f.ledger.db.prepare("SELECT COUNT(*) AS n FROM witness_catalog_admission").get().n, 0);
+  assert.deepEqual(await f.ledger.prepareQuiesce(f.next),
+    { status: "DRAINED", activeCount: 0 });
+});
+
+test("catalog policy must bind signer, epoch, sequence, principal, operation and every nonce to the external signature", async (t) => {
+  const f = await fixture(t);
+  const mutated = [
+    { signerDeviceId: crypto.randomBytes(16) }, { epoch: 2 },
+    { sequence: 2 }, { principal: "CD:".repeat(31) + "CD" },
+    { operationId: crypto.randomBytes(16) },
+    { floorCasSignerFingerprint: crypto.randomBytes(32) },
+    { catalogDigest: crypto.randomBytes(32) },
+    { ownerRevision: 2 },
+  ];
+  for (const change of mutated) {
+    await assert.rejects(f.ledger.beginCatalogAdmission({ ...f.input, ...change }),
+      /WITNESS_CATALOG_DENIED/);
+  }
+  const parsed = await z.decodeDeterministic(f.input.policyGrant);
+  await assert.rejects(f.ledger.beginCatalogAdmission({
+    ...f.input, policyGrant: Buffer.from(await z.encodeDeterministic({
+      ...parsed, nonce: crypto.randomBytes(32),
+    })),
+  }), /WITNESS_CATALOG_DENIED/, "caller cannot replace a signed grant nonce");
+  await assert.rejects(f.ledger.beginCatalogAdmission({
+    ...f.input, policyGrant: await f.signPolicy(f.input, { issued_at: 800 }),
+  }), /WITNESS_CATALOG_DENIED/, "even signed stale policy grants cannot be started");
+  assert.equal(f.ledger.db.prepare("SELECT COUNT(*) AS n FROM witness_catalog_admission").get().n, 0);
+  assert.deepEqual(await f.ledger.prepareQuiesce(f.next), { status: "DRAINED", activeCount: 0 });
+});
+
+test("policy nonce cannot be reused for another operation, and restart cannot downgrade pinned signer", async (t) => {
+  const f = await fixture(t);
+  const admission = await f.ledger.beginCatalogAdmission(f.input);
+  await f.ledger.completeCatalogAdmission({ scope: f.input.scope, admissionId: admission.admissionId,
+    principal: f.input.principal, floorProof: await f.signFloor(admission) });
+  const originalGrant = await z.decodeDeterministic(f.input.policyGrant);
+  const second = { ...f.input, operationId: crypto.randomBytes(16) };
+  second.policyGrant = await f.signPolicy(second, { nonce: originalGrant.nonce });
+  await assert.rejects(f.ledger.beginCatalogAdmission(second), /WITNESS_CATALOG_DENIED/);
+  assert.equal(f.ledger.db.prepare("SELECT COUNT(*) AS n FROM witness_catalog_admission").get().n, 1);
+  f.ledger.close();
+  assert.throws(() => new Zk1DurableWitnessLedger(f.file, {
+    ...f.options, catalogPolicyPublicKey: crypto.generateKeyPairSync("ed25519").publicKey,
+    bootstrapNew: false,
+  }), /WITNESS_CATALOG_DENIED/);
+  assert.throws(() => new Zk1DurableWitnessLedger(f.file, {
+    ...f.options, catalogPolicyPublicKey: null, bootstrapNew: false,
+  }), /WITNESS_CATALOG_DENIED/);
+  const restarted = f.open();
+  f.setClock(951);
+  const later = { ...f.input, operationId: crypto.randomBytes(16) };
+  later.policyGrant = await f.signPolicy(later);
+  await assert.rejects(restarted.beginCatalogAdmission(later), /WITNESS_CATALOG_DENIED/,
+    "expiry cannot turn a previously granted operation into a new authority");
+  assert.deepEqual(await restarted.prepareQuiesce(f.next), { status: "DRAINED", activeCount: 0 });
 });
 
 test("catalog reservation persists strict identity: no silent legacy upgrade, signer-key downgrade, or forged immutability trigger", async (t) => {

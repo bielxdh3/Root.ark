@@ -18,6 +18,17 @@ const RESERVE_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-reservation/v
 const COMMIT_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-commit/v1\0", "ascii");
 const CANCEL_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-cancel/v1\0", "ascii");
 const CATALOG_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-catalog-admission/v1\0", "ascii");
+// Policy signer must be independently provisioned. It attests the operator's
+// authorization decision; callers cannot self-certify identity or epoch.
+const CATALOG_POLICY_DOMAIN = Buffer.from(
+  "Root.ark/zk-1/recovery-witness-catalog-policy-grant/v1\0", "ascii");
+const CATALOG_POLICY_TYPE = "rootark-recovery-witness-catalog-policy-grant/v1";
+const CATALOG_POLICY_FIELDS = Object.freeze([
+  "type", "account_id", "compartment_id", "keyring_id", "operation_id",
+  "owner_revision", "owner_digest", "signer_device_id", "epoch", "sequence",
+  "catalog_digest", "cas_signer_spki_sha256", "expires_at", "principal",
+  "nonce", "issued_at",
+]);
 // This terminal type is NOT emitted by today's FLOOR service. A generic signed
 // floor readHead is not evidence of operation-specific physical finalization.
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-witness-terminal/v1\0", "ascii");
@@ -122,7 +133,7 @@ function normalizeIoFinish(input) {
 function catalogRequest(input) {
   const fields = ["scope", "ownerRevision", "ownerDigest", "operationId",
     "signerDeviceId", "epoch", "sequence", "catalogDigest",
-    "floorCasSignerFingerprint", "expiresAt", "principal"];
+    "floorCasSignerFingerprint", "expiresAt", "principal", "policyGrant"];
   if (!input || typeof input !== "object" || Array.isArray(input)
     || Reflect.ownKeys(input).length !== fields.length
     || fields.some((field) => !Object.hasOwn(input, field))
@@ -136,20 +147,21 @@ function catalogRequest(input) {
     epoch: number(input.epoch, 1), sequence: number(input.sequence, 1),
     catalogDigest: bytes(input.catalogDigest, 32),
     floorCasSignerFingerprint: bytes(input.floorCasSignerFingerprint, 32),
-    expiresAt: number(input.expiresAt), principal: input.principal };
+    expiresAt: number(input.expiresAt), principal: input.principal,
+    policyGrant: bytes(input.policyGrant, 1, 4096) };
 }
 
-function catalogSchema(db, floorFingerprint) {
+function catalogSchema(db, floorFingerprint, policyFingerprint) {
   const entries = new Set(db.prepare("SELECT type,name FROM sqlite_master").all()
     .map(({ type, name }) => `${type}:${name}`));
   const has = entries.has("table:witness_catalog_identity");
   if (!has) {
-    if (floorFingerprint !== null) fail("WITNESS_CATALOG_DENIED");
+    if (floorFingerprint !== null || policyFingerprint !== null) fail("WITNESS_CATALOG_DENIED");
     if (entries.has("table:witness_catalog_admission")
       || entries.has("table:witness_catalog_terminal")) fail("WITNESS_CATALOG_DENIED");
     return;
   }
-  if (floorFingerprint === null
+  if (floorFingerprint === null || policyFingerprint === null
     || !entries.has("table:witness_catalog_admission")
     || !entries.has("table:witness_catalog_terminal")) fail("WITNESS_CATALOG_DENIED");
   if (db.pragma("quick_check", { simple: true }) !== "ok") fail("WITNESS_CATALOG_DENIED");
@@ -169,7 +181,7 @@ function catalogSchema(db, floorFingerprint) {
     witness_catalog_admission: ["admission_id", "scope_key", "keyring_id",
       "operation_id", "principal", "owner_revision", "owner_digest",
       "signer_device_id", "epoch", "sequence", "catalog_digest", "cas_fp",
-      "expires_at", "floor_nonce", "ticket"],
+      "expires_at", "floor_nonce", "ticket", "policy_nonce", "policy_grant"],
     witness_catalog_terminal: ["admission_id", "floor_proof"],
   };
   for (const [table, names] of Object.entries(required)) {
@@ -178,17 +190,21 @@ function catalogSchema(db, floorFingerprint) {
       fail("WITNESS_CATALOG_DENIED");
     }
   }
-  const unique = db.pragma("index_list(witness_catalog_admission)")
+  const indexes = db.pragma("index_list(witness_catalog_admission)")
     .filter((index) => index.unique === 1)
-    .some((index) => {
+    .map((index) => {
       const columns = db.pragma(`index_info(${index.name})`)
         .map((column) => column.name);
-      return columns.length === 2 && columns[0] === "scope_key"
-        && columns[1] === "operation_id";
+      return columns.join(",");
     });
-  if (!unique || db.pragma("foreign_key_check").length) fail("WITNESS_CATALOG_DENIED");
-  const row = db.prepare("SELECT floor_fp FROM witness_catalog_identity WHERE id=1").get();
+  if (!indexes.includes("scope_key,operation_id")
+    || !indexes.includes("scope_key,policy_nonce")
+    || db.pragma("foreign_key_check").length) fail("WITNESS_CATALOG_DENIED");
+  const identityColumns = db.pragma("table_info(witness_catalog_identity)").map((v) => v.name);
+  if (identityColumns.join(",") !== "id,floor_fp,policy_fp") fail("WITNESS_CATALOG_DENIED");
+  const row = db.prepare("SELECT floor_fp,policy_fp FROM witness_catalog_identity WHERE id=1").get();
   if (!row || !equal(row.floor_fp, floorFingerprint)
+    || !equal(row.policy_fp, policyFingerprint)
     || db.prepare("SELECT COUNT(*) AS n FROM witness_catalog_identity").get().n !== 1) {
     fail("WITNESS_CATALOG_DENIED");
   }
@@ -198,7 +214,7 @@ class Zk1DurableWitnessLedger {
   constructor(filename, {
     witnessKeyId, witnessPrivateKey, statusPinned, statusProvider, nowSeconds,
     bootstrapNew = false, maxEventsPerScope = MAX_EVENTS_PER_SCOPE,
-    catalogFloorPublicKey = null,
+    catalogFloorPublicKey = null, catalogPolicyPublicKey = null,
   } = {}) {
     if (typeof filename !== "string" || !filename
       || !(witnessPrivateKey instanceof crypto.KeyObject)
@@ -217,9 +233,20 @@ class Zk1DurableWitnessLedger {
         || catalogFloorPublicKey.asymmetricKeyType !== "ed25519")) {
       fail("WITNESS_CATALOG_DENIED");
     }
+    if ((catalogFloorPublicKey === null) !== (catalogPolicyPublicKey === null)
+      || (catalogPolicyPublicKey !== null
+        && (!(catalogPolicyPublicKey instanceof crypto.KeyObject)
+          || catalogPolicyPublicKey.type !== "public"
+          || catalogPolicyPublicKey.asymmetricKeyType !== "ed25519"))) {
+      fail("WITNESS_CATALOG_DENIED");
+    }
     this.catalogFloorPublicKey = catalogFloorPublicKey;
+    this.catalogPolicyPublicKey = catalogPolicyPublicKey;
     const floorFingerprint = catalogFloorPublicKey === null ? null
       : crypto.createHash("sha256").update(catalogFloorPublicKey.export({
+        type: "spki", format: "der" })).digest();
+    const policyFingerprint = catalogPolicyPublicKey === null ? null
+      : crypto.createHash("sha256").update(catalogPolicyPublicKey.export({
         type: "spki", format: "der" })).digest();
     this.statusPinned = { keyId: this.statusKeyId, publicKey: statusPinned.publicKey };
     this.statusProvider = statusProvider;
@@ -243,7 +270,9 @@ class Zk1DurableWitnessLedger {
       fail("WITNESS_IDENTITY_CONFLICT");
     }
     if (floorFingerprint !== null
-      && (equal(floorFingerprint, ownFp) || equal(floorFingerprint, statusFp))) {
+      && (equal(floorFingerprint, ownFp) || equal(floorFingerprint, statusFp)
+        || equal(policyFingerprint, ownFp) || equal(policyFingerprint, statusFp)
+        || equal(policyFingerprint, floorFingerprint))) {
       fail("WITNESS_CATALOG_DENIED");
     }
     const verifyIdentity = (db) => {
@@ -252,7 +281,7 @@ class Zk1DurableWitnessLedger {
         if (!db.prepare(`SELECT name FROM sqlite_master
           WHERE type='table' AND name='witness_identity'`).get()) fail("WITNESS_STATE_MISSING");
         row = db.prepare("SELECT * FROM witness_identity WHERE id=1").get();
-        catalogSchema(db, floorFingerprint);
+        catalogSchema(db, floorFingerprint, policyFingerprint);
       } catch (error) {
         if (["WITNESS_STATE_MISSING", "WITNESS_CATALOG_DENIED"].includes(error.code)) throw error;
         fail("WITNESS_STATE_MISSING");
@@ -348,7 +377,8 @@ class Zk1DurableWitnessLedger {
           // pinned identity are NEVER implicitly migrated or upgraded.
           this.db.exec(`
             CREATE TABLE witness_catalog_identity (
-              id INTEGER PRIMARY KEY CHECK(id=1), floor_fp BLOB NOT NULL
+              id INTEGER PRIMARY KEY CHECK(id=1), floor_fp BLOB NOT NULL,
+              policy_fp BLOB NOT NULL
             );
             CREATE TABLE witness_catalog_admission (
               admission_id BLOB PRIMARY KEY, scope_key TEXT NOT NULL,
@@ -358,7 +388,9 @@ class Zk1DurableWitnessLedger {
               epoch INTEGER NOT NULL, sequence INTEGER NOT NULL,
               catalog_digest BLOB NOT NULL, cas_fp BLOB NOT NULL,
               expires_at INTEGER NOT NULL, floor_nonce BLOB NOT NULL,
-              ticket BLOB NOT NULL, UNIQUE(scope_key,operation_id),
+              ticket BLOB NOT NULL, policy_nonce BLOB NOT NULL,
+              policy_grant BLOB NOT NULL, UNIQUE(scope_key,operation_id),
+              UNIQUE(scope_key,policy_nonce),
               FOREIGN KEY(scope_key) REFERENCES witness_scope(scope_key)
             );
             CREATE TABLE witness_catalog_terminal (
@@ -374,11 +406,11 @@ class Zk1DurableWitnessLedger {
             CREATE TRIGGER catalog_terminal_delete BEFORE DELETE ON witness_catalog_terminal
               BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
           `);
-          this.db.prepare("INSERT INTO witness_catalog_identity VALUES(1,?)")
-            .run(floorFingerprint);
+          this.db.prepare("INSERT INTO witness_catalog_identity VALUES(1,?,?)")
+            .run(floorFingerprint, policyFingerprint);
         }
     }
-      catalogSchema(this.db, floorFingerprint);
+      catalogSchema(this.db, floorFingerprint, policyFingerprint);
     this.getScope = this.db.prepare("SELECT * FROM witness_scope WHERE scope_key=?");
     this.insertScope = this.db.prepare(
       "INSERT INTO witness_scope(scope_key,keyring_id,revision,digest,pending_id,tombstoned) VALUES(?,?,NULL,NULL,?,0)");
@@ -424,6 +456,37 @@ class Zk1DurableWitnessLedger {
     const canonical = await z.encodeDeterministic(unsigned);
     const signature = crypto.sign(null, Buffer.concat([domain, canonical]), this.witnessPrivateKey);
     return Buffer.from(await z.encodeDeterministic({ ...unsigned, signature }));
+  }
+
+  async verifyCatalogPolicy(req) {
+    if (!this.catalogPolicyPublicKey) fail("WITNESS_CATALOG_DENIED");
+    try {
+      const grant = await z.decodeDeterministic(req.policyGrant);
+      if (!grant || typeof grant !== "object" || Array.isArray(grant)
+        || Reflect.ownKeys(grant).length !== CATALOG_POLICY_FIELDS.length + 1
+        || [...CATALOG_POLICY_FIELDS, "signature"].some((field) => !Object.hasOwn(grant, field))) {
+        fail("WITNESS_CATALOG_DENIED");
+      }
+      const { signature, ...body } = grant;
+      if (body.type !== CATALOG_POLICY_TYPE
+        || !["account_id", "compartment_id", "keyring_id"]
+          .every((field) => equal(body[field], req.scope[field]))
+        || !equal(body.operation_id, req.operationId)
+        || body.owner_revision !== req.ownerRevision
+        || !equal(body.owner_digest, req.ownerDigest)
+        || !equal(body.signer_device_id, req.signerDeviceId)
+        || body.epoch !== req.epoch || body.sequence !== req.sequence
+        || !equal(body.catalog_digest, req.catalogDigest)
+        || !equal(body.cas_signer_spki_sha256, req.floorCasSignerFingerprint)
+        || body.expires_at !== req.expiresAt || body.principal !== req.principal
+        || !Number.isSafeInteger(body.issued_at) || body.issued_at < 1
+        || body.issued_at >= body.expires_at
+        || body.expires_at - body.issued_at > 60
+        || !crypto.verify(null, Buffer.concat([CATALOG_POLICY_DOMAIN,
+          Buffer.from(await z.encodeDeterministic(body))]),
+        this.catalogPolicyPublicKey, bytes(signature, 64))) fail("WITNESS_CATALOG_DENIED");
+      return { nonce: bytes(body.nonce, 32), issuedAt: body.issued_at };
+    } catch (_) { fail("WITNESS_CATALOG_DENIED"); }
   }
 
   assertClockFloor(key, now) {
@@ -493,8 +556,10 @@ class Zk1DurableWitnessLedger {
   // revocation. It is NOT a production-ready multi-host CAS/FLOOR protocol:
   // the floor currently does not consume the signed grant.
   async beginCatalogAdmission(input) {
-    if (!this.catalogFloorPublicKey) fail("WITNESS_CATALOG_DENIED");
+    if (!this.catalogFloorPublicKey || !this.catalogPolicyPublicKey)
+      fail("WITNESS_CATALOG_DENIED");
     const req = catalogRequest(input);
+    const policy = await this.verifyCatalogPolicy(req);
     const key = compartmentKey(req.scope.account_id, req.scope.compartment_id);
     const { row: checked } = await this.checkedScope(req.scope);
     const admissionId = crypto.randomBytes(16);
@@ -514,6 +579,7 @@ class Zk1DurableWitnessLedger {
       const now = number(this.nowSeconds());
       this.assertClockFloor(key, now);
       if (req.expiresAt <= now || req.expiresAt > now + 60
+        || policy.issuedAt > now + 30 || now - policy.issuedAt > 60
         || checked.revision !== req.ownerRevision
         || !equal(checked.digest, req.ownerDigest)) fail("WITNESS_CATALOG_DENIED");
       const head = this.getScope.get(key);
@@ -533,21 +599,27 @@ class Zk1DurableWitnessLedger {
           || !equal(old.catalog_digest, req.catalogDigest)
           || !equal(old.cas_fp, req.floorCasSignerFingerprint)
           || old.expires_at !== req.expiresAt
+          || !equal(old.policy_nonce, policy.nonce)
+          || !equal(old.policy_grant, req.policyGrant)
           || this.db.prepare("SELECT 1 FROM witness_catalog_terminal WHERE admission_id=?")
             .get(old.admission_id)) fail("WITNESS_CATALOG_DENIED");
         return { admissionId: Buffer.from(old.admission_id),
           floorNonce: Buffer.from(old.floor_nonce), ticket: Buffer.from(old.ticket) };
       }
       if (this.catalogActive.get(key)) fail("WITNESS_CATALOG_ACTIVE");
+      if (this.db.prepare(`SELECT 1 FROM witness_catalog_admission
+        WHERE scope_key=? AND policy_nonce=?`).get(key, policy.nonce)) {
+        fail("WITNESS_CATALOG_DENIED");
+      }
       if (this.db.prepare("SELECT COUNT(*) AS n FROM witness_catalog_admission WHERE scope_key=?")
         .get(key).n >= MAX_CATALOG_ADMISSIONS_PER_SCOPE) {
         fail("WITNESS_CATALOG_CAPACITY_EXHAUSTED");
       }
-      this.db.prepare(`INSERT INTO witness_catalog_admission VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      this.db.prepare(`INSERT INTO witness_catalog_admission VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(admissionId, key, req.scope.keyring_id, req.operationId,
           req.principal, req.ownerRevision, req.ownerDigest, req.signerDeviceId,
           req.epoch, req.sequence, req.catalogDigest, req.floorCasSignerFingerprint,
-          req.expiresAt, floorNonce, ticket);
+          req.expiresAt, floorNonce, ticket, policy.nonce, req.policyGrant);
       this.db.prepare(`INSERT INTO witness_clock_floor(scope_key,last_at) VALUES (?,?)
         ON CONFLICT(scope_key) DO UPDATE SET last_at=excluded.last_at
         WHERE excluded.last_at>witness_clock_floor.last_at`).run(key, now);
@@ -597,23 +669,27 @@ class Zk1DurableWitnessLedger {
         || body.sequence !== row.sequence
         || !Number.isSafeInteger(body.observed_at)
         || body.observed_at > row.expires_at
-        || Math.abs(body.observed_at - number(this.nowSeconds())) > 30
         || !crypto.verify(null, Buffer.concat([FLOOR_DOMAIN,
           Buffer.from(await z.encodeDeterministic(body))]),
         this.catalogFloorPublicKey, bytes(signature, 64))) fail("WITNESS_CATALOG_DENIED");
     } catch (_) { fail("WITNESS_CATALOG_DENIED"); }
     return this.db.transaction(() => {
-      const current = this.getScope.get(key);
-      if (!current || !equal(current.keyring_id, scope.keyring_id)
-        || current.tombstoned || current.pending_id !== null
-        || current.revision !== row.owner_revision
-        || !equal(current.digest, row.owner_digest)) fail("WITNESS_CATALOG_DENIED");
+      // Exact durable FINISH ACK replay, even after revocation advanced the
+      // owner HEAD or the terminal's observation expired. A replay only reads
+      // an immutable completed record; it cannot issue a new grant.
       const old = this.db.prepare("SELECT floor_proof FROM witness_catalog_terminal WHERE admission_id=?")
         .get(admissionId);
       if (old) {
         if (!equal(old.floor_proof, raw)) fail("WITNESS_CATALOG_DENIED");
         return { status: "completed" };
       }
+      if (Math.abs(proof.observed_at - number(this.nowSeconds())) > 30)
+        fail("WITNESS_CATALOG_DENIED");
+      const current = this.getScope.get(key);
+      if (!current || !equal(current.keyring_id, scope.keyring_id)
+        || current.tombstoned || current.pending_id !== null
+        || current.revision !== row.owner_revision
+        || !equal(current.digest, row.owner_digest)) fail("WITNESS_CATALOG_DENIED");
       this.assertClockFloor(key, number(this.nowSeconds()));
       if (number(this.nowSeconds()) > row.expires_at) fail("WITNESS_CATALOG_DENIED");
       this.db.prepare("INSERT INTO witness_catalog_terminal VALUES(?,?)")
