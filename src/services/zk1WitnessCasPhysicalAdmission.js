@@ -7,6 +7,7 @@
 // proof alone is external persistence or authorization for content I/O.
 const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
+const z = require("../crypto/rootark-zk-1");
 const { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
   derivePhysicalChainPageNonce, MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS } =
   require("../crypto/rootark-zk1-attested-inventory-commit-v1");
@@ -14,6 +15,7 @@ const { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
 const OWNER_DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
 const B64 = /^[A-Za-z0-9_-]+$/;
 const HEX = /^[0-9a-f]{64}$/;
+const MAX_CHAIN_ELAPSED_NS = 300_000_000_000n;
 function deny() {
   const error = new Error("WITNESS_CAS_PHYSICAL_ADMISSION_DENIED");
   error.code = error.message;
@@ -186,6 +188,8 @@ class Zk1WitnessCasPhysicalAdmission {
       const minimumHead = minimumInventory?.head || this.#minimumHead;
       const minimumSnapshot = minimumInventory?.snapshot || this.#minimumSnapshot;
       const chainNonce = crypto.randomBytes(32);
+      const chainStartSeconds = Math.floor(Date.now() / 1000);
+      const chainStartMonotonic = process.hrtime.bigint();
       const requested = { object_id: Buffer.from(operation.object_id),
         revision: operation.revision, epoch: operation.epoch,
         ciphertext_sha256: Buffer.from(operation.ciphertext_sha256) };
@@ -194,6 +198,10 @@ class Zk1WitnessCasPhysicalAdmission {
         minimumHead, minimumSnapshot: Buffer.from(minimumSnapshot),
         includeVerifiedProofChain: true,
       });
+      const chainEndSeconds = Math.floor(Date.now() / 1000);
+      if (process.hrtime.bigint() - chainStartMonotonic > MAX_CHAIN_ELAPSED_NS
+        || chainEndSeconds < chainStartSeconds - 30
+        || chainEndSeconds > chainStartSeconds + 330) deny();
       // Do not trust boolean VERIFIED claims from an injectable transport.
       // Reverify the actual Ed25519 signed checkpoint and every intervening
       // signed ancestry link inside this independently pinned witness process.
@@ -220,13 +228,26 @@ class Zk1WitnessCasPhysicalAdmission {
         const pageNonce = derivePhysicalChainPageNonce(chainNonce, pageStart);
         const entryNonce = derivePhysicalChainNonce(pageNonce, sequence,
           operationInChain.operation_id);
+        const physicalAttestation = continuation.authenticatedPhysicalProofChain[i];
+        if ((!Buffer.isBuffer(physicalAttestation)
+          && !(physicalAttestation instanceof Uint8Array))
+          || physicalAttestation.length < 1 || physicalAttestation.length > 2048
+          || (typeof SharedArrayBuffer !== "undefined"
+            && physicalAttestation.buffer instanceof SharedArrayBuffer)) deny();
+        const claims = await z.decodeDeterministic(Buffer.from(physicalAttestation));
+        if (!Number.isSafeInteger(claims?.issued_at)
+          || claims.issued_at < chainStartSeconds - 30
+          || claims.issued_at > chainEndSeconds + 30) deny();
+        // The signed nonce is unique to this witness invocation. A page can
+        // legitimately be >30s old by the time 16 bounded pages finish, but
+        // its signed issuance must lie inside this local challenge interval.
         await verifyAttestedInventoryCommit({ receipt: chain[i],
-          physicalAttestation: continuation.authenticatedPhysicalProofChain[i],
+          physicalAttestation,
           scope, operation: operationInChain, nonce: entryNonce,
           pinnedInventoryPublicKey: this.#inventory,
           pinnedInventorySignerKeyId: this.#signerId,
           pinnedPhysicalAttestorPublicKey: this.#physical,
-          nowSeconds: Math.floor(Date.now() / 1000),
+          nowSeconds: claims.issued_at,
         });
       }
       const checked = await inventory.verifySnapshot({

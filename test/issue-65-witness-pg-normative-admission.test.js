@@ -88,11 +88,14 @@ test("strict CAS witness floor refuses signed status advance without independent
   let forkSnapshot = null;
   let forkProofs = null;
   let chainPhysicalPresent = false;
+  let shiftClockAfterChain = false;
+  let oldChainProof = false;
+  const realDateNow = Date.now;
   const chainPhysicalProof = async (challenge) => {
     const pageNonce = derivePhysicalChainPageNonce(challenge, 0);
     const nonce = derivePhysicalChainNonce(pageNonce, 1, op.operation_id);
     return signCommittedPhysicalReadback({ scope, operation: op, nonce,
-      issuedAt: Math.floor(Date.now() / 1000),
+      issuedAt: Math.floor(Date.now() / 1000) - (oldChainProof ? 45 : 0),
       readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
         walFlushConfirmed: true, authorizesIo: false,
         provesIndependentOperator: false, generation: 1,
@@ -131,12 +134,14 @@ test("strict CAS witness floor refuses signed status advance without independent
       async getVerifiedSnapshotWithChain({ scope: argScope, nonce }) {
         inventoryCalls += 1;
         assert.deepEqual(argScope, scope);
-        return { serializedSnapshot: Buffer.from(await (
+        const answer = { serializedSnapshot: Buffer.from(await (
           forkSnapshot ? forkSnapshot(nonce) : buildCurrentSnapshot(nonce))),
           authenticatedProofChain: forkProofs || [receipt], authorizesIo: false,
           ...(chainPhysicalPresent ? {
             authenticatedPhysicalProofChain: [await chainPhysicalProof(nonce)],
           } : {}) };
+        if (shiftClockAfterChain) Date.now = () => realDateNow() + 45_000;
+        return answer;
       },
     },
   });
@@ -176,7 +181,19 @@ test("strict CAS witness floor refuses signed status advance without independent
     /WITNESS_CAS_FLOOR_DENIED/,
     "a target readback does not substitute for physical evidence on the signed chain");
   chainPhysicalPresent = true;
-  const result = await floor.advanceAttested({ records: [record], evidence: [evidence] });
+  oldChainProof = true;
+  await assert.rejects(floor.advanceAttested({ records: [record], evidence: [evidence] }),
+    /WITNESS_CAS_FLOOR_DENIED/,
+  "an attestation issued before this witness's fresh challenge is not rescued by signed bytes");
+  oldChainProof = false;
+  shiftClockAfterChain = true;
+  let result;
+  try {
+    result = await floor.advanceAttested({ records: [record], evidence: [evidence] });
+  } finally {
+    Date.now = realDateNow;
+    shiftClockAfterChain = false;
+  }
   assert.equal(result.sequence, 1);
   const durableFenceDb = new Database(path.join(directory, "witness-floor.sqlite"),
     { readonly: true, fileMustExist: true });
@@ -240,12 +257,12 @@ test("strict CAS witness floor refuses signed status advance without independent
     pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
     requirePhysicalAdmission: true,
   }), /WITNESS_CAS_FLOOR_DENIED/, "a replayed strict signed head fails a new challenge");
-  assert.equal(physicalCalls, 3,
-    "forged target, missing-chain attempt, and successful target each require a fresh readback");
-  assert.equal(inventoryCalls, 2,
-    "the missing-chain attempt and accepted attempt each require a fresh signed snapshot");
+  assert.equal(physicalCalls, 4,
+    "each attempted new admission requires a fresh target readback");
+  assert.equal(inventoryCalls, 3,
+    "each authorized attempt requires its own signed inventory snapshot");
   assert.deepEqual(await floor.advanceAttested({ records: [record], evidence: [evidence] }),
-    result, "exact retries are idempotent but must re-attest");
+    result, "exact retries of an already-fenced record are idempotent");
   // A compromised writer and separately valid inventory signer can make B1,
   // B2 on a divergent branch of the *same* signed genesis. B2 is genuinely
   // valid from genesis, but must be refused after this witness accepted A1.
