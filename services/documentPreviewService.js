@@ -54,6 +54,49 @@ function readPinnedText(filePath) {
   }
 }
 
+function sameDocumentIdentity(a, b) {
+  return a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
+    && a.dev === b.dev && a.ino === b.ino && a.size === b.size
+    && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
+function capturePrivateDocument(filePath) {
+  // Capture under the authorized pathname exactly once. Both DOCX preflight
+  // and the child parser must use these private bytes, never reopen that name.
+  const expected = fs.lstatSync(filePath, { bigint: true });
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.nlink !== 1n
+    || expected.size > BigInt(MAX_INPUT_BYTES)) {
+    throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
+  }
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!sameDocumentIdentity(expected, opened)) {
+      throw parserFailure("PREVIEW_FILE_CHANGED", "PREVIEW_FILE_CHANGED");
+    }
+    const chunks = [];
+    let total = 0;
+    while (total <= MAX_INPUT_BYTES) {
+      const part = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_INPUT_BYTES + 1 - total));
+      const size = fs.readSync(fd, part, 0, part.length, null);
+      if (!size) break;
+      total += size;
+      chunks.push(part.subarray(0, size));
+    }
+    if (total > MAX_INPUT_BYTES) throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
+    const ended = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(filePath, { bigint: true });
+    if (!sameDocumentIdentity(opened, ended)
+      || !sameDocumentIdentity(ended, named) || BigInt(total) !== opened.size) {
+      throw parserFailure("PREVIEW_FILE_CHANGED", "PREVIEW_FILE_CHANGED");
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function killParserProcess(child, force = false) {
   if (!child || child.exitCode !== null && child.exitCode !== undefined) return;
   const signal = force ? "SIGKILL" : "SIGTERM";
@@ -100,8 +143,9 @@ function isZipSymlink(entry) {
   return madeByUnix && (unixMode & 0xf000) === 0xa000;
 }
 
-async function preflightDocx(filePath) {
-  const archive = await unzipper.Open.file(filePath);
+async function preflightDocx(source) {
+  const archive = Buffer.isBuffer(source)
+    ? await unzipper.Open.buffer(source) : await unzipper.Open.file(source);
   if (archive.files.length > MAX_DOCX_ENTRIES) throw parserFailure("PREVIEW_DOCX_TOO_MANY_ENTRIES", "PREVIEW_DOCX_TOO_MANY_ENTRIES");
   let totalUncompressed = 0;
   const normalized = new Set();
@@ -136,7 +180,7 @@ async function preflightDocx(filePath) {
   }
 }
 
-async function parseDocumentInChildProcessUnbounded(filePath, extension, options = {}) {
+async function parseDocumentInChildProcessUnbounded(snapshot, extension, options = {}) {
   const spawnProcess = options.spawnImpl || spawn;
   const timeout = Number(options.timeoutMs ?? TIMEOUT_MS);
   const maxOutputBytes = Number(options.maxOutputBytes ?? Math.max(16_384, MAX_OUTPUT_CHARS * 8));
@@ -181,8 +225,8 @@ async function parseDocumentInChildProcessUnbounded(filePath, extension, options
       if (closeConfirmed) finish(pendingError);
     };
     try {
-      child = spawnProcess(process.execPath, [PARSER_WORKER, JSON.stringify({ filePath, extension })], {
-        stdio: ["ignore", "pipe", "pipe"],
+      child = spawnProcess(process.execPath, [PARSER_WORKER, JSON.stringify({ extension })], {
+        stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         detached: process.platform !== "win32",
         env: childEnvironment(),
@@ -204,6 +248,13 @@ async function parseDocumentInChildProcessUnbounded(filePath, extension, options
       if (errorBytes > maxOutputBytes) return stop(parserFailure("PREVIEW_ERROR_OUTPUT_TOO_LARGE", "PREVIEW_ERROR_OUTPUT_TOO_LARGE"));
       errorOutput += chunk.toString();
     });
+    if (!child.stdin || typeof child.stdin.end !== "function") {
+      stop(parserFailure("Parser input pipe unavailable", "PREVIEW_PARSER_FAILED"));
+    } else {
+      child.stdin.on("error", () => stop(parserFailure("Parser input failed", "PREVIEW_PARSER_FAILED")));
+      try { child.stdin.end(snapshot); }
+      catch (_) { stop(parserFailure("Parser input failed", "PREVIEW_PARSER_FAILED")); }
+    }
     child.once("error", () => stop(parserFailure("Falha no parser", "PREVIEW_PARSER_FAILED")));
     child.once("close", (code) => {
       closeConfirmed = true;
@@ -226,9 +277,21 @@ async function parseDocumentInChildProcessUnbounded(filePath, extension, options
 }
 
 async function parseDocumentInChildProcess(filePath, extension, options = {}) {
-  if (extension === ".docx") await preflightDocx(filePath);
+  if (extension !== ".doc" && extension !== ".docx") {
+    throw parserFailure("PREVIEW_UNSUPPORTED", "PREVIEW_UNSUPPORTED");
+  }
   const release = await acquireParserSlot();
-  try { return await parseDocumentInChildProcessUnbounded(filePath, extension, options); }
+  try {
+    const snapshot = capturePrivateDocument(filePath);
+    try {
+      if (extension === ".docx") await preflightDocx(snapshot);
+      return await parseDocumentInChildProcessUnbounded(snapshot, extension, options);
+    } finally {
+      // No on-disk plaintext staging, even if a killed child never closes.
+      // On timeout the input pipe is abandoned and these local bytes are erased.
+      snapshot.fill(0);
+    }
+  }
   finally { release(); }
 }
 
@@ -238,8 +301,6 @@ async function previewText(filePath, fileName, options = {}) {
   if (TEXT_EXTENSIONS.has(extension)) {
     return { content: bounded(readPinnedText(filePath)), format: "text", language: extension.slice(1) || "text" };
   }
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile() || stat.size > MAX_INPUT_BYTES) throw new Error("PREVIEW_TOO_LARGE");
   const content = await parseDocumentInChildProcess(filePath, extension, options);
   return { content, format: "document", language: extension.slice(1) };
 }

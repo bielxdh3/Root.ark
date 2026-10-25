@@ -1,5 +1,20 @@
 # Root.ark Plan Tree
 
+## CodeQL document preview DOC/DOCX local filesystem race (2026-10-24)
+
+The authenticated DOC/DOCX preview worker now parses only a bounded private
+in-memory snapshot captured through a verified regular-file descriptor.
+The original path is checked before and after the read using exact bigint
+device/inode, size and change timestamps; symlinks and hardlink aliases fail
+closed. The DOCX archive preflight examines these exact bytes; the worker
+receives the bounded bytes through a private standard-input pipe and parses
+from memory. No plaintext temporary directory or file is created. Parent
+bytes are zeroized on successful close or failure, including unreaped-child
+timeouts. Adversarial rename, oversized replacement, symlink and timeout
+cases and a real Mammoth DOCX extraction were added. This is a conditional
+local-filesystem threat; no network-only exploit has been demonstrated.
+It does not establish completion of PR #228 or release readiness.
+
 ## Issue #65 / PR #228: Windows Edge V2 IPv4 fixture binding (2026-10-24)
 
 The disposable positive Edge + strict mTLS CAS/witness fixture bound both HTTPS

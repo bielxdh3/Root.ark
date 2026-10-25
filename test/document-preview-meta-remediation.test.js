@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { ZipArchive } = require("archiver");
+const archiver = require("archiver");
 
 const servicePath = path.join(__dirname, "..", "services", "documentPreviewService.js");
 const workerPath = path.join(__dirname, "..", "services", "documentPreviewWorker.js");
@@ -17,6 +17,8 @@ function fakeSpawn({ output = "", code = 0, delay = 0, never = false, error = nu
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
+  child.stdin = new EventEmitter();
+  child.stdin.end = () => {};
   child.pid = 43123;
   child.exitCode = null;
   child.killed = false;
@@ -41,7 +43,7 @@ test("document preview killable parser and route boundary matrix", async (t) => 
   fs.writeFileSync(textPath, "fixture");
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(docxPath);
-    const archive = new ZipArchive({ zlib: { level: 9 } });
+    const archive = archiver("zip", { zlib: { level: 9 } });
     output.on("close", resolve); output.on("error", reject); archive.on("error", reject); archive.pipe(output);
     archive.append("<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>", { name: "[Content_Types].xml" });
     archive.append("<document><body>fixture</body></document>", { name: "word/document.xml" });
@@ -66,7 +68,7 @@ test("document preview killable parser and route boundary matrix", async (t) => 
     ["15 text preview bypasses child process", async () => { let called = false; const result = await previewText(textPath, "fixture.txt", { spawnImpl: () => { called = true; return fakeSpawn(); } }); assert.equal(result.content, "fixture"); assert.equal(called, false); }],
     ["16 child receives the node executable", async () => { let command; await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: (...args) => { command = args; return fakeSpawn({ output: JSON.stringify({ ok: true, content: "ok" }) }); } }); assert.equal(command[0], process.execPath); }],
     ["17 child receives worker path", async () => { let command; await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: (...args) => { command = args; return fakeSpawn({ output: JSON.stringify({ ok: true, content: "ok" }) }); } }); assert.equal(command[1][0], PARSER_WORKER); }],
-    ["18 child receives only serialized request metadata", async () => { let command; await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: (...args) => { command = args; return fakeSpawn({ output: JSON.stringify({ ok: true, content: "ok" }) }); } }); assert.deepEqual(JSON.parse(command[1][1]), { filePath: docxPath, extension: ".docx" }); }],
+    ["18 child receives only extension metadata and piped bytes", async () => { let command; await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: (...args) => { command = args; return fakeSpawn({ output: JSON.stringify({ ok: true, content: "ok" }) }); } }); assert.deepEqual(JSON.parse(command[1][1]), { extension: ".docx" }); assert.equal(command[2].stdio[0], "pipe"); }],
     ["19 child stdout response succeeds", async () => assert.equal(await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: () => fakeSpawn({ output: JSON.stringify({ ok: true, content: "parsed" }) }) }), "parsed")],
     ["20 child document result keeps docx language", async () => assert.equal((await previewText(docxPath, "fixture.docx", { spawnImpl: () => fakeSpawn({ output: JSON.stringify({ ok: true, content: "parsed" }) }) })).language, "docx")],
     ["21 child document result keeps doc language", async () => assert.equal((await previewText(docPath, "fixture.doc", { spawnImpl: () => fakeSpawn({ output: JSON.stringify({ ok: true, content: "parsed" }) }) })).language, "doc")],

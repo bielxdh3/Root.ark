@@ -10,6 +10,8 @@ function fakeSpawn({ output = JSON.stringify({ ok: true, content: "ok" }), stder
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
+  child.stdin = new EventEmitter();
+  child.stdin.end = () => {};
   child.pid = Math.floor(Math.random() * 10_000) + 1000;
   child.exitCode = null;
   child.killed = false;
