@@ -8,6 +8,7 @@ const { Readable } = require("node:stream");
 const os = require("node:os");
 const fs = require("node:fs");
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { Pool } = require("pg");
 const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAuthority");
@@ -31,12 +32,131 @@ const { createZk1ContentInventoryHttpsServer,
   require("../src/services/zk1ContentInventoryHttpsServer");
 const { createZk1ContentInventoryHttpsClient } =
   require("../src/services/zk1ContentInventoryHttpsClient");
+const { createZk1PgPhysicalAttestorHttpsClient } =
+  require("../src/services/zk1PgPhysicalAttestorHttpsClient");
+const { verifyCommittedPhysicalReadback } =
+  require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL
   && process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
+
+test("real PG18 child read-only attestor binds strict mTLS signed chain across restart", {
+  skip: !enabled && "requires isolated PostgreSQL 18 and distinct restricted SQL roles",
+}, async (t) => {
+  const f = await fixture(t);
+  const minimumHead = await f.ledger.readLocalHead();
+  const minimumSnapshot = (await f.ledger.getSnapshot({ nonce: crypto.randomBytes(32) })).bytes;
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-real-pg-attestor-chain-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
+  generateNativeFixtureCertificates(dir, { caSubject: "ZK65 real PG18 chain lab",
+    servers: ["attestor", "inventory"], clients: ["inventory-service", "reader"] });
+  const read = (name) => fs.readFileSync(path.join(dir, name));
+  const physicalSigner = crypto.generateKeyPairSync("ed25519");
+  assert.equal(crypto.KeyObject.prototype.equals.call(physicalSigner.publicKey,
+    f.keys.publicKey), false);
+  fs.writeFileSync(path.join(dir, "physical-signer.key"),
+    physicalSigner.privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  const wireScope = Object.fromEntries(Object.entries(f.scope).map(([key, value]) =>
+    [key, value.toString("base64url")]));
+  const wireOperation = Object.fromEntries(Object.entries(f.op).map(([key, value]) =>
+    [key, Buffer.isBuffer(value) ? value.toString("base64url") : value]));
+  const cfg = { useRealPg: true, scope: wireScope, operation: wireOperation,
+    digest: f.digest.toString("base64url"), root: f.root.toString("base64url"),
+    chunks: f.chunks.length, caPath: path.join(dir, "ca.pem"),
+    serverKeyPath: path.join(dir, "attestor.key"),
+    serverCertPath: path.join(dir, "attestor.pem"),
+    signerKeyPath: path.join(dir, "physical-signer.key"),
+    allowedFingerprint: new crypto.X509Certificate(read("inventory-service.pem")).fingerprint256 };
+  const cfgPath = path.join(dir, "child.json");
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
+  const child = spawn(process.execPath,
+    [path.join(__dirname, "../lab/issue-65-packet-b/pg-physical-attestor-child.js"), cfgPath],
+    { stdio: ["ignore", "ignore", "pipe", "ipc"], windowsHide: true,
+      env: { NODE_ENV: "test", PATH: process.env.PATH,
+        SystemRoot: process.env.SystemRoot,
+        ROOTARK_ZK1_ATTESTOR_PG_URL: process.env.ROOTARK_ZK1_ATTESTOR_PG_URL } });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let childError = "";
+  child.stderr.on("data", (bytes) => {
+    childError = (childError + bytes.toString()).slice(-1024);
+  });
+  const physicalPort = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("real PG attestor child timeout")), 15000);
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`real PG attestor child exited ${code}: ${childError}`)));
+    child.once("message", (message) => {
+      clearTimeout(timer);
+      if (!Number.isSafeInteger(message?.port) || message.port < 1) reject(new Error("invalid attestor port"));
+      else resolve(message.port);
+    });
+  });
+  const attestorClient = createZk1PgPhysicalAttestorHttpsClient({
+    endpoint: `https://localhost:${physicalPort}`, ca: read("ca.pem"),
+    clientKey: read("inventory-service.key"), clientCert: read("inventory-service.pem"),
+    serverFingerprint256: new crypto.X509Certificate(read("attestor.pem")).fingerprint256,
+  });
+  const nonce = crypto.randomBytes(32);
+  const physical = await attestorClient.requestAttestation({
+    scope: f.scope, operation: f.op, nonce });
+  const verifiedPhysical = await verifyCommittedPhysicalReadback(physical, {
+    scope: f.scope, operation: f.op, expected: {
+      digest: f.digest, root: f.root, chunks: f.chunks.length }, nonce,
+    pinnedPublicKey: physicalSigner.publicKey,
+    nowSeconds: Math.floor(Date.now() / 1000),
+  });
+  assert.equal(verifiedPhysical.walFlushConfirmed, true);
+  await assert.rejects(verifyCommittedPhysicalReadback(physical, {
+    scope: f.scope, operation: f.op, expected: undefined,
+    nonce: crypto.randomBytes(32), pinnedPublicKey: physicalSigner.publicKey,
+    nowSeconds: Math.floor(Date.now() / 1000),
+  }), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+  let server;
+  const startInventory = async () => {
+    server = createZk1ContentInventoryHttpsServer({
+      key: read("inventory.key"), cert: read("inventory.pem"), clientCa: read("ca.pem"),
+      ledger: f.ledger, physicalAttestorClient: attestorClient,
+      pinnedPhysicalAttestorPublicKey: physicalSigner.publicKey,
+      pinnedInventorySignerPublicKey: f.keys.publicKey,
+      principals: { [new crypto.X509Certificate(read("reader.pem")).fingerprint256]: {
+        roles: ["read", "status"], scopes: [wireScope] } },
+    });
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    return createZk1ContentInventoryHttpsClient({
+      endpoint: `https://localhost:${server.address().port}`, ca: read("ca.pem"),
+      clientKey: read("reader.key"), clientCert: read("reader.pem"),
+      serverFingerprint256: new crypto.X509Certificate(read("inventory.pem")).fingerprint256,
+      inventoryPublicKey: f.keys.publicKey, inventorySignerKeyId: f.signerKeyId,
+      physicalAttestorPublicKey: physicalSigner.publicKey,
+    });
+  };
+  t.after(async () => { if (server?.listening) await drainZk1ContentInventoryHttpsServer(server); });
+  const input = { scope: f.scope, nonce: crypto.randomBytes(32),
+    requested: { object_id: f.op.object_id, revision: f.op.revision,
+      epoch: f.op.epoch, ciphertext_sha256: f.op.ciphertext_sha256 },
+    minimumHead, minimumSnapshot, includeVerifiedProofChain: true };
+  let reader = await startInventory();
+  const first = await reader.getVerifiedSnapshotWithChain(input);
+  assert.equal(first.independentPhysicalChainVerified, true);
+  assert.equal(first.authenticatedProofChain.length, 1);
+  assert.equal(first.authenticatedPhysicalProofChain.length, 1);
+  await drainZk1ContentInventoryHttpsServer(server);
+  await f.restart();
+  reader = await startInventory();
+  const again = await reader.getVerifiedSnapshotWithChain({
+    ...input, nonce: crypto.randomBytes(32) });
+  assert.equal(again.independentPhysicalChainVerified, true);
+  assert.equal(again.authenticatedPhysicalProofChain.length, 1);
+  assert.notDeepEqual(again.authenticatedPhysicalProofChain[0],
+    first.authenticatedPhysicalProofChain[0], "restart must re-read PG under a new challenge");
+});
 
 async function fixture(t, { strictPhysicalIntent = true } = {}) {
   const admin = new Pool({ connectionString: process.env.ROOTARK_ZK1_TEST_PG_URL,

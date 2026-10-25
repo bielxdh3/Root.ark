@@ -2,12 +2,13 @@
 
 // Spawned laboratory child, kept outside test/ so Node's auto-discovery does
 // not execute its argv-dependent process bootstrap as an independent test.
-// Isolated protocol fixture: readback is SYNTHETIC. Real PG validation runs
-// in the disposable PG18 lab; never describe this as a physical disk test.
+// Isolated protocol fixture by default. The explicitly opted-in PG18 lab mode
+// uses only a separate read-only connection string passed to this child.
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { Zk1SharedPgPhysicalCiphertextVerifier } =
   require("../../src/services/zk1SharedPgPhysicalCiphertextVerifier");
+const { Pool } = require("pg");
 const { createZk1PgPhysicalAttestorHttpsServer } =
   require("../../src/services/zk1PgPhysicalAttestorHttpsServer");
 
@@ -37,12 +38,26 @@ class ProtocolFixtureVerifier extends Zk1SharedPgPhysicalCiphertextVerifier {
       authorizesIo: false, provesIndependentOperator: false };
   }
 }
+if (config.useRealPg !== undefined && config.useRealPg !== true) {
+  throw new Error("invalid real PG fixture mode");
+}
+if (config.useRealPg === true && !process.env.ROOTARK_ZK1_ATTESTOR_PG_URL) {
+  throw new Error("missing isolated attestor PG connection");
+}
+const pool = config.useRealPg === true ? new Pool({
+  connectionString: process.env.ROOTARK_ZK1_ATTESTOR_PG_URL,
+  max: 2, connectionTimeoutMillis: 2500,
+}) : null;
 const server = createZk1PgPhysicalAttestorHttpsServer({
   key: fs.readFileSync(config.serverKeyPath), cert: fs.readFileSync(config.serverCertPath),
   clientCa: fs.readFileSync(config.caPath),
   signerPrivateKey: crypto.createPrivateKey(fs.readFileSync(config.signerKeyPath)),
-  verifier: new ProtocolFixtureVerifier(),
+  verifier: pool ? new Zk1SharedPgPhysicalCiphertextVerifier({ pool })
+    : new ProtocolFixtureVerifier(),
   principals: { [config.allowedFingerprint]: [scope] },
 });
 server.listen(0, "127.0.0.1", () => process.send?.({ port: server.address().port }));
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
+process.on("SIGTERM", () => server.close(async () => {
+  await pool?.end();
+  process.exit(0);
+}));
