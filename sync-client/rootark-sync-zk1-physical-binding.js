@@ -221,8 +221,10 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const v = strict(input, ["envelope", "scope", "expectedSequence", "expectedRoot",
       "receipt", "physicalAttestation", "nonce", "pinnedInventoryPublicKey",
       "pinnedInventorySignerKeyId", "pinnedPhysicalAttestorPublicKey",
-      "localTrustedDevicePolicy", "admission", "freshFloor", "pinnedWitnessPublicKey",
+      "localTrustedDevicePolicy", "trustedCurrentDevicePolicyProvider",
+      "admission", "freshFloor", "pinnedWitnessPublicKey",
       "witnessKeyId", "statusKeyId", "trustedMinimumFloor"]);
+    if (typeof v.trustedCurrentDevicePolicyProvider !== "function") deny();
     const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence, v.expectedRoot);
     const challenge = checkedBytes(v.nonce, 32);
     const committedInventoryReceipt = checkedBytes(v.receipt, 1,
@@ -313,6 +315,15 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     if (admission.inventoryReceiptSha256 !== digest(committedInventoryReceipt)
       || physical.localPgReadbackVerified !== true
       || physical.authorizesIo !== false) deny();
+    // All awaited work is complete. The operator-owned live revocation source
+    // must be sampled synchronously at the final historical READ decision.
+    // A detached pre-await snapshot is insufficient: revocation can happen
+    // while a valid Ed25519 PG signature is being checked.
+    const live = snapshotLocalDevicePolicy(v.trustedCurrentDevicePolicyProvider());
+    if (live.username !== bound.envelope.authorization.username
+      || live.trustedDevicePublicKeys[bound.envelope.deviceId]
+        !== bound.envelope.authorization.publicKey
+      || live.revokedDeviceIds.includes(bound.envelope.deviceId)) deny();
     return Object.freeze({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
       envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,

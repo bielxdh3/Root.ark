@@ -420,6 +420,7 @@ test("strict CAS witness floor refuses signed status advance without independent
     pinnedInventorySignerKeyId: inventoryKeyId,
     pinnedPhysicalAttestorPublicKey: attestor.publicKey,
     localTrustedDevicePolicy: trustedSyncDevicePolicyProvider(),
+    trustedCurrentDevicePolicyProvider: trustedSyncDevicePolicyProvider,
     pinnedWitnessPublicKey: witness.publicKey,
     witnessKeyId, statusKeyId,
     trustedMinimumFloor: {

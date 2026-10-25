@@ -125,7 +125,8 @@ async function witnessedFixture() {
     statusKeyId, trustedMinimumFloor: { ...floor } };
   const evidence = { ...f.input, nonce: challenge,
     physicalAttestation: challengedPhysicalAttestation,
-    admission, freshFloor, ...policy };
+    admission, freshFloor, ...policy,
+    trustedCurrentDevicePolicyProvider: () => f.input.localTrustedDevicePolicy };
   return { ...f, witness, status, challenge, floor, admissionUnsigned, admission,
     freshFloor, policy, evidence };
 }
@@ -201,6 +202,41 @@ test("strict historical admission needs independently signed physical witness an
     pinnedPhysicalAttestorPublicKey: nativeAttestor,
     freshFloor: forgedFloor,
     admission: signedAlteration({}, f.attestor.privateKey) });
+});
+
+test("strict historical read refuses a device revoked during asynchronous PG proof verification", async () => {
+  const f = await witnessedFixture();
+  const trustedLivePolicy = f.evidence.localTrustedDevicePolicy;
+  let providerCalls = 0;
+  let revokedDuringPhysicalProof = false;
+  let signatureVerifications = 0;
+  const originalVerify = crypto.verify;
+  const originalNow = Date.now;
+  try {
+    Date.now = () => f.evidence.envelope.authorization.expiresAt + 1000;
+    crypto.verify = function (...args) {
+      signatureVerifications += 1;
+      const valid = originalVerify.apply(this, args);
+      if (valid && args[2] instanceof crypto.KeyObject
+        && crypto.KeyObject.prototype.equals.call(args[2], f.attestor.publicKey)
+        && !revokedDuringPhysicalProof) {
+        revokedDuringPhysicalProof = true;
+        trustedLivePolicy.revokedDeviceIds.push("device-a");
+      }
+      return valid;
+    };
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.evidence,
+      trustedCurrentDevicePolicyProvider() {
+        providerCalls += 1;
+        return trustedLivePolicy;
+      },
+    }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/);
+    assert.equal(revokedDuringPhysicalProof, true,
+      `PG attestor verification was not reached; verify calls=${signatureVerifications}, policy calls=${providerCalls}`);
+    assert.equal(providerCalls, 1,
+      "the trusted live policy must be queried AFTER awaited proof verification");
+  } finally { crypto.verify = originalVerify; Date.now = originalNow; }
 });
 
 test("a signed Sync v2 envelope binds exactly to two independent ZK1 signer identities and PG readback", async () => {

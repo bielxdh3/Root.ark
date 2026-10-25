@@ -82,7 +82,8 @@ async function start(options = {}) {
   const strictHistorical = externalMode;
   if (strictHistorical && (typeof options.historicalEvidenceProvider !== "function"
     || !options.trustedHistoricalAdmission
-    || !options.trustedHistoricalAdmission.localTrustedDevicePolicy)) {
+    || !options.trustedHistoricalAdmission.localTrustedDevicePolicy
+    || typeof options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider !== "function")) {
     throw new Error("Independent witness evidence provider and external pins are required");
   }
   const strictBinding = strictHistorical
@@ -90,6 +91,24 @@ async function start(options = {}) {
   const independentlyPinnedDevicePolicy = strictHistorical
     ? strictBinding.snapshotLocalDevicePolicy(
       options.trustedHistoricalAdmission.localTrustedDevicePolicy) : null;
+  const currentlyTrustedDevice = strictHistorical ? (deviceId) => {
+    // Only the operator-injected callback can supply the current policy.
+    // Recheck synchronously at the final decision, not before awaited crypto.
+    const live = strictBinding.snapshotLocalDevicePolicy(
+      options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider());
+    const originalSpki = independentlyPinnedDevicePolicy.trustedDevicePublicKeys[deviceId];
+    return live.username === independentlyPinnedDevicePolicy.username
+      && typeof originalSpki === "string"
+      && live.trustedDevicePublicKeys[deviceId] === originalSpki
+      && !independentlyPinnedDevicePolicy.revokedDeviceIds.includes(deviceId)
+      && !live.revokedDeviceIds.includes(deviceId);
+  } : null;
+  const currentlyAuthorized = strictHistorical ? (operation) =>
+    currentlyTrustedDevice(operation.deviceId)
+      && operation.authorization?.username === independentlyPinnedDevicePolicy.username
+      && operation.authorization?.publicKey
+        === independentlyPinnedDevicePolicy.trustedDevicePublicKeys[operation.deviceId]
+    : null;
   const trustedHistorical = strictHistorical ? (() => {
     const provided = options.trustedHistoricalAdmission;
     const copyPin = (pin) => Buffer.isBuffer(pin) || pin instanceof Uint8Array
@@ -125,9 +144,18 @@ async function start(options = {}) {
     fileKeyResolver: fileKeyResolver(config.fileKey, config.keyEpoch),
     authorize: async (operation) => operation.keyEpoch === config.keyEpoch,
     authorizeOutgoing: async (operation) => config.deviceRevoked !== true
-      && !(strictHistorical ? independentlyPinnedDevicePolicy.revokedDeviceIds
-        : config.revokedDeviceIds).includes(config.deviceId)
-      && operation.deviceId === config.deviceId,
+      && operation.deviceId === config.deviceId
+      && (strictHistorical ? currentlyTrustedDevice(config.deviceId)
+        : !config.revokedDeviceIds.includes(config.deviceId)),
+    // The engine must make a fresh independent decision after asynchronous
+    // signing, before durable enqueue, and again just before every queued
+    // retry/push. Authorization at initial operation creation is insufficient.
+    requireCurrentOutgoingAuthorization: strictHistorical,
+    currentDeviceAuthorization: strictHistorical
+      ? async (operation) => config.deviceRevoked !== true
+        && operation.deviceId === config.deviceId
+        && currentlyTrustedDevice(operation.deviceId)
+      : undefined,
     verifyIncoming: async (operation, { locallyAdmitted = false } = {}) => {
       if (!operation.authorization) return false;
       const expected = independentlyPinnedDevicePolicy || { username: config.username,
@@ -136,7 +164,8 @@ async function start(options = {}) {
       if (operation.authorization.expiresAt > Date.now()) {
         const verified = await verifyAuthorizationProof(operation.authorization, operation, expected);
         return verified === true && (!strictHistorical
-          || operation.authorization.expiresAt > Date.now());
+          || (operation.authorization.expiresAt > Date.now()
+            && currentlyAuthorized(operation)));
       }
       // A signed but expired record does not prove that the remote server
       // admitted it before expiry. The default legacy mode retains only the
@@ -163,8 +192,10 @@ async function start(options = {}) {
           statusKeyId: trustedHistorical.statusKeyId,
           trustedMinimumFloor: trustedHistorical.trustedMinimumFloor,
           localTrustedDevicePolicy: expected,
+          trustedCurrentDevicePolicyProvider:
+            options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider,
         });
-        return verified.authorizesHistoricalRead === true;
+        return verified.authorizesHistoricalRead === true && currentlyAuthorized(operation);
       }
       if (locallyAdmitted !== true) return false;
       return verifyHistoricalAuthorizationProof(operation.authorization, operation,

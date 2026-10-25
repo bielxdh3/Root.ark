@@ -118,7 +118,8 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     pinnedInventoryPublicKey: "trusted-inventory-key", trustedMinimumFloor: {
       sequence: 9, lastHash: "externally-pinned" },
     localTrustedDevicePolicy: { username: "alice",
-      trustedDevicePublicKeys: { device1: publicKey }, revokedDeviceIds: [] } });
+      trustedDevicePublicKeys: { device1: publicKey }, revokedDeviceIds: [] },
+    trustedCurrentDevicePolicyProvider() { return externalPins.localTrustedDevicePolicy; } });
   let challenge;
   // A config-only opt-in must not begin running a seemingly strict mode,
   // even if evidence/pins were injected: deleting this mutable JSON field
@@ -139,6 +140,8 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     } });
   assert.equal(engineOptions.reverifySeenIncoming, true,
     "a mutable legacy seen journal must not suppress witness checks");
+  assert.equal(engineOptions.requireCurrentOutgoingAuthorization, true,
+    "strict client must force current independent authorization at queued HTTP send");
   try {
     Date.now = () => signature.expiresAt + 1;
     assert.equal(await engineOptions.verifyIncoming(signedIncoming, {
@@ -149,6 +152,7 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     assert.equal(historicalVerifierArgs.pinnedWitnessPublicKey, "trusted-witness-key",
       "untrusted provider cannot overwrite the provisioned signer");
     assert.equal(historicalVerifierArgs.localTrustedDevicePolicy.username, "alice");
+    assert.equal(typeof historicalVerifierArgs.trustedCurrentDevicePolicyProvider, "function");
   } finally { Date.now = now; }
   // The mutable JSON policy can be rolled back or poisoned independently of
   // the protected external minimum; it must have no effect on strict checks.
@@ -157,6 +161,14 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   assert.equal(await engineOptions.verifyIncoming(signedIncoming), true,
     "strict mode uses independently pinned device keys, not the altered JSON");
   assert.equal(await engineOptions.authorizeOutgoing({ deviceId: "device1" }), true);
+  externalPins.localTrustedDevicePolicy.revokedDeviceIds.push("device1");
+  assert.equal(await engineOptions.verifyIncoming(signedIncoming), false,
+    "live independently trusted device revocation blocks historical read even with valid witness");
+  assert.equal(await engineOptions.authorizeOutgoing({ deviceId: "device1" }), false,
+    "outgoing authorization must not reuse a startup-only policy after live revocation");
+  assert.equal(await engineOptions.currentDeviceAuthorization({ deviceId: "device1" }), false,
+    "the final queued PUT callback must reject live-revoked devices");
+  externalPins.localTrustedDevicePolicy.revokedDeviceIds.pop();
   config.revokedDeviceIds.pop();
   config.trustedDevicePublicKeys.device1 = publicKey;
   // Verification can finish after its authorization expires. Strict mode
@@ -216,4 +228,18 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json",
     once: true, requireIndependentHistoricalAdmission: true }),
   /Independent witness evidence provider/);
+  // A rolled-back current-policy callback must never UNREVOKE a device that
+  // was already revoked in the independently pinned startup minimum.
+  await sandboxModule.exports.start({ config: "not-opened.json", once: true,
+    requireIndependentHistoricalAdmission: true,
+    trustedHistoricalAdmission: {
+      ...externalPins,
+      localTrustedDevicePolicy: { username: "alice",
+        trustedDevicePublicKeys: { device1: publicKey }, revokedDeviceIds: ["device1"] },
+      trustedCurrentDevicePolicyProvider: () => ({ username: "alice",
+        trustedDevicePublicKeys: { device1: publicKey }, revokedDeviceIds: [] }),
+    },
+    historicalEvidenceProvider: async () => ({}) });
+  assert.equal(await engineOptions.authorizeOutgoing({ deviceId: "device1" }), false,
+    "a stale live callback cannot reverse an independently pinned prior revocation");
 });

@@ -1,5 +1,21 @@
 # Root.ark Plan Tree
 
+## Issue #65: current-device revocation at strict historical Sync read (2026-10-25)
+
+Strict Sync v2 now requires an operator-injected, independently maintained
+`trustedCurrentDevicePolicyProvider` in addition to the initial pinned device
+policy. It resamples this synchronous source **after** awaited Ed25519/PG
+verification, before claiming a historical read is authorized, and checks the
+exact original device SPKI, username, and current revocation. Fresh incoming
+operations also recheck after signature verification, and new outgoing
+operations check the current device policy rather than the startup snapshot.
+The adversarial regression revokes the device while the signed PostgreSQL
+proof is being verified. This local decision does **not** itself provide
+cross-process transactionality with file application or queued HTTP retries,
+distributed revocation fencing, or a guarantee that an external policy source
+is authoritative/fresh. The independent server-side atomic registry and
+end-to-end final I/O fencing remain separate required guarantees.
+
 ## CodeQL document preview DOC/DOCX local filesystem race (2026-10-24)
 
 The authenticated DOC/DOCX preview worker now parses only a bounded private

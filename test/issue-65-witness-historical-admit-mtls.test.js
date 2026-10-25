@@ -264,6 +264,8 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
     pinnedPhysicalAttestorPublicKey: physicalSigner.publicKey,
     localTrustedDevicePolicy: { username: "alice", trustedDevicePublicKeys: {
       "device-a": deviceSpki }, revokedDeviceIds: [] },
+    trustedCurrentDevicePolicyProvider: () => ({ username: "alice",
+      trustedDevicePublicKeys: { "device-a": deviceSpki }, revokedDeviceIds: [] }),
     admission: answer.data.admission, freshFloor: answer.data.freshFloor,
     pinnedWitnessPublicKey: witness.publicKey,
     witnessKeyId, statusKeyId, trustedMinimumFloor: minimum, ...extra });
