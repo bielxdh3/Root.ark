@@ -20,7 +20,9 @@ const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", 
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
 const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v2\0", "ascii");
 const HISTORICAL_SYNC_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
-const RECOVERY_CHALLENGE_WINDOW_MS = 5 * 60 * 1000;
+const RECOVERY_LEDGER_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v1\0");
+// No TTL deletion is safe until an externally anchored compaction protocol
+// proves every retired challenge is still permanently non-replayable.
 const MAX_RECOVERY_CHALLENGES = 4096;
 const RECORD_FIELDS = ["sequence", "reservation", "scope", "status", "ticketHash",
   "manifestHash", "terminalSeal", "previousHash", "signature"];
@@ -45,6 +47,12 @@ function exact(value, keys) {
   return result;
 }
 function digest(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
+function recoveryRowHash(row) {
+  return digest(row.previous_hash + "\0" + JSON.stringify([
+    row.sequence, row.nonce.toString("base64url"), row.operation_id,
+    row.admission_hash, row.consumed_at_ms,
+  ]));
+}
 function rowEvidence(row) {
   // Frame all SQL columns and their types, including historical rows. A single
   // streaming SHA-256 avoids 100k separate hash allocations at the history cap.
@@ -167,6 +175,8 @@ class Zk1WitnessCasAnchorFloor {
   #advanceQueue = Promise.resolve();
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
+  #recoveryHead = Object.freeze({ sequence: 0, lastHash: ZERO });
+  #pinnedRecoveryHead;
   #trustedSyncDevicePolicyProvider;
   // Read-only capability for the separately reviewed mTLS issuer transport.
   // Never advertise legacy/writer-signed floors or a closed issuer as nonce
@@ -179,7 +189,8 @@ class Zk1WitnessCasAnchorFloor {
   constructor(filename, { bootstrapNew = false, witnessKeyId, witnessPrivateKey,
     statusKeyId, statusPublicKey, trustedMinimumHead,
     attestedAdmission = null, enableSyncHistoricalIssuer = false,
-    trustedHistoricalAdmissionHead, trustedSyncDevicePolicyProvider } = {}) {
+    trustedHistoricalAdmissionHead, trustedRecoveryNonceHead,
+    trustedSyncDevicePolicyProvider } = {}) {
     if (typeof enableSyncHistoricalIssuer !== "boolean"
       || (enableSyncHistoricalIssuer && (!attestedAdmission
         || typeof trustedSyncDevicePolicyProvider !== "function"))) fail();
@@ -197,6 +208,14 @@ class Zk1WitnessCasAnchorFloor {
           || (pinned.sequence === 0 && pinned.lastHash !== ZERO)
           || (bootstrapNew && (pinned.sequence !== 0 || pinned.lastHash !== ZERO))) fail();
         this.#historicalHead = Object.freeze({ ...pinned });
+      }
+      if (trustedRecoveryNonceHead !== undefined) {
+        const pinned = exact(trustedRecoveryNonceHead, ["sequence", "lastHash"]);
+        if (!Number.isSafeInteger(pinned.sequence) || pinned.sequence < 0
+          || pinned.sequence > MAX_RECOVERY_CHALLENGES || !validHex(pinned.lastHash)
+          || (pinned.sequence === 0 && pinned.lastHash !== ZERO)
+          || (bootstrapNew && (pinned.sequence !== 0 || pinned.lastHash !== ZERO))) fail();
+        this.#pinnedRecoveryHead = Object.freeze({ ...pinned });
       }
     }
     if (trustedMinimumHead !== undefined) {
@@ -316,15 +335,33 @@ class Zk1WitnessCasAnchorFloor {
             BEFORE DELETE ON witness_cas_sync_historical_issue_nonce
             BEGIN SELECT RAISE(ABORT,'HISTORICAL_NONCE_LOCKED'); END;
             CREATE TABLE witness_cas_sync_historical_recovery_nonce (
-              nonce BLOB PRIMARY KEY CHECK(length(nonce)=32),
+              sequence INTEGER PRIMARY KEY CHECK(sequence>=1 AND sequence<=4096),
+              nonce BLOB NOT NULL UNIQUE CHECK(length(nonce)=32),
               operation_id TEXT NOT NULL,
               admission_hash TEXT NOT NULL,
               consumed_at_ms INTEGER NOT NULL CHECK(consumed_at_ms>=1),
+              previous_hash TEXT NOT NULL,
+              hash TEXT NOT NULL UNIQUE,
               FOREIGN KEY(operation_id) REFERENCES witness_cas_sync_historical_admission(operation_id));
-            CREATE INDEX witness_cas_sync_recovery_nonce_time
-              ON witness_cas_sync_historical_recovery_nonce(consumed_at_ms);`);
+            CREATE TRIGGER no_historical_recovery_nonce_update
+            BEFORE UPDATE ON witness_cas_sync_historical_recovery_nonce
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_RECOVERY_LOCKED'); END;
+            CREATE TRIGGER no_historical_recovery_nonce_delete
+            BEFORE DELETE ON witness_cas_sync_historical_recovery_nonce
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_RECOVERY_LOCKED'); END;
+            CREATE TABLE witness_cas_sync_historical_recovery_head (
+              id INTEGER PRIMARY KEY CHECK(id=1),
+              sequence INTEGER NOT NULL CHECK(sequence>=0 AND sequence<=4096),
+              last_hash TEXT NOT NULL,
+              signature BLOB NOT NULL CHECK(length(signature)=64));`);
         }
         db.prepare("INSERT INTO witness_cas_floor_identity VALUES(1,?)").run(this.#identity);
+        if (this.#historicalEnabled) {
+          const initial = { sequence: 0, lastHash: ZERO };
+          db.prepare("INSERT INTO witness_cas_sync_historical_recovery_head"
+            + " (id,sequence,last_hash,signature) VALUES(1,?,?,?)").run(
+              0, ZERO, this.#signRecoveryHead(initial));
+        }
       }
       const state = db.prepare("SELECT sequence,hash FROM witness_cas_floor_event ORDER BY sequence DESC LIMIT 1").get();
       const count = db.prepare("SELECT COUNT(*) AS n FROM witness_cas_floor_event").get().n;
@@ -671,14 +708,32 @@ class Zk1WitnessCasAnchorFloor {
     this.#assertHistoricalIntegrity();
     return Object.freeze({ ...this.#historicalHead });
   }
+  historicalRecoveryNonceHead() {
+    if (!this.#historicalEnabled || this.#closed) fail();
+    this.head();
+    this.#assertHistoricalIntegrity();
+    // Operator-retained off-host minimum is needed to detect restoration of
+    // an ENTIRE previously valid signed SQLite replay ledger snapshot.
+    return Object.freeze({ ...this.#recoveryHead });
+  }
+  #recoveryHeadMessage({ sequence, lastHash }) {
+    return Buffer.concat([RECOVERY_LEDGER_DOMAIN, Buffer.from(JSON.stringify([
+      this.#witnessId.toString("base64url"), this.#statusId.toString("base64url"),
+      sequence, lastHash,
+    ]))]);
+  }
+  #signRecoveryHead(head) {
+    return crypto.sign(null, this.#recoveryHeadMessage(head), this.#witness);
+  }
   #assertHistoricalNonceIntegrity(db) {
     const schema = new Set(db.prepare(
       "SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')")
       .all().map((row) => row.name));
     for (const name of ["witness_cas_sync_historical_issue_nonce",
       "witness_cas_sync_historical_recovery_nonce",
-      "witness_cas_sync_recovery_nonce_time", "no_historical_issue_nonce_update",
-      "no_historical_issue_nonce_delete"]) {
+      "witness_cas_sync_historical_recovery_head",
+      "no_historical_issue_nonce_update", "no_historical_issue_nonce_delete",
+      "no_historical_recovery_nonce_update", "no_historical_recovery_nonce_delete"]) {
       if (!schema.has(name)) fail();
     }
     // The original challenge is mandatory for EVERY signed admission. No
@@ -699,21 +754,51 @@ class Zk1WitnessCasAnchorFloor {
         || !Buffer.isBuffer(row.nonce) || row.nonce.length !== 32) fail();
     }
     const recent = db.prepare(
-      "SELECT r.nonce,r.operation_id,r.admission_hash,r.consumed_at_ms,"
+      "SELECT r.sequence,r.nonce,r.operation_id,r.admission_hash,r.consumed_at_ms,"
+      + "r.previous_hash,r.hash,"
       + "a.hash AS original_hash,i.nonce AS issuance_nonce"
       + " FROM witness_cas_sync_historical_recovery_nonce r"
       + " LEFT JOIN witness_cas_sync_historical_admission a"
       + " ON a.operation_id=r.operation_id"
       + " LEFT JOIN witness_cas_sync_historical_issue_nonce i"
-      + " ON i.operation_id=r.operation_id LIMIT ?").all(MAX_RECOVERY_CHALLENGES + 1);
+      + " ON i.operation_id=r.operation_id ORDER BY r.sequence"
+      + " LIMIT ?").all(MAX_RECOVERY_CHALLENGES + 1);
     if (recent.length > MAX_RECOVERY_CHALLENGES) fail();
-    for (const row of recent) {
-      if (!Buffer.isBuffer(row.nonce) || row.nonce.length !== 32
+    let previous = ZERO;
+    for (let idx = 0; idx < recent.length; idx += 1) {
+      const row = recent[idx];
+      if (row.sequence !== idx + 1 || row.previous_hash !== previous
+        || !validHex(row.hash)
+        || !Buffer.isBuffer(row.nonce) || row.nonce.length !== 32
         || row.admission_hash !== row.original_hash
         || !Buffer.isBuffer(row.issuance_nonce) || row.issuance_nonce.length !== 32
         || row.nonce.equals(row.issuance_nonce)
         || !Number.isSafeInteger(row.consumed_at_ms)
-        || row.consumed_at_ms < 1) fail();
+        || row.consumed_at_ms < 1
+        || recoveryRowHash(row) !== row.hash) fail();
+      previous = row.hash;
+    }
+    const stored = db.prepare(
+      "SELECT sequence,last_hash,signature FROM"
+      + " witness_cas_sync_historical_recovery_head WHERE id=1").get();
+    if (!stored || stored.sequence !== recent.length
+      || stored.last_hash !== previous
+      || !Buffer.isBuffer(stored.signature) || stored.signature.length !== 64
+      || !crypto.verify(null, this.#recoveryHeadMessage({
+        sequence: stored.sequence, lastHash: stored.last_hash,
+      }), crypto.createPublicKey(this.#witness), stored.signature)) fail();
+    const pinned = { sequence: stored.sequence, lastHash: stored.last_hash };
+    if (this.#pinnedRecoveryHead
+      && (pinned.sequence < this.#pinnedRecoveryHead.sequence
+        || (this.#pinnedRecoveryHead.sequence === 0
+          ? this.#pinnedRecoveryHead.lastHash !== ZERO
+          : recent[this.#pinnedRecoveryHead.sequence - 1]?.hash
+            !== this.#pinnedRecoveryHead.lastHash))) fail();
+    if (this.#db === db) {
+      if (this.#recoveryHead.sequence !== pinned.sequence
+        || this.#recoveryHead.lastHash !== pinned.lastHash) fail();
+    } else {
+      this.#recoveryHead = Object.freeze(pinned);
     }
     const overlap = db.prepare(
       "SELECT 1 FROM witness_cas_sync_historical_issue_nonce i"
@@ -894,11 +979,11 @@ class Zk1WitnessCasAnchorFloor {
         || !Number.isSafeInteger(composite.physicalIssuedAt)
         || Math.abs(Math.floor(completed / 1000) - composite.physicalIssuedAt) > 30
         || admission.admittedAtMs > completed) fail();
-      // A durable nonce claim is part of the final decision. SQLite FULL and
-      // BEGIN IMMEDIATE make crashes, restarts and parallel processes observe
-      // one committed result, including when the HTTPS ACK is subsequently lost.
-      // Unlike the signed historical admission this bounded replay table may
-      // prune challenges only AFTER their 5-minute anti-replay window expires.
+      // A durable nonce claim is part of the final decision. SQLite FULL,
+      // BEGIN IMMEDIATE, an immutable row-chain and the signed high-water
+      // detect unauthorized deletes after the ACK. NO TTL deletion/compaction:
+      // a spent nonce must never become reusable, even after five minutes.
+      let committedHead;
       this.#db.transaction(() => {
         this.#assertHistoricalIntegrity();
         const own = this.#db.prepare(
@@ -914,9 +999,6 @@ class Zk1WitnessCasAnchorFloor {
         const commitAtMs = Date.now();
         if (!Number.isSafeInteger(commitAtMs) || commitAtMs < completed
           || Math.abs(Math.floor(commitAtMs / 1000) - composite.physicalIssuedAt) > 30) fail();
-        this.#db.prepare(
-          "DELETE FROM witness_cas_sync_historical_recovery_nonce"
-          + " WHERE consumed_at_ms<=?").run(commitAtMs - RECOVERY_CHALLENGE_WINDOW_MS);
         if (this.#db.prepare(
           "SELECT COUNT(*) AS count FROM witness_cas_sync_historical_recovery_nonce"
         ).get().count >= MAX_RECOVERY_CHALLENGES) fail();
@@ -924,13 +1006,32 @@ class Zk1WitnessCasAnchorFloor {
         // durable claim: no awaits, caller callbacks or HTTP response in between.
         if (JSON.stringify(snapshotLocalDevicePolicy(
           this.#trustedSyncDevicePolicyProvider())) !== policySnapshot) fail();
+        const row = {
+          sequence: this.#recoveryHead.sequence + 1,
+          nonce, operation_id: operationId,
+          admission_hash: originalRow.hash, consumed_at_ms: commitAtMs,
+          previous_hash: this.#recoveryHead.lastHash,
+        };
+        const hash = recoveryRowHash(row);
         this.#db.prepare("INSERT INTO witness_cas_sync_historical_recovery_nonce"
-          + " (nonce,operation_id,admission_hash,consumed_at_ms)"
-          + " VALUES(?,?,?,?)").run(nonce, operationId, originalRow.hash, commitAtMs);
+          + " (sequence,nonce,operation_id,admission_hash,consumed_at_ms,"
+          + "previous_hash,hash) VALUES(?,?,?,?,?,?,?)").run(
+            row.sequence, nonce, operationId, originalRow.hash, commitAtMs,
+            row.previous_hash, hash);
+        const nextHead = { sequence: row.sequence, lastHash: hash };
+        const advance = this.#db.prepare(
+          "UPDATE witness_cas_sync_historical_recovery_head"
+          + " SET sequence=?,last_hash=?,signature=?"
+          + " WHERE id=1 AND sequence=? AND last_hash=?").run(
+            nextHead.sequence, nextHead.lastHash, this.#signRecoveryHead(nextHead),
+            this.#recoveryHead.sequence, this.#recoveryHead.lastHash);
+        if (advance.changes !== 1) fail();
         const afterInsert = Date.now();
         if (!Number.isSafeInteger(afterInsert) || afterInsert < commitAtMs
           || Math.abs(Math.floor(afterInsert / 1000) - composite.physicalIssuedAt) > 30) fail();
+        committedHead = Object.freeze(nextHead);
       }).immediate();
+      this.#recoveryHead = committedHead;
       return Object.freeze({
         admission, freshFloor: floor,
         physicalAttestation: Buffer.from(composite.physicalAttestation),

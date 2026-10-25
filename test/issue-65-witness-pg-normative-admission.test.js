@@ -492,6 +492,13 @@ test("strict CAS witness floor refuses signed status advance without independent
   }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/, "old challenge cannot reuse recovery proof");
   await assert.rejects(historical.recoverSyncHistoricalAdmission(recoveryInput),
     /WITNESS_CAS_FLOOR_DENIED/, "nonce replay cannot recover twice");
+  const beforeReplayWindow = Date.now;
+  try {
+    Date.now = () => beforeReplayWindow() + 6 * 60 * 1000;
+    await assert.rejects(historical.recoverSyncHistoricalAdmission(recoveryInput),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      "even AFTER the former five-minute TTL, a committed nonce is permanently spent");
+  } finally { Date.now = beforeReplayWindow; }
   const contestedNonce = random(32);
   const competing = await Promise.allSettled([
     historical.recoverSyncHistoricalAdmission({ ...recoveryInput, nonce: contestedNonce }),
@@ -574,6 +581,9 @@ test("strict CAS witness floor refuses signed status advance without independent
   const admittedFloor = issued.freshFloor;
   const admittedHistoryHead = issued.historicalAdmissionHead;
   historical.close();
+  const olderSignedReplaySnapshot = path.join(directory,
+    "witness-valid-recovery-previous-signed-head.sqlite");
+  fs.copyFileSync(historicalFilename, olderSignedReplaySnapshot);
   assert.equal(historical.supportsClientHistoricalNonce, false,
     "closed issuer cannot advertise live nonce-bound admission service");
   assert.throws(() => new Zk1WitnessCasAnchorFloor(historicalFilename, {
@@ -611,7 +621,74 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.equal(restartRecovered.freshFloor.nonce, restartNonce.toString("base64url"));
   assert.deepEqual(historical.historicalAdmissionHead(), admittedHistoryHead,
     "recovery after restart must never append a new signed receipt");
+  const independentlyPinnedRecoveryHead = historical.historicalRecoveryNonceHead();
+  assert.ok(independentlyPinnedRecoveryHead.sequence >= 2,
+    "recovery ledger exports a separately retainable monotonic head");
   historical.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+    trustedRecoveryNonceHead: independentlyPinnedRecoveryHead,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "external recovery high-water detects a rollback to an older VALID signed ledger");
+  // Independent reviewer W13: a successful ACK can be replayed after an SQL
+  // actor deletes the recovery nonce row, with CAS and historical pins intact.
+  // Recovery claims are permanent once committed; expiration is NOT authority
+  // to erase their anti-replay history.
+  const recoveryDeletePath = path.join(directory, "witness-recovery-delete.sqlite");
+  fs.copyFileSync(historicalFilename, recoveryDeletePath);
+  const recoveryDelete = new Database(recoveryDeletePath);
+  try {
+    assert.throws(() => recoveryDelete.prepare(
+      "DELETE FROM witness_cas_sync_historical_recovery_nonce WHERE nonce=?"
+    ).run(recoveryNonce), /HISTORICAL_RECOVERY_LOCKED/,
+    "a direct SQL DELETE of an ACKed nonce must fail");
+  } finally { recoveryDelete.close(); }
+  const untouched = new Zk1WitnessCasAnchorFloor(recoveryDeletePath, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  });
+  await assert.rejects(untouched.recoverSyncHistoricalAdmission(recoveryInput),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "ACKed challenge remains spent after SQLite restart");
+  untouched.close();
+  const bypassDeletePath = path.join(directory, "witness-recovery-bypass-delete.sqlite");
+  fs.copyFileSync(historicalFilename, bypassDeletePath);
+  const bypassDelete = new Database(bypassDeletePath);
+  try {
+    bypassDelete.exec("DROP TRIGGER no_historical_recovery_nonce_delete");
+    bypassDelete.prepare(
+      "DELETE FROM witness_cas_sync_historical_recovery_nonce WHERE nonce=?"
+    ).run(recoveryNonce);
+    bypassDelete.exec(`CREATE TRIGGER no_historical_recovery_nonce_delete
+      BEFORE DELETE ON witness_cas_sync_historical_recovery_nonce
+      BEGIN SELECT RAISE(ABORT,'HISTORICAL_RECOVERY_LOCKED'); END;`);
+  } finally { bypassDelete.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(bypassDeletePath, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "recreating the DELETE trigger cannot hide a missing recovery entry from signed high-water");
+  const forgedHeadPath = path.join(directory, "witness-recovery-forged-head.sqlite");
+  fs.copyFileSync(historicalFilename, forgedHeadPath);
+  const forgedHeadDb = new Database(forgedHeadPath);
+  try {
+    forgedHeadDb.prepare("UPDATE witness_cas_sync_historical_recovery_head"
+      + " SET sequence=sequence-1 WHERE id=1").run();
+  } finally { forgedHeadDb.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(forgedHeadPath, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "offline attacker cannot forge updated Ed25519 signed high-water");
   const nonceTamperPath = path.join(directory, "witness-issue-nonce-corrupt.sqlite");
   fs.copyFileSync(historicalFilename, nonceTamperPath);
   const nonceTamper = new Database(nonceTamperPath);
