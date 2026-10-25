@@ -21,6 +21,13 @@ const { closeDb } = require("../db");
 const users = require("../repositories/usersRepository");
 const auditRepository = require("../repositories/auditRepository");
 const analyticsRepository = require("../repositories/analyticsRepository");
+const actionHistoryRepository = require("../repositories/actionHistoryRepository");
+const foldersRepository = require("../repositories/foldersRepository");
+const pendingUploadsRepository = require("../repositories/pendingUploadsRepository");
+const publicLinksRepository = require("../repositories/publicLinksRepository");
+const fileSearchIndexRepository = require("../repositories/fileSearchIndexRepository");
+const { ensureRootFolder } = require("../repositories/repositoryUtils");
+const { getDb } = require("../db");
 
 const execFileAsync = promisify(execFile);
 
@@ -354,6 +361,149 @@ test("audit and analytics SQLite writes during strict Sync do not stall the even
   analyticsRepository.saveAnalytics({ uploads: [{ id: "event-after-fence", timestamp: new Date().toISOString() }] });
   assert.equal(analyticsRepository.loadAnalytics().uploads.length, 1,
     "analytics writes resume normally after protected Sync finishes");
+});
+
+test("other synchronous repository writers fail immediately under strict Sync rather than freeze event loop", async (t) => {
+  const ctx = await fixture(t);
+  const originalRename = fsp.rename;
+  let reachedRename;
+  const reached = new Promise((resolve) => { reachedRename = resolve; });
+  let releaseRename;
+  const released = new Promise((resolve) => { releaseRename = resolve; });
+  fsp.rename = async (...args) => {
+    if (args[1] === ctx.storagePath) { reachedRename(); await released; }
+    return originalRename(...args);
+  };
+  t.after(() => { releaseRename(); fsp.rename = originalRename; });
+  const pending = post(ctx.listener.address().port, await ctx.signedOperation("global-writers"));
+  await reached;
+  const writers = [
+    ["actionHistory", () => actionHistoryRepository.saveActionHistory([])],
+    ["folders", () => foldersRepository.saveFolders([])],
+    ["pendingUploads", () => pendingUploadsRepository.savePendingUploads({})],
+    ["publicLinks", () => publicLinksRepository.savePublicLinks({})],
+    ["searchIndex", () => fileSearchIndexRepository.upsert("root", "test.txt")],
+    ["ensureRootFolder", () => ensureRootFolder(getDb())],
+  ];
+  let tickDelay = Infinity;
+  const before = performance.now();
+  const timer = setTimeout(() => { tickDelay = performance.now() - before; }, 20);
+  t.after(() => clearTimeout(timer));
+  try {
+    for (const [name, operation] of writers) {
+      const start = performance.now();
+      assert.throws(operation, { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" }, `${name} must fail-fast`);
+      assert.ok(performance.now() - start < 200, `${name} blocked event loop`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(tickDelay < 200, `heartbeat delayed ${tickDelay}ms`);
+  } finally { releaseRename(); }
+  assert.equal(await pending, 201);
+});
+
+test("stale cross-process audit snapshot cannot delete already consolidated sidecar event", async (t) => {
+  const ctx = await fixture(t);
+  const stale = auditRepository.loadAuditLogs();
+  const event = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
+    eventType: "user.deleted", action: "deleted", result: "success",
+    actor: { username: "admin" }, details: { operation: "durable" } };
+  const child = `const audit=require(process.argv[1]);const entry=JSON.parse(process.argv[2]);audit.deferAuditLog(entry);audit.saveAuditLogs(audit.loadAuditLogs());`;
+  await execFileAsync(process.execPath, ["-e", child, require.resolve("../repositories/auditRepository"),
+    JSON.stringify(event)], { timeout: 20000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((log) => log.id === event.id).length, 1);
+  auditRepository.saveAuditLogs(stale);
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((log) => log.id === event.id).length, 1,
+    "obsolete snapshot from another Node process must never erase an acknowledged audit event");
+  auditRepository.archiveAuditLogs([event]);
+  assert.equal(auditRepository.loadArchivedAuditLogs().logs.filter((log) => log.id === event.id).length, 1);
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((log) => log.id === event.id).length, 0,
+    "archived IDs must never reappear in the active audit view");
+  auditRepository.saveAuditLogs({ logs: [event] });
+  auditRepository.archiveAuditLogs([event]);
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((log) => log.id === event.id).length, 0);
+  assert.equal(auditRepository.loadArchivedAuditLogs().logs.filter((log) => log.id === event.id).length, 1,
+    "archive must remain idempotent after stale writers and duplicate requests");
+  const staleChild = `const a=require(process.argv[1]);a.saveAuditLogs({logs:[JSON.parse(process.argv[2])]})`;
+  await execFileAsync(process.execPath, ["-e", staleChild, require.resolve("../repositories/auditRepository"),
+    JSON.stringify(event)], { timeout: 20000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((log) => log.id === event.id).length, 0,
+    "a second process must not resurrect a durably archived event");
+});
+
+test("abrupt process exit after durable audit sidecar commit still recovers exactly once", async (t) => {
+  await fixture(t);
+  const event = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
+    eventType: "user.updated", actor: { username: "admin" },
+    action: "updated", result: "success" };
+  const script = `const a=require(process.argv[1]);a.deferAuditLog(JSON.parse(process.argv[2]));process.exit(23)`;
+  await assert.rejects(execFileAsync(process.execPath, ["-e", script,
+    require.resolve("../repositories/auditRepository"), JSON.stringify(event)], {
+    timeout: 15000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH },
+  }), { code: 23 });
+  assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
+  auditRepository.saveAuditLogs(auditRepository.loadAuditLogs());
+  assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
+});
+
+test("strict audit sidecar rejects an existing Windows directory with an untrusted DACL", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows ACL-specific security gate");
+  const root = isolatedDirectory();
+  const oldPath = process.env.DATABASE_URL;
+  t.after(() => {
+    if (oldPath === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = oldPath;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const dbPath = path.join(root, "untrusted-accounts.sqlite");
+  process.env.DATABASE_URL = dbPath;
+  const unsafeDir = dbPath + ".audit-private";
+  fs.mkdirSync(unsafeDir);
+  await execFileAsync("icacls.exe", [unsafeDir, "/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+  assert.throws(() => auditRepository.preparePendingAuditJournal(),
+    /Windows chunk staging ACL validation failed|Untrusted principal|Unsafe/);
+  assert.equal(fs.existsSync(path.join(unsafeDir, "pending.sqlite")), false);
+
+  // A directory can be restricted while an existing SQLite WAL/SHM or DB
+  // file carries an unsafe explicit ACE. Verify its descendants as well.
+  const nextDb = path.join(root, "unsafe-wal.sqlite");
+  process.env.DATABASE_URL = nextDb;
+  const safeDir = nextDb + ".audit-private";
+  ensureWindowsChunkUploadRoot(safeDir);
+  const unsafeWal = path.join(safeDir, "pending.sqlite-wal");
+  fs.writeFileSync(unsafeWal, "");
+  await execFileAsync("icacls.exe", [unsafeWal, "/grant", "*S-1-5-32-545:M"]);
+  assert.throws(() => auditRepository.preparePendingAuditJournal(),
+    /Windows chunk staging ACL validation failed|Untrusted principal|Unsafe/);
+});
+
+test("busy external audit sidecar writer fails promptly without corrupting earlier accepted records", async (t) => {
+  const ctx = await fixture(t);
+  const id = crypto.randomUUID();
+  const log = { id, eventType: "file.access.denied", timestamp: new Date().toISOString() };
+  auditRepository.deferAuditLog(log);
+  const sidecar = path.join(process.env.DATABASE_URL + ".audit-private", "pending.sqlite");
+  const program = `const D=require(process.argv[1]);const db=new D(process.argv[2]);db.exec('BEGIN IMMEDIATE');process.stdout.write('HELD\\n');setTimeout(()=>{db.exec('ROLLBACK');db.close()},800);`;
+  const child = spawn(process.execPath, ["-e", program, require.resolve("better-sqlite3"), sidecar],
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  await new Promise((resolve, reject) => {
+    child.stdout.once("data", (data) => data.toString().includes("HELD") ? resolve() : reject(new Error("No writer lock")));
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`writer ended early: ${code}`)));
+  });
+  const start = performance.now();
+  let actualError;
+  try { auditRepository.deferAuditLog({ ...log, id: crypto.randomUUID() }); }
+  catch (error) { actualError = error; }
+  const delay = performance.now() - start;
+  assert.equal(actualError?.code, "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+    `busy journal writer should map to unavailable; observed ${actualError?.code}`);
+  assert.ok(delay < 1500, `sidecar SQLite writer retry must have a strict short bound (${delay} ms)`);
+  await new Promise((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    child.once("exit", resolve);
+  });
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((entry) => entry.id === id).length, 1);
 });
 
 test("strict REST rejects a missing SQLite authority or concurrent legacy JSON account writes at setup", (t) => {

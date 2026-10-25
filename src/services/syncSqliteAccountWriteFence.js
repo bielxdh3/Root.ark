@@ -5,6 +5,7 @@ const { performance } = require("node:perf_hooks");
 const { getDatabasePath, isDbEnabled, isLegacyJsonWriteEnabled } = require("../../db");
 
 const localAccountWriters = new Map();
+const configuredStrictAccountPaths = new Set();
 const MAX_LOCAL_WAITERS = 64;
 const ACCOUNT_FENCE_WAIT_MS = 30000;
 const SQLITE_RETRY_MS = 25;
@@ -15,6 +16,10 @@ function assertNoLocalStrictSyncWriter(dbPath = getDatabasePath()) {
   // same Node event loop while a protected Sync owns the SQLite writer lock.
   // The admin write is rejected for a retry; it does not commit stale state.
   if (localAccountWriters.get(dbPath)?.held) throw unavailable();
+}
+
+function isStrictSyncAccountFenceConfigured(dbPath = getDatabasePath()) {
+  return configuredStrictAccountPaths.has(dbPath);
 }
 
 function sleep(ms) {
@@ -84,6 +89,7 @@ function createSyncSqliteAccountWriteFence() {
   // strict requests. Without it, access-denial auditing would block SQLite
   // during the cross-process authorization reservation.
   require("../../repositories/auditRepository").preparePendingAuditJournal();
+  configuredStrictAccountPaths.add(dbPath);
 
   return async function persistUnderAccountFence(user, operation, persist) {
     if (!user || typeof user.username !== "string" || !user.username
@@ -160,4 +166,5 @@ function createSyncSqliteAccountWriteFence() {
   };
 }
 
-module.exports = { createSyncSqliteAccountWriteFence, assertNoLocalStrictSyncWriter };
+module.exports = { createSyncSqliteAccountWriteFence, assertNoLocalStrictSyncWriter,
+  isStrictSyncAccountFenceConfigured };

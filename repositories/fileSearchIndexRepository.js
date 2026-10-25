@@ -1,5 +1,6 @@
 const path = require("path");
 const { getDb } = require("../db");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 
 const MIN_TRIGRAM_LENGTH = 3;
 
@@ -19,6 +20,7 @@ function buildMatchQuery(rawQuery) {
 }
 
 function upsert(folderId, fileName) {
+  assertNoLocalStrictSyncWriter();
   const name = basename(fileName);
   if (!name) return;
   const folder = String(folderId || "root");
@@ -30,6 +32,7 @@ function upsert(folderId, fileName) {
 }
 
 function remove(folderId, fileName) {
+  assertNoLocalStrictSyncWriter();
   const name = basename(fileName);
   if (!name) return;
   getDb().prepare("DELETE FROM file_search_index WHERE folder_id = ? AND file_name = ?")
@@ -37,6 +40,7 @@ function remove(folderId, fileName) {
 }
 
 function rename(folderId, oldName, newName) {
+  assertNoLocalStrictSyncWriter();
   const db = getDb();
   db.transaction(() => {
     remove(folderId, oldName);
@@ -47,6 +51,7 @@ function rename(folderId, oldName, newName) {
 // Lazy reconciliation: makes the folder's indexed names equal the current listing,
 // excluding protected (encrypted) names. Protected names are never inserted.
 function syncFolder(folderId, fileNames, isProtected = () => false) {
+  assertNoLocalStrictSyncWriter();
   const folder = String(folderId || "root");
   const db = getDb();
   const wanted = new Set();

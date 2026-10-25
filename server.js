@@ -1529,8 +1529,16 @@ function parseWebDavSegments(req) {
 
 function archiveAuditLogs(logs) {
   if (!logs.length) return;
+  if (shouldUseDatabase() && !shouldWriteLegacyJson()
+    && require("./src/services/syncSqliteAccountWriteFence").isStrictSyncAccountFenceConfigured()) {
+    auditRepository.archiveAuditLogs(logs);
+    return;
+  }
   const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE);
-  archive.logs.push(...logs);
+  const seen = new Set(archive.logs.map((entry) => entry.id));
+  for (const log of logs) {
+    if (!seen.has(log.id)) { seen.add(log.id); archive.logs.push(log); }
+  }
   saveAuditLogs(archive, AUDIT_ARCHIVE_FILE);
 }
 
@@ -1544,12 +1552,16 @@ function appendAuditLog(log) {
   }
   const entries = loadAuditLogs();
   const cutoff = Date.now() - AUDIT_RETENTION_MS;
+  const expired = [];
   const retained = entries.logs.filter((entry) => {
     const time = new Date(entry.timestamp).getTime();
-    return Number.isFinite(time) && time >= cutoff;
+    const valid = Number.isFinite(time) && time >= cutoff;
+    if (!valid) expired.push(entry);
+    return valid;
   });
 
   retained.push(log);
+  if (expired.length) archiveAuditLogs(expired);
   if (retained.length > MAX_AUDIT_LOGS) {
     archiveAuditLogs(retained.slice(0, retained.length - MAX_AUDIT_LOGS));
     entries.logs = retained.slice(-MAX_AUDIT_LOGS);

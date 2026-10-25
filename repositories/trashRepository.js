@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { getDb, isDbEnabled, jsonStringify, safeJsonParse } = require("../db");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 
 const TRASH_JSON_FILE = resolveRuntimePath("data", "trash-items.json");
@@ -88,6 +89,7 @@ function getTrashItem(id) {
 }
 
 function saveTrashItem(item) {
+  assertNoLocalStrictSyncWriter();
   const normalized = normalizeTrashItem(item);
   if (isDbEnabled() && hasTrashTable()) {
     getDb().prepare(`

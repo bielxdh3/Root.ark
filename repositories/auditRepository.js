@@ -3,7 +3,10 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const { getDb, getDatabasePath } = require("../db");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
-const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
+const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
+const { assertNoLocalStrictSyncWriter, isStrictSyncAccountFenceConfigured } =
+  require("../src/services/syncSqliteAccountWriteFence");
+const { assertPrivateSqliteDirectory } = require("../src/services/zk1PrivateSqlitePath");
 const { jsonStringify, runWrite, safeJsonParse } = require("./repositoryUtils");
 const MAX_DEFERRED_AUDITS = 4096;
 const preparedJournals = new Set();
@@ -20,6 +23,10 @@ function preparePendingAuditJournal() {
   // Never create sensitive audit content in an untrusted inherited-ACL file.
   if (process.platform === "win32") {
     ensureWindowsChunkUploadRoot(dir);
+    // "create" checks ancestors but does NOT verify an existing directory
+    // DACL or its SQLite/WAL/SHM children. A hostile preexisting tree must
+    // fail closed at strict-mode startup.
+    verifyWindowsChunkUploadTree(dir);
   } else {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const info = fs.lstatSync(dir);
@@ -28,9 +35,26 @@ function preparePendingAuditJournal() {
       || (typeof process.getuid === "function" && info.uid !== process.getuid())) {
       throw new Error("Private audit journal directory is not owner-only");
     }
+    assertPrivateSqliteDirectory(filename);
   }
   preparedJournals.add(filename);
   return filename;
+}
+
+function assertSafePendingFiles(filename) {
+  for (const candidate of [filename, `${filename}-wal`, `${filename}-shm`]) {
+    const info = fs.lstatSync(candidate, { throwIfNoEntry: false });
+    if (!info) continue;
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
+      throw new Error("Unsafe pending audit database / WAL / SHM inode");
+    }
+    if (process.platform !== "win32") {
+      if ((typeof process.getuid === "function" && info.uid !== process.getuid())
+        || (info.mode & 0o077) !== 0) {
+        throw new Error("Unsafe pending audit file owner or mode");
+      }
+    }
+  }
 }
 
 // Separate, FULL-durable SQLite sidecar: when strict Sync holds the MAIN SQLite
@@ -38,9 +62,13 @@ function preparePendingAuditJournal() {
 // The sidecar never bypasses the main account authorization transaction.
 function withPendingAuditDb(callback) {
   const filename = preparePendingAuditJournal();
-  const db = new Database(filename, { timeout: 0 });
+  assertSafePendingFiles(filename);
+  const db = new Database(filename, { timeout: 100 });
   try {
-    db.pragma("busy_timeout = 0");
+    // Sidecar is a separate SQLite file, NOT the locked account authority.
+    // A small bounded writer wait serializes peers without a five-second
+    // event-loop stall. Exhaustion is explicit fail-closed, never lost log.
+    db.pragma("busy_timeout = 100");
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = FULL");
     if (db.pragma("synchronous", { simple: true }) !== 2) throw new Error("Pending audit journal must be durable");
@@ -52,10 +80,58 @@ function withPendingAuditDb(callback) {
       }
     }
     db.exec("CREATE TABLE IF NOT EXISTS pending_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+    // The archive is a separate, FULL-durable tombstone ledger. A stale
+    // snapshot can never resurrect an archived ID, even after another process
+    // drops its staged pending copy.
+    db.exec("CREATE TABLE IF NOT EXISTS archived_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
     return callback(db);
   } finally {
     db.close();
   }
+}
+
+function archiveAuditLogs(logs) {
+  if (!Array.isArray(logs) || !logs.length) return;
+  try {
+    withPendingAuditDb((db) => {
+      const insert = db.prepare("INSERT INTO archived_audit(id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
+      const clear = db.prepare("DELETE FROM pending_audit WHERE id=?");
+      db.transaction(() => {
+        for (const log of logs) {
+          if (typeof log?.id !== "string" || !log.id || log.id.length > 128) {
+            throw new TypeError("Invalid archived audit ID");
+          }
+          const serialized = JSON.stringify(log);
+          if (Buffer.byteLength(serialized) > 64 * 1024) throw new Error("Archived audit too large");
+          insert.run(log.id, serialized);
+          clear.run(log.id);
+        }
+      })();
+    });
+  } catch (error) {
+    if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
+      throw Object.assign(new Error("Durable audit archive busy", { cause: error }), {
+        code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+      });
+    }
+    throw error;
+  }
+}
+
+function loadArchivedAuditLogs() {
+  if (!fs.existsSync(auditJournalPath())) return { logs: [] };
+  return { logs: withPendingAuditDb((db) =>
+    db.prepare("SELECT id,event FROM archived_audit ORDER BY rowid").all().map(({ id, event }) => {
+      const entry = JSON.parse(event);
+      if (entry.id !== id) throw new Error("Archive audit ID mismatch");
+      return entry;
+    })) };
+}
+
+function archivedAuditIds() {
+  if (!fs.existsSync(auditJournalPath())) return new Set();
+  return new Set(withPendingAuditDb((db) => db.prepare("SELECT id FROM archived_audit").all()
+    .map(({ id }) => id)));
 }
 
 function pendingAudits() {
@@ -88,18 +164,27 @@ function deferAuditLog(log) {
   }
   // Commit+fsync completes before auditLog reports success. No in-memory
   // queue, no timer-dependent guarantee and no swallowed errors.
-  withPendingAuditDb((db) => {
-    db.transaction(() => {
-      const exists = db.prepare("SELECT 1 FROM pending_audit WHERE id=?").get(log.id);
-      if (!exists && db.prepare("SELECT COUNT(*) AS n FROM pending_audit").get().n >= MAX_DEFERRED_AUDITS) {
-        throw Object.assign(new Error("Durable pending audit capacity exhausted"), {
-          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
-        });
-      }
-      db.prepare("INSERT INTO pending_audit (id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING")
-        .run(log.id, serialized);
-    })();
-  });
+  try {
+    withPendingAuditDb((db) => {
+      db.transaction(() => {
+        const exists = db.prepare("SELECT 1 FROM pending_audit WHERE id=?").get(log.id);
+        if (!exists && db.prepare("SELECT COUNT(*) AS n FROM pending_audit").get().n >= MAX_DEFERRED_AUDITS) {
+          throw Object.assign(new Error("Durable pending audit capacity exhausted"), {
+            code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+          });
+        }
+        db.prepare("INSERT INTO pending_audit (id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING")
+          .run(log.id, serialized);
+      })();
+    });
+  } catch (error) {
+    if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
+      throw Object.assign(new Error("Durable pending audit journal busy", { cause: error }), {
+        code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+      });
+    }
+    throw error;
+  }
 }
 
 function deferIfStrictSyncWriter(log) {
@@ -172,30 +257,28 @@ function loadAuditLogs() {
   for (const log of pendingAudits()) {
     if (!seen.has(log.id)) { seen.add(log.id); logs.push(log); }
   }
-  logs.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
-  return { logs };
+  const archived = archivedAuditIds();
+  const activeLogs = logs.filter(({ id }) => !archived.has(id));
+  activeLogs.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+  return { logs: activeLogs };
 }
 
 function saveAuditLogs(entries = {}) {
   assertNoLocalStrictSyncWriter();
   const db = getDb();
   const logs = Array.isArray(entries?.logs) ? entries.logs : [];
+  const protectedAudit = isStrictSyncAccountFenceConfigured() || fs.existsSync(auditJournalPath());
   runWrite(db, () => {
-    db.prepare("DELETE FROM audit_logs").run();
+    if (!protectedAudit) db.prepare("DELETE FROM audit_logs").run();
+    // Audit is monotonic: callers often supply whole-table snapshots read
+    // BEFORE another process committed a newer event. Blind DELETE+replace
+    // makes a late stale snapshot irreversibly erase that event after its
+    // sidecar has been acknowledged and cleared. Idempotent UPSERT retains
+    // concurrently committed IDs even when absent from the passed snapshot.
     const insert = db.prepare(`
       INSERT INTO audit_logs (id, event_type, severity, actor_username, actor_ip, target_type, target_id, action, result, timestamp, details_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        event_type = excluded.event_type,
-        severity = excluded.severity,
-        actor_username = excluded.actor_username,
-        actor_ip = excluded.actor_ip,
-        target_type = excluded.target_type,
-        target_id = excluded.target_id,
-        action = excluded.action,
-        result = excluded.result,
-        timestamp = excluded.timestamp,
-        details_json = excluded.details_json
+      ON CONFLICT(id) DO NOTHING
     `);
 
     for (const log of logs) {
@@ -230,4 +313,5 @@ function saveAuditLogs(entries = {}) {
   }
 }
 
-module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter, preparePendingAuditJournal };
+module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter,
+  preparePendingAuditJournal, archiveAuditLogs, loadArchivedAuditLogs };

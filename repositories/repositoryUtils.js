@@ -1,12 +1,14 @@
 const crypto = require("crypto");
 const path = require("path");
 const { getDb, jsonStringify, nowIso, safeJsonParse, splitStorageKey } = require("../db");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 
 function basename(value) {
   return path.basename(String(value || ""));
 }
 
 function ensureRootFolder(db) {
+  assertNoLocalStrictSyncWriter();
   const now = nowIso();
   db.prepare(`
     INSERT INTO folders (id, name, created_by, created_at, updated_at, allowed_users_json, is_root)
@@ -20,6 +22,7 @@ function ensureRootFolder(db) {
 }
 
 function ensureFolderId(db, folderId) {
+  assertNoLocalStrictSyncWriter();
   ensureRootFolder(db);
   const id = String(folderId || "root");
   if (id === "root") return;
@@ -66,6 +69,7 @@ function randomId() {
 }
 
 function runWrite(db, callback) {
+  assertNoLocalStrictSyncWriter();
   if (db.inTransaction) return callback();
   return db.transaction(callback)();
 }
