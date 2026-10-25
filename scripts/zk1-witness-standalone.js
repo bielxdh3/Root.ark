@@ -15,6 +15,8 @@ const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } = require("../
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
 const { Zk1WitnessCasAnchorFloor } =
   require("../src/services/zk1WitnessCasAnchorFloor");
+const { Zk1WitnessCasPhysicalAdmission } =
+  require("../src/services/zk1WitnessCasPhysicalAdmission");
 const ownerFloorCheckpoint = require("../src/crypto/rootark-zk1-owner-cas-floor-checkpoint");
 
 const TOP_FIELDS = Object.freeze([
@@ -70,10 +72,84 @@ function decodeId(value) {
   if (buffer.length !== 16 || buffer.toString("base64url") !== value) fail();
   return buffer;
 }
-function configure(config) {
+// This object is injected by a separately governed, executable operator
+// launcher, not read from JSON, a path contained in JSON or an HTTP request.
+// The stock `node zk1-witness-standalone.js --config ...` CLI intentionally
+// has no historical-issuer opt-in; missing external authority fails closed.
+function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
+  if (authority === undefined || authority === null) return null;
+  exact(authority, ["physicalAdmission", "trustedSyncDevicePolicyProvider",
+    "trustedMinimumHead", "trustedHistoricalAdmissionHead",
+    "witnessPublicKey", "statusPublicKey", "principals"]);
+  if (!(authority.physicalAdmission instanceof Zk1WitnessCasPhysicalAdmission)
+    || typeof authority.trustedSyncDevicePolicyProvider !== "function"
+    || !(authority.witnessPublicKey instanceof crypto.KeyObject)
+    || authority.witnessPublicKey.type !== "public"
+    || authority.witnessPublicKey.asymmetricKeyType !== "ed25519"
+    || !(authority.statusPublicKey instanceof crypto.KeyObject)
+    || authority.statusPublicKey.type !== "public"
+    || authority.statusPublicKey.asymmetricKeyType !== "ed25519"
+    || !crypto.KeyObject.prototype.equals.call(authority.witnessPublicKey,
+      crypto.createPublicKey(witnessKey))
+    || !crypto.KeyObject.prototype.equals.call(authority.statusPublicKey, statusKey)
+    || !config.casAnchorFloor || !authority.principals
+    || typeof authority.principals !== "object"
+    || Array.isArray(authority.principals)) fail();
+  const floor = authority.trustedMinimumHead;
+  exact(floor, ["sequence", "lastHash", "physicalFenceDigest"]);
+  const historical = authority.trustedHistoricalAdmissionHead;
+  exact(historical, ["sequence", "lastHash"]);
+  const checkHash = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+  if (!Number.isSafeInteger(floor.sequence) || floor.sequence < 0
+    || floor.sequence > 100000 || !checkHash(floor.lastHash)
+    || !checkHash(floor.physicalFenceDigest)
+    || !Number.isSafeInteger(historical.sequence) || historical.sequence < 0
+    || historical.sequence > 100000 || !checkHash(historical.lastHash)
+    || (historical.sequence === 0 && historical.lastHash !== "0".repeat(64))
+    || (config.bootstrapNew && (historical.sequence !== 0
+      || floor.sequence !== 0 || floor.lastHash !== "0".repeat(64)
+      || floor.physicalFenceDigest !== crypto.createHash("sha256")
+        .update("").digest("hex")))
+    || floor.sequence !== config.casAnchorFloor.trustedMinimumHead.sequence
+    || floor.lastHash !== config.casAnchorFloor.trustedMinimumHead.lastHash) fail();
+  const mTls = authority.principals;
+  const seen = Object.keys(mTls);
+  if (seen.length < 1 || seen.length > 128) fail();
+  const externalPrincipals = {};
+  for (const fingerprint of seen) {
+    if (!/^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i.test(fingerprint)
+      || Object.keys(config.principals).some((old) =>
+        old.toUpperCase() === fingerprint.toUpperCase())) fail();
+    const auth = mTls[fingerprint];
+    exact(auth, ["roles", "scopes"]);
+    if (!Array.isArray(auth.roles) || auth.roles.length !== 1
+      || auth.roles[0] !== "cas-historical-admit"
+      || !Array.isArray(auth.scopes) || auth.scopes.length < 1
+      || auth.scopes.length > 64) fail();
+    // The HTTPS layer independently parses and canonicalizes these scopes.
+    externalPrincipals[fingerprint] = { roles: ["cas-historical-admit"],
+      scopes: auth.scopes };
+  }
+  // Only check provider validity here; do not cache it! W2 asks the
+  // independently provisioned provider AGAIN before durable SQLite INSERT.
+  const policy = authority.trustedSyncDevicePolicyProvider();
+  if (!policy || typeof policy !== "object") fail();
+  return Object.freeze({ physicalAdmission: authority.physicalAdmission,
+    trustedSyncDevicePolicyProvider: authority.trustedSyncDevicePolicyProvider,
+    trustedMinimumHead: Object.freeze({ ...floor }),
+    trustedHistoricalAdmissionHead: Object.freeze({ ...historical }),
+    principals: externalPrincipals });
+}
+
+function configure(config, { historicalAuthority } = {}) {
   exact(config, Object.hasOwn(config || {}, "casAnchorFloor")
     ? [...TOP_FIELDS, "casAnchorFloor"] : TOP_FIELDS);
   exact(config.cas, CAS_FIELDS);
+  // A mutable file cannot self-grant historical issuance. Refuse BEFORE
+  // opening DBs or reading any signer/private-key file.
+  if (Object.values(config.principals || {}).some((item) =>
+    Array.isArray(item?.roles) && item.roles.includes("cas-historical-admit"))) fail();
+  if (historicalAuthority !== undefined && !config.casAnchorFloor) fail();
   if (config.bootstrapNew !== true && config.bootstrapNew !== false) fail();
   validateListenHost(config.listenHost);
   if (!Number.isSafeInteger(config.listenPort)
@@ -90,6 +166,8 @@ function configure(config) {
   const witnessPrivateKey = crypto.createPrivateKey(readFile(config.witnessPrivateKeyPath));
   const statusKeyId = decodeId(config.statusKeyId);
   const statusPublicKey = crypto.createPublicKey(readFile(config.statusPublicKeyPath));
+  const historical = snapshotHistoricalAuthority(historicalAuthority, config,
+    witnessPrivateKey, statusPublicKey);
   const serverCert = readFile(config.serverCertPath);
   if (config.listenHost !== "127.0.0.1" && config.listenHost !== "::1") {
     // IP SAN is independently verified by remote clients alongside CA and
@@ -183,7 +261,12 @@ function configure(config) {
     floor = new Zk1WitnessCasAnchorFloor(config.casAnchorFloor.dbPath, {
       bootstrapNew: config.bootstrapNew, witnessKeyId,
       witnessPrivateKey, statusKeyId, statusPublicKey,
-      trustedMinimumHead: config.casAnchorFloor.trustedMinimumHead,
+      trustedMinimumHead: historical?.trustedMinimumHead
+        || config.casAnchorFloor.trustedMinimumHead,
+      ...(historical ? { attestedAdmission: historical.physicalAdmission,
+        enableSyncHistoricalIssuer: true,
+        trustedSyncDevicePolicyProvider: historical.trustedSyncDevicePolicyProvider,
+        trustedHistoricalAdmissionHead: historical.trustedHistoricalAdmissionHead } : {}),
     });
   }
   let ledger;
@@ -200,7 +283,8 @@ function configure(config) {
       key: readFile(config.serverKeyPath),
       cert: serverCert,
       clientCa: readFile(config.clientCaPath),
-      principals: config.principals,
+      principals: historical ? { ...config.principals, ...historical.principals }
+        : config.principals,
       ledger,
       casAnchorFloor: floor,
     });
@@ -211,10 +295,8 @@ function configure(config) {
     throw error;
   }
 }
-async function main() {
-  if (process.argv.length !== 4 || process.argv[2] !== "--config") fail();
-  const config = JSON.parse(readFile(process.argv[3]).toString("utf8"));
-  const { server, ledger, floor } = configure(config);
+function serve(config, { historicalAuthority } = {}) {
+  const { server, ledger, floor } = configure(config, { historicalAuthority });
   server.once("error", () => {
     try { ledger.close(); } catch (_) { /* fail closed */ }
     try { floor?.close(); } catch (_) { /* fail closed */ }
@@ -258,8 +340,19 @@ async function main() {
       process.send({ type: "ready", port: server.address().port });
     }
   });
+  return Object.freeze({ server, ledger, floor });
 }
-main().catch(() => {
-  process.stderr.write("WITNESS_STARTUP_FAILED\n");
-  process.exitCode = 1;
-});
+async function main() {
+  if (process.argv.length !== 4 || process.argv[2] !== "--config") fail();
+  const config = JSON.parse(readFile(process.argv[3]).toString("utf8"));
+  return serve(config);
+}
+if (require.main === module) {
+  main().catch(() => {
+    process.stderr.write("WITNESS_STARTUP_FAILED\n");
+    process.exitCode = 1;
+  });
+}
+// For a separately controlled Node launcher only. This is NOT an IPC/HTTP
+// method and must not be called with trust material derived from JSON.
+module.exports = { configure, serve };

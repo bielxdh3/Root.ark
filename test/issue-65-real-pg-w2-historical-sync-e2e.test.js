@@ -42,6 +42,9 @@ const { Zk1WitnessCasAnchorFloor, verifyFreshWitnessCasFloor } =
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } =
   require("../src/services/zk1WitnessHttpsServer");
+const { configure: configureStandaloneHistoricalWitness,
+  serve: serveStandaloneHistoricalWitness } =
+  require("../scripts/zk1-witness-standalone");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL
@@ -108,7 +111,8 @@ function postHistorical(port, read, who, body) {
 test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLite historical issuer -> strict Sync v2", {
   skip: !enabled && "not covered: requires disposable PostgreSQL 18 with admin, gate and read-only attestor logins",
 }, async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-real-w2-pg-e2e-"));
+  const dir = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("zk65-real-w2-pg-e2e-");
   const cleanups = [];
   t.after(async () => {
     let failure;
@@ -204,6 +208,9 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   generateNativeFixtureCertificates(dir, { caSubject: "ZK65 real PG W2 historical E2E",
     servers: ["attestor", "inventory", "witness"],
     clients: ["inventory-service", "reader", "witness-pg", "historical", "denied"] });
+  for (const name of fs.readdirSync(dir)) {
+    if (/\.(?:pem|key)$/.test(name)) fs.chmodSync(path.join(dir, name), 0o600);
+  }
   const read = (name) => fs.readFileSync(path.join(dir, name));
   const physicalSigner = crypto.generateKeyPairSync("ed25519");
   assert.equal(crypto.KeyObject.prototype.equals.call(physicalSigner.publicKey,
@@ -266,12 +273,78 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
     trustedMinimumInventorySnapshot: minimumSnapshot,
   });
   const witnessPath = path.join(dir, "witness.sqlite");
-  const witness = new Zk1WitnessCasAnchorFloor(witnessPath, {
-    bootstrapNew: true, witnessKeyId, witnessPrivateKey: witnessKeys.privateKey,
-    statusKeyId, statusPublicKey: status.publicKey,
-    attestedAdmission: admission, enableSyncHistoricalIssuer: true,
-    trustedSyncDevicePolicyProvider: () => policy,
-  });
+  const witnessSigningPath = path.join(dir, "witness-signing.key");
+  const statusPublicPath = path.join(dir, "status-verifier.pub");
+  fs.writeFileSync(witnessSigningPath, witnessKeys.privateKey.export({
+    type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  fs.writeFileSync(statusPublicPath, status.publicKey.export({
+    type: "spki", format: "pem" }), { mode: 0o600 });
+  const genesisFloor = { sequence: 0, lastHash: "0".repeat(64) };
+  const config = {
+    bootstrapNew: true, listenHost: "127.0.0.1", listenPort: 0,
+    dbPath: path.join(dir, "witness-general.sqlite"),
+    witnessKeyId: b64(witnessKeyId), witnessPrivateKeyPath: witnessSigningPath,
+    statusKeyId: b64(statusKeyId), statusPublicKeyPath: statusPublicPath,
+    serverKeyPath: path.join(dir, "witness.key"),
+    serverCertPath: path.join(dir, "witness.pem"),
+    clientCaPath: path.join(dir, "ca.pem"),
+    // Mutable JSON NEVER contains the privileged historical principal.
+    principals: { [fingerprint(read("denied.pem"))]: {
+      roles: ["head"], scopes: [wire(scope)] } },
+    cas: { endpoint: "https://localhost:44444/v1/terminal",
+      caPath: path.join(dir, "ca.pem"), clientKeyPath: path.join(dir, "denied.key"),
+      clientCertPath: path.join(dir, "denied.pem"),
+      serverFingerprint256: fingerprint(read("witness.pem")) },
+    casAnchorFloor: { dbPath: witnessPath, trustedMinimumHead: genesisFloor },
+  };
+  const trustedHistorical = {
+    physicalAdmission: admission,
+    witnessPublicKey: witnessKeys.publicKey,
+    statusPublicKey: status.publicKey,
+    trustedMinimumHead: { ...genesisFloor,
+      physicalFenceDigest: crypto.createHash("sha256").update("").digest("hex") },
+    trustedHistoricalAdmissionHead: { sequence: 0, lastHash: "0".repeat(64) },
+    trustedSyncDevicePolicyProvider: () => ({ username: policy.username,
+      trustedDevicePublicKeys: { ...policy.trustedDevicePublicKeys },
+      revokedDeviceIds: [...policy.revokedDeviceIds] }),
+    principals: { [fingerprint(read("historical.pem"))]: {
+      roles: ["cas-historical-admit"], scopes: [wire(scope)] } },
+  };
+  assert.throws(() => configureStandaloneHistoricalWitness({ ...config,
+    casAnchorFloor: undefined }, { historicalAuthority: trustedHistorical }),
+  /WITNESS_STARTUP_FAILED|WITNESS_API_INVALID/,
+  "external issuer enrollment cannot be silently disabled by removing JSON casAnchorFloor");
+  assert.equal(fs.existsSync(config.dbPath), false);
+  assert.throws(() => configureStandaloneHistoricalWitness({ ...config,
+    principals: { ...config.principals, ...trustedHistorical.principals } }),
+  /WITNESS_STARTUP_FAILED/,
+  "JSON-only historical principal cannot become authority, even with valid keys on disk");
+  assert.equal(fs.existsSync(config.dbPath), false);
+  assert.throws(() => configureStandaloneHistoricalWitness(config, {
+    historicalAuthority: { ...trustedHistorical,
+      witnessPublicKey: crypto.generateKeyPairSync("ed25519").publicKey } }),
+  /WITNESS_STARTUP_FAILED/,
+  "external independent identity pin rejects a substituted witness signing key");
+  assert.throws(() => configureStandaloneHistoricalWitness(config, {
+    historicalAuthority: { ...trustedHistorical,
+      trustedMinimumHead: { ...trustedHistorical.trustedMinimumHead,
+        lastHash: "f".repeat(64) } } }),
+  /WITNESS_STARTUP_FAILED/,
+  "editable JSON head cannot silently override externally held floor minimum");
+  assert.throws(() => configureStandaloneHistoricalWitness(config, {
+    historicalAuthority: { ...trustedHistorical,
+      trustedHistoricalAdmissionHead: { sequence: 1, lastHash: "f".repeat(64) } } }),
+  /WITNESS_STARTUP_FAILED/,
+  "bootstrap cannot install independently claimed nonzero historical high-water");
+  assert.equal(fs.existsSync(config.dbPath), false);
+  for (const needed of [config.cas.caPath, config.cas.clientKeyPath,
+    config.cas.clientCertPath, config.witnessPrivateKeyPath]) {
+    assert.ok(fs.existsSync(needed) && fs.statSync(needed).size > 0,
+      "standalone fixture requires existing certificate and signer files");
+  }
+  const { floor: witness, ledger: standaloneLedger, server: witnessServer } =
+    serveStandaloneHistoricalWitness(config, { historicalAuthority: trustedHistorical });
+  cleanups.push(() => standaloneLedger.close());
   cleanups.push(() => witness.close());
   assert.equal(witness.supportsClientHistoricalNonce, true);
   const anchor = new Zk1CasTerminalAnchor(path.join(dir, "cas-anchor.log"), {
@@ -297,20 +370,12 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
     pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
     requirePhysicalAdmission: true,
   });
-  const failLedger = () => { throw Error("unrelated witness API role"); };
-  const witnessServer = createZk1WitnessHttpsServer({
-    key: read("witness.key"), cert: read("witness.pem"), clientCa: read("ca.pem"),
-    casAnchorFloor: witness,
-    ledger: { reserve: failLedger, freshHead: failLedger, resolve: failLedger,
-      prepareQuiesce: failLedger, cancelExpiredQuiesce: failLedger,
-      beginIoAdmission: failLedger, finishIoAdmission: failLedger },
-    principals: {
-      [fingerprint(read("historical.pem"))]: { roles: ["cas-historical-admit"],
-        scopes: [wire(scope)] },
-      [fingerprint(read("denied.pem"))]: { roles: ["head"], scopes: [wire(scope)] },
-    },
-  });
-  await new Promise((resolve) => witnessServer.listen(0, "127.0.0.1", resolve));
+  if (!witnessServer.listening) {
+    await new Promise((resolve, reject) => {
+      witnessServer.once("listening", resolve);
+      witnessServer.once("error", reject);
+    });
+  }
   cleanups.push(() => drainZk1WitnessHttpsServer(witnessServer));
   const body = (candidate, nonce) => ({
     envelope: candidate, scope: wire(scope),

@@ -14,6 +14,63 @@ const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor")
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
 const { Zk1WitnessCasAnchorFloor } = require("../src/services/zk1WitnessCasAnchorFloor");
 
+test("standalone denies mutable JSON historical issuer without an independent authority", async (t) => {
+  const dir = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("rootark-standalone-historical-denied-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  generateNativeFixtureCertificates(dir, { caSubject: "Historic Standalone Denial CA",
+    servers: ["server"], clients: ["client"] });
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const status = crypto.generateKeyPairSync("ed25519");
+  const witnessPath = path.join(dir, "witness.key");
+  const statusPath = path.join(dir, "status.pub");
+  fs.writeFileSync(witnessPath, witness.privateKey.export({ type: "pkcs8", format: "pem" }));
+  fs.writeFileSync(statusPath, status.publicKey.export({ type: "spki", format: "pem" }));
+  const fingerprint = new crypto.X509Certificate(fs.readFileSync(path.join(dir, "client.pem"))).fingerprint256;
+  const scope = { account_id: crypto.randomBytes(16).toString("base64url"),
+    compartment_id: Buffer.from("private").toString("base64url"),
+    keyring_id: crypto.randomBytes(16).toString("base64url") };
+  const config = {
+    listenHost: "127.0.0.1", listenPort: 0, bootstrapNew: true,
+    dbPath: path.join(dir, "witness.sqlite"),
+    witnessKeyId: crypto.randomBytes(16).toString("base64url"),
+    witnessPrivateKeyPath: witnessPath,
+    statusKeyId: crypto.randomBytes(16).toString("base64url"),
+    statusPublicKeyPath: statusPath,
+    serverKeyPath: path.join(dir, "server.key"),
+    serverCertPath: path.join(dir, "server.pem"),
+    clientCaPath: path.join(dir, "ca.pem"),
+    principals: { [fingerprint]: { roles: ["cas-historical-admit"], scopes: [scope] } },
+    cas: { endpoint: "https://localhost:44300/v1/terminal",
+      caPath: path.join(dir, "ca.pem"), clientKeyPath: path.join(dir, "client.key"),
+      clientCertPath: path.join(dir, "client.pem"),
+      serverFingerprint256: new crypto.X509Certificate(
+        fs.readFileSync(path.join(dir, "server.pem"))).fingerprint256 },
+    casAnchorFloor: { dbPath: path.join(dir, "cas-floor.sqlite"),
+      trustedMinimumHead: { sequence: 0, lastHash: "0".repeat(64) } },
+  };
+  const childConfig = path.join(dir, "config.json");
+  fs.writeFileSync(childConfig, JSON.stringify(config));
+  const env = { ...process.env };
+  delete env.ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256;
+  delete env.ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256;
+  const child = spawn(process.execPath, [
+    path.resolve(__dirname, "../scripts/zk1-witness-standalone.js"),
+    "--config", childConfig], { stdio: ["ignore", "pipe", "pipe", "ipc"],
+    windowsHide: true, env });
+  const chunks = [];
+  child.stderr.on("data", (part) => chunks.push(part));
+  const exited = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(Error("historic CLI did not fail closed")); }, 5000);
+    child.once("exit", (code) => { clearTimeout(timer); resolve(code); });
+    child.once("error", reject);
+  });
+  assert.notEqual(exited, 0);
+  assert.equal(Buffer.concat(chunks).toString().trim(), "WITNESS_STARTUP_FAILED");
+  assert.equal(fs.existsSync(config.dbPath), false);
+  assert.equal(fs.existsSync(config.casAnchorFloor.dbPath), false);
+});
+
 test("actual standalone witness refuses signed-prefix floor rollback against separately owner-pinned head", async (t) => {
   // A runner's TEMP can be a junction or have an unsafe inherited DACL.
   const dir = require("./support/issue-65-private-authority-fixture")

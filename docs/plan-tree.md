@@ -20,6 +20,59 @@ authority. Windows Node 22 targeted RED was `503 !== 201`, corrected targeted
 GREEN **1/1**, full Phase 16 **28/28**; Windows Node 24 targeted **1/1**.
 Hosted release-gate revalidation remains necessary; the PR stays DRAFT / NO-GO.
 
+## Issue #65 / standalone histórico estrito com autoridade externa (2026-10-25)
+
+`scripts/zk1-witness-standalone.js` permite agora injeção **somente em memória**
+de autoridade histórica através de `serve(config, { historicalAuthority })`.
+O comando legado `node scripts/zk1-witness-standalone.js --config arquivo.json`
+**nunca** habilita emissão histórica e rejeita `cas-historical-admit` no JSON
+**antes de abrir qualquer SQLite ou ler chaves**. Isso impede que um editor do
+JSON atribua a si mesmo o papel histórico ou retire a exigência externa.
+
+A *separate operator launcher*, hospedado com credenciais/permissions do
+operador fora do diretório modificável pelo writer, constrói e injeta um
+`Zk1WitnessCasPhysicalAdmission` real, instanciado com Ed25519 independentes
+de owner/inventário/PG, cliente PG read-only mTLS, cliente de inventário e
+snapshot mínimo autenticado. O objeto `historicalAuthority` **não é
+serializável em JSON**: exige exatamente `physicalAdmission`, função síncrona
+`trustedSyncDevicePolicyProvider` (estado vivo de revogações),
+`trustedMinimumHead` (sequence/lastHash/physicalFenceDigest),
+`trustedHistoricalAdmissionHead` (sequence/lastHash), pins `witnessPublicKey`
+e `statusPublicKey`, e `principals` contendo apenas certificados mTLS com o
+papel exclusivo `cas-historical-admit` e escopos explícitos. Os pins de
+identidade devem corresponder às chaves efetivamente carregadas pelo
+standalone, protegidas pelo verificador nativo de arquivos e ACL. O mínimo
+físico externo deve corresponder ao mínimo owner-autenticado legado. O
+emissor W2 reconsulta a política antes de emitir e antes do INSERT durável.
+
+Exemplo de chamada **somente do launcher externo confiável** (não adicione o
+módulo de autoridade, os pins ou paths secretos ao JSON editável):
+
+```js
+const { serve } = require("/operator/install/scripts/zk1-witness-standalone");
+const { buildHistoricalAuthority, loadPublicRuntimeConfig } =
+  require("/operator/private/owned-historical-bootstrap");
+const historicalAuthority = buildHistoricalAuthority();
+serve(loadPublicRuntimeConfig(), { historicalAuthority });
+```
+
+`buildHistoricalAuthority` e os paths `/operator/...` acima são **interfaces
+exemplificativas não fornecidas neste repositório**: a emissão física segura
+depende de provisionamento independente real pelo operador. O `serve` utiliza
+o mesmo listener TLS1.3, tratamento de sinais e mensagens de erro genéricas
+do CLI legado; nenhuma chave, pin ou caminho de segredo aparece nos logs.
+Uma configuração sem injeção, um papel histórico adicionado no JSON, pins
+incoerentes, falta de escopo, retirada do floor ou rollback do high-water
+externo são rejeitados antes de abrir os bancos no modo estrito.
+
+O laboratório opt-in `--historical-e2e-only` foi adaptado para chamar este
+`configure` de standalone com autoridade externa enquanto executa
+PostgreSQL18 real, assinatura PG em processo read-only separado, witness
+SQLite e consumidor Sync v2 sobre mTLS. Isso não constitui implantação real
+com custódia remota e não prova durabilidade externa/multi-host, atomicidade
+PG×SQLite nem piso antirrollback atualizado após cada nova emissão. O PR #228
+continua DRAFT/NO-GO produção.
+
 ## Issue #65 / PR #228: protected Sync v2 atomic revocation ingress gate (2026-10-25)
 
 **Security follow-up (independent W15 P1/P2 review).** The legacy direct-store
