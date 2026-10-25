@@ -1269,6 +1269,10 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     h.physicalAttestorClient.requestAttestation = async (request) => {
       calls += 1;
       if (calls === 2) entered();
+      // A regression in the server's denied-lease cleanup could admit the
+      // writer into a third physical readback. Fail it immediately rather
+      // than leaving the test blocked forever on the controlled barrier.
+      if (calls > 2) throw new Error("Unexpected third physical lease");
       await blocked;
       return original(request);
     };
@@ -1290,8 +1294,16 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       secondSettled = h.makeClient("writer").append({ ...appendInput,
         nonce: crypto.randomBytes(32) }).then(
         (value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.equal(calls, 2);
+      // The earlier fixed 50 ms sleep raced with TLS/HTTP scheduling under
+      // concurrent test load: the second request could arrive only after
+      // finally released both held leases, and legitimately append. Observe
+      // the actual denied HTTP response BEFORE releasing either lease.
+      const deniedWhileHeld = await secondSettled;
+      assert.equal(deniedWhileHeld.ok, false,
+        "a writer must be denied while two other principals hold active leases");
+      assert.equal(deniedWhileHeld.error.code, "INVENTORY_HTTP_UNAVAILABLE");
+      assert.equal(calls, 2,
+        "a rejected writer must never reach a third physical attestation");
     } finally {
       release();
       h.physicalAttestorClient.requestAttestation = original;
