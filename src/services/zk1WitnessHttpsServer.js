@@ -8,6 +8,7 @@
 const https = require("node:https");
 const crypto = require("node:crypto");
 const z = require("../crypto/rootark-zk-1");
+const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 
 const MAX_BODY_BYTES = 4096;
 const GENESIS_DOMAIN = Buffer.from("Root.ark/zk-1/witness-genesis-authorization/v1\0", "ascii");
@@ -22,6 +23,7 @@ const ROLES = Object.freeze({
   "/v1/admission/finish": "admit",
   "/v1/cas-anchor/head": "cas-anchor",
   "/v1/cas-anchor/advance": "cas-anchor",
+  "/v1/cas-anchor/historical-admit": "cas-historical-admit",
 });
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OP_FIELDS = Object.freeze([
@@ -155,7 +157,12 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
     // This principal can advance the GLOBAL CAS terminal high-water. Never
     // co-grant it a content/recovery reserve/head/IO role, and never silently
     // accept it when the separate witness-owned floor is not configured.
-    if (roles.includes("cas-anchor")
+    if (roles.includes("cas-historical-admit")
+      ? roles.length !== 1 || scopes.length < 1 || initializeKeys.length !== 0
+        || !casAnchorFloor || !casAnchorFloor.requiresPhysicalAttestation
+        || casAnchorFloor.supportsClientHistoricalNonce !== true
+        || typeof casAnchorFloor.issueSyncHistoricalAdmission !== "function"
+      : roles.includes("cas-anchor")
       ? roles.length !== 1 || scopes.length !== 0 || initializeKeys.length !== 0
         || !casAnchorFloor || typeof casAnchorFloor.advance !== "function"
         || typeof casAnchorFloor.freshHeadAsync !== "function"
@@ -196,9 +203,40 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
         return write(res, 403, { error: "FORBIDDEN" });
       }
       const body = await readBoundedJson(req,
-        req.url === "/v1/cas-anchor/advance"
+        req.url === "/v1/cas-anchor/historical-admit"
+          ? 12 * 1024 * 1024
+          : req.url === "/v1/cas-anchor/advance"
           ? (casAnchorFloor?.requiresPhysicalAttestation ? 96 * 1024 : 40 * 1024)
           : MAX_BODY_BYTES);
+      if (req.url === "/v1/cas-anchor/historical-admit") {
+        if (casAnchorFloor?.supportsClientHistoricalNonce !== true) invalid();
+        exact(body, ["envelope", "scope", "expectedSequence", "expectedRoot",
+          "inventoryReceipt", "nonce"]);
+        const scope = normalize(body.scope, SCOPE_FIELDS);
+        if (!granted.scopes.has(scopeKey(scope))) {
+          return write(res, 403, { error: "FORBIDDEN" });
+        }
+        const nonce = decode(body.nonce, BYTE_FIELDS.nonce);
+        if (!Number.isSafeInteger(body.expectedSequence) || body.expectedSequence < 0) invalid();
+        const input = { envelope: body.envelope, scope,
+          expectedSequence: body.expectedSequence,
+          expectedRoot: decode(body.expectedRoot, [32, 32]),
+          inventoryReceipt: decode(body.inventoryReceipt,
+            [1, inventory.MAX_COMMITTED_PROOF_BYTES]), nonce };
+        const issued = await casAnchorFloor.issueSyncHistoricalAdmission(input);
+        // A mismatched reply must never be delivered as proof of the caller's
+        // fresh challenge, even if the witness signed a different nonce.
+        if (!issued?.admission || !issued?.freshFloor
+          || issued.freshFloor.type !== "rootark-zk1-witness-cas-physical-floor/v2"
+          || issued.freshFloor.nonce !== nonce.toString("base64url")
+          || issued.admission.witnessSequence !== issued.freshFloor.sequence
+          || issued.admission.witnessLastHash !== issued.freshFloor.lastHash
+          || issued.admission.witnessPhysicalFenceDigest
+            !== issued.freshFloor.physicalFenceDigest) invalid();
+        return write(res, 200, { admission: issued.admission,
+          freshFloor: issued.freshFloor,
+          authority: "WITNESS_SYNC_HISTORICAL_ADMISSION_V1" });
+      }
       if (req.url === "/v1/cas-anchor/head") {
         exact(body, ["nonce"]);
         const head = await casAnchorFloor.freshHeadAsync({ nonce: decode(body.nonce, BYTE_FIELDS.nonce) });

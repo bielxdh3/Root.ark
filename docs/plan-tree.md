@@ -44,6 +44,40 @@ changes closed; only atomic mode receives a longer bounded writer-lock wait.
 The existing legacy mode remains unchanged.
 
 
+## Issue #65 / PR #228: dedicated mTLS transport for W2 historical issuer (2026-10-25)
+
+The isolated witness HTTPS server has an opt-in
+`POST /v1/cas-anchor/historical-admit` transport for the existing W2
+`Zk1WitnessCasAnchorFloor.issueSyncHistoricalAdmission()` service. No new
+receipt ledger, signing key or admission policy is introduced. The distinct,
+exclusive `cas-historical-admit` mTLS role requires exact provisioned scopes;
+neither the global `cas-anchor` role nor an unrelated scope can issue receipts.
+The endpoint accepts an exact 32-byte **client-generated nonce**, the canonical
+encrypted Sync v2 envelope, scope, checkpoint and bounded inventory receipt,
+and returns only the witness's admission and nonce-bound signed physical floor.
+The issued receipt must name precisely the returned floor, including physical
+fence digest; otherwise the endpoint denies the response. These checks do not
+replace the published client's Ed25519 and fresh PG-proof verifiers.
+
+**Critical W2 integration gate:** server configuration refuses to enroll the
+historical mTLS principal unless the real W2 witness core advertises
+`supportsClientHistoricalNonce === true`. This property MUST be an immutable
+read-only class getter enabled only when W2 pins the exact provided client nonce
+and uses it in the returned signed V2 physical floor. Older W2 commits which
+generate their own floor nonce are rejected at server startup **before** they
+can irreversibly persist a receipt that the client cannot authenticate. Do
+not set the capability with a mutable caller-supplied flag or bypass it.
+
+A real TLS 1.3 client-certificate test covers positive and negative roles,
+scope mismatch, malformed nonce, unrecognized fields, tampered signed floor,
+and cryptographic verification against the published Sync v2 historical
+consumer loaded from its own commit. The transport fixture signs test-only PG
+proofs; it does NOT prove real PostgreSQL18 fsync or external durability.
+This scoped patch alone does not make W2's historical issuer/PR #228 production
+ready. Cherry-pick **only the transport commit** onto W2's verified latest
+core, then run full issuer+TLS+consumer tests together. Do not combine the
+overlapping alternate W4 issuer SQLite schema.
+
 ## Issue #65 / PR #228: Windows Edge V2 IPv4 fixture binding (2026-10-24)
 
 The disposable positive Edge + strict mTLS CAS/witness fixture bound both HTTPS
