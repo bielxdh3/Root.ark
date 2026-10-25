@@ -13,6 +13,7 @@ const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const persisted = require("../public/client/rootark-zk1-persisted-portable-chunk-recovery");
+const nativeRoots = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const browser = require("../public/client/rootark-zk1-browser-recovery-http");
 
 const b64 = (raw) => Buffer.from(raw).toString("base64url");
@@ -72,6 +73,11 @@ async function fixture(t) {
     ciphertextRoot: Buffer.from(bundle.ciphertextRoot, "base64url"), issuedAt: 1421 });
   const ciphertext = Buffer.from(bundle.ciphertextBase64, "base64url");
   const chunks = [ciphertext.subarray(0, 65), ciphertext.subarray(65)];
+  const independentlyPinnedSourceChunkRoot = Buffer.from(
+    await nativeRoots.computeCiphertextRoot(chunks));
+  assert.notDeepEqual(independentlyPinnedSourceChunkRoot,
+    Buffer.from(bundle.ciphertextRoot, "base64url"),
+    "owner-pinned native two-chunk root cannot be substituted with the portable root");
   const inventory = await persisted.createSignedPersistedPortableChunkInventory({
     bundle, ownerSigningKey: owner.privateKey, ownerPublicKey: owner.publicKey,
     independentOwnerSpkiSha256, ownerHead: current,
@@ -97,6 +103,7 @@ async function fixture(t) {
     ownerRootCheckpoint: signedRoot, recoverySecret: secret, bundle,
     expectedMetadata: metadata,
     independentlyPinnedCiphertextRoot: Buffer.from(bundle.ciphertextRoot, "base64url"),
+    independentlyPinnedSourceChunkRoot,
     signedInventory: inventory,
     readChunk: async ({ index }) => {
       reads++;
@@ -128,11 +135,26 @@ test("independent trust absent refuses before ANY SQLite chunk access, even with
     { pinnedOwnerKeyHash: null },
     { pinnedCurrentHead: null },
     { independentlyPinnedCiphertextRoot: null },
+    { independentlyPinnedSourceChunkRoot: null },
     { ownerHistoryCheckpoint: null },
     { ownerRootCheckpoint: null },
   ]) await assert.rejects(browser.recoverFromOwnerSignedPersistedChunks({ ...f.input,
     ...modified }), /ZK_BROWSER_RECOVERY_EXTERNAL_TRUST_REQUIRED/);
   assert.equal(f.reads, 0);
+  f.secret.fill(0);
+});
+
+test("two-chunk source root must be independently pinned; forged bundle root cannot replace native root", async (t) => {
+  const f = await fixture(t);
+  assert.equal(f.input.independentlyPinnedSourceChunkRoot.length, 32);
+  const expected = /ZK_BROWSER_RECOVERY_HTTP_DENIED/;
+  await assert.rejects(browser.recoverFromOwnerSignedPersistedChunks({
+    ...f.input, independentlyPinnedSourceChunkRoot: f.input.independentlyPinnedCiphertextRoot,
+  }), expected, "signed portable ciphertext root is not the external native chunk root");
+  await assert.rejects(browser.recoverFromOwnerSignedPersistedChunks({
+    ...f.input, independentlyPinnedSourceChunkRoot: crypto.randomBytes(32),
+  }), expected, "wrong externally supplied native root cannot authorize plaintext");
+  assert.equal(f.reads, f.chunks.length * 2);
   f.secret.fill(0);
 });
 
@@ -185,10 +207,12 @@ test("experimental page explicitly loads the browser chunk API and keeps protect
   assert.match(html, /id="portable-offline-opt-in"/);
   assert.match(html, /id="portable-chunk-inventory"/);
   assert.match(html, /id="portable-chunks"[^>]*multiple/);
+  assert.match(html, /id="portable-source-chunk-root"/);
   assert.match(ui, /if \(offline\) \{/);
   assert.match(ui, /recoverFromOwnerSignedPersistedChunks/);
   assert.match(ui, /recoverFromOwnerSignedProtectedGet/);
   assert.match(ui, /ZK_BROWSER_RECOVERY_EXTERNAL_TRUST_REQUIRED/);
+  assert.match(ui, /independentlyPinnedSourceChunkRoot/);
 });
 
 test("real Edge opt-in UI refuses missing external pins and recovers signed local chunks without HTTP GET", {
@@ -219,6 +243,7 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
     ownerRoot: f.input.ownerRootCheckpoint,
     bundle: f.input.bundle, inventory: f.input.signedInventory,
     secret: b64(f.secret), root: b64(f.input.independentlyPinnedCiphertextRoot),
+    sourceRoot: b64(f.input.independentlyPinnedSourceChunkRoot),
     chunks: f.chunks.map(b64),
   };
   // Test-only disposable localhost fixture: no production HTTP routes, no
@@ -252,6 +277,7 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       document.getElementById("head-digest").value=v.ownerHead.digest;
       document.getElementById("head-epoch").value=v.ownerHead.epoch;
       document.getElementById("portable-root").value=v.root;
+      document.getElementById("portable-source-chunk-root").value=v.sourceRoot;
       document.getElementById("portable-offline-opt-in").checked=true;
     }
     try {
@@ -265,6 +291,13 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
         ownerPublicKey:ownerKey,independentOwnerSpkiSha256:decode(v.ownerSpki),
         pinnedCurrentHead:{revision:v.ownerHead.revision,digest:decode(v.ownerHead.digest),epoch:v.ownerHead.epoch},
         signedDeviceGrant:v.grant,ownerHistoryCheckpoint:v.ownerHistory,previousOwnerHistoryProof:null});
+      document.getElementById("portable-source-chunk-root").value="";
+      document.getElementById("portable-restore").click();await pause(130);
+      if(!status().includes("faltam pins externos")||downloads!==0)
+        throw Error("MISSING_NATIVE_PIN_NOT_CLOSED:"+status()+":"+downloads);
+      // A rejected restore deliberately clears local File inputs, so a
+      // second attempt must explicitly reselect those offline files.
+      prepare();
       document.getElementById("portable-restore").click();
       for(let i=0;i<100;i++){await pause(70);if(status().includes("Recuperação local concluída")||lastError)break;}
       if(!status().includes("Recuperação local concluída")||downloads!==1)

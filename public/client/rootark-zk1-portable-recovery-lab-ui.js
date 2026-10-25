@@ -242,6 +242,7 @@
         || !find("head-revision")?.value.trim()
         || !find("head-epoch")?.value.trim()
         || !find("portable-root")?.value.trim()
+        || !find("portable-source-chunk-root")?.value.trim()
         || !find("owner-history")?.files?.length
         || !find("portable-owner-root")?.files?.length
         || !find("portable-chunk-inventory")?.files?.length
@@ -259,6 +260,11 @@
       const independentlyPinnedCiphertextRoot =
         decode64(find("portable-root").value.trim());
       if (offline) {
+        // Source chunks need their own externally retained native root.
+        // Never derive this trust pin from the inventory, bundle, or server.
+        const independentlyPinnedSourceChunkRoot =
+          decode64(find("portable-source-chunk-root").value.trim());
+        if (independentlyPinnedSourceChunkRoot.length !== 32) deny();
         const inventory = JSON.parse(text.decode(
           await fileBytes("portable-chunk-inventory", 2, 16384)));
         const chunks = Array.from(find("portable-chunks").files || []);
@@ -283,6 +289,7 @@
           previousOwnerHistoryProof: ctx.previousOwnerHistoryProof,
           recoverySecret: secret, bundle,
           expectedMetadata: bundle.metadata, independentlyPinnedCiphertextRoot,
+          independentlyPinnedSourceChunkRoot,
           ownerRootCheckpoint,
           ownerSignerKeyId: ownerRootCheckpoint.signer_key_id,
           ownerDeviceId: ownerRootCheckpoint.device_id,

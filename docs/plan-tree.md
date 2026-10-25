@@ -1,5 +1,28 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: browser offline native source-root contract (2026-10-25)
+
+After native two-chunk source-root verification became mandatory in
+`rootark-zk1-persisted-portable-chunk-recovery`, the outer browser coordinator
+still omitted `independentlyPinnedSourceChunkRoot`. The existing standalone
+SQLite/owner-signature cryptography remained fail-closed, but all real offline
+browser restore attempts were denied, including the opt-in Edge UI. The
+development-only browser coordinator now requires and passes this distinct
+**externally supplied** 32-byte native source-root pin, without defaulting to
+the bundle's portable ciphertext root, signed inventory, fetched server data
+or hashes calculated from locally supplied chunks. The opt-in lab form has a
+separate manual input for that pinned native source root; the existing online
+protected GET mode is unchanged.
+
+Windows Node 24 TDD reproduced the integrated regression (4 FAIL/2 PASS);
+real Edge and isolated SQLite after the fix verify owner Ed25519, all native
+two-chunk hashes/root, the portable root, external pins and final liveness,
+including explicit missing-root rejection without a download. Wrong native
+pin and substituting the portable root remain fail-closed. This verifies only
+the equality to the operator-supplied pin, **not its independent provenance**;
+missing live remote witness/CAS and external storage durability remain
+out-of-scope. PR #228 stays DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: Windows release-gate Phase 16 authorization fixture (2026-10-25)
 
 At hosted SHA `37efce2`, Windows Node 22 mandatory release gate job

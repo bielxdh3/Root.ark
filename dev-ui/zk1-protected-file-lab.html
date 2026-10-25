@@ -86,12 +86,15 @@
       <button id="portable-restore" type="button">Recuperar por GET protegido e baixar arquivo</button>
       <label for="portable-offline-opt-in"><input id="portable-offline-opt-in" type="checkbox">
       Recuperar localmente dos chunks cifrados que selecionei (opt-in; sem GET do servidor)</label>
+      <label for="portable-source-chunk-root">Raiz NATIVA dos chunks selecionados (SHA-256, base64url 32 bytes; pin externo independente e distinto da raiz portátil)</label>
+      <input id="portable-source-chunk-root" type="text" maxlength="43" autocomplete="off" spellcheck="false">
       <label for="portable-chunk-inventory">Inventário Ed25519 dos chunks (.json, assinado pelo proprietário)</label>
       <input id="portable-chunk-inventory" type="file" accept=".json,application/json">
       <label for="portable-chunks">Chunks cifrados locais em ordem de índice 0, 1, ... (selecione todos, múltiplos arquivos)</label>
       <input id="portable-chunks" type="file" multiple accept=".bin,application/octet-stream">
       <p class="notice">No modo local, o navegador exige TODOS os pins externos da seção 1,
-      o checkpoint histórico e a raiz assinada pelo proprietário, além do piso local já
+      o checkpoint histórico, a raiz portátil assinada pelo proprietário e a raiz NATIVA
+      dos chunks retida fora do servidor, além do piso local já
       provisionado. Se faltar qualquer âncora externa, a recuperação é recusada. Nenhuma
       informação fornecida pelo servidor substitui esses pins. A ordem dos chunks
       selecionados deve corresponder exatamente ao inventário assinado. A verificação

@@ -234,13 +234,15 @@
       "devicePublicKey", "devicePrivateKey", "ownerHistoryCheckpoint",
       "previousOwnerHistoryProof", "ownerSignerKeyId", "ownerDeviceId",
       "ownerRootCheckpoint", "recoverySecret", "bundle", "expectedMetadata",
-      "independentlyPinnedCiphertextRoot", "signedInventory", "readChunk", "assertLive"];
+      "independentlyPinnedCiphertextRoot", "independentlyPinnedSourceChunkRoot",
+      "signedInventory", "readChunk", "assertLive"];
     async function recoverFromOwnerSignedPersistedChunks(input) {
       let opened;
       try {
         if (!input || !input.ownerPublicKey || !input.pinnedOwnerKeyHash
           || !input.independentOwnerSpkiSha256 || !input.pinnedCurrentHead?.digest
-          || !input.independentlyPinnedCiphertextRoot || !input.ownerHistoryCheckpoint
+          || !input.independentlyPinnedCiphertextRoot
+          || !input.independentlyPinnedSourceChunkRoot || !input.ownerHistoryCheckpoint
           || !input.ownerRootCheckpoint || !input.signedInventory
           || typeof input.readChunk !== "function"
           || typeof input.assertLive !== "function") {
@@ -305,6 +307,7 @@
           expectedOwnerHead: input.pinnedCurrentHead,
           expectedMetadata: metadata,
           independentlyPinnedCiphertextRoot: input.independentlyPinnedCiphertextRoot,
+          independentlyPinnedSourceChunkRoot: input.independentlyPinnedSourceChunkRoot,
           recoverySecret: input.recoverySecret,
           readChunk: input.readChunk, assertLive: input.assertLive,
         });
