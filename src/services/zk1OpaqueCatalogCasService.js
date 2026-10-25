@@ -3,10 +3,10 @@
 // Explicitly configured standalone authority. Run on an independently
 // administered host and keep signer PEM / floor outside the protected-content
 // app's credentials and SQLite. Never provision a key automatically here.
-const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const net = require("node:net");
+const { readAuthorityPinnedFile } = require("./zk1AuthorityPinnedFile");
 const { Zk1OpaqueCatalogCasLedger } = require("./zk1OpaqueCatalogCasLedger");
 const { createZk1OpaqueCatalogCasHttpsServer } =
   require("./zk1OpaqueCatalogCasHttpsServer");
@@ -31,24 +31,13 @@ function strict(value, fields) {
     || fields.some((field) => !Object.hasOwn(value, field))) deny();
 }
 function readBounded(filename, maximum = 65536) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) deny();
-  let fd;
   try {
-    const named = fs.lstatSync(filename, { bigint: true });
-    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n
-      || named.size < 1n || named.size > BigInt(maximum)) deny();
-    fd = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const before = fs.fstatSync(fd, { bigint: true });
-    if (before.dev !== named.dev || before.ino !== named.ino
-      || before.size !== named.size || before.mtimeNs !== named.mtimeNs) deny();
-    const raw = fs.readFileSync(fd);
-    const after = fs.fstatSync(fd, { bigint: true });
-    if (raw.length !== Number(named.size) || after.dev !== before.dev
-      || after.ino !== before.ino || after.size !== before.size
-      || after.mtimeNs !== before.mtimeNs) deny();
+    // Authority material is not ordinary input: verify its owner-only ACL,
+    // ancestor identity and unchanged named file across the bounded FD read.
+    const raw = readAuthorityPinnedFile(filename);
+    if (raw.length > maximum) deny();
     return raw;
   } catch (_) { deny(); }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 function decode(value, min, max = min) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) deny();

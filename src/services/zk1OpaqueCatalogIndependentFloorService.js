@@ -2,10 +2,10 @@
 
 // Provision this service on a separately administered host. Never co-locate
 // its signing key, TLS identity or durable database with the catalog CAS DB.
-const fs = require("node:fs");
 const path = require("node:path");
 const net = require("node:net");
 const crypto = require("node:crypto");
+const { readAuthorityPinnedFile } = require("./zk1AuthorityPinnedFile");
 const { createZk1WitnessHttpsClient } = require("./zk1WitnessHttpsClient");
 const { Zk1OpaqueCatalogIndependentFloorLedger,
   createZk1OpaqueCatalogIndependentFloorHttpsServer } =
@@ -27,24 +27,13 @@ function exact(value, fields) {
     || fields.some((k) => !Object.hasOwn(value, k))) fail();
 }
 function read(filename, maximum = 65536) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) fail();
-  let fd;
   try {
-    const named = fs.lstatSync(filename, { bigint: true });
-    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n
-      || named.size < 1n || named.size > BigInt(maximum)) fail();
-    fd = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const before = fs.fstatSync(fd, { bigint: true });
-    if (before.dev !== named.dev || before.ino !== named.ino
-      || before.size !== named.size || before.mtimeNs !== named.mtimeNs) fail();
-    const raw = fs.readFileSync(fd);
-    const after = fs.fstatSync(fd, { bigint: true });
-    if (raw.length !== Number(named.size) || after.dev !== before.dev
-      || after.ino !== before.ino || after.size !== before.size
-      || after.mtimeNs !== before.mtimeNs) fail();
+    // Keep startup signing/TLS material subject to the exact same ancestry,
+    // DACL and descriptor/path pinning as the standalone witness authority.
+    const raw = readAuthorityPinnedFile(filename);
+    if (raw.length > maximum) fail();
     return raw;
   } catch (_) { fail(); }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 function decode(text, min, max = min) {
   if (typeof text !== "string" || !/^[A-Za-z0-9_-]+$/.test(text)) fail();

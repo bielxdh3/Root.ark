@@ -45,3 +45,24 @@ This prevents the scoped substitution but does not establish trusted
 ancestor ACLs against arbitrary service-principal compromise or any
 independent hardware/remote durable witness. A future CodeQL rerun
 and review of remaining alerts remain necessary before production GO.
+
+## Follow-up: independent opaque CAS/floor startup readers
+
+At the later CodeQL policy check 121248957734 (analyzed commit a2a032dc),
+the policy still reported 61 high and 39 medium annotations. Its high
+filesystem-race annotations included the standalone opaque CAS and independent
+floor service readers (`src/services/zk1OpaqueCatalogCasService.js:40` and
+`src/services/zk1OpaqueCatalogIndependentFloorService.js:36`). Unlike the two
+already corrected standalone witness/CAS scripts, these two services kept
+separate `lstat -> open -> fstat -> read` logic and accepted public-readable
+operator key material or a symlinked/junction parent path. Their operator
+Ed25519/TLS/CA/config file readers now use `readAuthorityPinnedFile` with
+owner-only ACL, safe ancestors, bounded fd read, and named-file identity
+revalidation. The caller retains its existing generic configuration denial.
+
+Actual Windows tests exercise normal private material (allowed), an explicit
+untrusted Users read ACE (denied), and an ancestor junction (denied) for both
+CAS and floor entrypoints. This is an isolated loader hardening, not proof of
+CodeQL policy clearance, remote durability, or security against a compromised
+privileged service account. Operator configuration, public-key and CA files
+must also have private permissions where used as authority trust material.
