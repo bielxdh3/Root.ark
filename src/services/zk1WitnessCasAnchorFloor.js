@@ -164,13 +164,19 @@ class Zk1WitnessCasAnchorFloor {
   #advanceQueue = Promise.resolve();
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
+  #trustedSyncDevicePolicyProvider;
   constructor(filename, { bootstrapNew = false, witnessKeyId, witnessPrivateKey,
     statusKeyId, statusPublicKey, trustedMinimumHead,
     attestedAdmission = null, enableSyncHistoricalIssuer = false,
-    trustedHistoricalAdmissionHead } = {}) {
+    trustedHistoricalAdmissionHead, trustedSyncDevicePolicyProvider } = {}) {
     if (typeof enableSyncHistoricalIssuer !== "boolean"
-      || (enableSyncHistoricalIssuer && !attestedAdmission)) fail();
+      || (enableSyncHistoricalIssuer && (!attestedAdmission
+        || typeof trustedSyncDevicePolicyProvider !== "function"))) fail();
     this.#historicalEnabled = enableSyncHistoricalIssuer;
+    // Operator-supplied trust context, independent of the incoming request:
+    // remote callers may NEVER provide their own device pins or revocations.
+    this.#trustedSyncDevicePolicyProvider = enableSyncHistoricalIssuer
+      ? trustedSyncDevicePolicyProvider : null;
     if (enableSyncHistoricalIssuer && !bootstrapNew) {
       if (!trustedHistoricalAdmissionHead) fail();
       const pinned = exact(trustedHistoricalAdmissionHead, ["sequence", "lastHash"]);
@@ -684,10 +690,13 @@ class Zk1WitnessCasAnchorFloor {
   async #issueSyncSerial(input) {
     try {
       const v = exact(input, ["envelope", "scope", "expectedSequence",
-        "expectedRoot", "inventoryReceipt", "localTrustedDevicePolicy"]);
+        "expectedRoot", "inventoryReceipt"]);
       const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence,
         v.expectedRoot);
-      const policy = snapshotLocalDevicePolicy(v.localTrustedDevicePolicy);
+      // The trusted operator must provide a synchronous current policy, not
+      // attacker-chosen `input.localTrustedDevicePolicy` or mutable disk JSON.
+      const policy = snapshotLocalDevicePolicy(this.#trustedSyncDevicePolicyProvider());
+      const policySnapshot = JSON.stringify(policy);
       if ((!Buffer.isBuffer(v.inventoryReceipt)
         && !(v.inventoryReceipt instanceof Uint8Array))
         || v.inventoryReceipt.length < 1 || v.inventoryReceipt.length > 8192) fail();
@@ -743,6 +752,11 @@ class Zk1WitnessCasAnchorFloor {
       };
       const signature = crypto.sign(null, Buffer.concat([HISTORICAL_SYNC_DOMAIN,
         Buffer.from(JSON.stringify(unsigned))]), this.#witness);
+      // Crossing the device expiry while signing means we never admitted the
+      // operation on time, even if the Ed25519 signature is authentic.
+      const signedAtMs = Date.now();
+      if (!Number.isSafeInteger(signedAtMs) || signedAtMs < admittedAtMs
+        || signedAtMs >= bound.envelope.authorization.expiresAt) fail();
       const admission = Object.freeze({ ...unsigned,
         signature: signature.toString("base64url") });
       const serialized = JSON.stringify(admission);
@@ -754,6 +768,17 @@ class Zk1WitnessCasAnchorFloor {
       this.#db.transaction(() => {
         if (this.#db.prepare("SELECT COUNT(*) AS n FROM witness_cas_sync_historical_admission")
             .get().n !== previous.sequence) fail();
+        // The final authorization decision is inside the very same immediate
+        // SQLite transaction that persists this signed admission. No await or
+        // asynchronous callback may intervene between this check and INSERT.
+        const commitAtMs = Date.now();
+        if (!Number.isSafeInteger(commitAtMs) || commitAtMs < admittedAtMs
+          || commitAtMs >= bound.envelope.authorization.expiresAt
+          || !Number.isSafeInteger(composite.physicalIssuedAt)
+          || Math.abs(Math.floor(commitAtMs / 1000)
+            - composite.physicalIssuedAt) > 30
+          || JSON.stringify(snapshotLocalDevicePolicy(
+            this.#trustedSyncDevicePolicyProvider())) !== policySnapshot) fail();
         this.#db.prepare("INSERT INTO witness_cas_sync_historical_admission"
           + " (sequence,operation_id,previous_hash,receipt,hash) VALUES(?,?,?,?,?)")
           .run(previous.sequence + 1, unsigned.operationId,

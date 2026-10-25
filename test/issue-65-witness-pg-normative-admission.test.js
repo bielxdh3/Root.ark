@@ -236,24 +236,117 @@ test("strict CAS witness floor refuses signed status advance without independent
   // A forged writer ACK, unrelated physical operation or user-supplied floor
   // cannot manufacture this witness-signed admission.
   const historicalFilename = path.join(directory, "witness-historical-sync.sqlite");
+  let trustedDeviceRevocations = [];
+  const trustedSyncDevicePolicyProvider = () => ({ username: "owner",
+    trustedDevicePublicKeys: { "device-a": deviceSpki },
+    revokedDeviceIds: [...trustedDeviceRevocations] });
   const historicalOptions = {
     witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
-    enableSyncHistoricalIssuer: true,
+    enableSyncHistoricalIssuer: true, trustedSyncDevicePolicyProvider,
   };
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    path.join(directory, "forbidden-policyless-issuer.sqlite"), {
+      witnessKeyId, witnessPrivateKey: witness.privateKey,
+      statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+      enableSyncHistoricalIssuer: true, bootstrapNew: true,
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+  "historical issuer must never bootstrap without an operator-controlled policy source");
   let historical = new Zk1WitnessCasAnchorFloor(historicalFilename, {
     ...historicalOptions, bootstrapNew: true });
   await historical.advanceAttested({ records: [record], evidence: [evidence] });
   const issueInput = { envelope: syncEnvelope, scope, expectedSequence: 0,
-    expectedRoot: genesisRoot, inventoryReceipt: receipt,
-    localTrustedDevicePolicy: { username: "owner", trustedDevicePublicKeys: {
-      "device-a": deviceSpki }, revokedDeviceIds: [] } };
+    expectedRoot: genesisRoot, inventoryReceipt: receipt };
   await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
-    localTrustedDevicePolicy: { ...issueInput.localTrustedDevicePolicy,
-      revokedDeviceIds: ["device-a"] } }), /WITNESS_CAS_FLOOR_DENIED/);
+    localTrustedDevicePolicy: { username: "owner", trustedDevicePublicKeys: {
+      "device-a": deviceSpki }, revokedDeviceIds: [] } }), /WITNESS_CAS_FLOOR_DENIED/,
+  "caller-selected device policy is not a trusted witness configuration");
+  trustedDeviceRevocations = ["device-a"];
+  await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+    /WITNESS_CAS_FLOOR_DENIED/, "an owner-revoked device cannot issue historical receipts");
+  trustedDeviceRevocations = [];
   await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
     inventoryReceipt: Buffer.from("untrusted-user-ACK") }),
   /WITNESS_CAS_FLOOR_DENIED/);
+  assert.deepEqual(historical.historicalAdmissionHead(), {
+    sequence: 0, lastHash: "0".repeat(64) });
+  // A successfully completed witness Ed25519 signature is NOT enough: the
+  // device authorization may expire before the durable SQLite INSERT.
+  const originalWitnessSign = crypto.sign;
+  const originalClock = Date.now;
+  const expiryDomain = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
+  let signedBeforeExpiry = false;
+  crypto.sign = (...args) => {
+    const signed = originalWitnessSign(...args);
+    if (Buffer.isBuffer(args[1]) && args[1].subarray(0, expiryDomain.length).equals(expiryDomain)) {
+      signedBeforeExpiry = true;
+      Date.now = () => syncEnvelope.authorization.expiresAt + 1;
+    }
+    return signed;
+  };
+  try {
+    await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      "a device expiring immediately after witness signature cannot get a durable admission");
+  } finally {
+    crypto.sign = originalWitnessSign;
+    Date.now = originalClock;
+  }
+  assert.equal(signedBeforeExpiry, true,
+    "the adversarial fixture must cross expiry specifically AFTER signing");
+  assert.deepEqual(historical.historicalAdmissionHead(), {
+    sequence: 0, lastHash: "0".repeat(64) },
+  "expired post-sign admission must leave no persisted receipt or high-water advance");
+  // If a trusted owner revokes the device during independent PG/SQLite work,
+  // the final transaction must not persist a now-revoked signed operation.
+  let revokedAtSign = false;
+  crypto.sign = (...args) => {
+    const signed = originalWitnessSign(...args);
+    if (Buffer.isBuffer(args[1]) && args[1].subarray(0, expiryDomain.length).equals(expiryDomain)) {
+      trustedDeviceRevocations = ["device-a"];
+      revokedAtSign = true;
+    }
+    return signed;
+  };
+  try {
+    await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      "revocation between original validation and the SQLite transaction must fail closed");
+  } finally {
+    crypto.sign = originalWitnessSign;
+    trustedDeviceRevocations = [];
+  }
+  assert.equal(revokedAtSign, true);
+  assert.deepEqual(historical.historicalAdmissionHead(), {
+    sequence: 0, lastHash: "0".repeat(64) });
+  // A second adversarial interleaving passes the post-sign check and crosses
+  // expiry AFTER the SQLite .immediate transaction has already started.
+  const originalDbPrepare = Database.prototype.prepare;
+  let crossedInsideTransaction = false;
+  Database.prototype.prepare = function (sql, ...args) {
+    const prepared = originalDbPrepare.call(this, sql, ...args);
+    if (sql !== "SELECT COUNT(*) AS n FROM witness_cas_sync_historical_admission") {
+      return prepared;
+    }
+    return new Proxy(prepared, { get(target, name) {
+      if (name !== "get") return Reflect.get(target, name);
+      return (...params) => {
+        const result = target.get(...params);
+        crossedInsideTransaction = true;
+        Date.now = () => syncEnvelope.authorization.expiresAt + 1;
+        return result;
+      };
+    } });
+  };
+  try {
+    await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      "device expiration inside SQLite .immediate transaction must roll back");
+  } finally {
+    Database.prototype.prepare = originalDbPrepare;
+    Date.now = originalClock;
+  }
+  assert.equal(crossedInsideTransaction, true);
   assert.deepEqual(historical.historicalAdmissionHead(), {
     sequence: 0, lastHash: "0".repeat(64) });
   const issued = await historical.issueSyncHistoricalAdmission(issueInput);
@@ -558,6 +651,7 @@ test("strict CAS witness floor refuses signed status advance without independent
       bootstrapNew: true, witnessKeyId, witnessPrivateKey: witness.privateKey,
       statusKeyId, statusPublicKey: status.publicKey,
       attestedAdmission: endToEndAdmission, enableSyncHistoricalIssuer: true,
+      trustedSyncDevicePolicyProvider,
     });
   try {
     assert.equal((await remoteFloor.advanceAttested({

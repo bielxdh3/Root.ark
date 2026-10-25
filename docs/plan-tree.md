@@ -656,6 +656,12 @@ Duplicate issuance and missing/tampered historical rows fail closed.
 The issuer has no default HTTP/Sync CLI wiring, grants no historical-read or
 I/O permission by itself, and the receipt still needs a fresh independent
 witness/physical check by a separately pinned client before historical use.
+The issuer requires a witness-constructor-injected, operator-controlled
+**synchronous** `trustedSyncDevicePolicyProvider` rather than a remote
+operation's mutable device-policy object. Policy is re-read at commit, and
+both the current signed device expiration and physical proof freshness are
+rechecked inside the SQLite immediate transaction **directly before INSERT**;
+post-Ed25519-signature expiration and late device revocation fail closed.
 Focused tests exercise signed and revoked device envelopes, forged inventory
 proofs, operation/floor mismatch, replay, SQLite rewind/restart and a real
 mTLS peer in a separate OS child **whose PostgreSQL readback is simulated**.
