@@ -404,11 +404,11 @@ test("an inaccessible private SQLite snapshot cleanup cannot leave PROVEN eviden
 
 test("legacy SQLite bytes are staged only after proving a private directory, never in the ordinary system temp root", async (t) => {
   const f = await fixture(t);
-  const original = fs.writeFileSync;
+  const original = fs.openSync;
   let protectedStage = 0;
   let hookFailure;
   try {
-    fs.writeFileSync = function (target, content, options) {
+    fs.openSync = function (target, ...args) {
       if (typeof target === "string" && path.basename(target) === "image.sqlite") {
         try {
         protectedStage++;
@@ -419,7 +419,8 @@ test("legacy SQLite bytes are staged only after proving a private directory, nev
           assert.equal(path.resolve(parent).toLowerCase().startsWith(
             path.resolve(os.tmpdir()).toLowerCase() + path.sep), false,
           "ordinary Windows temp has untrusted inherited Modify principals");
-          const acl = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive",
+          const acl = spawnSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            ["-NoLogo", "-NoProfile", "-NonInteractive",
             "-ExecutionPolicy", "Bypass", "-File",
             path.resolve(__dirname, "../scripts/zk1-legacy-private-snapshot-acl.ps1"),
             "-Action", "verify", "-Directory", parent], {
@@ -432,21 +433,21 @@ test("legacy SQLite bytes are staged only after proving a private directory, nev
         }
         } catch (error) { hookFailure = error; throw error; }
       }
-      return original.call(fs, target, content, options);
+      return original.call(fs, target, ...args);
     };
     const report = await scan(f);
     if (hookFailure) throw hookFailure;
     assert.equal(report.sections.sqlite.status, "PROVEN", "private stage hook executed " + protectedStage + " time(s)");
     assert.ok(protectedStage > 0, "a fresh private descriptor-bound database image is required");
     assert.equal(report.sections.versions.status, "PROVEN");
-  } finally { fs.writeFileSync = original; }
+  } finally { fs.openSync = original; }
 });
 
 test("hostile temporary ancestor never receives plaintext SQLite bytes", async (t) => {
   const f = await fixture(t);
   const hostileParent = path.join(f.root, "hostile-stage");
   fs.mkdirSync(hostileParent);
-  const originalWrite = fs.writeFileSync;
+  const originalWrite = fs.openSync;
   const originalTmpdir = os.tmpdir;
   const previousLocal = process.env.LOCALAPPDATA;
   let wrote = false;
@@ -464,7 +465,7 @@ test("hostile temporary ancestor never receives plaintext SQLite bytes", async (
       fs.chmodSync(hostileParent, 0o777);
       os.tmpdir = () => hostileParent;
     }
-    fs.writeFileSync = function (filename, ...rest) {
+    fs.openSync = function (filename, ...rest) {
       if (typeof filename === "string" && path.basename(filename) === "image.sqlite") wrote = true;
       return originalWrite.call(fs, filename, ...rest);
     };
@@ -474,7 +475,7 @@ test("hostile temporary ancestor never receives plaintext SQLite bytes", async (
     assert.equal(wrote, false, "never stage a sensitive SQLite copy below an untrusted ancestor");
     assert.equal(report.canDeleteLegacy, false);
   } finally {
-    fs.writeFileSync = originalWrite;
+    fs.openSync = originalWrite;
     os.tmpdir = originalTmpdir;
     if (previousLocal === undefined) delete process.env.LOCALAPPDATA;
     else process.env.LOCALAPPDATA = previousLocal;
@@ -489,7 +490,7 @@ test("Windows parent inheritable-only foreign Modify is rejected before any SQLi
   const trustedRoot = process.env.LOCALAPPDATA;
   assert.ok(trustedRoot && path.isAbsolute(trustedRoot));
   const badParent = fs.mkdtempSync(path.join(trustedRoot, "zk65-acl-only-fixture-"));
-  const original = fs.writeFileSync;
+  const original = fs.openSync;
   const previousLocal = process.env.LOCALAPPDATA;
   let staged = false;
   try {
@@ -498,7 +499,7 @@ test("Windows parent inheritable-only foreign Modify is rejected before any SQLi
     });
     assert.equal(acl.status, 0, "inheritable-only adversarial ACE fixture must exist");
     process.env.LOCALAPPDATA = badParent;
-    fs.writeFileSync = function (target, ...args) {
+    fs.openSync = function (target, ...args) {
       if (typeof target === "string" && path.basename(target) === "image.sqlite") staged = true;
       return original.call(fs, target, ...args);
     };
@@ -509,7 +510,177 @@ test("Windows parent inheritable-only foreign Modify is rejected before any SQLi
     assert.equal(report.canDeleteLegacy, false);
   } finally {
     process.env.LOCALAPPDATA = previousLocal;
-    fs.writeFileSync = original;
+    fs.openSync = original;
     fs.rmSync(badParent, { recursive: true, force: true });
   }
+});
+
+test("Windows ACL verifier never resolves the PowerShell executable from hostile PATH", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const f = await fixture(t);
+  const child = require("node:child_process");
+  const actual = child.spawnSync;
+  const cacheKey = require.resolve("../src/services/zk1LegacyEvidenceManifest");
+  const hostile = path.join(f.root, "hostile-path");
+  fs.mkdirSync(hostile);
+  fs.writeFileSync(path.join(hostile, "powershell.exe"), Buffer.from("ATTACKER EXECUTABLE"));
+  const savedPath = process.env.PATH;
+  const calls = [];
+  try {
+    process.env.PATH = hostile + path.delimiter + savedPath;
+    child.spawnSync = function (command, args, options) {
+      calls.push(command);
+      if (path.basename(command).toLowerCase() === "powershell.exe"
+        && !path.isAbsolute(command))
+        return { status: 0, stdout: "", stderr: "" }; // forged ACL approval
+      return actual.call(child, command, args, options);
+    };
+    delete require.cache[cacheKey];
+    const guarded = require(cacheKey).inspectZk1LegacyEvidenceManifest;
+    const result = await guarded({ optIn: true, databasePath: f.databasePath,
+      uploadsDir: f.uploads, tempDir: f.temp, trashDir: f.trash, backupsDir: f.backups });
+    assert.ok(calls.length > 0);
+    assert.ok(calls.every((command) => path.isAbsolute(command)
+      && command.toLowerCase().includes("windows\\system32\\windowspowershell")),
+    "PowerShell invocation must bypass hostile PATH and point into the native OS tree");
+    assert.equal(result.sections.sqlite.status, "PROVEN");
+  } finally {
+    child.spawnSync = actual;
+    process.env.PATH = savedPath;
+    delete require.cache[cacheKey];
+  }
+});
+
+test("simulated recursive-delete failure cannot orphan plaintext SQLite snapshot bytes", async (t) => {
+  const f = await fixture(t);
+  const originalRm = fs.rmSync;
+  let isolatedPath;
+  let blocked = false;
+  try {
+    fs.rmSync = function (target, options) {
+      if (!blocked && typeof target === "string"
+        && path.basename(target).startsWith("zk1-legacy-sql-image-")) {
+        blocked = true;
+        isolatedPath = target;
+        throw Object.assign(Error("EACCES test injected during recursive cleanup"), { code: "EACCES" });
+      }
+      return originalRm.call(fs, target, options);
+    };
+    const report = await scan(f);
+    assert.equal(blocked, true);
+    assert.equal(report.sections.sqlite.status, "UNKNOWN");
+    assert.equal(report.canDeleteLegacy, false);
+    if (fs.existsSync(isolatedPath)) {
+      const leftovers = fs.readdirSync(isolatedPath);
+      for (const file of leftovers) {
+        const contents = fs.readFileSync(path.join(isolatedPath, file));
+        assert.equal(contents.includes(Buffer.from("SQLite format 3")), false,
+          "even if the cleanup directory remains, no complete plaintext SQLite image may survive");
+        assert.equal(contents.length, 0, "snapshot must be truncated after a verified scrub");
+      }
+    }
+  } finally {
+    fs.rmSync = originalRm;
+    if (isolatedPath && fs.existsSync(isolatedPath))
+      originalRm(isolatedPath, { recursive: true, force: true });
+  }
+});
+
+test("unlink and recursive removal both blocked still leave zero-length private image", async (t) => {
+  const f = await fixture(t);
+  const originalUnlink = fs.unlinkSync;
+  const originalRemove = fs.rmSync;
+  let snapshotDir;
+  let unlinkBlocked = false;
+  try {
+    fs.unlinkSync = function (target) {
+      if (typeof target === "string" && path.basename(target) === "image.sqlite") {
+        unlinkBlocked = true;
+        snapshotDir = path.dirname(target);
+        throw Object.assign(Error("injected unlink EACCES"), { code: "EACCES" });
+      }
+      return originalUnlink.apply(fs, arguments);
+    };
+    fs.rmSync = function (target, options) {
+      if (typeof target === "string" && path.basename(target).startsWith("zk1-legacy-sql-image-"))
+        throw Object.assign(Error("injected rm EACCES"), { code: "EACCES" });
+      return originalRemove.call(fs, target, options);
+    };
+    const report = await scan(f);
+    assert.equal(unlinkBlocked, true);
+    assert.equal(report.sections.sqlite.status, "UNKNOWN");
+    assert.ok(fs.existsSync(path.join(snapshotDir, "image.sqlite")));
+    assert.equal(fs.statSync(path.join(snapshotDir, "image.sqlite")).size, 0);
+    assert.equal(report.canDeleteLegacy, false);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+    fs.rmSync = originalRemove;
+    if (snapshotDir && fs.existsSync(snapshotDir))
+      originalRemove(snapshotDir, { recursive: true, force: true });
+  }
+});
+
+test("Windows generic access ACEs cannot evade private snapshot ancestor checks", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const f = await fixture(t);
+  const parent = fs.mkdtempSync(path.join(process.env.LOCALAPPDATA, "zk65-generic-ace-"));
+  const oldRoot = process.env.LOCALAPPDATA;
+  const nativePs = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+  const nativeScript = path.resolve(__dirname, "../scripts/zk1-legacy-private-snapshot-acl.ps1");
+  const originalWrite = fs.openSync;
+  let wrote = false;
+  try {
+    const quotedParent = parent.replace(/'/g, "''");
+    const apply = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
+      "$ErrorActionPreference='Stop';$p='" + quotedParent + "';$a=Get-Acl -LiteralPath $p;" +
+      "$id=New-Object Security.Principal.SecurityIdentifier('S-1-5-11');" +
+      "$raw=New-Object Security.AccessControl.RawSecurityDescriptor($a.GetSecurityDescriptorSddlForm('All'));" +
+      "$ace=New-Object Security.AccessControl.CommonAce(" +
+      "[Security.AccessControl.AceFlags]'ContainerInherit, ObjectInherit'," +
+      "[Security.AccessControl.AceQualifier]::AccessAllowed,268435456,$id,$false,$null);" +
+      "$raw.DiscretionaryAcl.InsertAce(0,$ace);" +
+      "$buf=New-Object byte[] $raw.BinaryLength;$raw.GetBinaryForm($buf,0);" +
+      "$a.SetSecurityDescriptorBinaryForm($buf,[Security.AccessControl.AccessControlSections]::Access);" +
+      "Set-Acl -LiteralPath $p -AclObject $a;" +
+      "$actual=(Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm();" +
+      "$r=New-Object Security.AccessControl.RawSecurityDescriptor($actual,0);" +
+      "$found=$false;foreach($entry in $r.DiscretionaryAcl) {" +
+      "if($entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
+      " ($entry.AccessMask -band 268435456) -ne 0){$found=$true}};" +
+      "if(-not $found){throw 'Generic access ACE did not persist'};" +
+      "Write-Output 'RAW_GENERIC_ALL_FOUND';"], {
+      windowsHide: true, encoding: "utf8", timeout: 12000,
+    });
+    assert.equal(apply.status, 0, apply.stderr);
+    assert.match(apply.stdout, /RAW_GENERIC_ALL_FOUND/,
+      "fixture must store the raw GENERIC_ALL bit, not a normalized file-right alias");
+    const check = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-File", nativeScript,
+      "-Action", "verify", "-Directory", parent], { encoding: "utf8", windowsHide: true });
+    assert.notEqual(check.status, 0, "raw GENERIC_ALL cannot pass the ACL guardian");
+    process.env.LOCALAPPDATA = parent;
+    fs.openSync = function (name, ...args) {
+      if (typeof name === "string" && path.basename(name) === "image.sqlite") wrote = true;
+      return originalWrite.call(fs, name, ...args);
+    };
+    const report = await scan(f);
+    assert.equal(wrote, false, "no SQLite bytes can be staged under a GENERIC_ALL principal");
+    assert.equal(report.sections.sqlite.status, "UNKNOWN");
+  } finally {
+    process.env.LOCALAPPDATA = oldRoot;
+    fs.openSync = originalWrite;
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("native ACL unsafe mask explicitly covers raw GENERIC_ALL and GENERIC_WRITE", () => {
+  const script = fs.readFileSync(path.resolve(__dirname,
+    "../scripts/zk1-legacy-private-snapshot-acl.ps1"), "utf8");
+  const m = script.match(/\$unsafe\s*=\s*\[long\]0x([a-f\d]+)/i);
+  assert.ok(m, "native guardian must use a known audited rights mask");
+  const mask = Number.parseInt(m[1], 16);
+  assert.equal(mask & 0x10000000, 0x10000000, "raw GENERIC_ALL must fail closed");
+  assert.equal(mask & 0x40000000, 0x40000000, "raw GENERIC_WRITE must fail closed");
+  assert.equal(mask & 0x000D0152, 0x000D0152, "specific FILE_* destructive bits remain rejected");
 });

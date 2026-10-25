@@ -26,11 +26,14 @@ function Assert-Directory([string]$name, [bool]$isSnapshot, [bool]$isDirectParen
     throw 'Private snapshot DACL is not protected'
   }
 
-  # DeleteChild, Delete, WriteDac, WriteOwner, WriteData, WriteEA,
-  # WriteAttributes. InheritOnly ACEs do NOT act on the checked ancestor.
+  # Explicit delete/overwrite/privilege-changing rights PLUS raw Windows
+  # GENERIC_ALL (0x10000000) and GENERIC_WRITE (0x40000000), which can
+  # survive as generic mask bits rather than FILE_* expansions. Treat both
+  # as unsafe even when the low-level FILE_WRITE masks are absent.
+  # InheritOnly ACEs on the direct parent still affect newly created children.
   # CreateSubdirectories/AppendData alone may create an unrelated sibling;
   # a random O_EXCL snapshot name cannot be replaced without the listed rights.
-  $unsafe = [long]0x000D0152
+  $unsafe = [long]0x500D0152
   $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
   foreach ($ace in $rules) {
     if ($ace.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }

@@ -31,13 +31,16 @@ const stable = (a, b) => a.dev === b.dev && a.ino === b.ino
   && a.nlink === b.nlink && a.size === b.size
   && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 const WINDOWS_ACL_CHECK = path.resolve(__dirname, "../../scripts/zk1-legacy-private-snapshot-acl.ps1");
+// Deliberately do not use PATH, PATHEXT, SystemRoot or WINDIR supplied by the
+// invoking environment. Nonstandard Windows installations fail closed.
+const WINDOWS_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 function verifyPrivateSnapshotDir(folder, action = "verify") {
   const snapshot = fs.lstatSync(folder, { bigint: true });
   if (!snapshot.isDirectory() || snapshot.isSymbolicLink()
     || fs.realpathSync.native(folder).toLowerCase() !== path.resolve(folder).toLowerCase())
     throw Error("untrusted snapshot directory");
   if (process.platform === "win32") {
-    const run = spawnSync("powershell.exe", [
+    const run = spawnSync(WINDOWS_POWERSHELL, [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
       "-File", WINDOWS_ACL_CHECK, "-Action", action, "-Directory", folder,
     ], { windowsHide: true, timeout: 12000, encoding: "utf8", maxBuffer: 16 * 1024 });
@@ -181,7 +184,7 @@ const KNOWN = new Set([
 ]);
 function observeDb(filename) {
   if (typeof filename !== "string" || !path.isAbsolute(filename)) return { section: unknown(), tables: null };
-  let db, snapshotDir;
+  let db, snapshotDir, snapshotFd, snapshotPath;
   let result = { section: unknown(), tables: null };
   try {
     if (["-wal", "-shm", "-journal"].some((part) => fs.existsSync(filename + part)))
@@ -194,9 +197,22 @@ function observeDb(filename) {
     // DACL and the entire ancestor chain are checked before even one byte is
     // staged; on POSIX require mode 0700 and trusted ancestors.
     snapshotDir = privateSnapshotDirectory();
-    const snapshotPath = path.join(snapshotDir, "image.sqlite");
+    snapshotPath = path.join(snapshotDir, "image.sqlite");
     verifyPrivateSnapshotDir(snapshotDir);
-    fs.writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o600 });
+    // Hold the *same* exclusive file descriptor from creation through secure
+    // cleanup. If later directory removal is denied, the pinned fd still
+    // permits a bounded zero-write and truncation before it is released.
+    snapshotFd = fs.openSync(snapshotPath, fs.constants.O_RDWR | fs.constants.O_CREAT
+      | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    const identity = fs.fstatSync(snapshotFd, { bigint: true });
+    if (!identity.isFile() || identity.nlink !== 1n) throw Error("unsafe snapshot");
+    for (let offset = 0; offset < bytes.length;) {
+      const size = Math.min(16 * 1024, bytes.length - offset);
+      const count = fs.writeSync(snapshotFd, bytes, offset, size, offset);
+      if (count <= 0 || count > size) throw Error("snapshot write incomplete");
+      offset += count;
+    }
+    fs.fsyncSync(snapshotFd);
     if (!bytes.equals(fileBytes(snapshotPath, { left: MAX_BYTES })))
       throw Error("snapshot mismatch");
     verifyPrivateSnapshotDir(snapshotDir);
@@ -234,7 +250,32 @@ function observeDb(filename) {
   } catch (_) { /* Any unavailable evidence stays UNKNOWN. */ }
   finally {
     try { db?.close(); } catch (_) { result = { section: unknown(), tables: null }; }
+    if (snapshotFd !== undefined) {
+      // Scrub is deliberately unconditional on success or failure. It must
+      // happen before releasing our descriptor, even if unlink/rm later fails.
+      try {
+        const stat = fs.fstatSync(snapshotFd, { bigint: true });
+        if (!stat.isFile() || stat.nlink !== 1n || stat.size > BigInt(MAX_FILE))
+          throw Error("unsafe snapshot scrub");
+        const zeros = Buffer.alloc(16 * 1024);
+        for (let offset = 0; BigInt(offset) < stat.size;) {
+          const length = Math.min(zeros.length, Number(stat.size) - offset);
+          const written = fs.writeSync(snapshotFd, zeros, 0, length, offset);
+          if (written <= 0 || written > length) throw Error("snapshot scrub incomplete");
+          offset += written;
+        }
+        fs.ftruncateSync(snapshotFd, 0);
+        fs.fsyncSync(snapshotFd);
+        if (fs.fstatSync(snapshotFd, { bigint: true }).size !== 0n)
+          throw Error("snapshot still contains readable bytes");
+      } catch (_) { result = { section: unknown(), tables: null }; }
+      try { fs.closeSync(snapshotFd); } catch (_) { result = { section: unknown(), tables: null }; }
+    }
     if (snapshotDir) {
+      if (snapshotPath) {
+        try { fs.unlinkSync(snapshotPath); }
+        catch (_) { result = { section: unknown(), tables: null }; }
+      }
       try { fs.rmSync(snapshotDir, { recursive: true, force: true }); }
       catch (_) { result = { section: unknown(), tables: null }; }
     }
