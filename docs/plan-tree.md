@@ -46,6 +46,36 @@ and concurrent independent disk writes; the bounded stage took approximately
 2,000-chunk flows were verified locally on Node 22/24 with the unchanged
 socket timeout; this local result does not establish hosted CI completion.
 
+## Issue #65 / PR #228: local persisted encrypted-chunk backup/recovery binding (2026-10-25)
+
+The browser-compatible, offline `rootark-zk1-persisted-portable-chunk-recovery`
+module can create an Ed25519 owner-signed inventory of the exact encrypted
+chunks in a user-held portable recovery bundle. On recovery it requires an
+**independently retained** owner SPKI SHA-256, current `{revision,digest,epoch}`
+head and ciphertext root, authenticates the signed inventory before any chunk
+read, and fetches every bounded persisted chunk. Each chunk length and SHA-256,
+the reassembled ciphertext SHA-256/root and the exact encrypted bundle are
+checked before the existing client-side HKDF/AES-256-GCM CEK and file recovery
+can return any plaintext. It rechecks a caller-provided local liveness guard
+after each asynchronous read and before return, and wipes temporary ciphertext
+and holder-secret copies on every path.
+
+The focused test uses an actual disposable SQLite file on disk across close,
+restart and rollback, with real Ed25519 signatures and AES-GCM encryption.
+An older correct DB snapshot, another owner's valid signature, wrong holder
+secret, missing/modified chunk and liveness loss during reading all deny.
+Windows Node 24 and Node 22: **6 new tests PASS / 0 FAIL** each, plus five
+existing portable file cryptography regressions (**11 PASS / 0 FAIL** each).
+SQLite's built-in
+`node:sqlite` API is experimental on these runtimes, and is test-only here.
+The signer and recovery consumer are available as an explicit opt-in client
+module; they are not automatically wired to a production backup scheduler,
+app restore route or disaster-recovery ceremony. A coherently rolled-back
+database **plus independently rolled-back owner pins** cannot be detected by
+this module. It does not establish witness/CAS freshness, off-host storage,
+durability, distributed epoch fencing or production restore authorization.
+PR #228 remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: development browser vault cross-tab revocation (2026-10-25)
 
 The **experimental** `/zk-dev` browser vault uses an IndexedDB v3 per-account
