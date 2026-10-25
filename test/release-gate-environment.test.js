@@ -8,6 +8,73 @@ const { PassThrough } = require("node:stream");
 const { getNpmInvocation, canonicalTestArgs, hasSeparateWindowsCiCanonicalTest, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
 const { createTapProgressRecorder } = require("../scripts/run-windows-canonical-tests");
 const { createAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
+const { reportEdgeFailure } = require("../scripts/edge-test-failure-diagnostic");
+
+test("Windows Edge reporter emits fixed stage and code, rethrowing without secrets", () => {
+  const output = [];
+  const t = { diagnostic: (entry) => output.push(entry) };
+  const error = Object.assign(Error("password=secret C:\\private\\profile"), { code: "ERR_ASSERTION" });
+  reportEdgeFailure(t, "INDEXEDDB", "OWNER_CHECKPOINT", error);
+  if (process.platform === "win32") assert.deepEqual(output, [
+    "ROOTARK_EDGE_V1 case=INDEXEDDB stage=OWNER_CHECKPOINT code=ASSERTION",
+  ]);
+  else assert.deepEqual(output, []);
+  assert.throws(() => reportEdgeFailure(t, "INDEXEDDB", "PRIVATE_TOKEN", error),
+    /INVALID_EDGE_DIAGNOSTIC_STAGE/);
+  assert.throws(() => reportEdgeFailure(t, "FOREIGN", "STARTUP", error),
+    /INVALID_EDGE_DIAGNOSTIC_CASE/);
+  assert.doesNotMatch(JSON.stringify(output), /secret|private|password|profile/);
+});
+
+test("canonical runner admits only named and path-pinned Edge diagnostics on failure", () => {
+  const title = "real Edge IndexedDB restores nonextractable trusted-device keys for independent recovery";
+  const location = "  location: 'C:\\host\\test\\issue-65-trusted-device-indexeddb-browser.test.js:405:1'";
+  const lines = [];
+  const tracker = createTapProgressRecorder((entry) => lines.push(entry));
+  tracker.accept(`not ok 1 - ${title}`);
+  tracker.accept(location);
+  tracker.accept("  error: 'C:\\keys\\sensitive.pem password=secret'");
+  tracker.accept("# ROOTARK_EDGE_V1 case=INDEXEDDB stage=OWNER_CHECKPOINT code=ASSERTION");
+  tracker.accept("ok 2 - next test");
+  assert.match(lines.join("\n"), /edgeStage=OWNER_CHECKPOINT edgeError=ASSERTION/);
+  assert.doesNotMatch(lines.join("\n"), /keys|sensitive|secret|INDEXEDDB|checkpoint\.test\.js/);
+
+  const wrong = [];
+  const guard = createTapProgressRecorder((entry) => wrong.push(entry));
+  guard.accept("not ok 3 - unrelated test with secrets");
+  guard.accept(location);
+  guard.accept("# ROOTARK_EDGE_V1 case=INDEXEDDB stage=OWNER_CHECKPOINT code=ASSERTION");
+  guard.accept(`not ok 4 - ${title}`);
+  guard.accept("  location: 'C:\\host\\test\\wrong-test.test.js:1:1'");
+  guard.accept("# ROOTARK_EDGE_V1 case=INDEXEDDB stage=OWNER_CHECKPOINT code=ASSERTION");
+  guard.accept(`not ok 5 - ${title}`);
+  guard.accept(location);
+  guard.accept("# ROOTARK_EDGE_V1 case=INDEXEDDB stage=PASSWORD_PRIVATE code=ASSERTION");
+  guard.accept("# ROOTARK_EDGE_V1 case=INDEXEDDB stage=OWNER_CHECKPOINT code=EXPLOIT");
+  guard.accept("# ROOTARK_EDGE_V1 case=INDEXEDDB stage=OWNER_CHECKPOINT code=ASSERTION password=secret");
+  guard.finish();
+  assert.doesNotMatch(wrong.join("\n"), /edgeStage=|edgeError=|EXPLOIT|password=secret|wrong-test/);
+});
+
+test("canonical runner names both Edge case profiles without leaking raw error content", () => {
+  const names = [
+    ["REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores only through signed-history strict mTLS-backed server", "issue-65-edge-v2-witnessed-positive.test.js", "V2_WITNESSED", "EDGE_PERSISTED_POSITIVE"],
+    ["real Edge IndexedDB restores nonextractable trusted-device keys for independent recovery", "issue-65-trusted-device-indexeddb-browser.test.js", "INDEXEDDB", "APPROVAL_REVOKE"],
+  ];
+  const lines = [];
+  const tracker = createTapProgressRecorder((entry) => lines.push(entry));
+  for (const [title, filename, caseId, stage] of names) {
+    tracker.accept(`not ok ${lines.length + 1} - ${title}`);
+    tracker.accept(`  location: 'C:\\secret\\test\\${filename}:15:1'`);
+    tracker.accept(`# ROOTARK_EDGE_V1 case=${caseId} stage=${stage} code=RUNTIME`);
+  }
+  tracker.finish();
+  const details = lines.filter((line) => line.startsWith("FAIL detail "));
+  assert.equal(details.length, 2);
+  for (const [, , , stage] of names)
+    assert.ok(details.some((line) => line.includes(`edgeStage=${stage} edgeError=RUNTIME`)));
+  assert.doesNotMatch(lines.join("\n"), /C:\\secret|\.test\.js|signed-history strict|nonextractable trusted-device/);
+});
 
 test("ACL stage reporter rethrows original failure but never emits source error text", async () => {
   const diagnostic = [];
@@ -121,6 +188,8 @@ test("Windows canonical runner synchronously reports failure even when console o
       };
       if (id === "./acl-test-failure-diagnostic")
         return require("../scripts/acl-test-failure-diagnostic");
+      if (id === "./edge-test-failure-diagnostic")
+        return require("../scripts/edge-test-failure-diagnostic");
       return require(id);
     };
     fakeRequire.main = fakeModule;

@@ -9,6 +9,7 @@ const { spawn, execFileSync } = require("node:child_process");
 const test = require("node:test");
 const WebSocket = require("ws");
 const { waitForIndexedDbEdgePage } = require("./support/issue-65-trusted-device-edge-target");
+const { reportEdgeFailure } = require("../scripts/edge-test-failure-diagnostic");
 
 const ROOT = path.resolve(__dirname, "..");
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
@@ -409,6 +410,8 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     t.skip("Microsoft Edge headless only runs on Windows");
     return;
   }
+  let stage = "STARTUP";
+  try {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-issue65-idb-"));
   const profile = path.join(tmp, "profile");
   const server = http.createServer((req, res) => {
@@ -468,6 +471,7 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
       });
       return r.result?.value === true;
     }, 15000);
+    stage = "TRUSTED_ROUNDTRIP";
     const response = await client.send("Runtime.evaluate", {
       expression: BROWSER_PROBE,
       awaitPromise: true,
@@ -476,12 +480,14 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     assert.equal(response.exceptionDetails, undefined,
       response.exceptionDetails?.text || "Device recovery crashed in browser");
     assert.equal(response.result?.value, "BROWSER_TRUSTED_DEVICE_INDEXEDDB_PASS");
+    stage = "OWNER_CHECKPOINT";
     const checkpoint = await client.send("Runtime.evaluate", {
       expression: OWNER_CHECKPOINT_PROBE, awaitPromise: true, returnByValue: true,
     });
     assert.equal(checkpoint.exceptionDetails, undefined,
       checkpoint.exceptionDetails?.text || "Owner checkpoint IndexedDB crashed in browser");
     assert.equal(checkpoint.result?.value, "BROWSER_OWNER_CHECKPOINT_INDEXEDDB_PASS");
+    stage = "NORMAL_SESSION";
     await client.send("Page.navigate", { url: origin + "/ui" });
     await waitFor(async () => {
       const result = await client.send("Runtime.evaluate", {
@@ -496,6 +502,7 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     assert.equal(ui.exceptionDetails, undefined,
       JSON.stringify(ui.exceptionDetails || ui.result));
     assert.equal(ui.result?.value, "NORMAL_SESSION_DEVICE_PENDING_UI_PASS");
+    stage = "CROSS_TAB_REVOKE";
     // Keep two real same-origin Edge tabs open. The second tab removes the
     // persisted key while the first has an in-flight ciphertext read.
     await client.send("Page.navigate", { url: origin + "/ui" });
@@ -608,6 +615,7 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
         }
         throw Error("APPROVAL_NOT_PENDING");
       })()`), true);
+      stage = "APPROVAL_REVOKE";
       const thirdTarget = await client.send("Target.createTarget", { url: origin + "/ui" });
       const thirdUrl = await waitFor(async () => {
         const list = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
@@ -665,5 +673,9 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
       }
     }
     if (!removed) process.stderr.write("DEV_DEVICE_TEST_PROFILE_CLEANUP_PENDING\n");
+  }
+  } catch (error) {
+    reportEdgeFailure(t, "INDEXEDDB", stage, error);
+    throw error;
   }
 });

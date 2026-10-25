@@ -14,6 +14,7 @@ const path = require("node:path");
 const https = require("node:https");
 const { spawn, execFileSync } = require("node:child_process");
 const { waitForEdgeDevtoolsPage } = require("./support/issue-65-edge-devtools-readiness");
+const { reportEdgeFailure } = require("../scripts/edge-test-failure-diagnostic");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { generateNativeFixtureCertificates } =
@@ -793,6 +794,7 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
   assert.ok(peers.requests.cas > 0 && peers.requests.witness > 0,
     "actual independent pinned mTLS CAS and witness network traffic occurred");
   } catch (error) {
+    reportEdgeFailure(t, "V2_WITNESSED", stage, error);
     console.error("EDGE_V2_STAGE", stage, String(error?.stack || error));
     throw error;
   }
