@@ -9,6 +9,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { DatabaseSync } = require("node:sqlite");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
+const roots = require("../public/client/rootark-zk1-ciphertext-chunk-root");
+const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 const { createSignedPersistedPortableChunkInventory, recoverPersistedPortableChunks } =
   require("../public/client/rootark-zk1-persisted-portable-chunk-recovery");
 
@@ -18,7 +20,7 @@ const domain = Buffer.from("Root.ark/zk-1/persisted-portable-chunk-inventory/v1\
 const b64 = (raw) => Buffer.from(raw).toString("base64url");
 const id = () => b64(crypto.randomBytes(16));
 
-async function fixture(t) {
+async function fixture(t, { twoChunks = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-persisted-portable-"));
   const databaseFile = path.join(dir, "opaque.sqlite");
   const owner = crypto.generateKeyPairSync("ed25519");
@@ -39,9 +41,12 @@ async function fixture(t) {
   const bundle = await portable.sealForUserHeldSecret({ recoverySecret,
     metadata: meta, name: "secret.txt", mediaType: "text/plain", data: plaintext });
   const ciphertext = Buffer.from(bundle.ciphertextBase64, "base64url");
-  const chunks = [ciphertext.subarray(0, 42), ciphertext.subarray(42, 151),
-    ciphertext.subarray(151)];
+  const chunks = twoChunks
+    ? [ciphertext.subarray(0, 42), ciphertext.subarray(42)]
+    : [ciphertext.subarray(0, 42), ciphertext.subarray(42, 151),
+      ciphertext.subarray(151)];
   assert.ok(chunks.every((chunk) => chunk.length > 0));
+  const sourceChunkRoot = Buffer.from(await roots.computeCiphertextRoot(chunks));
   function signInventory(head = expectedOwnerHead, data = chunks, signingKey = owner.privateKey) {
     const record = { format: "rootark-zk1-persisted-portable-chunk-inventory/v1", scope,
       ownerRevision: head.revision, ownerDigest: b64(head.digest), ownerEpoch: head.epoch,
@@ -79,14 +84,37 @@ async function fixture(t) {
       ownerPublicKey, independentOwnerSpkiSha256,
       expectedMetadata: meta, independentlyPinnedCiphertextRoot:
         Buffer.from(bundle.ciphertextRoot, "base64url"), recoverySecret,
+      independentlyPinnedSourceChunkRoot: sourceChunkRoot,
       readChunk: async ({ index }) => db.prepare("SELECT opaque FROM chunk WHERE ordinal=?")
         .get(index)?.opaque, assertLive: () => undefined, ...overrides });
   };
   return { db: () => db, databaseFile, restart, close, recover, signInventory, plaintext,
     inventory, expectedOwnerHead, recoverySecret, owner, ownerPublicKey,
     ownerSigningKey, independentOwnerSpkiSha256, meta,
-    chunks, bundle };
+    chunks, bundle, sourceChunkRoot };
 }
+
+test("real two-chunk source root is independently required alongside portable single-chunk wrapping root", async (t) => {
+  const f = await fixture(t, { twoChunks: true });
+  f.restart();
+  assert.deepEqual(f.sourceChunkRoot, computeZk1CiphertextRoot(f.chunks),
+    "the source pin must use the exact native provider/owner checkpoint root transcript");
+  assert.notDeepEqual(f.sourceChunkRoot,
+    Buffer.from(f.bundle.ciphertextRoot, "base64url"),
+    "the native owner-rooted two-chunk transcript is distinct from portable wrapping context");
+  const restored = await f.recover();
+  assert.deepEqual(Buffer.from(restored.data), f.plaintext);
+  assert.equal(restored.sourceChunkRootVerifiedAgainstIndependentPin, true);
+  restored.data.fill(0);
+  await assert.rejects(f.recover({ independentlyPinnedSourceChunkRoot:
+    Buffer.from(f.bundle.ciphertextRoot, "base64url") }),
+  /ZK_PERSISTED_PORTABLE_RECOVERY_DENIED/,
+  "a bundle's own portable root must not be accepted as the independently pinned native root");
+  await assert.rejects(f.recover({ independentlyPinnedSourceChunkRoot: undefined }),
+    /ZK_PERSISTED_PORTABLE_RECOVERY_DENIED/,
+  "source authority cannot be silently omitted");
+  f.recoverySecret.fill(0);
+});
 
 test("persisted SQLite ciphertext chunks restore only after signed inventory and real AES-GCM checks", async (t) => {
   const f = await fixture(t);

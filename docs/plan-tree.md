@@ -156,20 +156,32 @@ The browser-compatible, offline `rootark-zk1-persisted-portable-chunk-recovery`
 module can create an Ed25519 owner-signed inventory of the exact encrypted
 chunks in a user-held portable recovery bundle. On recovery it requires an
 **independently retained** owner SPKI SHA-256, current `{revision,digest,epoch}`
-head and ciphertext root, authenticates the signed inventory before any chunk
+head, portable ciphertext root **and separate native source-chunk root**,
+authenticates the signed inventory before any chunk
 read, and fetches every bounded persisted chunk. Each chunk length and SHA-256,
 the reassembled ciphertext SHA-256/root and the exact encrypted bundle are
 checked before the existing client-side HKDF/AES-256-GCM CEK and file recovery
 can return any plaintext. It rechecks a caller-provided local liveness guard
 after each asynchronous read and before return, and wipes temporary ciphertext
-and holder-secret copies on every path.
+and holder-secret copies on every path. The source-chunk root is computed with
+the actual persisted boundaries (chunk count, order, lengths and digests),
+not `computeCiphertextRoot([concatenatedCiphertext])`: the latter remains the
+portable HKDF/AES-GCM bundle's original one-envelope wrapping context. The
+additional native source root MUST come from an independently retained owner
+checkpoint, never the portable bundle or SQLite archive. This is a required
+consumer input, not a change to the signed-inventory or portable bundle wire
+formats.
 
 The focused test uses an actual disposable SQLite file on disk across close,
 restart and rollback, with real Ed25519 signatures and AES-GCM encryption.
 An older correct DB snapshot, another owner's valid signature, wrong holder
 secret, missing/modified chunk and liveness loss during reading all deny.
-Windows Node 24 and Node 22: **6 new tests PASS / 0 FAIL** each, plus five
-existing portable file cryptography regressions (**11 PASS / 0 FAIL** each).
+An adversarial real two-chunk source root test distinguishes the native root
+from the portable one and rejects omission or substitution of the native pin.
+Windows Node 24: **7 focused tests PASS / 0 FAIL**, plus five existing portable
+file cryptography regressions (**12 PASS / 0 FAIL** combined). Earlier six-test
+Node 22 evidence predates the extra native two-chunk source-root test; rerun
+the revised suite on Node 22 before claiming that runtime's updated results.
 SQLite's built-in
 `node:sqlite` API is experimental on these runtimes, and is test-only here.
 The signer and recovery consumer are available as an explicit opt-in client

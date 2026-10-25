@@ -13,6 +13,8 @@
 
     // Offline client-side bridge from independently pinned owner inventory to
     // persisted opaque chunk bytes and existing HKDF/AES-GCM portable recovery.
+    // The native persisted-chunk root and the portable single-envelope root
+    // are DISTINCT commitments when more than one source chunk exists.
     // No server-supplied head, archive-carried owner key or missing chunk can
     // authorize release. Not an online device/witness admission or backup fence.
     const FORMAT = "rootark-zk1-persisted-portable-chunk-inventory/v1";
@@ -195,12 +197,13 @@
       }
     }
     async function recoverPersistedPortableChunks(input) {
-      let secret, opened, combined;
+      let secret, opened, combined, sourceChunkRoot;
       const captured = [];
       try {
         const raw = exact(input, ["bundle", "signedInventory", "expectedOwnerHead",
           "ownerPublicKey", "independentOwnerSpkiSha256", "expectedMetadata",
-          "independentlyPinnedCiphertextRoot", "recoverySecret", "readChunk", "assertLive"]);
+          "independentlyPinnedCiphertextRoot", "independentlyPinnedSourceChunkRoot",
+          "recoverySecret", "readChunk", "assertLive"]);
         if (!crypto?.subtle || !portable?.openWithIndependentRoot
           || !roots?.computeCiphertextRoot || typeof raw.readChunk !== "function") deny();
         const signed = inventory(raw.signedInventory);
@@ -209,6 +212,7 @@
           "keyring_id", "object_id", "version_id", "parent_version_id", "epoch", "kind"]);
         const retainedDigest = bytes(current.digest, 32);
         const independentlyPinnedRoot = bytes(raw.independentlyPinnedCiphertextRoot, 32);
+        const independentlyPinnedSourceRoot = bytes(raw.independentlyPinnedSourceChunkRoot, 32);
         const ownerSpki = bytes(raw.independentOwnerSpkiSha256, 32);
         secret = bytes(raw.recoverySecret, 32);
         if (signed.ownerRevision !== positive(current.revision)
@@ -239,6 +243,12 @@
           if (!same(digest, from64(signed.chunkSha256[index], 32))) deny();
           live(raw.assertLive);
         }
+        // Native multi-chunk roots commit to the count, ordering and length
+        // of EVERY persisted chunk. A single-concatenation portable root is
+        // not interchangeable with an independently owner-pinned source root.
+        sourceChunkRoot = new Uint8Array(await roots.computeCiphertextRoot(captured));
+        if (!same(sourceChunkRoot, independentlyPinnedSourceRoot)) deny();
+        live(raw.assertLive);
         const total = signed.chunkLengths.reduce((sum, count) => sum + count, 0);
         combined = new Uint8Array(total);
         let cursor = 0;
@@ -255,12 +265,13 @@
           independentlyPinnedCiphertextRoot: independentlyPinnedRoot });
         live(raw.assertLive);
         return Object.freeze({ ...opened, persistedChunkInventoryVerified: true,
+          sourceChunkRootVerifiedAgainstIndependentPin: true,
           ownerSignatureVerified: true, independentOwnerHeadMatched: true,
           currentOnlineRevocationVerified: false,
           independentRemoteDurabilityProven: false, authorizesProductionRestore: false });
       } catch (_) { opened?.data?.fill(0); deny(); }
       finally {
-        secret?.fill(0); combined?.fill(0);
+        secret?.fill(0); combined?.fill(0); sourceChunkRoot?.fill(0);
         for (const part of captured) part.fill(0);
       }
     }
