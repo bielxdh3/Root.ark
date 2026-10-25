@@ -340,6 +340,9 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
     pinnedInventorySignerKeyId: inventoryKeyId,
     pinnedPhysicalAttestorPublicKey: physicalSigner.publicKey,
     localTrustedDevicePolicy: policy,
+    trustedCurrentDevicePolicyProvider: () => ({ username: policy.username,
+      trustedDevicePublicKeys: { ...policy.trustedDevicePublicKeys },
+      revokedDeviceIds: [...policy.revokedDeviceIds] }),
     admission: accepted.body.admission, freshFloor: accepted.body.freshFloor,
     pinnedWitnessPublicKey: witnessKeys.publicKey,
     witnessKeyId, statusKeyId, trustedMinimumFloor, ...extra,
@@ -349,6 +352,12 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   assert.equal(verified.localPgReadbackVerified, true);
   assert.equal(verified.externalDurabilityProven, false);
   assert.equal(verified.authorizesIo, false);
+  await assert.rejects(strict(challenge, {
+    trustedCurrentDevicePolicyProvider: () => ({ username: policy.username,
+      trustedDevicePublicKeys: { ...policy.trustedDevicePublicKeys },
+      revokedDeviceIds: ["device-a"] }),
+  }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+  "current independent revocation must reject otherwise valid PG18 historical proofs");
   await assert.rejects(strict(random(32)), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
     "another nonce cannot reuse the true PG18 attestation or signed W2 floor");
   const replay = await postHistorical(port, read, "historical", body(envelope, challenge));
