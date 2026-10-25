@@ -401,3 +401,115 @@ test("an inaccessible private SQLite snapshot cleanup cannot leave PROVEN eviden
       originalRm(snapshotDirectory, { recursive: true, force: true });
   }
 });
+
+test("legacy SQLite bytes are staged only after proving a private directory, never in the ordinary system temp root", async (t) => {
+  const f = await fixture(t);
+  const original = fs.writeFileSync;
+  let protectedStage = 0;
+  let hookFailure;
+  try {
+    fs.writeFileSync = function (target, content, options) {
+      if (typeof target === "string" && path.basename(target) === "image.sqlite") {
+        try {
+        protectedStage++;
+        const parent = path.dirname(target);
+        const metadata = fs.lstatSync(parent);
+        assert.equal(metadata.isSymbolicLink(), false);
+        if (process.platform === "win32") {
+          assert.equal(path.resolve(parent).toLowerCase().startsWith(
+            path.resolve(os.tmpdir()).toLowerCase() + path.sep), false,
+          "ordinary Windows temp has untrusted inherited Modify principals");
+          const acl = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File",
+            path.resolve(__dirname, "../scripts/zk1-legacy-private-snapshot-acl.ps1"),
+            "-Action", "verify", "-Directory", parent], {
+            encoding: "utf8", windowsHide: true, timeout: 10000,
+          });
+          assert.equal(acl.status, 0, "native Windows ACL must already be private before staging bytes");
+        } else {
+          assert.equal(metadata.mode & 0o777, 0o700, "private POSIX snapshot directory must be 0700");
+          assert.equal(metadata.uid, process.getuid());
+        }
+        } catch (error) { hookFailure = error; throw error; }
+      }
+      return original.call(fs, target, content, options);
+    };
+    const report = await scan(f);
+    if (hookFailure) throw hookFailure;
+    assert.equal(report.sections.sqlite.status, "PROVEN", "private stage hook executed " + protectedStage + " time(s)");
+    assert.ok(protectedStage > 0, "a fresh private descriptor-bound database image is required");
+    assert.equal(report.sections.versions.status, "PROVEN");
+  } finally { fs.writeFileSync = original; }
+});
+
+test("hostile temporary ancestor never receives plaintext SQLite bytes", async (t) => {
+  const f = await fixture(t);
+  const hostileParent = path.join(f.root, "hostile-stage");
+  fs.mkdirSync(hostileParent);
+  const originalWrite = fs.writeFileSync;
+  const originalTmpdir = os.tmpdir;
+  const previousLocal = process.env.LOCALAPPDATA;
+  let wrote = false;
+  try {
+    if (process.platform === "win32") {
+      // This is a real inherited-hostile subtree of Windows TEMP on the test host.
+      // Deterministically make the synthetic parent hostile via an explicit
+      // untrusted built-in principal so tests are independent of host policy.
+      const cmd = spawnSync("icacls.exe", [hostileParent, "/grant", "*S-1-5-11:(OI)(CI)M"], {
+        windowsHide: true, encoding: "utf8", timeout: 10000,
+      });
+      assert.equal(cmd.status, 0, "synthetic fixture must be writable by Authenticated Users");
+      process.env.LOCALAPPDATA = hostileParent;
+    } else {
+      fs.chmodSync(hostileParent, 0o777);
+      os.tmpdir = () => hostileParent;
+    }
+    fs.writeFileSync = function (filename, ...rest) {
+      if (typeof filename === "string" && path.basename(filename) === "image.sqlite") wrote = true;
+      return originalWrite.call(fs, filename, ...rest);
+    };
+    const report = await scan(f);
+    assert.equal(report.sections.sqlite.status, "UNKNOWN");
+    assert.equal(report.sections.versions.status, "UNKNOWN");
+    assert.equal(wrote, false, "never stage a sensitive SQLite copy below an untrusted ancestor");
+    assert.equal(report.canDeleteLegacy, false);
+  } finally {
+    fs.writeFileSync = originalWrite;
+    os.tmpdir = originalTmpdir;
+    if (previousLocal === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousLocal;
+    if (process.platform !== "win32") fs.chmodSync(hostileParent, 0o700);
+  }
+});
+
+test("Windows parent inheritable-only foreign Modify is rejected before any SQLite staging", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const f = await fixture(t);
+  const trustedRoot = process.env.LOCALAPPDATA;
+  assert.ok(trustedRoot && path.isAbsolute(trustedRoot));
+  const badParent = fs.mkdtempSync(path.join(trustedRoot, "zk65-acl-only-fixture-"));
+  const original = fs.writeFileSync;
+  const previousLocal = process.env.LOCALAPPDATA;
+  let staged = false;
+  try {
+    const acl = spawnSync("icacls.exe", [badParent, "/grant", "*S-1-5-11:(OI)(CI)(IO)M"], {
+      windowsHide: true, encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(acl.status, 0, "inheritable-only adversarial ACE fixture must exist");
+    process.env.LOCALAPPDATA = badParent;
+    fs.writeFileSync = function (target, ...args) {
+      if (typeof target === "string" && path.basename(target) === "image.sqlite") staged = true;
+      return original.call(fs, target, ...args);
+    };
+    const report = await scan(f);
+    assert.equal(staged, false, "inheritable Modify on the direct parent may reach new children");
+    assert.equal(report.sections.sqlite.status, "UNKNOWN");
+    assert.equal(report.sections.versions.status, "UNKNOWN");
+    assert.equal(report.canDeleteLegacy, false);
+  } finally {
+    process.env.LOCALAPPDATA = previousLocal;
+    fs.writeFileSync = original;
+    fs.rmSync(badParent, { recursive: true, force: true });
+  }
+});

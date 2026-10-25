@@ -5,6 +5,7 @@
 // completeness, backup restorability, provider durability or deletion safety.
 const fs = require("node:fs");
 const os = require("node:os");
+const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
@@ -29,6 +30,60 @@ const safePart = (name) => typeof name === "string" && name.length > 0 && name.l
 const stable = (a, b) => a.dev === b.dev && a.ino === b.ino
   && a.nlink === b.nlink && a.size === b.size
   && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+const WINDOWS_ACL_CHECK = path.resolve(__dirname, "../../scripts/zk1-legacy-private-snapshot-acl.ps1");
+function verifyPrivateSnapshotDir(folder, action = "verify") {
+  const snapshot = fs.lstatSync(folder, { bigint: true });
+  if (!snapshot.isDirectory() || snapshot.isSymbolicLink()
+    || fs.realpathSync.native(folder).toLowerCase() !== path.resolve(folder).toLowerCase())
+    throw Error("untrusted snapshot directory");
+  if (process.platform === "win32") {
+    const run = spawnSync("powershell.exe", [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      "-File", WINDOWS_ACL_CHECK, "-Action", action, "-Directory", folder,
+    ], { windowsHide: true, timeout: 12000, encoding: "utf8", maxBuffer: 16 * 1024 });
+    if (run.error || run.status !== 0 || run.signal) throw Error("private snapshot ACL rejected");
+  } else {
+    const uid = BigInt(process.getuid());
+    if (snapshot.uid !== uid || (snapshot.mode & 0o777n) !== 0o700n)
+      throw Error("private POSIX snapshot mode rejected");
+    let parent = path.dirname(folder);
+    for (;;) {
+      const stat = fs.lstatSync(parent, { bigint: true });
+      if (!stat.isDirectory() || stat.isSymbolicLink()
+        || (stat.uid !== uid && stat.uid !== 0n)) throw Error("untrusted ancestor");
+      if ((stat.mode & 0o022n) !== 0n
+        && !(stat.uid === 0n && (stat.mode & 0o1000n) !== 0n))
+        throw Error("untrusted ancestor write access");
+      const next = path.dirname(parent);
+      if (next === parent) break;
+      parent = next;
+    }
+  }
+  const after = fs.lstatSync(folder, { bigint: true });
+  // Applying a protected Windows DACL legitimately changes ctime; the
+  // directory identity must remain fixed, not its security metadata.
+  if ((action === "protect" && (snapshot.dev !== after.dev || snapshot.ino !== after.ino
+    || snapshot.nlink !== after.nlink || !after.isDirectory()))
+    || (action !== "protect" && !stable(snapshot, after)))
+    throw Error("snapshot directory changed");
+}
+function privateSnapshotDirectory() {
+  // On Windows default TEMP may be shared with unrelated accounts holding
+  // Modify on the parent. Do NOT use it for a plaintext SQLite copy. The
+  // native DACL guardian verifies the full ancestor chain before any bytes.
+  const root = process.platform === "win32" ? process.env.LOCALAPPDATA : os.tmpdir();
+  if (typeof root !== "string" || !path.isAbsolute(root)) throw Error("no trusted snapshot root");
+  const folder = fs.mkdtempSync(path.join(root, "zk1-legacy-sql-image-"), { mode: 0o700 });
+  try {
+    verifyPrivateSnapshotDir(folder, process.platform === "win32" ? "protect" : "verify");
+    return folder;
+  } catch (error) {
+    // The newly created random empty folder alone is ours; never touch a
+    // source directory. Failure to clean it still fails closed.
+    try { fs.rmdirSync(folder); } catch (_) { /* no sensitive bytes staged */ }
+    throw error;
+  }
+}
 function directory(target) {
   const stat = fs.lstatSync(target, { bigint: true });
   const real = fs.realpathSync.native(target);
@@ -135,13 +190,16 @@ function observeDb(filename) {
     const bytes = fileBytes(filename, budget);
     // The original pathname is mutable. Opening it with SQLite after reading
     // the hash permits an A -> B -> A rebind that pairs A's hash with B's rows.
-    // Query a private immutable-by-contract copy of the already pinned bytes.
-    // This temp file is ours, never a source record; it is always disposed.
-    snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-legacy-sql-image-"));
+    // Query a private copy of exactly the pinned bytes. On Windows the native
+    // DACL and the entire ancestor chain are checked before even one byte is
+    // staged; on POSIX require mode 0700 and trusted ancestors.
+    snapshotDir = privateSnapshotDirectory();
     const snapshotPath = path.join(snapshotDir, "image.sqlite");
+    verifyPrivateSnapshotDir(snapshotDir);
     fs.writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o600 });
     if (!bytes.equals(fileBytes(snapshotPath, { left: MAX_BYTES })))
       throw Error("snapshot mismatch");
+    verifyPrivateSnapshotDir(snapshotDir);
     db = new DatabaseSync(snapshotPath, { readOnly: true });
     db.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN");
     if (db.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") throw Error("invalid SQL");
@@ -165,6 +223,7 @@ function observeDb(filename) {
       tables[table] = rows(db, table, columns);
     db.exec("COMMIT");
     db.close(); db = null;
+    verifyPrivateSnapshotDir(snapshotDir);
     if (!bytes.equals(fileBytes(snapshotPath, { left: MAX_BYTES })))
       throw Error("snapshot changed during SQL inspection");
     if (!bytes.equals(fileBytes(filename, { left: MAX_BYTES }))) throw Error("database changed");
