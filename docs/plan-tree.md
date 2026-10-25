@@ -1,5 +1,45 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: protected Sync v2 atomic revocation ingress gate (2026-10-25)
+
+The signed, encrypted Sync v2 object PUT/POST/DELETE ingress now **fails closed**
+with `503 SYNC_PROTECTED_ATOMIC_REQUIRED` when the server does not use an
+explicitly provisioned, co-located atomic device registry. This applies when
+the route requires device authorization **or** the operation carries a signed
+authorization, including on a route accidentally configured without mandatory
+authorization. A direct `SyncObjectStore.put()` using a signed operation also
+rejects that non-atomic mode. An *unsigned*, explicitly non-protected legacy
+development route with `requireDeviceAuthorization: false` retains its
+existing behavior. No legacy data or authority is silently upgraded.
+
+The concrete pre-fix P1 was reproduced through a genuine HTTP PUT of a
+correctly signed encrypted operation: the separate legacy
+`SYNC_DEVICE_REGISTRY` authorized the device; it was then durably marked
+revoked before `SyncObjectStore.put()`; the old route still replied HTTP 200
+and persisted the ciphertext. Rechecking that separate registry at a different
+point would only move the TOCTOU window, so it is **not** the fix. This ingress
+gate makes that same test return HTTP 503 with no object committed, including
+after restart. The existing explicit strict mode binds the currently enrolled
+key, Ed25519 authorization and the ciphertext write under one process-external
+lock/atomic JSON state transaction; the same lock fences device revocation.
+In particular, a revocation that **durably commits first** must deny the PUT;
+a PUT that commits first is not retroactively canceled by a later revocation
+request or by a delay in sending its HTTP acknowledgement.
+
+Enabling strict mode is an **operator-owned, separate migration gate**:
+provision a new private service-owned storage directory with verified Windows
+NTFS ACL or POSIX ownership/mode; use `SYNC_ATOMIC_DEVICE_REGISTRY=true`,
+do not set `SYNC_DEVICE_REGISTRY` or supply a separate authorization callback,
+and explicitly enroll authorized device keys using the trusted owner/admin
+workflow. The code never infers device enrollment from legacy signatures,
+never rewrites legacy object stores in place, and refuses an unmigrated store.
+If strict startup fails (including unsafe ACL or missing registry), protected
+writes return `503 SYNC_ATOMIC_REGISTRY_UNAVAILABLE`; there is no fallback to
+legacy. Unmigrated existing stores remain untouched for explicit reconciliation.
+Do **not** enable production or merge PR #228 until the authorized migration,
+rollback/recovery procedure, external authority requirements and independent
+security review are complete. PR #228 remains **DRAFT / NO-GO**.
+
 ## Issue #65 / PR #228: opt-in browser restore of signed persisted ciphertext chunks (2026-10-25)
 
 The development-only `/zk1-protected-file-lab.html` now offers a separate,

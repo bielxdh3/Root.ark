@@ -479,6 +479,16 @@ class SyncObjectStore {
 
   async put(username, input) {
     return this.transact(async (next) => {
+      // A signed Sync v2 operation is protected data, even when a legacy
+      // route/worker forgot to request device authorization. A separate
+      // JSON/callback registry cannot fence revocation against durableWrite.
+      // Never interpret a valid old signature as permission to bypass the
+      // co-located, cross-process atomic registry.
+      if (!this.atomicDeviceRegistry && input.authorization) {
+        throw Object.assign(new Error("Protected Sync v2 requires an atomic device registry"), {
+          code: "SYNC_PROTECTED_ATOMIC_REQUIRED",
+        });
+      }
       // A legacy process may point at the SAME storage file during a staged
       // rollout. Never allow its pre-transaction JSON/callback authorization
       // to bypass this registry merely because its constructor flag is off.
@@ -728,19 +738,34 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
   const retentionMs = positiveEnvInteger(process.env.SYNC_RECOVERY_RETENTION_MS, DEFAULT_RECOVERY_RETENTION_MS);
   const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard(), retentionMs, atomicDeviceRegistry });
   const ready = store.open();
+  // Keep the rejected startup promise observable to boot supervisors, but
+  // allow HTTP to return a bounded 503 rather than an unhandled rejection.
+  ready.catch(() => {});
   const sizeGuard = (req, res, next) => {
     const length = Number(req.headers["content-length"]);
     if (Number.isSafeInteger(length) && length > MAX_REQUEST_BYTES) return errorResponse(res, 413, "Sync payload too large");
     next();
   };
   const write = async (req, res, input) => {
-    await ready;
+    try { await ready; } catch {
+      return errorResponse(res, 503, "Sync atomic registry unavailable",
+        { code: "SYNC_ATOMIC_REGISTRY_UNAVAILABLE" });
+    }
     const payload = input === undefined ? req.body : input;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return errorResponse(res, 400, "Invalid sync payload");
     if (Object.hasOwn(payload, "plaintext") || Object.hasOwn(payload, "fileKey")) return errorResponse(res, 400, "Plaintext and keys are not accepted");
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
     try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
+    // Safe rollout: old unsigned development writes may remain available when
+    // no device auth is required. A signed envelope OR a route configured for
+    // device authorization must fail closed until an operator explicitly
+    // provisions a private same-file registry. Do not auto-migrate user data.
+    // Checking the legacy external registry again here would still race PUT.
+    if (!atomicDeviceRegistry && (requireDeviceAuthorization || operation.authorization)) {
+      return errorResponse(res, 503, "Protected Sync v2 requires atomic device registry",
+        { code: "SYNC_PROTECTED_ATOMIC_REQUIRED" });
+    }
     // POST and PUT carry the operation kind inside the signed envelope, so
     // checking only the route's fixed "upload" permission would let an
     // upload-only account delete objects by submitting a tombstone there.

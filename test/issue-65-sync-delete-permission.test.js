@@ -11,8 +11,8 @@ const express = require("express");
 const { createRequirePermission } = require("../src/middlewares/permissions");
 const { registerSyncRoutes } = require("../src/routes/sync");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
-const { createAuthorizationProof, verifyAuthorizationProof } =
-  require("../sync-client/rootark-sync-authorization");
+const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 function send(port, method, route, operation) {
   return new Promise((resolve, reject) => {
@@ -29,7 +29,13 @@ function send(port, method, route, operation) {
 }
 
 test("upload-only account cannot delete sync ciphertext through POST, PUT or DELETE", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-delete-permission-"));
+  // Protected signed Sync v2 writes require the co-located atomic registry.
+  // On Windows a default temp directory inherits broad Modify permissions.
+  const directory = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA, "rootark-sync-delete-permission-"
+      + crypto.randomBytes(8).toString("hex"))
+    : await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-delete-permission-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(directory);
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
   const publicSpki = publicKey.export({ type: "spki", format: "der" }).toString("base64url");
@@ -43,10 +49,11 @@ test("upload-only account cannot delete sync ciphertext through POST, PUT or DEL
     authenticate: (req, _res, next) => { req.user = account; next(); },
     requirePermission: createRequirePermission(),
     requireDeviceAuthorization: true,
-    deviceAuthorization: ({ username, operation, proof }) => verifyAuthorizationProof(
-      proof, operation, { username, trustedDevicePublicKeys: { "device-a": publicSpki } }),
+    atomicDeviceRegistry: true,
   });
   await route.ready;
+  await route.store.enrollDevice({ username: "alice", deviceId: "device-a",
+    publicKey: publicSpki, expectedEpoch: 0 });
   const server = await new Promise((resolve) => {
     const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
   });

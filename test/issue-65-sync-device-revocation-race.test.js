@@ -166,7 +166,8 @@ test("registered signer can commit; wrong signer, revoked signer, and legacy pro
   const revoked = await signed("revoked");
   await assert.rejects(store.put("alice", revoked), { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" });
   const legacy = await new SyncObjectStore(storagePath).open();
-  await assert.rejects(legacy.put("alice", revoked), { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" });
+  await assert.rejects(legacy.put("alice", revoked), { code: "SYNC_PROTECTED_ATOMIC_REQUIRED" },
+    "a legacy process cannot commit a signed protected write without an atomic registry");
   assert.deepEqual(store.list("alice").map((record) => record.objectId), ["object-good"]);
 });
 
