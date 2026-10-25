@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const archiver = require("archiver");
+const { createZipArchive } = require("./support/document-preview-archive");
 
 const servicePath = path.join(__dirname, "..", "services", "documentPreviewService.js");
 const workerPath = path.join(__dirname, "..", "services", "documentPreviewWorker.js");
@@ -43,7 +43,7 @@ test("document preview killable parser and route boundary matrix", async (t) => 
   fs.writeFileSync(textPath, "fixture");
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(docxPath);
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = createZipArchive({ zlib: { level: 9 } });
     output.on("close", resolve); output.on("error", reject); archive.on("error", reject); archive.pipe(output);
     archive.append("<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>", { name: "[Content_Types].xml" });
     archive.append("<document><body>fixture</body></document>", { name: "word/document.xml" });

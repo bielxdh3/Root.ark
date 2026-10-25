@@ -7,14 +7,14 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const archiver = require("archiver");
+const { createZipArchive } = require("./support/document-preview-archive");
 const { parseDocumentInChildProcess, previewText, MAX_INPUT_BYTES } =
   require("../services/documentPreviewService");
 
 async function writeDocx(file) {
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(file);
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = createZipArchive({ zlib: { level: 9 } });
     output.on("close", resolve);
     output.on("error", reject);
     archive.on("error", reject);
