@@ -646,7 +646,8 @@ inventory predecessor checkpoint, exact committed inventory receipt digest,
 pre-device-expiry admission timestamp, and witness CAS/physical-fence head.
 Issuance requires fresh device Ed25519 authorization and revocation check,
 fresh independently pinned inventory and PostgreSQL-attestor signature proof
-over a private nonce, and an existing owner-authorized physically fenced CAS
+over the exact 32-byte **caller-provided challenge nonce** (the same challenge
+is also signed into the witness physical floor), and an existing owner-authorized physically fenced CAS
 terminal record whose operation ID, inventory sequence and root agree exactly.
 It uses a separate witness-owned immutable SQLite receipt table with
 `synchronous=FULL`, an Ed25519-signed and SHA-256 chained operation history,
@@ -662,6 +663,16 @@ operation's mutable device-policy object. Policy is re-read at commit, and
 both the current signed device expiration and physical proof freshness are
 rechecked inside the SQLite immediate transaction **directly before INSERT**;
 post-Ed25519-signature expiration and late device revocation fail closed.
+The time is sampled only **after** the synchronous trusted policy-provider
+refresh and SQL statement preparation, and sampled again after INSERT while
+the SQLite transaction can still roll back. An independently pinned non-genesis
+historical high-water forbids fresh SQLite bootstrap. The published strict
+`verifySyncV2HistoricalWitnessAdmission` verifier is used with the emitted
+admission, fresh signed floor and ephemeral PG attestation using that same
+nonce; wrong challenge, altered floor and substituted PG proof are rejected.
+Only an active, opt-in strict witness issuer advertises the read-only
+`supportsClientHistoricalNonce` capability used by the separate mTLS transport;
+legacy floors and closed issuers advertise false.
 Focused tests exercise signed and revoked device envelopes, forged inventory
 proofs, operation/floor mismatch, replay, SQLite rewind/restart and a real
 mTLS peer in a separate OS child **whose PostgreSQL readback is simulated**.

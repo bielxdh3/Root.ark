@@ -165,6 +165,14 @@ class Zk1WitnessCasAnchorFloor {
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   #trustedSyncDevicePolicyProvider;
+  // Read-only capability for the separately reviewed mTLS issuer transport.
+  // Never advertise legacy/writer-signed floors or a closed issuer as nonce
+  // bound; strict mode always uses the caller nonce for PG AND witness floor.
+  get supportsClientHistoricalNonce() {
+    return this.#historicalEnabled && !this.#closed
+      && this.#attestedAdmission instanceof Zk1WitnessCasPhysicalAdmission
+      && typeof this.#trustedSyncDevicePolicyProvider === "function";
+  }
   constructor(filename, { bootstrapNew = false, witnessKeyId, witnessPrivateKey,
     statusKeyId, statusPublicKey, trustedMinimumHead,
     attestedAdmission = null, enableSyncHistoricalIssuer = false,
@@ -177,12 +185,16 @@ class Zk1WitnessCasAnchorFloor {
     // remote callers may NEVER provide their own device pins or revocations.
     this.#trustedSyncDevicePolicyProvider = enableSyncHistoricalIssuer
       ? trustedSyncDevicePolicyProvider : null;
-    if (enableSyncHistoricalIssuer && !bootstrapNew) {
-      if (!trustedHistoricalAdmissionHead) fail();
-      const pinned = exact(trustedHistoricalAdmissionHead, ["sequence", "lastHash"]);
-      if (!Number.isSafeInteger(pinned.sequence) || pinned.sequence < 0
-        || pinned.sequence > 100000 || !validHex(pinned.lastHash)) fail();
-      this.#historicalHead = Object.freeze({ ...pinned });
+    if (enableSyncHistoricalIssuer) {
+      if (!bootstrapNew && !trustedHistoricalAdmissionHead) fail();
+      if (trustedHistoricalAdmissionHead !== undefined) {
+        const pinned = exact(trustedHistoricalAdmissionHead, ["sequence", "lastHash"]);
+        if (!Number.isSafeInteger(pinned.sequence) || pinned.sequence < 0
+          || pinned.sequence > 100000 || !validHex(pinned.lastHash)
+          || (pinned.sequence === 0 && pinned.lastHash !== ZERO)
+          || (bootstrapNew && (pinned.sequence !== 0 || pinned.lastHash !== ZERO))) fail();
+        this.#historicalHead = Object.freeze({ ...pinned });
+      }
     }
     if (trustedMinimumHead !== undefined) {
       // Strict restart's independent high-water anchor must bind the physical
@@ -683,16 +695,33 @@ class Zk1WitnessCasAnchorFloor {
   // This is NOT cross-service atomicity or an external monotonic anchor.
   async issueSyncHistoricalAdmission(input) {
     if (!this.#historicalEnabled || this.#closed) fail();
-    const pending = this.#advanceQueue.then(() => this.#issueSyncSerial(input));
+    // Pin the caller's challenge BEFORE entering the asynchronous witness
+    // queue. Otherwise a caller could mutate the same Buffer while waiting
+    // for another admission and silently change the attested nonce.
+    const captured = exact(input, ["envelope", "scope", "expectedSequence",
+      "expectedRoot", "inventoryReceipt", "nonce"]);
+    if ((!Buffer.isBuffer(captured.nonce) && !(captured.nonce instanceof Uint8Array))
+      || captured.nonce.byteLength !== 32
+      || (typeof SharedArrayBuffer !== "undefined"
+        && captured.nonce.buffer instanceof SharedArrayBuffer)) fail();
+    const pinnedInput = { ...captured, nonce: Buffer.from(captured.nonce) };
+    const pending = this.#advanceQueue.then(() => this.#issueSyncSerial(pinnedInput));
     this.#advanceQueue = pending.catch(() => {});
     return pending;
   }
   async #issueSyncSerial(input) {
     try {
       const v = exact(input, ["envelope", "scope", "expectedSequence",
-        "expectedRoot", "inventoryReceipt"]);
+        "expectedRoot", "inventoryReceipt", "nonce"]);
       const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence,
         v.expectedRoot);
+      if ((!Buffer.isBuffer(v.nonce) && !(v.nonce instanceof Uint8Array))
+        || v.nonce.byteLength !== 32
+        || (typeof SharedArrayBuffer !== "undefined"
+          && v.nonce.buffer instanceof SharedArrayBuffer)) fail();
+      // One exact caller challenge must bind the PG attestor signature and
+      // witness's signed physical floor. Detach before the first await.
+      const nonce = Buffer.from(v.nonce);
       // The trusted operator must provide a synchronous current policy, not
       // attacker-chosen `input.localTrustedDevicePolicy` or mutable disk JSON.
       const policy = snapshotLocalDevicePolicy(this.#trustedSyncDevicePolicyProvider());
@@ -715,7 +744,6 @@ class Zk1WitnessCasAnchorFloor {
         || bound.envelope.authorization.expiresAt <= Date.now()) fail();
       if (this.#db.prepare("SELECT 1 FROM witness_cas_sync_historical_admission WHERE operation_id=?")
         .get(bound.operation.operation_id.toString("base64url"))) fail();
-      const nonce = crypto.randomBytes(32);
       const composite = await this.#attestedAdmission.attestSyncCommitted({
         scope: bound.scope, operation: bound.operation,
         receipt: signedReceipt, nonce,
@@ -725,7 +753,7 @@ class Zk1WitnessCasAnchorFloor {
       const fenced = await this.proveCommittedPhysicalFence({ scope: bound.scope,
         operationId: bound.operation.operation_id,
         inventorySequence: composite.inventorySequence,
-        inventoryRoot: composite.inventoryRoot, nonce: crypto.randomBytes(32) });
+        inventoryRoot: composite.inventoryRoot, nonce });
       const admittedAtMs = Date.now();
       if (!Number.isSafeInteger(admittedAtMs) || admittedAtMs < 1
         || admittedAtMs >= bound.envelope.authorization.expiresAt
@@ -768,25 +796,37 @@ class Zk1WitnessCasAnchorFloor {
       this.#db.transaction(() => {
         if (this.#db.prepare("SELECT COUNT(*) AS n FROM witness_cas_sync_historical_admission")
             .get().n !== previous.sequence) fail();
+        // Native SQLite stmt creation precedes the final time sample too.
+        const insert = this.#db.prepare("INSERT INTO witness_cas_sync_historical_admission"
+          + " (sequence,operation_id,previous_hash,receipt,hash) VALUES(?,?,?,?,?)");
+        // Synchronous trusted callbacks may advance the clock during policy
+        // refresh/serialization. Never sample time before invoking them.
+        const freshPolicy = JSON.stringify(snapshotLocalDevicePolicy(
+          this.#trustedSyncDevicePolicyProvider()));
         // The final authorization decision is inside the very same immediate
         // SQLite transaction that persists this signed admission. No await or
-        // asynchronous callback may intervene between this check and INSERT.
+        // policy-provider callback may intervene between check and INSERT.
         const commitAtMs = Date.now();
         if (!Number.isSafeInteger(commitAtMs) || commitAtMs < admittedAtMs
           || commitAtMs >= bound.envelope.authorization.expiresAt
           || !Number.isSafeInteger(composite.physicalIssuedAt)
           || Math.abs(Math.floor(commitAtMs / 1000)
             - composite.physicalIssuedAt) > 30
-          || JSON.stringify(snapshotLocalDevicePolicy(
-            this.#trustedSyncDevicePolicyProvider())) !== policySnapshot) fail();
-        this.#db.prepare("INSERT INTO witness_cas_sync_historical_admission"
-          + " (sequence,operation_id,previous_hash,receipt,hash) VALUES(?,?,?,?,?)")
-          .run(previous.sequence + 1, unsigned.operationId,
+          || freshPolicy !== policySnapshot) fail();
+        insert.run(previous.sequence + 1, unsigned.operationId,
             previous.lastHash, serialized, hash);
+        // Abort and roll back if SQLite's own synchronous INSERT/WAL operation
+        // outlived the signed device authorization or PG freshness window.
+        const insertedAtMs = Date.now();
+        if (!Number.isSafeInteger(insertedAtMs) || insertedAtMs < commitAtMs
+          || insertedAtMs >= bound.envelope.authorization.expiresAt
+          || Math.abs(Math.floor(insertedAtMs / 1000)
+            - composite.physicalIssuedAt) > 30) fail();
       }).immediate();
       this.#historicalHead = Object.freeze({ sequence: previous.sequence + 1,
         lastHash: hash });
       return Object.freeze({ admission, freshFloor: floor,
+        physicalAttestation: Buffer.from(composite.physicalAttestation),
         historicalAdmissionHead: this.historicalAdmissionHead(),
         durableLocalWitnessAdmission: true,
         independentPhysicalReadbackVerified: true,

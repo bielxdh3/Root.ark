@@ -184,6 +184,9 @@ class Zk1WitnessCasPhysicalAdmission {
         inventoryRoot: Buffer.from(verified.inventoryReceipt.root),
         receiptSha256: crypto.createHash("sha256").update(signedReceipt).digest(),
         physicalIssuedAt: verified.physicalReadback.issuedAt,
+        // Ephemeral signed bytes for the strict client verifier to check the
+        // SAME caller-supplied nonce. Never part of the persisted admission.
+        physicalAttestation: Buffer.from(raw),
         pgReadbackVerified: true, authorizesIo: false,
       });
     } catch (_) { deny(); }

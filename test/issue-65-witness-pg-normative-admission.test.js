@@ -29,7 +29,8 @@ const { createZk1PgPhysicalAttestorHttpsClient } =
   require("../src/services/zk1PgPhysicalAttestorHttpsClient");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
-const { envelopeBinding } = require("../sync-client/rootark-sync-zk1-physical-binding");
+const { envelopeBinding, verifySyncV2HistoricalWitnessAdmission } =
+  require("../sync-client/rootark-sync-zk1-physical-binding");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
 const ENTRY = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
@@ -164,6 +165,8 @@ test("strict CAS witness floor refuses signed status advance without independent
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
   });
   t.after(() => floor.close());
+  assert.equal(floor.supportsClientHistoricalNonce, false,
+    "legacy/non-issuer floor cannot advertise client historical nonce binding");
   const binding = { recordHash: hex(Buffer.from(record)), scope: {
     account_id: scope.account_id.toString("base64url"),
     compartment_id: scope.compartment_id.toString("base64url"),
@@ -237,9 +240,17 @@ test("strict CAS witness floor refuses signed status advance without independent
   // cannot manufacture this witness-signed admission.
   const historicalFilename = path.join(directory, "witness-historical-sync.sqlite");
   let trustedDeviceRevocations = [];
-  const trustedSyncDevicePolicyProvider = () => ({ username: "owner",
-    trustedDevicePublicKeys: { "device-a": deviceSpki },
-    revokedDeviceIds: [...trustedDeviceRevocations] });
+  let advanceClockOnPolicyRefresh = false;
+  let policyRefreshCount = 0;
+  let policyRefreshExpired = false;
+  const trustedSyncDevicePolicyProvider = () => {
+    if (advanceClockOnPolicyRefresh && ++policyRefreshCount === 2) {
+      policyRefreshExpired = true;
+      Date.now = () => syncEnvelope.authorization.expiresAt + 1;
+    }
+    return { username: "owner", trustedDevicePublicKeys: { "device-a": deviceSpki },
+      revokedDeviceIds: [...trustedDeviceRevocations] };
+  };
   const historicalOptions = {
     witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
@@ -252,11 +263,26 @@ test("strict CAS witness floor refuses signed status advance without independent
       enableSyncHistoricalIssuer: true, bootstrapNew: true,
     }), /WITNESS_CAS_FLOOR_DENIED/,
   "historical issuer must never bootstrap without an operator-controlled policy source");
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    path.join(directory, "forbidden-rollback-bootstrap.sqlite"), {
+      ...historicalOptions, bootstrapNew: true,
+      trustedHistoricalAdmissionHead: { sequence: 1, lastHash: "f".repeat(64) },
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+  "bootstrap must reject a nonzero externally pinned historical high-water");
   let historical = new Zk1WitnessCasAnchorFloor(historicalFilename, {
     ...historicalOptions, bootstrapNew: true });
+  assert.equal(historical.supportsClientHistoricalNonce, true,
+    "only strict active issuer can satisfy the independent transport capability guard");
   await historical.advanceAttested({ records: [record], evidence: [evidence] });
+  const historicalChallenge = random(32);
   const issueInput = { envelope: syncEnvelope, scope, expectedSequence: 0,
-    expectedRoot: genesisRoot, inventoryReceipt: receipt };
+    expectedRoot: genesisRoot, inventoryReceipt: receipt, nonce: historicalChallenge };
+  await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
+    nonce: random(31) }), /WITNESS_CAS_FLOOR_DENIED/,
+  "historical admission must reject malformed caller challenges before physical IO");
+  await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
+    nonce: undefined }), /WITNESS_CAS_FLOOR_DENIED/,
+  "no witness-generated nonce may replace a missing client's challenge");
   await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
     localTrustedDevicePolicy: { username: "owner", trustedDevicePublicKeys: {
       "device-a": deviceSpki }, revokedDeviceIds: [] } }), /WITNESS_CAS_FLOOR_DENIED/,
@@ -349,7 +375,29 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.equal(crossedInsideTransaction, true);
   assert.deepEqual(historical.historicalAdmissionHead(), {
     sequence: 0, lastHash: "0".repeat(64) });
-  const issued = await historical.issueSyncHistoricalAdmission(issueInput);
+  // The second device-policy fetch was previously AFTER the purported final
+  // clock check; a synchronous trusted callback can cross expiry before INSERT.
+  advanceClockOnPolicyRefresh = true;
+  policyRefreshCount = 0;
+  policyRefreshExpired = false;
+  try {
+    await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      "expiry crossed synchronously by policy refresh must roll back INSERT");
+  } finally {
+    advanceClockOnPolicyRefresh = false;
+    policyRefreshCount = 0;
+    Date.now = originalClock;
+  }
+  assert.equal(policyRefreshExpired, true,
+    "the trusted policy refresh must really cross device expiry inside SQLite");
+  assert.deepEqual(historical.historicalAdmissionHead(), {
+    sequence: 0, lastHash: "0".repeat(64) });
+  const mutableChallenge = Buffer.from(historicalChallenge);
+  const inFlight = historical.issueSyncHistoricalAdmission({
+    ...issueInput, nonce: mutableChallenge });
+  mutableChallenge.fill(0);
+  const issued = await inFlight;
   assert.equal(issued.durableLocalWitnessAdmission, true);
   assert.equal(issued.authorizesHistoricalRead, false);
   assert.equal(issued.authorizesIo, false);
@@ -361,6 +409,41 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.ok(issued.admission.admittedAtMs < syncEnvelope.authorization.expiresAt);
   assert.equal(issued.admission.witnessPhysicalFenceDigest,
     issued.freshFloor.physicalFenceDigest);
+  assert.equal(issued.freshFloor.nonce, historicalChallenge.toString("base64url"),
+    "the exact pre-queue client challenge must bind both PG and signed witness floor");
+  const strictClientInput = {
+    envelope: syncEnvelope, scope, expectedSequence: 0, expectedRoot: genesisRoot,
+    receipt, physicalAttestation: issued.physicalAttestation,
+    nonce: historicalChallenge, admission: issued.admission,
+    freshFloor: issued.freshFloor,
+    pinnedInventoryPublicKey: inventory.publicKey,
+    pinnedInventorySignerKeyId: inventoryKeyId,
+    pinnedPhysicalAttestorPublicKey: attestor.publicKey,
+    localTrustedDevicePolicy: trustedSyncDevicePolicyProvider(),
+    pinnedWitnessPublicKey: witness.publicKey,
+    witnessKeyId, statusKeyId,
+    trustedMinimumFloor: {
+      sequence: issued.freshFloor.sequence,
+      lastHash: issued.freshFloor.lastHash,
+      physicalFenceDigest: issued.freshFloor.physicalFenceDigest,
+    },
+  };
+  const independentlyVerified = await verifySyncV2HistoricalWitnessAdmission(strictClientInput);
+  assert.equal(independentlyVerified.status, "SYNC_V2_HISTORICAL_WITNESS_VERIFIED");
+  assert.equal(independentlyVerified.historicalServerAdmissionProven, true);
+  assert.equal(independentlyVerified.authorizesHistoricalRead, true);
+  assert.equal(independentlyVerified.authorizesIo, false);
+  for (const forged of [
+    { nonce: random(32) },
+    { freshFloor: { ...issued.freshFloor, nonce: random(32).toString("base64url") } },
+    { physicalAttestation: Buffer.from("fake physical ACK") },
+    { trustedMinimumFloor: { ...strictClientInput.trustedMinimumFloor,
+      physicalFenceDigest: "f".repeat(64) } },
+  ]) {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...strictClientInput, ...forged }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "replayed/forged challenges, PG evidence or external floor must fail closed");
+  }
   const { signature: admissionSignature, ...unsignedAdmission } = issued.admission;
   assert.equal(crypto.verify(null, Buffer.concat([
     Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0"),
@@ -371,6 +454,8 @@ test("strict CAS witness floor refuses signed status advance without independent
   const admittedFloor = issued.freshFloor;
   const admittedHistoryHead = issued.historicalAdmissionHead;
   historical.close();
+  assert.equal(historical.supportsClientHistoricalNonce, false,
+    "closed issuer cannot advertise live nonce-bound admission service");
   assert.throws(() => new Zk1WitnessCasAnchorFloor(historicalFilename, {
     ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
       sequence: 1, lastHash: admittedFloor.lastHash,
