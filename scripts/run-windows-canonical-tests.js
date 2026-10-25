@@ -48,6 +48,7 @@ function createTapProgressRecorder(write) {
   const failurePaths = new Map();
   let pending = null;
   let detailed = 0;
+  let verifiedAclOverflowDetails = 0;
   const finish = () => {
     if (!pending) return;
     const category = categoryFor(pending.code);
@@ -62,6 +63,12 @@ function createTapProgressRecorder(write) {
         ? ` edgeStage=${pending.edge.stage} edgeError=${pending.edge.code}` : "";
       write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${acl}${edge}`);
       detailed++;
+    } else if (pending.acl && verifiedAclOverflowDetails < 4) {
+      // Numerous unrelated failed tests must not suppress the bounded, strictly
+      // allowlisted ACL diagnostics needed to investigate hosted security gates.
+      // parseAclFailureDiagnostic already verified case, test title and path hashes.
+      write(`FAIL verified ACL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}`);
+      verifiedAclOverflowDetails++;
     }
     pending = null;
   };

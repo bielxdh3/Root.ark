@@ -161,6 +161,26 @@ test("Windows canonical runner recognizes all four ACL failure profiles without 
   assert.doesNotMatch(logged.join("\n"), /private-host|test\.js|generic access ACEs|permission change/);
 });
 
+test("Windows canonical runner preserves bounded trusted ACL details after unrelated failure cap", () => {
+  const logged = [];
+  const recorder = createTapProgressRecorder((line) => logged.push(line));
+  for (let i = 1; i <= 14; i++) {
+    recorder.accept(`not ok ${i} - unrelated failure ${i}`);
+    recorder.accept("  code: 'ERR_TEST_FAILURE'");
+  }
+  const title = "strict atomic registry refuses a later untrusted file permission change";
+  for (let i = 15; i <= 20; i++) {
+    recorder.accept(`not ok ${i} - ${title}`);
+    recorder.accept("  location: 'C:\\private\\test\\issue-65-sync-atomic-private-acl.test.js:88:1'");
+    recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=REOPEN_CHECK code=ASSERTION trust=UNTRUSTED_ADDED");
+  }
+  recorder.finish();
+  const overflow = logged.filter((line) => line.startsWith("FAIL verified ACL detail "));
+  assert.equal(overflow.length, 4, "at most four vetted ACL overflow records");
+  assert.ok(overflow.every((line) => line.includes("aclStage=REOPEN_CHECK aclError=ASSERTION aclTrust=UNTRUSTED_ADDED")));
+  assert.doesNotMatch(logged.join("\n"), /C:\\private|\.test\.js|unrelated failure|private path/);
+});
+
 test("Windows canonical runner synchronously reports failure even when console output is buffered", () => {
   const runnerPath = path.join(__dirname, "..", "scripts", "run-windows-canonical-tests.js");
   const source = fs.readFileSync(runnerPath, "utf8");
