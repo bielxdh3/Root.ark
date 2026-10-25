@@ -37,6 +37,7 @@ test("strict bridge rejects a writer-owned physical proof and accepts only pinne
   ledger.getOperationStatus = async () => ({ status: "pending" });
   const received = [];
   let signer = attest.privateKey;
+  let issuedAtOverride = null;
   const attestorClient = { async requestAttestation(v) {
     received.push(v);
     const readback = { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
@@ -48,7 +49,7 @@ test("strict bridge rejects a writer-owned physical proof and accepts only pinne
       root, ciphertextSha256: v.operation.ciphertext_sha256,
       authorizesIo: false, provesIndependentOperator: false };
     return signCommittedPhysicalReadback({ ...v, readback,
-      issuedAt: Math.floor(Date.now() / 1000) }, signer);
+      issuedAt: issuedAtOverride ?? Math.floor(Date.now() / 1000) }, signer);
   } };
   const ctor = { sink: mockOf(Zk1SharedPgCiphertextSink), verifier,
     intentAuthority: mockOf(Zk1SharedPgPhysicalInventoryIntent), ledger,
@@ -60,6 +61,20 @@ test("strict bridge rejects a writer-owned physical proof and accepts only pinne
     pinnedPhysicalAttestorPublicKey: forgedSameWriter }), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
   "a mutable KeyObject export cannot invent an independent bridge attestor");
   const bridge = new Zk1PgPhysicalInventoryBridge(ctor);
+  const actualDateNow = Date.now;
+  const baseSeconds = Math.floor(actualDateNow() / 1000);
+  let clockReads = 0;
+  try {
+    issuedAtOverride = baseSeconds;
+    Date.now = () => (baseSeconds + (++clockReads === 1 ? 29 : 31)) * 1000;
+    await assert.rejects(bridge.reconcile(physical),
+      /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+      "strict bridge must reject attestation expiring during async verification");
+    assert.ok(clockReads >= 2);
+  } finally {
+    Date.now = actualDateNow;
+    issuedAtOverride = null;
+  }
   assert.deepEqual(await bridge.reconcile(physical),
     { status: "pending", authorizesIo: false });
   // The writer process must not need a physical PostgreSQL attestor login.
@@ -67,7 +82,7 @@ test("strict bridge rejects a writer-owned physical proof and accepts only pinne
   const remoteOnly = new Zk1PgPhysicalInventoryBridge({ ...ctor, verifier: undefined });
   assert.deepEqual(await remoteOnly.reconcile(physical),
     { status: "pending", authorizesIo: false });
-  assert.equal(received.length, 2);
+  assert.equal(received.length, 3, "includes the rejected stale proof readback");
   assert.deepEqual(received[0].operation.operation_id, operation.operation_id);
   // The bridge must export a verified composite receipt, rather than a
   // writer-signed local catalog entry with an unrelated boolean PG flag.

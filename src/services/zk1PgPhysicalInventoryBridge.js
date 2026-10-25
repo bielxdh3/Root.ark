@@ -53,6 +53,14 @@ function same(a, b) {
   return Buffer.isBuffer(a) && Buffer.isBuffer(b) && a.length === b.length
     && crypto.timingSafeEqual(a, b);
 }
+function requireFreshSignedPhysical(verified) {
+  // The signed timestamp is returned only after pinned Ed25519 verification.
+  // Network/CBOR awaits can outlive the attestor's 30 s acceptance window.
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(verified?.issuedAt)
+    || !Number.isSafeInteger(nowSeconds) || nowSeconds < 1
+    || Math.abs(nowSeconds - verified.issuedAt) > 30) fail();
+}
 function copyRequest(input) {
   const r = exact(input, ["scope", "operation", "digest", "expectedRootHash", "expectedChunkCount"]);
   const scope = inventory.normalizeScope(r.scope);
@@ -314,6 +322,7 @@ class Zk1PgPhysicalInventoryBridge {
           pinnedPublicKey: this.#attestorPublicKey,
           nowSeconds: Math.floor(Date.now() / 1000),
         });
+        requireFreshSignedPhysical(verified);
         proof = { ...verified, physicalAttestationBytes: Buffer.from(raw),
           challengeNonce: Buffer.from(nonce), root: Buffer.from(v.expectedRootHash),
           ciphertextSha256: Buffer.from(v.operation.ciphertext_sha256) };
@@ -357,6 +366,7 @@ class Zk1PgPhysicalInventoryBridge {
         pinnedPhysicalAttestorPublicKey: this.#attestorPublicKey,
         nowSeconds: Math.floor(Date.now() / 1000),
       });
+      requireFreshSignedPhysical(combined.physicalReadback);
       if (combined.inventoryReceipt.sequence !== status.sequence
         || !same(combined.inventoryReceipt.root, status.root)) fail();
       return { ...status, independentPhysicalAttestationVerified: true,

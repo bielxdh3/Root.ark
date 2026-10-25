@@ -1,5 +1,18 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: strict PostgreSQL bridge proof freshness (2026-10-24)
+
+The strict independent-attestor branch of `Zk1PgPhysicalInventoryBridge`
+now rechecks the signed `issuedAt` after each asynchronous verification of
+remote physical readback, and again after verifying the composite inventory
+receipt. A valid Ed25519 signature alone may not outlive its 30-second
+challenge freshness window. A signed proof crossing from age 29 seconds at
+verification to 31 seconds at return was reproduced RED and now fails closed.
+The original non-independent local verifier path is unchanged. Windows Node 24
+and Node 22 focused regressions: 24 PASS / 0 FAIL each. This patch does not
+establish independent trusted time, full distributed fencing, cloud fsync,
+or historical Sync v2 admission and does not imply merge readiness.
+
 ## Issue #65 / PR #228: physical proof expiry across async verification (2026-10-24)
 
 The opt-in Sync v2 to ZK1 physical-envelope verifier now requires the physical
