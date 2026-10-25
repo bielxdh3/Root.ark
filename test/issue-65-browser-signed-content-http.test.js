@@ -16,6 +16,9 @@ const chunks = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const browser = require("../public/client/rootark-zk1-protected-http-client");
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoot = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
+const portableRecovery = require("../public/client/rootark-zk1-portable-file-recovery");
+const persistedRecovery = require("../public/client/rootark-zk1-persisted-portable-chunk-recovery");
+const persistedBrowser = require("../public/client/rootark-zk1-persisted-browser-recovery");
 const reconciliation = require("../public/client/rootark-zk1-uncertain-put-reconciliation");
 const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
   require("../src/services/zk1ProtectedObjectStore");
@@ -413,6 +416,149 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   assert.equal(umdBackup.trustedRootProvenanceVerified, true,
     "plain browser UMD with independent owner checkpoint must work against real signed HTTP route");
   assert.deepEqual(Buffer.from(umdBackup.ciphertextBase64, "base64url"), Buffer.from(encrypted));
+  // The workspace's opt-in persisted recovery is exercised against the SAME
+  // real authenticated Express/SQLite route, with an independently owner-
+  // signed two-chunk checkpoint and actual persisted local chunk rows.
+  const persistedMeta = { ...scopeWire, object_id: randomId(),
+    version_id: randomId(), parent_version_id: null,
+    epoch: parameters.epoch, kind: "file" };
+  const heldSecret = portableRecovery.generateRecoverySecret();
+  const persistedPlaintext = Buffer.from("only user-held secret opens two persisted encrypted chunks");
+  const persistedBundle = await portableRecovery.sealForUserHeldSecret({
+    recoverySecret: heldSecret, metadata: persistedMeta,
+    name: "persisted.txt", mediaType: "text/plain", data: persistedPlaintext,
+  });
+  const persistedBytes = Buffer.from(persistedBundle.ciphertextBase64, "base64url");
+  const localPieces = [persistedBytes.subarray(0, 37), persistedBytes.subarray(37)];
+  const sourceRoot = await chunks.computeCiphertextRoot(localPieces);
+  assert.notDeepEqual(Buffer.from(sourceRoot),
+    Buffer.from(persistedBundle.ciphertextRoot, "base64url"));
+  store.db.exec("CREATE TABLE IF NOT EXISTS bridge_test_chunks (idx INTEGER PRIMARY KEY, data BLOB NOT NULL)");
+  const storeChunk = store.db.prepare("INSERT INTO bridge_test_chunks VALUES (?, ?)");
+  localPieces.forEach((part, i) => storeChunk.run(i, part));
+  const readPersistedChunk = async ({ index }) =>
+    store.db.prepare("SELECT data FROM bridge_test_chunks WHERE idx=?").get(index)?.data;
+  const pinnedOwnerPublic = await crypto.webcrypto.subtle.importKey("spki",
+    crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" }),
+    "Ed25519", true, ["verify"]);
+  const spkiFingerprint = crypto.createHash("sha256")
+    .update(crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" })).digest();
+  const ownerRawFingerprint = crypto.createHash("sha256")
+    .update(crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(-32)).digest();
+  const storedHead = { revision: parameters.manifestRevision,
+    digest: Buffer.from(parameters.manifestDigest), epoch: parameters.epoch };
+  const storedInventory = await persistedRecovery.createSignedPersistedPortableChunkInventory({
+    bundle: persistedBundle, ownerSigningKey: webKey,
+    ownerPublicKey: pinnedOwnerPublic, independentOwnerSpkiSha256: spkiFingerprint,
+    ownerHead: storedHead, chunks: localPieces, assertLive: () => undefined,
+  });
+  const pinnedNativeCheckpoint = await ownerRoot.signOwnerCiphertextRootCheckpoint({
+    ...ownerRootInput, objectId: persistedMeta.object_id, ciphertextRoot: sourceRoot,
+  });
+  const grantFields = ["schema", "account_id", "compartment_id", "keyring_id",
+    "device_id", "authorization_key_id", "authorization_public_key",
+    "manifest_revision", "manifest_digest", "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
+  const storedGrant = {
+    schema: "rootark-zk1-browser-owner-device-grant/v1", ...scopeWire,
+    device_id: device.device_id,
+    authorization_key_id: base64(device.authorization_key_id),
+    authorization_public_key: base64(crypto.createPublicKey(privateKey)
+      .export({ format: "der", type: "spki" }).subarray(-32)),
+    manifest_revision: storedHead.revision, manifest_digest: base64(storedHead.digest),
+    current_epoch: storedHead.epoch, enrolled_epoch: storedHead.epoch,
+    revoked_at_epoch: null,
+  };
+  storedGrant.signature = base64(crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+    Buffer.from(JSON.stringify(Object.fromEntries(grantFields.map((k) => [k, storedGrant[k]]))))]),
+  privateKey));
+  const putPersisted = await browser.signProtectedContentOperation({
+    ...parameters, operation: "put", objectId: persistedMeta.object_id,
+    expectedObjectRevision: null, ciphertext: persistedBytes,
+  });
+  assert.equal((await browser.postProtectedCiphertextPut({
+    origin, request: putPersisted, fetchImpl: sessionFetch })).revision, 1);
+  const trustedBridgeInput = {
+    ownerPublicKey: pinnedOwnerPublic, pinnedOwnerKeyHash: ownerRawFingerprint,
+    independentOwnerSpkiSha256: spkiFingerprint, pinnedCurrentHead: storedHead,
+    signedDeviceGrant: storedGrant, ownerHistoryCheckpoint: historyWire,
+    previousOwnerHistoryProof: null, devicePublicKey: pinnedOwnerPublic,
+    devicePrivateKey: webKey, origin, fetchImpl: sessionFetch,
+    nowSeconds: 1400, bundle: persistedBundle, signedInventory: storedInventory,
+    expectedMetadata: persistedMeta,
+    independentlyPinnedCiphertextRoot: Buffer.from(persistedBundle.ciphertextRoot, "base64url"),
+    independentlyPinnedSourceChunkRoot: Buffer.from(sourceRoot),
+    ownerSignerKeyId: Buffer.from(ownerPin.signerKeyId),
+    ownerDeviceId: device.device_id,
+    ownerRootCheckpoint: pinnedNativeCheckpoint, recoverySecret: heldSecret,
+    readChunk: readPersistedChunk, assertLive: () => undefined,
+  };
+  const bridgedResult = await persistedBrowser.recoverFromPinnedPersistedHttpGet(trustedBridgeInput);
+  assert.deepEqual(Buffer.from(bridgedResult.data), persistedPlaintext);
+  assert.equal(bridgedResult.protectedHttpReadbackVerified, true);
+  assert.equal(bridgedResult.ownerRootSignatureVerified, true);
+  assert.equal(bridgedResult.sourceChunkRootVerifiedAgainstIndependentPin, true);
+  assert.equal(bridgedResult.independentRemoteDurabilityProven, false);
+  assert.equal(bridgedResult.authorizesProductionRestore, false);
+  bridgedResult.data.fill(0);
+  let forgedOutbound = 0;
+  await assert.rejects(persistedBrowser.recoverFromPinnedPersistedHttpGet({
+    ...trustedBridgeInput, independentlyPinnedSourceChunkRoot:
+      Buffer.from(persistedBundle.ciphertextRoot, "base64url"),
+    fetchImpl: () => { forgedOutbound++; throw new Error("unexpected GET"); },
+  }), /ZK_PERSISTED_BROWSER_RECOVERY_DENIED/);
+  assert.equal(forgedOutbound, 0, "forged source root must fail before HTTP");
+  await assert.rejects(persistedBrowser.recoverFromPinnedPersistedHttpGet({
+    ...trustedBridgeInput, independentOwnerSpkiSha256: crypto.randomBytes(32),
+    fetchImpl: () => { forgedOutbound++; throw new Error("unexpected GET"); },
+  }), /ZK_PERSISTED_BROWSER_RECOVERY_DENIED/);
+  assert.equal(forgedOutbound, 0, "server cannot invent owner trust pins");
+  let localLive = true;
+  await assert.rejects(persistedBrowser.recoverFromPinnedPersistedHttpGet({
+    ...trustedBridgeInput,
+    readChunk: async ({ index }) => {
+      const value = await readPersistedChunk({ index });
+      if (index === 1) localLive = false;
+      return value;
+    },
+    assertLive: () => localLive ? undefined : false,
+  }), /ZK_PERSISTED_BROWSER_RECOVERY_DENIED/,
+  "revocation during persisted SQLite chunk reads must prevent plaintext release");
+  // The local assertLive guard cannot learn about external witness revocation:
+  // the server's gate must be freshly rechecked AFTER slow persisted reads.
+  try {
+    await assert.rejects(persistedBrowser.recoverFromPinnedPersistedHttpGet({
+      ...trustedBridgeInput,
+      readChunk: async ({ index }) => {
+        const part = await readPersistedChunk({ index });
+        if (index === 1) gateOpen = false;
+        return part;
+      },
+    }), /ZK_PERSISTED_BROWSER_RECOVERY_DENIED/,
+    "remote witness revocation after first GET must deny plaintext at final release");
+  } finally { gateOpen = true; }
+  const deleteNativeChunk = store.db.prepare("DELETE FROM bridge_test_chunks WHERE idx=1");
+  deleteNativeChunk.run();
+  await assert.rejects(persistedBrowser.recoverFromPinnedPersistedHttpGet(trustedBridgeInput),
+    /ZK_PERSISTED_BROWSER_RECOVERY_DENIED/,
+    "a real HTTP GET must not let missing local persisted chunks fall back to the full bundle");
+  const umdContext = vm.createContext({ crypto: crypto.webcrypto,
+    TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, atob, btoa,
+    RootarkZk1NormalBrowserContent: require("../public/client/rootark-zk1-normal-browser-content"),
+    RootarkZk1NormalBrowserTrustFloor: require("../public/client/rootark-zk1-normal-browser-trust-floor"),
+    RootarkZk1OwnerCiphertextRootCheckpoint: ownerRoot,
+    RootarkZk1ProtectedHttpClient: browser,
+    RootarkZk1PortableFileRecovery: portableRecovery,
+    RootarkZk1CiphertextRoot: chunks,
+  });
+  for (const file of ["rootark-zk1-persisted-portable-chunk-recovery.js",
+    "rootark-zk1-persisted-browser-recovery.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "../public/client", file), "utf8"),
+      umdContext);
+  }
+  assert.equal(typeof umdContext.RootarkZk1PersistedBrowserRecovery
+    .recoverFromPinnedPersistedHttpGet, "function");
+  heldSecret.fill(0);
   let ownerProofRejectedBeforeFetch = 0;
   await assert.rejects(browser.postProtectedCiphertextBackupRead({
     origin, request: await browser.signProtectedContentOperation({

@@ -246,6 +246,43 @@ and concurrent independent disk writes; the bounded stage took approximately
 2,000-chunk flows were verified locally on Node 22/24 with the unchanged
 socket timeout; this local result does not establish hosted CI completion.
 
+## Issue #65 / PR #228: browser persisted-chunk opt-in with real protected readback (2026-10-25)
+
+The development authenticated files workspace now has an explicit opt-in
+`restore-persisted` action backed by the browser UMD
+`rootark-zk1-persisted-browser-recovery`. The operator supplies the already
+existing **offline** owner key/SPKI fingerprint, owner signed checkpoint chain,
+current head, signed device grant, independent portable root, and an additional
+**independent owner-signed native source-chunk root**. It also requires an
+owner-root Ed25519 checkpoint for the exact object/revision/native root, the
+user-held 32-byte secret, a signed persisted-chunk inventory, and locally
+selected opaque chunk files in the owner's signed order. Neither the bundle,
+SQLite, server response, nor mutable config may be promoted into an owner pin.
+
+The bridge re-verifies the owner grant and browser monotonic floor, verifies
+native owner-root provenance before HTTP, performs a nonce-fresh device-signed
+historical GET against the existing protected route, and checks exact remote
+ciphertext against the externally pinned **portable single-envelope root**.
+It then verifies every local persisted chunk, its independent native root,
+the owner Ed25519 inventory, and portable HKDF/AES-GCM before allowing plaintext
+to leave the function. A **second independently signed GET** after slow local
+reads/decryption refuses plaintext if the real server-side witness gate revoked
+the device in that interval. Local liveness guards cover session changes,
+closed dialogs, CSRF changes, slow file reads, and the final download. Copies
+of the recovery secret, ciphertext and plaintext are zeroized on failure;
+UI-owned file buffers and returned plaintext are wiped after use.
+
+The focused integration test runs a real authenticated Express protected route,
+Ed25519 user/device keys, real SQLite persisted two-chunk rows, real HTTP GETs,
+and actual portable AES-GCM recovery. The revocation-during-local-read test
+was RED before the second GET and GREEN afterward. The browser UMD is also
+loaded in a Node-free VM. This is NOT a production restore, not remote SQLite
+chunk-proof, not current independent owner pin custody, and NOT a proof of
+off-host fsync, provider physical independence or cross-provider durable
+atomicity. The server still returns only opaque ciphertext, no trusted pins.
+PR #228 remains DRAFT and NO-GO for production; do not infer a deployment
+authorization from this opt-in development user interface.
+
 ## Issue #65 / PR #228: local persisted encrypted-chunk backup/recovery binding (2026-10-25)
 
 The browser-compatible, offline `rootark-zk1-persisted-portable-chunk-recovery`

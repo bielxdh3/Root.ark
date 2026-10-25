@@ -15,6 +15,7 @@
     "rootark-zk1-owner-inventory-trust-head",
     "rootark-zk1-browser-authoritative-backup",
     "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
+    "rootark-zk1-persisted-portable-chunk-recovery", "rootark-zk1-persisted-browser-recovery",
     "rootark-zk1-recoverable-pending-journal", "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-transition-receipt",
     "rootark-zk1-legacy-migration-workflow",
@@ -659,6 +660,7 @@
         || !window.RootarkZk1KeyringPortableArchive?.historicalRecoveryChallengeMessage) fail();
       if (!window.RootarkZk1AccountPortableRecovery?.createArchive
         || !window.RootarkZk1AccountPortableRecovery?.recoverArchive) fail();
+      if (!window.RootarkZk1PersistedBrowserRecovery?.recoverFromPinnedPersistedHttpGet) fail();
       if (!window.RootarkZk1BrowserAuthoritativeBackup?.verifyBackupSnapshot
         || !window.RootarkZk1KeyringPortableArchive?.verifyVersionedAuthority
         || !window.RootarkZk1BrowserVersionedArchive?.createArchive
@@ -705,6 +707,17 @@
       + '<label>Checkpoint de root Ed25519 assinado pelo proprietário (.json)<input type="file" data-zk1-field="owner-root" accept=".json,application/json"></label>'
       + '<label>Identidade do proprietário no checkpoint (device_id)<input type="text" data-zk1-field="owner-device" maxlength="64" spellcheck="false"></label>'
       + '<label>signer_key_id do proprietário (base64url, 16 bytes)<input type="text" data-zk1-field="owner-signer" maxlength="22" spellcheck="false"></label>'
+      + '<fieldset><legend>Recuperação portátil de chunks persistidos + GET autenticado (somente DEV)</legend>'
+      + '<p class="muted">Selecione o inventário Ed25519 e cada chunk opaco persistido localmente, na ordem assinada. '
+      + 'Exige hash SPKI e head atuais do proprietário importados offline acima, checkpoint owner-root ligado à raiz NATIVA, '
+      + 'e DUAS raízes confirmadas externamente: raiz do pacote portátil e raiz nativa dos chunks. '
+      + 'O GET assinado lê o ciphertext do servidor, mas não prova fsync, distribuição física nem durabilidade externa.</p>'
+      + '<label>Inventário assinado dos chunks persistidos (.json, offline)<input type="file" data-zk1-field="persisted-inventory" accept=".json,application/json"></label>'
+      + '<label>Chunks cifrados locais na sequência assinada (1–16 arquivos, até 1 MiB cada)<input type="file" multiple data-zk1-field="persisted-chunks" accept=".bin,.ct,application/octet-stream"></label>'
+      + '<label>Raiz NATIVA owner-signed fixada fora do servidor (base64url de 32 bytes)<input type="text" data-zk1-field="persisted-source-root" maxlength="43" spellcheck="false"></label>'
+      + '<label><input type="checkbox" data-zk1-field="persisted-opt-in"> Confirmo a proveniência EXTERNA de todos os pins, o checkpoint nativo e que não há autorização de restore em produção.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-primary" data-zk1-action="restore-persisted">Conferir chunks persistidos, GET assinado e recuperar localmente</button></div>'
+      + '</fieldset>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="provision">Provisionar piso offline</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="verify-inventory">Verificar checkpoint owner-signed</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="new-secret">Gerar segredo de 256 bits</button>'
@@ -945,7 +958,7 @@
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
       "pending-list", "pending-resume",
-      "restore", "new-secret", "new-device", "answer-pop", "import-approval", "verify-revocation",
+      "restore", "restore-persisted", "new-secret", "new-device", "answer-pop", "import-approval", "verify-revocation",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
@@ -2350,6 +2363,57 @@
           status("GET histórico autenticado sem repetir PUT. Pacote recuperável exportado; "
             + "aguarde checkpoint histórico independente assinado pelo proprietário. "
             + "O diário cifrado local permanece como cópia pendente.");
+        } else if (action === "restore-persisted") {
+          if (field("persisted-opt-in")?.checked !== true
+            || !committedDeviceApproval || committedDeviceApproval.sessionEpoch !== sessionEpoch
+            || !trust.ownerHistoryCheckpoint) fail();
+          await window.RootarkZk1V2CommittedApproval.assertForRestore({
+            proof: committedDeviceApproval.proof,
+            original: committedDeviceApproval.original, trust, devicePublicKey,
+          });
+          assertLive();
+          secret = await fileBytes("secret", 32, 32);
+          const bundle = JSON.parse(decoder.decode(await fileBytes("bundle", 1, 6 * 1024 * 1024)));
+          const signedInventory = JSON.parse(decoder.decode(await fileBytes("persisted-inventory", 1, 8192)));
+          const checkpoint = await optionalJson("owner-root");
+          const chunkFiles = Array.from(field("persisted-chunks")?.files || []);
+          if (!checkpoint || chunkFiles.length < 1 || chunkFiles.length > 16
+            || !Array.isArray(signedInventory.chunkLengths)
+            || signedInventory.chunkLengths.length !== chunkFiles.length) fail();
+          const readChunks = [];
+          let restored;
+          try {
+            restored = await window.RootarkZk1PersistedBrowserRecovery.recoverFromPinnedPersistedHttpGet({
+              ...common, recoverySecret: secret, bundle, signedInventory,
+              expectedMetadata: bundle.metadata,
+              independentlyPinnedCiphertextRoot: from64(field("root").value.trim()),
+              independentlyPinnedSourceChunkRoot: from64(field("persisted-source-root").value.trim()),
+              ownerSignerKeyId: from64(field("owner-signer").value.trim()),
+              ownerDeviceId: field("owner-device").value.trim(),
+              ownerRootCheckpoint: checkpoint,
+              readChunk: async ({ index }) => {
+                assertLive();
+                if (!Number.isSafeInteger(index) || index < 0 || index >= chunkFiles.length
+                  || chunkFiles[index].size < 1 || chunkFiles[index].size > 1024 * 1024) fail();
+                const chunk = new Uint8Array(await chunkFiles[index].arrayBuffer());
+                readChunks.push(chunk);
+                assertLive();
+                return chunk;
+              },
+              assertLive,
+            });
+            assertLive();
+            if (restored.ownerRootSignatureVerified !== true
+              || restored.protectedHttpReadbackVerified !== true
+              || restored.independentRemoteDurabilityProven !== false
+              || restored.authorizesProductionRestore !== false) fail();
+            downloadLocal(restored.name, restored.data,
+              restored.mediaType || "application/octet-stream", assertLive);
+            status("DEV: inventário Ed25519, root nativo, chunks locais, AES-GCM e GET autenticado conferidos. Sem prova de durabilidade externa ou autorização de produção.");
+          } finally {
+            restored?.data?.fill(0);
+            for (const chunk of readChunks) chunk.fill(0);
+          }
         } else if (action === "restore") {
           if (!committedDeviceApproval || committedDeviceApproval.sessionEpoch !== sessionEpoch) fail();
           await window.RootarkZk1V2CommittedApproval.assertForRestore({

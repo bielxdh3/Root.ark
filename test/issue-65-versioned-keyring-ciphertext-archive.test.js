@@ -545,7 +545,9 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
     "rootark-zk1-normal-browser-content", "rootark-zk1-owner-inventory-trust-head",
     "rootark-zk1-browser-authoritative-backup", "rootark-zk1-portable-file-recovery",
-    "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-pending-journal",
+    "rootark-zk1-browser-recovery-http",
+    "rootark-zk1-persisted-portable-chunk-recovery", "rootark-zk1-persisted-browser-recovery",
+    "rootark-zk1-recoverable-pending-journal",
     "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
     "rootark-zk1-legacy-transition-receipt",
@@ -727,6 +729,14 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
   await fill();
   await click("provision");
   await wait(async () => /Âncora offline|Piso local verificado/.test(await status()), "provision");
+  assert.equal(await evaluate("typeof window.RootarkZk1PersistedBrowserRecovery?.recoverFromPinnedPersistedHttpGet"),
+    "function", "real Edge must load the persisted recovery bridge as a browser UMD");
+  assert.equal(await evaluate("!!document.querySelector('[data-zk1-action=restore-persisted]')"),
+    true, "the real workspace must expose the opt-in persisted restore action");
+  await click("restore-persisted");
+  await untilStatus("Operação recusada");
+  assert.equal((await downloads()).length, 0,
+    "Edge must fail closed without an opt-in, independent native pin and owner approval");
   await fill();
   await evaluate("document.querySelector('[data-zk1-field=v2-opt-in]').checked=true");
   await click("versioned-create");
