@@ -58,7 +58,31 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
   assert.equal((await f.bridge().putAndAttest(f.physical)).status,
     "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-real-pg-attestor-chain-"));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
+  let child = null;
+  let server = null;
+  let floor = null;
+  // node:test runs after hooks in registration order. Close every handle before
+  // removing the certificate/SQLite directory, even if the test exits early.
+  t.after(async () => {
+    try {
+      if (floor) floor.close();
+    } finally {
+      try {
+        if (server?.listening) await drainZk1ContentInventoryHttpsServer(server);
+      } finally {
+        try {
+          if (child && child.exitCode === null && child.signalCode === null) {
+            const exited = new Promise((resolve) => child.once("exit", resolve));
+            child.kill("SIGTERM");
+            const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+            try { await exited; } finally { clearTimeout(timer); }
+          }
+        } finally {
+          fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+        }
+      }
+    }
+  });
   generateNativeFixtureCertificates(dir, { caSubject: "ZK65 real PG18 chain lab",
     servers: ["attestor", "inventory"], clients: ["inventory-service", "reader", "witness"] });
   const read = (name) => fs.readFileSync(path.join(dir, name));
@@ -81,19 +105,12 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
     additionalFingerprint: new crypto.X509Certificate(read("witness.pem")).fingerprint256 };
   const cfgPath = path.join(dir, "child.json");
   fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
-  const child = spawn(process.execPath,
+  child = spawn(process.execPath,
     [path.join(__dirname, "../lab/issue-65-packet-b/pg-physical-attestor-child.js"), cfgPath],
     { stdio: ["ignore", "ignore", "pipe", "ipc"], windowsHide: true,
       env: { NODE_ENV: "test", PATH: process.env.PATH,
         SystemRoot: process.env.SystemRoot,
         ROOTARK_ZK1_ATTESTOR_PG_URL: process.env.ROOTARK_ZK1_ATTESTOR_PG_URL } });
-  t.after(async () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const exited = new Promise((resolve) => child.once("exit", resolve));
-    child.kill("SIGTERM");
-    const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    try { await exited; } finally { clearTimeout(timer); }
-  });
   let childError = "";
   child.stderr.on("data", (bytes) => {
     childError = (childError + bytes.toString()).slice(-1024);
@@ -128,7 +145,6 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
     nonce: crypto.randomBytes(32), pinnedPublicKey: physicalSigner.publicKey,
     nowSeconds: Math.floor(Date.now() / 1000),
   }), /ZK_PHYSICAL_ATTESTATION_DENIED/);
-  let server;
   const startInventory = async () => {
     server = createZk1ContentInventoryHttpsServer({
       key: read("inventory.key"), cert: read("inventory.pem"), clientCa: read("ca.pem"),
@@ -150,7 +166,6 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
       physicalAttestorPublicKey: physicalSigner.publicKey,
     });
   };
-  t.after(async () => { if (server?.listening) await drainZk1ContentInventoryHttpsServer(server); });
   const input = { scope: f.scope, nonce: crypto.randomBytes(32),
     requested: { object_id: f.op.object_id, revision: f.op.revision,
       epoch: f.op.epoch, ciphertext_sha256: f.op.ciphertext_sha256 },
@@ -208,10 +223,9 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
     trustedMinimumInventorySnapshot: minimumSnapshot,
   });
   const floorPath = path.join(dir, "witness-floor.sqlite");
-  let floor = new Zk1WitnessCasAnchorFloor(floorPath, {
+  floor = new Zk1WitnessCasAnchorFloor(floorPath, {
     bootstrapNew: true, witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission });
-  t.after(() => floor.close());
   const witnessed = await floor.advanceAttested({ records: [record], evidence: [evidence] });
   assert.equal(witnessed.sequence, 1,
     "independently challenged real PG readback must precede witness floor advance");
