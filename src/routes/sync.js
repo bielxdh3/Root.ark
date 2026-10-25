@@ -10,6 +10,10 @@ const { attestCiphertextOnlySyncState } = require("../services/deploymentResilie
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
 const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCodeAsync, verifyTotp } = require("../services/totp");
 const { authorizationDigest } = require("../services/syncResumeAccountProof");
+const {
+  MAX_DEVICES, assertAtomicDeviceRegistry, emptyAtomicDeviceRegistry, invalidRegistry,
+  validIdentifier, validPublicKey,
+} = require("../services/syncAtomicDeviceRegistry");
 
 const STORE_VERSION = 2;
 const MAX_HISTORY_PER_OBJECT = 32;
@@ -57,6 +61,18 @@ function indeterminateCommitError() {
   const error = new Error("Sync commit state is indeterminate; restart and verify disk state before continuing");
   error.code = "SYNC_COMMIT_INDETERMINATE";
   return error;
+}
+
+function atomicDeviceAuthError() {
+  return Object.assign(new Error("Atomic sync device authorization rejected"), {
+    code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED",
+  });
+}
+
+function atomicDeviceEpochError() {
+  return Object.assign(new Error("Atomic sync device registry epoch mismatch"), {
+    code: "SYNC_ATOMIC_DEVICE_EPOCH_CONFLICT",
+  });
 }
 
 // JSON records are ordinary objects after JSON.parse: reserved account,
@@ -232,9 +248,12 @@ function pruneObjectHistory(history, times, cutoff, pausedDevices) {
 }
 
 class SyncObjectStore {
-  constructor(filePath, { burstGuard = createSyncBurstGuard(), retentionMs = DEFAULT_RECOVERY_RETENTION_MS, now = () => Date.now() } = {}) {
+  constructor(filePath, { burstGuard = createSyncBurstGuard(), retentionMs = DEFAULT_RECOVERY_RETENTION_MS,
+    now = () => Date.now(), atomicDeviceRegistry = false } = {}) {
     this.filePath = path.resolve(filePath);
-    this.state = { version: STORE_VERSION, users: {} };
+    this.atomicDeviceRegistry = atomicDeviceRegistry === true;
+    this.state = { version: STORE_VERSION, users: {},
+      ...(this.atomicDeviceRegistry ? { deviceRegistry: emptyAtomicDeviceRegistry() } : {}) };
     this.queue = Promise.resolve();
     this.commitIndeterminate = false;
     this.burstGuard = burstGuard;
@@ -292,6 +311,7 @@ class SyncObjectStore {
       throw new Error("Invalid sync object store");
     }
     attestCiphertextOnlySyncState(current);
+    if (this.atomicDeviceRegistry && !Object.hasOwn(current, "deviceRegistry")) throw invalidRegistry();
     return current;
   }
 
@@ -438,7 +458,26 @@ class SyncObjectStore {
   }
 
   async put(username, input) {
-    return this.transact((next) => {
+    return this.transact(async (next) => {
+      // A legacy process may point at the SAME storage file during a staged
+      // rollout. Never allow its pre-transaction JSON/callback authorization
+      // to bypass this registry merely because its constructor flag is off.
+      if (!this.atomicDeviceRegistry && Object.hasOwn(next, "deviceRegistry")) {
+        throw atomicDeviceAuthError();
+      }
+      // Validate the signed proof against the ACTIVE device binding in the
+      // SAME exclusive cross-process transaction as the durable object write.
+      // A revoke transaction that wins the lock first cannot be overtaken.
+      if (this.atomicDeviceRegistry) {
+        const registry = assertAtomicDeviceRegistry(next.deviceRegistry);
+        const record = ownRecord(ownRecord(registry.devices, username), input.deviceId);
+        if (!record || record.revokedAtEpoch !== null || !input.authorization) throw atomicDeviceAuthError();
+        try {
+          if (await verifyAuthorizationProof(input.authorization, input, {
+            username, trustedDevicePublicKeys: { [input.deviceId]: record.publicKey },
+          }) !== true) throw atomicDeviceAuthError();
+        } catch { throw atomicDeviceAuthError(); }
+      }
       const at = this.now();
       const user = this.user(next, username);
       if (ownRecord(user.seen, input.operationId)) return { kind: "replay", record: null };
@@ -475,6 +514,54 @@ class SyncObjectStore {
       for (const oldId of seenIds.slice(0, Math.max(0, seenIds.length - MAX_SEEN_OPERATIONS))) delete user.seen[oldId];
       return { kind: "stored", record };
     });
+  }
+
+  // These methods are for server-owned, already-authorized enrollment and
+  // revocation flows. They are intentionally NOT exposed as HTTP routes.
+  // Callers must authenticate the owner/admin independently before invoking.
+  async enrollDevice({ username, deviceId, publicKey, expectedEpoch }) {
+    if (!this.atomicDeviceRegistry) throw invalidRegistry();
+    if (!validIdentifier(username, 512) || !validIdentifier(deviceId, 256)
+      || !validPublicKey(publicKey)) throw invalidRegistry();
+    return this.transact((next) => {
+      const registry = assertAtomicDeviceRegistry(next.deviceRegistry);
+      if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch !== registry.epoch
+        || registry.epoch === Number.MAX_SAFE_INTEGER) throw atomicDeviceEpochError();
+      let records = ownRecord(registry.devices, username);
+      if (!records) {
+        records = {};
+        setOwnRecord(registry.devices, username, records);
+      }
+      // Device IDs remain permanently reserved once revoked; enrollment
+      // cannot silently reactivate an old key after a stale retry.
+      if (ownRecord(records, deviceId)) throw atomicDeviceAuthError();
+      let count = 0;
+      for (const devices of Object.values(registry.devices)) count += Object.keys(devices).length;
+      if (count >= MAX_DEVICES) throw invalidRegistry();
+      registry.epoch += 1;
+      setOwnRecord(records, deviceId, { publicKey, revokedAtEpoch: null });
+      return { epoch: registry.epoch };
+    });
+  }
+
+  async revokeDevice({ username, deviceId, expectedEpoch }) {
+    if (!this.atomicDeviceRegistry) throw invalidRegistry();
+    if (!validIdentifier(username, 512) || !validIdentifier(deviceId, 256)) throw invalidRegistry();
+    return this.transact((next) => {
+      const registry = assertAtomicDeviceRegistry(next.deviceRegistry);
+      if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch !== registry.epoch
+        || registry.epoch === Number.MAX_SAFE_INTEGER) throw atomicDeviceEpochError();
+      const record = ownRecord(ownRecord(registry.devices, username), deviceId);
+      if (!record || record.revokedAtEpoch !== null) throw atomicDeviceAuthError();
+      registry.epoch += 1;
+      record.revokedAtEpoch = registry.epoch;
+      return { epoch: registry.epoch };
+    });
+  }
+
+  atomicRegistryEpoch() {
+    if (!this.atomicDeviceRegistry) throw invalidRegistry();
+    return assertAtomicDeviceRegistry(this.readSnapshot().deviceRegistry).epoch;
   }
 
   async resumeDevice(username, deviceId) {
@@ -562,7 +649,17 @@ const RESUME_TRACKED_USERS_MAX = 10000;
 // Same public placeholder hash used by the auth route so unknown users cost one bcrypt compare too.
 const DUMMY_PASSWORD_HASH = "$2a$10$C8U56P8wZK.G7zWKmqF88e3f64PIxJ1xdTJN9WxiHcSVkYCfaSeDG";
 
-function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, commitSyncResumeProof = null, getTotpKey = null }) {
+function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", atomicDeviceRegistry = false, burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, commitSyncResumeProof = null, getTotpKey = null }) {
+  if (typeof atomicDeviceRegistry !== "boolean") {
+    throw Object.assign(new Error("Invalid atomic sync device registry mode"), {
+      code: "SYNC_ATOMIC_DEVICE_CONFIGURATION",
+    });
+  }
+  if (atomicDeviceRegistry && (!requireDeviceAuthorization || deviceRegistryPath || deviceAuthorization)) {
+    throw Object.assign(new Error("Strict atomic sync device authorization requires sole co-located registry authority"), {
+      code: "SYNC_ATOMIC_DEVICE_CONFIGURATION",
+    });
+  }
   const audit = (eventType, req, deviceId, action, result, details = {}) => {
     if (typeof auditLog !== "function") return;
     auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
@@ -590,7 +687,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     const users = await loadUsers();
     return Array.isArray(users) ? users.find((entry) => entry?.username === username) || null : null;
   };
-  const verifyRegisteredDevice = deviceAuthorization ||(deviceRegistryPath ? async ({ username, operation, proof }) => {
+  const verifyRegisteredDevice = !atomicDeviceRegistry && (deviceAuthorization ||(deviceRegistryPath ? async ({ username, operation, proof }) => {
     let registry;
     try { registry = JSON.parse(await fs.readFile(deviceRegistryPath, "utf8")); } catch { return false; }
     const record = registry?.devices?.[operation.deviceId];
@@ -598,9 +695,9 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     return verifyAuthorizationProof(proof, operation, {
       username, trustedDevicePublicKeys: { [operation.deviceId]: record.publicKey },
     });
-  } : null);
+  } : null));
   const retentionMs = positiveEnvInteger(process.env.SYNC_RECOVERY_RETENTION_MS, DEFAULT_RECOVERY_RETENTION_MS);
-  const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard(), retentionMs });
+  const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard(), retentionMs, atomicDeviceRegistry });
   const ready = store.open();
   const sizeGuard = (req, res, next) => {
     const length = Number(req.headers["content-length"]);
@@ -615,7 +712,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
     try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
-    if (requireDeviceAuthorization || verifyRegisteredDevice) {
+    if (!atomicDeviceRegistry && (requireDeviceAuthorization || verifyRegisteredDevice)) {
       if (typeof verifyRegisteredDevice !== "function" || !operation.authorization) return errorResponse(res, 403, "Sync device authorization required");
       try {
         if (await verifyRegisteredDevice({ username: req.user.username, operation, proof: operation.authorization }) !== true) return errorResponse(res, 403, "Sync device authorization rejected");
@@ -625,6 +722,9 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     try {
       result = await store.put(req.user.username, operation);
     } catch (error) {
+      if (error?.code === "SYNC_ATOMIC_DEVICE_AUTH_REJECTED") {
+        return errorResponse(res, 403, "Sync device authorization rejected");
+      }
       if (error?.code === "SYNC_COMMIT_INDETERMINATE" || store.commitIndeterminate) {
         return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
       }

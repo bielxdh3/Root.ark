@@ -6186,6 +6186,10 @@ if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
   throw new Error("ZK multiprovider restore requires protected content bootstrap");
 }
 
+if (process.env.SYNC_ATOMIC_DEVICE_REGISTRY !== undefined
+  && !["true", "false"].includes(process.env.SYNC_ATOMIC_DEVICE_REGISTRY)) {
+  throw new Error("SYNC_ATOMIC_DEVICE_REGISTRY must be explicitly true or false");
+}
 registerSyncRoutes({
   app,
   authenticate,
@@ -6193,6 +6197,7 @@ registerSyncRoutes({
   storagePath: process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json",
   requireDeviceAuthorization: true,
   deviceRegistryPath: process.env.SYNC_DEVICE_REGISTRY || "",
+  atomicDeviceRegistry: process.env.SYNC_ATOMIC_DEVICE_REGISTRY === "true",
   auditLog,
   bcrypt,
   loadUsers,

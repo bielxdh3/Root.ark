@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const { canonicalJson, validateStoredOperation } = require("../../sync-client/rootark-sync-protocol");
+const { assertAtomicDeviceRegistry } = require("./syncAtomicDeviceRegistry");
 
 const SAFE_PROVIDER_CODES = new Set([
   "configuration", "unsupported_provider", "invalid_path", "invalid_prefix", "foreign_prefix",
@@ -208,6 +209,9 @@ function attestCiphertextOnlySyncState(state) {
   if (!state || ![1, 2].includes(state.version) || !state.users || typeof state.users !== "object") {
     throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" });
   }
+  // An opt-in co-located registry contains only public Ed25519 keys and
+  // revocation epochs. Reject unexpected fields or secrets in that section.
+  if (Object.hasOwn(state, "deviceRegistry")) assertAtomicDeviceRegistry(state.deviceRegistry);
   const records = [];
   for (const user of Object.values(state.users)) {
     if (!user || typeof user !== "object" || !user.objects || typeof user.objects !== "object") {
