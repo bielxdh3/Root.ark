@@ -2,9 +2,11 @@
 
 **Status: P2 reproduced; NO-GO for strict atomic revocation fencing.** This
 document reports an unsolved authorization ordering gap. It does **not** claim
-that CAS, FLOOR, and the owner witness commit in one transaction. No production
-protocol, schema, authorization check, or protected-mode requirement was
-weakened or changed in this investigation.
+that CAS, FLOOR, and the owner witness commit in one transaction. No currently
+used CAS/FLOOR protocol, schema, authorization check, or protected-mode
+requirement was weakened or changed. An isolated opt-in **witness-side**
+prerequisite is implemented below, but no existing deployed flow invokes
+it or treats it as an authorization guarantee.
 
 ## Exact base and boundaries
 
@@ -139,7 +141,46 @@ authorization fencing. Local `owner_authority` monotonic checks detect a
 known newer revision, not an unobserved concurrent external revision.
 Similarly, a browser/session guard cannot reverse a remote commit.
 
-## Required external contract before implementation
+## Developable portion: witness-side durable admission prerequisite
+
+An opt-in witness-side reservation precursor now exists in
+`src/services/zk1DurableWitnessLedger.js`, with adversarial fixtures in
+`test/issue-65-witness-catalog-fence-partial.test.js`. This is **NOT** the
+missing cross-host revocation fence:
+
+- Only a **newly bootstrapped** witness SQLite explicitly configured with a
+  distinct `catalogFloorPublicKey` creates the new pinned
+  `witness_catalog_identity`, immutable `witness_catalog_admission` and
+  immutable `witness_catalog_terminal` tables. There is no automatic
+  migration of existing witness files. An already opted-in database must
+  reopen with the exact original FLOOR public key or fail closed. The
+  persisted identity and immutability trigger targets are checked on restart.
+- `beginCatalogAdmission` verifies the committed witness revision/digest
+  and no pending owner/quiescence transition. The **same** witness SQLite
+  `BEGIN IMMEDIATE` as owner reservation commits a FULL-durable, signer
+  device + owner revision/digest + epoch + operation ID + catalog
+  sequence/digest + CAS fingerprint + principal + expiry-bound signed grant.
+  While active it blocks owner `reserve`, and `prepareQuiesce` cannot
+  report DRAINED.
+- Identical START replays are idempotent, without extending deadline or
+  changing the grant. Expiry/restart never silently erases an ACTIVE record:
+  owner revocation remains blocked. This intentionally risks an indefinite
+  halt until independently proven completion or audited recovery exists.
+- `completeCatalogAdmission` only accepts a new token-specific Ed25519
+  FLOOR terminal signature pinned to admission ID, operation ID, owner
+  revision/digest, device, epoch, catalog head, nonce and expiry. A generic
+  signed FLOOR read/head **cannot** release it. **Today's FLOOR does not
+  issue this terminal type**. Fixture-signed terminals test the verifier
+  only, not a real independent FLOOR commit.
+
+No production CAS or FLOOR endpoint consumes that signed grant, no mTLS
+route binds authenticated peer identity to its principal, no normative
+externally signed terminal is emitted, and unresolved/expired admissions
+have no independently proved audited recovery. The existing unguarded
+remote CAS path still exists. Do **not** enable this laboratory capability
+in production or call this a resolved race.
+
+## Required external contract before production implementation
 
 A dedicated independently durable owner authority must linearize **both**
 owner revocation and catalog authorization. An acceptable design needs an
@@ -154,7 +195,8 @@ current `freshHead` API is only a signed read, not that transaction protocol.
 
 Do not gate off existing assertions, weaken cryptographic checks, invent a
 simultaneously atomic cross-DB quorum claim, or ship a cosmetic fresh-read
-workaround as a security fix. Until such a protocol exists, the conditional
-revocation race remains **NO-GO**. The temporary RED instrumentation was
-reverted; the original positive/revoked-signer regression must continue to
-pass unchanged.
+workaround as a security fix. Until the independent FLOOR consumes and
+terminally attests a witness-issued grant and every CAS admission enforces
+it, the conditional revocation race remains **NO-GO**. The temporary RED
+instrumentation was reverted; existing positive/revoked-signer regressions
+continue unchanged.
