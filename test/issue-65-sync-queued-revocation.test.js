@@ -43,7 +43,7 @@ test("queued ciphertext stays pending after current device revocation, then resu
   const { engine, operation } = await fixture(t, { push: async (op) => {
     calls.push(op.operationId);
     return { status: 201 };
-  } }, async (op) => !revoked && op.deviceId === "device-a");
+  } }, (op) => !revoked && op.deviceId === "device-a");
   revoked = true;
   await assert.rejects(engine.pushPending({ pushed: 0, conflicts: [], offline: false }),
     { code: "authorization_rejected" });
@@ -66,7 +66,7 @@ test("retry rechecks current authority after a failed PUT; stale first approval 
     pushes += 1;
     revoked = true;
     throw Object.assign(new Error("network interrupted"), { code: "ECONNREFUSED" });
-  } }, async () => { checks += 1; return !revoked; });
+  } }, () => { checks += 1; return !revoked; });
   await assert.rejects(engine.pushPending({ pushed: 0, conflicts: [], offline: false }),
     { code: "authorization_rejected" });
   assert.equal(pushes, 1, "no second PUT after revocation");
@@ -81,7 +81,7 @@ test("revocation while the old authorization awaits is rejected immediately befo
   let revoked = false;
   let pushes = 0;
   const { engine } = await fixture(t, { push: async () => { pushes += 1; return { status: 201 }; } },
-    async () => !revoked, { authorizeOutgoing: async () => {
+    () => !revoked, { authorizeOutgoing: async () => {
       initiated();
       await new Promise((resolve) => { releaseInitialCheck = resolve; });
       return true;
@@ -110,7 +110,7 @@ test("revocation during asynchronous Ed25519 signing denies pre-enqueue authoriz
     adapter: { push: async () => { pushes += 1; return { status: 201 }; }, list: async () => [] },
     fileKeyResolver: () => key, requireCurrentOutgoingAuthorization: true,
     authorizeOutgoing: async () => true,
-    currentDeviceAuthorization: async () => !revoked,
+    currentDeviceAuthorization: () => !revoked,
     authorizationFactory: async (operation) => {
       startedSigning();
       await new Promise((resolve) => { releaseSigning = resolve; });
@@ -132,7 +132,7 @@ test("independent authorization failures stay closed, preserving journal and rej
   let checks = 0;
   let pushes = 0;
   const { engine, operation } = await fixture(t, { push: async () => { pushes += 1; return { status: 201 }; } },
-    async () => { checks += 1; return undefined; });
+    () => { checks += 1; return undefined; });
   await assert.rejects(engine.pushPending({ pushed: 0, conflicts: [], offline: false }),
     { code: "authorization_rejected" });
   assert.equal(pushes, 0);
@@ -140,8 +140,91 @@ test("independent authorization failures stay closed, preserving journal and rej
   assert.deepEqual((await engine.journal.recover()).map((op) => op.operationId), [operation.operationId]);
 
   const another = await fixture(t, { push: async () => { pushes += 1; return { status: 201 }; } },
-    async () => true, { queuedDeviceId: "foreign-device" });
+    () => true, { queuedDeviceId: "foreign-device" });
   await assert.rejects(another.engine.pushPending({ pushed: 0, conflicts: [], offline: false }),
     { code: "authorization_rejected" });
   assert.equal(pushes, 0);
+});
+
+test("strict final live authorization and HTTP dispatch stay in one continuation across a queued microtask revocation", async (t) => {
+  let revoked = false;
+  let pushes = 0;
+  let authorizedAtDispatch = false;
+  const { engine, operation } = await fixture(t, { push: async () => {
+    pushes += 1;
+    authorizedAtDispatch = !revoked;
+    return { status: 201 };
+  } }, () => {
+    const decision = !revoked;
+    queueMicrotask(() => { revoked = true; });
+    return decision;
+  });
+  const summary = { pushed: 0, conflicts: [], offline: false };
+  await engine.pushPending(summary);
+  assert.equal(pushes, 1);
+  assert.equal(authorizedAtDispatch, true,
+    "the synchronous push must begin before the callback-scheduled revocation microtask");
+  assert.equal(revoked, true);
+  assert.equal(summary.pushed, 1);
+  assert.deepEqual(await engine.journal.recover(), []);
+  assert.equal(operation.deviceId, "device-a");
+});
+
+test("strict final authorization rejects asynchronous callbacks without dispatching or dropping queued ciphertext", async (t) => {
+  let pushes = 0;
+  const { engine, operation } = await fixture(t, { push: async () => {
+    pushes += 1;
+    return { status: 201 };
+  } }, async () => true);
+  await assert.rejects(engine.pushPending({ pushed: 0, conflicts: [], offline: false }),
+    { code: "authorization_required" });
+  assert.equal(pushes, 0);
+  assert.deepEqual((await engine.journal.recover()).map((op) => op.operationId), [operation.operationId]);
+});
+
+test("callback-thrown local authorization 409 cannot trigger remote-wins recovery or markSeen", async (t) => {
+  let pushes = 0;
+  const summary = { pushed: 0, conflicts: [], offline: false };
+  const { engine, operation } = await fixture(t, { push: async () => {
+    pushes += 1;
+    return { status: 201 };
+  } }, () => {
+    throw Object.assign(new Error("local authorization revoked"),
+      { code: "authorization_rejected", status: 409, currentRevision: "fabricated" });
+  });
+  await assert.rejects(engine.pushPending(summary), { code: "authorization_rejected" });
+  assert.equal(pushes, 0, "the server never received a PUT");
+  assert.deepEqual(summary, { pushed: 0, conflicts: [], offline: false },
+    "no local 409 is allowed to masquerade as a remote conflict");
+  assert.deepEqual((await engine.journal.recover()).map((op) => op.operationId), [operation.operationId]);
+  assert.equal(engine.journal.hasSeen(operation.operationId), false);
+  await assert.rejects(fsp.lstat(path.join(engine.rootDir, ".rootark-conflicts")), { code: "ENOENT" });
+});
+
+test("async legacy outgoing policy failures with forged HTTP conflicts do not consume the journal", async (t) => {
+  let pushes = 0;
+  const { engine, operation } = await fixture(t, { push: async () => {
+    pushes += 1;
+    return { status: 201 };
+  } }, () => true, { authorizeOutgoing: async () => {
+    throw Object.assign(new Error("locally denied"), { code: "sync_conflict", status: 409 });
+  } });
+  const summary = { pushed: 0, conflicts: [], offline: false };
+  await assert.rejects(engine.pushPending(summary), { code: "authorization_rejected" });
+  assert.equal(pushes, 0);
+  assert.deepEqual(summary.conflicts, []);
+  assert.equal(engine.journal.hasSeen(operation.operationId), false);
+  assert.deepEqual((await engine.journal.recover()).map((op) => op.operationId), [operation.operationId]);
+});
+
+test("non-strict callers retain compatibility with asynchronous current authorization", async (t) => {
+  const rootDir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-legacy-async-policy-"));
+  t.after(() => fsp.rm(rootDir, { recursive: true, force: true }));
+  let pushes = 0;
+  const engine = new SyncEngine({ rootDir,
+    deviceId: "device-a", keyEpoch: "epoch-1",
+    adapter: { push: async () => { pushes += 1; return { status: 201 }; }, list: async () => [] },
+    currentDeviceAuthorization: async () => true });
+  await engine.retryPush({ deviceId: "device-a" });
+  assert.equal(pushes, 1);
 });

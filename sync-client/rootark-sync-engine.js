@@ -620,18 +620,43 @@ class SyncEngine {
   }
 
   async assertOutgoingAuthorized(operation, authorizedAction = null) {
-    if (await this.authorizeOutgoing(operation) !== true) {
+    let locallyAuthorized;
+    try { locallyAuthorized = await this.authorizeOutgoing(operation); } catch {
+      fail("Local sync authorization rejected", "authorization_rejected");
+    }
+    if (locallyAuthorized !== true) {
       fail("Local sync authorization rejected", "authorization_rejected");
     }
     if (this.requireCurrentOutgoingAuthorization && operation.deviceId !== this.deviceId) {
       fail("Local sync device authorization rejected", "authorization_rejected");
     }
-    if (this.currentDeviceAuthorization
-      && await this.currentDeviceAuthorization(operation) !== true) {
-      fail("Current sync device authorization rejected", "authorization_rejected");
+    if (this.currentDeviceAuthorization) {
+      let currentDecision;
+      try { currentDecision = this.currentDeviceAuthorization(operation); } catch {
+        fail("Current sync device authorization rejected", "authorization_rejected");
+      }
+      if (this.requireCurrentOutgoingAuthorization) {
+        // Strict mode must use a synchronous, operator-trusted current policy.
+        // Awaiting even a resolved Promise would let a queued microtask revoke
+        // the device between reading true and beginning the HTTP PUT.
+        let isAsyncDecision;
+        try { isAsyncDecision = Boolean(currentDecision && typeof currentDecision.then === "function"); } catch {
+          fail("Current sync device authorization rejected", "authorization_rejected");
+        }
+        if (isAsyncDecision) {
+          Promise.resolve(currentDecision).catch(() => {});
+          fail("Synchronous current device authorization is required", "authorization_required");
+        }
+        if (currentDecision !== true) {
+          fail("Current sync device authorization rejected", "authorization_rejected");
+        }
+      } else if (await currentDecision !== true) {
+        // Backward compatibility for explicitly non-strict integrations.
+        fail("Current sync device authorization rejected", "authorization_rejected");
+      }
     }
-    // Invoke the network action in the same continuation as the last current
-    // policy check: no further await may open another client-side race window.
+    // No await after the strict synchronous policy decision. HTTP dispatch
+    // runs here, before any queued revocation microtask can execute.
     if (authorizedAction) return authorizedAction();
   }
 
@@ -645,8 +670,7 @@ class SyncEngine {
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
-    await this.assertOutgoingAuthorized(operation);
-    await this.journal.enqueue(operation);
+    await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
     let hash;
     if (operation.operation === "move") {
       const plaintext = protocol.decodeMovePayload(protocol.decryptPayload(operation, key), key);
@@ -966,6 +990,10 @@ class SyncEngine {
         await this.journal.markSeen(operation.operationId, acknowledgedDigest);
         summary.pushed += 1;
       } catch (error) {
+        // A local authorization failure is never an HTTP conflict. Even a
+        // callback that throws status:409 must not consume a pending journal
+        // operation or trigger remote-wins recovery without a real response.
+        if (error?.code === "authorization_rejected" || error?.code === "authorization_required") throw error;
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
           const current = error.current
             ? envelopeCopy(protocol.validateStoredOperation(error.current)) : null;
@@ -1294,8 +1322,7 @@ class SyncEngine {
       }
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
-      await this.assertOutgoingAuthorized(operation);
-      await this.journal.enqueue(operation);
+      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation);
     }
     for (const [relative, file] of Object.entries(current)) {
@@ -1327,8 +1354,7 @@ class SyncEngine {
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
-      await this.assertOutgoingAuthorized(operation);
-      await this.journal.enqueue(operation);
+      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation, contentHash);
     }
     await this.persistSnapshot();
