@@ -30,12 +30,24 @@ function getDb() {
   const databasePath = getDatabasePath();
   fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
-  dbInstance = new Database(databasePath);
-  dbInstance.pragma("journal_mode = WAL");
-  dbInstance.pragma("foreign_keys = ON");
-  dbInstance.pragma("busy_timeout = 5000");
-
-  return dbInstance;
+  const database = new Database(databasePath);
+  try {
+    database.pragma("journal_mode = WAL");
+    // A successful recovery-code spend must survive a system crash before we
+    // acknowledge it. WAL's NORMAL mode does not sync each committed write.
+    database.pragma("synchronous = FULL");
+    database.pragma("foreign_keys = ON");
+    database.pragma("busy_timeout = 5000");
+    if (String(database.pragma("journal_mode", { simple: true })).toLowerCase() !== "wal"
+      || database.pragma("synchronous", { simple: true }) !== 2) {
+      throw new Error("SQLite recovery store requires durable WAL/FULL");
+    }
+    dbInstance = database;
+    return dbInstance;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
 }
 
 function closeDb() {
