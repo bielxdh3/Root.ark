@@ -175,6 +175,57 @@ test("unreaped parser zeroizes captured input without creating a plaintext file"
   assert.ok(heldBytes.every((value) => value === 0));
 });
 
+test("DOC snapshot erases intermediate descriptor read buffers after parsing", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preview-chunk-zero-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const target = path.join(dir, "captured.doc");
+  fs.writeFileSync(target, "private document data, erased after snapshot copy");
+  const originalRead = fs.readSync;
+  const inputChunks = [];
+  fs.readSync = (fd, buffer, ...args) => {
+    const bytes = originalRead.call(fs, fd, buffer, ...args);
+    if (bytes > 0 && Buffer.isBuffer(buffer)) inputChunks.push({ buffer, bytes });
+    return bytes;
+  };
+  try {
+    await parseDocumentInChildProcess(target, ".doc", { spawnImpl: fakeSuccess });
+  } finally {
+    fs.readSync = originalRead;
+  }
+  assert.ok(inputChunks.length > 0, "real source descriptor reads must be exercised");
+  for (const { buffer, bytes } of inputChunks) {
+    assert.ok(buffer.subarray(0, bytes).every((value) => value === 0),
+      "all source read buffers must be erased, not only their concatenated snapshot");
+  }
+});
+
+test("DOC snapshot erases partial plaintext if descriptor read throws", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preview-read-error-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const target = path.join(dir, "partial.doc");
+  fs.writeFileSync(target, "plaintext partially read before an I/O error");
+  const originalRead = fs.readSync;
+  let captured = null;
+  fs.readSync = (fd, buffer, ...args) => {
+    const bytes = originalRead.call(fs, fd, buffer, ...args);
+    if (bytes > 0 && Buffer.isBuffer(buffer) && !captured) {
+      captured = buffer.subarray(0, bytes);
+      throw new Error("INJECTED_READ_FAILURE");
+    }
+    return bytes;
+  };
+  try {
+    await assert.rejects(parseDocumentInChildProcess(target, ".doc", {
+      spawnImpl: () => { throw new Error("parser must never start after a failed read"); },
+    }), /INJECTED_READ_FAILURE/);
+  } finally {
+    fs.readSync = originalRead;
+  }
+  assert.ok(captured && captured.length > 0);
+  assert.ok(captured.every((value) => value === 0),
+    "a failed read must erase partially populated descriptor buffers");
+});
+
 test("actual Mammoth child can extract DOCX bytes from a private snapshot", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preview-real-docx-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

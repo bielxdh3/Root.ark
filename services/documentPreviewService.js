@@ -70,6 +70,7 @@ function capturePrivateDocument(filePath) {
   }
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY
     | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+  const allocatedChunks = [];
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
     if (!sameDocumentIdentity(expected, opened)) {
@@ -79,6 +80,9 @@ function capturePrivateDocument(filePath) {
     let total = 0;
     while (total <= MAX_INPUT_BYTES) {
       const part = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_INPUT_BYTES + 1 - total));
+      // Track every allocation before readSync: it may throw after writing
+      // partial bytes. Both successful and failed captures must erase them.
+      allocatedChunks.push(part);
       const size = fs.readSync(fd, part, 0, part.length, null);
       if (!size) break;
       total += size;
@@ -93,6 +97,10 @@ function capturePrivateDocument(filePath) {
     }
     return Buffer.concat(chunks, total);
   } finally {
+    // Buffer.concat creates the independently owned snapshot returned to the
+    // parser. The original read allocations also contain plaintext and must
+    // not be left live until garbage collection (even on a thrown read).
+    for (const part of allocatedChunks) part.fill(0);
     fs.closeSync(fd);
   }
 }
