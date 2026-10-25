@@ -77,6 +77,7 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   let corruptProof = "";
   let alreadyIssued = false;
   let issuedState;
+  let issuedNonce;
   const recoveredNonces = new Set();
   let recoveryCalls = 0;
   const floor = {
@@ -134,12 +135,16 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
         physicalAttestation: corruptProof === "malformed" ? "not-a-buffer"
           : corruptProof === "oversize" ? Buffer.alloc(2049) : attestation,
       }) };
-      if (alreadyIssued && !issuedState) issuedState = issued;
+      if (alreadyIssued && !issuedState) {
+        issuedState = issued;
+        issuedNonce = Buffer.from(input.nonce);
+      }
       return issued;
     },
     async recoverSyncHistoricalAdmission(input) {
       recoveryCalls += 1;
       if (!issuedState || !Buffer.isBuffer(input.nonce) || input.nonce.length !== 32
+        || input.nonce.equals(issuedNonce)
         || recoveredNonces.has(input.nonce.toString("base64url"))) {
         throw Error("RECOVERY_UNAVAILABLE");
       }
@@ -280,6 +285,9 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
     "an exact client nonce and operation replay cannot mint a second historical admission");
   const recoverRoute = "/v1/cas-anchor/historical-recover";
   const freshRecovery = { ...data, nonce: random(32).toString("base64url") };
+  assert.notEqual((await post("recovery", data, recoverRoute)).status, 200,
+    "the exact original ISSUE nonce was already consumed durably");
+  assert.equal(recoveryCalls, 1, "only the authorized issuance-nonce replay reached the authority");
   assert.equal((await post("denied", freshRecovery, recoverRoute)).status, 403);
   assert.equal((await post("wrongscope", freshRecovery, recoverRoute)).status, 403);
   assert.equal((await post("historical", freshRecovery, recoverRoute, "GET")).status, 404);
@@ -289,7 +297,7 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   assert.equal(recovered.data.freshFloor.nonce, freshRecovery.nonce);
   assert.deepEqual(recovered.data.admission, answer.data.admission,
     "recovery must not re-sign or alter persisted receipt");
-  assert.equal(recoveryCalls, 1, "wrong peer/scope never reaches recovery authority");
+  assert.equal(recoveryCalls, 2, "wrong peer/scope never reaches recovery authority");
   assert.notEqual((await post("recovery", freshRecovery, recoverRoute)).status, 200,
     "replayed challenge cannot recover twice");
   // Exercise the ACTUAL consumer transport adapter, rather than only a

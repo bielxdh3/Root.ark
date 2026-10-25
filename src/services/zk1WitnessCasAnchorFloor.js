@@ -20,7 +20,7 @@ const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", 
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
 const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v2\0", "ascii");
 const HISTORICAL_SYNC_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
-const RECOVERY_CHALLENGE_WINDOW_NS = 300_000_000_000n;
+const RECOVERY_CHALLENGE_WINDOW_MS = 5 * 60 * 1000;
 const MAX_RECOVERY_CHALLENGES = 4096;
 const RECORD_FIELDS = ["sequence", "reservation", "scope", "status", "ticketHash",
   "manifestHash", "terminalSeal", "previousHash", "signature"];
@@ -168,7 +168,6 @@ class Zk1WitnessCasAnchorFloor {
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   #trustedSyncDevicePolicyProvider;
-  #recoveryChallenges = new Map();
   // Read-only capability for the separately reviewed mTLS issuer transport.
   // Never advertise legacy/writer-signed floors or a closed issuer as nonce
   // bound; strict mode always uses the caller nonce for PG AND witness floor.
@@ -302,7 +301,28 @@ class Zk1WitnessCasAnchorFloor {
             BEGIN SELECT RAISE(ABORT,'HISTORICAL_ADMISSION_LOCKED'); END;
             CREATE TRIGGER no_historical_admission_delete
             BEFORE DELETE ON witness_cas_sync_historical_admission
-            BEGIN SELECT RAISE(ABORT,'HISTORICAL_ADMISSION_LOCKED'); END;`);
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_ADMISSION_LOCKED'); END;
+            CREATE TABLE witness_cas_sync_historical_issue_nonce (
+              admission_sequence INTEGER PRIMARY KEY CHECK(admission_sequence>=1),
+              operation_id TEXT NOT NULL UNIQUE,
+              admission_hash TEXT NOT NULL,
+              nonce BLOB NOT NULL UNIQUE CHECK(length(nonce)=32),
+              FOREIGN KEY(admission_sequence) REFERENCES witness_cas_sync_historical_admission(sequence),
+              FOREIGN KEY(operation_id) REFERENCES witness_cas_sync_historical_admission(operation_id));
+            CREATE TRIGGER no_historical_issue_nonce_update
+            BEFORE UPDATE ON witness_cas_sync_historical_issue_nonce
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_NONCE_LOCKED'); END;
+            CREATE TRIGGER no_historical_issue_nonce_delete
+            BEFORE DELETE ON witness_cas_sync_historical_issue_nonce
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_NONCE_LOCKED'); END;
+            CREATE TABLE witness_cas_sync_historical_recovery_nonce (
+              nonce BLOB PRIMARY KEY CHECK(length(nonce)=32),
+              operation_id TEXT NOT NULL,
+              admission_hash TEXT NOT NULL,
+              consumed_at_ms INTEGER NOT NULL CHECK(consumed_at_ms>=1),
+              FOREIGN KEY(operation_id) REFERENCES witness_cas_sync_historical_admission(operation_id));
+            CREATE INDEX witness_cas_sync_recovery_nonce_time
+              ON witness_cas_sync_historical_recovery_nonce(consumed_at_ms);`);
         }
         db.prepare("INSERT INTO witness_cas_floor_identity VALUES(1,?)").run(this.#identity);
       }
@@ -407,6 +427,10 @@ class Zk1WitnessCasAnchorFloor {
         if (exists && (this.#historicalHead.sequence !== sequence
           || this.#historicalHead.lastHash !== previousHash)) fail();
         this.#historicalHead = Object.freeze({ sequence, lastHash: previousHash });
+        // A pre-upgrade database does not contain the original ISSUE nonce.
+        // Never silently migrate it to an all-clear anti-replay ledger: safe
+        // recovery requires the nonce co-committed with the original receipt.
+        this.#assertHistoricalNonceIntegrity(db);
       }
       this.#verifiedChain = verifiedChain;
       this.#verifiedChainDigest = verifiedChain.copy().digest("hex");
@@ -647,6 +671,62 @@ class Zk1WitnessCasAnchorFloor {
     this.#assertHistoricalIntegrity();
     return Object.freeze({ ...this.#historicalHead });
   }
+  #assertHistoricalNonceIntegrity(db) {
+    const schema = new Set(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')")
+      .all().map((row) => row.name));
+    for (const name of ["witness_cas_sync_historical_issue_nonce",
+      "witness_cas_sync_historical_recovery_nonce",
+      "witness_cas_sync_recovery_nonce_time", "no_historical_issue_nonce_update",
+      "no_historical_issue_nonce_delete"]) {
+      if (!schema.has(name)) fail();
+    }
+    // The original challenge is mandatory for EVERY signed admission. No
+    // retroactive nonce can be invented for an old signed receipt.
+    const originals = db.prepare(
+      "SELECT a.sequence,a.operation_id,a.hash,i.admission_sequence,"
+      + "i.operation_id AS nonce_operation,i.admission_hash,i.nonce"
+      + " FROM witness_cas_sync_historical_admission a"
+      + " LEFT JOIN witness_cas_sync_historical_issue_nonce i"
+      + " ON i.admission_sequence=a.sequence ORDER BY a.sequence").all();
+    if (originals.length !== this.#historicalHead.sequence) fail();
+    if (db.prepare("SELECT COUNT(*) AS n FROM witness_cas_sync_historical_issue_nonce")
+      .get().n !== this.#historicalHead.sequence) fail();
+    for (const row of originals) {
+      if (row.sequence !== row.admission_sequence
+        || row.operation_id !== row.nonce_operation
+        || row.hash !== row.admission_hash
+        || !Buffer.isBuffer(row.nonce) || row.nonce.length !== 32) fail();
+    }
+    const recent = db.prepare(
+      "SELECT r.nonce,r.operation_id,r.admission_hash,r.consumed_at_ms,"
+      + "a.hash AS original_hash,i.nonce AS issuance_nonce"
+      + " FROM witness_cas_sync_historical_recovery_nonce r"
+      + " LEFT JOIN witness_cas_sync_historical_admission a"
+      + " ON a.operation_id=r.operation_id"
+      + " LEFT JOIN witness_cas_sync_historical_issue_nonce i"
+      + " ON i.operation_id=r.operation_id LIMIT ?").all(MAX_RECOVERY_CHALLENGES + 1);
+    if (recent.length > MAX_RECOVERY_CHALLENGES) fail();
+    for (const row of recent) {
+      if (!Buffer.isBuffer(row.nonce) || row.nonce.length !== 32
+        || row.admission_hash !== row.original_hash
+        || !Buffer.isBuffer(row.issuance_nonce) || row.issuance_nonce.length !== 32
+        || row.nonce.equals(row.issuance_nonce)
+        || !Number.isSafeInteger(row.consumed_at_ms)
+        || row.consumed_at_ms < 1) fail();
+    }
+    const overlap = db.prepare(
+      "SELECT 1 FROM witness_cas_sync_historical_issue_nonce i"
+      + " JOIN witness_cas_sync_historical_recovery_nonce r"
+      + " ON i.nonce=r.nonce LIMIT 1").get();
+    if (overlap) fail();
+  }
+  #historicalNonceUsed(nonce) {
+    return Boolean(this.#db.prepare(
+      "SELECT 1 FROM witness_cas_sync_historical_issue_nonce WHERE nonce=?").get(nonce)
+      || this.#db.prepare(
+        "SELECT 1 FROM witness_cas_sync_historical_recovery_nonce WHERE nonce=?").get(nonce));
+  }
   #assertHistoricalIntegrity() {
     if (!this.#historicalEnabled) fail();
     let sequence = 0;
@@ -679,6 +759,7 @@ class Zk1WitnessCasAnchorFloor {
     }
     if (this.#historicalHead.sequence !== sequence
       || this.#historicalHead.lastHash !== previousHash) fail();
+    this.#assertHistoricalNonceIntegrity(this.#db);
   }
   historicalAdmissionForOperation(operationId) {
     if (!this.#historicalEnabled || this.#closed) fail();
@@ -779,12 +860,15 @@ class Zk1WitnessCasAnchorFloor {
         bound.envelope, policy) !== true) fail();
       const policySnapshot = JSON.stringify(policy);
       const nonceText = nonce.toString("base64url");
-      const now = process.hrtime.bigint();
-      for (const [old, when] of this.#recoveryChallenges) {
-        if (now - when >= RECOVERY_CHALLENGE_WINDOW_NS) this.#recoveryChallenges.delete(old);
-      }
-      if (this.#recoveryChallenges.has(nonceText)
-        || this.#recoveryChallenges.size >= MAX_RECOVERY_CHALLENGES) fail();
+      const originalRow = this.#db.prepare(
+        "SELECT a.hash,i.nonce,i.admission_hash"
+        + " FROM witness_cas_sync_historical_admission a"
+        + " JOIN witness_cas_sync_historical_issue_nonce i"
+        + " ON i.admission_sequence=a.sequence AND i.operation_id=a.operation_id"
+        + " WHERE a.operation_id=?").get(operationId);
+      if (!originalRow || originalRow.hash !== originalRow.admission_hash
+        || !Buffer.isBuffer(originalRow.nonce) || originalRow.nonce.length !== 32
+        || this.#historicalNonceUsed(nonce)) fail();
       const composite = await this.#attestedAdmission.attestSyncCommitted({
         scope: bound.scope, operation: bound.operation, receipt, nonce });
       if (!composite.pgReadbackVerified || composite.authorizesIo !== false
@@ -809,14 +893,44 @@ class Zk1WitnessCasAnchorFloor {
       if (!Number.isSafeInteger(completed) || completed < stamp
         || !Number.isSafeInteger(composite.physicalIssuedAt)
         || Math.abs(Math.floor(completed / 1000) - composite.physicalIssuedAt) > 30
-        || admission.admittedAtMs > completed
-        || this.#recoveryChallenges.has(nonceText)) fail();
-      // Device revocation may arrive during async Ed25519/PG checks or the
-      // last clock sample. No await, user callback or clock hook follows this
-      // final synchronous operator-policy read before returning the proof.
-      if (JSON.stringify(snapshotLocalDevicePolicy(
-        this.#trustedSyncDevicePolicyProvider())) !== policySnapshot) fail();
-      this.#recoveryChallenges.set(nonceText, now);
+        || admission.admittedAtMs > completed) fail();
+      // A durable nonce claim is part of the final decision. SQLite FULL and
+      // BEGIN IMMEDIATE make crashes, restarts and parallel processes observe
+      // one committed result, including when the HTTPS ACK is subsequently lost.
+      // Unlike the signed historical admission this bounded replay table may
+      // prune challenges only AFTER their 5-minute anti-replay window expires.
+      this.#db.transaction(() => {
+        this.#assertHistoricalIntegrity();
+        const own = this.#db.prepare(
+          "SELECT a.hash,i.admission_hash,i.nonce"
+          + " FROM witness_cas_sync_historical_admission a"
+          + " JOIN witness_cas_sync_historical_issue_nonce i"
+          + " ON i.admission_sequence=a.sequence AND i.operation_id=a.operation_id"
+          + " WHERE a.operation_id=?").get(operationId);
+        if (!own || own.hash !== originalRow.hash
+          || own.admission_hash !== originalRow.hash
+          || !Buffer.isBuffer(own.nonce) || !own.nonce.equals(originalRow.nonce)
+          || this.#historicalNonceUsed(nonce)) fail();
+        const commitAtMs = Date.now();
+        if (!Number.isSafeInteger(commitAtMs) || commitAtMs < completed
+          || Math.abs(Math.floor(commitAtMs / 1000) - composite.physicalIssuedAt) > 30) fail();
+        this.#db.prepare(
+          "DELETE FROM witness_cas_sync_historical_recovery_nonce"
+          + " WHERE consumed_at_ms<=?").run(commitAtMs - RECOVERY_CHALLENGE_WINDOW_MS);
+        if (this.#db.prepare(
+          "SELECT COUNT(*) AS count FROM witness_cas_sync_historical_recovery_nonce"
+        ).get().count >= MAX_RECOVERY_CHALLENGES) fail();
+        // Final *synchronous* current-policy check is immediately before the
+        // durable claim: no awaits, caller callbacks or HTTP response in between.
+        if (JSON.stringify(snapshotLocalDevicePolicy(
+          this.#trustedSyncDevicePolicyProvider())) !== policySnapshot) fail();
+        this.#db.prepare("INSERT INTO witness_cas_sync_historical_recovery_nonce"
+          + " (nonce,operation_id,admission_hash,consumed_at_ms)"
+          + " VALUES(?,?,?,?)").run(nonce, operationId, originalRow.hash, commitAtMs);
+        const afterInsert = Date.now();
+        if (!Number.isSafeInteger(afterInsert) || afterInsert < commitAtMs
+          || Math.abs(Math.floor(afterInsert / 1000) - composite.physicalIssuedAt) > 30) fail();
+      }).immediate();
       return Object.freeze({
         admission, freshFloor: floor,
         physicalAttestation: Buffer.from(composite.physicalAttestation),
@@ -932,6 +1046,11 @@ class Zk1WitnessCasAnchorFloor {
           || freshPolicy !== policySnapshot) fail();
         insert.run(previous.sequence + 1, unsigned.operationId,
             previous.lastHash, serialized, hash);
+        if (this.#historicalNonceUsed(nonce)) fail();
+        this.#db.prepare("INSERT INTO witness_cas_sync_historical_issue_nonce"
+          + " (admission_sequence,operation_id,admission_hash,nonce)"
+          + " VALUES(?,?,?,?)").run(previous.sequence + 1, unsigned.operationId,
+            hash, nonce);
         // Abort and roll back if SQLite's own synchronous INSERT/WAL operation
         // outlived the signed device authorization or PG freshness window.
         const insertedAtMs = Date.now();

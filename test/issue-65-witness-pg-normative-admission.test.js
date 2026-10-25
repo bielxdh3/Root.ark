@@ -458,8 +458,27 @@ test("strict CAS witness floor refuses signed status advance without independent
   const persistedBeforeRecovery = historical.historicalAdmissionHead();
   const recoveryNonce = random(32);
   const recoveryInput = { ...issueInput, nonce: recoveryNonce };
+  await assert.rejects(historical.recoverSyncHistoricalAdmission(issueInput),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "the ORIGINAL issuance nonce is consumed by its durable FULL receipt");
   const recovered = await historical.recoverSyncHistoricalAdmission(recoveryInput);
   assert.deepEqual(recovered.admission, issued.admission);
+  const durableNonces = new Database(historicalFilename, { readonly: true,
+    fileMustExist: true });
+  try {
+    assert.deepEqual(durableNonces.prepare(
+      "SELECT nonce FROM witness_cas_sync_historical_issue_nonce WHERE operation_id=?"
+    ).get(op.operation_id.toString("base64url")).nonce, historicalChallenge,
+    "ISSUE nonce is physically stored in the same FULL SQLite admission commit");
+    const stored = durableNonces.prepare(
+      "SELECT r.operation_id,r.admission_hash,r.nonce,a.hash FROM"
+      + " witness_cas_sync_historical_recovery_nonce r JOIN"
+      + " witness_cas_sync_historical_admission a ON a.operation_id=r.operation_id"
+      + " WHERE r.nonce=?").get(recoveryNonce);
+    assert.equal(stored.operation_id, op.operation_id.toString("base64url"));
+    assert.equal(stored.admission_hash, stored.hash,
+      "recovery nonce is durably bound to the exact original admission hash");
+  } finally { durableNonces.close(); }
   assert.deepEqual(historical.historicalAdmissionHead(), persistedBeforeRecovery);
   assert.equal(recovered.freshFloor.nonce, recoveryNonce.toString("base64url"));
   assert.equal((await verifySyncV2HistoricalWitnessAdmission({
@@ -473,6 +492,40 @@ test("strict CAS witness floor refuses signed status advance without independent
   }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/, "old challenge cannot reuse recovery proof");
   await assert.rejects(historical.recoverSyncHistoricalAdmission(recoveryInput),
     /WITNESS_CAS_FLOOR_DENIED/, "nonce replay cannot recover twice");
+  const contestedNonce = random(32);
+  const competing = await Promise.allSettled([
+    historical.recoverSyncHistoricalAdmission({ ...recoveryInput, nonce: contestedNonce }),
+    historical.recoverSyncHistoricalAdmission({ ...recoveryInput, nonce: contestedNonce }),
+  ]);
+  assert.deepEqual(competing.map((result) => result.status).sort(),
+    ["fulfilled", "rejected"], "concurrent same-nonce recovery cannot double-claim");
+  const originalPrepareForNonce = Database.prototype.prepare;
+  let simulatedSqlInsert = false;
+  Database.prototype.prepare = function (sql, ...args) {
+    const stmt = originalPrepareForNonce.call(this, sql, ...args);
+    if (!sql.startsWith("INSERT INTO witness_cas_sync_historical_recovery_nonce")) return stmt;
+    return new Proxy(stmt, { get(target, key) {
+      if (key !== "run") return Reflect.get(target, key);
+      return (...values) => {
+        target.run(...values);
+        simulatedSqlInsert = true;
+        throw Error("SIMULATED_RECOVERY_COMMIT_INTERRUPTED");
+      };
+    } });
+  };
+  const interruptedNonce = random(32);
+  try {
+    await assert.rejects(historical.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: interruptedNonce,
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "failure AFTER SQL INSERT must roll back the entire replay claim");
+  } finally { Database.prototype.prepare = originalPrepareForNonce; }
+  assert.equal(simulatedSqlInsert, true);
+  const afterRollback = await historical.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: interruptedNonce,
+  });
+  assert.equal(afterRollback.freshFloor.nonce, interruptedNonce.toString("base64url"),
+    "rolled-back replay claim may be reattempted only with fresh PG proof");
   for (const bad of [
     { envelope: { ...syncEnvelope, deviceId: "wrong-device" } },
     { scope: { ...scope, keyring_id: random(16) } },
@@ -539,6 +592,16 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.deepEqual(historical.historicalAdmissionForOperation(op.operation_id).admission,
     issued.admission, "signed admission remains retrievable after durable restart");
   assert.equal(historical.historicalAdmissionForOperation(random(16)), null);
+  await assert.rejects(historical.recoverSyncHistoricalAdmission(issueInput),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "issuer nonce remains consumed across process restart");
+  await assert.rejects(historical.recoverSyncHistoricalAdmission(recoveryInput),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "a completed recovery nonce cannot replay after process restart");
+  await assert.rejects(historical.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: expiredRecoveryNonce,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "historically expired device does not reset used nonce state on restart");
   const restartNonce = random(32);
   const restartRecovered = await historical.recoverSyncHistoricalAdmission({
     ...recoveryInput, nonce: restartNonce,
@@ -549,10 +612,29 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.deepEqual(historical.historicalAdmissionHead(), admittedHistoryHead,
     "recovery after restart must never append a new signed receipt");
   historical.close();
+  const nonceTamperPath = path.join(directory, "witness-issue-nonce-corrupt.sqlite");
+  fs.copyFileSync(historicalFilename, nonceTamperPath);
+  const nonceTamper = new Database(nonceTamperPath);
+  try {
+    nonceTamper.pragma("foreign_keys = OFF");
+    nonceTamper.exec("DROP TRIGGER no_historical_issue_nonce_delete");
+    nonceTamper.prepare("DELETE FROM witness_cas_sync_historical_issue_nonce").run();
+  } finally { nonceTamper.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(nonceTamperPath, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "removing original nonce ledger cannot silently enable historical recovery");
   // A SQL editor can forge an empty local history by deleting a row, but
   // cannot make the exact separately pinned signed-receipt high-water agree.
   const historicalDb = new Database(historicalFilename);
   try {
+    // The stronger nonce ledger also has foreign keys to the immutable
+    // admission. Explicitly simulate a malicious offline SQLite editor
+    // bypassing referential integrity, rather than merely hitting its FK.
+    historicalDb.pragma("foreign_keys = OFF");
     historicalDb.exec("DROP TRIGGER no_historical_admission_delete");
     historicalDb.prepare("DELETE FROM witness_cas_sync_historical_admission").run();
   } finally { historicalDb.close(); }

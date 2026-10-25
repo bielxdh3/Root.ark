@@ -406,6 +406,9 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   assert.equal(lost.status, "DROPPED", "client never receives the signed receipt body");
   assert.equal(witness.historicalAdmissionHead().sequence, 1,
     "witness persisted original admission before HTTPS response was lost");
+  assert.notEqual((await postHistorical(port, read, "historical",
+    body(envelope, challenge), { route: "/v1/cas-anchor/historical-recover" })).status, 200,
+  "real PG18 recovery rejects the issuance challenge consumed in the FULL durable receipt");
   const recoveryChallenge = random(32);
   const clientProvider = createSyncV2HistoricalEvidenceProvider({
     endpoint: `https://127.0.0.1:${port}`,
@@ -429,6 +432,10 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   } };
   assert.equal(accepted.body.freshFloor.nonce, b64(recoveryChallenge),
     "real Sync client adapter re-proves FULL durable original with new PG challenge");
+  await assert.rejects(clientProvider(envelope, {
+    nonce: recoveryChallenge, recovery: true,
+  }), /SYNC_V2_HISTORICAL_EVIDENCE_UNAVAILABLE/,
+  "real mTLS endpoint cannot replay a recovery challenge after its FULL SQLite claim");
   assert.equal(witness.historicalAdmissionHead().sequence, 1);
   assert.deepEqual(witness.historicalAdmissionForOperation(
     physical.operation.operation_id).admission, accepted.body.admission,
