@@ -7,6 +7,19 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
+function restrictFixtureCertificatePermissions(dir) {
+  if (process.platform === "win32") return;
+  for (const name of fs.readdirSync(dir)) {
+    if (!/\.(?:pem|key)$/.test(name)) continue;
+    const filename = path.join(dir, name);
+    const info = fs.lstatSync(filename);
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error("ZK1_TEST_CERT_FIXTURE_INVALID");
+    }
+    fs.chmodSync(filename, 0o600);
+  }
+}
+
 function binary() {
   if (process.platform !== "win32") return "openssl";
   const programFiles = process.env.ProgramFiles || "C:\\Program Files";
@@ -27,6 +40,10 @@ function runNativeOpenSsl(cwd, args) {
   execFileSync(binary(), args, {
     cwd, stdio: "ignore", timeout: 30000, windowsHide: true,
   });
+  // OpenSSL normally creates public certificates as 0644 on POSIX. The
+  // standalone authority reader intentionally rejects *all* world-readable
+  // trust material, including public certs. Keep only test fixtures private.
+  restrictFixtureCertificatePermissions(cwd);
 }
 function generateNativeFixtureCertificates(dir, { caSubject, servers = [], clients = [] }) {
   if (!path.isAbsolute(dir) || !fs.statSync(dir).isDirectory()
@@ -58,4 +75,5 @@ function generateNativeFixtureCertificates(dir, { caSubject, servers = [], clien
       "-out", name + ".pem", "-days", "1", "-extfile", name + ".ext"]);
   }
 }
-module.exports = { runNativeOpenSsl, generateNativeFixtureCertificates };
+module.exports = { runNativeOpenSsl, generateNativeFixtureCertificates,
+  restrictFixtureCertificatePermissions };

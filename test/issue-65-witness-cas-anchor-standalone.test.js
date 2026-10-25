@@ -33,9 +33,9 @@ test("actual standalone witness refuses signed-prefix floor rollback against sep
     statusPub: path.join(dir, "status-public.pem"),
     ownerPub: path.join(dir, "owner-public.pem"),
     config: path.join(dir, "witness-config.json") };
-  fs.writeFileSync(files.witnessKey, witness.privateKey.export({ type: "pkcs8", format: "pem" }));
-  fs.writeFileSync(files.statusPub, status.publicKey.export({ type: "spki", format: "pem" }));
-  fs.writeFileSync(files.ownerPub, owner.publicKey.export({ type: "spki", format: "pem" }));
+  fs.writeFileSync(files.witnessKey, witness.privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  fs.writeFileSync(files.statusPub, status.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 });
+  fs.writeFileSync(files.ownerPub, owner.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 });
   const ownWitness = new Zk1DurableWitnessLedger(witnessDb, {
     bootstrapNew: true, witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusPinned: { keyId: statusKeyId, publicKey: status.publicKey },
@@ -207,8 +207,8 @@ test("actual standalone witness refuses signed-prefix floor rollback against sep
   const forgedStatus = crypto.generateKeyPairSync("ed25519");
   const forgedWitnessPath = path.join(dir, "impostor-witness-private.pem");
   const forgedStatusPath = path.join(dir, "impostor-status-public.pem");
-  fs.writeFileSync(forgedWitnessPath, forgedWitness.privateKey.export({ type: "pkcs8", format: "pem" }));
-  fs.writeFileSync(forgedStatusPath, forgedStatus.publicKey.export({ type: "spki", format: "pem" }));
+  fs.writeFileSync(forgedWitnessPath, forgedWitness.privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  fs.writeFileSync(forgedStatusPath, forgedStatus.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 });
   const forged = { ...newBootstrap("impostor-v2"),
     witnessPrivateKeyPath: forgedWitnessPath,
     statusPublicKeyPath: forgedStatusPath,
@@ -242,8 +242,8 @@ test("actual standalone witness refuses signed-prefix floor rollback against sep
   const signerOutput = path.join(dir, "operator-checkpoint.json");
   const ownerPrivate = path.join(dir, "owner-private.pem");
   const witnessPublic = path.join(dir, "witness-public.pem");
-  fs.writeFileSync(ownerPrivate, owner.privateKey.export({ type: "pkcs8", format: "pem" }));
-  fs.writeFileSync(witnessPublic, witness.publicKey.export({ type: "spki", format: "pem" }));
+  fs.writeFileSync(ownerPrivate, owner.privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  fs.writeFileSync(witnessPublic, witness.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 });
   fs.writeFileSync(signerInput, JSON.stringify({
     source: "owner-retained-independent-floor/v1",
     witnessKeyId: config.witnessKeyId, statusKeyId: config.statusKeyId,

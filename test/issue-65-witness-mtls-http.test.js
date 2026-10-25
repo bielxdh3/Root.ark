@@ -7,7 +7,8 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
-const { generateNativeFixtureCertificates, runNativeOpenSsl } =
+const { generateNativeFixtureCertificates, runNativeOpenSsl,
+  restrictFixtureCertificatePermissions } =
   require("./support/issue-65-native-openssl-fixture");
 const https = require("node:https");
 const test = require("node:test");
@@ -39,6 +40,7 @@ function createCertificates(dir) {
   } else {
     execFileSync("bash", ["-lc", commands], { cwd: dir, stdio: "pipe", timeout: 20000 });
   }
+  restrictFixtureCertificatePermissions(dir);
   const read = (name) => fs.readFileSync(path.join(dir, name));
   return { ca: read("ca.pem"), serverKey: read("server.key"), serverCert: read("server.pem"),
     clientKey: read("allowed.key"), clientCert: read("allowed.pem"),
@@ -364,7 +366,7 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
   const keyFile = path.join(dir, "witness-private.pem");
   const pubFile = path.join(dir, "cas-signing-public.pem");
   fs.writeFileSync(keyFile, witnessKey.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
-  fs.writeFileSync(pubFile, authorityKey.publicKey.export({ format: "pem", type: "spki" }));
+  fs.writeFileSync(pubFile, authorityKey.publicKey.export({ format: "pem", type: "spki" }), { mode: 0o600 });
   const configFile = path.join(dir, "witness-config.json");
   const dbFile = path.join(dir, "witness-process.sqlite");
   const config = {

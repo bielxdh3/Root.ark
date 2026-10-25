@@ -8,7 +8,8 @@ const net = require("node:net");
 const path = require("node:path");
 const https = require("node:https");
 const { execFileSync, spawn } = require("node:child_process");
-const { generateNativeFixtureCertificates, runNativeOpenSsl } =
+const { generateNativeFixtureCertificates, runNativeOpenSsl,
+  restrictFixtureCertificatePermissions } =
   require("./support/issue-65-native-openssl-fixture");
 const test = require("node:test");
 const z = require("../src/crypto/rootark-zk-1");
@@ -38,6 +39,7 @@ function createCertificates(dir) {
   } else {
     execFileSync("bash", ["-lc", commands], { cwd: dir, stdio: "pipe", timeout: 20000 });
   }
+  restrictFixtureCertificatePermissions(dir);
   const read = (file) => fs.readFileSync(path.join(dir, file));
   return { ca: read("ca.pem"), serverKey: read("server.key"), serverCert: read("server.pem"),
     allowedKey: read("allowed.key"), allowedCert: read("allowed.pem"),
@@ -320,7 +322,7 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
   }), { mode: 0o600 });
   fs.writeFileSync(witnessPubPath, witnessKeys.publicKey.export({
     format: "pem", type: "spki",
-  }));
+  }), { mode: 0o600 });
   const config = {
     listenHost: "127.0.0.1", listenPort: 0, bootstrapNew: false,
     dbPath: path.join(dir, "cas.sqlite"), statusKeyId: enc(statusKeyId),

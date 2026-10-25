@@ -125,8 +125,8 @@ test("real mTLS CAS commit publishes signed independent witness floor; both loca
   const statusPath = path.join(directory, "status-private.pem");
   const witnessPath = path.join(directory, "witness-public.pem");
   const configPath = path.join(directory, "cas-standalone-config.json");
-  fs.writeFileSync(statusPath, statusKeys.privateKey.export({ type: "pkcs8", format: "pem" }));
-  fs.writeFileSync(witnessPath, witnessKeys.publicKey.export({ type: "spki", format: "pem" }));
+  fs.writeFileSync(statusPath, statusKeys.privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  fs.writeFileSync(witnessPath, witnessKeys.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 });
   const scopeWire = Object.fromEntries(Object.entries(state.scope)
     .map(([key, bytes]) => [key, Buffer.from(bytes).toString("base64url")]));
   const standaloneConfig = {
@@ -147,7 +147,7 @@ test("real mTLS CAS commit publishes signed independent witness floor; both loca
     },
   };
   async function launchStandalone(config, expectReady, extraEnv = {}) {
-    fs.writeFileSync(configPath, JSON.stringify(config));
+    fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
     const child = spawn(process.execPath, [
       path.resolve(__dirname, "../scripts/zk1-cas-status-standalone.js"),
       "--config", configPath,
