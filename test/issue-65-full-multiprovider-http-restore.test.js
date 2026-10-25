@@ -538,6 +538,68 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     webdavCurrentEtag = '"opaque-v1"';
   });
 
+  await t.test("a prior S3 GET loses quorum when later Drive GET rebinds its principal or namespace", async () => {
+    for (const changed of ["principal", "namespace"]) {
+      let rebound = false;
+      let s3Downloads = 0;
+      const s3 = { ...readers[0], cloudReader: {
+        ...readers[0].cloudReader,
+        async resolveInventoryContext() {
+          return rebound && changed === "principal" ? "f".repeat(64)
+            : s3Adapter.resolveInventoryContext();
+        },
+        zk1StorageNamespace() {
+          return rebound && changed === "namespace" ? "e".repeat(64)
+            : s3Adapter.zk1StorageNamespace();
+        },
+        async download(...args) {
+          s3Downloads++;
+          return s3Adapter.download(...args);
+        },
+      } };
+      const drive = { ...readers[1], cloudReader: {
+        ...readers[1].cloudReader,
+        async download(...args) {
+          const result = await driveAdapter.download(...args);
+          rebound = true;
+          return result;
+        },
+      } };
+      try {
+        await assert.rejects(gateway.restoreExact({ ...recoverInput,
+          readers: [s3, drive, readers[2]], minimumMatchingProviders: 2 }),
+        /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+        `stale S3 ${changed} must not count even with identical owner-pinned ciphertext`);
+        assert.equal(s3Downloads, 1, `S3 ${changed} changed only after its valid GET`);
+      } finally { rebound = false; }
+    }
+    const clean = await gateway.restoreExact(recoverInput);
+    assert.deepEqual(clean.verifiedProviders.map((entry) => entry.provider), ["s3", "gdrive"]);
+  });
+
+  await t.test("last owner authorization check cannot leave stale provider counted", async () => {
+    let changed = false;
+    let calls = 0;
+    const specific = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
+      assertCurrentAuthorization: async (...args) => {
+        calls++;
+        if (calls === 2) changed = true;
+        return directGatewayPins.assertCurrentAuthorization(...args);
+      },
+    });
+    const s3 = { ...readers[0], cloudReader: { ...readers[0].cloudReader,
+      async resolveInventoryContext() {
+        return changed ? "d".repeat(64) : s3Adapter.resolveInventoryContext();
+      },
+    } };
+    try {
+      await assert.rejects(specific.restoreExact({ ...recoverInput,
+        readers: [s3, readers[1], readers[2]] }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "quorum needs one final provider recheck after fresh owner state");
+      assert.equal(calls >= 2, true, "the second owner check was executed");
+    } finally { changed = false; }
+  });
+
   await t.test("a verified 2/3 ciphertext quorum never waits on silent third provider", async () => {
     let thirdCalled = 0;
     const slow = { ...readers[2], cloudReader: { ...readers[2].cloudReader,

@@ -187,6 +187,27 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
   }
 }
 
+async function assertCountedReaderStillPinned(target, scope, operation, deadline) {
+  // An earlier successful GET is not a durable claim on a provider identity.
+  // Later providers and the fresh owner-status callback may run after its
+  // credentials, principal or namespace have changed. Recheck each counted
+  // reader immediately before returning any bytes, not just its GET peer.
+  const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
+  const locallyPinned = () => {
+    const key = target.reader.key(address.folder, address.name, "uploads");
+    return target.reader.status?.()?.provider === target.provider
+      && target.reader.enabled?.() === true
+      && typeof key === "string"
+      && key === target.ownerPinnedObjectKey
+      && key.endsWith(`/uploads/${address.folder}/${address.name}`)
+      && target.reader.zk1StorageNamespace() === target.namespace;
+  };
+  if (!locallyPinned()) deny();
+  if (await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context) deny();
+  deadline.assertActive();
+  if (!locallyPinned()) deny();
+}
+
 class Zk1MultiproviderCiphertextRestore {
   #publicKey;
   #signerId;
@@ -370,7 +391,8 @@ class Zk1MultiproviderCiphertextRestore {
       const failed = [];
       for (const provider of readers) {
         if (good.length >= quorum) break;
-        try { good.push(await exactGet(provider, scope, operation, root, lengths, byteLength, limit)); }
+        try { good.push({ ...await exactGet(provider, scope, operation, root, lengths, byteLength, limit),
+          countedReader: provider }); }
         catch (_) {
           if (limit.signal.aborted) deny();
           failed.push(provider.provider);
@@ -378,13 +400,20 @@ class Zk1MultiproviderCiphertextRestore {
       }
       if (good.length < quorum) deny();
       for (const match of good.slice(1)) if (!same(match.data, good[0].data)) deny();
+      await this.#current(operation);
+      limit.assertActive();
+      // The owner state must still be fresh and EVERY provider counted in the
+      // quorum must still match its owner-signed principal, namespace and key.
+      // A rebind on S3 while Drive downloads must invalidate both successes.
+      for (const match of good) {
+        await assertCountedReaderStillPinned(match.countedReader, scope, operation, limit);
+        limit.assertActive();
+      }
       this.#providerDomains.verify({ targets: readers.map((item) => ({
         provider: item.provider, namespaceIdentity: item.namespace,
         expectedReaderContext: item.context, pinnedDriveFileId: item.driveId,
         domainAttestation: item.domainAttestation,
       })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
-      await this.#current(operation);
-      limit.assertActive();
       const ciphertext = Buffer.from(good[0].data);
       returned = Object.freeze({ status: "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE",
         ciphertext, ciphertextSha256: Buffer.from(operation.ciphertext_sha256),
