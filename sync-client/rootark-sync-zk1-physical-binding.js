@@ -188,8 +188,15 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
       pinnedPhysicalAttestorPublicKey: physicalKey,
       nowSeconds: Math.floor(Date.now() / 1000),
     });
+    const completedAtSeconds = Math.floor(Date.now() / 1000);
     if (result.status !== "VERIFIED_COMPOSITE_NONAUTHORIZING"
-      || result.authorizesIo !== false) deny();
+      || result.authorizesIo !== false
+      // A proof may cross the ±30 s physical freshness window while CBOR and
+      // Ed25519 verification await. Recheck the SIGNED issuance timestamp
+      // rather than relying only on the pre-await wall-clock sample.
+      || !Number.isSafeInteger(result.physicalReadback?.issuedAt)
+      || !Number.isSafeInteger(completedAtSeconds) || completedAtSeconds < 1
+      || Math.abs(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
     return Object.freeze({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
       operationId: Buffer.from(bound.operation.operation_id),
       ciphertextSha256: Buffer.from(bound.operation.ciphertext_sha256),

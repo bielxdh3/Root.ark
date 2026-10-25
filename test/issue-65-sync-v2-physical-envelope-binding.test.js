@@ -64,16 +64,18 @@ async function createFixture({ deviceExpiryOffsetMs = 60000 } = {}) {
     ciphertextSha256: bound.operation.ciphertext_sha256,
     digest: random(32), root: random(32), chunkCount: 1 };
   const nonce = random(32);
+  const issuedAt = Math.floor(Date.now() / 1000);
   const physicalAttestation = await signCommittedPhysicalReadback({
     scope, operation: bound.operation, readback, nonce,
-    issuedAt: Math.floor(Date.now() / 1000) }, attestor.privateKey);
+    issuedAt }, attestor.privateKey);
   const input = { envelope, scope, expectedSequence, expectedRoot, receipt,
     physicalAttestation, nonce, pinnedInventoryPublicKey: inventory.publicKey,
     pinnedInventorySignerKeyId: signerId,
     pinnedPhysicalAttestorPublicKey: attestor.publicKey,
     localTrustedDevicePolicy: { username: "alice", trustedDevicePublicKeys: {
       "device-a": devicePublicKey }, revokedDeviceIds: [] } };
-  return { input, bound, readback, inventory, attestor, rogue, signSync, scope };
+  return { input, bound, readback, inventory, attestor, rogue, signSync, scope,
+    issuedAt };
 }
 
 test("a signed Sync v2 envelope binds exactly to two independent ZK1 signer identities and PG readback", async () => {
@@ -203,5 +205,32 @@ test("valid signatures on an expired Sync v2 envelope still do not prove origina
     const result = await verifySyncV2PhysicalEnvelopeEvidence(f.input);
     assert.equal(result.historicalServerAdmissionProven, false);
     assert.equal(result.authorizesIo, false);
+  } finally { Date.now = original; }
+});
+
+test("physical freshness must remain valid after asynchronous signature verification", async () => {
+  const f = await createFixture();
+  const original = Date.now;
+  let reads = 0;
+  try {
+    // The physical attestation begins at age 29 s and finishes at age 31 s.
+    // A pre-await clock sample is insufficient to authorize even the
+    // nonauthorizing evidence result for an expired physical readback.
+    Date.now = () => f.issuedAt * 1000 + (++reads === 1 ? 29000 : 31000);
+    await assert.rejects(verifySyncV2PhysicalEnvelopeEvidence(f.input),
+      /SYNC_ZK1_PHYSICAL_BINDING_DENIED/);
+    assert.ok(reads >= 2, "the verifier must recheck the clock after awaited crypto");
+  } finally { Date.now = original; }
+});
+
+test("non-finite post-verification clock cannot bypass physical freshness", async () => {
+  const f = await createFixture();
+  const original = Date.now;
+  let reads = 0;
+  try {
+    Date.now = () => ++reads === 1 ? f.issuedAt * 1000 : NaN;
+    await assert.rejects(verifySyncV2PhysicalEnvelopeEvidence(f.input),
+      /SYNC_ZK1_PHYSICAL_BINDING_DENIED/);
+    assert.ok(reads >= 2);
   } finally { Date.now = original; }
 });

@@ -1,5 +1,20 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: physical proof expiry across async verification (2026-10-24)
+
+The opt-in Sync v2 to ZK1 physical-envelope verifier now requires the physical
+readback to remain within its signed 30-second freshness window **after**
+awaiting both Ed25519 and deterministic CBOR checks. Previously, a response
+starting at age 29 seconds could finish at age 31 seconds and still be accepted.
+The physical attestation parser returns the already-verified `issuedAt` claim;
+the Sync v2 bridge rechecks it against the wall clock just before returning.
+RED before the patch; Windows Node 24 and Node 22 focused tests 23 PASS / 0 FAIL
+each after the change, including a non-finite clock rejection. This is a
+non-authorizing proof freshness repair; it does
+not establish original historical server admission time, an independently
+anchored floor, actual external provider durability, or a complete Sync v2
+PostgreSQL runtime integration. PR #228 remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: canonical JSON and idempotency object identity (2026-10-24)
 
 A JSON object carrying its own `__proto__` field previously collided with an

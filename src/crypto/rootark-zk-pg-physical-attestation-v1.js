@@ -139,6 +139,9 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     return Object.freeze({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
       walFlushConfirmed: true, generation, admissionId: Buffer.from(unsigned.admission_id),
       physicalDigest, chunkRoot, chunkCount,
+      // Return the already-verified, signed issuance time so callers that
+      // perform more asynchronous work can enforce freshness again at use.
+      issuedAt: unsigned.issued_at,
       operationId: Buffer.from(op.operation_id), authorizesIo: false,
       provesIndependentOperator: false });
   } catch (_) { deny(); }
