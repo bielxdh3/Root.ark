@@ -9,6 +9,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const os = require("node:os");
 const net = require("node:net");
+const { readAuthorityPinnedFile } = require("../src/services/zk1AuthorityPinnedFile");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
 const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } = require("../src/services/zk1WitnessHttpsServer");
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
@@ -61,10 +62,7 @@ function exact(value, names) {
     || Reflect.ownKeys(value).some((name) => !names.includes(name))) fail();
 }
 function readFile(value) {
-  if (typeof value !== "string" || !path.isAbsolute(value)) fail();
-  const stat = fs.statSync(value);
-  if (!stat.isFile() || stat.size === 0 || stat.size > 65536) fail();
-  return fs.readFileSync(value);
+  try { return readAuthorityPinnedFile(value); } catch (_) { fail(); }
 }
 function decodeId(value) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(value)) fail();

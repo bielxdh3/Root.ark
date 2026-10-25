@@ -3,11 +3,11 @@
 // Independently startable single-node zk-1 CAS/status engine. Does NOT imply
 // distributed durability, separate operator custody or physical I/O fencing.
 // Operator provisions all identity files and externally pinned trust roots.
-const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const os = require("node:os");
 const net = require("node:net");
+const { readAuthorityPinnedFile } = require("../src/services/zk1AuthorityPinnedFile");
 const { Zk1DurableCasStatusLedger } = require("../src/services/zk1DurableCasStatusLedger");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 const { Zk1WitnessCasAnchorHttpsClient } =
@@ -57,10 +57,7 @@ function exact(value, fields) {
     || Reflect.ownKeys(value).some((key) => !fields.includes(key))) fail();
 }
 function readFile(value) {
-  if (typeof value !== "string" || !path.isAbsolute(value)) fail();
-  const info = fs.statSync(value);
-  if (!info.isFile() || info.size <= 0 || info.size > 65536) fail();
-  return fs.readFileSync(value);
+  try { return readAuthorityPinnedFile(value); } catch (_) { fail(); }
 }
 function id(value) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(value)) fail();
