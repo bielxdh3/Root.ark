@@ -99,7 +99,7 @@ function stableValue(value) {
   if (value && typeof value === "object") return Object.keys(value).sort().reduce((result, key) => {
     result[key] = stableValue(value[key]);
     return result;
-  }, {});
+  }, Object.create(null));
   return value;
 }
 

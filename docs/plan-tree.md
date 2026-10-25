@@ -1,5 +1,19 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: canonical JSON and idempotency object identity (2026-10-24)
+
+A JSON object carrying its own `__proto__` field previously collided with an
+object lacking that field when constructing deterministic sync JSON and
+idempotency fingerprints: the plain-object accumulator invoked JavaScript's
+prototype setter instead of preserving the field. Both the outer and nested
+variants were reproduced RED. Canonical accumulators now use null-prototype
+objects so every own JSON field is retained in the signed/hash input without
+mutating shared prototypes. Node 22/24 focused historical authorization,
+readiness, and idempotency tests: 12 PASS/0 FAIL each; Node 24 adjacent client
+and sync regressions: 33 PASS/0 FAIL. These are local serializations only:
+they do not prove historical admission, distributed authority or external
+provider durability. PR #228 remains DRAFT and NO-GO.
+
 ## Issue #65 / PR #228: independently attested strict inventory chain (2026-10-24)
 
 The opt-in strict mTLS inventory chain now requires a fresh caller challenge per

@@ -62,7 +62,7 @@ function canonicalize(value) {
   return Object.keys(value).sort().reduce((result, key) => {
     result[key] = canonicalize(value[key]);
     return result;
-  }, {});
+  }, Object.create(null));
 }
 
 function canonicalJson(value) {
