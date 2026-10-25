@@ -6,6 +6,7 @@ const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const http = require("node:http");
+const { createRequire } = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
@@ -14,6 +15,7 @@ const vm = require("node:vm");
 
 const execFileAsync = promisify(execFile);
 const syncScript = path.resolve(__dirname, "../sync-client/rootark-sync.js");
+const requireSyncModule = createRequire(syncScript);
 
 async function listen(t, handler) {
   const server = http.createServer(handler);
@@ -92,7 +94,7 @@ test("legacy login rejects cross-origin 307 without forwarding password", {
   });
   const source = fs.readFileSync(syncScript, "utf8");
   const context = vm.createContext({
-    require, Buffer, fetch, setTimeout, clearTimeout,
+    require: requireSyncModule, Buffer, fetch, setTimeout, clearTimeout,
     console: { log() {}, error() {} },
     process: { argv: ["node", syncScript, "help"], cwd: () => process.cwd(), env: {} },
   });
@@ -116,7 +118,7 @@ test("legacy JSON writer cannot truncate a file hardlinked to predictable PID st
   await fsp.link(protectedFile, planted);
 
   const context = vm.createContext({
-    require, Buffer, fetch, setTimeout, clearTimeout,
+    require: requireSyncModule, Buffer, fetch, setTimeout, clearTimeout,
     console: { log() {}, error() {} },
     process: {
       argv: ["node", syncScript, "help"], cwd: () => root,
