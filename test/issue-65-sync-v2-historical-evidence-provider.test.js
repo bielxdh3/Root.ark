@@ -92,7 +92,7 @@ test("Sync v2 historical provider uses real child witness mTLS and fails closed 
     Buffer.concat([ENTRY_DOMAIN, await z.encodeDeterministic(entry)]),
     inventorySigner.privateKey);
   const receipt = Buffer.from(await z.encodeDeterministic({ ...entry, signature }));
-  const child = fork(path.join(__dirname, "support/issue-65-sync-historical-provider-child.js"),
+  const child = fork(path.join(__dirname, "../scripts/fixtures/issue-65-sync-historical-provider-child.js"),
     [dir, scope.account_id.toString("base64url"), scope.keyring_id.toString("base64url")],
     { stdio: ["ignore", "ignore", "ignore", "ipc"] });
   t.after(async () => {
