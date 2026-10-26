@@ -16,16 +16,21 @@ function record(name, status, details) {
 }
 
 function failedTestDiagnostics(output) {
-  return String(output || "").split(/\r?\n/)
+  const lines = String(output || "").split(/\r?\n/)
     .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
-    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line))
-    .slice(-20)
-    .map((line) => line
+    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line));
+  const sanitize = (line) => line
       .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
       .replace(/\b(?:password|passphrase|client_secret|refresh_token|access_token|id_token|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
       .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
-      .slice(0, 240))
-    .join("\n").slice(0, 3000);
+      .slice(0, 240);
+  // The canonical Windows test suite may produce many errors *after* the
+  // first failed TAP cases. Retain their names separately instead of hiding
+  // the first failures behind the last 20 generic diagnostics. The printed
+  // output remains strictly allowlisted, redacted and bounded.
+  const failures = lines.filter((line) => /^(?:not ok \d+ - |[✖✗×] )/.test(line));
+  const selected = [...new Set([...failures.slice(0, 96), ...failures.slice(-12), ...lines.slice(-16)])];
+  return selected.map(sanitize).join("\n").slice(0, 12000);
 }
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
