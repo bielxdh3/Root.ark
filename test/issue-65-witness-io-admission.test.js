@@ -4,15 +4,16 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const z = require("../src/crypto/rootark-zk-1");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const STATUS_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-cas-status/v1\0", "ascii");
 
 async function setup(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-witness-admit-"));
+  const dir = createPrivateAuthorityFixture("rootark-witness-admit-");
   const instances = [];
   t.after(() => {
     for (const entry of instances) entry.close();

@@ -1,11 +1,13 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const z = require("../src/crypto/rootark-zk-1");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
 const { inspectVerifiedWitnessReservationV1 } = require("../src/crypto/rootark-zk-witness-operation-wire-v1");
@@ -13,7 +15,7 @@ const { inspectVerifiedWitnessFreshHeadV1 } = require("../src/crypto/rootark-zk-
 
 const STATUS_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-cas-status/v1\0", "ascii");
 function fixture(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-issue65-witness-"));
+  const dir = createPrivateAuthorityFixture("rootark-issue65-witness-");
   const connections = new Set();
   t.after(() => {
     for (const instance of connections) instance.close();
@@ -86,6 +88,24 @@ function fixture(t) {
     requests() { return terminalRequests; },
   };
 }
+
+test("Windows witness rejects unsafe SQLite/WAL/SHM directory ACL before bootstrap or restart", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const f = fixture(t);
+  const existing = f.make();
+  existing.close();
+  execFileSync("icacls.exe", [path.dirname(f.filename), "/grant",
+    "*S-1-5-32-545:(OI)(CI)M"], { stdio: "ignore", windowsHide: true });
+
+  assert.throws(() => f.make({ bootstrapNew: false }), /WITNESS_STATE_MISSING/,
+    "restart must not open a ledger in a directory modifiable by Windows Users");
+  const newFilename = path.join(path.dirname(f.filename), "new-witness.sqlite");
+  assert.throws(() => new Zk1DurableWitnessLedger(newFilename, f.options),
+    /WITNESS_STATE_MISSING/,
+    "bootstrap must reject unsafe directory permissions before creating a database");
+  assert.equal(fs.existsSync(newFilename), false);
+});
 
 test("reservation closes the head gate durably before response, including across witness restarts", async (t) => {
   const f = fixture(t);
