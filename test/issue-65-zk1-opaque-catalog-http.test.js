@@ -1,5 +1,8 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -29,7 +32,7 @@ const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest();
 
 test("ZK1 opaque catalog: two owner-enrolled device sessions enumerate signed versions and GET; no names, stale/forged/missing/replay/rollback rejected", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-opaque-catalog-"));
+  const dir = createPrivateAuthorityFixture("zk1-opaque-catalog-");
   const state = await fixture.createInitialState(2);
   let manifest = state.headManifest;
   let clock = 1100;

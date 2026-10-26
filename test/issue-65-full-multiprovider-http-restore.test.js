@@ -1,10 +1,12 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const https = require("node:https");
@@ -86,7 +88,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   process.env.NODE_ENV = "development";
   t.after(() => { if (before === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = before; });
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-full-restore-"));
+  const dir = createPrivateAuthorityFixture("zk65-full-restore-");
   const sockets = [];
   const servers = [];
   const shutdown = async () => {

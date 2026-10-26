@@ -8,7 +8,8 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteAuthorityDirectory } = require("./zk1PrivateSqlitePath");
 const Database = require("better-sqlite3");
 const z = require("../crypto/rootark-zk-1");
 const manifestV2 = require("../crypto/rootark-zk-recovery-manifest-v2");
@@ -197,6 +198,10 @@ class Zk1ProtectedObjectStore {
     try {
       if (existed) assertPrivateSqliteFile(absolute);
       else ensurePrivateSqliteDirectory(absolute);
+      // SQLite also opens mutable WAL/SHM sidecars by name. A Windows Users
+      // Modify/DELETE_CHILD ACE on this directory (or an ancestor) bypasses
+      // main-file lstat/fstat checks, including on an otherwise valid restart.
+      assertPrivateSqliteAuthorityDirectory(absolute);
     } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
     const expectedIdentity = {
       scope: scopeKey(this.trustedScope),
@@ -227,14 +232,20 @@ class Zk1ProtectedObjectStore {
       }
       try { assertPrivateSqliteFile(absolute); } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
     } else {
-      try { ensurePrivateSqliteDirectory(absolute); } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
+      try {
+        ensurePrivateSqliteDirectory(absolute);
+        assertPrivateSqliteAuthorityDirectory(absolute);
+      } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
       // Never race another bootstrap into overwriting an existing database.
       const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
         | fs.constants.O_RDWR, 0o600);
       try { inspectedIdentity = statIdentity(fs.fstatSync(fd, { bigint: true })); }
       finally { fs.closeSync(fd); }
     }
-    try { assertPrivateSqliteFile(absolute); } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
+    try {
+      assertPrivateSqliteFile(absolute);
+      assertPrivateSqliteAuthorityDirectory(absolute);
+    } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
     this.db = new Database(absolute, { fileMustExist: true });
     try {
       try { assertPrivateSqliteFile(absolute); } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }

@@ -1,10 +1,12 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const express = require("express");
 const z = require("../src/crypto/rootark-zk-1");
@@ -51,7 +53,7 @@ test("catalog transition retains exactly each archived metadata AEAD and ciphert
 });
 
 test("revoked former signer cannot read or recommit; ACTIVE device re-endorses immutable historical pages through independent CAS", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-catalog-endorse-"));
+  const dir = createPrivateAuthorityFixture("zk1-catalog-endorse-");
   const state = await fixture.createInitialState(2);
   const scope = state.scope;
   const witnessKey = crypto.generateKeyPairSync("ed25519");

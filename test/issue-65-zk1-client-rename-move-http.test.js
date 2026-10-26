@@ -1,9 +1,11 @@
 "use strict";
+
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const express = require("express");
@@ -80,7 +82,7 @@ for (const mode of ["committed", "post-commit-read-fail", "forged-catalog-receip
   "rename/move uses witnessed catalog historical GET and signed CAS PUT; "
     + mode,
   async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-client-move-"));
+  const dir = createPrivateAuthorityFixture("zk1-client-move-");
   const state = await fixture.createInitialState(2);
   const manifest = state.headManifest, scope = state.scope, now = 1100;
   const witness = crypto.generateKeyPairSync("ed25519");

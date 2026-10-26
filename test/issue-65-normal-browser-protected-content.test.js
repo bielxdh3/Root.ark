@@ -1,5 +1,8 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -76,7 +79,7 @@ test("production static paths cannot disclose the opt-in normal browser laborato
 });
 
 async function setup(t) {
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-normal-browser-"));
+  const folder = createPrivateAuthorityFixture("rootark-normal-browser-");
   const clock = Math.floor(Date.now() / 1000);
   // Keep a third still-trusted device so two independent revocations can
   // rotate epochs without illegally removing every recovery authority.

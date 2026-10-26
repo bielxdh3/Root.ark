@@ -3,9 +3,10 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const express = require("express");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -16,7 +17,7 @@ const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1Protected
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
 
 test("opaque content plane enforces independently signed live head, device signature and durable replay fencing", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-content-gate-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk-content-gate-");
   const instances = [];
   const servers = [];
   t.after(async () => {

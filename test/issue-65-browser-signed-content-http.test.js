@@ -1,10 +1,12 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const express = require("express");
@@ -118,7 +120,7 @@ test("browser UMD executes without Node require and refuses a cross-origin signe
 });
 
 test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obey server admission and verified ciphertext root", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-browser-protected-http-"));
+  const dir = createPrivateAuthorityFixture("rootark-browser-protected-http-");
   const state = await fixtures.createInitialState(2);
   const scope = state.scope;
   const scopeWire = Object.fromEntries(Object.entries(scope).map(([key, value]) => [key, base64(value)]));

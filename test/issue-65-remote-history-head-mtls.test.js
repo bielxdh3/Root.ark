@@ -1,5 +1,8 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -248,7 +251,7 @@ test("pending live witness reservation, unpinned TLS peer and switched client sc
 
 test("real CAS and witness mTLS history authorizes local encrypted PUT/GET only for signed active devices", async (t) => {
   const f = await fixture(t);
-  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-signed-io-"));
+  const contentDir = createPrivateAuthorityFixture("rootark-zk1-signed-io-");
   const genesisDigest = await v2.recoveryManifestDigestV2(f.state.baseManifest);
   const proofProvider = createZk1SignedHistoryCasProofProvider({
     casClient: f.casClient, trustedScope: f.scope,

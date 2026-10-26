@@ -1,10 +1,12 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const express = require("express");
@@ -42,7 +44,7 @@ test("legacy ciphertext copy rejects oversized manifest digest before reading so
 });
 
 async function fixture(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-legacy-copy-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk1-legacy-copy-");
   const state = await fixtures.createInitialState(2);
   const witnessKey = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);

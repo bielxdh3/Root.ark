@@ -1,5 +1,8 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 // Disposable integration fixture: REAL Edge UI, owner-offline V2 ceremony,
 // independently signed commitment receipts, two separate pinned mTLS peers,
 // strict server-side V2 history and an actual authenticated HTTP ciphertext GET.
@@ -292,7 +295,7 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
   let stage = "initial";
   try {
   if (!fs.existsSync(EDGE)) return t.skip("Microsoft Edge unavailable");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-edge-v2-strict-"));
+  const dir = createPrivateAuthorityFixture("zk65-edge-v2-strict-");
   const state = await fixtures.createInitialState(2);
   const former = state.headManifest;
   const owner = crypto.generateKeyPairSync("ed25519");

@@ -1,10 +1,12 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const z = require("../src/crypto/rootark-zk-1");
@@ -17,7 +19,7 @@ const DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
 const rand = (n) => crypto.randomBytes(n);
 
 test("protected local PUT archives ciphertext revisions atomically and never replaces earlier opaque bytes", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-version-ledger-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk1-version-ledger-");
   const filename = path.join(dir, "content.sqlite");
   const state = await fixtures.createInitialState(2);
   const scope = state.scope;

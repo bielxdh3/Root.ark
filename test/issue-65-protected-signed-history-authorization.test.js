@@ -1,12 +1,14 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 // The protected store must never treat a current-head CAS manifest as proof
 // that an Ed25519 device enrollment/revocation chain has been verified.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -21,7 +23,7 @@ const DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0");
 const forbidden = /ZK_CONTENT_UNAVAILABLE|ZK_CONTENT_DENIED/;
 
 test("signed-history-required content denies forged approval and accepts ONLY independent branded complete chain", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk65-signed-content-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk65-signed-content-");
   const instances = [];
   t.after(() => {
     for (const store of instances) store.close();

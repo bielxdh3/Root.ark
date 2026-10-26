@@ -1,12 +1,14 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 // Three real signed v2 state transitions, durable CAS and witness engines,
 // live protected-file I/O with two devices, and concurrent pending revocation.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -17,7 +19,7 @@ const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLe
 const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } = require("../src/services/zk1ProtectedObjectStore");
 
 test("CAS+witness true signed genesis/enrollment/revocation fence cross-device ciphertext and survive restart", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-integrated-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk1-integrated-");
   const ledgers = [];
   t.after(() => {
     for (const ledger of ledgers) ledger.close();

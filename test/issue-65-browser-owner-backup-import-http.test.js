@@ -1,10 +1,12 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const express = require("express");
@@ -26,7 +28,7 @@ const id = () => crypto.randomBytes(16).toString("base64url");
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
 
 async function scenario(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-owner-import-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk1-owner-import-");
   const state = await fixtures.createInitialState(2);
   const scope = state.scope;
   const scopeWire = Object.fromEntries(Object.entries(scope)

@@ -1,11 +1,13 @@
 "use strict";
 
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const nodeCrypto = require("node:crypto");
 const crypto = nodeCrypto.webcrypto;
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const express = require("express");
@@ -43,7 +45,7 @@ test("opaque catalog UMD boots without CommonJS or Node globals", () => {
 });
 
 test("browser CAS intent seq4->5 survives restart after lost final proof; rejects rollback fork replay", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-browser-catalog-commit-"));
+  const dir = createPrivateAuthorityFixture("zk1-browser-catalog-commit-");
   const state = await fixture.createInitialState(2);
   const scope = state.scope;
   let manifest = state.headManifest;
