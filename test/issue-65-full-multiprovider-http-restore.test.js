@@ -602,6 +602,45 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     } finally { changed = false; }
   });
 
+  await t.test("late signed revocation, bad nonce and expiry during final provider probes deny ciphertext", async () => {
+    for (const { provider, attack } of [
+      { provider: "s3", attack: "revoked" },
+      { provider: "gdrive", attack: "revoked" },
+      { provider: "gdrive", attack: "wrong-nonce" },
+      { provider: "s3", attack: "expired" },
+    ]) {
+      let identityReads = 0;
+      const hitsBefore = { ...hits };
+      const index = provider === "s3" ? 0 : 1;
+      const original = readers[index];
+      const monitored = { ...original, cloudReader: { ...original.cloudReader,
+        async resolveInventoryContext() {
+          const context = await original.cloudReader.resolveInventoryContext();
+          identityReads += 1;
+          // Only the third check runs in the final quorum identity sweep,
+          // after both real remote ciphertext GETs and the previous signed
+          // owner check. The independent owner/device signer changes here.
+          if (identityReads === 3) {
+            if (attack === "revoked") revoked = true;
+            else freshAttack = attack;
+          }
+          return context;
+        },
+      } };
+      const changedReaders = readers.map((reader, position) => position === index
+        ? monitored : reader);
+      try {
+        await assert.rejects(gateway.restoreExact({ ...recoverInput,
+          readers: changedReaders }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+        `${provider} final await with signed ${attack} cannot release ciphertext`);
+        assert.equal(identityReads >= 3, true,
+          "attack ran during final quorum principal check after remote GET");
+        assert.ok(hits.s3 > hitsBefore.s3 && hits.drive > hitsBefore.drive,
+          "the signed-state attack occurred only after real S3 and Drive ciphertext GETs");
+      } finally { revoked = false; freshAttack = null; }
+    }
+  });
+
   await t.test("a verified 2/3 ciphertext quorum never waits on silent third provider", async () => {
     let thirdCalled = 0;
     const slow = { ...readers[2], cloudReader: { ...readers[2].cloudReader,

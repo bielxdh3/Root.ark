@@ -414,6 +414,12 @@ class Zk1MultiproviderCiphertextRestore {
         expectedReaderContext: item.context, pinnedDriveFileId: item.driveId,
         domainAttestation: item.domainAttestation,
       })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
+      // Per-provider principal checks above perform independent async network
+      // probes. An owner/device can become revoked while the last probe is
+      // pending. Fetch a NEW signed, nonce-fresh owner/device status after all
+      // those awaits and enforce the bounded restore deadline before egress.
+      await this.#current(operation);
+      limit.assertActive();
       const ciphertext = Buffer.from(good[0].data);
       returned = Object.freeze({ status: "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE",
         ciphertext, ciphertextSha256: Buffer.from(operation.ciphertext_sha256),
