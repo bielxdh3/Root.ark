@@ -8,6 +8,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { types: { isAsyncFunction } } = require("node:util");
 const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
   assertPrivateSqliteAuthorityDirectory } = require("./zk1PrivateSqlitePath");
 const Database = require("better-sqlite3");
@@ -181,6 +182,7 @@ function fileIdentity(filename) {
 
 class Zk1ProtectedObjectStore {
   #ownerPutFence;
+  #physicalPutActive = false;
   constructor(filename, { witnessProvider, witnessPinned, manifestProvider,
     trustedScope, minimumHead, bootstrapNew = false,
     admissionRequired = false,
@@ -224,15 +226,21 @@ class Zk1ProtectedObjectStore {
     if (physicalCommitOwnerFence !== undefined) {
       if (!signedHistoryRequired || !admissionRequired) fail();
       strict(physicalCommitOwnerFence,
-        ["pinnedPublicKey", "pinnedKeyId", "minimumGeneration", "readSignedHead"]);
-      const { pinnedPublicKey, pinnedKeyId, minimumGeneration, readSignedHead } =
+        ["pinnedPublicKey", "pinnedKeyId", "minimumGeneration", "readSignedHead",
+          "withCommitLease"]);
+      const { pinnedPublicKey, pinnedKeyId, minimumGeneration, readSignedHead,
+        withCommitLease } =
         physicalCommitOwnerFence;
       if (!(pinnedPublicKey instanceof crypto.KeyObject)
         || pinnedPublicKey.type !== "public"
         || pinnedPublicKey.asymmetricKeyType !== "ed25519"
         || crypto.KeyObject.prototype.equals.call(pinnedPublicKey,
           this.witnessPinned.publicKey)
-        || typeof readSignedHead !== "function") fail();
+        || typeof readSignedHead !== "function"
+        || typeof withCommitLease !== "function"
+        // An async function can perform SQLite mutations before its first
+        // await and only THEN return a Promise. Detect it before any effect.
+        || isAsyncFunction(withCommitLease)) fail();
       const rawSigner = Buffer.from(pinnedPublicKey.export({
         type: "spki", format: "der",
       })).subarray(-32);
@@ -242,6 +250,7 @@ class Zk1ProtectedObjectStore {
         fingerprint: crypto.createHash("sha256").update(
           pinnedPublicKey.export({ type: "spki", format: "der" })).digest(),
         minimumGeneration: positive(minimumGeneration), readSignedHead,
+        withCommitLease,
       });
     }
     const absolute = path.resolve(filename);
@@ -567,10 +576,9 @@ class Zk1ProtectedObjectStore {
         Buffer.from(device.authorization_public_key).equals(fence.rawSigner))) {
       fail("ZK_CONTENT_UNAVAILABLE");
     }
-    // Called INSIDE the physical SQLite IMMEDIATE transaction, after ALL
-    // witness/history/admission awaits. This callback must be a synchronous
-    // operator-owned signer backed by an independently monotonic owner state.
-    // A Promise is not a physical commit fence.
+    // Called INSIDE the physical SQLite IMMEDIATE transaction and INSIDE the
+    // operator's revocation/commit critical section, after all awaits.
+    // A signed snapshot alone does not protect the later SQLite COMMIT.
     const nonce = crypto.randomBytes(32);
     const devicePublicKeySha256 = crypto.createHash("sha256")
       .update(deviceAuthorizationPublicKey).digest();
@@ -640,7 +648,7 @@ class Zk1ProtectedObjectStore {
   }
   perform({ key, request, head, sealed, deviceAuthorizationPublicKey,
     verifiedHeadManifest }, operation) {
-    return this.db.transaction(() => {
+    const transaction = this.db.transaction(() => {
       if (operation === "put") this.#checkOwnerPutFence(
         key, request, deviceAuthorizationPublicKey, verifiedHeadManifest);
       // Never use the time from the first auth check after an asynchronous
@@ -735,7 +743,55 @@ class Zk1ProtectedObjectStore {
         ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,digest=excluded.digest`)
         .run(key, revision, digest);
       return result;
-    }).immediate();
+    });
+    if (operation !== "put" || !this.#ownerPutFence) return transaction.immediate();
+    // This callback is a TRUSTED, independently provisioned operator API, not
+    // an arbitrary application-supplied wrapper. The independent operator MUST
+    // serialize every acknowledged owner/device revocation against this call.
+    // A revocation requested inside a SQLite trigger must remain pending
+    // until the COMMIT completes (or the whole transaction rolls back). The
+    // operator's lease is the linearization boundary.
+    // This is a local DEV contract. Remote revocations require the same
+    // independently enforced authority and are not established by this API.
+    if (this.#physicalPutActive) fail("ZK_CONTENT_UNAVAILABLE");
+    this.#physicalPutActive = true;
+    let callbackOpen = true;
+    let callbackUsed = false;
+    let committed = false;
+    let result;
+    const commit = () => {
+      if (!callbackOpen || callbackUsed) fail("ZK_CONTENT_UNAVAILABLE");
+      callbackUsed = true;
+      result = transaction.immediate(); // includes WAL/FULL durable COMMIT
+      committed = true;
+      return result;
+    };
+    let returned;
+    try {
+      returned = this.#ownerPutFence.withCommitLease({
+        scope: { account_id: Buffer.from(this.trustedScope.account_id),
+          compartment_id: Buffer.from(this.trustedScope.compartment_id),
+          keyring_id: Buffer.from(this.trustedScope.keyring_id) },
+        deviceId: request.device_id, manifestRevision: request.manifest_revision,
+        manifestDigest: Buffer.from(request.manifest_digest),
+      }, commit);
+    } catch (_) {
+      fail("ZK_CONTENT_UNAVAILABLE");
+    } finally {
+      callbackOpen = false;
+      this.#physicalPutActive = false;
+    }
+    // Detect deferred/unexecuted calls or fabricated acknowledgments. An
+    // operator that returns a thenable *after* a synchronous commit has already
+    // changed SQLite; denial here cannot undo it. Operator implementations
+    // must never release their real revocation lease before the commit returns
+    // or return a thenable. The trusted operator's implementation is a
+    // prerequisite for the claimed local serialization.
+    if (!committed || returned !== result
+      || (returned && typeof returned.then === "function")) {
+      fail("ZK_CONTENT_UNAVAILABLE");
+    }
+    return result;
   }
 
   async put(input) {

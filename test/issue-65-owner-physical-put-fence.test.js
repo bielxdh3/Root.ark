@@ -21,7 +21,7 @@ const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0");
 const COMMIT_DOMAIN = Buffer.from("Root.ark/zk-1/owner-physical-put-fence/v1\0");
 const deny = /ZK_CONTENT_UNAVAILABLE|ZK_CONTENT_DENIED|ZK_CONTENT_IDENTITY_MISMATCH/;
 
-test("protected physical PUT rechecks an independent signed owner generation after async admission", async (t) => {
+test("physical PUT holds operator-owned revocation lease across SQLite durable commit", async (t) => {
   const folder = createPrivateAuthorityFixture("zk65-owner-physical-put-");
   const state = await fixtures.createInitialState(2);
   const scope = state.scope;
@@ -39,6 +39,23 @@ test("protected physical PUT rechecks an independent signed owner generation aft
   let replayResponse = null;
   let admitted = null;
   let unlock = null;
+  let leaseActive = false;
+  let queuedRevocations = [];
+  let leaseBehavior = "normal";
+  let lateCallbackError;
+  let rowsAtRevocation;
+  let store;
+  const confirmRevoke = (complete) => {
+    rowsAtRevocation = store.db.prepare(
+      "SELECT COUNT(*) AS n FROM zk_content_object").get().n;
+    generation += 1;
+    allowed = false;
+    complete();
+  };
+  const requestRevocation = () => new Promise((resolve) => {
+    if (leaseActive) queuedRevocations.push(resolve);
+    else confirmRevoke(resolve);
+  });
   const scopeKey = scope.account_id.toString("hex") + ":" +
     scope.compartment_id.toString("hex") + ":" + scope.keyring_id.toString("hex");
   const witnessProvider = {
@@ -90,6 +107,27 @@ test("protected physical PUT rechecks an independent signed owner generation aft
         Buffer.from(JSON.stringify(statement))]), signer);
       return { statement, signature };
     },
+    withCommitLease(_request, commit) {
+      if (leaseBehavior === "unavailable") throw new Error("operator unavailable");
+      if (leaseBehavior === "timeout") throw new Error("operator lease timed out");
+      if (leaseBehavior === "async") return Promise.resolve({ proceed: true });
+      if (leaseBehavior === "deferred") {
+        queueMicrotask(() => {
+          try { commit(); } catch (error) { lateCallbackError = error; }
+        });
+        return null;
+      }
+      if (leaseActive || !allowed) throw new Error("owner lease denied");
+      leaseActive = true;
+      try {
+        // Operator and owner revocation MUST use this same arbiter. No owner
+        // revocation can be acknowledged before the callback's SQLite COMMIT.
+        return commit();
+      } finally {
+        leaseActive = false;
+        for (const complete of queuedRevocations.splice(0)) confirmRevoke(complete);
+      }
+    },
   };
   const filename = path.join(folder, "protected.sqlite");
   const floor = { revision: 1, witnessSequence: 1,
@@ -114,7 +152,7 @@ test("protected physical PUT rechecks an independent signed owner generation aft
     for (const store of stores) store.close();
     fs.rmSync(folder, { recursive: true, force: true, maxRetries: 10 });
   });
-  let store = open(true);
+  store = open(true);
   const createPut = async () => {
     const device = manifest.devices[0];
     const ciphertext = crypto.randomBytes(64);
@@ -155,10 +193,67 @@ test("protected physical PUT rechecks an independent signed owner generation aft
   });
   await assert.rejects(physicalWrite(await createPut()), deny, "old signed nonce replay");
   replayResponse = null;
+  // W52: a reentrant revocation request lands AFTER a genuine fresh owner
+  // signature, inside the SQLite write, BEFORE the WAL/FULL COMMIT. It must
+  // stay UNACKNOWLEDGED until the physical write is durably completed.
+  let revokedInsideWrite = false;
+  let revocationConfirmed = false;
+  let revokePending;
+  store.db.function("w58_revoke_inside_put", () => {
+    revokedInsideWrite = true;
+    revokePending = requestRevocation().then(() => { revocationConfirmed = true; });
+    assert.equal(allowed, true, "owner still active until SQLite COMMIT");
+    assert.equal(revocationConfirmed, false, "revoke not confirmed before commit");
+    return 0;
+  });
+  store.db.exec(`CREATE TEMP TRIGGER w58_revoke_inside_put
+    BEFORE INSERT ON zk_content_object
+    BEGIN SELECT w58_revoke_inside_put(); END`);
+  const committedBeforeRevoke = await createPut();
+  assert.deepEqual(await physicalWrite(committedBeforeRevoke),
+    { id: committedBeforeRevoke.authorization.object_id, revision: 1 });
+  assert.equal(revokedInsideWrite, true);
+  await revokePending;
+  assert.equal(revocationConfirmed, true);
+  assert.equal(allowed, false);
+  assert.equal(rowsAtRevocation, 1, "revocation acknowledged only after WAL COMMIT");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 1);
+  store.db.exec("DROP TRIGGER w58_revoke_inside_put");
+  await assert.rejects(physicalWrite(await createPut()), deny,
+    "revocation confirmed immediately after commit fences all later PUTs");
+  generation = Number(manifest.revision);
+  allowed = true;
+  for (const behavior of ["unavailable", "timeout", "async", "deferred"]) {
+    leaseBehavior = behavior;
+    await assert.rejects(physicalWrite(await createPut()), deny,
+      "missing, timed-out or asynchronous lease must be unavailable");
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n,
+      1, "failed operator lease never writes durable ciphertext");
+  }
+  assert.match(String(lateCallbackError), deny,
+    "deferred callback cannot mutate after the lease returned");
+  leaseBehavior = "normal";
+  let rollbackRevoke;
+  store.db.function("w58_revoke_then_abort", () => {
+    rollbackRevoke = requestRevocation();
+    assert.equal(allowed, true);
+    return 0;
+  });
+  store.db.exec(`CREATE TEMP TRIGGER w58_revoke_then_abort
+    BEFORE INSERT ON zk_content_object
+    BEGIN SELECT w58_revoke_then_abort(); SELECT RAISE(ABORT,'W58_SIMULATED_SQLITE_FAILURE'); END`);
+  await assert.rejects(physicalWrite(await createPut()), deny,
+    "SQLite failure rolls back and releases operator lease");
+  await rollbackRevoke;
+  assert.equal(rowsAtRevocation, 1, "rollback before revocation acknowledgment");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 1);
+  store.db.exec("DROP TRIGGER w58_revoke_then_abort");
+  generation = Number(manifest.revision);
+  allowed = true;
   const genuine = await createPut();
   assert.deepEqual(await physicalWrite(genuine),
     { id: genuine.authorization.object_id, revision: 1 });
-  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 1);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 2);
   // Exercise the canonical HTTP ingress, including the physical put under
   // admission while revocation wins during the delayed witness handshake.
   const app = express();
@@ -197,17 +292,43 @@ test("protected physical PUT rechecks an independent signed owner generation aft
   const rejectedHttp = await deniedRequest;
   assert.equal(rejectedHttp.status, 503);
   assert.deepEqual(await rejectedHttp.json(), { error: "ZK_CONTENT_UNAVAILABLE" });
-  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 2);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 3);
   store.close();
   store = open(false);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 3,
+    "successful ciphertext writes survive restart");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_version").get().n, 3,
+    "full version archive survives restart");
   await assert.rejects(physicalWrite(await createPut()), deny, "revocation after restart");
-  store.close();
   assert.throws(() => new Zk1ProtectedObjectStore(filename, {
     ...settings, bootstrapNew: false, physicalCommitOwnerFence: undefined,
   }), deny, "restart cannot silently disable pinned external owner fence");
   assert.throws(() => new Zk1ProtectedObjectStore(filename, {
     ...settings, bootstrapNew: false, physicalCommitOwnerFence: {
+      ...policy, withCommitLease: undefined,
+    },
+  }), deny, "restart cannot replace the physical operator lease with signed reads");
+  for (const asyncLease of [
+    async (_request, commit) => { await Promise.resolve(); return commit(); },
+    async (_request, commit) => { const result = commit(); await Promise.resolve(); return result; },
+  ]) {
+    let invoked = false;
+    assert.throws(() => new Zk1ProtectedObjectStore(filename, {
+      ...settings, bootstrapNew: false, physicalCommitOwnerFence: {
+        ...policy, withCommitLease: async (request, commit) => {
+          invoked = true;
+          return asyncLease(request, commit);
+        },
+      },
+    }), deny, "async lease must be rejected before it can trigger a physical COMMIT");
+    assert.equal(invoked, false);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n,
+      3, "rejecting an async provider has no durable effect");
+  }
+  assert.throws(() => new Zk1ProtectedObjectStore(filename, {
+    ...settings, bootstrapNew: false, physicalCommitOwnerFence: {
       ...policy, pinnedPublicKey: foreign.publicKey,
     },
   }), deny, "restart cannot replace independently pinned operator signer");
+  store.close();
 });
