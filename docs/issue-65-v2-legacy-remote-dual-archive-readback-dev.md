@@ -40,6 +40,14 @@ original V1 handoff still needs to be **fresh and valid** for the existing
 128-archive verifier. Its owner may need to issue a fresh independently
 witnessed handoff bound to the same two archival roots.
 
+Follow-up liveness fence: the owner witness is challenged **again after**
+the final V1 archival preflight and CAS/FLOOR signed stage readbacks. An
+owner revocation or manifest advance committed during the asynchronous
+readback window invalidates the result. This additional freshness check
+is a bounded race mitigation, **not an atomic witness reservation**;
+revocation immediately after the final observed head still requires
+the independent monotonic migration fence described below.
+
 Readback caps the legacy V2 suffix at **1,024 signed transitions** beyond
 the V1 absolute #128; beyond that bound the operator must use a separately
 reviewed paginated proof protocol. Normal historical `head()` remains

@@ -1372,17 +1372,20 @@ async function verifyLegacyArchiveDualReadback(input) {
       }
     };
     await checkedReadback();
-    const challenge = crypto.randomBytes(32);
-    const fresh = bytes(await ownerTrust.freshWitnessHead({
-      scope, nonce: challenge }), 1, 8192);
-    await inspectVerifiedWitnessFreshHeadV1({
-      raw: fresh, scope, nonce: challenge,
-      pinned: ownerTrust.pinnedWitness, minimumHead: ownerTrust.minimumHead });
-    const witnessed = await z.decodeDeterministic(fresh);
-    if (Math.abs(Math.floor(Date.now() / 1000) - witnessed.observed_at) > 30
-      || witnessed.current_revision !== ownerConsent.owner_revision
-      || !same(bytes(witnessed.current_manifest_digest, 32),
-        canonical32(ownerConsent.owner_digest))) fail();
+    const assertOwnerCurrent = async () => {
+      const challenge = crypto.randomBytes(32);
+      const fresh = bytes(await ownerTrust.freshWitnessHead({
+        scope, nonce: challenge }), 1, 8192);
+      await inspectVerifiedWitnessFreshHeadV1({
+        raw: fresh, scope, nonce: challenge,
+        pinned: ownerTrust.pinnedWitness, minimumHead: ownerTrust.minimumHead });
+      const witnessed = await z.decodeDeterministic(fresh);
+      if (Math.abs(Math.floor(Date.now() / 1000) - witnessed.observed_at) > 30
+        || witnessed.current_revision !== ownerConsent.owner_revision
+        || !same(bytes(witnessed.current_manifest_digest, 32),
+          canonical32(ownerConsent.owner_digest))) fail();
+    };
+    await assertOwnerCurrent();
     await checkedReadback();
     // A real signed V1 provider rollback between the initial archive proof
     // and stage interrogation must not be hidden by otherwise valid V2
@@ -1394,6 +1397,11 @@ async function verifyLegacyArchiveDualReadback(input) {
       || !same(canonical32(finalArchive.checkpointDigest),
         expected.full_archive_checkpoint)) fail();
     await checkedReadback();
+    // A revocation can commit while HTTPS stage or full-128 reads are in
+    // flight. Rechallenge the independent owner witness AFTER the final
+    // signed readback, before reporting current-owner verification.
+    // This still does not provide a distributed atomic cutover fence.
+    await assertOwnerCurrent();
     return Object.freeze({ state: "LEGACY_DUAL_ARCHIVE_SIGNED_READBACK_ONLY",
       legacySequence: ownerConsent.legacy_sequence,
       fullArchiveRoot: ownerConsent.full_archive_root,

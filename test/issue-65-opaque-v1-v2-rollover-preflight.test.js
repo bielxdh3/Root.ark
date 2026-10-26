@@ -651,6 +651,25 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     await assert.rejects(verifyLegacyArchiveDualReadback(readback),
       /ZK_CHECKPOINT_V2_/, 'owner witness epoch advancement fences stale archive readback');
     context.setLiveOwnerDigest(options.ownerHead.digest);
+    // Real TLS readback number two finishes AFTER the first fresh owner
+    // witness. A revocation committed in that window must be detected
+    // before a readback report claims to reflect the current owner state.
+    const originalFloorReadback = context.floor.legacyArchiveReadback.bind(context.floor);
+    let floorReadbacks = 0;
+    context.floor.legacyArchiveReadback = async (...args) => {
+      const result = await originalFloorReadback(...args);
+      if (++floorReadbacks === 2) context.setLiveOwnerDigest(crypto.randomBytes(32));
+      return result;
+    };
+    try {
+      await assert.rejects(verifyLegacyArchiveDualReadback(readback),
+        /ZK_CHECKPOINT_V2_LEGACY_READBACK_UNVERIFIED/,
+      'witnessed revocation during the second genuine HTTPS stage read must fence readback');
+      assert.ok(floorReadbacks >= 2);
+    } finally {
+      context.floor.legacyArchiveReadback = originalFloorReadback;
+      context.setLiveOwnerDigest(options.ownerHead.digest);
+    }
     await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
       fullV1ArchiveRollover: { ...fullProof, v1CasClient: options.v1CasClient } }),
       /ZK_CHECKPOINT_V2_/, 'in-memory provider cannot replace the pinned V1 HTTPS client');

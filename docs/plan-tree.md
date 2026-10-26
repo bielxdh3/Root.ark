@@ -1,5 +1,18 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: legacy dual-archive owner revocation during readback (DEV)
+
+An adversarial synthetic TLS1.3 mTLS test reproduced a race on the
+integrated dual-archive readback: a real independently signed owner
+revocation after the first witness query but during the second authority
+readback still yielded success. The opt-in read-only verifier now performs
+a final fresh, nonce-bound, pinned owner witness check **after all remote
+CAS/FLOOR and complete V1 archive preflight reads**. A changed owner revision
+or manifest digest fails closed. This is a liveness guard only; it cannot
+replace independent durable cross-host stage fencing, cannot authorize
+restore/cutover and cannot prevent a revision change after the final
+observation. PR #228 remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: legacy V2 two-authority signed stage readback (DEV, 2026-10-25)
 
 After the opt-in phase-1 legacy V2 dual-archive write quarantine (`a4b5ea6`),
