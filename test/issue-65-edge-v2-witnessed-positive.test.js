@@ -486,11 +486,14 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
   const signedPop = JSON.parse(Buffer.from(popOutput.data, "base64url").toString("utf8"));
   stage = "owner-stage";
   const actor = state.actors.get(Buffer.from(former.devices[0].authorization_key_id).toString("hex"));
+  // The browser and hosted Windows runner may take longer than three seconds.
+  // Keep the real monotonic ceremony gate; supply its actual current clock.
   const candidate = await enrollment.stageBrowserPopResponse({
-    prepared, response: signedPop, trustedActorPrivateKey: actor, nowSeconds: at + 3 });
+    prepared, response: signedPop, trustedActorPrivateKey: actor, nowSeconds: time() });
   const currentDigest = await v2.recoveryManifestDigestV2(candidate.manifest);
   const current = { revision: candidate.manifest.revision,
     digest: b64(currentDigest), epoch: candidate.manifest.current_epoch };
+  const approvalNow = time();
   const committedReceipt = signedReceipt({
     ...current, previous_revision: former.revision, previous_digest: b64(formerDigest),
     operation_id: b64(candidate.manifest.operation.operation_id),
@@ -498,11 +501,11 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
     request_nonce: request.challenge, commit_nonce: prepared.commitmentNonce,
     sequence: priorReceipt.sequence + 1,
     previous_receipt_sha256: b64(receiptDigest(priorReceipt)),
-    issued_at: at + 4, expires_at: at + 290,
+    issued_at: approvalNow, expires_at: approvalNow + 290,
   }, witnessKey.privateKey, scope);
   const issued = await enrollment.ownerApproveCommittedEnrollment({
     candidate, signedCommittedHead: committedReceipt,
-    ownerPrivateKey: owner.privateKey, nowSeconds: at + 5 });
+    ownerPrivateKey: owner.privateKey, nowSeconds: approvalNow });
   // The trusted owner host publishes the signed V2 transition only AFTER its
   // independent witnessed operation is committed. CAS and witness remain separate mTLS peers.
   head = candidate.manifest;

@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const vm = require("node:vm");
+const { waitForEdgeDevtoolsPage } = require("./support/issue-65-edge-devtools-readiness");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { createAuthenticate } = require("../src/middlewares/auth");
@@ -1019,16 +1020,12 @@ if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
       }
       throw new Error("Edge normal browser probe timeout");
     };
-    const port = await waitFor(() => {
-      const file = path.join(profile, "DevToolsActivePort");
-      if (!fs.existsSync(file)) return null;
-      const n = Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
-      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    // DevToolsActivePort may exist before /json/list publishes a page target.
+    // Reuse the established readiness check within the original 20s budget.
+    const debuggerPage = await waitForEdgeDevtoolsPage({
+      profileDir: profile, child: edge, timeoutMs: 20000,
     });
-    const tabs = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
-    const tab = tabs.find((item) => item.type === "page");
-    assert.ok(tab?.webSocketDebuggerUrl);
-    socket = new WebSocket(tab.webSocketDebuggerUrl);
+    socket = new WebSocket(debuggerPage);
     await new Promise((resolve, reject) => {
       socket.addEventListener("open", resolve, { once: true });
       socket.addEventListener("error", reject, { once: true });
