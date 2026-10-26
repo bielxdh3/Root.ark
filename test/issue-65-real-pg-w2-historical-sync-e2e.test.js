@@ -312,7 +312,14 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
     casAnchorFloor: { dbPath: witnessPath, trustedMinimumHead: genesisFloor },
   };
   const operatorRecovery = createExternalRecoveryHeadFixture(
-    path.join(dir, "separate-operator-recovery-floor.sqlite"));
+    path.join(dir, "separate-operator-recovery-floor.sqlite"),
+    { sequence: 0, lastHash: "0".repeat(64) }, {
+      witnessPublicKey: witnessKeys.publicKey,
+      physicalAttestorPublicKey: physicalSigner.publicKey,
+      policyProvider: () => ({ username: policy.username,
+        trustedDevicePublicKeys: { ...policy.trustedDevicePublicKeys },
+        revokedDeviceIds: [...policy.revokedDeviceIds] }),
+    });
   cleanups.push(() => operatorRecovery.close());
   const trustedHistorical = {
     physicalAdmission: admission,

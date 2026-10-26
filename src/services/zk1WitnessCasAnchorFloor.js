@@ -210,7 +210,9 @@ class Zk1WitnessCasAnchorFloor {
         || typeof trustedSyncDevicePolicyProvider !== "function"
         || !trustedRecoveryNonceAuthority
         || typeof trustedRecoveryNonceAuthority.loadHead !== "function"
-        || typeof trustedRecoveryNonceAuthority.compareAndAdvance !== "function"))
+        || typeof trustedRecoveryNonceAuthority.compareAndAdvance !== "function"
+        || typeof trustedRecoveryNonceAuthority.loadFinalizedHead !== "function"
+        || typeof trustedRecoveryNonceAuthority.finalizeAck !== "function"))
       || (!enableSyncHistoricalIssuer && trustedRecoveryNonceAuthority !== undefined)) fail();
     this.#historicalEnabled = enableSyncHistoricalIssuer;
     this.#externalRecoveryAuthority = trustedRecoveryNonceAuthority || null;
@@ -831,6 +833,24 @@ class Zk1WitnessCasAnchorFloor {
     const external = this.#readExternallyCommittedRecoveryHead();
     if (external.sequence !== this.#recoveryHead.sequence
       || external.lastHash !== this.#recoveryHead.lastHash) fail();
+    // A READY signature may have FULL-committed just before a stale-proof
+    // check, process crash, or failed compensating SQLite write. An operator
+    // must have independently and durably finalized THAT precise ACK.
+    const finalized = this.#readExternallyFinalizedRecoveryHead();
+    if (finalized.sequence !== external.sequence
+      || finalized.lastHash !== external.lastHash) fail();
+  }
+  #readExternallyFinalizedRecoveryHead() {
+    if (!this.#externalRecoveryAuthority) fail();
+    let observed;
+    try { observed = this.#externalRecoveryAuthority.loadFinalizedHead(); }
+    catch (_) { fail(); }
+    const head = exact(observed, ["sequence", "lastHash"]);
+    if (!Number.isSafeInteger(head.sequence)
+      || head.sequence < 0 || head.sequence > MAX_RECOVERY_CHALLENGES
+      || !validHex(head.lastHash)
+      || (head.sequence === 0 && head.lastHash !== ZERO)) fail();
+    return Object.freeze({ sequence: head.sequence, lastHash: head.lastHash });
   }
   #commitExternalRecoveryHead(previous, next) {
     const loaded = this.#readExternallyCommittedRecoveryHead();
@@ -880,13 +900,15 @@ class Zk1WitnessCasAnchorFloor {
     this.#recoveryAckPhase = "PENDING";
     this.#recoveryAckPreviousHash = previousHash;
   }
-  #finishConfirmedRecoveryAck(head, previousHash, {
+  async #finishConfirmedRecoveryAck(head, previous, {
     originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt,
+    physicalAttestation, scope, operation, nonce,
   }) {
+    const previousHash = previous.lastHash;
     if (this.#recoveryAckPhase !== "PENDING"
       || this.#recoveryAckPreviousHash !== previousHash) fail();
-    // This is the ONLY transition to READY. No public reconciliation/clear
-    // method exists: ambiguous CAS results must remain quarantined.
+    // READY alone is never authoritative. An independent operator must also
+    // durably finalize this very nonce using the signed READY proof.
     const freshness = { originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt };
     this.#db.transaction(() => {
       this.#assertHistoricalIntegrity();
@@ -924,6 +946,33 @@ class Zk1WitnessCasAnchorFloor {
       catch (_) { this.#recoveryAckPhase = "PENDING"; }
       fail();
     }
+    // Operator MUST validate the witness signature, original physical PG
+    // attestation, and live independent owner policy/expiry before its own
+    // monotonic FULL finalization. It must not trust these claimed fields on
+    // their own; no success/default bypass exists if the operator is missing.
+    const stored = this.#db.prepare(
+      "SELECT signature FROM witness_cas_sync_historical_recovery_head WHERE id=1").get();
+    if (!Buffer.isBuffer(stored?.signature) || stored.signature.length !== 64) fail();
+    const proof = Object.freeze({
+      witnessKeyId: this.#witnessId.toString("base64url"),
+      statusKeyId: this.#statusId.toString("base64url"),
+      readySignature: Buffer.from(stored.signature),
+      policySnapshot: originalPolicySnapshot,
+      physicalIssuedAt,
+      physicalAttestation: Buffer.from(physicalAttestation),
+      scope, operation, nonce: Buffer.from(nonce),
+    });
+    let acknowledged;
+    try {
+      acknowledged = await this.#externalRecoveryAuthority.finalizeAck(
+        Object.freeze({ ...previous }), Object.freeze({ ...head }), proof);
+    } catch (_) { fail(); }
+    if (acknowledged !== true) fail();
+    const finalized = this.#readExternallyFinalizedRecoveryHead();
+    if (finalized.sequence !== head.sequence || finalized.lastHash !== head.lastHash) fail();
+    // A separate operator reconciliation or subsequent CAS advancement while
+    // awaiting finalization must also fence this particular recovery response.
+    this.#assertExternalRecoveryHead();
   }
   #assertHistoricalNonceIntegrity(db) {
     const schema = new Set(db.prepare(
@@ -1260,10 +1309,12 @@ class Zk1WitnessCasAnchorFloor {
       // Explicit successful CAS+independent readback is followed by a SECOND
       // WAL synchronous=FULL transaction. Any exception/crash prior to that
       // durable READY signature leaves PENDING, including after process restart.
-      this.#finishConfirmedRecoveryAck(committedHead, previousExternal.lastHash, {
+      await this.#finishConfirmedRecoveryAck(committedHead, previousExternal, {
         originalPolicySnapshot: policySnapshot,
         physicalIssuedAt: composite.physicalIssuedAt,
         minimumCompletedAt: completed,
+        physicalAttestation: composite.physicalAttestation,
+        scope: bound.scope, operation: bound.operation, nonce,
       });
       return Object.freeze({
         admission, freshFloor: floor,

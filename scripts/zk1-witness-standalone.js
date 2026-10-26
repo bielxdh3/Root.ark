@@ -93,6 +93,8 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
     || !authority.trustedRecoveryNonceAuthority
     || typeof authority.trustedRecoveryNonceAuthority.loadHead !== "function"
     || typeof authority.trustedRecoveryNonceAuthority.compareAndAdvance !== "function"
+    || typeof authority.trustedRecoveryNonceAuthority.loadFinalizedHead !== "function"
+    || typeof authority.trustedRecoveryNonceAuthority.finalizeAck !== "function"
     || !crypto.KeyObject.prototype.equals.call(authority.witnessPublicKey,
       crypto.createPublicKey(witnessKey))
     || !crypto.KeyObject.prototype.equals.call(authority.statusPublicKey, statusKey)
@@ -107,9 +109,13 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
   // never config JSON, request JSON, the witness SQLite or the CAS writer.
   // A *live* externally committed read is mandatory before any DB startup.
   let externalRecoveryHead;
+  let finalizedRecoveryHead;
   try { externalRecoveryHead = authority.trustedRecoveryNonceAuthority.loadHead(); }
   catch (_) { fail(); }
+  try { finalizedRecoveryHead = authority.trustedRecoveryNonceAuthority.loadFinalizedHead(); }
+  catch (_) { fail(); }
   exact(externalRecoveryHead, ["sequence", "lastHash"]);
+  exact(finalizedRecoveryHead, ["sequence", "lastHash"]);
   const checkHash = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
   if (!Number.isSafeInteger(floor.sequence) || floor.sequence < 0
     || floor.sequence > 100000 || !checkHash(floor.lastHash)
@@ -119,10 +125,19 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
     || !Number.isSafeInteger(externalRecoveryHead.sequence)
     || externalRecoveryHead.sequence < 0 || externalRecoveryHead.sequence > 4096
     || !checkHash(externalRecoveryHead.lastHash)
+    || !Number.isSafeInteger(finalizedRecoveryHead.sequence)
+    || finalizedRecoveryHead.sequence < 0 || finalizedRecoveryHead.sequence > 4096
+    || !checkHash(finalizedRecoveryHead.lastHash)
+    || finalizedRecoveryHead.sequence > externalRecoveryHead.sequence
+    || (finalizedRecoveryHead.sequence === externalRecoveryHead.sequence
+      && finalizedRecoveryHead.lastHash !== externalRecoveryHead.lastHash)
+    || (finalizedRecoveryHead.sequence === 0
+      && finalizedRecoveryHead.lastHash !== "0".repeat(64))
     || (externalRecoveryHead.sequence === 0
       && externalRecoveryHead.lastHash !== "0".repeat(64))
     || (historical.sequence === 0 && historical.lastHash !== "0".repeat(64))
     || (config.bootstrapNew && (externalRecoveryHead.sequence !== 0
+      || finalizedRecoveryHead.sequence !== 0
       || historical.sequence !== 0
       || floor.sequence !== 0 || floor.lastHash !== "0".repeat(64)
       || floor.physicalFenceDigest !== crypto.createHash("sha256")

@@ -266,15 +266,32 @@ test("strict CAS witness floor refuses signed status advance without independent
     return { username: "owner", trustedDevicePublicKeys: { "device-a": deviceSpki },
       revokedDeviceIds: [...trustedDeviceRevocations] };
   };
+  const operatorProofPins = {
+    witnessPublicKey: witness.publicKey,
+    physicalAttestorPublicKey: attestor.publicKey,
+    policyProvider: trustedSyncDevicePolicyProvider,
+  };
   const historicalOptions = {
     witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
     enableSyncHistoricalIssuer: true, trustedSyncDevicePolicyProvider,
   };
   const externalRecovery = createExternalRecoveryHeadFixture(
-    path.join(directory, "operator-outside-witness-recovery-head.sqlite"));
+    path.join(directory, "operator-outside-witness-recovery-head.sqlite"),
+    { sequence: 0, lastHash: "0".repeat(64) }, operatorProofPins);
   externalAuthorities.push(externalRecovery);
   historicalOptions.trustedRecoveryNonceAuthority = externalRecovery.authority;
+  const unfinalizedOperatorPath = path.join(directory, "legacy-operator-no-finalization.sqlite");
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(unfinalizedOperatorPath, {
+    ...historicalOptions, bootstrapNew: true,
+    trustedRecoveryNonceAuthority: {
+      loadHead: externalRecovery.authority.loadHead,
+      compareAndAdvance: externalRecovery.authority.compareAndAdvance,
+    },
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "old two-method operator adapters must not silently bypass ACK finalization");
+  assert.equal(fs.existsSync(unfinalizedOperatorPath), false,
+    "reject the missing operator finalizer before creating an issuer database");
   assert.throws(() => new Zk1WitnessCasAnchorFloor(
     path.join(directory, "forbidden-policyless-issuer.sqlite"), {
       witnessKeyId, witnessPrivateKey: witness.privateKey,
@@ -668,7 +685,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   fs.copyFileSync(historicalFilename, pendingPath);
   const externalPending = createExternalRecoveryHeadFixture(
     path.join(directory, "separate-operator-pending-recovery-head.sqlite"),
-    independentlyPinnedRecoveryHead);
+    independentlyPinnedRecoveryHead, operatorProofPins);
   externalAuthorities.push(externalPending);
   const pendingOptions = {
     ...pinnedRestart, trustedRecoveryNonceAuthority: externalPending.authority,
@@ -716,7 +733,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   fs.copyFileSync(historicalFilename, ackLostPath);
   const externalAckLost = createExternalRecoveryHeadFixture(
     path.join(directory, "separate-operator-ack-lost-head.sqlite"),
-    independentlyPinnedRecoveryHead);
+    independentlyPinnedRecoveryHead, operatorProofPins);
   externalAuthorities.push(externalAckLost);
   const ackLostOptions = {
     ...pinnedRestart, trustedRecoveryNonceAuthority: externalAckLost.authority,
@@ -772,6 +789,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   const snapshotPending = new Database(ackLostPath, { readonly: true, fileMustExist: true });
   try { await backupPrivateWitnessFixture(snapshotPending, forgedReadyPath); }
   finally { snapshotPending.close(); }
+  fs.chmodSync(forgedReadyPath, 0o600);
   const forgedReadyDb = new Database(forgedReadyPath);
   try {
     // A SQL editor with no witness private key cannot convert a signed
@@ -787,6 +805,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   const beforeUpgrade = new Database(historicalFilename, { readonly: true, fileMustExist: true });
   try { await backupPrivateWitnessFixture(beforeUpgrade, legacyRecoveryPath); }
   finally { beforeUpgrade.close(); }
+  fs.chmodSync(legacyRecoveryPath, 0o600);
   const oldSchema = new Database(legacyRecoveryPath);
   try {
     oldSchema.exec("ALTER TABLE witness_cas_sync_historical_recovery_head"
@@ -809,9 +828,10 @@ test("strict CAS witness floor refuses signed status advance without independent
   const originalSql = new Database(historicalFilename, { readonly: true, fileMustExist: true });
   try { await backupPrivateWitnessFixture(originalSql, failedClearPath); }
   finally { originalSql.close(); }
+  fs.chmodSync(failedClearPath, 0o600);
   const failedClearExternal = createExternalRecoveryHeadFixture(
     path.join(directory, "separate-operator-second-full-failed.sqlite"),
-    independentlyPinnedRecoveryHead);
+    independentlyPinnedRecoveryHead, operatorProofPins);
   externalAuthorities.push(failedClearExternal);
   const failedClearOpts = { ...pinnedRestart,
     trustedRecoveryNonceAuthority: failedClearExternal.authority };
@@ -844,12 +864,15 @@ test("strict CAS witness floor refuses signed status advance without independent
     const source = new Database(historicalFilename, { readonly: true, fileMustExist: true });
     try { await backupPrivateWitnessFixture(source, isolatedPath); }
     finally { source.close(); }
+    fs.chmodSync(isolatedPath, 0o600);
     const remote = createExternalRecoveryHeadFixture(
       path.join(directory, `operator-post-cas-${label}.sqlite`),
-      independentlyPinnedRecoveryHead);
+      independentlyPinnedRecoveryHead, operatorProofPins);
     externalAuthorities.push(remote);
     const authority = {
       loadHead: remote.authority.loadHead,
+      loadFinalizedHead: remote.authority.loadFinalizedHead,
+      finalizeAck: remote.authority.finalizeAck,
       compareAndAdvance(expected, next) {
         const accepted = remote.authority.compareAndAdvance(expected, next);
         if (accepted) afterExternalCas();
@@ -911,9 +934,10 @@ test("strict CAS witness floor refuses signed status advance without independent
     const source = new Database(historicalFilename, { readonly: true, fileMustExist: true });
     try { await source.backup(isolatedPath); }
     finally { source.close(); }
+    fs.chmodSync(isolatedPath, 0o600);
     const remote = createExternalRecoveryHeadFixture(
       path.join(directory, `operator-ready-delay-${phase}.sqlite`),
-      independentlyPinnedRecoveryHead);
+      independentlyPinnedRecoveryHead, operatorProofPins);
     externalAuthorities.push(remote);
     const options = { ...pinnedRestart, trustedRecoveryNonceAuthority: remote.authority };
     const instance = new Zk1WitnessCasAnchorFloor(isolatedPath, options);
@@ -966,6 +990,32 @@ test("strict CAS witness floor refuses signed status advance without independent
           return wrap;
         };
       }
+      if (phase === "after-commit-compensation-ioerr") {
+        Database.prototype.transaction = function (...args) {
+          if (this.name !== isolatedPath) return originalTransaction.apply(this, args);
+          const native = originalTransaction.apply(this, args);
+          const wrap = (...values) => native(...values);
+          for (const kind of ["immediate", "deferred", "exclusive"]) {
+            wrap[kind] = (...values) => {
+              const result = native[kind](...values);
+              if (readyUpdateObserved) advanceClock();
+              return result;
+            };
+          }
+          return wrap;
+        };
+        Database.prototype.prepare = function (sql, ...args) {
+          if (typeof sql === "string" && readyUpdateObserved
+            && sql.includes("SET ack_phase='PENDING',ack_previous_hash")) {
+            throw Error("TEST_COMPENSATION_SQLITE_IOERR");
+          }
+          const result = originalPrepare.call(this, sql, ...args);
+          if (typeof sql === "string" && sql.includes("SET ack_phase='READY'")) {
+            readyUpdateObserved = true;
+          }
+          return result;
+        };
+      }
       await assert.rejects(instance.recoverSyncHistoricalAdmission({
         ...recoveryInput, nonce: random(32),
       }), /WITNESS_CAS_FLOOR_DENIED/,
@@ -978,6 +1028,8 @@ test("strict CAS witness floor refuses signed status advance without independent
       }
       assert.equal(remote.read().sequence, independentlyPinnedRecoveryHead.sequence + 1,
         "external CAS must have durably committed before READY delay");
+      assert.deepEqual(remote.authority.loadFinalizedHead(), independentlyPinnedRecoveryHead,
+        "expired/failed READY must never acquire independent operator finalization");
       assert.equal(instance.supportsClientHistoricalNonce, false);
     } finally {
       Date.now = originalNow;
@@ -991,7 +1043,8 @@ test("strict CAS witness floor refuses signed status advance without independent
     try {
       assert.equal(saved.prepare("SELECT ack_phase FROM"
         + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
-      "PENDING", `slow ${phase} must keep original witness-signed quarantine`);
+      phase === "after-commit-compensation-ioerr" ? "READY" : "PENDING",
+      `slow ${phase} retains signed evidence of the actual durability boundary`);
     } finally { saved.close(); }
     assert.throws(() => new Zk1WitnessCasAnchorFloor(isolatedPath, options),
       /WITNESS_CAS_FLOOR_DENIED/,
@@ -1000,6 +1053,112 @@ test("strict CAS witness floor refuses signed status advance without independent
   await simulateSlowReady("after-prepare");
   await simulateSlowReady("late-sign-revocation");
   await simulateSlowReady("after-commit");
+  await simulateSlowReady("after-commit-compensation-ioerr");
+  // A process crash after the second FULL READY commit, before it even calls
+  // operator finalization, must not turn that valid signed READY into admission.
+  const readyCrashPath = path.join(directory, "witness-ready-before-final-ack-crash.sqlite");
+  const readyCrashSource = new Database(historicalFilename, {
+    readonly: true, fileMustExist: true });
+  try { await readyCrashSource.backup(readyCrashPath); }
+  finally { readyCrashSource.close(); }
+  fs.chmodSync(readyCrashPath, 0o600);
+  const readyCrashExternal = createExternalRecoveryHeadFixture(
+    path.join(directory, "operator-ready-before-ack-crash.sqlite"),
+    independentlyPinnedRecoveryHead, operatorProofPins);
+  externalAuthorities.push(readyCrashExternal);
+  const readyCrashOpts = { ...pinnedRestart,
+    trustedRecoveryNonceAuthority: readyCrashExternal.authority };
+  const readyCrashWitness = new Zk1WitnessCasAnchorFloor(readyCrashPath, readyCrashOpts);
+  const originalCrashPrepare = Database.prototype.prepare;
+  let readySignatureRead = false;
+  try {
+    Database.prototype.prepare = function (sql, ...args) {
+      if (typeof sql === "string" && sql.includes("SELECT signature FROM"
+        + " witness_cas_sync_historical_recovery_head WHERE id=1")) {
+        readySignatureRead = true;
+        throw Error("TEST_CRASH_BEFORE_OPERATOR_FINALIZATION");
+      }
+      return originalCrashPrepare.call(this, sql, ...args);
+    };
+    await assert.rejects(readyCrashWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: random(32),
+    }), /WITNESS_CAS_FLOOR_DENIED/);
+  } finally {
+    Database.prototype.prepare = originalCrashPrepare;
+    readyCrashWitness.close();
+  }
+  assert.equal(readySignatureRead, true);
+  const durableReadyCrash = new Database(readyCrashPath, {
+    readonly: true, fileMustExist: true });
+  try {
+    assert.equal(durableReadyCrash.prepare("SELECT ack_phase FROM"
+      + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
+    "READY", "READY was actually FULL-committed before the simulated crash");
+  } finally { durableReadyCrash.close(); }
+  assert.equal(readyCrashExternal.read().sequence,
+    independentlyPinnedRecoveryHead.sequence + 1);
+  assert.deepEqual(readyCrashExternal.authority.loadFinalizedHead(),
+    independentlyPinnedRecoveryHead);
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(readyCrashPath, readyCrashOpts),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "valid signed READY plus matching CAS must remain NO-GO before operator finalization");
+  // Owner revocation/PG expiry while the operator verifies a signed READY
+  // must be caught by the OPERATOR, despite a successful local FULL READY.
+  const finalizeDrift = async (label, changeDuringOperator) => {
+    const fixturePath = path.join(directory, `witness-operator-finalize-${label}.sqlite`);
+    const source = new Database(historicalFilename, {
+      readonly: true, fileMustExist: true });
+    try { await source.backup(fixturePath); }
+    finally { source.close(); }
+    fs.chmodSync(fixturePath, 0o600);
+    const remote = createExternalRecoveryHeadFixture(
+      path.join(directory, `operator-finalize-${label}.sqlite`),
+      independentlyPinnedRecoveryHead, operatorProofPins);
+    externalAuthorities.push(remote);
+    const options = { ...pinnedRestart, trustedRecoveryNonceAuthority: {
+      ...remote.authority,
+      finalizeAck(...args) {
+        changeDuringOperator();
+        return remote.authority.finalizeAck(...args);
+      },
+    } };
+    const instance = new Zk1WitnessCasAnchorFloor(fixturePath, options);
+    try {
+      await assert.rejects(instance.recoverSyncHistoricalAdmission({
+        ...recoveryInput, nonce: random(32),
+      }), /WITNESS_CAS_FLOOR_DENIED/);
+    } finally { instance.close(); }
+    assert.equal(remote.read().sequence, independentlyPinnedRecoveryHead.sequence + 1);
+    assert.deepEqual(remote.authority.loadFinalizedHead(), independentlyPinnedRecoveryHead);
+    const sql = new Database(fixturePath, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(sql.prepare("SELECT ack_phase FROM"
+        + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
+      "READY", "the local READY can predate an independent operator refusal");
+    } finally { sql.close(); }
+    return { fixturePath, options };
+  };
+  let revokedFinalize;
+  try {
+    revokedFinalize = await finalizeDrift("revoked", () => {
+      trustedDeviceRevocations = ["device-a"];
+    });
+  } finally { trustedDeviceRevocations = []; }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    revokedFinalize.fixturePath, revokedFinalize.options),
+  /WITNESS_CAS_FLOOR_DENIED/,
+  "independent owner-policy refusal survives restoration of the live policy");
+  const beforeOperatorSlow = Date.now;
+  let expiredFinalize;
+  try {
+    expiredFinalize = await finalizeDrift("expired-pg", () => {
+      Date.now = () => beforeOperatorSlow() + 45_000;
+    });
+  } finally { Date.now = beforeOperatorSlow; }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    expiredFinalize.fixturePath, expiredFinalize.options),
+  /WITNESS_CAS_FLOOR_DENIED/,
+  "independent PG freshness refusal survives clock restoration");
   assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot, {
     ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
       sequence: 1, lastHash: admittedFloor.lastHash,
@@ -1181,6 +1340,7 @@ test("strict CAS witness floor refuses signed status advance without independent
     { readonly: true, fileMustExist: true });
   try { await backupPrivateWitnessFixture(sourceDb, corruptedPath); }
   finally { sourceDb.close(); }
+  fs.chmodSync(corruptedPath, 0o600);
   const corruptedDb = new Database(corruptedPath);
   try {
     const row = corruptedDb.prepare(
@@ -1443,7 +1603,8 @@ test("strict CAS witness floor refuses signed status advance without independent
       trustedSyncDevicePolicyProvider,
       trustedRecoveryNonceAuthority: (() => {
         const authority = createExternalRecoveryHeadFixture(
-          path.join(directory, "remote-witness-operator-recovery-head.sqlite"));
+          path.join(directory, "remote-witness-operator-recovery-head.sqlite"),
+          { sequence: 0, lastHash: "0".repeat(64) }, operatorProofPins);
         externalAuthorities.push(authority);
         return authority.authority;
       })(),

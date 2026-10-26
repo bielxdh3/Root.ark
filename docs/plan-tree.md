@@ -38,6 +38,31 @@ sources or assert a distributed migration. Independent monotonic physical
 stage witness, durable two-host reconciliation, provider readback/restore
 and signed dual-anchor successor envelopes remain **NO-GO** prerequisites.
 Details: `docs/issue-65-v2-legacy-remote-dual-archive-readback-dev.md`.
+## Issue #65 / PR #228: independent durable historical recovery ACK finalization (2026-10-25)
+
+The witness recovery issuer now requires an additional **operator-retained**
+monotonic ACK-finalization floor. `loadHead()` / `compareAndAdvance()` remain
+the consumed-recovery-nonce CAS; a second pair `loadFinalizedHead()` /
+`finalizeAck(previous, next, proof)` proves the external operator durably
+approved the exact witness-signed READY state. The issuer must check both
+external heads on every historical admission, capability read, and restart.
+Local SQLite READY plus matching external nonce CAS is insufficient: a
+slow FULL COMMIT followed by expired PG evidence, owner revocation, crashed
+postcommit process, or SQLite compensation IOERR can leave valid READY bytes.
+
+`finalizeAck` is an operator-controlled approval boundary. Its implementation
+must independently verify the Ed25519 READY signature and pinned witness
+identity, the original signed PG attestation and its operation/nonce binding,
+current owner policy, and signed PG freshness immediately before its own
+durable, monotonic CAS. It must reject a stale claim, conflicting head or
+duplicate, and return success only after durable commit; the issuer then
+re-reads the independently committed finalization floor. The supplied SQLite
+fixture exercises these checks with disposable separate custody; **no real
+operator finalization adapter is provided**. Existing two-method adapters are
+intentionally rejected until the operator provisions and validates the new
+contract. An ambiguous crash leaves the issuer denied pending independent
+reconciliation; there is no automatic promotion of a locally signed READY.
+All work remains DRAFT / NO-GO production.
 
 ## Issue #65 / PR #228: browser offline native source-root contract (2026-10-25)
 
