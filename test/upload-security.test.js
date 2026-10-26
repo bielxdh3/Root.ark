@@ -122,6 +122,32 @@ test("release gate emits a bounded redacted TAP failure from canonical npm test 
   assert.equal(simulatedProcess.exitCode, 1);
 });
 
+test("release gate keeps early failing TAP names without printing secrets after long diagnostics", () => {
+  const vm = require("node:vm");
+  const { createRequire } = require("node:module");
+  const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
+  const gateRequire = createRequire(gatePath);
+  const printed = [];
+  const secret = "synthetic-early-failure-secret";
+  const names = Array.from({ length: 7 }, (_, i) =>
+    `not ok ${i + 1} - WebDAV failure ${i + 1} token=${secret}`);
+  const trailing = Array.from({ length: 40 }, (_, i) => `  error: synthetic error detail ${i}`);
+  vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
+    __dirname: path.dirname(gatePath),
+    process: { execPath: process.execPath, exitCode: 0 },
+    console: { log: (line) => printed.push(String(line)) },
+    require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) =>
+      isCanonicalNpmTestInvocation(executable, args)
+        ? { status: 1, stdout: `${names.join("\n")}\n${trailing.join("\n")}\n# fail 7\n`, stderr: "" }
+        : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+  }, { filename: gatePath });
+  const output = printed.join("\n");
+  for (let i = 1; i <= 7; i++) assert.match(output, new RegExp(`not ok ${i} - WebDAV failure ${i}`));
+  assert.match(output, /# fail 7/);
+  assert.doesNotMatch(output, new RegExp(secret));
+  assert.ok(output.length < 12000, "retained names and tail remain bounded");
+});
+
 test("release gate prints metadata-only failure diagnostics for unknown npm output", () => {
   const vm = require("node:vm");
   const { createRequire } = require("node:module");
