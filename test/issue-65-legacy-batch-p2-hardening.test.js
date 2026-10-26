@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const http = require("node:http");
+const os = require("node:os");
 const file = require("../public/client/rootark-zk1-file-content");
 const legacy = require("../public/client/rootark-dev-vault-migration");
 
@@ -71,6 +73,53 @@ test("historical Last-Modified uses pinned version metadata even after cloud cac
   await handler(req, res);
   assert.equal(res.statusCode, 409);
   assert.equal(transmitted.length, 2, "missing timestamp must not stream historical bytes");
+});
+
+test("real historical HTTP responses emit pinned Last-Modified for full and range GET and deny invalid pins", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-legacy-lastmodified-http-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const localPath = path.join(temp, "rehydrated.ct");
+  const bytes = Buffer.from("historical ciphertext bytes", "utf8");
+  fs.writeFileSync(localPath, bytes);
+  fs.utimesSync(localPath, new Date("2026-10-26T12:01:00.000Z"), new Date("2026-10-26T12:01:00.000Z"));
+  const pinned = "Thu, 22 Oct 2026 01:00:00 GMT";
+  const parseRangeHeader = vm.runInNewContext("(" + section("function parseRangeHeader(",
+    "\nfunction sendOptimizedFile(") + ")");
+  const sendOptimizedFile = vm.runInNewContext("(" + section("function sendOptimizedFile(",
+    "\nfunction removeFileExpiration(") + ")", {
+    fs, path, parseRangeHeader,
+    openReadHandle(name) {
+      const fd = fs.openSync(name, fs.constants.O_RDONLY);
+      return { fd, stats: fs.fstatSync(fd) };
+    },
+    getMimeType() { return "application/octet-stream"; },
+    getFileContentDisposition() { return 'attachment; filename="archive.ct"'; },
+    isActiveContentFile() { return false; }, console,
+  });
+  const server = http.createServer((req, res) => {
+    res.status = function (status) { this.statusCode = status; return this; };
+    res.send = function (message) { this.end(message); return this; };
+    sendOptimizedFile(req, res, localPath, "archive.ct", "attachment", {
+      includeLastModified: true,
+      lastModified: req.url === "/invalid" ? "Thu, 22 Oct 2026 01:00:00 GMT\r\nX-Injected: yes" : pinned,
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  for (const [name, headers, status, expected] of [
+    ["full", {}, 200, bytes],
+    ["range", { Range: "bytes=0-3" }, 206, bytes.subarray(0, 4)],
+  ]) {
+    const response = await fetch(base + "/" + name, { headers });
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get("last-modified"), pinned,
+      `${name} must use the stored, not newly rehydrated, file timestamp`);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), expected);
+  }
+  const rejected = await fetch(base + "/invalid");
+  assert.equal(rejected.status, 409, "a noncanonical/injected pin must fail before bytes are sent");
+  assert.notDeepEqual(Buffer.from(await rejected.arrayBuffer()), bytes);
 });
 
 test("oversized MIME header cancels plaintext response without returning bytes", async () => {

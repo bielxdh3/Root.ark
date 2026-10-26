@@ -3885,6 +3885,18 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
   const range = parseRangeHeader(req.headers.range, size);
   const cacheControl = options.cacheControl || "private, max-age=3600";
   const highWaterMark = Number(options.highWaterMark) || 1024 * 1024;
+  // Versioned legacy migration signs/pins the historical upload date, not
+  // the filesystem mtime of a freshly rehydrated ciphertext cache copy.
+  // Never silently omit or emit a noncanonical HTTP date when opted in.
+  let lastModified = null;
+  if (options.includeLastModified === true) {
+    lastModified = options.lastModified;
+    if (typeof lastModified !== "string" || !Number.isFinite(Date.parse(lastModified))
+      || new Date(lastModified).toUTCString() !== lastModified) {
+      try { fs.closeSync(fd); } catch {}
+      return res.status(409).send("Metadados historicos da versao indisponiveis");
+    }
+  }
 
   if (range?.invalid) {
     try { fs.closeSync(fd); } catch {}
@@ -3918,6 +3930,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
+  if (lastModified !== null) commonHeaders["Last-Modified"] = lastModified;
   if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
