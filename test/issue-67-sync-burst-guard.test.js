@@ -132,7 +132,7 @@ const TEST_TOTP_KEY = crypto.randomBytes(32);
 
 // Account state persists through load/save like the users file does, so replay state and consumed
 // recovery codes are real. Each load returns a fresh copy.
-async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt, accountUsers = null, totpKey = TEST_TOTP_KEY }) {
+async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt, accountUsers = null, totpKey = TEST_TOTP_KEY, atomicResumeAvailable = true }) {
   const accountState = { users: accountUsers || [{ username: "alice", password: ALICE_HASH }] };
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
@@ -161,7 +161,8 @@ async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryp
     return outcome;
   };
   const getTotpKey = () => totpKey;
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers, commitSyncResumeProof, getTotpKey });
+  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers,
+    commitSyncResumeProof: atomicResumeAvailable ? commitSyncResumeProof : null, getTotpKey });
   route.accountState = accountState;
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
   t.after(async () => { await new Promise((resolve) => server.close(resolve)); });
@@ -767,6 +768,30 @@ test("issue 67 resume 2FA: without the TOTP key the resume fails closed with 503
   const key = crypto.randomBytes(32);
   await pauseDeviceA(port, key, 1, 2);
   assert.equal((await resumeRequest(port, { password: PASSWORD, code: codeAt(account.secret) })).status, 503);
+});
+
+test("issue 65 resume: unsupported legacy account authority rejects before staging intent or spending factor", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-no-atomic-account-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, {
+    storagePath, accountUsers: account.users,
+    burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }),
+    atomicResumeAvailable: false,
+  });
+  await pauseDeviceA(port, crypto.randomBytes(32), 340, 341);
+  const recovery = account.recoveryCodes[0];
+  for (const code of [recovery, account.recoveryCodes[1]]) {
+    const rejected = await resumeRequest(port, { password: PASSWORD, code });
+    assert.equal(rejected.status, 503);
+    assert.equal(rejected.body.error, "Sync re-authentication unavailable");
+    assert.equal(route.store.pendingResume("alice"), null, "unsupported mode must not stage a durable intent");
+    assert.equal(route.store.isDevicePaused("alice", "device-a"), true);
+    assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2, "no factor may be spent");
+  }
+  const disk = JSON.parse(await fsp.readFile(storagePath, "utf8"));
+  assert.equal(disk.users.alice.resumeIntent, undefined, "restart must not inherit a poisoned intent");
 });
 
 test("issue 67 store: a paused device is blocked at the store boundary and history is not trimmed by rejected operations", async (t) => {

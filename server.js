@@ -6090,7 +6090,8 @@ registerSyncRoutes({
   bcrypt,
   loadUsers,
   saveUsers,
-  commitSyncResumeProof,
+  commitSyncResumeProof: shouldUseDatabase() && !shouldWriteLegacyJson()
+    ? commitSyncResumeProof : null,
   getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 
