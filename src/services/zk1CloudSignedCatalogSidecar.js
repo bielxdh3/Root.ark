@@ -59,6 +59,12 @@ function copyAddress(scope, operationId) {
     .update(bytes(operationId, 16)).digest().subarray(0, 16);
   return zk1CloudCopyAddress({ scope: inventory.normalizeScope(scope), operationId: id });
 }
+function writerLocallyPinned(target, address, expectedKey) {
+  return target.adapter.enabled?.() === true
+    && target.adapter.status?.()?.provider === target.provider
+    && target.adapter.zk1StorageNamespace() === target.namespace
+    && target.adapter.key(address.folder, address.name, "uploads") === expectedKey;
+}
 function encodeCatalog(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) deny();
   const raw = {
@@ -136,24 +142,42 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
     pinnedDomains(providerDomainPinset, scope, pinned);
     const payload = encodeCatalog({ ...signedCatalog, operationId });
     const address = copyAddress(scope, operationId);
+    const keys = pinned.map((target) => target.adapter.key(
+      address.folder, address.name, "uploads"));
+    for (const [index, target] of pinned.entries())
+      if (!writerLocallyPinned(target, address, keys[index])) deny();
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
     const staged = path.join(dir, "signed-catalog.ct");
     fs.writeFileSync(staged, payload, { flag: "wx", mode: 0o600 });
     const acknowledgements = [];
-    for (const target of pinned) {
+    for (const [index, target] of pinned.entries()) {
+      const expectedKey = keys[index];
+      if (!writerLocallyPinned(target, address, expectedKey)) deny();
       if (await target.adapter.resolveInventoryContext() !== target.context) deny();
-      const expectedKey = target.adapter.key(address.folder, address.name, "uploads");
+      if (!writerLocallyPinned(target, address, expectedKey)) deny();
       const result = await target.adapter.upload(staged, address.folder, address.name,
         "uploads", { zk1BoundedBytes: payload.length,
           ...(target.provider === "webdav" ? { zk1ExpectedSha256: crypto.createHash("sha256").update(payload).digest("hex") } : {}),
           ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
-      if (!result || result.provider !== target.provider || result.key !== expectedKey
+      if (!writerLocallyPinned(target, address, expectedKey)
+        || !result || result.provider !== target.provider || result.key !== expectedKey
         || (target.driveFileId !== null && result.id !== target.driveFileId)
         || await target.adapter.resolveInventoryContext() !== target.context
-        || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
+        || !writerLocallyPinned(target, address, expectedKey)) deny();
       acknowledgements.push(Object.freeze({ provider: target.provider,
         providerObjectKey: expectedKey, providerFileId: target.driveFileId }));
     }
+    // A later remote PUT can revoke an earlier writer. Recheck every counted
+    // provider before even a NON-AUTHORIZING ACK, including expiry of signed
+    // domain attestations; separate probes do not prove an atomic cloud lease.
+    for (const [index, target] of pinned.entries()) {
+      if (!writerLocallyPinned(target, address, keys[index])) deny();
+      if (await target.adapter.resolveInventoryContext() !== target.context) deny();
+      if (!writerLocallyPinned(target, address, keys[index])) deny();
+    }
+    pinnedDomains(providerDomainPinset, scope, pinned);
+    for (const [index, target] of pinned.entries())
+      if (!writerLocallyPinned(target, address, keys[index])) deny();
     return Object.freeze({ status: "SIGNED_CATALOG_PUT_ACK_NONAUTHORITATIVE",
       acknowledgements: Object.freeze(acknowledgements), remoteDurabilityProven: false });
   } catch (_) { deny(); }

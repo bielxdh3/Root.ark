@@ -161,6 +161,26 @@ test("readback is bound to the exact sidecar across process restart, provider co
   "missing remote ciphertext cannot satisfy the configured three-provider quorum");
 });
 
+test("sidecar PUT does not acknowledge an earlier S3 principal revoked during later Drive upload", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-stale-put-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  const drive = fixture.publication.writers[1].cloudWriter;
+  const upload = drive.upload;
+  let uploaded = false;
+  drive.upload = async function (...args) {
+    const result = await upload.apply(this, args);
+    uploaded = true;
+    fixture.identities.s3 = sha("revoked-s3-during-drive-put");
+    return result;
+  };
+  await assert.rejects(publishSignedCatalogSidecars({ ...fixture.publication,
+    writers: fixture.publication.writers.slice(0, 2) }),
+  /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+  "previous S3 upload cannot be acknowledged after its pinned principal changes");
+  assert.equal(uploaded, true, "exercise actual later Drive PUT before detecting stale S3");
+});
+
 test("recovery refuses a provider whose pinned principal changes while another provider downloads", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-principal-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
