@@ -176,9 +176,17 @@ class Zk1CasTerminalAnchor {
           || before.ctimeNs !== namedBefore.ctimeNs) fail();
         assertPrivateFile(before);
         // Never accept a cached signature on the strength of size/mtime.
-        // Reads use this fixed FD, not a pathname that can be retargeted
-        // between stat() and readFile().
-        raw = fs.readFileSync(fd);
+        // Keep the pinned descriptor and bounded initial size: a concurrent
+        // writer can grow its inode before an unbounded readFileSync(fd)
+        // allocates memory, even when the postread check ultimately denies.
+        raw = Buffer.alloc(Number(before.size));
+        let offset = 0;
+        while (offset < raw.length) {
+          const count = fs.readSync(fd, raw, offset,
+            Math.min(64 * 1024, raw.length - offset), offset);
+          if (count <= 0 || count > raw.length - offset) fail();
+          offset += count;
+        }
         const after = fs.fstatSync(fd, { bigint: true });
         const namedAfter = fs.lstatSync(this.filename, { bigint: true });
         assertPrivateDirectory(this.filename);

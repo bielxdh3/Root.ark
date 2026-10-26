@@ -8,6 +8,49 @@ const path = require("node:path");
 const test = require("node:test");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 
+test("CAS signed anchor reload cannot allocate inode bytes appended after pinned fstat", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-anchor-growth-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const filename = path.join(dir, "anchor.log");
+  const anchor = new Zk1CasTerminalAnchor(filename, {
+    bootstrapNew: true, statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey,
+  });
+  const realOpen = fs.openSync;
+  const realFstat = fs.fstatSync;
+  const realReadFile = fs.readFileSync;
+  let selectedFd;
+  let attacked = false;
+  const readLengths = [];
+  fs.openSync = function (name, ...args) {
+    const fd = realOpen.call(fs, name, ...args);
+    if (name === filename && selectedFd === undefined) selectedFd = fd;
+    return fd;
+  };
+  fs.fstatSync = function (fd, ...args) {
+    const opened = realFstat.call(fs, fd, ...args);
+    if (fd === selectedFd && !attacked) {
+      attacked = true;
+      fs.truncateSync(filename, Number(opened.size) + 65 * 1024 * 1024);
+    }
+    return opened;
+  };
+  fs.readFileSync = function (source, ...args) {
+    const bytes = realReadFile.call(fs, source, ...args);
+    if (typeof source === "number") readLengths.push(bytes.length);
+    return bytes;
+  };
+  try {
+    assert.throws(() => anchor.reload(true), /CAS_ANCHOR_INVALID/);
+  } finally {
+    fs.openSync = realOpen;
+    fs.fstatSync = realFstat;
+    fs.readFileSync = realReadFile;
+  }
+  assert.equal(attacked, true, "race the signed anchor after validated descriptor fstat");
+  assert.deepEqual(readLengths, [], "CAS authority must not allocate more than the pinned 64 MiB cap");
+});
+
 test("two CAS handles cannot append a duplicate sequence or permanently corrupt continuity on restart", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-anchor-lock-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
@@ -233,20 +276,20 @@ test("CAS reload refuses a signed old prefix substituted during FD read of a pin
   const floor = first.headCheckpoint();
   const trusted = new Zk1CasTerminalAnchor(filename, { ...opts,
     bootstrapNew: false, trustedMinimumHead: floor });
-  const originalRead = fs.readFileSync;
+  const originalRead = fs.readSync;
   let attacked = false;
   try {
-    fs.readFileSync = function (source) {
-      const snapshot = originalRead.apply(this, arguments);
-      if (!attacked && (source === filename || typeof source === "number")) {
+    fs.readSync = function (fd) {
+      const count = originalRead.apply(this, arguments);
+      if (!attacked && typeof fd === "number") {
         attacked = true;
         fs.writeFileSync(filename, oldSigned);
       }
-      return snapshot;
+      return count;
     };
     assert.throws(() => trusted.get(newQuery.reservation_id), /CAS_ANCHOR_INVALID/,
       "signed new bytes do not prove the live disk file still has the pinned history");
-  } finally { fs.readFileSync = originalRead; }
+  } finally { fs.readSync = originalRead; }
   assert.equal(attacked, true);
   assert.throws(() => trusted.headCheckpoint(), /CAS_ANCHOR_INVALID/);
 });
