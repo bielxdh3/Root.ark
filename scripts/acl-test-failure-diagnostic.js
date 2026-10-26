@@ -13,7 +13,7 @@ const CASES = Object.freeze({
   },
   ATOMIC_INHERIT: {
     file: "test/issue-65-sync-atomic-private-acl.test.js",
-    title: "strict atomic registry rejects insecure default inherited ACL/mode without mutating it",
+    title: "strict atomic registry rejects unsafe inherited or explicit ACL/mode without mutating it",
     stages: ["START", "ROOT_CREATED", "INHERIT_CHECK", "ROOT_OPEN", "NO_FILES"],
   },
   ATOMIC_MUTATION: {

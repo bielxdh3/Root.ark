@@ -139,7 +139,7 @@ test("Windows canonical runner recognizes all four ACL failure profiles without 
   const profiles = [
     ["Windows generic access ACEs cannot evade private snapshot ancestor checks",
       "issue-65-legacy-deterministic-evidence-manifest.test.js", "LEGACY_GENERIC_ACE", "GUARD_VERIFY"],
-    ["strict atomic registry rejects insecure default inherited ACL/mode without mutating it",
+    ["strict atomic registry rejects unsafe inherited or explicit ACL/mode without mutating it",
       "issue-65-sync-atomic-private-acl.test.js", "ATOMIC_INHERIT", "INHERIT_CHECK"],
     ["strict atomic registry refuses a later untrusted file permission change",
       "issue-65-sync-atomic-private-acl.test.js", "ATOMIC_MUTATION", "ACL_WRITE"],
@@ -159,6 +159,18 @@ test("Windows canonical runner recognizes all four ACL failure profiles without 
   for (const [, , , stage] of profiles)
     assert.ok(details.some((line) => line.includes(`aclStage=${stage} aclError=RUNTIME aclTrust=UNKNOWN`)), stage);
   assert.doesNotMatch(logged.join("\n"), /private-host|test\.js|generic access ACEs|permission change/);
+});
+
+test("Windows canonical reporter recognizes the current hostile inherited ACL fixture title", () => {
+  const title = "strict atomic registry rejects unsafe inherited or explicit ACL/mode without mutating it";
+  const output = [];
+  const recorder = createTapProgressRecorder((line) => output.push(line));
+  recorder.accept(`not ok 1 - ${title}`);
+  recorder.accept("  location: 'C:\\ci-host\\test\\issue-65-sync-atomic-private-acl.test.js:73:1'");
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_INHERIT stage=INHERIT_CHECK code=ASSERTION trust=UNKNOWN");
+  recorder.finish();
+  assert.match(output.join("\n"), /aclStage=INHERIT_CHECK aclError=ASSERTION aclTrust=UNKNOWN/);
+  assert.doesNotMatch(output.join("\n"), /ci-host|unsafe inherited or explicit ACL/);
 });
 
 test("Windows canonical runner preserves bounded trusted ACL details after unrelated failure cap", () => {
