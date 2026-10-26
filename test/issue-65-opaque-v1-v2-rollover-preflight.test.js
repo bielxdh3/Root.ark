@@ -682,6 +682,13 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     // before the witness appends; only local monotonic evidence is acknowledged.
     const witnessSigner = pair();
     const witnessDb = path.join(folder, 'independent-legacy-stage-witness.sqlite');
+    const trustedOwnerWitness = {
+      pinnedWitness: { publicKey: trust.pinnedWitness.publicKey,
+        keyId: Buffer.from(trust.pinnedWitness.keyId) },
+      minimumHead: { revision: trust.minimumHead.revision,
+        witnessSequence: trust.minimumHead.witnessSequence,
+        digest: Buffer.from(trust.minimumHead.digest) },
+    };
     const witnessSetup = {
       filename: witnessDb,
       privateKey: b64(witnessSigner.privateKey.export({ format: 'der', type: 'pkcs8' })),
@@ -690,13 +697,20 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
         [name, b64(value)])),
       pins: Object.fromEntries(Object.entries(readback.operatorPins).map(([name, value]) =>
         [name, b64(value.export({ format: 'der', type: 'spki' }))])),
+      ownerWitness: {
+        publicKey: b64(trustedOwnerWitness.pinnedWitness.publicKey.export({ format: 'der', type: 'spki' })),
+        keyId: b64(trustedOwnerWitness.pinnedWitness.keyId),
+        minimumHead: { revision: trustedOwnerWitness.minimumHead.revision,
+          witnessSequence: trustedOwnerWitness.minimumHead.witnessSequence,
+          digest: b64(trustedOwnerWitness.minimumHead.digest) },
+      },
     };
     const offlineWitnessDb = path.join(folder, 'independent-offline-forgery.sqlite');
     const offlineWitness = new Zk1LegacyArchiveStageWitness({
       filename: offlineWitnessDb,
       bootstrapNew: true, privateKey: witnessSigner.privateKey,
       witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
-      operatorPins: readback.operatorPins });
+      operatorPins: readback.operatorPins, trustedOwnerWitness });
     try {
       const forgedSubjectRaw = Buffer.from(await z.encodeDeterministic({
         ...subject, owner_revision: subject.owner_revision + 9,
@@ -722,7 +736,7 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       filename: offlineWitnessDb, bootstrapNew: false,
       privateKey: witnessSigner.privateKey,
       witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
-      operatorPins: readback.operatorPins });
+      operatorPins: readback.operatorPins, trustedOwnerWitness });
     try {
       assert.equal(offlineRestart.audit(), null,
         'process restart must not recover a witness-signed forged offline stage');
@@ -730,12 +744,25 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const witness = new Zk1LegacyArchiveStageWitness({
       filename: witnessDb, bootstrapNew: true,
       privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
-      trustedScope: options.scope, operatorPins: readback.operatorPins });
+      trustedScope: options.scope, operatorPins: readback.operatorPins,
+      trustedOwnerWitness });
+    await assert.rejects(witness.stageFromLiveReadback({
+      readbackInput: { ...readback, ownerTrust: { ...trust,
+        minimumHead: { ...trust.minimumHead, witnessSequence: 7 } } },
+      expectedHead: null }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+    'caller cannot lower independently pinned owner witness minimum');
+    await assert.rejects(witness.stageFromLiveReadback({
+      readbackInput: { ...readback, ownerTrust: { ...trust,
+        pinnedWitness: { ...trust.pinnedWitness, keyId: crypto.randomBytes(16) } } },
+      expectedHead: null }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+    'caller cannot swap current-owner witness key identity');
+    assert.equal(witness.audit(), null,
+      'rejected witness trust substitution does not persist a ledger record');
     const raceWitness = new Zk1LegacyArchiveStageWitness({
       filename: path.join(folder, 'independent-stage-owner-race.sqlite'),
       bootstrapNew: true, privateKey: witnessSigner.privateKey,
       witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
-      operatorPins: readback.operatorPins });
+      operatorPins: readback.operatorPins, trustedOwnerWitness });
     const originalFreshWitness = trust.freshWitnessHead;
     let ownerReadbacks = 0;
     trust.freshWitnessHead = async (...args) => {
@@ -755,6 +782,36 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       trust.freshWitnessHead = originalFreshWitness;
       context.setLiveOwnerDigest(options.ownerHead.digest);
       raceWitness.close();
+    }
+    const fakeSigner = pair();
+    const fakeKeyId = crypto.randomBytes(16);
+    const rogueDb = path.join(folder, 'independent-stage-rogue-witness.sqlite');
+    const rogueStage = new Zk1LegacyArchiveStageWitness({
+      filename: rogueDb, bootstrapNew: true, privateKey: witnessSigner.privateKey,
+      witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
+      operatorPins: readback.operatorPins, trustedOwnerWitness });
+    context.setLiveOwnerDigest(crypto.randomBytes(32));
+    try {
+      const counterfeit = { ...trust,
+        pinnedWitness: { publicKey: fakeSigner.publicKey, keyId: fakeKeyId },
+        minimumHead: { revision: 8, witnessSequence: 8,
+          digest: options.ownerHead.digest },
+        freshWitnessHead: async ({ scope, nonce }) => signed(Buffer.from(
+          'Root.ark/zk-1/recovery-witness-head/v1\0'), {
+          type: 'rootark-recovery-witness-head/v1', witness_key_id: fakeKeyId,
+          ...scope, current_revision: 8,
+          current_manifest_digest: options.ownerHead.digest,
+          witness_sequence: 8, nonce, observed_at: Math.floor(Date.now() / 1000),
+          status: 'committed', pending_reservation_id: null,
+        }, fakeSigner.privateKey) };
+      await assert.rejects(rogueStage.stageFromLiveReadback({
+        readbackInput: { ...readback, ownerTrust: counterfeit }, expectedHead: null }),
+      /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+      'caller-supplied fake witness signer cannot re-stage old owner after real revocation');
+      assert.equal(rogueStage.audit(), null);
+    } finally {
+      context.setLiveOwnerDigest(options.ownerHead.digest);
+      rogueStage.close();
     }
     let liveStage;
     try {
@@ -776,6 +833,14 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const initialChild = await witnessChild(witnessSetup, 'audit', {
       minimumHead: liveStage.head });
     assert.equal(initialChild.ok, true);
+    assert.throws(() => new Zk1LegacyArchiveStageWitness({
+      filename: witnessDb, bootstrapNew: false,
+      privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
+      trustedScope: options.scope, operatorPins: readback.operatorPins,
+      trustedOwnerWitness: { ...trustedOwnerWitness,
+        minimumHead: { ...trustedOwnerWitness.minimumHead, witnessSequence: 7 } },
+    }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+    'restart must not reinterpret signed receipts under weaker owner floor');
     assert.deepEqual(initialChild.output, liveStage.head,
       'signed witness head survives a separate-process restart');
     assert.equal(initialChild.output.provenance, 'LIVE_OWNER_V1_V2_READBACK');
@@ -802,7 +867,8 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const freshStageWitness = new Zk1LegacyArchiveStageWitness({
       filename: witnessDb, bootstrapNew: false,
       privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
-      trustedScope: options.scope, operatorPins: readback.operatorPins });
+      trustedScope: options.scope, operatorPins: readback.operatorPins,
+      trustedOwnerWitness });
     let newerHead;
     try {
       const restaged = await freshStageWitness.stageFromLiveReadback({
@@ -829,6 +895,7 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       trustedScope: options.scope,
       operatorPins: { ...readback.operatorPins,
         ownerPublicKey: impostor.publicKey },
+      trustedOwnerWitness,
     }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
     'an old signed ledger may not be reinterpreted under a new owner pin');
     const forgedTrigger = new Database(witnessDb);

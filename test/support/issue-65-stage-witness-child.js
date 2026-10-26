@@ -21,6 +21,13 @@ process.once("message", async ({ setup, action, expectedHead, candidate,
         ([name, value]) => [name, Buffer.from(value, "base64url")])),
       operatorPins: Object.fromEntries(Object.entries(setup.pins).map(
         ([name, value]) => [name, publicKey(value)])),
+      trustedOwnerWitness: {
+        pinnedWitness: { publicKey: publicKey(setup.ownerWitness.publicKey),
+          keyId: Buffer.from(setup.ownerWitness.keyId, "base64url") },
+        minimumHead: { revision: setup.ownerWitness.minimumHead.revision,
+          witnessSequence: setup.ownerWitness.minimumHead.witnessSequence,
+          digest: Buffer.from(setup.ownerWitness.minimumHead.digest, "base64url") },
+      },
     });
     let output;
     if (action === "stage") output = await witness.stageSignedEvidence({ candidate, expectedHead });

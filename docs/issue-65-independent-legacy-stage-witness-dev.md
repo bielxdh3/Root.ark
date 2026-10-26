@@ -6,10 +6,15 @@ dual-archive staging. It never alters source data, migration checkpoints,
 CAS/FLOOR authority databases, signed predecessors, backups or trash.
 **No write, restore or destructive cutover is authorized.**
 
-The operator provisions a separate witness Ed25519 keypair, a private SQLite
-directory and six pinned keys from independent custody: owner, archive
-checkpoint, V1 CAS/FLOOR, V2 CAS/FLOOR. All seven keys must differ. The
-persisted trust configuration binds the expected scope and every key pin,
+The operator provisions a separate stage-ledger Ed25519 keypair, a private
+SQLite directory, six keys from independent custody (owner, archive
+checkpoint, V1 CAS/FLOOR, V2 CAS/FLOOR), **and a separately provisioned
+current-owner witness Ed25519 public key, key ID and externally retained
+minimum witness head**. All eight signer keys must differ. The owner witness
+pin and minimum head are mandatory `trustedOwnerWitness` constructor inputs,
+never derived from the request's mutable `readbackInput.ownerTrust`.
+The persisted trust configuration binds the expected scope, all signer pins,
+the owner witness key ID and the minimum revision/sequence/digest floor,
 and is immutable. SQLite uses WAL and `synchronous=FULL`, no-clobber file
 bootstrap, private SQLite-path/sidecar checks, immutable triggers and
 an `IMMEDIATE` transaction for generational compare-and-swap.
@@ -21,7 +26,11 @@ archival fields but do **not** authenticate subject assertions
 `owner_revision`, `owner_epoch`, or `owner_digest`. An attacker could
 forge those fields and recompute the subject digest. Only
 `stageFromLiveReadback`, including its nonce-fresh pinned owner/V1/V2
-readbacks, may commit STAGED.
+readbacks, may commit STAGED. A caller-supplied owner witness signing key or
+lower minimum head is rejected before any asynchronous readback; cryptographic
+verification uses an immutable copy of the constructor trust. This prevents
+an attacker from forging an apparently current owner witness after revocation
+while reusing genuine earlier signed CAS/FLOOR staging evidence.
 
 Every signed v2 receipt cryptographically covers `provenance`:
 `LIVE_OWNER_V1_V2_READBACK` for STAGED and
@@ -45,7 +54,10 @@ compete on the same SQLite CAS; only one can advance.
 Offline signed CAS/FLOOR evidence can be archived or inspected outside
 this witness ledger for forensic purposes, but cannot create a STAGED head,
 be used after a WITHDRAWN tombstone to re-stage, or attest owner liveness.
-Callers cannot supply synthetic transport clients to the live method.
+Callers cannot substitute the independent witness signer, key ID, rollback
+floor, or synthetic TLS transport clients in the live method. Provisioning a
+new minimum head requires a new stage ledger bootstrap; it cannot silently
+reinterpret an existing signed ledger under another trust policy.
 
 `withdraw({expectedHead})` appends a witness-signed `WITHDRAWN` tombstone
 at the next generation. This reverses **the operator's evidence stage**,
@@ -55,7 +67,9 @@ and duplicate withdrawals are rejected. On restart, compare the newest
 witness receipt to a separately preserved trusted head via
 `audit(minimumHead)`. A valid older SQLite copy is refused when the retained
 head points to a newer generation. If both DB and independently stored head
-are rolled back, this protection is lost.
+are rolled back, this protection is lost. A constructor-pinned witness floor
+alone does not prove external liveness: the custodian must independently
+retain and advance it with revocations, outside request-controlled state.
 
 Every result returns `v2WriteAuthorized:false`, `restoreAuthorized:false`,
 `destructiveCutoverAuthorized:false`,

@@ -29,6 +29,7 @@ const GENESIS = Buffer.alloc(32).toString("base64url");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const PINS = ["ownerPublicKey", "archiveCheckpointPublicKey", "v1CasPublicKey",
   "v1FloorPublicKey", "v2CasPublicKey", "v2FloorPublicKey"];
+const OWNER_WITNESS_PIN_FIELDS = ["pinnedWitness", "minimumHead"];
 const SUBJECT_FIELDS = ["type", ...SCOPE, "legacy_sequence", "owner_revision",
   "owner_digest", "owner_epoch", "cas_signer_fp", "floor_signer_fp",
   "legacy_base_digest", "legacy_base_checkpoint", "legacy_head_digest",
@@ -113,15 +114,37 @@ function rejectAuthorization(report) {
 
 class Zk1LegacyArchiveStageWitness {
   constructor({ filename, bootstrapNew, privateKey, witnessPublicKey,
-    trustedScope, operatorPins }) {
+    trustedScope, operatorPins, trustedOwnerWitness }) {
     if (!path.isAbsolute(filename) || typeof bootstrapNew !== "boolean"
       || !(privateKey instanceof crypto.KeyObject) || privateKey.type !== "private"
       || privateKey.asymmetricKeyType !== "ed25519") deny();
     exact(operatorPins, PINS);
-    this.pins = Object.fromEntries(PINS.map((name) => [name, operatorPins[name]]));
+    this.pins = Object.freeze(Object.fromEntries(PINS.map((name) =>
+      [name, operatorPins[name]])));
     const signerPin = fingerprint(witnessPublicKey);
     if (fingerprint(crypto.createPublicKey(privateKey)) !== signerPin) deny();
     if (new Set([...PINS.map((name) => fingerprint(this.pins[name])), signerPin]).size !== 7) deny();
+    // The signed owner witness is a SEVENTH independently provisioned
+    // authority, not an input supplied by the readback request. Pin its
+    // signer, key id and externally retained minimum before opening SQLite.
+    exact(trustedOwnerWitness, OWNER_WITNESS_PIN_FIELDS);
+    exact(trustedOwnerWitness.pinnedWitness, ["publicKey", "keyId"]);
+    exact(trustedOwnerWitness.minimumHead, ["revision", "witnessSequence", "digest"]);
+    const witnessFp = fingerprint(trustedOwnerWitness.pinnedWitness.publicKey);
+    const keyId = trustedOwnerWitness.pinnedWitness.keyId;
+    const minimum = trustedOwnerWitness.minimumHead;
+    if (!(keyId instanceof Uint8Array) || keyId.length !== 16
+      || !(minimum.digest instanceof Uint8Array) || minimum.digest.length !== 32
+      || !Number.isSafeInteger(minimum.revision) || minimum.revision < 1
+      || !Number.isSafeInteger(minimum.witnessSequence) || minimum.witnessSequence < 1
+      || new Set([...PINS.map((name) => fingerprint(this.pins[name])), signerPin,
+        witnessFp]).size !== 8) deny();
+    this.trustedOwnerWitness = Object.freeze({
+      publicKey: trustedOwnerWitness.pinnedWitness.publicKey,
+      fingerprint: witnessFp, keyId: Buffer.from(keyId).toString("base64url"),
+      revision: minimum.revision, witnessSequence: minimum.witnessSequence,
+      digest: Buffer.from(minimum.digest).toString("base64url"),
+    });
     exact(trustedScope, SCOPE);
     this.scope = Object.fromEntries(SCOPE.map((name) => [name,
       Buffer.from(trustedScope[name])]));
@@ -130,7 +153,10 @@ class Zk1LegacyArchiveStageWitness {
         || (name !== "compartment_id" && this.scope[name].length !== 16)) deny();
     }
     this.trustHash = digest(RECEIPT_DOMAIN, ...SCOPE.map((name) => this.scope[name]),
-      ...PINS.map((name) => b64(fingerprint(this.pins[name]))), b64(signerPin));
+      ...PINS.map((name) => b64(fingerprint(this.pins[name]))), b64(signerPin),
+      Buffer.from(JSON.stringify([this.trustedOwnerWitness.fingerprint,
+        this.trustedOwnerWitness.keyId, this.trustedOwnerWitness.revision,
+        this.trustedOwnerWitness.witnessSequence, this.trustedOwnerWitness.digest])));
     this.privateKey = privateKey;
     this.publicKey = witnessPublicKey;
     this.filename = filename;
@@ -294,18 +320,45 @@ class Zk1LegacyArchiveStageWitness {
     // even if the offline payload is otherwise well formed or genuine.
     deny();
   }
+  #trustedReadbackInput(input) {
+    const supplied = input?.ownerTrust;
+    const pin = supplied?.pinnedWitness;
+    const minimum = supplied?.minimumHead;
+    const trusted = this.trustedOwnerWitness;
+    if (!pin || !minimum || typeof supplied.freshWitnessHead !== "function"
+      || fingerprint(pin.publicKey) !== trusted.fingerprint
+      || !(pin.keyId instanceof Uint8Array)
+      || Buffer.from(pin.keyId).toString("base64url") !== trusted.keyId
+      || minimum.revision !== trusted.revision
+      || minimum.witnessSequence !== trusted.witnessSequence
+      || !(minimum.digest instanceof Uint8Array)
+      || Buffer.from(minimum.digest).toString("base64url") !== trusted.digest) deny();
+    // Never let a mutable request select the verification key or rollback
+    // floor after an await. Always use fresh private copies of constructor
+    // trust instead of trusting the request's identical-looking objects.
+    return { ...input, operatorPins: this.pins,
+      ownerTrust: {
+        pinnedWitness: { publicKey: trusted.publicKey,
+          keyId: Buffer.from(trusted.keyId, "base64url") },
+        minimumHead: { revision: trusted.revision,
+          witnessSequence: trusted.witnessSequence,
+          digest: Buffer.from(trusted.digest, "base64url") },
+        freshWitnessHead: ({ scope, nonce }) => supplied.freshWitnessHead({ scope, nonce }),
+      } };
+  }
   async stageFromLiveReadback({ readbackInput, expectedHead }) {
     try {
       if (!readbackInput || PINS.some((name) =>
         fingerprint(readbackInput.operatorPins?.[name])
           !== fingerprint(this.pins[name]))) deny();
-      const live = await verifyLegacyArchiveDualReadback(readbackInput);
+      const pinnedInput = this.#trustedReadbackInput(readbackInput);
+      const live = await verifyLegacyArchiveDualReadback(pinnedInput);
       const subjectDigest = await this.#verifyCandidate(live.witnessCandidate);
       // CBOR decoding and signature verification are asynchronous. Owner
       // revision can advance during that work; demand one last complete
       // independent live readback, whose final action is a fresh owner witness
       // check, immediately before the synchronous ledger CAS.
-      const final = await verifyLegacyArchiveDualReadback(readbackInput);
+      const final = await verifyLegacyArchiveDualReadback(pinnedInput);
       if (final.witnessCandidate.subjectDigest !== subjectDigest) deny();
       const head = this.#append("STAGED", subjectDigest, expectedHead,
         PROVENANCE.STAGED);
