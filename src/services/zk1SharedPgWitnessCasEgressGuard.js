@@ -9,6 +9,9 @@
 const crypto = require("node:crypto");
 const { Zk1WitnessCasAnchorHttpsClient } = require("./zk1WitnessCasAnchorHttpsClient");
 const { Zk1IndependentWitnessFloorQuorum } = require("./zk1IndependentWitnessFloorQuorum");
+// Capture the intrinsic before any caller can poison a native function's
+// mutable `.call` property after the authority is provisioned.
+const NATIVE_APPLY = Reflect.apply;
 const NATIVE_SINGLE_WITNESS_HEAD = Zk1WitnessCasAnchorHttpsClient.prototype.freshHead;
 const NATIVE_DISTRIBUTED_HEAD = Zk1IndependentWitnessFloorQuorum.prototype.freshHead;
 const ownerRoots = require("../../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
@@ -162,8 +165,8 @@ function validWitness(witness) {
 }
 function freshWitnessHead(witness, minimum) {
   return witness instanceof Zk1IndependentWitnessFloorQuorum
-    ? NATIVE_DISTRIBUTED_HEAD.call(witness, minimum)
-    : NATIVE_SINGLE_WITNESS_HEAD.call(witness, minimum);
+    ? NATIVE_APPLY(NATIVE_DISTRIBUTED_HEAD, witness, [minimum])
+    : NATIVE_APPLY(NATIVE_SINGLE_WITNESS_HEAD, witness, [minimum]);
 }
 function matchingHead(head, floor) {
   return head?.sequence === floor.sequence && head.lastHash === floor.lastHash

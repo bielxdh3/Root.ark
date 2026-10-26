@@ -6,6 +6,7 @@
 // It does not persist evidence, distribute a new floor, prove remote fsync,
 // establish independent machines, or implement consensus/atomic GET fencing.
 const { Zk1WitnessCasAnchorHttpsClient } = require("./zk1WitnessCasAnchorHttpsClient");
+const NATIVE_APPLY = Reflect.apply;
 const NATIVE_FRESH_HEAD = Zk1WitnessCasAnchorHttpsClient.prototype.freshHead;
 
 const HEX = /^[a-f0-9]{64}$/;
@@ -88,7 +89,7 @@ class Zk1IndependentWitnessFloorQuorum {
       // enrollment. Invoke the original class method against its private
       // pinned TLS/Ed25519 fields rather than a caller-overridden callback.
       const results = await Promise.all(this.#witnesses.map((client) =>
-        NATIVE_FRESH_HEAD.call(client, this.#floor)));
+        NATIVE_APPLY(NATIVE_FRESH_HEAD, client, [this.#floor])));
       if (results.length !== this.#witnesses.length) deny();
       for (const result of results) {
         if (!sameHead(floorCopy(result), this.#floor)) deny();

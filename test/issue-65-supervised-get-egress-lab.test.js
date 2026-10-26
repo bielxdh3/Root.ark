@@ -293,6 +293,19 @@ test("separate OS witness signer retains real mTLS nonce-signed CAS floor and ex
     witness: new SubstitutedWitness(witness.config) }),
   /ZK_LAB_QUORUM_UNAVAILABLE/,
   "a subclass method must never impersonate the pinned native floor transport");
+  const native = Zk1WitnessCasAnchorHttpsClient.prototype.freshHead;
+  const originalCall = Object.getOwnPropertyDescriptor(native, "call");
+  try {
+    // Capturing a function reference is not enough: its own `.call` can be
+    // poisoned while the original function and its private fields stay valid.
+    native.call = async () => ({ ...witness.genesis });
+    await assert.rejects(guard.authorize({ io, expectedRootHash: root }),
+      /ZK_LAB_QUORUM_UNAVAILABLE/,
+      "poisoning function.call must not bypass native signed witness readback");
+  } finally {
+    if (originalCall) Object.defineProperty(native, "call", originalCall);
+    else delete native.call;
+  }
 });
 
 function request(port, token, method = "GET", url = "/fixture-ciphertext") {

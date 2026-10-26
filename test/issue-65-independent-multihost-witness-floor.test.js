@@ -148,6 +148,24 @@ test("separate pinned mTLS witnesses expose fork; distributed floor denies split
   await assert.rejects(authorizedGuard.authorize({ io, expectedRootHash: sealedRoot }),
     /ZK_LAB_QUORUM_UNAVAILABLE/,
   "witness rollback prevents the next supervised ciphertext frame");
+  const singleNative = Zk1WitnessCasAnchorHttpsClient.prototype.freshHead;
+  const distributedNative = Zk1IndependentWitnessFloorQuorum.prototype.freshHead;
+  const originals = [singleNative, distributedNative].map((fn) =>
+    Object.getOwnPropertyDescriptor(fn, "call"));
+  try {
+    singleNative.call = async (_instance, retained) => ({ ...retained });
+    distributedNative.call = async (_instance, retained) => ({ ...retained });
+    await assert.rejects(quorum.freshHead(), /INDEPENDENT_WITNESS_FLOOR_UNAVAILABLE/,
+      "poisoned native peer function.call must not forge a full signed physical floor");
+    await assert.rejects(authorizedGuard.authorize({ io, expectedRootHash: sealedRoot }),
+      /ZK_LAB_QUORUM_UNAVAILABLE/,
+      "poisoned quorum function.call must not unlock physical GET egress");
+  } finally {
+    for (const [index, fn] of [singleNative, distributedNative].entries()) {
+      if (originals[index]) Object.defineProperty(fn, "call", originals[index]);
+      else delete fn.call;
+    }
+  }
   states[0] = { ...trusted };
   states[1] = floor(6, "4".repeat(64), digest("physical-6"));
   await assert.rejects(quorum.freshHead(), /INDEPENDENT_WITNESS_FLOOR_UNAVAILABLE/,
