@@ -7,7 +7,7 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
-const { verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectoryAsync } =
+const { verifyWindowsLocalWebDavTree, createWindowsLocalWebDavAclVerifier } =
   require("../services/chunkUploadWindowsAcl");
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -120,6 +120,7 @@ class LocalSyncWebDavBridge {
     this.protocolJournal = options.protocolJournal || null;
     this.toProtocolOperation = options.toProtocolOperation || null;
     this.onOperation = options.onOperation || (options.journal ? (operation) => options.journal.enqueue(operation) : null);
+    this.windowsAclVerifier = null;
     if (!this.token) throw new Error("Local WebDAV bridge bearer token is required");
     if (!isLoopback(this.host)) throw new Error("Local WebDAV bridge must bind to loopback");
     this.server = http.createServer((req, res) => this.handle(req, res));
@@ -137,6 +138,7 @@ class LocalSyncWebDavBridge {
     if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
     if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
     await this.recoverPending();
+    if (process.platform === "win32") this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
     await new Promise((resolve, reject) => {
       this.server.once("error", reject);
       this.server.listen(this.port, this.host, resolve);
@@ -228,6 +230,8 @@ class LocalSyncWebDavBridge {
   }
 
   async stop() {
+    this.windowsAclVerifier?.stop();
+    this.windowsAclVerifier = null;
     if (!this.server.listening) return;
     await new Promise((resolve) => this.server.close(resolve));
   }
@@ -286,7 +290,7 @@ class LocalSyncWebDavBridge {
         // This excludes actors
         // with trusted owner/admin privileges; no pathname recheck solves that.
         try {
-          await verifyWindowsLocalWebDavDirectoryAsync(target === this.rootDir
+          await this.windowsAclVerifier.verify(target === this.rootDir
             ? this.rootDir : path.dirname(target));
         }
         catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
@@ -444,7 +448,7 @@ class LocalSyncWebDavBridge {
       destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
       // The Destination header can select a different directory than the
       // authenticated source; its ancestry must be independently trusted.
-      try { await verifyWindowsLocalWebDavDirectoryAsync(path.dirname(destinationTarget)); }
+      try { await this.windowsAclVerifier.verify(path.dirname(destinationTarget)); }
       catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
     }
     if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");

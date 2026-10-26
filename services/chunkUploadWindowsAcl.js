@@ -1,4 +1,5 @@
-const { execFile, execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 
 // This verifier is the final authority for protected on-disk ciphertext and
 // its co-located device registry. Executing a PATH-selected powershell.exe
@@ -220,50 +221,6 @@ function runAclScript(rootDir, action) {
   }
 }
 
-// Never compile the native ACL verifier synchronously on the WebDAV HTTP
-// event loop. Admit only a bounded number of native checks: a saturated queue
-// fails closed instead of accumulating unlimited subprocesses or requests.
-const MAX_ASYNC_BRIDGE_CHECKS = 4;
-const MAX_QUEUED_BRIDGE_CHECKS = 16;
-let activeBridgeChecks = 0;
-const queuedBridgeChecks = [];
-
-function runBridgeAclScriptAsync(rootDir) {
-  return new Promise((resolve, reject) => {
-    const run = () => {
-      activeBridgeChecks += 1;
-      const escapedRoot = rootDir.replace(/'/g, "''");
-      const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', 'verify-bridge-directory')`;
-      const encoded = Buffer.from(script, "utf16le").toString("base64");
-      const release = () => {
-        activeBridgeChecks -= 1;
-        const next = queuedBridgeChecks.shift();
-        if (next) next();
-      };
-      try {
-        execFile(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive",
-          "-OutputFormat", "Text", "-EncodedCommand", encoded], {
-          encoding: "utf8", windowsHide: true, timeout: 12000,
-          maxBuffer: 32 * 1024,
-        }, (error, stdout, stderr) => {
-          release();
-          if (error) {
-            const detail = String(stdout || stderr || "")
-              .match(/Untrusted principal can replace[^"_<\r\n]*/)?.[0];
-            reject(new Error(detail || "Windows bridge ACL validation failed"));
-          } else resolve(String(stdout).trim());
-        });
-      } catch (_) {
-        release();
-        reject(new Error("Windows bridge ACL validation failed"));
-      }
-    };
-    if (activeBridgeChecks < MAX_ASYNC_BRIDGE_CHECKS) run();
-    else if (queuedBridgeChecks.length < MAX_QUEUED_BRIDGE_CHECKS) queuedBridgeChecks.push(run);
-    else reject(new Error("Windows bridge ACL admission exhausted"));
-  });
-}
-
 function ensureWindowsChunkUploadRoot(rootDir) {
   if (process.platform !== "win32") return;
   runAclScript(rootDir, "create");
@@ -284,9 +241,160 @@ function verifyWindowsLocalWebDavDirectory(directory) {
   runAclScript(directory, "verify-bridge-directory");
 }
 
-function verifyWindowsLocalWebDavDirectoryAsync(directory) {
-  if (process.platform !== "win32") return Promise.resolve();
-  return runBridgeAclScriptAsync(directory);
+// A bridge owns one long-lived, isolated PowerShell subprocess. Compile the
+// native ACL verifier ONCE, then perform a fresh native ACL lookup for EACH
+// request. The pipe is private to the child process; no PATH lookup, shell,
+// temporary script, TTL, optimistic cache, or skipped check is involved.
+// A single worker and at most 16 waiting requests bound native admission.
+function createWindowsLocalWebDavAclVerifier() {
+  if (process.platform !== "win32") {
+    return { verify: async () => {}, stop: () => {} };
+  }
+  const script = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n` + String.raw`
+[Console]::Out.WriteLine('READY')
+[Console]::Out.Flush()
+while ($true) {
+  $line = [Console]::ReadLine()
+  if ($null -eq $line) { break }
+  if ($line.Length -gt 131072) { break }
+  $parts = $line.Split('|')
+  if ($parts.Length -ne 2 -or $parts[0] -cnotmatch '^[a-f0-9]{32}$') { break }
+  $nonce = $parts[0]
+  try {
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $directory = $utf8.GetString([Convert]::FromBase64String($parts[1]))
+    [void][RootarkChunkAclNative]::Ensure($directory, 'verify-bridge-directory')
+    [Console]::Out.WriteLine($nonce + '|OK')
+  } catch {
+    [Console]::Out.WriteLine($nonce + '|DENY')
+  }
+  [Console]::Out.Flush()
+}
+`;
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const MAX_WAITING = 16;
+  const CHECK_DEADLINE_MS = 12000;
+  let closed = false;
+  let worker = null;
+  let ready = false;
+  let output = "";
+  let errorOutput = "";
+  let active = null;
+  const queue = [];
+  const rejectCheck = () => new Error("Windows bridge ACL validation failed");
+
+  function finish(job, error) {
+    if (job.finished) return;
+    job.finished = true;
+    clearTimeout(job.timer);
+    if (error) job.reject(rejectCheck());
+    else job.resolve();
+  }
+  function failWorker() {
+    const old = worker;
+    worker = null;
+    ready = false;
+    output = "";
+    errorOutput = "";
+    if (old) {
+      old.stdout.removeAllListeners("data");
+      old.stderr.removeAllListeners("data");
+      old.kill();
+    }
+    if (active) { finish(active, true); active = null; }
+    while (queue.length) finish(queue.shift(), true);
+  }
+  function sendNext() {
+    if (!ready || !worker || active || closed) return;
+    let next;
+    do { next = queue.shift(); } while (next?.finished);
+    if (!next) return;
+    active = next;
+    const nonce = crypto.randomBytes(16).toString("hex");
+    next.nonce = nonce;
+    const bytes = Buffer.from(next.directory, "utf8").toString("base64");
+    try {
+      if (!worker.stdin.write(nonce + "|" + bytes + "\n")) {
+        // Pipe backpressure is bounded by one in-flight request. The response
+        // cannot authorize a read without an exact matching nonce either way.
+      }
+    } catch (_) { failWorker(); }
+  }
+  function onLine(line) {
+    if (!ready) {
+      if (line !== "READY") return failWorker();
+      ready = true;
+      return sendNext();
+    }
+    if (!active || line !== active.nonce + "|OK" && line !== active.nonce + "|DENY") {
+      return failWorker();
+    }
+    const job = active;
+    active = null;
+    finish(job, line.endsWith("|DENY"));
+    sendNext();
+  }
+  function startWorker() {
+    if (worker || closed) return;
+    try {
+      const child = spawn(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive",
+        "-OutputFormat", "Text", "-EncodedCommand", encoded], {
+        windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+      });
+      worker = child;
+      ready = false;
+      output = "";
+      errorOutput = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (data) => {
+        if (worker !== child) return;
+        output += data;
+        if (output.length > 4096) return failWorker();
+        let index;
+        while (worker === child && (index = output.indexOf("\n")) !== -1) {
+          const line = output.slice(0, index).replace(/\r$/, "");
+          output = output.slice(index + 1);
+          onLine(line);
+        }
+      });
+      child.stderr.on("data", (data) => {
+        if (worker !== child) return;
+        errorOutput += data.toString("utf8");
+        // Windows PowerShell writes only this empty CLIXML prologue to its
+        // redirected error stream on successful native console startup.
+        // Any actual error record or unexpected stderr content kills the
+        // authority subprocess and denies all outstanding requests.
+        const harmlessHeader = "#< CLIXML\r\n";
+        if (!harmlessHeader.startsWith(errorOutput)
+          && errorOutput !== harmlessHeader) failWorker();
+      });
+      child.stdin.on("error", () => { if (worker === child) failWorker(); });
+      child.on("error", () => { if (worker === child) failWorker(); });
+      child.on("exit", () => { if (worker === child) failWorker(); });
+    } catch (_) { failWorker(); }
+  }
+  return {
+    verify(directory) {
+      if (closed || typeof directory !== "string" || !directory.length
+        || Buffer.byteLength(directory, "utf8") > 65000
+        || queue.length >= MAX_WAITING) return Promise.reject(rejectCheck());
+      return new Promise((resolve, reject) => {
+        const job = { directory, resolve, reject, nonce: "", finished: false };
+        job.timer = setTimeout(() => {
+          // If the child is blocked or its output is missing/ambiguous, fail
+          // ALL unfinished checks, kill it, and never accept a late response.
+          failWorker();
+        }, CHECK_DEADLINE_MS);
+        queue.push(job);
+        startWorker();
+        sendNext();
+      });
+    },
+    stop() {
+      closed = true;
+      failWorker();
+    },
+  };
 }
 
 function getWindowsChunkAclDescriptor(rootDir) {
@@ -301,4 +409,4 @@ function verifyWindowsAuthorityFilePath(filename) {
 
 module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
   verifyWindowsAuthorityFilePath, verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory,
-  verifyWindowsLocalWebDavDirectoryAsync };
+  createWindowsLocalWebDavAclVerifier };

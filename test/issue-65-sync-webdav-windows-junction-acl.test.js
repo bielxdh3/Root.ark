@@ -187,12 +187,15 @@ test("Windows local WebDAV concurrent ACL checks leave the Node event loop respo
     beats += 1;
   }, 20);
   let responses;
+  const started = Date.now();
   try {
     responses = await Promise.all(Array.from({ length: 12 }, () =>
       request(bridge.address().port, "/file.ct")));
   } finally {
     clearInterval(interval);
   }
+  const elapsed = Date.now() - started;
+  t.diagnostic(`12 authenticated GETs: ${elapsed}ms ACL-checked HTTP, including verifier startup`);
   for (const result of responses) {
     assert.equal(result.status, 200);
     assert.equal(result.body, content);
@@ -200,6 +203,8 @@ test("Windows local WebDAV concurrent ACL checks leave the Node event loop respo
   assert.ok(beats >= 12, `event loop must advance during 12 ACL checks: ${beats} ticks`);
   assert.ok(worstLag < 275,
     `ACL checks must not block the event loop for a PowerShell startup: ${worstLag}ms`);
+  assert.ok(elapsed < 1500,
+    `12 request-time native ACL checks must reuse a compiled verifier: ${elapsed}ms`);
 });
 
 test("Windows bridge ACL admission is bounded and excess requests fail closed", {
@@ -226,4 +231,26 @@ test("Windows bridge ACL admission is bounded and excess requests fail closed", 
   assert.ok(allowed.every((item) => item.body === "PRIVATE_BOUNDED_CONTENT"));
   assert.ok(denied.every((item) => item.body === "Untrusted bridge storage"));
   assert.equal(responses[30].status, 401, "unauthenticated requests cannot exhaust ACL subprocesses");
+});
+
+test("Windows native ACL verifier stop rejects every queued check and never reuses prior trust", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-worker-stop-");
+  fs.writeFileSync(path.join(root, "file.ct"), "PRIVATE_WORKER_STOP_CONTENT");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  const queued = Array.from({ length: 12 }, () => bridge.windowsAclVerifier.verify(root));
+  bridge.windowsAclVerifier.stop();
+  const settled = await Promise.allSettled(queued);
+  assert.ok(settled.every((result) => result.status === "rejected"),
+    "terminated worker must not authorize pending checks");
+  const denied = await request(bridge.address().port, "/file.ct");
+  assert.equal(denied.status, 503);
+  assert.equal(denied.body, "Untrusted bridge storage");
 });
