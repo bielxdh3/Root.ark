@@ -62,7 +62,17 @@ function inspectZk1LiveLegacyDerivedLocalEvidence({ tempDir, runSecret }) {
         try {
           fd = fs.openSync(full, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
           if (!same(candidate, fs.fstatSync(fd, { bigint: true }))) deny();
-          const bytes = fs.readFileSync(fd);
+          // A writer may grow this inode after fstat. readFileSync(fd) can
+          // allocate the new size before our post-read identity check rejects
+          // it; only read the already-pinned (<= MAX_FILE_BYTES) byte budget.
+          const bytes = Buffer.alloc(Number(candidate.size));
+          let offset = 0;
+          while (offset < bytes.length) {
+            const count = fs.readSync(fd, bytes, offset,
+              Math.min(64 * 1024, bytes.length - offset), offset);
+            if (count <= 0 || count > bytes.length - offset) deny();
+            offset += count;
+          }
           if (BigInt(bytes.length) !== candidate.size
             || !same(candidate, fs.fstatSync(fd, { bigint: true }))
             || !same(candidate, stat(full, false))) deny();
