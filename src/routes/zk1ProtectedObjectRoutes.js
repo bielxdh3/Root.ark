@@ -5,6 +5,7 @@
 // provider, plus authenticated server-side account-to-scope resolution.
 // They do not replace or secure legacy upload/download, WebDAV, or sync.
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
 const FIELDS = Object.freeze([
   "account_id", "compartment_id", "keyring_id", "device_id", "operation",
   "object_id", "expected_object_revision", "manifest_revision", "manifest_digest",
@@ -55,6 +56,16 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     || typeof store.put !== "function" || typeof store.get !== "function"
     || typeof authenticate !== "function" || typeof requirePermission !== "function"
     || typeof resolveTrustedScope !== "function") invalid();
+  // These DEV-only endpoints must stay bounded even in a standalone mount
+  // without the application's global API limiter. This is a process-local
+  // abuse control, not a substitute for an upstream distributed rate limit.
+  const protectedRequestLimit = rateLimit({
+    windowMs: 60_000,
+    limit: 240,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "ZK_CONTENT_RATE_LIMITED" },
+  });
   const fenceHeaders = (_req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -151,7 +162,7 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
       || casClient.role !== "CAS" || floorClient.role !== "FLOOR"
       || casClient.publicKey.equals(floorClient.publicKey)
       || !store.signedHistoryRequired) invalid();
-    app.post("/zk-1/v1/catalog/authority/v2-heads", fenceHeaders, authenticate,
+    app.post("/zk-1/v1/catalog/authority/v2-heads", fenceHeaders, protectedRequestLimit, authenticate,
       requirePermission("listFiles"), parseAuthorityChallenge, async (req, res) => {
         try {
           exact(req.body, ["nonce"]);
@@ -188,7 +199,7 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
   // The normal workspace discovers this opt-in capability only through its
   // authenticated session. Registration itself is dev/test-only (bootstrap).
   // Never publish the configured owner's scope or authority pins to browsers.
-  app.get("/zk-1/v1/workspace-capability", fenceHeaders, authenticate,
+  app.get("/zk-1/v1/workspace-capability", fenceHeaders, protectedRequestLimit, authenticate,
     requirePermission("listFiles"), requirePermission("upload"), (req, res) => {
       try {
         if (!resolveTrustedScope(req.user)) invalid();
@@ -202,9 +213,9 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
       } catch (_) { res.status(403).json({ error: "ZK_CONTENT_DENIED" }); }
     });
   // POST-for-read prevents accidental caches and keeps signed nonces out of URLs.
-  app.post("/zk-1/v1/content/read", fenceHeaders, authenticate,
+  app.post("/zk-1/v1/content/read", fenceHeaders, protectedRequestLimit, authenticate,
     requirePermission("listFiles"), parseSealedContent, checked("get"));
-  app.post("/zk-1/v1/content/put", fenceHeaders, authenticate,
+  app.post("/zk-1/v1/content/put", fenceHeaders, protectedRequestLimit, authenticate,
     requirePermission("upload"), parseSealedContent, checked("put"));
   // Opt-in only: a separate pinned, independent signed CAS authority must
   // be configured to register these routes. No generic sync-v2 metadata.
@@ -260,9 +271,9 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
           .json({ error: "ZK_CATALOG_UNAVAILABLE" });
       }
     };
-    app.post("/zk-1/v1/catalog/authority/witness-head", fenceHeaders, authenticate,
+    app.post("/zk-1/v1/catalog/authority/witness-head", fenceHeaders, protectedRequestLimit, authenticate,
       requirePermission("listFiles"), parseAuthorityChallenge, authorityHead("witness"));
-    app.post("/zk-1/v1/catalog/authority/cas-head", fenceHeaders, authenticate,
+    app.post("/zk-1/v1/catalog/authority/cas-head", fenceHeaders, protectedRequestLimit, authenticate,
       requirePermission("listFiles"), parseAuthorityChallenge, authorityHead("cas"));
     const sendUnderGate = (res, status, recheck = null) => (result) => new Promise((resolve, reject) => {
       if (res.destroyed || res.writableEnded || res.headersSent) {
@@ -337,9 +348,9 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
           ? "ZK_CATALOG_UNAVAILABLE" : error.code });
       }
     };
-    app.post("/zk-1/v1/catalog/commit", fenceHeaders, authenticate,
+    app.post("/zk-1/v1/catalog/commit", fenceHeaders, protectedRequestLimit, authenticate,
       requirePermission("upload"), parseSealedContent, respond("commit"));
-    app.post("/zk-1/v1/catalog/read", fenceHeaders, authenticate,
+    app.post("/zk-1/v1/catalog/read", fenceHeaders, protectedRequestLimit, authenticate,
       requirePermission("listFiles"), parseSealedContent, respond("read"));
   }
   if (multiproviderRestore !== null) {
