@@ -44,6 +44,8 @@ const { Zk1CasTerminalAnchor } =
   require("../src/services/zk1CasTerminalAnchor");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const { createRealLocalWebdav } = require("./support/issue-65-real-local-webdav");
 const { createZk1WebdavCiphertextAdapter } =
   require("../src/services/zk1WebdavCiphertextAdapter");
@@ -60,7 +62,7 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
   const minimumSnapshot = (await f.ledger.getSnapshot({ nonce: crypto.randomBytes(32) })).bytes;
   assert.equal((await f.bridge().putAndAttest(f.physical)).status,
     "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-real-pg-attestor-chain-"));
+  const dir = createPrivateAuthorityFixture("zk65-real-pg-attestor-chain-");
   let child = null;
   let server = null;
   let floor = null;
