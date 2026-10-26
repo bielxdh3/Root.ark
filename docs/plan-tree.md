@@ -1,5 +1,32 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: independent legacy stage witness CAS (opt-in DEV, 2026-10-26)
+
+`Zk1LegacyArchiveStageWitness` adds a separate operator-run SQLite witness
+ledger for the existing signed dual V1/V2 archive `witnessCandidate` after
+full live mTLS and signed owner readback verification. Its distinct Ed25519
+witness key, immutable trust scope/7-pin config, signed hash-linked
+generations, `BEGIN IMMEDIATE` CAS, and append-only `WITHDRAWN` tombstones
+make a non-destructive evidence stage reversible by a new generation. Operators
+must retain the latest signed witness head independently and present it on
+restart to detect a restored earlier local snapshot. They cannot reactivate
+either V2 authority or delete the V1 source through this ledger. The offline
+candidate method authenticates only signed stage snapshots and explicitly
+reports narrower forensic evidence.
+
+Windows Node24 genuine V1+V2 TLS1.3 mTLS integration (including two competing
+child-process withdrawals, two competing staged restarts, a stale generation,
+signed-minimum rollback detection, tampered stage receipt, changed owner pin
+and same-name no-op SQLite trigger): **1 PASS / 0 FAIL**;
+three JS `node --check` and `git diff --check`: **PASS**. These tests do not
+prove independent operator custody, external cross-host monotonic storage,
+power-loss persistence, rollback of both witness DB and external retained
+head, or external provider readback. The returned flags remain
+`v2WriteAuthorized:false`, `restoreAuthorized:false`,
+`destructiveCutoverAuthorized:false`, and
+`independentMonotonicStageWitnessProven:false`.
+**DRAFT / NO-GO**. See `docs/issue-65-independent-legacy-stage-witness-dev.md`.
+
 ## Issue #65 / PR #228: legacy dual-archive owner revocation during readback (DEV)
 
 An adversarial synthetic TLS1.3 mTLS test reproduced a race on the

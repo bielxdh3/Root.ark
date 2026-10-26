@@ -7,7 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const http = require("node:http");
-const { execFile } = require("node:child_process");
+const { execFile, fork } = require("node:child_process");
 const { promisify } = require("node:util");
 const z = require("../src/crypto/rootark-zk-1");
 const { createAuthenticatedOpaqueCatalogArchiveV2 } =
@@ -30,6 +30,8 @@ const { OpaqueCheckpointV2Authority, createOpaqueCheckpointV2HttpsServer,
   require("../src/services/zk1OpaqueCheckpointV2Remote");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
+const { Zk1LegacyArchiveStageWitness } =
+  require("../src/services/zk1LegacyArchiveStageWitness");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { privateAuthorityDirectory } =
@@ -49,6 +51,18 @@ const signed = async (domain, body, privateKey) =>
   Buffer.from(await z.encodeDeterministic({ ...body, signature:
     crypto.sign(null, Buffer.concat([domain,
       Buffer.from(await z.encodeDeterministic(body))]), privateKey) }));
+function witnessChild(setup, action, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = fork(path.join(__dirname, "support", "issue-65-stage-witness-child.js"),
+      [], { windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    let answer;
+    child.once("message", (message) => { answer = message; });
+    child.once("error", reject);
+    child.once("exit", (code) => answer ? resolve(answer)
+      : reject(Error(`WITNESS_CHILD_EXIT_${code}`)));
+    child.send({ setup, action, ...options });
+  });
+}
 let fixture;
 async function build() {
   const scope = { account_id: crypto.randomBytes(16),
@@ -663,6 +677,119 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     assert.notEqual(rerun.witnessCandidate.casSignedStage, candidate.casSignedStage,
       'export must carry a new signed live readback, not replay old receipts');
     assert.equal(rerun.destructiveCutoverAuthorized, false);
+    // A separate witness key and private ledger accept the opt-in evidence.
+    // Genuine V1/V2 HTTPS, consent and signed owner witness are revalidated
+    // before the witness appends; only local monotonic evidence is acknowledged.
+    const witnessSigner = pair();
+    const witnessDb = path.join(folder, 'independent-legacy-stage-witness.sqlite');
+    const witnessSetup = {
+      filename: witnessDb,
+      privateKey: b64(witnessSigner.privateKey.export({ format: 'der', type: 'pkcs8' })),
+      publicKey: b64(witnessSigner.publicKey.export({ format: 'der', type: 'spki' })),
+      scope: Object.fromEntries(Object.entries(options.scope).map(([name, value]) =>
+        [name, b64(value)])),
+      pins: Object.fromEntries(Object.entries(readback.operatorPins).map(([name, value]) =>
+        [name, b64(value.export({ format: 'der', type: 'spki' }))])),
+    };
+    const witness = new Zk1LegacyArchiveStageWitness({
+      filename: witnessDb, bootstrapNew: true,
+      privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
+      trustedScope: options.scope, operatorPins: readback.operatorPins });
+    const raceWitness = new Zk1LegacyArchiveStageWitness({
+      filename: path.join(folder, 'independent-stage-owner-race.sqlite'),
+      bootstrapNew: true, privateKey: witnessSigner.privateKey,
+      witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
+      operatorPins: readback.operatorPins });
+    const originalFreshWitness = trust.freshWitnessHead;
+    let ownerReadbacks = 0;
+    trust.freshWitnessHead = async (...args) => {
+      const signedHead = await originalFreshWitness(...args);
+      if (++ownerReadbacks === 2) context.setLiveOwnerDigest(crypto.randomBytes(32));
+      return signedHead;
+    };
+    try {
+      await assert.rejects(raceWitness.stageFromLiveReadback({
+        readbackInput: readback, expectedHead: null }),
+      /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+      'owner revocation after first final witness read must block ledger append');
+      assert.ok(ownerReadbacks >= 3,
+        'must reach the second full live check after the first owner witness');
+      assert.equal(raceWitness.audit(), null);
+    } finally {
+      trust.freshWitnessHead = originalFreshWitness;
+      context.setLiveOwnerDigest(options.ownerHead.digest);
+      raceWitness.close();
+    }
+    let liveStage;
+    try {
+      liveStage = await witness.stageFromLiveReadback({
+        readbackInput: readback, expectedHead: null });
+      assert.equal(liveStage.state, 'LIVE_READBACK_STAGE_RECORDED');
+      assert.equal(liveStage.v2WriteAuthorized, false);
+      assert.equal(liveStage.destructiveCutoverAuthorized, false);
+      assert.equal(liveStage.independentMonotonicStageWitnessProven, false);
+      assert.equal(witness.audit().generation, 1);
+      await assert.rejects(witness.stageSignedEvidence({ candidate: {
+        ...candidate, casSignedStage: b64(crypto.randomBytes(80)) },
+      expectedHead: liveStage.head }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+      'a forged stage response cannot advance the independent ledger');
+    } finally { witness.close(); }
+    const snapshot = path.join(folder, 'witness-generation-one.snapshot');
+    const initialChild = await witnessChild(witnessSetup, 'audit', {
+      minimumHead: liveStage.head });
+    assert.equal(initialChild.ok, true);
+    assert.deepEqual(initialChild.output, liveStage.head,
+      'signed witness head survives a separate-process restart');
+    const backup = await witnessChild(witnessSetup, 'snapshot', { snapshot });
+    assert.equal(backup.ok, true);
+    const concurrentWithdraw = await Promise.all([1, 2].map(() =>
+      witnessChild(witnessSetup, 'withdraw', { expectedHead: liveStage.head })));
+    assert.equal(concurrentWithdraw.filter((entry) => entry.ok).length, 1,
+      'only one process can consume a signed fencing generation');
+    const withdrawn = concurrentWithdraw.find((entry) => entry.ok).output;
+    assert.equal(withdrawn.head.generation, 2);
+    assert.equal(withdrawn.state, 'STAGE_EVIDENCE_WITHDRAWN');
+    assert.equal(withdrawn.restoreAuthorized, false);
+    const stale = await witnessChild(witnessSetup, 'stage', {
+      candidate, expectedHead: liveStage.head });
+    assert.deepEqual(stale, { ok: false, code: 'ZK_LEGACY_STAGE_WITNESS_DENIED' },
+      'withdrawn stage cannot replay a stale receipt even across processes');
+    const concurrentStage = await Promise.all([1, 2].map(() =>
+      witnessChild(witnessSetup, 'stage', { candidate: rerun.witnessCandidate,
+        expectedHead: withdrawn.head })));
+    assert.equal(concurrentStage.filter((entry) => entry.ok).length, 1,
+      'a cancelled witness stage may only be restaged via newer CAS generation');
+    const newerHead = concurrentStage.find((entry) => entry.ok).output.head;
+    assert.equal(newerHead.generation, 3);
+    assert.equal(newerHead.previousHash, withdrawn.head.hash);
+    assert.equal((await witnessChild(witnessSetup, 'audit', {
+      minimumHead: newerHead })).ok, true);
+    assert.equal(fs.existsSync(witnessDb + '-wal'), false,
+      'closed writer must checkpoint before offline operator snapshot restore');
+    fs.copyFileSync(snapshot, witnessDb);
+    const rolledWitness = await witnessChild(witnessSetup, 'audit', {
+      minimumHead: newerHead });
+    assert.equal(rolledWitness.ok, false,
+      'externally retained signed minimum generation detects restored old DB');
+    const impostor = pair();
+    assert.throws(() => new Zk1LegacyArchiveStageWitness({
+      filename: witnessDb, bootstrapNew: false,
+      privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
+      trustedScope: options.scope,
+      operatorPins: { ...readback.operatorPins,
+        ownerPublicKey: impostor.publicKey },
+    }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+    'an old signed ledger may not be reinterpreted under a new owner pin');
+    const forgedTrigger = new Database(witnessDb);
+    try {
+      forgedTrigger.exec(`DROP TRIGGER receipts_sequential;
+        CREATE TRIGGER receipts_sequential BEFORE INSERT ON stage_receipts
+        BEGIN SELECT 1; END;`);
+    } finally { forgedTrigger.close(); }
+    assert.equal((await witnessChild(witnessSetup, 'audit')).ok, false,
+      'a same-name no-op SQLite CAS trigger must fail on restart');
+    assert.equal((await casClient.head()).state, 'V1_BASELINE');
+    assert.equal((await floorClient.head()).state, 'V1_BASELINE');
     // Revoke at the asynchronous CBOR subject generation boundary, after
     // signed remote stage reads. The last owner witness must observe this.
     const originalEncode = z.encodeDeterministic;

@@ -81,3 +81,9 @@ An independent operator must reconstruct the subject and verify both stage
 signatures against its own pinned keys, consent and historical archive before
 any monotonic ledger append. This bundle itself **has no monotonicity or
 rollback resistance**, and cannot be used for write or deletion authorization.
+
+The separately opt-in operator witness evidence ledger is documented in
+`issue-65-independent-legacy-stage-witness-dev.md`. Its private signed
+generation/CAS/withdrawal records remain forensic DEV evidence only. Neither
+the ledger nor a restored SQLite snapshot proves independent physical custody,
+and all cutover/write/restore authorizations remain false.
