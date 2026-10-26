@@ -7,7 +7,6 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const fs = require("node:fs");
-const os = require("node:os");
 const { fork } = require("node:child_process");
 const { Pool } = require("pg");
 const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAuthority");
@@ -23,6 +22,8 @@ const { Zk1WitnessCasAnchorHttpsClient } =
   require("../src/services/zk1WitnessCasAnchorHttpsClient");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 
@@ -134,7 +135,7 @@ function onceChild(child, kind, timeoutMs = 25000) {
 }
 
 async function isolatedWitness(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-quorum-witness-"));
+  const dir = createPrivateAuthorityFixture("zk65-quorum-witness-");
   generateNativeFixtureCertificates(dir, { caSubject: "Quorum Lab CA",
     servers: ["server"], clients: ["allowed", "denied"] });
   const child = fork(path.join(__dirname, "support/issue-65-mtls-quorum-child.js"), [], {

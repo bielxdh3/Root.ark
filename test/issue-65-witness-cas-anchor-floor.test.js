@@ -4,14 +4,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 const { Zk1WitnessCasAnchorFloor } = require("../src/services/zk1WitnessCasAnchorFloor");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const nonce = () => crypto.randomBytes(32);
 function make(t) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-witness-floor-"));
+  const directory = createPrivateAuthorityFixture("rootark-witness-floor-");
   const openFloors = new Set();
   t.after(() => {
     for (const floor of openFloors) floor.close();
