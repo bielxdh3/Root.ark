@@ -7,6 +7,8 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
+const { verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory } =
+  require("../services/chunkUploadWindowsAcl");
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 function isLoopback(host) {
@@ -126,8 +128,13 @@ class LocalSyncWebDavBridge {
   async start() {
     await fsp.mkdir(this.rootDir, { recursive: true });
     await rejectSymlinks(this.rootDir, this.rootDir, false);
+    // Reject an unsafe root before creating trash/journal state or replaying
+    // pending mutations. Runtime requests repeat this check because a trusted
+    // actor might later introduce a subtree with a permissive inherited ACL.
+    if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
     await fsp.mkdir(this.trashDir, { recursive: true });
     await rejectSymlinks(this.rootDir, this.trashDir, false);
+    if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
     if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
     await this.recoverPending();
     await new Promise((resolve, reject) => {
@@ -268,6 +275,22 @@ class LocalSyncWebDavBridge {
       safeSegments(String(req.url || "/").split("?", 1)[0]);
       const parsed = new URL(req.url, "http://localhost");
       const target = await this.target(parsed.pathname);
+      if (process.platform === "win32") {
+        // NTFS O_NOFOLLOW protects the leaf but not an ancestor junction.
+        // A transient swap can open an outside-root inode, restore the safe
+        // pathname, then pass every later lstat/fstat comparison. An untrusted
+        // local SID with Modify/DELETE_CHILD on ANY ancestor or descendant
+        // could race an authenticated request. Startup proves the full tree;
+        // each request revalidates the selected parent plus ALL its ancestors
+        // so unrelated data need not be recursively scanned per request.
+        // This excludes actors
+        // with trusted owner/admin privileges; no pathname recheck solves that.
+        try {
+          verifyWindowsLocalWebDavDirectory(target === this.rootDir
+            ? this.rootDir : path.dirname(target));
+        }
+        catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+      }
       if (req.method === "OPTIONS") return writeResponse(res, 204, "", { DAV: "1", Allow: "OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, MOVE, DELETE" });
       if (req.method === "PROPFIND") {
         const depth = String(req.headers.depth || "0");
@@ -419,6 +442,10 @@ class LocalSyncWebDavBridge {
         destinationTarget = path.join(canonicalParent, path.basename(destination.target));
       }
       destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
+      // The Destination header can select a different directory than the
+      // authenticated source; its ancestry must be independently trusted.
+      try { verifyWindowsLocalWebDavDirectory(path.dirname(destinationTarget)); }
+      catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
     }
     if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
     if (existingStats && (await fsp.lstat(source)).isDirectory() !== existingStats.isDirectory()) return writeResponse(res, 409, "Cannot overwrite a file with a collection or vice versa");

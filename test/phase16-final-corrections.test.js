@@ -309,7 +309,7 @@ test("sync snapshot retries a transient Windows rename EPERM", { skip: process.p
 });
 
 test("WebDAV mutation journal translates into v2 move and reaches a second client", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-sync-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-sync-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true }); await fsp.mkdir(rootB, { recursive: true });
@@ -451,7 +451,7 @@ test("WebDAV mutation journal translates into v2 move and reaches a second clien
 });
 
 test("WebDAV file overwrite keeps the moved source identity and tombstones the old destination", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-file-overwrite-identity-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-file-overwrite-identity-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -505,7 +505,7 @@ test("WebDAV file overwrite keeps the moved source identity and tombstones the o
 });
 
 test("WebDAV recreation after delete uses a fresh identity on the same path", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recreate-identity-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recreate-identity-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -556,7 +556,7 @@ test("WebDAV recreation after delete uses a fresh identity on the same path", as
 });
 
 test("WebDAV directory MOVE overwrite and DELETE reconcile complete subtrees", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-subtree-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-subtree-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -633,7 +633,7 @@ test("WebDAV directory MOVE overwrite and DELETE reconcile complete subtrees", a
 });
 
 test("WebDAV move preserves an explicit source directory when the destination has no snapshot record", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-new-directory-destination-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-new-directory-destination-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -676,7 +676,7 @@ test("WebDAV move preserves an explicit source directory when the destination ha
 });
 
 test("WebDAV MOVE preserves explicit directory identities when Windows source casing differs", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-source-case-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-source-case-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -735,7 +735,7 @@ test("WebDAV MOVE preserves explicit directory identities when Windows source ca
 });
 
 test("WebDAV MOVE rejects a Windows case-only rename before changing the source", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-case-only-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-case-only-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "source.txt"), "case-only source");
@@ -810,7 +810,7 @@ test("remote case-only MOVE in a parent directory casing applies on Windows", { 
 });
 
 test("WebDAV MOVE resolves Windows parent casing for new and overwritten destinations", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-destination-parent-case-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-destination-parent-case-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(path.join(rootA, "CaseParent"), { recursive: true });
@@ -912,7 +912,7 @@ test("remote Windows paths preserve actual parent casing through reconciliation"
 });
 
 test("WebDAV PUT and DELETE canonicalize Windows parent casing before enqueue", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-put-delete-parent-case-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-put-delete-parent-case-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(path.join(rootA, "CaseParent"), { recursive: true });
@@ -1071,7 +1071,7 @@ test("offline peers delete moved directory trees by identity from latest-only to
 });
 
 test("WebDAV directory MOVE rejects nested file/collection collisions without changing either tree", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-nested-types-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-nested-types-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
@@ -1116,7 +1116,7 @@ test("WebDAV directory MOVE rejects nested file/collection collisions without ch
 });
 
 test("WebDAV keeps a queued move committed when transaction completion marking fails", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-outbox-mark-failure-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-outbox-mark-failure-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "source.txt"), "durable move payload");
@@ -1165,7 +1165,7 @@ test("WebDAV keeps a queued move committed when transaction completion marking f
 
 test("WebDAV recovery clears staged transactions after a failed update rolls back PUT and MOVE", { timeout: 30_000 }, async (t) => {
   for (const method of ["PUT", "MOVE"]) {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-phase16-webdav-${method.toLowerCase()}-rollback-`));
+    const dir = createPrivateAuthorityFixture(`rootark-phase16-webdav-${method.toLowerCase()}-rollback-`);
     const root = path.join(dir, "root");
     await fsp.mkdir(root, { recursive: true });
     await fsp.writeFile(path.join(root, "destination.txt"), "original destination");
@@ -1206,7 +1206,7 @@ test("WebDAV recovery clears staged transactions after a failed update rolls bac
 });
 
 test("WebDAV retains recovery state when protocol journal directory sync fails after rename", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-journal-sync-failure-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-journal-sync-failure-");
   const root = path.join(dir, "root");
   const protocolDirectory = path.join(dir, "protocol");
   const protocolPath = path.join(protocolDirectory, "journal.json");
@@ -1287,7 +1287,7 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
 });
 
 test("WebDAV recovery translates a source-moved transaction after a crash before enqueue", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-before-enqueue-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-before-enqueue-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "destination.txt"), "crash-recovered payload");
@@ -1317,7 +1317,7 @@ test("WebDAV recovery translates a source-moved transaction after a crash before
 });
 
 test("WebDAV recovery recreates an outbox entry when protocol-queued survived without it", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-missing-outbox-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-missing-outbox-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "destination.txt"), "recovered after directory sync loss");
@@ -1345,7 +1345,7 @@ test("WebDAV recovery recreates an outbox entry when protocol-queued survived wi
 });
 
 test("WebDAV recovery deduplicates a batch after the protocol-queued phase write fails", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-queued-phase-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-queued-phase-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "source.txt"), "queued phase payload");
@@ -1384,7 +1384,7 @@ test("WebDAV recovery deduplicates a batch after the protocol-queued phase write
 });
 
 test("sync reconciliation protects URL-encoded pending WebDAV paths", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-encoded-webdav-reconcile-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-encoded-webdav-reconcile-");
   const key = crypto.randomBytes(32);
   const filename = "résumé report.txt";
   await fsp.writeFile(path.join(dir, filename), "renamed bytes");

@@ -137,6 +137,15 @@ public static class RootarkChunkAclNative {
       AssertAuthorityFile(root, trusted);
       return String.Empty;
     }
+    if (action == "verify-bridge-directory") {
+      // The full tree is verified at bridge startup. At each request, pin the
+      // ACL trust boundary for the specific directory containing the target;
+      // scanning every unrelated file would make GET O(total tree size).
+      AssertTrustedOwnerAndSafeAncestors(root, trusted);
+      AssertDirectoryNoReparse(root);
+      AssertRestrictedItem(root, false, trusted);
+      return String.Empty;
+    }
     AssertTrustedOwnerAndSafeAncestors(root, trusted);
     if (action == "create") {
       if (!Directory.Exists(root)) {
@@ -156,7 +165,7 @@ public static class RootarkChunkAclNative {
       AssertDirectoryNoReparse(root);
       return String.Empty;
     }
-    if (action == "verify") {
+    if (action == "verify" || action == "verify-bridge") {
       // Concurrent trusted SQLite writers may delete transient WAL/SHM files
       // after enumeration but before the ACL query. Restart the ENTIRE scan,
       // including ancestry and root, only for positively identified absence;
@@ -165,7 +174,11 @@ public static class RootarkChunkAclNative {
         try {
           AssertTrustedOwnerAndSafeAncestors(root, trusted);
           AssertDirectoryNoReparse(root);
-          AssertRestrictedItem(root, true, trusted);
+          // Existing user-selected WebDAV roots can inherit a safe DACL from
+          // a private parent. Require identical trusted principals/full access
+          // on every item, but do not demand a protected root ACL for this
+          // bridge-only mode. The original "verify" contract remains strict.
+          AssertRestrictedItem(root, action == "verify", trusted);
           Stack<string> pending = new Stack<string>();
           pending.Push(root);
           while (pending.Count > 0) {
@@ -217,6 +230,16 @@ function verifyWindowsChunkUploadTree(rootDir) {
   runAclScript(rootDir, "verify");
 }
 
+function verifyWindowsLocalWebDavTree(rootDir) {
+  if (process.platform !== "win32") return;
+  runAclScript(rootDir, "verify-bridge");
+}
+
+function verifyWindowsLocalWebDavDirectory(directory) {
+  if (process.platform !== "win32") return;
+  runAclScript(directory, "verify-bridge-directory");
+}
+
 function getWindowsChunkAclDescriptor(rootDir) {
   if (process.platform !== "win32") throw new Error("Windows ACL inspection is only available on Windows");
   return runAclScript(rootDir, "sddl");
@@ -228,4 +251,4 @@ function verifyWindowsAuthorityFilePath(filename) {
 }
 
 module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
-  verifyWindowsAuthorityFilePath };
+  verifyWindowsAuthorityFilePath, verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory };
