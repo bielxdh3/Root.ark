@@ -34,8 +34,6 @@ const { envelopeBinding, verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
 const { createExternalRecoveryHeadFixture } =
   require("./support/issue-65-external-recovery-head-fixture");
-const { createPrivateAuthorityFixture } =
-  require("./support/issue-65-private-authority-fixture");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
 const ENTRY = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
