@@ -30,7 +30,9 @@ test("external catalog authority never starts without pinned independent signers
     "client must carry pinned server TLS SPKI and mTLS certificate");
 });
 
-test("real separate-process TLS1.3/mTLS policy and physical FLOOR terminal require independent signed evidence before W25 owner DRAINED", async (t) => {
+for (const scenario of ["normal", "revoked-before-commit", "revoked-after-commit",
+  "revoked-during-delayed-proof-after-commit", "revoked-during-delayed-proof-before-commit"]) {
+test(`real TLS1.3/mTLS catalog issuer W30 owner/physical fence (${scenario})`, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-catalog-external-"));
   const witness = crypto.generateKeyPairSync("ed25519");
   const status = crypto.generateKeyPairSync("ed25519");
@@ -147,9 +149,48 @@ test("real separate-process TLS1.3/mTLS policy and physical FLOOR terminal requi
   }));
   await assert.rejects(client.floorTerminal(forged), /CATALOG_EXTERNAL_DENIED/,
     "tampered witness signed admission may not obtain FLOOR terminal");
-  await step("physicalCommitted", { kind: "physicalCommit",
-    ticket: started.ticket.toString("base64url") });
-  const terminal = await client.floorTerminal(started.ticket);
+  if (scenario === "revoked-before-commit" || scenario === "revoked-during-delayed-proof-before-commit") {
+    await step("revoked", { kind: "revoke" });
+  }
+  if (scenario !== "revoked-during-delayed-proof-before-commit") {
+    await step("physicalCommitted", { kind: "physicalCommit",
+      ticket: started.ticket.toString("base64url") });
+  }
+  let delayedTerminal;
+  if (scenario.startsWith("revoked-during-delayed-proof")) {
+    await step("holding", { kind: "holdPhysical" });
+    const physicalEntered = step("physicalEntered");
+    delayedTerminal = client.floorTerminal(started.ticket);
+    await physicalEntered;
+    if (scenario === "revoked-during-delayed-proof-after-commit") {
+      await step("revoked", { kind: "revoke" });
+    } else {
+      await step("physicalCommitted", { kind: "physicalCommit",
+        ticket: started.ticket.toString("base64url") });
+    }
+    await step("released", { kind: "releasePhysical" });
+  }
+  if (scenario === "revoked-before-commit" || scenario === "revoked-during-delayed-proof-before-commit") {
+    // Never accept FLOOR if the durable revocation fence won the race,
+    // even when another process claims a subsequently committed record.
+    await assert.rejects(delayedTerminal || client.floorTerminal(started.ticket), /CATALOG_EXTERNAL_DENIED/,
+      "W30 P2: terminal signing must reconsult revoked owner policy even with a signed physical proof");
+    await assert.rejects(client.floorTerminal(started.ticket), /CATALOG_EXTERNAL_DENIED/,
+      "a previously denied operation cannot mint FLOOR via nonce/ticket replay");
+    assert.deepEqual(await ledger.prepareQuiesce({ ...first, reservation_id: crypto.randomBytes(16),
+      operation_id: crypto.randomBytes(16), expected_revision: 1, expected_manifest_digest: ownerDigest,
+      proposed_revision: 2, proposed_manifest_digest: crypto.randomBytes(32) }),
+    { status: "QUIESCING", activeCount: 1 }, "owner must not be allowed to DRAIN");
+    return;
+  }
+  if (scenario === "revoked-after-commit") {
+    await step("revoked", { kind: "revoke" });
+  }
+  const terminal = await (delayedTerminal || client.floorTerminal(started.ticket));
+  if (scenario !== "normal") {
+    assert.deepEqual(await client.floorTerminal(started.ticket), terminal,
+      "already-committed exact admission can replay its terminal after revocation");
+  }
   const badTerminal = Buffer.from(terminal);
   badTerminal[badTerminal.length - 1] ^= 1;
   await assert.rejects(ledger.completeCatalogAdmission({ scope,
@@ -168,7 +209,8 @@ test("real separate-process TLS1.3/mTLS policy and physical FLOOR terminal requi
   assert.deepEqual(await ledger.completeCatalogAdmission({ scope,
     admissionId: started.admissionId, principal: expectedPrincipal,
     floorProof: terminal }), { status: "completed" });
-  await step("revoked", { kind: "revoke" });
+  if (scenario !== "revoked-after-commit") await step("revoked", { kind: "revoke" });
   await assert.rejects(client.policyGrant(policyRequest), /CATALOG_EXTERNAL_DENIED/,
     "live external policy revocation cannot keep signing old grants");
 });
+}

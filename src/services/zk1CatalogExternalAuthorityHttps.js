@@ -21,7 +21,7 @@ const TICKET_FIELDS = ["type", "witness_key_id", ...SCOPE, "admission_id", "oper
 const PHYSICAL_FIELDS = ["type", ...SCOPE, "admission_id", "operation_id",
   "owner_revision", "owner_digest", "signer_device_id", "epoch", "sequence",
   "catalog_digest", "cas_signer_spki_sha256", "floor_nonce", "expires_at",
-  "principal", "observed_at", "committed", "signature"];
+  "principal", "observed_at", "committed", "commit_fence", "signature"];
 const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/;
 function deny() { throw new Error("CATALOG_EXTERNAL_DENIED"); }
 function exact(value, fields) {
@@ -81,6 +81,19 @@ function match(a, b, f) {
 }
 function sameFields(a, b, fields) {
   return fields.every((f) => match(a[f], b[f], f));
+}
+// Operator custody requirement: a single trusted monotonic owner/physical
+// ordering must serialize revocation against the durable physical commit.
+// A local wall-clock timestamp (seconds) cannot establish which won.
+function assertTerminalOwnerFence(snapshot, expected, physicalCommitFence) {
+  exact(snapshot, [...Object.keys(expected), "physical_commit_fence", "owner_revocation_fence"]);
+  if (!sameFields(snapshot, expected, Object.keys(expected))
+    || snapshot.physical_commit_fence !== physicalCommitFence
+    || !Number.isSafeInteger(physicalCommitFence) || physicalCommitFence < 1
+    || (snapshot.owner_revocation_fence !== null
+      && (!Number.isSafeInteger(snapshot.owner_revocation_fence)
+        || snapshot.owner_revocation_fence < 1
+        || physicalCommitFence >= snapshot.owner_revocation_fence))) deny();
 }
 function requestFromWire(wire) {
   exact(wire, FIELDS);
@@ -208,13 +221,15 @@ function createCatalogAuthorityHttpsServer({ key: tlsKey, cert, clientCa,
         if (observed.type !== "rootark-zk1-catalog-physical-operation-terminal/v1"
           || observed.committed !== true || !sameFields(observed, ticket, fields)
           || !Number.isSafeInteger(observed.observed_at)
+          || !Number.isSafeInteger(observed.commit_fence)
+          || observed.commit_fence < 1
           || observed.observed_at > ticket.expires_at
           || Math.abs(now - observed.observed_at) > 30) deny();
         const readyAt = nowSeconds();
         if (!Number.isSafeInteger(readyAt) || readyAt < now
           || readyAt > ticket.expires_at
           || Math.abs(readyAt - observed.observed_at) > 30) deny();
-        result = await sign(floorPrivateKey, { type: "rootark-zk1-opaque-catalog-witness-terminal/v1",
+        const terminal = { type: "rootark-zk1-opaque-catalog-witness-terminal/v1",
           ...Object.fromEntries(SCOPE.map((f) => [f, ticket[f]])),
           admission_id: ticket.admission_id, operation_id: ticket.operation_id,
           owner_revision: ticket.owner_revision, owner_digest: ticket.owner_digest,
@@ -222,7 +237,37 @@ function createCatalogAuthorityHttpsServer({ key: tlsKey, cert, clientCa,
           sequence: ticket.sequence, digest: ticket.catalog_digest,
           cas_signer_spki_sha256: ticket.cas_signer_spki_sha256,
           nonce: ticket.floor_nonce, expires_at: ticket.expires_at,
-          observed_at: observed.observed_at }, FLOOR_DOMAIN);
+          observed_at: observed.observed_at };
+        // Encode the complete signed FLOOR terminal *before* the mandatory
+        // synchronous final owner read; no async gap after the fence check.
+        const encoded = Buffer.from(await z.encodeDeterministic(terminal));
+        const ownerExpected = { ...Object.fromEntries(SCOPE.map((f) => [f, ticket[f]])),
+          owner_revision: ticket.owner_revision, owner_digest: ticket.owner_digest,
+          operation_id: ticket.operation_id, signer_device_id: ticket.signer_device_id,
+          epoch: ticket.epoch, sequence: ticket.sequence,
+          catalog_digest: ticket.catalog_digest,
+          cas_signer_spki_sha256: ticket.cas_signer_spki_sha256,
+          expires_at: ticket.expires_at, principal };
+        // Production authority must supply a SYNCHRONOUS, independently
+        // governed owner+physical ordering snapshot. This special callback
+        // never issues a new grant: it permits ACK of a durable physical
+        // commit before revocation, but NEVER a post-revoke physical commit.
+        const ticketHash = crypto.createHash("sha256")
+          .update(Buffer.from(await z.encodeDeterministic(ticket))).digest();
+        const owner = trustedOwnerPolicy({
+          ...ownerExpected, kind: "terminal-finalize", ticket,
+          ticketHash,
+          physicalProof: observed, physicalCommitFence: observed.commit_fence,
+        });
+        if (owner && typeof owner.then === "function") deny();
+        assertTerminalOwnerFence(owner, ownerExpected, observed.commit_fence);
+        const finalAt = nowSeconds();
+        if (!Number.isSafeInteger(finalAt) || finalAt < readyAt
+          || finalAt > ticket.expires_at
+          || Math.abs(finalAt - observed.observed_at) > 30) deny();
+        const signature = crypto.sign(null, Buffer.concat([FLOOR_DOMAIN, encoded]),
+          floorPrivateKey);
+        result = Buffer.from(await z.encodeDeterministic({ ...terminal, signature }));
       }
       respond(res, 200, { signedProof: result.toString("base64url") });
     } catch (_) { respond(res, 403, { error: "DENIED" }); }
