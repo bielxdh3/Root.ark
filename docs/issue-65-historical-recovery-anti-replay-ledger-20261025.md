@@ -46,6 +46,18 @@ WAL `synchronous=FULL` transaction to sign `READY` on that same recovery head.
 Immediately before signing in the second FULL transaction, the witness reads
 the **last trusted-device revocation policy** again and checks the originally
 verified PG Ed25519 proof age against the then-current clock (30-second bound).
+Because synchronous SQLite statement preparation, Ed25519 signing and UPDATE
+execution can stall, the same checks run **again after the READY UPDATE and
+before the FULL COMMIT**. The entire READY change rolls back if policy was
+revoked or the proof expired during any of those steps. A slow FULL/fsync can
+also cross the freshness boundary: the witness checks again **after COMMIT
+and before returning any ACK**, rejects the recovery if stale and attempts a
+separately FULL-committed, witness-signed transition back to `PENDING`.
+If that compensating durable commit itself becomes unavailable, the current
+process denies further historical operations; the operator must not assume
+crash-safe reconciliation without independent evidence of the final persisted
+phase. External device-policy changes and a local SQLite COMMIT cannot be made
+globally atomic without a separately governed external policy-fencing protocol.
 Revocation or physical-proof expiry while an external CAS blocks leaves the
 already-consumed nonce and signed `PENDING` marker in durable quarantine, even
 if the external CAS itself succeeded. Old device proof expiry alone is not a

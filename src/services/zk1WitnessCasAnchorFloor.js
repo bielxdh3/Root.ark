@@ -852,6 +852,34 @@ class Zk1WitnessCasAnchorFloor {
       || (phase === "READY" && previousHash !== ZERO)) fail();
     return crypto.sign(null, this.#recoveryHeadMessage(head, phase, previousHash), this.#witness);
   }
+  #assertRecoveryAckStillFresh({ originalPolicySnapshot, physicalIssuedAt,
+    minimumCompletedAt }) {
+    const samePolicy = JSON.stringify(snapshotLocalDevicePolicy(
+      this.#trustedSyncDevicePolicyProvider())) === originalPolicySnapshot;
+    const observed = Date.now();
+    if (!samePolicy) fail();
+    if (!Number.isSafeInteger(observed) || observed < minimumCompletedAt
+      || !Number.isSafeInteger(physicalIssuedAt)
+      || Math.abs(Math.floor(observed / 1000) - physicalIssuedAt) > 30) fail();
+  }
+  #restorePendingRecoveryAck(head, previousHash) {
+    // A FULL COMMIT can itself stall after the final in-transaction check.
+    // Never ACK stale evidence; restore the signed quarantine in another FULL
+    // transaction while the recovery nonce/head remain permanently consumed.
+    this.#db.transaction(() => {
+      this.#assertHistoricalIntegrity();
+      const reset = this.#db.prepare(
+        "UPDATE witness_cas_sync_historical_recovery_head"
+        + " SET ack_phase='PENDING',ack_previous_hash=?,signature=?"
+        + " WHERE id=1 AND sequence=? AND last_hash=?"
+        + " AND ack_phase='READY' AND ack_previous_hash=?").run(
+          previousHash, this.#signRecoveryHead(head, "PENDING", previousHash),
+          head.sequence, head.lastHash, ZERO);
+      if (reset.changes !== 1) fail();
+    }).immediate();
+    this.#recoveryAckPhase = "PENDING";
+    this.#recoveryAckPreviousHash = previousHash;
+  }
   #finishConfirmedRecoveryAck(head, previousHash, {
     originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt,
   }) {
@@ -859,6 +887,7 @@ class Zk1WitnessCasAnchorFloor {
       || this.#recoveryAckPreviousHash !== previousHash) fail();
     // This is the ONLY transition to READY. No public reconciliation/clear
     // method exists: ambiguous CAS results must remain quarantined.
+    const freshness = { originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt };
     this.#db.transaction(() => {
       this.#assertHistoricalIntegrity();
       const external = this.#readExternallyCommittedRecoveryHead();
@@ -867,12 +896,7 @@ class Zk1WitnessCasAnchorFloor {
       // or until the independently signed PG proof is no longer fresh.
       // This last synchronous owner-policy read and time sample are inside
       // the SECOND FULL transaction, immediately before signing READY.
-      if (JSON.stringify(snapshotLocalDevicePolicy(
-        this.#trustedSyncDevicePolicyProvider())) !== originalPolicySnapshot) fail();
-      const atReady = Date.now();
-      if (!Number.isSafeInteger(atReady) || atReady < minimumCompletedAt
-        || !Number.isSafeInteger(physicalIssuedAt)
-        || Math.abs(Math.floor(atReady / 1000) - physicalIssuedAt) > 30) fail();
+      this.#assertRecoveryAckStillFresh(freshness);
       const cleared = this.#db.prepare(
         "UPDATE witness_cas_sync_historical_recovery_head"
         + " SET ack_phase='READY',ack_previous_hash=?,signature=?"
@@ -881,11 +905,25 @@ class Zk1WitnessCasAnchorFloor {
           ZERO, this.#signRecoveryHead(head, "READY", ZERO),
           head.sequence, head.lastHash, previousHash);
       if (cleared.changes !== 1) fail();
+      // SQLite statement preparation, signing, and .run() are synchronous
+      // but may block. This check is AFTER the UPDATE and BEFORE FULL COMMIT,
+      // so a delayed statement rolls back and retains signed PENDING.
+      this.#assertRecoveryAckStillFresh(freshness);
     }).immediate();
     // SQLite WAL synchronous=FULL commits READY before the in-memory mirror
     // changes or a success response can be returned.
     this.#recoveryAckPhase = "READY";
     this.#recoveryAckPreviousHash = ZERO;
+    // FULL COMMIT/fsync may also have taken the physical proof past its
+    // allowed age. Deny the ACK; re-quarantine durably rather than allowing a
+    // freshly consumed nonce to turn into an unverified READY on restart.
+    try {
+      this.#assertRecoveryAckStillFresh(freshness);
+    } catch (_) {
+      try { this.#restorePendingRecoveryAck(head, previousHash); }
+      catch (_) { this.#recoveryAckPhase = "PENDING"; }
+      fail();
+    }
   }
   #assertHistoricalNonceIntegrity(db) {
     const schema = new Set(db.prepare(

@@ -902,6 +902,104 @@ test("strict CAS witness floor refuses signed status advance without independent
     trustedDeviceRevocations = [];
     Date.now = clockBeforeSlowCas;
   }
+  // Reviewer26: synchronously blocking SQLite's READY statement can age out
+  // the signed physical proof AFTER the old pre-UPDATE check. Separately, an
+  // expensive SQLite FULL COMMIT can age it out AFTER all transactional reads.
+  // Neither may return a recovery ACK or leave a durable READY after failure.
+  const simulateSlowReady = async (phase) => {
+    const isolatedPath = path.join(directory, `witness-ready-delay-${phase}.sqlite`);
+    const source = new Database(historicalFilename, { readonly: true, fileMustExist: true });
+    try { await source.backup(isolatedPath); }
+    finally { source.close(); }
+    const remote = createExternalRecoveryHeadFixture(
+      path.join(directory, `operator-ready-delay-${phase}.sqlite`),
+      independentlyPinnedRecoveryHead);
+    externalAuthorities.push(remote);
+    const options = { ...pinnedRestart, trustedRecoveryNonceAuthority: remote.authority };
+    const instance = new Zk1WitnessCasAnchorFloor(isolatedPath, options);
+    const originalPrepare = Database.prototype.prepare;
+    const originalTransaction = Database.prototype.transaction;
+    const originalNow = Date.now;
+    const originalSign = crypto.sign;
+    let readyUpdateObserved = false;
+    let signedReadyObserved = false;
+    const advanceClock = () => { Date.now = () => originalNow() + 45_000; };
+    try {
+      Database.prototype.prepare = function (sql, ...args) {
+        const prepared = originalPrepare.call(this, sql, ...args);
+        if (typeof sql === "string" && sql.includes("SET ack_phase='READY'")) {
+          readyUpdateObserved = true;
+          if (phase === "after-prepare") advanceClock();
+        }
+        return prepared;
+      };
+      if (phase === "late-sign-revocation") {
+        crypto.sign = function (algorithm, data, key) {
+          const signature = originalSign.call(crypto, algorithm, data, key);
+          if (!signedReadyObserved && Buffer.isBuffer(data)
+            && data.includes(Buffer.from('"READY"'))
+            && data.includes(Buffer.from("historical-witness-recovery-ledger/v2"))) {
+            signedReadyObserved = true;
+            trustedDeviceRevocations = ["device-a"];
+          }
+          return signature;
+        };
+      }
+      if (phase === "after-commit") {
+        Database.prototype.transaction = function (...args) {
+          // The externally governed CAS is a different database/transaction.
+          // Inject latency ONLY into this witness's final SQLite FULL COMMIT.
+          if (this.name !== isolatedPath) {
+            return originalTransaction.apply(this, args);
+          }
+          const native = originalTransaction.apply(this, args);
+          const wrap = (...values) => native(...values);
+          for (const kind of ["immediate", "deferred", "exclusive"]) {
+            wrap[kind] = (...values) => {
+              const result = native[kind](...values);
+              if (readyUpdateObserved) {
+                advanceClock();
+              }
+              return result;
+            };
+          }
+          return wrap;
+        };
+      }
+      await assert.rejects(instance.recoverSyncHistoricalAdmission({
+        ...recoveryInput, nonce: random(32),
+      }), /WITNESS_CAS_FLOOR_DENIED/,
+      `45s synchronous READY ${phase} delay cannot ACK expired PG proof`);
+      assert.equal(readyUpdateObserved, true,
+        "injection must reach final READY statement after real external CAS");
+      if (phase === "late-sign-revocation") {
+        assert.equal(signedReadyObserved, true,
+          "device revocation must occur synchronously during the actual Ed25519 READY signature");
+      }
+      assert.equal(remote.read().sequence, independentlyPinnedRecoveryHead.sequence + 1,
+        "external CAS must have durably committed before READY delay");
+      assert.equal(instance.supportsClientHistoricalNonce, false);
+    } finally {
+      Date.now = originalNow;
+      trustedDeviceRevocations = [];
+      crypto.sign = originalSign;
+      Database.prototype.prepare = originalPrepare;
+      Database.prototype.transaction = originalTransaction;
+      instance.close();
+    }
+    const saved = new Database(isolatedPath, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(saved.prepare("SELECT ack_phase FROM"
+        + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
+      "PENDING", `slow ${phase} must keep original witness-signed quarantine`);
+    } finally { saved.close(); }
+    assert.throws(() => new Zk1WitnessCasAnchorFloor(isolatedPath, options),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      `slow READY ${phase} cannot resume after restart with matching external head`);
+  };
+  await simulateSlowReady("after-prepare");
+  await simulateSlowReady("late-sign-revocation");
+  await simulateSlowReady("after-commit");
   assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot, {
     ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
       sequence: 1, lastHash: admittedFloor.lastHash,
