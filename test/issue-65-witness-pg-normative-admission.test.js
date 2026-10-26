@@ -22,6 +22,8 @@ const { Zk1WitnessCasAnchorHttpsClient } =
   require("../src/services/zk1WitnessCasAnchorHttpsClient");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const { Zk1DurableCasStatusLedger } =
   require("../src/services/zk1DurableCasStatusLedger");
 const { createZk1PgPhysicalAttestorHttpsClient } =
@@ -40,6 +42,14 @@ const ENTRY = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
 const random = (n) => crypto.randomBytes(n);
 const sha = (b) => crypto.createHash("sha256").update(b).digest();
 const hex = (b) => sha(b).toString("hex");
+
+async function backupPrivateWitnessFixture(db, filename) {
+  await db.backup(filename);
+  // better-sqlite3's backup destination inherits the process umask (usually
+  // 0644 on Ubuntu). This is a disposable *authority* DB later reopened by
+  // the witness's required owner-only SQLite guard; resecure the copy first.
+  if (process.platform !== "win32") fs.chmodSync(filename, 0o600);
+}
 
 test("strict CAS witness floor refuses signed status advance without independent PG attestation and owner binding", async (t) => {
   const directory = createPrivateAuthorityFixture("zk65-witness-physical-");
@@ -762,7 +772,7 @@ test("strict CAS witness floor refuses signed status advance without independent
     "even though durable external CAS equals local head, ACK-lost quarantine survives restart");
   const forgedReadyPath = path.join(directory, "witness-pending-ack-forged-ready.sqlite");
   const snapshotPending = new Database(ackLostPath, { readonly: true, fileMustExist: true });
-  try { await snapshotPending.backup(forgedReadyPath); }
+  try { await backupPrivateWitnessFixture(snapshotPending, forgedReadyPath); }
   finally { snapshotPending.close(); }
   const forgedReadyDb = new Database(forgedReadyPath);
   try {
@@ -777,7 +787,7 @@ test("strict CAS witness floor refuses signed status advance without independent
     "forged READY without witness Ed25519 signature fails closed on restart");
   const legacyRecoveryPath = path.join(directory, "witness-legacy-recovery-head-schema.sqlite");
   const beforeUpgrade = new Database(historicalFilename, { readonly: true, fileMustExist: true });
-  try { await beforeUpgrade.backup(legacyRecoveryPath); }
+  try { await backupPrivateWitnessFixture(beforeUpgrade, legacyRecoveryPath); }
   finally { beforeUpgrade.close(); }
   const oldSchema = new Database(legacyRecoveryPath);
   try {
@@ -799,7 +809,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   // the external head already matching local nonce history.
   const failedClearPath = path.join(directory, "witness-recovery-second-full-failed.sqlite");
   const originalSql = new Database(historicalFilename, { readonly: true, fileMustExist: true });
-  try { await originalSql.backup(failedClearPath); }
+  try { await backupPrivateWitnessFixture(originalSql, failedClearPath); }
   finally { originalSql.close(); }
   const failedClearExternal = createExternalRecoveryHeadFixture(
     path.join(directory, "separate-operator-second-full-failed.sqlite"),
@@ -834,7 +844,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   const simulatePostCasDrift = async (label, afterExternalCas) => {
     const isolatedPath = path.join(directory, `witness-post-cas-${label}.sqlite`);
     const source = new Database(historicalFilename, { readonly: true, fileMustExist: true });
-    try { await source.backup(isolatedPath); }
+    try { await backupPrivateWitnessFixture(source, isolatedPath); }
     finally { source.close(); }
     const remote = createExternalRecoveryHeadFixture(
       path.join(directory, `operator-post-cas-${label}.sqlite`),
@@ -1073,7 +1083,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   const corruptedPath = path.join(directory, "corrupted-original-pg.sqlite");
   const sourceDb = new Database(path.join(directory, "witness-floor.sqlite"),
     { readonly: true, fileMustExist: true });
-  try { await sourceDb.backup(corruptedPath); }
+  try { await backupPrivateWitnessFixture(sourceDb, corruptedPath); }
   finally { sourceDb.close(); }
   const corruptedDb = new Database(corruptedPath);
   try {
