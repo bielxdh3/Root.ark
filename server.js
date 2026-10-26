@@ -2973,7 +2973,10 @@ function normalizeVersionHistory(entry) {
           version: Number(version.version),
           storedAs: path.basename(version.storedAs || ""),
           uploadedBy: version.uploadedBy || "sistema",
-          uploadedAt: version.uploadedAt || new Date().toISOString(),
+          // A missing historical date cannot be fabricated during a read:
+          // the signed migration pin needs a stable, independently checkable value.
+          uploadedAt: typeof version.uploadedAt === "string" && Number.isFinite(Date.parse(version.uploadedAt))
+            ? version.uploadedAt : null,
           size: Number(version.size) || 0,
           comment: version.comment || "",
         }))
@@ -11331,6 +11334,19 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
+  // Deny a suppressed archive alias before reporting missing metadata, so
+  // protected source existence cannot leak through a differing 409 response.
+  if (target?.version?.storedAs
+    && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) {
+    return res.status(403).json({ error: "Acesso negado a esta versao" });
+  }
+  // Cache rehydration can replace the local file timestamp. Only the pinned
+  // historical upload date may become the Last-Modified response header.
+  const storedUploadedAt = target?.version?.uploadedAt;
+  if (target && (typeof storedUploadedAt !== "string"
+    || !Number.isFinite(Date.parse(storedUploadedAt)))) {
+    return res.status(409).json({ error: "Metadados historicos da versao indisponiveis" });
+  }
   if (target?.version?.storedAs) {
     if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
@@ -11350,7 +11366,9 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
-  sendOptimizedFile(req, res, target.filePath, name, "attachment");
+  sendOptimizedFile(req, res, target.filePath, name, "attachment", {
+    includeLastModified: true, lastModified: new Date(storedUploadedAt).toUTCString(),
+  });
 });
 
 app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
