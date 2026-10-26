@@ -30,6 +30,9 @@ function validateRuntimeArtifacts(root = process.cwd()) {
   for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"]) {
     delete gitEnv[name];
   }
+  // A repository-level core.worktree can also point at another checkout.
+  // This invocation must inspect the root requested by this guard instead.
+  gitEnv.GIT_WORK_TREE = path.resolve(root);
   const status = execFileSync("git", ["status", "--porcelain"],
     { cwd: root, encoding: "utf8", env: gitEnv });
   for (const line of status.split(/\r?\n/).filter(Boolean)) {

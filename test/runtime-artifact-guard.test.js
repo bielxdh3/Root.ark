@@ -14,6 +14,10 @@ test("runtime artifact guard passes cleanly and fails on a disposable seeded dat
   }
   try {
     execFileSync("git", ["init", "-q"], { cwd: root, env: gitEnv });
+    // A repo-level core.worktree may be stale even after inherited Git env
+    // variables are removed. The guard must explicitly pin its own root.
+    execFileSync("git", ["config", "core.worktree", path.join(root, "stale-other-worktree")],
+      { cwd: root, env: gitEnv });
     // A caller's unrelated worktree must not steer the gate's git inspection.
     const originalWorkTree = process.env.GIT_WORK_TREE;
     process.env.GIT_WORK_TREE = path.join(root, "unrelated-worktree");
