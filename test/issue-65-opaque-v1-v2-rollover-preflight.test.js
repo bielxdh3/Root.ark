@@ -846,6 +846,9 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     assert.equal(initialChild.output.provenance, 'LIVE_OWNER_V1_V2_READBACK');
     const backup = await witnessChild(witnessSetup, 'snapshot', { snapshot });
     assert.equal(backup.ok, true);
+    // SQLite backup() can create a 0644 snapshot on Linux. Keep the disposable
+    // archive private before restoring it into the strict witness authority.
+    fs.chmodSync(snapshot, 0o600);
     const concurrentWithdraw = await Promise.all([1, 2].map(() =>
       witnessChild(witnessSetup, 'withdraw', { expectedHead: liveStage.head })));
     assert.equal(concurrentWithdraw.filter((entry) => entry.ok).length, 1,
@@ -884,6 +887,7 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     assert.equal(fs.existsSync(witnessDb + '-wal'), false,
       'closed writer must checkpoint before offline operator snapshot restore');
     fs.copyFileSync(snapshot, witnessDb);
+    fs.chmodSync(witnessDb, 0o600);
     const rolledWitness = await witnessChild(witnessSetup, 'audit', {
       minimumHead: newerHead });
     assert.equal(rolledWitness.ok, false,
