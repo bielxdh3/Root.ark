@@ -19,7 +19,7 @@ const { generateNativeFixtureCertificates } =
 
 const operatorScript = path.resolve(__dirname, "../scripts/zk1-historical-recovery-operator.js");
 const lockChildScript = path.resolve(__dirname,
-  "support/issue-65-historical-operator-lock-child.js");
+  "../scripts/fixtures/issue-65-historical-operator-lock-child.js");
 const DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v2\0");
 const sha = (raw) => crypto.createHash("sha256").update(raw).digest("hex");
 const random = (n) => crypto.randomBytes(n);

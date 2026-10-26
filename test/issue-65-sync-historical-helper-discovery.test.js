@@ -14,3 +14,12 @@ test("historical mTLS provider child stays outside automatic Node test discovery
   assert.equal(fs.existsSync(fixturePath), true,
     "the historical mTLS test still needs the real child-process fixture");
 });
+
+test("historical recovery operator lock child stays outside automatic Node test discovery", () => {
+  const oldPath = path.resolve(__dirname, "support/issue-65-historical-operator-lock-child.js");
+  const fixturePath = path.resolve(__dirname, "../scripts/fixtures/issue-65-historical-operator-lock-child.js");
+  assert.equal(fs.existsSync(oldPath), false,
+    "Node --test must not execute the SQLite lock child without its spawn arguments");
+  assert.equal(fs.existsSync(fixturePath), true,
+    "the signed recovery operator must retain the real lock-process fixture");
+});
