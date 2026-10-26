@@ -10,6 +10,7 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");
 const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
@@ -69,11 +70,13 @@ const registerAuditRoutes = require("./src/routes/audit");
 const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
+const { registerZk1ProtectedContentFromConfig } = require("./src/services/zk1ProtectedContentBootstrap");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
+const { parseIndependentCatalogConnectOrigins } = require("./src/zk1-catalog-connect-csp");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
@@ -5935,8 +5938,16 @@ const APP_CONTENT_SECURITY_POLICY = [
   "form-action 'self'",
   "frame-ancestors 'self'",
 ].join("; ");
+const independentCatalogConnectOrigins = parseIndependentCatalogConnectOrigins(
+  process.env.ROOTARK_ZK1_INDEPENDENT_CATALOG_CONNECT_ORIGINS);
+const WORKSPACE_CONTENT_SECURITY_POLICY = independentCatalogConnectOrigins.length
+  ? APP_CONTENT_SECURITY_POLICY.replace("connect-src 'self' ws: wss:",
+    "connect-src 'self' ws: wss: " + independentCatalogConnectOrigins.join(" "))
+  : APP_CONTENT_SECURITY_POLICY;
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY);
+  const isWorkspace = req.path === "/" || req.path === "/index.html";
+  res.setHeader("Content-Security-Policy",
+    isWorkspace ? WORKSPACE_CONTENT_SECURITY_POLICY : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
@@ -5952,11 +5963,20 @@ app.use((req, res, next) => {
   }
   next();
 });
+if ((NODE_ENV === "development" || NODE_ENV === "test")
+  && process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  app.get("/zk1-protected-file-lab.html", apiRequestRateLimit, (_req, res) =>
+    res.sendFile(path.join(__dirname, "dev-ui", "zk1-protected-file-lab.html"),
+      { dotfiles: "allow" }));
+}
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
+  if (shouldDeferZk1JsonParsing(req, {
+    contentConfig: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+  })) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
   return express.json()(req, res, next);
 });
@@ -6066,6 +6086,41 @@ wss.on("connection", (socket, req) => {
 });
 
 const requirePermission = createRequirePermission();
+
+// Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
+// This is an experimental single-scope integration, not a replacement for
+// legacy file, sync, cloud, backup or WebDAV routes and not complete ZK.
+if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  if (!["development", "test"].includes(NODE_ENV)) {
+    throw new Error("ROOTARK_ZK1_CONTENT_CONFIG requires development or test mode");
+  }
+  // Optional operator-owned JavaScript provisioning (trusted startup code)
+  // constructs real provider readers and OFF-SERVER pinned public trust roots.
+  // This opt-in module is executed only in development/test, never from a
+  // request body or legacy file and never with production restore privileges.
+  let multiproviderRestore = null;
+  if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+    const filename = process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE;
+    if (!path.isAbsolute(filename)) throw new Error("ZK restore provisioning requires absolute module path");
+    const stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("ZK restore provisioning must be an ordinary operator-owned file");
+    }
+    const provision = require(filename);
+    if (typeof provision !== "function") {
+      throw new Error("ZK restore provisioning must export a function");
+    }
+    multiproviderRestore = provision();
+  }
+  const zk1ContentStore = registerZk1ProtectedContentFromConfig({
+    app, authenticate, requirePermission,
+    configPath: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+    multiproviderRestore,
+  });
+  server.once("close", () => zk1ContentStore.close());
+} else if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+  throw new Error("ZK multiprovider restore requires protected content bootstrap");
+}
 
 registerSyncRoutes({
   app,
