@@ -1,0 +1,55 @@
+{
+  "schema": "rootark-web-offline-contract/v1",
+  "classification": "TEST_ONLY_POLICY_NOT_RUNTIME_ENFORCEMENT",
+  "runtimeAdmissionEnforced": false,
+  "actions": [
+    {
+      "id": "read-downloaded-copy",
+      "decision": "allow-user-copy",
+      "requiresFreshAuthority": false,
+      "scope": "user-controlled file already downloaded or exported"
+    },
+    {
+      "id": "view-already-open-plaintext",
+      "decision": "already-held-only",
+      "requiresFreshAuthority": false,
+      "scope": "plaintext already present in the user's memory or current local view"
+    },
+    {
+      "id": "new-transfer",
+      "decision": "block",
+      "requiresFreshAuthority": true,
+      "scope": "new service-mediated transfer"
+    },
+    {
+      "id": "resume-transfer",
+      "decision": "block",
+      "requiresFreshAuthority": true,
+      "scope": "resuming or publishing a protected transfer"
+    },
+    {
+      "id": "enroll-device",
+      "decision": "block",
+      "requiresFreshAuthority": true,
+      "scope": "device enrollment or authorization change"
+    },
+    {
+      "id": "recover-package",
+      "decision": "block",
+      "requiresFreshAuthority": true,
+      "scope": "emergency-package or account/content recovery"
+    },
+    {
+      "id": "browse-protected-index",
+      "decision": "block",
+      "requiresFreshAuthority": true,
+      "scope": "new service download of protected index or content"
+    },
+    {
+      "id": "legacy-queued-sync",
+      "decision": "not-authorized-for-zk",
+      "requiresFreshAuthority": true,
+      "scope": "legacy offline queue has no new Zero-Knowledge publication authority"
+    }
+  ]
+}

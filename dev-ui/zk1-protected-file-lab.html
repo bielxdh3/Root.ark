@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Arquivo protegido zk-1 · laboratório</title>
+  <link rel="stylesheet" href="/styles/zk-dev-vault.css">
+  <script defer src="/client/rootark-zk1-file-content.js"></script>
+  <script defer src="/client/rootark-zk1-ciphertext-chunk-root.js"></script>
+  <script defer src="/client/rootark-zk1-ciphertext-download-integrity.js"></script>
+  <script defer src="/client/rootark-zk1-owner-signed-checkpoint.js"></script>
+  <script defer src="/client/rootark-zk1-owner-ciphertext-root-checkpoint.js"></script>
+  <script defer src="/client/rootark-zk1-protected-http-client.js"></script>
+  <script defer src="/client/rootark-zk1-uncertain-put-reconciliation.js"></script>
+  <script defer src="/client/rootark-zk1-normal-browser-trust-floor.js"></script>
+  <script defer src="/client/rootark-zk1-normal-browser-content.js"></script>
+  <script defer src="/client/rootark-zk1-portable-file-recovery.js"></script>
+  <script defer src="/client/rootark-zk1-persisted-portable-chunk-recovery.js"></script>
+  <script defer src="/client/rootark-zk1-browser-recovery-http.js"></script>
+  <script defer src="/client/rootark-zk1-normal-browser-lab-ui.js"></script>
+  <script defer src="/client/rootark-zk1-portable-recovery-lab-ui.js"></script>
+</head>
+<body>
+  <main class="vault">
+    <header>
+      <a class="back" href="/">← Arquivos</a>
+      <span class="eyebrow">Root.ark · Desenvolvimento · zk-1</span>
+      <h1>Arquivo protegido com confirmação no navegador</h1>
+      <p>Importe a identidade do proprietário e o checkpoint atual por um canal
+      independente do servidor. A assinatura do proprietário precisa autorizar
+      o dispositivo na mesma revisão e época. O navegador cifra o arquivo,
+      envia apenas ciphertext e relê o resultado pela rota protegida.</p>
+    </header>
+    <section class="panel">
+      <h2>1. Autoridade externa e dispositivo</h2>
+      <p class="notice">Use somente arquivos de desenvolvimento descartáveis.
+      Confira o fingerprint SPKI e o checkpoint atual fora do Root.ark, por um
+      canal independente. O clique abaixo grava apenas um piso local no IndexedDB;
+      uma cópia antiga do perfil ou o apagamento do armazenamento ainda pode
+      causar rollback. Uma assinatura válida não comprova atualidade.</p>
+      <label for="owner-key">Chave pública Ed25519 do proprietário (raw, 32 bytes)</label>
+      <input id="owner-key" type="file">
+      <label for="owner-hash">SHA-256 da chave pública raw, base64url (pin independente)</label>
+      <input id="owner-hash" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="owner-spki-hash">SHA-256 do SPKI DER do proprietário, base64url (pin externo independente)</label>
+      <input id="owner-spki-hash" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="head-revision">Revisão atual confirmada externamente</label>
+      <input id="head-revision" type="number" min="1" step="1">
+      <label for="head-digest">Digest da revisão atual, base64url (pin independente)</label>
+      <input id="head-digest" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="head-epoch">Época atual confirmada externamente</label>
+      <input id="head-epoch" type="number" min="1" step="1">
+      <label for="device-grant">Autorização do dispositivo assinada pelo proprietário (.json)</label>
+      <input id="device-grant" type="file" accept=".json,application/json">
+      <label for="owner-history">Checkpoint histórico assinado pelo proprietário (.json, opcional: primeiro elo)</label>
+      <input id="owner-history" type="file" accept=".json,application/json">
+      <label for="device-public">Chave pública Ed25519 do dispositivo (raw, 32 bytes)</label>
+      <input id="device-public" type="file">
+      <label for="device-private">Chave privada Ed25519 do dispositivo (PKCS#8 local)</label>
+      <input id="device-private" type="file">
+      <button id="provision-owner" type="button">Provisionar offline a âncora e o piso monotônico</button>
+      <p class="notice">Somente a ação explícita acima cria ou avança o piso local.
+      O navegador verifica SPKI e assinatura; a origem independente desses dados
+      deve ser conferida por você. Trocar proprietário, retroceder época ou
+      reaproveitar digest de outra revisão é recusado.</p>
+    </section>
+    <section class="panel">
+      <h2>3. Pacote portátil e GET recuperável (experimental)</h2>
+      <p class="notice">Este fluxo exige um segredo aleatório de 32 bytes mantido
+      pelo proprietário fora do Root.ark. <strong>Não use senha humana</strong>
+      neste campo: o pacote de recuperação por senha Argon2id é um formato
+      diferente. O servidor só armazena ciphertext; o segredo e a CEK nunca
+      são enviados. A operação exige os mesmos pins, grant e dispositivo atuais
+      da seção 1 e <strong>não</strong> conclui recuperação automática de contas.</p>
+      <button id="portable-generate-secret" type="button">Gerar segredo e salvar fora do servidor</button>
+      <label for="portable-secret">Segredo de recuperação já salvo (binário, exatos 32 bytes)</label>
+      <input id="portable-secret" type="file" accept=".bin,application/octet-stream">
+      <button id="portable-publish" type="button">Enviar arquivo recuperável e salvar pacote cifrado</button>
+      <label for="portable-bundle">Pacote de ciphertext portátil (.json)</label>
+      <input id="portable-bundle" type="file" accept=".json,application/json">
+      <label for="portable-owner-root">Checkpoint da raiz cifrada assinado pelo proprietário (.json, obrigatório para recuperar)</label>
+      <input id="portable-owner-root" type="file" accept=".json,application/json">
+      <label for="portable-root">Raiz do ciphertext conferida fora do pacote, base64url</label>
+      <input id="portable-root" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <button id="portable-restore" type="button">Recuperar por GET protegido e baixar arquivo</button>
+      <label for="portable-offline-opt-in"><input id="portable-offline-opt-in" type="checkbox">
+      Recuperar localmente dos chunks cifrados que selecionei (opt-in; sem GET do servidor)</label>
+      <label for="portable-source-chunk-root">Raiz NATIVA dos chunks selecionados (SHA-256, base64url 32 bytes; pin externo independente e distinto da raiz portátil)</label>
+      <input id="portable-source-chunk-root" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="portable-chunk-inventory">Inventário Ed25519 dos chunks (.json, assinado pelo proprietário)</label>
+      <input id="portable-chunk-inventory" type="file" accept=".json,application/json">
+      <label for="portable-chunks">Chunks cifrados locais em ordem de índice 0, 1, ... (selecione todos, múltiplos arquivos)</label>
+      <input id="portable-chunks" type="file" multiple accept=".bin,application/octet-stream">
+      <p class="notice">No modo local, o navegador exige TODOS os pins externos da seção 1,
+      o checkpoint histórico, a raiz portátil assinada pelo proprietário e a raiz NATIVA
+      dos chunks retida fora do servidor, além do piso local já
+      provisionado. Se faltar qualquer âncora externa, a recuperação é recusada. Nenhuma
+      informação fornecida pelo servidor substitui esses pins. A ordem dos chunks
+      selecionados deve corresponder exatamente ao inventário assinado. A verificação
+      local não comprova atualidade de witness/CAS remoto nem durabilidade externa.</p>
+      <p class="notice">Guarde a raiz separada do pacote. Ela deve ser conferida
+      por um checkpoint Ed25519 assinado pelo proprietário e por um canal
+      independente antes de restaurar. A recuperação exige também o checkpoint
+      histórico da seção 1 com a assinatura do mesmo proprietário.
+      Uma cópia antiga do perfil ou chaves já expostas ao
+      dispositivo perdido não podem ser revogadas retroativamente. Somente
+      conteúdo e chaves locais são usados para descriptografia.</p>
+    </section>
+    <section class="panel">
+      <h2>2. Cifrar, enviar e conferir</h2>
+      <label for="file">Arquivo descartável (até 2 MiB)</label>
+      <input id="file" type="file">
+      <button id="upload" type="button">Enviar ciphertext e conferir GET protegido</button>
+      <p class="notice">A chave de conteúdo aleatória permanece apenas na
+      memória durante esta operação. O resultado não é um arquivo recuperável
+      após fechar a página. Uma confirmação HTTP não comprova durabilidade
+      externa. Nenhuma cópia legada é modificada.</p>
+    </section>
+    <p id="status" role="status" aria-live="polite">Aguardando arquivos e pins confiáveis.</p>
+  </main>
+</body>
+</html>

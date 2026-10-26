@@ -1,5 +1,1294 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: fail-closed witness stage provenance (opt-in DEV, 2026-10-26)
+
+Adversarial real V1/V2 mTLS signed-stage receipts demonstrated that an
+offline candidate could forge unsigned owner revision, epoch and digest,
+recompute subject digest, and create a witness-signed STAGED receipt.
+The witness now rejects all offline stage promotion, including after
+WITHDRAWN. Only nonce-fresh, pinned live owner/V1/V2 readback creates STAGED.
+Signed v2 ledger receipts bind explicit provenance (LIVE or WITHDRAWN);
+v1 trust/receipt formats are rejected on restart, not automatically upgraded.
+No restore, write, production or destructive cutover grant; independent
+external monotonic custody remains absent. **DRAFT / NO-GO**.
+
+## Issue #65 / PR #228: independent legacy stage witness CAS (opt-in DEV, 2026-10-26)
+
+`Zk1LegacyArchiveStageWitness` adds a separate operator-run SQLite witness
+ledger for the existing signed dual V1/V2 archive `witnessCandidate` after
+full live mTLS and signed owner readback verification. Its distinct Ed25519
+witness key, immutable trust scope/7-pin config, signed hash-linked
+generations, `BEGIN IMMEDIATE` CAS, and append-only `WITHDRAWN` tombstones
+make a non-destructive evidence stage reversible by a new generation. Operators
+must retain the latest signed witness head independently and present it on
+restart to detect a restored earlier local snapshot. They cannot reactivate
+either V2 authority or delete the V1 source through this ledger. The former
+offline candidate staging method is denied because signed CAS/FLOOR fields
+cannot authenticate unsigned owner subject assertions.
+
+Windows Node24 genuine V1+V2 TLS1.3 mTLS integration (including two competing
+child-process withdrawals, denied offline re-staging after restart, fresh
+live re-staging, a stale generation,
+signed-minimum rollback detection, tampered stage receipt, changed owner pin
+and same-name no-op SQLite trigger): **1 PASS / 0 FAIL**;
+three JS `node --check` and `git diff --check`: **PASS**. These tests do not
+prove independent operator custody, external cross-host monotonic storage,
+power-loss persistence, rollback of both witness DB and external retained
+head, or external provider readback. The returned flags remain
+`v2WriteAuthorized:false`, `restoreAuthorized:false`,
+`destructiveCutoverAuthorized:false`, and
+`independentMonotonicStageWitnessProven:false`.
+**DRAFT / NO-GO**. See `docs/issue-65-independent-legacy-stage-witness-dev.md`.
+
+## Issue #65 / PR #228: legacy dual-archive owner revocation during readback (DEV)
+
+An adversarial synthetic TLS1.3 mTLS test reproduced a race on the
+integrated dual-archive readback: a real independently signed owner
+revocation after the first witness query but during the second authority
+readback still yielded success. The opt-in read-only verifier now performs
+a final fresh, nonce-bound, pinned owner witness check **after all remote
+CAS/FLOOR and complete V1 archive preflight reads**. A changed owner revision
+or manifest digest fails closed. This is a liveness guard only; it cannot
+replace independent durable cross-host stage fencing, cannot authorize
+restore/cutover and cannot prevent a revision change after the final
+observation. PR #228 remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: legacy V2 two-authority signed stage readback (DEV, 2026-10-25)
+
+After the opt-in phase-1 legacy V2 dual-archive write quarantine (`a4b5ea6`),
+operators can now request signed, challenge-bound READBACK from independently
+pinned CAS and FLOOR mTLS authorities. Each checks its native immutable staged
+SQLite marker and original V2 signed history; a distinct role Ed25519 signer
+binds the owner consent hash, old #128 baseline, current legacy #129+ terminal,
+and the distinct full 1..128 archive root/checkpoint. An operator-side bounded
+verifier requires separate out-of-band owner/archive/V1/V2 public pins, actual
+pinned V1/V2 HTTPS clients, complete 128-head signed history, two fresh V1
+provider checks, both role signatures, an independently signed fresh owner
+witness and double remote stage readback. Missing/partial stage, foreign owner,
+tampered signature, changed roots or owner revision fail closed. Legacy history
+verification is capped at 1,024 successor transitions in this DEV gate.
+
+Windows Node24 targeted real synthetic TLS1.3 mTLS suites (V1 #128 and legacy
+V2 #129/#130) **2 PASS / 0 FAIL**; four changed JS source/test files
+`node --check` **PASS**, `git diff --check` **PASS**. This proves only
+bounded read-only stage evidence: historical consent may be expired but the
+128-archive handoff still needs a current authenticated owner signature.
+The endpoint cannot restore ciphertext, issue new V2 writes, delete legacy
+sources or assert a distributed migration. Independent monotonic physical
+stage witness, durable two-host reconciliation, provider readback/restore
+and signed dual-anchor successor envelopes remain **NO-GO** prerequisites.
+Details: `docs/issue-65-v2-legacy-remote-dual-archive-readback-dev.md`.
+## Issue #65 / PR #228: independent durable historical recovery ACK finalization (2026-10-25)
+
+The witness recovery issuer now requires an additional **operator-retained**
+monotonic ACK-finalization floor. `loadHead()` / `compareAndAdvance()` remain
+the consumed-recovery-nonce CAS; a second pair `loadFinalizedHead()` /
+`finalizeAck(previous, next, proof)` proves the external operator durably
+approved the exact witness-signed READY state. The issuer must check both
+external heads on every historical admission, capability read, and restart.
+Local SQLite READY plus matching external nonce CAS is insufficient: a
+slow FULL COMMIT followed by expired PG evidence, owner revocation, crashed
+postcommit process, or SQLite compensation IOERR can leave valid READY bytes.
+
+`finalizeAck` is an operator-controlled approval boundary. Its implementation
+must independently verify the Ed25519 READY signature and pinned witness
+identity, the original signed PG attestation and its operation/nonce binding,
+current owner policy, and signed PG freshness immediately before its own
+durable, monotonic CAS. **The first FULL commit is only PROVISIONAL**: a
+separate *synchronous*, operator-held `sealAck(head, proof)` CAS must validate
+the same PG attestation digest, 30-second issued_at bound, independent owner
+policy snapshot and monotonic `loadOwnerGeneration()` under the operator's
+own transaction before changing the record to SEALED. `loadFinalizedHead()`
+MUST deny PROVISIONAL, revoked generations and quarantined heads on every
+issuance, restart and capability query; witness SQLite READY is never enough.
+The operator also receives the entire immutable
+`recoveryRow` preimage (`sequence`, `nonce`, `operation_id`, `admission_hash`,
+`consumed_at_ms`, `previous_hash`, `hash`), recomputes the canonical recovery
+SHA-256 chain head under the witness READY signature and binds the original
+physical attestor nonce and operation to **this** row. Replaying the genuine
+PG attestation for nonce A when finalizing B is rejected, even when the READY
+signature for B is valid. It must reject a stale claim, conflicting head or
+duplicate, and return success only after durable commit; the issuer then
+re-reads the independently committed finalization floor. The supplied SQLite
+fixture exercises these checks with disposable separate custody; **no real
+operator finalization adapter is provided**. Existing two-method adapters are
+intentionally rejected until the operator provisions and validates the new
+contract. An ambiguous crash leaves the issuer denied pending independent
+reconciliation; there is no automatic promotion of a locally signed READY.
+The W36 follow-up requires the operator's additional synchronous,
+independently durable `quarantineFinalizedAck(head)` and exact
+`loadQuarantinedHead()` readback. The witness checks owner policy and original
+PG age again **after** awaiting the independent ACK and after final head
+readback. If either changed during delayed ACK delivery, the witness rejects
+the HTTP result, burns the nonce, restores local PENDING when possible and
+first latches a monotonic operator quarantine that prevents READY reuse across
+restart. The operator's **authoritative owner revocation** must increment its
+own generation and quarantine the sealed head in the same independently
+durable CAS transaction (see synthetic `advanceOwnerPolicy(expected, next)`).
+Owner-policy ABA (revoke, later restore identical keys) must not restore a
+prior SEALED grant. A crash after PROVISIONAL FULL but before synchronous
+SEALED CAS remains fail-closed without any compensating local write. Older
+operator adapters lacking `loadOwnerGeneration()` and `sealAck()` are refused
+at startup; there is no automatic repair of a provisional ACK.
+
+**Bounded invariant**: a SEALED recovery is authorized at the operator's
+single FULL CAS linearization point, not at HTTP response delivery. Owner
+revocation made effective through this same operator transaction invalidates
+it even if the witness has crashed. Mere mutation of a different, unversioned
+owner-policy callback is NOT an independently enforced revocation; a real
+operator must provision this mandatory same-custodian generation/write API,
+independent signer pins, live PostgreSQL readback and reconciliation. The
+disposable fixture is only a simulation. Time passing after a valid SEALED
+commit does not retroactively revoke that historical proof; stale proof
+*before* seal is rejected. No two-phase operator protocol can make HTTP ACK
+delivery atomic with both SQLite and PostgreSQL, nor prove the client received
+an ACK across a crash. These remain external acceptance gates.
+All work remains DRAFT / NO-GO production.
+
+## Issue #65 / PR #228: browser offline native source-root contract (2026-10-25)
+
+After native two-chunk source-root verification became mandatory in
+`rootark-zk1-persisted-portable-chunk-recovery`, the outer browser coordinator
+still omitted `independentlyPinnedSourceChunkRoot`. The existing standalone
+SQLite/owner-signature cryptography remained fail-closed, but all real offline
+browser restore attempts were denied, including the opt-in Edge UI. The
+development-only browser coordinator now requires and passes this distinct
+**externally supplied** 32-byte native source-root pin, without defaulting to
+the bundle's portable ciphertext root, signed inventory, fetched server data
+or hashes calculated from locally supplied chunks. The opt-in lab form has a
+separate manual input for that pinned native source root; the existing online
+protected GET mode is unchanged.
+
+Windows Node 24 TDD reproduced the integrated regression (4 FAIL/2 PASS);
+real Edge and isolated SQLite after the fix verify owner Ed25519, all native
+two-chunk hashes/root, the portable root, external pins and final liveness,
+including explicit missing-root rejection without a download. Wrong native
+pin and substituting the portable root remain fail-closed. This verifies only
+the equality to the operator-supplied pin, **not its independent provenance**;
+missing live remote witness/CAS and external storage durability remain
+out-of-scope. PR #228 stays DRAFT / NO-GO.
+
+## Issue #65 / PR #228: Windows release-gate Phase 16 authorization fixture (2026-10-25)
+
+At hosted SHA `37efce2`, Windows Node 22 mandatory release gate job
+`121238464999` failed only the Phase 16 final-corrections suite (27/28):
+its historical `device authorization is exact, signed, expiry-bound, and
+revocable` fixture still used an **external mutable JSON device registry** and
+expected an HTTP `201`. The new protected Sync v2 atomic-ingress rule correctly
+returned HTTP `503 SYNC_PROTECTED_ATOMIC_REQUIRED`. Production behavior is
+unchanged; weakening this rejection would reinstate the revocation race.
+
+The test now provisions its own protected Windows ACL/owner-only POSIX directory,
+authoritative disposable SQLite user/session/permission record, and co-located
+atomic registry with explicit Ed25519 device enrollment. It exercises real HTTP
+creation (`201`), replay rejection (`409`), an **independently signed** proof
+rejected after expiry (`403`), and an independently signed proof rejected after
+durable device revocation (`403`). No legacy JSON trust is treated as an atomic
+authority. Windows Node 22 targeted RED was `503 !== 201`, corrected targeted
+GREEN **1/1**, full Phase 16 **28/28**; Windows Node 24 targeted **1/1**.
+Hosted release-gate revalidation remains necessary; the PR stays DRAFT / NO-GO.
+
+## Issue #65 / standalone histórico estrito com autoridade externa (2026-10-25)
+
+`scripts/zk1-witness-standalone.js` permite agora injeção **somente em memória**
+de autoridade histórica através de `serve(config, { historicalAuthority })`.
+O comando legado `node scripts/zk1-witness-standalone.js --config arquivo.json`
+**nunca** habilita emissão histórica e rejeita `cas-historical-admit` no JSON
+**antes de abrir qualquer SQLite ou ler chaves**. Isso impede que um editor do
+JSON atribua a si mesmo o papel histórico ou retire a exigência externa.
+
+A *separate operator launcher*, hospedado com credenciais/permissions do
+operador fora do diretório modificável pelo writer, constrói e injeta um
+`Zk1WitnessCasPhysicalAdmission` real, instanciado com Ed25519 independentes
+de owner/inventário/PG, cliente PG read-only mTLS, cliente de inventário e
+snapshot mínimo autenticado. O objeto `historicalAuthority` **não é
+serializável em JSON**: exige exatamente `physicalAdmission`, função síncrona
+`trustedSyncDevicePolicyProvider` (estado vivo de revogações),
+`trustedMinimumHead` (sequence/lastHash/physicalFenceDigest),
+`trustedHistoricalAdmissionHead` (sequence/lastHash), pins `witnessPublicKey`
+e `statusPublicKey`, e `principals` contendo apenas certificados mTLS com o
+papel exclusivo `cas-historical-admit` e escopos explícitos. Os pins de
+identidade devem corresponder às chaves efetivamente carregadas pelo
+standalone, protegidas pelo verificador nativo de arquivos e ACL. O mínimo
+físico externo deve corresponder ao mínimo owner-autenticado legado. O
+emissor W2 reconsulta a política antes de emitir e antes do INSERT durável.
+
+Exemplo de chamada **somente do launcher externo confiável** (não adicione o
+módulo de autoridade, os pins ou paths secretos ao JSON editável):
+
+```js
+const { serve } = require("/operator/install/scripts/zk1-witness-standalone");
+const { buildHistoricalAuthority, loadPublicRuntimeConfig } =
+  require("/operator/private/owned-historical-bootstrap");
+const historicalAuthority = buildHistoricalAuthority();
+serve(loadPublicRuntimeConfig(), { historicalAuthority });
+```
+
+`buildHistoricalAuthority` e os paths `/operator/...` acima são **interfaces
+exemplificativas não fornecidas neste repositório**: a emissão física segura
+depende de provisionamento independente real pelo operador. O `serve` utiliza
+o mesmo listener TLS1.3, tratamento de sinais e mensagens de erro genéricas
+do CLI legado; nenhuma chave, pin ou caminho de segredo aparece nos logs.
+Uma configuração sem injeção, um papel histórico adicionado no JSON, pins
+incoerentes, falta de escopo, retirada do floor ou rollback do high-water
+externo são rejeitados antes de abrir os bancos no modo estrito.
+
+O laboratório opt-in `--historical-e2e-only` foi adaptado para chamar este
+`configure` de standalone com autoridade externa enquanto executa
+PostgreSQL18 real, assinatura PG em processo read-only separado, witness
+SQLite e consumidor Sync v2 sobre mTLS. Isso não constitui implantação real
+com custódia remota e não prova durabilidade externa/multi-host, atomicidade
+PG×SQLite nem piso antirrollback atualizado após cada nova emissão. O PR #228
+continua DRAFT/NO-GO produção.
+
+## Issue #65 / PR #228: protected Sync v2 atomic revocation ingress gate (2026-10-25)
+
+**Security follow-up (independent W15 P1/P2 review).** The legacy direct-store
+gate now also checks the **current record and every retained historical
+version** for any `authorization` field, including malformed values, inside
+the transaction's freshly reloaded on-disk snapshot and **before** replay,
+stale revision, create, update or delete handling. A historically signed
+ciphertext can no longer be downgraded to an unsigned tombstone through an
+otherwise permitted legacy route, even after process restart or when a peer
+commits the signed version after HTTP request parsing. The route returns
+`503 SYNC_PROTECTED_ATOMIC_REQUIRED` rather than an unhandled 500. Unsigned
+legacy-only objects remain writable. This can only protect signed history
+**still present in the legacy inventory**; a former signed version already
+erased from all durable records before this patch requires independent
+reconciliation and cannot be proven from absent evidence.
+
+POSIX atomic registry storage validation now rejects **every foreign-owned
+ancestor** (owner neither the current service UID nor trusted root), even if
+its mode is `0755`: the foreign owner could still rename/chmod the parent
+and replace the private registry tree. The real root-owned world-writable
+sticky `/tmp` exception remains permitted, and a foreign-owned sticky
+directory does not qualify. On Windows the shared chunk/registry ACL helper
+executes the **absolute canonical system PowerShell path for create, verify
+and SDDL**. A real malicious `powershell.exe` injected first in `PATH`
+previously made an unsafe NTFS directory pass verification; the focused
+adversarial test now verifies it is rejected and genuine secured roots
+still pass. No ACLs or legacy data are silently modified.
+
+The signed, encrypted Sync v2 object PUT/POST/DELETE ingress now **fails closed**
+with `503 SYNC_PROTECTED_ATOMIC_REQUIRED` when the server does not use an
+explicitly provisioned, co-located atomic device registry. This applies when
+the route requires device authorization **or** the operation carries a signed
+authorization, including on a route accidentally configured without mandatory
+authorization. A direct `SyncObjectStore.put()` using a signed operation also
+rejects that non-atomic mode. An *unsigned*, explicitly non-protected legacy
+development route with `requireDeviceAuthorization: false` retains its
+existing behavior. No legacy data or authority is silently upgraded.
+
+The concrete pre-fix P1 was reproduced through a genuine HTTP PUT of a
+correctly signed encrypted operation: the separate legacy
+`SYNC_DEVICE_REGISTRY` authorized the device; it was then durably marked
+revoked before `SyncObjectStore.put()`; the old route still replied HTTP 200
+and persisted the ciphertext. Rechecking that separate registry at a different
+point would only move the TOCTOU window, so it is **not** the fix. This ingress
+gate makes that same test return HTTP 503 with no object committed, including
+after restart. The existing explicit strict mode binds the currently enrolled
+key, Ed25519 authorization and the ciphertext write under one process-external
+lock/atomic JSON state transaction; the same lock fences device revocation.
+In particular, a revocation that **durably commits first** must deny the PUT;
+a PUT that commits first is not retroactively canceled by a later revocation
+request or by a delay in sending its HTTP acknowledgement.
+
+Enabling strict mode is an **operator-owned, separate migration gate**:
+provision a new private service-owned storage directory with verified Windows
+NTFS ACL or POSIX ownership/mode; use `SYNC_ATOMIC_DEVICE_REGISTRY=true`,
+do not set `SYNC_DEVICE_REGISTRY` or supply a separate authorization callback,
+and explicitly enroll authorized device keys using the trusted owner/admin
+workflow. The code never infers device enrollment from legacy signatures,
+never rewrites legacy object stores in place, and refuses an unmigrated store.
+If strict startup fails (including unsafe ACL or missing registry), protected
+writes return `503 SYNC_ATOMIC_REGISTRY_UNAVAILABLE`; there is no fallback to
+legacy. Unmigrated existing stores remain untouched for explicit reconciliation.
+Do **not** enable production or merge PR #228 until the authorized migration,
+rollback/recovery procedure, external authority requirements and independent
+security review are complete. PR #228 remains **DRAFT / NO-GO**.
+
+## Issue #65 / PR #228: opt-in browser restore of signed persisted ciphertext chunks (2026-10-25)
+
+The development-only `/zk1-protected-file-lab.html` now offers a separate,
+explicit **local ciphertext-chunk recovery** option. Without that checkbox,
+the existing signed protected HTTP GET path remains unchanged. With it, the
+owner imports the portable encrypted bundle, separate ciphertext-root pin,
+signed owner-root/history, signed persisted-chunk inventory and every opaque
+chunk file from their **local device**. Owner Ed25519 raw key, independent
+raw/SPKI SHA-256 fingerprints and current revision/digest/epoch come only from
+the manually provided off-server inputs, never from a Root.ark endpoint or
+the self-attesting archive. Missing trust material displays an explicit refusal
+before ciphertext reads. A separately and explicitly provisioned IndexedDB
+owner floor, active owner-signed device grant, signed history and root are
+checked before accessing chunks. The `rootark-zk1-persisted-portable-chunk-recovery`
+module authenticates all chunk hashes/lengths, reassembled ciphertext root,
+and encrypted bundle before local HKDF/AES-GCM decryption; the browser rechecks
+the floor after the last asynchronous decryption and before downloading.
+A synchronous liveness callback returning a rejection value, rather than
+throwing, is also denied at the final plaintext-release fence: an adversarial
+late-revocation test failed before this fix and passed afterward.
+
+The disposable local SQLite integration tests on Node 24/22 cover missing
+pins, fork, wrong key, revocation, rollback/mismatched head and missing chunk
+without using a legacy or production restore route. A real headless Edge
+test verifies the **actual UI** refuses missing external pins, accepts correctly
+signed local chunks, and denies a revised pinned head without a second file
+download. Its test server does not expose a protected ciphertext GET endpoint.
+The focused local matrix (including the existing portable recovery crypto
+regressions) completed **17 PASS / 0 FAIL** each on Windows Node 24 and Node 22,
+including the actual Edge scenario on each runtime. The unrelated full legacy
+suite was not rerun in this isolated worktree, where optional dependencies
+for that broader suite are not installed.
+This does not verify pin *provenance*, defend against jointly rolled-back
+off-server pins and browser IndexedDB, provide external witness/CAS freshness,
+live server revocation, external provider durability or recovery of an entire
+account. The experimental option cannot authorize production restore; PR #228
+remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: remote CAS witness-enrollment preflight (2026-10-25)
+
+The opt-in standalone CAS status service now refuses an RFC1918/private-interface
+listener unless `casAnchorWitness` is explicitly provisioned. As before,
+the service obtains and verifies a fresh signed, nonce-bound witness high-water
+head over pinned mutual TLS **before opening CAS SQLite or its terminal log**.
+Missing, null, offline or misconfigured witness configuration fails closed;
+loopback-only legacy/laboratory workflows remain unchanged. Adversarial
+separate-process tests exercise an assigned private interface with IP-SAN
+certificate, genuine HTTPS witness, missing witness (including a fresh CAS
+genesis), witness outage and successful pinned restart, without rewriting
+the existing CAS/FLOOR consensus protocols.
+
+This is a startup/configuration fail-closed gate, **not** proof that the
+witness lives on a different machine, has separately administered keys, uses
+independently monotonic media, or is externally recoverable after coordinated
+rollback. A same-host SQLite witness in a disposable test gives only a
+local runtime invariant. No hosted two-administrator independent witness,
+provider durability, cross-service atomicity or production GO is claimed.
+PR #228 remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: Windows hosted 2,000-chunk assembly latency (2026-10-25)
+
+The hosted Windows Node 22 gate on `16dfd12` reported a socket timeout on
+the **final** chunk of 2,000 while the server was still running. The final
+request is uniquely responsible for joining 2,000 on-disk `.part` files.
+Its prior implementation serialized 2,000 independent `fs.createReadStream`
+open/read/close cycles, multiplying intermittent Windows filesystem/AV latency
+into a single 30-second idle-socket boundary. This is the identified local
+amplification mechanism; the exact hosted machine bottleneck remains unproven
+without server-side stage traces from that run.
+
+The assembler now opens up to 16 part descriptors in parallel and streams their
+contents **sequentially** into an exclusively created destination. Only bounded
+stream buffers are retained; each descriptor is closed before release, and
+missing/hardlinked parts, I/O failures and a preexisting destination fail
+closed without overwriting or deleting an existing payload. Storage quota,
+required part count, the request's existing deadline, scanning, encryption,
+and durable handoff rules are unchanged. A disposable Windows Node 22/24
+fixture validates exact 2,000-byte ordering under synthetic 7ms/open latency
+and concurrent independent disk writes; the bounded stage took approximately
+1.8–2.0 seconds, with 16 peak concurrent opens. Tests also cover two full
+8 MiB parts, absent parts and intact destination preservation. Full HTTP
+2,000-chunk flows were verified locally on Node 22/24 with the unchanged
+socket timeout; this local result does not establish hosted CI completion.
+
+## Issue #65 / PR #228: real Edge positive persisted restore signer-id repair (2026-10-25)
+
+Independent review of standalone commit `07e6f43` found an unconditional
+browser UI denial: `restore-persisted` decoded the **16-byte / 22-character**
+owner `signer_key_id` with `from64`, which only accepts a 32-byte digest.
+The existing strict `signerIdFrom64` decoder is now used at that call site;
+neither the owner trust source nor the signed checkpoint contract changed.
+
+TDD RED reproduced the failed real Edge workspace contract, followed by a
+real Edge witnessed-V2 **GREEN** with the original signed owner approval,
+independent mTLS CAS/witness peers, authenticated Express/SQLite protected PUT,
+two local ciphertext chunks, distinct owner-pinned native and portable roots,
+and two fresh device-signed protected GETs bracketing local HKDF/AES-GCM
+decryption. Edge's intercepted local download bytes match the original
+plaintext and no plaintext, filename or holder secret is sent on the HTTP
+content route. An incorrect owner SPKI or native root denies before GET;
+revoking the actual disposable mTLS witness after reading the second local
+chunk forces the second GET to deny, with **zero new plaintext downloads**.
+The browser's fixed script allowlist includes both persisted modules. This
+is DEV-only; a successful signed GET does not establish external physical
+durability, production restore authorization or custody of the independent
+pins. PR #228 remains **DRAFT / NO-GO for production**.
+
+## Issue #65 / PR #228: browser persisted-chunk opt-in with real protected readback (2026-10-25)
+
+The development authenticated files workspace now has an explicit opt-in
+`restore-persisted` action backed by the browser UMD
+`rootark-zk1-persisted-browser-recovery`. The operator supplies the already
+existing **offline** owner key/SPKI fingerprint, owner signed checkpoint chain,
+current head, signed device grant, independent portable root, and an additional
+**independent owner-signed native source-chunk root**. It also requires an
+owner-root Ed25519 checkpoint for the exact object/revision/native root, the
+user-held 32-byte secret, a signed persisted-chunk inventory, and locally
+selected opaque chunk files in the owner's signed order. Neither the bundle,
+SQLite, server response, nor mutable config may be promoted into an owner pin.
+
+The bridge re-verifies the owner grant and browser monotonic floor, verifies
+native owner-root provenance before HTTP, performs a nonce-fresh device-signed
+historical GET against the existing protected route, and checks exact remote
+ciphertext against the externally pinned **portable single-envelope root**.
+It then verifies every local persisted chunk, its independent native root,
+the owner Ed25519 inventory, and portable HKDF/AES-GCM before allowing plaintext
+to leave the function. A **second independently signed GET** after slow local
+reads/decryption refuses plaintext if the real server-side witness gate revoked
+the device in that interval. Local liveness guards cover session changes,
+closed dialogs, CSRF changes, slow file reads, and the final download. Copies
+of the recovery secret, ciphertext and plaintext are zeroized on failure;
+UI-owned file buffers and returned plaintext are wiped after use.
+
+The focused integration test runs a real authenticated Express protected route,
+Ed25519 user/device keys, real SQLite persisted two-chunk rows, real HTTP GETs,
+and actual portable AES-GCM recovery. The revocation-during-local-read test
+was RED before the second GET and GREEN afterward. The browser UMD is also
+loaded in a Node-free VM. This is NOT a production restore, not remote SQLite
+chunk-proof, not current independent owner pin custody, and NOT a proof of
+off-host fsync, provider physical independence or cross-provider durable
+atomicity. The server still returns only opaque ciphertext, no trusted pins.
+PR #228 remains DRAFT and NO-GO for production; do not infer a deployment
+authorization from this opt-in development user interface.
+
+## Issue #65 / PR #228: local persisted encrypted-chunk backup/recovery binding (2026-10-25)
+
+The browser-compatible, offline `rootark-zk1-persisted-portable-chunk-recovery`
+module can create an Ed25519 owner-signed inventory of the exact encrypted
+chunks in a user-held portable recovery bundle. On recovery it requires an
+**independently retained** owner SPKI SHA-256, current `{revision,digest,epoch}`
+head, portable ciphertext root **and separate native source-chunk root**,
+authenticates the signed inventory before any chunk
+read, and fetches every bounded persisted chunk. Each chunk length and SHA-256,
+the reassembled ciphertext SHA-256/root and the exact encrypted bundle are
+checked before the existing client-side HKDF/AES-256-GCM CEK and file recovery
+can return any plaintext. It rechecks a caller-provided local liveness guard
+after each asynchronous read and before return, and wipes temporary ciphertext
+and holder-secret copies on every path. The source-chunk root is computed with
+the actual persisted boundaries (chunk count, order, lengths and digests),
+not `computeCiphertextRoot([concatenatedCiphertext])`: the latter remains the
+portable HKDF/AES-GCM bundle's original one-envelope wrapping context. The
+additional native source root MUST come from an independently retained owner
+checkpoint, never the portable bundle or SQLite archive. This is a required
+consumer input, not a change to the signed-inventory or portable bundle wire
+formats.
+
+The focused test uses an actual disposable SQLite file on disk across close,
+restart and rollback, with real Ed25519 signatures and AES-GCM encryption.
+An older correct DB snapshot, another owner's valid signature, wrong holder
+secret, missing/modified chunk and liveness loss during reading all deny.
+An adversarial real two-chunk source root test distinguishes the native root
+from the portable one and rejects omission or substitution of the native pin.
+Windows Node 24: **7 focused tests PASS / 0 FAIL**, plus five existing portable
+file cryptography regressions (**12 PASS / 0 FAIL** combined). Earlier six-test
+Node 22 evidence predates the extra native two-chunk source-root test; rerun
+the revised suite on Node 22 before claiming that runtime's updated results.
+SQLite's built-in
+`node:sqlite` API is experimental on these runtimes, and is test-only here.
+The signer and recovery consumer are available as an explicit opt-in client
+module; they are not automatically wired to a production backup scheduler,
+app restore route or disaster-recovery ceremony. A coherently rolled-back
+database **plus independently rolled-back owner pins** cannot be detected by
+this module. It does not establish witness/CAS freshness, off-host storage,
+durability, distributed epoch fencing or production restore authorization.
+PR #228 remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: development browser vault cross-tab revocation (2026-10-25)
+
+The **experimental** `/zk-dev` browser vault uses an IndexedDB v3 per-account
+`{epoch, nonce}` fence. "Forget this browser" atomically deletes stored
+content keys, trusted-device escrow and pending recovery requests, and commits
+the next fence in the same readwrite transaction. Open tabs verify the fence
+before releasing decrypted content or a trusted-device approval, and before
+restoring, storing or exporting key material. BroadcastChannel and `storage`
+events are advisory wakeups only; stale/replayed messages do not choose the
+authoritative epoch. Focus/page restore and foreground operations resample
+IndexedDB even after a sender tab closes. A real Edge multi-tab test covers
+revocation during an in-flight read and during paused trusted-device approval,
+closing the revoker tab and replaying old notifications.
+
+This is local browser-session invalidation. It cannot revoke already exported
+recovery secrets, prevent same-origin script/profile compromise, enforce a
+server-authoritative device policy or protect against coherent IndexedDB
+rollback/deletion across a full browser restart. A tab terminated **before**
+its revocation transaction commits also cannot guarantee another tab was
+invalidated. No independent witness, zk-1 epoch policy or production GO follows.
+
+## Issue #65 / PR #228: disposable real loopback WebDAV mTLS physical-copy milestone (2026-10-25)
+
+The opt-in, development-only ZK1 ciphertext WebDAV adapter now refuses any
+HTTPS destination other than the literal `127.0.0.1`, avoiding DNS rebinding,
+private-network and cloud-metadata SSRF through experimental provider setup.
+Redirect responses remain errors; no remote redirect is followed. The
+disposable real HTTPS fixture provisions WebDAV parents using `MKCOL`, then
+exercises bounded `PUT`, `GET` and independent `HEAD`, with separately
+enrolled writer and reader mTLS identities, unknown-client rejection, a
+pinned server leaf certificate, strong ETag CAS, stale-version refusal,
+corrupted PUT/GET content and malicious redirect rejection. WebDAV parents
+must be provisioned by an operator; the client does not automatically create
+arbitrary remote folders.
+
+The isolated PostgreSQL 18 extension verifies the exact physical ciphertext
+and signed local inventory operation before any WebDAV PUT, then challenges
+the reader with a separate real HTTPS GET. A successful `PUT` remains
+`CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE`, and a matched GET is only a point-in-time
+observation. Neither proves remote durable persistence, independent provider
+administration, nonrollbackable external epochs, atomic PostgreSQL-to-WebDAV
+commit, client authorization, or production readiness. Tests and the adapter
+do not enable a production endpoint. Windows Node 24 and Node 22 focused
+WebDAV regressions passed 10/10 each; a separate isolated PostgreSQL 18
+physical-copy lab passed 1/1 for each Node version, with verified disposable
+database cleanup. PR #228 remains DRAFT / NO-GO.
+
+## Issue #65: current-device revocation at strict historical Sync read (2026-10-25)
+
+Strict Sync v2 now requires an operator-injected, independently maintained
+`trustedCurrentDevicePolicyProvider` in addition to the initial pinned device
+policy. It resamples this synchronous source **after** awaited Ed25519/PG
+verification, before claiming a historical read is authorized, and checks the
+exact original device SPKI, username, and current revocation. Fresh incoming
+operations also recheck after signature verification, and new outgoing
+operations check the current device policy rather than the startup snapshot.
+The adversarial regression revokes the device while the signed PostgreSQL
+proof is being verified. This local decision does **not** itself provide
+cross-process transactionality with file application or queued HTTP retries,
+distributed revocation fencing, or a guarantee that an external policy source
+is authoritative/fresh. The independent server-side atomic registry and
+end-to-end final I/O fencing remain separate required guarantees.
+
+## CodeQL document preview DOC/DOCX local filesystem race (2026-10-24)
+
+The authenticated DOC/DOCX preview worker now parses only a bounded private
+in-memory snapshot captured through a verified regular-file descriptor.
+The original path is checked before and after the read using exact bigint
+device/inode, size and change timestamps; symlinks and hardlink aliases fail
+closed. The DOCX archive preflight examines these exact bytes; the worker
+receives the bounded bytes through a private standard-input pipe and parses
+from memory. No plaintext temporary directory or file is created. Parent
+bytes are zeroized on successful close or failure, including unreaped-child
+timeouts. Adversarial rename, oversized replacement, symlink and timeout
+cases and a real Mammoth DOCX extraction were added. This is a conditional
+local-filesystem threat; no network-only exploit has been demonstrated.
+It does not establish completion of PR #228 or release readiness.
+
+## Issue #65 / PR #228: strict atomic device-registry storage permissions (2026-10-25)
+
+The opt-in same-file device registry now **fails closed** unless the complete
+storage directory is provisioned with a private service-owned ACL (Windows) or
+strict private ownership/mode (POSIX). On Windows it reuses the native NTFS
+GetNamedSecurityInfoW-based verification used for protected chunk staging:
+the storage directory must have a protected DACL with only the service
+principal, SYSTEM and Administrators, and its ancestors must not be replaceable
+by other local principals. Store, exclusive writer lock and rename-temp files
+are inspected before critical operations. An ACL failure observed after the
+atomic JSON rename quarantines the writer lock and flags the commit as
+indeterminate rather than permitting a blind retry. On POSIX the owned directory must
+be 0700, store/lock/temp files 0600, without symlinks or hardlinks, and
+writable ancestors require a root-owned sticky directory. Existing shared
+directories or ACLs are **never altered or hardened automatically**.
+
+In particular, the existing `E:/servidor/data` inherits broad local Modify
+rights in the tested Windows environment and **cannot** host the protected
+atomic registry. An operator must separately provision a service-private
+directory under safe ancestry before enabling
+`SYNC_ATOMIC_DEVICE_REGISTRY=true` and point `SYNC_OBJECTS_FILE` there.
+No claim of external nonrollbackable monotonic anchoring, protection against
+the privileged service principal/Administrators/SYSTEM, cross-volume
+durability, or readiness for production is made. Native NTFS ACL verification
+adds measurable latency to synchronous operations and may reject concurrent
+changes closed; only atomic mode receives a longer bounded writer-lock wait.
+The existing legacy mode remains unchanged.
+
+
+## Issue #65 / PR #228: dedicated mTLS transport for W2 historical issuer (2026-10-25)
+
+The isolated witness HTTPS server has an opt-in
+`POST /v1/cas-anchor/historical-admit` transport for the existing W2
+`Zk1WitnessCasAnchorFloor.issueSyncHistoricalAdmission()` service. No new
+receipt ledger, signing key or admission policy is introduced. The distinct,
+exclusive `cas-historical-admit` mTLS role requires exact provisioned scopes;
+neither the global `cas-anchor` role nor an unrelated scope can issue receipts.
+The endpoint accepts an exact 32-byte **client-generated nonce**, the canonical
+encrypted Sync v2 envelope, scope, checkpoint and bounded inventory receipt,
+and returns only the witness's admission and nonce-bound signed physical floor.
+The issued receipt must name precisely the returned floor, including physical
+fence digest; otherwise the endpoint denies the response. These checks do not
+replace the published client's Ed25519 and fresh PG-proof verifiers.
+
+**Critical W2 integration gate:** server configuration refuses to enroll the
+historical mTLS principal unless the real W2 witness core advertises
+`supportsClientHistoricalNonce === true`. This property MUST be an immutable
+read-only class getter enabled only when W2 pins the exact provided client nonce
+and uses it in the returned signed V2 physical floor. Older W2 commits which
+generate their own floor nonce are rejected at server startup **before** they
+can irreversibly persist a receipt that the client cannot authenticate. Do
+not set the capability with a mutable caller-supplied flag or bypass it.
+
+A real TLS 1.3 client-certificate test covers positive and negative roles,
+scope mismatch, malformed nonce, unrecognized fields, tampered signed floor,
+and cryptographic verification against the published Sync v2 historical
+consumer loaded from its own commit. The transport fixture signs test-only PG
+proofs; it does NOT prove real PostgreSQL18 fsync or external durability.
+An incremental transport hardening gate now **requires** the existing W2 issuer
+to return its own independently verified signed `physicalAttestation` Buffer
+(1..2048 bytes); the endpoint inspects the deterministic CBOR PG-attestation
+nonce, requires it to equal the exact 32-byte caller challenge, and sends the
+same raw bytes as canonical base64url in `physicalAttestation`. Missing,
+non-Buffer, oversized or nonce-mismatched evidence is refused; transport tests
+feed **only the HTTP-returned physical proof** to the published consumer,
+never fabricate a PG signature on behalf of the caller after HTTP succeeds.
+
+Authenticated historical clients additionally face a fixed monotonic 60s
+window at most **12 attempted requests per principal** and **24 globally**,
+plus **one in-flight request per principal** and **two globally**. The slot is
+reserved immediately after mTLS role authentication and **before reading** the
+up-to-12MiB body, and always released after request completion/error. HTTP
+429 never invokes the issuer or reads the body. Tests hold simultaneous issuer
+calls, reject a third authorized peer with a deliberately unsent 12MiB body,
+and exhaust both principal/global request budgets. These local process budgets
+do not replace a cross-host distributed rate limit or an external witness
+monotonicity guarantee.
+This scoped patch alone does not make W2's historical issuer/PR #228 production
+ready. Cherry-pick **only the transport commit** onto W2's verified latest
+core, then run full issuer+TLS+consumer tests together. Do not combine the
+overlapping alternate W4 issuer SQLite schema.
+
+## Issue #65 / PR #228: Windows Edge V2 IPv4 fixture binding (2026-10-24)
+
+The disposable positive Edge + strict mTLS CAS/witness fixture bound both HTTPS
+authorities to `127.0.0.1` but requested them through `localhost`. When Node 22
+was forced to resolve localhost to `::1` first without network-family fallback,
+the previously passing end-to-end test reproduced `ERR_TEST_FAILURE` and
+`ZK_BROWSER_CONTENT_UNAVAILABLE` during the first authenticated ciphertext PUT.
+The isolated fixture now connects to the actual IPv4 listener using its
+existing `127.0.0.1` certificate IP SAN, without weakening TLS or fingerprint
+pinning. Windows Node 22 original/fixed RED→GREEN in forced IPv6 resolution,
+and the normal case remains GREEN (1 PASS / 0 FAIL each fixed run). This matches
+the hosted failure category and test hash but does not establish that hosted
+Windows had the same DNS configuration; a completed hosted run is required.
+No production transport or deployment was changed. PR remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: physical evidence freshness after multiprovider owner verification (2026-10-24)
+
+The strict multiprovider recovery path now retains the independently verified
+Ed25519-signed physical readback `issuedAt` from its final PostgreSQL inventory
+reconcile and checks it again after awaited owner-checkpoint authentication.
+Previously, a signed proof verified at age 29 seconds could be returned as a
+fresh composite after the owner verification stalled until age 31 seconds.
+An adversarial isolated WebDAV HTTPS + S3/Drive fixture reproduced this RED,
+then passed GREEN; Windows Node 22 and 24 focused matrix: 12 PASS / 0 FAIL
+each. This avoids an extra physical network request and does not establish
+trusted monotonic time, independent external durability, historic Sync v2
+admission, or end-to-end PG18 correctness. PR #228 remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: strict PostgreSQL bridge proof freshness (2026-10-24)
+
+The strict independent-attestor branch of `Zk1PgPhysicalInventoryBridge`
+now rechecks the signed `issuedAt` after each asynchronous verification of
+remote physical readback, and again after verifying the composite inventory
+receipt. A valid Ed25519 signature alone may not outlive its 30-second
+challenge freshness window. A signed proof crossing from age 29 seconds at
+verification to 31 seconds at return was reproduced RED and now fails closed.
+The original non-independent local verifier path is unchanged. Windows Node 24
+and Node 22 focused regressions: 24 PASS / 0 FAIL each. This patch does not
+establish independent trusted time, full distributed fencing, cloud fsync,
+or historical Sync v2 admission and does not imply merge readiness.
+
+## Issue #65 / PR #228: physical proof expiry across async verification (2026-10-24)
+
+The opt-in Sync v2 to ZK1 physical-envelope verifier now requires the physical
+readback to remain within its signed 30-second freshness window **after**
+awaiting both Ed25519 and deterministic CBOR checks. Previously, a response
+starting at age 29 seconds could finish at age 31 seconds and still be accepted.
+The physical attestation parser returns the already-verified `issuedAt` claim;
+the Sync v2 bridge rechecks it against the wall clock just before returning.
+RED before the patch; Windows Node 24 and Node 22 focused tests 23 PASS / 0 FAIL
+each after the change, including a non-finite clock rejection. This is a
+non-authorizing proof freshness repair; it does
+not establish original historical server admission time, an independently
+anchored floor, actual external provider durability, or a complete Sync v2
+PostgreSQL runtime integration. PR #228 remains DRAFT / NO-GO.
+
+## Issue #65 / PR #228: canonical JSON and idempotency object identity (2026-10-24)
+
+A JSON object carrying its own `__proto__` field previously collided with an
+object lacking that field when constructing deterministic sync JSON and
+idempotency fingerprints: the plain-object accumulator invoked JavaScript's
+prototype setter instead of preserving the field. Both the outer and nested
+variants were reproduced RED. Canonical accumulators now use null-prototype
+objects so every own JSON field is retained in the signed/hash input without
+mutating shared prototypes. Node 22/24 focused historical authorization,
+readiness, and idempotency tests: 12 PASS/0 FAIL each; Node 24 adjacent client
+and sync regressions: 33 PASS/0 FAIL. These are local serializations only:
+they do not prove historical admission, distributed authority or external
+provider durability. PR #228 remains DRAFT and NO-GO.
+
+## Issue #65 / PR #228: independently attested strict inventory chain (2026-10-24)
+
+The opt-in strict mTLS inventory chain now requires a fresh caller challenge per
+page and derives a distinct challenge for every signed entry. The server
+verifies each ledger receipt under its pinned inventory identity, asks the
+separate read-only physical attestor for a fresh PostgreSQL readback, and
+returns both. The client independently verifies each Ed25519 receipt/readback
+pair against the exact operation and pinned identities before authenticating
+the complete chain against its caller-retained signed floor and fresh snapshot.
+Missing, forged, or downgraded physical evidence fails closed. Strict pages
+are capped at four receipts. The independently reviewed P2 in `98c2f4d`
+was that sharing the 4-request append/status budget made a 9-entry chain
+impossible; a separate 16-page-per-minute budget now permits the full 64-entry
+client cap while retaining a shared two-active-read ceiling and the tighter
+append/status quotas. Contention can still return unavailable; it must never
+be mistaken for a verified result. This is nonauthorizing proof of local
+physical readback, **not** a
+cloud durability guarantee or an externally anchored floor.
+
+Windows Node 24 mTLS after the rate-budget RED/GREEN: 24 PASS / 0 FAIL,
+including 9-entry status continuation and the full 64-entry client cap.
+Ubuntu WSL Node 22 mTLS: 24 PASS / 0 FAIL. The separate independent-attestor
+transport test and its synthetic ledger fixture passed before this revision;
+the multi-page restart fixture uses a synthetic signed
+readback; it does not replace the separate PostgreSQL 18 laboratory, and the
+sync historical-admission gap below remains NO-GO. No publication or cutover.
+
+## Issue #65 / PR #228: historical signed sync reads (2026-10-24)
+
+The isolated descendant of `caf3ed2` separates fresh authorization for new
+sync writes from verification of a previously stored remote operation. Pull,
+conflict-current, cache eviction, and remote-only materialization parse the
+historical record without re-imposing its expired write deadline; the Sync v2
+client still checks its Ed25519 signature, exact operation scope, independently
+pinned device key, current revocation snapshot, selected path and key epoch.
+Server ingress and outgoing writes retain fresh expiry enforcement. Malformed
+expiry values fail closed. A persisted signed operation was pulled after expiry
+and local restart in adversarial tests; Windows Node 24 focused regressions
+passed 43/0, Ubuntu WSL Node 22 focused regressions passed 14/0, and syntax
+validation checked 646 files/0 failures. This does not independently prove
+the *time of original server admission* for an old signed operation; a separate
+admission anchor remains necessary for a compromised-server threat model.
+Normative physical inclusion, final independent review, Windows hosted Edge
+failure and CodeQL gate remain NO-GO; no publication/cutover.
+
+## Issue #65 / PR #228: exact-factor grant and local cross-process sync fencing (2026-10-24)
+
+The descendant of `59bc97c` adds SQLite migration 8, `sync_resume_factor_spend_grant`.
+An already-consumed TOTP/recovery factor may resume a staged intent **only**
+when the durable `(username, replay_digest, code_mac, device_id, pause_fence)`
+grant matches exactly. A competing device, changed pause marker, or different
+MAC cannot borrow an earlier spent factor; the selective account mutation and
+grant insertion are one `BEGIN IMMEDIATE` transaction. The live route fails
+closed for JSON-only or dual JSON-mirror account persistence, where that SQLite
+transaction is unavailable.
+
+The local sync JSON store now obtains an exclusive `wx` writer lock before
+opening or mutating the file, refreshes and validates the latest persisted
+state **under** the lock, and holds the lock through durable rename/fence. A
+stale second Node process can no longer overwrite a sibling's committed pause,
+intent, history or object state. Orphaned locks are never stolen automatically:
+recovery is deliberately blocked pending operator investigation. The lock is
+only a **single-host, cooperating-process filesystem boundary**, not a remote
+CAS, distributed quorum, independent monotonic floor, NFS safety proof or
+guarantee against a host filesystem attacker.
+
+Adversarial RED before the cross-process fix: **2 FAIL** (stale reopened
+instance and actual independent child processes lost records). GREEN after
+the fix: Windows Node 24 **39 PASS / 0 FAIL** across focused SQLite grant,
+resume, local child process, and strict witness tests; Ubuntu WSL Node 22
+**36 PASS / 0 FAIL** on local child process plus resume tests. Independently
+signed PG readback inclusion, truly remote monotonic fencing, physical PG18
+validation, complete suite on this new HEAD, mandatory independent review,
+and published CI remain separately blocked/unverified. PR #228 stays
+**OPEN/DRAFT; NO-GO; no push/merge/deploy/cutover**.
+
+## Issue #65 / PR #228: resumable 2FA CAS and physical witness startup minimum (2026-10-24)
+
+The remote draft branch was still at 6a5e71e when verified. In an
+isolated descendant of local 21d9047, e99500a introduced a durable,
+MAC-bound resume intent before consuming a second factor. Failed final
+sync persistence leaves the device paused and a same-code/same-device/
+same-pause restart-safe recovery grant; staging failure spends nothing.
+The reviewer found a concrete P1: awaiting staging before bulk saveUsers
+could overwrite a simultaneous administrative revocation. The follow-up
+removes bulk saves from this path: SQLite performs selective one-row
+compare-and-update inside BEGIN IMMEDIATE and rejects stale password,
+session version, disabled, key, or second-factor state. The JSON-only path
+is single-process only, and dual-store JSON mirroring is denied for this
+sensitive operation until an atomic protocol exists.
+
+Strict witness restart now pins and verifies the signed physical fence
+chain digest independently of the CAS last hash. Unpinned, mismatched,
+and whole-file-restored physical histories fail closed.
+
+RED-to-GREEN covered recovery failure/restart, code replay, forged resume
+intent, concurrent reactivation, admin revoke race, SQLite selective CAS,
+and strict physical witness minimum. The unchanged prior 21d9047
+Windows Node 24 complete suite reported 2476 PASS / 0 FAIL / 167 SKIP;
+those numbers are NOT evidence for these newer edits. No claim of
+PostgreSQL-to-SQLite atomicity or remote durability is made.
+Hosted CI, PostgreSQL 18 locally, Ubuntu native SQLite coverage,
+physical normative client inclusion, full affected suite and independent
+re-review still gate publication. PR stays DRAFT and NO-GO.
+
+## Issue #65 / PR #228 native authority and signed-claim fixes — 2026-10-24
+
+The last *remote* draft PR HEAD observed for
+`cdx/rootark-dual-recovery-20261019` remains
+`6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`. In the isolated worktree,
+local unpublished commits `b5792b2`, `e16f5b3`, `bf18851`, `ea9a8a2`,
+`3323737`, `62fff4f`, `e91053e`, `48f3da7`, `0722405`,
+`083f3b0`, `a3a9f13`, `e1824f4`, `a1dd767`, `228dc6d`, `eb54e5b`,
+`b2ff600` and `c607e81` are descendants, not
+published CI checkpoints.
+They preserve the previously integrated owner V2 security fixes `356bf2f`
+and `d014005`.
+
+Fresh adversarial RED→GREEN cases found and fixed independently pinned
+Ed25519 public keys spoofed by instance-owned `KeyObject.export()`, affecting
+offline witness/CAS signed claims, owner inventory trust heads, owner device
+enrollment, multi-provider domain pins, remote V2 CAS/FLOOR constructor pins,
+owner-retained CAS/FLOOR checkpoint pins, and the separate signed V2 floor
+SQLite identity across restart. The independent floor now rejects reuse of
+the same actual signing key across CAS/FLOOR/owner/witness roles and closes its
+SQLite connection if constructor validation fails. A separate signed-claims
+attack could present valid fields A during verification and fields B for the
+decision; immutable primitive snapshots now bind the offline CAS/witness
+decisions to the exact bytes verified.
+The later `48f3da7` reproduces and closes another authority-separation bypass:
+the V2 device would accept the existing CAS public key as an independently
+pinned historical signer-grant root if the caller overrode that key's
+`KeyObject.export()`. The native fingerprint now rejects this alias before
+creating the client SQLite journal; Windows Node 24 and Ubuntu Node 22 each
+validated 6 PASS / 0 FAIL, and actual V2 mTLS/owner-history regression passed
+2 / 0 on Windows.
+
+Focused validation: Windows Node 24 signed-claim and pin tests 34 PASS/0 FAIL;
+Ubuntu Node 22 corresponding tests 20 PASS/0 FAIL; real V2 mTLS, signer
+revocation, uncertain ACK, restart and authenticated historical signer
+rotation tests 2 PASS/0 FAIL; independently pinned V2 floor process/mTLS
+plus regressions 3 PASS/0 FAIL. S3/Drive/WebDAV loopback remote GET/integrity
+and failover 14 PASS/0 FAIL on each Node 22/24. Syntax, runtime artifact and
+diff checks PASS. A broad Windows Node 24 suite returned **2620 total / 2453
+PASS / 0 FAIL / 167 SKIP**, but source files were edited during its run;
+this is *not* final-HEAD CI evidence. A subsequent exact-code suite on
+`e91053e` completed **2626 total / 2459 PASS / 0 FAIL / 167 SKIP**. Since
+`48f3da7` then changed runtime behavior and added a regression test.
+An overlapping Windows Node 24 run reached **2627 total / 2460 PASS /
+0 FAIL / 167 SKIP**, but synchronization source was changed during that run;
+it is not an exact-current-HEAD validation. A fresh Windows Node 24 full
+suite after the pinned synchronization commits finished with **2628 total /
+2461 PASS / 0 FAIL / 167 SKIP**, `duration_ms=707405.1237`, in
+`.local-full-node24-20261024-final-pinned-sync.log` (local-only evidence,
+not hosted PR CI).
+
+Additional RED→GREEN security changes in `083f3b0` and `a3a9f13` close
+three concrete synchronization authorization gaps: a reusable `SyncEngine`
+with `requireAuthorization:true` previously accepted remote ciphertext
+without any incoming verifier; the Sync v2 CLI trusted self-signed remote
+device public keys without an independently provisioned device-to-key pin;
+and the shared proof verifier silently allowed callers to omit that pin.
+The CLI now requires a pinned Ed25519-SPKI device map and explicit revoked
+device snapshot; the server passes the already-registered key into the shared
+verifier. Windows Node 24 sync/HTTP/WebDAV tests **41 PASS / 0 FAIL**;
+Ubuntu Node 22 corresponding tests **32 PASS / 0 FAIL / 8 SKIP**.
+Those snapshots are *not* owner-signed monotonic revocation records and can
+be rolled back by an attacker controlling local configuration.
+
+`a1dd767` adds crash/failure recovery on the real persisted sync JSON store.
+Adversarial RED cases confirmed that a rejected transaction permanently
+poisoned the in-process queue and that merely clearing the rejection could
+silently overwrite an operation already renamed onto disk when directory
+`fsync` failed. The repaired queue recovers only pre-rename failures;
+post-rename durability ambiguity now fences all reads and writes, including
+HTTP sync endpoints (`503 sync_commit_indeterminate`), until a fresh store
+instance reads and validates the disk state. A second RED case caught the
+previously uncaught HTTP rejection; GREEN requires the explicit 503.
+This proves only bounded local failure handling and a fresh readback, not
+external fsync, process-independent CAS, or revocation atomicity. Windows
+Node 24 targeted 69 tests: **68 PASS / 0 FAIL / 1 SKIP**; Ubuntu Node 22
+targeted 41: **39 PASS / 0 FAIL / 2 SKIP**; the final three focused
+Ubuntu Node 22 failure/recovery tests **3 PASS / 0 FAIL**. The full
+Windows Node 24 run on `a1dd767` finished **2631 total / 2464 PASS /
+0 FAIL / 167 SKIP**, `duration_ms=723095.6808`, in
+`.local-full-node24-20261024-post-ambiguous-fsync-fence.log`. This run
+precedes the following recovery guard and is not final-HEAD evidence.
+
+`228dc6d` closes a separate availability/credential-consumption gap:
+when the sync store is already quarantined or becomes indeterminate
+during asynchronous bcrypt/recovery verification, the device-resume
+HTTP route now returns **503 SYNC_COMMIT_INDETERMINATE** before persisting
+TOTP replay state or spending a single-use recovery code. Adversarial
+RED tests saw **400** (already quarantined) and **401** (became quarantined
+after bcrypt) instead of the required **503**. GREEN on the actual
+server route and real JSON store, including opening a separate store
+instance and using the previously untouched recovery code once:
+Windows Node 24 **30 PASS / 0 FAIL / 0 SKIP**; Ubuntu Node 22
+**30 PASS / 0 FAIL / 0 SKIP**. This does **not** make writes to
+the separate user account file atomic with sync-store transactions,
+nor establish a process-independent monotonic revocation authority.
+
+`eb54e5b` resolves a separate sync tenant/index isolation bug: JavaScript
+inherited properties such as `constructor` and `toString` were previously
+treated as committed operations or existing objects, while an authenticated
+`__proto__` username could mutate the process-wide prototype and fail to
+persist a private tenant. Legacy accounts with missing index maps could also
+read inherited ciphertext or history when a different component had already
+polluted `Object.prototype`. Child-process adversarial tests reproduced
+all three failure classes in RED, including a GET of counterfeit history
+*before* the first write. GREEN uses own-property reads, defined own keys and
+safe index initialization, including V1 migration and restart. Integrated
+Windows Node 24: **71 total / 70 PASS / 0 FAIL / 1 SKIP**; Ubuntu/WSL
+Node 22: **71 total / 69 PASS / 0 FAIL / 2 SKIP**. Syntax:
+**638 checked / 0 FAIL**; artifact validation and diff-check PASS.
+Independent read-only P1/P2 review identified the inherited GET gap,
+which was reproduced and closed in this same commit, and found no further
+concrete P1/P2 in this bounded patch. Neither this review nor focused
+validation constitutes acceptance of the entire issue.
+
+`c607e81` tightens the authenticated loopback sync WebDAV bridge:
+plain-text error/denial responses now send `Content-Type: text/plain` and
+`X-Content-Type-Options: nosniff` (CodeQL alert #2), while `PROPFIND`
+remains XML. GET/HEAD now use a verified regular single-link file descriptor
+instead of opening the pathname again when streaming, send bounded MIME
+headers, refuse leaf swaps between `lstat` and `open`, and close the stream
+when a client aborts. RED tests reproduced the missing MIME headers, path
+reopen, and descriptor leak on abrupt disconnect; GREEN on Windows Node 24
+and Ubuntu/WSL Node 22 **4 PASS / 0 FAIL / 0 SKIP each**. The broader
+Windows WebDAV crash/recovery/remediation matrix initially FAILED when run
+concurrently with WSL (server readiness timeout, not silently reclassified);
+an isolated Windows `--test-concurrency=1` rerun passed **84 / 0 / 0**.
+An independent reviewer confirmed the abort-FD fix, but found a remaining
+conditional parent-directory symlink swap/restore race: `O_NOFOLLOW` on the
+leaf cannot replace native secure open-relative-to-pinned-directories.
+This is an explicit **P2 / NO-GO** under an adversarial local-filesystem
+trust boundary; the WebDAV patch as a whole is not approved for publication.
+CodeQL open-alert spot triage without suppressions: #268
+(`js/insufficient-password-hash`) refers to an ephemeral
+`HMAC-SHA256(random-process-secret, username + NUL + password)` used only
+as a cache lookup key in `webdavCredentialCache.js`, with actual password
+verification performed separately by bcrypt; this is not a password hash
+substituting for the password verifier. #160
+(`js/user-controlled-bypass`) flags the optional `authorization` field
+in a client-side operation builder; the shipped `server.js` sync route
+explicitly starts with `requireDeviceAuthorization: true` and fails
+closed absent a verified registered device. These findings do not prove
+a bypass on those checked runtime paths; unrelated call sites and remaining
+CodeQL sinks require separate triage. Neither alert was blanket-suppressed.
+
+Hosted checks still refer **only** to the published `6a5e71e`: Ubuntu Node 22
+full, disposable PostgreSQL 18, Windows mandatory release gates, JavaScript
+analysis and dependency review PASS; Windows canonical Edge V2, its dependent
+syntax gate and CodeQL policy FAIL. The Edge failure could not be reproduced
+in five local real-Edge repetitions; no timeout or failure masking was done.
+CodeQL findings require exact-sink triage, not blanket suppressions. The
+independent reviewer service blocked an earlier broad review attempt.
+The later bounded independent read-only review of `083f3b0` + `a3a9f13`
+found no newly introduced P1/P2, but identified a **pre-existing P2**:
+`src/routes/sync.js` checks device revocation before `store.put()` without
+a shared registry/store fence, permitting a concurrent revocation race.
+The formal security-diff-scan reference was unavailable, and no independent
+final approval covers the whole issue #65 integration. Therefore **NO PUSH**
+until the mandatory full review gate and remaining security conditions are
+met; PR remains DRAFT and the release/cutover decision remains NO-GO.
+
+Physical PostgreSQL Ed25519/mTLS and inventory composite readback remain
+non-authorizing opt-in evidence. They do **not** yet prove an independently
+anchored normative CAS/FLOOR/witness admission, shared PG/SQLite/provider
+atomicity, external multi-provider durability, or full legacy history/trash/
+derived/retention inventory and safe cutover. Missing joins remain UNKNOWN.
+PR #228 stays OPEN/DRAFT, issue #65 OPEN, overall **NO-GO**; no merge, deploy,
+production activation, cutover or legacy deletion.
+
+## Issue #65 / PR #228 security development checkpoint — 2026-10-24
+
+The last remotely confirmed draft-PR HEAD before this checkpoint is
+`6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`; the new *local* isolated
+worktree commit `b5792b246d1adbe5eb87420c176acd6e54ae7ffe` has **not**
+yet been counted as a published or CI-accepted milestone.
+
+Two adversarial RED→GREEN regressions prevent a compromised owner from using
+an overridable `KeyObject.export()` to fabricate independently pinned Ed25519
+generation evidence in the read-only legacy S3/Drive inventory or to pass one
+signing identity off as two separate witness/CAS authorities during owner-side
+V2 device revocation and epoch rotation. Revocation also pins the actual native
+owner/CAS/witness SPKI identities rather than caller-provided export bytes.
+Focused Node 24/Windows and Node 22/Ubuntu tests for both modules each yielded
+**11 PASS / 0 FAIL**; artifact and diff checks passed; syntax checked **629 / 0**.
+
+The hosted checks for the *published* `6a5e71e` HEAD show Ubuntu Node 22 full,
+disposable PostgreSQL 18, JavaScript analysis and Windows mandatory release
+gates **PASS**. The hosted Windows canonical suite has **one FAIL** in the real
+Edge V2 witnessed-recovery test, while Windows syntax dependent gate and CodeQL
+policy also **FAIL** (CodeQL reports 57 high + 35 medium untriaged alerts).
+The failing Edge test name and file were identified from the canonical runner's
+privacy-preserving hashes; the same real-Edge test passed **5/5** consecutive
+local stress runs, which does **not** erase the hosted Windows failure.
+An earlier complete local Node 24 run at the preceding code checkpoint yielded
+**2445 PASS / 0 FAIL / 167 SKIP**, which must not be transferred to this diff.
+Independent final review for the new local patch could not finish because the
+reviewer service blocked the request; do not claim that gate passed.
+
+This narrows cryptographic forgery, **not** physical external custody, a
+monotonic independently retained CAS/FLOOR, PostgreSQL-to-remote atomicity,
+complete legacy reference inventory, or safe migration cutover. PR #228 remains
+**OPEN/DRAFT**, issue #65 **OPEN**, overall status **NO-GO**; no merge, deploy,
+production activation or legacy deletion is authorized.
+
+> **Most recent issue #65 development checkpoint — 2026-10-23:**
+> [PR #228 source, validation and remaining blocker evidence](validation/2026-10-23-issue-65-pr228-development-checkpoint.md).
+> The `da02715` checkpoint below is historical and not the current HEAD.
+> PR #228 remains OPEN/DRAFT, issue #65 OPEN; no merge/deploy/cutover.
+
+## Live issue #65 development evidence — 2026-10-23 (`da02715`)
+
+At the observed checkpoint, PR #228 (`cdx/rootark-dual-recovery-20261019`)
+is **OPEN/DRAFT** and issue #65 is **OPEN**. Local integration HEAD and
+remote branch HEAD both equal `da02715a8a6787836a05aeb06e6d1b0bdc61d61a`;
+the worktree was clean. This checkpoint supersedes the *live-status claims*
+in the older dated addenda below, not their historical test evidence.
+
+Newly integrated development work includes `7feb752` (restore missing local
+catalog snapshots from remotely signed CAS snapshots after an uncertain ACK),
+`db7baa6` (private POSIX SQLite file creation), `80baa3a` (authenticated
+browser writable opaque catalog), `7a93a9b` (an independently signed,
+monotonically advancing mTLS/SQLite floor with owner V2 signer rotation),
+and `da02715` (browser relay of independently signed witness/CAS heads).
+These are *opt-in protected* paths and must not be conflated with ordinary
+plaintext sync-v2, a physically independent deployed authority or provider
+durability. The catalog still has a fail-closed 128-head limit; authenticated
+logical delete/trash, complete account inventory and automatic safe legacy
+cutover need their own end-to-end evidence before declaring 100% development.
+
+Exact-HEAD hosted checks: Ubuntu Node22 full suite **2358 total / 2221 PASS /
+0 FAIL / 137 SKIP**; real disposable PostgreSQL18 **PASS**; JS/TS analysis
+**PASS**; dependency review **PASS**. Windows Node22's release gate was
+**CANCELLED** after earlier steps had passed, not a proved assertion failure.
+The separate CodeQL policy check remains **FAIL**; do not label it green or
+silently dismiss its findings. The next validated HEAD must be checked again
+after publication: CI results do not transfer between SHAs.
+
+Local Windows Node24 on the same `da02715` checkpoint: focused browser,
+owner revocation, authenticated catalog, multi-version Edge archive, session
+fencing and rename selection **67 PASS / 0 FAIL / 0 SKIP**; real mTLS CAS,
+owner signer rotation and re-endorsement selection **6 PASS / 0 FAIL**;
+independent floor/CAS/Edge selection **17 PASS / 0 FAIL** (overlapping
+selections, **not** additive coverage). `validate-syntax.js`: **513 checked /
+0 failed**; `validate-runtime-artifacts.js` and `git diff --check`: **PASS**.
+These local focused runs do not substitute for the hosted full suite.
+
+The trust boundary still requires independent custody of out-of-band SPKI
+pins, witness/floor keys and monotonic state. Distinguish Ed25519 receipts,
+PostgreSQL local readback, SQLite WAL/FULL commits, HTTP ACK and actual remote
+storage durability. No merge, deploy, production activation, plaintext-to-
+server fallback or destructive migration cutover is authorized.
+
+## Current development addendum — 2026-10-23, issue #65 / PR #228
+
+**Additional integration after the published `0e571eb` milestone (local DEV
+checkpoint `df7c8f2`, pending next coherent push):** `9239e52` adds real Edge
+12-version archive creation and recovery assertions; `a8116a7` reconciles its
+test fixture with separately integrated legacy signed transition; `aa8091e`
+implements owner-local V2 revocation/epoch rotation requiring distinct
+independently pinned witness and CAS commitment with fresh HPKE wraps only for
+survivors; `e71ef3b` fixes a reproduced independently identified P2 browser
+roster substitution (RED before fix, GREEN after, strict pin and exact signed
+roster equality); `df7c8f2` adds the normal authenticated **read-only** ZK1
+opaque catalog UI, owner-pinned page/delta visibility and signed version GET.
+The combined checks on this local sequence yielded Node24 **70 PASS / 0 FAIL**,
+Node22 pure crypto **19 PASS / 0 FAIL**, syntax **492 / 0**, and a separate
+real Edge catalog+archive **11 PASS / 0 FAIL**. This is not a full-suite or
+exact-head CI verdict. The previous published `0e571eb` passed Ubuntu Node22,
+PostgreSQL18, JS/TS and dependency review, but the Windows Node22 job was
+**cancelled during the release gate**; the CodeQL policy still listed 62 alerts.
+Do not count a canceled job as a code failure, or static alerts as resolved.
+The browser catalog still requires independently pinned CAS/owner authority
+and user-imported head and remains read-only; owner revocation transfer is not
+automatic proof of current full V2 grant/history or remote key custody.
+
+**Independent catalog CAS development extension:** local commit `90932d7`
+adds an explicit opt-in standalone mTLS HTTPS CAS service/client with a
+separately pinned Ed25519 signing identity, trusted device-signed catalog
+headers and encrypted pages, atomic local SQLite WAL/FULL persistence and
+monotonic floor, writer competition, replay checks, bounded transport and
+lost-ACK reconciliation. Its integrated Node24 catalog/Edge selection passed
+**12 PASS / 0 FAIL**; focused Node22 owner/catalog crypto **9 PASS / 0 FAIL**;
+syntax **499 / 0**. The separate standalone CAS service tests used actual
+disposable OS child processes and mTLS, not cloud infrastructure. This is a
+local physical SQLite durability boundary, **not proof of cloud fsync**, a
+physically independent host or guaranteed operator control of the external
+floor. External CAS and historical catalog recovery still require explicit
+trust-pin provisioning and operator-owned records, not a server-supplied pin.
+
+This is an additive development snapshot, not a revision of the dated phase
+history below. The PR branch `cdx/rootark-dual-recovery-20261019` remains
+`OPEN/DRAFT` with issue #65 open; no merge, deployment or production activation
+is authorized. The last *verified published* code baseline before this addendum
+was `0c9034c` (full Ubuntu Node22 2183 PASS / 0 FAIL / 136 SKIP; full Windows
+Node24 local 2153 PASS / 0 FAIL / 166 SKIP, on the same code; local Windows
+Node22 release gate canceled, not failed). That snapshot's CodeQL policy check
+was red with 62 static findings, no new runtime P1/P2 confirmed by its focused
+audit. None of those prior CI outcomes is a new-head verdict.
+
+The active isolated issue #65 integration now includes local commits
+`b6635a9` (metadata leakage register), `7d55c4c` (witnessed owner enrollment
+CLI), `dd7cf11` (opt-in owner/device-signed opaque catalog with externally
+pinned CAS head), `a4f63f2` (owner-signed per-version legacy transition state)
+and `de94f1f` (normal-browser opt-in versioned archive, original per-version
+ciphertext and CEK). Together they passed targeted local Node24 **78 PASS /
+0 FAIL**, Node22 crypto **14 PASS / 0 FAIL**, and syntax **485 / 0**. The
+catalog's two-device authenticated HTTP read is tested; this does not prove a
+production authority, a complete protected bidirectional sync client or every
+destructive mutation. Signed migration receipts permit verified state for
+individually selected versions only, *never* deletion/cutover of legacy sources
+whose references or retention are unknown. Default owner upload uses a
+single-use CEK and is not inherently recoverable without user-held archive
+material.
+
+Still open in development: real end-to-end normal-browser catalog discovery and
+delta sync, authenticated rename/move/delete/trash/conflict operations,
+owner-signed witnessed revocation and epoch rotation ceremony, full account
+inventory completeness and recovery UX, and cutover graph completeness for
+legacy backup/trash/links/derived/retention. Absence of external provider
+durability or physically independent witness evidence must remain explicitly
+distinguished from local cryptographic and PostgreSQL proof. Do not mark issue
+#65 100% done until each acceptance criterion has executable evidence. See
+`docs/issue-65-zk1-runtime-leakage-register.md` for the current threat boundary.
+
+Sync v2 historical admission development note (2026-10-24): a device's expired
+Ed25519 authorization proves historical signing, not when a server admitted the
+operation. The current CLI intentionally rejects never-observed expired
+envelopes; only exact pre-expiry signed envelopes recorded in the local durable
+journal can be replayed after expiry, subject to ongoing revocation. Legacy
+`seen` IDs, HTTP success/opaque ACKs, unsigned server timestamps, and mismatched
+push echoes do not constitute admission evidence. Conflicting envelopes using
+the same `operationId` are rejected before remote-only snapshot or filesystem
+mutation, including conflicts within a single pulled batch. Incoming envelopes
+are detached from mutable transport references before asynchronous application.
+Verified remote winners of 409 conflicts are also pinned by their own exact
+envelope IDs only after snapshot persistence, not by the unsigned conflict ACK.
+The journal is
+local JSON. For materialization, local operation authorization, file-key resolution,
+AEAD decryption and path validation precede the fsynced pre-expiry observation;
+excluded/remote-only entries preserve signed-envelope-only observation without
+requiring client-side file keys. Observations are fsynced before file/snapshot
+mutation and only later promoted to applied admissions; a failed final journal write
+retains the pre-observation across restart without falsely setting `seen`.
+Outstanding pre-observations have a fail-closed limit of 10,000 without an
+independent lifecycle/GC witness: prolonged failed applications can exhaust
+this budget and block new entries. This remains a development availability
+limitation, not an assurance of infinite historical retention.
+The journal can be forged or rolled back by a filesystem writer; it is NOT
+an independent monotonic witness, proof of external admission, or physical
+PostgreSQL attestation. Independent Sync v2 admission receipts bound to the
+ZK1 physical inventory/CAS/FLOOR authority remain an acceptance blocker.
+
+Sync v2 to ZK1 physical-binding prototype (2026-10-24, isolated development):
+`sync-client/rootark-sync-zk1-physical-binding.js` deterministically binds
+the FULL canonical signed and encrypted Sync v2 envelope bytes (not a
+server-provided flag) to a scoped ZK1 inventory operation, including
+domain-separated 128-bit operation/object IDs, epoch/revision and SHA-256 of
+the exact bytes to be physically stored as opaque ciphertext. Its opt-in
+`physicalWriteRequest` prepares the existing bridge's exact gate request with
+bounded 1 MiB ciphertext chunks and an authenticated chunk root, but requires
+fresh, currently non-revoked client Ed25519 authorization before returning
+any candidate write. It verifies
+real Ed25519 client authorization and the existing independently pinned
+inventory + physical PostgreSQL readback signatures, rejecting a different
+valid signed envelope with the same operation ID. This is **pure
+cryptographic interface validation**, tested with signed PG-proof-shaped
+fixtures, **not a completed PostgreSQL write/attestation integration**. The
+normal sync server and clients do not yet produce or consume this composite;
+the PG ciphertext writer must be proven to store exactly those canonical
+envelope bytes before it can be used normatively. The result explicitly does
+NOT prove when the server originally admitted an expired operation, an
+independently anchored monotonic floor, remote durability, or IO authority.
+Only explicit `epoch-N` key epochs are interoperable with this prototype;
+other epoch names fail closed rather than inventing a numeric mapping.
+
+Isolated Sync v2 witness-admission verifier milestone (2026-10-25):
+`verifySyncV2HistoricalWitnessAdmission` checks an independently pinned
+Ed25519 witness signature over the full encrypted, signed envelope hash,
+device identity and SPKI hash, operation ID, epoch, inventory checkpoint and
+stable signed-inventory receipt digest. The signed witness `admittedAtMs` must
+precede the device's signed expiry, and the verifier independently challenges
+fresh PostgreSQL readback and a separate physically fenced witness head using
+the caller-owned nonce. The fresh physical witness floor must match an exact
+out-of-band pinned minimum, including its physical-fence digest; this
+conservatively refuses later head advances until signed ancestry is supported.
+The opt-in `independent-physical-witness-v1` CLI engine mode disregards mutable
+local journal historical-admission evidence, MUST be enforced independently via
+`requireIndependentHistoricalAdmission` or the external
+`ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY=1` environment setting, requires separately injected
+trusted keys/floor and an independent evidence provider, and refuses to start
+without all. A JSON-only `historicalAdmissionMode` setting is rejected even if
+evidence/pins are supplied: deleting it before restart would silently fall
+back to forgeable legacy `locallyAdmitted` journal evidence. Removing the JSON
+setting does NOT disable the externally required mode. Previously seen remote
+entries are rechecked in strict mode,
+because mutable `seen` journal IDs cannot suppress independent authorization
+on a restarted LIST. Default CLI behavior remains unchanged. Fixture-level negative
+tests cover forged signatures, replay, floor rollback, wrong device/checkpoint,
+expired device signing and valid witness/PG signatures with wrong contents.
+**Not a deployed issuance path or PostgreSQL integration:** no independently
+durable admission-receipt issuer, real mTLS evidence adapter, witnessed
+historical enrollment timestamp, externally retained post-restart floor, or
+full signed ancestry for later witness heads exists. No production historical
+admission guarantee or issue #65 GO can be claimed from this standalone
+verifier. Do not bootstrap witness trust from the mutable local sync config.
+
+Follow-up security validation (2026-10-25): the witness's signed admission
+timestamp must be STRICTLY earlier than the device signature expiration (equal
+milliseconds fail), and strict fresh verification checks expiration again after
+asynchronous signature verification. Signer separation compares native Ed25519
+KeyObject identities, bypassing attacker-defined `.export()` methods. Strict
+mode now also requires a separately provisioned `localTrustedDevicePolicy`
+containing username, device SPKI pins and current revocations; both historical
+and fresh verification use that detached policy, and local outgoing revocations
+cannot be lifted by editing the on-disk config. Without independent policy
+custody the strict mode refuses to start; this is not a substitute for a
+fresh network revocation source or durable independent floor retention.
+
+Isolated Sync v2 strict witness historical-ISSUER development milestone
+(2026-10-25): the opt-in `enableSyncHistoricalIssuer` mode of
+`Zk1WitnessCasAnchorFloor` issues an independently witness-Ed25519-signed
+historical receipt over the full canonical encrypted and device-signed Sync v2
+envelope SHA-256, device ID and SPKI fingerprint, ZK1 operation ID, epoch,
+inventory predecessor checkpoint, exact committed inventory receipt digest,
+pre-device-expiry admission timestamp, and witness CAS/physical-fence head.
+Issuance requires fresh device Ed25519 authorization and revocation check,
+fresh independently pinned inventory and PostgreSQL-attestor signature proof
+over the exact 32-byte **caller-provided challenge nonce** (the same challenge
+is also signed into the witness physical floor), and an existing owner-authorized physically fenced CAS
+terminal record whose operation ID, inventory sequence and root agree exactly.
+It uses a separate witness-owned immutable SQLite receipt table with
+`synchronous=FULL`, an Ed25519-signed and SHA-256 chained operation history,
+unique operation IDs, and a mandatory **externally retained exact** historical
+receipt high-water on restart (in addition to the external physical floor).
+Duplicate issuance and missing/tampered historical rows fail closed.
+The issuer has no default HTTP/Sync CLI wiring, grants no historical-read or
+I/O permission by itself, and the receipt still needs a fresh independent
+witness/physical check by a separately pinned client before historical use.
+The issuer requires a witness-constructor-injected, operator-controlled
+**synchronous** `trustedSyncDevicePolicyProvider` rather than a remote
+operation's mutable device-policy object. Policy is re-read at commit, and
+both the current signed device expiration and physical proof freshness are
+rechecked inside the SQLite immediate transaction **directly before INSERT**;
+post-Ed25519-signature expiration and late device revocation fail closed.
+The time is sampled only **after** the synchronous trusted policy-provider
+refresh and SQL statement preparation, and sampled again after INSERT while
+the SQLite transaction can still roll back. An independently pinned non-genesis
+historical high-water forbids fresh SQLite bootstrap. The published strict
+`verifySyncV2HistoricalWitnessAdmission` verifier is used with the emitted
+admission, fresh signed floor and ephemeral PG attestation using that same
+nonce; wrong challenge, altered floor and substituted PG proof are rejected.
+Only an active, opt-in strict witness issuer advertises the read-only
+`supportsClientHistoricalNonce` capability used by the separate mTLS transport;
+legacy floors and closed issuers advertise false.
+Focused tests exercise signed and revoked device envelopes, forged inventory
+proofs, operation/floor mismatch, replay, SQLite rewind/restart and a real
+mTLS peer in a separate OS child **whose PostgreSQL readback is simulated**.
+This is a local durable signing milestone, **not** a demonstrated production
+PG18 end-to-end deployment, atomic PG-to-witness commit, owner-custodied
+monotonic receipt floor, cross-provider external durability, or issue #65 GO.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 

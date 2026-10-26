@@ -11,6 +11,7 @@ const test = require("node:test");
 
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
+const { applySyncResumeAccountProof } = require("../src/services/syncResumeAccountProof");
 const { DEFAULT_MAX_DESTRUCTIVE, DEFAULT_WINDOW_MS, createSyncBurstGuard } = require("../src/services/syncBurstGuard");
 
 // ---- unit tests of the metadata-only guard ----
@@ -135,13 +136,32 @@ async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryp
   const accountState = { users: accountUsers || [{ username: "alice", password: ALICE_HASH }] };
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
-  const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user" }; next(); };
+  // Route tests exercise legitimately authorized deletes, then assert burst fencing.
+  const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user", permissions: { delete: true } }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
   const loadUsers = () => JSON.parse(JSON.stringify(accountState.users));
   const saveUsers = (users) => { accountState.users = JSON.parse(JSON.stringify(users)); };
+  const commitSyncResumeProof = (claim) => {
+    const current = loadUsers();
+    const user = current.find((entry) => entry?.username === claim.username);
+    const outcome = applySyncResumeAccountProof(user, claim);
+    if (outcome === "already") {
+      const ticket = user?.syncResumeGrants?.[claim.expectedReplayDigest];
+      return ticket?.codeMac === claim.codeMac && ticket?.deviceId === claim.deviceId
+        && ticket?.pauseFence === claim.pauseFence ? "already" : "conflict";
+    }
+    if (outcome === "committed") {
+      user.syncResumeGrants ||= {};
+      user.syncResumeGrants[claim.expectedReplayDigest] = {
+        codeMac: claim.codeMac, deviceId: claim.deviceId, pauseFence: claim.pauseFence,
+      };
+      saveUsers(current);
+    }
+    return outcome;
+  };
   const getTotpKey = () => totpKey;
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers, getTotpKey });
+  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers, commitSyncResumeProof, getTotpKey });
   route.accountState = accountState;
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
   t.after(async () => { await new Promise((resolve) => server.close(resolve)); });
@@ -508,6 +528,215 @@ test("issue 67 resume 2FA: a recovery code works once", async (t) => {
   assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
   await pauseDeviceA(port, key, 3, 4);
   assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 401);
+});
+
+test("issue 65 resume: indeterminate sync persistence rejects re-auth before spending a recovery code", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-indeterminate-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const storagePath = path.join(dir, "objects.json");
+  const { port, route } = await startServer(t, {
+    storagePath, accountUsers: account.users,
+  });
+  const recovery = account.recoveryCodes[0];
+  route.store.commitIndeterminate = true;
+
+  const missingPassword = await resumeRequest(port, {});
+  assert.equal(missingPassword.status, 503);
+  assert.equal(missingPassword.body.code, "SYNC_COMMIT_INDETERMINATE");
+  const rejected = await resumeRequest(port, { password: PASSWORD, code: recovery });
+  assert.equal(rejected.status, 503);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2);
+
+  // A newly opened store reads the persisted JSON rather than bypassing the quarantine flag.
+  const reopened = await startServer(t, { storagePath, accountUsers: route.accountState.users });
+  assert.equal((await resumeRequest(reopened.port, { password: PASSWORD, code: recovery })).status, 200);
+  assert.equal(reopened.route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
+test("issue 65 resume: an already locked sync store cannot consume a recovery code", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-locked-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, {
+    storagePath: path.join(dir, "objects.json"), accountUsers: account.users,
+  });
+  const recovery = account.recoveryCodes[0];
+  const originalTransact = route.store.transact.bind(route.store);
+  route.store.transact = async () => {
+    throw Object.assign(new Error("storage busy"), { code: "EACCES" });
+  };
+  const locked = await resumeRequest(port, { password: PASSWORD, code: recovery });
+  assert.equal(locked.status, 503);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2,
+    "no recovery factor may be spent when the sync storage cannot persist");
+  route.store.transact = originalTransact;
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 200,
+    "the same code works after storage becomes writable");
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
+test("issue 65 resume: post-consumption sync failure leaves durable same-factor resume grant across restart", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-journal-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath, burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: account.users });
+  const key = crypto.randomBytes(32);
+  await pauseDeviceA(opened.port, key, 210, 211);
+  const recovery = account.recoveryCodes[0];
+  const originalTransact = opened.route.store.transact.bind(opened.route.store);
+  let writes = 0;
+  opened.route.store.transact = async (mutator) => {
+    writes += 1;
+    if (writes === 3) throw Object.assign(new Error("storage blocked after factor commit"), { code: "EACCES" });
+    return originalTransact(mutator);
+  };
+  const failed = await resumeRequest(opened.port, { password: PASSWORD, code: recovery });
+  assert.equal(failed.status, 503);
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 1);
+  assert.equal(opened.route.store.isDevicePaused("alice", "device-a"), true);
+  const persisted = JSON.parse(await fsp.readFile(storagePath, "utf8"));
+  assert.equal(JSON.stringify(persisted).includes(recovery), false, "never persist a raw recovery code");
+  opened.route.store.transact = originalTransact;
+  const restarted = await startServer(t, { storagePath, burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: opened.route.accountState.users });
+  const recovered = await resumeRequest(restarted.port, { password: PASSWORD, code: recovery });
+  assert.equal(recovered.status, 200, "a verified-but-consumed factor must retain a restart-safe finish path");
+  assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), false);
+  await pauseDeviceA(restarted.port, key, 212, 213);
+  assert.equal((await resumeRequest(restarted.port, { password: PASSWORD, code: recovery })).status, 401,
+    "completed grant cannot reactivate a subsequent pause");
+});
+
+test("issue 65 resume: failure persisting staged authorization cannot spend the recovery code", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-stage-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, { storagePath: path.join(dir, "objects.json"), accountUsers: account.users });
+  const originalTransact = route.store.transact.bind(route.store);
+  let writes = 0;
+  route.store.transact = async (mutator) => {
+    writes += 1;
+    if (writes === 2) throw Object.assign(new Error("sync store rejected staging"), { code: "EACCES" });
+    return originalTransact(mutator);
+  };
+  const code = account.recoveryCodes[0];
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code })).status, 503);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2);
+  route.store.transact = originalTransact;
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code })).status, 200);
+});
+
+test("issue 65 resume: a forged on-disk pending replay proof cannot finish a paused device", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-tamper-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath, accountUsers: account.users, burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }) });
+  await pauseDeviceA(opened.port, crypto.randomBytes(32), 220, 221);
+  const code = account.recoveryCodes[0];
+  const originalTransact = opened.route.store.transact.bind(opened.route.store);
+  let writes = 0;
+  opened.route.store.transact = async (mutator) => {
+    if (++writes === 3) throw Object.assign(new Error("no final write"), { code: "EACCES" });
+    return originalTransact(mutator);
+  };
+  assert.equal((await resumeRequest(opened.port, { password: PASSWORD, code })).status, 503);
+  const tampered = JSON.parse(await fsp.readFile(storagePath, "utf8"));
+  tampered.users.alice.resumeIntent.proof.hash = account.users[0].totpRecoveryHashes[1];
+  await fsp.writeFile(storagePath, JSON.stringify(tampered));
+  const restarted = await startServer(t, { storagePath, accountUsers: opened.route.accountState.users });
+  assert.equal((await resumeRequest(restarted.port, { password: PASSWORD, code })).status, 401);
+  assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), true,
+    "forged grant cannot lift the durable paused-device fence");
+});
+
+test("issue 65 resume: administrative revocation while durable staging waits cannot be overwritten by stale account snapshot", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-revoked-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath: path.join(dir, "objects.json"), accountUsers: account.users });
+  const realStage = opened.route.store.stageResume.bind(opened.route.store);
+  let release;
+  const staged = new Promise((resolve) => { release = resolve; });
+  let stagedReady;
+  const staging = new Promise((resolve) => { stagedReady = resolve; });
+  opened.route.store.stageResume = async (username, intent) => {
+    await realStage(username, intent);
+    stagedReady();
+    await staged;
+  };
+  const code = account.recoveryCodes[0];
+  const resume = resumeRequest(opened.port, { password: PASSWORD, code });
+  await staging;
+  const revoked = opened.route.accountState.users[0];
+  revoked.disabled = true;
+  revoked.sessionVersion += 1;
+  const expectedVersion = revoked.sessionVersion;
+  release();
+  assert.equal((await resume).status, 401);
+  assert.equal(opened.route.accountState.users[0].disabled, true);
+  assert.equal(opened.route.accountState.users[0].sessionVersion, expectedVersion);
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 2,
+    "admin revocation must not accidentally consume or resurrect a recovery factor");
+});
+
+test("issue 65 resume: permission-only admin revocation during staging denies reactivation", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-permission-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  account.users[0].role = "user";
+  account.users[0].permissions = { upload: true };
+  const opened = await startServer(t, { storagePath: path.join(dir, "objects.json"), accountUsers: account.users });
+  const originalStage = opened.route.store.stageResume.bind(opened.route.store);
+  let release, signal;
+  const wait = new Promise((resolve) => { release = resolve; });
+  const ready = new Promise((resolve) => { signal = resolve; });
+  opened.route.store.stageResume = async (username, intent) => {
+    await originalStage(username, intent);
+    signal();
+    await wait;
+  };
+  const response = resumeRequest(opened.port, { password: PASSWORD, code: account.recoveryCodes[0] });
+  await ready;
+  opened.route.accountState.users[0].permissions = { upload: false };
+  release();
+  assert.equal((await response).status, 401);
+  assert.deepEqual(opened.route.accountState.users[0].permissions, { upload: false });
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 2);
+});
+
+test("issue 65 resume: a store becoming indeterminate during bcrypt fails before second-factor consumption", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-race-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const storagePath = path.join(dir, "objects.json");
+  let route;
+  let quarantineNext = true;
+  const bcryptImpl = {
+    compare: async (...args) => {
+      const result = await bcrypt.compare(...args);
+      if (quarantineNext) {
+        route.store.commitIndeterminate = true;
+        quarantineNext = false;
+      }
+      return result;
+    },
+  };
+  const opened = await startServer(t, {
+    storagePath, accountUsers: account.users, bcryptImpl,
+  });
+  route = opened.route;
+  const recovery = account.recoveryCodes[0];
+
+  const rejected = await resumeRequest(opened.port, { password: PASSWORD, code: "000000" });
+  assert.equal(rejected.status, 503);
+  assert.equal(rejected.body.code, "SYNC_COMMIT_INDETERMINATE");
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2);
+
+  const reopened = await startServer(t, { storagePath, accountUsers: route.accountState.users });
+  assert.equal((await resumeRequest(reopened.port, { password: PASSWORD, code: recovery })).status, 200);
+  assert.equal(reopened.route.accountState.users[0].totpRecoveryHashes.length, 1);
 });
 
 test("issue 203 sync resume: recovery verification does not call synchronous scrypt", async (t) => {

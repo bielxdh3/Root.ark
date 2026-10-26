@@ -1,0 +1,81 @@
+"use strict";
+
+// Explicit fail-closed startup path for the standalone PostgreSQL gate.
+// A web-application pool and a PostgreSQL superuser must NEVER be accepted
+// as this service's runtime credential. Operator provisions a distinct login
+// with inherited zk1_gate_runtime membership out of band.
+const { Zk1SharedPgGateAuthority } = require("./zk1SharedPgGateAuthority");
+const { createZk1SharedPgGateHttpsServer } = require("./zk1SharedPgGateHttpsServer");
+const { Zk1SharedPgSealedObjectStore } = require("./zk1SharedPgSealedObjectStore");
+const { Zk1SharedPgStrictStopOperator } = require("./zk1SharedPgStrictStopOperator");
+
+function refuse() {
+  const error = new Error("ZK_GATE_RUNTIME_IDENTITY_INVALID");
+  error.code = "ZK_GATE_RUNTIME_IDENTITY_INVALID";
+  throw error;
+}
+
+async function verifyZk1SharedPgRuntimePool(pool) {
+  if (!pool || typeof pool.connect !== "function") refuse();
+  let c;
+  try {
+    c = await pool.connect();
+    const result = await c.query(`SELECT
+      session_user AS session_identity, current_user AS active_identity,
+      r.rolcanlogin AS can_login, r.rolsuper AS is_superuser,
+      r.rolcreatedb AS can_create_db, r.rolcreaterole AS can_create_role,
+      pg_catalog.pg_has_role(current_user, 'zk1_gate_runtime', 'USAGE') AS gate_access,
+      pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'USAGE') AS stop_access,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'USAGE') AS writer_access,
+      pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'MEMBER') AS stop_member,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'MEMBER') AS writer_member,
+      pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'SET') AS can_set_stop,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'SET') AS can_set_writer,
+      pg_catalog.has_schema_privilege(current_user,'zk1_gate','USAGE') AS schema_access,
+      pg_catalog.has_schema_privilege(current_user,'zk1_gate','CREATE') AS schema_create,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.head','revision','UPDATE') AS can_change_revision,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.head','phase','UPDATE') AS can_change_phase,
+      pg_catalog.has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','DELETE') AS can_delete_ciphertext,
+      pg_catalog.has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','TRUNCATE') AS can_truncate_ciphertext
+      FROM pg_catalog.pg_roles AS r WHERE r.rolname=current_user`);
+    const x = result.rows?.[0];
+    if (result.rowCount !== 1 || !x || x.session_identity !== x.active_identity
+      || x.active_identity === "zk1_gate_runtime" || x.can_login !== true
+      || x.is_superuser !== false || x.can_create_db !== false
+      || x.can_create_role !== false || x.gate_access !== true
+      || x.stop_access !== false || x.writer_access !== false
+      || x.stop_member !== false || x.writer_member !== false
+      || x.can_set_stop !== false || x.can_set_writer !== false
+      || x.schema_access !== true || x.schema_create !== false
+      || x.can_change_revision !== false || x.can_change_phase !== true
+      || x.can_delete_ciphertext !== false || x.can_truncate_ciphertext !== false) refuse();
+    return Object.freeze({ verified: true, runtimeRole: x.active_identity });
+  } catch (_) { refuse(); }
+  finally { if (c) c.release(); }
+}
+
+async function createIsolatedZk1SharedPgGateServer({ pool, key, cert, clientCa,
+  principals, enableSealing = false, stopPinned, stopHostPolicy,
+  stopSupervisor, stopRecorder } = {}) {
+  // No listener/socket exists until the live PostgreSQL login and permissions
+  // have been reconciled from the same pool used by gate transactions.
+  await verifyZk1SharedPgRuntimePool(pool);
+  if (typeof enableSealing !== "boolean") refuse();
+  if ((stopSupervisor === undefined) !== (stopRecorder === undefined)) refuse();
+  const gate = new Zk1SharedPgGateAuthority({ pool, stopPinned, stopHostPolicy });
+  const strictStopOperator = stopSupervisor === undefined ? null
+    : new Zk1SharedPgStrictStopOperator({ gate,
+      supervisor: stopSupervisor, recorder: stopRecorder });
+  const server = createZk1SharedPgGateHttpsServer({ key, cert, clientCa,
+    gate,
+    sealedStore: enableSealing ? new Zk1SharedPgSealedObjectStore({ pool }) : null,
+    principals });
+  // Exposed only to local operator code with access to this JS server object;
+  // this is not an HTTP endpoint or grant for strict remote workers.
+  if (strictStopOperator) Object.defineProperty(server, "strictStopOperator", {
+    value: strictStopOperator, enumerable: false, writable: false });
+  return server;
+}
+
+module.exports = { verifyZk1SharedPgRuntimePool,
+  createIsolatedZk1SharedPgGateServer };

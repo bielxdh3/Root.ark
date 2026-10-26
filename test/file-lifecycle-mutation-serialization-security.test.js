@@ -174,11 +174,15 @@ function makeS3Fixture(objects) {
 
 async function waitForServer(port, child) {
   const deadline = Date.now() + 15_000;
+  let lastRequestError = "none";
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("disposable server exited");
-    try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+    try { return await request(port, "/login.html"); } catch (error) {
+      lastRequestError = /^[A-Z][A-Z0-9_]{1,30}$/.test(error.code || "") ? error.code : "unknown";
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
-  throw new Error("disposable server did not start");
+  throw new Error(`disposable server did not start; childAlive=${child.exitCode === null} lastRequestError=${lastRequestError}`);
 }
 
 function stop(child) {

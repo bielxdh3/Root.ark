@@ -94,7 +94,15 @@ function xml(value) {
 }
 
 function writeResponse(res, status, body = "", headers = {}) {
-  res.writeHead(status, { "Cache-Control": "no-store", ...headers });
+  // A WebDAV error can contain a rejected caller-controlled path. Browsers
+  // must not treat that text as HTML via MIME sniffing. Successful PROPFIND
+  // explicitly overrides this default with the required XML media type.
+  res.writeHead(status, {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Type": "text/plain; charset=utf-8",
+    ...headers,
+  });
   res.end(body);
 }
 
@@ -274,11 +282,47 @@ class LocalSyncWebDavBridge {
         return writeResponse(res, 207, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${results.join("")}</d:multistatus>`, { "Content-Type": "application/xml; charset=utf-8" });
       }
       if (["GET", "HEAD"].includes(req.method)) {
-        const stats = await fsp.lstat(target);
-        if (!stats.isFile()) return writeResponse(res, 405, "Not a file");
-        res.writeHead(200, { "Content-Length": stats.size, "Cache-Control": "no-store" });
-        if (req.method === "HEAD") return res.end();
-        return fs.createReadStream(target).pipe(res);
+        // Opening a pathname only when the stream begins would let a local
+        // rename/symlink swap serve a different file than the one authorized.
+        // Pin a regular, single-link inode before emitting success headers;
+        // close only that descriptor, never reopen the mutable pathname.
+        let fd;
+        try {
+          const named = fs.lstatSync(target, { bigint: true });
+          if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n) {
+            return writeResponse(res, 405, "Not a regular file");
+          }
+          fd = fs.openSync(target, fs.constants.O_RDONLY
+            | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+          const opened = fs.fstatSync(fd, { bigint: true });
+          const again = fs.lstatSync(target, { bigint: true });
+          const same = (a, b) => a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
+            && a.dev === b.dev && a.ino === b.ino && a.size === b.size
+            && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+          if (!same(named, opened) || !same(opened, again)
+            || opened.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw Object.assign(new Error("WebDAV source identity changed"), { statusCode: 409 });
+          }
+          await rejectSymlinks(this.rootDir, target, false);
+          res.writeHead(200, {
+            "Content-Length": Number(opened.size), "Cache-Control": "no-store",
+            "Content-Type": "application/octet-stream", "X-Content-Type-Options": "nosniff",
+          });
+          if (req.method === "HEAD") {
+            fs.closeSync(fd);
+            fd = undefined;
+            return res.end();
+          }
+          const stream = fs.createReadStream(null, { fd, autoClose: true, start: 0 });
+          fd = undefined;
+          // pipe() only unpipes on client abort; it does not guarantee the
+          // source ReadStream closes its pinned FD before end-of-file.
+          res.once("close", () => stream.destroy());
+          stream.once("error", () => res.destroy());
+          return stream.pipe(res);
+        } finally {
+          if (fd !== undefined) fs.closeSync(fd);
+        }
       }
       if (req.method === "PUT") {
         if (target === this.rootDir) return writeResponse(res, 400, "Invalid target");

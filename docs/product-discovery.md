@@ -762,4 +762,26 @@ Round 3 questions are resolved locally in D-007 through D-009. The next discover
 - Required follow-up issues:
   - No open naming issue remains; any future naming or visual-brand change requires a new decision record.
 
+### D-011: Web-first temporary transfers and online recovery boundary
+
+- Status: `[DECIDED]`
+- Date: 2026-10-19
+- Decision: Root.ark is primarily a temporary encrypted file-transfer service, with the web client first. A native Android app remains on the roadmap. No new native Windows or Linux desktop app is approved.
+- Offline access and authorization:
+  - Users may access files they have already downloaded or exported to their own devices while offline. Those local copies are under the user's control and cannot be revoked remotely.
+  - Every new transfer, download from the service, authorization, device change, and account or content recovery requires an online connection and fresh independent authorization.
+  - An offline queue or draft does not gain permission to publish a protected operation. Pending legacy queued work must remain untrusted until it receives the required fresh online authorization.
+- Browser recovery-device boundary:
+  - A browser may become a trusted recovery device only after independent verification of its exact browser, operating-system, and key-custody configuration.
+  - Feature detection, WebAuthn login or PRF availability, synchronized passkeys, IndexedDB storage, and a non-extractable `CryptoKey` do not by themselves establish trusted key custody.
+  - The approved recovery methods remain the user's password-protected emergency package and previously trusted devices. No administrator master key or hidden recovery fallback is approved.
+- Historical decision reconciliation:
+  - This web-specific offline restriction supersedes the broader D-006 offline-access default for new web Zero-Knowledge flows. D-006 remains an intact historical decision; this record does not claim legacy synchronization has already changed or that runtime enforcement exists.
+  - D-008's existing trash, backup, and log-retention decisions remain separate from transfer lifetime. No transfer TTL is selected by this decision.
+  - D-009 remains in force for compatibility and synchronization direction; this decision does not implement or reclassify its runtime work.
+- Consequences:
+  - Previously downloaded files remain available to their user offline, while service-mediated transfers, downloads, recovery, authorization, and device changes stay online-only for new web Zero-Knowledge flows.
+  - Browser capability observations are evidence for independent review only and cannot grant production trusted-device status.
+  - Runtime admission, browser key custody, and legacy queue enforcement require separately approved implementation and validation.
+
 Do not ask all remaining questions at once. Each round must preserve explicit decisions, inferred consequences, and unresolved details separately.

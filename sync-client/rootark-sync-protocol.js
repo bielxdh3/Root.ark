@@ -62,7 +62,7 @@ function canonicalize(value) {
   return Object.keys(value).sort().reduce((result, key) => {
     result[key] = canonicalize(value[key]);
     return result;
-  }, {});
+  }, Object.create(null));
 }
 
 function canonicalJson(value) {
@@ -127,16 +127,21 @@ function aadFor(operation) {
   });
 }
 
-function normalizeAuthorization(value) {
+function normalizeAuthorizationShape(value, requireFresh) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("Invalid device authorization");
   assertExactKeys(value, AUTHORIZATION_FIELDS, "authorization");
   if (AUTHORIZATION_FIELDS.some((field) => !Object.hasOwn(value, field)) || value.schemaVersion !== 1 || value.type !== "rootark-sync-device-authorization-v1" || value.suite !== "rootark-zk-1" || value.protocolVersion !== PROTOCOL_VERSION) fail("Invalid device authorization");
-  if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now()) fail("Expired device authorization", "authorization_expired");
+  if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0
+    || (requireFresh && value.expiresAt <= Date.now())) fail("Expired device authorization", "authorization_expired");
   for (const field of ["aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest", "replayId", "publicKey", "signature"]) {
     if (typeof value[field] !== "string" || !/^[A-Za-z0-9_-]+$/.test(value[field]) || value[field].length % 4 === 1) fail("Invalid device authorization");
   }
   if (!isValidIdempotencyKey(value.idempotencyKey)) fail("Invalid device authorization");
   return canonicalize(value);
+}
+
+function normalizeAuthorization(value) {
+  return normalizeAuthorizationShape(value, true);
 }
 
 function encryptPayload(operation, plaintext, fileKey) {
@@ -241,14 +246,19 @@ function createOperation(input = {}) {
   return result;
 }
 
-function validateOperation(input) {
+function validateOperationInternal(input, requireFreshAuthorization) {
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("Invalid operation");
   if (input.protocolVersion !== PROTOCOL_VERSION) fail("Unsupported sync protocol version", "invalid_protocol_version");
   assertExactKeys(input, OPERATION_FIELDS, "operation");
   for (const field of OPERATION_FIELDS) {
     if (!OPTIONAL_OPERATION_FIELDS.has(field) && !Object.hasOwn(input, field)) fail(`Missing operation field: ${field}`);
   }
-  const operation = createOperation({ ...input, plaintext: Buffer.alloc(0), fileKey: Buffer.alloc(32) });
+  const operation = createOperation({ ...input, authorization: undefined,
+    plaintext: Buffer.alloc(0), fileKey: Buffer.alloc(32) });
+  if (input.authorization !== undefined) {
+    operation.authorization = normalizeAuthorizationShape(input.authorization,
+      requireFreshAuthorization);
+  }
   if (input.tombstone !== operation.tombstone) fail("Invalid tombstone flag");
   if (!operation.metadata.path) fail("Operation metadata.path is required");
   if (operation.operation === "move" && !operation.metadata.sourcePath) fail("Move metadata.sourcePath is required");
@@ -262,6 +272,17 @@ function validateOperation(input) {
   const expectedAad = Buffer.from(aadFor(operation), "utf8");
   if (aad.length !== expectedAad.length || !crypto.timingSafeEqual(aad, expectedAad)) fail("AAD binding mismatch", "aad_mismatch");
   return { ...operation, ciphertext: input.ciphertext, nonce: input.nonce, tag: input.tag, aad: input.aad };
+}
+
+function validateOperation(input) {
+  return validateOperationInternal(input, true);
+}
+
+// A persisted record's authorization was checked at ingress. Its historical
+// expiry must not make unrelated ciphertext unreadable after a restart.
+// This is structural validation only; never use it to admit a new write.
+function validateStoredOperation(input) {
+  return validateOperationInternal(input, false);
 }
 
 function nextRevision(current, deviceId) {
@@ -285,5 +306,6 @@ module.exports = {
   normalizeAuthorization,
   safeRelativePath,
   validateOperation,
+  validateStoredOperation,
   OPTIONAL_OPERATION_FIELDS,
 };

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none';">
+  <title>Root.ark local browser evidence probe</title>
+  <style>
+    body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; color: #17212b; }
+    h1 { font-size: 1.35rem; }
+    button { padding: 0.65rem 0.9rem; font: inherit; }
+    pre { padding: 1rem; overflow-wrap: anywhere; background: #f1f4f7; }
+    .limit { border-left: 4px solid #8a5a00; padding-left: 0.75rem; }
+  </style>
+</head>
+<body>
+  <h1>Local browser capability observations</h1>
+  <p>This test-only page records sanitized observations in this page only. It does not create or use credentials, contact a server, save results, or establish trusted-device status.</p>
+  <p class="limit">A reported capability is not proof of PRF operation, device-bound keys, recovery, freshness, or production eligibility. Run only from a local test origin such as localhost. No authenticator operation is performed.</p>
+  <button id="observe" type="button">Collect local observations</button>
+  <p id="state" role="status">NOT_RUN — select the button to collect non-secret browser metadata.</p>
+  <pre id="result" aria-live="polite">No observations collected.</pre>
+  <script>
+    "use strict";
+
+    function browserLabel(userAgent) {
+      const patterns = [
+        ["Edge", /Edg\/([\d.]+)/],
+        ["Chrome", /Chrome\/([\d.]+)/],
+        ["Firefox", /Firefox\/([\d.]+)/],
+        ["Safari", /Version\/([\d.]+).*Safari/],
+      ];
+      for (const [name, pattern] of patterns) {
+        const match = userAgent.match(pattern);
+        if (match) return `${name} ${match[1].split(".")[0]}`;
+      }
+      return "UNKNOWN";
+    }
+
+    function platformFamily(value) {
+      if (/windows/i.test(value)) return "Windows";
+      if (/mac|darwin/i.test(value)) return "macOS";
+      if (/android/i.test(value)) return "Android";
+      if (/iphone|ipad|ios/i.test(value)) return "iOS";
+      if (/linux/i.test(value)) return "Linux";
+      return "UNKNOWN";
+    }
+
+    function originKind() {
+      if (location.protocol === "https:") return "HTTPS";
+      if (location.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(location.hostname)) {
+        return "LOCALHOST";
+      }
+      return "INSECURE";
+    }
+
+    document.getElementById("observe").addEventListener("click", () => {
+      const platform = navigator.userAgentData?.platform || navigator.platform || "UNKNOWN";
+      const publicKeyApiPresent = typeof window.PublicKeyCredential === "function";
+      const observation = {
+        browserVersion: browserLabel(navigator.userAgent || ""),
+        osVersion: "UNKNOWN",
+        platform: platformFamily(platform),
+        originKind: originKind(),
+        secureContext: window.isSecureContext === true,
+        publicKeyCredentialApiPresent: publicKeyApiPresent,
+        prfObserved: "NOT_RUN — API presence is not a PRF result",
+        userVerificationObserved: "NOT_RUN",
+        credentialSyncBehavior: "NOT_RUN",
+        privateKeyWrappingObserved: "NOT_RUN",
+        keyCopyOrRestoreTested: "NOT_RUN",
+        originDeliveryReviewed: "NOT_RUN",
+        independentReviewerVerified: "NOT_RUN",
+        measuredAt: new Date().toISOString(),
+        result: "UNVERIFIED",
+      };
+      document.getElementById("state").textContent = "UNVERIFIED — observations are local and are not authorization.";
+      document.getElementById("result").textContent = JSON.stringify(observation, null, 2);
+    });
+  </script>
+</body>
+</html>

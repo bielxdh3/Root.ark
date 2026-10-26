@@ -70,7 +70,7 @@ function request(port, requestPath, method = "GET", headers = {}, body) {
   });
 }
 
-function serverBootstrap() {
+function serverBootstrap({ stubProtectedContent = false } = {}) {
   return `
 const http = require("node:http");
 const originalListen = http.Server.prototype.listen;
@@ -92,16 +92,27 @@ http.Server.prototype.listen = function (...args) {
   }
   return originalListen.apply(this, args);
 };
+${stubProtectedContent ? `
+// Isolate routing/rate-limit behavior from external witness and CAS provisioning.
+const Module = require("node:module");
+const originalLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (parent?.filename === ${JSON.stringify(SERVER)}
+    && request === "./src/services/zk1ProtectedContentBootstrap") {
+    return { registerZk1ProtectedContentFromConfig: () => ({ close() {} }) };
+  }
+  return originalLoad.call(this, request, parent, isMain);
+};` : ""}
 require(${JSON.stringify(SERVER)});
 `;
 }
 
-async function waitForServer(child) {
+async function waitForServer(child, deadlineMs = 10_000) {
   let startupError = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { startupError += chunk; });
   const port = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => finish(new Error("server readiness timed out")), 10_000);
+    const timer = setTimeout(() => finish(new Error("server readiness timed out")), deadlineMs);
     const cleanup = () => {
       clearTimeout(timer);
       child.off("message", onMessage);
@@ -176,6 +187,56 @@ test("dynamic request limit is shared across API routes while static assets rema
   const third = await request(port, "/list");
   assert.deepEqual([first.status, second.status, third.status], [401, 404, 429]);
   assert.equal(third.headers["ratelimit-limit"], "2");
+});
+
+test("opt-in ZK laboratory page is rate limited before serving its private static file", {
+  timeout: 60_000,
+}, async (t) => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-lab-rate-limit-"));
+  fs.mkdirSync(path.join(sandbox, "data"), { recursive: true });
+  fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
+  fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
+
+  const child = spawn(process.execPath, ["-e", serverBootstrap({ stubProtectedContent: true })], {
+    cwd: sandbox,
+    env: {
+      ...process.env,
+      PORT: "0",
+      DB_ENABLED: "false",
+      CLOUD_STORAGE_PROVIDER: "local",
+      NODE_ENV: "test",
+      ROOTARK_ZK1_CONTENT_CONFIG: "isolated-test-provisioning",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      TOTP_POLICY: "optional",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      ROUTE_RATE_LIMIT_MAX: "1000",
+      ROUTE_RATE_LIMIT_WINDOW_MS: "60000",
+      API_RATE_LIMIT_MAX: "2",
+      TRUSTED_PROXIES: "",
+    },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    windowsHide: true,
+  });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 10_000);
+        child.once("exit", () => { clearTimeout(timer); resolve(); });
+        child.kill();
+      });
+    }
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  const port = await waitForServer(child, 30_000);
+  const first = await request(port, "/zk1-protected-file-lab.html");
+  const second = await request(port, "/zk1-protected-file-lab.html");
+  const limited = await request(port, "/zk1-protected-file-lab.html");
+  assert.deepEqual([first.status, second.status, limited.status], [200, 200, 429]);
+  assert.match(first.body, /<html/i);
+  assert.equal(limited.headers["ratelimit-limit"], "2");
+  assert.equal((await request(port, "/login.html")).status, 200,
+    "public static assets retain their existing quota exemption");
 });
 
 test("route rate limits enforce separate budgets despite direct-origin X-Forwarded-For spoofing", { timeout: 30_000 }, async (t) => {

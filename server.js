@@ -10,10 +10,18 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");
 const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
 const multer = require("multer");
+// Multer 1.x silently ignores fieldNestingDepth/defParamCharset and enforces
+// a different file-size boundary. Node can otherwise inherit that old parser
+// from a parent worktree when this checkout has no node_modules.
+const lockedMulterVersion = require("./package-lock.json").packages?.["node_modules/multer"]?.version;
+if (!lockedMulterVersion || require("multer/package.json").version !== lockedMulterVersion) {
+  throw new Error("MULTER_LOCKFILE_MISMATCH: install dependencies using npm ci in this checkout");
+}
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
@@ -36,6 +44,7 @@ const {
   createChunkUploadQuota,
   parseChunkUploadQuotaConfig,
 } = require("./services/chunkUploadQuota");
+const { assembleChunkedUpload } = require("./services/chunkUploadAssembler");
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
@@ -69,11 +78,15 @@ const registerAuditRoutes = require("./src/routes/audit");
 const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
+const { registerOpaqueDevVaultRoutes } = require("./src/routes/zkOpaqueDevVault");
+const { registerZk1LocalSignedHistoryRoutes } = require("./src/routes/zk1LocalSignedHistoryRoutes");
+const { registerZk1ProtectedContentFromConfig } = require("./src/services/zk1ProtectedContentBootstrap");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
+const { parseIndependentCatalogConnectOrigins } = require("./src/zk1-catalog-connect-csp");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
@@ -631,14 +644,14 @@ function getCreatedUserSessionVersion(username) {
   return Object.hasOwn(generations, username) ? generations[username] + 1 : 0;
 }
 
-function saveUsers(users) {
+function saveUsers(users, options = {}) {
   const passwordHashesToValidate = trustedUserPasswordHashes === null
     ? users
     : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
   if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
     throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
   }
-  if (shouldUseDatabase()) usersRepository.saveUsers(users);
+  if (shouldUseDatabase()) usersRepository.saveUsers(users, options);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
     const temporaryFile = `${USERS_FILE}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
@@ -651,6 +664,15 @@ function saveUsers(users) {
     }
   }
   trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
+}
+
+function commitSyncResumeProof(claim) {
+  // Interprocess JSON read+rename has no globally serialized CAS. Fail closed
+  // instead of allowing parallel servers to spend a single recovery factor.
+  if (!shouldUseDatabase() || shouldWriteLegacyJson()) {
+    throw new Error("Sync 2FA resume requires one authoritative SQLite account store");
+  }
+  return usersRepository.commitSyncResumeProof(claim);
 }
 
 function getBasePermissions() {
@@ -1299,11 +1321,35 @@ function sanitizeAuditValue(value, maxLength = 500) {
 }
 
 function loadAuditLogs(file = AUDIT_LOGS_FILE) {
+  if (shouldUseDatabase() && file === AUDIT_ARCHIVE_FILE) {
+    dbConfig.getDb(); // Observe the main SQLite's durable strict marker.
+    if (dbConfig.isStrictSyncModeObserved()) {
+      const fromJournal = auditRepository.loadArchivedAuditLogs();
+      if (!fs.existsSync(file)) return fromJournal;
+      const legacy = JSON.parse(fs.readFileSync(file, "utf8"));
+      const seen = new Set(fromJournal.logs.map(({ id }) => id));
+      for (const log of Array.isArray(legacy?.logs) ? legacy.logs : []) {
+        if (!seen.has(log.id)) { seen.add(log.id); fromJournal.logs.push(log); }
+      }
+      return fromJournal;
+    }
+  }
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) {
     try {
       const entries = auditRepository.loadAuditLogs();
-      if (entries.logs.length || !shouldReadJsonFallback()) return entries;
+      // Once the MAIN SQLite records strict audit enrollment, even a truly
+      // empty active audit view is authoritative. A JSON mirror must never
+      // fabricate stale audit evidence or hide a broken sidecar.
+      if (dbConfig.isStrictSyncModeObserved() || entries.logs.length || !shouldReadJsonFallback()) {
+        return entries;
+      }
     } catch (error) {
+      if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") throw error;
+      if (dbConfig.isStrictSyncModeObserved()) {
+        throw Object.assign(new Error("Durable strict audit unavailable", { cause: error }), {
+          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+        });
+      }
       console.error("Falha ao ler auditoria do SQLite:", error.message);
       if (!shouldReadJsonFallback()) return getDefaultAuditLogs();
     }
@@ -1506,20 +1552,41 @@ function parseWebDavSegments(req) {
 
 function archiveAuditLogs(logs) {
   if (!logs.length) return;
+  if (shouldUseDatabase() && !shouldWriteLegacyJson()) {
+    dbConfig.getDb();
+  }
+  if (shouldUseDatabase() && !shouldWriteLegacyJson() && dbConfig.isStrictSyncModeObserved()) {
+    auditRepository.archiveAuditLogs(logs);
+    return;
+  }
   const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE);
-  archive.logs.push(...logs);
+  const seen = new Set(archive.logs.map((entry) => entry.id));
+  for (const log of logs) {
+    if (!seen.has(log.id)) { seen.add(log.id); archive.logs.push(log); }
+  }
   saveAuditLogs(archive, AUDIT_ARCHIVE_FILE);
 }
 
 function appendAuditLog(log) {
+  // Synchronous audit callsites must never silently drop post-commit events.
+  // While strict Sync owns the primary SQLite writer, durably stage a pending
+  // audit in its independent journal, then include it on subsequent reads.
+  if (shouldUseDatabase() && !shouldWriteLegacyJson() && auditRepository.deferIfStrictSyncWriter(log)) {
+    broadcastDataChanged("audit");
+    return;
+  }
   const entries = loadAuditLogs();
   const cutoff = Date.now() - AUDIT_RETENTION_MS;
+  const expired = [];
   const retained = entries.logs.filter((entry) => {
     const time = new Date(entry.timestamp).getTime();
-    return Number.isFinite(time) && time >= cutoff;
+    const valid = Number.isFinite(time) && time >= cutoff;
+    if (!valid) expired.push(entry);
+    return valid;
   });
 
   retained.push(log);
+  if (expired.length) archiveAuditLogs(expired);
   if (retained.length > MAX_AUDIT_LOGS) {
     archiveAuditLogs(retained.slice(0, retained.length - MAX_AUDIT_LOGS));
     entries.logs = retained.slice(-MAX_AUDIT_LOGS);
@@ -2963,7 +3030,11 @@ function normalizeVersionHistory(entry) {
           version: Number(version.version),
           storedAs: path.basename(version.storedAs || ""),
           uploadedBy: version.uploadedBy || "sistema",
-          uploadedAt: version.uploadedAt || new Date().toISOString(),
+          // Missing historical timestamps must remain explicitly unavailable.
+          // Inventing a new wall-clock timestamp on every catalog read makes
+          // authenticated legacy migration pins impossible to reproduce.
+          uploadedAt: typeof version.uploadedAt === "string" && Number.isFinite(Date.parse(version.uploadedAt))
+            ? version.uploadedAt : null,
           size: Number(version.size) || 0,
           comment: version.comment || "",
         }))
@@ -3905,6 +3976,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
+  if (options.includeLastModified) commonHeaders["Last-Modified"] = options.lastModified || stats.mtime.toUTCString();
   if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
@@ -4034,7 +4106,7 @@ function normalizeFilePermissionEntry(entry) {
   };
 }
 
-function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, ...user }) {
+function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, storageRevision, ...user }) {
   return user;
 }
 
@@ -5935,8 +6007,23 @@ const APP_CONTENT_SECURITY_POLICY = [
   "form-action 'self'",
   "frame-ancestors 'self'",
 ].join("; ");
+const independentCatalogConnectOrigins = parseIndependentCatalogConnectOrigins(
+  process.env.ROOTARK_ZK1_INDEPENDENT_CATALOG_CONNECT_ORIGINS);
+const WORKSPACE_CONTENT_SECURITY_POLICY = independentCatalogConnectOrigins.length
+  ? APP_CONTENT_SECURITY_POLICY.replace("connect-src 'self' ws: wss:",
+    `connect-src 'self' ws: wss: ${independentCatalogConnectOrigins.join(" ")}`)
+  : APP_CONTENT_SECURITY_POLICY;
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY);
+  // The opt-in development-only emergency package uses Argon2id from
+  // libsodium's WebAssembly build. Permit WASM compilation on that single
+  // page, not unrestricted JS eval and never on legacy application pages.
+  const devVaultWasm = process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true"
+    && NODE_ENV !== "production" && req.path === "/zk-dev-vault.html";
+  const isWorkspace = req.path === "/" || req.path === "/index.html";
+  res.setHeader("Content-Security-Policy", devVaultWasm
+    ? APP_CONTENT_SECURITY_POLICY.replace("script-src 'self'",
+      "script-src 'self' 'wasm-unsafe-eval'")
+    : isWorkspace ? WORKSPACE_CONTENT_SECURITY_POLICY : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
@@ -5952,12 +6039,38 @@ app.use((req, res, next) => {
   }
   next();
 });
+// A development-only page must not live in public/: static serving on Windows
+// is case-insensitive and can decode path aliases differently from req.path.
+// Mount this exact, non-public file only for an explicitly opted-in dev/test
+// process. With no route, all spellings are 404, even through express.static.
+if ((NODE_ENV === "development" || NODE_ENV === "test")
+  && process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  app.get("/zk1-protected-file-lab.html", apiRequestRateLimit, (_req, res) =>
+    res.sendFile(path.join(__dirname, "dev-ui", "zk1-protected-file-lab.html"),
+      { dotfiles: "allow" }));
+}
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
+// Express routes ignore case and accept a trailing slash by default. Match the
+// same dev API families BEFORE the global body parser, including when disabled:
+// otherwise unknown routes or unauthenticated requests allocate up to 9 MiB.
+// Dev route handlers install their JSON parsers only after auth and permission.
+const isDeferredZkDevApiPath = (pathname) =>
+  /^\/zk-dev\/v1\/(?:objects|zk1-history)(?:\/|$)/i.test(pathname);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
-  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
+  if (isDeferredZkDevApiPath(req.path)) return next();
+  if (shouldDeferZk1JsonParsing(req, {
+    contentConfig: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+  })) {
+    // Auth, permissions, and route-local limits (512b for authority probes;
+    // 8kb for multiprovider restore) precede any body parsing.
+    return next();
+  }
+  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) {
+    return syncJsonParser(req, res, next);
+  }
   return express.json()(req, res, next);
 });
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
@@ -6067,6 +6180,62 @@ wss.on("connection", (socket, req) => {
 
 const requirePermission = createRequirePermission();
 
+// Opt-in developer workflow: a browser-only encrypted file vault. This is
+// deliberately NOT integrated with legacy uploads or presented as zk-1.
+// Enabling it never creates a server-held recovery key.
+if (process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true" && ["development", "test"].includes(NODE_ENV)) {
+  const devVaultDbPath = process.env.ROOTARK_ZK_DEV_VAULT_DB || "./data/zk-dev-vault.sqlite";
+  registerOpaqueDevVaultRoutes({
+    app, authenticate, requirePermission, auditLog,
+    dbPath: devVaultDbPath,
+  });
+  // An independent local archive of public SIGNED zk-1 v2 manifests.
+  // Do not use its unwitnessed head for protected content authorization.
+  registerZk1LocalSignedHistoryRoutes({
+    app, authenticate, requirePermission, auditLog,
+    dbPath: devVaultDbPath + ".zk1-history.sqlite",
+  });
+}
+
+// Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
+// This is an experimental single-scope integration, not a replacement for
+// legacy file, sync, cloud, backup or WebDAV routes and not complete ZK.
+if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  if (!["development", "test"].includes(NODE_ENV)) {
+    throw new Error("ROOTARK_ZK1_CONTENT_CONFIG requires development or test mode");
+  }
+  // Optional operator-owned JavaScript provisioning (trusted startup code)
+  // constructs real provider readers and OFF-SERVER pinned public trust roots.
+  // This opt-in module is executed only in development/test, never from a
+  // request body or legacy file and never with production restore privileges.
+  let multiproviderRestore = null;
+  if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+    const filename = process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE;
+    if (!path.isAbsolute(filename)) throw new Error("ZK restore provisioning requires absolute module path");
+    const stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("ZK restore provisioning must be an ordinary operator-owned file");
+    }
+    const provision = require(filename);
+    if (typeof provision !== "function") {
+      throw new Error("ZK restore provisioning must export a function");
+    }
+    multiproviderRestore = provision();
+  }
+  const zk1ContentStore = registerZk1ProtectedContentFromConfig({
+    app, authenticate, requirePermission,
+    configPath: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+    multiproviderRestore,
+  });
+  server.once("close", () => zk1ContentStore.close());
+} else if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+  throw new Error("ZK multiprovider restore requires protected content bootstrap");
+}
+
+if (process.env.SYNC_ATOMIC_DEVICE_REGISTRY !== undefined
+  && !["true", "false"].includes(process.env.SYNC_ATOMIC_DEVICE_REGISTRY)) {
+  throw new Error("SYNC_ATOMIC_DEVICE_REGISTRY must be explicitly true or false");
+}
 registerSyncRoutes({
   app,
   authenticate,
@@ -6074,10 +6243,13 @@ registerSyncRoutes({
   storagePath: process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json",
   requireDeviceAuthorization: true,
   deviceRegistryPath: process.env.SYNC_DEVICE_REGISTRY || "",
+  atomicDeviceRegistry: process.env.SYNC_ATOMIC_DEVICE_REGISTRY === "true",
   auditLog,
   bcrypt,
   loadUsers,
   saveUsers,
+  commitSyncResumeProof: shouldUseDatabase() && !shouldWriteLegacyJson()
+    ? commitSyncResumeProof : null,
   getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 
@@ -6227,7 +6399,7 @@ app.post("/users", authenticate, requirePermission("manageUsers"), async (req, r
     sessionVersion: getCreatedUserSessionVersion(username),
   });
 
-  saveUsers(users);
+  saveUsers(users, { allowRecreateUsernames: [username] });
   auditLog("user.created", getAuditActor(req), { type: "user", id: username }, "created", "success", {
     role: role || "user",
     permissions: finalPermissions,
@@ -6315,7 +6487,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   }
 
   if (shouldWriteLegacyJson()) rememberUserGenerations(users);
-  saveUsers(filtered);
+  saveUsers(filtered, { expectedDeletedUsers: users.filter((u) => u.username === req.params.username) });
   removeUserFromFilePermissions(req.params.username);
   removeUserFromFolderPermissions(req.params.username);
   auditLog("user.deleted", getAuditActor(req), { type: "user", id: req.params.username }, "deleted", "success", {
@@ -9103,33 +9275,6 @@ function hasAllChunks(sessionDir, totalChunks) {
   return received === totalChunks;
 }
 
-async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
-  fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
-  const output = fs.createWriteStream(destinationPath);
-
-  try {
-    for (let index = 0; index < totalChunks; index += 1) {
-      const chunkPath = path.join(sessionDir, `${index}.part`);
-      await new Promise((resolve, reject) => {
-        const input = fs.createReadStream(chunkPath);
-        input.on("error", reject);
-        input.on("end", resolve);
-        input.pipe(output, { end: false });
-      });
-    }
-
-    await new Promise((resolve, reject) => {
-      output.on("finish", resolve);
-      output.on("error", reject);
-      output.end();
-    });
-  } catch (error) {
-    output.destroy();
-    fs.rmSync(destinationPath, { force: true });
-    throw error;
-  }
-}
-
 app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimit, prepareUploadFolder, reserveChunkUploadBeforeMulter, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
@@ -11262,8 +11407,23 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
+  // The restore-provider suppression policy is an access-control boundary.
+  // Deny a suppressed storedAs alias before inspecting optional legacy
+  // timestamps: missing history metadata cannot turn a forbidden 403 into a
+  // distinguishable 409, even when the current file itself is readable.
+  if (target?.version?.storedAs
+    && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) {
+    return res.status(403).json({ error: "Acesso negado a esta versao" });
+  }
+  // Cloud cache rehydration gives the local copy a fresh filesystem mtime.
+  // Historical Last-Modified must instead derive from immutable version data,
+  // or fail closed when that legacy metadata was never persisted.
+  const storedUploadedAt = target?.version?.uploadedAt;
+  if (target && (typeof storedUploadedAt !== "string"
+    || !Number.isFinite(Date.parse(storedUploadedAt)))) {
+    return res.status(409).json({ error: "Metadados historicos da versao indisponiveis" });
+  }
   if (target?.version?.storedAs) {
-    if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
   }
   if (!refreshAuthenticatedUser(req, res)) return;
@@ -11281,7 +11441,9 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
-  sendOptimizedFile(req, res, target.filePath, name, "attachment");
+  sendOptimizedFile(req, res, target.filePath, name, "attachment", {
+    includeLastModified: true, lastModified: new Date(storedUploadedAt).toUTCString(),
+  });
 });
 
 app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
@@ -12520,6 +12682,16 @@ setInterval(() => {
   });
 }, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
+// Account writes must fail fast while protected Sync holds the local SQLite
+// reservation. Administrative callers receive an explicit retryable response
+// instead of Express's generic 500 error for the intentional busy fence.
+app.use((error, _req, res, next) => {
+  if (error?.code !== "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" || res.headersSent) return next(error);
+  return res.status(503).set("Retry-After", "1").json({
+    error: "Account authorization temporarily busy",
+    code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+  });
+});
 const listenForRequests = () => {
   const onListening = () => {
     void (async () => {

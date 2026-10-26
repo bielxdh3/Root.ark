@@ -3,7 +3,6 @@ const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
-const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
@@ -13,17 +12,6 @@ try { ({ chromium } = require("playwright")); } catch {}
 const chromiumInstalled = Boolean(chromium && fs.existsSync(chromium.executablePath()));
 
 const ROOT = path.resolve(__dirname, "..");
-
-function getUnusedPort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const port = server.address().port;
-      server.close(() => resolve(port));
-    });
-  });
-}
 
 function request(port, url, { method = "GET", headers = {}, body = "" } = {}) {
   return new Promise((resolve, reject) => {
@@ -67,25 +55,44 @@ async function startFixture(t, envOverrides = {}) {
     { folderId: "root", fileName: name, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString(), createdBy: "tester", views: 0, maxViews: 0, downloads: 0, maxDownloads: 0, activeViewers: {} },
   ]));
   fs.writeFileSync(path.join(dir, "data", "public-links.json"), JSON.stringify(shares));
-  const port = await getUnusedPort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], {
     cwd: dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...envOverrides },
-    stdio: "ignore", windowsHide: true,
+    // Allocate and bind atomically in the server process itself. Probing an
+    // unused port and releasing it before startup can route this fixture's
+    // login to a concurrently starting, unrelated test server (HTTP 401).
+    env: { ...process.env, NODE_ENV: "test", PORT: "0", DB_ENABLED: "false", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...envOverrides },
+    stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
+  let startupOutput = "";
+  let stderrObserved = false;
+  child.stdout.on("data", (chunk) => {
+    startupOutput = (startupOutput + chunk.toString("utf8")).slice(-4096);
+  });
+  child.stderr.on("data", () => { stderrObserved = true; });
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) {
       await new Promise((resolve) => { child.once("exit", resolve); child.kill(); });
     }
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
+  // An HTTP listener can become reachable before asynchronous startup
+  // reconciliation has acknowledged the selected inventory. Do not submit
+  // credentials until the server advertises its final startup acknowledgement.
   const deadline = Date.now() + 15_000;
   let loginPage;
+  let port = null;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`disposable server exited (${child.exitCode})`);
-    try { loginPage = await request(port, "/login.html"); break; } catch { await new Promise((resolve) => setTimeout(resolve, 100)); }
+    const announcedPort = startupOutput.match(/Servidor rodando em http:\/\/(?:\[[^\]]+\]|[^:\s]+):(\d+)/)?.[1];
+    if (announcedPort) {
+      port = Number(announcedPort);
+      try { loginPage = await request(port, "/login.html"); break; } catch { /* still binding */ }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert.equal(loginPage?.status, 200, "disposable server is ready");
+  assert.equal(Number.isSafeInteger(port) && port > 0 && port <= 65535, true,
+    `disposable server did not announce its own bound port${stderrObserved ? " (diagnostic stderr present)" : ""}`);
+  assert.equal(loginPage?.status, 200, "disposable server is ready after final startup acknowledgement");
   const body = JSON.stringify({ username: "tester", password });
   const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
   assert.equal(login.status, 200, login.body);
@@ -166,6 +173,15 @@ test("HSTS is emitted only when request originated over trusted HTTPS", { timeou
   assert.equal(httpResponse.headers["strict-transport-security"], undefined);
   const trustedHttps = await request(port, "/login.html", { headers: { "x-forwarded-proto": "https" } });
   assert.equal(trustedHttps.headers["strict-transport-security"], "max-age=31536000");
+});
+
+test("concurrent disposable servers bind unique kernel-allocated ports before authenticated requests", { timeout: 30_000 }, async (t) => {
+  const fixtures = await Promise.all(Array.from({ length: 4 }, () => startFixture(t)));
+  assert.equal(new Set(fixtures.map(({ port }) => port)).size, fixtures.length,
+    "concurrent fixtures must never rely on a previously closed port probe");
+  for (const { port, cookie } of fixtures) {
+    assert.equal((await request(port, "/login.html", { headers: { cookie } })).status, 200);
+  }
 });
 
 test("browser loads static login scripts and same-origin public-share image preview under CSP", { skip: !chromiumInstalled, timeout: 45_000 }, async (t) => {

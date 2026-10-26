@@ -1,4 +1,5 @@
 const { getDb } = require("../db");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 const { ensureFolderId, ensureRootFolder, jsonStringify, nowIso, safeJsonParse, basename } = require("./repositoryUtils");
 
 function isPublicLinkViewerId(viewerId) {
@@ -70,6 +71,7 @@ function getRecordedPublicLinkTokens(tokens = []) {
 }
 
 function savePublicLinks(entries = {}, options = {}) {
+  assertNoLocalStrictSyncWriter();
   const db = getDb();
   const now = nowIso();
   db.transaction(() => {
@@ -184,6 +186,7 @@ function savePublicLinks(entries = {}, options = {}) {
 }
 
 function incrementPublicLinkViews(token, link) {
+  assertNoLocalStrictSyncWriter();
   const db = getDb();
   const update = () => {
     const row = db.prepare("SELECT views FROM public_links WHERE token = ? AND revoked_at IS NULL").get(token);
@@ -204,6 +207,7 @@ function incrementPublicLinkViews(token, link) {
 }
 
 function consumePublicLinkQuota(token, options = {}) {
+  assertNoLocalStrictSyncWriter();
   const db = getDb();
   const kind = options.kind;
   if (kind !== "view" && kind !== "download" && kind !== "session") throw new TypeError("Invalid public link quota kind");

@@ -3,6 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
 const { getDb, isDbEnabled, jsonStringify, safeJsonParse } = require("../db");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 const { RUNTIME_ROOT, resolveRuntimePath } = require("../src/runtime-paths");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 
@@ -453,6 +454,7 @@ function applyRestoreSyncMutation(current, options) {
 }
 
 function mutateRestoreSyncEntry(options = {}) {
+  if (isDbEnabled()) assertNoLocalStrictSyncWriter();
   for (const required of ["backupId", "operationId", "entryId", "expectedState", "expectedLeaseToken", "expectedRevision", "mutate"]) {
     if (!(required in options)) throw new TypeError(`Missing restore mutation field: ${required}`);
   }
@@ -516,6 +518,7 @@ function getBackup(id) {
 }
 
 function saveBackup(entry, options = {}) {
+  if (isDbEnabled()) assertNoLocalStrictSyncWriter();
   const normalized = normalize(entry);
   if (isDbEnabled() && hasBackupTable()) {
     getDb().prepare(`
@@ -559,6 +562,7 @@ function saveBackup(entry, options = {}) {
 }
 
 function deleteBackup(id, options = {}) {
+  if (isDbEnabled()) assertNoLocalStrictSyncWriter();
   if (isDbEnabled() && hasBackupTable()) {
     const db = getDb();
     const removeWithSnapshot = db.transaction(() => {

@@ -6,6 +6,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const readline = require("readline");
+const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 
 const DEFAULT_CONFIG_PATH = path.resolve(process.cwd(), ".rootark-sync.json");
 const STATE_FILE_NAME = ".rootark-sync-state.json";
@@ -67,7 +68,7 @@ async function fileExists(filePath) {
 }
 
 function normalizeServerUrl(serverUrl) {
-  return String(serverUrl || "").trim().replace(/\/+$/, "");
+  return normalizeTrustedSyncServerUrl(serverUrl);
 }
 
 function safeResolveInside(rootDir, targetPath) {
@@ -101,9 +102,21 @@ async function readJson(filePath, fallback) {
 
 async function writeJsonAtomic(filePath, data) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  await fsp.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-  await fsp.rename(tempPath, filePath);
+  const tempPath = `${filePath}.tmp-${crypto.randomBytes(16).toString("hex")}`;
+  let created = false;
+  try {
+    // Exclusive creation prevents a planted symlink/hardlink from receiving
+    // credentials or causing an unrelated file to be truncated.
+    const handle = await fsp.open(tempPath, "wx", 0o600);
+    created = true;
+    try {
+      await handle.writeFile(`${JSON.stringify(data, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally { await handle.close(); }
+    await fsp.rename(tempPath, filePath);
+  } finally {
+    if (created) await fsp.rm(tempPath, { force: true });
+  }
 }
 
 async function loadConfig(configPath) {
@@ -127,10 +140,12 @@ async function saveConfig(configPath, config) {
 }
 
 async function login(serverUrl, username, password) {
-  const response = await fetch(`${serverUrl}/auth/login`, {
+  const response = await fetch(`${normalizeServerUrl(serverUrl)}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
+    // A 307/308 can replay the password body to an attacker-controlled origin.
+    redirect: "error",
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.token) {
@@ -151,9 +166,14 @@ async function ensureToken(config, configPath, passwordProvider = null) {
 }
 
 async function authFetch(config, configPath, urlPath, options = {}) {
+  // Check again at the final network boundary. A caller must not be able to
+  // inject an unsafe origin after initial loadConfig/initialization.
+  const serverUrl = normalizeServerUrl(config.serverUrl);
   const token = await ensureToken(config, configPath, options.passwordProvider);
-  const response = await fetch(`${config.serverUrl}${urlPath}`, {
+  const response = await fetch(`${serverUrl}${urlPath}`, {
     ...options,
+    // Never replay uploaded files or bearer-authenticated requests on redirects.
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {}),
@@ -163,8 +183,9 @@ async function authFetch(config, configPath, urlPath, options = {}) {
   if (response.status === 401 && options.passwordProvider) {
     config.token = "";
     const freshToken = await ensureToken(config, configPath, options.passwordProvider);
-    return fetch(`${config.serverUrl}${urlPath}`, {
+    return fetch(`${serverUrl}${urlPath}`, {
       ...options,
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${freshToken}`,
         ...(options.headers || {}),
@@ -194,28 +215,28 @@ async function approveRemoteFile(config, configPath, fileName, passwordProvider)
   return payload;
 }
 
-async function hashFile(filePath) {
-  const hash = crypto.createHash("sha256");
-  const stream = fs.createReadStream(filePath);
-  await new Promise((resolve, reject) => {
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", resolve);
-  });
-  return hash.digest("hex");
-}
-
-async function getStableFileInfo(filePath, waitMs) {
-  const first = await fsp.stat(filePath);
-  if (!first.isFile()) return null;
+async function getStableFileInfo(filePath, waitMs, config) {
+  const first = await fsp.lstat(filePath, { bigint: true });
+  if (!first.isFile() || first.isSymbolicLink()) return null;
+  if (first.nlink !== 1n) throw new Error("Arquivo sincronizado com hardlink inseguro");
   await new Promise((resolve) => setTimeout(resolve, waitMs));
-  const second = await fsp.stat(filePath);
-  if (!second.isFile()) return null;
-  if (first.size !== second.size || first.mtimeMs !== second.mtimeMs) return null;
+  const second = await fsp.lstat(filePath, { bigint: true });
+  if (!second.isFile() || second.isSymbolicLink()) return null;
+  if (second.nlink !== 1n) throw new Error("Arquivo sincronizado com hardlink inseguro");
+  if (!sameFileIdentity(first, second)) return null;
+  const buffer = await readVerifiedUpload(config, filePath, second);
   return {
-    size: second.size,
-    mtimeMs: second.mtimeMs,
-    hash: await hashFile(filePath),
+    size: Number(second.size),
+    mtimeMs: Number(second.mtimeNs) / 1_000_000,
+    identity: {
+      dev: second.dev,
+      ino: second.ino,
+      size: second.size,
+      mtimeNs: second.mtimeNs,
+      ctimeNs: second.ctimeNs,
+      nlink: second.nlink,
+    },
+    hash: crypto.createHash("sha256").update(buffer).digest("hex"),
   };
 }
 
@@ -229,12 +250,13 @@ async function scanFiles(rootDir) {
       const safePath = safeResolveInside(rootDir, fullPath);
       if (!safePath) continue;
       const relativePath = path.relative(rootDir, safePath);
-      const stats = await fsp.stat(safePath).catch(() => null);
-      if (!stats || shouldIgnore(relativePath, stats)) continue;
+      const stats = await fsp.lstat(safePath).catch(() => null);
+      if (!stats || stats.isSymbolicLink() || shouldIgnore(relativePath, stats)) continue;
 
       if (stats.isDirectory()) {
         await walk(safePath);
-      } else if (stats.isFile()) {
+      } else if (stats.isFile() && stats.nlink === 1) {
+        // Hardlink aliases can expose bytes from files outside localFolder.
         result.push({ fullPath: safePath, relativePath, stats });
       }
     }
@@ -244,17 +266,69 @@ async function scanFiles(rootDir) {
   return result;
 }
 
-async function uploadFile(config, configPath, filePath, relativePath, stateEntry, passwordProvider) {
-  const stats = await fsp.stat(filePath);
-  if (stats.size > MAX_FILE_BYTES) {
-    throw new Error(`Arquivo maior que ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB ainda nao e suportado pelo cliente MVP`);
+function uploadFileTooLarge() {
+  return new Error(`Arquivo maior que ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB ainda nao e suportado pelo cliente MVP`);
+}
+
+function sameFileIdentity(a, b) {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size &&
+    a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
+}
+
+async function readVerifiedUpload(config, filePath, expected) {
+  const root = await fsp.realpath(config.localFolder);
+  const canonical = await fsp.realpath(filePath);
+  if (!safeResolveInside(root, canonical)) throw new Error("Caminho fora da pasta sincronizada bloqueado");
+  const before = await fsp.lstat(filePath, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+    throw new Error("Arquivo sincronizado alterado ou link inseguro");
   }
+  if (before.size > BigInt(MAX_FILE_BYTES)) throw uploadFileTooLarge();
+  if (expected && !sameFileIdentity(before, expected.identity || expected)) throw new Error("Arquivo sincronizado alterado durante o upload");
+
+  const handle = await fsp.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n || !sameFileIdentity(before, opened)) {
+      throw new Error("Arquivo sincronizado alterado durante o upload");
+    }
+    if (opened.size > BigInt(MAX_FILE_BYTES)) throw uploadFileTooLarge();
+    const chunks = [];
+    let total = 0;
+    while (total <= MAX_FILE_BYTES) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_FILE_BYTES + 1 - total));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      total += bytesRead;
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    if (total > MAX_FILE_BYTES) throw uploadFileTooLarge();
+    const after = await handle.stat({ bigint: true });
+    if (!sameFileIdentity(opened, after)) throw new Error("Arquivo sincronizado alterado durante o upload");
+    const pathAfter = await fsp.lstat(filePath, { bigint: true });
+    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.nlink !== 1n
+      || !sameFileIdentity(opened, pathAfter)) {
+      throw new Error("Arquivo sincronizado alterado durante o upload");
+    }
+    const canonicalAfter = await fsp.realpath(filePath);
+    if (!safeResolveInside(root, canonicalAfter)) throw new Error("Caminho fora da pasta sincronizada bloqueado");
+    const buffer = Buffer.concat(chunks, total);
+    if (expected?.hash && crypto.createHash("sha256").update(buffer).digest("hex") !== expected.hash) {
+      throw new Error("Arquivo sincronizado alterado durante o upload");
+    }
+    return buffer;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function uploadFile(config, configPath, filePath, relativePath, stateEntry, passwordProvider, expectedInfo) {
 
   const fileName = path.basename(relativePath);
   const remoteFiles = await listRemoteFiles(config, configPath, passwordProvider).catch(() => []);
   const remoteExists = remoteFiles.some((file) => file.name === fileName);
   const formData = new FormData();
-  const buffer = await fsp.readFile(filePath);
+  const buffer = await readVerifiedUpload(config, filePath, expectedInfo);
   formData.append("file", new Blob([buffer]), fileName);
   formData.append("encryptionLevel", "none");
   if (remoteExists || stateEntry?.remoteFileName === fileName) {
@@ -341,7 +415,7 @@ class SyncClient {
     if (!safePath) throw new Error("Caminho fora da pasta sincronizada bloqueado");
     if (!(await fileExists(safePath))) return;
 
-    const info = await getStableFileInfo(safePath, this.config.stabilityMs);
+    const info = await getStableFileInfo(safePath, this.config.stabilityMs, this.config);
     if (!info) {
       this.schedule(relativePath, "not-stable");
       return;
@@ -361,7 +435,7 @@ class SyncClient {
     for (let attempt = 1; attempt <= this.config.retryLimit; attempt += 1) {
       try {
         log(`Enviando ${relativePath} (${reason}, tentativa ${attempt})`);
-        const uploaded = await uploadFile(this.config, this.configPath, safePath, relativePath, previous, this.passwordProvider);
+        const uploaded = await uploadFile(this.config, this.configPath, safePath, relativePath, previous, this.passwordProvider, info);
         this.state.files[relativePath] = {
           relativePath,
           remoteFileName: uploaded.remoteFileName,

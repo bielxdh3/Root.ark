@@ -61,7 +61,11 @@ function createWebDavFixture(prefix) {
 }
 
 function serverEnv(port, extra = {}) {
-  return { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
+  // These fixtures exercise local WebDAV and local realtime events. CI may
+  // supply an external cloud provider in inherited environment variables;
+  // that provider correctly disables legacy rename until reconciliation is
+  // available. Pin the disposable fixture to local storage, not the app gate.
+  return { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
 }
 
 test("PROPFIND rejects malformed and unsupported non-empty bodies while empty requests succeed", { timeout: 20_000 }, async (t) => {

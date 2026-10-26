@@ -3,9 +3,11 @@
 const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { SyncEngine } = require("./rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
-const { createAuthorizationProof } = require("./rootark-sync-authorization");
+const { createAuthorizationProof, verifyAuthorizationProof,
+  verifyHistoricalAuthorizationProof } = require("./rootark-sync-authorization");
 
 const DEFAULT_CONFIG = path.resolve(process.cwd(), ".rootark-sync.json");
 
@@ -31,7 +33,27 @@ async function readConfig(filePath) {
   const privateKeyBytes = process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY ? Buffer.from(process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY, "base64url") : null;
   const publicKey = process.env.ROOTARK_SYNC_DEVICE_PUBLIC_KEY || "";
   if (!privateKeyBytes || !publicKey) throw new Error("Sync v2 requires device signing keys held only in memory");
-  return { ...config, serverUrl: String(config.serverUrl).replace(/\/+$/, ""), localFolder: path.resolve(config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
+  const pins = config.trustedDevicePublicKeys;
+  if (!pins || typeof pins !== "object" || Array.isArray(pins) || !Object.keys(pins).length) {
+    throw new Error("Sync v2 requires independently provisioned trustedDevicePublicKeys");
+  }
+  for (const [deviceId, spki] of Object.entries(pins)) {
+    if (!deviceId || deviceId.length > 512 || typeof spki !== "string") {
+      throw new Error("Sync v2 trusted device pin is invalid");
+    }
+    const bytes = Buffer.from(spki, "base64url");
+    if (bytes.toString("base64url") !== spki
+      || bytes.length !== 44
+      || crypto.createPublicKey({ key: bytes, format: "der", type: "spki" }).asymmetricKeyType !== "ed25519") {
+      throw new Error("Sync v2 trusted device pin must be canonical Ed25519 SPKI");
+    }
+  }
+  if (!Array.isArray(config.revokedDeviceIds)
+    || config.revokedDeviceIds.some((id) => typeof id !== "string"
+      || !id || id.length > 512)) {
+    throw new Error("Sync v2 requires an explicit revokedDeviceIds snapshot");
+  }
+  return { ...config, serverUrl: normalizeTrustedSyncServerUrl(config.serverUrl), localFolder: path.resolve(config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
 }
 
 function fileKeyResolver(master, fallbackEpoch) {
@@ -41,6 +63,73 @@ function fileKeyResolver(master, fallbackEpoch) {
 async function start(options = {}) {
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
+  // The historical witness mode requires pins provisioned by the embedding
+  // trusted process, outside the mutable sync config and local JSON journal.
+  // The standalone CLI deliberately fails closed until a real independent
+  // mTLS PG/witness evidence source is wired by that embedding process.
+  const historicalMode = config.historicalAdmissionMode;
+  if (historicalMode !== undefined
+    && historicalMode !== "independent-physical-witness-v1") {
+    throw new Error("Unsupported Sync v2 historical admission mode");
+  }
+  // The required mode MUST be activated outside the mutable on-disk config.
+  // A config-only opt-in would silently become the legacy locallyAdmitted
+  // policy when an attacker deletes this JSON field before a restart.
+  const externalMode = options.requireIndependentHistoricalAdmission === true
+    || process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY === "1";
+  if (historicalMode === "independent-physical-witness-v1" && !externalMode) {
+    throw new Error("Strict historical admission must be externally enforced; config-only mode is unsafe");
+  }
+  const strictHistorical = externalMode;
+  if (strictHistorical && (typeof options.historicalEvidenceProvider !== "function"
+    || !options.trustedHistoricalAdmission
+    || !options.trustedHistoricalAdmission.localTrustedDevicePolicy
+    || typeof options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider !== "function")) {
+    throw new Error("Independent witness evidence provider and external pins are required");
+  }
+  const strictBinding = strictHistorical
+    ? require("./rootark-sync-zk1-physical-binding") : null;
+  const independentlyPinnedDevicePolicy = strictHistorical
+    ? strictBinding.snapshotLocalDevicePolicy(
+      options.trustedHistoricalAdmission.localTrustedDevicePolicy) : null;
+  const currentlyTrustedDevice = strictHistorical ? (deviceId) => {
+    // Only the operator-injected callback can supply the current policy.
+    // Recheck synchronously at the final decision, not before awaited crypto.
+    const live = strictBinding.snapshotLocalDevicePolicy(
+      options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider());
+    const originalSpki = independentlyPinnedDevicePolicy.trustedDevicePublicKeys[deviceId];
+    return live.username === independentlyPinnedDevicePolicy.username
+      && typeof originalSpki === "string"
+      && live.trustedDevicePublicKeys[deviceId] === originalSpki
+      && !independentlyPinnedDevicePolicy.revokedDeviceIds.includes(deviceId)
+      && !live.revokedDeviceIds.includes(deviceId);
+  } : null;
+  const currentlyAuthorized = strictHistorical ? (operation) =>
+    currentlyTrustedDevice(operation.deviceId)
+      && operation.authorization?.username === independentlyPinnedDevicePolicy.username
+      && operation.authorization?.publicKey
+        === independentlyPinnedDevicePolicy.trustedDevicePublicKeys[operation.deviceId]
+    : null;
+  const trustedHistorical = strictHistorical ? (() => {
+    const provided = options.trustedHistoricalAdmission;
+    const copyPin = (pin) => Buffer.isBuffer(pin) || pin instanceof Uint8Array
+      ? Buffer.from(pin) : pin;
+    const floor = provided.trustedMinimumFloor;
+    return {
+      pinnedInventoryPublicKey: copyPin(provided.pinnedInventoryPublicKey),
+      pinnedInventorySignerKeyId: copyPin(provided.pinnedInventorySignerKeyId),
+      pinnedPhysicalAttestorPublicKey: copyPin(provided.pinnedPhysicalAttestorPublicKey),
+      pinnedWitnessPublicKey: copyPin(provided.pinnedWitnessPublicKey),
+      witnessKeyId: copyPin(provided.witnessKeyId),
+      statusKeyId: copyPin(provided.statusKeyId),
+      trustedMinimumFloor: floor && {
+        sequence: floor.sequence, lastHash: floor.lastHash,
+        physicalFenceDigest: floor.physicalFenceDigest,
+      },
+    };
+  })() : null;
+  const strictVerifier = strictHistorical
+    ? strictBinding.verifySyncV2HistoricalWitnessAdmission : null;
   const adapter = createOpaqueSyncAdapter({
     baseUrl: config.serverUrl,
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
@@ -55,12 +144,77 @@ async function start(options = {}) {
     compartmentId: config.compartmentId || "private",
     fileKeyResolver: fileKeyResolver(config.fileKey, config.keyEpoch),
     authorize: async (operation) => operation.keyEpoch === config.keyEpoch,
-    authorizeOutgoing: async (operation) => config.deviceRevoked !== true && operation.deviceId === config.deviceId,
-    verifyIncoming: async (operation) => operation.authorization
-      ? verifyAuthorizationProof(operation.authorization, operation, { username: config.username })
-      : false,
+    authorizeOutgoing: async (operation) => config.deviceRevoked !== true
+      && operation.deviceId === config.deviceId
+      && (strictHistorical ? currentlyTrustedDevice(config.deviceId)
+        : !config.revokedDeviceIds.includes(config.deviceId)),
+    // The engine must make a fresh independent decision after asynchronous
+    // signing, before durable enqueue, and again just before every queued
+    // retry/push. Authorization at initial operation creation is insufficient.
+    requireCurrentOutgoingAuthorization: strictHistorical,
+    currentDeviceAuthorization: strictHistorical
+      ? (operation) => config.deviceRevoked !== true
+        && operation.deviceId === config.deviceId
+        && currentlyTrustedDevice(operation.deviceId)
+      : undefined,
+    verifyIncoming: async (operation, { locallyAdmitted = false } = {}) => {
+      if (!operation.authorization) return false;
+      const expected = independentlyPinnedDevicePolicy || { username: config.username,
+        trustedDevicePublicKeys: config.trustedDevicePublicKeys,
+        revokedDeviceIds: config.revokedDeviceIds };
+      if (operation.authorization.expiresAt > Date.now()) {
+        const verified = await verifyAuthorizationProof(operation.authorization, operation, expected);
+        return verified === true && (!strictHistorical
+          || (operation.authorization.expiresAt > Date.now()
+            && currentlyAuthorized(operation)));
+      }
+      // A signed but expired record does not prove that the remote server
+      // admitted it before expiry. The default legacy mode retains only the
+      // exact envelope locally witnessed while fresh; strict mode requires an
+      // independently signed admission and a currently attested physical floor.
+      if (strictHistorical) {
+        // Rechecks overwhelmingly reference already-issued durable receipts.
+        // First try read-only recovery. When none exists, issue with another
+        // CLIENT-generated challenge. If issuance committed but its HTTP ACK
+        // was lost, recover with yet another fresh challenge; no nonce or
+        // authority claim is accepted from the untrusted response.
+        for (const recovery of [true, false, true]) {
+          const nonce = crypto.randomBytes(32);
+          try {
+            const proof = await options.historicalEvidenceProvider(operation,
+              { nonce: Buffer.from(nonce), recovery });
+            if (!proof || typeof proof !== "object" || Array.isArray(proof)) continue;
+            const verified = await strictVerifier({
+              envelope: operation, scope: proof.scope,
+              expectedSequence: proof.expectedSequence, expectedRoot: proof.expectedRoot,
+              receipt: proof.receipt, physicalAttestation: proof.physicalAttestation,
+              nonce, admission: proof.admission, freshFloor: proof.freshFloor,
+              pinnedInventoryPublicKey: trustedHistorical.pinnedInventoryPublicKey,
+              pinnedInventorySignerKeyId: trustedHistorical.pinnedInventorySignerKeyId,
+              pinnedPhysicalAttestorPublicKey: trustedHistorical.pinnedPhysicalAttestorPublicKey,
+              pinnedWitnessPublicKey: trustedHistorical.pinnedWitnessPublicKey,
+              witnessKeyId: trustedHistorical.witnessKeyId,
+              statusKeyId: trustedHistorical.statusKeyId,
+              trustedMinimumFloor: trustedHistorical.trustedMinimumFloor,
+              localTrustedDevicePolicy: expected,
+              trustedCurrentDevicePolicyProvider:
+                options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider,
+            });
+            if (verified.authorizesHistoricalRead === true
+              && verified.authorizesIo !== true
+              && currentlyAuthorized(operation)) return true;
+          } catch (_) { /* This attempt cannot authorize a read. */ }
+          if (!currentlyAuthorized(operation)) return false;
+        }
+        return false;
+      }
+      if (locallyAdmitted !== true) return false;
+      return verifyHistoricalAuthorizationProof(operation.authorization, operation,
+        expected);
+    },
     authorizationFactory: (operation) => createAuthorizationProof(operation, { username: config.username, privateKey: config.privateKey, publicKey: config.publicKey }),
     requireAuthorization: true,
+    reverifySeenIncoming: strictHistorical,
   }).open();
   const once = options.once === true || options.once === "true";
   do {

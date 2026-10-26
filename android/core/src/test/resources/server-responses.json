@@ -31,19 +31,19 @@
           "versionId": "fixture-version-1"
         },
         "tombstone": false,
-        "ciphertext": "NEBYymk",
-        "nonce": "0NJouKMILAaHC-ZA",
-        "tag": "DBYq6eFFNeHwurcNogn7rw",
+        "ciphertext": "ZjDXq7E",
+        "nonce": "BLd3GKELTxJcAf--",
+        "tag": "ROzaqwpSYVrAbCx59NmQJA",
         "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
         "authorization": {
           "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
           "baseRevision": null,
-          "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
+          "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
           "compartmentId": "private",
           "deviceId": "fixture-device-a",
-          "expiresAt": 1792281585161,
+          "expiresAt": 1792950477643,
           "fileId": "fixture-file-1",
-          "idempotencyKey": "fixture-create-key",
+          "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
           "keyEpoch": "epoch-1",
           "metadata": {
             "compartmentId": "private",
@@ -57,21 +57,21 @@
             "size": 5,
             "versionId": "fixture-version-1"
           },
-          "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
+          "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
           "objectId": "fixture-object-1",
           "operation": "create",
           "operationId": "fixture-op-create",
           "protocolVersion": 2,
-          "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-          "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
+          "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+          "replayId": "LcGhvPNJOmRwLQPteGGBiA",
           "revision": {
             "counter": 1,
             "deviceId": "fixture-device-a"
           },
           "schemaVersion": 1,
-          "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ",
+          "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA",
           "suite": "rootark-zk-1",
-          "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
+          "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
           "type": "rootark-sync-device-authorization-v1",
           "username": "alice",
           "versionId": "fixture-version-1"
@@ -123,19 +123,19 @@
               "versionId": "fixture-version-1"
             },
             "tombstone": false,
-            "ciphertext": "NEBYymk",
-            "nonce": "0NJouKMILAaHC-ZA",
-            "tag": "DBYq6eFFNeHwurcNogn7rw",
+            "ciphertext": "ZjDXq7E",
+            "nonce": "BLd3GKELTxJcAf--",
+            "tag": "ROzaqwpSYVrAbCx59NmQJA",
             "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
             "authorization": {
               "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
               "baseRevision": null,
-              "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
+              "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
               "compartmentId": "private",
               "deviceId": "fixture-device-a",
-              "expiresAt": 1792281585161,
+              "expiresAt": 1792950477643,
               "fileId": "fixture-file-1",
-              "idempotencyKey": "fixture-create-key",
+              "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
               "keyEpoch": "epoch-1",
               "metadata": {
                 "compartmentId": "private",
@@ -149,21 +149,21 @@
                 "size": 5,
                 "versionId": "fixture-version-1"
               },
-              "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
+              "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
               "objectId": "fixture-object-1",
               "operation": "create",
               "operationId": "fixture-op-create",
               "protocolVersion": 2,
-              "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-              "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
+              "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+              "replayId": "LcGhvPNJOmRwLQPteGGBiA",
               "revision": {
                 "counter": 1,
                 "deviceId": "fixture-device-a"
               },
               "schemaVersion": 1,
-              "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ",
+              "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA",
               "suite": "rootark-zk-1",
-              "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
+              "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
               "type": "rootark-sync-device-authorization-v1",
               "username": "alice",
               "versionId": "fixture-version-1"
@@ -202,19 +202,19 @@
           "versionId": "fixture-version-1"
         },
         "tombstone": false,
-        "ciphertext": "NEBYymk",
-        "nonce": "0NJouKMILAaHC-ZA",
-        "tag": "DBYq6eFFNeHwurcNogn7rw",
+        "ciphertext": "ZjDXq7E",
+        "nonce": "BLd3GKELTxJcAf--",
+        "tag": "ROzaqwpSYVrAbCx59NmQJA",
         "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
         "authorization": {
           "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
           "baseRevision": null,
-          "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
+          "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
           "compartmentId": "private",
           "deviceId": "fixture-device-a",
-          "expiresAt": 1792281585161,
+          "expiresAt": 1792950477643,
           "fileId": "fixture-file-1",
-          "idempotencyKey": "fixture-create-key",
+          "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
           "keyEpoch": "epoch-1",
           "metadata": {
             "compartmentId": "private",
@@ -228,21 +228,21 @@
             "size": 5,
             "versionId": "fixture-version-1"
           },
-          "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
+          "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
           "objectId": "fixture-object-1",
           "operation": "create",
           "operationId": "fixture-op-create",
           "protocolVersion": 2,
-          "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-          "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
+          "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+          "replayId": "LcGhvPNJOmRwLQPteGGBiA",
           "revision": {
             "counter": 1,
             "deviceId": "fixture-device-a"
           },
           "schemaVersion": 1,
-          "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ",
+          "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA",
           "suite": "rootark-zk-1",
-          "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
+          "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
           "type": "rootark-sync-device-authorization-v1",
           "username": "alice",
           "versionId": "fixture-version-1"
@@ -287,10 +287,53 @@
           "versionId": "fixture-version-1"
         },
         "tombstone": false,
-        "ciphertext": "MbjkQx5M",
-        "nonce": "m1PgmOblwlCJjJFe",
-        "tag": "WAFUUsdNZ_GL5dSZO-g49A",
-        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ"
+        "ciphertext": "tx3eq6uq",
+        "nonce": "A9Ku8CkHJbXBA9KX",
+        "tag": "EC559IE02rMQ8Q9BHn2yZg",
+        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
+        "authorization": {
+          "aadDigest": "0WX_mA21TrcFP8md7Fok7tXMCUK-zITqUUg8lJy08mw",
+          "baseRevision": {
+            "counter": 1,
+            "deviceId": "fixture-device-a"
+          },
+          "ciphertextDigest": "WCJA9naHpKgcwEZCNj8JO8av1G6YUgiRTL1LvuWG71Q",
+          "compartmentId": "private",
+          "deviceId": "fixture-device-a",
+          "expiresAt": 1792950478576,
+          "fileId": "fixture-file-1",
+          "idempotencyKey": "Eb3Li-YD95XkljXEa6ed1jDuJlBKU8T_LhAIX-bq6Dc",
+          "keyEpoch": "epoch-1",
+          "metadata": {
+            "compartmentId": "private",
+            "contentType": "text/plain",
+            "deviceId": "fixture-device-a",
+            "fileId": "fixture-file-1",
+            "keyEpoch": "epoch-1",
+            "name": "readme.txt",
+            "path": "docs/readme.txt",
+            "size": 6,
+            "versionId": "fixture-version-1"
+          },
+          "nonceDigest": "k0bWq_imwxiUkm8ytpEwlABhp_9vD90idmby5Ee8KtI",
+          "objectId": "fixture-object-1",
+          "operation": "update",
+          "operationId": "fixture-op-update",
+          "protocolVersion": 2,
+          "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+          "replayId": "mR_rhsfFJb0X7CMTVSbCBg",
+          "revision": {
+            "counter": 2,
+            "deviceId": "fixture-device-a"
+          },
+          "schemaVersion": 1,
+          "signature": "TrVBJCV-rFOLP2PG_5jmxAhBO6UEEXb8ETOmrk9n03aZ0vu1ieB03U9j_Gi5qzF1-ORYly6ocG8QnwNGMG7vAg",
+          "suite": "rootark-zk-1",
+          "tagDigest": "Ixb7TbOa89bCHhGwfpBFC1I0H1-_JCNF8N1lNTxue7o",
+          "type": "rootark-sync-device-authorization-v1",
+          "username": "alice",
+          "versionId": "fixture-version-1"
+        }
       }
     },
     "sync.put.409.stale": {
@@ -331,10 +374,53 @@
             "versionId": "fixture-version-1"
           },
           "tombstone": false,
-          "ciphertext": "MbjkQx5M",
-          "nonce": "m1PgmOblwlCJjJFe",
-          "tag": "WAFUUsdNZ_GL5dSZO-g49A",
-          "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ"
+          "ciphertext": "tx3eq6uq",
+          "nonce": "A9Ku8CkHJbXBA9KX",
+          "tag": "EC559IE02rMQ8Q9BHn2yZg",
+          "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
+          "authorization": {
+            "aadDigest": "0WX_mA21TrcFP8md7Fok7tXMCUK-zITqUUg8lJy08mw",
+            "baseRevision": {
+              "counter": 1,
+              "deviceId": "fixture-device-a"
+            },
+            "ciphertextDigest": "WCJA9naHpKgcwEZCNj8JO8av1G6YUgiRTL1LvuWG71Q",
+            "compartmentId": "private",
+            "deviceId": "fixture-device-a",
+            "expiresAt": 1792950478576,
+            "fileId": "fixture-file-1",
+            "idempotencyKey": "Eb3Li-YD95XkljXEa6ed1jDuJlBKU8T_LhAIX-bq6Dc",
+            "keyEpoch": "epoch-1",
+            "metadata": {
+              "compartmentId": "private",
+              "contentType": "text/plain",
+              "deviceId": "fixture-device-a",
+              "fileId": "fixture-file-1",
+              "keyEpoch": "epoch-1",
+              "name": "readme.txt",
+              "path": "docs/readme.txt",
+              "size": 6,
+              "versionId": "fixture-version-1"
+            },
+            "nonceDigest": "k0bWq_imwxiUkm8ytpEwlABhp_9vD90idmby5Ee8KtI",
+            "objectId": "fixture-object-1",
+            "operation": "update",
+            "operationId": "fixture-op-update",
+            "protocolVersion": 2,
+            "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+            "replayId": "mR_rhsfFJb0X7CMTVSbCBg",
+            "revision": {
+              "counter": 2,
+              "deviceId": "fixture-device-a"
+            },
+            "schemaVersion": 1,
+            "signature": "TrVBJCV-rFOLP2PG_5jmxAhBO6UEEXb8ETOmrk9n03aZ0vu1ieB03U9j_Gi5qzF1-ORYly6ocG8QnwNGMG7vAg",
+            "suite": "rootark-zk-1",
+            "tagDigest": "Ixb7TbOa89bCHhGwfpBFC1I0H1-_JCNF8N1lNTxue7o",
+            "type": "rootark-sync-device-authorization-v1",
+            "username": "alice",
+            "versionId": "fixture-version-1"
+          }
         }
       }
     },
@@ -376,10 +462,53 @@
             "versionId": "fixture-version-1"
           },
           "tombstone": false,
-          "ciphertext": "MbjkQx5M",
-          "nonce": "m1PgmOblwlCJjJFe",
-          "tag": "WAFUUsdNZ_GL5dSZO-g49A",
-          "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ"
+          "ciphertext": "tx3eq6uq",
+          "nonce": "A9Ku8CkHJbXBA9KX",
+          "tag": "EC559IE02rMQ8Q9BHn2yZg",
+          "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
+          "authorization": {
+            "aadDigest": "0WX_mA21TrcFP8md7Fok7tXMCUK-zITqUUg8lJy08mw",
+            "baseRevision": {
+              "counter": 1,
+              "deviceId": "fixture-device-a"
+            },
+            "ciphertextDigest": "WCJA9naHpKgcwEZCNj8JO8av1G6YUgiRTL1LvuWG71Q",
+            "compartmentId": "private",
+            "deviceId": "fixture-device-a",
+            "expiresAt": 1792950478576,
+            "fileId": "fixture-file-1",
+            "idempotencyKey": "Eb3Li-YD95XkljXEa6ed1jDuJlBKU8T_LhAIX-bq6Dc",
+            "keyEpoch": "epoch-1",
+            "metadata": {
+              "compartmentId": "private",
+              "contentType": "text/plain",
+              "deviceId": "fixture-device-a",
+              "fileId": "fixture-file-1",
+              "keyEpoch": "epoch-1",
+              "name": "readme.txt",
+              "path": "docs/readme.txt",
+              "size": 6,
+              "versionId": "fixture-version-1"
+            },
+            "nonceDigest": "k0bWq_imwxiUkm8ytpEwlABhp_9vD90idmby5Ee8KtI",
+            "objectId": "fixture-object-1",
+            "operation": "update",
+            "operationId": "fixture-op-update",
+            "protocolVersion": 2,
+            "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+            "replayId": "mR_rhsfFJb0X7CMTVSbCBg",
+            "revision": {
+              "counter": 2,
+              "deviceId": "fixture-device-a"
+            },
+            "schemaVersion": 1,
+            "signature": "TrVBJCV-rFOLP2PG_5jmxAhBO6UEEXb8ETOmrk9n03aZ0vu1ieB03U9j_Gi5qzF1-ORYly6ocG8QnwNGMG7vAg",
+            "suite": "rootark-zk-1",
+            "tagDigest": "Ixb7TbOa89bCHhGwfpBFC1I0H1-_JCNF8N1lNTxue7o",
+            "type": "rootark-sync-device-authorization-v1",
+            "username": "alice",
+            "versionId": "fixture-version-1"
+          }
         }
       }
     },
@@ -414,9 +543,50 @@
         },
         "tombstone": false,
         "ciphertext": "",
-        "nonce": "oEqRBesP1gdubyro",
-        "tag": "eD-frRJNhg5aV0PgV2s1nQ",
-        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwicGF0aCI6ImRvY3MvbW92ZWQudHh0Iiwic291cmNlUGF0aCI6ImRvY3MvcmVhZG1lLnR4dCIsInZlcnNpb25JZCI6ImZpeHR1cmUtdmVyc2lvbi0xIn0sIm9iamVjdElkIjoiZml4dHVyZS1vYmplY3QtMSIsIm9wZXJhdGlvbiI6Im1vdmUiLCJwcm90b2NvbFZlcnNpb24iOjIsInJldmlzaW9uIjp7ImNvdW50ZXIiOjMsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSJ9LCJ0b21ic3RvbmUiOmZhbHNlLCJ2ZXJzaW9uSWQiOiJmaXh0dXJlLXZlcnNpb24tMSJ9"
+        "nonce": "FJbB7WwShwJKlsTp",
+        "tag": "o6n4th1F4s_YpoWDvhOIaA",
+        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwicGF0aCI6ImRvY3MvbW92ZWQudHh0Iiwic291cmNlUGF0aCI6ImRvY3MvcmVhZG1lLnR4dCIsInZlcnNpb25JZCI6ImZpeHR1cmUtdmVyc2lvbi0xIn0sIm9iamVjdElkIjoiZml4dHVyZS1vYmplY3QtMSIsIm9wZXJhdGlvbiI6Im1vdmUiLCJwcm90b2NvbFZlcnNpb24iOjIsInJldmlzaW9uIjp7ImNvdW50ZXIiOjMsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSJ9LCJ0b21ic3RvbmUiOmZhbHNlLCJ2ZXJzaW9uSWQiOiJmaXh0dXJlLXZlcnNpb24tMSJ9",
+        "authorization": {
+          "aadDigest": "sApkp3I4BjeX6cfiIGjR6NNwhW7RDzyFAu5ohuGz7IA",
+          "baseRevision": {
+            "counter": 2,
+            "deviceId": "fixture-device-a"
+          },
+          "ciphertextDigest": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+          "compartmentId": "private",
+          "deviceId": "fixture-device-a",
+          "expiresAt": 1792950478644,
+          "fileId": "fixture-file-1",
+          "idempotencyKey": "rn2IyB2Q58NGnze2laec9vSqYWaNkYs1tu5VkXQIX0A",
+          "keyEpoch": "epoch-1",
+          "metadata": {
+            "compartmentId": "private",
+            "deviceId": "fixture-device-a",
+            "fileId": "fixture-file-1",
+            "keyEpoch": "epoch-1",
+            "path": "docs/moved.txt",
+            "sourcePath": "docs/readme.txt",
+            "versionId": "fixture-version-1"
+          },
+          "nonceDigest": "xnZkmE308fpto-ZXqNJ9ngeBj5v9e8c1qH2az1hI5PY",
+          "objectId": "fixture-object-1",
+          "operation": "move",
+          "operationId": "fixture-op-move",
+          "protocolVersion": 2,
+          "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+          "replayId": "YubxwKR9HXr-u5xFIYvPog",
+          "revision": {
+            "counter": 3,
+            "deviceId": "fixture-device-a"
+          },
+          "schemaVersion": 1,
+          "signature": "IdYrCccGFvo9UUWiAkJ4_U-YnHu_vXIY3ltJ-U8uXwKh3AnJkm30-551Aavl_D04-NT7msVcmZ9s5WP0MjZ6Dw",
+          "suite": "rootark-zk-1",
+          "tagDigest": "B3O3zAhqI8nzRs3biKTF2Lfm_X2nQ191Fw1pxKDoWoU",
+          "type": "rootark-sync-device-authorization-v1",
+          "username": "alice",
+          "versionId": "fixture-version-1"
+        }
       }
     },
     "sync.delete.200": {
@@ -449,9 +619,49 @@
         },
         "tombstone": true,
         "ciphertext": "",
-        "nonce": "oGQQAYkXe_Nw1RIT",
-        "tag": "H2vSqmiFWgPVBHa2q3PA1A",
-        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MywiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwicGF0aCI6ImRvY3MvbW92ZWQudHh0IiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiZGVsZXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjo0LCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjp0cnVlLCJ2ZXJzaW9uSWQiOiJmaXh0dXJlLXZlcnNpb24tMSJ9"
+        "nonce": "LRgB0dW1T0KDo75-",
+        "tag": "E-xHq29XB0F69v7KbxDvZA",
+        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MywiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwicGF0aCI6ImRvY3MvbW92ZWQudHh0IiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiZGVsZXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjo0LCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjp0cnVlLCJ2ZXJzaW9uSWQiOiJmaXh0dXJlLXZlcnNpb24tMSJ9",
+        "authorization": {
+          "aadDigest": "kcGRLqrrMCy20m-u4zD_98s4NlXtGUizAY5AVgTKXF0",
+          "baseRevision": {
+            "counter": 3,
+            "deviceId": "fixture-device-a"
+          },
+          "ciphertextDigest": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+          "compartmentId": "private",
+          "deviceId": "fixture-device-a",
+          "expiresAt": 1792950478665,
+          "fileId": "fixture-file-1",
+          "idempotencyKey": "VDJXYO4_BEnj1roM-sC7N-5qGVut4Vo0e-el3iTkkwI",
+          "keyEpoch": "epoch-1",
+          "metadata": {
+            "compartmentId": "private",
+            "deviceId": "fixture-device-a",
+            "fileId": "fixture-file-1",
+            "keyEpoch": "epoch-1",
+            "path": "docs/moved.txt",
+            "versionId": "fixture-version-1"
+          },
+          "nonceDigest": "zw3IO_TCLkq2N7AUWtZHO2yTD0x5-u4lNGxI5A0qeY8",
+          "objectId": "fixture-object-1",
+          "operation": "delete",
+          "operationId": "fixture-op-delete",
+          "protocolVersion": 2,
+          "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+          "replayId": "DbpvtBqUiRZLxX_6-dgG9g",
+          "revision": {
+            "counter": 4,
+            "deviceId": "fixture-device-a"
+          },
+          "schemaVersion": 1,
+          "signature": "jJo-Swrxg6vizVEiWuD7fvPtKJjD0BCMGrnlUTDSOF7cY3L6ILD6Wj1hOn60FR5r81ffEu9E0PGURR0AG7Y4Aw",
+          "suite": "rootark-zk-1",
+          "tagDigest": "gk7E5hf4JlKYN5m9TxgNKKZ9t5SBHg2gbJ22KnzPUCc",
+          "type": "rootark-sync-device-authorization-v1",
+          "username": "alice",
+          "versionId": "fixture-version-1"
+        }
       }
     },
     "login.200.authenticated": {
@@ -547,12 +757,12 @@
     "SyncAuthorizationProof": {
       "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
       "baseRevision": null,
-      "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
+      "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
       "compartmentId": "private",
       "deviceId": "fixture-device-a",
-      "expiresAt": 1792281585161,
+      "expiresAt": 1792950477643,
       "fileId": "fixture-file-1",
-      "idempotencyKey": "fixture-create-key",
+      "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
       "keyEpoch": "epoch-1",
       "metadata": {
         "compartmentId": "private",
@@ -566,21 +776,21 @@
         "size": 5,
         "versionId": "fixture-version-1"
       },
-      "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
+      "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
       "objectId": "fixture-object-1",
       "operation": "create",
       "operationId": "fixture-op-create",
       "protocolVersion": 2,
-      "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-      "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
+      "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+      "replayId": "LcGhvPNJOmRwLQPteGGBiA",
       "revision": {
         "counter": 1,
         "deviceId": "fixture-device-a"
       },
       "schemaVersion": 1,
-      "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ",
+      "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA",
       "suite": "rootark-zk-1",
-      "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
+      "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
       "type": "rootark-sync-device-authorization-v1",
       "username": "alice",
       "versionId": "fixture-version-1"
@@ -613,9 +823,9 @@
         "versionId": "fixture-version-1"
       },
       "tombstone": false,
-      "ciphertext": "NEBYymk",
-      "nonce": "0NJouKMILAaHC-ZA",
-      "tag": "DBYq6eFFNeHwurcNogn7rw",
+      "ciphertext": "ZjDXq7E",
+      "nonce": "BLd3GKELTxJcAf--",
+      "tag": "ROzaqwpSYVrAbCx59NmQJA",
       "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
       "authorization": {
         "schemaVersion": 1,
@@ -649,14 +859,14 @@
           "versionId": "fixture-version-1"
         },
         "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
-        "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
-        "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
-        "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
-        "expiresAt": 1792281585161,
-        "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
-        "idempotencyKey": "fixture-create-key",
-        "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-        "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ"
+        "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
+        "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
+        "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
+        "expiresAt": 1792950477643,
+        "replayId": "LcGhvPNJOmRwLQPteGGBiA",
+        "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
+        "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+        "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA"
       }
     },
     "SyncRecord": {
@@ -687,19 +897,19 @@
         "versionId": "fixture-version-1"
       },
       "tombstone": false,
-      "ciphertext": "NEBYymk",
-      "nonce": "0NJouKMILAaHC-ZA",
-      "tag": "DBYq6eFFNeHwurcNogn7rw",
+      "ciphertext": "ZjDXq7E",
+      "nonce": "BLd3GKELTxJcAf--",
+      "tag": "ROzaqwpSYVrAbCx59NmQJA",
       "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
       "authorization": {
         "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
         "baseRevision": null,
-        "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
+        "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
         "compartmentId": "private",
         "deviceId": "fixture-device-a",
-        "expiresAt": 1792281585161,
+        "expiresAt": 1792950477643,
         "fileId": "fixture-file-1",
-        "idempotencyKey": "fixture-create-key",
+        "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
         "keyEpoch": "epoch-1",
         "metadata": {
           "compartmentId": "private",
@@ -713,21 +923,21 @@
           "size": 5,
           "versionId": "fixture-version-1"
         },
-        "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
+        "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
         "objectId": "fixture-object-1",
         "operation": "create",
         "operationId": "fixture-op-create",
         "protocolVersion": 2,
-        "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-        "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
+        "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+        "replayId": "LcGhvPNJOmRwLQPteGGBiA",
         "revision": {
           "counter": 1,
           "deviceId": "fixture-device-a"
         },
         "schemaVersion": 1,
-        "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ",
+        "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA",
         "suite": "rootark-zk-1",
-        "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
+        "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
         "type": "rootark-sync-device-authorization-v1",
         "username": "alice",
         "versionId": "fixture-version-1"
@@ -764,19 +974,19 @@
             "versionId": "fixture-version-1"
           },
           "tombstone": false,
-          "ciphertext": "NEBYymk",
-          "nonce": "0NJouKMILAaHC-ZA",
-          "tag": "DBYq6eFFNeHwurcNogn7rw",
+          "ciphertext": "ZjDXq7E",
+          "nonce": "BLd3GKELTxJcAf--",
+          "tag": "ROzaqwpSYVrAbCx59NmQJA",
           "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
           "authorization": {
             "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
             "baseRevision": null,
-            "ciphertextDigest": "2cfgvEu1paSK0_Yur9hewyQ7fz1hQPqC04f0LRGqiJU",
+            "ciphertextDigest": "PBp0gmNyEbXWd7Da3ML5UctZYMpv_zoiVJS0lxx3pgA",
             "compartmentId": "private",
             "deviceId": "fixture-device-a",
-            "expiresAt": 1792281585161,
+            "expiresAt": 1792950477643,
             "fileId": "fixture-file-1",
-            "idempotencyKey": "fixture-create-key",
+            "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
             "keyEpoch": "epoch-1",
             "metadata": {
               "compartmentId": "private",
@@ -790,21 +1000,21 @@
               "size": 5,
               "versionId": "fixture-version-1"
             },
-            "nonceDigest": "TvjV0JPg8LwiDuWpdBXtV9IJIl1c_QQUKCjrm6YBb_0",
+            "nonceDigest": "pTAHqhZOMy9XCZ2mw5MOTy295cjhYN3Q0iZL2iGsEFI",
             "objectId": "fixture-object-1",
             "operation": "create",
             "operationId": "fixture-op-create",
             "protocolVersion": 2,
-            "publicKey": "MCowBQYDK2VwAyEAywENdJ6n7UzZgmxg7HdyVbWL0W_gSNqpDjNn2eSypU0",
-            "replayId": "4qkv9-9SH_4ezMC0pFe8tg",
+            "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+            "replayId": "LcGhvPNJOmRwLQPteGGBiA",
             "revision": {
               "counter": 1,
               "deviceId": "fixture-device-a"
             },
             "schemaVersion": 1,
-            "signature": "o6tD5gU-vDqvgAw4TIM21ebXdr4Quee-7OljztHye-rpXJYTF3B1S9GLpB7WZvBK9Gs-D0e74PunY7YbEIZzCQ",
+            "signature": "Z_FnSnvN7Q_i_DSs63BW9p_er-C-rj0oKb9zU6PflPVRa-3pj6LhLtOdDHOEXhqUSC_QdsFRtmgq-kTV2HrlAA",
             "suite": "rootark-zk-1",
-            "tagDigest": "cQGp0rRB207YJodP0X4k3B62TssY_7-Zi9IlVhrwa64",
+            "tagDigest": "FQXBnXWZGh9N7Xl7nZWUxbAXnBTX1KhRM35KEqOoxt0",
             "type": "rootark-sync-device-authorization-v1",
             "username": "alice",
             "versionId": "fixture-version-1"
@@ -848,10 +1058,53 @@
           "versionId": "fixture-version-1"
         },
         "tombstone": false,
-        "ciphertext": "MbjkQx5M",
-        "nonce": "m1PgmOblwlCJjJFe",
-        "tag": "WAFUUsdNZ_GL5dSZO-g49A",
-        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ"
+        "ciphertext": "tx3eq6uq",
+        "nonce": "A9Ku8CkHJbXBA9KX",
+        "tag": "EC559IE02rMQ8Q9BHn2yZg",
+        "aad": "eyJiYXNlUmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NiwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoidXBkYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoyLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
+        "authorization": {
+          "aadDigest": "0WX_mA21TrcFP8md7Fok7tXMCUK-zITqUUg8lJy08mw",
+          "baseRevision": {
+            "counter": 1,
+            "deviceId": "fixture-device-a"
+          },
+          "ciphertextDigest": "WCJA9naHpKgcwEZCNj8JO8av1G6YUgiRTL1LvuWG71Q",
+          "compartmentId": "private",
+          "deviceId": "fixture-device-a",
+          "expiresAt": 1792950478576,
+          "fileId": "fixture-file-1",
+          "idempotencyKey": "Eb3Li-YD95XkljXEa6ed1jDuJlBKU8T_LhAIX-bq6Dc",
+          "keyEpoch": "epoch-1",
+          "metadata": {
+            "compartmentId": "private",
+            "contentType": "text/plain",
+            "deviceId": "fixture-device-a",
+            "fileId": "fixture-file-1",
+            "keyEpoch": "epoch-1",
+            "name": "readme.txt",
+            "path": "docs/readme.txt",
+            "size": 6,
+            "versionId": "fixture-version-1"
+          },
+          "nonceDigest": "k0bWq_imwxiUkm8ytpEwlABhp_9vD90idmby5Ee8KtI",
+          "objectId": "fixture-object-1",
+          "operation": "update",
+          "operationId": "fixture-op-update",
+          "protocolVersion": 2,
+          "publicKey": "MCowBQYDK2VwAyEA2lce1LB1GjCmNPwtIOE9mq3RthNe--HZxiSI3pE-Krc",
+          "replayId": "mR_rhsfFJb0X7CMTVSbCBg",
+          "revision": {
+            "counter": 2,
+            "deviceId": "fixture-device-a"
+          },
+          "schemaVersion": 1,
+          "signature": "TrVBJCV-rFOLP2PG_5jmxAhBO6UEEXb8ETOmrk9n03aZ0vu1ieB03U9j_Gi5qzF1-ORYly6ocG8QnwNGMG7vAg",
+          "suite": "rootark-zk-1",
+          "tagDigest": "Ixb7TbOa89bCHhGwfpBFC1I0H1-_JCNF8N1lNTxue7o",
+          "type": "rootark-sync-device-authorization-v1",
+          "username": "alice",
+          "versionId": "fixture-version-1"
+        }
       }
     },
     "Authenticated": {
