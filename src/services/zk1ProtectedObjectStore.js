@@ -255,9 +255,10 @@ class Zk1ProtectedObjectStore {
     }
     const absolute = path.resolve(filename);
     if (bootstrapNew !== true && bootstrapNew !== false) fail();
-    const existed = fs.existsSync(absolute);
-    if (existed === bootstrapNew) fail("ZK_CONTENT_BOOTSTRAP_REQUIRED");
-    if (existed && !fs.lstatSync(absolute).isFile()) fail();
+    // Operator bootstrap is the authority for create vs. restart. O_EXCL
+    // atomically denies an already-named file; no exists/stat preflight can
+    // safely authorize exclusive creation.
+    const existed = !bootstrapNew;
     try {
       if (existed) assertPrivateSqliteFile(absolute);
       else ensurePrivateSqliteDirectory(absolute);
@@ -301,10 +302,13 @@ class Zk1ProtectedObjectStore {
         assertPrivateSqliteAuthorityDirectory(absolute);
       } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
       // Never race another bootstrap into overwriting an existing database.
-      const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
-        | fs.constants.O_RDWR, 0o600);
-      try { inspectedIdentity = statIdentity(fs.fstatSync(fd, { bigint: true })); }
-      finally { fs.closeSync(fd); }
+      let fd;
+      try {
+        fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
+          | fs.constants.O_RDWR, 0o600);
+        inspectedIdentity = statIdentity(fs.fstatSync(fd, { bigint: true }));
+      } catch (_) { fail("ZK_CONTENT_BOOTSTRAP_REQUIRED"); }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
     }
     try {
       assertPrivateSqliteFile(absolute);
