@@ -21,17 +21,25 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
   const db = new Database(filename);
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = FULL");
+  if (typeof operator.policyProvider !== "function") throw Error("TEST_OPERATOR_POLICY_REQUIRED");
+  const initialPolicy = JSON.stringify(snapshotLocalDevicePolicy(operator.policyProvider()));
   db.exec(`CREATE TABLE IF NOT EXISTS operator_recovery_floor (
     id INTEGER PRIMARY KEY CHECK(id=1),
     sequence INTEGER NOT NULL, last_hash TEXT NOT NULL,
     finalized_sequence INTEGER NOT NULL, finalized_hash TEXT NOT NULL,
-    quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)));
+    quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)),
+    owner_generation INTEGER NOT NULL DEFAULT 0,
+    owner_policy TEXT NOT NULL,
+    finalized_owner_generation INTEGER NOT NULL DEFAULT 0,
+    ack_settlement TEXT NOT NULL DEFAULT 'SEALED'
+      CHECK(ack_settlement IN ('SEALED','PROVISIONAL')),
+    provisional_proof_hash TEXT NOT NULL DEFAULT '');
   `);
   db.prepare("INSERT OR IGNORE INTO operator_recovery_floor"
-    + " (id,sequence,last_hash,finalized_sequence,finalized_hash)"
-    + " VALUES(1,?,?,?,?)").run(
+    + " (id,sequence,last_hash,finalized_sequence,finalized_hash,owner_policy)"
+    + " VALUES(1,?,?,?,?,?)").run(
       initialHead.sequence, initialHead.lastHash,
-      initialHead.sequence, initialHead.lastHash);
+      initialHead.sequence, initialHead.lastHash, initialPolicy);
   let available = true;
   let failurePhase = null;
   let reads = 0;
@@ -47,11 +55,44 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
     loadHead: read,
     loadFinalizedHead() {
       if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
-      const row = db.prepare("SELECT finalized_sequence,finalized_hash,quarantined"
+      const row = db.prepare("SELECT finalized_sequence,finalized_hash,quarantined,"
+        + " owner_generation,finalized_owner_generation,owner_policy,ack_settlement"
         + " FROM operator_recovery_floor WHERE id=1").get();
       if (!row) throw Error("TEST_FINALIZATION_MISSING");
       if (row.quarantined !== 0) throw Error("TEST_FINALIZATION_DURABLY_QUARANTINED");
+      if (row.ack_settlement !== "SEALED"
+        || row.finalized_owner_generation !== row.owner_generation)
+        throw Error("TEST_FINALIZATION_PROVISIONAL_OR_REVOKED");
+      if (JSON.stringify(snapshotLocalDevicePolicy(operator.policyProvider()))
+        !== row.owner_policy) throw Error("TEST_OPERATOR_POLICY_DRIFT_UNFENCED");
       return { sequence: row.finalized_sequence, lastHash: row.finalized_hash };
+    },
+    loadProvisionalHead() {
+      if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
+      const row = db.prepare("SELECT sequence,last_hash,ack_settlement"
+        + " FROM operator_recovery_floor WHERE id=1").get();
+      if (!row || row.ack_settlement !== "PROVISIONAL")
+        throw Error("TEST_NO_PROVISIONAL_HEAD");
+      return { sequence: row.sequence, lastHash: row.last_hash };
+    },
+    loadOwnerGeneration() {
+      if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
+      const row = db.prepare("SELECT owner_generation FROM operator_recovery_floor"
+        + " WHERE id=1").get();
+      if (!row) throw Error("TEST_OWNER_GENERATION_MISSING");
+      return row.owner_generation;
+    },
+    // Owner-policy writes must be delivered to this custodian as the
+    // authoritative effective revocation, not merely mutated in the witness.
+    // Monotonic generation and quarantine commit in one FULL SQLite CAS.
+    advanceOwnerPolicy(expectedGeneration, nextPolicy) {
+      if (!available || !Number.isSafeInteger(expectedGeneration)
+        || expectedGeneration < 0) throw Error("TEST_OWNER_CAS_INVALID");
+      const canonical = JSON.stringify(snapshotLocalDevicePolicy(nextPolicy));
+      return db.transaction(() => db.prepare("UPDATE operator_recovery_floor"
+        + " SET owner_generation=owner_generation+1, owner_policy=?,quarantined=1"
+        + " WHERE id=1 AND owner_generation=? AND quarantined=0").run(
+          canonical, expectedGeneration).changes === 1).immediate();
     },
     loadQuarantinedHead() {
       if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
@@ -144,19 +185,59 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
         throw Error("TEST_FINALIZATION_PHYSICAL_TIME_MISMATCH");
       const changed = db.transaction(() => {
         const currentPolicy = JSON.stringify(snapshotLocalDevicePolicy(operator.policyProvider()));
-        if (currentPolicy !== proof.policySnapshot
+        const persisted = db.prepare("SELECT owner_policy,owner_generation,"
+          + " ack_settlement FROM operator_recovery_floor WHERE id=1").get();
+        if (!persisted || currentPolicy !== proof.policySnapshot
+          || persisted.owner_policy !== proof.policySnapshot
+          || persisted.owner_generation !== proof.ownerGeneration
+          || persisted.ack_settlement !== "SEALED"
           || Math.abs(Math.floor(Date.now() / 1000) - verified.issuedAt) > 30)
           throw Error("TEST_FINALIZATION_STALE_POLICY_OR_PROOF");
         return db.prepare("UPDATE operator_recovery_floor"
-          + " SET finalized_sequence=?,finalized_hash=?"
+          + " SET finalized_sequence=?,finalized_hash=?,"
+          + " ack_settlement='PROVISIONAL',provisional_proof_hash=?,"
+          + " finalized_owner_generation=?"
           + " WHERE id=1 AND sequence=? AND last_hash=?"
           + " AND quarantined=0"
+          + " AND owner_generation=? AND ack_settlement='SEALED'"
           + " AND finalized_sequence=? AND finalized_hash=?").run(
-            next.sequence, next.lastHash, next.sequence, next.lastHash,
+            next.sequence, next.lastHash,
+            sha(Buffer.concat([proof.readySignature, proof.physicalAttestation,
+              proof.nonce, Buffer.from(proof.policySnapshot),
+              Buffer.from(String(proof.ownerGeneration))])), proof.ownerGeneration,
+            next.sequence, next.lastHash, proof.ownerGeneration,
             previous.sequence, previous.lastHash).changes;
       }).immediate();
       if (failurePhase === "finalize-after") throw Error("TEST_FINALIZATION_ACK_LOST");
       return changed === 1;
+    },
+    sealAck(expected, proof) {
+      if (!available || failurePhase === "seal-before") throw Error("TEST_SEAL_UNAVAILABLE");
+      const proofHash = sha(Buffer.concat([proof.readySignature,
+        proof.physicalAttestation, proof.nonce,
+        Buffer.from(proof.policySnapshot), Buffer.from(String(proof.ownerGeneration))]));
+      const sealed = db.transaction(() => {
+        const live = JSON.stringify(snapshotLocalDevicePolicy(operator.policyProvider()));
+        if (live !== proof.policySnapshot || !Number.isSafeInteger(proof.physicalIssuedAt)
+          || Math.abs(Math.floor(Date.now() / 1000) - proof.physicalIssuedAt) > 30)
+          throw Error("TEST_SEAL_STALE_OWNER_OR_PG");
+        // This FULL CAS is the only authorization linearization point: it
+        // requires operator-owner generation and the already verified signed
+        // PG proof to remain valid under the same external write lock.
+        return db.prepare("UPDATE operator_recovery_floor"
+          + " SET ack_settlement='SEALED'"
+          + " WHERE id=1 AND sequence=? AND last_hash=?"
+          + " AND finalized_sequence=? AND finalized_hash=?"
+          + " AND quarantined=0 AND ack_settlement='PROVISIONAL'"
+          + " AND owner_generation=? AND finalized_owner_generation=?"
+          + " AND owner_policy=? AND provisional_proof_hash=?").run(
+            expected.sequence, expected.lastHash,
+            expected.sequence, expected.lastHash,
+            proof.ownerGeneration, proof.ownerGeneration,
+            proof.policySnapshot, proofHash).changes === 1;
+      }).immediate();
+      if (failurePhase === "seal-after") throw Error("TEST_SEAL_ACK_LOST");
+      return sealed;
     },
   };
   return { authority, read, setAvailable(value) { available = value; },

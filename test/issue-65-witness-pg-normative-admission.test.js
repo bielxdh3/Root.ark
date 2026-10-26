@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const Database = require("better-sqlite3");
 const z = require("../src/crypto/rootark-zk-1");
 const contentInventory = require("../src/crypto/rootark-zk-content-inventory-v1");
@@ -874,6 +874,8 @@ test("strict CAS witness floor refuses signed status advance without independent
       loadFinalizedHead: remote.authority.loadFinalizedHead,
       loadQuarantinedHead: remote.authority.loadQuarantinedHead,
       finalizeAck: remote.authority.finalizeAck,
+      loadOwnerGeneration: remote.authority.loadOwnerGeneration,
+      sealAck: remote.authority.sealAck,
       quarantineFinalizedAck: remote.authority.quarantineFinalizedAck,
       compareAndAdvance(expected, next) {
         const accepted = remote.authority.compareAndAdvance(expected, next);
@@ -1030,8 +1032,14 @@ test("strict CAS witness floor refuses signed status advance without independent
       }
       assert.equal(remote.read().sequence, independentlyPinnedRecoveryHead.sequence + 1,
         "external CAS must have durably committed before READY delay");
-      assert.deepEqual(remote.authority.loadFinalizedHead(), independentlyPinnedRecoveryHead,
-        "expired/failed READY must never acquire independent operator finalization");
+      if (trustedDeviceRevocations.length) {
+        assert.throws(() => remote.authority.loadFinalizedHead(),
+          /TEST_OPERATOR_POLICY_DRIFT_UNFENCED/,
+          "operator observes unfenced owner-policy drift even for an old valid head");
+      } else {
+        assert.deepEqual(remote.authority.loadFinalizedHead(), independentlyPinnedRecoveryHead,
+          "expired/failed READY must never acquire independent operator finalization");
+      }
       assert.equal(instance.supportsClientHistoricalNonce, false);
     } finally {
       Date.now = originalNow;
@@ -1104,6 +1112,121 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.throws(() => new Zk1WitnessCasAnchorFloor(readyCrashPath, readyCrashOpts),
     /WITNESS_CAS_FLOOR_DENIED/,
     "valid signed READY plus matching CAS must remain NO-GO before operator finalization");
+  // W36 residual P2: operator's verified FULL commit is ONLY PROVISIONAL.
+  // A witness process that dies while finalizeAck response is in flight never
+  // executes its stale-policy check or compensating SQLite write. A REAL
+  // separate Node process inspects both FULL committed SQLite stores and
+  // exits, then restart from the original witness bytes must fail closed.
+  const provisionalPath = path.join(directory, "witness-crash-after-operator-full.sqlite");
+  const provisionalSource = new Database(historicalFilename, {
+    readonly: true, fileMustExist: true });
+  try { await provisionalSource.backup(provisionalPath); }
+  finally { provisionalSource.close(); }
+  fs.chmodSync(provisionalPath, 0o600);
+  const provisionalOperatorPath = path.join(directory, "operator-crash-after-full.sqlite");
+  const provisionalRemote = createExternalRecoveryHeadFixture(
+    provisionalOperatorPath, independentlyPinnedRecoveryHead, operatorProofPins);
+  externalAuthorities.push(provisionalRemote);
+  let completeDurableOperatorCommit;
+  const operatorCommitted = new Promise((resolve) => { completeDurableOperatorCommit = resolve; });
+  const provisionalOptions = { ...pinnedRestart,
+    trustedRecoveryNonceAuthority: {
+      ...provisionalRemote.authority,
+      async finalizeAck(...args) {
+        const [previous, next, proof] = args;
+        const crashManifest = path.join(directory, "operator-crash-full-manifest.json");
+        fs.writeFileSync(crashManifest, JSON.stringify({
+          operatorPath: provisionalOperatorPath, previous, next, proof,
+          witnessPublicKeyPem: witness.publicKey.export({ type: "spki", format: "pem" }),
+          pgPublicKeyPem: attestor.publicKey.export({ type: "spki", format: "pem" }),
+          ownerPolicy: trustedSyncDevicePolicyProvider(),
+        }));
+        const crashed = spawnSync(process.execPath, [
+          path.join(__dirname, "support", "issue-65-operator-provisional-crash-child.js"),
+          crashManifest,
+        ], { cwd: path.resolve(__dirname, ".."), encoding: "utf8", timeout: 15000 });
+        assert.equal(crashed.status, 73,
+          `real external operator child MUST exit directly after FULL CAS: ${crashed.stderr}`);
+        completeDurableOperatorCommit();
+        return new Promise(() => {}); // Simulate unreturned async RPC when process dies.
+      },
+    } };
+  const hangingWitness = new Zk1WitnessCasAnchorFloor(provisionalPath, provisionalOptions);
+  const unacknowledged = hangingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: random(32),
+  });
+  await operatorCommitted;
+  assert.deepEqual(provisionalRemote.authority.loadProvisionalHead(),
+    provisionalRemote.read());
+  assert.throws(() => provisionalRemote.authority.loadFinalizedHead(),
+    /TEST_FINALIZATION_PROVISIONAL_OR_REVOKED/,
+    "a durable PROVISIONAL FULL operator commit is NOT an admission authority");
+  const physicalCrash = spawnSync(process.execPath, ["-e", `
+    const D=require('better-sqlite3');
+    const w=new D(process.argv[1],{readonly:true,fileMustExist:true});
+    const o=new D(process.argv[2],{readonly:true,fileMustExist:true});
+    const x=w.prepare('SELECT ack_phase FROM witness_cas_sync_historical_recovery_head WHERE id=1').get();
+    const y=o.prepare('SELECT ack_settlement,sequence,finalized_sequence FROM operator_recovery_floor WHERE id=1').get();
+    w.close();o.close();
+    if(x.ack_phase!=='READY'||y.ack_settlement!=='PROVISIONAL'||y.sequence!==y.finalized_sequence)process.exit(44);
+    process.exit(73); // external observer terminates without witness clean-up.
+  `, provisionalPath, provisionalOperatorPath], { cwd: path.resolve(__dirname, ".."),
+    encoding: "utf8", timeout: 15000 });
+  assert.equal(physicalCrash.status, 73,
+    `separate Node process must physically observe both FULL commits: ${physicalCrash.stderr}`);
+  hangingWitness.close(); // Treat the in-flight unresolved witness RPC as lost/crashed.
+  void unacknowledged;
+  const freshOperatorProcess = createExternalRecoveryHeadFixture(
+    provisionalOperatorPath, independentlyPinnedRecoveryHead, operatorProofPins);
+  externalAuthorities.push(freshOperatorProcess);
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(provisionalPath, {
+    ...pinnedRestart, trustedRecoveryNonceAuthority: freshOperatorProcess.authority,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "restarted witness refuses ready+provisional operator state without relying on compensation");
+  // Owner revocation and later policy ABA must have monotonic durable custody:
+  // an operator-local generation bump atomically quarantines even a SEALED
+  // previous recovery. Reverting the test provider does NOT erase the fence.
+  const generationPath = path.join(directory, "witness-owner-generation-aba.sqlite");
+  const generationSource = new Database(historicalFilename, {
+    readonly: true, fileMustExist: true });
+  try { await generationSource.backup(generationPath); }
+  finally { generationSource.close(); }
+  fs.chmodSync(generationPath, 0o600);
+  const generationRemote = createExternalRecoveryHeadFixture(
+    path.join(directory, "operator-owner-generation-aba.sqlite"),
+    independentlyPinnedRecoveryHead, operatorProofPins);
+  externalAuthorities.push(generationRemote);
+  const generationOptions = { ...pinnedRestart,
+    trustedRecoveryNonceAuthority: generationRemote.authority };
+  const generationWitness = new Zk1WitnessCasAnchorFloor(generationPath, generationOptions);
+  const generationNonce = random(32);
+  try {
+    assert.deepEqual((await generationWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: generationNonce,
+    })).admission, issued.admission,
+    "recovery with operator SEALED epoch 0 succeeds before owner revocation");
+    assert.equal(generationRemote.authority.loadOwnerGeneration(), 0);
+    trustedDeviceRevocations = ["device-a"];
+    assert.equal(generationRemote.authority.advanceOwnerPolicy(0,
+      trustedSyncDevicePolicyProvider()), true,
+    "operator commits owner revocation and monotonic generation in FULL CAS");
+    trustedDeviceRevocations = [];
+    assert.equal(generationRemote.authority.loadOwnerGeneration(), 1);
+    assert.throws(() => generationRemote.authority.loadFinalizedHead(),
+      /TEST_FINALIZATION_DURABLY_QUARANTINED/,
+      "owner generation must not be cleared by policy reverting (ABA)");
+    await assert.rejects(generationWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: random(32),
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "fresh recovery cannot pass an independently revoked owner generation");
+    await assert.rejects(generationWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: generationNonce,
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "old consumed nonce never reopens after owner policy ABA");
+  } finally { trustedDeviceRevocations = []; generationWitness.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(generationPath, generationOptions),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "operator owner generation revocation persists independently across restart");
   // Owner revocation/PG expiry while the operator verifies a signed READY
   // must be caught by the OPERATOR, despite a successful local FULL READY.
   const finalizeDrift = async (label, changeDuringOperator) => {
@@ -1182,7 +1305,7 @@ test("strict CAS witness floor refuses signed status advance without independent
       async finalizeAck(...args) {
         const confirmed = await remote.authority.finalizeAck(...args);
         assert.equal(confirmed, true);
-        assert.equal(remote.authority.loadFinalizedHead().sequence,
+        assert.equal(remote.authority.loadProvisionalHead().sequence,
           independentlyPinnedRecoveryHead.sequence + 1);
         committedOperatorAck = true;
         drift();

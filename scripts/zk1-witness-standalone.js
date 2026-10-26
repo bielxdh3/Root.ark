@@ -95,6 +95,8 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
     || typeof authority.trustedRecoveryNonceAuthority.compareAndAdvance !== "function"
     || typeof authority.trustedRecoveryNonceAuthority.loadFinalizedHead !== "function"
     || typeof authority.trustedRecoveryNonceAuthority.finalizeAck !== "function"
+    || typeof authority.trustedRecoveryNonceAuthority.loadOwnerGeneration !== "function"
+    || typeof authority.trustedRecoveryNonceAuthority.sealAck !== "function"
     || typeof authority.trustedRecoveryNonceAuthority.loadQuarantinedHead !== "function"
     || typeof authority.trustedRecoveryNonceAuthority.quarantineFinalizedAck !== "function"
     || !crypto.KeyObject.prototype.equals.call(authority.witnessPublicKey,

@@ -54,7 +54,14 @@ postcommit process, or SQLite compensation IOERR can leave valid READY bytes.
 must independently verify the Ed25519 READY signature and pinned witness
 identity, the original signed PG attestation and its operation/nonce binding,
 current owner policy, and signed PG freshness immediately before its own
-durable, monotonic CAS. The operator also receives the entire immutable
+durable, monotonic CAS. **The first FULL commit is only PROVISIONAL**: a
+separate *synchronous*, operator-held `sealAck(head, proof)` CAS must validate
+the same PG attestation digest, 30-second issued_at bound, independent owner
+policy snapshot and monotonic `loadOwnerGeneration()` under the operator's
+own transaction before changing the record to SEALED. `loadFinalizedHead()`
+MUST deny PROVISIONAL, revoked generations and quarantined heads on every
+issuance, restart and capability query; witness SQLite READY is never enough.
+The operator also receives the entire immutable
 `recoveryRow` preimage (`sequence`, `nonce`, `operation_id`, `admission_hash`,
 `consumed_at_ms`, `previous_hash`, `hash`), recomputes the canonical recovery
 SHA-256 chain head under the witness READY signature and binds the original
@@ -75,13 +82,27 @@ PG age again **after** awaiting the independent ACK and after final head
 readback. If either changed during delayed ACK delivery, the witness rejects
 the HTTP result, burns the nonce, restores local PENDING when possible and
 first latches a monotonic operator quarantine that prevents READY reuse across
-restart. Existing operator adapters without this veto fail closed at startup.
-No finite two-system protocol can atomically prove that a completed external
-finalization was also delivered as a successful HTTP ACK to the client; a
-process crash exactly after remote FULL but before detecting/revoking the
-late owner/physical drift can still leave a valid operator finalization. The
-operator needs independent owner-revocation fencing and an explicit
-reconciliation/recovery protocol before claiming that stronger invariant.
+restart. The operator's **authoritative owner revocation** must increment its
+own generation and quarantine the sealed head in the same independently
+durable CAS transaction (see synthetic `advanceOwnerPolicy(expected, next)`).
+Owner-policy ABA (revoke, later restore identical keys) must not restore a
+prior SEALED grant. A crash after PROVISIONAL FULL but before synchronous
+SEALED CAS remains fail-closed without any compensating local write. Older
+operator adapters lacking `loadOwnerGeneration()` and `sealAck()` are refused
+at startup; there is no automatic repair of a provisional ACK.
+
+**Bounded invariant**: a SEALED recovery is authorized at the operator's
+single FULL CAS linearization point, not at HTTP response delivery. Owner
+revocation made effective through this same operator transaction invalidates
+it even if the witness has crashed. Mere mutation of a different, unversioned
+owner-policy callback is NOT an independently enforced revocation; a real
+operator must provision this mandatory same-custodian generation/write API,
+independent signer pins, live PostgreSQL readback and reconciliation. The
+disposable fixture is only a simulation. Time passing after a valid SEALED
+commit does not retroactively revoke that historical proof; stale proof
+*before* seal is rejected. No two-phase operator protocol can make HTTP ACK
+delivery atomic with both SQLite and PostgreSQL, nor prove the client received
+an ACK across a crash. These remain external acceptance gates.
 All work remains DRAFT / NO-GO production.
 
 ## Issue #65 / PR #228: browser offline native source-root contract (2026-10-25)

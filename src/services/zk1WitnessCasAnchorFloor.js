@@ -213,6 +213,8 @@ class Zk1WitnessCasAnchorFloor {
         || typeof trustedRecoveryNonceAuthority.compareAndAdvance !== "function"
         || typeof trustedRecoveryNonceAuthority.loadFinalizedHead !== "function"
         || typeof trustedRecoveryNonceAuthority.finalizeAck !== "function"
+        || typeof trustedRecoveryNonceAuthority.loadOwnerGeneration !== "function"
+        || typeof trustedRecoveryNonceAuthority.sealAck !== "function"
         || typeof trustedRecoveryNonceAuthority.loadQuarantinedHead !== "function"
         || typeof trustedRecoveryNonceAuthority.quarantineFinalizedAck !== "function"))
       || (!enableSyncHistoricalIssuer && trustedRecoveryNonceAuthority !== undefined)) fail();
@@ -854,6 +856,15 @@ class Zk1WitnessCasAnchorFloor {
       || (head.sequence === 0 && head.lastHash !== ZERO)) fail();
     return Object.freeze({ sequence: head.sequence, lastHash: head.lastHash });
   }
+  #readOperatorOwnerGeneration() {
+    // This generation lives in the SAME independent durable transaction
+    // domain as the finalization CAS, not a caller-supplied JSON policy.
+    let observed;
+    try { observed = this.#externalRecoveryAuthority.loadOwnerGeneration(); }
+    catch (_) { fail(); }
+    if (!Number.isSafeInteger(observed) || observed < 0) fail();
+    return observed;
+  }
   #commitExternalRecoveryHead(previous, next) {
     const loaded = this.#readExternallyCommittedRecoveryHead();
     if (loaded.sequence !== previous.sequence
@@ -874,8 +885,9 @@ class Zk1WitnessCasAnchorFloor {
       || (phase === "READY" && previousHash !== ZERO)) fail();
     return crypto.sign(null, this.#recoveryHeadMessage(head, phase, previousHash), this.#witness);
   }
-  #assertRecoveryAckStillFresh({ originalPolicySnapshot, physicalIssuedAt,
+  #assertRecoveryAckStillFresh({ originalPolicySnapshot, originalOwnerGeneration, physicalIssuedAt,
     minimumCompletedAt }) {
+    if (this.#readOperatorOwnerGeneration() !== originalOwnerGeneration) fail();
     const samePolicy = JSON.stringify(snapshotLocalDevicePolicy(
       this.#trustedSyncDevicePolicyProvider())) === originalPolicySnapshot;
     const observed = Date.now();
@@ -932,7 +944,7 @@ class Zk1WitnessCasAnchorFloor {
     if (!fenced) fail();
   }
   async #finishConfirmedRecoveryAck(head, previous, {
-    originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt,
+    originalPolicySnapshot, originalOwnerGeneration, physicalIssuedAt, minimumCompletedAt,
     physicalAttestation, scope, operation, nonce,
   }) {
     const previousHash = previous.lastHash;
@@ -940,7 +952,8 @@ class Zk1WitnessCasAnchorFloor {
       || this.#recoveryAckPreviousHash !== previousHash) fail();
     // READY alone is never authoritative. An independent operator must also
     // durably finalize this very nonce using the signed READY proof.
-    const freshness = { originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt };
+    const freshness = { originalPolicySnapshot, originalOwnerGeneration,
+      physicalIssuedAt, minimumCompletedAt };
     this.#db.transaction(() => {
       this.#assertHistoricalIntegrity();
       const external = this.#readExternallyCommittedRecoveryHead();
@@ -996,6 +1009,7 @@ class Zk1WitnessCasAnchorFloor {
       statusKeyId: this.#statusId.toString("base64url"),
       readySignature: Buffer.from(stored.signature),
       policySnapshot: originalPolicySnapshot,
+      ownerGeneration: originalOwnerGeneration,
       physicalIssuedAt,
       physicalAttestation: Buffer.from(physicalAttestation),
       scope, operation, nonce: Buffer.from(nonce),
@@ -1015,11 +1029,20 @@ class Zk1WitnessCasAnchorFloor {
       this.#quarantineRecoveryAck(head, previousHash);
       fail();
     }
-    // W36: independent FULL operator CAS can succeed but the awaited reply
-    // may arrive after revocation or the physical PG signature expires.
+    // A successful async finalizeAck creates PROVISIONAL custody only. It
+    // MUST NEVER grant admission on restart. A second synchronous operator
+    // FULL CAS atomically fences the owner generation and PG proof expiry.
+    // The operator's SEALED status, not a delayed finalizeAck reply, is the
+    // authorization linearization point.
     // Never let a stale ACK escape merely because both heads now match.
     try { this.#assertRecoveryAckStillFresh(freshness); }
     catch (_) { this.#quarantineRecoveryAck(head, previousHash); fail(); }
+    let sealed;
+    try {
+      sealed = this.#externalRecoveryAuthority.sealAck(
+        Object.freeze({ ...head }), proof);
+    } catch (_) { this.#quarantineRecoveryAck(head, previousHash); fail(); }
+    if (sealed !== true) { this.#quarantineRecoveryAck(head, previousHash); fail(); }
     const finalized = this.#readExternallyFinalizedRecoveryHead();
     if (finalized.sequence !== head.sequence || finalized.lastHash !== head.lastHash) fail();
     // A separate operator reconciliation or subsequent CAS advancement while
@@ -1261,6 +1284,7 @@ class Zk1WitnessCasAnchorFloor {
       if (await verifyHistoricalAuthorizationProof(bound.envelope.authorization,
         bound.envelope, policy) !== true) fail();
       const policySnapshot = JSON.stringify(policy);
+      const originalOwnerGeneration = this.#readOperatorOwnerGeneration();
       const nonceText = nonce.toString("base64url");
       const originalRow = this.#db.prepare(
         "SELECT a.hash,i.nonce,i.admission_hash"
@@ -1366,6 +1390,7 @@ class Zk1WitnessCasAnchorFloor {
       // durable READY signature leaves PENDING, including after process restart.
       await this.#finishConfirmedRecoveryAck(committedHead, previousExternal, {
         originalPolicySnapshot: policySnapshot,
+        originalOwnerGeneration,
         physicalIssuedAt: composite.physicalIssuedAt,
         minimumCompletedAt: completed,
         physicalAttestation: composite.physicalAttestation,
