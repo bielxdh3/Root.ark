@@ -1,0 +1,387 @@
+(function (root, factory) {
+  if (typeof module === "object" && module.exports) {
+    module.exports = factory(require("node:crypto").webcrypto,
+      require("./rootark-zk1-ciphertext-download-integrity"),
+      require("./rootark-zk1-owner-ciphertext-root-checkpoint"));
+  } else {
+    root.RootarkZk1ProtectedHttpClient = factory(root.crypto,
+      root.RootarkZk1CiphertextDownloadIntegrity,
+      root.RootarkZk1OwnerCiphertextRootCheckpoint);
+  }
+}(typeof globalThis === "object" ? globalThis : this, function (webCrypto, download, ownerRoot) {
+  "use strict";
+
+  // Explicitly opt-in browser client for the development-only protected
+  // ciphertext HTTP plane. It neither provisions owner trust roots nor
+  // authorizes key release. The independently trusted client must acquire
+  // a committed head before choosing the manifest fields signed here.
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const domain = encoder.encode("Root.ark/zk-1/protected-object-operation/v1\0");
+  const MAX_CIPHERTEXT = 4 * 1024 * 1024;
+  const HTTP_DEADLINE_MS = 15000;
+  const fields = ["account_id", "compartment_id", "keyring_id", "device_id",
+    "operation", "object_id", "expected_object_revision", "manifest_revision",
+    "manifest_digest", "epoch", "nonce", "issued_at", "expires_at", "ciphertext_digest"];
+  const encodedFields = new Set(["account_id", "compartment_id", "keyring_id",
+    "manifest_digest", "nonce", "ciphertext_digest"]);
+  const identityFields = ["account_id", "compartment_id", "keyring_id"];
+  const idPattern = /^[A-Za-z0-9_-]{22}$/;
+  const b64Pattern = /^[A-Za-z0-9_-]+$/;
+  const genuineSigned = new WeakMap();
+  function deny() { throw new Error("ZK_BROWSER_CONTENT_UNAVAILABLE"); }
+  function exact(value, keys) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+      || Reflect.ownKeys(value).length !== keys.length
+      || keys.some((key) => !Object.hasOwn(value, key))) deny();
+  }
+  function copy(raw, min, max = min) {
+    if (!ArrayBuffer.isView(raw) && !(raw instanceof ArrayBuffer)) deny();
+    // Reject untrusted oversized bytes BEFORE cloning their backing storage.
+    // A caller must not force a multi-megabyte allocation for a 32-byte key
+    // digest or an oversized ciphertext that will be rejected anyway.
+    const length = raw.byteLength;
+    if (!Number.isSafeInteger(length) || length < min || length > max) deny();
+    const output = raw instanceof ArrayBuffer ? new Uint8Array(raw.slice(0))
+      : new Uint8Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+    if (output.length !== length) deny();
+    return output;
+  }
+  function b64(bytes) {
+    let binary = "";
+    for (const value of bytes) binary += String.fromCharCode(value);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  function from64(input, min, max = min) {
+    if (typeof input !== "string" || !b64Pattern.test(input)
+      || input.length > Math.ceil(max * 4 / 3) + 4) deny();
+    let binary;
+    try {
+      binary = atob(input.replace(/-/g, "+").replace(/_/g, "/")
+        .padEnd(Math.ceil(input.length / 4) * 4, "="));
+    } catch (_) { deny(); }
+    const raw = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    if (raw.length < min || raw.length > max || b64(raw) !== input) deny();
+    return raw;
+  }
+  function unsigned(value) {
+    if (!Number.isSafeInteger(value) || value < 0) deny();
+    return value;
+  }
+  function positive(value) {
+    if (unsigned(value) < 1) deny();
+    return value;
+  }
+  function id(value) {
+    if (typeof value !== "string" || !idPattern.test(value)) deny();
+    from64(value, 16);
+    return value;
+  }
+  function header(major, value) {
+    const n = BigInt(unsigned(value));
+    const initial = major << 5;
+    if (n < 24n) return Uint8Array.of(initial + Number(n));
+    if (n <= 0xffn) return Uint8Array.of(initial + 24, Number(n));
+    if (n <= 0xffffn) return Uint8Array.of(initial + 25,
+      Number(n >> 8n), Number(n & 255n));
+    if (n <= 0xffffffffn) return Uint8Array.of(initial + 26,
+      Number((n >> 24n) & 255n), Number((n >> 16n) & 255n),
+      Number((n >> 8n) & 255n), Number(n & 255n));
+    return Uint8Array.of(initial + 27, ...Array.from({ length: 8 },
+      (_, index) => Number((n >> BigInt(56 - 8 * index)) & 255n)));
+  }
+  function join(parts, limit = 8192) {
+    const total = parts.reduce((sum, item) => sum + item.byteLength, 0);
+    if (total > limit) deny();
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) { result.set(part, offset); offset += part.byteLength; }
+    return result;
+  }
+  function encodeItem(value) {
+    if (value === null) return Uint8Array.of(0xf6);
+    if (Number.isSafeInteger(value) && value >= 0) return header(0, value);
+    if (typeof value === "string") {
+      const text = encoder.encode(value);
+      return join([header(3, text.byteLength), text]);
+    }
+    if (value instanceof Uint8Array) return join([header(2, value.byteLength), value]);
+    deny();
+  }
+  function cborSignedMessage(payload) {
+    const entries = Object.entries(payload).map(([key, value]) => ({
+      key: encodeItem(key), val: encodeItem(value),
+    }));
+    // For this fixed, all-text-key map, length then encoded-byte order is
+    // identical to RFC 8949's deterministic encoded-byte lexicographic order.
+    // This encoder is deliberately NOT a general-purpose CBOR implementation.
+    entries.sort((a, b) => a.key.length - b.key.length
+      || (() => {
+        for (let i = 0; i < a.key.length; i += 1) {
+          if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
+        }
+        return 0;
+      })());
+    return join([domain, header(5, entries.length),
+      ...entries.flatMap((entry) => [entry.key, entry.val])]);
+  }
+  async function signProtectedContentOperation(input) {
+    try {
+      const historicalDigestSupplied = Object.hasOwn(input || {}, "expectedCiphertextDigest");
+      exact(input, ["signerKey", "scope", "deviceId", "operation", "objectId",
+        "expectedObjectRevision", "manifestRevision", "manifestDigest", "epoch",
+        "nowSeconds", "ciphertext", ...(historicalDigestSupplied ? ["expectedCiphertextDigest"] : [])]);
+      if (!webCrypto?.subtle || !webCrypto?.getRandomValues
+        || input.signerKey?.type !== "private"
+        || input.signerKey?.extractable !== false
+        || input.signerKey?.algorithm?.name !== "Ed25519"
+        || !input.signerKey?.usages?.includes("sign")) deny();
+      exact(input.scope, identityFields);
+      const op = input.operation;
+      if (!["put", "get"].includes(op)) deny();
+      const now = unsigned(input.nowSeconds);
+      if (now + 45 > Number.MAX_SAFE_INTEGER) deny();
+      // Snapshot every caller-controlled scalar/reference before the first
+      // asynchronous crypto operation; changing a form field during hashing
+      // must never retarget the signed permission or associated ciphertext.
+      const signerKey = input.signerKey;
+      const deviceId = input.deviceId;
+      const objectId = id(input.objectId);
+      const expectedRevision = input.expectedObjectRevision === null ? null
+        : positive(input.expectedObjectRevision);
+      const revision = positive(input.manifestRevision);
+      const epoch = positive(input.epoch);
+      const compartment = from64(input.scope.compartment_id, 1, 128);
+      const trustedScope = {
+        account_id: from64(input.scope.account_id, 16),
+        compartment_id: compartment,
+        keyring_id: from64(input.scope.keyring_id, 16),
+      };
+      const manifestDigest = copy(input.manifestDigest, 32);
+      const historicDigest = historicalDigestSupplied
+        ? copy(input.expectedCiphertextDigest, 32) : null;
+      const nonce = webCrypto.getRandomValues(new Uint8Array(32));
+      if (typeof deviceId !== "string" || deviceId.length < 1
+        || deviceId.length > 64 || /[\u0000-\u001f\u007f]/.test(deviceId)) deny();
+      let sealed = null;
+      let ciphertextDigest = null;
+      if (op === "put") {
+        sealed = copy(input.ciphertext, 16, MAX_CIPHERTEXT);
+        ciphertextDigest = new Uint8Array(await webCrypto.subtle.digest("SHA-256", sealed));
+      } else if (input.ciphertext !== null
+        || (expectedRevision === null) !== (historicDigest === null)) deny();
+      if (op === "get") ciphertextDigest = historicDigest;
+      else if (historicalDigestSupplied) deny();
+      const request = {
+        ...trustedScope, device_id: deviceId, operation: op, object_id: objectId,
+        expected_object_revision: expectedRevision,
+        manifest_revision: revision,
+        manifest_digest: manifestDigest, epoch,
+        nonce, issued_at: now, expires_at: now + 45,
+        ciphertext_digest: ciphertextDigest,
+      };
+      const signature = new Uint8Array(await webCrypto.subtle.sign(
+        "Ed25519", signerKey, cborSignedMessage(request)));
+      if (signature.length !== 64) deny();
+      const wireAuth = {};
+      for (const field of fields) {
+        const value = request[field];
+        wireAuth[field] = encodedFields.has(field) && value !== null ? b64(value) : value;
+      }
+      const wire = Object.freeze({ authorization: Object.freeze(wireAuth),
+        signatureBase64: b64(signature),
+        ...(op === "put" ? { ciphertextBase64: b64(sealed) } : {}) });
+      genuineSigned.set(wire, { op, request: wire, objectId: request.object_id });
+      return wire;
+    } catch (_) { deny(); }
+  }
+  function httpEndpoint(origin, op) {
+    if (typeof origin !== "string" || !origin) deny();
+    let url;
+    try { url = new URL(origin); } catch (_) { deny(); }
+    if (url.href !== url.origin + "/" || url.username || url.password
+      || url.search || url.hash || !["http:", "https:"].includes(url.protocol)) deny();
+    if (url.protocol === "http:"
+      && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) deny();
+    if (typeof location === "object" && location?.origin && url.origin !== location.origin) deny();
+    return url.origin + "/zk-1/v1/content/" + (op === "get" ? "read" : "put");
+  }
+  async function readLimited(response, limit) {
+    if (!response || !response.body || !response.headers
+      || !/^(?:application\/json)(?:;\s*charset=utf-8)?$/i.test(
+        response.headers.get("content-type") || "")) deny();
+    const reader = response.body.getReader();
+    const pieces = [];
+    let bytes = 0;
+    let completed = false;
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) { completed = true; break; }
+        bytes += next.value.byteLength;
+        if (bytes > limit) deny();
+        pieces.push(next.value);
+      }
+    } finally {
+      if (!completed) {
+        try { await reader.cancel(); } catch (_) { /* network failure is denial */ }
+      }
+      reader.releaseLock();
+    }
+    return JSON.parse(decoder.decode(join(pieces, limit)));
+  }
+  async function post(request, op, origin, fetchImpl) {
+    const brand = genuineSigned.get(request);
+    if (!brand || brand.op !== op || typeof fetchImpl !== "function") deny();
+    const url = httpEndpoint(origin, op);
+    const controller = new AbortController();
+    let timer;
+    let completed = false;
+    try {
+      // A stalled header or trickling JSON body must not retain a signed
+      // operation indefinitely. A socket-idle timeout alone is insufficient.
+      // Race the complete request AND response stream: even a mock transport
+      // that ignores AbortSignal must never yield a false successful ACK.
+      let expire;
+      const deadline = new Promise((_, reject) => { expire = reject; });
+      timer = setTimeout(() => {
+        controller.abort();
+        expire(new Error("ZK_PROTECTED_HTTP_DEADLINE"));
+      }, HTTP_DEADLINE_MS);
+      const work = (async () => {
+        const response = await fetchImpl(url, {
+          method: "POST", redirect: "error", credentials: "same-origin",
+          cache: "no-store", mode: "same-origin", signal: controller.signal,
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify(brand.request),
+        });
+        if ((op === "put" && ![200, 201].includes(response.status))
+          || (op === "get" && response.status !== 200)) deny();
+        return readLimited(response, op === "put" ? 2048 : 6 * 1024 * 1024);
+      })();
+      const result = await Promise.race([work, deadline]);
+      if (controller.signal.aborted) deny();
+      completed = true;
+      return result;
+    } catch (_) { deny(); }
+    finally {
+      clearTimeout(timer);
+      if (!completed) controller.abort();
+    }
+  }
+  async function postProtectedCiphertextPut({ origin, request, fetchImpl = fetch } = {}) {
+    try {
+      const signed = genuineSigned.get(request);
+      if (!signed || signed.op !== "put") deny();
+      // The signed predecessor is the only valid reference for the ACK. An
+      // authenticated route or intermediary returning a stale or future
+      // revision must not move the browser's revision/checkpoint forward.
+      const previous = signed.request.authorization.expected_object_revision;
+      const expectedRevision = previous === null ? 1 : positive(previous) + 1;
+      if (!Number.isSafeInteger(expectedRevision)) deny();
+      const decoded = await post(request, "put", origin, fetchImpl);
+      exact(decoded, ["id", "revision"]);
+      if (decoded.id !== signed.objectId || positive(decoded.revision) !== expectedRevision) deny();
+      return Object.freeze({ id: decoded.id, revision: expectedRevision });
+    } catch (_) { deny(); }
+  }
+  async function inspectProtectedCiphertextRead({ origin, request, fetchImpl,
+    expectedObjectRevision, expectedRoot, expectedEpoch, requireHistorical }) {
+    const commitment = copy(expectedRoot, 32);
+    const revision = positive(expectedObjectRevision);
+    const epoch = positive(expectedEpoch);
+    const signed = genuineSigned.get(request);
+    if (!signed || signed.op !== "get") deny();
+    const boundRevision = signed.request.authorization.expected_object_revision;
+    if ((requireHistorical && boundRevision === null)
+      || (boundRevision !== null && boundRevision !== revision)) deny();
+    const response = await post(request, "get", origin, fetchImpl);
+    exact(response, ["id", "revision", "epoch", "ciphertextBase64"]);
+    if (response.id !== signed.objectId || response.revision !== revision
+      || response.epoch !== epoch) deny();
+    const ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
+    if (boundRevision !== null) {
+      const signedDigest = from64(signed.request.authorization.ciphertext_digest, 32);
+      const actualDigest = new Uint8Array(await webCrypto.subtle.digest("SHA-256", ciphertext));
+      let difference = 0;
+      for (let index = 0; index < 32; ++index) difference |= signedDigest[index] ^ actualDigest[index];
+      if (difference !== 0) deny();
+    }
+    // The response cannot define its own expected root. This is an integrity
+    // comparison only: the caller is responsible for independent provenance.
+    const inspection = await download.inspectCiphertextDownload({
+      frames: [{ index: 0, bytes: ciphertext }],
+      expectedChunkCount: 1, expectedRoot: commitment,
+      maxCiphertextBytes: MAX_CIPHERTEXT,
+    });
+    return { inspection, id: response.id, revision, epoch,
+      ciphertextBase64: response.ciphertextBase64 };
+  }
+  async function postProtectedCiphertextRead({ origin, request, fetchImpl = fetch,
+    expectedObjectRevision, expectedRoot, cek, metadata } = {}) {
+    try {
+      const inspected = await inspectProtectedCiphertextRead({
+        origin, request, fetchImpl, expectedObjectRevision, expectedRoot,
+        expectedEpoch: metadata?.epoch, requireHistorical: false,
+      });
+      if (metadata?.object_id !== inspected.id) deny();
+      return await download.decryptVerifiedCiphertext({
+        inspection: inspected.inspection, cek, metadata,
+      });
+    } catch (_) { deny(); }
+  }
+  async function postProtectedCiphertextBackupRead(input = {}) {
+    try {
+      // A backup copy never accepts a CEK, plaintext, metadata or an implicit
+      // latest-version read. Signing the exact historical revision and digest
+      // is required even when the storage server has a newer version.
+      exact(input, ["origin", "request", "expectedObjectRevision", "expectedEpoch",
+        "expectedRoot", ...(Object.hasOwn(input, "fetchImpl") ? ["fetchImpl"] : []),
+        ...(Object.hasOwn(input, "ownerRootProof") ? ["ownerRootProof"] : [])]);
+      const ownerProvenance = Object.hasOwn(input, "ownerRootProof");
+      if (ownerProvenance) {
+        const signed = genuineSigned.get(input.request);
+        if (!signed || signed.op !== "get"
+          || signed.request.authorization.expected_object_revision !== input.expectedObjectRevision
+          || typeof ownerRoot?.assertOwnerCiphertextRootProof !== "function") deny();
+        const authorization = signed.request.authorization;
+        ownerRoot.assertOwnerCiphertextRootProof({
+          proof: input.ownerRootProof,
+          scope: { account_id: authorization.account_id,
+            compartment_id: authorization.compartment_id,
+            keyring_id: authorization.keyring_id },
+          deviceId: authorization.device_id,
+          manifestRevision: authorization.manifest_revision,
+          manifestDigest: from64(authorization.manifest_digest, 32),
+          manifestEpoch: authorization.epoch,
+          objectId: signed.objectId,
+          objectRevision: input.expectedObjectRevision,
+          ciphertextEpoch: input.expectedEpoch,
+          ciphertextRoot: input.expectedRoot,
+        });
+      }
+      const inspected = await inspectProtectedCiphertextRead({
+        origin: input.origin, request: input.request,
+        fetchImpl: input.fetchImpl ?? fetch,
+        expectedObjectRevision: input.expectedObjectRevision,
+        expectedRoot: input.expectedRoot, expectedEpoch: input.expectedEpoch,
+        requireHistorical: true,
+      });
+      return Object.freeze({
+        objectId: inspected.id, revision: inspected.revision, epoch: inspected.epoch,
+        // Immutable canonical base64url preserves the verified bytes across
+        // backup serialization. A mutable Uint8Array plus a fixed integrity
+        // flag would allow later mutation to contradict the verification.
+        ciphertextBase64: inspected.ciphertextBase64,
+        integrityMatchesPinnedRoot: true,
+        trustedRootProvenanceVerified: ownerProvenance,
+        authorizesRecovery: false, authorizesRestore: false,
+        durableBackupProven: false,
+      });
+    } catch (_) { deny(); }
+  }
+  return Object.freeze({ signProtectedContentOperation,
+    postProtectedCiphertextPut, postProtectedCiphertextRead,
+    postProtectedCiphertextBackupRead });
+}));
