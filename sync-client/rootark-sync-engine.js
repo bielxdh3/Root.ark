@@ -18,6 +18,16 @@ const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+function signedEnvelopeDigest(operation) {
+  return crypto.createHash("sha256")
+    .update(protocol.canonicalJson(operation), "utf8").digest("hex");
+}
+function envelopeCopy(operation) {
+  // Detach incoming JSON from transport/callback-owned mutable references.
+  // An async key resolver must never be able to swap an already-verified
+  // signed envelope before the filesystem is changed.
+  return JSON.parse(protocol.canonicalJson(operation));
+}
 
 function fail(message, code = "sync_engine_error") {
   throw Object.assign(new Error(message), { code });
@@ -75,7 +85,9 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
   const root = path.resolve(rootDir);
   const target = await contained(root, relativePath, false);
   const before = expectedStats || await fsp.lstat(target, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.ino === 0n) {
+  // A hardlink into the selected root can alias an unrelated file outside it.
+  // Canonical path and FD identity checks alone cannot detect that provenance.
+  if (!before.isFile() || before.isSymbolicLink() || before.ino === 0n || before.nlink !== 1n) {
     fail("Sync file must be a regular file with a stable identity", "unsafe_path");
   }
 
@@ -83,22 +95,24 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
   const handle = await fsp.open(target, flags);
   try {
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || !sameFileVersion(before, opened)) fail("Sync file changed while opening", "unsafe_path");
+    if (!opened.isFile() || opened.nlink !== 1n || !sameFileVersion(before, opened)) fail("Sync file changed while opening", "unsafe_path");
 
     await containedAbsolute(root, target, false);
     const canonicalRoot = await fsp.realpath(root);
     const canonicalTarget = await fsp.realpath(target);
     if (!isWithinPath(canonicalRoot, canonicalTarget)) fail("Sync file escaped root", "unsafe_path");
     const pathStats = await fsp.lstat(target, { bigint: true });
-    if (!pathStats.isFile() || pathStats.isSymbolicLink() || !sameFileIdentity(opened, pathStats)) {
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1n
+      || !sameFileIdentity(opened, pathStats)) {
       fail("Sync file changed while opening", "unsafe_path");
     }
 
     const data = await handle.readFile();
     const openedAfterRead = await handle.stat({ bigint: true });
     const pathAfterRead = await fsp.lstat(target, { bigint: true });
-    if (!sameFileVersion(opened, openedAfterRead) || !sameFileIdentity(openedAfterRead, pathAfterRead)
-      || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink()) {
+    if (!sameFileVersion(opened, openedAfterRead) || openedAfterRead.nlink !== 1n
+      || !sameFileIdentity(openedAfterRead, pathAfterRead)
+      || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink() || pathAfterRead.nlink !== 1n) {
       fail("Sync file changed while reading", "unsafe_path");
     }
     await containedAbsolute(root, target, false);
@@ -240,7 +254,16 @@ class SyncEngine {
     this.fileKeyResolver = options.fileKeyResolver || (() => options.fileKey);
     this.authorize = options.authorize || (() => true);
     this.authorizeOutgoing = options.authorizeOutgoing || (() => true);
+    // Supplied by the embedding process from independently trusted, CURRENT
+    // device policy. Config snapshots and the local journal are not authority.
+    this.currentDeviceAuthorization = options.currentDeviceAuthorization || null;
+    this.requireCurrentOutgoingAuthorization = options.requireCurrentOutgoingAuthorization === true;
+    if ((options.currentDeviceAuthorization != null && typeof options.currentDeviceAuthorization !== "function")
+      || (this.requireCurrentOutgoingAuthorization && !this.currentDeviceAuthorization)) {
+      fail("Current device authorization callback is required", "authorization_required");
+    }
     this.verifyIncoming = options.verifyIncoming || null;
+    this.reverifySeenIncoming = options.reverifySeenIncoming === true;
     this.authorizationFactory = options.authorizationFactory || null;
     this.requireAuthorization = options.requireAuthorization === true;
     this.translateWebDavOperation = options.translateWebDavOperation || null;
@@ -372,8 +395,57 @@ class SyncEngine {
     return key;
   }
 
-  async verifyIncomingOperation(operation) {
-    if (this.verifyIncoming && await this.verifyIncoming(operation) !== true) fail("Remote sync authorization rejected", "remote_authorization_rejected");
+  async verifyIncomingOperation(operation, { preObserve = true } = {}) {
+    const digest = signedEnvelopeDigest(operation);
+    // A valid signer can sign two different envelopes using one operation ID.
+    // Reject a conflicting identity BEFORE mutating the filesystem or snapshot.
+    this.journal.assertCompatibleAdmission(operation.operationId, digest);
+    // A remote LIST/materialization can race with an unsent signed local
+    // operation. `markSeen` removes pending by ID: require the FULL exact
+    // signed envelope match so an incoming same-ID variant cannot erase it.
+    for (const queued of await this.journal.recover()) {
+      if (queued.operationId !== operation.operationId) continue;
+      let queuedDigest;
+      try {
+        queuedDigest = signedEnvelopeDigest(protocol.validateStoredOperation(queued));
+      } catch {
+        fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
+      }
+      if (queuedDigest !== digest) {
+        fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
+      }
+    }
+    if (!this.verifyIncoming) {
+      if (this.requireAuthorization) fail("Remote sync authorization verifier is required", "remote_authorization_rejected");
+      return null;
+    }
+    // Capture freshness before asynchronous verification and I/O. Successful
+    // authentication can cross the expiry deadline before the journal fsync.
+    const candidate = this.localAdmissionDigestIfFresh(operation);
+    const locallyAdmitted = this.journal.hasLocalAdmission(operation.operationId, digest);
+    if (await this.verifyIncoming(operation, { locallyAdmitted }) !== true) {
+      fail("Remote sync authorization rejected", "remote_authorization_rejected");
+    }
+    // A well-signed remote envelope must not consume finite durable journal
+    // capacity if this client does not authorize its operation at all.
+    if (await this.authorize(operation) !== true) {
+      fail("Sync authorization rejected", "authorization_rejected");
+    }
+    if (signedEnvelopeDigest(operation) !== digest) {
+      fail("Remote sync envelope changed during authorization", "remote_authorization_rejected");
+    }
+    this.journal.assertCompatibleAdmission(operation.operationId, digest);
+    if (candidate && preObserve) await this.journal.observeAdmission(operation.operationId, candidate);
+    // The exact historical digest already pinned locally can complete its
+    // observed->admitted transition after a crash, even after expiry. Never
+    // derive this from operation-ID-only legacy `seen` entries.
+    return candidate || (locallyAdmitted ? digest : null);
+  }
+  localAdmissionDigestIfFresh(operation) {
+    return this.requireAuthorization && this.verifyIncoming && operation.authorization
+      && Number.isSafeInteger(operation.authorization.expiresAt)
+      && operation.authorization.expiresAt > Date.now()
+      ? signedEnvelopeDigest(operation) : null;
   }
 
   isInScope(relativePath) {
@@ -538,10 +610,54 @@ class SyncEngine {
       operationId: input.operationId || crypto.randomUUID(),
       fileKey: key,
     });
-    if (await this.authorizeOutgoing(operation) !== true) fail("Local sync authorization rejected", "authorization_rejected");
+    await this.assertOutgoingAuthorized(operation);
     if (this.authorizationFactory) operation.authorization = await this.authorizationFactory(operation);
     else if (this.requireAuthorization) fail("Device authorization is required", "authorization_required");
+    // Signing can await an external key provider. Revocation after the initial
+    // check must stop the signed operation before it reaches the journal.
+    await this.assertOutgoingAuthorized(operation);
     return operation;
+  }
+
+  async assertOutgoingAuthorized(operation, authorizedAction = null) {
+    let locallyAuthorized;
+    try { locallyAuthorized = await this.authorizeOutgoing(operation); } catch {
+      fail("Local sync authorization rejected", "authorization_rejected");
+    }
+    if (locallyAuthorized !== true) {
+      fail("Local sync authorization rejected", "authorization_rejected");
+    }
+    if (this.requireCurrentOutgoingAuthorization && operation.deviceId !== this.deviceId) {
+      fail("Local sync device authorization rejected", "authorization_rejected");
+    }
+    if (this.currentDeviceAuthorization) {
+      let currentDecision;
+      try { currentDecision = this.currentDeviceAuthorization(operation); } catch {
+        fail("Current sync device authorization rejected", "authorization_rejected");
+      }
+      if (this.requireCurrentOutgoingAuthorization) {
+        // Strict mode must use a synchronous, operator-trusted current policy.
+        // Awaiting even a resolved Promise would let a queued microtask revoke
+        // the device between reading true and beginning the HTTP PUT.
+        let isAsyncDecision;
+        try { isAsyncDecision = Boolean(currentDecision && typeof currentDecision.then === "function"); } catch {
+          fail("Current sync device authorization rejected", "authorization_rejected");
+        }
+        if (isAsyncDecision) {
+          Promise.resolve(currentDecision).catch(() => {});
+          fail("Synchronous current device authorization is required", "authorization_required");
+        }
+        if (currentDecision !== true) {
+          fail("Current sync device authorization rejected", "authorization_rejected");
+        }
+      } else if (await currentDecision !== true) {
+        // Backward compatibility for explicitly non-strict integrations.
+        fail("Current sync device authorization rejected", "authorization_rejected");
+      }
+    }
+    // No await after the strict synchronous policy decision. HTTP dispatch
+    // runs here, before any queued revocation microtask can execute.
+    if (authorizedAction) return authorizedAction();
   }
 
   async enqueueChange(input) {
@@ -554,7 +670,7 @@ class SyncEngine {
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
-    await this.journal.enqueue(operation);
+    await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
     let hash;
     if (operation.operation === "move") {
       const plaintext = protocol.decodeMovePayload(protocol.decryptPayload(operation, key), key);
@@ -800,8 +916,13 @@ class SyncEngine {
   async retryPush(operation) {
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
-      try { return await this.adapter.push(operation); } catch (error) {
+      // The journal's prior authorization is not a live device grant. Check
+      // again on EVERY attempt, after all queue/retry waits, before HTTP PUT.
+      // An in-flight request still needs independent server-side revocation
+      // fencing in the atomic PUT transaction.
+      try { return await this.assertOutgoingAuthorized(operation, () => this.adapter.push(operation)); } catch (error) {
         lastError = error;
+        if (error?.code === "authorization_rejected" || error?.code === "authorization_required") throw error;
         if (!transient(error) || attempt + 1 === this.maxRetries) throw error;
       }
     }
@@ -842,11 +963,18 @@ class SyncEngine {
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
+        const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
           throw new SyncConflictError(result);
         }
+        // Persist the exact pre-expiry observation BEFORE snapshot writes. A
+        // later journal fsync failure must not make this verified ciphertext
+        // impossible to authenticate after authorization expires.
+        const acknowledgedDigest = outboundFreshDigest && result?.operationId === operation.operationId
+          && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
+        if (acknowledgedDigest) await this.journal.observeAdmission(operation.operationId, acknowledgedDigest);
         if (operation.operation === "move" || operation.operation === "delete") {
           const hash = operation.operation === "move" ? await this.hashPendingPayload(operation) : undefined;
           this.rememberOperation(operation, hash);
@@ -856,18 +984,49 @@ class SyncEngine {
           this.rememberOperation(operation, hash);
           await this.persistSnapshot();
         }
-        await this.journal.markSeen(operation.operationId);
+        // HTTP 2xx is not an independently signed admission receipt. Pin only
+        // our locally signed exact envelope if the response echoes every byte.
+        // Unknown ACKs and conflict results remain seen-only.
+        await this.journal.markSeen(operation.operationId, acknowledgedDigest);
         summary.pushed += 1;
       } catch (error) {
+        // A local authorization failure is never an HTTP conflict. Even a
+        // callback that throws status:409 must not consume a pending journal
+        // operation or trigger remote-wins recovery without a real response.
+        if (error?.code === "authorization_rejected" || error?.code === "authorization_required") throw error;
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
+          const current = error.current
+            ? envelopeCopy(protocol.validateStoredOperation(error.current)) : null;
+          if (current?.operationId === operation?.operationId
+            && signedEnvelopeDigest(current) !== signedEnvelopeDigest(operation)) {
+            fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
+          }
+          // A conflict response for A can point to B, whose operation ID may
+          // already be reserved by a DIFFERENT pending signed envelope. Never
+          // let markSeen(B) silently consume that still-unsent local operation.
+          if (current) {
+            const currentDigest = signedEnvelopeDigest(current);
+            for (const queued of await this.journal.recover()) {
+              if (queued.operationId !== current.operationId) continue;
+              let queuedDigest;
+              try {
+                queuedDigest = signedEnvelopeDigest(protocol.validateStoredOperation(queued));
+              } catch {
+                fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
+              }
+              if (queuedDigest !== currentDigest) {
+                fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
+              }
+            }
+          }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
-          if (error.current) {
-            const current = protocol.validateOperation(error.current);
+          if (current) {
+            let verifiedFreshDigest;
             if (this.operationDestinationIsSelected(current)) {
-              await this._apply(current, summary);
+              verifiedFreshDigest = await this._apply(current, summary);
             } else {
-              await this.verifyIncomingOperation(current);
+              verifiedFreshDigest = await this.verifyIncomingOperation(current);
               const reconciled = await this.reconcileOutOfScopeMove(current, summary, {
                 preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
               });
@@ -876,6 +1035,10 @@ class SyncEngine {
                 await this.persistSnapshot();
               }
             }
+            // A verified remote winner is not the local pending operation.
+            // Its separately signed envelope needs its own durable admission
+            // pin after the remote snapshot/materialization is persisted.
+            await this.journal.markSeen(current.operationId, verifiedFreshDigest);
           }
           await this.journal.markSeen(operation.operationId);
           summary.pushed += 1;
@@ -912,7 +1075,8 @@ class SyncEngine {
   }
 
   async _apply(operation, summary = null) {
-    await this.verifyIncomingOperation(operation);
+    operation = envelopeCopy(operation);
+    const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
     const plaintext = protocol.decryptPayload(operation, key);
     const incomingMetadata = operation.metadata || {};
@@ -940,6 +1104,10 @@ class SyncEngine {
     };
     operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
+    // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
+    // envelope before the first filesystem or snapshot mutation; failure here
+    // must not leave an applied object with no restart-safe observation.
+    if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
     let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
@@ -951,7 +1119,7 @@ class SyncEngine {
       if (!sourcePath) {
         delete this.snapshot.remoteOnly[operation.objectId];
         await this.persistSnapshot();
-        return;
+        return verifiedFreshDigest;
       }
       cleanupPath = sourcePath;
       const pathOccupiedByOther = priorAtTarget && !priorAtTarget.deleted
@@ -1040,6 +1208,7 @@ class SyncEngine {
     }
     await this.persistSnapshot();
     if (summary) summary.applied = (summary.applied || 0) + 1;
+    return verifiedFreshDigest;
   }
 
   async scanFiles() {
@@ -1153,7 +1322,7 @@ class SyncEngine {
       }
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
-      await this.journal.enqueue(operation);
+      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation);
     }
     for (const [relative, file] of Object.entries(current)) {
@@ -1185,7 +1354,7 @@ class SyncEngine {
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
-      await this.journal.enqueue(operation);
+      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation, contentHash);
     }
     await this.persistSnapshot();
@@ -1239,7 +1408,7 @@ class SyncEngine {
     const remoteRecords = Array.isArray(remoteResult) ? remoteResult
       : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
-    const remote = protocol.validateOperation(remoteRecords[0]);
+    const remote = protocol.validateStoredOperation(remoteRecords[0]);
     if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
       fail("Current remote object no longer matches the local cache", "remote_object_changed");
     }
@@ -1346,18 +1515,19 @@ class SyncEngine {
     const result = await this.adapter.list(entry.objectId);
     const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
     if (!records.length) fail("Remote object is no longer available", "remote_object_unavailable");
-    const operation = protocol.validateOperation(records[0]);
+    const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
     if (operation.objectId !== entry.objectId || !this.operationDestinationIsSelected(operation)) {
       fail("Remote object is outside the selected scope", "path_not_selected");
     }
-    await this.verifyIncomingOperation(operation);
+    const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     if (operation.tombstone) {
+      if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
       this.rememberRemoteOnly(operation, entry.reason);
       await this.persistSnapshot();
       return false;
     }
-    await this._apply(operation);
-    await this.journal.markSeen(operation.operationId);
+    const appliedDigest = await this._apply(operation);
+    await this.journal.markSeen(operation.operationId, verifiedFreshDigest || appliedDigest);
     return true;
   }
 
@@ -1393,30 +1563,64 @@ class SyncEngine {
       }
       return String(left.objectId).localeCompare(String(right.objectId)) || String(left.versionId).localeCompare(String(right.versionId));
     });
-    let remoteOnlyChanged = false;
-    for (const raw of ordered) {
-      const operation = protocol.validateOperation(raw);
+    // Fail before touching any local state if this single untrusted response
+    // contains incompatible signatures for one operation ID. Remote-only pins
+    // are intentionally fsynced after the snapshot and cannot guard the batch.
+    const batchDigests = new Map();
+    const inspected = ordered.map((raw) => envelopeCopy(protocol.validateStoredOperation(raw)));
+    for (const operation of inspected) {
+      const digest = signedEnvelopeDigest(operation);
+      this.journal.assertCompatibleAdmission(operation.operationId, digest);
+      const previous = batchDigests.get(operation.operationId);
+      if (previous !== undefined && previous !== digest) {
+        fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
+      }
+      batchDigests.set(operation.operationId, digest);
+    }
+    const REMOTE_ONLY_ADMISSION_BATCH = 128;
+    const observedRemoteOnly = [];
+    const flushRemoteOnly = async () => {
+      if (!observedRemoteOnly.length) return;
+      // Bounded durability boundaries: a 10k-object response must not hold
+      // 10k unpromoted pre-observations until the very end of the LIST.
+      // Fsync the current snapshot before converting any pin to applied.
+      await this.persistSnapshot();
+      for (const { operation, verifiedFreshDigest } of observedRemoteOnly) {
+        await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+      }
+      observedRemoteOnly.length = 0;
+    };
+    for (const operation of inspected) {
       if (!this.operationDestinationIsSelected(operation)) {
-        await this.verifyIncomingOperation(operation);
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
-        remoteOnlyChanged = true;
+        observedRemoteOnly.push({ operation, verifiedFreshDigest });
+        if (observedRemoteOnly.length >= REMOTE_ONLY_ADMISSION_BATCH) await flushRemoteOnly();
         continue;
       }
       const remoteOnly = this.snapshot.remoteOnly[operation.objectId];
       if (remoteOnly?.reason === "evicted") {
-        await this.verifyIncomingOperation(operation);
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         this.rememberRemoteOnly(operation, "evicted");
-        remoteOnlyChanged = true;
+        observedRemoteOnly.push({ operation, verifiedFreshDigest });
+        if (observedRemoteOnly.length >= REMOTE_ONLY_ADMISSION_BATCH) await flushRemoteOnly();
         continue;
       }
       // A folder re-included after an exclusion must hydrate even if this operation was seen before.
-      if (this.journal.hasSeen(operation.operationId) && remoteOnly?.reason !== "excluded") continue;
-      await this._apply(operation, summary);
-      await this.journal.markSeen(operation.operationId);
+      if (this.journal.hasSeen(operation.operationId) && remoteOnly?.reason !== "excluded") {
+        // The local seen JSON is mutable. In independently enforced historical
+        // mode it cannot suppress verification of remote signed envelopes on
+        // a restarted pull; a forged seen ID only risks local availability.
+        if (this.reverifySeenIncoming) await this.verifyIncomingOperation(operation,
+          { preObserve: false });
+        continue;
+      }
+      const verifiedFreshDigest = await this._apply(operation, summary);
+      await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
       summary.pulled += 1;
     }
-    if (remoteOnlyChanged) await this.persistSnapshot();
+    await flushRemoteOnly();
   }
 
   // Applies the configured exclusions once per change. Excluded tracked files are evicted
