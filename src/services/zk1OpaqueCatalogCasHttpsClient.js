@@ -14,6 +14,7 @@ const FIELDS = ["type", "account_id", "compartment_id", "keyring_id",
   "sequence", "digest", "nonce", "observed_at"];
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const PIN = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
+const pinnedClients = new WeakSet();
 function fail(code = "ZK_OPAQUE_CAS_TRANSPORT_UNAVAILABLE") {
   const error = new Error(code); error.code = code; throw error;
 }
@@ -131,7 +132,7 @@ function createZk1OpaqueCatalogCasHttpsClient({
     return proof;
   }
   const failError = () => new Error("ZK_OPAQUE_CAS_TRANSPORT_UNAVAILABLE");
-  return Object.freeze({
+  const client = Object.freeze({
     publicKey: authorityPublicKey,
     // The catalog independently verifies the signed snapshot envelope and
     // its current pinned head before accepting any missing SQLite rows.
@@ -200,5 +201,11 @@ function createZk1OpaqueCatalogCasHttpsClient({
       });
     },
   });
+  pinnedClients.add(client);
+  return client;
 }
-module.exports = { createZk1OpaqueCatalogCasHttpsClient };
+function isZk1OpaqueCatalogCasHttpsClient(client) {
+  return pinnedClients.has(client);
+}
+module.exports = { createZk1OpaqueCatalogCasHttpsClient,
+  isZk1OpaqueCatalogCasHttpsClient };

@@ -25,7 +25,8 @@ const { Zk1OpaqueCatalogIndependentFloorLedger,
   createZk1OpaqueCatalogIndependentFloorHttpsClient } =
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { OpaqueCheckpointV2Authority, createOpaqueCheckpointV2HttpsServer,
-  createOpaqueCheckpointV2HttpsClient, createOpaqueCheckpointV2Coordinator } =
+  createOpaqueCheckpointV2HttpsClient, createOpaqueCheckpointV2Coordinator,
+  verifyLegacyArchiveDualReadback, inspectLegacyArchiveReadback } =
   require("../src/services/zk1OpaqueCheckpointV2Remote");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
@@ -235,7 +236,8 @@ test("real Edge verifies owner V1 #128 -> V2 epoch handoff under strict CSP/loop
 
 test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and missing full-128 owner proof", {
   timeout: 120000 }, async (t) => {
-  const { options, v2Cas, v2Floor, v1Cas, v1Floor, catalog, checkpoint, owner } = await build();
+  const { options, v2Cas, v2Floor, v1Cas, v1Floor,
+    catalog, checkpoint, owner } = await build();
   const folder = privateAuthorityDirectory("zk65-128-gate-mtls-");
   if (process.platform !== "win32") fs.chmodSync(folder, 0o700);
   generateNativeFixtureCertificates(folder, {
@@ -593,6 +595,14 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const fullProof = { ...options, v1CasClient, v1FloorClient };
     const floorArgs = { fullV1ArchiveRollover: fullProof, ownerConsent: statement,
       ownerSignature: signedConsent, peerClient: casClient };
+    const readback = { fullV1ArchiveRollover: fullProof, ownerConsent: statement,
+      ownerSignature: signedConsent, casClient, floorClient, ownerTrust: trust,
+      operatorPins: { ownerPublicKey: owner.publicKey,
+        archiveCheckpointPublicKey: checkpoint.publicKey,
+        v1CasPublicKey: v1Cas.publicKey, v1FloorPublicKey: v1Floor.publicKey,
+        v2CasPublicKey: v2Cas.publicKey, v2FloorPublicKey: v2Floor.publicKey } };
+    await assert.rejects(verifyLegacyArchiveDualReadback(readback),
+      /ZK_CHECKPOINT_V2_/, 'readback requires independently signed stage on BOTH authorities');
     await assert.rejects(context.floor.stageLegacyArchiveMigration({
       ...floorArgs, fullV1ArchiveRollover: null,
     }), /ZK_CHECKPOINT_V2_/, 'missing full128 archive cannot stage a legacy migration');
@@ -606,12 +616,54 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const stagedFloor = await context.floor.stageLegacyArchiveMigration(floorArgs);
     assert.equal(stagedFloor.state, 'LEGACY_ARCHIVE_MIGRATION_STAGED_READ_ONLY');
     assert.equal(stagedFloor.v2WriteAuthorized, false);
+    await assert.rejects(verifyLegacyArchiveDualReadback(readback),
+      /ZK_CHECKPOINT_V2_/, 'one staged authority cannot masquerade as dual stage');
     assert.notEqual(statement.legacy_base_checkpoint, statement.full_archive_checkpoint);
     await assert.rejects(context.floor.prepare(Buffer.from([0xa0]), crypto.randomBytes(32)),
       { code: 'ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING' });
     const stagedCas = await context.cas.stageLegacyArchiveMigration({
       ...floorArgs, peerClient: floorClient });
     assert.equal(stagedCas.state, stagedFloor.state);
+    const verified = await verifyLegacyArchiveDualReadback(readback);
+    assert.equal(verified.state, 'LEGACY_DUAL_ARCHIVE_SIGNED_READBACK_ONLY');
+    assert.equal(verified.legacySequence, 128);
+    assert.equal(verified.v2WriteAuthorized, false);
+    assert.equal(verified.restoreAuthorized, false);
+    assert.equal(verified.independentMonotonicStageWitnessProven, false);
+    await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
+      ownerSignature: crypto.randomBytes(64) }), /ZK_CHECKPOINT_V2_/,
+    'owner consent signature must be bound to both authority stage receipts');
+    await assert.rejects(verifyLegacyArchiveDualReadback({
+      ...readback, operatorPins: undefined }), /ZK_CHECKPOINT_V2_/,
+    'self-declared handoff pins never replace operator-custodied keys');
+    await assert.rejects(verifyLegacyArchiveDualReadback({
+      ...readback, operatorPins: { ...readback.operatorPins,
+        ownerPublicKey: pair().publicKey } }), /ZK_CHECKPOINT_V2_/,
+    'a foreign owner key cannot be introduced by rollover metadata');
+    await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
+      ownerConsent: { ...statement, full_archive_root: b64(crypto.randomBytes(32)) } }),
+    /ZK_CHECKPOINT_V2_/, 'cannot substitute an independently signed full archive');
+    await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
+      fullV1ArchiveRollover: { ...fullProof, independentSpkiPins: {
+        ...fullProof.independentSpkiPins, owner: b64(crypto.randomBytes(32)) } } }),
+    /ZK_CHECKPOINT_V2_/, 'must reject foreign out-of-band owner pin');
+    context.setLiveOwnerDigest(crypto.randomBytes(32));
+    await assert.rejects(verifyLegacyArchiveDualReadback(readback),
+      /ZK_CHECKPOINT_V2_/, 'owner witness epoch advancement fences stale archive readback');
+    context.setLiveOwnerDigest(options.ownerHead.digest);
+    await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
+      fullV1ArchiveRollover: { ...fullProof, v1CasClient: options.v1CasClient } }),
+      /ZK_CHECKPOINT_V2_/, 'in-memory provider cannot replace the pinned V1 HTTPS client');
+    const challenge = crypto.randomBytes(32);
+    const floorReceipt = await floorClient.legacyArchiveReadback(challenge);
+    assert.equal(floorReceipt.role, 'FLOOR');
+    const altered = Buffer.from(floorReceipt.raw);
+    altered[altered.length - 1] ^= 1;
+    await assert.rejects(inspectLegacyArchiveReadback(altered, {
+      scope: options.scope, signer: v2Floor.publicKey, role: 'FLOOR',
+      casFp: id(v2Cas.publicKey), floorFp: id(v2Floor.publicKey),
+      nonce: challenge }), /ZK_CHECKPOINT_V2_/,
+    'tampering the FLOOR readback signature is rejected');
     await assert.rejects(context.cas.commit(Buffer.from([0xa0]), Buffer.alloc(64),
       crypto.randomBytes(32)), { code: 'ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING' });
     await assert.rejects(floorClient.prepare(Buffer.from([0xa0])),

@@ -32,7 +32,8 @@ const { Zk1OpaqueCatalogIndependentFloorLedger,
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { OpaqueCheckpointV2Authority,
   createOpaqueCheckpointV2HttpsServer, createOpaqueCheckpointV2HttpsClient,
-  signCheckpointOwnerApprovalV2, createOpaqueCheckpointV2Coordinator, inspectIntent } =
+  signCheckpointOwnerApprovalV2, createOpaqueCheckpointV2Coordinator, inspectIntent,
+  verifyLegacyArchiveDualReadback } =
   require("../src/services/zk1OpaqueCheckpointV2Remote");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
@@ -465,6 +466,20 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
         const casStage = await caCas.stageLegacyArchiveMigration({
           ...migrationArgs, peerClient: floorClient });
         assert.equal(casStage.legacySequence, 130);
+        const dualProof = await verifyLegacyArchiveDualReadback({
+          fullV1ArchiveRollover: fullProof, ownerConsent: consent,
+          ownerSignature: migrationArgs.ownerSignature, casClient, floorClient,
+          ownerTrust: trust, operatorPins: {
+            ownerPublicKey: owner.publicKey,
+            archiveCheckpointPublicKey: checkpoint.publicKey,
+            v1CasPublicKey: v1CasKeys.publicKey,
+            v1FloorPublicKey: v1FloorKeys.publicKey,
+            v2CasPublicKey: v2CasKeys.publicKey,
+            v2FloorPublicKey: v2FloorKeys.publicKey } });
+        assert.equal(dualProof.state, "LEGACY_DUAL_ARCHIVE_SIGNED_READBACK_ONLY");
+        assert.equal(dualProof.legacySequence, 130);
+        assert.equal(dualProof.v2WriteAuthorized, false);
+        assert.equal(dualProof.restoreAuthorized, false);
         assert.equal((await recipient.read()).sequence, 130,
           'both stage rows must preserve intact signed old 129+ history');
       } finally { recipient.close(); }

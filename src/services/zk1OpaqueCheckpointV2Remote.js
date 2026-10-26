@@ -16,6 +16,8 @@ const z = require("../crypto/rootark-zk-1");
 const archiveV2 = require("../crypto/rootark-zk1-opaque-catalog-checkpoint-v2");
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
+const { isZk1OpaqueCatalogCasHttpsClient } =
+  require("./zk1OpaqueCatalogCasHttpsClient");
 const { Zk1V2CheckpointFloorHttpsClient } =
   require("./zk1V2CheckpointFloorHttps");
 const { catalogCasDomain } = require("./zk1OpaqueCatalog");
@@ -38,6 +40,8 @@ const APPROVAL_DOMAIN = Buffer.from(PREFIX + "owner-approval/v2\0");
 const RECEIPT_DOMAIN = Buffer.from(PREFIX + "receipt/v2\0");
 const LEGACY_MIGRATION_DOMAIN = Buffer.from(
   "Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0");
+const LEGACY_READBACK_DOMAIN = Buffer.from(
+  "Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-readback/v1\0");
 const ROLE_CAS = "CAS";
 const ROLE_FLOOR = "FLOOR";
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
@@ -47,6 +51,12 @@ const LEGACY_MIGRATION_FIELDS = ["type", ...SCOPE, "legacy_base_digest",
   "full_archive_checkpoint", "cas_signer_fp", "floor_signer_fp",
   "owner_revision", "owner_digest", "owner_epoch", "nonce",
   "issued_at", "expires_at"];
+const LEGACY_READBACK_FIELDS = ["type", ...SCOPE, "role", "state",
+  "legacy_base_digest", "legacy_base_checkpoint", "legacy_sequence",
+  "legacy_head_digest", "legacy_checkpoint_digest", "legacy_operation_id",
+  "full_archive_root", "full_archive_checkpoint", "cas_signer_fp",
+  "floor_signer_fp", "owner_consent_hash", "terminal_receipt", "nonce",
+  "issued_at"];
 const INTENT_FIELDS = ["type", ...SCOPE, "operation_id", "checkpoint_bytes",
   "checkpoint_signature", "records", "previous_sequence",
   "previous_digest", "previous_checkpoint_digest", "owner_approval",
@@ -70,6 +80,7 @@ const MAX_OWNER = 2 * 1024 * 1024;
 const CERT_PIN = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
 const ZERO = Buffer.alloc(32);
 const MAX_V2_SEQUENCE = 1000000;
+const MAX_LEGACY_READBACK_TRANSITIONS = 1024;
 // A coordinator must never accept caller-supplied stand-ins whose head()
 // advertises FINALIZED without independently verifying a remote receipt.
 const pinnedV2Clients = new WeakSet();
@@ -290,6 +301,35 @@ function receiptMatches(raw, { scope, role, state, sequence, headDigest,
     key(signer), bytes(signature, 64))) fail();
     return { ...statement, raw: Buffer.from(raw) };
   })();
+}
+async function inspectLegacyArchiveReadback(raw, { scope, signer, role, casFp,
+  floorFp, nonce }) {
+  const signed = await z.decodeDeterministic(bytes(raw, 1, 8192));
+  exact(signed, [...LEGACY_READBACK_FIELDS, "signature"]);
+  const { signature, ...body } = signed;
+  exact(body, LEGACY_READBACK_FIELDS);
+  matchesScope(body, scope);
+  if (body.type !== "rootark-opaque-checkpoint-v2-legacy-archive-readback/v1"
+    || body.role !== role || body.state !== "STAGED_READ_ONLY"
+    || !same(bytes(body.cas_signer_fp, 32), casFp)
+    || !same(bytes(body.floor_signer_fp, 32), floorFp)
+    || !same(bytes(body.nonce, 32), nonce)
+    || Math.abs(Math.floor(Date.now() / 1000) - num(body.issued_at, 0)) > 30
+    || !crypto.verify(null, Buffer.concat([LEGACY_READBACK_DOMAIN,
+      Buffer.from(await z.encodeDeterministic(body))]),
+    key(signer), bytes(signature, 64))) fail();
+  for (const name of ["legacy_base_digest", "legacy_base_checkpoint",
+    "legacy_head_digest", "legacy_checkpoint_digest",
+    "legacy_operation_id", "full_archive_root", "full_archive_checkpoint",
+    "owner_consent_hash"]) bytes(body[name], 32);
+  const sequence = num(body.legacy_sequence, 128, MAX_V2_SEQUENCE);
+  const state = sequence === 128 ? "V1_BASELINE" : "FINALIZED";
+  await receiptMatches(body.terminal_receipt, { scope, role, state,
+    sequence, headDigest: body.legacy_head_digest,
+    checkpointDigest: body.legacy_checkpoint_digest,
+    operationId: body.legacy_operation_id, casFp, floorFp, signer,
+    nonce, fresh: true });
+  return { ...body, raw: Buffer.from(raw) };
 }
 
 async function signCheckpointOwnerApprovalV2(statement, privateKey) {
@@ -802,6 +842,47 @@ class OpaqueCheckpointV2Authority {
         independentlyReconciledAcrossAuthorities: false });
     });
   }
+  // Non-mutating, challenge-bound operator evidence for an already fenced
+  // SQLite stage. The statement is signed by this role's independent key.
+  // It is NOT a durable witness anchor or a dual-authority activation.
+  async legacyArchiveReadback(nonce) {
+    return this.#serial(async () => {
+      const challenge = bytes(nonce, 32);
+      const stage = this.#legacyMigrationStage();
+      if (!stage) fail("ZK_CHECKPOINT_V2_LEGACY_READBACK_NOT_STAGED");
+      if (stage.legacy_sequence > 128 + MAX_LEGACY_READBACK_TRANSITIONS)
+        fail("ZK_CHECKPOINT_V2_LEGACY_READBACK_BOUNDED");
+      const rows = await this.#history();
+      const last = rows.at(-1);
+      if (last && last.state !== "FINALIZED")
+        fail("ZK_CHECKPOINT_V2_LEGACY_MIGRATION_PENDING");
+      const current = this.#legacyMigrationStage();
+      const s = this.#settings;
+      if (!current || !same(stage.owner_consent, current.owner_consent)
+        || !same(stage.owner_signature, current.owner_signature)) fail();
+      const terminal = last || { final_digest: s.baseDigest,
+        checkpoint_digest: s.baseCheckpoint, operation_id: ZERO };
+      const receipt = await this.#signed(terminal,
+        last ? "FINALIZED" : "V1_BASELINE", challenge);
+      const statement = { type: "rootark-opaque-checkpoint-v2-legacy-archive-readback/v1",
+        ...s.scope, role: s.role, state: "STAGED_READ_ONLY",
+        legacy_base_digest: s.baseDigest, legacy_base_checkpoint: s.baseCheckpoint,
+        legacy_sequence: current.legacy_sequence,
+        legacy_head_digest: bytes(current.legacy_head_digest, 32),
+        legacy_checkpoint_digest: bytes(current.legacy_checkpoint_digest, 32),
+        legacy_operation_id: bytes(current.legacy_operation_id, 32),
+        full_archive_root: bytes(current.full_archive_root, 32),
+        full_archive_checkpoint: bytes(current.full_archive_checkpoint, 32),
+        cas_signer_fp: s.casFp, floor_signer_fp: s.floorFp,
+        owner_consent_hash: hash(LEGACY_MIGRATION_DOMAIN, current.owner_consent,
+          current.owner_signature), terminal_receipt: receipt,
+        nonce: challenge, issued_at: Math.floor(Date.now() / 1000) };
+      const raw = Buffer.from(await z.encodeDeterministic(statement));
+      return Buffer.from(await z.encodeDeterministic({ ...statement,
+        signature: crypto.sign(null, Buffer.concat([LEGACY_READBACK_DOMAIN, raw]),
+          s.signer) }));
+    });
+  }
   get role() { return this.#settings.role; }
   get publicKey() { return crypto.createPublicKey(this.#settings.signer); }
   async #signed(row, state, nonce) {
@@ -1020,7 +1101,8 @@ function createOpaqueCheckpointV2HttpsServer({ ledger, tlsKey, tlsCert, clientCa
       if (!req.socket.authorized
         || req.socket.getPeerCertificate()?.fingerprint256?.toUpperCase() !== pin
         || req.method !== "POST" || req.headers["content-type"] !== "application/json"
-        || !["/v2/prepare", "/v2/commit", "/v2/finalize", "/v2/attest", "/v2/head"]
+        || !["/v2/prepare", "/v2/commit", "/v2/finalize", "/v2/attest",
+          "/v2/head", "/v2/legacy-readback"]
           .includes(req.url)) fail();
       const parts = []; let count = 0;
       for await (const chunk of req) {
@@ -1045,6 +1127,8 @@ function createOpaqueCheckpointV2HttpsServer({ ledger, tlsKey, tlsCert, clientCa
       else if (req.url === "/v2/commit") result = await ledger.commit(raw, proof, nonce);
       else if (req.url === "/v2/finalize") result = await ledger.finalize(proof, nonce);
       else if (req.url === "/v2/attest") result = await ledger.attestFinalized(proof, nonce);
+      else if (req.url === "/v2/legacy-readback")
+        result = await ledger.legacyArchiveReadback(nonce);
       else result = await ledger.head(nonce);
       if ((req.url === "/v2/commit" && dropCommit)
         || (req.url === "/v2/finalize" && dropFinal)) {
@@ -1125,6 +1209,12 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
       req.end(encoded);
     }).catch(() => fail("ZK_CHECKPOINT_V2_ACK_UNCERTAIN"));
     const rawProof = outcome.proof ? Buffer.from(outcome.proof, "base64url") : null;
+    if (route === "/v2/legacy-readback") {
+      if (!rawProof) fail();
+      return inspectLegacyArchiveReadback(rawProof, { scope: scopeBytes,
+        signer, role: same(fp(signer), casFp) ? ROLE_CAS : ROLE_FLOOR,
+        casFp, floorFp, nonce });
+    }
     if (route === "/v2/head") {
       if (outcome.state === "V1_BASELINE") {
           if (outcome.sequence !== 128 || !rawProof) fail();
@@ -1171,12 +1261,148 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
     finalize: (casCommit) => request("/v2/finalize", null, casCommit),
     attest: (floorFinalized) => request("/v2/attest", null, floorFinalized),
     head: (challenge) => request("/v2/head", null, null, challenge),
+    legacyArchiveReadback: (challenge) =>
+      request("/v2/legacy-readback", null, null, challenge),
   });
   pinnedV2Clients.add(client);
   return client;
 }
 function isOpaqueCheckpointV2PinnedClient(client) {
   return pinnedV2Clients.has(client);
+}
+
+// PHASE-2 bounded evidence gate: two independently signed, nonce-fresh,
+// owner-consent-bound stage snapshots plus full historical V1 cryptographic
+// verification and a fresh separately pinned owner witness. No writes.
+async function verifyLegacyArchiveDualReadback(input) {
+  try {
+    exact(input, ["fullV1ArchiveRollover", "ownerConsent", "ownerSignature",
+      "casClient", "floorClient", "ownerTrust", "operatorPins"]);
+    const { fullV1ArchiveRollover: proof, ownerConsent: suppliedConsent, ownerSignature,
+      casClient, floorClient, ownerTrust, operatorPins } = input;
+    if (!pinnedV2Clients.has(casClient) || casClient.role !== ROLE_CAS
+      || !pinnedV2Clients.has(floorClient) || floorClient.role !== ROLE_FLOOR
+      || !proof || typeof ownerTrust?.freshWitnessHead !== "function"
+      || !ownerTrust.pinnedWitness || !ownerTrust.minimumHead) fail();
+    if (!isZk1OpaqueCatalogCasHttpsClient(proof.v1CasClient)
+      || !isZk1OpaqueCatalogIndependentFloorClient(proof.v1FloorClient)
+      || !same(fp(key(proof.v1CasClient.publicKey)), fp(key(proof.v1CasKey)))
+      || !same(fp(key(proof.v1FloorClient.publicKey)), fp(key(proof.v1FloorKey))))
+      fail();
+    // These are operator-custodied public keys, injected independently from
+    // the candidate rollover proof. A proof's self-declared pins alone
+    // cannot bootstrap trust in a different owner/archive/authority.
+    exact(operatorPins, ["ownerPublicKey", "archiveCheckpointPublicKey",
+      "v1CasPublicKey", "v1FloorPublicKey", "v2CasPublicKey", "v2FloorPublicKey"]);
+    for (const [provided, candidate] of [
+      ["ownerPublicKey", proof.ownerKey],
+      ["archiveCheckpointPublicKey", proof.checkpointKey],
+      ["v1CasPublicKey", proof.v1CasKey],
+      ["v1FloorPublicKey", proof.v1FloorKey],
+      ["v2CasPublicKey", proof.v2CasKey],
+      ["v2FloorPublicKey", proof.v2FloorKey],
+    ]) if (!same(fp(key(operatorPins[provided])), fp(key(candidate)))) fail();
+    const scope = scopeOf(proof.scope);
+    if (!same(fp(key(proof.v2CasKey)), fp(casClient.publicKey))
+      || !same(fp(key(proof.v2FloorKey)), fp(floorClient.publicKey))
+      || !same(fp(key(proof.ownerKey)), canonical32(proof.independentSpkiPins.owner)))
+      fail();
+    const { verifyRolloverPreflight } =
+      require("./zk1OpaqueCatalogV1RolloverPreflight");
+    const archive = await verifyRolloverPreflight(proof);
+    if (archive.sequence !== 128 || archive.archivesRetained !== 128
+      || archive.v2WriteAuthorized !== false) fail();
+    exact(suppliedConsent, LEGACY_MIGRATION_FIELDS);
+    // The input may be held by a mutable UI/coordinator. Snapshot exactly
+    // what was signed before the first asynchronous mTLS or witness check.
+    const ownerConsent = JSON.parse(JSON.stringify(suppliedConsent));
+    exact(ownerConsent, LEGACY_MIGRATION_FIELDS);
+    const consent = Buffer.from(JSON.stringify(ownerConsent));
+    const signature = bytes(ownerSignature, 64);
+    const now = Math.floor(Date.now() / 1000);
+    if (ownerConsent.type !== "rootark-opaque-checkpoint-v2-legacy-archive-migration/v1"
+      || !SCOPE.every((field) => ownerConsent[field] === scope[field].toString("base64url"))
+      || !same(canonical32(ownerConsent.legacy_base_digest), canonical32(archive.digest))
+      || !same(canonical32(ownerConsent.full_archive_root), canonical32(archive.archiveRoot))
+      || !same(canonical32(ownerConsent.full_archive_checkpoint),
+        canonical32(archive.checkpointDigest))
+      || !same(canonical32(ownerConsent.cas_signer_fp), fp(casClient.publicKey))
+      || !same(canonical32(ownerConsent.floor_signer_fp), fp(floorClient.publicKey))
+      || ownerConsent.owner_revision !== proof.ownerHead.revision
+      || !same(canonical32(ownerConsent.owner_digest), bytes(proof.ownerHead.digest, 32))
+      || ownerConsent.owner_epoch !== proof.ownerHead.epoch
+      || !Number.isSafeInteger(ownerConsent.issued_at)
+      || !Number.isSafeInteger(ownerConsent.expires_at)
+      || ownerConsent.issued_at < 1 || ownerConsent.issued_at > now + 30
+      || ownerConsent.expires_at <= ownerConsent.issued_at
+      || ownerConsent.expires_at - ownerConsent.issued_at > 300
+      || !crypto.verify(null, Buffer.concat([LEGACY_MIGRATION_DOMAIN, consent]),
+        key(proof.ownerKey), signature)) fail();
+    canonical32(ownerConsent.nonce);
+    const consentHash = hash(LEGACY_MIGRATION_DOMAIN, consent, signature);
+    const expected = { legacy_base_digest: canonical32(ownerConsent.legacy_base_digest),
+      legacy_base_checkpoint: canonical32(ownerConsent.legacy_base_checkpoint),
+      legacy_head_digest: canonical32(ownerConsent.legacy_head_digest),
+      legacy_checkpoint_digest: canonical32(ownerConsent.legacy_checkpoint_digest),
+      legacy_operation_id: canonical32(ownerConsent.legacy_operation_id),
+      full_archive_root: canonical32(ownerConsent.full_archive_root),
+      full_archive_checkpoint: canonical32(ownerConsent.full_archive_checkpoint),
+      owner_consent_hash: consentHash };
+    if (same(expected.legacy_base_checkpoint, expected.full_archive_checkpoint)
+      || ownerConsent.legacy_sequence < 128
+      || ownerConsent.legacy_sequence > 128 + MAX_LEGACY_READBACK_TRANSITIONS
+      || (ownerConsent.legacy_sequence === 128
+        && !same(expected.legacy_operation_id, ZERO))) fail();
+    const checkedReadback = async () => {
+      const challenges = [crypto.randomBytes(32), crypto.randomBytes(32)];
+      const clients = [casClient, floorClient];
+      const seen = await Promise.all(clients.map((client, i) =>
+        client.legacyArchiveReadback(challenges[i])));
+      for (const [i, report] of seen.entries()) {
+        const identity = { scope, signer: clients[i].publicKey,
+          role: i ? ROLE_FLOOR : ROLE_CAS,
+          casFp: fp(casClient.publicKey), floorFp: fp(floorClient.publicKey),
+          nonce: challenges[i] };
+        // Re-verify the raw cryptographic bytes even if a client object
+        // has been mutated after its TLS / Ed25519 verification.
+        const result = await inspectLegacyArchiveReadback(report.raw, identity);
+        if (result.legacy_sequence !== ownerConsent.legacy_sequence
+          || Object.entries(expected).some(([name, value]) =>
+            !same(bytes(result[name], 32), value))) fail();
+      }
+    };
+    await checkedReadback();
+    const challenge = crypto.randomBytes(32);
+    const fresh = bytes(await ownerTrust.freshWitnessHead({
+      scope, nonce: challenge }), 1, 8192);
+    await inspectVerifiedWitnessFreshHeadV1({
+      raw: fresh, scope, nonce: challenge,
+      pinned: ownerTrust.pinnedWitness, minimumHead: ownerTrust.minimumHead });
+    const witnessed = await z.decodeDeterministic(fresh);
+    if (Math.abs(Math.floor(Date.now() / 1000) - witnessed.observed_at) > 30
+      || witnessed.current_revision !== ownerConsent.owner_revision
+      || !same(bytes(witnessed.current_manifest_digest, 32),
+        canonical32(ownerConsent.owner_digest))) fail();
+    await checkedReadback();
+    // A real signed V1 provider rollback between the initial archive proof
+    // and stage interrogation must not be hidden by otherwise valid V2
+    // operator receipts. Repeat the two V1 remote heads at the end.
+    const finalArchive = await verifyRolloverPreflight(proof);
+    if (finalArchive.sequence !== 128 || finalArchive.archivesRetained !== 128
+      || !same(canonical32(finalArchive.archiveRoot),
+        expected.full_archive_root)
+      || !same(canonical32(finalArchive.checkpointDigest),
+        expected.full_archive_checkpoint)) fail();
+    await checkedReadback();
+    return Object.freeze({ state: "LEGACY_DUAL_ARCHIVE_SIGNED_READBACK_ONLY",
+      legacySequence: ownerConsent.legacy_sequence,
+      fullArchiveRoot: ownerConsent.full_archive_root,
+      fullArchiveCheckpoint: ownerConsent.full_archive_checkpoint,
+      v2WriteAuthorized: false, restoreAuthorized: false,
+      destructiveCutoverAuthorized: false,
+      independentMonotonicStageWitnessProven: false,
+      externalProviderDurabilityProven: false });
+  } catch (_) { fail("ZK_CHECKPOINT_V2_LEGACY_READBACK_UNVERIFIED"); }
 }
 
 function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
@@ -1440,4 +1666,5 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
 module.exports = { OpaqueCheckpointV2Authority, createOpaqueCheckpointV2HttpsServer,
   createOpaqueCheckpointV2HttpsClient, signCheckpointOwnerApprovalV2,
   createOpaqueCheckpointV2Coordinator, inspectIntent, receiptMatches,
-  isOpaqueCheckpointV2PinnedClient };
+  isOpaqueCheckpointV2PinnedClient, verifyLegacyArchiveDualReadback,
+  inspectLegacyArchiveReadback };

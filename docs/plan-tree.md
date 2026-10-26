@@ -1,5 +1,31 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: legacy V2 two-authority signed stage readback (DEV, 2026-10-25)
+
+After the opt-in phase-1 legacy V2 dual-archive write quarantine (`a4b5ea6`),
+operators can now request signed, challenge-bound READBACK from independently
+pinned CAS and FLOOR mTLS authorities. Each checks its native immutable staged
+SQLite marker and original V2 signed history; a distinct role Ed25519 signer
+binds the owner consent hash, old #128 baseline, current legacy #129+ terminal,
+and the distinct full 1..128 archive root/checkpoint. An operator-side bounded
+verifier requires separate out-of-band owner/archive/V1/V2 public pins, actual
+pinned V1/V2 HTTPS clients, complete 128-head signed history, two fresh V1
+provider checks, both role signatures, an independently signed fresh owner
+witness and double remote stage readback. Missing/partial stage, foreign owner,
+tampered signature, changed roots or owner revision fail closed. Legacy history
+verification is capped at 1,024 successor transitions in this DEV gate.
+
+Windows Node24 targeted real synthetic TLS1.3 mTLS suites (V1 #128 and legacy
+V2 #129/#130) **2 PASS / 0 FAIL**; four changed JS source/test files
+`node --check` **PASS**, `git diff --check` **PASS**. This proves only
+bounded read-only stage evidence: historical consent may be expired but the
+128-archive handoff still needs a current authenticated owner signature.
+The endpoint cannot restore ciphertext, issue new V2 writes, delete legacy
+sources or assert a distributed migration. Independent monotonic physical
+stage witness, durable two-host reconciliation, provider readback/restore
+and signed dual-anchor successor envelopes remain **NO-GO** prerequisites.
+Details: `docs/issue-65-v2-legacy-remote-dual-archive-readback-dev.md`.
+
 ## Issue #65 / PR #228: browser offline native source-root contract (2026-10-25)
 
 After native two-chunk source-root verification became mandatory in
