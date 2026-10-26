@@ -204,7 +204,7 @@ test("Phase 12 server route stores opaque records and rejects conflict/replay", 
   const app = express();
   app.use((req, res, next) => req.path.startsWith("/sync/v1/") ? next() : express.json()(req, res, next));
   app.use("/sync/v1", express.json({ limit: "9mb" }));
-  const authenticate = (req, _res, next) => { req.user = { username: "alice" }; next(); };
+  const authenticate = (req, _res, next) => { req.user = { username: "alice", permissions: { upload: true, delete: true } }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath: path.join(dir, "objects.json") });
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
