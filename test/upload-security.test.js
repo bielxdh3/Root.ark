@@ -2500,8 +2500,17 @@ test("chunk assembly fails closed when a session ledger path is duplicated", { t
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
-test("a valid upload can send all 2,000 allowed chunks within the configured window", { timeout: 180_000 }, async (t) => {
-  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1" } });
+// The hosted Windows runner can need more than 180 seconds for the same 2,000
+// individually authenticated requests. Keep every assertion and per-request
+// deadline; restore the bounded CI-only budget from the historical #228 test.
+const chunkBoundarySuiteTimeoutMs = process.platform === "win32" && process.env.CI === "true"
+  ? 480_000 : 180_000;
+test("a valid upload can send all 2,000 allowed chunks within the configured window",
+  { timeout: chunkBoundarySuiteTimeoutMs }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1" },
+    readyTimeout: process.platform === "win32" ? 45_000 : TIMEOUT_MS,
+  });
   const session = await login(harness.port, "uploader", harness.password);
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   t.after(() => agent.destroy());
