@@ -3,9 +3,10 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
@@ -16,7 +17,7 @@ const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } =
   require("../src/services/zk1WitnessHttpsServer");
 
 test("independent real mTLS witness retains exact signed CAS journal history and refuses forged/forked ACK", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-witness-cas-anchor-mtls-"));
+  const dir = createPrivateAuthorityFixture("rootark-witness-cas-anchor-mtls-");
   generateNativeFixtureCertificates(dir, { caSubject: "CAS Floor CA",
     servers: ["server"], clients: ["allowed", "denied"] });
   const read = (name) => fs.readFileSync(path.join(dir, name));
