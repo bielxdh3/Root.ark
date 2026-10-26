@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - Root/main
+      - 'cdx/zk65-split-pr*'
   schedule:
     - cron: "37 11 * * 1"
 
