@@ -231,7 +231,18 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
         const opened = fs.fstatSync(fd, { bigint: true });
         if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== info.dev
           || opened.ino !== info.ino || opened.size !== info.size) deny();
-        data = fs.readFileSync(fd);
+        // A hostile writer may grow the same inode after fstat. Reading an
+        // unbounded descriptor would allocate attacker-controlled bytes before
+        // the post-read identity check can reject the changed file.
+        const exactLength = Number(opened.size);
+        data = Buffer.alloc(exactLength);
+        let offset = 0;
+        while (offset < exactLength) {
+          const count = fs.readSync(fd, data, offset,
+            Math.min(64 * 1024, exactLength - offset), offset);
+          if (count <= 0 || count > exactLength - offset) deny();
+          offset += count;
+        }
         const after = fs.fstatSync(fd, { bigint: true });
         const now = fs.lstatSync(destination, { bigint: true });
         if (data.length !== Number(info.size) || after.ino !== opened.ino

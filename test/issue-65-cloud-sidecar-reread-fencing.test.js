@@ -229,3 +229,53 @@ test("late principal change during final probe is observational only; strict quo
   assert.equal(observed.crossProviderAtomicFenceProven, false);
   assert.equal(observed.authorizesIo, false);
 });
+
+test("signed sidecar read cannot allocate bytes appended after descriptor fstat", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-size-race-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const s3 = fixture.readers[0].cloudReader;
+  const download = s3.download;
+  let destination;
+  s3.download = async function (...args) {
+    const result = await download.apply(this, args);
+    destination = args[2];
+    return result;
+  };
+  const realOpen = fs.openSync;
+  const realFstat = fs.fstatSync;
+  const realReadFile = fs.readFileSync;
+  let selectedFd;
+  let attacked = false;
+  const fdReadLengths = [];
+  fs.openSync = function (name, ...args) {
+    const fd = realOpen.call(fs, name, ...args);
+    if (name === destination && selectedFd === undefined) selectedFd = fd;
+    return fd;
+  };
+  fs.fstatSync = function (fd, ...args) {
+    const stat = realFstat.call(fs, fd, ...args);
+    if (fd === selectedFd && !attacked) {
+      attacked = true;
+      fs.appendFileSync(destination, Buffer.alloc(5 * 1024 * 1024, 0x58));
+    }
+    return stat;
+  };
+  fs.readFileSync = function (source, ...args) {
+    const bytes = realReadFile.call(fs, source, ...args);
+    if (typeof source === "number") fdReadLengths.push(bytes.length);
+    return bytes;
+  };
+  try {
+    await assert.rejects(verifyPublishedSignedCatalogSidecars({ ...fixture.verification,
+      readers: fixture.readers.slice(0, 2) }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/);
+  } finally {
+    fs.openSync = realOpen;
+    fs.fstatSync = realFstat;
+    fs.readFileSync = realReadFile;
+  }
+  assert.equal(attacked, true, "the file must grow after descriptor identity preflight");
+  assert.deepEqual(fdReadLengths, [],
+    "a bounded sidecar read must never use readFileSync(fd) on attacker-growable inode");
+});
