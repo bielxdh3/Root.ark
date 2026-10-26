@@ -165,7 +165,16 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
       const before = fs.fstatSync(fd, { bigint: true });
       if (!before.isFile() || before.dev !== named.dev || before.ino !== named.ino
         || before.size !== named.size || before.nlink !== 1n) deny();
-      data = fs.readFileSync(fd);
+      // A local writer can grow the same destination inode after fstat;
+      // never allocate more than the owner-pinned ciphertext byte budget.
+      data = Buffer.alloc(byteLength);
+      let offset = 0;
+      while (offset < byteLength) {
+        const count = fs.readSync(fd, data, offset,
+          Math.min(64 * 1024, byteLength - offset), offset);
+        if (count <= 0 || count > byteLength - offset) deny();
+        offset += count;
+      }
       const after = fs.fstatSync(fd, { bigint: true });
       const now = fs.lstatSync(destination, { bigint: true });
       if (data.length !== byteLength || after.dev !== before.dev || after.ino !== before.ino

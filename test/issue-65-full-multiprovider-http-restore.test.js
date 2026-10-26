@@ -48,6 +48,7 @@ const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 
 const b64 = (data) => Buffer.from(data).toString("base64url");
 const random = (n) => crypto.randomBytes(n);
@@ -758,6 +759,19 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     }
     const good = await gateway.restoreExact(recoverInput);
     assert.deepEqual(good.ciphertext, ciphertext);
+  });
+
+  await t.test("multiprovider GET never allocates an inode grown after pinned fstat", async () => {
+    const observed = await withInodeGrowthAfterFstat({
+      targetMatch: (name) => typeof name === "string" && path.basename(name) === "opaque.ct",
+      extraBytes: 5 * 1024 * 1024,
+      run: () => assert.rejects(gateway.restoreExact({ ...recoverInput,
+        readers: readers.slice(0, 2), minimumMatchingProviders: 2 }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/),
+    });
+    assert.equal(observed.attacked, true, "race a real provider ciphertext destination");
+    assert.deepEqual(observed.numericFdReadLengths, [],
+      "a grown ciphertext destination must not cause unbounded descriptor allocation");
   });
 
   await t.test("a verified 2/3 ciphertext quorum never waits on silent third provider", async () => {
