@@ -11,6 +11,7 @@ const { DatabaseSync } = require("node:sqlite");
 const { MIGRATIONS } = require("../db/migrations");
 const { inspectZk1LiveLegacyRecoverableArchiveGraph: inspect } =
   require("../src/services/zk1LiveLegacyRecoverableArchiveGraph");
+const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const FILE = "SECRET-ARCHIVED-ENCRYPTED-FILE.dat";
@@ -211,4 +212,17 @@ test("local derived root refuses unknown aliases, hardlinks and noncanonical dir
     await rejected(f, { localTempDir: temp });
     assert.equal(fs.existsSync(f.archive), true);
   }
+});
+
+test("graph's second archive read cannot allocate inode growth beyond ZIP cap", async (t) => {
+  const f = fixture(t);
+  await archive(f);
+  // The legacy preflight intentionally reads this ZIP first. Race only the
+  // graph's SECOND descriptor open, so this tests its own readPinnedArchive.
+  const observed = await withInodeGrowthAfterFstat({ target: f.archive,
+    openOrdinal: 2, extraBytes: 33 * 1024 * 1024,
+    run: () => rejected(f) });
+  assert.equal(observed.attacked, true);
+  assert.deepEqual(observed.numericFdReadLengths, [],
+    "a renamed or enlarged graph archive must not allocate beyond its cap");
 });

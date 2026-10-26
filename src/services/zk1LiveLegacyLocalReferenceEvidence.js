@@ -90,7 +90,15 @@ function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret,
       if (totalBytes > BigInt(MAX_TOTAL_BYTES)) deny();
       fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
       if (!same(before, fs.fstatSync(fd, { bigint: true }))) deny();
-      const data = fs.readFileSync(fd);
+      // Pin the allocation to the pre-open size, not a writer-grown inode.
+      const data = Buffer.alloc(Number(before.size));
+      let offset = 0;
+      while (offset < data.length) {
+        const count = fs.readSync(fd, data, offset,
+          Math.min(64 * 1024, data.length - offset), offset);
+        if (count <= 0 || count > data.length - offset) deny();
+        offset += count;
+      }
       if (BigInt(data.length) !== before.size
         || !same(before, fs.fstatSync(fd, { bigint: true }))
         || !same(before, fs.lstatSync(file, { bigint: true }))) deny();

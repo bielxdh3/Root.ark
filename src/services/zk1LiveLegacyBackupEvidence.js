@@ -71,7 +71,15 @@ function readFile(file, identities, snapshots, budget, max = MAX_BYTES) {
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
     const opened = fs.fstatSync(fd, { bigint: true });
     if (!stable(before, opened)) deny();
-    const content = fs.readFileSync(fd);
+    // Concurrent archive/JSON growth must never expand our read allocation.
+    const content = Buffer.alloc(Number(opened.size));
+    let offset = 0;
+    while (offset < content.length) {
+      const count = fs.readSync(fd, content, offset,
+        Math.min(64 * 1024, content.length - offset), offset);
+      if (count <= 0 || count > content.length - offset) deny();
+      offset += count;
+    }
     if (BigInt(content.length) !== opened.size
       || !stable(before, fs.fstatSync(fd, { bigint: true }))
       || !stable(before, fs.lstatSync(file, { bigint: true }))) deny();

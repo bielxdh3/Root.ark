@@ -10,6 +10,7 @@ const { once } = require("node:events");
 const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyReferencePreflight: inspect } =
   require("../src/services/zk1LiveLegacyReferencePreflight");
+const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const NAME = "rootark-backup-2026-10-23-08-00-00.zip";
@@ -316,4 +317,14 @@ test("late backup swap after hashing is rejected on final filesystem identity re
     fs.lstatSync = original;
   }
   assert.equal(fs.existsSync(f.zip), true, "never remove concurrent source material");
+});
+
+test("legacy backup mirror never allocates bytes grown past its JSON cap after fstat", async (t) => {
+  const f = fixture(t);
+  const observed = await withInodeGrowthAfterFstat({ target: f.history,
+    extraBytes: 257 * 1024,
+    run: () => mustDeny(f) });
+  assert.equal(observed.attacked, true);
+  assert.deepEqual(observed.numericFdReadLengths, [],
+    "a growing backup JSON mirror must remain bounded before postread rejection");
 });

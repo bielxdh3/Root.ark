@@ -10,6 +10,7 @@ const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyReferencePreflight: inspect } =
   require("../src/services/zk1LiveLegacyReferencePreflight");
 const { MIGRATIONS } = require("../db/migrations");
+const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const PRIVATE_NAME = "PRIVATE-LEGACY-DO-NOT-EXPORT.txt";
@@ -202,4 +203,14 @@ test("full migrated SQLite, real backup archive and real derived/version files c
   fs.writeFileSync(archive, backupBytes);
   fs.rmSync(path.join(uploadsDir, PRIVATE_NAME));
   assert.throws(() => inspect(args), /ZK_LIVE_LEGACY_INVENTORY_UNAVAILABLE/);
+});
+
+test("legacy uploaded version never allocates bytes grown after descriptor fstat", async (t) => {
+  const f = fixture(t);
+  const observed = await withInodeGrowthAfterFstat({ target: f.current,
+    extraBytes: 33 * 1024 * 1024,
+    run: () => denied(f) });
+  assert.equal(observed.attacked, true);
+  assert.deepEqual(observed.numericFdReadLengths, [],
+    "a mutable upload cannot trigger an unbounded descriptor allocation");
 });

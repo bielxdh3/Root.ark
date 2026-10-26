@@ -41,7 +41,15 @@ function readPinnedArchive(file, expected) {
     const before = regular(file);
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
     if (!same(before, fs.fstatSync(fd, { bigint: true }))) refuse();
-    const buffer = fs.readFileSync(fd);
+    // A growing archive cannot bypass MAX_ARCHIVE_BYTES before the postcheck.
+    const buffer = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = fs.readSync(fd, buffer, offset,
+        Math.min(64 * 1024, buffer.length - offset), offset);
+      if (count <= 0 || count > buffer.length - offset) refuse();
+      offset += count;
+    }
     if (buffer.length !== Number(before.size)
       || !same(before, fs.fstatSync(fd, { bigint: true }))
       || !same(before, regular(file))) refuse();
