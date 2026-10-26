@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
@@ -16,6 +16,20 @@ const { createAclFailureDiagnostic } =
 
 const UNSAFE = { code: "SYNC_ATOMIC_REGISTRY_STORAGE_UNSAFE" };
 const TRUSTED_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const TRUSTED_ICACLS = "C:\\Windows\\System32\\icacls.exe";
+function assertUntrustedModifyPersisted(target) {
+  const literal = "'" + target.replace(/'/g, "''") + "'";
+  const verify = spawnSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
+    "-Command", "$ErrorActionPreference='Stop';$p=" + literal + ";"
+      + "$r=New-Object Security.AccessControl.RawSecurityDescriptor((Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm(),0);"
+      + "$found=$false;foreach($a in $r.DiscretionaryAcl){"
+      + "if($a.SecurityIdentifier.Value -eq 'S-1-5-11' -and"
+      + " (($a.AccessMask -band 327682) -ne 0)){$found=$true}};"
+      + "if(-not $found){exit 3};Write-Output 'UNTRUSTED_MODIFY_VERIFIED';"],
+    { encoding: "utf8", windowsHide: true, timeout: 12000 });
+  assert.equal(verify.status, 0, "disposable NTFS fixture must retain a real untrusted destructive ACE");
+  assert.match(verify.stdout || "", /UNTRUSTED_MODIFY_VERIFIED/);
+}
 function ownedPrivateRoot(t) {
   let dir;
   if (process.platform === "win32") {
@@ -32,10 +46,15 @@ function ownedPrivateRoot(t) {
 
 function weakenRegistryFile(file) {
   if (process.platform === "win32") {
-    const literal = "'" + file.replace(/'/g, "''") + "'";
-    const command = `$p=${literal}; $a=Get-Acl -LiteralPath $p; $sid=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11'); $r=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'Modify','Allow'); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
-    execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
-      "-Command", command], { windowsHide: true });
+    // Native icacls applies the hostile ACE to the actual disposable inode.
+    // Set-Acl may refuse to persist or normalize this ACE on hosted NTFS;
+    // a synthetic test-only Boolean would not exercise the real guard.
+    const folder = fs.statSync(file).isDirectory();
+    const grant = spawnSync(TRUSTED_ICACLS,
+      [file, "/grant", folder ? "*S-1-5-11:(OI)(CI)M" : "*S-1-5-11:M"],
+      { encoding: "utf8", windowsHide: true, timeout: 12000 });
+    assert.equal(grant.status, 0, "disposable NTFS fixture must accept the hostile ACE");
+    assertUntrustedModifyPersisted(file);
   } else {
     fs.chmodSync(file, 0o666);
   }
@@ -43,16 +62,15 @@ function weakenRegistryFile(file) {
 
 function revokeUntrustedRegistryFileGrant(file) {
   if (process.platform === "win32") {
-    const literal = "'" + file.replace(/'/g, "''") + "'";
-    const command = `$p=${literal}; $a=Get-Acl -LiteralPath $p; $sid=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11'); $a.PurgeAccessRules($sid); Set-Acl -LiteralPath $p -AclObject $a`;
-    execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
-      "-Command", command], { windowsHide: true });
+    const remove = spawnSync(TRUSTED_ICACLS, [file, "/remove:g", "*S-1-5-11"],
+      { encoding: "utf8", windowsHide: true, timeout: 12000 });
+    assert.equal(remove.status, 0, "disposable NTFS fixture must remove the hostile ACE");
   } else {
     fs.chmodSync(file, 0o600);
   }
 }
 
-test("strict atomic registry rejects insecure default inherited ACL/mode without mutating it", async (t) => {
+test("strict atomic registry rejects unsafe inherited or explicit ACL/mode without mutating it", async (t) => {
   const diag = createAclFailureDiagnostic(t, "ATOMIC_INHERIT");
   return diag.run(async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-atomic-unsafe-"));
@@ -61,11 +79,23 @@ test("strict atomic registry rejects insecure default inherited ACL/mode without
   if (process.platform === "win32") {
     diag.stage("INHERIT_CHECK");
     const literal = "'" + dir.replace(/'/g, "''") + "'";
-    const acl = execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
-      "-Command", "(Get-Acl -LiteralPath " + literal + ").AreAccessRulesProtected"],
-    { encoding: "utf8", windowsHide: true });
-    diag.trust(/False/i.test(acl) ? "INHERITED" : "PROTECTED");
-    assert.match(acl, /False/i, "real inherited NTFS DACL must be detected");
+    let acl = "";
+    try {
+      acl = execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
+        "-Command", "(Get-Acl -LiteralPath " + literal + ").AreAccessRulesProtected"],
+      { encoding: "utf8", windowsHide: true, timeout: 12000 });
+    } catch (_) {
+      // Probe failure must not be mistaken for a safe inherited directory;
+      // materialize and read back a real explicit hostile ACL instead.
+    }
+    if (/False/i.test(acl)) diag.trust("INHERITED");
+    else {
+      // The hosted runner can supply an already protected TEMP root. Build a
+      // real hostile DACL rather than asserting that ambient inheritance is
+      // always enabled or weakening the runtime's private-ACL requirement.
+      weakenRegistryFile(dir);
+      diag.trust("UNTRUSTED_ADDED");
+    }
   } else {
     fs.chmodSync(dir, 0o777);
   }
