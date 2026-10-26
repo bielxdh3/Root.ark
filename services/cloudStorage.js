@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const { pipeline } = require("stream/promises");
 const { Transform, Readable } = require("stream");
 const { normalizeProviderError } = require("../src/services/deploymentResilience");
+const { checkWindowsPrivateCloudDirectory } = require("../src/services/zk1WindowsPrivateCloudAcl");
 
 async function abortableProviderRead(action, signal) {
   if (signal?.aborted) throw cloudError("provider_error", "Bounded cloud readback deadline exceeded");
@@ -86,6 +87,27 @@ function pinBoundedDownloadParent(localPath) {
   };
   guard();
   return guard;
+}
+
+function pinUploadSourceParent(localPath) {
+  try {
+    // Check every ancestor BEFORE the first stat can follow a junction. The
+    // returned guard also detects subsequent renames across provider awaits.
+    return pinBoundedDownloadParent(path.resolve(localPath));
+  } catch (error) {
+    // Preserve the ordinary absent-source result. There is no path to read
+    // or publish when an ancestor does not exist.
+    if (error?.code === "ENOENT") return null;
+    throw cloudError("invalid_path", "Cloud upload source has an unsafe parent");
+  }
+}
+
+function sameUploadSource(left, right) {
+  return left.isFile() && right.isFile() && !left.isSymbolicLink()
+    && !right.isSymbolicLink() && left.nlink === 1n && right.nlink === 1n
+    && left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
 }
 
 // Legacy uploads may be larger than the bounded ZK staging contract. Keep
@@ -456,6 +478,34 @@ function createCloudStorage(options = {}) {
   }
   async function upload(localPath, folderId, fileName, area = "uploads", uploadOptions = {}) {
     assertProvider(); if (!enabled()) return null;
+    const bound = uploadOptions?.zk1BoundedBytes;
+    if (bound !== undefined && (!Number.isSafeInteger(bound) || bound < 1
+      || bound > 16 * 1024 * 1024 || !uploadOptions
+      || typeof uploadOptions !== "object" || Array.isArray(uploadOptions)
+      || Reflect.ownKeys(uploadOptions).some((key) => ![
+        "providerFileId", "zk1BoundedBytes", "zk1ExpectedSha256",
+      ].includes(key))
+      || (uploadOptions.zk1ExpectedSha256 !== undefined
+        && (typeof uploadOptions.zk1ExpectedSha256 !== "string"
+          || !/^[a-f0-9]{64}$/.test(uploadOptions.zk1ExpectedSha256))))) {
+      throw cloudError("configuration", "Invalid bounded ZK ciphertext upload");
+    }
+    // Preserve the historical POSIX legacy stream behavior; bounded ZK copies
+    // and Windows uploads require ancestor validation before the first stat.
+    const guardSourceParent = process.platform === "win32" || bound !== undefined
+      ? pinUploadSourceParent(localPath) : () => {};
+    if (!guardSourceParent) return null;
+    if (bound !== undefined && process.platform === "win32") {
+      // A caller-created staging directory is not trusted just because its
+      // filename is random. Verify native owner, DACL and all ancestors before
+      // reading anything that may become a remote ciphertext PUT.
+      try {
+        await checkWindowsPrivateCloudDirectory(path.dirname(path.resolve(localPath)), "verify");
+      } catch (_) {
+        throw cloudError("invalid_path", "Cloud upload source staging ACL is unsafe");
+      }
+    }
+    guardSourceParent();
     // The initial path check is an authorization boundary, not just an
     // existence probe. An attacker can rename a parent directory after this
     // stat and before the upload's later FD open. Retain the original inode
@@ -463,26 +513,19 @@ function createCloudStorage(options = {}) {
     const initialSource = fs.statSync(localPath, { throwIfNoEntry: false, bigint: true });
     if (!initialSource?.isFile()) return null;
     const cloudKey = objectKey(folderId, fileName, area);
-    const bound = uploadOptions?.zk1BoundedBytes;
     let boundedBytes = null;
     if (bound !== undefined) {
-      if (!Number.isSafeInteger(bound) || bound < 1 || bound > 16 * 1024 * 1024
-        || !uploadOptions || typeof uploadOptions !== "object" || Array.isArray(uploadOptions)
-        || Reflect.ownKeys(uploadOptions).some((key) => !["providerFileId", "zk1BoundedBytes"].includes(key))) {
-        throw cloudError("configuration", "Invalid bounded ZK ciphertext upload");
-      }
       const stat = fs.lstatSync(localPath, { bigint: true });
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
-        || stat.size !== BigInt(bound) || stat.dev !== initialSource.dev
-        || stat.ino !== initialSource.ino) {
+      if (stat.size !== BigInt(bound) || !sameUploadSource(stat, initialSource)) {
         throw cloudError("configuration", "Ciphertext staging file is not an exact private upload");
       }
+      guardSourceParent();
       const fd = fs.openSync(localPath,
         fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
       try {
         const opened = fs.fstatSync(fd, { bigint: true });
-        if (!opened.isFile() || opened.nlink !== 1n || opened.size !== BigInt(bound)
-          || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+        if (opened.size !== BigInt(bound) || !sameUploadSource(opened, stat)
+          || !sameUploadSource(opened, initialSource)) {
           throw cloudError("configuration", "Bounded ciphertext staging file changed identity");
         }
         // The source may grow after fstat while another process still holds
@@ -499,11 +542,18 @@ function createCloudStorage(options = {}) {
           offset += count;
         }
         const ended = fs.fstatSync(fd, { bigint: true });
-        if (boundedBytes.length !== bound || ended.dev !== opened.dev
-          || ended.ino !== opened.ino || ended.size !== opened.size
-          || ended.mtimeNs !== opened.mtimeNs || ended.ctimeNs !== opened.ctimeNs
-          || ended.nlink !== 1n) {
+        if (boundedBytes.length !== bound || !sameUploadSource(ended, opened)
+          || !sameUploadSource(fs.lstatSync(localPath, { bigint: true }), opened)) {
           throw cloudError("configuration", "Bounded ciphertext staging file changed during capture");
+        }
+        guardSourceParent();
+        // The publisher already authenticated the exact ciphertext against
+        // its signed root. Compare that trusted digest with the detached bytes
+        // before either SDK can receive the body.
+        if (uploadOptions.zk1ExpectedSha256 !== undefined
+          && crypto.createHash("sha256").update(boundedBytes).digest("hex")
+            !== uploadOptions.zk1ExpectedSha256) {
+          throw cloudError("configuration", "Bounded ciphertext digest mismatch");
         }
       } finally { fs.closeSync(fd); }
     }
@@ -516,6 +566,7 @@ function createCloudStorage(options = {}) {
     }
     const legacyBody = () => {
       if (!initialLegacy) throw cloudError("invalid_path", "Missing verified upload source");
+      guardSourceParent();
       if (!firstLegacyBody) {
         initialLegacy.verifyName();
         firstLegacyBody = true;
@@ -540,6 +591,7 @@ function createCloudStorage(options = {}) {
         if (initialLegacy && initialLegacy.identity.size > BigInt(Number.MAX_SAFE_INTEGER)) {
           throw cloudError("invalid_path", "Cloud upload source size is unsupported");
         }
+        guardSourceParent();
         return client.send(new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName,
           Key: cloudKey, Body: boundedBytes === null ? legacyBody() : boundedBytes,
           ContentLength: bound || Number(initialLegacy.identity.size) }),
@@ -561,6 +613,7 @@ function createCloudStorage(options = {}) {
     const providerFileId = String(uploadOptions?.providerFileId || "").trim();
     if (providerFileId) {
       if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
+      guardSourceParent();
       const result = await abortableProviderRead(() => uploadToPinnedDriveId(localPath,
         providerFileId, driveRequestBody(folderId, fileName, area, cloudKey),
         cloudKey, folderId, area, signal, boundedBytes, legacyBody), signal);
