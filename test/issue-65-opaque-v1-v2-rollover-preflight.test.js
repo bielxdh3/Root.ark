@@ -663,6 +663,31 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     assert.notEqual(rerun.witnessCandidate.casSignedStage, candidate.casSignedStage,
       'export must carry a new signed live readback, not replay old receipts');
     assert.equal(rerun.destructiveCutoverAuthorized, false);
+    // Revoke at the asynchronous CBOR subject generation boundary, after
+    // signed remote stage reads. The last owner witness must observe this.
+    const originalEncode = z.encodeDeterministic;
+    let delayedSubjectEncodings = 0;
+    z.encodeDeterministic = async (...args) => {
+      if (args[0]?.type ===
+        'rootark-opaque-checkpoint-v2-legacy-stage-witness-subject/v1') {
+        delayedSubjectEncodings++;
+        await new Promise((resolve) => setImmediate(() => {
+          context.setLiveOwnerDigest(crypto.randomBytes(32));
+          resolve();
+        }));
+      }
+      return originalEncode(...args);
+    };
+    try {
+      await assert.rejects(verifyLegacyArchiveDualReadback(readback),
+        /ZK_CHECKPOINT_V2_LEGACY_READBACK_UNVERIFIED/,
+      'revocation during awaited witness subject encoding must fence readback');
+      assert.equal(delayedSubjectEncodings, 1,
+        'adversarial test must reach actual subject encoding await');
+    } finally {
+      z.encodeDeterministic = originalEncode;
+      context.setLiveOwnerDigest(options.ownerHead.digest);
+    }
     await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
       ownerSignature: crypto.randomBytes(64) }), /ZK_CHECKPOINT_V2_/,
     'owner consent signature must be bound to both authority stage receipts');

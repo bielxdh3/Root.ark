@@ -1400,11 +1400,6 @@ async function verifyLegacyArchiveDualReadback(input) {
       || !same(canonical32(finalArchive.checkpointDigest),
         expected.full_archive_checkpoint)) fail();
     const finalSignedStages = await checkedReadback();
-    // A revocation can commit while HTTPS stage or full-128 reads are in
-    // flight. Rechallenge the independent owner witness AFTER the final
-    // signed readback, before reporting current-owner verification.
-    // This still does not provide a distributed atomic cutover fence.
-    await assertOwnerCurrent();
     // Produce a domain-separated, canonical subject and the two last verified
     // signed stage responses for an INDEPENDENT operator to anchor later.
     // Stable subject identity excludes freshness nonces and timestamps. These
@@ -1425,6 +1420,10 @@ async function verifyLegacyArchiveDualReadback(input) {
       casSignedStage: finalSignedStages[0].toString("base64url"),
       floorSignedStage: finalSignedStages[1].toString("base64url"),
     });
+    // A revocation can commit while HTTPS readback or asynchronous subject
+    // encoding is in flight. Rechallenge the owner witness after both, with
+    // no other await before returning. This is not an atomic cutover fence.
+    await assertOwnerCurrent();
     return Object.freeze({ state: "LEGACY_DUAL_ARCHIVE_SIGNED_READBACK_ONLY",
       legacySequence: ownerConsent.legacy_sequence,
       fullArchiveRoot: ownerConsent.full_archive_root,
