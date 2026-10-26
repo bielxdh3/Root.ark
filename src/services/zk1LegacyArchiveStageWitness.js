@@ -17,7 +17,14 @@ const { assertSafeSqliteSidecars } = require("./zk1OpaqueCheckpointV2SqliteGuard
 const SUBJECT_DOMAIN = Buffer.from(
   "Root.ark/zk-1/opaque-checkpoint-v2-legacy-stage-witness-subject/v1\0");
 const RECEIPT_DOMAIN = Buffer.from(
-  "Root.ark/zk-1/opaque-checkpoint-v2-independent-stage-ledger/v1\0");
+  "Root.ark/zk-1/opaque-checkpoint-v2-independent-stage-ledger/v2\0");
+// A ledger head can only be minted from live, pinned independent owner/V1/V2
+// verification. An offline CAS/FLOOR signature alone cannot attest owner
+// revision, epoch or digest. Never import v1 receipts as live evidence.
+const PROVENANCE = Object.freeze({
+  STAGED: "LIVE_OWNER_V1_V2_READBACK",
+  WITHDRAWN: "OPERATOR_WITHDRAWAL_OF_LIVE_STAGE",
+});
 const GENESIS = Buffer.alloc(32).toString("base64url");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const PINS = ["ownerPublicKey", "archiveCheckpointPublicKey", "v1CasPublicKey",
@@ -31,7 +38,7 @@ const BINDINGS = ["legacy_base_digest", "legacy_base_checkpoint",
   "legacy_head_digest", "legacy_checkpoint_digest", "legacy_operation_id",
   "full_archive_root", "full_archive_checkpoint", "owner_consent_hash"];
 const RECEIPT_FIELDS = ["type", "generation", "action", "subjectDigest",
-  "previousHash", "trustHash", "issuedAt"];
+  "previousHash", "trustHash", "provenance", "issuedAt"];
 const SCHEMA = `
 CREATE TABLE stage_config (
   marker INTEGER PRIMARY KEY CHECK(marker=1), trust_hash TEXT NOT NULL
@@ -83,10 +90,11 @@ function validReceipt(raw, publicKey) {
   exact(parsed, [...RECEIPT_FIELDS, "signature"]);
   const { signature, ...statement } = parsed;
   exact(statement, RECEIPT_FIELDS);
-  if (statement.type !== "rootark-zk1-independent-legacy-stage-ledger/v1"
+  if (statement.type !== "rootark-zk1-independent-legacy-stage-ledger/v2"
     || !Number.isSafeInteger(statement.generation) || statement.generation < 1
     || statement.generation > 1000000
     || !["STAGED", "WITHDRAWN"].includes(statement.action)
+    || statement.provenance !== PROVENANCE[statement.action]
     || !Number.isSafeInteger(statement.issuedAt) || statement.issuedAt < 1) deny();
   b64(statement.subjectDigest); b64(statement.previousHash);
   const message = Buffer.from(JSON.stringify(statement));
@@ -192,7 +200,8 @@ class Zk1LegacyArchiveStageWitness {
         || row.previous_hash !== (head ? head.hash : GENESIS)
         || (row.action === "WITHDRAWN" && (!head || head.action !== "STAGED"
           || head.subjectDigest !== row.subject_digest))
-        || (row.action === "STAGED" && head?.action === "STAGED")) deny();
+        || (row.action === "STAGED" && head?.action === "STAGED")
+        || parsed.provenance !== PROVENANCE[row.action]) deny();
       const hash = digest(RECEIPT_DOMAIN, row.signed_receipt);
       if (hash !== row.receipt_hash) deny();
       head = { ...parsed, hash, raw: Buffer.from(row.signed_receipt).toString("base64url") };
@@ -212,8 +221,9 @@ class Zk1LegacyArchiveStageWitness {
       || digest(RECEIPT_DOMAIN, raw) !== head.hash) deny();
     return head;
   }
-  #append(action, subjectDigest, expectedHead) {
+  #append(action, subjectDigest, expectedHead, provenance) {
     b64(subjectDigest);
+    if (provenance !== PROVENANCE[action]) deny();
     if (expectedHead !== null) this.validateHead(expectedHead);
     return this.db.transaction(() => {
       const head = this.audit();
@@ -223,10 +233,11 @@ class Zk1LegacyArchiveStageWitness {
       if (head && (head.action === "STAGED" && (action !== "WITHDRAWN"
         || head.subjectDigest !== subjectDigest)
         || head.action === "WITHDRAWN" && action !== "STAGED")) deny();
-      const statement = { type: "rootark-zk1-independent-legacy-stage-ledger/v1",
+      const statement = { type: "rootark-zk1-independent-legacy-stage-ledger/v2",
         generation: head ? head.generation + 1 : 1, action, subjectDigest,
         previousHash: head ? head.hash : GENESIS,
         trustHash: this.trustHash,
+        provenance,
         issuedAt: Math.floor(Date.now() / 1000) };
       if (statement.generation > 1000000) deny();
       const unsigned = Buffer.from(JSON.stringify(statement));
@@ -275,12 +286,13 @@ class Zk1LegacyArchiveStageWitness {
     }
     return candidate.subjectDigest;
   }
-  async stageSignedEvidence({ candidate, expectedHead }) {
-    try {
-      const subjectDigest = await this.#verifyCandidate(candidate);
-      const head = this.#append("STAGED", subjectDigest, expectedHead);
-      return rejectAuthorization({ state: "SIGNED_STAGE_EVIDENCE_ONLY", head });
-    } catch (_) { deny(); }
+  async stageSignedEvidence() {
+    // Archived CAS/FLOOR receipts authenticate only authority signatures,
+    // not the unsigned owner fields inside the supplied subject. It is
+    // impossible to promote this offline proof into a witness-signed stage
+    // without an independently verified live owner assertion. Fail closed,
+    // even if the offline payload is otherwise well formed or genuine.
+    deny();
   }
   async stageFromLiveReadback({ readbackInput, expectedHead }) {
     try {
@@ -295,7 +307,8 @@ class Zk1LegacyArchiveStageWitness {
       // check, immediately before the synchronous ledger CAS.
       const final = await verifyLegacyArchiveDualReadback(readbackInput);
       if (final.witnessCandidate.subjectDigest !== subjectDigest) deny();
-      const head = this.#append("STAGED", subjectDigest, expectedHead);
+      const head = this.#append("STAGED", subjectDigest, expectedHead,
+        PROVENANCE.STAGED);
       return rejectAuthorization({ state: "LIVE_READBACK_STAGE_RECORDED", head });
     } catch (_) { deny(); }
   }
@@ -303,7 +316,8 @@ class Zk1LegacyArchiveStageWitness {
     try {
       this.validateHead(expectedHead);
       if (expectedHead.action !== "STAGED") deny();
-      const head = this.#append("WITHDRAWN", expectedHead.subjectDigest, expectedHead);
+      const head = this.#append("WITHDRAWN", expectedHead.subjectDigest, expectedHead,
+        PROVENANCE.WITHDRAWN);
       return rejectAuthorization({ state: "STAGE_EVIDENCE_WITHDRAWN", head });
     } catch (_) { deny(); }
   }

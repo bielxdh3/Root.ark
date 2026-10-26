@@ -691,6 +691,42 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       pins: Object.fromEntries(Object.entries(readback.operatorPins).map(([name, value]) =>
         [name, b64(value.export({ format: 'der', type: 'spki' }))])),
     };
+    const offlineWitnessDb = path.join(folder, 'independent-offline-forgery.sqlite');
+    const offlineWitness = new Zk1LegacyArchiveStageWitness({
+      filename: offlineWitnessDb,
+      bootstrapNew: true, privateKey: witnessSigner.privateKey,
+      witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
+      operatorPins: readback.operatorPins });
+    try {
+      const forgedSubjectRaw = Buffer.from(await z.encodeDeterministic({
+        ...subject, owner_revision: subject.owner_revision + 9,
+        owner_epoch: subject.owner_epoch + 3,
+        owner_digest: crypto.randomBytes(32) }));
+      const forgedCandidate = { ...candidate,
+        subject: b64(forgedSubjectRaw),
+        subjectDigest: b64(digest(Buffer.from(
+          'Root.ark/zk-1/opaque-checkpoint-v2-legacy-stage-witness-subject/v1\0'),
+        forgedSubjectRaw)) };
+      await assert.rejects(offlineWitness.stageSignedEvidence({
+        candidate: forgedCandidate, expectedHead: null }),
+      /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+      'forged owner revision/epoch/digest with genuine CAS/FLOOR signatures cannot be STAGED');
+      assert.equal(offlineWitness.audit(), null,
+        'rejected offline assertion must not leave a signed stage on disk');
+      await assert.rejects(offlineWitness.stageSignedEvidence({
+        candidate, expectedHead: null }),
+      /ZK_LEGACY_STAGE_WITNESS_DENIED/,
+      'even matching offline owner assertions lack nonce-fresh owner provenance');
+    } finally { offlineWitness.close(); }
+    const offlineRestart = new Zk1LegacyArchiveStageWitness({
+      filename: offlineWitnessDb, bootstrapNew: false,
+      privateKey: witnessSigner.privateKey,
+      witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
+      operatorPins: readback.operatorPins });
+    try {
+      assert.equal(offlineRestart.audit(), null,
+        'process restart must not recover a witness-signed forged offline stage');
+    } finally { offlineRestart.close(); }
     const witness = new Zk1LegacyArchiveStageWitness({
       filename: witnessDb, bootstrapNew: true,
       privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
@@ -729,6 +765,8 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       assert.equal(liveStage.destructiveCutoverAuthorized, false);
       assert.equal(liveStage.independentMonotonicStageWitnessProven, false);
       assert.equal(witness.audit().generation, 1);
+      assert.equal(liveStage.head.provenance, 'LIVE_OWNER_V1_V2_READBACK',
+        'live owner provenance is inside the signed stage head');
       await assert.rejects(witness.stageSignedEvidence({ candidate: {
         ...candidate, casSignedStage: b64(crypto.randomBytes(80)) },
       expectedHead: liveStage.head }), /ZK_LEGACY_STAGE_WITNESS_DENIED/,
@@ -740,6 +778,7 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     assert.equal(initialChild.ok, true);
     assert.deepEqual(initialChild.output, liveStage.head,
       'signed witness head survives a separate-process restart');
+    assert.equal(initialChild.output.provenance, 'LIVE_OWNER_V1_V2_READBACK');
     const backup = await witnessChild(witnessSetup, 'snapshot', { snapshot });
     assert.equal(backup.ok, true);
     const concurrentWithdraw = await Promise.all([1, 2].map(() =>
@@ -757,10 +796,22 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const concurrentStage = await Promise.all([1, 2].map(() =>
       witnessChild(witnessSetup, 'stage', { candidate: rerun.witnessCandidate,
         expectedHead: withdrawn.head })));
-    assert.equal(concurrentStage.filter((entry) => entry.ok).length, 1,
-      'a cancelled witness stage may only be restaged via newer CAS generation');
-    const newerHead = concurrentStage.find((entry) => entry.ok).output.head;
+    assert.equal(concurrentStage.filter((entry) => entry.ok).length, 0,
+      'offline CAS after withdrawal must never promote stale signatures to live stage');
+    assert.equal((await witnessChild(witnessSetup, 'audit')).output.action, 'WITHDRAWN');
+    const freshStageWitness = new Zk1LegacyArchiveStageWitness({
+      filename: witnessDb, bootstrapNew: false,
+      privateKey: witnessSigner.privateKey, witnessPublicKey: witnessSigner.publicKey,
+      trustedScope: options.scope, operatorPins: readback.operatorPins });
+    let newerHead;
+    try {
+      const restaged = await freshStageWitness.stageFromLiveReadback({
+        readbackInput: readback, expectedHead: withdrawn.head });
+      assert.equal(restaged.state, 'LIVE_READBACK_STAGE_RECORDED');
+      newerHead = restaged.head;
+    } finally { freshStageWitness.close(); }
     assert.equal(newerHead.generation, 3);
+    assert.equal(newerHead.provenance, 'LIVE_OWNER_V1_V2_READBACK');
     assert.equal(newerHead.previousHash, withdrawn.head.hash);
     assert.equal((await witnessChild(witnessSetup, 'audit', {
       minimumHead: newerHead })).ok, true);

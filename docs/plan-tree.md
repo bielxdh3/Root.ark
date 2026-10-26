@@ -1,5 +1,17 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: fail-closed witness stage provenance (opt-in DEV, 2026-10-26)
+
+Adversarial real V1/V2 mTLS signed-stage receipts demonstrated that an
+offline candidate could forge unsigned owner revision, epoch and digest,
+recompute subject digest, and create a witness-signed STAGED receipt.
+The witness now rejects all offline stage promotion, including after
+WITHDRAWN. Only nonce-fresh, pinned live owner/V1/V2 readback creates STAGED.
+Signed v2 ledger receipts bind explicit provenance (LIVE or WITHDRAWN);
+v1 trust/receipt formats are rejected on restart, not automatically upgraded.
+No restore, write, production or destructive cutover grant; independent
+external monotonic custody remains absent. **DRAFT / NO-GO**.
+
 ## Issue #65 / PR #228: independent legacy stage witness CAS (opt-in DEV, 2026-10-26)
 
 `Zk1LegacyArchiveStageWitness` adds a separate operator-run SQLite witness
@@ -10,12 +22,13 @@ generations, `BEGIN IMMEDIATE` CAS, and append-only `WITHDRAWN` tombstones
 make a non-destructive evidence stage reversible by a new generation. Operators
 must retain the latest signed witness head independently and present it on
 restart to detect a restored earlier local snapshot. They cannot reactivate
-either V2 authority or delete the V1 source through this ledger. The offline
-candidate method authenticates only signed stage snapshots and explicitly
-reports narrower forensic evidence.
+either V2 authority or delete the V1 source through this ledger. The former
+offline candidate staging method is denied because signed CAS/FLOOR fields
+cannot authenticate unsigned owner subject assertions.
 
 Windows Node24 genuine V1+V2 TLS1.3 mTLS integration (including two competing
-child-process withdrawals, two competing staged restarts, a stale generation,
+child-process withdrawals, denied offline re-staging after restart, fresh
+live re-staging, a stale generation,
 signed-minimum rollback detection, tampered stage receipt, changed owner pin
 and same-name no-op SQLite trigger): **1 PASS / 0 FAIL**;
 three JS `node --check` and `git diff --check`: **PASS**. These tests do not

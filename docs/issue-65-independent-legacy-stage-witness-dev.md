@@ -14,6 +14,24 @@ and is immutable. SQLite uses WAL and `synchronous=FULL`, no-clobber file
 bootstrap, private SQLite-path/sidecar checks, immutable triggers and
 an `IMMEDIATE` transaction for generational compare-and-swap.
 
+Security repair (ledger v2): **offline stage promotion is disabled**.
+The former `stageSignedEvidence` method is now fail-closed, even when its
+CAS/FLOOR signatures are genuine. Those signatures authenticate authority
+archival fields but do **not** authenticate subject assertions
+`owner_revision`, `owner_epoch`, or `owner_digest`. An attacker could
+forge those fields and recompute the subject digest. Only
+`stageFromLiveReadback`, including its nonce-fresh pinned owner/V1/V2
+readbacks, may commit STAGED.
+
+Every signed v2 receipt cryptographically covers `provenance`:
+`LIVE_OWNER_V1_V2_READBACK` for STAGED and
+`OPERATOR_WITHDRAWAL_OF_LIVE_STAGE` for WITHDRAWN. Receipt validation,
+restart, `audit(minimumHead)` and CAS/withdrawal enforce provenance.
+The receipt signature domain, type and persisted trust hash have been
+versioned from v1 to v2; **old v1 ledger databases are rejected on
+restart**, never silently promoted. Retain historical v1 evidence
+separately and provision a new v2 witness with genuine live readback.
+
 `stageFromLiveReadback({readbackInput, expectedHead})` repeats
 `verifyLegacyArchiveDualReadback`: independent TLS-pinned V1 and V2
 authorities, complete authenticated V1 archive, owner consent, both V2
@@ -24,12 +42,10 @@ allowed only for an empty ledger. Each subsequent operation must supply the
 exact last signed receipt, including generation and hash. Concurrent writers
 compete on the same SQLite CAS; only one can advance.
 
-`stageSignedEvidence` verifies the cryptographic candidate without repeating
-the remote owner and historical archive queries. It returns the narrower
-`SIGNED_STAGE_EVIDENCE_ONLY` result, suitable for forensic archiving. It is
-**not** evidence of a current owner, complete historical archive or physical
-independence. Callers cannot supply synthetic transport clients to the live
-method, which uses the existing strict pinned-client verifier.
+Offline signed CAS/FLOOR evidence can be archived or inspected outside
+this witness ledger for forensic purposes, but cannot create a STAGED head,
+be used after a WITHDRAWN tombstone to re-stage, or attest owner liveness.
+Callers cannot supply synthetic transport clients to the live method.
 
 `withdraw({expectedHead})` appends a witness-signed `WITHDRAWN` tombstone
 at the next generation. This reverses **the operator's evidence stage**,
