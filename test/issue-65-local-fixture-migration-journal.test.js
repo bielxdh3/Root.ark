@@ -12,6 +12,7 @@ const {
   verifyLocalFixtureCiphertextMigration,
   rollbackLocalFixtureCiphertextMigration,
 } = require("../src/services/zk1LocalFixtureMigrationJournal");
+const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const bytes = Buffer.from("synthetic encrypted ciphertext, never plaintext/user material\x00", "utf8");
@@ -64,6 +65,20 @@ test("opt-in disposable migration verifies independent ciphertext copy while pre
   assert.deepEqual(fs.readFileSync(f.source), bytes);
   assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
   assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+});
+
+test("disposable migration source never allocates bytes appended after descriptor fstat", async (t) => {
+  const f = fixture(t);
+  const outcome = await withInodeGrowthAfterFstat({
+    target: f.source, extraBytes: 17 * 1024 * 1024,
+    run: () => assert.throws(() => runLocalFixtureCiphertextMigration(f.plan),
+      /LOCAL_FIXTURE_MIGRATION_REFUSED/),
+  });
+  assert.equal(outcome.attacked, true, "must race the actual source descriptor");
+  assert.deepEqual(outcome.numericFdReadLengths, [],
+    "a growable fixture source must never be consumed by unbounded readFileSync(fd)");
+  assert.equal(fs.existsSync(f.journal), false);
+  assert.equal(fs.existsSync(f.target), false);
 });
 
 for (const checkpoint of ["journal-created", "staging-synced", "target-published", "target-verified", "commit-recorded"]) {

@@ -99,7 +99,16 @@ function readRegular(file, maximum = MAX_BYTES, allowedLinks = 1) {
     const opened = fs.fstatSync(fd);
     if (!opened.isFile() || !sameFile(before, opened) || opened.nlink !== allowedLinks
       || opened.size > maximum) refuse();
-    const bytes = fs.readFileSync(fd);
+    // The same inode may grow after the size check. Never allocate bytes
+    // beyond the opened descriptor's already-authorized fixture budget.
+    const bytes = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(fd, bytes, offset,
+        Math.min(64 * 1024, bytes.length - offset), offset);
+      if (count <= 0 || count > bytes.length - offset) refuse();
+      offset += count;
+    }
     const after = fs.fstatSync(fd);
     const lastPath = fs.lstatSync(file);
     if (bytes.length > maximum || !sameFile(opened, after) || !sameFile(after, lastPath)
