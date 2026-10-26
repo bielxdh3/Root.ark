@@ -9,6 +9,7 @@
 const crypto = require("node:crypto");
 const { Zk1WitnessCasAnchorHttpsClient } = require("./zk1WitnessCasAnchorHttpsClient");
 const { Zk1IndependentWitnessFloorQuorum } = require("./zk1IndependentWitnessFloorQuorum");
+const NATIVE_SINGLE_WITNESS_HEAD = Zk1WitnessCasAnchorHttpsClient.prototype.freshHead;
 const NATIVE_DISTRIBUTED_HEAD = Zk1IndependentWitnessFloorQuorum.prototype.freshHead;
 const ownerRoots = require("../../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 
@@ -154,14 +155,15 @@ class Zk1SharedPgWitnessCasEgressGuard {
   }
 }
 function validWitness(witness) {
-  return witness instanceof Zk1WitnessCasAnchorHttpsClient
+  return (witness !== null && typeof witness === "object"
+      && Object.getPrototypeOf(witness) === Zk1WitnessCasAnchorHttpsClient.prototype)
     || (witness !== null && typeof witness === "object"
       && Object.getPrototypeOf(witness) === Zk1IndependentWitnessFloorQuorum.prototype);
 }
 function freshWitnessHead(witness, minimum) {
   return witness instanceof Zk1IndependentWitnessFloorQuorum
     ? NATIVE_DISTRIBUTED_HEAD.call(witness, minimum)
-    : witness.freshHead(minimum);
+    : NATIVE_SINGLE_WITNESS_HEAD.call(witness, minimum);
 }
 function matchingHead(head, floor) {
   return head?.sequence === floor.sequence && head.lastHash === floor.lastHash

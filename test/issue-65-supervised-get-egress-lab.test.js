@@ -277,6 +277,22 @@ test("separate OS witness signer retains real mTLS nonce-signed CAS floor and ex
   assert.equal((await witness.advance()).sequence, 1);
   await assert.rejects(guard.authorize({ io, expectedRootHash: root }),
     /ZK_LAB_QUORUM_UNAVAILABLE/);
+  // A caller retaining the client instance must not replace its method with
+  // a fake matching floor and bypass the originally pinned TLS/Ed25519 check.
+  witness.client.freshHead = async () => ({ ...witness.genesis });
+  await assert.rejects(guard.authorize({ io, expectedRootHash: root }),
+    /ZK_LAB_QUORUM_UNAVAILABLE/,
+    "a replaced witness method cannot reopen egress after a real signed floor advance");
+  await assert.rejects(Zk1SharedPgWitnessCasEgressGuard.establish(config),
+    /ZK_LAB_QUORUM_UNAVAILABLE/,
+    "a replaced witness method cannot bootstrap a stale floor after real advancement");
+  class SubstitutedWitness extends Zk1WitnessCasAnchorHttpsClient {
+    async freshHead() { return { ...witness.genesis }; }
+  }
+  await assert.rejects(Zk1SharedPgWitnessCasEgressGuard.establish({ ...config,
+    witness: new SubstitutedWitness(witness.config) }),
+  /ZK_LAB_QUORUM_UNAVAILABLE/,
+  "a subclass method must never impersonate the pinned native floor transport");
 });
 
 function request(port, token, method = "GET", url = "/fixture-ciphertext") {
