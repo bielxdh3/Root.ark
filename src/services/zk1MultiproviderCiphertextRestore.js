@@ -287,6 +287,9 @@ class Zk1MultiproviderCiphertextRestore {
       || result.currentEpoch !== this.#ownerHead.epoch
       || !Buffer.isBuffer(result.currentManifestDigest)
       || !same(result.currentManifestDigest, this.#ownerHead.digest)) deny();
+    // A fresh Ed25519 owner/device state can expire while an independently
+    // supplied authorization callback is awaiting policy or remote storage.
+    if (freshOwner.expiresAtSeconds < Math.floor(Date.now() / 1000)) deny();
     return freshOwner;
   }
   checkRequesterDeviceIdentity(value) {
@@ -418,12 +421,35 @@ class Zk1MultiproviderCiphertextRestore {
       // pending. Fetch a NEW signed, nonce-fresh owner/device status after all
       // those awaits and enforce the bounded restore deadline before egress.
       await this.#current(operation);
+      // The final signed owner callback may itself await an external oracle;
+      // during that wait a previously rechecked remote reader can change its
+      // principal without changing its locally exposed key or namespace.
+      // Re-probe the counted remote principals after that callback, then
+      // rechallenge owner/device again to catch revocation during the probes.
+      // These are bounded observations, NOT an atomic cross-provider lease.
+      for (const match of good) {
+        await assertCountedReaderStillPinned(match.countedReader, scope, operation, limit);
+      }
+      this.#providerDomains.verify({ targets: readers.map((item) => ({
+        provider: item.provider, namespaceIdentity: item.namespace,
+        expectedReaderContext: item.context, pinnedDriveFileId: item.driveId,
+        domainAttestation: item.domainAttestation,
+      })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
+      limit.assertActive();
+      await this.#current(operation);
       // A later reader's awaited context check can rebind an earlier one.
       // Close that local window with a synchronous sweep after the last await;
       // this is still not a cross-provider atomic custody guarantee.
       for (const match of good) {
         if (!countedReaderLocallyPinned(match.countedReader, scope, operation)) deny();
       }
+      // Do not return ciphertext with an independently signed provider
+      // domain attestation that expired during the last owner oracle await.
+      this.#providerDomains.verify({ targets: readers.map((item) => ({
+        provider: item.provider, namespaceIdentity: item.namespace,
+        expectedReaderContext: item.context, pinnedDriveFileId: item.driveId,
+        domainAttestation: item.domainAttestation,
+      })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
       limit.assertActive();
       const ciphertext = Buffer.from(good[0].data);
       returned = Object.freeze({ status: "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE",

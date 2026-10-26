@@ -602,6 +602,77 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     } finally { changed = false; }
   });
 
+  await t.test("remote principal changed during last signed-owner await loses counted quorum", async () => {
+    let ownerChecks = 0;
+    let switched = false;
+    const late = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
+      assertCurrentAuthorization: async (...args) => {
+        const checked = await directGatewayPins.assertCurrentAuthorization(...args);
+        if (++ownerChecks === 3) switched = true;
+        return checked;
+      },
+    });
+    const s3 = { ...readers[0], cloudReader: { ...readers[0].cloudReader,
+      async resolveInventoryContext() {
+        return switched ? "f".repeat(64) : s3Adapter.resolveInventoryContext();
+      },
+    } };
+    try {
+      await assert.rejects(late.restoreExact({ ...recoverInput,
+        readers: [s3, readers[1], readers[2]] }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "final owner callback must not conceal a newly changed remote S3 principal");
+      assert.equal(ownerChecks >= 3, true, "drift occurs only after final remote quorum probes");
+    } finally { switched = false; }
+  });
+
+  await t.test("short-lived signed owner state cannot expire while final authorization callback awaits", async () => {
+    let statusReads = 0;
+    let authorizationReads = 0;
+    const slowOwner = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
+      fetchFreshSignedDeviceState: async (challenge) => {
+        const answer = await fetchFreshSignedDeviceState(challenge);
+        if (++statusReads !== 3) return answer;
+        const now = Math.floor(Date.now() / 1000);
+        const state = { ...answer.state, issued_at: now - 1, expires_at: now };
+        const signature = crypto.sign(null, Buffer.concat([STATUS_DOMAIN,
+          Buffer.from(JSON.stringify(Object.fromEntries(
+            STATE_FIELDS.map((field) => [field, state[field]]))))]), ownerKeys.privateKey);
+        return { ...answer, state: { ...state, signature: b64(signature) } };
+      },
+      assertCurrentAuthorization: async (...args) => {
+        if (++authorizationReads === 3) await new Promise((done) => setTimeout(done, 1200));
+        return directGatewayPins.assertCurrentAuthorization(...args);
+      },
+    });
+    await assert.rejects(slowOwner.restoreExact(recoverInput),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "a once-valid signed status is stale after a slow final policy callback");
+    assert.equal(statusReads, 3);
+    assert.equal(authorizationReads, 3);
+  });
+
+  await t.test("independent provider signatures are rechecked after slow final owner callback", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const shortReaders = readers.map((reader) => {
+      const { signature: ignored, ...statement } = reader.domainAttestation;
+      return { ...reader, domainAttestation: signProviderDomainAttestation({
+        administratorPrivateKey: administrators[reader.provider].keys.privateKey,
+        statement: { ...statement, issued_at: now - 1, expires_at: now },
+      }) };
+    });
+    let checks = 0;
+    const slow = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
+      assertCurrentAuthorization: async (...args) => {
+        if (++checks === 3) await new Promise((done) => setTimeout(done, 1200));
+        return directGatewayPins.assertCurrentAuthorization(...args);
+      },
+    });
+    await assert.rejects(slow.restoreExact({ ...recoverInput, readers: shortReaders }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "provider attestation expiry during owner callback must fail closed");
+    assert.equal(checks, 3);
+  });
+
   await t.test("late signed revocation, bad nonce and expiry during final provider probes deny ciphertext", async () => {
     for (const { provider, attack } of [
       { provider: "s3", attack: "revoked" },

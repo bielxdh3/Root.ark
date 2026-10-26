@@ -43,6 +43,15 @@ closed even when both previously downloaded ciphertext copies still hash to
 the owner's pinned root. The DEV HTTP fixture reproduces this rebind after
 the first reader has already passed its prior synchronous and asynchronous
 checks, and verifies rejection for namespace, key and enabled-status changes.
+The signed owner callback can itself wait while a provider's remote principal
+changes without altering the locally visible namespace or key. A second
+bounded remote principal probe of every counted quorum reader, another fresh
+signed owner/device challenge and a final synchronous local reader sweep
+reject the demonstrated late principal substitution. The final decision also
+checks that signed owner/device status and independently signed provider-domain
+attestations have not expired during the last asynchronous authorization.
+The adversarial HTTP fixture covers these late owner, principal, nonce and
+expiry races without relaxing the required 2/3 ciphertext quorum.
 
 These are best-effort fail-closed observations, **not** a cross-provider atomic
 snapshot, lease, fencing token, or durable custody proof: a provider could
