@@ -212,7 +212,9 @@ class Zk1WitnessCasAnchorFloor {
         || typeof trustedRecoveryNonceAuthority.loadHead !== "function"
         || typeof trustedRecoveryNonceAuthority.compareAndAdvance !== "function"
         || typeof trustedRecoveryNonceAuthority.loadFinalizedHead !== "function"
-        || typeof trustedRecoveryNonceAuthority.finalizeAck !== "function"))
+        || typeof trustedRecoveryNonceAuthority.finalizeAck !== "function"
+        || typeof trustedRecoveryNonceAuthority.loadQuarantinedHead !== "function"
+        || typeof trustedRecoveryNonceAuthority.quarantineFinalizedAck !== "function"))
       || (!enableSyncHistoricalIssuer && trustedRecoveryNonceAuthority !== undefined)) fail();
     this.#historicalEnabled = enableSyncHistoricalIssuer;
     this.#externalRecoveryAuthority = trustedRecoveryNonceAuthority || null;
@@ -900,6 +902,35 @@ class Zk1WitnessCasAnchorFloor {
     this.#recoveryAckPhase = "PENDING";
     this.#recoveryAckPreviousHash = previousHash;
   }
+  #quarantineRecoveryAck(head, previousHash) {
+    // Finalization may already be durably recorded by a remote operator before
+    // its async reply is delivered. The operator MUST provide a distinct
+    // monotonic veto in its own durable custody. Rewriting witness SQLite
+    // alone cannot revoke the external finalization after a crash/restore.
+    let fenced = false;
+    try {
+      fenced = this.#externalRecoveryAuthority.quarantineFinalizedAck(
+        Object.freeze({ ...head })) === true;
+    } catch (_) { /* Attempt a second independently signed local barrier. */ }
+    // A genuine external quarantine must be independently readable as the
+    // exact burned nonce head; a network outage isn't positive readback.
+    if (fenced) {
+      try {
+        const blocked = exact(this.#externalRecoveryAuthority.loadQuarantinedHead(),
+          ["sequence", "lastHash"]);
+        if (blocked.sequence !== head.sequence || blocked.lastHash !== head.lastHash)
+          fenced = false;
+      } catch (_) { fenced = false; }
+    }
+    try { this.#restorePendingRecoveryAck(head, previousHash); }
+    catch (_) {
+      // If the FULL signed compensation itself IOERRs, a crashed witness
+      // may retain READY; only the independent monotonic veto can fence it.
+      this.#recoveryAckPhase = "PENDING";
+      this.#recoveryAckPreviousHash = previousHash;
+    }
+    if (!fenced) fail();
+  }
   async #finishConfirmedRecoveryAck(head, previous, {
     originalPolicySnapshot, physicalIssuedAt, minimumCompletedAt,
     physicalAttestation, scope, operation, nonce,
@@ -953,6 +984,13 @@ class Zk1WitnessCasAnchorFloor {
     const stored = this.#db.prepare(
       "SELECT signature FROM witness_cas_sync_historical_recovery_head WHERE id=1").get();
     if (!Buffer.isBuffer(stored?.signature) || stored.signature.length !== 64) fail();
+    const row = this.#db.prepare("SELECT sequence,nonce,operation_id,admission_hash,"
+      + "consumed_at_ms,previous_hash,hash FROM"
+      + " witness_cas_sync_historical_recovery_nonce WHERE sequence=?").get(head.sequence);
+    if (!row || !Buffer.isBuffer(row.nonce) || !row.nonce.equals(nonce)
+      || row.operation_id !== operation.operation_id.toString("base64url")
+      || row.previous_hash !== previousHash || row.hash !== head.lastHash
+      || recoveryRowHash(row) !== head.lastHash) fail();
     const proof = Object.freeze({
       witnessKeyId: this.#witnessId.toString("base64url"),
       statusKeyId: this.#statusId.toString("base64url"),
@@ -961,18 +999,35 @@ class Zk1WitnessCasAnchorFloor {
       physicalIssuedAt,
       physicalAttestation: Buffer.from(physicalAttestation),
       scope, operation, nonce: Buffer.from(nonce),
+      recoveryRow: Object.freeze({
+        sequence: row.sequence, nonce: Buffer.from(row.nonce),
+        operation_id: row.operation_id, admission_hash: row.admission_hash,
+        consumed_at_ms: row.consumed_at_ms, previous_hash: row.previous_hash,
+        hash: row.hash,
+      }),
     });
     let acknowledged;
     try {
       acknowledged = await this.#externalRecoveryAuthority.finalizeAck(
         Object.freeze({ ...previous }), Object.freeze({ ...head }), proof);
-    } catch (_) { fail(); }
-    if (acknowledged !== true) fail();
+    } catch (_) { this.#quarantineRecoveryAck(head, previousHash); fail(); }
+    if (acknowledged !== true) {
+      this.#quarantineRecoveryAck(head, previousHash);
+      fail();
+    }
+    // W36: independent FULL operator CAS can succeed but the awaited reply
+    // may arrive after revocation or the physical PG signature expires.
+    // Never let a stale ACK escape merely because both heads now match.
+    try { this.#assertRecoveryAckStillFresh(freshness); }
+    catch (_) { this.#quarantineRecoveryAck(head, previousHash); fail(); }
     const finalized = this.#readExternallyFinalizedRecoveryHead();
     if (finalized.sequence !== head.sequence || finalized.lastHash !== head.lastHash) fail();
     // A separate operator reconciliation or subsequent CAS advancement while
     // awaiting finalization must also fence this particular recovery response.
     this.#assertExternalRecoveryHead();
+    // Even the final independent readback can itself be synchronously slow.
+    try { this.#assertRecoveryAckStillFresh(freshness); }
+    catch (_) { this.#quarantineRecoveryAck(head, previousHash); fail(); }
   }
   #assertHistoricalNonceIntegrity(db) {
     const schema = new Set(db.prepare(

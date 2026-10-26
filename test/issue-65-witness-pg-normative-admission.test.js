@@ -872,7 +872,9 @@ test("strict CAS witness floor refuses signed status advance without independent
     const authority = {
       loadHead: remote.authority.loadHead,
       loadFinalizedHead: remote.authority.loadFinalizedHead,
+      loadQuarantinedHead: remote.authority.loadQuarantinedHead,
       finalizeAck: remote.authority.finalizeAck,
+      quarantineFinalizedAck: remote.authority.quarantineFinalizedAck,
       compareAndAdvance(expected, next) {
         const accepted = remote.authority.compareAndAdvance(expected, next);
         if (accepted) afterExternalCas();
@@ -1129,12 +1131,14 @@ test("strict CAS witness floor refuses signed status advance without independent
       }), /WITNESS_CAS_FLOOR_DENIED/);
     } finally { instance.close(); }
     assert.equal(remote.read().sequence, independentlyPinnedRecoveryHead.sequence + 1);
-    assert.deepEqual(remote.authority.loadFinalizedHead(), independentlyPinnedRecoveryHead);
+    assert.throws(() => remote.authority.loadFinalizedHead(),
+      /TEST_FINALIZATION_DURABLY_QUARANTINED/,
+      "stale finalization latches independent operator quarantine");
     const sql = new Database(fixturePath, { readonly: true, fileMustExist: true });
     try {
       assert.equal(sql.prepare("SELECT ack_phase FROM"
         + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
-      "READY", "the local READY can predate an independent operator refusal");
+      "PENDING", "rejected remote finalization also restores signed local PENDING");
     } finally { sql.close(); }
     return { fixturePath, options };
   };
@@ -1159,6 +1163,162 @@ test("strict CAS witness floor refuses signed status advance without independent
     expiredFinalize.fixturePath, expiredFinalize.options),
   /WITNESS_CAS_FLOOR_DENIED/,
   "independent PG freshness refusal survives clock restoration");
+  // W36: even a correctly authorized operator may finish its durable CAS and
+  // then delay resolving the promise. The witness must not report a stale ACK
+  // or admit a fresh request after restart because the external head matches.
+  const postFinalizeDelay = async (label, drift, failLocalCompensation = false) => {
+    const fixturePath = path.join(directory, `witness-final-ack-delayed-${label}.sqlite`);
+    const source = new Database(historicalFilename, {
+      readonly: true, fileMustExist: true });
+    try { await source.backup(fixturePath); }
+    finally { source.close(); }
+    fs.chmodSync(fixturePath, 0o600);
+    const remote = createExternalRecoveryHeadFixture(
+      path.join(directory, `operator-final-ack-delayed-${label}.sqlite`),
+      independentlyPinnedRecoveryHead, operatorProofPins);
+    externalAuthorities.push(remote);
+    let committedOperatorAck = false;
+    const authority = { ...remote.authority,
+      async finalizeAck(...args) {
+        const confirmed = await remote.authority.finalizeAck(...args);
+        assert.equal(confirmed, true);
+        assert.equal(remote.authority.loadFinalizedHead().sequence,
+          independentlyPinnedRecoveryHead.sequence + 1);
+        committedOperatorAck = true;
+        drift();
+        return confirmed;
+      },
+    };
+    const options = { ...pinnedRestart, trustedRecoveryNonceAuthority: authority };
+    const instance = new Zk1WitnessCasAnchorFloor(fixturePath, options);
+    const originalPrepare = Database.prototype.prepare;
+    try {
+      if (failLocalCompensation) {
+        Database.prototype.prepare = function (sql, ...args) {
+          if (this.name === fixturePath && typeof sql === "string"
+            && sql.includes("SET ack_phase='PENDING',ack_previous_hash"))
+            throw Error("TEST_SQLITE_COMPENSATION_IOERR_AFTER_OPERATOR_ACK");
+          return originalPrepare.call(this, sql, ...args);
+        };
+      }
+      await assert.rejects(instance.recoverSyncHistoricalAdmission({
+        ...recoveryInput, nonce: random(32),
+      }), /WITNESS_CAS_FLOOR_DENIED/,
+      `late ${label} after finalized operator CAS must deny ACK`);
+      assert.equal(committedOperatorAck, true,
+        "attacker timing must be strictly AFTER durable remote finalization");
+      assert.equal(instance.supportsClientHistoricalNonce, false,
+        "same-process historical admissions remain quarantined");
+    } finally {
+      Database.prototype.prepare = originalPrepare;
+      instance.close();
+    }
+    const saved = new Database(fixturePath, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(saved.prepare("SELECT ack_phase FROM"
+        + " witness_cas_sync_historical_recovery_head WHERE id=1").get().ack_phase,
+      failLocalCompensation ? "READY" : "PENDING",
+      "a failed local compensation must preserve the signed READY without reopening admissions");
+    } finally { saved.close(); }
+    assert.deepEqual(remote.authority.loadQuarantinedHead(), remote.read(),
+      "the separate operator veto is durably anchored to the consumed nonce");
+    return { fixturePath, options, remote };
+  };
+  let staleRemote;
+  const beforeLateFinalize = Date.now;
+  try {
+    staleRemote = await postFinalizeDelay("pg-expired", () => {
+      Date.now = () => beforeLateFinalize() + 45_000;
+    });
+  } finally { Date.now = beforeLateFinalize; }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    staleRemote.fixturePath, staleRemote.options),
+  /WITNESS_CAS_FLOOR_DENIED/,
+  "restart cannot reuse a finalized external head after expired postcommit ACK");
+  let staleWithIoerr;
+  try {
+    staleWithIoerr = await postFinalizeDelay("pg-expired-local-ioerr", () => {
+      Date.now = () => beforeLateFinalize() + 45_000;
+    }, true);
+  } finally { Date.now = beforeLateFinalize; }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    staleWithIoerr.fixturePath, staleWithIoerr.options),
+  /WITNESS_CAS_FLOOR_DENIED/,
+  "durable operator veto fences valid local READY even when local compensation IOERRs");
+  let revokedRemote;
+  try {
+    revokedRemote = await postFinalizeDelay("owner-revoked", () => {
+      trustedDeviceRevocations = ["device-a"];
+    });
+  } finally { trustedDeviceRevocations = []; }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(
+    revokedRemote.fixturePath, revokedRemote.options),
+  /WITNESS_CAS_FLOOR_DENIED/,
+  "restart cannot reuse a finalized external head after late owner revocation");
+  // W36: an operator must verify the ED25519 READY nonce-head commits to the
+  // precise recovery row. A compromised witness→operator bridge may replay
+  // real, fresh attestor proof for nonce A while finalizing unrelated nonce B.
+  const relayPath = path.join(directory, "witness-cross-recovery-nonce-relay.sqlite");
+  const relaySource = new Database(historicalFilename, {
+    readonly: true, fileMustExist: true });
+  try { await relaySource.backup(relayPath); }
+  finally { relaySource.close(); }
+  fs.chmodSync(relayPath, 0o600);
+  const relayRemote = createExternalRecoveryHeadFixture(
+    path.join(directory, "operator-cross-recovery-nonce-relay.sqlite"),
+    independentlyPinnedRecoveryHead, operatorProofPins);
+  externalAuthorities.push(relayRemote);
+  let firstSignedPgProof = null;
+  let relayAttempted = false;
+  const relayAuthority = { ...relayRemote.authority,
+    finalizeAck(previous, next, proof) {
+      if (!firstSignedPgProof) {
+        firstSignedPgProof = proof;
+        return relayRemote.authority.finalizeAck(previous, next, proof);
+      }
+      relayAttempted = true;
+      // The original PG evidence is authentic, but bound to the wrong
+      // consumed recovery nonce. The new READY head still signs nonce B.
+      return relayRemote.authority.finalizeAck(previous, next, {
+        ...proof, nonce: firstSignedPgProof.nonce,
+        physicalAttestation: firstSignedPgProof.physicalAttestation,
+        physicalIssuedAt: firstSignedPgProof.physicalIssuedAt,
+      });
+    },
+  };
+  const relayOptions = { ...pinnedRestart,
+    trustedRecoveryNonceAuthority: relayAuthority };
+  const relayWitness = new Zk1WitnessCasAnchorFloor(relayPath, relayOptions);
+  try {
+    const relayA = random(32), relayB = random(32);
+    assert.deepEqual((await relayWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: relayA,
+    })).admission, issued.admission,
+    "recovery A with its own authentic signed PG proof remains valid");
+    await assert.rejects(relayWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: relayB,
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "recovery B cannot finalize using authentic but unrelated PG nonce A proof");
+    assert.equal(relayAttempted, true);
+    assert.equal(relayRemote.read().sequence,
+      independentlyPinnedRecoveryHead.sequence + 2,
+      "recovery B nonce remains durably consumed despite rejected ACK");
+    assert.throws(() => relayRemote.authority.loadFinalizedHead(),
+      /TEST_FINALIZATION_DURABLY_QUARANTINED/,
+      "operator retains monotonic veto after cross-nonce relay");
+    assert.equal(relayWitness.supportsClientHistoricalNonce, false);
+    await assert.rejects(relayWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: random(32),
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "fresh nonce cannot bypass quarantined failed B proof");
+    await assert.rejects(relayWitness.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: relayB,
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "the burned B nonce cannot be reissued after operator rejection");
+  } finally { relayWitness.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(relayPath, relayOptions),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "signed READY and consumed B nonce do not unfreeze cross-nonce relay on restart");
   assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot, {
     ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
       sequence: 1, lastHash: admittedFloor.lastHash,

@@ -54,7 +54,13 @@ postcommit process, or SQLite compensation IOERR can leave valid READY bytes.
 must independently verify the Ed25519 READY signature and pinned witness
 identity, the original signed PG attestation and its operation/nonce binding,
 current owner policy, and signed PG freshness immediately before its own
-durable, monotonic CAS. It must reject a stale claim, conflicting head or
+durable, monotonic CAS. The operator also receives the entire immutable
+`recoveryRow` preimage (`sequence`, `nonce`, `operation_id`, `admission_hash`,
+`consumed_at_ms`, `previous_hash`, `hash`), recomputes the canonical recovery
+SHA-256 chain head under the witness READY signature and binds the original
+physical attestor nonce and operation to **this** row. Replaying the genuine
+PG attestation for nonce A when finalizing B is rejected, even when the READY
+signature for B is valid. It must reject a stale claim, conflicting head or
 duplicate, and return success only after durable commit; the issuer then
 re-reads the independently committed finalization floor. The supplied SQLite
 fixture exercises these checks with disposable separate custody; **no real
@@ -62,6 +68,20 @@ operator finalization adapter is provided**. Existing two-method adapters are
 intentionally rejected until the operator provisions and validates the new
 contract. An ambiguous crash leaves the issuer denied pending independent
 reconciliation; there is no automatic promotion of a locally signed READY.
+The W36 follow-up requires the operator's additional synchronous,
+independently durable `quarantineFinalizedAck(head)` and exact
+`loadQuarantinedHead()` readback. The witness checks owner policy and original
+PG age again **after** awaiting the independent ACK and after final head
+readback. If either changed during delayed ACK delivery, the witness rejects
+the HTTP result, burns the nonce, restores local PENDING when possible and
+first latches a monotonic operator quarantine that prevents READY reuse across
+restart. Existing operator adapters without this veto fail closed at startup.
+No finite two-system protocol can atomically prove that a completed external
+finalization was also delivered as a successful HTTP ACK to the client; a
+process crash exactly after remote FULL but before detecting/revoking the
+late owner/physical drift can still leave a valid operator finalization. The
+operator needs independent owner-revocation fencing and an explicit
+reconciliation/recovery protocol before claiming that stronger invariant.
 All work remains DRAFT / NO-GO production.
 
 ## Issue #65 / PR #228: browser offline native source-root contract (2026-10-25)

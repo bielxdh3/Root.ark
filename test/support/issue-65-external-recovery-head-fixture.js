@@ -12,6 +12,7 @@ const { verifyCommittedPhysicalReadback } =
   require("../../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const ZERO = "0".repeat(64);
 const READY_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v2\0");
+const sha = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 
 function createExternalRecoveryHeadFixture(filename, initialHead = {
   sequence: 0, lastHash: ZERO,
@@ -23,7 +24,8 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
   db.exec(`CREATE TABLE IF NOT EXISTS operator_recovery_floor (
     id INTEGER PRIMARY KEY CHECK(id=1),
     sequence INTEGER NOT NULL, last_hash TEXT NOT NULL,
-    finalized_sequence INTEGER NOT NULL, finalized_hash TEXT NOT NULL);
+    finalized_sequence INTEGER NOT NULL, finalized_hash TEXT NOT NULL,
+    quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)));
   `);
   db.prepare("INSERT OR IGNORE INTO operator_recovery_floor"
     + " (id,sequence,last_hash,finalized_sequence,finalized_hash)"
@@ -45,10 +47,30 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
     loadHead: read,
     loadFinalizedHead() {
       if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
-      const row = db.prepare("SELECT finalized_sequence,finalized_hash"
+      const row = db.prepare("SELECT finalized_sequence,finalized_hash,quarantined"
         + " FROM operator_recovery_floor WHERE id=1").get();
       if (!row) throw Error("TEST_FINALIZATION_MISSING");
+      if (row.quarantined !== 0) throw Error("TEST_FINALIZATION_DURABLY_QUARANTINED");
       return { sequence: row.finalized_sequence, lastHash: row.finalized_hash };
+    },
+    loadQuarantinedHead() {
+      if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
+      const row = db.prepare("SELECT sequence,last_hash,quarantined"
+        + " FROM operator_recovery_floor WHERE id=1").get();
+      if (!row || row.quarantined !== 1) throw Error("TEST_QUARANTINE_MISSING");
+      return { sequence: row.sequence, lastHash: row.last_hash };
+    },
+    quarantineFinalizedAck(expected) {
+      if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
+      if (!Number.isSafeInteger(expected?.sequence)
+        || !/^[a-f0-9]{64}$/.test(expected.lastHash))
+        throw Error("TEST_QUARANTINE_INVALID_HEAD");
+      // A separate monotonic veto survives restart. It MUST fence the current
+      // consumed nonce even if finalization's completion result is unknown.
+      return db.transaction(() => db.prepare("UPDATE operator_recovery_floor"
+        + " SET quarantined=1 WHERE id=1 AND sequence=? AND last_hash=?"
+        + " AND quarantined=0").run(expected.sequence, expected.lastHash)
+        .changes === 1).immediate();
     },
     compareAndAdvance(expected, next) {
       if (!available) throw Error("TEST_AUTHORITY_UNAVAILABLE");
@@ -61,7 +83,7 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
       if (failurePhase === "before") throw Error("TEST_EXTERNAL_CAS_DOWN");
       const n = db.transaction(() => db.prepare(
         "UPDATE operator_recovery_floor SET sequence=?,last_hash=?"
-        + " WHERE id=1 AND sequence=? AND last_hash=?").run(
+        + " WHERE id=1 AND sequence=? AND last_hash=? AND quarantined=0").run(
           next.sequence, next.lastHash, expected.sequence, expected.lastHash).changes);
       const changed = n.immediate();
       if (failurePhase === "after") throw Error("TEST_EXTERNAL_ACK_LOST");
@@ -85,6 +107,26 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
         || !Buffer.isBuffer(proof.nonce)
         || !Number.isSafeInteger(proof.physicalIssuedAt))
         throw Error("TEST_FINALIZATION_PROOF_REQUIRED");
+      const row = proof.recoveryRow;
+      if (!row || typeof row !== "object" || Array.isArray(row)
+        || Reflect.ownKeys(row).length !== 7
+        || !["sequence", "nonce", "operation_id", "admission_hash",
+          "consumed_at_ms", "previous_hash", "hash"].every((k) => Object.hasOwn(row, k))
+        || !Number.isSafeInteger(row.sequence) || row.sequence !== next.sequence
+        || !Buffer.isBuffer(row.nonce) || row.nonce.length !== 32
+        || !row.nonce.equals(proof.nonce)
+        || !/^[A-Za-z0-9_-]{22}$/.test(row.operation_id)
+        || row.operation_id !== proof.operation?.operation_id?.toString("base64url")
+        || !/^[a-f0-9]{64}$/.test(row.admission_hash)
+        || !Number.isSafeInteger(row.consumed_at_ms) || row.consumed_at_ms < 1
+        || row.previous_hash !== previous.lastHash
+        || !/^[a-f0-9]{64}$/.test(row.hash)
+        || row.hash !== next.lastHash || next.sequence !== previous.sequence + 1
+        || sha(row.previous_hash + "\0" + JSON.stringify([
+          row.sequence, row.nonce.toString("base64url"), row.operation_id,
+          row.admission_hash, row.consumed_at_ms,
+        ])) !== next.lastHash)
+        throw Error("TEST_FINALIZATION_WRONG_RECOVERY_ROW_BINDING");
       const readyMessage = Buffer.concat([READY_DOMAIN, Buffer.from(JSON.stringify([
         proof.witnessKeyId, proof.statusKeyId, next.sequence,
         next.lastHash, "READY", ZERO,
@@ -108,6 +150,7 @@ function createExternalRecoveryHeadFixture(filename, initialHead = {
         return db.prepare("UPDATE operator_recovery_floor"
           + " SET finalized_sequence=?,finalized_hash=?"
           + " WHERE id=1 AND sequence=? AND last_hash=?"
+          + " AND quarantined=0"
           + " AND finalized_sequence=? AND finalized_hash=?").run(
             next.sequence, next.lastHash, next.sequence, next.lastHash,
             previous.sequence, previous.lastHash).changes;
