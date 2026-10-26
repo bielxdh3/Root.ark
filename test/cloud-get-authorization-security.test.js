@@ -218,7 +218,9 @@ function startS3Fixture() {
 }
 
 async function waitForServer(port, child) {
-  const deadline = Date.now() + 15_000;
+  // Canonical Windows runs contend with many process-isolated suites;
+  // tolerate slower disposable startup without relaxing HTTP assertions.
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("disposable server exited");
     try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
