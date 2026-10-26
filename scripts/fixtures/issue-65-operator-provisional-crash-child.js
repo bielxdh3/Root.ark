@@ -6,7 +6,7 @@
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { createExternalRecoveryHeadFixture } =
-  require("./issue-65-external-recovery-head-fixture");
+  require("../../test/support/issue-65-external-recovery-head-fixture");
 
 const revive = (_, value) => value && typeof value === "object"
   && value.type === "Buffer" && Array.isArray(value.data)

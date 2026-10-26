@@ -1142,7 +1142,7 @@ test("strict CAS witness floor refuses signed status advance without independent
           ownerPolicy: trustedSyncDevicePolicyProvider(),
         }));
         const crashed = spawnSync(process.execPath, [
-          path.join(__dirname, "support", "issue-65-operator-provisional-crash-child.js"),
+          path.join(__dirname, "..", "scripts", "fixtures", "issue-65-operator-provisional-crash-child.js"),
           crashManifest,
         ], { cwd: path.resolve(__dirname, ".."), encoding: "utf8", timeout: 15000 });
         assert.equal(crashed.status, 73,
