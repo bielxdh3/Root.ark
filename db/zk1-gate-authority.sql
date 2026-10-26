@@ -581,8 +581,12 @@ END $$;
 -- Independently flush every WAL record up to the snapshot taken *after* the
 -- attestor observes a physically committed sealed row. A writer's own
 -- synchronous_commit setting cannot be trusted: it may be SET LOCAL off.
--- Run as the operator-owned function, expose only a bounded boolean, and
--- never expose WAL internals or a checkpoint/privileged SQL broker to callers.
+-- Merely polling pg_current_wal_flush_lsn can time out during delayed WAL
+-- writer fsync even when the sealed operation itself was committed. PostgreSQL
+-- 18's nontransactional, flush=true logical message invokes XLogFlush for all
+-- earlier WAL (including asynchronously committed transactions). Its fixed
+-- empty payload is not caller input. Only the operator-owned function may
+-- emit this marker; callers receive no WAL internals or privileged SQL broker.
 CREATE OR REPLACE FUNCTION zk1_gate.physical_inventory_wal_flush_barrier()
 RETURNS boolean LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$
 DECLARE
@@ -591,11 +595,11 @@ DECLARE
 BEGIN
   barrier := pg_catalog.pg_current_wal_insert_lsn();
   expires := pg_catalog.clock_timestamp() + interval '2 seconds';
-  LOOP
-    IF pg_catalog.pg_current_wal_flush_lsn() >= barrier THEN RETURN true; END IF;
-    IF pg_catalog.clock_timestamp() > expires THEN RETURN false; END IF;
-    PERFORM pg_catalog.pg_sleep(0.025);
-  END LOOP;
+  IF pg_catalog.pg_current_wal_flush_lsn() >= barrier THEN RETURN true; END IF;
+  PERFORM pg_catalog.pg_logical_emit_message(
+    false, 'zk1-physical-wal-flush-barrier', ''::pg_catalog.text, true);
+  RETURN pg_catalog.clock_timestamp() <= expires
+    AND pg_catalog.pg_current_wal_flush_lsn() >= barrier;
 END $$;
 REVOKE ALL ON FUNCTION zk1_gate.physical_inventory_wal_flush_barrier() FROM PUBLIC;
 -- A trusted worker may still possess an ACTIVE admission after sealing.

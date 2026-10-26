@@ -128,7 +128,10 @@ async function main() {
   // for the release reference), not a different node.exe found on PATH.
   const focusedHistoricalE2e = process.argv.includes("--historical-e2e-only");
   const focusedRealWebdav = process.argv.includes("--real-webdav-only");
-  const tests = focusedRealWebdav ? [
+  const focusedWalFlush = process.argv.includes("--wal-flush-only");
+  const tests = focusedWalFlush ? [
+    "test/issue-65-wal-flush-active-postgres.test.js",
+  ] : focusedRealWebdav ? [
     "test/issue-65-pg-physical-inventory-bridge.test.js",
   ] : focusedHistoricalE2e ? [
     "test/issue-65-real-pg-w2-historical-sync-e2e.test.js",
