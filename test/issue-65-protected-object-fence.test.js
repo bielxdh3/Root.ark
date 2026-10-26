@@ -69,6 +69,8 @@ test("opaque content plane enforces independently signed live head, device signa
   assert.throws(() => make(), /ZK_CONTENT_BOOTSTRAP_REQUIRED/,
     "a missing replay/floor database must never silently reset on restart");
   let store = make(scope, true);
+  assert.throws(() => make(scope, true), /ZK_CONTENT_BOOTSTRAP_REQUIRED/,
+    "exclusive bootstrap must reject an already-created protected store");
   const auth = (device = manifest.devices[0], operation = "put", objectId = crypto.randomBytes(16).toString("base64url"), expectedRevision = null) => ({
     ...scope, device_id: device.device_id, operation, object_id: objectId,
     expected_object_revision: expectedRevision, manifest_revision: manifest.revision,
