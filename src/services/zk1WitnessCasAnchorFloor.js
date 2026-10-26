@@ -6,7 +6,8 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteAuthorityDirectory } = require("./zk1PrivateSqlitePath");
 const { Worker } = require("node:worker_threads");
 const Database = require("better-sqlite3");
 const { Zk1WitnessCasPhysicalAdmission } = require("./zk1WitnessCasPhysicalAdmission");
@@ -287,6 +288,11 @@ class Zk1WitnessCasAnchorFloor {
     try {
       if (exists) assertPrivateSqliteFile(absolute);
       else ensurePrivateSqliteDirectory(absolute);
+      // SQLite opens the DB and WAL/SHM sidecars by pathname. A hostile
+      // Windows DELETE_CHILD/Modify ACE on an ancestor can redirect those
+      // opens after the file's lstat/fstat pin has passed. Require the same
+      // owner-only authority directory gate used by independent FLOOR.
+      assertPrivateSqliteAuthorityDirectory(absolute);
     } catch (_) { fail(); }
     if (!exists) {
       const fd = fs.openSync(absolute, "wx", 0o600);

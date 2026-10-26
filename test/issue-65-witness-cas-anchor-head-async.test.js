@@ -5,7 +5,6 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const https = require("node:https");
-const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const { generateNativeFixtureCertificates } =
@@ -58,7 +57,8 @@ function post(port, certificates, name, route, body) {
 }
 
 test("100k signed events: HTTPS anchor head stays nonce-bound, serves other witness routes while scanning, rejects earlier-row tamper and rollback", { timeout: 120000 }, async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-async-anchor-"));
+  const dir = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("rootark-async-anchor-");
   let floor;
   let server;
   t.after(async () => {

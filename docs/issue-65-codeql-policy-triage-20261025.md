@@ -66,3 +66,38 @@ CAS and floor entrypoints. This is an isolated loader hardening, not proof of
 CodeQL policy clearance, remote durability, or security against a compromised
 privileged service account. Operator configuration, public-key and CA files
 must also have private permissions where used as authority trust material.
+
+## Current CodeQL policy check 121328433002 (2026-10-25)
+
+All 100 annotations were retrieved for PR #228 published head `c9c7a7c`:
+60 high (`failure`) and 40 medium (`warning`). The 100 break down into
+43 filesystem races, 33 outbound file-data flows, 10 missing rate limits,
+5 network-to-file flows, 3 user-controlled check bypasses, 2 sanitization,
+2 insecure temporaries, 1 untrusted path and 1 reflected XSS. By location:
+40 tests, 1 script and 59 remaining runtime paths. These are scanner counts,
+not 100 independently established exploits.
+
+One confirmed Windows authority boundary defect was reproduced at
+`src/services/zk1WitnessCasAnchorFloor.js:288`: although file identity was
+checked before `better-sqlite3`, a witness-floor parent could grant the
+untrusted local Users SID `S-1-5-32-545` Modify, including rename/delete
+rights against the SQLite DB and its WAL/SHM sidecars. The old constructor
+accepted such a fixture and created the database. The constructor now calls
+the existing owner-only `assertPrivateSqliteAuthorityDirectory` before
+either opening or creating the witness-floor SQLite. A disposable physical
+Windows ACL regression went RED 1 FAIL / 1 PASS, then GREEN 2 PASS / 0 FAIL;
+private operator directory bootstrap remains accepted. Witness standalone
+startup, 30k-row async signed head and mTLS CAS/witness floor tests pass.
+
+Targeted triage: the `zk1PgPhysicalAttestorHttpsServer.js:109` method/route
+check occurs after mTLS peer authorization and before body/PG access; that
+annotation alone is not an authentication bypass. The WebDAV adapter's
+`readBoundedFile` FD is checked against its named inode and digest before
+upload; its configured endpoint is literal `127.0.0.1` with certificate
+pinning. The `zk1ProtectedObjectStore.js:232` bootstrap uses exclusive
+creation and follows with identity checks, but its separate Windows local
+SQLite authority ACL remains a review target. The PG attestor uses a
+read-only transaction, verifies the effective login/role and rejects
+prohibited grants before serving a signed physical claim. None of this
+disposes of other CodeQL findings without route-specific review. The
+policy check remains **NO-GO** until the hosted gate passes independently.
