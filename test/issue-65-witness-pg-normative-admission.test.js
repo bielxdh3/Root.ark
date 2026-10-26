@@ -4,7 +4,6 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const Database = require("better-sqlite3");
@@ -33,6 +32,8 @@ const { envelopeBinding, verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
 const { createExternalRecoveryHeadFixture } =
   require("./support/issue-65-external-recovery-head-fixture");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
 const ENTRY = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
@@ -41,7 +42,7 @@ const sha = (b) => crypto.createHash("sha256").update(b).digest();
 const hex = (b) => sha(b).toString("hex");
 
 test("strict CAS witness floor refuses signed status advance without independent PG attestation and owner binding", async (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-witness-physical-"));
+  const directory = createPrivateAuthorityFixture("zk65-witness-physical-");
   const externalAuthorities = [];
   t.after(() => {
     for (const authority of externalAuthorities.reverse()) authority.close();
@@ -1439,7 +1440,7 @@ test("strict CAS witness floor refuses signed status advance without independent
 });
 
 test("CAS persists mandatory physical evidence provider enrollment and refuses restart downgrade", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-cas-normative-policy-"));
+  const directory = createPrivateAuthorityFixture("zk65-cas-normative-policy-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const status = crypto.generateKeyPairSync("ed25519");
   const witness = crypto.generateKeyPairSync("ed25519");
