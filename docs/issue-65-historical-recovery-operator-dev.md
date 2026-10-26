@@ -128,11 +128,26 @@ and `loadFinalizedHead` refuses admission until sealing. After a verified seal,
 its durable readback survives process restart. The witness's existing
 `quarantineFinalizedAck` transition creates a separate monotonic veto for
 stale or failed ACKs; all such states require operator-supervised inspection.
+`sealAck` rechecks the original signed PG issuance time **inside** the SQLite
+`BEGIN IMMEDIATE` transaction, both immediately before the SEALED update and
+after that update but before FULL COMMIT. If SQLite lock contention makes the
+proof older than 30 seconds, the transaction rolls back to PROVISIONAL and the
+nonce remains unusable across restart. Once FULL COMMIT returns, the operator
+checks freshness and retained owner/head/proof state again. If the post-commit
+readback is stale, it durably quarantines the head and denies the seal ACK.
+An operator crash between FULL COMMIT and that final compensating quarantine
+remains a distributed ACK ambiguity: a durable SEALED head is evidence of a
+fresh **commit**, not proof that the witness received the response. The witness
+must still quarantine an interrupted/expired RPC and never infer positive ACK
+from an equal historical head alone. No cross-host power-failure atomicity is
+claimed.
 
 ## Verification and limits
 
 `node --test test/issue-65-historical-recovery-independent-operator.test.js`
 exercises original signature/PG validation, altered timestamp rejection,
+an actual separate-process SQLite writer lock with virtual 31-second expiry,
+after-COMMIT delayed ACK quarantine and durable restart denial,
 distinct client identities, real localhost mTLS and child-process bridge,
 crash/restart persistence, provisional/SEALED transitions, CAS stale head,
 owner generation and revoked/quarantined restart. Local TLS and process

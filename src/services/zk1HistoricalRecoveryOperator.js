@@ -247,15 +247,24 @@ class Zk1HistoricalRecoveryOperator {
           previous.sequence, previous.lastHash).changes === 1;
     }).immediate();
   }
+  #assertSealPhysicalFresh(proof) {
+    const observed = Date.now();
+    if (!Number.isSafeInteger(observed) || observed < 1
+      || !Number.isSafeInteger(proof?.physicalIssuedAt)
+      || Math.abs(Math.floor(observed / 1000) - proof.physicalIssuedAt) > 30) deny();
+  }
   sealAck(expected, proof) {
     head(expected);
-    if (!proof || typeof proof !== "object" || !Number.isSafeInteger(proof.physicalIssuedAt)
-      || Math.abs(Math.floor(Date.now() / 1000) - proof.physicalIssuedAt) > 30
+    if (!proof || typeof proof !== "object"
       || !Number.isSafeInteger(proof.ownerGeneration)) deny();
+    this.#assertSealPhysicalFresh(proof);
     const hash = proofHash(proof);
-    return this.#db.transaction(() => {
+    const sealed = this.#db.transaction(() => {
       const row = this.#current();
-      return this.#db.prepare("UPDATE operator_recovery_floor SET ack_settlement='SEALED'"
+      // BEGIN IMMEDIATE can block behind another process holding the SQLite
+      // writer lock. The earlier freshness sample cannot authorize this CAS.
+      this.#assertSealPhysicalFresh(proof);
+      const changed = this.#db.prepare("UPDATE operator_recovery_floor SET ack_settlement='SEALED'"
         + " WHERE id=1 AND sequence=? AND last_hash=?"
         + " AND finalized_sequence=? AND finalized_hash=?"
         + " AND quarantined=0 AND ack_settlement='PROVISIONAL'"
@@ -264,7 +273,39 @@ class Zk1HistoricalRecoveryOperator {
         .run(expected.sequence, expected.lastHash, expected.sequence, expected.lastHash,
           proof.ownerGeneration, proof.ownerGeneration,
           proof.policySnapshot, hash).changes === 1;
+      // A slow UPDATE or final SQL work must roll back before FULL COMMIT.
+      if (changed) this.#assertSealPhysicalFresh(proof);
+      return changed;
     }).immediate();
+    if (!sealed) return false;
+    // FULL COMMIT/fsync and remote response handling can outlive PG TTL.
+    // Never advertise this as a fresh sealed ACK without one last readback.
+    try {
+      this.#assertSealPhysicalFresh(proof);
+      const row = this.#current();
+      if (row.quarantined !== 0 || row.ack_settlement !== "SEALED"
+        || row.sequence !== expected.sequence || row.last_hash !== expected.lastHash
+        || row.finalized_sequence !== expected.sequence
+        || row.finalized_hash !== expected.lastHash
+        || row.owner_generation !== proof.ownerGeneration
+        || row.finalized_owner_generation !== proof.ownerGeneration
+        || row.owner_policy !== proof.policySnapshot
+        || row.provisional_proof_hash !== hash) deny();
+      this.#assertSealPhysicalFresh(proof);
+    } catch (_) {
+      // Monotonic veto survives restart even when the SEALED commit succeeded
+      // but its timely acknowledgement is uncertain. If fencing fails, DENY.
+      let fenced = false;
+      try {
+        fenced = this.quarantineFinalizedAck(expected) === true;
+        const veto = this.loadQuarantinedHead();
+        if (veto.sequence !== expected.sequence || veto.lastHash !== expected.lastHash)
+          fenced = false;
+      } catch (_) { deny(); }
+      if (!fenced) deny();
+      return false;
+    }
+    return true;
   }
   close() { this.#db.close(); }
 }

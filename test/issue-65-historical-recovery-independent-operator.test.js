@@ -18,6 +18,8 @@ const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
 const operatorScript = path.resolve(__dirname, "../scripts/zk1-historical-recovery-operator.js");
+const lockChildScript = path.resolve(__dirname,
+  "support/issue-65-historical-operator-lock-child.js");
 const DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v2\0");
 const sha = (raw) => crypto.createHash("sha256").update(raw).digest("hex");
 const random = (n) => crypto.randomBytes(n);
@@ -163,6 +165,86 @@ test("operator verifies original witness/PG evidence, quarantines provisional AC
       "an owner revoke between verification and SEAL wins the atomic CAS");
     assert.throws(() => notYetSealed.loadFinalizedHead());
   } finally { notYetSealed.close(); }
+});
+
+test("seal must recheck PG expiry after another process releases SQLite IMMEDIATE lock", async (t) => {
+  const dir = privateDir();
+  const id = identity();
+  const config = { databasePath: path.join(dir, "locked-seal.sqlite"),
+    initialPolicy: policy, ...id.pins };
+  const op = new Zk1HistoricalRecoveryOperator({ ...config, bootstrapNew: true });
+  t.after(() => { op.close(); disposeFixture(dir); });
+  const { next, proof } = await recoveryEvidence(id);
+  assert.equal(op.compareAndAdvance(ZERO_HEAD, next), true);
+  assert.equal(await op.finalizeAck(ZERO_HEAD, next, proof), true);
+  const acquired = path.join(dir, "writer-acquired");
+  const elapsed = path.join(dir, "virtual-time-expired");
+  const child = spawn(process.execPath, [lockChildScript, config.databasePath,
+    acquired, elapsed], { stdio: "ignore", windowsHide: true });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
+  let released;
+  const exited = new Promise((resolve) => {
+    released = resolve;
+    child.once("exit", (code) => resolve(code));
+  });
+  const ready = await Promise.race([
+    new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve(false), 5000);
+      const check = () => {
+        if (fs.existsSync(acquired)) { clearTimeout(deadline); resolve(true); }
+        else setTimeout(check, 10);
+      };
+      check();
+    }), exited.then(() => false),
+  ]);
+  assert.equal(ready, true, "independent SQLite writer must hold the real lock");
+  const originalClock = Date.now;
+  const fresh = proof.physicalIssuedAt * 1000;
+  Date.now = () => fresh + (fs.existsSync(elapsed) ? 31000 : 0);
+  try {
+    assert.throws(() => op.sealAck(next, proof),
+      /HISTORICAL_RECOVERY_OPERATOR_DENIED/,
+      "time crossing PG TTL while BEGIN IMMEDIATE waits must not persist SEALED");
+  } finally { Date.now = originalClock; }
+  assert.equal(await exited, 0);
+  assert.throws(() => op.loadFinalizedHead());
+  op.close();
+  const restarted = new Zk1HistoricalRecoveryOperator(config);
+  try {
+    assert.deepEqual(restarted.loadHead(), next);
+    assert.throws(() => restarted.loadFinalizedHead(),
+      "after crash/restart, expired unsealed proof stays PROVISIONAL");
+  } finally { restarted.close(); }
+});
+
+test("late commit-to-ACK expiry durably quarantines SEALED before returning success", async (t) => {
+  const dir = privateDir();
+  const id = identity();
+  const config = { databasePath: path.join(dir, "postcommit-seal.sqlite"),
+    initialPolicy: policy, ...id.pins };
+  const op = new Zk1HistoricalRecoveryOperator({ ...config, bootstrapNew: true });
+  t.after(() => { op.close(); disposeFixture(dir); });
+  const { next, proof } = await recoveryEvidence(id);
+  assert.equal(op.compareAndAdvance(ZERO_HEAD, next), true);
+  assert.equal(await op.finalizeAck(ZERO_HEAD, next, proof), true);
+  const originalClock = Date.now;
+  let reads = 0;
+  const fresh = proof.physicalIssuedAt * 1000;
+  Date.now = () => fresh + (++reads >= 4 ? 31000 : 0);
+  try {
+    assert.equal(op.sealAck(next, proof), false,
+      "post-FULL-commit delayed ACK must not report a sealed success");
+  } finally { Date.now = originalClock; }
+  assert.ok(reads >= 4, "time was checked before UPDATE, before COMMIT and after COMMIT");
+  assert.deepEqual(op.loadQuarantinedHead(), next);
+  assert.throws(() => op.loadFinalizedHead());
+  op.close();
+  const restarted = new Zk1HistoricalRecoveryOperator(config);
+  try {
+    assert.deepEqual(restarted.loadQuarantinedHead(), next);
+    assert.throws(() => restarted.loadFinalizedHead());
+    assert.equal(restarted.sealAck(next, proof), false);
+  } finally { restarted.close(); }
 });
 
 function writeJson(filename, value) {
