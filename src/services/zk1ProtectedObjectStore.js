@@ -30,6 +30,13 @@ const MAX_NONCES = 100_000;
 const MAX_VERSION_RECORDS = 4096;
 const MAX_VERSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_CONCURRENT_SIGNED_HISTORY_CHECKS = 2;
+const OWNER_PUT_FENCE_DOMAIN =
+  Buffer.from("Root.ark/zk-1/owner-physical-put-fence/v1\0", "ascii");
+const OWNER_PUT_FENCE_FIELDS = Object.freeze([
+  "type", "signerKeyId", "scopeKey", "nonce", "generation",
+  "manifestRevision", "manifestDigest", "deviceId",
+  "devicePublicKeySha256", "allowed", "observedAt",
+]);
 
 function fail(code = "ZK_CONTENT_DENIED") {
   const error = new Error(code);
@@ -67,6 +74,29 @@ function normalizeScope(input) {
 function scopeKey(scope) {
   return scope.account_id.toString("hex") + ":" + scope.compartment_id.toString("hex")
     + ":" + scope.keyring_id.toString("hex");
+}
+function canonicalB64(value, length) {
+  return typeof value === "string" && Buffer.from(value, "base64url").length === length
+    && Buffer.from(value, "base64url").toString("base64url") === value;
+}
+function assertOwnerFenceIdentity(db, ownerFence, scope) {
+  const exists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' "
+    + "AND name='zk_content_owner_put_fence'").get();
+  // If the operator enabled this mode when the store was created, a later
+  // restart cannot silently remove the independently pinned physical gate.
+  if (Boolean(exists) !== Boolean(ownerFence)) fail("ZK_CONTENT_IDENTITY_MISMATCH");
+  if (!exists) return;
+  let row;
+  try {
+    row = db.prepare("SELECT * FROM zk_content_owner_put_fence WHERE scope=?").get(scope);
+  } catch (_) { fail("ZK_CONTENT_IDENTITY_MISMATCH"); }
+  if (!row || !equal(row.signer_key_id, ownerFence.keyId)
+    || !equal(row.signer_fingerprint, ownerFence.fingerprint)
+    || row.minimum_generation !== ownerFence.minimumGeneration
+    || !Number.isSafeInteger(row.high_generation)
+    || row.high_generation < row.minimum_generation
+    || (row.high_digest !== null && (!Buffer.isBuffer(row.high_digest)
+      || row.high_digest.length !== 32))) fail("ZK_CONTENT_IDENTITY_MISMATCH");
 }
 function normalizeAuthorization(value) {
   strict(value, FIELDS);
@@ -150,11 +180,12 @@ function fileIdentity(filename) {
 }
 
 class Zk1ProtectedObjectStore {
+  #ownerPutFence;
   constructor(filename, { witnessProvider, witnessPinned, manifestProvider,
     trustedScope, minimumHead, bootstrapNew = false,
     admissionRequired = false,
     signedHistoryRequired = false, signedHistoryGenesisDigest,
-    verifiedHistoryProvider,
+    verifiedHistoryProvider, physicalCommitOwnerFence,
     nowSeconds = () => Math.floor(Date.now() / 1000) } = {}) {
     if (typeof filename !== "string" || !filename || !witnessProvider
       || typeof witnessProvider.freshHead !== "function"
@@ -190,6 +221,29 @@ class Zk1ProtectedObjectStore {
     this.admissionRequired = admissionRequired;
     this.manifestProvider = manifestProvider;
     this.nowSeconds = nowSeconds;
+    if (physicalCommitOwnerFence !== undefined) {
+      if (!signedHistoryRequired || !admissionRequired) fail();
+      strict(physicalCommitOwnerFence,
+        ["pinnedPublicKey", "pinnedKeyId", "minimumGeneration", "readSignedHead"]);
+      const { pinnedPublicKey, pinnedKeyId, minimumGeneration, readSignedHead } =
+        physicalCommitOwnerFence;
+      if (!(pinnedPublicKey instanceof crypto.KeyObject)
+        || pinnedPublicKey.type !== "public"
+        || pinnedPublicKey.asymmetricKeyType !== "ed25519"
+        || crypto.KeyObject.prototype.equals.call(pinnedPublicKey,
+          this.witnessPinned.publicKey)
+        || typeof readSignedHead !== "function") fail();
+      const rawSigner = Buffer.from(pinnedPublicKey.export({
+        type: "spki", format: "der",
+      })).subarray(-32);
+      this.#ownerPutFence = Object.freeze({
+        publicKey: pinnedPublicKey, keyId: bytes(pinnedKeyId, 16),
+        rawSigner,
+        fingerprint: crypto.createHash("sha256").update(
+          pinnedPublicKey.export({ type: "spki", format: "der" })).digest(),
+        minimumGeneration: positive(minimumGeneration), readSignedHead,
+      });
+    }
     const absolute = path.resolve(filename);
     if (bootstrapNew !== true && bootstrapNew !== false) fail();
     const existed = fs.existsSync(absolute);
@@ -220,6 +274,7 @@ class Zk1ProtectedObjectStore {
       const readonly = new Database(absolute, { readonly: true, fileMustExist: true });
       try {
         verifyStoreIdentity(readonly, expectedIdentity);
+        assertOwnerFenceIdentity(readonly, this.#ownerPutFence, expectedIdentity.scope);
         if (!readonly.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='zk_content_version'").get()) {
           // An old opt-in store has already overwritten its previous content.
           // Do not invent complete version history or silently mutate it.
@@ -257,6 +312,7 @@ class Zk1ProtectedObjectStore {
       // mutating statement, to reject a file swapped during the read-only check.
       if (existed) {
         verifyStoreIdentity(this.db, expectedIdentity);
+        assertOwnerFenceIdentity(this.db, this.#ownerPutFence, expectedIdentity.scope);
       }
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
@@ -309,6 +365,20 @@ class Zk1ProtectedObjectStore {
         VALUES(1,?,?,?,?,?,?)`).run(expectedIdentity.scope, expectedIdentity.keyId,
         expectedIdentity.fingerprint, expectedIdentity.revision, expectedIdentity.digest,
         expectedIdentity.signedGenesisDigest);
+      if (this.#ownerPutFence) {
+        // Create ONLY on a new, operator-provisioned private store. Neither
+        // an existing store nor a restart may opt in/out or switch the signer.
+        this.db.exec(`CREATE TABLE zk_content_owner_put_fence (
+          scope TEXT PRIMARY KEY, signer_key_id BLOB NOT NULL,
+          signer_fingerprint BLOB NOT NULL, minimum_generation INTEGER NOT NULL,
+          high_generation INTEGER NOT NULL, high_digest BLOB
+        )`);
+        this.db.prepare(`INSERT INTO zk_content_owner_put_fence
+          (scope,signer_key_id,signer_fingerprint,minimum_generation,high_generation,high_digest)
+          VALUES(?,?,?,?,?,NULL)`).run(expectedIdentity.scope, this.#ownerPutFence.keyId,
+          this.#ownerPutFence.fingerprint, this.#ownerPutFence.minimumGeneration,
+          this.#ownerPutFence.minimumGeneration);
+      }
     }
     // Upgrade earlier disposable/local content planes without erasing any
     // durable replay state. Unattributed legacy nonces remain permanently
@@ -485,8 +555,94 @@ class Zk1ProtectedObjectStore {
       authorizationKeyId: Buffer.from(device.authorization_key_id).toString("base64url") };
   }
 
-  perform({ key, request, head, sealed }, operation) {
+  #checkOwnerPutFence(key, request, deviceAuthorizationPublicKey, verifiedHeadManifest) {
+    const fence = this.#ownerPutFence;
+    if (!fence) return;
+    // Owner/device Ed25519 history and the physical custodian must have
+    // separate key custody; otherwise a compromised device could mint both.
+    if (!Buffer.isBuffer(deviceAuthorizationPublicKey)
+      || deviceAuthorizationPublicKey.equals(fence.rawSigner)
+      || !verifiedHeadManifest || !Array.isArray(verifiedHeadManifest.devices)
+      || verifiedHeadManifest.devices.some((device) =>
+        Buffer.from(device.authorization_public_key).equals(fence.rawSigner))) {
+      fail("ZK_CONTENT_UNAVAILABLE");
+    }
+    // Called INSIDE the physical SQLite IMMEDIATE transaction, after ALL
+    // witness/history/admission awaits. This callback must be a synchronous
+    // operator-owned signer backed by an independently monotonic owner state.
+    // A Promise is not a physical commit fence.
+    const nonce = crypto.randomBytes(32);
+    const devicePublicKeySha256 = crypto.createHash("sha256")
+      .update(deviceAuthorizationPublicKey).digest();
+    let signed;
+    try {
+      signed = fence.readSignedHead({
+        nonce: Buffer.from(nonce), scope: {
+          account_id: Buffer.from(this.trustedScope.account_id),
+          compartment_id: Buffer.from(this.trustedScope.compartment_id),
+          keyring_id: Buffer.from(this.trustedScope.keyring_id),
+        }, deviceId: request.device_id,
+        devicePublicKeySha256: Buffer.from(devicePublicKeySha256),
+      });
+    } catch (_) { fail("ZK_CONTENT_UNAVAILABLE"); }
+    if (!signed || typeof signed !== "object" || Array.isArray(signed)
+      || Reflect.ownKeys(signed).length !== 2
+      || !Object.hasOwn(signed, "statement") || !Object.hasOwn(signed, "signature")
+      || signed instanceof Promise) fail("ZK_CONTENT_UNAVAILABLE");
+    const s = signed.statement;
+    if (!s || typeof s !== "object" || Array.isArray(s)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(s))
+      || Reflect.ownKeys(s).length !== OWNER_PUT_FENCE_FIELDS.length
+      || OWNER_PUT_FENCE_FIELDS.some((field) => {
+        const desc = Object.getOwnPropertyDescriptor(s, field);
+        return !desc || !Object.hasOwn(desc, "value");
+      })) fail("ZK_CONTENT_UNAVAILABLE");
+    const now = currentTime(this.nowSeconds);
+    if (s.type !== "rootark-zk1-owner-physical-put-fence-v1"
+      || s.signerKeyId !== fence.keyId.toString("base64url")
+      || s.scopeKey !== key || s.nonce !== nonce.toString("base64url")
+      || !Number.isSafeInteger(s.generation)
+      || s.generation < fence.minimumGeneration
+      // A revoked-and-reenrolled device cannot reuse an old signed PUT
+      // even if the owner later enrolls the same key again (owner ABA).
+      || s.generation !== request.manifest_revision
+      || s.manifestRevision !== request.manifest_revision
+      || !canonicalB64(s.manifestDigest, 32)
+      || s.manifestDigest !== request.manifest_digest.toString("base64url")
+      || s.deviceId !== request.device_id
+      || !canonicalB64(s.devicePublicKeySha256, 32)
+      || s.devicePublicKeySha256 !== devicePublicKeySha256.toString("base64url")
+      || s.allowed !== true || !Number.isSafeInteger(s.observedAt)
+      || Math.abs(now - s.observedAt) > 2
+      || !Buffer.isBuffer(signed.signature) || signed.signature.length !== 64) {
+      fail("ZK_CONTENT_UNAVAILABLE");
+    }
+    const body = Buffer.concat([OWNER_PUT_FENCE_DOMAIN,
+      Buffer.from(JSON.stringify(s), "utf8")]);
+    if (!crypto.verify(null, body, fence.publicKey, signed.signature)) {
+      fail("ZK_CONTENT_UNAVAILABLE");
+    }
+    const stored = this.db.prepare(
+      "SELECT high_generation,high_digest FROM zk_content_owner_put_fence WHERE scope=?")
+      .get(key);
+    if (!stored || !Number.isSafeInteger(stored.high_generation)
+      || stored.high_generation > s.generation
+      || (stored.high_generation === s.generation && stored.high_digest
+        && !equal(stored.high_digest, request.manifest_digest))) fail("ZK_CONTENT_UNAVAILABLE");
+    if (stored.high_generation < s.generation) {
+      this.db.prepare(`UPDATE zk_content_owner_put_fence
+        SET high_generation=?,high_digest=? WHERE scope=?`)
+        .run(s.generation, request.manifest_digest, key);
+    } else if (stored.high_digest === null) {
+      this.db.prepare("UPDATE zk_content_owner_put_fence SET high_digest=? WHERE scope=?")
+        .run(request.manifest_digest, key);
+    }
+  }
+  perform({ key, request, head, sealed, deviceAuthorizationPublicKey,
+    verifiedHeadManifest }, operation) {
     return this.db.transaction(() => {
+      if (operation === "put") this.#checkOwnerPutFence(
+        key, request, deviceAuthorizationPublicKey, verifiedHeadManifest);
       // Never use the time from the first auth check after an asynchronous
       // network/crypto operation. The request must be valid at the physical
       // read/write effect boundary, not merely when it entered the process.
