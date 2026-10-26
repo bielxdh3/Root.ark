@@ -69,3 +69,15 @@ provided. Until then the verified result always reports
 `v2WriteAuthorized:false`, `restoreAuthorized:false`,
 `destructiveCutoverAuthorized:false`, and
 `independentMonotonicStageWitnessProven:false`.
+
+The operator-local verifier additionally returns a `witnessCandidate`, only
+after its final live CAS/FLOOR readback and fresh owner witness check. It
+contains canonical deterministic CBOR `subject` (base64url), domain-separated
+SHA-256 `subjectDigest`, and the final nonce-bound Ed25519 `casSignedStage` /
+`floorSignedStage` (base64url). The subject fixes scope, legacy terminal state,
+both separate archival roots/checkpoints, original owner consent hash/epoch,
+and both signer pins; the digest is independent of renewed readback nonces.
+An independent operator must reconstruct the subject and verify both stage
+signatures against its own pinned keys, consent and historical archive before
+any monotonic ledger append. This bundle itself **has no monotonicity or
+rollback resistance**, and cannot be used for write or deletion authorization.

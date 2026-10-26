@@ -42,6 +42,8 @@ const LEGACY_MIGRATION_DOMAIN = Buffer.from(
   "Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0");
 const LEGACY_READBACK_DOMAIN = Buffer.from(
   "Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-readback/v1\0");
+const LEGACY_STAGE_WITNESS_SUBJECT_DOMAIN = Buffer.from(
+  "Root.ark/zk-1/opaque-checkpoint-v2-legacy-stage-witness-subject/v1\0");
 const ROLE_CAS = "CAS";
 const ROLE_FLOOR = "FLOOR";
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
@@ -1370,6 +1372,7 @@ async function verifyLegacyArchiveDualReadback(input) {
           || Object.entries(expected).some(([name, value]) =>
             !same(bytes(result[name], 32), value))) fail();
       }
+      return seen.map((report) => Buffer.from(report.raw));
     };
     await checkedReadback();
     const assertOwnerCurrent = async () => {
@@ -1396,16 +1399,37 @@ async function verifyLegacyArchiveDualReadback(input) {
         expected.full_archive_root)
       || !same(canonical32(finalArchive.checkpointDigest),
         expected.full_archive_checkpoint)) fail();
-    await checkedReadback();
+    const finalSignedStages = await checkedReadback();
     // A revocation can commit while HTTPS stage or full-128 reads are in
     // flight. Rechallenge the independent owner witness AFTER the final
     // signed readback, before reporting current-owner verification.
     // This still does not provide a distributed atomic cutover fence.
     await assertOwnerCurrent();
+    // Produce a domain-separated, canonical subject and the two last verified
+    // signed stage responses for an INDEPENDENT operator to anchor later.
+    // Stable subject identity excludes freshness nonces and timestamps. These
+    // bytes are evidence to verify, never a local monotonic witness or permit.
+    const witnessSubject = Buffer.from(await z.encodeDeterministic({
+      type: "rootark-opaque-checkpoint-v2-legacy-stage-witness-subject/v1",
+      ...scope, legacy_sequence: ownerConsent.legacy_sequence,
+      owner_revision: ownerConsent.owner_revision,
+      owner_digest: canonical32(ownerConsent.owner_digest),
+      owner_epoch: ownerConsent.owner_epoch,
+      cas_signer_fp: fp(casClient.publicKey),
+      floor_signer_fp: fp(floorClient.publicKey), ...expected,
+    }));
+    const witnessCandidate = Object.freeze({
+      subject: witnessSubject.toString("base64url"),
+      subjectDigest: hash(LEGACY_STAGE_WITNESS_SUBJECT_DOMAIN,
+        witnessSubject).toString("base64url"),
+      casSignedStage: finalSignedStages[0].toString("base64url"),
+      floorSignedStage: finalSignedStages[1].toString("base64url"),
+    });
     return Object.freeze({ state: "LEGACY_DUAL_ARCHIVE_SIGNED_READBACK_ONLY",
       legacySequence: ownerConsent.legacy_sequence,
       fullArchiveRoot: ownerConsent.full_archive_root,
       fullArchiveCheckpoint: ownerConsent.full_archive_checkpoint,
+      witnessCandidate,
       v2WriteAuthorized: false, restoreAuthorized: false,
       destructiveCutoverAuthorized: false,
       independentMonotonicStageWitnessProven: false,

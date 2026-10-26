@@ -630,6 +630,39 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     assert.equal(verified.v2WriteAuthorized, false);
     assert.equal(verified.restoreAuthorized, false);
     assert.equal(verified.independentMonotonicStageWitnessProven, false);
+    const candidate = verified.witnessCandidate;
+    assert.ok(Object.isFrozen(candidate));
+    const subjectRaw = Buffer.from(candidate.subject, 'base64url');
+    const subject = await z.decodeDeterministic(subjectRaw);
+    assert.equal(subject.type,
+      'rootark-opaque-checkpoint-v2-legacy-stage-witness-subject/v1');
+    assert.equal(subject.legacy_sequence, 128);
+    assert.equal(subject.owner_revision, options.ownerHead.revision);
+    assert.ok(Buffer.from(subject.owner_consent_hash).equals(digest(
+      Buffer.from('Root.ark/zk-1/opaque-checkpoint-v2-legacy-archive-migration/v1\0'),
+      Buffer.from(JSON.stringify(statement)), signedConsent)));
+    assert.equal(candidate.subjectDigest, b64(digest(Buffer.from(
+      'Root.ark/zk-1/opaque-checkpoint-v2-legacy-stage-witness-subject/v1\0'),
+    subjectRaw)), 'independent witness can recompute a domain-separated subject');
+    for (const [encoded, signer, role] of [
+      [candidate.casSignedStage, v2Cas.publicKey, 'CAS'],
+      [candidate.floorSignedStage, v2Floor.publicKey, 'FLOOR'],
+    ]) {
+      const raw = Buffer.from(encoded, 'base64url');
+      const signedStage = await z.decodeDeterministic(raw);
+      const independentlyChecked = await inspectLegacyArchiveReadback(raw, {
+        scope: options.scope, signer, role, casFp: id(v2Cas.publicKey),
+        floorFp: id(v2Floor.publicKey), nonce: signedStage.nonce,
+      });
+      assert.ok(Buffer.from(independentlyChecked.owner_consent_hash).equals(
+        subject.owner_consent_hash), 'both stage signatures bind the same consent');
+    }
+    const rerun = await verifyLegacyArchiveDualReadback(readback);
+    assert.equal(rerun.witnessCandidate.subjectDigest, candidate.subjectDigest,
+      'fresh TLS nonces must not change immutable monotonic witness subject');
+    assert.notEqual(rerun.witnessCandidate.casSignedStage, candidate.casSignedStage,
+      'export must carry a new signed live readback, not replay old receipts');
+    assert.equal(rerun.destructiveCutoverAuthorized, false);
     await assert.rejects(verifyLegacyArchiveDualReadback({ ...readback,
       ownerSignature: crypto.randomBytes(64) }), /ZK_CHECKPOINT_V2_/,
     'owner consent signature must be bound to both authority stage receipts');
