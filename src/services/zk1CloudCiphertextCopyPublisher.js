@@ -110,6 +110,18 @@ class Zk1CloudCiphertextCopyPublisher {
       namespaceIdentity: this.#namespace });
   }
 
+  #assertWriterStillPinned(address, key) {
+    // A prior async principal check or remote PUT result cannot pin a mutable
+    // provider adapter for future use. Synchronously refuse a provider,
+    // namespace, enabled-state or object-key rebind at each local boundary.
+    // This is rejection-only; it is NOT a remote linearizable owner fence.
+    if (this.#writer.enabled() !== true
+      || this.#writer.status()?.provider !== this.#provider
+      || (typeof this.#writer.zk1StorageNamespace === "function"
+        ? this.#writer.zk1StorageNamespace() : null) !== this.#namespace
+      || this.#writer.key(address.folder, address.name, "uploads") !== key) fail();
+  }
+
   async publishExact(input) {
     let directory;
     try {
@@ -125,6 +137,7 @@ class Zk1CloudCiphertextCopyPublisher {
       if (typeof key !== "string"
         || !key.endsWith(`/uploads/${address.folder}/${address.name}`)) fail();
       if (await boundedIdentity(() => this.#writer.resolveInventoryContext()) !== this.#context) fail();
+      this.#assertWriterStillPinned(address, key);
       directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-copy-"));
       const staged = path.join(directory, "sealed-opaque-copy.ct");
       const fd = fs.openSync(staged,
@@ -145,6 +158,7 @@ class Zk1CloudCiphertextCopyPublisher {
           ...(this.#provider === "webdav" ? { zk1ExpectedSha256: sha.toString("hex") } : {}),
           ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
+      this.#assertWriterStillPinned(address, key);
       if (!answer || answer.provider !== this.#provider || answer.key !== key
         || (this.#driveId !== null && answer.id !== this.#driveId)) fail();
       if (this.#provider === "s3" && answer.versionId !== undefined
@@ -154,6 +168,7 @@ class Zk1CloudCiphertextCopyPublisher {
         && answer.etag !== null && !WEBDAV_ETAG.test(answer.etag)) fail();
       if (this.#webdavEtag !== null && !WEBDAV_ETAG.test(answer.etag)) fail();
       if (await boundedIdentity(() => this.#writer.resolveInventoryContext()) !== this.#context) fail();
+      this.#assertWriterStillPinned(address, key);
       return Object.freeze({ status: "CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE",
         operationId: Buffer.from(operationId), provider: this.#provider,
         providerFileId: this.#driveId,

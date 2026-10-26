@@ -11,6 +11,55 @@ const { Zk1CloudCiphertextCopyPublisher } =
 const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
   require("../src/services/zk1CloudCiphertextReadbackVerifier");
 
+test("late S3/Drive/WebDAV writer rebind after real synthetic PUT cannot mint even a nonauthoritative copy ACK", async () => {
+  const results = [];
+  for (const provider of ["s3", "gdrive", "webdav"]) {
+    const f = fixture(provider === "webdav" ? "s3" : provider);
+    const drift = { value: false, put: false };
+    let writer;
+    if (provider !== "webdav") {
+      writer = f.client("writer");
+      const upload = writer.upload.bind(writer);
+      writer.upload = async (...args) => {
+        const result = await upload(...args);
+        drift.put = true;
+        drift.value = true;
+        if (provider === "s3") writer.enabled = () => false;
+        else writer.zk1StorageNamespace = () => "f".repeat(64);
+        return result;
+      };
+    } else {
+      const context = "f".repeat(64);
+      writer = {
+        enabled: () => true, status: () => ({ provider: drift.value ? "s3" : "webdav" }),
+        resolveInventoryContext: async () => context,
+        zk1StorageNamespace: () => "e".repeat(64),
+        key: (folder, name, area) => `disposable-webdav/${area}/${folder}/${name}`,
+        async upload(staged, folder, name, area) {
+          assert.deepEqual(require("node:fs").readFileSync(staged), Buffer.concat(f.chunks));
+          drift.put = true;
+          drift.value = true;
+          return { provider: "webdav", key: this.key(folder, name, area), etag: '"synthetic"' };
+        },
+      };
+    }
+    const pub = new Zk1CloudCiphertextCopyPublisher({
+      cloudWriter: writer, expectedProvider: provider,
+      expectedWriterContext: await writer.resolveInventoryContext(),
+      pinnedDriveFileId: provider === "gdrive" ? f.fileId : null,
+    });
+    let accepted;
+    try { accepted = (await pub.publishExact(f.payload)).status; }
+    catch (_) { accepted = "DENIED"; }
+    results.push({ provider, accepted });
+    assert.equal(drift.value, true);
+    assert.equal(drift.put, true, "remote physical side-effect already happened");
+  }
+  assert.deepEqual(results, ["s3", "gdrive", "webdav"].map((provider) =>
+    ({ provider, accepted: "DENIED" })),
+  "a late provider disable, namespace rebind or type switch invalidates even a nonauthoritative receipt");
+});
+
 function fixture(provider) {
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: crypto.randomBytes(7), keyring_id: crypto.randomBytes(16) };
