@@ -1,4 +1,4 @@
-const { execFileSync } = require("node:child_process");
+const { execFile, execFileSync } = require("node:child_process");
 
 // This verifier is the final authority for protected on-disk ciphertext and
 // its co-located device registry. Executing a PATH-selected powershell.exe
@@ -220,6 +220,50 @@ function runAclScript(rootDir, action) {
   }
 }
 
+// Never compile the native ACL verifier synchronously on the WebDAV HTTP
+// event loop. Admit only a bounded number of native checks: a saturated queue
+// fails closed instead of accumulating unlimited subprocesses or requests.
+const MAX_ASYNC_BRIDGE_CHECKS = 4;
+const MAX_QUEUED_BRIDGE_CHECKS = 16;
+let activeBridgeChecks = 0;
+const queuedBridgeChecks = [];
+
+function runBridgeAclScriptAsync(rootDir) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      activeBridgeChecks += 1;
+      const escapedRoot = rootDir.replace(/'/g, "''");
+      const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', 'verify-bridge-directory')`;
+      const encoded = Buffer.from(script, "utf16le").toString("base64");
+      const release = () => {
+        activeBridgeChecks -= 1;
+        const next = queuedBridgeChecks.shift();
+        if (next) next();
+      };
+      try {
+        execFile(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive",
+          "-OutputFormat", "Text", "-EncodedCommand", encoded], {
+          encoding: "utf8", windowsHide: true, timeout: 12000,
+          maxBuffer: 32 * 1024,
+        }, (error, stdout, stderr) => {
+          release();
+          if (error) {
+            const detail = String(stdout || stderr || "")
+              .match(/Untrusted principal can replace[^"_<\r\n]*/)?.[0];
+            reject(new Error(detail || "Windows bridge ACL validation failed"));
+          } else resolve(String(stdout).trim());
+        });
+      } catch (_) {
+        release();
+        reject(new Error("Windows bridge ACL validation failed"));
+      }
+    };
+    if (activeBridgeChecks < MAX_ASYNC_BRIDGE_CHECKS) run();
+    else if (queuedBridgeChecks.length < MAX_QUEUED_BRIDGE_CHECKS) queuedBridgeChecks.push(run);
+    else reject(new Error("Windows bridge ACL admission exhausted"));
+  });
+}
+
 function ensureWindowsChunkUploadRoot(rootDir) {
   if (process.platform !== "win32") return;
   runAclScript(rootDir, "create");
@@ -240,6 +284,11 @@ function verifyWindowsLocalWebDavDirectory(directory) {
   runAclScript(directory, "verify-bridge-directory");
 }
 
+function verifyWindowsLocalWebDavDirectoryAsync(directory) {
+  if (process.platform !== "win32") return Promise.resolve();
+  return runBridgeAclScriptAsync(directory);
+}
+
 function getWindowsChunkAclDescriptor(rootDir) {
   if (process.platform !== "win32") throw new Error("Windows ACL inspection is only available on Windows");
   return runAclScript(rootDir, "sddl");
@@ -251,4 +300,5 @@ function verifyWindowsAuthorityFilePath(filename) {
 }
 
 module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
-  verifyWindowsAuthorityFilePath, verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory };
+  verifyWindowsAuthorityFilePath, verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory,
+  verifyWindowsLocalWebDavDirectoryAsync };

@@ -134,3 +134,96 @@ test("Windows local WebDAV permits GET from a verified owner-only directory tree
   assert.equal(response.status, 200);
   assert.equal(response.body, content);
 });
+
+test("Windows WebDAV MOVE independently refuses an untrusted destination parent", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-move-acl-");
+  const sourceDir = path.join(root, "safe");
+  const destinationDir = path.join(root, "destination");
+  fs.mkdirSync(sourceDir);
+  fs.mkdirSync(destinationDir);
+  const source = path.join(sourceDir, "opaque.ct");
+  const destination = path.join(destinationDir, "opaque.ct");
+  fs.writeFileSync(source, "KEEP_SOURCE_BYTES");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  execFileSync("icacls.exe", [destinationDir, "/grant", "*S-1-5-32-545:(OI)(CI)M"],
+    { stdio: "ignore", windowsHide: true });
+  const denied = await request(bridge.address().port, "/safe/opaque.ct", {
+    method: "MOVE",
+    headers: { destination: `http://127.0.0.1:${bridge.address().port}/destination/opaque.ct` },
+  });
+  assert.equal(denied.status, 503);
+  assert.equal(fs.readFileSync(source, "utf8"), "KEEP_SOURCE_BYTES");
+  assert.equal(fs.existsSync(destination), false);
+});
+
+test("Windows local WebDAV concurrent ACL checks leave the Node event loop responsive", {
+  skip: process.platform !== "win32", timeout: 45_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-async-load-");
+  const content = "PRIVATE_BOUNDED_WEB_DAV_BYTES";
+  fs.writeFileSync(path.join(root, "file.ct"), content);
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  let beats = 0;
+  let worstLag = 0;
+  let previous = Date.now();
+  const interval = setInterval(() => {
+    const now = Date.now();
+    worstLag = Math.max(worstLag, now - previous);
+    previous = now;
+    beats += 1;
+  }, 20);
+  let responses;
+  try {
+    responses = await Promise.all(Array.from({ length: 12 }, () =>
+      request(bridge.address().port, "/file.ct")));
+  } finally {
+    clearInterval(interval);
+  }
+  for (const result of responses) {
+    assert.equal(result.status, 200);
+    assert.equal(result.body, content);
+  }
+  assert.ok(beats >= 12, `event loop must advance during 12 ACL checks: ${beats} ticks`);
+  assert.ok(worstLag < 275,
+    `ACL checks must not block the event loop for a PowerShell startup: ${worstLag}ms`);
+});
+
+test("Windows bridge ACL admission is bounded and excess requests fail closed", {
+  skip: process.platform !== "win32", timeout: 55_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-async-cap-");
+  fs.writeFileSync(path.join(root, "file.ct"), "PRIVATE_BOUNDED_CONTENT");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  const responses = await Promise.all([
+    ...Array.from({ length: 30 }, () => request(bridge.address().port, "/file.ct")),
+    request(bridge.address().port, "/file.ct", { headers: { authorization: "" } }),
+  ]);
+  const allowed = responses.slice(0, 30).filter((item) => item.status === 200);
+  const denied = responses.slice(0, 30).filter((item) => item.status === 503);
+  assert.ok(allowed.length > 0, "trusted requests retain a working GET path");
+  assert.ok(denied.length > 0, "excess concurrent ACL checks must reject, not queue without bound");
+  assert.equal(allowed.length + denied.length, 30, "no unexpected status or unverified success");
+  assert.ok(allowed.every((item) => item.body === "PRIVATE_BOUNDED_CONTENT"));
+  assert.ok(denied.every((item) => item.body === "Untrusted bridge storage"));
+  assert.equal(responses[30].status, 401, "unauthenticated requests cannot exhaust ACL subprocesses");
+});

@@ -7,7 +7,7 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
-const { verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory } =
+const { verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectoryAsync } =
   require("../services/chunkUploadWindowsAcl");
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -286,7 +286,7 @@ class LocalSyncWebDavBridge {
         // This excludes actors
         // with trusted owner/admin privileges; no pathname recheck solves that.
         try {
-          verifyWindowsLocalWebDavDirectory(target === this.rootDir
+          await verifyWindowsLocalWebDavDirectoryAsync(target === this.rootDir
             ? this.rootDir : path.dirname(target));
         }
         catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
@@ -444,7 +444,7 @@ class LocalSyncWebDavBridge {
       destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
       // The Destination header can select a different directory than the
       // authenticated source; its ancestry must be independently trusted.
-      try { verifyWindowsLocalWebDavDirectory(path.dirname(destinationTarget)); }
+      try { await verifyWindowsLocalWebDavDirectoryAsync(path.dirname(destinationTarget)); }
       catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
     }
     if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
