@@ -653,17 +653,25 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
 
   await t.test("independent provider signatures are rechecked after slow final owner callback", async () => {
     const now = Math.floor(Date.now() / 1000);
+    // A one-second attestation window is flaky under CI load: the first
+    // remote GETs may straddle the next wall-clock second and fail before
+    // the final owner callback is ever reached. The expiry must be crossed
+    // INSIDE that callback so this tests post-callback revalidation.
+    const expiresAt = now + 4;
     const shortReaders = readers.map((reader) => {
       const { signature: ignored, ...statement } = reader.domainAttestation;
       return { ...reader, domainAttestation: signProviderDomainAttestation({
         administratorPrivateKey: administrators[reader.provider].keys.privateKey,
-        statement: { ...statement, issued_at: now - 1, expires_at: now },
+        statement: { ...statement, issued_at: now - 1, expires_at: expiresAt },
       }) };
     });
     let checks = 0;
     const slow = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
       assertCurrentAuthorization: async (...args) => {
-        if (++checks === 3) await new Promise((done) => setTimeout(done, 1200));
+        if (++checks === 3) {
+          await new Promise((done) => setTimeout(done,
+            Math.max(0, (expiresAt + 1) * 1000 - Date.now())));
+        }
         return directGatewayPins.assertCurrentAuthorization(...args);
       },
     });
