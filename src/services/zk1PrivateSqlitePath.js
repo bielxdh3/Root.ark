@@ -74,14 +74,8 @@ function ensurePrivateSqliteDirectory(filename) {
 
 function assertPrivateSqliteFile(filename) {
   checkDirectory(filename);
-  const before = fs.lstatSync(filename, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
-    throw Error("UNTRUSTED_SQLITE_PATH");
-  }
-  if (process.platform !== "win32"
-    && (before.uid !== BigInt(process.getuid()) || (before.mode & 0o077n) !== 0n)) {
-    throw Error("UNTRUSTED_SQLITE_PATH");
-  }
+  // Open first and compare the actual descriptor with the named entry.
+  // A prior pathname lstat is not a stable authorization for this open.
   const fd = fs.openSync(filename,
     fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
       | (fs.constants.O_CLOEXEC || 0));
@@ -90,10 +84,10 @@ function assertPrivateSqliteFile(filename) {
     const named = fs.lstatSync(filename, { bigint: true });
     checkDirectory(filename);
     for (const stat of [pinned, named]) {
-      if (!stat.isFile() || stat.nlink !== 1n || stat.dev !== before.dev
-        || stat.ino !== before.ino
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+        || stat.dev !== pinned.dev || stat.ino !== pinned.ino
         || (process.platform !== "win32"
-          && (stat.uid !== before.uid || (stat.mode & 0o077n) !== 0n))) {
+          && (stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n) !== 0n))) {
         throw Error("UNTRUSTED_SQLITE_PATH");
       }
     }

@@ -13,6 +13,8 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const { Zk1DurableCasStatusLedger } = require("../src/services/zk1DurableCasStatusLedger");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
 const { inspectVerifiedCasStatusProofV1 } = require("../src/crypto/rootark-zk-cas-status-wire-v1");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const QUERY_FIELDS = [
   "account_id", "compartment_id", "keyring_id", "reservation_id", "operation_id",
@@ -20,7 +22,7 @@ const QUERY_FIELDS = [
   "expected_manifest_digest", "proposed_revision", "proposed_manifest_digest",
 ];
 async function setup(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cas-status-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk1-cas-status-");
   const connections = new Set();
   t.after(() => {
     for (const connection of connections) connection.close();
