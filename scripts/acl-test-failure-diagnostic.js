@@ -19,7 +19,7 @@ const CASES = Object.freeze({
   ATOMIC_MUTATION: {
     file: "test/issue-65-sync-atomic-private-acl.test.js",
     title: "strict atomic registry refuses a later untrusted file permission change",
-    stages: ["START", "PRIVATE_ROOT", "REGISTRY_OPEN", "ACL_WRITE", "REOPEN_CHECK"],
+    stages: ["START", "PRIVATE_ROOT", "REGISTRY_OPEN", "ACL_WRITE", "REOPEN_CHECK", "ACL_REVOKE", "TRUSTED_REOPEN"],
   },
   ATOMIC_RENAME: {
     file: "test/issue-65-sync-atomic-private-acl.test.js",

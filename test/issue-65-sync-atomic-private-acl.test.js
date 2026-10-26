@@ -15,6 +15,7 @@ const { createAclFailureDiagnostic } =
   require("../scripts/acl-test-failure-diagnostic");
 
 const UNSAFE = { code: "SYNC_ATOMIC_REGISTRY_STORAGE_UNSAFE" };
+const TRUSTED_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 function ownedPrivateRoot(t) {
   let dir;
   if (process.platform === "win32") {
@@ -33,10 +34,21 @@ function weakenRegistryFile(file) {
   if (process.platform === "win32") {
     const literal = "'" + file.replace(/'/g, "''") + "'";
     const command = `$p=${literal}; $a=Get-Acl -LiteralPath $p; $sid=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11'); $r=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'Modify','Allow'); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
-    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive",
+    execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
       "-Command", command], { windowsHide: true });
   } else {
     fs.chmodSync(file, 0o666);
+  }
+}
+
+function revokeUntrustedRegistryFileGrant(file) {
+  if (process.platform === "win32") {
+    const literal = "'" + file.replace(/'/g, "''") + "'";
+    const command = `$p=${literal}; $a=Get-Acl -LiteralPath $p; $sid=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11'); $a.PurgeAccessRules($sid); Set-Acl -LiteralPath $p -AclObject $a`;
+    execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
+      "-Command", command], { windowsHide: true });
+  } else {
+    fs.chmodSync(file, 0o600);
   }
 }
 
@@ -49,7 +61,7 @@ test("strict atomic registry rejects insecure default inherited ACL/mode without
   if (process.platform === "win32") {
     diag.stage("INHERIT_CHECK");
     const literal = "'" + dir.replace(/'/g, "''") + "'";
-    const acl = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive",
+    const acl = execFileSync(TRUSTED_POWERSHELL, ["-NoProfile", "-NonInteractive",
       "-Command", "(Get-Acl -LiteralPath " + literal + ").AreAccessRulesProtected"],
     { encoding: "utf8", windowsHide: true });
     diag.trust(/False/i.test(acl) ? "INHERITED" : "PROTECTED");
@@ -99,6 +111,11 @@ test("strict atomic registry refuses a later untrusted file permission change", 
   diag.stage("REOPEN_CHECK");
   await assert.rejects(new SyncObjectStore(file, { atomicDeviceRegistry: true }).open(), UNSAFE);
   diag.trust("REJECTED");
+  diag.stage("ACL_REVOKE");
+  revokeUntrustedRegistryFileGrant(file);
+  diag.stage("TRUSTED_REOPEN");
+  await new SyncObjectStore(file, { atomicDeviceRegistry: true }).open();
+  diag.trust("PROTECTED");
   });
 });
 

@@ -663,16 +663,37 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
       windowsHide: true, encoding: "utf8", timeout: 12000,
     });
     diag.stage("ACE_READBACK");
-    if (apply.status === 0 && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(apply.stdout || ""))
+    let persisted = apply.status === 0
+      && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(apply.stdout || "");
+    if (!persisted) {
+      // Some hosted NTFS configurations cannot persist the raw generic mask
+      // through Set-Acl. Prove the same real destructive rights with a
+      // normalized FullControl ACE; never accept a synthetic or missing ACE.
+      const grant = spawnSync("C:\\Windows\\System32\\icacls.exe",
+        [parent, "/grant", "*S-1-5-11:(OI)(CI)F"],
+        { windowsHide: true, encoding: "utf8", timeout: 12000 });
+      assert.equal(grant.status, 0, "normalized unsafe ACL fixture must be written to NTFS");
+      const readback = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop';$p='" + quotedParent + "';" +
+        "$r=New-Object Security.AccessControl.RawSecurityDescriptor((Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm(),0);" +
+        "$found=$false;foreach($entry in $r.DiscretionaryAcl){" +
+        "if($entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
+        " (($entry.AccessMask -band 268435456) -ne 0 -or" +
+        " ($entry.AccessMask -band 327682) -ne 0)){$found=$true}};" +
+        "if(-not $found){exit 3};Write-Output 'UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND';"],
+        { windowsHide: true, encoding: "utf8", timeout: 12000 });
+      persisted = readback.status === 0
+        && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(readback.stdout || "");
+    }
+    if (persisted)
       diag.trust("UNTRUSTED_ADDED");
-    assert.equal(apply.status, 0, apply.stderr);
-    assert.match(apply.stdout, /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/,
+    assert.equal(persisted, true,
       "fixture must store a GENERIC_ALL ACE or its dangerous normalized file-right equivalent");
     diag.stage("GUARD_VERIFY");
     const check = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-File", nativeScript,
       "-Action", "verify", "-Directory", parent], { encoding: "utf8", windowsHide: true });
     diag.trust(check.status === 0 ? "ACCEPTED" : "REJECTED");
-    assert.notEqual(check.status, 0, "raw GENERIC_ALL cannot pass the ACL guardian");
+    assert.notEqual(check.status, 0, "generic or normalized destructive rights cannot pass the ACL guardian");
     process.env.LOCALAPPDATA = parent;
     fs.openSync = function (name, ...args) {
       if (typeof name === "string" && path.basename(name) === "image.sqlite") wrote = true;
