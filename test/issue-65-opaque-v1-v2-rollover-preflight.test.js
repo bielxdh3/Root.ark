@@ -53,7 +53,7 @@ const signed = async (domain, body, privateKey) =>
       Buffer.from(await z.encodeDeterministic(body))]), privateKey) }));
 function witnessChild(setup, action, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = fork(path.join(__dirname, "support", "issue-65-stage-witness-child.js"),
+    const child = fork(path.join(__dirname, "..", "scripts", "fixtures", "issue-65-stage-witness-child.js"),
       [], { windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
     let answer;
     child.once("message", (message) => { answer = message; });

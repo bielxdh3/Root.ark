@@ -23,3 +23,12 @@ test("historical recovery operator lock child stays outside automatic Node test 
   assert.equal(fs.existsSync(fixturePath), true,
     "the signed recovery operator must retain the real lock-process fixture");
 });
+
+test("legacy V1/V2 stage witness IPC child stays outside automatic Node test discovery", () => {
+  const oldPath = path.resolve(__dirname, "support/issue-65-stage-witness-child.js");
+  const fixturePath = path.resolve(__dirname, "../scripts/fixtures/issue-65-stage-witness-child.js");
+  assert.equal(fs.existsSync(oldPath), false,
+    "Node --test must never treat the IPC-only stage witness as a passing test");
+  assert.equal(fs.existsSync(fixturePath), true,
+    "real cross-process signed-stage witness fixture must remain available");
+});
