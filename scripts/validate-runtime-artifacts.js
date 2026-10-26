@@ -5,18 +5,31 @@ const { execFileSync } = require("child_process");
 const protectedRoots = ["uploads", "temp", "data/backups", "data/trash", "data/quarantine"];
 const protectedFiles = [/^data\/.*\.(sqlite|sqlite-wal|sqlite-shm)$/i, /^data\/.*\.(sqlite-wal|sqlite-shm)$/i, /^data\/(token|credential)/i];
 
+function inspectedPathStat(target) {
+  // existsSync follows links, including Windows junctions, and incorrectly
+  // classifies a broken link as absent. Never follow links inside runtime roots.
+  try { return fs.lstatSync(target); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+}
+
 function hasContent(root, relative) {
   const target = path.join(root, relative);
-  return fs.existsSync(target) && fs.readdirSync(target).length > 0;
+  const stat = inspectedPathStat(target);
+  if (!stat) return false;
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return true;
+  return fs.readdirSync(target).length > 0;
 }
 
 function findProtectedFiles(root, relative = "data") {
   const target = path.join(root, relative);
-  if (!fs.existsSync(target)) return [];
+  const stat = inspectedPathStat(target);
+  if (!stat) return [];
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return [relative];
   const found = [];
   for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
     const child = path.posix.join(relative.replace(/\\/g, "/"), entry.name);
-    if (entry.isDirectory()) found.push(...findProtectedFiles(root, child));
+    if (entry.isSymbolicLink()) found.push(child);
+    else if (entry.isDirectory()) found.push(...findProtectedFiles(root, child));
     else if (protectedFiles.some((pattern) => pattern.test(child))) found.push(child);
   }
   return found;
