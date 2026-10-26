@@ -3,18 +3,19 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const test = require("node:test");
 const express = require("express");
 const Database = require("better-sqlite3");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const { registerZk1ProtectedContentFromConfig } = require("../src/services/zk1ProtectedContentBootstrap");
 
 test("app opt-in requires independently provisioned roots, explicit genesis and authenticated owner binding", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-bootstrap-"));
+  const dir = createPrivateAuthorityFixture("rootark-zk1-bootstrap-");
   const objects = [];
   t.after(() => {
     for (const store of objects) store.close();

@@ -24,7 +24,14 @@ function findProtectedFiles(root, relative = "data") {
 
 function validateRuntimeArtifacts(root = process.cwd()) {
   const violations = [...protectedRoots.filter((relative) => hasContent(root, relative)), ...findProtectedFiles(root)];
-  const status = execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" });
+  // The caller may be operating another worktree. Inspect this root's .git,
+  // never a repository or index selected by inherited Git environment state.
+  const gitEnv = { ...process.env };
+  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"]) {
+    delete gitEnv[name];
+  }
+  const status = execFileSync("git", ["status", "--porcelain"],
+    { cwd: root, encoding: "utf8", env: gitEnv });
   for (const line of status.split(/\r?\n/).filter(Boolean)) {
     const relative = line.slice(3).replace(/\\/g, "/");
     if (protectedFiles.some((pattern) => pattern.test(relative))) violations.push(relative);

@@ -8,10 +8,25 @@ const { validateRuntimeArtifacts } = require("../scripts/validate-runtime-artifa
 
 test("runtime artifact guard passes cleanly and fails on a disposable seeded database", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-artifact-"));
-  execFileSync("git", ["init", "-q"], { cwd: root });
-  assert.doesNotThrow(() => validateRuntimeArtifacts(root));
-  fs.mkdirSync(path.join(root, "data"), { recursive: true });
-  fs.writeFileSync(path.join(root, "data", "rootark.sqlite"), "disposable");
-  assert.throws(() => validateRuntimeArtifacts(root), /Runtime artifact guard failed/);
-  fs.rmSync(root, { recursive: true, force: true });
+  const gitEnv = { ...process.env };
+  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"]) {
+    delete gitEnv[name];
+  }
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: root, env: gitEnv });
+    // A caller's unrelated worktree must not steer the gate's git inspection.
+    const originalWorkTree = process.env.GIT_WORK_TREE;
+    process.env.GIT_WORK_TREE = path.join(root, "unrelated-worktree");
+    try {
+      assert.doesNotThrow(() => validateRuntimeArtifacts(root));
+      fs.mkdirSync(path.join(root, "data"), { recursive: true });
+      fs.writeFileSync(path.join(root, "data", "rootark.sqlite"), "disposable");
+      assert.throws(() => validateRuntimeArtifacts(root), /Runtime artifact guard failed/);
+    } finally {
+      if (originalWorkTree === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = originalWorkTree;
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
