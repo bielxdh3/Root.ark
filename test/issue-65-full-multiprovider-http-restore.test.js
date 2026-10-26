@@ -641,6 +641,46 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     }
   });
 
+  await t.test("last counted provider await cannot rebind an already rechecked quorum peer", async () => {
+    for (const changed of ["namespace", "key", "enabled"]) {
+      let rebound = false;
+      let driveContextChecks = 0;
+      const s3 = { ...readers[0], cloudReader: {
+        ...readers[0].cloudReader,
+        zk1StorageNamespace() {
+          return rebound && changed === "namespace" ? "c".repeat(64)
+            : s3Adapter.zk1StorageNamespace();
+        },
+        key(...args) {
+          const key = s3Adapter.key(...args);
+          return rebound && changed === "key" ? `swapped/${key}` : key;
+        },
+        enabled() {
+          return rebound && changed === "enabled" ? false : s3Adapter.enabled();
+        },
+      } };
+      const drive = { ...readers[1], cloudReader: {
+        ...readers[1].cloudReader,
+        async resolveInventoryContext() {
+          const context = await driveAdapter.resolveInventoryContext();
+          // Its third context read is the final asynchronous quorum check.
+          // S3 already passed its final check when this mutation occurs.
+          if (++driveContextChecks === 3) rebound = true;
+          return context;
+        },
+      } };
+      await assert.rejects(gateway.restoreExact({ ...recoverInput,
+        readers: [s3, drive, readers[2]], minimumMatchingProviders: 2 }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      `late ${changed} rebind while checking Drive invalidates the S3/Drive quorum`);
+      assert.equal(driveContextChecks, 3,
+        "race is triggered after valid GETs and S3 final asynchronous check");
+      rebound = false;
+    }
+    const good = await gateway.restoreExact(recoverInput);
+    assert.deepEqual(good.ciphertext, ciphertext);
+  });
+
   await t.test("a verified 2/3 ciphertext quorum never waits on silent third provider", async () => {
     let thirdCalled = 0;
     const slow = { ...readers[2], cloudReader: { ...readers[2].cloudReader,

@@ -187,25 +187,24 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
   }
 }
 
+function countedReaderLocallyPinned(target, scope, operation) {
+  const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
+  const key = target.reader.key(address.folder, address.name, "uploads");
+  return target.reader.status?.()?.provider === target.provider
+    && target.reader.enabled?.() === true
+    && typeof key === "string"
+    && key === target.ownerPinnedObjectKey
+    && key.endsWith(`/uploads/${address.folder}/${address.name}`)
+    && target.reader.zk1StorageNamespace() === target.namespace;
+}
+
 async function assertCountedReaderStillPinned(target, scope, operation, deadline) {
   // An earlier successful GET is not a durable claim on a provider identity.
-  // Later providers and the fresh owner-status callback may run after its
-  // credentials, principal or namespace have changed. Recheck each counted
-  // reader immediately before returning any bytes, not just its GET peer.
-  const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
-  const locallyPinned = () => {
-    const key = target.reader.key(address.folder, address.name, "uploads");
-    return target.reader.status?.()?.provider === target.provider
-      && target.reader.enabled?.() === true
-      && typeof key === "string"
-      && key === target.ownerPinnedObjectKey
-      && key.endsWith(`/uploads/${address.folder}/${address.name}`)
-      && target.reader.zk1StorageNamespace() === target.namespace;
-  };
-  if (!locallyPinned()) deny();
+  // Later providers and fresh owner status may run after credentials change.
+  if (!countedReaderLocallyPinned(target, scope, operation)) deny();
   if (await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context) deny();
   deadline.assertActive();
-  if (!locallyPinned()) deny();
+  if (!countedReaderLocallyPinned(target, scope, operation)) deny();
 }
 
 class Zk1MultiproviderCiphertextRestore {
@@ -419,6 +418,12 @@ class Zk1MultiproviderCiphertextRestore {
       // pending. Fetch a NEW signed, nonce-fresh owner/device status after all
       // those awaits and enforce the bounded restore deadline before egress.
       await this.#current(operation);
+      // A later reader's awaited context check can rebind an earlier one.
+      // Close that local window with a synchronous sweep after the last await;
+      // this is still not a cross-provider atomic custody guarantee.
+      for (const match of good) {
+        if (!countedReaderLocallyPinned(match.countedReader, scope, operation)) deny();
+      }
       limit.assertActive();
       const ciphertext = Buffer.from(good[0].data);
       returned = Object.freeze({ status: "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE",

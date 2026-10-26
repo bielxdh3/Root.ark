@@ -36,6 +36,13 @@ principal/namespace switch during a later Drive GET, or during the final owner
 authorization check, invalidates the entire result even if both remote copies
 have the same signed digest and ciphertext root. The externally pinned provider
 domain attestations are also revalidated at the final decision point.
+Because the last reader's asynchronous principal check can change an earlier
+reader's local namespace, key or enabled status, a final synchronous sweep of
+all counted quorum readers follows the last await. A late local rebind fails
+closed even when both previously downloaded ciphertext copies still hash to
+the owner's pinned root. The DEV HTTP fixture reproduces this rebind after
+the first reader has already passed its prior synchronous and asynchronous
+checks, and verifies rejection for namespace, key and enabled-status changes.
 
 These are best-effort fail-closed observations, **not** a cross-provider atomic
 snapshot, lease, fencing token, or durable custody proof: a provider could
