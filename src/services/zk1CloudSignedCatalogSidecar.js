@@ -142,12 +142,21 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
       || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
     pinnedDomains(providerDomainPinset, scope, pinned);
     const payload = encodeCatalog({ ...signedCatalog, operationId });
+    // The canonical signed wire is frozen before staging and any provider
+    // awaits. Bind every remote bounded PUT to this exact trusted digest.
+    const payloadSha256 = crypto.createHash("sha256").update(payload).digest("hex");
     const address = copyAddress(scope, operationId);
     const keys = pinned.map((target) => target.adapter.key(
       address.folder, address.name, "uploads"));
     for (const [index, target] of pinned.entries())
       if (!writerLocallyPinned(target, address, keys[index])) deny();
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
+    // Bounded S3/Drive upload now requires native private staging ACLs on
+    // Windows. The ordinary shared OS temp root is not a trusted authority;
+    // fail closed rather than weakening the storage adapter's source checks.
+    // POSIX retains the original disposable staging directory behavior.
+    dir = process.platform === "win32"
+      ? await createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-write-")
+      : fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
     const staged = path.join(dir, "signed-catalog.ct");
     fs.writeFileSync(staged, payload, { flag: "wx", mode: 0o600 });
     const acknowledgements = [];
@@ -157,8 +166,7 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
       if (await target.adapter.resolveInventoryContext() !== target.context) deny();
       if (!writerLocallyPinned(target, address, expectedKey)) deny();
       const result = await target.adapter.upload(staged, address.folder, address.name,
-        "uploads", { zk1BoundedBytes: payload.length,
-          ...(target.provider === "webdav" ? { zk1ExpectedSha256: crypto.createHash("sha256").update(payload).digest("hex") } : {}),
+        "uploads", { zk1BoundedBytes: payload.length, zk1ExpectedSha256: payloadSha256,
           ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
       if (!writerLocallyPinned(target, address, expectedKey)
         || !result || result.provider !== target.provider || result.key !== expectedKey
