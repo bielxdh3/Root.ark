@@ -485,7 +485,19 @@ function createCloudStorage(options = {}) {
           || opened.dev !== stat.dev || opened.ino !== stat.ino) {
           throw cloudError("configuration", "Bounded ciphertext staging file changed identity");
         }
-        boundedBytes = fs.readFileSync(fd);
+        // The source may grow after fstat while another process still holds
+        // the inode. readFileSync(fd) can then allocate/read beyond the
+        // trusted ZK byte budget before the later identity check rejects it.
+        boundedBytes = Buffer.alloc(bound);
+        let offset = 0;
+        while (offset < bound) {
+          const count = fs.readSync(fd, boundedBytes, offset,
+            Math.min(64 * 1024, bound - offset), offset);
+          if (count <= 0 || count > bound - offset) {
+            throw cloudError("configuration", "Bounded ciphertext staging file truncated during capture");
+          }
+          offset += count;
+        }
         const ended = fs.fstatSync(fd, { bigint: true });
         if (boundedBytes.length !== bound || ended.dev !== opened.dev
           || ended.ino !== opened.ino || ended.size !== opened.size
