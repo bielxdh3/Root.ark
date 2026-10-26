@@ -16,6 +16,8 @@ const {
 } = require("../src/services/zk1ContentInventoryHttpsServer");
 const { createZk1ContentInventoryHttpsClient } =
   require("../src/services/zk1ContentInventoryHttpsClient");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const { signCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 
@@ -219,7 +221,7 @@ async function stopChild(childProcess) {
 }
 
 test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonauthorizing results", async (t) => {
-  const tlsDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-issue65-mtls-certs-"));
+  const tlsDir = createPrivateAuthorityFixture("rootark-issue65-mtls-certs-");
   const tls = makeCertificates(tlsDir);
   t.after(() => fs.rmSync(tlsDir, { recursive: true, force: true, maxRetries: 10 }));
 
