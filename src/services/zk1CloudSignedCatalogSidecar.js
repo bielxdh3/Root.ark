@@ -8,6 +8,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { createZk1PrivateCloudStagingDirectory } = require("./zk1PrivateCloudStagingDirectory");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
 const { Zk1ExternallyPinnedProviderDomains } =
@@ -213,7 +214,9 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
     let dir;
     try {
       if (await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context) deny();
-      dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
+      dir = target.provider === "webdav"
+        ? await limit.run(() => createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-read-"))
+        : fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
       const destination = path.join(dir, "catalog.ct");
       const received = await limit.run((signal) => target.adapter.download(address.folder, address.name,
         destination, "uploads", () => !signal.aborted,

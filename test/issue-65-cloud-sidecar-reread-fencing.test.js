@@ -91,8 +91,12 @@ function durableFixture(directory) {
     pinnedDriveFileId, domainAttestation }));
   const publication = { scope, operationId, signedCatalog, writers,
     providerDomainPinset: pinset };
+  // The Windows WebDAV path now performs native ACL verification in a bounded
+  // child process. Parallel CI test files can consume several seconds across
+  // three sequential providers; only this disposable fixture gets extra time.
   const verification = { scope, operationId, signedCatalog, readers,
-    providerDomainPinset: pinset, minimumMatchingProviders: 2, deadlineMs: 3000,
+    providerDomainPinset: pinset, minimumMatchingProviders: 2,
+    deadlineMs: process.platform === "win32" ? 8000 : 3000,
     observationOnly: true };
   return { directory, scope, operationId, signedCatalog, pinset,
     targets, readers, identities, publication, verification };
