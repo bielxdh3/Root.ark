@@ -252,6 +252,24 @@ class LocalSyncWebDavBridge {
     return path.join(parent, path.basename(target));
   }
 
+  async verifyWindowsItem(target) {
+    // One framed native check verifies the selected leaf (if present) and
+    // its private parent. A missing leaf still needs a trusted parent before
+    // PUT/MKCOL. Pin inode identity across the asynchronous ACL lookup.
+    const original = await fsp.lstat(target, { bigint: true }).catch((error) =>
+      error.code === "ENOENT" ? null : Promise.reject(error));
+    if (original?.isFile()) await this.windowsAclVerifier.verifyFile(target);
+    else await this.windowsAclVerifier.verify(original ? target : path.dirname(target));
+    if (original) {
+      const current = await fsp.lstat(target, { bigint: true });
+      if (current.dev !== original.dev || current.ino !== original.ino
+        || current.isDirectory() !== original.isDirectory()
+        || current.isFile() !== original.isFile()) {
+        throw new Error("Bridge item identity changed during ACL verification");
+      }
+    }
+  }
+
   async body(req) {
     const declared = Number(req.headers["content-length"]);
     if (Number.isSafeInteger(declared) && declared > this.maxBodyBytes) throw Object.assign(new Error("Payload too large"), { statusCode: 413 });
@@ -285,13 +303,12 @@ class LocalSyncWebDavBridge {
         // pathname, then pass every later lstat/fstat comparison. An untrusted
         // local SID with Modify/DELETE_CHILD on ANY ancestor or descendant
         // could race an authenticated request. Startup proves the full tree;
-        // each request revalidates the selected parent plus ALL its ancestors
-        // so unrelated data need not be recursively scanned per request.
+        // each request revalidates the selected leaf (if present), its parent,
+        // and ALL ancestors without rescanning unrelated data.
         // This excludes actors
         // with trusted owner/admin privileges; no pathname recheck solves that.
         try {
-          await this.windowsAclVerifier.verify(target === this.rootDir
-            ? this.rootDir : path.dirname(target));
+          await this.verifyWindowsItem(target);
         }
         catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
       }
@@ -448,7 +465,7 @@ class LocalSyncWebDavBridge {
       destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
       // The Destination header can select a different directory than the
       // authenticated source; its ancestry must be independently trusted.
-      try { await this.windowsAclVerifier.verify(path.dirname(destinationTarget)); }
+      try { await this.verifyWindowsItem(destinationTarget); }
       catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
     }
     if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");

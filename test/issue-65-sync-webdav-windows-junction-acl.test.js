@@ -254,3 +254,72 @@ test("Windows native ACL verifier stop rejects every queued check and never reus
   assert.equal(denied.status, 503);
   assert.equal(denied.body, "Untrusted bridge storage");
 });
+
+test("Windows local WebDAV refuses post-start untrusted leaf ACLs for reads and mutations", {
+  skip: process.platform !== "win32", timeout: 35_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-leaf-drift-");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  const port = bridge.address().port;
+  const grantUnsafeLeaf = (name, content) => {
+    const filename = path.join(root, name);
+    fs.writeFileSync(filename, content);
+    // A trusted operator may import an ACL-bearing file after startup;
+    // an untrusted user can then alter its bytes without parent write access.
+    execFileSync("icacls.exe", [filename, "/grant", "*S-1-5-32-545:M"],
+      { stdio: "ignore", windowsHide: true });
+    return filename;
+  };
+  for (const method of ["GET", "PUT", "DELETE", "MOVE"]) {
+    const name = `unsafe-${method.toLowerCase()}.ct`;
+    const content = `ORIGINAL_${method}_BYTES`;
+    const file = grantUnsafeLeaf(name, content);
+    const denied = await request(port, `/${name}`, {
+      method, body: method === "PUT" ? "UNTRUSTED_REPLACEMENT" : null,
+      headers: method === "MOVE" ? { destination: `http://127.0.0.1:${port}/moved.ct` } : {},
+    });
+    assert.equal(denied.status, 503, `${method} must deny an unsafe existing file ACL`);
+    assert.equal(denied.body, "Untrusted bridge storage");
+    assert.equal(fs.readFileSync(file, "utf8"), content);
+  }
+  const safeSource = path.join(root, "safe-source.ct");
+  fs.writeFileSync(safeSource, "SAFE_SOURCE_BYTES");
+  const unsafeDestination = grantUnsafeLeaf("unsafe-destination.ct", "KEEP_DESTINATION_BYTES");
+  const deniedDestination = await request(port, "/safe-source.ct", {
+    method: "MOVE", headers: { destination: `http://127.0.0.1:${port}/unsafe-destination.ct` },
+  });
+  assert.equal(deniedDestination.status, 503, "MOVE must check an existing destination file ACL");
+  assert.equal(fs.readFileSync(safeSource, "utf8"), "SAFE_SOURCE_BYTES");
+  assert.equal(fs.readFileSync(unsafeDestination, "utf8"), "KEEP_DESTINATION_BYTES");
+});
+
+test("Windows local WebDAV keeps owner-only GET PUT MOVE DELETE working", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-leaf-positive-");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  const port = bridge.address().port;
+  const source = path.join(root, "trusted.ct");
+  fs.writeFileSync(source, "TRUSTED_START");
+  assert.equal((await request(port, "/trusted.ct")).body, "TRUSTED_START");
+  assert.equal((await request(port, "/trusted.ct", { method: "PUT", body: "TRUSTED_REPLACEMENT" })).status, 204);
+  assert.equal((await request(port, "/trusted.ct")).body, "TRUSTED_REPLACEMENT");
+  assert.equal((await request(port, "/trusted.ct", {
+    method: "MOVE", headers: { destination: `http://127.0.0.1:${port}/moved.ct` },
+  })).status, 201);
+  assert.equal((await request(port, "/moved.ct")).body, "TRUSTED_REPLACEMENT");
+  assert.equal((await request(port, "/moved.ct", { method: "DELETE" })).status, 204);
+  assert.equal(fs.existsSync(path.join(root, "moved.ct")), false);
+});

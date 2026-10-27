@@ -147,6 +147,18 @@ public static class RootarkChunkAclNative {
       AssertRestrictedItem(root, false, trusted);
       return String.Empty;
     }
+    if (action == "verify-bridge-file") {
+      // The parent must remain a trusted directory, and the leaf must not
+      // acquire a writable/readable foreign ACE after the startup tree scan.
+      AssertTrustedOwnerAndSafeAncestors(root, trusted);
+      string parent = Path.GetDirectoryName(root);
+      AssertDirectoryNoReparse(parent);
+      AssertRestrictedItem(parent, false, trusted);
+      if ((File.GetAttributes(root) & FileAttributes.Directory) != 0)
+        throw new InvalidOperationException("Bridge leaf must be a file");
+      AssertRestrictedItem(root, false, trusted);
+      return String.Empty;
+    }
     AssertTrustedOwnerAndSafeAncestors(root, trusted);
     if (action == "create") {
       if (!Directory.Exists(root)) {
@@ -248,9 +260,14 @@ function verifyWindowsLocalWebDavDirectory(directory) {
 // A single worker and at most 16 waiting requests bound native admission.
 function createWindowsLocalWebDavAclVerifier() {
   if (process.platform !== "win32") {
-    return { verify: async () => {}, stop: () => {} };
+    return { verify: async () => {}, verifyFile: async () => {}, stop: () => {} };
   }
-  const script = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n` + String.raw`
+  // Windows CreateProcess has a 32K command-line limit. The native source is
+  // shared with the one-shot verifier; omit comment-only/blank C# lines from
+  // this EncodedCommand rather than weakening checks or spawning per request.
+  const compactNativeAcl = NATIVE_ACL.replace(/^[ \t]*\/\/[^\r\n]*\r?\n/gm, "")
+    .replace(/^[ \t]*\r?\n/gm, "");
+  const script = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n${compactNativeAcl}\n'@\n` + String.raw`
 [Console]::Out.WriteLine('READY')
 [Console]::Out.Flush()
 while ($true) {
@@ -258,12 +275,13 @@ while ($true) {
   if ($null -eq $line) { break }
   if ($line.Length -gt 131072) { break }
   $parts = $line.Split('|')
-  if ($parts.Length -ne 2 -or $parts[0] -cnotmatch '^[a-f0-9]{32}$') { break }
+  if ($parts.Length -ne 3 -or $parts[0] -cnotmatch '^[a-f0-9]{32}$' -or ($parts[1] -cne 'D' -and $parts[1] -cne 'F')) { break }
   $nonce = $parts[0]
   try {
     $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
-    $directory = $utf8.GetString([Convert]::FromBase64String($parts[1]))
-    [void][RootarkChunkAclNative]::Ensure($directory, 'verify-bridge-directory')
+    $item = $utf8.GetString([Convert]::FromBase64String($parts[2]))
+    $action = if ($parts[1] -ceq 'F') { 'verify-bridge-file' } else { 'verify-bridge-directory' }
+    [void][RootarkChunkAclNative]::Ensure($item, $action)
     [Console]::Out.WriteLine($nonce + '|OK')
   } catch {
     [Console]::Out.WriteLine($nonce + '|DENY')
@@ -314,7 +332,7 @@ while ($true) {
     next.nonce = nonce;
     const bytes = Buffer.from(next.directory, "utf8").toString("base64");
     try {
-      if (!worker.stdin.write(nonce + "|" + bytes + "\n")) {
+      if (!worker.stdin.write(nonce + "|" + next.kind + "|" + bytes + "\n")) {
         // Pipe backpressure is bounded by one in-flight request. The response
         // cannot authorize a read without an exact matching nonce either way.
       }
@@ -373,13 +391,12 @@ while ($true) {
       child.on("exit", () => { if (worker === child) failWorker(); });
     } catch (_) { failWorker(); }
   }
-  return {
-    verify(directory) {
+  function enqueue(directory, kind) {
       if (closed || typeof directory !== "string" || !directory.length
         || Buffer.byteLength(directory, "utf8") > 65000
         || queue.length >= MAX_WAITING) return Promise.reject(rejectCheck());
       return new Promise((resolve, reject) => {
-        const job = { directory, resolve, reject, nonce: "", finished: false };
+        const job = { directory, kind, resolve, reject, nonce: "", finished: false };
         job.timer = setTimeout(() => {
           // If the child is blocked or its output is missing/ambiguous, fail
           // ALL unfinished checks, kill it, and never accept a late response.
@@ -389,7 +406,10 @@ while ($true) {
         startWorker();
         sendNext();
       });
-    },
+  }
+  return {
+    verify(directory) { return enqueue(directory, "D"); },
+    verifyFile(filename) { return enqueue(filename, "F"); },
     stop() {
       closed = true;
       failWorker();
