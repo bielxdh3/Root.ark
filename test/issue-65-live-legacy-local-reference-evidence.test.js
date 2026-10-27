@@ -4,13 +4,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyReferencePreflight: inspect } =
   require("../src/services/zk1LiveLegacyReferencePreflight");
 const { MIGRATIONS } = require("../db/migrations");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
+const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const PRIVATE_NAME = "PRIVATE-LEGACY-DO-NOT-EXPORT.txt";
@@ -18,7 +18,7 @@ const PRIVATE_ARCHIVE = `${PRIVATE_NAME}.v1`;
 const PAYLOAD = Buffer.from("local test-only historic version bytes");
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-local-ref-"));
+  const root = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-local-ref-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const uploadsDir = path.join(root, "uploads");
   const child = path.join(uploadsDir, "folder-a");
@@ -159,7 +159,7 @@ test("explicit local root must be absolute, present, and bounded", (t) => {
 });
 
 test("full migrated SQLite, real backup archive and real derived/version files combine without cutover proof", (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-combined-preflight-"));
+  const root = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-combined-preflight-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataDir = path.join(root, "data");
   const backupDir = path.join(dataDir, "backups");

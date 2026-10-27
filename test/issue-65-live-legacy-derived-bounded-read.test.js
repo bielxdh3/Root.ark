@@ -3,14 +3,14 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { inspectZk1LiveLegacyDerivedLocalEvidence } = require("../src/services/zk1LiveLegacyDerivedLocalEvidence");
+const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const runSecret = Buffer.alloc(32, 0x42);
 
 test("derived local observation includes only the stable bounded source bytes", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-derived-stable-"));
+  const directory = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-derived-stable-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
   fs.writeFileSync(path.join(directory, "artifact.bin"), Buffer.from("ok"));
   const result = inspectZk1LiveLegacyDerivedLocalEvidence({ tempDir: directory, runSecret });
@@ -20,7 +20,7 @@ test("derived local observation includes only the stable bounded source bytes", 
 });
 
 test("derived local observation never allocates an inode grown after descriptor fstat", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-derived-growth-"));
+  const directory = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-derived-growth-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
   const target = path.join(directory, "artifact.bin");
   fs.writeFileSync(target, Buffer.from("x"));
