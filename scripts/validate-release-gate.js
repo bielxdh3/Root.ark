@@ -7,6 +7,7 @@ const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
 const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 const { extractHostedAclFailureDiagnostics } = require("./release-gate-acl-diagnostics");
+const { summarizeUnrecognizedChild } = require("./release-gate-child-diagnostics");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -17,25 +18,12 @@ function record(name, status, details) {
 }
 
 function failedTestDiagnostics(output, tapStdout) {
-  const lines = String(output || "").split(/\r?\n/)
-    .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
-    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line));
-  const sanitize = (line) => line
-      .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
-      .replace(/\b(?:password|passphrase|client_secret|refresh_token|access_token|id_token|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
-      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
-      .slice(0, 240);
-  // The canonical Windows test suite may produce many errors *after* the
-  // first failed TAP cases. Retain their names separately instead of hiding
-  // the first failures behind the last 20 generic diagnostics. The printed
-  // output remains strictly allowlisted, redacted and bounded.
-  const failures = lines.filter((line) => /^(?:not ok \d+ - |[✖✗×] )/.test(line));
-  // Child stderr is untrusted free-form diagnostic text. Never associate its
-  // lines with a failed TAP case seen on stdout, even though the ordinary
-  // generic failure summary still processes the already-sanitized aggregate.
-  const aclStages = extractHostedAclFailureDiagnostics(tapStdout);
-  const selected = [...new Set([...aclStages, ...failures.slice(0, 96), ...failures.slice(-12), ...lines.slice(-16)])];
-  return selected.map(sanitize).join("\n").slice(0, 12000);
+  // Every freeform TAP name, exception, path or error message is untrusted.
+  // A few secret regex replacements are not an exhaustive output allowlist;
+  // retain ONLY the already identity-pinned categorical ACL diagnostics.
+  // Other failures remain visible as finite numeric counters/ordinals below.
+  void output;
+  return [...new Set(extractHostedAclFailureDiagnostics(tapStdout))].join("\n").slice(0, 12000);
 }
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
@@ -51,12 +39,9 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
   }
   record(name, "FAIL", `exit ${result.status ?? "unknown"}`);
   const diagnostics = failedTestDiagnostics(output, result.stdout || "");
-  if (diagnostics) console.log(`FAIL diagnostics (${name}):\n${diagnostics}`);
-  else {
-    const code = String(result.error?.code || "none");
-    const safeCode = /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "unknown";
-    console.log(`FAIL diagnostics (${name}): unrecognized child output; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")} spawnError=${safeCode}; raw output withheld`);
-  }
+  // Emit the categorical child envelope even for TAP/ACL failures; a child
+  // without trusted ACL telemetry never gets to print its arbitrary test name.
+  console.log(`FAIL diagnostics (${name}):\n${diagnostics ? `${diagnostics}\n` : ""}${summarizeUnrecognizedChild(result)}; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")}; raw output withheld`);
   return false;
 }
 

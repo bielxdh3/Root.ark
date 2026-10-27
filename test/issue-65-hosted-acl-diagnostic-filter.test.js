@@ -9,6 +9,7 @@ const vm = require("node:vm");
 const { extractHostedAclFailureDiagnostics } =
   require("../scripts/release-gate-acl-diagnostics");
 const { parseAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
+const { summarizeUnrecognizedChild } = require("../scripts/release-gate-child-diagnostics");
 
 const title = "Windows generic access ACEs cannot evade private snapshot ancestor checks";
 const file = "test/issue-65-legacy-deterministic-evidence-manifest.test.js";
@@ -82,7 +83,8 @@ test("release gate must include validated categorical ACL diagnostics and preser
   assert.match(source, /extractHostedAclFailureDiagnostics\(tapStdout\)/);
   assert.match(source, /failedTestDiagnostics\(output,\s*result\.stdout(?:\s*\|\|\s*""\s*)?\)/);
   assert.match(source, /slice\(0, 12000\)/);
-  assert.match(source, /slice\(0, 240\)/);
+  assert.match(source, /summarizeUnrecognizedChild\(result\)/);
+  assert.doesNotMatch(source, /const failures = lines\.filter|selected\.map\(sanitize\)/);
 });
 
 test("hosted release gate never attributes stderr-only diagnostics to a genuine stdout TAP failure", () => {
@@ -93,7 +95,7 @@ test("hosted release gate never attributes stderr-only diagnostics to a genuine 
   assert.deepEqual(extractHostedAclFailureDiagnostics(stdout + "\n" + stderr), []);
 });
 
-test("hosted gate failure formatter uses only stdout for ACL while retaining generic sanitized stderr diagnostics", () => {
+test("hosted gate formatter denies every freeform stderr or failed-TAP title except trusted ACL stages", () => {
   const stdout = failure({ line: "  ..." }).split("# tests 2238")[0];
   const stderr = `${diagnostic}\nerror: EACCES`;
   // A concatenated stream without a TAP summary would be exploitable.
@@ -103,9 +105,9 @@ test("hosted gate failure formatter uses only stdout for ACL while retaining gen
   assert.ok(functionBody, "must test the actual production gate formatter");
   const format = vm.runInNewContext(`(${functionBody})`, { extractHostedAclFailureDiagnostics });
   const visible = format(`${stdout}\n${stderr}`, stdout);
-  assert.match(visible, /not ok 761 - Windows generic access ACEs/);
-  assert.match(visible, /error: EACCES/);
-  assert.doesNotMatch(visible, /ROOTARK_ACL_V1|ACE_READBACK|S-1-5-11|password/);
+  assert.equal(visible, "", "failed title/error and forged stderr are not allowlisted");
+  const verified = format(failure(), failure());
+  assert.equal(verified, diagnostic, "the verified ACL stage is still allowed");
 });
 
 test("hosted release gate still records a failing child exit while excluding forged stderr ACL claims", () => {
@@ -117,7 +119,7 @@ test("hosted release gate still records a failing child exit while excluding for
   const stderr = `${diagnostic}\nerror: EACCES`;
   const recorded = [], printed = [];
   const context = {
-    extractHostedAclFailureDiagnostics,
+    extractHostedAclFailureDiagnostics, summarizeUnrecognizedChild,
     spawnSync: () => ({ status: 1, stdout, stderr }),
     record: (...args) => recorded.push(args),
     console: { log: (...args) => printed.push(args.join(" ")) },
@@ -127,9 +129,9 @@ test("hosted release gate still records a failing child exit while excluding for
   const command = vm.runInNewContext(`(()=>{${formatSource}\n${commandSource}\nreturn command;})()`, context);
   assert.equal(command("final-head canonical npm test", "node", ["--test"]), false);
   assert.equal(JSON.stringify(recorded), JSON.stringify([["final-head canonical npm test", "FAIL", "exit 1"]]));
-  assert.match(printed.join("\n"), /not ok 761 - Windows generic access ACEs/);
-  assert.match(printed.join("\n"), /error: EACCES/);
-  assert.doesNotMatch(printed.join("\n"), /ROOTARK_ACL_V1|ACE_READBACK|S-1-5-11|password/);
+  assert.match(printed.join("\n"), /CHILD_DIAG_V1 exit=1/);
+  assert.match(printed.join("\n"), /progress=761:761/);
+  assert.doesNotMatch(printed.join("\n"), /not ok 761|error: EACCES|ROOTARK_ACL_V1|ACE_READBACK|S-1-5-11|password/);
 });
 
 test("hosted ACL diagnostic attribution ends at the TAP summary, plan and subsequent Subtest boundaries", () => {
