@@ -1048,6 +1048,95 @@ test("concurrent first startup reopens a database file created by another proces
   }
 });
 
+test("POSIX quota startup distinguishes SQLite sidecar unlink from unsafe replacement", { skip: process.platform !== "linux" }, () => {
+  for (const suffix of ["-wal", "-shm"]) {
+    for (const outcome of ["unlinked", "symlink", "hardlink", "directory"]) {
+      const { parent, root } = createQuotaTestRoot("rootark-quota-sidecar-unlink-");
+      const sidecar = path.join(root, `.quota.sqlite${suffix}`);
+      const foreign = path.join(root, "other-sidecar");
+      fs.writeFileSync(sidecar, "transient sidecar", { flag: "wx", mode: 0o600 });
+      fs.writeFileSync(foreign, "foreign sentinel", { flag: "wx", mode: 0o600 });
+      const originalLstat = fs.lstatSync;
+      let injected = false;
+      let quota;
+      try {
+        fs.lstatSync = function (target, ...args) {
+          const info = originalLstat.call(this, target, ...args);
+          if (!injected && path.resolve(target) === sidecar) {
+            injected = true;
+            // A real POSIX lstat may observe nlink=0 while SQLite unlinks a
+            // sidecar. Remove the actual directory entry; spoof only the
+            // already-unlinked inode count returned by the racing stat call.
+            fs.unlinkSync(sidecar);
+            if (outcome === "symlink") fs.symlinkSync(foreign, sidecar);
+            else if (outcome === "hardlink") fs.linkSync(foreign, sidecar);
+            else if (outcome === "directory") fs.mkdirSync(sidecar);
+            info.nlink = 0;
+          }
+          return info;
+        };
+        if (outcome === "unlinked") {
+          quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 20, systemBytes: 20 });
+          assert.equal(quota.initialize().alreadyReady, false);
+          assert.equal(quota.isReady(), true);
+        } else {
+          assert.throws(() => createChunkUploadQuota({
+            rootDir: root, perAccountBytes: 20, systemBytes: 20,
+          }), /Unsafe chunk quota SQLite sidecar/, `${suffix} ${outcome} must fail closed`);
+        }
+        assert.equal(injected, true, `${suffix} ${outcome} actually hit the lstat/unlink race`);
+        assert.equal(fs.readFileSync(foreign, "utf8"), "foreign sentinel");
+      } finally {
+        fs.lstatSync = originalLstat;
+        quota?.close();
+        fs.rmSync(parent, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("POSIX quota startup never adopts a persistent zero-link or unsecured SQLite sidecar", { skip: process.platform !== "linux" }, () => {
+  for (const mode of ["persistent-zero-link", "unsafe-permissions"]) {
+    const { parent, root } = createQuotaTestRoot("rootark-quota-sidecar-deny-");
+    const sidecar = path.join(root, ".quota.sqlite-shm");
+    fs.writeFileSync(sidecar, "untrusted sidecar", { flag: "wx", mode: 0o600 });
+    const originalLstat = fs.lstatSync;
+    const originalChmod = fs.chmodSync;
+    let checked = 0;
+    try {
+      if (mode === "persistent-zero-link") {
+        fs.lstatSync = function (target, ...args) {
+          const info = originalLstat.call(this, target, ...args);
+          if (path.resolve(target) === sidecar) {
+            info.nlink = 0;
+            checked++;
+          }
+          return info;
+        };
+      } else {
+        fs.chmodSync(sidecar, 0o666);
+        fs.chmodSync = function (target, ...args) {
+          if (path.resolve(target) === sidecar) {
+            checked++;
+            throw Object.assign(new Error("SQLite sidecar permissions cannot be secured"), { code: "EPERM" });
+          }
+          return originalChmod.call(this, target, ...args);
+        };
+      }
+      assert.throws(() => createChunkUploadQuota({
+        rootDir: root, perAccountBytes: 20, systemBytes: 20,
+      }), mode === "persistent-zero-link"
+        ? /Unsafe chunk quota SQLite sidecar/
+        : /SQLite sidecar permissions cannot be secured/);
+      assert.ok(checked > 0, `${mode}: the unsafe condition must actually be exercised`);
+    } finally {
+      fs.lstatSync = originalLstat;
+      fs.chmodSync = originalChmod;
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  }
+});
+
 test("separate Node processes cannot oversubscribe the shared system quota", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-processes-");
   const setup = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10 });
