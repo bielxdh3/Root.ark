@@ -261,19 +261,28 @@ test("WebDAV does not PUT a source rewritten after FD pin with its mtime restore
   const realFstat = fs.fstatSync;
   const realLstat = fs.lstatSync;
   let attacked = false;
-  // Model the observed NTFS 100ns timestamp collision deterministically:
-  // a same-size rewrite can preserve both mtimeNs and ctimeNs. The digest
-  // must catch this even when the metadata guard cannot distinguish writes.
+  let forgedFdMetadata = false;
+  let forgedNameMetadata = false;
+  // Model the observed NTFS timestamp collision deterministically: Windows
+  // runners may round fs.utimesSync differently, so force BOTH mtimeNs and
+  // ctimeNs to alias the original for the actual post-rewrite metadata guards.
+  // The publisher-pinned digest must catch altered bytes independently.
   fs.fstatSync = function (...args) {
     const stat = realFstat.apply(fs, args);
     if (attacked && stat.dev === original.dev && stat.ino === original.ino) {
       stat.ctimeNs = original.ctimeNs;
+      stat.mtimeNs = original.mtimeNs;
+      forgedFdMetadata = true;
     }
     return stat;
   };
   fs.lstatSync = function (...args) {
     const stat = realLstat.apply(fs, args);
-    if (attacked && args[0] === source) stat.ctimeNs = original.ctimeNs;
+    if (attacked && args[0] === source) {
+      stat.ctimeNs = original.ctimeNs;
+      stat.mtimeNs = original.mtimeNs;
+      forgedNameMetadata = true;
+    }
     return stat;
   };
   fs.readSync = function (fd, buffer, offset, length, position) {
@@ -301,7 +310,8 @@ test("WebDAV does not PUT a source rewritten after FD pin with its mtime restore
   assert.equal(changed.dev, original.dev);
   assert.equal(changed.ino, original.ino);
   assert.equal(changed.size, original.size);
-  assert.equal(changed.mtimeNs, original.mtimeNs);
+  assert.equal(forgedFdMetadata, true, "the FD guard must see identical mtime and ctime");
+  assert.equal(forgedNameMetadata, true, "the pathname guard must see identical mtime and ctime");
   assert.deepEqual(fs.readFileSync(source), substituted);
   assert.equal(f.requests.length, 0, "a modified source must never reach the remote HTTPS peer");
 });
