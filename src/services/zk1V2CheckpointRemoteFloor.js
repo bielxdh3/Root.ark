@@ -8,7 +8,8 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const z = require("../crypto/rootark-zk-1");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteAuthorityDirectory } =
   require("./zk1PrivateSqlitePath");
 const { nativeEd25519Spki } =
   require("../crypto/rootark-zk1-native-ed25519-public-key");
@@ -245,6 +246,7 @@ async function verifySignedHead(raw, { scope, pinnedFloorPublicKey,
 
 class Zk1V2CheckpointRemoteFloor {
   #db;
+  #filename;
   #scope;
   #cas;
   #floor;
@@ -257,6 +259,7 @@ class Zk1V2CheckpointRemoteFloor {
     floorPublicKey, ownerPublicKey, witnessPrivateKey, baseHeadDigest,
     baseCheckpointDigest, minimum } = {}) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)) deny();
+    this.#filename = filename;
     this.#scope = scopeOf(scope);
     if (this.#scope.compartment_id.length < 1
       || this.#scope.compartment_id.length > 128) deny();
@@ -286,11 +289,49 @@ class Zk1V2CheckpointRemoteFloor {
         checkpointDigest: this.#base.checkpoint_digest });
     const existed = fs.existsSync(filename);
     if (!existed && !bootstrapNew) deny();
-    if (existed) assertPrivateSqliteFile(filename);
-    else ensurePrivateSqliteDirectory(filename);
     const Database = require("better-sqlite3");
-    this.#db = new Database(filename);
+    let filePin;
     try {
+      if (existed) {
+        filePin = assertPrivateSqliteFile(filename);
+      } else {
+        ensurePrivateSqliteDirectory(filename);
+      }
+      this.#assertAuthorityDirectory();
+      if (existed) {
+        // An unrelated SQLite file must be refused read-only before WAL mode,
+        // CREATE TABLE or any other mutation. Identity is the authority pin.
+        const probe = new Database(filename, { readonly: true, fileMustExist: true });
+        try {
+          const tables = new Set(probe.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table'").all()
+            .map((row) => row.name));
+          if (!tables.has("floor_identity") || !tables.has("floor_event")
+            || probe.pragma("quick_check", { simple: true }) !== "ok") deny();
+          const saved = probe.prepare("SELECT identity FROM floor_identity WHERE id=1").get();
+          if (!saved || !same(saved.identity, identityDigest)) deny();
+        } finally { probe.close(); }
+      } else {
+        // SQLite's implicit creation would permit a pathname replacement
+        // between the admission checks and its first WAL open.
+        const fd = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
+          | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0), 0o600);
+        try {
+          const stat = fs.fstatSync(fd, { bigint: true });
+          if (!stat.isFile() || stat.nlink !== 1n) deny();
+          filePin = { dev: stat.dev, ino: stat.ino };
+        } finally { fs.closeSync(fd); }
+      }
+      this.#assertAuthorityDirectory();
+      const current = assertPrivateSqliteFile(filename);
+      if (current.dev !== filePin.dev || current.ino !== filePin.ino) deny();
+    } catch (_) { deny(); }
+    this.#assertAuthorityDirectory();
+    this.#db = new Database(filename, { fileMustExist: true });
+    try {
+      this.#assertAuthorityDirectory();
+      const current = assertPrivateSqliteFile(filename);
+      if (current.dev !== filePin.dev || current.ino !== filePin.ino) deny();
       this.#db.pragma("journal_mode = WAL");
       this.#db.pragma("synchronous = FULL");
       this.#db.exec(`CREATE TABLE IF NOT EXISTS floor_identity(id INTEGER PRIMARY KEY,
@@ -313,6 +354,10 @@ class Zk1V2CheckpointRemoteFloor {
       throw error;
     }
   }
+  #assertAuthorityDirectory() {
+    try { assertPrivateSqliteAuthorityDirectory(this.#filename); }
+    catch (_) { deny(); }
+  }
   async #verifyReceipts(v) {
     const { receiptMatches } = require("./zk1OpaqueCheckpointV2Remote");
     const fp = (pub) => hash(nativeEd25519Spki(pub));
@@ -333,6 +378,7 @@ class Zk1V2CheckpointRemoteFloor {
     this.#owner, byte(v.ownerSignature, 64))) deny();
   }
   #quickVerify() {
+    this.#assertAuthorityDirectory();
     const rows = this.#db.prepare("SELECT * FROM floor_event ORDER BY sequence").all();
     if (rows.length > 100000) deny();
     let head = { ...this.#base };
@@ -357,6 +403,7 @@ class Zk1V2CheckpointRemoteFloor {
     return head;
   }
   async #verify() {
+    this.#assertAuthorityDirectory();
     const rows = this.#db.prepare("SELECT * FROM floor_event ORDER BY sequence").all();
     if (rows.length > 4096) deny(); // deliberately bounded DEV full-history verification
     const before = snapshotDigest(rows);
@@ -404,6 +451,7 @@ class Zk1V2CheckpointRemoteFloor {
     return head;
   }
   async advance(v) {
+    this.#assertAuthorityDirectory();
     // Only a complete pinned owner+CAS+FLOOR signed FINALIZED package advances.
     const statement = advanceStatement({ scope: this.#scope, sequence: v.sequence,
       epoch: v.epoch, headDigest: v.headDigest, checkpointDigest: v.checkpointDigest,
@@ -436,6 +484,7 @@ class Zk1V2CheckpointRemoteFloor {
       || !same(normalized.previousCheckpointDigest, head.checkpoint_digest)) deny();
     const chain = hash(Buffer.from("v2-independent-floor-entry\0"), head.chain_hash,
       Buffer.from(await z.encodeDeterministic(statement)), normalized.ownerSignature);
+    this.#assertAuthorityDirectory();
     this.#db.transaction(() => {
       const row = this.#db.prepare("SELECT MAX(sequence) AS seq FROM floor_event").get();
       if ((row.seq || 128) !== head.sequence) deny();
@@ -452,6 +501,7 @@ class Zk1V2CheckpointRemoteFloor {
     return this.#trusted;
   }
   async freshHead(nonce, minimum) {
+    this.#assertAuthorityDirectory();
     const head = await this.#verify();
     if (head.sequence !== this.#trusted.sequence
       || !same(head.chain_hash, this.#trusted.chain_hash)) deny();
