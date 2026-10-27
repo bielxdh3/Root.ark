@@ -6,6 +6,7 @@ const path = require("node:path");
 const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
 const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
+const { extractHostedAclFailureDiagnostics } = require("./release-gate-acl-diagnostics");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -29,7 +30,8 @@ function failedTestDiagnostics(output) {
   // the first failures behind the last 20 generic diagnostics. The printed
   // output remains strictly allowlisted, redacted and bounded.
   const failures = lines.filter((line) => /^(?:not ok \d+ - |[✖✗×] )/.test(line));
-  const selected = [...new Set([...failures.slice(0, 96), ...failures.slice(-12), ...lines.slice(-16)])];
+  const aclStages = extractHostedAclFailureDiagnostics(output);
+  const selected = [...new Set([...aclStages, ...failures.slice(0, 96), ...failures.slice(-12), ...lines.slice(-16)])];
   return selected.map(sanitize).join("\n").slice(0, 12000);
 }
 
