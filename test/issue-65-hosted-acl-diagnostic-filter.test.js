@@ -8,9 +8,39 @@ const { spawnSync } = require("node:child_process");
 const vm = require("node:vm");
 const { extractHostedAclFailureDiagnostics } =
   require("../scripts/release-gate-acl-diagnostics");
+const { parseAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
 
 const title = "Windows generic access ACEs cannot evade private snapshot ancestor checks";
+const file = "test/issue-65-legacy-deterministic-evidence-manifest.test.js";
 const diagnostic = "# ROOTARK_ACL_V1 case=LEGACY_GENERIC_ACE stage=ACE_READBACK code=ASSERTION trust=UNKNOWN";
+
+test("ACL stage parser requires exact non-secret TAP title and test file instead of password hashes", () => {
+  const valid = { name: title, path: file };
+  assert.deepEqual(parseAclFailureDiagnostic(diagnostic, valid), {
+    stage: "ACE_READBACK", code: "ASSERTION", trust: "UNKNOWN",
+  });
+  for (const pending of [
+    { ...valid, name: `${title} ` },
+    { ...valid, name: title.slice(0, -1) },
+    { ...valid, name: `not ${title}` },
+    { ...valid, name: `${title}\npassword=secret` },
+    { ...valid, path: "test/other.test.js" },
+    { ...valid, path: `${file}.bak` },
+    { ...valid, path: `${file}\nS-1-5-11` },
+    { ...valid, path: `../${file}` },
+    { nameHash: "0".repeat(24), pathHash: "0".repeat(24) },
+  ]) assert.equal(parseAclFailureDiagnostic(diagnostic, pending), null);
+});
+
+test("hosted diagnostics compare public TAP identities directly without a cryptographic password hash", () => {
+  for (const relative of ["../scripts/release-gate-acl-diagnostics.js", "../scripts/acl-test-failure-diagnostic.js"]) {
+    const source = fs.readFileSync(path.join(__dirname, relative), "utf8");
+    assert.doesNotMatch(source, /createHash|node:crypto|nameHash|pathHash|sha256/i);
+  }
+  const nearCollision = failure({ name: `${title}!`, location: `D:\\a\\Root.ark\\Root.ark\\${file.replace(/\//g, "\\")}:689:1` });
+  assert.deepEqual(extractHostedAclFailureDiagnostics(nearCollision), []);
+  assert.deepEqual(extractHostedAclFailureDiagnostics(failure({ name: title.replace("cannot", "can") })), []);
+});
 
 function failure({ name = title, location = String.raw`D:\a\Root.ark\Root.ark\test\issue-65-legacy-deterministic-evidence-manifest.test.js:689:1`, line = diagnostic } = {}) {
   return ["TAP version 13", `not ok 761 - ${name}`, "  ---",
@@ -76,6 +106,30 @@ test("hosted gate failure formatter uses only stdout for ACL while retaining gen
   assert.match(visible, /not ok 761 - Windows generic access ACEs/);
   assert.match(visible, /error: EACCES/);
   assert.doesNotMatch(visible, /ROOTARK_ACL_V1|ACE_READBACK|S-1-5-11|password/);
+});
+
+test("hosted release gate still records a failing child exit while excluding forged stderr ACL claims", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../scripts/validate-release-gate.js"), "utf8");
+  const formatSource = source.match(/function failedTestDiagnostics\(output, tapStdout\) \{[\s\S]*?\n\}/)?.[0];
+  const commandSource = source.match(/function command\(name, executable, args, \{ blockedOnMissing = false, shell = false \} = \{\}\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(formatSource && commandSource, "must exercise unchanged release gate exit handling");
+  const stdout = failure({ line: "  ..." }).split("# tests 2238")[0];
+  const stderr = `${diagnostic}\nerror: EACCES`;
+  const recorded = [], printed = [];
+  const context = {
+    extractHostedAclFailureDiagnostics,
+    spawnSync: () => ({ status: 1, stdout, stderr }),
+    record: (...args) => recorded.push(args),
+    console: { log: (...args) => printed.push(args.join(" ")) },
+    isDependencyOrNetworkUnavailable: () => false,
+    Buffer, root: "test-only",
+  };
+  const command = vm.runInNewContext(`(()=>{${formatSource}\n${commandSource}\nreturn command;})()`, context);
+  assert.equal(command("final-head canonical npm test", "node", ["--test"]), false);
+  assert.equal(JSON.stringify(recorded), JSON.stringify([["final-head canonical npm test", "FAIL", "exit 1"]]));
+  assert.match(printed.join("\n"), /not ok 761 - Windows generic access ACEs/);
+  assert.match(printed.join("\n"), /error: EACCES/);
+  assert.doesNotMatch(printed.join("\n"), /ROOTARK_ACL_V1|ACE_READBACK|S-1-5-11|password/);
 });
 
 test("hosted ACL diagnostic attribution ends at the TAP summary, plan and subsequent Subtest boundaries", () => {

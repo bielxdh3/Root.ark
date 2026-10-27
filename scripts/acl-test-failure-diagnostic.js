@@ -3,8 +3,6 @@
 // Security-sensitive Windows ACL test telemetry: fixed categorical vocabulary
 // only. Never expose PowerShell stderr/stdout, paths, SIDs, ACEs or exception
 // messages to the hosted canonical test log.
-const { createHash } = require("node:crypto");
-
 const CASES = Object.freeze({
   LEGACY_GENERIC_ACE: {
     file: "test/issue-65-legacy-deterministic-evidence-manifest.test.js",
@@ -29,7 +27,6 @@ const CASES = Object.freeze({
 });
 const TRUST = new Set(["UNKNOWN", "INHERITED", "PROTECTED", "UNTRUSTED_ADDED", "REJECTED", "ACCEPTED", "QUARANTINED"]);
 const ERRORS = new Set(["UNKNOWN", "ASSERTION", "ATOMIC_UNSAFE", "PERMISSION", "RUNTIME"]);
-const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 const LINE = /^# ROOTARK_ACL_V1 case=([A-Z_]{1,32}) stage=([A-Z_]{1,32}) code=([A-Z_]{1,32}) trust=([A-Z_]{1,32})$/;
 
 function classify(error) {
@@ -72,7 +69,7 @@ function parseAclFailureDiagnostic(line, pending) {
   const [, caseId, stage, code, trust] = match;
   const config = CASES[caseId];
   if (!config || !config.stages.includes(stage) || !ERRORS.has(code) || !TRUST.has(trust)
-    || pending.nameHash !== hash(config.title) || pending.pathHash !== hash(config.file)) return null;
+    || pending.name !== config.title || pending.path !== config.file) return null;
   return { stage, code, trust };
 }
 
