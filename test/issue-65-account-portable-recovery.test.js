@@ -86,6 +86,26 @@ function signAltered(f, mutate) {
   return { ...f.recovery(f.sealed), accountArchive, independentlyPinnedAccountSha256 };
 }
 
+function corruptGcmTag(ciphertextBase64) {
+  // Replacing a random base64url suffix with "AA" can be a no-op when the
+  // original already ends in "AA". Flip an actual authenticated tag byte.
+  const ciphertext = Buffer.from(ciphertextBase64, "base64url");
+  assert.ok(ciphertext.length >= 17);
+  ciphertext[ciphertext.length - 1] ^= 1;
+  const corrupted = b64(ciphertext);
+  assert.notEqual(corrupted, ciphertextBase64);
+  return corrupted;
+}
+
+test("account ciphertext corruption always alters the GCM tag, including an AA suffix", () => {
+  const original = b64(Buffer.alloc(17));
+  assert.ok(original.endsWith("AA"), "adversarial fixture reproduces prior no-op mutation");
+  const changed = corruptGcmTag(original);
+  assert.notEqual(changed, original);
+  assert.equal(Buffer.from(changed, "base64url").length, 17);
+  assert.equal(Buffer.from(changed, "base64url").at(-1), 1);
+});
+
 test("owner signed account manifest atomically recovers independent keyrings under one offline pin", async () => {
   const f = await fixture();
   f.sealed = await api.createArchive(f.create);
@@ -144,7 +164,7 @@ test("owner signed aggregate with corrupted last keyring cannot release earlier 
   f.sealed = await api.createArchive(f.create);
   const malicious = signAltered(f, (aggregate) => {
     const last = aggregate.keyrings.at(-1);
-    last.archive.ciphertextBase64 = last.archive.ciphertextBase64.slice(0, -2) + "AA";
+    last.archive.ciphertextBase64 = corruptGcmTag(last.archive.ciphertextBase64);
     last.archiveSha256 = b64(crypto.createHash("sha256")
       .update(JSON.stringify(last.archive)).digest());
   });
