@@ -5,6 +5,7 @@
 // boundary. It cannot establish cloud fsync, current revocation on its own,
 // permanent remote custody, cross-provider atomicity or an I/O permit.
 const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -162,9 +163,21 @@ function createPrivateRestoreStagingDirectory() {
     || current.dev !== windowsPrivateRestoreRoot.dev
     || current.ino !== windowsPrivateRestoreRoot.ino
     || path.resolve(fs.realpathSync.native(root)).toLowerCase() !== path.resolve(root).toLowerCase()) deny();
-  // Every random child inherits the verified protected DACL. Reuse the root
-  // to avoid launching an expensive PowerShell ACL audit for every cloud GET.
-  return fs.mkdtempSync(path.join(root, "zk1-cloud-recovery-"));
+  // Windows does not mark a new directory's inherited DACL as protected even
+  // when every inherited ACE came from a protected and verified parent. The
+  // WebDAV adapter requires the destination directory's own DACL_PROTECTED
+  // bit before O_EXCL, so convert only those trusted inherited ACEs to explicit
+  // ACEs with the pinned native utility. No permissions are granted or relaxed.
+  const directory = fs.mkdtempSync(path.join(root, "zk1-cloud-recovery-"));
+  try {
+    execFileSync("C:\\Windows\\System32\\icacls.exe", [directory, "/inheritance:d"], {
+      stdio: "ignore", windowsHide: true, timeout: 12000,
+    });
+    return directory;
+  } catch (_) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    deny();
+  }
 }
 async function exactGet(target, scope, operation, root, lengths, byteLength, deadline) {
   let dir;

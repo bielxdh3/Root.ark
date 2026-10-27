@@ -275,13 +275,18 @@ while ($true) {
   if ($null -eq $line) { break }
   if ($line.Length -gt 131072) { break }
   $parts = $line.Split('|')
-  if ($parts.Length -ne 3 -or $parts[0] -cnotmatch '^[a-f0-9]{32}$' -or ($parts[1] -cne 'D' -and $parts[1] -cne 'F')) { break }
+  if ($parts.Length -ne 3 -or $parts[0] -cnotmatch '^[a-f0-9]{32}$' -or ($parts[1] -cne 'D' -and $parts[1] -cne 'F' -and $parts[1] -cne 'P' -and $parts[1] -cne 'C')) { break }
   $nonce = $parts[0]
   try {
     $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
     $item = $utf8.GetString([Convert]::FromBase64String($parts[2]))
-    $action = if ($parts[1] -ceq 'F') { 'verify-bridge-file' } else { 'verify-bridge-directory' }
-    [void][RootarkChunkAclNative]::Ensure($item, $action)
+    if ($parts[1] -ceq 'C') {
+      [void][RootarkChunkAclNative]::Ensure($item, 'create')
+      [void][RootarkChunkAclNative]::Ensure($item, 'verify')
+    } else {
+      $action = if ($parts[1] -ceq 'F') { 'verify-bridge-file' } elseif ($parts[1] -ceq 'P') { 'verify' } else { 'verify-bridge-directory' }
+      [void][RootarkChunkAclNative]::Ensure($item, $action)
+    }
     [Console]::Out.WriteLine($nonce + '|OK')
   } catch {
     [Console]::Out.WriteLine($nonce + '|DENY')
@@ -409,6 +414,10 @@ while ($true) {
   }
   return {
     verify(directory) { return enqueue(directory, "D"); },
+    // Same strict, protected-root and recursive ACL verifier as the one-shot
+    // `verifyWindowsChunkUploadTree`, with its native C# compiled only once.
+    verifyPrivateDirectory(directory) { return enqueue(directory, "P"); },
+    createPrivateDirectory(directory) { return enqueue(directory, "C"); },
     verifyFile(filename) { return enqueue(filename, "F"); },
     stop() {
       closed = true;

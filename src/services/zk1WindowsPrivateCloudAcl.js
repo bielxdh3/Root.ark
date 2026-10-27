@@ -1,25 +1,14 @@
 "use strict";
 
-const { execFile } = require("node:child_process");
+const { createWindowsLocalWebDavAclVerifier } = require("../../services/chunkUploadWindowsAcl");
 
-// Run the existing pinned native Windows owner/ACL checker outside the HTTP
-// event loop. Synchronous PowerShell Add-Type in a provider GET can otherwise
-// stall unrelated requests. No PATH executable or caller-supplied script runs.
-const ACL_SUBPROCESS = String.raw`
-"use strict";
-try {
-  const acl = require(process.argv[3]);
-  const action = process.argv[1];
-  const directory = process.argv[2];
-  if (action === "create") acl.ensureWindowsChunkUploadRoot(directory);
-  else if (action !== "verify") throw Error("Unknown private cloud ACL action");
-  acl.verifyWindowsChunkUploadTree(directory);
-} catch (_) { process.exitCode = 1; }
-`;
-
-const ACL_MODULE = require.resolve("../../services/chunkUploadWindowsAcl");
+// Compile the exact same native strict ACL checks once in a bounded, private
+// PowerShell worker. Each request still checks current NTFS owner/DACL and
+// ancestry, with no cached verdict, shell or PATH lookup.
 const MAX_INFLIGHT = 4;
 let inflight = 0;
+let resident = null;
+let idleStop = null;
 
 function checkWindowsPrivateCloudDirectory(directory, action) {
   if (process.platform !== "win32") return Promise.resolve();
@@ -27,15 +16,21 @@ function checkWindowsPrivateCloudDirectory(directory, action) {
     || inflight >= MAX_INFLIGHT) {
     return Promise.reject(new Error("Unverifiable private cloud directory"));
   }
+  if (idleStop) { clearTimeout(idleStop); idleStop = null; }
+  if (!resident) resident = createWindowsLocalWebDavAclVerifier();
   inflight++;
-  return new Promise((resolve, reject) => {
-    execFile(process.execPath, ["-e", ACL_SUBPROCESS, action, directory, ACL_MODULE], {
-      windowsHide: true, timeout: 26000, maxBuffer: 4096, encoding: "utf8",
-    }, (error, stdout, stderr) => {
-      if (error || stdout || stderr) reject(new Error("Unverifiable private cloud directory"));
-      else resolve();
-    });
-  }).finally(() => { inflight--; });
+  const check = action === "create" ? resident.createPrivateDirectory(directory)
+    : resident.verifyPrivateDirectory(directory);
+  return check.finally(() => {
+    inflight--;
+    if (inflight === 0) {
+      idleStop = setTimeout(() => {
+        if (inflight === 0 && resident) { resident.stop(); resident = null; }
+        idleStop = null;
+      }, 2000);
+      idleStop.unref?.();
+    }
+  });
 }
 
 module.exports = { checkWindowsPrivateCloudDirectory };

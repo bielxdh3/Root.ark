@@ -550,7 +550,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       ...entry.cloudReader,
       async download(folder, name, destination, area, allowWrite, options) {
         // WebDAV's exclusive writer must never inherit a writable shared TEMP DACL.
-        verifyWindowsChunkUploadTree(path.dirname(path.dirname(destination)));
+        verifyWindowsChunkUploadTree(path.dirname(destination));
         guardedDownloads++;
         return entry.cloudReader.download(folder, name, destination, area, allowWrite, options);
       },
