@@ -9,6 +9,108 @@ const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor")
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
+test("CAS bootstrap rejects ancestor symlink without creating a foreign directory", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const root = createPrivateAuthorityFixture("rootark-cas-bootstrap-link-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const privateRoot = path.join(root, "private");
+  const foreign = path.join(root, "foreign");
+  fs.mkdirSync(privateRoot);
+  fs.mkdirSync(foreign);
+  fs.symlinkSync(foreign, path.join(privateRoot, "redirect"), "dir");
+  const foreignDirectory = path.join(foreign, "new-authority");
+  const filename = path.join(privateRoot, "redirect", "new-authority", "anchor.log");
+  const options = { bootstrapNew: true, statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey };
+  assert.equal(fs.existsSync(foreignDirectory), false);
+  assert.throws(() => new Zk1CasTerminalAnchor(filename, options), /CAS_ANCHOR_INVALID/);
+  assert.equal(fs.existsSync(foreignDirectory), false,
+    "reject the symlink before mkdir can modify the foreign directory tree");
+  assert.deepEqual(fs.readdirSync(foreign), [],
+    "a rejected bootstrap must leave the foreign parent untouched");
+});
+
+test("CAS bootstrap refuses a new sticky-parent symlink planted after preflight before mkdir", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const root = createPrivateAuthorityFixture("rootark-cas-bootstrap-mkdir-swap-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const sticky = path.join(root, "sticky-parent");
+  const foreign = path.join(root, "foreign");
+  fs.mkdirSync(sticky, { mode: 0o700 });
+  fs.chmodSync(sticky, 0o1777);
+  fs.mkdirSync(foreign, { mode: 0o700 });
+  const firstMissing = path.join(sticky, "attacker-entry");
+  const containingDirectory = path.join(firstMissing, "new-authority");
+  const filename = path.join(containingDirectory, "anchor.log");
+  const foreignDirectory = path.join(foreign, "new-authority");
+  const options = { bootstrapNew: true, statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey };
+  const actualMkdir = fs.mkdirSync;
+  let injected = false;
+  fs.mkdirSync = function (target) {
+    // Deterministic adversarial interleaving: a less-privileged principal can
+    // plant its own symlink in a trusted 01777 sticky parent after preflight.
+    // Old recursive mkdir is called for containingDirectory; safe
+    // component-wise mkdir is called for firstMissing. Trigger either call.
+    if (!injected && (target === containingDirectory || target === firstMissing)) {
+      injected = true;
+      fs.symlinkSync(foreign, firstMissing, "dir");
+    }
+    return actualMkdir.apply(this, arguments);
+  };
+  try {
+    assert.throws(() => new Zk1CasTerminalAnchor(filename, options), /CAS_ANCHOR_INVALID/);
+  } finally {
+    fs.mkdirSync = actualMkdir;
+  }
+  assert.equal(injected, true, "the symlink must land strictly after ancestor preflight");
+  assert.equal(fs.lstatSync(firstMissing).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(foreignDirectory), false,
+    "mkdir must not follow an attacker-injected symlink into foreign storage");
+  assert.deepEqual(fs.readdirSync(foreign), [],
+    "a rejected bootstrap must not create foreign directories or a signed journal");
+});
+
+test("CAS bootstrap preserves private journal creation and signed restart verification", (t) => {
+  const root = createPrivateAuthorityFixture("rootark-cas-bootstrap-private-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  // The Windows native verifier requires a protected DACL on the immediate
+  // journal directory; only POSIX supports recursive 0700 bootstrap here.
+  const directory = process.platform === "win32" ? root : path.join(root, "first", "second");
+  const filename = path.join(directory, "anchor.log");
+  const options = { statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey };
+  assert.equal(fs.existsSync(directory), process.platform === "win32");
+  const created = new Zk1CasTerminalAnchor(filename, { ...options, bootstrapNew: true });
+  assert.equal(created.sequence, 0);
+  assert.equal(fs.statSync(filename).isFile(), true);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(directory).mode & 0o077, 0,
+      "new authority directories must remain private to the service UID");
+  }
+  const restarted = new Zk1CasTerminalAnchor(filename, { ...options, bootstrapNew: false });
+  assert.equal(restarted.sequence, 0,
+    "new nested private directories must retain signed journal restart continuity");
+});
+
+test("CAS bootstrap retains the POSIX owner-owned sticky ancestor exception", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const root = createPrivateAuthorityFixture("rootark-cas-bootstrap-sticky-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const sticky = path.join(root, "sticky-parent");
+  fs.mkdirSync(sticky, { mode: 0o700 });
+  fs.chmodSync(sticky, 0o1777);
+  const filename = path.join(sticky, "private-child", "anchor.log");
+  const options = { statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey };
+  const anchor = new Zk1CasTerminalAnchor(filename, { ...options, bootstrapNew: true });
+  assert.equal(anchor.sequence, 0);
+  assert.equal(new Zk1CasTerminalAnchor(filename, { ...options, bootstrapNew: false }).sequence, 0);
+});
+
 test("CAS anchor refuses a foreign-owned 0755 ancestor on restart before any journal IO", {
   skip: process.platform === "win32",
 }, (t) => {

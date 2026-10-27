@@ -26,10 +26,27 @@ function fail() {
 // Anchor directories must be private to this service's OS principal. A
 // privileged actor able to rename trusted ancestors still needs an external
 // owner/witness floor for rollback protection.
-function assertPrivateDirectory(filename) {
-  let current = path.dirname(filename);
-  const containingDirectory = current;
+function assertPrivateDirectory(filename, existingAncestorsOnly = false) {
+  const containingDirectory = path.dirname(filename);
+  let current = containingDirectory;
   try {
+    if (existingAncestorsOnly) {
+      // Bootstrap can need to create nested private directories. Check the
+      // nearest EXISTING ancestor and everything above it before mkdir, so a
+      // preinstalled symlink cannot redirect even directory creation into a
+      // foreign tree. This ancestor retains the original sticky-dir exception;
+      // only the final containing directory must be strictly private.
+      for (;;) {
+        try { fs.lstatSync(current); break; }
+        catch (error) {
+          if (error?.code !== "ENOENT") fail();
+          const parent = path.dirname(current);
+          if (parent === current) fail();
+          current = parent;
+        }
+      }
+    }
+    const nearestExisting = current;
     while (true) {
       const stat = fs.lstatSync(current, { bigint: true });
       if (!stat.isDirectory() || stat.isSymbolicLink()) fail();
@@ -49,7 +66,31 @@ function assertPrivateDirectory(filename) {
       if (parent === current) break;
       current = parent;
     }
+    return nearestExisting;
   } catch (_) { fail(); }
+}
+function ensurePrivateAnchorDirectory(filename) {
+  // Never use mkdir(recursive): even after an ancestor preflight, an
+  // unprivileged actor can plant a symlink in a trusted 01777 sticky parent
+  // before mkdir. mkdir(recursive) would follow that symlink to create a
+  // foreign child *before* the post-create trust check rejects the journal.
+  const existing = assertPrivateDirectory(filename, true);
+  const relative = path.relative(existing, path.dirname(filename));
+  if (path.isAbsolute(relative) || relative === ".."
+    || relative.startsWith(".." + path.sep)) fail();
+  let current = existing;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    if (part === "." || part === "..") fail();
+    current = path.join(current, part);
+    try {
+      // EEXIST is not a benign concurrent bootstrap: the new name may be an
+      // attacker-owned symlink. Fail closed instead of following it.
+      fs.mkdirSync(current, { recursive: false, mode: 0o700 });
+    } catch (_) { fail(); }
+    // Each new component must be service-owned, non-reparse and private before
+    // it may be used as the parent for creating the next component.
+    assertPrivateDirectory(path.join(current, "_anchor_directory_check"));
+  }
 }
 function assertWindowsPrivateAnchorDirectory(filename) {
   if (process.platform !== "win32") return;
@@ -162,7 +203,7 @@ class Zk1CasTerminalAnchor {
       if (process.platform === "win32") {
         try { ensurePrivateSqliteDirectory(filename); } catch (_) { fail(); }
       } else {
-        fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+        ensurePrivateAnchorDirectory(filename);
       }
       assertPrivateDirectory(filename);
       assertWindowsPrivateAnchorDirectory(filename);
