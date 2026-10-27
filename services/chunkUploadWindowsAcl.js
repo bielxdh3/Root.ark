@@ -219,9 +219,18 @@ public static class RootarkChunkAclNative {
 }
 `;
 
+// Windows CreateProcess limits the *entire* argv command line to 32,767
+// characters. Base64-encoding the full C# source plus a long owner-private
+// path can exceed that limit even though the ACL itself is perfectly valid.
+// The bridge verifier already compiles this exact comment/blank-free source;
+// reuse it for the one-shot pinned PowerShell invocations, without removing
+// a single native security check or changing the fail-closed behavior.
+const COMPACT_NATIVE_ACL = NATIVE_ACL.replace(/^[ \t]*\/\/[^\r\n]*\r?\n/gm, "")
+  .replace(/^[ \t]*\r?\n/gm, "");
+
 function runAclScript(rootDir, action) {
   const escapedRoot = rootDir.replace(/'/g, "''");
-  const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
+  const script = `Add-Type -TypeDefinition @'\n${COMPACT_NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
     // Pin every ACL action, not only authority verification, while retaining
@@ -265,9 +274,7 @@ function createWindowsLocalWebDavAclVerifier() {
   // Windows CreateProcess has a 32K command-line limit. The native source is
   // shared with the one-shot verifier; omit comment-only/blank C# lines from
   // this EncodedCommand rather than weakening checks or spawning per request.
-  const compactNativeAcl = NATIVE_ACL.replace(/^[ \t]*\/\/[^\r\n]*\r?\n/gm, "")
-    .replace(/^[ \t]*\r?\n/gm, "");
-  const script = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n${compactNativeAcl}\n'@\n` + String.raw`
+  const script = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n${COMPACT_NATIVE_ACL}\n'@\n` + String.raw`
 [Console]::Out.WriteLine('READY')
 [Console]::Out.Flush()
 while ($true) {
@@ -438,4 +445,4 @@ function verifyWindowsAuthorityFilePath(filename) {
 
 module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
   verifyWindowsAuthorityFilePath, verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory,
-  createWindowsLocalWebDavAclVerifier };
+  createWindowsLocalWebDavAclVerifier, NATIVE_ACL, TRUSTED_POWERSHELL };
