@@ -222,7 +222,7 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
     let dir;
     try {
       if (await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context) deny();
-      dir = target.provider === "webdav"
+      dir = process.platform === "win32"
         ? await limit.run(() => createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-read-"))
         : fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
       const destination = path.join(dir, "catalog.ct");

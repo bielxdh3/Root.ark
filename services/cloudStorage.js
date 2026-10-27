@@ -670,9 +670,32 @@ function createCloudStorage(options = {}) {
     const cloudKey = objectKey(folderId, fileName, area);
     const parentPath = path.dirname(localPath);
     const guardParent = constraints ? pinBoundedDownloadParent(localPath) : null;
+    if (constraints && process.platform === "win32") {
+      // The destination's inode alone is not enough. A shared temp ancestor
+      // may rename the disposable staging directory while an SDK GET awaits,
+      // making a later createWriteStream(path) overwrite a foreign file.
+      try { await checkWindowsPrivateCloudDirectory(parentPath, "verify"); }
+      catch (_) {
+        throw cloudError("provider_error", "Bounded ciphertext destination is not private");
+      }
+      guardParent();
+    }
     if (!constraints) fs.mkdirSync(parentPath, { recursive: true });
     const stagingDirectory = fs.mkdtempSync(path.join(parentPath, ".rootark-cloud-cache-"));
     const stagedPath = path.join(stagingDirectory, path.basename(localPath));
+    const secureWindowsStage = Boolean(constraints && process.platform === "win32");
+    const pinnedStage = secureWindowsStage ? fs.lstatSync(stagingDirectory, { bigint: true }) : null;
+    const guardStage = secureWindowsStage ? () => {
+      guardParent();
+      const named = fs.lstatSync(stagingDirectory, { bigint: true });
+      if (!pinnedStage.isDirectory() || pinnedStage.isSymbolicLink()
+        || !named.isDirectory() || named.isSymbolicLink()
+        || named.dev !== pinnedStage.dev || named.ino !== pinnedStage.ino) {
+        throw cloudError("provider_error", "Bounded ciphertext staging directory changed");
+      }
+    } : null;
+    let stagedFd = null;
+    let pinnedFile = null;
     const boundedController = constraints ? new AbortController() : null;
     const boundedDeadline = boundedController ? setTimeout(() => boundedController.abort(), 15000) : null;
     const signal = boundedController?.signal;
@@ -683,6 +706,19 @@ function createCloudStorage(options = {}) {
     }
     try {
       if (signal?.aborted) throw cloudError("provider_error", "Cancelled bounded cloud readback");
+      if (secureWindowsStage) {
+        // Pin the actual output file BEFORE awaiting a remote provider. All
+        // streamed bytes go to this FD, never to a pathname resolved after a
+        // junction swap. O_EXCL refuses a preinstalled foreign leaf.
+        guardStage();
+        stagedFd = fs.openSync(stagedPath, fs.constants.O_WRONLY | fs.constants.O_CREAT
+          | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+        pinnedFile = fs.fstatSync(stagedFd, { bigint: true });
+        guardStage();
+        if (!pinnedFile.isFile() || pinnedFile.nlink !== 1n || pinnedFile.size !== 0n) {
+          throw cloudError("provider_error", "Bounded ciphertext staging file is unsafe");
+        }
+      }
       let input;
       if (provider === "s3") {
         const bucketName = bucket();
@@ -718,9 +754,27 @@ function createCloudStorage(options = {}) {
           if (size > constraints.maxBytes) next(cloudError("provider_error", "Ciphertext copy exceeds bounded readback size"));
           else next(null, chunk);
         } });
-        await pipeline(input, bounded, fs.createWriteStream(stagedPath), {
-          signal,
-        });
+        if (secureWindowsStage) {
+          guardStage();
+          await pipeline(input, bounded, fs.createWriteStream(null,
+            { fd: stagedFd, autoClose: false }), { signal });
+          const written = fs.fstatSync(stagedFd, { bigint: true });
+          guardStage();
+          const named = fs.lstatSync(stagedPath, { bigint: true });
+          if (!written.isFile() || written.nlink !== 1n
+            || written.dev !== pinnedFile.dev || written.ino !== pinnedFile.ino
+            || written.size !== BigInt(size)
+            || !named.isFile() || named.isSymbolicLink() || named.nlink !== 1n
+            || named.dev !== pinnedFile.dev || named.ino !== pinnedFile.ino
+            || named.size !== BigInt(size)) {
+            throw cloudError("provider_error", "Bounded ciphertext staging file changed");
+          }
+          fs.closeSync(stagedFd);
+          stagedFd = null;
+        } else {
+          // Preserve the POSIX bounded-download transport and staging flow.
+          await pipeline(input, bounded, fs.createWriteStream(stagedPath), { signal });
+        }
         if (boundedLengthOnly && size === 0) {
           throw cloudError("provider_error", "Empty signed catalog object");
         }
@@ -736,12 +790,21 @@ function createCloudStorage(options = {}) {
         // be able to win an exists/rename race and have its own bytes falsely
         // attributed to this GET. Hardlink publication is atomic NO_REPLACE
         // on the same filesystem (staging is under the destination parent).
-        guardParent();
+        if (guardStage) guardStage();
+        else guardParent();
         const stage = fs.lstatSync(stagedPath, { bigint: true });
-        if (!stage.isFile() || stage.isSymbolicLink() || stage.nlink !== 1n) {
+        if (!stage.isFile() || stage.isSymbolicLink() || stage.nlink !== 1n
+          || (pinnedFile && (stage.dev !== pinnedFile.dev || stage.ino !== pinnedFile.ino))) {
           throw cloudError("provider_error", "Bounded ciphertext staging is not a private file");
         }
         fs.linkSync(stagedPath, localPath);
+        if (pinnedFile) {
+          const published = fs.lstatSync(localPath, { bigint: true });
+          if (!published.isFile() || published.dev !== pinnedFile.dev
+            || published.ino !== pinnedFile.ino) {
+            throw cloudError("provider_error", "Bounded ciphertext published unexpected inode");
+          }
+        }
       } else {
         if (fs.existsSync(localPath)) return true;
         fs.renameSync(stagedPath, localPath);
@@ -751,6 +814,9 @@ function createCloudStorage(options = {}) {
       if (boundedController) boundedController.abort();
       throw classify(error);
     } finally {
+      if (stagedFd !== null) {
+        try { fs.closeSync(stagedFd); } catch (_) { /* descriptor already closed */ }
+      }
       if (boundedDeadline) clearTimeout(boundedDeadline);
       if (externalSignal) externalSignal.removeEventListener("abort", cancel);
       // A parent replaced by a junction after the provider call must not turn
@@ -759,6 +825,9 @@ function createCloudStorage(options = {}) {
       let cleanupSafe = true;
       if (guardParent) {
         try { guardParent(); } catch (_) { cleanupSafe = false; }
+      }
+      if (guardStage) {
+        try { guardStage(); } catch (_) { cleanupSafe = false; }
       }
       if (cleanupSafe) fs.rmSync(stagingDirectory, { recursive: true, force: true });
     }

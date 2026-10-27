@@ -138,10 +138,10 @@ class Zk1CloudCiphertextReadbackVerifier {
       if (typeof expectedKey !== "string" || !expectedKey.endsWith(`/uploads/${folder}/${name}`)) fail();
       const before = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());
       if (before !== this.#expectedContext) fail();
-      // WebDAV performs an exclusive local file create by pathname. Only that
-      // provider needs the Windows private-root admission precondition; keep
-      // the other providers' established disposable staging behavior intact.
-      dir = this.#expectedProvider === "webdav"
+      // Every bounded Windows provider GET now requires a private root:
+      // S3/Drive stage through a nested disposable directory, while WebDAV
+      // performs an exclusive create at the selected target pathname.
+      dir = process.platform === "win32"
         ? await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-readback-")
         : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-readback-"));
       const destination = path.join(dir, "ciphertext.ct");
