@@ -59,16 +59,68 @@ function assertPrivateSqliteAuthorityDirectory(filename) {
 }
 
 function ensurePrivateSqliteDirectory(filename) {
-  // Verify the existing ancestors BEFORE mkdir. mkdir(recursive) otherwise
-  // follows a preinstalled symlink and creates files in a foreign directory.
+  // A recursive mkdir can follow an attacker-planted junction in a missing
+  // ancestor AFTER the preflight, creating a foreign child before we refuse.
+  // Pin the nearest existing ancestor, then create each absent name without
+  // recursive traversal. POSIX EEXIST fails closed; Windows native creation
+  // always re-verifies the real owner, protected DACL and ancestry even when
+  // the name already existed after an interleaving.
+  const missing = [];
   let existing = path.dirname(filename);
-  while (!fs.existsSync(existing)) {
-    const parent = path.dirname(existing);
-    if (parent === existing) throw Error("UNTRUSTED_SQLITE_PATH");
-    existing = parent;
+  while (true) {
+    try {
+      const stat = fs.lstatSync(existing);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error("UNTRUSTED_SQLITE_PATH");
+      break;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw Error("UNTRUSTED_SQLITE_PATH");
+      const parent = path.dirname(existing);
+      if (parent === existing) throw Error("UNTRUSTED_SQLITE_PATH");
+      missing.push(path.basename(existing));
+      existing = parent;
+    }
   }
   checkDirectory(path.join(existing, "_sqlite_db"));
-  fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+  // Node's mkdir(mode:0700) does not protect an NTFS DACL: a newly created
+  // directory inherits an UNPROTECTED ACL even from a protected parent. The
+  // canonical native helper checks destructive grants on every existing
+  // ancestor *before* CreateDirectoryW and installs protected owner-only
+  // security attributes at creation, not as a vulnerable second step.
+  const native = process.platform === "win32"
+    ? require("../../services/chunkUploadWindowsAcl") : null;
+  try { native?.verifyWindowsChunkUploadTree(existing); }
+  catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
+  for (const name of missing.reverse()) {
+    // Recheck this PARENT immediately before writing the next child. In
+    // particular, reject a junction substituted after the previous child's
+    // post-mkdir verification, before native or POSIX mkdir may descend.
+    checkDirectory(path.join(existing, "_sqlite_db"));
+    try { native?.verifyWindowsChunkUploadTree(existing); }
+    catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
+    const child = path.join(existing, name);
+    // The component was absent at preflight. A name newly materialized in
+    // the meantime is not our directory and must not be adopted, including
+    // the native CREATE_ALREADY_EXISTS case.
+    try {
+      fs.lstatSync(child);
+      throw Error("UNTRUSTED_SQLITE_PATH");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw Error("UNTRUSTED_SQLITE_PATH");
+    }
+    try {
+      if (native) {
+        // Unlike fs.mkdirSync, native CreateDirectoryW receives an explicit
+        // protected owner/SYSTEM/Admin DACL at the instant of creation.
+        native.ensureWindowsChunkUploadRoot(child);
+        native.verifyWindowsChunkUploadTree(child);
+      } else fs.mkdirSync(child, { recursive: false, mode: 0o700 });
+    }
+    catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
+    existing = child;
+    // Do not descend into an untrusted replacement of the directory just
+    // created, even if the original mkdir returned successfully.
+    checkDirectory(path.join(existing, "_sqlite_db"));
+  }
   checkDirectory(filename);
 }
 
