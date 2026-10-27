@@ -150,7 +150,17 @@ function readRegular(file, maxSize, expectedFailure = "UNSAFE_FIXTURE_ENTRY", ve
     if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== before.dev
       || opened.ino !== before.ino || opened.size !== before.size
       || opened.mtimeNs !== before.mtimeNs || opened.ctimeNs !== before.ctimeNs) deny(expectedFailure);
-    const contents = fs.readFileSync(descriptor);
+    // The descriptor's file may grow after fstat even with its pathname and
+    // inode pinned. Never let readFileSync(fd) allocate through the attacker-
+    // controlled EOF: read exactly the already validated original byte budget.
+    const contents = Buffer.alloc(Number(opened.size));
+    let offset = 0;
+    while (offset < contents.length) {
+      const count = fs.readSync(descriptor, contents, offset,
+        contents.length - offset, offset);
+      if (count <= 0 || count > contents.length - offset) deny(expectedFailure);
+      offset += count;
+    }
     verifyBoundary();
     const after = fs.fstatSync(descriptor, { bigint: true });
     const again = fs.lstatSync(file, { bigint: true });
