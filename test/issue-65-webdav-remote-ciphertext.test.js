@@ -238,7 +238,11 @@ test("WebDAV rejects coercion-based remote path escape before any HTTPS PUT", as
 test("WebDAV does not PUT a source rewritten after FD pin with its mtime restored", async (t) => {
   const f = await fixture(t);
   const writer = createZk1WebdavCiphertextAdapter(f.config);
-  const staging = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-source-ctime-"));
+  // Windows CI may expose TEMP through a junction. The adapter correctly
+  // refuses such a parent before its pinned read begins; stage this specific
+  // rewrite regression in the native canonical directory instead.
+  const staging = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()),
+    "rootark-webdav-source-ctime-"));
   t.after(() => fs.rmSync(staging, { recursive: true, force: true, maxRetries: 5 }));
   const source = path.join(staging, "source.ct");
   const prior = Buffer.from(f.ciphertext);
