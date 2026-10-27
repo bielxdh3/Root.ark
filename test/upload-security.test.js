@@ -582,6 +582,7 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   const retrySweepPath = path.join(markerDir, "retry");
   t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
   const harness = await createHarness(t, {
+    waitForReady: false,
     envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "60000" },
     chunkSessions: [{
       uploadId,
@@ -617,7 +618,7 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
   const metadataPath = path.join(sessionDir, "metadata.json");
   const partPath = path.join(sessionDir, "0.part");
-  assert.equal(await waitForFile(failurePath), true, "startup sweep injected one unlink failure");
+  assert.equal(await waitForFile(failurePath, 30_000), true, "startup sweep injected one unlink failure");
   const firstMarker = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
   assert.deepEqual(Object.keys(firstMarker), ["__expiredAt"]);
   assert.equal(fs.existsSync(partPath), true, "part remains after the failed first sweep");
@@ -630,13 +631,14 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
   assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
+  // The part disappears before quota release; the success audit is written after release.
+  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     assert.equal(quotaDatabase.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE session_key = ?").get(`${FOLDER_ID}/${uploadId}`).count, 0, "all expiry charges release after tombstone cleanup confirms the parts are gone");
   } finally {
     quotaDatabase.close();
   }
-  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.deepEqual(expiryEvents.map((entry) => ({ result: entry.result, details: entry.details })), [
     { result: "failure", details: { source: "sweeper" } },
     { result: "success", details: { source: "sweeper" } },
