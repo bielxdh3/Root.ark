@@ -8,6 +8,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { createCloudStorage } = require("../services/cloudStorage");
+const { createZk1PrivateCloudStagingDirectory } =
+  require("../src/services/zk1PrivateCloudStagingDirectory");
 const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
   require("../src/services/zk1CloudCiphertextReadbackVerifier");
@@ -234,7 +236,11 @@ test("cloud ciphertext readback never allocates beyond pinned size if the downlo
 });
 
 test("bounded S3 readback never substitutes a file raced into the destination after GET", async () => {
-  const disposable = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-race-"));
+  // On Windows, a bounded GET deliberately refuses a shared OS temp root.
+  // Race the destination in a valid, ACL-protected private staging root.
+  const disposable = process.platform === "win32"
+    ? await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-race-")
+    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-race-"));
   const destination = path.join(disposable, "ciphertext.ct");
   const remoteBytes = Buffer.from("provider-ciphertext");
   const replacement = Buffer.from("untrusted-local-copy");

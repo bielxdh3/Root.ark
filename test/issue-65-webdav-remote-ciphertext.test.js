@@ -7,6 +7,11 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
+const { execFileSync } = require("node:child_process");
+const { createZk1PrivateCloudStagingDirectory } =
+  require("../src/services/zk1PrivateCloudStagingDirectory");
+const { checkWindowsPrivateCloudDirectory } =
+  require("../src/services/zk1WindowsPrivateCloudAcl");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { createZk1WebdavCiphertextAdapter } =
@@ -328,7 +333,7 @@ test("WebDAV must reject download parent replaced by a junction or fresh directo
   const f = await fixture(t);
   const { publisher, reader, writer } = await f.makePair();
   await publisher.publishExact(f.pubInput);
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-webdav-parent-race-"));
+  const scratch = await createZk1PrivateCloudStagingDirectory("rootark-zk1-webdav-parent-race-");
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
   const foreign = path.join(scratch, "foreign");
   fs.mkdirSync(foreign);
@@ -339,7 +344,8 @@ test("WebDAV must reject download parent replaced by a junction or fresh directo
   });
   for (const replacement of ["junction", "ordinary-directory"]) {
     const authorized = path.join(scratch, `authorized-${replacement}`);
-    fs.mkdirSync(authorized);
+    if (process.platform === "win32") await checkWindowsPrivateCloudDirectory(authorized, "create");
+    else fs.mkdirSync(authorized);
     const destination = path.join(authorized, "ciphertext.ct");
     let checked = 0;
     await assert.rejects(reader.download(folder, name, destination, "uploads", () => {
@@ -373,6 +379,69 @@ test("WebDAV must reject download parent replaced by a junction or fresh directo
   /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
   assert.equal(f.requests.length, sentBefore,
     "source through foreign parent must be refused before any HTTPS PUT");
+});
+
+test("Windows WebDAV never writes ciphertext through a swapped and restored parent junction", async (t) => {
+  if (process.platform !== "win32") return t.skip("NTFS ACL and directory junction regression");
+  const f = await fixture(t);
+  const { publisher, reader } = await f.makePair();
+  await publisher.publishExact(f.pubInput);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-webdav-ntfs-race-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const authorized = path.join(root, "authorized");
+  const relocated = path.join(root, "original");
+  const foreign = path.join(root, "foreign");
+  fs.mkdirSync(authorized);
+  fs.mkdirSync(foreign);
+  // Explicitly grant a non-service principal rename/write rights. The guard
+  // must reject this destination even if an attacker restores the original
+  // directory before the next pathname lstat/fstat.
+  execFileSync("C:\\Windows\\System32\\icacls.exe", [authorized,
+    "/grant", "*S-1-5-11:(OI)(CI)M"], { windowsHide: true });
+  const destination = path.join(authorized, "ciphertext.ct");
+  const outside = path.join(foreign, "ciphertext.ct");
+  const sentinel = path.join(foreign, "keep.txt");
+  fs.writeFileSync(sentinel, "untouched");
+  const { folder, name } = zk1CloudCopyAddress({
+    scope: f.pubInput.scope, operationId: f.pubInput.operationId,
+  });
+  const originalOpen = fs.openSync;
+  let intercepted = 0;
+  fs.openSync = function openThroughReplacedParent(filename, flags, ...rest) {
+    if (filename !== destination || (flags & fs.constants.O_EXCL) === 0) {
+      return originalOpen.call(this, filename, flags, ...rest);
+    }
+    intercepted++;
+    fs.renameSync(authorized, relocated);
+    fs.symlinkSync(foreign, authorized, "junction");
+    try { return originalOpen.call(this, filename, flags, ...rest); }
+    finally {
+      fs.rmdirSync(authorized);
+      fs.renameSync(relocated, authorized);
+    }
+  };
+  let outcome;
+  try {
+    outcome = await reader.download(folder, name, destination, "uploads", () => true,
+      { maxBytes: f.ciphertext.length }).then(() => "acknowledged", (error) => error.code);
+  } finally { fs.openSync = originalOpen; }
+  assert.equal(fs.existsSync(outside), false, "no network bytes may reach the foreign inode");
+  assert.equal(outcome, "ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE",
+    "WebDAV must fail closed rather than acknowledge an unsafe destination");
+  assert.equal(fs.existsSync(destination), false, "the denied write cannot be acknowledged");
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "untouched");
+  assert.ok(intercepted <= 1, "at most one exclusive open can be attempted");
+});
+
+test("Windows WebDAV private ACL verification does not block the Node event loop", async (t) => {
+  if (process.platform !== "win32") return t.skip("native Windows ACL subprocess contract");
+  const directory = await createZk1PrivateCloudStagingDirectory("rootark-zk1-webdav-async-acl-");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  let heartbeat = false;
+  const ping = new Promise((resolve) => setTimeout(() => { heartbeat = true; resolve(); }, 0));
+  await checkWindowsPrivateCloudDirectory(directory, "verify");
+  assert.equal(heartbeat, true, "native ACL verification must not block unrelated HTTP requests");
+  await ping;
 });
 
 test("WebDAV stalled HTTPS peer is terminated at the 15-second deadline", async (t) => {
