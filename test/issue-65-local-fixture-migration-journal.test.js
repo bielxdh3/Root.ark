@@ -13,13 +13,14 @@ const {
   rollbackLocalFixtureCiphertextMigration,
 } = require("../src/services/zk1LocalFixtureMigrationJournal");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
+const { canonicalTestTempEnvironment } = require("./support/issue-65-canonical-temp-fixture");
 
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const bytes = Buffer.from("synthetic encrypted ciphertext, never plaintext/user material\x00", "utf8");
 const REFERENCE_KINDS = ["versions", "backups", "trash", "links", "derived", "retention"];
 
 function fixture(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-local-fixture-"));
+  const dir = fs.mkdtempSync(path.join(canonicalTestTempEnvironment(t), "rootark-zk-local-fixture-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   for (const sub of ["source", "target", "journal",
     ...REFERENCE_KINDS.map((kind) => "references/" + kind)])

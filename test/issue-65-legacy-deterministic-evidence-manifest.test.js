@@ -14,6 +14,7 @@ const { inspectZk1LegacyEvidenceManifest: inspect } =
   require("../src/services/zk1LegacyEvidenceManifest");
 const { createAclFailureDiagnostic } =
   require("../scripts/acl-test-failure-diagnostic");
+const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const sha = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
 const payload = Buffer.from("fixture ciphertext bytes \0 stored");
@@ -44,9 +45,34 @@ test("legacy hosted diagnostic 01 locked archiver ZIP constructor", () => {
 test("legacy hosted diagnostic 02 canonical Windows TEMP fixture root", {
   skip: process.platform !== "win32",
 }, () => {
-  const fixtureRoot = path.resolve(os.tmpdir());
+  const fixtureRoot = canonicalTestTemp();
+  // The OS-supplied TEMP may be a junction. Fixtures use its independently
+  // resolved directory so the production native directory guard stays strict.
   assert.ok(fs.realpathSync.native(fixtureRoot).toLowerCase() === fixtureRoot.toLowerCase(),
-    "Windows test TEMP root is redirected");
+    "Windows selected test fixture root remains redirected");
+  // Prove the selector resolves a real redirected TEMP, not just a currently
+  // canonical runner environment. The disposable junction never holds data.
+  const fixture = fs.mkdtempSync(path.join(fixtureRoot, "zk65-canonical-temp-probe-"));
+  const alias = path.join(fixture, "redirected-temp");
+  const original = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+  let linked = false;
+  try {
+    fs.symlinkSync(fixtureRoot, alias, "junction");
+    linked = true;
+    process.env.TEMP = alias;
+    process.env.TMP = alias;
+    assert.notEqual(path.resolve(os.tmpdir()).toLowerCase(), fixtureRoot.toLowerCase(),
+      "diagnostic must exercise a noncanonical TEMP junction");
+    assert.equal(canonicalTestTemp().toLowerCase(), fixtureRoot.toLowerCase(),
+      "test fixture selector must resolve redirected TEMP to its canonical root");
+  } finally {
+    for (const name of ["TEMP", "TMP"]) {
+      if (original[name] === undefined) delete process.env[name];
+      else process.env[name] = original[name];
+    }
+    if (linked) fs.rmdirSync(alias);
+    fs.rmdirSync(fixture);
+  }
 });
 
 test("legacy hosted diagnostic 03 canonical Windows LOCALAPPDATA snapshot root", {
@@ -79,7 +105,7 @@ async function archive(filename) {
 }
 
 async function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-deterministic-manifest-"));
+  const root = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-deterministic-manifest-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dirs = Object.fromEntries(["uploads", "temp", "trash", "backups", "data"]
     .map((item) => [item, path.join(root, item)]));

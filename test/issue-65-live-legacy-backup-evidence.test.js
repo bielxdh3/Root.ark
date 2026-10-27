@@ -4,13 +4,13 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
-const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
 const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyReferencePreflight: inspect } =
   require("../src/services/zk1LiveLegacyReferencePreflight");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
+const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const NAME = "rootark-backup-2026-10-23-08-00-00.zip";
@@ -20,7 +20,7 @@ const BYTES = Buffer.from("disposable synthetic backup archive bytes, not user d
 const SHA = crypto.createHash("sha256").update(BYTES).digest("hex");
 const TX_ID = "cb9733c6-b4a2-4faa-aac5-84d540155645";
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-live-backup-"));
+  const root = fs.mkdtempSync(path.join(canonicalTestTemp(), "rootark-zk-live-backup-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataDir = path.join(root, "data");
   const backupDir = path.join(dataDir, "backups");

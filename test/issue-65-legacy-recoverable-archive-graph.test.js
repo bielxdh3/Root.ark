@@ -2,7 +2,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { once } = require("node:events");
@@ -12,6 +11,7 @@ const { MIGRATIONS } = require("../db/migrations");
 const { inspectZk1LiveLegacyRecoverableArchiveGraph: inspect } =
   require("../src/services/zk1LiveLegacyRecoverableArchiveGraph");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
+const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const FILE = "SECRET-ARCHIVED-ENCRYPTED-FILE.dat";
@@ -22,7 +22,7 @@ const TRASH = "data/trash/files/11223344-1234-4234-8234-123456789abc/old-private
 const DERIVED = "temp/generated/derived-outside-search-index.bin";
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-archive-graph-"));
+  const root = fs.mkdtempSync(path.join(canonicalTestTemp(), "rootark-archive-graph-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataDir = path.join(root, "data"), backupDir = path.join(dataDir, "backups");
   fs.mkdirSync(backupDir, { recursive: true });

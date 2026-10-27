@@ -2,7 +2,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
@@ -12,6 +11,7 @@ const { inspectZk1LiveLegacyRecoverableArchiveGraph: inspect } =
   require("../src/services/zk1LiveLegacyRecoverableArchiveGraph");
 const { signZk1LegacyArchiveReferentialProof } =
   require("../src/services/zk1LegacyArchiveReferentialProof");
+const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const ARCHIVE = "rootark-backup-2026-10-23-09-00-00.zip";
@@ -23,7 +23,7 @@ const SOURCE = Buffer.from("private synthetic encrypted material");
 const TRASH = Buffer.from("private synthetic trash data");
 
 function make(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-real-backup-join-"));
+  const root = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-real-backup-join-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const data = path.join(root, "data");
   const backup = path.join(data, "backups");

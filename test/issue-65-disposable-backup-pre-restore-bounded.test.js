@@ -19,6 +19,9 @@ test("disposable backup marker read cannot allocate inode bytes appended after f
   fs.writeFileSync(marker, "rootark-zk-backup-fixture-v1\n");
   for (const name of ["manifest.json", "backup-index.json", "owner-authorization.json"])
     fs.writeFileSync(path.join(root, name), "{}");
+  // The verifier accepts the lexical TEMP fixture but reads its canonical
+  // path. Hosted Windows TEMP may be a junction, so hook the actual FD path.
+  const canonicalMarker = fs.realpathSync.native(marker);
   let report;
   const originalRead = fs.readSync;
   const boundedReads = [];
@@ -29,7 +32,7 @@ test("disposable backup marker read cannot allocate inode bytes appended after f
   let outcome;
   try {
     outcome = await withInodeGrowthAfterFstat({
-      target: marker, extraBytes: 5 * 1024 * 1024,
+      target: canonicalMarker, extraBytes: 5 * 1024 * 1024,
       run: () => { report = inspectZk1DisposableBackupPreRestore({
         fixtureDir: root, expectedCompartmentId: "compartment1",
         checkpoint: { epoch: 0, revision: 0 },
