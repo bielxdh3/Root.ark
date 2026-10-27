@@ -4,7 +4,6 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
 const { Readable } = require("node:stream");
@@ -13,6 +12,8 @@ const { runOfflineSigner } =
 const { checkpointDigest } = require("../src/crypto/rootark-zk1-owner-inventory-trust-head");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 const { createZk1WebdavCiphertextAdapter } =
   require("../src/services/zk1WebdavCiphertextAdapter");
 const { computeZk1CiphertextRoot } =
@@ -39,7 +40,9 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   process.env.NODE_ENV = "development";
   t.after(() => { if (previous === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previous; });
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-multiprovider-restart-"));
+  // The SQLite authority opens WAL/SHM by pathname: its disposable test root
+  // must satisfy the same native-private ACL as a real Windows authority.
+  const directory = privateAuthorityDirectory("zk65-multiprovider-restart-");
   generateNativeFixtureCertificates(directory, { caSubject: "Recovery CA",
     servers: ["server"], clients: ["client"] });
   const read = (name) => fs.readFileSync(path.join(directory, name), "utf8");
