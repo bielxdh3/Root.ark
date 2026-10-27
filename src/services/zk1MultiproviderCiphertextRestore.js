@@ -135,6 +135,37 @@ function pinnedReaders(values, providerDomains, scope, operation, root, byteLeng
   })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
   return result;
 }
+let windowsPrivateRestoreRoot = null;
+function createPrivateRestoreStagingDirectory() {
+  if (process.platform !== "win32") {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cloud-recovery-"));
+  }
+  // On Windows the default TEMP directory can grant Modify to unrelated SIDs.
+  // Its descendants inherit that right, allowing a competing local principal
+  // to swap the staging parent before WebDAV's exclusive destination create.
+  // Pin staging to a verified owner-writable ancestry and atomically create a
+  // protected owner/SYSTEM/Administrators directory before any provider GET.
+  const base = process.env.LOCALAPPDATA;
+  if (typeof base !== "string" || !/^[A-Za-z]:[\\/]/.test(base)) deny();
+  const root = path.join(base, "rootark-zk1-private-restore");
+  const { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree } =
+    require("../../services/chunkUploadWindowsAcl");
+  if (windowsPrivateRestoreRoot?.path !== root) {
+    ensureWindowsChunkUploadRoot(root);
+    verifyWindowsChunkUploadTree(root);
+    const stat = fs.lstatSync(root, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) deny();
+    windowsPrivateRestoreRoot = { path: root, dev: stat.dev, ino: stat.ino };
+  }
+  const current = fs.lstatSync(root, { bigint: true });
+  if (!current.isDirectory() || current.isSymbolicLink()
+    || current.dev !== windowsPrivateRestoreRoot.dev
+    || current.ino !== windowsPrivateRestoreRoot.ino
+    || path.resolve(fs.realpathSync.native(root)).toLowerCase() !== path.resolve(root).toLowerCase()) deny();
+  // Every random child inherits the verified protected DACL. Reuse the root
+  // to avoid launching an expensive PowerShell ACL audit for every cloud GET.
+  return fs.mkdtempSync(path.join(root, "zk1-cloud-recovery-"));
+}
 async function exactGet(target, scope, operation, root, lengths, byteLength, deadline) {
   let dir;
   try {
@@ -145,7 +176,7 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
       || (target.ownerPinnedObjectKey !== null && key !== target.ownerPinnedObjectKey)
       || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cloud-recovery-"));
+    dir = createPrivateRestoreStagingDirectory();
     const destination = path.join(dir, "opaque.ct");
     const ok = await deadline.run((signal) => target.reader.download(address.folder, address.name, destination,
       "uploads", () => !signal.aborted, { maxBytes: byteLength,

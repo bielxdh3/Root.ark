@@ -7,7 +7,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
 const express = require("express");
@@ -49,6 +51,7 @@ const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1Protected
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
+const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
 
 const b64 = (data) => Buffer.from(data).toString("base64url");
 const random = (n) => crypto.randomBytes(n);
@@ -539,6 +542,48 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     stores.drive.set(driveId, Buffer.from(ciphertext));
     s3CurrentVersion = "owner-version-v1";
     webdavCurrentEtag = '"opaque-v1"';
+  });
+
+  if (process.platform === "win32") await t.test("S3, Drive and WebDAV restore into private Windows staging", async () => {
+    let guardedDownloads = 0;
+    const guarded = readers.map((entry) => ({ ...entry, cloudReader: {
+      ...entry.cloudReader,
+      async download(folder, name, destination, area, allowWrite, options) {
+        // WebDAV's exclusive writer must never inherit a writable shared TEMP DACL.
+        verifyWindowsChunkUploadTree(path.dirname(path.dirname(destination)));
+        guardedDownloads++;
+        return entry.cloudReader.download(folder, name, destination, area, allowWrite, options);
+      },
+    } }));
+    const restored = await gateway.restoreExact({ ...recoverInput,
+      readers: guarded, minimumMatchingProviders: 3 });
+    assert.deepEqual(restored.ciphertext, ciphertext);
+    assert.deepEqual(restored.verifiedProviders.map((item) => item.provider),
+      ["s3", "gdrive", "webdav"]);
+    assert.equal(guardedDownloads, 3);
+
+    // An actual foreign Modify ACE on a disposable parent must be rejected.
+    // Do not assume every Windows host configures TEMP with unsafe permissions.
+    const insecureBase = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-unsafe-staging-"));
+    const previous = process.env.LOCALAPPDATA;
+    let unsafeDownloads = 0;
+    try {
+      execFileSync("C:\\Windows\\System32\\icacls.exe", [insecureBase,
+        "/grant", "*S-1-5-32-545:(OI)(CI)M"], { windowsHide: true });
+      process.env.LOCALAPPDATA = insecureBase;
+      const unsafe = readers.map((entry) => ({ ...entry, cloudReader: {
+        ...entry.cloudReader,
+        async download(...args) { unsafeDownloads++; return entry.cloudReader.download(...args); },
+      } }));
+      await assert.rejects(gateway.restoreExact({ ...recoverInput,
+        readers: unsafe, minimumMatchingProviders: 3 }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/);
+      assert.equal(unsafeDownloads, 0, "unsafe staging ancestry must fail before a remote GET");
+    } finally {
+      if (previous === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = previous;
+      fs.rmSync(insecureBase, { recursive: true, force: true });
+    }
   });
 
   await t.test("a prior S3 GET loses quorum when later Drive GET rebinds its principal or namespace", async () => {
