@@ -9,6 +9,67 @@ const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor")
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
+test("CAS anchor refuses a foreign-owned 0755 ancestor on restart before any journal IO", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const root = createPrivateAuthorityFixture("rootark-cas-foreign-owner-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const ancestor = path.join(root, "operator-parent");
+  const owned = path.join(ancestor, "private-anchor");
+  fs.mkdirSync(owned, { recursive: true, mode: 0o700 });
+  fs.chmodSync(ancestor, 0o755);
+  const filename = path.join(owned, "anchor.log");
+  const options = { statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey };
+  new Zk1CasTerminalAnchor(filename, { ...options, bootstrapNew: true });
+  assert.equal(new Zk1CasTerminalAnchor(filename, {
+    ...options, bootstrapNew: false }).sequence, 0,
+  "private owner-controlled 0755 ancestors remain valid");
+  const initial = fs.readFileSync(filename);
+  const initialNames = fs.readdirSync(owned);
+  const nativeLstat = fs.lstatSync;
+  let observed = false;
+  try {
+    // Simulate the same host-observed stat as a foreign UID 0755 parent.
+    // The parent owner can rename its 0700 child without entering that child.
+    fs.lstatSync = function (target, ...args) {
+      const stat = nativeLstat.call(this, target, ...args);
+      if (String(target) === ancestor && args[0]?.bigint === true) {
+        observed = true;
+        return Object.assign(Object.create(stat), {
+          uid: BigInt(process.getuid()) + 100000n,
+        });
+      }
+      return stat;
+    };
+    assert.throws(() => new Zk1CasTerminalAnchor(filename, {
+      ...options, bootstrapNew: false }), /CAS_ANCHOR_INVALID/,
+    "an existing signed journal must not excuse a foreign-controlled ancestor");
+  } finally { fs.lstatSync = nativeLstat; }
+  assert.equal(observed, true, "the attempted restart inspected the foreign ancestor");
+  assert.deepEqual(fs.readFileSync(filename), initial,
+    "rejection neither truncates nor rewrites a signed journal");
+  assert.deepEqual(fs.readdirSync(owned), initialNames,
+    "rejection cannot leave a lock or a new file in the foreign path");
+  assert.equal(new Zk1CasTerminalAnchor(filename, {
+    ...options, bootstrapNew: false }).sequence, 0,
+  "the original trusted journal remains usable after denial");
+  fs.chmodSync(ancestor, 0o1777);
+  assert.equal(new Zk1CasTerminalAnchor(filename, {
+    ...options, bootstrapNew: false }).sequence, 0,
+  "a sticky writable ancestor owned by the service retains its existing exception");
+  try {
+    fs.lstatSync = function (target, ...args) {
+      const stat = nativeLstat.call(this, target, ...args);
+      return String(target) === ancestor && args[0]?.bigint === true
+        ? Object.assign(Object.create(stat), { uid: 0n }) : stat;
+    };
+    assert.equal(new Zk1CasTerminalAnchor(filename, {
+      ...options, bootstrapNew: false }).sequence, 0,
+    "root-owned sticky directories retain the existing exception");
+  } finally { fs.lstatSync = nativeLstat; }
+});
+
 test("CAS signed anchor reload cannot allocate inode bytes appended after pinned fstat", (t) => {
   const dir = createPrivateAuthorityFixture("rootark-cas-anchor-growth-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
