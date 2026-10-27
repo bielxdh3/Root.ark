@@ -27,7 +27,17 @@ const backupName = "rootark-backup-2026-10-25-00-00-00.zip";
 // assertions and filesystem paths. Keep these independent and read-only so a
 // ZIP dependency mismatch or redirected Windows test root has a safe label.
 test("legacy hosted diagnostic 01 locked archiver ZIP constructor", () => {
-  assert.equal(require("archiver/package.json").version, "8.0.0");
+  // archiver 8 exports only its entrypoint; the package.json subpath is NOT
+  // public. Read the manifest beside the resolved entry without using that
+  // blocked package subpath or printing local paths in assertion diagnostics.
+  let version;
+  try {
+    const entry = require.resolve("archiver");
+    version = JSON.parse(fs.readFileSync(path.join(path.dirname(entry), "package.json"), "utf8")).version;
+  } catch {
+    assert.fail("locked archiver package manifest could not be inspected");
+  }
+  assert.equal(version, "8.0.0", "locked archiver version must match package-lock");
   assert.equal(typeof ZipArchive, "function", "locked archiver must export ZipArchive");
 });
 
