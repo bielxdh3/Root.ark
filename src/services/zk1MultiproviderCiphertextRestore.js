@@ -137,7 +137,7 @@ function pinnedReaders(values, providerDomains, scope, operation, root, byteLeng
   return result;
 }
 let windowsPrivateRestoreRoot = null;
-function createPrivateRestoreStagingDirectory() {
+async function createPrivateRestoreStagingDirectory(deadline) {
   if (process.platform !== "win32") {
     return fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cloud-recovery-"));
   }
@@ -149,14 +149,21 @@ function createPrivateRestoreStagingDirectory() {
   const base = process.env.LOCALAPPDATA;
   if (typeof base !== "string" || !/^[A-Za-z]:[\\/]/.test(base)) deny();
   const root = path.join(base, "rootark-zk1-private-restore");
-  const { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree } =
-    require("../../services/chunkUploadWindowsAcl");
+  const { checkWindowsPrivateCloudDirectory } = require("./zk1WindowsPrivateCloudAcl");
   if (windowsPrivateRestoreRoot?.path !== root) {
-    ensureWindowsChunkUploadRoot(root);
-    verifyWindowsChunkUploadTree(root);
+    // The resident native authority creates AND verifies the protected root.
+    // Reuse native C# while avoiding two PowerShell startup costs per root.
+    try { await deadline.run(() => checkWindowsPrivateCloudDirectory(root, "create")); }
+    catch (_) { deny(); }
     const stat = fs.lstatSync(root, { bigint: true });
     if (!stat.isDirectory() || stat.isSymbolicLink()) deny();
     windowsPrivateRestoreRoot = { path: root, dev: stat.dev, ino: stat.ino };
+  } else {
+    // Device/inode/path continuity does NOT imply DACL continuity. Check the
+    // live owner, ancestry and protected root DACL for every provider GET,
+    // including after a previously successful restore on this same inode.
+    try { await deadline.run(() => checkWindowsPrivateCloudDirectory(root, "verify")); }
+    catch (_) { deny(); }
   }
   const current = fs.lstatSync(root, { bigint: true });
   if (!current.isDirectory() || current.isSymbolicLink()
@@ -189,7 +196,7 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
       || (target.ownerPinnedObjectKey !== null && key !== target.ownerPinnedObjectKey)
       || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
-    dir = createPrivateRestoreStagingDirectory();
+    dir = await createPrivateRestoreStagingDirectory(deadline);
     const destination = path.join(dir, "opaque.ct");
     const ok = await deadline.run((signal) => target.reader.download(address.folder, address.name, destination,
       "uploads", () => !signal.aborted, { maxBytes: byteLength,

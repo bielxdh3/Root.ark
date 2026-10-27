@@ -52,6 +52,8 @@ const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
+const { createZk1PrivateCloudStagingDirectory } =
+  require("../src/services/zk1PrivateCloudStagingDirectory");
 
 const b64 = (data) => Buffer.from(data).toString("base64url");
 const random = (n) => crypto.randomBytes(n);
@@ -561,6 +563,95 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     assert.deepEqual(restored.verifiedProviders.map((item) => item.provider),
       ["s3", "gdrive", "webdav"]);
     assert.equal(guardedDownloads, 3);
+
+    // A root already admitted in this process must not retain authority after
+    // its native DACL changes without any dev/ino/realpath change.
+    const privateBase = await createZk1PrivateCloudStagingDirectory("zk65-restore-warm-acl-");
+    const originalBase = process.env.LOCALAPPDATA;
+    const root = path.join(privateBase, "rootark-zk1-private-restore");
+    const users = "*S-1-5-32-545";
+    const icacls = "C:\\Windows\\System32\\icacls.exe";
+    try {
+      process.env.LOCALAPPDATA = privateBase;
+      const valid = await gateway.restoreExact({ ...recoverInput,
+        readers: readers.slice(0, 2), minimumMatchingProviders: 2 });
+      assert.deepEqual(valid.ciphertext, ciphertext);
+      const originalRoot = fs.statSync(root, { bigint: true });
+      execFileSync(icacls, [root, "/grant", `${users}:(OI)(CI)M`], { windowsHide: true });
+      const downgradedRoot = fs.statSync(root, { bigint: true });
+      assert.equal(downgradedRoot.dev, originalRoot.dev);
+      assert.equal(downgradedRoot.ino, originalRoot.ino);
+      assert.equal(fs.realpathSync.native(root).toLowerCase(), path.resolve(root).toLowerCase());
+      let unsafeDownloads = 0;
+      const monitored = readers.slice(0, 2).map((entry) => ({ ...entry,
+        cloudReader: { ...entry.cloudReader,
+          async download(...args) { unsafeDownloads++; return entry.cloudReader.download(...args); },
+        },
+      }));
+      await assert.rejects(gateway.restoreExact({ ...recoverInput,
+        readers: monitored, minimumMatchingProviders: 2 }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "post-warm Users Modify must revoke a once-trusted private restore root");
+      assert.equal(unsafeDownloads, 0,
+        "post-warm DACL downgrade must be denied before provider ciphertext IO");
+      execFileSync(icacls, [root, "/remove:g", users], {
+        windowsHide: true, stdio: "ignore",
+      });
+
+      // Same-root inode, but a foreign Modify grant on the parent ancestry.
+      try {
+        execFileSync(icacls, [privateBase, "/grant", `${users}:(OI)(CI)M`], {
+          windowsHide: true, stdio: "ignore",
+        });
+        await assert.rejects(gateway.restoreExact({ ...recoverInput,
+          readers: monitored, minimumMatchingProviders: 2 }),
+        /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+        "post-warm untrusted ancestor Modify must not authorize provider IO");
+        assert.equal(unsafeDownloads, 0);
+      } finally {
+        execFileSync(icacls, [privateBase, "/remove:g", users], {
+          windowsHide: true, stdio: "ignore",
+        });
+      }
+
+      // A replacement junction may keep the same pathname, never the pinned
+      // physical root. Nothing in the foreign directory may be touched.
+      const relocated = path.join(privateBase, "original-private-root");
+      const foreign = path.join(privateBase, "foreign");
+      fs.mkdirSync(foreign);
+      const sentinel = path.join(foreign, "sentinel.txt");
+      fs.writeFileSync(sentinel, "unchanged", { flag: "wx" });
+      fs.renameSync(root, relocated);
+      try {
+        fs.symlinkSync(foreign, root, "junction");
+        await assert.rejects(gateway.restoreExact({ ...recoverInput,
+          readers: monitored, minimumMatchingProviders: 2 }),
+        /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+        "post-warm staging root junction must deny prior to provider IO");
+        assert.equal(unsafeDownloads, 0);
+        assert.equal(fs.readFileSync(sentinel, "utf8"), "unchanged");
+        assert.equal(fs.existsSync(path.join(foreign, "opaque.ct")), false);
+      } finally {
+        let replacement;
+        try { replacement = fs.lstatSync(root); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (replacement) {
+          assert.equal(replacement.isSymbolicLink(), true,
+            "cleanup cannot delete an unrelated replacement directory");
+          fs.rmdirSync(root);
+        }
+        fs.renameSync(relocated, root);
+      }
+    } finally {
+      try {
+        if (fs.existsSync(root)) execFileSync(icacls, [root, "/remove:g", users], {
+          windowsHide: true, stdio: "ignore",
+        });
+      } finally {
+        if (originalBase === undefined) delete process.env.LOCALAPPDATA;
+        else process.env.LOCALAPPDATA = originalBase;
+        fs.rmSync(privateBase, { recursive: true, force: true, maxRetries: 5 });
+      }
+    }
 
     // An actual foreign Modify ACE on a disposable parent must be rejected.
     // Do not assume every Windows host configures TEMP with unsafe permissions.
