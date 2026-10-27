@@ -19,16 +19,15 @@ const METHODS = new Set(["loadHead", "loadFinalizedHead", "loadOwnerGeneration",
 const ADMIN_METHODS = new Set(["advanceOwnerPolicy", "loadOwnerGeneration",
   "loadHead", "loadFinalizedHead", "loadQuarantinedHead"]);
 const MAX_BODY = 256 * 1024;
+const MAX_PROTECTED_FILE = 1024 * 1024;
 function deny() { throw Error("HISTORICAL_RECOVERY_OPERATOR_TRANSPORT_DENIED"); }
 function readConfig(filename) {
-  protectedFile(filename);
-  const config = JSON.parse(fs.readFileSync(filename, "utf8"));
+  const config = JSON.parse(readProtectedFile(filename).toString("utf8"));
   if (!config || typeof config !== "object" || Array.isArray(config)) deny();
   return config;
 }
 function certPath(filename) {
-  protectedFile(filename);
-  return fs.readFileSync(filename);
+  return readProtectedFile(filename);
 }
 function fingerprint(v) {
   if (typeof v !== "string" || !/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/i.test(v)) deny();
@@ -44,6 +43,41 @@ function protectedFile(filename) {
     // operator's live SQLite WAL/SHM tree on every short-lived bridge call.
     verifyWindowsAuthorityFilePath(filename);
   }
+}
+function sameFileIdentity(a, b) {
+  return a.isFile() && b.isFile() && !a.isSymbolicLink()
+    && !b.isSymbolicLink() && a.nlink === 1n && b.nlink === 1n
+    && a.dev === b.dev && a.ino === b.ino;
+}
+function readProtectedFile(filename) {
+  if (typeof filename !== "string" || !path.isAbsolute(filename)) deny();
+  // Keep the opened object pinned across pathname and native Windows ACL
+  // checks. A second read by pathname would reopen an unverified replacement.
+  const fd = fs.openSync(filename, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!sameFileIdentity(opened, opened) || opened.size < 1n
+      || opened.size > BigInt(MAX_PROTECTED_FILE)) deny();
+    protectedFile(filename);
+    const named = fs.lstatSync(filename, { bigint: true });
+    const checked = fs.fstatSync(fd, { bigint: true });
+    if (!sameFileIdentity(opened, named) || !sameFileIdentity(opened, checked)
+      || opened.size !== checked.size || opened.mtimeNs !== checked.mtimeNs
+      || opened.ctimeNs !== checked.ctimeNs) deny();
+    const result = Buffer.alloc(Number(opened.size));
+    let offset = 0;
+    while (offset < result.length) {
+      const amount = fs.readSync(fd, result, offset, result.length - offset, offset);
+      if (amount <= 0) deny();
+      offset += amount;
+    }
+    const complete = fs.fstatSync(fd, { bigint: true });
+    if (!sameFileIdentity(opened, complete) || complete.size !== opened.size
+      || complete.mtimeNs !== opened.mtimeNs
+      || complete.ctimeNs !== opened.ctimeNs) deny();
+    return result;
+  } finally { fs.closeSync(fd); }
 }
 function parsePayload(bytes) {
   if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > MAX_BODY) deny();
