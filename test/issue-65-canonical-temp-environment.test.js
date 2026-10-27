@@ -29,3 +29,31 @@ test("canonical TEMP/TMP fixture restores original aliases after repeated calls 
     }
   });
 });
+
+test("canonical TEMP/TMP fixture refuses overlapping test contexts instead of leaking a global alias", {
+  skip: process.platform !== "win32",
+}, () => {
+  const before = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+  const alias = fs.realpathSync.native(os.tmpdir()) + path.sep + ".";
+  const cleanupA = [];
+  const cleanupB = [];
+  const firstTest = { after(callback) { cleanupA.push(callback); } };
+  const secondTest = { after(callback) { cleanupB.push(callback); } };
+  try {
+    process.env.TEMP = alias;
+    process.env.TMP = alias;
+    const firstRoot = canonicalTestTempEnvironment(firstTest);
+    assert.equal(process.env.TEMP, firstRoot);
+    assert.throws(() => canonicalTestTempEnvironment(secondTest),
+      /CONCURRENT_CANONICAL_TEMP_FIXTURE/);
+    assert.equal(process.env.TEMP, firstRoot, "second context must not overwrite TEMP");
+    assert.equal(process.env.TMP, firstRoot, "second context must not overwrite TMP");
+  } finally {
+    for (const callback of cleanupB) callback();
+    for (const callback of cleanupA) callback();
+    for (const name of ["TEMP", "TMP"]) {
+      if (before[name] === undefined) delete process.env[name];
+      else process.env[name] = before[name];
+    }
+  }
+});
