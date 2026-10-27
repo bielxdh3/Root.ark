@@ -228,4 +228,4 @@ function verifyWindowsAuthorityFilePath(filename) {
 }
 
 module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
-  verifyWindowsAuthorityFilePath };
+  verifyWindowsAuthorityFilePath, NATIVE_ACL, TRUSTED_POWERSHELL };

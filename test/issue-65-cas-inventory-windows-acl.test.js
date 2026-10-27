@@ -151,6 +151,34 @@ test("Windows inventory refuses Users Modify on bootstrap and restart", {
   assert.equal(fs.existsSync(fresh), false);
 });
 
+test("Windows inventory close fences native ACL verification pending on an older SQLite handle", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const root = fixture(t);
+  const file = path.join(root, "closed-pending.sqlite");
+  const ledger = await Zk1DurableContentInventoryLedger.open(file, inventoryOptions(true));
+  let notifyEntered;
+  const entered = new Promise((resolve) => { notifyEntered = resolve; });
+  let release;
+  // Model the boundary precisely: even an old successful native verdict cannot
+  // authorize a SQLite read once its owner closed the underlying handle.
+  ledger.privateAclVerifier.verify = () => new Promise((resolve) => {
+    release = resolve;
+    notifyEntered();
+  });
+  const pending = ledger.readLocalHead();
+  await entered;
+  ledger.close();
+  release();
+  await assert.rejects(pending, { code: "INVENTORY_CLOSED" });
+  const reopened = await Zk1DurableContentInventoryLedger.open(file,
+    { ...inventoryOptions(false), bootstrapNew: false,
+      signerPrivateKey: ledger.privateKey, signerKeyId: ledger.signerKeyId,
+      scope: ledger.scope });
+  try { assert.equal((await reopened.readLocalHead()).sequence, 0); }
+  finally { reopened.close(); }
+});
+
 test("Windows opaque catalog CAS rejects Users Modify on bootstrap and restart", {
   skip: process.platform !== "win32",
 }, (t) => {

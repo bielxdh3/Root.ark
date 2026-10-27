@@ -6,7 +6,10 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
-  assertPrivateSqliteAuthorityDirectory } = require("./zk1PrivateSqlitePath");
+  assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteDirectory } =
+  require("./zk1PrivateSqlitePath");
+const { createWindowsPrivateSqliteAclVerifier } =
+  require("./zk1WindowsSqliteAuthorityAclWorker");
 const Database = require("better-sqlite3");
 const z = require("../crypto/rootark-zk-1");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
@@ -292,6 +295,8 @@ class Zk1DurableContentInventoryLedger {
     this.scope = inventory.normalizeScope(raw.scope);
     this.db = null;
     this.closed = false;
+    this.privateAclVerifier = process.platform === "win32"
+      ? createWindowsPrivateSqliteAclVerifier() : null;
     this.scopeCbor = null;
     this.genesisRoot = null;
   }
@@ -515,9 +520,27 @@ class Zk1DurableContentInventoryLedger {
     return db.prepare(`SELECT ${HEAD_COLUMNS.join(",")} FROM content_head WHERE id=1`).get();
   }
 
-  assertOpen() {
-    if (!this.db || this.closed) fail("INVENTORY_CLOSED");
-    this.assertAuthorityDirectory();
+  async assertOpen() {
+    const capturedDb = this.db;
+    if (!capturedDb || this.closed) fail("INVENTORY_CLOSED");
+    if (!this.privateAclVerifier) {
+      this.assertAuthorityDirectory();
+    } else {
+      // Every protected SQLite operation gets a fresh native NTFS owner/DACL
+      // scan. The resident verifier caches compiled code only, never approval.
+      // Keep the event loop responsive while real HTTPS clients wait for IO.
+      try {
+        assertPrivateSqliteDirectory(this.filename);
+        await this.privateAclVerifier.verify(path.dirname(this.filename));
+        assertPrivateSqliteDirectory(this.filename);
+      } catch (_) {
+        if (this.closed || this.db !== capturedDb) fail("INVENTORY_CLOSED");
+        fail("INVENTORY_STATE");
+      }
+    }
+    // A close/restart can occur while the asynchronous native verifier runs.
+    // A previously approved pathname is never authority for a different DB.
+    if (this.closed || this.db !== capturedDb) fail("INVENTORY_CLOSED");
   }
 
   async parseRequestBytes(value) {
@@ -537,7 +560,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async loadState() {
-    this.assertOpen();
+    await this.assertOpen();
     try {
       if (this.db.pragma("quick_check", { simple: true }) !== "ok") fail("INVENTORY_LEDGER_CORRUPT");
       if (this.db.prepare("PRAGMA foreign_key_check").get() !== undefined) fail("INVENTORY_LEDGER_CORRUPT");
@@ -764,7 +787,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async prepareAppend(input) {
-    this.assertOpen();
+    await this.assertOpen();
     const operation = normalizeOperation(input);
     const requestBytes = await z.encodeDeterministic(operationMap(operation));
     if (requestBytes.length > 1024) fail("INVENTORY_LIMIT");
@@ -879,6 +902,7 @@ class Zk1DurableContentInventoryLedger {
         );
         return { status: "pending", replay: false };
       });
+      await this.assertOpen();
       try {
         const result = insert.immediate();
         if (result.status !== "retry") return result;
@@ -905,7 +929,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async sealAppend(operationIdValue) {
-    this.assertOpen();
+    await this.assertOpen();
     const operationId = bytes(operationIdValue, 16);
     const state = await this.loadState();
     const verified = state.operations.get(operationId.toString("hex"));
@@ -979,6 +1003,7 @@ class Zk1DurableContentInventoryLedger {
         WHERE operation_id=? AND status='pending'`).run(sequence, root, operation.operation_id);
       return { status: "committed", replay: false, sequence, root: Buffer.from(root) };
     });
+    await this.assertOpen();
     try {
       const result = seal.immediate();
       if (result.status !== "reconcile") return result;
@@ -998,7 +1023,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async getOperationStatus(operationIdValue) {
-    this.assertOpen();
+    await this.assertOpen();
     const operationId = bytes(operationIdValue, 16);
     const state = await this.loadState();
     const key = operationId.toString("hex");
@@ -1018,7 +1043,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async getCommittedProofPage(input) {
-    this.assertOpen();
+    await this.assertOpen();
     const raw = exact(input, ["afterSequence", "limit"], "INVENTORY_PAGE_INPUT");
     if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
       || raw.afterSequence > inventory.MAX_ENTRIES
@@ -1048,7 +1073,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async getSnapshot(input) {
-    this.assertOpen();
+    await this.assertOpen();
     const raw = exact(input, ["nonce"], "INVENTORY_SNAPSHOT_INPUT");
     const nonce = inventory.normalizeNonce(raw.nonce);
     const state = await this.loadState();
@@ -1075,7 +1100,7 @@ class Zk1DurableContentInventoryLedger {
   }
 
   async query(input) {
-    this.assertOpen();
+    await this.assertOpen();
     const required = ["nonce", "requested", "minimumHead", "pinnedPublicKey", "pinnedSignerKeyId"];
     const optional = ["minimumSnapshot"];
     const raw = objectWithOptional(input, required, optional, "INVENTORY_QUERY_INPUT");
@@ -1103,6 +1128,7 @@ class Zk1DurableContentInventoryLedger {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.privateAclVerifier?.stop();
     if (this.db) {
       this.db.close();
       this.db = null;
