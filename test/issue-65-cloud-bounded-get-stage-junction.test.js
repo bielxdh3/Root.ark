@@ -65,7 +65,7 @@ for (const provider of ["s3", "gdrive"]) {
       assert.equal(fs.readFileSync(outside, "utf8"), "FOREIGN_SENTINEL_MUST_SURVIVE",
         "a swapped disposable stage must NEVER overwrite an unrelated existing file");
       if (attack) {
-        assert.equal(swaps, 1, `exercise an actual NTFS junction swap during GET; result=${result}`);
+        assert.equal(swaps, 1, `exercise a real directory junction/symlink swap during GET; result=${result}`);
         assert.notEqual(result, true, "a changed stage must never be credited as a successful GET");
       } else {
         assert.equal(result, true, "an authorized private destination must still work");
