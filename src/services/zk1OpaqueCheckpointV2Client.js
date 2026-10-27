@@ -14,7 +14,7 @@ const { createOpaqueCheckpointV2Coordinator, signCheckpointOwnerApprovalV2,
 const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
   withReadonlySqliteSnapshot } =
   require("./zk1OpaqueCheckpointV2SqliteGuard");
-const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } =
+const { assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
 const { syncPrivateParent, publishStagedJournal } =
   require("./zk1V2DurableJournalMigration");
@@ -167,7 +167,7 @@ function scopeOf(v) {
 }
 function privateFile(filename, bootstrapNew) {
   if (typeof filename !== "string" || !path.isAbsolute(filename)) deny();
-  assertPrivateSqliteDirectory(filename);
+  assertPrivateSqliteAuthorityDirectory(filename);
   const parent = fs.lstatSync(path.dirname(filename));
   if (!parent.isDirectory() || parent.isSymbolicLink()
     || (process.platform !== "win32"
@@ -217,7 +217,7 @@ function privateNewDestination(filename) {
   if (typeof filename !== "string" || !path.isAbsolute(filename)
     || fs.existsSync(filename)
     || ["-wal", "-shm", "-journal"].some((suffix) => fs.existsSync(filename + suffix))) deny();
-  assertPrivateSqliteDirectory(filename);
+  assertPrivateSqliteAuthorityDirectory(filename);
   const parent = path.dirname(filename);
   const stat = fs.lstatSync(parent);
   if (!stat.isDirectory() || stat.isSymbolicLink()
@@ -252,6 +252,8 @@ function inspectedLegacy129(db, identity) {
 
 class Zk1OpaqueCheckpointV2Client {
   #db;
+  #journalPath;
+  #journalIdentity;
   #trust;
   #coordinator;
   #queue = Promise.resolve();
@@ -381,6 +383,7 @@ class Zk1OpaqueCheckpointV2Client {
       : withReadonlySqliteSnapshot(journalPath,
         (probe) => verifyJournal(probe, identity, !!signerGrantRootKey), deny,
         MAX_LOCAL_PREFLIGHT_BYTES);
+    assertPrivateSqliteAuthorityDirectory(journalPath);
     const current = assertPrivateSqliteFile(journalPath);
     if (pinned.dev !== current.dev || pinned.ino !== current.ino) deny();
     assertSafeSqliteSidecars(journalPath, deny);
@@ -404,6 +407,8 @@ class Zk1OpaqueCheckpointV2Client {
       if (bootstrapNew) db.exec(SUCCESSOR_SCHEMA + SIGNER_GRANT_SCHEMA);
     } catch (error) { db.close(); throw error; }
     this.#db = db;
+    this.#journalPath = journalPath;
+    this.#journalIdentity = Object.freeze({ dev: pinned.dev, ino: pinned.ino });
     this.#coordinator = coordinator;
     this.#trust = { scope, digest, checkpoint, casFp: fingerprints[0],
       floorFp: fingerprints[1], casKey: cas, floorKey: floor,
@@ -412,11 +417,23 @@ class Zk1OpaqueCheckpointV2Client {
       strictFullV1Archive: requireFullV1ArchiveRollover };
   }
   #serial(fn) {
-    const result = this.#queue.then(fn);
+    const result = this.#queue.then(() => {
+      this.#assertPrivateJournal();
+      return fn();
+    });
     this.#queue = result.catch(() => {});
     return result;
   }
+  #assertPrivateJournal() {
+    try {
+      assertPrivateSqliteAuthorityDirectory(this.#journalPath);
+      const current = assertPrivateSqliteFile(this.#journalPath);
+      if (current.dev !== this.#journalIdentity.dev
+        || current.ino !== this.#journalIdentity.ino) deny();
+    } catch (_) { deny(); }
+  }
   #saved() {
+    this.#assertPrivateJournal();
     const row = this.#db.prepare("SELECT bytes FROM successors ORDER BY sequence DESC LIMIT 1").get()
       || this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
     return row ? Buffer.from(row.bytes) : null;
@@ -477,6 +494,7 @@ class Zk1OpaqueCheckpointV2Client {
     return { ...inspected, grant };
   }
   async #chain() {
+    this.#assertPrivateJournal();
     const first = this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
     const successors = this.#db.prepare("SELECT sequence,bytes FROM successors ORDER BY sequence").all();
     const grants = this.#db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='signer_grants'").get()
@@ -640,6 +658,7 @@ class Zk1OpaqueCheckpointV2Client {
   }
   read() { return this.#serial(() => this.#read()); }
   #append(raw, sequence, grant) {
+    this.#assertPrivateJournal();
     this.#db.transaction(() => {
       if (sequence === 129) this.#db.prepare("INSERT INTO intent(id,bytes) VALUES(1,?)").run(raw);
       else this.#db.prepare("INSERT INTO successors(sequence,bytes) VALUES(?,?)")

@@ -14,7 +14,8 @@ const {
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
 const { catalogCasDomain } = require("./zk1OpaqueCatalog");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteAuthorityDirectory,
+  assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
 const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
   withReadonlySqliteSnapshot } =
@@ -145,6 +146,7 @@ async function createSignedOpaqueCheckpointOwnerApprovalV2(statement, ownerPriva
 }
 function fileCheck(filename, bootstrapNew) {
   if (typeof filename !== "string" || !path.isAbsolute(filename)) fail();
+  assertPrivateSqliteAuthorityDirectory(filename);
   const folder = fs.lstatSync(path.dirname(filename));
   if (!folder.isDirectory() || folder.isSymbolicLink()
     || (process.platform !== "win32"
@@ -179,6 +181,8 @@ function verifyStageIdentity(db, id, pins) {
 }
 class Zk1OpaqueCatalogCheckpointV2Stage {
   #serialized = Promise.resolve();
+  #journalPath;
+  #journalIdentity;
   #scope;
   #id;
   #ownerPublicKey;
@@ -190,9 +194,20 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
   #floorClient;
   #resolveCatalogSigner;
   #queue(action) {
-    const result = this.#serialized.then(action);
+    const result = this.#serialized.then(() => {
+      this.#assertPrivateJournal();
+      return action();
+    });
     this.#serialized = result.catch(() => {});
     return result;
+  }
+  #assertPrivateJournal() {
+    try {
+      assertPrivateSqliteAuthorityDirectory(this.#journalPath);
+      const current = assertPrivateSqliteFile(this.#journalPath);
+      if (current.dev !== this.#journalIdentity.dev
+        || current.ino !== this.#journalIdentity.ino) fail();
+    } catch (_) { fail(); }
   }
   constructor(filename, { bootstrapNew, trustedScope, ownerPublicKey,
     checkpointPublicKey, casClient, floorClient, resolveCatalogSigner }) {
@@ -216,6 +231,7 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
       || !fs.existsSync(path.dirname(filename))) fail();
     if (bootstrapNew) ensurePrivateSqliteDirectory(filename);
     else assertPrivateSqliteFile(filename);
+    assertPrivateSqliteAuthorityDirectory(filename);
     assertSafeSqliteSidecars(filename, fail);
     const createdPin = fileCheck(filename, bootstrapNew);
     // Validate even the trigger bodies in read-only mode before SQLite can
@@ -226,6 +242,7 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
         MAX_V1_SEQUENCE * MAX_BUNDLE + 64 * 1024 * 1024);
     const beforeOpen = assertPrivateSqliteFile(filename);
     if (beforeOpen.dev !== pinned.dev || beforeOpen.ino !== pinned.ino) fail();
+    assertPrivateSqliteAuthorityDirectory(filename);
     assertSafeSqliteSidecars(filename, fail);
     this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
@@ -245,6 +262,8 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
           .run(this.#id, ...this.#pins);
       }
     } catch (error) { this.db.close(); throw error; }
+    this.#journalPath = filename;
+    this.#journalIdentity = Object.freeze({ dev: pinned.dev, ino: pinned.ino });
   }
   async #verifyOwner(raw, signature, verified, requireFresh) {
     const approvalBytes = bytes(raw, 1, 4096);
@@ -354,6 +373,7 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
     return detail;
   }
   async audit() {
+    this.#assertPrivateJournal();
     const rows = this.db.prepare("SELECT * FROM checkpoint_stages ORDER BY final_sequence").all();
     let prior = { finalSequence: 0, finalDigest: ZERO, checkpointDigest: ZERO };
     let pending = false;
@@ -418,6 +438,7 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
       } else if (details.previousSequence !== 0
         || !same(bytes(previousDigest, 32), ZERO)
         || !same(details.previousCheckpointDigest, ZERO)) fail();
+      this.#assertPrivateJournal();
       try {
         this.db.prepare(`INSERT INTO checkpoint_stages
           (final_sequence, checkpoint_digest, payload_digest, payload, status)
@@ -440,6 +461,7 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
   }
   async #reconcileNoQueue() {
     await this.audit();
+    this.#assertPrivateJournal();
     const rows = this.db.prepare("SELECT * FROM checkpoint_stages ORDER BY final_sequence").all();
     const last = rows.at(-1);
     if (!last) fail();
@@ -453,6 +475,7 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
     // STAGED. This does not prove that remote CAS/floor durably committed v2.
     await this.#readHeads(details);
     const confirmation = await this.#readHeads(details);
+    this.#assertPrivateJournal();
     try {
       this.db.prepare(`UPDATE checkpoint_stages
         SET status='STAGED', cas_proof=?, floor_proof=?, cas_nonce=?
