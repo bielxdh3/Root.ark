@@ -12,12 +12,20 @@ const ANSI = /\x1b\[[\d;]*m/g;
 const FAILURE = /^not ok \d+ - (.+)$/;
 const LOCATION = /^location:\s*['"]?(.+?):\d+:\d+['"]?$/;
 const CATEGORICAL = /^# ROOTARK_ACL_V1 case=([A-Z_]{1,32}) stage=[A-Z_]{1,32} code=[A-Z_]{1,32} trust=[A-Z_]{1,32}$/;
+// t.diagnostic() is legitimately printed *after* the failed test's YAML
+// terminator, but never after the TAP plan/summary or a following Subtest.
+// Keep this order-sensitive: do not let later output inherit old authority.
+const BOUNDARY = /^(?:TAP version \d+|# Subtest:|\d+\.\.\d+(?:\s|$)|#\s*(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b)/;
 
 function extractHostedAclFailureDiagnostics(output) {
   let pending = null;
   const safe = [];
   for (const raw of String(output || "").split(/\r?\n/)) {
     const line = raw.replace(ANSI, "").trim();
+    if (BOUNDARY.test(line)) {
+      pending = null;
+      continue;
+    }
     const failure = FAILURE.exec(line);
     if (failure) {
       pending = { nameHash: hash(failure[1]), pathHash: null };

@@ -16,7 +16,7 @@ function record(name, status, details) {
   console.log(`${status}: ${name}${details ? ` — ${details}` : ""}`);
 }
 
-function failedTestDiagnostics(output) {
+function failedTestDiagnostics(output, tapStdout) {
   const lines = String(output || "").split(/\r?\n/)
     .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
     .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line));
@@ -30,7 +30,10 @@ function failedTestDiagnostics(output) {
   // the first failures behind the last 20 generic diagnostics. The printed
   // output remains strictly allowlisted, redacted and bounded.
   const failures = lines.filter((line) => /^(?:not ok \d+ - |[✖✗×] )/.test(line));
-  const aclStages = extractHostedAclFailureDiagnostics(output);
+  // Child stderr is untrusted free-form diagnostic text. Never associate its
+  // lines with a failed TAP case seen on stdout, even though the ordinary
+  // generic failure summary still processes the already-sanitized aggregate.
+  const aclStages = extractHostedAclFailureDiagnostics(tapStdout);
   const selected = [...new Set([...aclStages, ...failures.slice(0, 96), ...failures.slice(-12), ...lines.slice(-16)])];
   return selected.map(sanitize).join("\n").slice(0, 12000);
 }
@@ -47,7 +50,7 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
     return false;
   }
   record(name, "FAIL", `exit ${result.status ?? "unknown"}`);
-  const diagnostics = failedTestDiagnostics(output);
+  const diagnostics = failedTestDiagnostics(output, result.stdout || "");
   if (diagnostics) console.log(`FAIL diagnostics (${name}):\n${diagnostics}`);
   else {
     const code = String(result.error?.code || "none");
