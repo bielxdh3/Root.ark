@@ -59,16 +59,34 @@ function assertPrivateSqliteAuthorityDirectory(filename) {
 }
 
 function ensurePrivateSqliteDirectory(filename) {
-  // Verify the existing ancestors BEFORE mkdir. mkdir(recursive) otherwise
-  // follows a preinstalled symlink and creates files in a foreign directory.
+  // A recursive mkdir can follow an attacker-planted junction in a missing
+  // ancestor AFTER the preflight, creating a foreign child before we refuse.
+  // Pin the nearest existing ancestor, then create each absent name exactly
+  // once. EEXIST is a hostile race, never permission to follow that name.
+  const missing = [];
   let existing = path.dirname(filename);
-  while (!fs.existsSync(existing)) {
-    const parent = path.dirname(existing);
-    if (parent === existing) throw Error("UNTRUSTED_SQLITE_PATH");
-    existing = parent;
+  while (true) {
+    try {
+      const stat = fs.lstatSync(existing);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error("UNTRUSTED_SQLITE_PATH");
+      break;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw Error("UNTRUSTED_SQLITE_PATH");
+      const parent = path.dirname(existing);
+      if (parent === existing) throw Error("UNTRUSTED_SQLITE_PATH");
+      missing.push(path.basename(existing));
+      existing = parent;
+    }
   }
   checkDirectory(path.join(existing, "_sqlite_db"));
-  fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+  for (const name of missing.reverse()) {
+    existing = path.join(existing, name);
+    try { fs.mkdirSync(existing, { recursive: false, mode: 0o700 }); }
+    catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
+    // Do not descend into an untrusted replacement of the directory just
+    // created, even if the original mkdir returned successfully.
+    checkDirectory(path.join(existing, "_sqlite_db"));
+  }
   checkDirectory(filename);
 }
 
