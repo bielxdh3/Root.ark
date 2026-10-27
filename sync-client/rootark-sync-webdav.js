@@ -36,6 +36,72 @@ function sameOrBelow(candidate, parent) {
   return a === b || a.startsWith(`${b}${path.sep}`);
 }
 
+function assertPosixTrustedBridgePath(rootDir, targetPath, allowMissingLeaf = true,
+  createMissingDirectories = false) {
+  // Deny directory replacement by a different local UID before a pathname
+  // open or journal rename. The bridge owner and root remain trusted actors;
+  // this is an ownership/mode gate, not descriptor-relative openat2.
+  if (process.platform === "win32") return;
+  const uid = process.getuid?.();
+  if (!Number.isSafeInteger(uid)) throw new Error("POSIX bridge owner unavailable");
+  const trusted = (owner) => owner === BigInt(uid) || owner === 0n;
+  const root = path.resolve(rootDir);
+  const target = path.resolve(targetPath);
+  if (!sameOrBelow(target, root)) throw new Error("Untrusted bridge path");
+  const filesystemRoot = path.parse(target).root;
+  const segments = path.relative(filesystemRoot, target).split(path.sep).filter(Boolean);
+  let current = filesystemRoot;
+  for (let index = -1; index < segments.length; index += 1) {
+    if (index >= 0) current = path.join(current, segments[index]);
+    let stat;
+    try { stat = fs.lstatSync(current, { bigint: true }); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      if (createMissingDirectories) {
+        // Only the immediate component is created after its parent passed the
+        // owner/mode gate. Recursive mkdir can follow an untrusted ancestor.
+        fs.mkdirSync(current, { mode: 0o700 });
+        stat = fs.lstatSync(current, { bigint: true });
+      } else {
+        if (allowMissingLeaf && index === segments.length - 1) return;
+        throw error;
+      }
+    }
+    if (stat.isSymbolicLink() || !trusted(stat.uid)) throw new Error("Untrusted POSIX bridge owner or link");
+    if (!stat.isDirectory()) {
+      if (createMissingDirectories || index !== segments.length - 1 || !stat.isFile()) {
+        throw new Error("Untrusted POSIX bridge path type");
+      }
+      return;
+    }
+    if ((stat.mode & 0o022n) === 0n) continue;
+    // /tmp-style sticky ancestors can host a private bridge directory. A
+    // different UID cannot rename that trusted-owned child under sticky rules.
+    // The exception never applies to the bridge root or its descendants.
+    const aboveRoot = current !== root && sameOrBelow(root, current);
+    const next = index + 1 < segments.length ? path.join(current, segments[index + 1]) : null;
+    if (!aboveRoot || stat.uid !== 0n || (stat.mode & 0o1000n) === 0n || !next) {
+      throw new Error("Untrusted writable POSIX bridge ancestor");
+    }
+    let child;
+    try { child = fs.lstatSync(next, { bigint: true }); }
+    catch (error) {
+      if (!createMissingDirectories || error.code !== "ENOENT") throw error;
+      // Sticky root-owned /tmp protects only an owner-owned entry. Create the
+      // immediate missing entry with O_EXCL-equivalent mkdir before proceeding.
+      fs.mkdirSync(next, { mode: 0o700 });
+      child = fs.lstatSync(next, { bigint: true });
+    }
+    if (child.isSymbolicLink() || !trusted(child.uid)) {
+      throw new Error("Untrusted POSIX sticky ancestor child");
+    }
+  }
+}
+
+function createPosixTrustedBridgeDirectory(rootDir, directory) {
+  assertPosixTrustedBridgePath(rootDir, directory, false, true);
+}
+
 async function rejectSymlinks(rootDir, targetPath, allowMissing = true) {
   const root = path.resolve(rootDir);
   const resolved = path.resolve(targetPath);
@@ -127,14 +193,24 @@ class LocalSyncWebDavBridge {
   }
 
   async start() {
-    await fsp.mkdir(this.rootDir, { recursive: true });
+    if (process.platform === "win32") {
+      await fsp.mkdir(this.rootDir, { recursive: true });
+    } else {
+      if (!sameOrBelow(this.trashDir, this.rootDir) || this.trashDir === this.rootDir) {
+        throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
+      }
+      createPosixTrustedBridgeDirectory(this.rootDir, this.rootDir);
+    }
     await rejectSymlinks(this.rootDir, this.rootDir, false);
+    assertPosixTrustedBridgePath(this.rootDir, this.rootDir, false);
     // Reject an unsafe root before creating trash/journal state or replaying
     // pending mutations. Runtime requests repeat this check because a trusted
     // actor might later introduce a subtree with a permissive inherited ACL.
     if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
-    await fsp.mkdir(this.trashDir, { recursive: true });
+    if (process.platform === "win32") await fsp.mkdir(this.trashDir, { recursive: true });
+    else createPosixTrustedBridgeDirectory(this.rootDir, this.trashDir);
     await rejectSymlinks(this.rootDir, this.trashDir, false);
+    assertPosixTrustedBridgePath(this.rootDir, this.trashDir, false);
     if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
     if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
     await this.recoverPending();
@@ -164,6 +240,11 @@ class LocalSyncWebDavBridge {
       const destination = await this.target(destinationPath);
       const source = sourcePath ? await this.target(sourcePath) : null;
       const backup = operation.trash ? path.resolve(this.rootDir, operation.trash) : null;
+      // Journal replay can rename files before the HTTP request guard runs.
+      // The same POSIX ancestry boundary must hold during recovery.
+      assertPosixTrustedBridgePath(this.rootDir, destination);
+      if (source) assertPosixTrustedBridgePath(this.rootDir, source);
+      if (backup) assertPosixTrustedBridgePath(this.rootDir, backup);
       if (backup) await rejectSymlinks(this.rootDir, backup, true);
       const backupExists = backup ? await fsp.lstat(backup).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)) : false;
       const destinationExists = await fsp.lstat(destination).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error));
@@ -297,6 +378,10 @@ class LocalSyncWebDavBridge {
       safeSegments(String(req.url || "/").split("?", 1)[0]);
       const parsed = new URL(req.url, "http://localhost");
       const target = await this.target(parsed.pathname);
+      if (process.platform !== "win32") {
+        try { assertPosixTrustedBridgePath(this.rootDir, target); }
+        catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+      }
       if (process.platform === "win32") {
         // NTFS O_NOFOLLOW protects the leaf but not an ancestor junction.
         // A transient swap can open an outside-root inode, restore the safe
@@ -444,6 +529,10 @@ class LocalSyncWebDavBridge {
   async move(req, res, source, parsed) {
     if (source === this.rootDir) return writeResponse(res, 400, "Cannot move root");
     const destination = await this.destination(req);
+    if (process.platform !== "win32") {
+      try { assertPosixTrustedBridgePath(this.rootDir, destination.target); }
+      catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+    }
     if (destination.target === source) return writeResponse(res, 400, "Source and destination are identical");
     let existingTarget = destination.target;
     let destinationTarget = destination.target;
