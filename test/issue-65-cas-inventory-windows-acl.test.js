@@ -209,6 +209,99 @@ test("V2 checkpoint floor rejects foreign SQLite before WAL or schema writes", (
   } finally { readonly.close(); }
 });
 
+function persistedFiles(filename) {
+  return Object.fromEntries(["", "-wal", "-shm"].map((suffix) => {
+    const name = filename + suffix;
+    return [suffix || "db", fs.existsSync(name)
+      ? crypto.createHash("sha256").update(fs.readFileSync(name)).digest("hex") : null];
+  }));
+}
+
+test("Windows V2 rejects foreign WAL SQLite without altering existing SHM with live writer", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const root = fixture(t);
+  const file = path.join(root, "foreign-live-wal.sqlite");
+  const writer = new Database(file);
+  try {
+    assert.equal(writer.pragma("journal_mode = WAL", { simple: true }), "wal");
+    writer.exec("CREATE TABLE foreign_identity(id INTEGER PRIMARY KEY, marker TEXT)");
+    writer.prepare("INSERT INTO foreign_identity VALUES(1,'UNTOUCHED')").run();
+    assert.equal(fs.existsSync(file + "-wal"), true);
+    assert.equal(fs.existsSync(file + "-shm"), true);
+    const before = persistedFiles(file);
+    assert.throws(() => new Zk1V2CheckpointRemoteFloor(file, {
+      ...v2FloorOptions(), bootstrapNew: false,
+    }), /ZK_V2_INDEPENDENT_FLOOR_DENIED/);
+    assert.deepEqual(persistedFiles(file), before,
+      "foreign main, WAL and existing SHM must remain bit identical");
+    assert.equal(writer.prepare("SELECT marker FROM foreign_identity").get().marker, "UNTOUCHED");
+  } finally { writer.close(); }
+});
+
+test("Windows V2 rejects orphan foreign WAL without creating missing SHM", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const root = fixture(t);
+  const file = path.join(root, "foreign-orphan-wal.sqlite");
+  const child = String.raw`const Database=require("better-sqlite3");
+const db=new Database(process.argv[1]);
+db.pragma("journal_mode = WAL");
+db.exec("CREATE TABLE foreign_identity(id INTEGER PRIMARY KEY, marker TEXT)");
+db.prepare("INSERT INTO foreign_identity VALUES(1,'UNTOUCHED')").run();
+process.exit(0);`;
+  execFileSync(process.execPath, ["-e", child, file], { stdio: "pipe" });
+  assert.equal(fs.existsSync(file + "-wal"), true);
+  if (fs.existsSync(file + "-shm")) fs.unlinkSync(file + "-shm");
+  assert.equal(fs.existsSync(file + "-shm"), false);
+  const before = persistedFiles(file);
+  assert.throws(() => new Zk1V2CheckpointRemoteFloor(file, {
+    ...v2FloorOptions(), bootstrapNew: false,
+  }), /ZK_V2_INDEPENDENT_FLOOR_DENIED/);
+  assert.deepEqual(persistedFiles(file), before,
+    "orphan WAL must remain unchanged and foreign SHM must stay absent");
+});
+
+test("Windows V2 reopens authentic WAL floor with uncheckpointed identity", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const root = fixture(t);
+  const file = path.join(root, "authentic-v2.sqlite");
+  const options = v2FloorOptions();
+  const original = new Zk1V2CheckpointRemoteFloor(file, options);
+  try {
+    assert.equal(fs.existsSync(file + "-wal"), true);
+    assert.ok(fs.statSync(file + "-wal").size > 0, "bootstrap identity resides in WAL");
+    const restarted = new Zk1V2CheckpointRemoteFloor(file, {
+      ...options, bootstrapNew: false,
+    });
+    restarted.close();
+  } finally { original.close(); }
+});
+
+test("Windows V2 reopens authentic orphan WAL with no preexisting SHM", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const root = fixture(t);
+  const file = path.join(root, "authentic-orphan-v2.sqlite");
+  const options = v2FloorOptions();
+  const original = new Zk1V2CheckpointRemoteFloor(file, options);
+  const dbBytes = fs.readFileSync(file);
+  const walBytes = fs.readFileSync(file + "-wal");
+  assert.ok(walBytes.length > 32);
+  original.close();
+  // Restore the exact disposable pre-checkpoint state after SQLite's clean
+  // close; a crashed authority can leave the same WAL with no WAL-index.
+  fs.writeFileSync(file, dbBytes);
+  fs.writeFileSync(file + "-wal", walBytes);
+  fs.rmSync(file + "-shm", { force: true });
+  assert.equal(fs.existsSync(file + "-shm"), false);
+  const restarted = new Zk1V2CheckpointRemoteFloor(file, {
+    ...options, bootstrapNew: false,
+  });
+  restarted.close();
+});
+
 test("Windows CAS and inventory reject a junction installed before admission without foreign writes", {
   skip: process.platform !== "win32",
 }, async (t) => {

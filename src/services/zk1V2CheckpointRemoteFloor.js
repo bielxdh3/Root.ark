@@ -6,6 +6,7 @@
 // custody. Keep this module independent of the witness's SQLite connection.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const z = require("../crypto/rootark-zk-1");
 const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
@@ -31,6 +32,117 @@ const MAX_ANCESTRY = 8;
 const ENTRY_DOMAIN = Buffer.from("v2-independent-floor-entry\0");
 const RECEIPT_ID_DOMAIN = Buffer.from("v2-independent-floor-receipt-identity\0");
 function deny() { const e = new Error("ZK_V2_INDEPENDENT_FLOOR_DENIED"); e.code = e.message; throw e; }
+
+// SQLite's readonly option still writes a WAL-index (-shm) at its source path.
+// Inspect a private, bounded snapshot instead, so a rejected foreign SQLite
+// cannot gain or mutate DB/WAL/SHM files during identity preflight.
+function inspectExistingV2Floor(filename, expectedIdentity, Database) {
+  const original = assertPrivateSqliteFile(filename);
+  const scratch = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA || "", "rootark-v2-floor-probe-"
+      + crypto.randomBytes(12).toString("hex"))
+    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-v2-floor-probe-"));
+  let opened;
+  try {
+    if (process.platform === "win32") {
+      if (!path.isAbsolute(scratch) || fs.existsSync(scratch)) deny();
+      const { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree } =
+        require("../../services/chunkUploadWindowsAcl");
+      ensureWindowsChunkUploadRoot(scratch);
+      verifyWindowsChunkUploadTree(scratch);
+    } else fs.chmodSync(scratch, 0o700);
+    const observations = new Map();
+    function observe(suffix, required = false) {
+      const pathname = filename + suffix;
+      let stat;
+      try { stat = fs.lstatSync(pathname, { bigint: true }); }
+      catch (error) {
+        if (!required && error?.code === "ENOENT") return null;
+        deny();
+      }
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+        || (process.platform !== "win32"
+          && (stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n) !== 0n))) deny();
+      return stat;
+    }
+    function sameObservation(a, b) {
+      if (a === null || b === null) return a === b;
+      return ["dev", "ino", "nlink", "size", "mtimeNs", "ctimeNs", "mode"]
+        .every((name) => a[name] === b[name]);
+    }
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      observations.set(suffix, observe(suffix, suffix === ""));
+    }
+    if (observations.get("-journal")) deny();
+    let total = 0n;
+    const dest = path.join(scratch, "floor.sqlite");
+    for (const suffix of ["", "-wal"]) {
+      const before = observations.get(suffix);
+      if (!before) continue;
+      total += before.size;
+      // The preflight is bounded independently of attacker-controlled DB size.
+      if (total > 1024n * 1024n * 1024n) deny();
+      const src = fs.openSync(filename + suffix,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        if (!sameObservation(before, fs.fstatSync(src, { bigint: true }))) deny();
+        const dst = fs.openSync(dest + suffix,
+          fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+        try {
+          const buffer = Buffer.allocUnsafe(128 * 1024);
+          const originalHash = crypto.createHash("sha256");
+          let remaining = Number(before.size);
+          while (remaining) {
+            const count = fs.readSync(src, buffer, 0, Math.min(buffer.length, remaining), null);
+            if (count < 1) deny();
+            originalHash.update(buffer.subarray(0, count));
+            let offset = 0;
+            while (offset < count) {
+              const written = fs.writeSync(dst, buffer, offset, count - offset, null);
+              if (written < 1) deny();
+              offset += written;
+            }
+            remaining -= count;
+          }
+          // A writer may alter bytes in place without changing the inode.
+          // Re-read the pinned FD and refuse non-atomic copies.
+          const verifiedHash = crypto.createHash("sha256");
+          let position = 0;
+          while (position < Number(before.size)) {
+            const count = fs.readSync(src, buffer, 0,
+              Math.min(buffer.length, Number(before.size) - position), position);
+            if (count < 1) deny();
+            verifiedHash.update(buffer.subarray(0, count));
+            position += count;
+          }
+          if (!crypto.timingSafeEqual(originalHash.digest(), verifiedHash.digest())) deny();
+        } finally { fs.closeSync(dst); }
+        if (!sameObservation(before, fs.fstatSync(src, { bigint: true }))
+          || !sameObservation(before, observe(suffix, true))) deny();
+      } finally { fs.closeSync(src); }
+    }
+    opened = new Database(dest, { readonly: true, fileMustExist: true });
+    const tables = new Set(opened.prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all().map((row) => row.name));
+    if (!tables.has("floor_identity") || !tables.has("floor_event")
+      || opened.pragma("quick_check", { simple: true }) !== "ok") deny();
+    const saved = opened.prepare("SELECT identity FROM floor_identity WHERE id=1").get();
+    if (!saved || !Buffer.isBuffer(saved.identity)
+      || !same(saved.identity, expectedIdentity)) deny();
+    for (const [suffix, before] of observations) {
+      if (!sameObservation(before, observe(suffix, suffix === ""))) deny();
+    }
+    const current = assertPrivateSqliteFile(filename);
+    if (current.dev !== original.dev || current.ino !== original.ino) deny();
+    return original;
+  } catch (_) { deny(); }
+  finally {
+    try { opened?.close(); } finally {
+      if (path.isAbsolute(scratch)) fs.rmSync(scratch,
+        { recursive: true, force: true, maxRetries: 4, retryDelay: 25 });
+    }
+  }
+}
 function byte(v, length) {
   if ((!Buffer.isBuffer(v) && !(v instanceof Uint8Array))
     || v.length !== length) deny();
@@ -299,18 +411,9 @@ class Zk1V2CheckpointRemoteFloor {
       }
       this.#assertAuthorityDirectory();
       if (existed) {
-        // An unrelated SQLite file must be refused read-only before WAL mode,
-        // CREATE TABLE or any other mutation. Identity is the authority pin.
-        const probe = new Database(filename, { readonly: true, fileMustExist: true });
-        try {
-          const tables = new Set(probe.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table'").all()
-            .map((row) => row.name));
-          if (!tables.has("floor_identity") || !tables.has("floor_event")
-            || probe.pragma("quick_check", { simple: true }) !== "ok") deny();
-          const saved = probe.prepare("SELECT identity FROM floor_identity WHERE id=1").get();
-          if (!saved || !same(saved.identity, identityDigest)) deny();
-        } finally { probe.close(); }
+        // Never give SQLite the original foreign DB path while determining
+        // trust. Even readonly opens create/mutate an existing WAL-index.
+        filePin = inspectExistingV2Floor(filename, identityDigest, Database);
       } else {
         // SQLite's implicit creation would permit a pathname replacement
         // between the admission checks and its first WAL open.
