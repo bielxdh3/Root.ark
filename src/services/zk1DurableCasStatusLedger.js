@@ -12,7 +12,8 @@ const v2 = require("../crypto/rootark-zk-recovery-manifest-v2");
 const limits = require("../crypto/rootark-zk-recovery-history-v2");
 const { inspectVerifiedWitnessReservationV1 } = require("../crypto/rootark-zk-witness-operation-wire-v1");
 const { Zk1CasTerminalAnchor } = require("./zk1CasTerminalAnchor");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteAuthorityDirectory } = require("./zk1PrivateSqlitePath");
 
 const STATUS_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-cas-status/v1\0", "ascii");
 const TERMINAL_SEAL_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-seal/v1\0", "ascii");
@@ -120,10 +121,12 @@ class Zk1DurableCasStatusLedger {
     if (same(ownFp, witnessFp) || same(this.statusKeyId, this.witnessKeyId)) fail("CAS_IDENTITY_CONFLICT");
 
     const absolute = path.resolve(filename);
+    this.filename = absolute;
     const existed = fs.existsSync(absolute);
     try {
       if (existed) assertPrivateSqliteFile(absolute);
       else ensurePrivateSqliteDirectory(absolute);
+      assertPrivateSqliteAuthorityDirectory(absolute);
     } catch (_) { fail("CAS_STATE_MISSING"); }
     if (!existed && !bootstrapNew) fail("CAS_BOOTSTRAP_REQUIRED");
     // A nonempty external floor identifies an existing independently kept
@@ -223,9 +226,15 @@ class Zk1DurableCasStatusLedger {
         fail("CAS_ANCHOR_REQUIRED");
       }
       if (fileIdentity() !== expectedFile) fail("CAS_STATE_MISSING");
-      try { assertPrivateSqliteFile(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
+      try {
+        assertPrivateSqliteFile(absolute);
+        assertPrivateSqliteAuthorityDirectory(absolute);
+      } catch (_) { fail("CAS_STATE_MISSING"); }
     } else {
-      try { ensurePrivateSqliteDirectory(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
+      try {
+        ensurePrivateSqliteDirectory(absolute);
+        assertPrivateSqliteAuthorityDirectory(absolute);
+      } catch (_) { fail("CAS_STATE_MISSING"); }
       const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
         | fs.constants.O_RDWR, 0o600);
       try {
@@ -233,10 +242,16 @@ class Zk1DurableCasStatusLedger {
         expectedFile = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
       } finally { fs.closeSync(fd); }
     }
-    try { assertPrivateSqliteFile(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
+    try {
+      assertPrivateSqliteFile(absolute);
+      assertPrivateSqliteAuthorityDirectory(absolute);
+    } catch (_) { fail("CAS_STATE_MISSING"); }
     this.db = new Database(absolute, { fileMustExist: true });
     try {
-      try { assertPrivateSqliteFile(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
+      try {
+        assertPrivateSqliteFile(absolute);
+        assertPrivateSqliteAuthorityDirectory(absolute);
+      } catch (_) { fail("CAS_STATE_MISSING"); }
       if (fileIdentity() !== expectedFile) fail("CAS_STATE_MISSING");
       if (existed) {
         verifyIdentity(this.db);
@@ -304,6 +319,11 @@ class Zk1DurableCasStatusLedger {
       this.db.close();
       throw error;
     }
+  }
+
+  assertAuthorityDirectory() {
+    try { assertPrivateSqliteAuthorityDirectory(this.filename); }
+    catch (_) { fail("CAS_STATE_MISSING"); }
   }
 
   now() {
@@ -425,11 +445,13 @@ class Zk1DurableCasStatusLedger {
 
   // The witness must reserve first; CAS cannot create a ticket for itself.
   async registerReservation({ receipt }) {
+    this.assertAuthorityDirectory();
     await this.#attestIndependentCasAnchor();
     const ticket = await this.verifiedTicket(receipt);
     const op = ticket.query;
     const scopeKey = compartmentKey(op);
     const independentTerminal = this.anchor.get(op.reservation_id);
+    this.assertAuthorityDirectory();
     const result = this.db.transaction(() => {
       const previous = this.operationRow.get(op.reservation_id);
       if (previous) {
@@ -477,12 +499,14 @@ class Zk1DurableCasStatusLedger {
   }
 
   async commit({ receipt, manifestBytes }) {
+    this.assertAuthorityDirectory();
     await this.#attestIndependentCasAnchor();
     const ticket = await this.verifiedTicket(receipt);
     const op = ticket.query;
     const scopeKey = compartmentKey(op);
     const raw = asBytes(manifestBytes, 1, limits.MAX_ENTRY_BYTES);
     const priorTerminal = this.anchor.get(op.reservation_id);
+    this.assertAuthorityDirectory();
     const initial = this.db.transaction(() => {
       const existing = this.operationRow.get(op.reservation_id);
       const scope = this.scopeRow.get(scopeKey);
@@ -581,11 +605,13 @@ class Zk1DurableCasStatusLedger {
   }
 
   async getTerminalProof({ query, nonce }) {
+    this.assertAuthorityDirectory();
     await this.#attestIndependentCasAnchor();
     const op = normalizeQuery(query);
     const challenge = asBytes(nonce, 32);
     const scopeKey = compartmentKey(op);
     const now = this.now();
+    this.assertAuthorityDirectory();
     const terminal = this.db.transaction(() => {
       const operation = this.operationRow.get(op.reservation_id);
       const scope = this.scopeRow.get(scopeKey);
@@ -684,6 +710,7 @@ class Zk1DurableCasStatusLedger {
   }
 
   async getCommittedManifest({ scope }) {
+    this.assertAuthorityDirectory();
     await this.#attestIndependentCasAnchor();
     // Public manifest retrieval is intentionally distinct from terminality.
     // The caller MUST verify it against a fresh independently signed witness
@@ -695,6 +722,7 @@ class Zk1DurableCasStatusLedger {
       keyring_id: asBytes(scope.keyring_id, 16),
     };
     const key = compartmentKey(identity);
+    this.assertAuthorityDirectory();
     const state = this.db.transaction(() => {
       const current = this.scopeRow.get(key);
       // Validate persisted size claims with SQL aggregates *before* .all().
@@ -778,6 +806,7 @@ class Zk1DurableCasStatusLedger {
   }
 
   async getCommittedHistoryPage({ scope, startRevision }) {
+    this.assertAuthorityDirectory();
     await this.#attestIndependentCasAnchor();
     // History bytes are NEVER an authorization response. In particular do
     // NOT fully audit/materialize the 64 MiB CAS status ledger for EACH
@@ -793,6 +822,7 @@ class Zk1DurableCasStatusLedger {
       keyring_id: asBytes(scope.keyring_id, 16),
     };
     const key = compartmentKey(identity);
+    this.assertAuthorityDirectory();
     const snapshot = this.db.transaction(() => {
       const current = this.scopeRow.get(key);
       if (!current || current.pending_id !== null

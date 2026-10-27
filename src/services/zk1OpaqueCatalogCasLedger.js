@@ -17,7 +17,7 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
-const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -78,7 +78,7 @@ function privateDir(filename) {
     && (current.uid !== process.getuid() || (current.mode & 0o077) !== 0)) fail();
   // SQLite follows ancestor junctions while opening the DB and WAL/SHM paths.
   // Reject aliases even when the immediate parent itself is a real directory.
-  try { assertPrivateSqliteDirectory(filename); } catch (_) { fail(); }
+  try { assertPrivateSqliteAuthorityDirectory(filename); } catch (_) { fail(); }
 }
 function requireExistingCatalogSchema(db, identity, hasOwner) {
   // A restart must inspect the existing file read-only before switching WAL
@@ -110,7 +110,10 @@ class Zk1OpaqueCatalogCasLedger {
   #serialize(operation) {
     // A local FULL commit cannot overlap a signed read or another CAS before
     // its independent floor is durably advanced and read back.
-    const pending = this.#serialized.then(operation);
+    const pending = this.#serialized.then(() => {
+      privateDir(this.filename);
+      return operation();
+    });
     this.#serialized = pending.catch(() => {});
     return pending;
   }
@@ -123,6 +126,7 @@ class Zk1OpaqueCatalogCasLedger {
       || catalogSignerPublicKey.type !== "public" || catalogSignerPublicKey.asymmetricKeyType !== "ed25519"
       || !minimumHead || !isZk1OpaqueCatalogIndependentFloorClient(independentFloor)) fail();
     this.scope = scopeInput(trustedScope);
+    this.filename = filename;
     this.scopeId = scopeId(this.scope);
     this.signer = signingPrivateKey;
     this.publicKey = crypto.createPublicKey(signingPrivateKey);
@@ -198,6 +202,7 @@ class Zk1OpaqueCatalogCasLedger {
     // run WAL pragmas or authority DDL on a different inode.
     const checkFilePin = () => {
       try {
+        privateDir(filename);
         const current = assertPrivateSqliteFile(filename);
         if (current.dev !== filePin.dev || current.ino !== filePin.ino) fail();
       } catch (_) { fail(); }
@@ -632,6 +637,7 @@ class Zk1OpaqueCatalogCasLedger {
     // the head and burning the nonce. FULL commits the complete snapshot
     // transaction before the independent Ed25519 receipt is produced.
     const transaction = this.db.transaction(() => {
+      privateDir(this.filename);
       const current = this.#inspectSync();
       if (current.sequence !== old || !same(current.digest, previous)) fail("ZK_OPAQUE_CAS_CONFLICT");
       if (this.db.prepare("SELECT 1 FROM snapshots WHERE scope=? AND nonce=?")

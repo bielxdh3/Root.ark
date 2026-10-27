@@ -683,9 +683,12 @@ function createCloudStorage(options = {}) {
     if (!constraints) fs.mkdirSync(parentPath, { recursive: true });
     const stagingDirectory = fs.mkdtempSync(path.join(parentPath, ".rootark-cloud-cache-"));
     const stagedPath = path.join(stagingDirectory, path.basename(localPath));
-    const secureWindowsStage = Boolean(constraints && process.platform === "win32");
-    const pinnedStage = secureWindowsStage ? fs.lstatSync(stagingDirectory, { bigint: true }) : null;
-    const guardStage = secureWindowsStage ? () => {
+    // All bounded GETs must pin their stage and file descriptor before the
+    // provider await. POSIX permits renaming an open staging directory, so a
+    // later pathname-based stream would still overwrite a foreign symlink.
+    const secureBoundedStage = Boolean(constraints);
+    const pinnedStage = secureBoundedStage ? fs.lstatSync(stagingDirectory, { bigint: true }) : null;
+    const guardStage = secureBoundedStage ? () => {
       guardParent();
       const named = fs.lstatSync(stagingDirectory, { bigint: true });
       if (!pinnedStage.isDirectory() || pinnedStage.isSymbolicLink()
@@ -706,10 +709,10 @@ function createCloudStorage(options = {}) {
     }
     try {
       if (signal?.aborted) throw cloudError("provider_error", "Cancelled bounded cloud readback");
-      if (secureWindowsStage) {
+      if (secureBoundedStage) {
         // Pin the actual output file BEFORE awaiting a remote provider. All
         // streamed bytes go to this FD, never to a pathname resolved after a
-        // junction swap. O_EXCL refuses a preinstalled foreign leaf.
+        // junction/symlink swap. O_EXCL refuses a preexisting foreign leaf.
         guardStage();
         stagedFd = fs.openSync(stagedPath, fs.constants.O_WRONLY | fs.constants.O_CREAT
           | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
@@ -754,7 +757,7 @@ function createCloudStorage(options = {}) {
           if (size > constraints.maxBytes) next(cloudError("provider_error", "Ciphertext copy exceeds bounded readback size"));
           else next(null, chunk);
         } });
-        if (secureWindowsStage) {
+        if (secureBoundedStage) {
           guardStage();
           await pipeline(input, bounded, fs.createWriteStream(null,
             { fd: stagedFd, autoClose: false }), { signal });
@@ -771,9 +774,6 @@ function createCloudStorage(options = {}) {
           }
           fs.closeSync(stagedFd);
           stagedFd = null;
-        } else {
-          // Preserve the POSIX bounded-download transport and staging flow.
-          await pipeline(input, bounded, fs.createWriteStream(stagedPath), { signal });
         }
         if (boundedLengthOnly && size === 0) {
           throw cloudError("provider_error", "Empty signed catalog object");
