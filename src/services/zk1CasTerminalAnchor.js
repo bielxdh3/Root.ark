@@ -38,8 +38,12 @@ function assertPrivateDirectory(filename) {
         const writableByOthers = (stat.mode & 0o022n) !== 0n;
         const sticky = (stat.mode & 0o1000n) !== 0n;
         if ((current === containingDirectory && (stat.uid !== owner || writableByOthers))
-          || (current !== containingDirectory && writableByOthers
-            && !(sticky && (stat.uid === 0n || stat.uid === owner)))) fail();
+          || (current !== containingDirectory && (
+            // A foreign owner can chmod a 0755 ancestor or rename its child
+            // even while the ancestor has no group/other write bits.
+            (stat.uid !== owner && stat.uid !== 0n)
+            || (writableByOthers
+              && !(sticky && (stat.uid === 0n || stat.uid === owner)))))) fail();
       }
       const parent = path.dirname(current);
       if (parent === current) break;
