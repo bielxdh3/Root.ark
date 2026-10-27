@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const https = require("node:https");
 const path = require("node:path");
 const tls = require("node:tls");
+const { checkWindowsPrivateCloudDirectory } = require("./zk1WindowsPrivateCloudAcl");
 
 const MAX_BYTES = 16 * 1024 * 1024;
 const DEADLINE_MS = 15000;
@@ -321,6 +322,13 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
             && !opts.abortSignal?.aborted
             && typeof allowWrite === "function" && allowWrite() === true);
           const parent = pinParent(destination);
+          // O_NOFOLLOW only protects the leaf. In Windows, require a trusted
+          // native owner and ACL on the root, descendants and every ancestor:
+          // otherwise a transient junction during O_EXCL can write elsewhere.
+          // The native verifier runs in a bounded child process, never on the
+          // Node HTTP event loop. A changed directory identity fails closed.
+          await checkWindowsPrivateCloudDirectory(parent.directory, "verify");
+          verifyParent(parent);
           const bytes = await transfer("GET", objectKey, null, opts.maxBytes,
             opts.abortSignal, expectedEtag, boundedLengthOnly);
           ensure(!opts.abortSignal?.aborted && allowWrite() === true);

@@ -13,6 +13,7 @@ const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { SyncJournal } = require("../sync-client/rootark-sync-journal");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { MAX_REQUEST_BYTES, SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
 
 function request(port, requestPath, options = {}) {
@@ -97,7 +98,7 @@ test("sync journal commits move batches atomically and remains usable after capa
 });
 
 test("Phase 12 local bridge is loopback bearer protected, contained, and trash-backed", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase12-bridge-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase12-bridge-");
   const events = [];
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, token: "bridge-test-token", onOperation: async (event) => events.push(event) });
   await bridge.start();
@@ -116,7 +117,7 @@ test("Phase 12 local bridge is loopback bearer protected, contained, and trash-b
 });
 
 test("Phase 16 WebDAV overwrite is recoverable, journaled, and protects configured trash", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-");
   const trashDir = path.join(dir, "private-trash");
   const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, trashDir, token: "phase16-token", journal });
@@ -143,7 +144,7 @@ test("Phase 16 WebDAV overwrite is recoverable, journaled, and protects configur
 });
 
 test("Phase 16 WebDAV rename and journal failures leave both paths unchanged", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-rollback-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-rollback-");
   const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, token: "phase16-token", journal });
   await bridge.start();
@@ -174,7 +175,7 @@ test("Phase 16 WebDAV rename and journal failures leave both paths unchanged", a
 });
 
 test("Phase 16 WebDAV journal recovery resolves a staged completed move", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-recovery-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-recovery-");
   const trashDir = path.join(dir, "configured-trash");
   const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
   const backup = path.join(trashDir, "staged-recovery.txt");
