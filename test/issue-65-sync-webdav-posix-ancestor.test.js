@@ -230,3 +230,91 @@ test("POSIX recovery refuses a writable descendant before staged backup rollback
   assert.equal(fs.existsSync(path.join(nested, "file.txt")), false);
   assert.equal(bridge.server.listening, false);
 });
+
+test("POSIX startup must not create root beneath other-UID symlink ancestor", {
+  skip: !LINUX || process.getuid?.() !== 0,
+}, async (t) => {
+  const { dir } = fixture(t);
+  const writable = path.join(dir, "writable");
+  const outside = path.join(dir, "private-outside");
+  const pivot = path.join(writable, "pivot");
+  const foreignRoot = path.join(outside, "unauthorized-created-root");
+  fs.mkdirSync(writable, { mode: 0o777 });
+  fs.chmodSync(writable, 0o777);
+  fs.mkdirSync(outside, { mode: 0o700 });
+  fs.chmodSync(dir, 0o755);
+  execFileSync("/usr/sbin/runuser", ["-u", "nobody", "--", process.execPath,
+    "-e", 'require("node:fs").symlinkSync(process.argv[1],process.argv[2],"dir")',
+    outside, pivot]);
+  assert.equal(fs.lstatSync(pivot).uid, 65534);
+  const bridge = new LocalSyncWebDavBridge({ rootDir: path.join(pivot, "unauthorized-created-root"),
+    token: TOKEN });
+  await assert.rejects(bridge.start(), /Untrusted|EACCES|Path outside|Symlink/);
+  assert.equal(fs.existsSync(foreignRoot), false,
+    "startup must not create a directory through a foreign-UID symlink");
+  assert.equal(bridge.server.listening, false);
+});
+
+test("POSIX startup must not create trash under other-UID symlink or outside bridge root", {
+  skip: !LINUX || process.getuid?.() !== 0,
+}, async (t) => {
+  const { dir, root } = fixture(t);
+  const writable = path.join(root, "writable");
+  const outside = path.join(dir, "private-outside");
+  const pivot = path.join(writable, "pivot");
+  fs.mkdirSync(writable, { mode: 0o777 });
+  fs.chmodSync(writable, 0o777);
+  fs.mkdirSync(outside, { mode: 0o700 });
+  fs.chmodSync(root, 0o755);
+  fs.chmodSync(dir, 0o755);
+  execFileSync("/usr/sbin/runuser", ["-u", "nobody", "--", process.execPath,
+    "-e", 'require("node:fs").symlinkSync(process.argv[1],process.argv[2],"dir")',
+    outside, pivot]);
+  const trashDir = path.join(pivot, "unauthorized-created-trash");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, trashDir, token: TOKEN });
+  await assert.rejects(bridge.start(), /Untrusted|Symlink/);
+  assert.equal(fs.existsSync(path.join(outside, "unauthorized-created-trash")), false,
+    "startup must not create trash through a foreign-UID symlink");
+  const otherTrash = path.join(outside, "outside-configured-trash");
+  const external = new LocalSyncWebDavBridge({ rootDir: root, trashDir: otherTrash, token: TOKEN });
+  await assert.rejects(external.start(), /outside|Untrusted|Path outside|below bridge root/);
+  assert.equal(fs.existsSync(otherTrash), false,
+    "startup must not create a configured trash directory outside the root");
+});
+
+test("POSIX startup creates private nested root and trash through trusted parents", {
+  skip: !LINUX,
+}, async (t) => {
+  const { dir } = fixture(t);
+  const root = path.join(dir, "new", "deep", "bridge");
+  const trashDir = path.join(root, ".rootark-trash", "new", "deep");
+  assert.equal(fs.existsSync(root), false);
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, trashDir, token: TOKEN });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  assert.equal(fs.statSync(root).mode & 0o077, 0);
+  assert.equal(fs.statSync(path.join(dir, "new")).mode & 0o077, 0);
+  assert.equal(fs.statSync(trashDir).mode & 0o077, 0);
+  const port = bridge.address().port;
+  assert.equal((await request(port, "/newfile.txt", "PUT", "NEW_CONTENT")).status, 201);
+  assert.deepEqual(await request(port, "/newfile.txt"), { status: 200, body: "NEW_CONTENT" });
+  assert.deepEqual(await request(port, "/newfile.txt", "HEAD"), { status: 200, body: "" });
+  assert.equal((await request(port, "/newfile.txt", "MOVE", null,
+    { destination: "http://127.0.0.1/moved.txt" })).status, 201);
+  assert.equal((await request(port, "/moved.txt")).body, "NEW_CONTENT");
+});
+
+test("POSIX startup can create a new owner-only root directly below sticky /tmp", {
+  skip: !LINUX,
+}, async (t) => {
+  const root = path.join(os.tmpdir(), `rootark-posix-new-sticky-${crypto.randomUUID()}`);
+  assert.equal(fs.existsSync(root), false);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  assert.equal(fs.statSync(root).mode & 0o077, 0);
+  assert.equal(fs.statSync(path.join(root, ".rootark-trash")).mode & 0o077, 0);
+  assert.equal((await request(bridge.address().port, "/created.txt", "PUT", "OK")).status, 201);
+  assert.equal((await request(bridge.address().port, "/created.txt")).body, "OK");
+});
