@@ -248,14 +248,21 @@ test("WebDAV does not PUT a source rewritten after FD pin with its mtime restore
   fs.utimesSync(source, fixedTime, fixedTime);
   const folder = `zk1-${"a".repeat(64)}`;
   const name = `${"b".repeat(22)}.ct`;
-  await assert.rejects(writer.upload(source, folder, name, "uploads",
-    { zk1BoundedBytes: prior.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
-  "a low-level upload without a publisher-pinned digest must fail closed");
-  await assert.rejects(writer.upload(source, folder, name, "uploads",
-    { zk1BoundedBytes: prior.length, zk1ExpectedSha256: "0".repeat(64) }),
-  /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
-  "a mismatching publisher pin must fail before HTTPS");
-  assert.equal(f.requests.length, 0);
+  // The release gate suppresses raw TAP assertion details. Named subtests
+  // preserve only a safe failure-stage identifier in hosted CI diagnostics.
+  await t.test("webdav-fd-digest 01 missing publisher pin rejected before HTTPS", async () => {
+    await assert.rejects(writer.upload(source, folder, name, "uploads",
+      { zk1BoundedBytes: prior.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+    "a low-level upload without a publisher-pinned digest must fail closed");
+    assert.equal(f.requests.length, 0, "missing digest pin must not issue HTTPS requests");
+  });
+  await t.test("webdav-fd-digest 02 mismatched publisher pin rejected before HTTPS", async () => {
+    await assert.rejects(writer.upload(source, folder, name, "uploads",
+      { zk1BoundedBytes: prior.length, zk1ExpectedSha256: "0".repeat(64) }),
+    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+    "a mismatching publisher pin must fail before HTTPS");
+    assert.equal(f.requests.length, 0, "mismatched digest pin must not issue HTTPS requests");
+  });
   const original = fs.statSync(source, { bigint: true });
   const realRead = fs.readSync;
   const realFstat = fs.fstatSync;
@@ -296,24 +303,34 @@ test("WebDAV does not PUT a source rewritten after FD pin with its mtime restore
     return realRead.call(fs, fd, buffer, offset, length, position);
   };
   try {
-    await assert.rejects(writer.upload(source, folder, name, "uploads",
-      { zk1BoundedBytes: prior.length,
-        zk1ExpectedSha256: crypto.createHash("sha256").update(prior).digest("hex") }),
-    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+    await t.test("webdav-fd-digest 03 rewritten pinned FD rejected before HTTPS", async () => {
+      await assert.rejects(writer.upload(source, folder, name, "uploads",
+        { zk1BoundedBytes: prior.length,
+          zk1ExpectedSha256: crypto.createHash("sha256").update(prior).digest("hex") }),
+      /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+    });
   } finally {
     fs.readSync = realRead;
     fs.fstatSync = realFstat;
     fs.lstatSync = realLstat;
   }
   const changed = fs.statSync(source, { bigint: true });
-  assert.equal(attacked, true, "the source must be rewritten during its pinned FD read");
-  assert.equal(changed.dev, original.dev);
-  assert.equal(changed.ino, original.ino);
-  assert.equal(changed.size, original.size);
-  assert.equal(forgedFdMetadata, true, "the FD guard must see identical mtime and ctime");
-  assert.equal(forgedNameMetadata, true, "the pathname guard must see identical mtime and ctime");
-  assert.deepEqual(fs.readFileSync(source), substituted);
-  assert.equal(f.requests.length, 0, "a modified source must never reach the remote HTTPS peer");
+  await t.test("webdav-fd-digest 04 real rewrite preserved inode and byte length", () => {
+    assert.equal(attacked, true, "the source must be rewritten during its pinned FD read");
+    assert.equal(changed.dev, original.dev);
+    assert.equal(changed.ino, original.ino);
+    assert.equal(changed.size, original.size);
+  });
+  await t.test("webdav-fd-digest 05 both metadata guards observed forged timestamps", () => {
+    assert.equal(forgedFdMetadata, true, "the FD guard must see identical mtime and ctime");
+    assert.equal(forgedNameMetadata, true, "the pathname guard must see identical mtime and ctime");
+  });
+  await t.test("webdav-fd-digest 06 source bytes actually changed", () => {
+    assert.deepEqual(fs.readFileSync(source), substituted);
+  });
+  await t.test("webdav-fd-digest 07 modified source caused zero HTTPS requests", () => {
+    assert.equal(f.requests.length, 0, "a modified source must never reach the remote HTTPS peer");
+  });
 });
 
 test("WebDAV remote errors, redirect, truncated/oversized/corrupt data fail closed", async (t) => {
