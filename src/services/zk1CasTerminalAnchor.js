@@ -8,6 +8,8 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ensurePrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
+const { verifyWindowsChunkUploadTree } = require("../../services/chunkUploadWindowsAcl");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const INTENT_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-intent/v1\0", "ascii");
@@ -43,6 +45,15 @@ function assertPrivateDirectory(filename) {
       if (parent === current) break;
       current = parent;
     }
+  } catch (_) { fail(); }
+}
+function assertWindowsPrivateAnchorDirectory(filename) {
+  if (process.platform !== "win32") return;
+  try {
+    // A valid signed prefix is still replaceable by a local principal with
+    // Modify/DELETE_CHILD. Validate the native owner and DACL of the whole
+    // anchor directory, including sidecar intents and every ancestor.
+    verifyWindowsChunkUploadTree(path.dirname(filename));
   } catch (_) { fail(); }
 }
 function assertPrivateFile(stat) {
@@ -144,8 +155,13 @@ class Zk1CasTerminalAnchor {
         && this.#trustedMinimumHead.sequence !== 0) fail();
       if (bootstrapNew !== true) fail();
       // Do not create an implicit new anchor at an unexpected path on restart.
-      fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+      if (process.platform === "win32") {
+        try { ensurePrivateSqliteDirectory(filename); } catch (_) { fail(); }
+      } else {
+        fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+      }
       assertPrivateDirectory(filename);
+      assertWindowsPrivateAnchorDirectory(filename);
       const fd = fs.openSync(filename, "wx", 0o600);
       try {
         fs.writeSync(fd, JSON.stringify(this.identity) + "\n");
@@ -160,6 +176,7 @@ class Zk1CasTerminalAnchor {
     let raw;
     let stat;
     try {
+      assertWindowsPrivateAnchorDirectory(this.filename);
       assertPrivateDirectory(this.filename);
       const namedBefore = fs.lstatSync(this.filename, { bigint: true });
       if (!namedBefore.isFile() || namedBefore.isSymbolicLink()
@@ -338,6 +355,7 @@ class Zk1CasTerminalAnchor {
     let fd;
     let bytes;
     try {
+      assertWindowsPrivateAnchorDirectory(pathname);
       assertPrivateDirectory(pathname);
       let namedBefore;
       try { namedBefore = fs.lstatSync(pathname, { bigint: true }); }
@@ -407,6 +425,7 @@ class Zk1CasTerminalAnchor {
   }
 
   prepare(query, signedTicket, status, manifestBytes) {
+    assertWindowsPrivateAnchorDirectory(this.filename);
     assertPrivateDirectory(this.filename);
     const payload = this.intentPayload(query, signedTicket, status, manifestBytes);
     if (this.getIntent(query)) return this.assertIntent(query, signedTicket, status, manifestBytes);
@@ -460,6 +479,7 @@ class Zk1CasTerminalAnchor {
   }
 
   async append(query, signedTicket, status, manifestBytes, terminalSeal) {
+    assertWindowsPrivateAnchorDirectory(this.filename);
     assertPrivateDirectory(this.filename);
     this.assertIntent(query, signedTicket, status, manifestBytes);
     // All live handles/processes must reload the signed journal under the

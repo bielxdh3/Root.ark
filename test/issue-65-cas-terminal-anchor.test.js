@@ -3,13 +3,14 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 test("CAS signed anchor reload cannot allocate inode bytes appended after pinned fstat", (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-anchor-growth-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-anchor-growth-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const filename = path.join(dir, "anchor.log");
   const anchor = new Zk1CasTerminalAnchor(filename, {
@@ -52,7 +53,7 @@ test("CAS signed anchor reload cannot allocate inode bytes appended after pinned
 });
 
 test("two CAS handles cannot append a duplicate sequence or permanently corrupt continuity on restart", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-anchor-lock-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-anchor-lock-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const file = path.join(dir, "anchor.log");
   const statusPrivateKey = crypto.generateKeyPairSync("ed25519").privateKey;
@@ -89,7 +90,7 @@ test("two CAS handles cannot append a duplicate sequence or permanently corrupt 
 });
 
 test("CAS append cannot unlink another writer's replacement lock during release", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-lock-replaced-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-lock-replaced-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const filename = path.join(dir, "anchor.log");
   const lockPath = filename + ".append.lock";
@@ -136,7 +137,7 @@ test("CAS append cannot unlink another writer's replacement lock during release"
 });
 
 test("incomplete staging file from a crashed intent writer is not an authoritative intent", (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-intent-stage-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-intent-stage-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const pathname = path.join(dir, "anchor.log");
   const statusPrivateKey = crypto.generateKeyPairSync("ed25519").privateKey;
@@ -162,7 +163,7 @@ test("incomplete staging file from a crashed intent writer is not an authoritati
 });
 
 test("trusted externally retained CAS anchor floor refuses signed rollback and valid signer fork", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-floor-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-floor-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const filename = path.join(dir, "anchor.log");
   const statusPrivateKey = crypto.generateKeyPairSync("ed25519").privateKey;
@@ -218,7 +219,7 @@ test("trusted externally retained CAS anchor floor refuses signed rollback and v
 });
 
 test("cached CAS lookup rechecks signatures when equal size and timestamp conceal in-place tampering", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-tamper-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-tamper-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const filename = path.join(dir, "anchor.log");
   const privateKey = crypto.generateKeyPairSync("ed25519").privateKey;
@@ -254,7 +255,7 @@ test("cached CAS lookup rechecks signatures when equal size and timestamp concea
 });
 
 test("CAS reload refuses a signed old prefix substituted during FD read of a pinned head", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-fd-swap-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-fd-swap-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const filename = path.join(dir, "anchor.log");
   const privateKey = crypto.generateKeyPairSync("ed25519").privateKey;
@@ -295,7 +296,7 @@ test("CAS reload refuses a signed old prefix substituted during FD read of a pin
 });
 
 test("CAS append cannot write into a path replaced after its signed reload", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-append-swap-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-append-swap-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const filename = path.join(dir, "anchor.log");
   const detached = path.join(dir, "detached-anchor.log");
@@ -331,7 +332,7 @@ test("CAS append cannot write into a path replaced after its signed reload", asy
 });
 
 test("cached CAS reads hash current FD bytes but do not redo signature verification for identical content", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-cache-"));
+  const dir = createPrivateAuthorityFixture("rootark-cas-cache-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const filename = path.join(dir, "anchor.log");
   const anchor = new Zk1CasTerminalAnchor(filename, { bootstrapNew: true,
