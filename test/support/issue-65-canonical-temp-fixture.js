@@ -3,6 +3,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const environmentRegisteredForTest = new WeakSet();
 
 // Fixtures that must be read through canonical paths cannot inherit a hosted
 // Windows TEMP junction. This changes test paths only, never runtime guards.
@@ -23,15 +24,22 @@ function canonicalTestTemp() {
 function canonicalTestTempEnvironment(t) {
   const root = canonicalTestTemp();
   if (process.platform === "win32") {
-    const original = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+    if (!t || typeof t.after !== "function") throw Error("INVALID_TEST_CONTEXT");
+    if (!environmentRegisteredForTest.has(t)) {
+      // A test may create many fixtures. Register exactly one restoration:
+      // multiple t.after hooks run FIFO and could otherwise restore a later
+      // *canonical* intermediate value instead of the original TEMP alias.
+      const original = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+      t.after(() => {
+        for (const name of ["TEMP", "TMP"]) {
+          if (original[name] === undefined) delete process.env[name];
+          else process.env[name] = original[name];
+        }
+      });
+      environmentRegisteredForTest.add(t);
+    }
     process.env.TEMP = root;
     process.env.TMP = root;
-    t.after(() => {
-      for (const name of ["TEMP", "TMP"]) {
-        if (original[name] === undefined) delete process.env[name];
-        else process.env[name] = original[name];
-      }
-    });
   }
   return root;
 }
