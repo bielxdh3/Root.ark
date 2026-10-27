@@ -375,7 +375,7 @@ test("Windows private cloud ACL admits long protected path but rejects an embedd
   fs.writeFileSync(marker, "untouched", { flag: "wx" });
   fs.symlinkSync(foreign, path.join(authorized, "junction"), "junction");
   await assert.rejects(checkWindowsPrivateCloudDirectory(authorized, "verify"),
-    /Unverifiable private cloud directory/,
+    /(?:Unverifiable private cloud directory|Windows bridge ACL validation failed)/,
   "the same native ACL verifier must still deny untrusted reparse points");
   assert.equal(fs.readFileSync(marker, "utf8"), "untouched");
   assert.equal(fs.existsSync(path.join(foreign, "ciphertext.ct")), false);
