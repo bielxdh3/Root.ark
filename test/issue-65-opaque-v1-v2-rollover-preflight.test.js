@@ -295,16 +295,49 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     v1CasLedger.close(); v1FloorLedger.close();
     fs.rmSync(folder, { recursive: true, force: true, maxRetries: 5 });
   });
+  // A real V1 CAS admission checks issued_at against a strict 60-second
+  // window. Sign each of 128 dependent heads immediately before the actual
+  // authenticated mTLS write, not before the entire potentially slow test.
+  const liveRecords = [];
   let previous = Buffer.alloc(32);
   for (const record of options.records128) {
-    const nextDigest = digest(HEAD, record.header, record.signature);
-    await v1CasClient.compareAndSwap({ scope: options.scope,
+    const head = { ...(await z.decodeDeterministic(record.header)),
+      previous_digest: Buffer.from(previous),
+      issued_at: Math.floor(Date.now() / 1000) };
+    const header = Buffer.from(await z.encodeDeterministic(head));
+    const signature = crypto.sign(null, Buffer.concat([HEAD, header]), catalog.privateKey);
+    const nextDigest = digest(HEAD, header, signature);
+    const receipt = await v1CasClient.compareAndSwap({ scope: options.scope,
       expectedSequence: record.sequence - 1, expectedDigest: previous,
       nextSequence: record.sequence, nextDigest, nonce: crypto.randomBytes(32),
-      headBytes: record.header, headSignature: record.signature, pageBodies: [] });
+      headBytes: header, headSignature: signature, pageBodies: [] });
+    assert.ok(Buffer.isBuffer(receipt), `signed real mTLS CAS receipt #${record.sequence}`);
+    liveRecords.push({ sequence: record.sequence, header, signature, page_bodies: [] });
     previous = nextDigest;
   }
-  assert.equal(v1FloorLedger.inspect().sequence, 128);
+  assert.equal(liveRecords.length, 128);
+  assert.deepEqual(v1FloorLedger.inspect(), { sequence: 128, digest: previous });
+  const liveArchive = await createAuthenticatedOpaqueCatalogArchiveV2({
+    scope: options.scope, records: liveRecords, previousSequence: 0,
+    previousDigest: Buffer.alloc(32), previousCheckpointDigest: Buffer.alloc(32),
+    resolveCatalogSigner: async () => catalog.publicKey,
+    checkpointPrivateKey: checkpoint.privateKey,
+    issuedAt: Math.floor(Date.now() / 1000) });
+  const liveCheckpoint = await z.decodeDeterministic(liveArchive.checkpointBytes);
+  const now = Math.floor(Date.now() / 1000);
+  const liveHandoff = { ...options.handoff, v1_digest: b64(previous),
+    v1_archive_root: b64(liveCheckpoint.archive_root),
+    v1_archive_checkpoint: b64(liveArchive.checkpointDigest),
+    issued_at: now - 2, expires_at: now + 120 };
+  const liveOwnerSignature = crypto.sign(null, Buffer.concat([OWNER_DOMAIN,
+    Buffer.from(JSON.stringify(liveHandoff))]), owner.privateKey);
+  Object.assign(options, { records128: liveRecords, stateDigest: Buffer.from(previous),
+    archiveCheckpointBytes: liveArchive.checkpointBytes,
+    archiveCheckpointSignature: liveArchive.checkpointSignature,
+    v2PredecessorCheckpointPin: b64(liveArchive.checkpointDigest),
+    handoff: liveHandoff, ownerSignature: liveOwnerSignature });
+  assert.equal((await verifyRolloverPreflight({ ...options, v1CasClient,
+    v1FloorClient })).archivesRetained, 128);
   const fullCheckpoint = Buffer.from(options.archiveCheckpointBytes);
   const fullDigest = digest(Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0"),
     fullCheckpoint, options.archiveCheckpointSignature);
