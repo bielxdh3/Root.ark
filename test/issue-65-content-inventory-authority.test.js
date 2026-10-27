@@ -10,6 +10,8 @@ const Database = require("better-sqlite3");
 const z = require("../src/crypto/rootark-zk-1");
 const inventory = require("../src/crypto/rootark-zk-content-inventory-v1");
 const { Zk1DurableContentInventoryLedger } = require("../src/services/zk1DurableContentInventoryLedger");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const ROOT_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-root/v1\0", "ascii");
 const SIGNATURE_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-snapshot/v1\0", "ascii");
@@ -77,7 +79,7 @@ async function decodedSnapshot(serialized) {
 }
 
 async function testFixture(t) {
-  const dir = t ? fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-content-inventory-")) : null;
+  const dir = t ? createPrivateAuthorityFixture("rootark-zk1-content-inventory-") : null;
   const keys = crypto.generateKeyPairSync("ed25519");
   const signerKeyId = crypto.randomBytes(16);
   const scope = makeScope();

@@ -335,7 +335,7 @@ test("durable CAS refuses separately pinned signed anchor rollback before SQLite
 
 test("a configured external CAS floor cannot create empty SQLite or anchor bootstrap files", async (t) => {
   const f = await setup(t);
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-no-floor-bootstrap-"));
+  const outside = createPrivateAuthorityFixture("rootark-cas-no-floor-bootstrap-");
   t.after(() => fs.rmSync(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const sqlite = path.join(outside, "cas.sqlite");
   const journal = path.join(outside, "terminal.log");

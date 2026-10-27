@@ -138,7 +138,10 @@ class Zk1CloudCiphertextCopyPublisher {
         || !key.endsWith(`/uploads/${address.folder}/${address.name}`)) fail();
       if (await boundedIdentity(() => this.#writer.resolveInventoryContext()) !== this.#context) fail();
       this.#assertWriterStillPinned(address, key);
-      directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-copy-"));
+      directory = process.platform === "win32"
+        ? await require("./zk1PrivateCloudStagingDirectory")
+          .createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-copy-")
+        : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-copy-"));
       const staged = path.join(directory, "sealed-opaque-copy.ct");
       const fd = fs.openSync(staged,
         fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
@@ -155,6 +158,8 @@ class Zk1CloudCiphertextCopyPublisher {
       } finally { fs.closeSync(fd); }
       const answer = await this.#writer.upload(staged, address.folder,
         address.name, "uploads", { zk1BoundedBytes: payload.size,
+          ...(this.#provider === "s3" || this.#provider === "gdrive"
+            ? { zk1ExpectedSha256: sha.toString("hex") } : {}),
           ...(this.#provider === "webdav" ? { zk1ExpectedSha256: sha.toString("hex") } : {}),
           ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
