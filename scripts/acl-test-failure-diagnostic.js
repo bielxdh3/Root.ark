@@ -7,7 +7,10 @@ const CASES = Object.freeze({
   LEGACY_GENERIC_ACE: {
     file: "test/issue-65-legacy-deterministic-evidence-manifest.test.js",
     title: "Windows generic access ACEs cannot evade private snapshot ancestor checks",
-    stages: ["START", "FIXTURE_READY", "ACE_WRITE", "ACE_READBACK", "GUARD_VERIFY", "CUSTODY_SCAN", "CUSTODY_ASSERT"],
+    stages: ["START", "FIXTURE_READY", "BASELINE_PROTECT", "BASELINE_VERIFY",
+      "ACE_WRITE", "ACE_READBACK",
+      "ACE_FALLBACK_WRITE", "ACE_FALLBACK_READBACK", "ACE_DOTNET_WRITE",
+      "ACE_DOTNET_READBACK", "GUARD_VERIFY", "CUSTODY_SCAN", "CUSTODY_ASSERT"],
   },
   ATOMIC_INHERIT: {
     file: "test/issue-65-sync-atomic-private-acl.test.js",

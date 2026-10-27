@@ -700,6 +700,20 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
   const originalWrite = fs.openSync;
   let wrote = false;
   try {
+    // A fresh TEMP directory often inherits an unprotected DACL. Rejection
+    // of that baseline would NOT prove the generic ACE guard. First make the
+    // real native guardian accept this precise directory, before poisoning it.
+    diag.stage("BASELINE_PROTECT");
+    const baselineProtect = spawnSync(nativePs, ["-NoProfile", "-NonInteractive",
+      "-File", nativeScript, "-Action", "protect", "-Directory", parent],
+    { windowsHide: true, encoding: "utf8", timeout: 12000 });
+    assert.equal(baselineProtect.status, 0, "owner-only ACL fixture must be protected before poisoning");
+    diag.stage("BASELINE_VERIFY");
+    const baselineVerify = spawnSync(nativePs, ["-NoProfile", "-NonInteractive",
+      "-File", nativeScript, "-Action", "verify", "-Directory", parent],
+    { windowsHide: true, encoding: "utf8", timeout: 12000 });
+    assert.equal(baselineVerify.status, 0,
+      "the guardian must accept this exact protected directory before the untrusted ACE");
     diag.stage("ACE_WRITE");
     const quotedParent = parent.replace(/'/g, "''");
     const apply = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
@@ -713,12 +727,17 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
       "$buf=New-Object byte[] $raw.BinaryLength;$raw.GetBinaryForm($buf,0);" +
       "$a.SetSecurityDescriptorBinaryForm($buf,[Security.AccessControl.AccessControlSections]::Access);" +
       "Set-Acl -LiteralPath $p -AclObject $a;" +
-      "$actual=(Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm();" +
+      "$actualAcl=Get-Acl -LiteralPath $p;" +
+      "if(-not $actualAcl.AreAccessRulesProtected){throw 'DACL protection changed'};" +
+      "$actual=$actualAcl.GetSecurityDescriptorBinaryForm();" +
       "$r=New-Object Security.AccessControl.RawSecurityDescriptor($actual,0);" +
       // Hosted NTFS may normalize GENERIC_ALL into destructive FILE_* rights on Set-Acl.
       // Require a persisted untrusted write/delete/WRITE_DAC ACE in either form.
       "$found=$false;foreach($entry in $r.DiscretionaryAcl) {" +
-      "if($entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
+      "if($entry.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and" +
+      " $entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
+      " ((([int]$entry.AceFlags -band [int][Security.AccessControl.AceFlags]::InheritOnly) -eq 0) -or" +
+      " (([int]$entry.AceFlags -band [int][Security.AccessControl.AceFlags]::ContainerInherit) -ne 0)) -and" +
       " (($entry.AccessMask -band 268435456) -ne 0 -or" +
       " ($entry.AccessMask -band 327682) -ne 0)){$found=$true}};" +
       "if(-not $found){throw 'Unsafe access ACE did not persist'};" +
@@ -728,25 +747,55 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
     diag.stage("ACE_READBACK");
     let persisted = apply.status === 0
       && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(apply.stdout || "");
+    const readbackNative = () => {
+      // Read the actual persisted NTFS DACL. A successful grant command, or
+      // an in-memory FileSystemSecurity instance, is never proof of custody.
+      const readback = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop';$p='" + quotedParent + "';" +
+        "$d=[IO.Directory]::GetAccessControl($p);" +
+        "if(-not $d.AreAccessRulesProtected){exit 4};" +
+        "$r=New-Object Security.AccessControl.RawSecurityDescriptor($d.GetSecurityDescriptorBinaryForm(),0);" +
+        "$found=$false;foreach($entry in $r.DiscretionaryAcl){" +
+        "if($entry.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and" +
+        " $entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
+        " ((([int]$entry.AceFlags -band [int][Security.AccessControl.AceFlags]::InheritOnly) -eq 0) -or" +
+        " (([int]$entry.AceFlags -band [int][Security.AccessControl.AceFlags]::ContainerInherit) -ne 0)) -and" +
+        " (($entry.AccessMask -band 268435456) -ne 0 -or" +
+        " ($entry.AccessMask -band 327682) -ne 0)){$found=$true}};" +
+        "if(-not $found){exit 3};Write-Output 'UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND';"],
+      { windowsHide: true, encoding: "utf8", timeout: 12000 });
+      return readback.status === 0
+        && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(readback.stdout || "");
+    };
     if (!persisted) {
       // Some hosted NTFS configurations cannot persist the raw generic mask
       // through Set-Acl. Prove the same real destructive rights with a
       // normalized FullControl ACE; never accept a synthetic or missing ACE.
+      diag.stage("ACE_FALLBACK_WRITE");
       const grant = spawnSync("C:\\Windows\\System32\\icacls.exe",
         [parent, "/grant", "*S-1-5-11:(OI)(CI)F"],
         { windowsHide: true, encoding: "utf8", timeout: 12000 });
-      assert.equal(grant.status, 0, "normalized unsafe ACL fixture must be written to NTFS");
-      const readback = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
+      diag.stage("ACE_FALLBACK_READBACK");
+      if (grant.status === 0) persisted = readbackNative();
+    }
+    if (!persisted) {
+      // Hosted policy may forbid icacls grants even when the current owner
+      // can set a normal .NET file-system rule. Independently persist a real
+      // Allow/FullControl ACE; never treat the setter exit as native proof.
+      diag.stage("ACE_DOTNET_WRITE");
+      const grant = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
         "$ErrorActionPreference='Stop';$p='" + quotedParent + "';" +
-        "$r=New-Object Security.AccessControl.RawSecurityDescriptor((Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm(),0);" +
-        "$found=$false;foreach($entry in $r.DiscretionaryAcl){" +
-        "if($entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
-        " (($entry.AccessMask -band 268435456) -ne 0 -or" +
-        " ($entry.AccessMask -band 327682) -ne 0)){$found=$true}};" +
-        "if(-not $found){exit 3};Write-Output 'UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND';"],
+        "$id=New-Object Security.Principal.SecurityIdentifier('S-1-5-11');" +
+        "$a=[IO.Directory]::GetAccessControl($p);" +
+        "$rule=New-Object Security.AccessControl.FileSystemAccessRule(" +
+        "$id,[Security.AccessControl.FileSystemRights]::FullControl," +
+        "[Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'," +
+        "[Security.AccessControl.PropagationFlags]::None," +
+        "[Security.AccessControl.AccessControlType]::Allow);" +
+        "$a.AddAccessRule($rule);[IO.Directory]::SetAccessControl($p,$a);"],
         { windowsHide: true, encoding: "utf8", timeout: 12000 });
-      persisted = readback.status === 0
-        && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(readback.stdout || "");
+      diag.stage("ACE_DOTNET_READBACK");
+      if (grant.status === 0) persisted = readbackNative();
     }
     if (persisted)
       diag.trust("UNTRUSTED_ADDED");
