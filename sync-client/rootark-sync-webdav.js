@@ -576,8 +576,20 @@ class LocalSyncWebDavBridge {
       }
       if (req.method === "MKCOL") {
         if (target === this.rootDir) return writeResponse(res, 405, "Already exists");
-        await fsp.mkdir(target, { recursive: false });
+        // MKCOL must never inherit a permissive process umask (including
+        // umask 000): otherwise another local UID can write under this
+        // authenticated WebDAV collection without presenting the bearer.
+        await fsp.mkdir(target, { recursive: false, mode: 0o700 });
         await rejectSymlinks(this.rootDir, target, false);
+        if (process.platform !== "win32") {
+          assertPosixTrustedBridgePath(this.rootDir, target, false);
+          const created = await fsp.lstat(target, { bigint: true });
+          if (!created.isDirectory() || created.isSymbolicLink()
+            || created.uid !== BigInt(process.getuid())
+            || (created.mode & 0o777n) !== 0o700n) {
+            throw Object.assign(new Error("Untrusted POSIX MKCOL owner or mode"), { statusCode: 503 });
+          }
+        }
         return writeResponse(res, 201);
       }
       if (req.method === "MOVE") return await this.move(req, res, target, parsed);
