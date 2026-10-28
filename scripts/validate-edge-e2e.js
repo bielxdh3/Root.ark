@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { summarizeFailedEdgeChild } = require("./edge-child-failure-diagnostics");
 
 const root = path.resolve(__dirname, "..");
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
@@ -95,6 +96,9 @@ function runFocusedEdgeCases() {
   });
   // Never reproduce untrusted child logs here: test failures may include local
   // secrets or stack traces. This gate prints only controlled numeric evidence.
+  if (result.status !== 0 || result.error) {
+    console.error(summarizeFailedEdgeChild(result, EDGE_FILES));
+  }
   const evidence = assessEdgeTap(result.stdout, result.status);
   console.log(`PASS: focused Edge E2E gate — ${evidence.verifiedCases} required cases executed, ${evidence.skipped} skipped, ${evidence.tests} tests passed`);
 }
@@ -129,4 +133,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { EDGE_FILES, EXPECTED_EDGE_CASES, assessEdgeTap };
+module.exports = { EDGE_FILES, EXPECTED_EDGE_CASES, assessEdgeTap, runFocusedEdgeCases };
