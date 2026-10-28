@@ -412,6 +412,36 @@ test("WebDAV must reject download parent replaced by a junction or fresh directo
     "source through foreign parent must be refused before any HTTPS PUT");
 });
 
+test("POSIX WebDAV refuses foreign-writable destination and source ancestors before HTTPS", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory owner and mode contract");
+  const f = await fixture(t);
+  const { publisher, reader, writer } = await f.makePair();
+  await publisher.publishExact(f.pubInput);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-posix-trust-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const privateChild = path.join(root, "private-child");
+  fs.mkdirSync(privateChild, { mode: 0o700 });
+  fs.chmodSync(root, 0o777);
+  const { folder, name } = zk1CloudCopyAddress({
+    scope: f.pubInput.scope, operationId: f.pubInput.operationId,
+  });
+  const count = f.requests.length;
+  for (const directory of [root, privateChild]) {
+    const destination = path.join(directory, "ciphertext.ct");
+    await assert.rejects(reader.download(folder, name, destination, "uploads", () => true,
+      { maxBytes: f.ciphertext.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+    assert.equal(fs.existsSync(destination), false);
+  }
+  const source = path.join(privateChild, "staged.ct");
+  fs.writeFileSync(source, f.ciphertext, { mode: 0o600 });
+  await assert.rejects(writer.upload(source, folder, name, "uploads", {
+    zk1BoundedBytes: f.ciphertext.length,
+    zk1ExpectedSha256: crypto.createHash("sha256").update(f.ciphertext).digest("hex"),
+  }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+  assert.equal(f.requests.length, count,
+    "foreign-writable ancestors must be rejected before HTTPS GET or PUT");
+});
+
 test("Windows WebDAV never writes ciphertext through a swapped and restored parent junction", async (t) => {
   if (process.platform !== "win32") return t.skip("NTFS ACL and directory junction regression");
   const f = await fixture(t);
