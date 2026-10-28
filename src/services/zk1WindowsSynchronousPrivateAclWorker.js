@@ -23,8 +23,10 @@ parentPort.on("message", async (request) => {
   if (!slot) return;
   let approved = false;
   try {
-    if (!stopped && typeof request.path === "string") {
-      await native.verifyPrivateDirectory(request.path);
+    if (!stopped && typeof request.path === "string"
+      && ["private-directory", "authority-file"].includes(request.kind)) {
+      if (request.kind === "authority-file") await native.verifyAuthorityFile(request.path);
+      else await native.verifyPrivateDirectory(request.path);
       approved = true;
     }
   } catch (_) { /* Native failure always DENIES. */ }
