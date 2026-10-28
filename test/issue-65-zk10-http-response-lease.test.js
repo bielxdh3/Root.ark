@@ -156,3 +156,26 @@ test("ZK10 real HTTP prevents late body bytes even if a busy event loop delays t
   assert.equal(Buffer.concat(bytes).length, 0,
     "the physical HTTP client must not receive bytes after external lease deadline");
 });
+
+test("ZK10 synchronously rejects every available HTTP egress method at a stale wall-clock deadline", async () => {
+  for (const method of ["write", "end", "writeHead", "flushHeaders", "writeContinue",
+    "writeProcessing", "writeEarlyHints", "addTrailers", "uncork"]) {
+    const res = response();
+    let emitted = 0;
+    res[method] = () => { emitted++; };
+    const abort = new AbortController();
+    const deadline = Date.now() + 5;
+    const guard = createZk10HttpResponseLeaseGuard(res, abort.signal, () => {
+      if (abort.signal.aborted || Date.now() >= deadline)
+        throw new Error("ZK10_LEASE_EXPIRED");
+    });
+    const until = Date.now() + 15;
+    while (Date.now() < until) { /* timer-free, no signal.abort() */ }
+    assert.equal(abort.signal.aborted, false);
+    assert.throws(() => res[method](), /ZK10_LEASE_EXPIRED/, method);
+    assert.equal(emitted, 0, `${method} must not pass through to the underlying response`);
+    assert.equal(res.destroyCalls, 1, `${method} must close the stream`);
+    await assert.rejects(guard.waitForFinish(), /ZK10_RESPONSE_INTERRUPTED/);
+    guard.disarm();
+  }
+});
