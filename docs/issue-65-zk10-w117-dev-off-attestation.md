@@ -78,12 +78,17 @@ the owner's desired policy, but does not prove that the server enforces it.
 The current DEV-OFF adapter is scoped to the W101 Sync integration. Legacy
 egress routes outside it remain unfenced, including `server.js` handlers for
 `/files/search`, `/files/:name`, `/list`, `/versions`, `/download`, `/history`,
-`/share/:token` and its previews/downloads, `/preview/file` and text previews,
+`/preview/file` and text previews,
 plus `src/routes/backups.js`, ordinary uploads and native WebDAV. Each covered
 path needs a verified external lease held across the real read/write/egress
-boundary. Anonymous share-token routes additionally require a trusted
-object-to-immutable-owner mapping because no authenticated username is
-available. Until all paths are fenced and proven adversarially, no
+boundary. Anonymous `/share`, `/open-file` and both token-issuance routes now
+fail closed when the **experimental** `ROOTARK_ZK10_SYNC_CUTOVER_STRICT` switch
+is enabled; default-OFF legacy behavior remains unchanged. This denies all
+anonymous objects and does not supply a positive authorization path, off-host
+current owner proof, full-corpus membership, or anti-downgrade enforcement.
+Those routes still require a trusted object-to-immutable-owner mapping and a
+verified, current external lease before any strict read can be permitted.
+Until all paths are fenced and proven adversarially, no
 account-wide confidentiality or production `protected_enforced` claim holds.
 
 ## Disposable tests

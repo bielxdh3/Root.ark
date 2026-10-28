@@ -110,6 +110,9 @@ const REALTIME_IDLE_TIMEOUT_MS = parseBoundedNumber("REALTIME_IDLE_TIMEOUT_MS", 
 const REALTIME_UPGRADE_MAX_PER_WINDOW = parseBoundedNumber("REALTIME_UPGRADE_MAX_PER_WINDOW", 120, 1, 100_000);
 const REALTIME_UPGRADE_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_UPGRADE_RATE_WINDOW_MS", 60_000, 1000, 10 * 60 * 1000);
 const REALTIME_MAX_CONNECTIONS_PER_PEER = parseBoundedNumber("REALTIME_MAX_CONNECTIONS_PER_PEER", 100, 1, 10_000);
+const requestedZk10RealtimeStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10RealtimeEgress = requestedZk10RealtimeStrict !== ""
+  && requestedZk10RealtimeStrict !== "0" && requestedZk10RealtimeStrict !== "off";
 const ROUTE_RATE_LIMIT_MAX = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_MAX", 60, 1_000_000);
 const ROUTE_RATE_LIMIT_WINDOW_MS = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 2_147_483_647);
 const realtimeUpgradeGuard = createRealtimeUpgradeGuard({
@@ -563,6 +566,12 @@ function sendRealtime(socket, event, payload = {}) {
 }
 
 function broadcastRealtime(event, payload = {}) {
+  // A globally delivered event reveals mutation presence, category and timing
+  // even when object metadata is stripped. ZK10 strict mode has no verified
+  // external owner/account identity or lease to authorize any recipient, so
+  // suppress all application broadcasts until one is provisioned. Session
+  // greetings and direct ping/pong remain available via sendRealtime().
+  if (strictZk10RealtimeEgress) return;
   for (const socket of wss.clients) {
     sendRealtime(socket, event, payload);
   }
@@ -7322,6 +7331,23 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
   }
 
   sendOptimizedFile(req, res, filePath, name, "attachment");
+});
+
+// The experimental ZK10 Sync strict switch cannot authorize anonymous file
+// egress: neither a JWT/local file owner nor a public token proves the
+// independent immutable-account/object mapping. Until a current external
+// issuer and owner inventory are wired through these routes, strict means
+// denial of *both* legacy token issuance and anonymous redemption. Default
+// OFF retains the #63/#64 legacy behavior; this is not production cutover.
+const requestedZk10AnonymousFence = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10AnonymousFence = requestedZk10AnonymousFence !== ""
+  && requestedZk10AnonymousFence !== "0" && requestedZk10AnonymousFence !== "off";
+app.use(["/file-open-token", "/version-open-token", "/open-file", "/share"], (req, res, next) => {
+  if (!strictZk10AnonymousFence) return next();
+  return res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external anonymous owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
 });
 
 app.post("/file-open-token", fileOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
