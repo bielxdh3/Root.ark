@@ -89,6 +89,31 @@ test("private SQLite bootstrap preserves legitimate nested creation and restart"
   }
 });
 
+test("Windows SQLite bootstrap accepts unrelated Everyone Read sibling without weakening a new private child", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const root = createPrivateAuthorityFixture("rootark-zk-sqlite-read-sibling-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // The pre-existing private root is safe for mkdir. An unrelated sibling
+  // intentionally allows READ (not Modify) and is outside the new DB subtree.
+  const sibling = path.join(root, "public-read-only.txt");
+  fs.writeFileSync(sibling, "unrelated disposable public data");
+  const grant = spawnSync("C:\\Windows\\System32\\icacls.exe",
+    [sibling, "/grant", "*S-1-1-0:R"],
+    { windowsHide: true, encoding: "utf8", timeout: 12000 });
+  assert.equal(grant.status, 0, "real NTFS Everyone Read ACE must be installed");
+  const child = path.join(root, "private-sqlite", "nested");
+  const filename = path.join(child, "authority.sqlite");
+  assert.equal(fs.existsSync(child), false);
+  assert.doesNotThrow(() => ensurePrivateSqliteDirectory(filename),
+    "an unrelated safe READ-only sibling must not deny private SQLite creation");
+  assert.equal(fs.statSync(child).isDirectory(), true);
+  assert.doesNotThrow(() => assertPrivateSqliteAuthorityDirectory(filename),
+    "new SQLite child still must have the native protected owner-only DACL");
+  assert.doesNotThrow(() => ensurePrivateSqliteDirectory(filename),
+    "restart of the private SQLite child must remain supported");
+});
+
 test("private SQLite bootstrap does not descend through a later component swapped for a junction", (t) => {
   const root = createPrivateAuthorityFixture("rootark-zk-sqlite-later-swap-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

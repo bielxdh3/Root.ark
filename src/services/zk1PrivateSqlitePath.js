@@ -88,15 +88,21 @@ function ensurePrivateSqliteDirectory(filename) {
   // security attributes at creation, not as a vulnerable second step.
   const native = process.platform === "win32"
     ? require("../../services/chunkUploadWindowsAcl") : null;
-  try { native?.verifyWindowsChunkUploadTree(existing); }
-  catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
+  // Preserve the full private-tree guard for an existing SQLite directory.
+  // During bootstrap, however, unrelated children of an existing ancestor
+  // may legitimately be readable; they cannot replace our new private child.
+  // The native CREATE guard checks ancestor owners and destructive ACEs
+  // before creating each protected child; scanning ancestor siblings here
+  // would reject safe pre-existing data without improving that boundary.
+  if (missing.length === 0) {
+    try { native?.verifyWindowsChunkUploadTree(existing); }
+    catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
+  }
   for (const name of missing.reverse()) {
     // Recheck this PARENT immediately before writing the next child. In
     // particular, reject a junction substituted after the previous child's
     // post-mkdir verification, before native or POSIX mkdir may descend.
     checkDirectory(path.join(existing, "_sqlite_db"));
-    try { native?.verifyWindowsChunkUploadTree(existing); }
-    catch (_) { throw Error("UNTRUSTED_SQLITE_PATH"); }
     const child = path.join(existing, name);
     // The component was absent at preflight. A name newly materialized in
     // the meantime is not our directory and must not be adopted, including
