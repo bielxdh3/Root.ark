@@ -41,8 +41,11 @@ function assessEdgeTap(output, exitCode) {
     const result = /^(ok|not ok) [1-9]\d* - (.+)$/.exec(line);
     if (!result) continue;
     const annotation = / # (SKIP|TODO)(?:\s|$)/.exec(result[2]);
-    const name = annotation ? result[2].slice(0, annotation.index) : result[2];
-    if (!EXPECTED_EDGE_CASES.includes(name)) continue;
+    const reportedName = annotation ? result[2].slice(0, annotation.index) : result[2];
+    // Node's TAP reporter escapes literal # in test titles as \#.
+    const name = EXPECTED_EDGE_CASES.find((expected) =>
+      reportedName === expected || reportedName === expected.replaceAll("#", "\\#"));
+    if (!name) continue;
     if (cases.has(name)) throw new Error("Duplicate mandatory Edge E2E case");
     cases.set(name, { passed: result[1] === "ok", annotation: annotation?.[1] || null });
   }

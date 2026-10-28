@@ -25,6 +25,15 @@ test("mandatory Edge gate accepts six unique executed E2E cases and no skipped c
   assert.equal(evidence.skipped, 0);
 });
 
+test("mandatory Edge gate recognizes Node TAP escaped hash in the owner V1 #128 title", () => {
+  const escapedNodeTap = tap().replaceAll("V1 #128", "V1 \\#128");
+  const evidence = assessEdgeTap(escapedNodeTap, 0);
+  assert.equal(evidence.verifiedCases, 6);
+  const duplicate = tap([...EXPECTED_EDGE_CASES, EXPECTED_EDGE_CASES[3]])
+    .replace("V1 #128", "V1 \\#128");
+  assert.throws(() => assessEdgeTap(duplicate, 0), /duplicate/i);
+});
+
 test("mandatory Edge gate rejects the exact hosted Ubuntu skip false-positive", () => {
   assert.throws(() => assessEdgeTap(tap(EXPECTED_EDGE_CASES,
     { skipped: EXPECTED_EDGE_CASES }), 0), /skipped/i);
