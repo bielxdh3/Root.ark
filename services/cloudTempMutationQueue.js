@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { assertZk10LegacyBackupNotStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false, isEnabled = () => true, area = "temp", retryBaseMs = 2000, retryMaxMs = 30000 } = {}) {
   if (!directory || !lifecycleLock?.run || typeof localPathFor !== "function" || typeof upload !== "function" || typeof remove !== "function") {
@@ -138,8 +139,13 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   }
 
   async function processLocked(item) {
+    // Legacy background cloud PUT/DELETE has neither an authenticated owner
+    // nor a current external account floor. Check immediately before IO,
+    // including retries from persisted queue records after restart.
+    assertZk10LegacyBackupNotStrict();
     if (!isEnabled()) return;
     for (let pass = 0; pass < 100; pass += 1) {
+      assertZk10LegacyBackupNotStrict();
       const record = read(item.folderId, item.fileName);
       if (!record) return;
       if (record.desired === "absent") {
@@ -189,6 +195,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   }
 
   async function enqueue(folderId, fileName, desired) {
+    assertZk10LegacyBackupNotStrict();
     const item = identity(folderId, fileName);
     return lifecycleLock.run(item.folderId, item.fileName, async () => {
       setDesired(item.folderId, item.fileName, desired);
@@ -197,6 +204,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   }
 
   async function sweep() {
+    assertZk10LegacyBackupNotStrict();
     if (!isEnabled()) return;
     if (!fs.existsSync(queueDirectory)) return;
     const records = [];

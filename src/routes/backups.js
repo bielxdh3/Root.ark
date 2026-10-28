@@ -1,3 +1,5 @@
+const { isZk10LegacyBackupStrict } = require("../services/zk10LegacyBackupDeny");
+
 function registerBackupRoutes(app, context) {
   const {
     auditLog,
@@ -10,15 +12,28 @@ function registerBackupRoutes(app, context) {
     waitForRequestQuiescence,
   } = context;
 
-  app.get("/backups", authenticate, requireBackupAccess, (req, res) => {
+  // These are whole-instance archives: an authenticated manager is not an
+  // externally attested owner of every account, object, or historic ZIP.
+  // Deny even metadata and mutations on this route module while experimental
+  // STRICT is requested without an external account-wide authority.
+  const denyStrictZk10Backup = (_req, res, next) => {
+    if (!isZk10LegacyBackupStrict()) return next();
+    return res.status(503).set("Cache-Control", "no-store").json({
+      error: "ZK10 external account-wide backup authority unavailable",
+      code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+    });
+  };
+  const access = [authenticate, requireBackupAccess, denyStrictZk10Backup];
+
+  app.get("/backups", ...access, (req, res) => {
     res.json({ backups: backupService.listBackups() });
   });
 
-  app.get("/backups/latest-status", authenticate, requireBackupAccess, (req, res) => {
+  app.get("/backups/latest-status", ...access, (req, res) => {
     res.json({ latest: backupService.latestStatus() });
   });
 
-  app.post("/backups", authenticate, requireBackupAccess, async (req, res) => {
+  app.post("/backups", ...access, async (req, res) => {
     try {
       const backup = await backupService.createBackup({
         type: "manual",
@@ -63,7 +78,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.get("/backups/:id/download", authenticate, requireBackupAccess, (req, res) => {
+  app.get("/backups/:id/download", ...access, (req, res) => {
     try {
       const { backup, archivePath } = backupService.getBackupOrThrow(req.params.id);
       if (req.method !== "HEAD") {
@@ -77,7 +92,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.get("/backups/:id/manifest", authenticate, requireBackupAccess, async (req, res) => {
+  app.get("/backups/:id/manifest", ...access, async (req, res) => {
     try {
       const manifest = await restoreService.getBackupManifest(req.params.id);
       res.json(manifest);
@@ -86,7 +101,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.post("/backups/:id/restore", authenticate, requireBackupAccess, async (req, res) => {
+  app.post("/backups/:id/restore", ...access, async (req, res) => {
     auditLog("backup.restore.started", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "partial", {});
     try {
       const result = await restoreService.restoreBackup(req.params.id, {
@@ -142,7 +157,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.delete("/backups/:id", authenticate, requireBackupAccess, async (req, res) => {
+  app.delete("/backups/:id", ...access, async (req, res) => {
     try {
       const backup = await backupService.deleteBackup(req.params.id);
       auditLog("backup.deleted", getAuditActor(req), { type: "backup", id: backup.id }, "deleted", "success", {

@@ -12,6 +12,7 @@ const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilien
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
+const { assertZk10LegacyBackupNotStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
@@ -366,6 +367,7 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 }
 
 async function collectBackupFiles(options = {}) {
+  assertZk10LegacyBackupNotStrict();
   if (options.persistenceMode && options.persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
     throw new Error("Persistence mode changed while collecting backup files");
   }
@@ -970,6 +972,7 @@ function createLockRelease(operation, token) {
 }
 
 async function createZipArchive(archivePath, manifest, files) {
+  assertZk10LegacyBackupNotStrict();
   const closeTimeoutMs = Math.max(50, Math.min(5000, envNumber("BACKUP_OUTPUT_CLOSE_TIMEOUT_MS", 1000)));
   const cleanupRetries = 2;
   const cleanupDelayMs = 25;
@@ -1405,6 +1408,9 @@ async function cleanupRetention(options = {}) {
 }
 
 async function createBackup(options = {}) {
+  // A global archive mixes all accounts and cannot prove per-object ownership.
+  // Abort before snapshots, directory creation, locks or cloud download.
+  assertZk10LegacyBackupNotStrict();
   if (!envBool("BACKUP_ENABLED", true)) {
     throw new Error("Backups desativados por BACKUP_ENABLED=false");
   }
@@ -1595,6 +1601,8 @@ function listBackups() {
 }
 
 function getBackupOrThrow(id) {
+  // Includes direct service callers, not only HTTP GET/HEAD downloads.
+  assertZk10LegacyBackupNotStrict();
   if (!/^[a-f0-9-]{36}$/i.test(String(id || ""))) throw new Error("Backup invalido");
   const backup = backupRepository.getBackup(id);
   if (!backup) throw new Error("Backup nao encontrado");

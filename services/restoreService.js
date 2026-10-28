@@ -13,6 +13,7 @@ const restorePreimage = require("./restorePreimage");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
+const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const RESTORE_TMP_DIR = path.join(backupService.BACKUPS_DIR, ".restore-tmp");
@@ -800,6 +801,20 @@ async function refreshPendingRestoreDownloadFences() {
 }
 
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
+  // This startup path bypasses the public processRestoreSync wrapper. Under
+  // strict mode, avoid ALL provider I/O. An idle, already-known inventory
+  // should still let the app boot (legacy endpoints remain deny-only), but
+  // unknown inventory or a pending restore queue must remain blocked.
+  if (isZk10LegacyBackupStrict()) {
+    const status = restoreProviderOrphans.getInventoryStatus();
+    const pendingQueue = backupRepository.listBackups().some((backup) => {
+      const sync = backup.metadata?.restoreSync;
+      return sync && !["completed", "cancelled"].includes(sync.state)
+        && (sync.entries || []).some((entry) => !["completed", "cancelled"].includes(entry.state));
+    });
+    if (status.state === "unknown" || pendingQueue) assertZk10LegacyBackupNotStrict();
+    return { state: status.state, changed: false };
+  }
   if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   const previousStatus = restoreProviderOrphans.getInventoryStatus();
   let status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
@@ -998,6 +1013,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     if (!hasEligibleEntry && !allCompleted) break;
     const revision = Number(sync?.revision) || 0;
     const priorAttempts = new Map(entries.map((entry) => [entry.entryId, Number(entry.attempts) || 0]));
+    assertZk10LegacyBackupNotStrict();
     selectedBackup = await processRestoreSyncInternal(
       { backupId: selectedBackupId, clock, uploader: contextBoundCloudStorage },
       STARTUP_INVENTORY_RECONCILIATION,
@@ -1013,7 +1029,9 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     throw new Error(`Selected archive uploads are not fully reconciled (${sync?.state || "missing"}); cloud access remains blocked`);
   }
   const selectedUploads = new Set(sync.entries.map((entry) => restoreProviderOrphans.identityKey(entry.area, entry.folderId, entry.name)));
+  assertZk10LegacyBackupNotStrict();
   const inventory = await contextBoundCloudStorage.inventory();
+  assertZk10LegacyBackupNotStrict();
   if (!Array.isArray(inventory)) throw new Error("Cloud provider inventory is invalid; cloud access remains blocked");
   const normalizedInventory = restoreProviderOrphans.normalizeObjects(inventory
     .filter((entry) => ["uploads", "temp"].includes(entry.area))
@@ -1150,6 +1168,10 @@ function cancelRestoreSync(backupId, reason = "cancelled", { clock } = {}) {
 const STARTUP_INVENTORY_RECONCILIATION = Symbol("startup-inventory-reconciliation");
 
 async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}, authority) {
+  // Mandatory physical source-of-work boundary, including the privileged
+  // STARTUP_INVENTORY_RECONCILIATION caller which intentionally does not use
+  // the public processRestoreSync() method.
+  assertZk10LegacyBackupNotStrict();
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
@@ -1168,6 +1190,7 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
     }
     operationProvider = bindProviderContext(provider, expectedProviderContext);
   }
+  assertZk10LegacyBackupNotStrict();
   if (restoreProviderOrphans.isInventoryUnknown(provider) && authority !== STARTUP_INVENTORY_RECONCILIATION) restoreProviderOrphans.assertProviderAvailable(provider);
   if (latest.metadata.restoreSync.entries?.length
     && latest.metadata.restoreSync.entries.every((entry) => entry.state === "completed")
@@ -1192,12 +1215,14 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
   const now = typeof clock === "function" ? clock() : clock?.now ? clock.now() : Date.now();
   const providerIdentity = String(provider.provider || provider.name || "cloud").toLowerCase();
   for (const candidate of latest.metadata.restoreSync.entries || []) {
+    assertZk10LegacyBackupNotStrict();
     if (candidate.state === "completed") continue;
     if (candidate.nextAttemptAt && new Date(candidate.nextAttemptAt).getTime() > now) continue;
     const lease = claimSyncEntry(backupId, candidate.entryId, { now, leaseMs, workerId, providerIdentity });
     if (!lease) continue;
     try {
       const reconcileObject = async () => {
+        assertZk10LegacyBackupNotStrict();
         const localPath = resolveRuntimePath(lease.entry.path);
         const sourceStat = fs.lstatSync(localPath, { throwIfNoEntry: false });
         if (!sourceStat?.isFile() || sourceStat.isSymbolicLink()) {
@@ -1235,8 +1260,12 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
               if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) return false;
             }
           }
+          // Never rely on a pre-await check: a background reconciliation can
+          // change strict state while hashing or reserving a Drive file ID.
+          assertZk10LegacyBackupNotStrict();
           const uploaded = await operationProvider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
             providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
+          assertZk10LegacyBackupNotStrict();
           if (!uploaded) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
           if (lease.entry.sourceHash && await backupService.calculateFileHash(localPath) !== lease.entry.sourceHash) {
             throw Object.assign(new Error("restore source changed during upload"), { code: "source_unavailable" });
@@ -1273,7 +1302,10 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
       if (error.code?.startsWith("backup_")) throw error;
       const current = backupRepository.getBackup(backupId);
       const entry = current?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId && value.leaseToken === lease.token);
-      if (!entry) continue;
+      if (!entry) {
+        if (error.code === "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE") throw error;
+        continue;
+      }
       const attempts = Math.max(1, Number(entry.attempts) || 1);
       const failureCategory = ["source_unavailable", "configuration"].includes(error.code) ? error.code : "provider_error";
       const at = syncNow(clock);
@@ -1291,6 +1323,9 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
       } catch (mutationError) {
         if (!["backup_revision_conflict", "backup_state_conflict", "backup_lease_conflict", "backup_mutation_conflict"].includes(mutationError.code)) throw mutationError;
       }
+      // A strict fence is not a transient provider outage. After releasing
+      // the durable lease into retry_wait, propagate denial to startup.
+      if (error.code === "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE") throw error;
     }
     latest = backupRepository.getBackup(backupId) || latest;
   }
@@ -1298,6 +1333,9 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
 }
 
 async function processRestoreSync(options = {}) {
+  // Restarted cloud-reconciliation workers must not replay unverified backup
+  // corpus into provider storage while strict cutover is requested.
+  assertZk10LegacyBackupNotStrict();
   return processRestoreSyncInternal(options);
 }
 
@@ -2618,6 +2656,9 @@ function restoreDatabaseFiles(extractedRoot, options = {}) {
 }
 
 async function restoreBackup(id, options = {}) {
+  // Whole-account restore and its pre-restore ZIP cannot be attributed to a
+  // single owner. Deny before entering a persistent whole-restore state.
+  require("../src/services/zk10LegacyBackupDeny").assertZk10LegacyBackupNotStrict();
   if (String(options.confirmation || "") !== "RESTORE") {
     throw new Error("Confirmacao invalida. Digite RESTORE para restaurar.");
   }

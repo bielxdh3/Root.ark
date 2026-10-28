@@ -31,6 +31,7 @@ const WebSocket = require("ws");
 const cron = require("node-cron");
 const { Transform } = require("node:stream");
 const { scheduleAutomaticBackups } = require("./services/backupScheduler");
+const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("./src/services/zk10LegacyBackupDeny");
 const { getServerMasterKey: readServerMasterKey } = require("./services/serverMasterKey");
 const {
   assertSafeChunkUploadAncestors,
@@ -360,13 +361,20 @@ function isCloudStorageEnabled() { return cloudStorage.enabled(); }
 function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
 async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") {
+  assertZk10LegacyBackupNotStrict();
   const result = await guardedCloudStorage.upload(localPath, folderId, fileName, area);
   if (result) await restoreProviderOrphans.clear(folderId, fileName, area, cloudStorage);
   return result;
 }
 async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return guardedCloudStorage.download(folderId, fileName, localPath, area, canPublish); }
-async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return guardedCloudStorage.remove(folderId, fileName, area); }
-async function deleteCloudPrefix(prefix) { return guardedCloudStorage.removePrefix(prefix); }
+async function deleteFileFromCloud(folderId, fileName, area = "uploads") {
+  assertZk10LegacyBackupNotStrict();
+  return guardedCloudStorage.remove(folderId, fileName, area);
+}
+async function deleteCloudPrefix(prefix) {
+  assertZk10LegacyBackupNotStrict();
+  return guardedCloudStorage.removePrefix(prefix);
+}
 async function listCloudFiles(folderId, area = "uploads") { return guardedCloudStorage.list(folderId, area); }
 
 async function syncFolderCacheFromCloud(folderId, area = "uploads") {
@@ -399,6 +407,9 @@ let cloudUploadMutationDrainRunning = false;
 let cloudUploadMutationDrainRequested = false;
 
 function requestCloudUploadMutationDrain(label) {
+  // Replayed provider writes have no attached authenticated immutable owner.
+  // Preserve queue records until an actual independently authorized handler exists.
+  if (isZk10LegacyBackupStrict()) return;
   if (!isCloudStorageEnabled()) return;
   cloudUploadMutationDrainRequested = true;
   if (cloudUploadMutationDrainScheduled || cloudUploadMutationDrainRunning) return;
@@ -4330,6 +4341,10 @@ function getTrashRetentionDays() {
 }
 
 async function cleanupExpiredTrashItems() {
+  // Direct retention cleanup is also called independently of the guarded
+  // processPendingCloudTrashItems() retry loop. Do not queue a destructive
+  // expired-item operation, much less call its provider, under strict cutover.
+  if (isZk10LegacyBackupStrict()) return;
   if (!isTrashEnabled()) return;
   if (!shouldAutoCleanupTrash()) return;
 
@@ -5716,6 +5731,7 @@ function isWebDavInternalStoredFile(folderId, fileName) {
 }
 
 async function deleteCloudTrashItem(item) {
+  assertZk10LegacyBackupNotStrict();
   if (!isCloudStorageEnabled()) return false;
   if (item.itemType === "folder") {
     await deleteCloudPrefix(getCloudKey(item.originalFolderId, "", "uploads"));
@@ -5745,6 +5761,9 @@ function isTrashReplacementActive(item) {
 }
 
 function processCloudTrashDeletion(item) {
+  // Callers include HTTP DELETE /trash/:id, bulk deletion, startup retries,
+  // and automatic expiry cleanup. Guard independently of those entry points.
+  assertZk10LegacyBackupNotStrict();
   return trashService.processRemoteDeletion({
     item,
     provider: deleteCloudTrashItem,
@@ -5755,6 +5774,8 @@ function processCloudTrashDeletion(item) {
 }
 
 async function processPendingCloudTrashItems() {
+  // Do not replay unowned remote-delete jobs under experimental strict cutover.
+  if (isZk10LegacyBackupStrict()) return;
   return restoreRequestGate.run(async () => {
     if (!isCloudStorageEnabled()) return;
     try {
@@ -5795,6 +5816,7 @@ function deleteCloudTrashItemLater(item) {
 }
 
 async function processPendingCloudRestoreSync() {
+  if (isZk10LegacyBackupStrict()) return;
   return restoreRequestGate.run(async () => {
     if (!isCloudStorageEnabled()) return;
     for (const backup of backupService.listBackups()) {
@@ -12674,6 +12696,7 @@ scheduleAutomaticBackups({
 void processPendingCloudTrashItems();
 const cloudTempReconciliationIntervalMs = parseBoundedNumber("CLOUD_TEMP_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
 const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
+  if (isZk10LegacyBackupStrict()) return;
   if (!isCloudStorageEnabled()) return;
   let pendingUploads = {};
   try { pendingUploads = loadPendingUploads(); }
@@ -12691,7 +12714,10 @@ const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
 }).catch((error) => {
   console.error("[cloud-temp] startup reconciliation failed:", sanitizeLogValue(error.message));
 });
-const retryCloudTempMutations = () => restoreRequestGate.run(() => cloudTempMutationQueue.processAll()).catch((error) => {
+const retryCloudTempMutations = () => restoreRequestGate.run(() => {
+  if (isZk10LegacyBackupStrict()) return;
+  return cloudTempMutationQueue.processAll();
+}).catch((error) => {
   console.error("[cloud-temp] retry reconciliation failed:", sanitizeLogValue(error.message));
 });
 setTimeout(() => { void recoverCloudTempMutations(); }, 0);
