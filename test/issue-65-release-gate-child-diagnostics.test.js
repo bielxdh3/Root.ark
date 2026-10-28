@@ -5,12 +5,47 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { Buffer } = require("node:buffer");
-const { summarizeUnrecognizedChild } = require("../scripts/release-gate-child-diagnostics");
+const { createHash } = require("node:crypto");
+const { summarizeUnrecognizedChild, summarizeFailedChildTests } = require("../scripts/release-gate-child-diagnostics");
 const { extractHostedAclFailureDiagnostics } = require("../scripts/release-gate-acl-diagnostics");
 
 const poisoned = ["password=my-dangerous-value", "Bearer sent-in-stdout",
   "D:\\a\\Root.ark\\fake\\private.key", "S-1-5-11", "host.internal.test",
   "synthetic_credential_marker_abcdefghijklmnopqrstuvwxyz0123456789", "ROOTARK_ACL_V1 case=LEGACY_GENERIC_ACE stage=ACE_WRITE code=ASSERTION trust=UNKNOWN"].join("\n");
+
+test("failed canonical child emits only bounded existing name and path hashes, never titles", () => {
+  const name = `secret ${poisoned.replace(/\n/g, " ")}`;
+  const file = "test/issue-65-release-gate-child-diagnostics.test.js";
+  const sha = (input) => createHash("sha256").update(input).digest("hex").slice(0, 24);
+  const stdout = ["TAP version 13", `not ok 911 - ${name}`, "  ---",
+    `  location: 'C:\\runner\\repo\\${file.replaceAll("/", "\\")}:27:5'`,
+    "  failureType: 'testCodeFailure'", "  code: 'ERR_ASSERTION'",
+    `  error: ${poisoned.replace(/\n/g, " ")}`, "  ...", "1..911",
+    "# tests 911", "# pass 910", "# fail 1", "# cancelled 0", "# skipped 0", "# todo 0"].join("\n");
+  const output = summarizeFailedChildTests({ status: 1, stdout, stderr: poisoned });
+  assert.match(output, /^CHILD_FAIL_HASH_V1 /);
+  assert.match(output, new RegExp(`nameSha256=${sha(name)}`));
+  assert.match(output, new RegExp(`testPathSha256=${sha(file)}`));
+  assert.match(output, /category=assertion/);
+  assert.doesNotMatch(output, /password|Bearer|private|S-1-|host\.internal|ROOTARK|ACE_WRITE|ERR_ASSERTION.*private/i);
+  assert.ok(output.length < 1500);
+  const source = fs.readFileSync(path.join(__dirname, "../scripts/validate-release-gate.js"), "utf8");
+  assert.match(source, /summarizeFailedChildTests\(result\)/);
+  assert.match(source, /record\(name, "FAIL", `exit \$\{result\.status \?\? "unknown"\}`\)/);
+});
+
+test("failure hashes are diagnostic-only, bounded, and absent for successful or non-TAP children", () => {
+  assert.equal(summarizeFailedChildTests({ status: 0, stdout: "TAP version 13\nnot ok 1 - poisoned" }), "");
+  assert.equal(summarizeFailedChildTests({ status: 1, stdout: "arbitrary child output" }), "");
+  const stdout = ["TAP version 13", ...Array.from({ length: 30 }, (_, n) =>
+    `not ok ${n + 1} - ${poisoned.replace(/\n/g, " ")}`),
+  "1..30", "# tests 30", "# pass 0", "# fail 30", "# cancelled 0",
+  "# skipped 0", "# todo 0"].join("\n");
+  const safe = summarizeFailedChildTests({ status: 1, stdout });
+  assert.match(safe, /CHILD_FAIL_HASH_V1/);
+  assert.ok(safe.length < 3000);
+  assert.doesNotMatch(safe, /password|Bearer|private|S-1-|host\.internal|ROOTARK|ACE_WRITE/);
+});
 
 test("realistic 79KB non-TAP Windows Node child exception yields bounded category without source details", () => {
   const stdout = `${"unrecognized opaque stdout\n".repeat(3000)}\nnode:internal/modules/cjs/loader:1234\nReferenceError: private key reference\n${poisoned}`;

@@ -7,7 +7,7 @@ const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
 const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 const { extractHostedAclFailureDiagnostics } = require("./release-gate-acl-diagnostics");
-const { summarizeUnrecognizedChild } = require("./release-gate-child-diagnostics");
+const { summarizeUnrecognizedChild, summarizeFailedChildTests } = require("./release-gate-child-diagnostics");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -41,7 +41,9 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
   const diagnostics = failedTestDiagnostics(output, result.stdout || "");
   // Emit the categorical child envelope even for TAP/ACL failures; a child
   // without trusted ACL telemetry never gets to print its arbitrary test name.
-  console.log(`FAIL diagnostics (${name}):\n${diagnostics ? `${diagnostics}\n` : ""}${summarizeUnrecognizedChild(result)}; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")}; raw output withheld`);
+  const identities = name === "final-head canonical npm test"
+    ? summarizeFailedChildTests(result) : "";
+  console.log(`FAIL diagnostics (${name}):\n${diagnostics ? `${diagnostics}\n` : ""}${identities ? `${identities}\n` : ""}${summarizeUnrecognizedChild(result)}; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")}; raw output withheld`);
   return false;
 }
 

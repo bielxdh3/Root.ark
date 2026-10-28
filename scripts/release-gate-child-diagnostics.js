@@ -107,4 +107,44 @@ function summarizeUnrecognizedChild(child = {}) {
   return `CHILD_DIAG_V1 exit=${exit} signal=${signal} spawn=${spawn} footer=${footer} progress=${progress} reporter=${reporter} hint=${hint} failCount=${failCount} failTop=${boundedOrdinals(failedTop)} failNested=${boundedOrdinals(failedNested)} window=${sampled ? "sampled" : "complete"}`;
 }
 
-module.exports = { summarizeUnrecognizedChild };
+// Optional failed-child identity hints. Reuse the canonical Windows recorder's
+// existing 96-bit SHA-256 name/path digests and finite error categories, but
+// NEVER forward untrusted TAP titles, paths, exception text, stdout or stderr.
+// This only observes an already-failed child; it cannot affect test execution,
+// concurrency, status, timeouts or the mandatory release gate's verdict.
+function summarizeFailedChildTests(child = {}) {
+  const stdout = typeof child.stdout === "string" ? child.stdout : "";
+  if (child.status === 0 || stdout.length > 16 * 1024 * 1024) return "";
+  // npm writes a short script header ahead of TAP. Require the exact TAP
+  // marker near the beginning; arbitrary non-TAP stdout gets no identity hint.
+  const marker = /^TAP version 13\r?$/m.exec(stdout.slice(0, 8192));
+  if (!marker) return "";
+  const { createTapProgressRecorder } = require("./run-windows-canonical-tests");
+  const safe = [];
+  const tracker = createTapProgressRecorder((line) => {
+    if (safe.length < 12 && /^(?:FAIL test result index=|FAIL detail index=)/.test(line))
+      safe.push(line);
+  });
+  let cursor = marker.index;
+  let lines = 0;
+  let incomplete = false;
+  while (cursor < stdout.length && lines < 200000) {
+    const newline = stdout.indexOf("\n", cursor);
+    const end = newline < 0 ? stdout.length : newline;
+    const raw = stdout.slice(cursor, end);
+    // Do not let one hostile megabyte-long title or a huge number of blank
+    // lines exhaust the diagnostic parser. Both conditions lose only hints.
+    if (raw.length <= 8192) tracker.accept(raw.replace(/\r$/, ""));
+    else incomplete = true;
+    cursor = newline < 0 ? stdout.length : newline + 1;
+    lines++;
+  }
+  if (cursor < stdout.length) incomplete = true;
+  tracker.finish();
+  if (!tracker.state.failures) return "";
+  return (`CHILD_FAIL_HASH_V1 observed=${tracker.state.failures}`
+    + ` hints=${safe.length} incomplete=${incomplete ? 1 : 0}\n`
+    + safe.join("\n")).slice(0, 3000);
+}
+
+module.exports = { summarizeUnrecognizedChild, summarizeFailedChildTests };

@@ -9,7 +9,7 @@ const vm = require("node:vm");
 const { extractHostedAclFailureDiagnostics } =
   require("../scripts/release-gate-acl-diagnostics");
 const { parseAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
-const { summarizeUnrecognizedChild } = require("../scripts/release-gate-child-diagnostics");
+const { summarizeUnrecognizedChild, summarizeFailedChildTests } = require("../scripts/release-gate-child-diagnostics");
 
 const title = "Windows generic access ACEs cannot evade private snapshot ancestor checks";
 const file = "test/issue-65-legacy-deterministic-evidence-manifest.test.js";
@@ -118,6 +118,7 @@ test("hosted release gate still records a failing child exit while excluding for
   const recorded = [], printed = [];
   const context = {
     extractHostedAclFailureDiagnostics, summarizeUnrecognizedChild,
+    summarizeFailedChildTests,
     spawnSync: () => ({ status: 1, stdout, stderr }),
     record: (...args) => recorded.push(args),
     console: { log: (...args) => printed.push(args.join(" ")) },
