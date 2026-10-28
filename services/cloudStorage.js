@@ -59,6 +59,22 @@ function validZk1S3VersionId(value) {
 // not permission to follow a local junction/symlink into an unrelated tree.
 // The caller creates a private cache directory first; unlike legacy downloads,
 // missing parents are refused rather than implicitly created through links.
+function assertTrustedBoundedPosixParent(stat, finalParent) {
+  if (process.platform === "win32") return;
+  const owner = BigInt(process.getuid());
+  const rootOwned = stat.uid === 0n;
+  const foreignWritable = (stat.mode & 0o022n) !== 0n;
+  // A foreign UID can chmod/rename its directory even if it is 0755 today.
+  // Root-owned sticky ancestors (e.g. /tmp) cannot rename our owned child;
+  // the actual destination parent must be owned by this process and not
+  // writable by any other UID. Owner-owned 0755 parents remain supported.
+  if ((stat.uid !== owner && !rootOwned)
+    || (finalParent && (stat.uid !== owner || foreignWritable))
+    || (!finalParent && foreignWritable
+      && !(rootOwned && (stat.mode & 0o1000n) !== 0n))) {
+    throw cloudError("provider_error", "Bounded ciphertext destination has an unsafe owner or mode");
+  }
+}
 function pinBoundedDownloadParent(localPath) {
   if (typeof localPath !== "string" || !path.isAbsolute(localPath)) {
     throw cloudError("provider_error", "Bounded ciphertext destination must be absolute");
@@ -74,6 +90,7 @@ function pinBoundedDownloadParent(localPath) {
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw cloudError("provider_error", "Bounded ciphertext destination has a redirected parent");
     }
+    assertTrustedBoundedPosixParent(stat, current === parent);
     pinned.push({ current, dev: stat.dev, ino: stat.ino });
   }
   const guard = () => {
@@ -83,6 +100,7 @@ function pinBoundedDownloadParent(localPath) {
         || stat.dev !== item.dev || stat.ino !== item.ino) {
         throw cloudError("provider_error", "Bounded ciphertext destination parent changed");
       }
+      assertTrustedBoundedPosixParent(stat, item.current === parent);
     }
   };
   guard();
