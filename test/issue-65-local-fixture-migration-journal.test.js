@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawnSync, execFileSync } = require("node:child_process");
 const {
   runLocalFixtureCiphertextMigration,
   verifyLocalFixtureCiphertextMigration,
@@ -14,13 +14,29 @@ const {
 } = require("../src/services/zk1LocalFixtureMigrationJournal");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 const { canonicalTestTempEnvironment } = require("./support/issue-65-canonical-temp-fixture");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const bytes = Buffer.from("synthetic encrypted ciphertext, never plaintext/user material\x00", "utf8");
 const REFERENCE_KINDS = ["versions", "backups", "trash", "links", "derived", "retention"];
 
 function fixture(t) {
-  const dir = fs.mkdtempSync(path.join(canonicalTestTempEnvironment(t), "rootark-zk-local-fixture-"));
+  const temporary = canonicalTestTempEnvironment(t);
+  let dir;
+  if (process.platform === "win32") {
+    // In CI, normal %TEMP% may inherit other sandbox SIDs with Modify and
+    // DELETE_CHILD. It cannot safely host a fixture that writes by pathname.
+    // Keep the exact os.tmpdir()-child contract but use a truly private native
+    // DACL from birth, never an inherited-then-fixed ACL.
+    const privateParent = fs.realpathSync.native(process.env.LOCALAPPDATA);
+    process.env.TEMP = privateParent;
+    process.env.TMP = privateParent;
+    dir = path.join(privateParent,
+      "rootark-zk-local-fixture-" + crypto.randomBytes(12).toString("hex"));
+    ensureWindowsChunkUploadRoot(dir);
+  } else {
+    dir = fs.mkdtempSync(path.join(temporary, "rootark-zk-local-fixture-"));
+  }
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   for (const sub of ["source", "target", "journal",
     ...REFERENCE_KINDS.map((kind) => "references/" + kind)])
@@ -477,4 +493,48 @@ test("truncated staged ciphertext cannot be recorded as committed or rolled back
   assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("Windows foreign-MODIFY fixture target cannot redirect the stage write after its last guard", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const f = fixture(t);
+  const targetDir = path.join(f.dir, "target");
+  const parkedDir = path.join(f.dir, "target-parked");
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-w78-stage-outside-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const outsideStage = path.join(outside, ".operation1.stage");
+  // Give the foreign Users SID Modify on the ACTUAL fixture root, so a less
+  // privileged process can both rename target and install a junction there.
+  // The same-UID hook only schedules the adversarial interleaving precisely.
+  execFileSync("C:\\Windows\\System32\\icacls.exe",
+    [f.dir, "/grant", "*S-1-5-32-545:(OI)(CI)M"],
+    { windowsHide: true, stdio: "ignore" });
+  const nativeOpen = fs.openSync;
+  let attemptedSwap = false;
+  try {
+    fs.openSync = (filename, ...args) => {
+      if (filename === path.join(targetDir, ".operation1.stage")) {
+        attemptedSwap = true;
+        fs.renameSync(targetDir, parkedDir);
+        fs.symlinkSync(outside, targetDir, "junction");
+      }
+      return nativeOpen(filename, ...args);
+    };
+    assert.throws(() => runLocalFixtureCiphertextMigration(f.plan),
+      /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  } finally {
+    fs.openSync = nativeOpen;
+    if (attemptedSwap) {
+      fs.unlinkSync(targetDir);
+      fs.renameSync(parkedDir, targetDir);
+    }
+  }
+  assert.equal(attemptedSwap, false,
+    "foreign-modifiable fixture must be denied before any attempted stage open");
+  assert.equal(fs.existsSync(f.journal), false,
+    "untrusted fixture must not create even a local journal before denial");
+  assert.equal(fs.existsSync(path.join(targetDir, ".operation1.stage")), false);
+  assert.equal(fs.existsSync(outsideStage), false,
+    "foreign-modifiable target must never redirect even a failed stage write outside the fixture");
 });

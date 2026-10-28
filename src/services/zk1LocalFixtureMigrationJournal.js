@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { verifyWindowsLocalWebDavTree } = require("../../services/chunkUploadWindowsAcl");
 
 const SCHEMA = "rootark-zk1-local-fixture-migration-journal/v1";
 const MODE = "rootark-zk-local-fixture-only/v1";
@@ -59,6 +60,15 @@ function safeRoot(dir, mode) {
   const root = path.resolve(dir);
   const temporary = path.resolve(os.tmpdir());
   if (path.dirname(root) !== temporary || !path.basename(root).startsWith("rootark-zk-local-fixture-")) refuse();
+  if (process.platform === "win32") {
+    // A disposable fixture is not exempt from the Windows DACL boundary:
+    // a different local user with DELETE_CHILD/Modify on this directory can
+    // replace a validated child with a junction between guard() and wx/rename.
+    // The later identity check detects the swap only AFTER writing outside.
+    // Require every existing fixture item to have a trusted native owner/DACL,
+    // and reject an unsafe ancestor before any journal or staging side effect.
+    try { verifyWindowsLocalWebDavTree(root); } catch (_) { refuse(); }
+  }
   // Pin every directory identity (including Windows junction ancestors) so a
   // checkpoint cannot redirect subsequent writes or rollback outside this
   // disposable fixture. Native openat-style protection against a hostile
