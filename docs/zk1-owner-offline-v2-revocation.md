@@ -10,8 +10,11 @@ remain on the offline owner machine; only wrapped ciphertext is exported.
 
 ## Local execution
 
-Use a fresh private directory under owner control and a trusted local
-operator module called owner-context.js (see the existing offline owner
+Use a fresh private directory under owner control (POSIX `0700` with a
+`0600` trusted JavaScript module; on Windows a native verified owner-only
+NTFS DACL). These conditions are enforced by the shared offline CLI and
+unsafe writable ancestors or executable context files are denied. Use a
+trusted local operator module called owner-context.js (see the existing offline owner
 enrollment documentation). It must reconstruct the full signed V2 history
 with canonical verifier and provide:
 

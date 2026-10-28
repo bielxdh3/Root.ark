@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 "use strict";
 // Offline: no HTTP, cloud SDK, server account keys or key export.
-const path = require("node:path");
 const shared = require("./zk1-owner-offline-enroll-local");
 const { executeOwnerRevocation } = require("../src/services/zk1OwnerOfflineRevocationOrchestrator");
 
@@ -28,8 +27,7 @@ function pin(value) {
 async function run(argv) {
   const args = parse(argv);
   const folder = shared.safeDir(args["--owned-dir"]);
-  const modulePath = shared.fileAt(folder, args["--context-module"]);
-  if (path.extname(modulePath).toLowerCase() !== ".js") deny();
+  const modulePath = shared.trustedContextFile(folder, args["--context-module"]);
   const buildTrusted = require(modulePath);
   if (typeof buildTrusted !== "function") deny();
   // The operator's trusted code MUST reconstruct a branded history by

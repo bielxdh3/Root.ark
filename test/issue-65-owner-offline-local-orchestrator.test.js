@@ -11,6 +11,8 @@ const manifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const z = require("../src/crypto/rootark-zk-1");
 const commit = require("../src/crypto/rootark-zk1-offline-commitment-receipt");
 const browserPop = require("../public/client/rootark-zk1-v2-browser-pop");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const { executeOwnerEnrollment } = require("../src/services/zk1OwnerOfflineEnrollmentOrchestrator");
 
 test("offline owner CLI rejects context module traversal outside the owned directory", (t) => {
@@ -167,7 +169,7 @@ test("owner local orchestrator rejects forged pins, PoP, unsigned head, witnesse
 
 test("executable Node owner CLI interchanges real browser PoP + signed receipt using disposable owner files", async (t) => {
   const f = await setup();
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-ceremony-"));
+  const root = createPrivateAuthorityFixture("rootark-owner-ceremony-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   const source = path.resolve(__dirname, "../");
   const state = f.state;
@@ -216,7 +218,7 @@ test("executable Node owner CLI interchanges real browser PoP + signed receipt u
         trustedCommitmentSignerPublicKey:crypto.createPublicKey(input.witnessPublicPem),
         trustedPriorCommitment:input.prior,
         trustedActorPrivateKey:crypto.createPrivateKey(input.actorPrivatePem)};
-    };`);
+    };`, { mode: 0o600 });
   const cli = path.join(source, "scripts/zk1-owner-offline-enroll-local.js");
   const args = [cli, "--owned-dir", root, "--context-module", "owner-context.js",
     "--owner-spki", f.pins.ownerSpkiSha256, "--witness-spki", f.pins.witnessSpkiSha256,

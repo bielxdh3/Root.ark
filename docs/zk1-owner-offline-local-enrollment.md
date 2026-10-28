@@ -28,11 +28,19 @@ It must:
    V2 transition; the independently pinned **owner** signs the grant only
    after committed-head confirmation.
 
-Only populate the CLI directory with operator-owned files (no writable access
-by other users). Use an ephemeral dedicated folder on a trusted filesystem.
-The CLI rejects symlinks in its owned directory and existing output names.
-The path checks are not atomic defenses against a hostile local administrator
-replacing directory components concurrently.
+Only populate the CLI directory with operator-owned files. The CLI now
+**enforces** a private owner-controlled `--owned-dir`: on POSIX the final
+directory must be owned by the invoking UID with no group/other permissions
+(typically `0700`), and the trusted `--context-module` must be an owner-only
+regular single-link file (typically `0600`). Its ancestors must have trusted
+ownership and cannot be group/other writable, except for trusted root-owned
+sticky ancestors such as `/tmp`. On Windows native NTFS owner/DACL checks
+must exclude untrusted principals from modifying the ceremony directory or
+reading/writing the trusted context module; simple NTFS mode bits are not
+proof of isolation. Use a dedicated folder on a trusted filesystem.
+The CLI rejects symlinks/junctions in its owned ancestry and existing files.
+These checks do not protect against a privileged local administrator or the
+operator itself changing trusted files concurrently.
 
 ## Running the ceremony
 

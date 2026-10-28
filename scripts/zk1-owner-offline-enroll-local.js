@@ -7,6 +7,12 @@
 // be serialized across restarts without lowering assurance.
 const fs = require("node:fs");
 const path = require("node:path");
+const { assertPrivateSqliteDirectory } =
+  require("../src/services/zk1PrivateSqlitePath");
+const { readAuthorityPinnedFile } =
+  require("../src/services/zk1AuthorityPinnedFile");
+const { verifyWindowsLocalWebDavDirectory } =
+  require("../services/chunkUploadWindowsAcl");
 const { executeOwnerEnrollment } =
   require("../src/services/zk1OwnerOfflineEnrollmentOrchestrator");
 
@@ -39,6 +45,21 @@ function safeDir(value) {
   walkSafe(absolute);
   if (path.resolve(fs.realpathSync.native(absolute)).toLowerCase()
     !== absolute.toLowerCase()) deny();
+  // The directory contains executable trusted operator code AND private
+  // signing material supplied to that code. A writable or traversable folder
+  // allows a different local UID to replace modules/ceremony inputs. Check
+  // every ancestor, then require a private owner-controlled final directory.
+  try {
+    assertPrivateSqliteDirectory(path.join(absolute, ".rootark-offline-owner-boundary"));
+    if (process.platform === "win32") {
+      // NTFS mode bits cannot represent an inherited write/delete ACE. Use
+      // the existing pinned native owner/DACL/ancestor verification helper.
+      verifyWindowsLocalWebDavDirectory(absolute);
+    } else {
+      const stat = fs.lstatSync(absolute, { bigint: true });
+      if (stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n) !== 0n) deny();
+    }
+  } catch (_) { deny(); }
   return absolute;
 }
 function fileAt(root, filename, mustExist = true) {
@@ -55,6 +76,21 @@ function fileAt(root, filename, mustExist = true) {
       || stat.size < 1 || stat.size > MAX_INPUT) deny();
   } else if (fs.existsSync(value)) deny();
   return value;
+}
+function trustedContextFile(root, filename) {
+  safeDir(root);
+  const modulePath = fileAt(root, filename);
+  if (path.extname(modulePath).toLowerCase() !== ".js") deny();
+  // The shared authority reader pins file and ancestor identities and checks
+  // owner-only POSIX 0600 or native Windows leaf owner/DACL before returning.
+  // A trusted owner may still change their own code; less-privileged local
+  // principals cannot replace this module after the trust checks.
+  let source;
+  try {
+    source = readAuthorityPinnedFile(modulePath);
+  } catch (_) { deny(); }
+  finally { source?.fill(0); }
+  return modulePath;
 }
 function readJson(root, filename) {
   const target = fileAt(root, filename);
@@ -90,8 +126,7 @@ async function awaitJson(root, filename, until) {
 async function run(argv) {
   const args = parse(argv);
   const root = safeDir(args["--owned-dir"]);
-  const modulePath = fileAt(root, args["--context-module"]);
-  if (path.extname(modulePath).toLowerCase() !== ".js") deny();
+  const modulePath = trustedContextFile(root, args["--context-module"]);
   // This module IS trusted operator code, never a response from a server.
   // It must reconstruct a REAL branded verifiedHistory using the canonical
   // verifier and provision private keys from offline owner-controlled storage.
@@ -133,4 +168,5 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
-module.exports = { run, parse, safeDir, fileAt, readJson, publishJson, awaitJson };
+module.exports = { run, parse, safeDir, fileAt, trustedContextFile,
+  readJson, publishJson, awaitJson };

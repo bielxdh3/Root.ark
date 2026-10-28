@@ -9,6 +9,8 @@ const vm = require("node:vm");
 const { spawn } = require("node:child_process");
 const { publishFixtureJson, awaitFixtureJson } =
   require("./support/issue-65-owner-revocation-fixture-ipc");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const m = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const z = require("../src/crypto/rootark-zk-1");
@@ -369,7 +371,7 @@ test("revocation fails closed on forged current head, revoked actor, old epoch, 
 test("real Node CLI exchanges candidate and two signed witness proofs with separate owner process", async (t) => {
   for (const mode of ["valid", "missing-cas", "bad-prior-pin"]) {
     const f = await setup();
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-revoke-"));
+    const root = createPrivateAuthorityFixture("rootark-owner-revoke-");
     t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
     const file = (name) => path.join(root, name);
     const write = (name, data) => publishFixtureJson(root, name, data);
@@ -393,7 +395,7 @@ test("real Node CLI exchanges candidate and two signed witness proofs with separ
     });
     fs.writeFileSync(file("owner-context.js"), "module.exports = require("
       + JSON.stringify(path.join(source, "test/support/issue-65-owner-revocation-cli-context.js"))
-      + ");");
+      + ");", { mode: 0o600 });
     const args = [
       path.join(source, "scripts/zk1-owner-offline-revoke-local.js"),
       "--owned-dir", root, "--context-module", "owner-context.js",
