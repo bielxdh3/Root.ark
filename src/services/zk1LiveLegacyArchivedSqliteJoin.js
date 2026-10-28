@@ -5,7 +5,11 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
+const { assertPrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
+const { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree } =
+  require("../../services/chunkUploadWindowsAcl");
 
 const MAX_ROWS = 5000;
 const MAX_JSON = 256 * 1024;
@@ -28,6 +32,25 @@ const KNOWN_REFERENCE_COLUMNS = Object.freeze({
   sync_resume_factor_spend_grant: "username replay_digest code_mac device_id pause_fence committed_at",
 });
 function deny() { throw new Error("ZK_LEGACY_ARCHIVE_SQLITE_JOIN_UNVERIFIED"); }
+function assertPosixTrustedTemporaryParent(folder) {
+  // mkdtemp(0700) protects the new inode but not its directory entry: a
+  // foreign UID with write access to a non-sticky ancestor can replace it
+  // before SQLite's pathname open or our cleanup. Check BEFORE mkdir.
+  let cursor = path.resolve(folder);
+  const owner = BigInt(process.getuid());
+  while (true) {
+    const stat = fs.lstatSync(cursor, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()
+      || fs.realpathSync.native(cursor) !== cursor
+      || (stat.uid !== owner && stat.uid !== 0n)) deny();
+    const writable = (stat.mode & 0o022n) !== 0n;
+    const rootSticky = stat.uid === 0n && (stat.mode & 0o1000n) !== 0n;
+    if (writable && !rootSticky) deny();
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+}
 function safePart(value) {
   return typeof value === "string" && value.length >= 1 && value.length <= 255
     && value !== "." && value !== ".." && !/[\\/\x00-\x1f<>:"|?*]/.test(value)
@@ -62,11 +85,29 @@ function inspectZk1LiveLegacyArchivedSqliteJoin({ sqliteBytes, members }) {
     || sqliteBytes.length > 32 * 1024 * 1024 || !members || !(members instanceof Map)) deny();
   let tmp, db;
   try {
-    // Node 22/24 DatabaseSync has no deserialize(bytes) API. Open the pinned
-    // archive image from a new private directory, query_only, no sidecars.
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-archive-sql-"));
+    // Node 22/24 DatabaseSync has no deserialize(bytes) API. On Windows,
+    // mkdtemp inherits TEMP's DACL, which can give unrelated local users READ
+    // (archived user/link/trash metadata) or MODIFY (replace the SQLite image)
+    // before the read-only DB is opened. Native CreateDirectoryW installs the
+    // protected owner-only DACL AT CREATION and first rejects destructive ACEs
+    // on any ancestor. Never adopt/delete a candidate until verified.
+    if (process.platform === "win32") {
+      const candidate = path.join(os.tmpdir(),
+        "zk1-archive-sql-" + crypto.randomBytes(12).toString("hex"));
+      ensureWindowsChunkUploadRoot(candidate);
+      verifyWindowsChunkUploadTree(candidate);
+      tmp = candidate;
+    } else {
+      assertPosixTrustedTemporaryParent(os.tmpdir());
+      tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-archive-sql-"));
+      // A private leaf under an attacker-owned/writable parent can still be
+      // swapped. Root-owned sticky /tmp and owner-only ancestors are allowed.
+      assertPrivateSqliteDirectory(path.join(tmp, "archive.sqlite"));
+    }
     const filename = path.join(tmp, "archive.sqlite");
     fs.writeFileSync(filename, sqliteBytes, { flag: "wx", mode: 0o600 });
+    if (process.platform === "win32") verifyWindowsChunkUploadTree(tmp);
+    else assertPrivateSqliteDirectory(filename);
     db = new DatabaseSync(filename, { readOnly: true });
     db.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF");
     if (db.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") deny();

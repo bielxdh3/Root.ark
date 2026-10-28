@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const { MIGRATIONS } = require("../db/migrations");
 const { createZipArchive } = require("../services/backupService");
@@ -12,6 +13,8 @@ const { inspectZk1LiveLegacyRecoverableArchiveGraph: inspect } =
 const { signZk1LegacyArchiveReferentialProof } =
   require("../src/services/zk1LegacyArchiveReferentialProof");
 const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const ARCHIVE = "rootark-backup-2026-10-23-09-00-00.zip";
@@ -293,4 +296,87 @@ test("trash source with incorrect archived SQL size is not a recoverable join", 
   const graph = (await scan(f)).historicalSqlite;
   assert.equal(graph.joinedTrashReferences, 0);
   assert.equal(graph.status, "UNKNOWN");
+});
+
+test("Windows archived SQLite historical staging remains private under readable TEMP across restart", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const f = make(t);
+  await build(f);
+  const temp = createPrivateAuthorityFixture("rootark-zk-archive-sql-temp-");
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const grant = spawnSync("C:\\Windows\\System32\\icacls.exe",
+    [temp, "/grant", "*S-1-1-0:(OI)(CI)R"],
+    { encoding: "utf8", windowsHide: true, timeout: 12000 });
+  assert.equal(grant.status, 0, "real Everyone inherited READ ACE must be present");
+  const oldTemp = process.env.TEMP, oldTmp = process.env.TMP;
+  const originalWrite = fs.writeFileSync;
+  let staged = 0, privateStage = false;
+  process.env.TEMP = process.env.TMP = temp;
+  fs.writeFileSync = function (file, ...args) {
+    const outcome = originalWrite.call(this, file, ...args);
+    if (path.basename(String(file)) === "archive.sqlite") {
+      staged++;
+      try { verifyWindowsChunkUploadTree(path.dirname(file)); privateStage = true; }
+      catch (_) { privateStage = false; }
+    }
+    return outcome;
+  };
+  try {
+    const result = await scan(f);
+    assert.equal(result.historicalSqlite.joinedVersionReferences, 1);
+    assert.equal(result.historicalSqlite.joinedTrashReferences, 1);
+    assert.equal(result.historicalSqlite.joinedMetadataReferences, 3);
+    assert.equal(result.wholeCorpusVerified, false);
+    assert.equal(result.authorizesCutover, false);
+  } finally {
+    fs.writeFileSync = originalWrite;
+    if (oldTemp === undefined) delete process.env.TEMP; else process.env.TEMP = oldTemp;
+    if (oldTmp === undefined) delete process.env.TMP; else process.env.TMP = oldTmp;
+  }
+  assert.equal(staged, 1, "real extracted archived SQLite file must be materialized");
+  assert.equal(privateStage, true, "the staged DB tree must not inherit Everyone READ");
+  // The original archived SQLite/ZIP bytes survive a new process opening the
+  // same persisted archive. The authenticated whole-account cutover stays OFF.
+  const script = `const fs=require('node:fs'),path=require('node:path');
+    const check=require('./services/chunkUploadWindowsAcl').verifyWindowsChunkUploadTree;
+    const original=fs.writeFileSync; let privateSql=false;
+    fs.writeFileSync=function(name,...args){const result=original.call(this,name,...args);
+      if(path.basename(String(name))==='archive.sqlite'){
+        try{check(path.dirname(name));privateSql=true;}catch(_){privateSql=false;}}
+      return result;};
+    require('./src/services/zk1LiveLegacyRecoverableArchiveGraph')
+      .inspectZk1LiveLegacyRecoverableArchiveGraph({ optIn:true,
+        databasePath:process.env.ROOTARK_TEST_DB,backupDataDir:process.env.ROOTARK_TEST_DATA,
+        persistence:{dbEnabled:true,jsonReadFallback:false,jsonWriteMirror:false}})
+      .then((x)=>process.exit(privateSql&&x.historicalSqlite.joinedVersionReferences===1
+        &&x.canDeleteLegacy===false&&x.authorizesCutover===false?0:42))
+      .catch(()=>process.exit(43));`;
+  const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8",
+    cwd: path.resolve(__dirname, ".."), windowsHide: true, timeout: 20000,
+    env: { ...process.env, TEMP: temp, TMP: temp,
+      ROOTARK_TEST_DB: f.databasePath, ROOTARK_TEST_DATA: f.data } });
+  assert.equal(child.status, 0, "restart must reopen archive with private staging and no cutover: " + child.stderr);
+});
+
+test("Windows archived SQLite refuses foreign-Modify TEMP before creating a staging directory", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const f = make(t);
+  await build(f);
+  const temp = createPrivateAuthorityFixture("rootark-zk-archive-sql-weak-");
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const grant = spawnSync("C:\\Windows\\System32\\icacls.exe",
+    [temp, "/grant", "*S-1-1-0:(OI)(CI)M"],
+    { encoding: "utf8", windowsHide: true, timeout: 12000 });
+  assert.equal(grant.status, 0, "real inherited Everyone Modify ACE must be present");
+  const originalTemp = process.env.TEMP, originalTmp = process.env.TMP;
+  process.env.TEMP = process.env.TMP = temp;
+  try { await assert.rejects(scan(f), /ZK_LEGACY_RECOVERABLE_GRAPH_UNVERIFIED/); }
+  finally {
+    if (originalTemp === undefined) delete process.env.TEMP; else process.env.TEMP = originalTemp;
+    if (originalTmp === undefined) delete process.env.TMP; else process.env.TMP = originalTmp;
+  }
+  assert.deepEqual(fs.readdirSync(temp), [],
+    "untrusted TEMP must cause refusal before any extraction or SQLite side effect");
 });
