@@ -4,7 +4,6 @@
 // and permission middleware. No legacy route is reclassified as zk-1; this
 // explicit isolated cipher plane remains unsafe to call production ZK until
 // an independently administered, linearizable per-chunk gate is available.
-const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { createZk1WitnessHttpsClient } = require("./zk1WitnessHttpsClient");
@@ -16,6 +15,7 @@ const { Zk1OpaqueCatalog } = require("./zk1OpaqueCatalog");
 const { createZk1OpaqueCatalogCasHttpsClient } =
   require("./zk1OpaqueCatalogCasHttpsClient");
 const { registerZk1ProtectedObjectRoutes } = require("../routes/zk1ProtectedObjectRoutes");
+const { createAuthorityPinnedReader } = require("./zk1AuthorityPinnedFile");
 
 const B64U = /^[A-Za-z0-9_-]+$/;
 const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
@@ -55,46 +55,11 @@ function absolute(value) {
   if (typeof value !== "string" || !value || !path.isAbsolute(value)) fail();
   return value;
 }
-function sameFileIdentity(left, right) {
-  return left.isFile() && right.isFile()
-    && left.dev === right.dev && left.ino === right.ino
-    && left.mode === right.mode && left.nlink === right.nlink
-    && left.size === right.size && left.mtimeNs === right.mtimeNs
-    && left.ctimeNs === right.ctimeNs;
+function readFile(filename, max = 65536, reader) {
+  try { return reader(absolute(filename), max); }
+  catch (_) { fail(); }
 }
-function readFile(filename, max = 65536) {
-  const input = absolute(filename);
-  let descriptor;
-  try {
-    // Path validation alone leaves a lstat -> readFile race. Pin the exact
-    // inode through an open descriptor before reading operator-provisioned
-    // pins and TLS keys. BigInt avoids adjacent 64-bit file-ID collisions.
-    const before = fs.lstatSync(input, { bigint: true });
-    if (!before.isFile() || before.nlink !== 1n
-      || before.size < 1n || before.size > BigInt(max)) fail();
-    descriptor = fs.openSync(input,
-      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const opened = fs.fstatSync(descriptor, { bigint: true });
-    if (!sameFileIdentity(before, opened)) fail();
-    const bytes = Buffer.alloc(Number(opened.size));
-    let consumed = 0;
-    while (consumed < bytes.length) {
-      const size = fs.readSync(descriptor, bytes, consumed,
-        bytes.length - consumed, null);
-      if (size < 1) fail();
-      consumed += size;
-    }
-    // Never trust a file that grew while being read, even within a pinned fd.
-    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) fail();
-    const after = fs.fstatSync(descriptor, { bigint: true });
-    const currentPath = fs.lstatSync(input, { bigint: true });
-    if (!sameFileIdentity(opened, after)
-      || !sameFileIdentity(opened, currentPath)) fail();
-    return bytes;
-  } catch (_) { fail(); }
-  finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
-}
-function endpoint(config, witness) {
+function endpoint(config, witness, reader) {
   const tunedFields = witness ? [] : Object.keys(CAS_DEADLINE_LIMITS)
     .filter((field) => Object.hasOwn(config || {}, field));
   exact(config, witness ? WITNESS_FIELDS : [...CAS_FIELDS, ...tunedFields]);
@@ -108,9 +73,9 @@ function endpoint(config, witness) {
   }
   return {
     endpoint: config.endpoint,
-    ca: readFile(config.caPath),
-    clientKey: readFile(config.clientKeyPath),
-    clientCert: readFile(config.clientCertPath),
+    ca: readFile(config.caPath, 65536, reader),
+    clientKey: readFile(config.clientKeyPath, 65536, reader),
+    clientCert: readFile(config.clientCertPath, 65536, reader),
     serverFingerprint256: config.serverFingerprint256,
     ...tuning,
   };
@@ -128,14 +93,14 @@ function clientTlsIdentity(settings) {
     return { key, certificate: cert.raw };
   } catch (_) { fail(); }
 }
-function trustedSignedHistory(config, scope, casClient) {
+function trustedSignedHistory(config, scope, casClient, reader) {
   exact(config, SIGNED_HISTORY_FIELDS);
   const genesisDigest = b64(config.genesisDigest, 32);
   const baseKeyId = b64(config.baseWitnessKeyId, 16);
-  const basePublicKey = crypto.createPublicKey(readFile(config.baseWitnessPublicKeyPath));
+  const basePublicKey = crypto.createPublicKey(readFile(config.baseWitnessPublicKeyPath, 65536, reader));
   if (basePublicKey.type !== "public" || basePublicKey.asymmetricKeyType !== "ed25519") fail();
   let receipt;
-  try { receipt = JSON.parse(readFile(config.baseReceiptPath, 8192).toString("utf8")); }
+  try { receipt = JSON.parse(readFile(config.baseReceiptPath, 8192, reader).toString("utf8")); }
   catch (_) { fail(); }
   exact(receipt, BASE_RECEIPT_FIELDS);
   const copied = {};
@@ -164,7 +129,7 @@ function trustedSignedHistory(config, scope, casClient) {
     exact(item, ["activationRevision", "envelopePath"]);
     if (!Number.isSafeInteger(item.activationRevision)
       || item.activationRevision < 2) fail();
-    const envelope = readFile(item.envelopePath, 8 * 1024 * 1024);
+    const envelope = readFile(item.envelopePath, 8 * 1024 * 1024, reader);
     envelopeBytes += envelope.length;
     if (envelopeBytes > 64 * 1024 * 1024) fail();
     return { activationRevision: item.activationRevision, envelopeBytes: envelope };
@@ -179,16 +144,16 @@ function trustedSignedHistory(config, scope, casClient) {
     }),
   };
 }
-function registerZk1ProtectedContentFromConfig({
+function registerZk1ProtectedContentWithReader({
   app, authenticate, requirePermission, configPath, environment,
   multiproviderRestore = null,
   opaqueCatalogAuthority = null,
   opaqueCheckpointV2 = null,
-}) {
+}, reader) {
   if (!["development", "test"].includes(environment)
     || !app || typeof app.post !== "function"
     || typeof authenticate !== "function" || typeof requirePermission !== "function") fail();
-  const configBytes = readFile(configPath);
+  const configBytes = readFile(configPath, 65536, reader);
   let config;
   try { config = JSON.parse(configBytes.toString("utf8")); }
   catch (_) { fail(); }
@@ -214,8 +179,8 @@ function registerZk1ProtectedContentFromConfig({
     witnessSequence: config.minimumHead.revision,
     digest: b64(config.minimumHead.digest, 32),
   };
-  const witnessTransport = endpoint(config.witness, true);
-  const casTransport = endpoint(config.cas, false);
+  const witnessTransport = endpoint(config.witness, true, reader);
+  const casTransport = endpoint(config.cas, false, reader);
   // Separate logical endpoints are NOT independent trust roots if a single
   // server certificate or mTLS client identity is accepted as both CAS and
   // witness. Detect this unsafe alias at opt-in bootstrap, before opening or
@@ -227,7 +192,7 @@ function registerZk1ProtectedContentFromConfig({
     === config.cas.serverFingerprint256.toUpperCase()
     || witnessClient.key.equals(casClient.key)
     || witnessClient.certificate.equals(casClient.certificate)) fail();
-  const publicKey = crypto.createPublicKey(readFile(config.witness.signingPublicKeyPath));
+  const publicKey = crypto.createPublicKey(readFile(config.witness.signingPublicKeyPath, 65536, reader));
   if (publicKey.type !== "public" || publicKey.asymmetricKeyType !== "ed25519") fail();
   // Explicit V2-only opt-in. This signer is pinned by the operator and
   // cannot alias either the witness or manifest-CAS mTLS identity.
@@ -236,7 +201,7 @@ function registerZk1ProtectedContentFromConfig({
     if (opaqueCatalogAuthority !== null) fail();
     exact(config.catalogCas, CATALOG_CAS_FIELDS);
     const catalogTransport = endpoint(Object.fromEntries(CAS_FIELDS.map((field) =>
-      [field, config.catalogCas[field]])), false);
+      [field, config.catalogCas[field]])), false, reader);
     const catalogIdentity = clientTlsIdentity(catalogTransport);
     if ([config.witness.serverFingerprint256, config.cas.serverFingerprint256]
       .some((pin) => pin.toUpperCase()
@@ -246,7 +211,7 @@ function registerZk1ProtectedContentFromConfig({
       || catalogIdentity.certificate.equals(witnessClient.certificate)
       || catalogIdentity.certificate.equals(casClient.certificate)) fail();
     const catalogPublicKey = crypto.createPublicKey(readFile(
-      config.catalogCas.authorityPublicKeyPath));
+      config.catalogCas.authorityPublicKeyPath, 65536, reader));
     if (catalogPublicKey.type !== "public" || catalogPublicKey.asymmetricKeyType !== "ed25519"
       || catalogPublicKey.equals(publicKey)) fail();
     configuredCatalogAuthority = createZk1OpaqueCatalogCasHttpsClient({
@@ -259,7 +224,7 @@ function registerZk1ProtectedContentFromConfig({
   // Version 2 is opt-in only in development/test and requires independently
   // provisioned public genesis/recovery witness roots, not CAS-provided ones.
   const signedHistory = config.version === 2
-    ? trustedSignedHistory(config.signedHistory, scope, manifestProvider) : {};
+    ? trustedSignedHistory(config.signedHistory, scope, manifestProvider, reader) : {};
   const store = new Zk1ProtectedObjectStore(absolute(config.contentDbPath), {
     bootstrapNew: config.bootstrapNew, trustedScope: scope, admissionRequired: true,
     minimumHead: floor, witnessProvider,
@@ -284,6 +249,14 @@ function registerZk1ProtectedContentFromConfig({
     throw error;
   }
   return store;
+}
+function registerZk1ProtectedContentFromConfig(options) {
+  // Keep startup and every sensitive read synchronous and fail-closed.
+  // One resident native verifier compiles once and authorizes each file anew.
+  // Always release it after startup, including malformed config/errors.
+  const pinned = createAuthorityPinnedReader();
+  try { return registerZk1ProtectedContentWithReader(options, pinned.read); }
+  finally { pinned.stop(); }
 }
 
 module.exports = { registerZk1ProtectedContentFromConfig };

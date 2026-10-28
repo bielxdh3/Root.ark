@@ -9,8 +9,35 @@ const path = require("node:path");
 const { assertPrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
 const { verifyWindowsAuthorityFilePath } =
   require("../../services/chunkUploadWindowsAcl");
+const { createWindowsSynchronousPrivateAclVerifier } =
+  require("./zk1WindowsSynchronousPrivateAclVerifier");
 
 const LIMIT = 65536;
+const MAX_LIMIT = 8 * 1024 * 1024;
+// Reuse the compiled native verifier across successive startup attempts.
+// The resident process stores NO approvals: every read requests fresh native
+// `verify-authority` including owner, leaf ACEs and all ancestors.
+let resident = null;
+let residentUsers = 0;
+let idleStop = null;
+function acquireResident() {
+  if (idleStop) { clearTimeout(idleStop); idleStop = null; }
+  if (!resident) resident = createWindowsSynchronousPrivateAclVerifier();
+  residentUsers += 1;
+  return resident;
+}
+function releaseResident() {
+  residentUsers -= 1;
+  if (residentUsers !== 0) return;
+  idleStop = setTimeout(() => {
+    idleStop = null;
+    if (residentUsers === 0) {
+      resident?.stop();
+      resident = null;
+    }
+  }, 2000);
+  idleStop.unref?.();
+}
 function denied() {
   const error = new Error("ZK_AUTHORITY_FILE_UNTRUSTED");
   error.code = error.message;
@@ -53,26 +80,27 @@ function sameDirectories(first, filename) {
       || a.mode !== b.mode) denied();
   }
 }
-function checkAuthorityPermissions(filename, stat) {
+function checkAuthorityPermissions(filename, stat, verifyWindowsFile) {
   if (process.platform === "win32") {
     // Native GetNamedSecurityInfoW traverses the ancestor DACLs and rejects
     // their reparse points, unsafe owners and DELETE_CHILD rights. The leaf
     // must have no non-operator read/write ACEs. The helper invokes only the
     // fixed system PowerShell, never PATH-selected code.
-    verifyWindowsAuthorityFilePath(filename);
+    verifyWindowsFile(filename);
   } else if (stat.uid !== BigInt(process.getuid())
     || (stat.mode & 0o077n) !== 0n) denied();
 }
-function readAuthorityPinnedFile(value) {
-  if (typeof value !== "string" || !path.isAbsolute(value)) denied();
+function readPinned(value, maxBytes, verifyWindowsFile) {
+  if (typeof value !== "string" || !path.isAbsolute(value)
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_LIMIT) denied();
   let fd;
   let content;
   try {
     const directories = directoryIdentity(value);
     const before = fs.lstatSync(value, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
-      || before.size < 1n || before.size > BigInt(LIMIT)) denied();
-    checkAuthorityPermissions(value, before);
+      || before.size < 1n || before.size > BigInt(maxBytes)) denied();
+    checkAuthorityPermissions(value, before, verifyWindowsFile);
     fd = fs.openSync(value, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
       | (fs.constants.O_CLOEXEC || 0));
     const opened = fs.fstatSync(fd, { bigint: true });
@@ -102,4 +130,24 @@ function readAuthorityPinnedFile(value) {
     }
   }
 }
-module.exports = { readAuthorityPinnedFile };
+function readAuthorityPinnedFile(value, maxBytes = LIMIT) {
+  return readPinned(value, maxBytes, verifyWindowsAuthorityFilePath);
+}
+function createAuthorityPinnedReader() {
+  const native = process.platform === "win32" ? acquireResident() : null;
+  let released = false;
+  return {
+    read(value, maxBytes = LIMIT) {
+      if (released) denied();
+      return readPinned(value, maxBytes, native
+        ? (filename) => native.verifyAuthorityFile(filename)
+        : verifyWindowsAuthorityFilePath);
+    },
+    stop() {
+      if (released) return;
+      released = true;
+      if (native) releaseResident();
+    },
+  };
+}
+module.exports = { readAuthorityPinnedFile, createAuthorityPinnedReader };

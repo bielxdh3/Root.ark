@@ -7,14 +7,13 @@ const { Worker } = require("node:worker_threads");
 // caller blocked INSIDE the SQLite transaction while a separate Node worker
 // drives the verified resident C# PowerShell ACL check (never a cached verdict).
 function createWindowsSynchronousPrivateAclVerifier() {
-  if (process.platform !== "win32") return { verify() {}, stop() {} };
+  if (process.platform !== "win32") return { verify() {}, verifyAuthorityFile() {}, stop() {} };
   const DEADLINE_MS = 12000;
   let stopped = false;
   let dead = false;
   let worker = null;
   const denial = () => new Error("Windows SQLite CAS ACL validation failed");
-  return {
-    verify(directory) {
+  function verify(directory, kind) {
       if (stopped || dead || typeof directory !== "string" || !directory.length
         || Buffer.byteLength(directory, "utf8") > 65000) throw denial();
       if (!worker) {
@@ -29,7 +28,7 @@ function createWindowsSynchronousPrivateAclVerifier() {
       // A distinct shared slot per call prevents a late response to an
       // expired check from authorizing ANY later operation.
       const status = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-      try { worker.postMessage({ path: directory, signal: status.buffer }); }
+      try { worker.postMessage({ path: directory, kind, signal: status.buffer }); }
       catch (_) { dead = true; throw denial(); }
       const result = Atomics.wait(status, 0, 0, DEADLINE_MS);
       // A fast native worker may notify before Atomics.wait starts; Node
@@ -43,7 +42,10 @@ function createWindowsSynchronousPrivateAclVerifier() {
         throw denial();
       }
       if (stopped || dead) throw denial();
-    },
+  }
+  return {
+    verify(directory) { return verify(directory, "private-directory"); },
+    verifyAuthorityFile(filename) { return verify(filename, "authority-file"); },
     stop() {
       if (stopped) return;
       stopped = true;

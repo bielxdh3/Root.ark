@@ -13,6 +13,140 @@ const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const { registerZk1ProtectedContentFromConfig } = require("../src/services/zk1ProtectedContentBootstrap");
+const { readAuthorityPinnedFile } = require("../src/services/zk1AuthorityPinnedFile");
+const { createWindowsLocalWebDavAclVerifier, TRUSTED_POWERSHELL } =
+  require("../services/chunkUploadWindowsAcl");
+const { createWindowsSynchronousPrivateAclVerifier } =
+  require("../src/services/zk1WindowsSynchronousPrivateAclVerifier");
+
+test("synchronous resident ACL verifier still enforces private directory mode", {
+  skip: process.platform !== "win32", timeout: 30000,
+}, (t) => {
+  const dir = createPrivateAuthorityFixture("rootark-zk1-native-dir-");
+  const verifier = createWindowsSynchronousPrivateAclVerifier();
+  t.after(() => {
+    verifier.stop();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  verifier.verify(dir);
+  execFileSync(path.join(process.env.SystemRoot, "System32", "icacls.exe"),
+    [dir, "/grant", "*S-1-5-32-545:M"], { stdio: "pipe", timeout: 20000 });
+  assert.throws(() => verifier.verify(dir),
+    "original synchronous private-directory action must still reject Users:Modify");
+});
+
+test("synchronous native authority verifier denies stopped sessions and rechecks after restart", {
+  skip: process.platform !== "win32", timeout: 30000,
+}, (t) => {
+  const dir = createPrivateAuthorityFixture("rootark-zk1-native-lifecycle-");
+  const file = path.join(dir, "private.json");
+  fs.writeFileSync(file, "private-synthetic-fixture", { mode: 0o600 });
+  const stopped = createWindowsSynchronousPrivateAclVerifier();
+  stopped.stop();
+  assert.throws(() => stopped.verifyAuthorityFile(file),
+    "stopped verifier must never authorize or start a worker");
+  const first = createWindowsSynchronousPrivateAclVerifier();
+  const restarted = createWindowsSynchronousPrivateAclVerifier();
+  t.after(() => {
+    first.stop();
+    restarted.stop();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  first.verifyAuthorityFile(file);
+  assert.throws(() => first.verifyAuthorityFile(path.join(dir, "not-present.json")),
+    "an invalid pathname must fail closed");
+  first.verifyAuthorityFile(file);
+  first.stop();
+  assert.throws(() => first.verifyAuthorityFile(file),
+    "an already-started session must remain denied after stop");
+  restarted.verifyAuthorityFile(file);
+  execFileSync(path.join(process.env.SystemRoot, "System32", "icacls.exe"),
+    [file, "/grant", "*S-1-5-32-545:R"], { stdio: "pipe", timeout: 20000 });
+  assert.throws(() => restarted.verifyAuthorityFile(file),
+    "restart may not reuse an old authority ACL verdict");
+});
+
+test("crashed Windows native authority process cannot reuse an old ACL approval", {
+  skip: process.platform !== "win32", timeout: 30000,
+}, async (t) => {
+  const dir = createPrivateAuthorityFixture("rootark-zk1-native-failure-");
+  const file = path.join(dir, "authority.json");
+  fs.writeFileSync(file, "private-synthetic-fixture", { mode: 0o600 });
+  const verifier = createWindowsSynchronousPrivateAclVerifier();
+  t.after(() => {
+    verifier.stop();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  verifier.verifyAuthorityFile(file);
+  // Identify ONLY this Node test process's encoded native verifier child.
+  // The probe PowerShell itself has a plain -Command and is not selected.
+  const childList = execFileSync(TRUSTED_POWERSHELL, [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    `Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${process.pid}' | `
+      + "Where-Object { $_.ProcessId -ne $PID -and $_.Name -eq 'powershell.exe' -and $_.CommandLine -match '-EncodedCommand' } | "
+      + "Select-Object -ExpandProperty ProcessId",
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 20000 })
+    .trim().split(/\s+/).filter(Boolean).map(Number);
+  assert.equal(childList.length, 1, "must target exactly our resident native process");
+  assert.ok(Number.isSafeInteger(childList[0]) && childList[0] > 0);
+  process.kill(childList[0]);
+  execFileSync(path.join(process.env.SystemRoot, "System32", "icacls.exe"),
+    [file, "/grant", "*S-1-5-32-545:R"], { stdio: "pipe", timeout: 20000 });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.throws(() => verifier.verifyAuthorityFile(file),
+    "worker process crash must not authorize a now-untrusted private leaf");
+});
+
+test("resident Windows authority verifier uses strict fresh authority ACLs on every file", {
+  skip: process.platform !== "win32", timeout: 30000,
+}, async (t) => {
+  const dir = createPrivateAuthorityFixture("rootark-zk1-native-authority-");
+  const verifier = createWindowsLocalWebDavAclVerifier();
+  t.after(() => {
+    verifier.stop();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const good = path.join(dir, "good.json");
+  const exposed = path.join(dir, "untrusted-read.json");
+  const replaced = path.join(dir, "substitutable.json");
+  for (const file of [good, exposed, replaced]) {
+    fs.writeFileSync(file, "private-authority-fixture", { mode: 0o600 });
+  }
+  const grant = (file, access) => execFileSync(
+    path.join(process.env.SystemRoot, "System32", "icacls.exe"),
+    [file, "/grant", `*S-1-5-32-545:${access}`],
+    { stdio: "pipe", timeout: 20000 });
+  assert.equal(typeof verifier.verifyAuthorityFile, "function");
+  await verifier.verifyAuthorityFile(good);
+  grant(exposed, "R");
+  await assert.rejects(verifier.verifyAuthorityFile(exposed),
+    "authority leaf with Users:Read must be rejected despite its valid owner");
+  const unsafe = path.join(dir, "ancestor-users-modify");
+  fs.mkdirSync(unsafe);
+  fs.renameSync(replaced, path.join(unsafe, "substitutable.json"));
+  grant(unsafe, "M");
+  await assert.rejects(verifier.verifyAuthorityFile(path.join(unsafe, "substitutable.json")),
+    "DELETE_CHILD on ancestor invalidates even an owner-only leaf");
+  grant(good, "R");
+  await assert.rejects(verifier.verifyAuthorityFile(good),
+    "an earlier successful ACL verdict must never authorize a later modified file");
+});
+
+test("authority bootstrap reader keeps the 64 KiB default and explicit 8 MiB envelope limit", (t) => {
+  const dir = createPrivateAuthorityFixture("rootark-zk1-bounded-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const filename = path.join(dir, "private-envelope.bin");
+  fs.writeFileSync(filename, Buffer.alloc(65537, 0x61), { mode: 0o600 });
+  assert.throws(() => readAuthorityPinnedFile(filename), /ZK_AUTHORITY_FILE_UNTRUSTED/);
+  assert.equal(readAuthorityPinnedFile(filename, 8 * 1024 * 1024).length, 65537);
+  fs.writeFileSync(filename, Buffer.alloc(8 * 1024 * 1024, 0x62), { mode: 0o600 });
+  assert.equal(readAuthorityPinnedFile(filename, 8 * 1024 * 1024).length, 8 * 1024 * 1024);
+  fs.appendFileSync(filename, Buffer.from([0x63]));
+  assert.throws(() => readAuthorityPinnedFile(filename, 8 * 1024 * 1024),
+    /ZK_AUTHORITY_FILE_UNTRUSTED/);
+  assert.throws(() => readAuthorityPinnedFile(filename, 8 * 1024 * 1024 + 1),
+    /ZK_AUTHORITY_FILE_UNTRUSTED/);
+});
 
 test("app opt-in requires independently provisioned roots, explicit genesis and authenticated owner binding", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-zk1-bootstrap-");
@@ -23,17 +157,19 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   });
   const witness = crypto.generateKeyPairSync("ed25519");
   const signing = path.join(dir, "witness-public.pem");
-  fs.writeFileSync(signing, witness.publicKey.export({ format: "pem", type: "spki" }));
+  fs.writeFileSync(signing, witness.publicKey.export({ format: "pem", type: "spki" }),
+    { mode: 0o600 });
   const dummyTlsPaths = ["ca.pem", "client.key", "client.crt",
     "cas-client.key", "cas-client.crt"];
-  fs.writeFileSync(path.join(dir, "ca.pem"), "test-fixture-only-ca");
+  fs.writeFileSync(path.join(dir, "ca.pem"), "test-fixture-only-ca", { mode: 0o600 });
   for (const basename of ["client", "cas-client"]) {
     const pair = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
       publicKeyEncoding: { format: "pem", type: "spki" },
       privateKeyEncoding: { format: "pem", type: "pkcs8" },
     });
-    fs.writeFileSync(path.join(dir, basename + ".key"), pair.privateKey);
+    fs.writeFileSync(path.join(dir, basename + ".key"), pair.privateKey,
+      { mode: 0o600 });
     const args = ["req", "-new", "-x509", "-key", basename + ".key",
       "-out", basename + ".crt", "-days", "1", "-subj", "/CN=" + basename];
     if (process.platform === "win32") {
@@ -41,6 +177,7 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     } else {
       execFileSync("openssl", args, { cwd: dir, stdio: "pipe", timeout: 20000 });
     }
+    fs.chmodSync(path.join(dir, basename + ".crt"), 0o600);
   }
   const scope = { account_id: crypto.randomBytes(16).toString("base64url"),
     compartment_id: Buffer.from("test-compartment").toString("base64url"),
@@ -62,7 +199,8 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     witness: endpoint("witness"), cas: endpoint("cas"),
   };
   const configPath = path.join(dir, "zk-content.json");
-  const write = (value) => fs.writeFileSync(configPath, JSON.stringify(value));
+  const write = (value) => fs.writeFileSync(configPath, JSON.stringify(value),
+    { mode: 0o600 });
   const snapshot = (filename) => ["", "-wal", "-shm", "-journal"].map((suffix) => {
     const file = filename + suffix;
     return fs.existsSync(file)
@@ -85,10 +223,40 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     return app;
   }
   {
+    // An attacker needs only DELETE_CHILD/Modify on the parent to replace an
+    // otherwise private config leaf before this process starts. Exercise the
+    // actual startup API and verify that nothing gets created on rejection.
+    const hostileFixture = createPrivateAuthorityFixture("rootark-zk1-hostile-");
+    t.after(() => fs.rmSync(hostileFixture, { recursive: true, force: true }));
+    const untrustedParent = path.join(hostileFixture, "less-privileged-writable-ancestor");
+    fs.mkdirSync(untrustedParent, { mode: 0o700 });
+    const untrustedConfig = path.join(untrustedParent, "zk-content.json");
+    const mustStayAbsent = path.join(dir, "untrusted-ancestor-must-not-create.sqlite");
+    fs.writeFileSync(untrustedConfig, JSON.stringify({ ...data,
+      contentDbPath: mustStayAbsent }), { mode: 0o600 });
+    if (process.platform === "win32") {
+      // Grant Users Modify on the directory only; the config file remains
+      // private, but a member of Users can replace its name via DELETE_CHILD.
+      execFileSync(path.join(process.env.SystemRoot, "System32", "icacls.exe"),
+        [untrustedParent, "/grant", "*S-1-5-32-545:M"], { stdio: "pipe", timeout: 20000 });
+    } else fs.chmodSync(untrustedParent, 0o777);
+    assert.throws(() => {
+      const store = registerZk1ProtectedContentFromConfig({
+        app: express(), authenticate: (_req, _res, next) => next(),
+        requirePermission: () => (_req, _res, next) => next(),
+        configPath: untrustedConfig, environment: "test",
+      });
+      objects.push(store);
+    }, /ZK_CONTENT_BOOTSTRAP_INVALID/,
+    "startup must refuse a valid operator config beneath an attacker-writable ancestor");
+    assert.equal(fs.existsSync(mustStayAbsent), false,
+      "untrusted config must not instantiate the protected store");
+  }
+  {
     const originalOpen = fs.openSync;
     const replacement = path.join(dir, "replacement-config.json");
     const prior = path.join(dir, "swapped-old-config.json");
-    fs.writeFileSync(replacement, JSON.stringify(data));
+    fs.writeFileSync(replacement, JSON.stringify(data), { mode: 0o600 });
     let swappedConfig = false;
     try {
       fs.openSync = (filename, flags, ...rest) => {
@@ -113,8 +281,8 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     const originalRead = fs.readSync;
     const previous = path.join(dir, "post-read-old-config.json");
     const replacement = path.join(dir, "post-read-new-config.json");
-    fs.writeFileSync(configPath, JSON.stringify(data));
-    fs.writeFileSync(replacement, JSON.stringify(data));
+    fs.writeFileSync(configPath, JSON.stringify(data), { mode: 0o600 });
+    fs.writeFileSync(replacement, JSON.stringify(data), { mode: 0o600 });
     const identity = fs.lstatSync(configPath, { bigint: true });
     let swappedAfterRead = false;
     try {
@@ -153,8 +321,10 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   "reusing just the witness certificate mismatches the CAS private key");
   const aliasedKey = path.join(dir, "cas-aliased-client.key");
   const aliasedCert = path.join(dir, "cas-aliased-client.crt");
-  fs.writeFileSync(aliasedKey, "\n" + fs.readFileSync(data.witness.clientKeyPath, "utf8"));
-  fs.writeFileSync(aliasedCert, "\n" + fs.readFileSync(data.witness.clientCertPath, "utf8"));
+  fs.writeFileSync(aliasedKey, "\n" + fs.readFileSync(data.witness.clientKeyPath, "utf8"),
+    { mode: 0o600 });
+  fs.writeFileSync(aliasedCert, "\n" + fs.readFileSync(data.witness.clientCertPath, "utf8"),
+    { mode: 0o600 });
   assert.deepEqual(crypto.createPublicKey(crypto.createPrivateKey(
     fs.readFileSync(aliasedKey))).export({ type: "spki", format: "der" }),
   crypto.createPublicKey(crypto.createPrivateKey(
@@ -226,11 +396,11 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   const encodedBase = Object.fromEntries(Object.entries(signedState.baseReceipt).map(
     ([name, value]) => [name, Buffer.isBuffer(value)
       ? value.toString("base64url") : value]));
-  fs.writeFileSync(signedBasePath, JSON.stringify(encodedBase));
+  fs.writeFileSync(signedBasePath, JSON.stringify(encodedBase), { mode: 0o600 });
   const basePublicKeyPath = path.join(dir, "trusted-base-witness.pem");
   fs.writeFileSync(basePublicKeyPath, signedState.pinnedWitness.publicKey.export({
     format: "pem", type: "spki",
-  }));
+  }), { mode: 0o600 });
   const v2Data = {
     ...data, version: 2,
     contentDbPath: path.join(dir, "strict-signed-history.sqlite"),
