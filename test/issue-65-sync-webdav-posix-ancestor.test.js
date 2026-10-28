@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -57,6 +57,52 @@ test("POSIX owner-only bridge supports bearer GET HEAD PUT and MOVE through stic
   assert.equal((await request(port, "/created", "MKCOL")).status, 201);
   assert.equal((await request(port, "/created/child.txt", "PUT", "NESTED")).status, 201);
   assert.equal((await request(port, "/created/child.txt")).body, "NESTED");
+});
+
+test("POSIX MKCOL stays 0700 under umask 000 and denies real foreign UID writes", {
+  skip: !LINUX,
+}, async (t) => {
+  const { dir, root } = fixture(t);
+  // Allow the lower UID to traverse every ordinary ancestor, but never to
+  // modify one. /tmp itself is root-owned sticky, as in production.
+  fs.chmodSync(dir, 0o755);
+  fs.chmodSync(root, 0o755);
+  const bridge = await bridgeFor(t, root);
+  const port = bridge.address().port;
+  const previousUmask = process.umask(0);
+  let response;
+  try { response = await request(port, "/private", "MKCOL"); }
+  finally { process.umask(previousUmask); }
+  assert.equal(response.status, 201);
+  const created = path.join(root, "private");
+  const createdStat = fs.lstatSync(created);
+  assert.equal(createdStat.mode & 0o777, 0o700,
+    "MKCOL cannot inherit world-write from umask 000");
+  assert.equal(createdStat.uid, process.getuid());
+  assert.equal((await request(port, "/private", "MKCOL", null,
+    { authorization: "" })).status, 401);
+  if (process.getuid() === 0) {
+    const nobody = (...args) => spawnSync("/usr/sbin/runuser",
+      ["-u", "nobody", "--", ...args], { encoding: "utf8", timeout: 10000 });
+    for (const ancestor of [dir, root]) {
+      assert.equal(nobody("test", "-x", ancestor).status, 0,
+        "foreign UID must be able to traverse the fixture ancestor");
+      assert.notEqual(nobody("test", "-w", ancestor).status, 0,
+        "foreign UID must not be able to mutate an ancestor");
+    }
+    assert.notEqual(nobody("mkdir", path.join(created, "foreign-dir")).status, 0);
+    assert.notEqual(nobody(process.execPath, "-e",
+      "require('node:fs').writeFileSync(process.argv[1], 'foreign')",
+      path.join(created, "foreign-file")).status, 0);
+    assert.equal(fs.existsSync(path.join(created, "foreign-file")), false);
+  }
+  assert.equal((await request(port, "/private/owner.txt", "PUT", "OWNER")).status, 201);
+  assert.deepEqual(await request(port, "/private/owner.txt"), { status: 200, body: "OWNER" });
+  assert.equal((await request(port, "/private/owner.txt", "HEAD")).status, 200);
+  assert.equal((await request(port, "/private", "PROPFIND", null, { depth: "1" })).status, 207);
+  assert.equal((await request(port, "/private/owner.txt", "MOVE", null,
+    { destination: "http://127.0.0.1/private/moved.txt" })).status, 201);
+  assert.equal((await request(port, "/private/moved.txt")).body, "OWNER");
 });
 
 test("POSIX writable root, ancestor and nested directory fail closed", { skip: !LINUX }, async (t) => {
