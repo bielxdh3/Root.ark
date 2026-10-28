@@ -187,39 +187,85 @@ class LocalSyncWebDavBridge {
     this.toProtocolOperation = options.toProtocolOperation || null;
     this.onOperation = options.onOperation || (options.journal ? (operation) => options.journal.enqueue(operation) : null);
     this.windowsAclVerifier = null;
+    this.starting = false;
+    this.startSettled = null;
+    this.listenPending = false;
+    this.stopRequested = false;
+    this.stopping = false;
+    this.stopSettled = null;
     if (!this.token) throw new Error("Local WebDAV bridge bearer token is required");
     if (!isLoopback(this.host)) throw new Error("Local WebDAV bridge must bind to loopback");
     this.server = http.createServer((req, res) => this.handle(req, res));
   }
 
   async start() {
-    if (process.platform === "win32") {
-      await fsp.mkdir(this.rootDir, { recursive: true });
-    } else {
-      if (!sameOrBelow(this.trashDir, this.rootDir) || this.trashDir === this.rootDir) {
-        throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
-      }
-      createPosixTrustedBridgeDirectory(this.rootDir, this.rootDir);
+    // Reject repeated and concurrent starts BEFORE any await or replacement
+    // of the bridge's long-lived native ACL subprocess.
+    if (this.starting || this.stopping || this.server.listening) {
+      throw new Error("Local WebDAV bridge is already starting or listening");
     }
-    await rejectSymlinks(this.rootDir, this.rootDir, false);
-    assertPosixTrustedBridgePath(this.rootDir, this.rootDir, false);
-    // Reject an unsafe root before creating trash/journal state or replaying
-    // pending mutations. Runtime requests repeat this check because a trusted
-    // actor might later introduce a subtree with a permissive inherited ACL.
-    if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
-    if (process.platform === "win32") await fsp.mkdir(this.trashDir, { recursive: true });
-    else createPosixTrustedBridgeDirectory(this.rootDir, this.trashDir);
-    await rejectSymlinks(this.rootDir, this.trashDir, false);
-    assertPosixTrustedBridgePath(this.rootDir, this.trashDir, false);
-    if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
-    if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
-    await this.recoverPending();
-    if (process.platform === "win32") this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
-    await new Promise((resolve, reject) => {
-      this.server.once("error", reject);
-      this.server.listen(this.port, this.host, resolve);
-    });
-    return this.address();
+    this.starting = true;
+    this.stopRequested = false;
+    let settleStart;
+    this.startSettled = new Promise((resolve) => { settleStart = resolve; });
+    try {
+      if (process.platform === "win32") {
+        await fsp.mkdir(this.rootDir, { recursive: true });
+      } else {
+        if (!sameOrBelow(this.trashDir, this.rootDir) || this.trashDir === this.rootDir) {
+          throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
+        }
+        createPosixTrustedBridgeDirectory(this.rootDir, this.rootDir);
+      }
+      await rejectSymlinks(this.rootDir, this.rootDir, false);
+      assertPosixTrustedBridgePath(this.rootDir, this.rootDir, false);
+      // Reject an unsafe root before creating trash/journal state or replaying
+      // pending mutations. Runtime requests repeat this check because a trusted
+      // actor might later introduce a subtree with a permissive inherited ACL.
+      if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
+      if (process.platform === "win32") await fsp.mkdir(this.trashDir, { recursive: true });
+      else createPosixTrustedBridgeDirectory(this.rootDir, this.trashDir);
+      await rejectSymlinks(this.rootDir, this.trashDir, false);
+      assertPosixTrustedBridgePath(this.rootDir, this.trashDir, false);
+      if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
+      if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
+      await this.recoverPending();
+      if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
+      if (process.platform === "win32") this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
+      // No await occurs between the cancellation guard above and issuing
+      // listen. A stop before this point can return without waiting for an
+      // unbounded or recursively stopping journal recovery.
+      this.listenPending = true;
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          this.server.off("error", onError);
+          reject(error);
+        };
+        this.server.once("error", onError);
+        try {
+          this.server.listen(this.port, this.host, () => {
+            this.server.off("error", onError);
+            resolve();
+          });
+        } catch (error) {
+          this.server.off("error", onError);
+          reject(error);
+        }
+      });
+      if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
+      return this.address();
+    } catch (error) {
+      // Failed listen/start must not retain a verifier that a caller has no
+      // reason to stop, including when the underlying server throws.
+      this.windowsAclVerifier?.stop();
+      this.windowsAclVerifier = null;
+      throw error;
+    } finally {
+      this.listenPending = false;
+      this.starting = false;
+      settleStart();
+      this.startSettled = null;
+    }
   }
 
   address() { return this.server.address(); }
@@ -311,10 +357,26 @@ class LocalSyncWebDavBridge {
   }
 
   async stop() {
-    this.windowsAclVerifier?.stop();
-    this.windowsAclVerifier = null;
-    if (!this.server.listening) return;
-    await new Promise((resolve) => this.server.close(resolve));
+    if (this.stopping) return this.stopSettled;
+    this.stopping = true;
+    this.stopRequested = true;
+    let settleStop;
+    this.stopSettled = new Promise((resolve) => { settleStop = resolve; });
+    try {
+      // Pre-listen recovery may be unbounded, or may itself await stop().
+      // Cancel immediately in that phase; the start's post-recovery guard
+      // prevents a later listener or native worker. Once listen was issued,
+      // wait for its outcome so stop cannot return with a late HTTP listener.
+      if (this.listenPending && this.startSettled) await this.startSettled;
+      this.windowsAclVerifier?.stop();
+      this.windowsAclVerifier = null;
+      if (!this.server.listening) return;
+      await new Promise((resolve) => this.server.close(resolve));
+    } finally {
+      this.stopping = false;
+      settleStop();
+      this.stopSettled = null;
+    }
   }
 
   authorized(req) {
