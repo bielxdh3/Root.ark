@@ -16,6 +16,10 @@ const cekTransfer = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
+const cekBatch = (() => {
+  try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
+  catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
+})();
 const z = require("../src/crypto/rootark-zk-1");
 const manifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const verify = require("../src/crypto/rootark-zk-recovery-history-v2");
@@ -684,6 +688,98 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(decrypted.data), bytes,
       "B independently decrypts exact SQLite-reopened HTTP bytes without receiving A recoverySecret");
     bCek.cek.fill(0); decrypted.data.fill(0);
+    // This proof covers the three explicitly owner-selected versions, never
+    // unknown historical versions or externally held backup copies.
+    assert.equal(typeof cekBatch.sealOwnerAuthorizedVersionedCeks, "function",
+      "missing owner-signed multi-object, per-version CEK handoff");
+    const secondMeta = { ...metadata, version_id: b64(crypto.randomBytes(16)),
+      parent_version_id: metadata.version_id };
+    const otherMeta = { ...metadata, object_id: b64(crypto.randomBytes(16)),
+      version_id: b64(crypto.randomBytes(16)), parent_version_id: null };
+    const secondCek = crypto.randomBytes(32), otherCek = crypto.randomBytes(32);
+    const secondCiphertext = await content.encryptFile({
+      cek: await content.importFileCek(secondCek), metadata: secondMeta,
+      name: "historical-r2.txt", mediaType: "text/plain", data: Buffer.from("revision-2") });
+    const otherCiphertext = await content.encryptFile({
+      cek: await content.importFileCek(otherCek), metadata: otherMeta,
+      name: "other-file.txt", mediaType: "text/plain", data: Buffer.from("other-object") });
+    const versionRows = [
+      { metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
+        ciphertextRoot: root, ownerHeldCek: Buffer.from(ownerHeldCek) },
+      { metadata: secondMeta, objectRevision: 2,
+        ciphertext: Buffer.from(secondCiphertext),
+        ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([secondCiphertext]),
+        ownerHeldCek: Buffer.from(secondCek) },
+      { metadata: otherMeta, objectRevision: 1,
+        ciphertext: Buffer.from(otherCiphertext),
+        ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([otherCiphertext]),
+        ownerHeldCek: Buffer.from(otherCek) },
+    ];
+    const bundle = await cekBatch.sealOwnerAuthorizedVersionedCeks({
+      ownerPrivateKey: owner.privateKey, authority: publicAuthority, versions: versionRows,
+    });
+    assert.equal(bundle.entries.length, 3);
+    assert.equal(bundle.globalAccountCompletenessProven, false);
+    assert.equal(bundle.authorizesProductionRestore, false);
+    const openBatch = (overrides = {}) => cekBatch.openOwnerAuthorizedVersionedCeks({
+      bundle, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9,
+      ...overrides,
+    });
+    const recoveredBatch = await openBatch();
+    assert.equal(recoveredBatch.entries.length, 3);
+    assert.equal(recoveredBatch.signedBatchCompletenessVerified, true);
+    assert.equal(recoveredBatch.globalAccountCompletenessProven, false);
+    for (const entry of recoveredBatch.entries) {
+      const original = versionRows.find((row) => row.metadata.object_id === entry.metadata.object_id
+        && row.objectRevision === entry.objectRevision);
+      assert.ok(original);
+      assert.deepEqual(entry.cek, original.ownerHeldCek);
+      entry.cek.fill(0);
+    }
+    for (const entries of [bundle.entries.slice(1),
+      [...bundle.entries.slice(0, 2), bundle.entries[0]],
+      bundle.entries.map((entry, index) => index === 1
+        ? { ...entry, metadata: { ...entry.metadata,
+          parent_version_id: b64(crypto.randomBytes(16)) } } : entry)]) {
+      await assert.rejects(openBatch({ bundle: { ...bundle, entries } }),
+        /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+      "owner-signed batch may never release an omitted, repeated or altered version");
+    }
+    const collisionMetadata = { ...otherMeta, version_id: metadata.version_id };
+    const collisionCiphertext = await content.encryptFile({
+      cek: await content.importFileCek(otherCek), metadata: collisionMetadata,
+      name: "collision.txt", mediaType: "text/plain", data: Buffer.from("other-object") });
+    await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+      ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      versions: [versionRows[0], { ...versionRows[2], metadata: collisionMetadata,
+        ciphertext: Buffer.from(collisionCiphertext),
+        ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([collisionCiphertext]) }],
+    }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "two distinct object UUIDs cannot reuse one version UUID in a signed recovery batch");
+    const reusedCekCiphertext = await content.encryptFile({
+      cek: await content.importFileCek(ownerHeldCek), metadata: otherMeta,
+      name: "reused-cek.txt", mediaType: "text/plain", data: Buffer.from("same-cek-different-file") });
+    await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+      ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      versions: [versionRows[0], { ...versionRows[2], ownerHeldCek: Buffer.from(ownerHeldCek),
+        ciphertext: Buffer.from(reusedCekCiphertext),
+        ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([reusedCekCiphertext]) }],
+    }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "two distinct historical file versions cannot reuse the same authenticated CEK");
+    await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+      ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      versions: versionRows.slice(1),
+    }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "declared versions cannot omit revision one of any object");
+    await assert.rejects(openBatch({ authority: { ...linked,
+      signedDeviceGrant: { ...issued.signedDeviceGrant,
+        revoked_at_epoch: committed.epoch } } }),
+    /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "a forged revocation field cannot grant a batch CEK");
+    secondCek.fill(0); otherCek.fill(0);
+    for (const row of versionRows) row.ownerHeldCek.fill(0);
     await assert.rejects(open({
       deviceHpkePrivateKey: await z.hpkeSuite().kem.generateKeyPair().then((pair) => pair.privateKey),
     }), /ZK_OWNER_FILE_CEK_DENIED/, "different X25519 private key cannot open B-specific CEK");
