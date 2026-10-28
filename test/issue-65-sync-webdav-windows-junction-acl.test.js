@@ -323,3 +323,118 @@ test("Windows local WebDAV keeps owner-only GET PUT MOVE DELETE working", {
   assert.equal((await request(port, "/moved.ct", { method: "DELETE" })).status, 204);
   assert.equal(fs.existsSync(path.join(root, "moved.ct")), false);
 });
+
+test("Windows bridge repeated start cannot orphan its live native ACL worker", {
+  skip: process.platform !== "win32", timeout: 35_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-repeat-start-");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  let firstVerifier;
+  t.after(async () => {
+    // Retain the original reference so even a failing regression test cannot
+    // leave a live native PowerShell child behind in the test runner.
+    firstVerifier?.stop();
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await bridge.start();
+  assert.equal(bridge.server.listenerCount("error"), 0,
+    "successful listen must not retain a one-shot failure listener");
+  firstVerifier = bridge.windowsAclVerifier;
+  await firstVerifier.verify(root);
+  await assert.rejects(bridge.start(), /already starting or listening/);
+  assert.equal(bridge.windowsAclVerifier, firstVerifier,
+    "a rejected second start must not replace the live native child");
+  assert.equal(bridge.server.listenerCount("error"), 0,
+    "duplicate-start denial must not add stale error listeners");
+  const positive = await request(bridge.address().port, "/missing.ct");
+  assert.equal(positive.status, 404, "the original listener must remain usable");
+  await bridge.stop();
+  await assert.rejects(firstVerifier.verify(root), /Windows bridge ACL validation failed/);
+  await bridge.start();
+  const restarted = bridge.windowsAclVerifier;
+  assert.notEqual(restarted, firstVerifier,
+    "a clean stop may start again only with a fresh ACL worker");
+  await restarted.verify(root);
+  await bridge.stop();
+  await assert.rejects(restarted.verify(root), /Windows bridge ACL validation failed/);
+});
+
+test("Windows bridge concurrent starts admit exactly one native verifier", {
+  skip: process.platform !== "win32", timeout: 35_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-concurrent-start-");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const first = bridge.start();
+  const second = bridge.start();
+  const results = await Promise.allSettled([first, second]);
+  assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(results.filter((item) => item.status === "rejected"
+    && /already starting or listening/.test(item.reason?.message)).length, 1);
+  assert.equal(bridge.server.listenerCount("error"), 0);
+  const verifier = bridge.windowsAclVerifier;
+  await verifier.verify(root);
+  await bridge.stop();
+  await assert.rejects(verifier.verify(root), /Windows bridge ACL validation failed/);
+});
+
+test("Windows bridge stop during startup prevents a late listener and ACL child", {
+  skip: process.platform !== "win32", timeout: 35_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-stop-during-start-");
+  let signalRecovery;
+  const enteredRecovery = new Promise((resolve) => { signalRecovery = resolve; });
+  let releaseRecovery;
+  const recoverBarrier = new Promise((resolve) => { releaseRecovery = resolve; });
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0,
+    journal: { async recover() { signalRecovery(); await recoverBarrier; return []; } } });
+  t.after(async () => {
+    releaseRecovery();
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const starting = bridge.start();
+  await enteredRecovery;
+  const stopping = bridge.stop();
+  releaseRecovery();
+  await assert.rejects(starting, /start cancelled by stop/);
+  await stopping;
+  assert.equal(bridge.server.listening, false,
+    "stop must not let a still-running startup reopen the HTTP listener");
+  assert.equal(bridge.windowsAclVerifier, null);
+  assert.equal(bridge.server.listenerCount("error"), 0);
+});
+
+test("Windows bridge failed listen releases the native ACL verifier before retry", {
+  skip: process.platform !== "win32", timeout: 35_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-listen-fail-");
+  const occupied = http.createServer();
+  await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve));
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: occupied.address().port });
+  t.after(async () => {
+    await bridge.stop();
+    if (occupied.listening) await new Promise((resolve) => occupied.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await assert.rejects(bridge.start(), /EADDRINUSE/);
+  assert.equal(bridge.windowsAclVerifier, null,
+    "a failed bind must release and discard its newly created ACL verifier");
+  assert.equal(bridge.server.listenerCount("error"), 0,
+    "failed listen cannot retain stale error listeners");
+  await new Promise((resolve) => occupied.close(resolve));
+  await bridge.start();
+  assert.equal(bridge.server.listenerCount("error"), 0);
+  const verifier = bridge.windowsAclVerifier;
+  await verifier.verify(root);
+  await bridge.stop();
+  await assert.rejects(verifier.verify(root), /Windows bridge ACL validation failed/);
+});
