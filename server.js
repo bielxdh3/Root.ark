@@ -567,8 +567,14 @@ function broadcastRealtime(event, payload = {}) {
   }
 }
 
-function broadcastDataChanged(source, payload = {}) {
-  broadcastRealtime("data:changed", { source, ...payload });
+function broadcastDataChanged(source, _payload = {}) {
+  // A /ws connection authenticates a *session*, not access to every folder,
+  // filename, pending upload or protected account. The realtime fanout is
+  // global; forward only the fixed invalidation category already consumed by
+  // the workspace and management clients. Never relay per-object metadata
+  // from WebDAV, trash, or future mutation call sites across ACL boundaries.
+  // Individual data is fetched later through ordinary authenticated routes.
+  broadcastRealtime("data:changed", { source });
 }
 
 function loadUsers({ failOnDatabaseError = false, allowJsonFallback = true } = {}) {
