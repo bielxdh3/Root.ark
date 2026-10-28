@@ -717,14 +717,35 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     ];
     const bundle = await cekBatch.sealOwnerAuthorizedVersionedCeks({
       ownerPrivateKey: owner.privateKey, authority: publicAuthority, versions: versionRows,
+      assertLive: () => undefined,
     });
     assert.equal(bundle.entries.length, 3);
     assert.equal(bundle.globalAccountCompletenessProven, false);
     assert.equal(bundle.authorizesProductionRestore, false);
+    // Logout during the final real per-file owner HPKE seal must also fence
+    // the signed release; every selected CEK was independently AEAD checked.
+    const trueHpkeSeal = z.hpkeSeal;
+    let ownerSessionLive = true, realSeals = 0;
+    z.hpkeSeal = async (...args) => {
+      const sealedCek = await trueHpkeSeal(...args);
+      if (++realSeals === versionRows.length) ownerSessionLive = false;
+      return sealedCek;
+    };
+    try {
+      await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+        ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+        versions: versionRows,
+        assertLive: () => { if (!ownerSessionLive) throw Error("OWNER_LOGGED_OUT"); },
+      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+      "owner logout after last genuine CEK seal must refuse the signed batch");
+    } finally { z.hpkeSeal = trueHpkeSeal; }
+    assert.equal(realSeals, versionRows.length,
+      "owner-side revocation must occur after all genuine CEK seals");
     const openBatch = (overrides = {}) => cekBatch.openOwnerAuthorizedVersionedCeks({
       bundle, authority: { ...linked, nowSeconds: now + 9 },
       operatorMinimumSequence: signedCommittedHead.sequence,
       recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9,
+      assertLive: () => undefined,
       ...overrides,
     });
     const recoveredBatch = await openBatch();
@@ -738,6 +759,59 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.deepEqual(entry.cek, original.ownerHeldCek);
       entry.cek.fill(0);
     }
+    // A local session revoked while the LAST genuine X25519 HPKE open is
+    // awaiting must never receive even the first validated historical CEK.
+    // This exercises real crypto; the wrapper only schedules a local logout.
+    const trueHpkeOpen = z.hpkeOpen;
+    let localSessionLive = true, realOpens = 0;
+    z.hpkeOpen = async (...args) => {
+      const opened = await trueHpkeOpen(...args);
+      if (++realOpens === versionRows.length) localSessionLive = false;
+      return opened;
+    };
+    try {
+      await assert.rejects(cekBatch.openOwnerAuthorizedVersionedCeks({
+        bundle, authority: { ...linked, nowSeconds: now + 9 },
+        operatorMinimumSequence: signedCommittedHead.sequence,
+        recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9,
+        assertLive: () => { if (!localSessionLive) throw Error("SESSION_REVOKED"); },
+      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+      "revocation after last real HPKE open must fence all CEKs at final release");
+    } finally { z.hpkeOpen = trueHpkeOpen; }
+    assert.equal(realOpens, versionRows.length,
+      "the test must exercise every real HPKE version before local revocation");
+    // A revoked session must stop immediately, not perform unrelated file
+    // decryptions or leak a successful partial result.
+    localSessionLive = true; realOpens = 0;
+    z.hpkeOpen = async (...args) => {
+      const opened = await trueHpkeOpen(...args);
+      if (++realOpens === 1) localSessionLive = false;
+      return opened;
+    };
+    try {
+      await assert.rejects(openBatch({
+        assertLive: () => { if (!localSessionLive) throw Error("SESSION_REVOKED"); },
+      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    } finally { z.hpkeOpen = trueHpkeOpen; }
+    assert.equal(realOpens, 1,
+      "first revoked CEK must stop later HPKE operations");
+    await assert.rejects(openBatch({ assertLive: async () => undefined }),
+      /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "an asynchronous local fence cannot masquerade as a final sync check");
+    await assert.rejects(openBatch({ assertLive: () => false }),
+      /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "a false session result cannot authorize CEK release");
+    let hostileGetterRuns = 0;
+    const hostileInput = { bundle, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9 };
+    Object.defineProperty(hostileInput, "assertLive", {
+      enumerable: true, get() { hostileGetterRuns++; throw Error("UNTRUSTED_GETTER"); },
+    });
+    await assert.rejects(cekBatch.openOwnerAuthorizedVersionedCeks(hostileInput),
+      /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    assert.equal(hostileGetterRuns, 0,
+      "snapshotting trust and session callback cannot invoke hostile getters");
     for (const entries of [bundle.entries.slice(1),
       [...bundle.entries.slice(0, 2), bundle.entries[0]],
       bundle.entries.map((entry, index) => index === 1
@@ -753,6 +827,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       name: "collision.txt", mediaType: "text/plain", data: Buffer.from("other-object") });
     await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
       ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      assertLive: () => undefined,
       versions: [versionRows[0], { ...versionRows[2], metadata: collisionMetadata,
         ciphertext: Buffer.from(collisionCiphertext),
         ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([collisionCiphertext]) }],
@@ -763,6 +838,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       name: "reused-cek.txt", mediaType: "text/plain", data: Buffer.from("same-cek-different-file") });
     await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
       ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      assertLive: () => undefined,
       versions: [versionRows[0], { ...versionRows[2], ownerHeldCek: Buffer.from(ownerHeldCek),
         ciphertext: Buffer.from(reusedCekCiphertext),
         ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([reusedCekCiphertext]) }],
@@ -770,6 +846,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "two distinct historical file versions cannot reuse the same authenticated CEK");
     await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
       ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      assertLive: () => undefined,
       versions: versionRows.slice(1),
     }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
     "declared versions cannot omit revision one of any object");

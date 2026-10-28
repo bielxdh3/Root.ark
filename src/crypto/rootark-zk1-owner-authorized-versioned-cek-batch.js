@@ -86,6 +86,20 @@ function snapshot(value, meter = { count: 0, bytes: 0 }, depth = 0) {
   }
   return Object.freeze(out);
 }
+function snapshotWithSessionFence(input, fields) {
+  exact(input, [...fields, "assertLive"]);
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  if (!Object.hasOwn(descriptors.assertLive, "value")
+    || typeof descriptors.assertLive.value !== "function") deny();
+  const callback = descriptors.assertLive.value;
+  // Only values captured from data descriptors may enter the immutable
+  // crypto snapshot. An accessor must never execute as a side effect.
+  const stable = snapshot(Object.fromEntries(fields.map(
+    (name) => [name, descriptors[name].value])));
+  return { stable, assertLive: () => {
+    if (callback() !== undefined) deny();
+  } };
+}
 function normalizedMetadata(meta) {
   exact(meta, META_KEYS);
   for (const key of ["account_id", "keyring_id", "object_id", "version_id"])
@@ -171,10 +185,11 @@ function signingBytes(manifest) {
 }
 
 async function sealOwnerAuthorizedVersionedCeks(input) {
-  let stable;
+  let stable, assertLive;
   try {
-    stable = snapshot(input);
-    exact(stable, ["ownerPrivateKey", "authority", "versions"]);
+    ({ stable, assertLive } = snapshotWithSessionFence(input,
+      ["ownerPrivateKey", "authority", "versions"]));
+    assertLive();
     if (!Array.isArray(stable.versions) || stable.versions.length > 8) deny();
     const versions = verifyVersionChain(stable.versions.map((row) => exact(row, VERSION_KEYS)));
     for (let i = 0; i < versions.length; i++) {
@@ -186,21 +201,26 @@ async function sealOwnerAuthorizedVersionedCeks(input) {
     }
     const entries = [];
     for (const row of versions) {
+      assertLive();
       const envelope = await transfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: stable.ownerPrivateKey, authority: stable.authority,
         ownerHeldCek: row.ownerHeldCek, metadata: row.metadata,
         objectRevision: row.objectRevision,
         ciphertext: row.ciphertext, ciphertextRoot: row.ciphertextRoot,
       });
+      assertLive();
       entries.push({ metadata: normalizedMetadata(row.metadata),
         objectRevision: row.objectRevision,
         ciphertext: row.ciphertext.toString("base64url"),
         ciphertextRoot: Buffer.from(row.ciphertextRoot).toString("base64url"), envelope });
     }
+    assertLive();
     const manifest = makeManifest(entries);
+    const ownerSignature = crypto.sign(null, signingBytes(manifest),
+      stable.ownerPrivateKey).toString("base64url");
+    assertLive();
     return { schema: SCHEMA, manifest, entries,
-      owner_signature: crypto.sign(null, signingBytes(manifest),
-        stable.ownerPrivateKey).toString("base64url"),
+      owner_signature: ownerSignature,
       signedBatchCompletenessVerified: true,
       globalAccountCompletenessProven: false, authorizesProductionRestore: false };
   } catch (_) { deny(); }
@@ -208,12 +228,14 @@ async function sealOwnerAuthorizedVersionedCeks(input) {
 }
 
 async function openOwnerAuthorizedVersionedCeks(input) {
-  let stable, raw;
+  let stable, raw, assertLive;
   const released = [];
   try {
-    stable = snapshot(input);
-    exact(stable, ["bundle", "authority", "operatorMinimumSequence",
-      "recipientHpkePrivateRaw", "nowSeconds"]);
+    // Client-side logout/session fence, not a proof of off-host revocation.
+    ({ stable, assertLive } = snapshotWithSessionFence(input, [
+      "bundle", "authority", "operatorMinimumSequence",
+      "recipientHpkePrivateRaw", "nowSeconds"]));
+    assertLive();
     const wire = exact(stable.bundle, BUNDLE_KEYS);
     if (wire.schema !== SCHEMA || wire.signedBatchCompletenessVerified !== true
       || wire.globalAccountCompletenessProven !== false
@@ -227,13 +249,16 @@ async function openOwnerAuthorizedVersionedCeks(input) {
     const ownerKey = stable.authority.ownerPublicKey;
     if (!nativeTypes.isCryptoKey(ownerKey)) deny();
     const ownerSpki = Buffer.from(await crypto.webcrypto.subtle.exportKey("spki", ownerKey));
+    assertLive();
     const ownerPublic = crypto.createPublicKey({ key: ownerSpki, format: "der", type: "spki" });
     if (!crypto.verify(null, signingBytes(manifest), ownerPublic,
       b64(wire.owner_signature, 64))) deny();
     raw = Buffer.from(stable.recipientHpkePrivateRaw);
     if (raw.length !== 32) deny();
     for (const row of rows) {
+      assertLive();
       const recipient = await z.hpkeSuite().kem.deserializePrivateKey(raw);
+      assertLive();
       const opened = await transfer.openOwnerAuthorizedFileCek({
         envelope: row.envelope, authority: stable.authority,
         operatorMinimumSequence: stable.operatorMinimumSequence,
@@ -248,7 +273,11 @@ async function openOwnerAuthorizedVersionedCeks(input) {
       }
       released.push({ metadata: row.metadata, objectRevision: row.objectRevision,
         cek: opened.cek });
+      // Protect the last awaited HPKE operation as well as intermediate ones.
+      // No CEK escapes until the full batch passes this final synchronous gate.
+      assertLive();
     }
+    assertLive();
     return { entries: released, signedBatchCompletenessVerified: true,
       globalAccountCompletenessProven: false, authorizesProductionRestore: false };
   } catch (_) {
