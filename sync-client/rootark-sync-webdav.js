@@ -521,8 +521,27 @@ class LocalSyncWebDavBridge {
             fd = undefined;
             return res.end();
           }
-          const stream = fs.createReadStream(null, { fd, autoClose: true, start: 0 });
+          if (opened.size === 0n) {
+            fs.closeSync(fd);
+            fd = undefined;
+            return res.end();
+          }
+          // A foreign UID may retain an old writable descriptor even after
+          // the owner makes this inode read-only. A later append must never
+          // overrun the already advertised HTTP Content-Length and corrupt
+          // the framing of a subsequent response on this connection.
+          const stream = fs.createReadStream(null, {
+            fd, autoClose: true, start: 0, end: Number(opened.size) - 1,
+          });
           fd = undefined;
+          let sent = 0;
+          stream.on("data", (chunk) => { sent += chunk.length; });
+          stream.once("end", () => {
+            // Shrinking the same inode is the dual of append: pipe() would
+            // finish a short Content-Length body and leave keep-alive waiting
+            // for attacker-controlled bytes from a subsequent HTTP response.
+            if (sent !== Number(opened.size)) res.destroy();
+          });
           // pipe() only unpipes on client abort; it does not guarantee the
           // source ReadStream closes its pinned FD before end-of-file.
           res.once("close", () => stream.destroy());
