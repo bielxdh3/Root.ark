@@ -479,15 +479,24 @@ function createCloudStorage(options = {}) {
   async function upload(localPath, folderId, fileName, area = "uploads", uploadOptions = {}) {
     assertProvider(); if (!enabled()) return null;
     const bound = uploadOptions?.zk1BoundedBytes;
-    if (bound !== undefined && (!Number.isSafeInteger(bound) || bound < 1
-      || bound > 16 * 1024 * 1024 || !uploadOptions
+    // The legacy path is intentionally still supported, but must never
+    // silently accept a partial ZK/verified-integrity opt-in. The hash comes
+    // from the caller's independent ciphertext commitment, not this live FD.
+    const zk1Selected = bound !== undefined
+      || uploadOptions?.zk1ExpectedSha256 !== undefined
+      || (uploadOptions && typeof uploadOptions === "object"
+        && Reflect.ownKeys(uploadOptions).some((name) =>
+          typeof name === "string" && name.startsWith("zk1")));
+    if (zk1Selected && (!uploadOptions
       || typeof uploadOptions !== "object" || Array.isArray(uploadOptions)
+      || !Object.hasOwn(uploadOptions, "zk1BoundedBytes")
+      || !Object.hasOwn(uploadOptions, "zk1ExpectedSha256")
+      || !Number.isSafeInteger(bound) || bound < 1 || bound > 16 * 1024 * 1024
       || Reflect.ownKeys(uploadOptions).some((key) => ![
         "providerFileId", "zk1BoundedBytes", "zk1ExpectedSha256",
       ].includes(key))
-      || (uploadOptions.zk1ExpectedSha256 !== undefined
-        && (typeof uploadOptions.zk1ExpectedSha256 !== "string"
-          || !/^[a-f0-9]{64}$/.test(uploadOptions.zk1ExpectedSha256))))) {
+      || typeof uploadOptions.zk1ExpectedSha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(uploadOptions.zk1ExpectedSha256))) {
       throw cloudError("configuration", "Invalid bounded ZK ciphertext upload");
     }
     // Preserve the historical POSIX legacy stream behavior; bounded ZK copies
@@ -550,8 +559,7 @@ function createCloudStorage(options = {}) {
         // The publisher already authenticated the exact ciphertext against
         // its signed root. Compare that trusted digest with the detached bytes
         // before either SDK can receive the body.
-        if (uploadOptions.zk1ExpectedSha256 !== undefined
-          && crypto.createHash("sha256").update(boundedBytes).digest("hex")
+        if (crypto.createHash("sha256").update(boundedBytes).digest("hex")
             !== uploadOptions.zk1ExpectedSha256) {
           throw cloudError("configuration", "Bounded ciphertext digest mismatch");
         }
