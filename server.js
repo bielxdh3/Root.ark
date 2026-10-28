@@ -6024,6 +6024,55 @@ const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseErr
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 
+// DEV-OFF deny-only guard for authenticated legacy HTTP reads. JWT proves a
+// session, NOT an independently signed immutable owner/account cutover state.
+// There is no off-host monotonic floor or external authority in this process.
+// Install before the route handlers so HEAD, If-None-Match, Range and file
+// streams cannot produce legacy metadata, 304s or bytes under strict cutover.
+const requestedZk10LegacyHttpStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10LegacyHttpEgress = requestedZk10LegacyHttpStrict !== ""
+  && requestedZk10LegacyHttpStrict !== "0" && requestedZk10LegacyHttpStrict !== "off";
+const legacyAuthenticatedHttpReadPaths = [
+  /^\/files\/(?:search|[^/]+)\/?$/i,
+  /^\/list\/?$/i,
+  /^\/versions\/[^/]+\/?$/i,
+  /^\/download\/[^/]+\/v\/[^/]+\/?$/i,
+  /^\/history\/?$/i,
+  /^\/preview\/(?:file|text)\/[^/]+\/[^/]+\/?$/i,
+  // Other genuine authenticated metadata responders, including routes
+  // registered by separate route modules below. Keep this data-plane list
+  // bounded: do not block auth, health, or unrelated POST mutations.
+  /^\/folders\/?$/i,
+  /^\/folders\/[^/]+\/access\/?$/i,
+  /^\/file-access\/?$/i,
+  /^\/encrypted\/[^/]+\/metadata\/?$/i,
+  /^\/pending\/?$/i,
+  /^\/quarantine\/?$/i,
+  /^\/trash(?:\/summary)?\/?$/i,
+  /^\/backups(?:\/latest-status|\/[^/]+\/(?:manifest|download))?\/?$/i,
+  /^\/analytics\/(?:summary|uploads-by-month|uploads-by-user|active-users|file-types|downloads-by-file|recent)\/?$/i,
+  /^\/audit\/(?:logs|summary)\/?$/i,
+  /^\/groups(?:\/[^/]+\/key-manifest)?\/?$/i,
+];
+// These are POST *read responses*, not mutations: one returns decrypted
+// plaintext, the other exports private audit records as JSON/CSV.
+const legacyAuthenticatedHttpPostReadPaths = [
+  /^\/encrypted-download\/[^/]+\/?$/i,
+  /^\/audit\/export\/?$/i,
+];
+app.use((req, res, next) => {
+  if (!strictZk10LegacyHttpEgress) return next();
+  const readGet = (req.method === "GET" || req.method === "HEAD")
+    && legacyAuthenticatedHttpReadPaths.some((pattern) => pattern.test(req.path));
+  const readPost = req.method === "POST"
+    && legacyAuthenticatedHttpPostReadPaths.some((pattern) => pattern.test(req.path));
+  if (!readGet && !readPost) return next();
+  return authenticate(req, res, () => res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external authenticated owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  }));
+});
+
 function refreshAuthenticatedUserState(req) {
   if (isAuthTokenExpired(req)) return { status: 401, error: "Sessao invalida ou expirada" };
   let user;
