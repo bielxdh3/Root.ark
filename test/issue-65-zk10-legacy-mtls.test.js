@@ -7,7 +7,15 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const https = require("node:https");
+const http = require("node:http");
 const path = require("node:path");
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const registerAuthRoutes = require("../src/routes/auth");
+const { createAuthenticate } = require("../src/middlewares/auth");
+const { registerSyncRoutes } = require("../src/routes/sync");
+const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const test = require("node:test");
 const { generateNativeFixtureCertificates } = require("./support/issue-65-native-openssl-fixture");
 const { privateAuthorityDirectory } = require("./support/issue-65-private-authority-directory");
@@ -60,7 +68,7 @@ async function fixture(t) {
     witnessRollback: false, unavailable: false, forceEnrolledAsNegative: false,
     authorityRollback: false, witnessFalseStatus: false, replayChallenge: false,
     badHeadSignature: false,
-    releaseCount: 0, admittedCount: 0 };
+    releaseCount: 0, admittedCount: 0, onRelease: null };
   const signedHead = (root) => {
     const previous = heads.length ? headDigest(heads[heads.length - 1]) : "0".repeat(64);
     heads.push(sign({ type: "rootark-zk10-account-authority-head/v1",
@@ -114,6 +122,7 @@ async function fixture(t) {
         const lease = leases.get(request.lease_id);
         if (!lease || lease.account !== request.immutable_account_id
           || lease.operation !== request.operation) throw Error("bad release");
+        if (state.onRelease) state.onRelease(request, lease);
         leases.delete(request.lease_id);
         state.releaseCount += 1;
         return { released: true };
@@ -307,4 +316,209 @@ test("ZK10 real TLS1.3/mTLS CURRENT, signed negative proof, monotonic cutover an
   await assert.rejects(f.makeFence({ authority: wrongPin })
     .withCurrentAccountLegacyPolicy({ authenticatedUsername: "bob", operation: "sync:get" },
       () => "UNSAFE"), { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" });
+});
+
+function httpJson(port, route, method = "GET", body, token) {
+  const bytes = body === undefined ? null : Buffer.from(JSON.stringify(body));
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: "127.0.0.1", port, path: route, method,
+      headers: { ...(bytes ? { "content-type": "application/json",
+        "content-length": bytes.length } : {}),
+      ...(token ? { authorization: "Bearer " + token } : {}) },
+      signal: AbortSignal.timeout(10000),
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (part) => chunks.push(part));
+      res.on("error", reject);
+      res.on("end", () => {
+        try {
+          resolve({ status: res.statusCode, headers: res.headers,
+            body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+        } catch (error) { reject(error); }
+      });
+    });
+    req.on("error", reject);
+    req.end(bytes);
+  });
+}
+
+test("ZK10 DEV-OFF real Express login/JWT → signed never_enrolled mTLS → durable Sync and post-finish lease release", {
+  timeout: 90000,
+}, async (t) => {
+  // These two separately signed TLS1.3/mTLS endpoints run on the SAME test
+  // machine. This tests transport + cryptographic admission, NEVER independent
+  // physical custody or durable external monotonic floor in production.
+  const f = await fixture(t);
+  const dir = privateAuthorityDirectory("zk65-zk10-http-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "sync.json");
+  const users = [
+    { username: "alice", password: bcrypt.hashSync("alice-test-only", 4),
+      sessionVersion: 0, role: "user", totpEnabled: false,
+      permissions: { listFiles: true, upload: true, delete: true } },
+    { username: "bob", password: bcrypt.hashSync("bob-test-only", 4),
+      sessionVersion: 0, role: "user", totpEnabled: false,
+      permissions: { listFiles: true, upload: true, delete: true } },
+  ];
+  const jwtSecret = crypto.randomBytes(48).toString("base64url");
+  const authenticate = createAuthenticate({ jwt, jwtSecret,
+    loadUser: (name) => users.find((item) => item.username === name),
+    normalizeUserPermissions: (item) => item.permissions });
+  const permission = (scope) => (req, res, next) => req.user?.permissions?.[scope] === true
+    ? next() : res.status(403).json({ error: "Forbidden" });
+  let writeResponseFinished = false;
+  let cutoverAtResponseFinish = null;
+  const writeReleaseObservations = [];
+  f.state.onRelease = (request) => {
+    if (request.operation !== "write") return;
+    const saved = fs.readFileSync(storagePath, "utf8");
+    writeReleaseObservations.push({
+      responseFinished: writeResponseFinished,
+      alreadyDurable: saved.includes('"http-signed-object"')
+        && saved.includes('"signed-legacy-name.txt"'),
+    });
+  };
+  const running = new Set();
+  t.after(async () => {
+    for (const server of running) await closeServer(server);
+  });
+  async function start(fence) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      if (req.method === "POST" && req.path === "/sync/v1/objects")
+        res.once("finish", () => {
+          writeResponseFinished = true;
+          // Even the final HTTP flush must remain inside the signed lease.
+          cutoverAtResponseFinish = f.cutover();
+        });
+      next();
+    });
+    registerAuthRoutes(app, {
+      authenticate, auditLog: () => {}, bcrypt, checkAnomalies: () => {},
+      getAuditActor: (_req, username) => ({ username, role: "user", ip: "127.0.0.1" }),
+      jwt, jwtSecret, loadUsers: () => users, saveUsers: () => {},
+      getTotpKey: () => Buffer.alloc(32, 1), logAnalyticsEvent: () => {},
+      normalizeUserPermissions: (item) => item.permissions,
+      qrcode: {}, requirePermission: permission,
+      sessionCookieOptions: { httpOnly: true, sameSite: "lax" },
+    });
+    const { ready } = registerSyncRoutes({ app, authenticate,
+      requirePermission: permission, storagePath,
+      legacyCutoverStrict: true, legacyCutoverFence: fence,
+      bcrypt, loadUsers: () => users,
+    });
+    await ready;
+    const server = http.createServer(app);
+    const port = await onServer(server);
+    running.add(server);
+    return { server, port };
+  }
+  async function stop(server) {
+    running.delete(server);
+    await closeServer(server);
+  }
+  async function login(port, username, password) {
+    const response = await httpJson(port, "/auth/login", "POST", { username, password });
+    assert.equal(response.status, 200);
+    const cookie = response.headers["set-cookie"].find((item) =>
+      item.startsWith("rootark_session="));
+    assert.ok(cookie, "token must be issued by the real auth/login endpoint");
+    const token = cookie.split(";")[0].slice("rootark_session=".length);
+    assert.equal(jwt.verify(token, jwtSecret, { algorithms: ["HS256"] }).username, username);
+    return token;
+  }
+  async function awaitRelease(count) {
+    const deadline = Date.now() + 5000;
+    while (f.state.releaseCount < count && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(f.state.releaseCount >= count, "external lease release must complete");
+  }
+
+  const noAuthority = await start(null);
+  const prelogin = await login(noAuthority.port, "alice", "alice-test-only");
+  const failClosed = await httpJson(noAuthority.port, "/sync/v1/objects", "GET", undefined, prelogin);
+  assert.equal(failClosed.status, 503);
+  assert.equal(failClosed.body.code, "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE");
+  await stop(noAuthority.server);
+
+  const fence = f.makeFence();
+  assert.equal(isAuthenticZk10LegacyCutoverFence(fence), true);
+  assert.equal(fence.independentOffServerCustodyProven, false);
+  const enabled = await start(fence);
+  const alice = await login(enabled.port, "alice", "alice-test-only");
+  const bob = await login(enabled.port, "bob", "bob-test-only");
+  assert.equal((await httpJson(enabled.port, "/sync/v1/objects", "GET", undefined, alice)).status, 200);
+  await awaitRelease(f.state.admittedCount);
+  const operation = createOperation({ operation: "create", objectId: "http-signed-object",
+    fileId: "file-a", versionId: "v1", operationId: "signed-op-a",
+    deviceId: "device-a", keyEpoch: "legacy-epoch", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { name: "signed-legacy-name.txt", path: "personal/signed-legacy-name.txt" },
+    plaintext: Buffer.from("ciphertext under old client keys"), fileKey: crypto.randomBytes(32),
+  });
+  const write = await httpJson(enabled.port, "/sync/v1/objects", "POST", operation, alice);
+  assert.equal(write.status, 201, JSON.stringify(write.body));
+  await awaitRelease(f.state.admittedCount);
+  assert.deepEqual(writeReleaseObservations, [{ responseFinished: true, alreadyDurable: true }],
+    "authority release must occur AFTER Express response finish and durable file write");
+  assert.equal(cutoverAtResponseFinish, false,
+    "cohosted test authority must not cut over while HTTP response is finishing");
+  assert.equal(f.leases.size, 0);
+  const read = await httpJson(enabled.port, "/sync/v1/objects/http-signed-object",
+    "GET", undefined, alice);
+  assert.equal(read.status, 200);
+  assert.equal(read.body.metadata.name, "signed-legacy-name.txt");
+  const other = await httpJson(enabled.port, "/sync/v1/objects", "GET", undefined, bob);
+  assert.equal(other.status, 200);
+  assert.deepEqual(other.body.objects, [], "signed negative proof is account-scoped");
+  await awaitRelease(f.state.admittedCount - 0);
+  assert.equal(f.leases.size, 0);
+
+  assert.equal(f.cutover(), true, "all prior HTTP leases must have been released");
+  const blocked = await httpJson(enabled.port, "/sync/v1/objects/http-signed-object",
+    "GET", undefined, alice);
+  assert.equal(blocked.status, 403);
+  assert.equal(blocked.body.code, "ZK10_LEGACY_ENFORCED");
+  const blockedResume = await httpJson(enabled.port,
+    "/sync/v1/devices/device-a/resume", "POST", { password: "alice-test-only" }, alice);
+  assert.equal(blockedResume.status, 403, "resume must not reopen legacy writes after cutover");
+  assert.equal((await httpJson(enabled.port, "/sync/v1/objects", "GET",
+    undefined, bob)).status, 200);
+  users[0].sessionVersion += 1;
+  assert.equal((await httpJson(enabled.port, "/sync/v1/objects", "GET",
+    undefined, alice)).status, 401, "real JWT revocation remains effective");
+  await stop(enabled.server);
+
+  // Recreating the app/fence is a disposable process-restart simulation: the
+  // signed external cutover head remains at the fixture authority.
+  const restarted = await start(f.makeFence());
+  const freshAlice = await login(restarted.port, "alice", "alice-test-only");
+  assert.equal((await httpJson(restarted.port, "/sync/v1/objects", "GET",
+    undefined, freshAlice)).status, 403);
+  await stop(restarted.server);
+
+  const wrongPin = { ...f.endpoints[0], serverFingerprint256: "00:".repeat(31) + "00" };
+  const untrusted = await start(f.makeFence({ authority: wrongPin }));
+  const freshBob = await login(untrusted.port, "bob", "bob-test-only");
+  assert.equal((await httpJson(untrusted.port, "/sync/v1/objects", "GET",
+    undefined, freshBob)).status, 503, "TLS identity pin mismatch fails closed");
+  await stop(untrusted.server);
+
+  const missingIdentityBinding = await start(f.makeFence({
+    independentlyPinnedIdentityBindings: new Map(),
+  }));
+  const unsignedBob = await login(missingIdentityBinding.port, "bob", "bob-test-only");
+  assert.equal((await httpJson(missingIdentityBinding.port, "/sync/v1/objects",
+    "GET", undefined, unsignedBob)).status, 503,
+  "without a server-pinned durable account identity, TLS signatures alone do not allow legacy");
+  await stop(missingIdentityBinding.server);
+
+  const forged = await start({ withCurrentAccountLegacyPolicy: async (_, callback) =>
+    callback({ status: "never_enrolled", assertActive: () => {},
+      immutableAccountId: ID(6) }) });
+  const fakeBob = await login(forged.port, "bob", "bob-test-only");
+  assert.equal((await httpJson(forged.port, "/sync/v1/objects", "GET",
+    undefined, fakeBob)).status, 503, "duck-typed attacker function is not a trusted fence");
+  await stop(forged.server);
 });
