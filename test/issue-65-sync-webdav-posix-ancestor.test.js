@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -57,6 +57,88 @@ test("POSIX owner-only bridge supports bearer GET HEAD PUT and MOVE through stic
   assert.equal((await request(port, "/created", "MKCOL")).status, 201);
   assert.equal((await request(port, "/created/child.txt", "PUT", "NESTED")).status, 201);
   assert.equal((await request(port, "/created/child.txt")).body, "NESTED");
+});
+
+test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and journal replay", {
+  skip: !LINUX,
+}, async (t) => {
+  const { root } = fixture(t);
+  const nested = path.join(root, "nested");
+  fs.mkdirSync(nested, { mode: 0o700 });
+  const leaf = path.join(nested, "unsafe.txt");
+  fs.writeFileSync(leaf, "ORIGINAL");
+  const bridge = await bridgeFor(t, root);
+  const port = bridge.address().port;
+  assert.equal((await request(port, "/nested/unsafe.txt")).status, 200);
+  for (const mode of [0o666, 0o660]) {
+    fs.chmodSync(leaf, mode);
+    for (const method of ["GET", "HEAD", "PUT"]) {
+      const response = await request(port, "/nested/unsafe.txt", method,
+        method === "PUT" ? "FORBIDDEN" : null);
+      assert.equal(response.status, 503, `${method} must deny existing leaf mode ${mode.toString(8)}`);
+      assert.doesNotMatch(response.body, /ORIGINAL|FORBIDDEN/);
+    }
+    assert.equal((await request(port, "/nested/unsafe.txt", "PROPFIND")).status, 503);
+    assert.equal((await request(port, "/nested/", "PROPFIND", null, { depth: "1" })).status, 503,
+      "Depth:1 cannot expose a sibling file without its own mode check");
+    assert.equal(fs.readFileSync(leaf, "utf8"), "ORIGINAL");
+    const recovering = new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN, port: 0,
+      journal: { async recover() { return [{ operationId: "untrusted-leaf-recovery",
+        kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; } } });
+    t.after(() => recovering.stop());
+    await assert.rejects(recovering.start(), /Untrusted POSIX bridge file mode/,
+      "journal replay must refuse an existing untrusted file before any mutation");
+    assert.equal(recovering.server.listening, false);
+  }
+  fs.chmodSync(leaf, 0o644);
+  assert.deepEqual(await request(port, "/nested/unsafe.txt"), { status: 200, body: "ORIGINAL" });
+  assert.equal((await request(port, "/nested/unsafe.txt", "HEAD")).status, 200);
+  assert.equal((await request(port, "/nested/", "PROPFIND", null, { depth: "1" })).status, 207);
+  assert.equal((await request(port, "/nested/unsafe.txt", "PUT", "RECOVERED")).status, 204);
+  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  const marked = [];
+  const recoveringSafe = new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN, port: 0,
+    journal: { async recover() { return [{ operationId: "trusted-leaf-recovery",
+      kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; },
+    async markSeen(id) { marked.push(id); } } });
+  t.after(() => recoveringSafe.stop());
+  await recoveringSafe.start();
+  assert.deepEqual(marked, ["trusted-leaf-recovery"],
+    "trusted existing leaf may be checked during safe journal recovery");
+  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  await recoveringSafe.stop();
+});
+
+test("POSIX different local UID can change 0666 file, but HTTP must deny it until made private", {
+  skip: !LINUX || process.getuid?.() !== 0,
+}, async (t) => {
+  const { dir, root } = fixture(t);
+  const nested = path.join(root, "nested");
+  fs.mkdirSync(nested, { mode: 0o755 });
+  const leaf = path.join(nested, "unsafe.txt");
+  fs.writeFileSync(leaf, "OWNER_ORIGINAL");
+  const bridge = await bridgeFor(t, root);
+  const port = bridge.address().port;
+  assert.equal((await request(port, "/nested/unsafe.txt")).body, "OWNER_ORIGINAL");
+  // Root's fixture is deliberately traversable but not directory-writable.
+  // A separate unprivileged local UID gains access ONLY through the leaf mode.
+  fs.chmodSync(dir, 0o755);
+  fs.chmodSync(root, 0o755);
+  fs.chmodSync(leaf, 0o666);
+  const attacker = spawnSync(process.execPath, ["-e",
+    `require("node:fs").writeFileSync(${JSON.stringify(leaf)}, "OTHER_UID_CONTENT")`],
+  { uid: 65534, gid: 65534, encoding: "utf8" });
+  assert.equal(attacker.status, 0, `UID 65534 must actually write: ${attacker.stderr}`);
+  assert.equal(fs.readFileSync(leaf, "utf8"), "OTHER_UID_CONTENT");
+  assert.equal((await request(port, "/nested/unsafe.txt")).status, 503);
+  assert.equal((await request(port, "/nested/unsafe.txt", "HEAD")).status, 503);
+  assert.equal((await request(port, "/nested/unsafe.txt", "PUT", "TRUSTED_REPAIR")).status, 503);
+  assert.equal(fs.readFileSync(leaf, "utf8"), "OTHER_UID_CONTENT");
+  fs.chmodSync(leaf, 0o600);
+  assert.equal((await request(port, "/nested/unsafe.txt")).body, "OTHER_UID_CONTENT",
+    "restoring permissions alone does not roll back altered content");
+  assert.equal((await request(port, "/nested/unsafe.txt", "PUT", "TRUSTED_REPAIR")).status, 204);
+  assert.equal((await request(port, "/nested/unsafe.txt")).body, "TRUSTED_REPAIR");
 });
 
 test("POSIX writable root, ancestor and nested directory fail closed", { skip: !LINUX }, async (t) => {

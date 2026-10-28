@@ -72,6 +72,10 @@ function assertPosixTrustedBridgePath(rootDir, targetPath, allowMissingLeaf = tr
       if (createMissingDirectories || index !== segments.length - 1 || !stat.isFile()) {
         throw new Error("Untrusted POSIX bridge path type");
       }
+      // An owner-trusted file can still be modified by a different UID when
+      // its group/other write bits are set. Verify the existing leaf as well
+      // as its ancestors before HTTP I/O or journal recovery.
+      if ((stat.mode & 0o022n) !== 0n) throw new Error("Untrusted POSIX bridge file mode");
       return;
     }
     if ((stat.mode & 0o022n) === 0n) continue;
@@ -467,7 +471,12 @@ class LocalSyncWebDavBridge {
         if (depth === "1" && (await fsp.lstat(target)).isDirectory()) {
           for (const entry of await fsp.readdir(target, { withFileTypes: true })) {
             if (entry.isSymbolicLink()) continue;
-            results.push(await this.properties(path.join(target, entry.name), `${parsed.pathname.replace(/\/$/, "")}/${entry.name}`));
+            const child = path.join(target, entry.name);
+            if (process.platform !== "win32") {
+              try { assertPosixTrustedBridgePath(this.rootDir, child, false); }
+              catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+            }
+            results.push(await this.properties(child, `${parsed.pathname.replace(/\/$/, "")}/${entry.name}`));
           }
         }
         return writeResponse(res, 207, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${results.join("")}</d:multistatus>`, { "Content-Type": "application/xml; charset=utf-8" });
