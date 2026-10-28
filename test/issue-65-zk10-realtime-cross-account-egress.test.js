@@ -107,10 +107,10 @@ test("ZK10 real authenticated A/B websocket does not disclose private WebDAV fol
       fs.rmSync(dir, { recursive: true, force: true });
     });
     let started = false;
-    for (let i = 0; i < 240; i++) {
+    for (let i = 0; i < 120; i++) {
       try { await request(number, "/login.html"); started = true; break; }
       catch { if (child.exitCode !== null) break;
-        await new Promise((resolve) => setTimeout(resolve, 75)); }
+        await new Promise((resolve) => setTimeout(resolve, 40)); }
     }
     assert.ok(started, "server bootstrap failed: " + logs);
     const origin = "http://127.0.0.1:" + number;
