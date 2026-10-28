@@ -98,3 +98,67 @@ test("existing generic TAP error/title/location lines must never leak even when 
   assert.doesNotMatch(source, /selected\.map\(sanitize\)|failures\.slice\(/);
   assert.doesNotMatch(log, /password|Bearer|private|S-1-|host\.internal|ghp_|ROOTARK|ACE_WRITE|SECRET\.txt|fake\\/i);
 });
+
+test("nested Node TAP has a valid top-level plan distinct from the total subtest count", () => {
+  const stdout = ["TAP version 13", "# Subtest: outer password=my-dangerous-value",
+    "    ok 1 - hidden nested pass", "    not ok 2 - Bearer sent-in-stdout",
+    "    1..2", "not ok 1 - hidden outer failure", "ok 2 - another outer test",
+    "1..2", "# tests 4", "# pass 2", "# fail 2", "# cancelled 0",
+    "# skipped 0", "# todo 0"].join("\n");
+  const value = summarizeUnrecognizedChild({ status: 1, stdout, stderr: poisoned });
+  assert.match(value, /footer=valid progress=1:2/);
+  assert.match(value, /failCount=2 failTop=1 failNested=4:2/);
+  assert.doesNotMatch(value, /password|Bearer|private|hidden|outer|secret/i);
+});
+
+test("hosted successful Ubuntu-shaped TAP footer is valid with 1661 top-level and 2286 total tests", () => {
+  const stdout = ["TAP version 13", "ok 1 - untrusted title", "ok 1661 - untrusted title",
+    "1..1661", "# tests 2286", "# pass 2184", "# fail 0", "# cancelled 0",
+    "# skipped 102", "# todo 0"].join("\n");
+  const value = summarizeUnrecognizedChild({ status: 0, stdout });
+  assert.match(value, /footer=valid progress=1:1661/);
+  assert.match(value, /failCount=0 failTop=none failNested=none/);
+});
+
+test("aggregate counters and top-level plan still reject contradictions", () => {
+  const base = ["TAP version 13", "ok 1 - hidden title", "ok 2 - hidden title",
+    "1..2", "# tests 4", "# pass 4", "# fail 0", "# cancelled 0",
+    "# skipped 0", "# todo 0"].join("\n");
+  assert.match(summarizeUnrecognizedChild({ stdout: base.replace("1..2\n# tests", "1..3\n# tests") }), /footer=invalid/);
+  assert.match(summarizeUnrecognizedChild({ stdout: base.replace("# pass 4", "# pass 3") }), /footer=invalid/);
+  assert.match(summarizeUnrecognizedChild({ stdout: base.replace("# tests 4", "# tests 1") }), /footer=invalid/);
+});
+
+test("bounded failed ordinals never reflect untrusted names, locations, stderr, or very large ordinals", () => {
+  const stdout = ["TAP version 13", "    not ok 2 - password=my-dangerous-value",
+    "    not ok 3 - Bearer sent-in-stdout", "not ok 10 - host.internal.test",
+    "not ok 11 - D:\\a\\Root.ark\\fake\\private.key",
+    "not ok 99999999 - oversized", "  location: 'C:\\private\\secret.txt:1:2'",
+    "1..11", "# tests 13", "# pass 9", "# fail 4", "# cancelled 0",
+    "# skipped 0", "# todo 0"].join("\n");
+  const value = summarizeUnrecognizedChild({ status: 1, stdout, stderr: poisoned });
+  assert.match(value, /failCount=4 failTop=10,11 failNested=4:2,4:3/);
+  assert.doesNotMatch(value, /password|Bearer|host\.internal|private|secret|S-1-|ROOTARK|location|99999999/i);
+  assert.ok(value.length < 260);
+});
+
+test("failed TAP ordinals in the middle of a sampled 16 MiB child are not silently lost", () => {
+  const stdout = ["TAP version 13", "ok 1 - private fixture", "noise\n".repeat(110000),
+    "    not ok 2 - password=my-dangerous-value", "not ok 333 - Bearer sent-in-stdout",
+    "noise\n".repeat(110000), "ok 1661 - final", "1..1661",
+    "# tests 1663", "# pass 1661", "# fail 2", "# cancelled 0", "# skipped 0", "# todo 0"].join("\n");
+  const value = summarizeUnrecognizedChild({ status: 1, stdout });
+  assert.match(value, /failCount=2 failTop=333 failNested=4:2/);
+  assert.match(value, /window=sampled$/);
+  assert.doesNotMatch(value, /private|password|Bearer|fixture|secret/i);
+});
+
+test("failure summaries cap every ordinal list and never echo a hostile huge TAP name", () => {
+  const lines = ["TAP version 13", ...Array.from({ length: 20 }, (_, i) =>
+    `not ok ${i + 1} - ${poisoned.replace(/\n/g, " ")}`), "1..20", "# tests 20",
+  "# pass 0", "# fail 20", "# cancelled 0", "# skipped 0", "# todo 0"];
+  const value = summarizeUnrecognizedChild({ status: 1, stdout: lines.join("\n") });
+  assert.match(value, /failCount=20 failTop=1,2,3,4,5,6\+ failNested=none/);
+  assert.ok(value.length < 260);
+  assert.doesNotMatch(value, /password|Bearer|host\.internal|private|synthetic_credential|ROOTARK|ACE_WRITE/);
+});
