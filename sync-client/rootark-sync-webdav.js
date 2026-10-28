@@ -189,6 +189,7 @@ class LocalSyncWebDavBridge {
     this.windowsAclVerifier = null;
     this.starting = false;
     this.startSettled = null;
+    this.listenPending = false;
     this.stopRequested = false;
     this.stopping = false;
     this.stopSettled = null;
@@ -231,6 +232,10 @@ class LocalSyncWebDavBridge {
       await this.recoverPending();
       if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
       if (process.platform === "win32") this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
+      // No await occurs between the cancellation guard above and issuing
+      // listen. A stop before this point can return without waiting for an
+      // unbounded or recursively stopping journal recovery.
+      this.listenPending = true;
       await new Promise((resolve, reject) => {
         const onError = (error) => {
           this.server.off("error", onError);
@@ -256,6 +261,7 @@ class LocalSyncWebDavBridge {
       this.windowsAclVerifier = null;
       throw error;
     } finally {
+      this.listenPending = false;
       this.starting = false;
       settleStart();
       this.startSettled = null;
@@ -357,9 +363,11 @@ class LocalSyncWebDavBridge {
     let settleStop;
     this.stopSettled = new Promise((resolve) => { settleStop = resolve; });
     try {
-      // A stop issued during journal recovery or a pending listen cannot
-      // return before that startup is fully cancelled and its worker closed.
-      if (this.startSettled) await this.startSettled;
+      // Pre-listen recovery may be unbounded, or may itself await stop().
+      // Cancel immediately in that phase; the start's post-recovery guard
+      // prevents a later listener or native worker. Once listen was issued,
+      // wait for its outcome so stop cannot return with a late HTTP listener.
+      if (this.listenPending && this.startSettled) await this.startSettled;
       this.windowsAclVerifier?.stop();
       this.windowsAclVerifier = null;
       if (!this.server.listening) return;

@@ -412,6 +412,95 @@ test("Windows bridge stop during startup prevents a late listener and ACL child"
   assert.equal(bridge.server.listenerCount("error"), 0);
 });
 
+test("Windows bridge stop completes while journal recovery never settles", {
+  skip: process.platform !== "win32", timeout: 15_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-stalled-recovery-");
+  let announceRecovery;
+  const recovering = new Promise((resolve) => { announceRecovery = resolve; });
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0,
+    journal: { recover() { announceRecovery(); return new Promise(() => {}); } } });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  // The deliberately unresolved startup is never allowed to listen. The
+  // orphaned promise owns no native process or timer after this test.
+  void bridge.start().catch(() => {});
+  await recovering;
+  let deadline;
+  const result = await Promise.race([
+    bridge.stop().then(() => "stopped"),
+    new Promise((resolve) => { deadline = setTimeout(() => resolve("timed-out"), 1000); }),
+  ]);
+  clearTimeout(deadline);
+  assert.equal(result, "stopped", "shutdown cannot wait on unbounded journal recovery");
+  assert.equal(bridge.server.listening, false);
+  assert.equal(bridge.windowsAclVerifier, null);
+});
+
+test("Windows bridge recovery awaiting its own stop cannot deadlock startup", {
+  skip: process.platform !== "win32", timeout: 15_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-recursive-stop-");
+  let announceRecovery;
+  const recovering = new Promise((resolve) => { announceRecovery = resolve; });
+  let bridge;
+  bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0,
+    journal: { async recover() { announceRecovery(); await bridge.stop(); return []; } } });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const starting = bridge.start();
+  await recovering;
+  let deadline;
+  const result = await Promise.race([
+    starting.then(() => "started", (error) =>
+      /start cancelled by stop/.test(error.message) ? "cancelled" : "wrong rejection"),
+    new Promise((resolve) => { deadline = setTimeout(() => resolve("timed-out"), 1000); }),
+  ]);
+  clearTimeout(deadline);
+  assert.equal(result, "cancelled", "journal recovery must be able to await stop without deadlock");
+  assert.equal(bridge.server.listening, false);
+  assert.equal(bridge.windowsAclVerifier, null);
+});
+
+test("Windows bridge stop waits for an issued but unacknowledged listen", {
+  skip: process.platform !== "win32", timeout: 20_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-pending-listen-");
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root,
+    token: "junction-acl-test-token", port: 0 });
+  const listen = bridge.server.listen.bind(bridge.server);
+  let announceBind;
+  const bound = new Promise((resolve) => { announceBind = resolve; });
+  let releaseCallback;
+  const callbackGate = new Promise((resolve) => { releaseCallback = resolve; });
+  bridge.server.listen = (port, host, callback) => listen(port, host, () => {
+    announceBind();
+    void callbackGate.then(callback);
+  });
+  t.after(async () => {
+    releaseCallback();
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const starting = bridge.start();
+  await bound;
+  assert.equal(bridge.server.listening, true);
+  const stopping = bridge.stop();
+  let deadline;
+  const result = await Promise.race([
+    stopping.then(() => "stopped"),
+    new Promise((resolve) => { deadline = setTimeout(() => resolve("pending"), 80); }),
+  ]);
+  clearTimeout(deadline);
+  assert.equal(result, "pending", "stop cannot return while issued listen has no callback");
+  releaseCallback();
+  await assert.rejects(starting, /start cancelled by stop/);
+  await stopping;
+  assert.equal(bridge.server.listening, false);
+  assert.equal(bridge.windowsAclVerifier, null);
+  assert.equal(bridge.server.listenerCount("error"), 0);
+});
+
 test("Windows bridge failed listen releases the native ACL verifier before retry", {
   skip: process.platform !== "win32", timeout: 35_000,
 }, async (t) => {
