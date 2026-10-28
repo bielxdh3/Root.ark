@@ -17,7 +17,12 @@ const PAYLOAD = Buffer.from("synthetic encrypted legacy fixture data");
 const ARCHIVE = Buffer.from("synthetic archived legacy fixture data");
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-source-type-inventory-"));
+  // The hosted Windows TEMP directory may be an administrator-managed junction.
+  // This fixture itself must be a real path: the production inventory reader
+  // correctly rejects aliased data roots, and that security check must remain.
+  const temp = process.platform === "win32"
+    ? fs.realpathSync.native(os.tmpdir()) : os.tmpdir();
+  const root = fs.mkdtempSync(path.join(temp, "zk65-source-type-inventory-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataDir = path.join(root, "data");
   const backupDir = path.join(dataDir, "backups");
