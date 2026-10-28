@@ -52,7 +52,7 @@ test("bounded S3 refuses same-inode rewrite between stat and open before provide
   };
   try {
     await assert.rejects(cloud.upload(source, "folder", "sealed.ct", "uploads",
-      { zk1BoundedBytes: 64 }));
+      { zk1BoundedBytes: 64, zk1ExpectedSha256: sha(trusted) }));
   } finally { fs.openSync = open; }
   assert.equal(injected, true);
   assert.equal(writes.length, 0);
@@ -152,4 +152,99 @@ test("bounded S3 and pinned Drive send only the trusted captured Buffer", async 
     providerFileId: "drive-pinned-file",
   })).id, "drive-pinned-file");
   assert.deepEqual(driveWrites, [trusted]);
+});
+
+test("ZK integrity opt-in requires independently supplied digest before S3 or pinned Drive provider writes", async (t) => {
+  const root = stage(t);
+  const source = path.join(root, "sealed.ct");
+  const trusted = Buffer.from("immutable independently hashed ciphertext");
+  fs.writeFileSync(source, trusted, { flag: "wx", mode: 0o600 });
+  const { cloud, writes } = s3();
+  const driveWrites = [];
+  const drive = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "root" },
+    createGoogleDriveClient: async () => ({ files: {
+      get: async () => { throw Object.assign(new Error("missing"), { status: 404 }); },
+      create: async ({ media }) => {
+        const parts = []; for await (const part of media.body) parts.push(Buffer.from(part));
+        driveWrites.push(Buffer.concat(parts));
+        return { data: { id: "pinned" } };
+      },
+    } }) });
+  for (const writer of [cloud, drive]) {
+    const extras = writer === drive ? { providerFileId: "pinned" } : {};
+    for (const options of [
+      { ...extras, zk1BoundedBytes: trusted.length },
+      { ...extras, zk1ExpectedSha256: sha(trusted) },
+      { ...extras, zk1BoundedBytes: undefined, zk1ExpectedSha256: sha(trusted) },
+      { ...extras, zk1BoundedBytes: trusted.length, zk1ExpectedSha256: undefined },
+      { ...extras, zk1BoundedBytes: trusted.length, zk1ExpectedSha256: sha(trusted), zk1UnsafeFallback: true },
+      Object.assign(Object.create({ zk1BoundedBytes: trusted.length,
+        zk1ExpectedSha256: sha(trusted) }), extras),
+      Object.assign(Object.create({ zk1ExpectedSha256: sha(trusted) }), extras),
+    ]) {
+      await assert.rejects(writer.upload(source, "folder", "sealed.ct", "uploads", options),
+        { code: "configuration" });
+    }
+  }
+  assert.deepEqual(writes, []);
+  assert.deepEqual(driveWrites, []);
+});
+
+test("bounded S3 lost ACK never retries changed bytes under the prior trusted digest", async (t) => {
+  const root = stage(t);
+  const source = path.join(root, "ciphertext.ct");
+  const original = Buffer.from("original-authenticated-ciphertext");
+  const changed = Buffer.alloc(original.length, 0x42);
+  assert.equal(original.length, changed.length);
+  fs.writeFileSync(source, original, { flag: "wx", mode: 0o600 });
+  const remote = [];
+  const storage = createCloudStorage({ provider: "s3", s3: { bucket: "fixture" },
+    createS3Client: async () => ({ send: async ({ input }) => {
+      remote.push(Buffer.from(input.Body));
+      if (remote.length === 1) throw new Error("lost remote acknowledgement");
+      return {};
+    } }) });
+  const options = { zk1BoundedBytes: original.length, zk1ExpectedSha256: sha(original) };
+  await assert.rejects(storage.upload(source, "folder", "ciphertext.ct", "uploads", options));
+  assert.deepEqual(remote, [original], "remote PUT might have happened despite missing ACK");
+  fs.writeFileSync(source, changed);
+  await assert.rejects(storage.upload(source, "folder", "ciphertext.ct", "uploads", options),
+    { code: "configuration" });
+  assert.deepEqual(remote, [original], "retries never downgrade to attacker content");
+  fs.writeFileSync(source, original);
+  assert.equal((await storage.upload(source, "folder", "ciphertext.ct", "uploads", options)).provider, "s3");
+  assert.deepEqual(remote, [original, original]);
+});
+
+test("bounded pinned Drive 409 recovery reuses authenticated snapshot after source rewrite", async (t) => {
+  const root = stage(t);
+  const source = path.join(root, "ciphertext.ct");
+  const original = Buffer.from("signed-cloud-ciphertext-data");
+  fs.writeFileSync(source, original, { flag: "wx", mode: 0o600 });
+  const received = [];
+  let gets = 0;
+  const cloud = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "root" },
+    createGoogleDriveClient: async () => ({ files: {
+      get: async () => {
+        if (++gets === 1) throw Object.assign(new Error("missing"), { status: 404 });
+        return { data: { id: "pinned", parents: ["root"], appProperties: {
+          rootArkKey: "rootark/uploads/folder/ciphertext.ct",
+          rootArkFolderId: "folder", rootArkArea: "uploads" } } };
+      },
+      create: async ({ media }) => {
+        received.push(Buffer.concat(await Array.fromAsync(media.body)));
+        fs.writeFileSync(source, Buffer.alloc(original.length, 0x42));
+        throw Object.assign(new Error("ambiguous create 409"), { status: 409 });
+      },
+      update: async ({ media, fileId }) => {
+        assert.equal(fileId, "pinned");
+        received.push(Buffer.concat(await Array.fromAsync(media.body)));
+        return { data: { id: fileId } };
+      },
+    } }) });
+  assert.equal((await cloud.upload(source, "folder", "ciphertext.ct", "uploads", {
+    providerFileId: "pinned", zk1BoundedBytes: original.length,
+    zk1ExpectedSha256: sha(original),
+  })).id, "pinned");
+  assert.deepEqual(received, [original, original], "retry must not reread altered source");
 });
