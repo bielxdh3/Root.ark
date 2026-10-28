@@ -137,9 +137,67 @@ function pinnedReaders(values, providerDomains, scope, operation, root, byteLeng
   return result;
 }
 let windowsPrivateRestoreRoot = null;
+// A 0700 mkdtemp child is NOT private if a different UID can rename that
+// child through a non-sticky writable TMPDIR. Check all parent components
+// before creating anything, then retain their identities through cleanup.
+function pinPosixRestoreTempParent(directory) {
+  if (typeof directory !== "string" || !path.isAbsolute(directory)
+    || path.resolve(directory) !== directory) deny();
+  const ownUid = BigInt(process.getuid());
+  const parsed = path.parse(directory);
+  const parts = path.relative(parsed.root, directory).split(path.sep).filter(Boolean);
+  const pinned = [];
+  let current = parsed.root;
+  for (const part of ["", ...parts]) {
+    if (part) current = path.join(current, part);
+    const stat = fs.lstatSync(current, { bigint: true });
+    const foreignWritable = (stat.mode & 0o022n) !== 0n;
+    const rootSticky = stat.uid === 0n && (stat.mode & 0o1000n) !== 0n;
+    if (!stat.isDirectory() || stat.isSymbolicLink()
+      || (stat.uid !== ownUid && stat.uid !== 0n)
+      || (foreignWritable && !rootSticky)) deny();
+    pinned.push({ name: current, dev: stat.dev, ino: stat.ino });
+  }
+  const verify = () => {
+    for (const entry of pinned) {
+      const stat = fs.lstatSync(entry.name, { bigint: true });
+      const foreignWritable = (stat.mode & 0o022n) !== 0n;
+      const rootSticky = stat.uid === 0n && (stat.mode & 0o1000n) !== 0n;
+      if (!stat.isDirectory() || stat.isSymbolicLink()
+        || stat.dev !== entry.dev || stat.ino !== entry.ino
+        || (stat.uid !== ownUid && stat.uid !== 0n)
+        || (foreignWritable && !rootSticky)) deny();
+    }
+  };
+  verify();
+  return verify;
+}
+function pinRestoreStagingCleanup(directory, verifyParent) {
+  const initial = fs.lstatSync(directory, { bigint: true });
+  if (!initial.isDirectory() || initial.isSymbolicLink()
+    || (process.platform !== "win32"
+      && (initial.uid !== BigInt(process.getuid())
+        || (initial.mode & 0o077n) !== 0n))) deny();
+  return Object.freeze({
+    directory,
+    async cleanup() {
+      await verifyParent();
+      const current = fs.lstatSync(directory, { bigint: true });
+      if (!current.isDirectory() || current.isSymbolicLink()
+        || current.dev !== initial.dev || current.ino !== initial.ino
+        || (process.platform !== "win32" && (current.uid !== initial.uid
+          || (current.mode & 0o077n) !== 0n))) deny();
+      fs.rmSync(directory, { recursive: true, force: true, maxRetries: 4 });
+    },
+  });
+}
 async function createPrivateRestoreStagingDirectory(deadline) {
   if (process.platform !== "win32") {
-    return fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cloud-recovery-"));
+    const parent = os.tmpdir();
+    const verifyParent = pinPosixRestoreTempParent(parent);
+    const directory = fs.mkdtempSync(path.join(parent, "zk1-cloud-recovery-"));
+    verifyParent();
+    return pinRestoreStagingCleanup(directory, verifyParent);
   }
   // On Windows the default TEMP directory can grant Modify to unrelated SIDs.
   // Its descendants inherit that right, allowing a competing local principal
@@ -176,18 +234,28 @@ async function createPrivateRestoreStagingDirectory(deadline) {
   // bit before O_EXCL, so convert only those trusted inherited ACEs to explicit
   // ACEs with the pinned native utility. No permissions are granted or relaxed.
   const directory = fs.mkdtempSync(path.join(root, "zk1-cloud-recovery-"));
+  const expectedRoot = { ...windowsPrivateRestoreRoot };
+  const verifyParent = async () => {
+    await checkWindowsPrivateCloudDirectory(root, "verify");
+    const live = fs.lstatSync(root, { bigint: true });
+    if (!live.isDirectory() || live.isSymbolicLink()
+      || live.dev !== expectedRoot.dev || live.ino !== expectedRoot.ino
+      || path.resolve(fs.realpathSync.native(root)).toLowerCase()
+        !== path.resolve(root).toLowerCase()) deny();
+  };
+  const pinnedStage = pinRestoreStagingCleanup(directory, verifyParent);
   try {
     execFileSync("C:\\Windows\\System32\\icacls.exe", [directory, "/inheritance:d"], {
       stdio: "ignore", windowsHide: true, timeout: 12000,
     });
-    return directory;
+    return pinnedStage;
   } catch (_) {
-    fs.rmSync(directory, { recursive: true, force: true });
+    try { await pinnedStage.cleanup(); } catch (_) { /* Refuse unsafe cleanup. */ }
     deny();
   }
 }
 async function exactGet(target, scope, operation, root, lengths, byteLength, deadline) {
-  let dir;
+  let stage;
   try {
     const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
     const key = target.reader.key(address.folder, address.name, "uploads");
@@ -196,8 +264,8 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
       || (target.ownerPinnedObjectKey !== null && key !== target.ownerPinnedObjectKey)
       || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
-    dir = await createPrivateRestoreStagingDirectory(deadline);
-    const destination = path.join(dir, "opaque.ct");
+    stage = await createPrivateRestoreStagingDirectory(deadline);
+    const destination = path.join(stage.directory, "opaque.ct");
     const ok = await deadline.run((signal) => target.reader.download(address.folder, address.name, destination,
       "uploads", () => !signal.aborted, { maxBytes: byteLength,
         ...(target.driveId === null ? {} : { providerFileId: target.driveId }),
@@ -243,7 +311,7 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
       providerFileId: target.driveId, providerVersionId: target.providerVersionId,
       providerEtag: target.providerEtag, byteLength }) };
   } finally {
-    if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 4 });
+    if (stage) await stage.cleanup();
   }
 }
 
