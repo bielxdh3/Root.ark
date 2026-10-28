@@ -558,22 +558,53 @@ class LocalSyncWebDavBridge {
         let staged = false;
         let installed = false;
         let protocolQueued = false;
+        let ownedTemporary = null;
+        const stillOwned = (named) => ownedTemporary && named.isFile()
+          && !named.isSymbolicLink() && named.nlink === 1n
+          && named.dev === ownedTemporary.dev && named.ino === ownedTemporary.ino;
         try {
-          await fsp.writeFile(temporary, data, { mode: 0o600 });
+          // O_EXCL is essential even with a random basename: a preexisting
+          // collision must never be truncated, and its owner never becomes us.
+          const handle = await fsp.open(temporary, "wx", 0o600);
+          try {
+            const created = await handle.stat({ bigint: true });
+            if (!created.isFile() || created.nlink !== 1n) throw new Error("Unsafe PUT staging file");
+            ownedTemporary = { dev: created.dev, ino: created.ino };
+            await handle.writeFile(data);
+            const written = await handle.stat({ bigint: true });
+            if (!stillOwned(written) || written.size !== BigInt(data.length)) {
+              throw new Error("PUT staging file identity changed");
+            }
+          } finally { await handle.close(); }
+          if (!stillOwned(await fsp.lstat(temporary, { bigint: true }))) {
+            throw new Error("PUT staging pathname changed");
+          }
           if (backup) {
             await rejectSymlinks(this.rootDir, backup, true);
             await fsp.rename(target, backup);
             staged = true;
             await this.updateJournal(operationId, { phase: "staged" });
           }
+          if (!stillOwned(await fsp.lstat(temporary, { bigint: true }))) {
+            throw new Error("PUT staging pathname changed");
+          }
           await fsp.rename(temporary, target);
+          ownedTemporary = null;
           installed = true;
           await this.updateJournal(operationId, { phase: "source-moved" });
           protocolQueued = await this.enqueueProtocol(operation);
           if (protocolQueued) await this.updateJournal(operationId, { phase: "protocol-queued" });
           try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
         } catch (error) {
-          await fsp.rm(temporary, { force: true }).catch(() => {});
+          // A failed O_EXCL open or replaced pathname is not ours to remove.
+          // Check the opened inode, not merely the predictable temporary name.
+          if (ownedTemporary) {
+            try {
+              if (stillOwned(await fsp.lstat(temporary, { bigint: true }))) {
+                await fsp.unlink(temporary);
+              }
+            } catch (_) { /* missing or inaccessible: never delete an unverified name */ }
+          }
           if (error.protocolQueueUncertain) return writeResponse(res, existing ? 204 : 201);
           if (protocolQueued) return writeResponse(res, existing ? 204 : 201);
           if (installed) await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
