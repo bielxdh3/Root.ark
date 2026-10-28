@@ -12,7 +12,7 @@ const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilien
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
-const { assertZk10LegacyBackupNotStrict } = require("../src/services/zk10LegacyBackupDeny");
+const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
@@ -1281,6 +1281,8 @@ function recoverLegacyRetentionTombstones() {
 }
 
 function recoverRetentionTombstones() {
+  // Exported for direct callers: may delete archived private bytes or history.
+  assertZk10LegacyBackupNotStrict();
   recoverRetentionTransactions();
   recoverLegacyRetentionTombstones();
 }
@@ -1344,11 +1346,16 @@ function cleanupOrphanSqliteBackupStages() {
 }
 
 async function recoverRetentionAtStartup() {
+  // Legacy retained ciphertext/SQLite stages are not globally owner-authorized
+  // for deletion. Preserve them under strict cutover, without blocking boot.
+  if (isZk10LegacyBackupStrict()) return;
   const release = acquireLock("backup-history-recovery");
   let inventoryLease = null;
   try {
     if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
     inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    // The strict state may have changed while inventory operations awaited.
+    if (isZk10LegacyBackupStrict()) return;
     recoverRetentionTombstones();
     cleanupOrphanCloudBackupStages();
     cleanupOrphanSqliteBackupStages();
@@ -1359,11 +1366,15 @@ async function recoverRetentionAtStartup() {
 }
 
 async function cleanupRetention(options = {}) {
+  // This exported service entrypoint may run outside the guarded scheduler.
+  // Retention removes historical ZIP bytes and their durable references.
+  assertZk10LegacyBackupNotStrict();
   const release = options.lockHeld ? null : acquireLock("backup");
   let inventoryLease = null;
   try {
   if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+  assertZk10LegacyBackupNotStrict();
   const count = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_COUNT", 10)));
   const days = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_DAYS", 30)));
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
@@ -1376,17 +1387,24 @@ async function cleanupRetention(options = {}) {
 
   const toDelete = backups.filter((item, index) => (count > 0 && index >= count) || (cutoff && new Date(item.createdAt).getTime() < cutoff));
   for (const backup of toDelete) {
+    assertZk10LegacyBackupNotStrict();
     const archivePath = getArchivePath(backup.filename);
     if (!archivePath || !fs.existsSync(archivePath)) continue;
     const transactionId = crypto.randomUUID();
     const tombstone = retentionTombstone(archivePath);
-    const transaction = { version: 1, transactionId, phase: "prepared", backupId: String(backup.id), filename: path.basename(archivePath), archivePath, tombstonePath: tombstone, checksum: await calculateFileHash(archivePath), createdAt: new Date().toISOString() };
+    const checksum = await calculateFileHash(archivePath);
+    // Do not write even a prepared durable deletion journal after a late
+    // STRICT flip during the asynchronous archive hash.
+    assertZk10LegacyBackupNotStrict();
+    const transaction = { version: 1, transactionId, phase: "prepared", backupId: String(backup.id), filename: path.basename(archivePath), archivePath, tombstonePath: tombstone, checksum, createdAt: new Date().toISOString() };
     const record = { transaction, transactionPath: persistRetentionTransaction(transaction), directory: path.dirname(retentionTransactionPath(transactionId)) };
     try {
+      assertZk10LegacyBackupNotStrict();
       renameDurably(archivePath, tombstone);
       transaction.phase = "archive_moved";
       persistRetentionTransaction(transaction);
       inventoryLease.renew();
+      assertZk10LegacyBackupNotStrict();
       backupRepository.deleteBackup(backup.id, { mutationLease: inventoryLease });
       transaction.phase = "history_removed";
       persistRetentionTransaction(transaction);
@@ -1627,8 +1645,11 @@ function compensateFailedBackupDeletion(backup, mutationLease, originalError) {
 }
 
 async function deleteBackupTransaction(backup, archivePath, mutationLease) {
+  assertZk10LegacyBackupNotStrict();
   const transactionId = crypto.randomUUID();
   const tombstone = retentionTombstone(archivePath);
+  const checksum = await calculateFileHash(archivePath);
+  assertZk10LegacyBackupNotStrict();
   const transaction = {
     version: 1,
     transactionId,
@@ -1637,7 +1658,7 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
     filename: path.basename(archivePath),
     archivePath,
     tombstonePath: tombstone,
-    checksum: await calculateFileHash(archivePath),
+    checksum,
     createdAt: new Date().toISOString(),
   };
   const record = {
@@ -1647,6 +1668,7 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
   };
   let removedBackup = null;
   try {
+    assertZk10LegacyBackupNotStrict();
     renameDurably(archivePath, tombstone);
     transaction.phase = "archive_moved";
     persistRetentionTransaction(transaction);
@@ -1675,6 +1697,7 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
 }
 
 async function deleteBackup(id, options = {}) {
+  assertZk10LegacyBackupNotStrict();
   const release = options.lockHeld ? null : acquireLock("delete");
   let inventoryLease = null;
   try {
