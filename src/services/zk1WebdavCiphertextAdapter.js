@@ -49,17 +49,42 @@ function samePath(left, right) {
 function pinParent(filename) {
   ensure(typeof filename === "string" && path.isAbsolute(filename));
   const directory = path.dirname(filename);
-  const stat = fs.lstatSync(directory, { bigint: true });
   // O_NOFOLLOW only guards the leaf. A redirected ancestor can make a valid
   // exclusive create publish bytes into a foreign directory on Windows/Unix.
+  const stat = fs.lstatSync(directory, { bigint: true });
   ensure(stat.isDirectory() && !stat.isSymbolicLink()
     && samePath(fs.realpathSync.native(directory), directory));
-  return { directory, dev: stat.dev, ino: stat.ino };
+  const chain = [];
+  if (process.platform !== "win32") {
+    const root = path.parse(directory).root;
+    const segments = path.relative(root, directory).split(path.sep).filter(Boolean);
+    const owner = BigInt(process.getuid());
+    let current = root;
+    for (const segment of ["", ...segments]) {
+      if (segment) current = path.join(current, segment);
+      const ancestor = fs.lstatSync(current, { bigint: true });
+      const finalParent = current === directory;
+      const rootOwned = ancestor.uid === 0n;
+      const foreignWritable = (ancestor.mode & 0o022n) !== 0n;
+      // A foreign owner can redirect even a currently read-only directory.
+      // Root-owned sticky /tmp is safe only as an ancestor of our private leaf.
+      ensure(ancestor.isDirectory() && !ancestor.isSymbolicLink()
+        && (ancestor.uid === owner || rootOwned)
+        && (!finalParent || ancestor.uid === owner)
+        && (!foreignWritable || (!finalParent && rootOwned
+          && (ancestor.mode & 0o1000n) !== 0n)));
+      chain.push({ dev: ancestor.dev, ino: ancestor.ino });
+    }
+  }
+  return { directory, dev: stat.dev, ino: stat.ino, chain };
 }
 
 function verifyParent(pin) {
   const current = pinParent(path.join(pin.directory, "_webdav_parent_pin"));
-  ensure(current.dev === pin.dev && current.ino === pin.ino);
+  ensure(current.dev === pin.dev && current.ino === pin.ino
+    && current.chain.length === pin.chain.length
+    && pin.chain.every((ancestor, i) => ancestor.dev === current.chain[i].dev
+      && ancestor.ino === current.chain[i].ino));
 }
 
 function readBoundedFile(source, length) {
