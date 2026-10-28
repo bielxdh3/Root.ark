@@ -8,6 +8,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { verifyWindowsLocalWebDavTree } = require("../../services/chunkUploadWindowsAcl");
+const { assertPrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
 
 const SCHEMA = "rootark-zk1-local-fixture-migration-journal/v1";
 const MODE = "rootark-zk-local-fixture-only/v1";
@@ -60,6 +61,13 @@ function safeRoot(dir, mode) {
   const root = path.resolve(dir);
   const temporary = path.resolve(os.tmpdir());
   if (path.dirname(root) !== temporary || !path.basename(root).startsWith("rootark-zk-local-fixture-")) refuse();
+  if (process.platform !== "win32") {
+    // A 0700 fixture still can be renamed by another UID owning its TMPDIR
+    // parent. Enforce private/trusted ancestry before any journal or stage
+    // creation; a root-owned sticky /tmp remains a valid ancestor.
+    try { assertPrivateSqliteDirectory(path.join(root, "_fixture_guard")); }
+    catch (_) { refuse(); }
+  }
   if (process.platform === "win32") {
     // A disposable fixture is not exempt from the Windows DACL boundary:
     // a different local user with DELETE_CHILD/Modify on this directory can
