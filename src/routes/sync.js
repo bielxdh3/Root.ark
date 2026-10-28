@@ -11,6 +11,7 @@ const { createSyncBurstGuard } = require("../services/syncBurstGuard");
 const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCodeAsync, verifyTotp } = require("../services/totp");
 const { authorizationDigest } = require("../services/syncResumeAccountProof");
 const { createSyncSqliteAccountWriteFence } = require("../services/syncSqliteAccountWriteFence");
+const { createZk10HttpResponseLeaseGuard } = require("../services/zk10LegacyHttpResponseLease");
 const {
   MAX_DEVICES, assertAtomicDeviceRegistry, emptyAtomicDeviceRegistry, invalidRegistry,
   validIdentifier, validPublicKey,
@@ -768,18 +769,24 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           throw new Error("ZK10 verified never-enrolled lease missing");
         }
         lease.assertActive();
-        const result = await handler(req, res, lease);
-        // Do not release an authorized read lease before HTTP has handed off
-        // the response. A valid authority must also fence writes atomically
-        // against account cutover; this Express wrapper alone is not a CAS.
-        if (res.writableEnded && !res.writableFinished && !res.destroyed) {
-          await new Promise((resolve, reject) => {
-            res.once("finish", resolve);
-            res.once("close", () => reject(new Error("ZK10 response closed before flush")));
-          });
+        // Arm BEFORE handler invocation: a streaming handler may keep its
+        // Promise unresolved while the external signed lease expires.
+        const responseGuard = createZk10HttpResponseLeaseGuard(res, lease.signal,
+          lease.assertActive);
+        try {
+          lease.assertActive();
+          const result = await handler(req, res, lease);
+          // A handler may return after headers/chunks but before HTTP finish.
+          // Never release the external legacy lease at handler return.
+          await responseGuard.waitForFinish();
+          lease.assertActive();
+          return result;
+        } finally {
+          // A handler throwing after it sent headers must never leave a stream
+          // emitting bytes after its lease is released.
+          if (res.headersSent && !res.writableFinished && !res.destroyed) res.destroy();
+          responseGuard.disarm();
         }
-        lease.assertActive();
-        return result;
       });
       if (!invoked && !res.headersSent) {
         return errorResponse(res, 503, "ZK10 cutover authorization was not established",
