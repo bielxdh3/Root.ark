@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { TextDecoder } = require("node:util");
+const { assertPrivateSqliteAuthorityDirectory } = require("./zk1PrivateSqlitePath");
 
 const REPORT_SCHEMA = "rootark-zk1-disposable-backup-pre-restore-report/v1";
 const MANIFEST_SCHEMA = "rootark-zk1-backup-pre-restore-fixture/v1";
@@ -85,6 +86,19 @@ function safeRoot(input) {
       || !canonical.isDirectory() || canonical.isSymbolicLink()
       || lexical.dev !== canonical.dev || lexical.ino !== canonical.ino
       || !samePath(fs.realpathSync.native(requestedRoot), root)) deny("UNSAFE_FIXTURE");
+  } catch (_) { deny("UNSAFE_FIXTURE"); }
+  // Pinning the inode of a fixture is insufficient if another OS principal
+  // can rename that inode through a shared, non-sticky TEMP ancestor. Reject
+  // untrusted POSIX owners/modes and native Windows owner/DACL ancestry before
+  // opening the first fixture file. SQLite's authority-path guard enforces
+  // exactly this cross-principal pathname boundary without creating a file.
+  try {
+    assertPrivateSqliteAuthorityDirectory(path.join(root, "_backup_fixture_guard"));
+    if (process.platform !== "win32") {
+      const stat = fs.lstatSync(root, { bigint: true });
+      if (stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n) !== 0n)
+        deny("UNSAFE_FIXTURE");
+    }
   } catch (_) { deny("UNSAFE_FIXTURE"); }
   const parsed = path.parse(root);
   let current = parsed.root;

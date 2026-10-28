@@ -6,12 +6,30 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const { inspectZk1DisposableBackupPreRestore } =
   require("../src/services/zk1DisposableBackupPreRestore");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
+const { canonicalTestTempEnvironment } = require("./support/issue-65-canonical-temp-fixture");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
+
+function privateFixture(t) {
+  if (process.platform !== "win32")
+    return fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-fixture-"));
+  canonicalTestTempEnvironment(t);
+  // A normal hosted Windows TEMP directory may inherit foreign account
+  // Modify rights. Create the synthetic signed fixture with a private DACL
+  // from birth, just like the other protected ZK fixture tests.
+  const parent = fs.realpathSync.native(process.env.LOCALAPPDATA);
+  process.env.TEMP = parent;
+  process.env.TMP = parent;
+  const root = path.join(parent, `rootark-zk-backup-fixture-${crypto.randomBytes(12).toString("hex")}`);
+  ensureWindowsChunkUploadRoot(root);
+  return root;
+}
 
 test("disposable backup marker read cannot allocate inode bytes appended after fstat", async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-fixture-"));
+  const root = privateFixture(t);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const name of ["versions", "copies", "envelopes"])
     fs.mkdirSync(path.join(root, name));
@@ -50,7 +68,7 @@ test("disposable backup marker read cannot allocate inode bytes appended after f
 });
 
 test("disposable backup bounded FD reads preserve a valid signed fixture", (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-fixture-"));
+  const root = privateFixture(t);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const write = (name, contents) => fs.writeFileSync(path.join(root, name), contents, { flag: "wx" });
   for (const name of ["versions", "copies", "envelopes"])
@@ -97,4 +115,36 @@ test("disposable backup bounded FD reads preserve a valid signed fixture", (t) =
   assert.equal(report.checkedCopies, 1);
   assert.equal(report.checkedEnvelopes, 2);
   assert.deepEqual(report.findings, []);
+});
+
+test("backup fixture rejects foreign Windows SID Modify before reading a fixture file", (t) => {
+  if (process.platform !== "win32") {
+    t.skip("requires native Windows SID/DACL check");
+    return;
+  }
+  const root = privateFixture(t);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const name of ["versions", "copies", "envelopes"])
+    fs.mkdirSync(path.join(root, name));
+  for (const name of ["manifest.json", "backup-index.json", "owner-authorization.json"])
+    fs.writeFileSync(path.join(root, name), "{}");
+  fs.writeFileSync(path.join(root, ".rootark-disposable-fixture"),
+    "rootark-zk-backup-fixture-v1\n");
+  // Grant the well-known Everyone SID actual NTFS Modify access, representing
+  // a different local account that may rename our directory's child entries.
+  execFileSync("C:\\Windows\\System32\\icacls.exe", [root, "/grant", "*S-1-1-0:(OI)(CI)M"],
+    { windowsHide: true, stdio: "pipe", timeout: 10000 });
+  const original = fs.openSync;
+  let opened = false;
+  fs.openSync = function (filename, ...args) {
+    if (path.basename(String(filename)) === ".rootark-disposable-fixture") opened = true;
+    return original.call(fs, filename, ...args);
+  };
+  let report;
+  try {
+    report = inspectZk1DisposableBackupPreRestore({ fixtureDir: root,
+      expectedCompartmentId: "compartment1", checkpoint: { epoch: 0, revision: 0 } });
+  } finally { fs.openSync = original; }
+  assert.equal(opened, false, "an unrelated Windows SID must not be able to win a read-path race");
+  assert.ok(report.findings.includes("UNSAFE_FIXTURE"));
 });
