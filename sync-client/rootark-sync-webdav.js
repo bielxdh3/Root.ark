@@ -235,10 +235,18 @@ class LocalSyncWebDavBridge {
       if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
       await this.recoverPending();
       if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
-      if (process.platform === "win32") this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
-      // No await occurs between the cancellation guard above and issuing
-      // listen. A stop before this point can return without waiting for an
-      // unbounded or recursively stopping journal recovery.
+      if (process.platform === "win32") {
+        this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
+        // Compile/prime the long-lived native ACL worker before accepting
+        // HTTP. Its first use otherwise puts variable PowerShell Add-Type
+        // startup latency on the first authenticated request. This is a
+        // FRESH native check, not a cached ACL approval for later requests.
+        await this.windowsAclVerifier.verify(this.rootDir);
+      }
+      // stop() may cancel the async native warm-up without waiting for it;
+      // prohibit a late listener after such a cancellation. No await occurs
+      // between this cancellation fence and issuing listen.
+      if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
       this.listenPending = true;
       await new Promise((resolve, reject) => {
         const onError = (error) => {

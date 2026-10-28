@@ -8,6 +8,8 @@ const http = require("node:http");
 const path = require("node:path");
 const test = require("node:test");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
+const { createWindowsLocalWebDavAclVerifier } =
+  require("../services/chunkUploadWindowsAcl");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
@@ -164,6 +166,43 @@ test("Windows WebDAV MOVE independently refuses an untrusted destination parent"
   assert.equal(fs.existsSync(destination), false);
 });
 
+test("Windows native ACL worker initialization leaves the Node event loop responsive", {
+  skip: process.platform !== "win32", timeout: 45_000,
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-bridge-cold-worker-");
+  const file = path.join(root, "file.ct");
+  fs.writeFileSync(file, "DISPOSABLE_BOUNDED_CIPHERTEXT");
+  const verifier = createWindowsLocalWebDavAclVerifier();
+  t.after(() => {
+    verifier.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  let beats = 0;
+  let worstLag = 0;
+  let previous = Date.now();
+  const interval = setInterval(() => {
+    const now = Date.now();
+    worstLag = Math.max(worstLag, now - previous);
+    previous = now;
+    beats += 1;
+  }, 20);
+  try {
+    // This includes cold Add-Type compilation; it MUST remain asynchronous.
+    // A fixed independent observation window prevents a very fast native
+    // worker from falsely failing the 12-tick responsiveness assertion.
+    // The ACL checks still run concurrently and must ALL complete successfully.
+    await Promise.all([
+      Promise.all(Array.from({ length: 12 }, () => verifier.verifyFile(file))),
+      new Promise((resolve) => setTimeout(resolve, 320)),
+    ]);
+  } finally {
+    clearInterval(interval);
+  }
+  assert.ok(beats >= 12, `event loop must advance during cold native ACL checks: ${beats} ticks`);
+  assert.ok(worstLag < 275,
+    `cold native ACL worker must not block the Node event loop: ${worstLag}ms`);
+});
+
 test("Windows local WebDAV concurrent ACL checks leave the Node event loop responsive", {
   skip: process.platform !== "win32", timeout: 45_000,
 }, async (t) => {
@@ -177,32 +216,17 @@ test("Windows local WebDAV concurrent ACL checks leave the Node event loop respo
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   await bridge.start();
-  let beats = 0;
-  let worstLag = 0;
-  let previous = Date.now();
-  const interval = setInterval(() => {
-    const now = Date.now();
-    worstLag = Math.max(worstLag, now - previous);
-    previous = now;
-    beats += 1;
-  }, 20);
-  let responses;
   const started = Date.now();
-  try {
-    responses = await Promise.all(Array.from({ length: 12 }, () =>
-      request(bridge.address().port, "/file.ct")));
-  } finally {
-    clearInterval(interval);
-  }
+  const responses = await Promise.all(Array.from({ length: 12 }, () =>
+    request(bridge.address().port, "/file.ct")));
   const elapsed = Date.now() - started;
-  t.diagnostic(`12 authenticated GETs: ${elapsed}ms ACL-checked HTTP, including verifier startup`);
+  t.diagnostic(`12 authenticated GETs: ${elapsed}ms ACL-checked HTTP after native startup`);
   for (const result of responses) {
     assert.equal(result.status, 200);
     assert.equal(result.body, content);
   }
-  assert.ok(beats >= 12, `event loop must advance during 12 ACL checks: ${beats} ticks`);
-  assert.ok(worstLag < 275,
-    `ACL checks must not block the event loop for a PowerShell startup: ${worstLag}ms`);
+  // The separate cold-worker test retains the 12-beat/275ms responsiveness
+  // invariant; a correctly warmed 12-GET burst may finish before 12 ticks.
   assert.ok(elapsed < 1500,
     `12 request-time native ACL checks must reuse a compiled verifier: ${elapsed}ms`);
 });
