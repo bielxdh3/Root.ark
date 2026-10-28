@@ -9,7 +9,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
 const express = require("express");
@@ -57,6 +57,56 @@ const { createZk1PrivateCloudStagingDirectory } =
 
 const b64 = (data) => Buffer.from(data).toString("base64url");
 const random = (n) => crypto.randomBytes(n);
+function requireRealForeignUidFixture() {
+  assert.equal(process.platform, "linux", "foreign-UID test must run on Linux");
+  assert.equal(process.getuid(), 0, "foreign-UID test requires actual root service UID");
+  const root = fs.lstatSync("/tmp");
+  assert.equal(root.uid, 0, "trusted control root must be owned by root");
+  assert.equal(root.mode & 0o1777, 0o1777, "control /tmp must be root-owned sticky 1777");
+  const attacker = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", "/usr/bin/id", "-u"],
+    { timeout: 5000, encoding: "utf8" });
+  assert.equal(attacker.status, 0, "runuser must really launch another UID");
+  assert.equal(attacker.stdout.trim(), "65534", "attacker process must be nobody, not service UID");
+  const unsafe = process.env.W110_UNSAFE_TMPDIR;
+  assert.ok(typeof unsafe === "string" && path.isAbsolute(unsafe)
+    && path.dirname(unsafe) === "/tmp"
+    && path.basename(unsafe).startsWith("zk65-w110-unsafe-"),
+  "must use the script's disposable hostile parent");
+  const stat = fs.lstatSync(unsafe);
+  assert.equal(stat.uid, 0, "attacker must not own hostile parent");
+  assert.ok(stat.isDirectory() && !stat.isSymbolicLink());
+  assert.equal(stat.mode & 0o1777, process.env.W110_ATTACK_DRIFT === "1" ? 0o700 : 0o777,
+    "test must distinguish initially-private versus genuinely nonsticky-writable ancestor");
+  return unsafe;
+}
+function proveForeignUidCanRenamePrivateChild(unsafe) {
+  // Positive cross-UID precondition independent of restore: without this,
+  // early denial could be a false green caused by nonexistent attack rights.
+  const stage = path.join(unsafe, `zk1-cloud-recovery-w110-preflight-${process.pid}`);
+  const victim = path.join(unsafe, `w110-private-victim-preflight-${process.pid}`);
+  const parked = `${stage}-parked`;
+  fs.mkdirSync(stage, { mode: 0o700 });
+  fs.mkdirSync(victim, { mode: 0o700 });
+  const marker = path.join(victim, "protected-synthetic-sentinel");
+  fs.writeFileSync(marker, "W110_SYNTHETIC_SENTINEL\n", { mode: 0o600 });
+  try {
+    const noRead = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", "/usr/bin/test", "-r", marker],
+      { timeout: 5000 });
+    assert.equal(noRead.status, 1, "real foreign UID must be unable to read the private sentinel");
+    const mover = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", process.execPath,
+      path.join(__dirname, "support/issue-65-w110-foreign-uid-mover.js"), stage, victim],
+    { timeout: 5000, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } });
+    assert.equal(mover.status, 0, "real foreign UID must successfully rename both private child directories");
+    assert.equal(mover.stdout.trim(), "FOREIGN_UID_RENAMED");
+    assert.equal(fs.readFileSync(path.join(stage, "protected-synthetic-sentinel"), "utf8"),
+      "W110_SYNTHETIC_SENTINEL\n");
+    assert.equal(fs.statSync(parked).isDirectory(), true);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
+    fs.rmSync(parked, { recursive: true, force: true });
+    fs.rmSync(victim, { recursive: true, force: true });
+  }
+}
 async function on(port, server) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   return `http://127.0.0.1:${server.address().port}`;
@@ -90,6 +140,11 @@ async function secureTransfer(uri, ca, method, data = null) {
 test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 SDK, Drive HTTPS and WebDAV mTLS quorum, rejecting rollback and revoked owner", {
   timeout: 35000,
 }, async (t) => {
+  if (process.env.W110_ATTACK === "1") {
+    const unsafe = requireRealForeignUidFixture();
+    if (process.env.W110_ATTACK_DRIFT !== "1") proveForeignUidCanRenamePrivateChild(unsafe);
+    assert.ok(globalThis.__w110RestoreAttack, "a real filesystem observation hook is mandatory");
+  }
   const before = process.env.NODE_ENV;
   process.env.NODE_ENV = "development";
   t.after(() => { if (before === undefined) delete process.env.NODE_ENV;
@@ -449,23 +504,27 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     expectedCiphertextRoot: root, chunkLengths: [ciphertext.length],
     readers, minimumMatchingProviders: 2 };
   if (process.env.W110_ATTACK === "1") {
-    assert.equal(process.platform, "linux", "foreign UID restore exploit requires Linux");
-    assert.equal(process.getuid?.(), 0, "foreign UID restore exploit requires root + real nobody");
     const initialTemp = process.env.TMPDIR;
     process.env.TMPDIR = process.env.W110_UNSAFE_TMPDIR;
     process.stdout.write(`W110_TEST_ENV_TEMP_MATCH=${os.tmpdir() === process.env.W110_UNSAFE_TMPDIR}\n`);
     try {
       await assert.rejects(gateway.restoreExact(recoverInput), /ZK_MULTIPROVIDER_RESTORE_DENIED/);
-      assert.equal(globalThis.__w110RestoreAttack?.victimDeleted, false,
+      const attack = globalThis.__w110RestoreAttack;
+      assert.equal(attack.victimDeleted, false,
         "a foreign UID must not trigger cleanup of an unrelated owner-private directory");
-      assert.equal(globalThis.__w110RestoreAttack?.stageCreated,
-        process.env.W110_ATTACK_DRIFT === "1",
-        "unsafe parent refuses pre-create; post-create permission drift is detected at cleanup");
-      assert.equal(globalThis.__w110RestoreAttack?.swapped,
-        process.env.W110_ATTACK_DRIFT === "1",
-        "post-create attack must perform a real foreign UID rename/swap; no false-green on setup failure");
-      assert.equal(globalThis.__w110RestoreAttack?.cleanupObserved, false,
-        "cleanup must never recursively remove the substituted victim directory");
+      if (process.env.W110_ATTACK_DRIFT === "1") {
+        assert.equal(attack.stageCreated, true, "drift attack must reach actual restore staging");
+        assert.equal(attack.swapped, true, "foreign UID must ACTUALLY rename the real restore staging path");
+        assert.equal(attack.cleanupObserved, false,
+          "cleanup must reject the replaced private directory before any recursive deletion");
+        assert.equal(fs.readFileSync(attack.victimSentinel, "utf8"), "W110_SYNTHETIC_SENTINEL\n",
+          "the original victim private bytes must remain at the swapped restore staging name");
+      } else {
+        assert.equal(attack.stageAttempts, 0,
+          "untrusted nonsticky parent must be rejected BEFORE mkdtemp");
+        assert.equal(attack.stageCreated, false,
+          "pre-create denial must not be confused with a failed foreign-UID swap");
+      }
     } finally {
       process.env.TMPDIR = initialTemp;
     }

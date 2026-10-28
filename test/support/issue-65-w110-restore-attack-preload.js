@@ -12,12 +12,13 @@ let stage = null;
 let victimSentinel = null;
 let swapped = false;
 let cleanupObserved = false;
-const observation = { stageCreated: false, swapped: false,
-  cleanupObserved: false, victimDeleted: false };
+const observation = { stageCreated: false, stageAttempts: 0, swapped: false,
+  victimSentinel: null, cleanupObserved: false, victimDeleted: false };
 globalThis.__w110RestoreAttack = observation;
 
 fs.mkdtempSync = function (prefix, ...args) {
   if (String(prefix).includes("zk1-cloud-recovery-")) {
+    observation.stageAttempts += 1;
     process.stdout.write(`W110_RESTORE_STAGE_MKDTEMP_ATTEMPT=${String(prefix).includes("zk65-w110-unsafe-")}\n`);
   }
   // Keep the unrelated signed SQLite authority on the legitimate trusted
@@ -32,8 +33,6 @@ fs.mkdtempSync = function (prefix, ...args) {
     throw error;
   }
   if (stage || !String(prefix).endsWith("/zk1-cloud-recovery-")) return result;
-  observation.stageCreated = true;
-  process.stdout.write("W110_STAGE_CREATED\n");
   const parent = path.dirname(result);
   const expected = os.tmpdir();
   const stat = fs.statSync(parent);
@@ -45,6 +44,8 @@ fs.mkdtempSync = function (prefix, ...args) {
     process.stdout.write(`W110_ENV_MISMATCH_PARENT=${parent === expected} MODE=${(stat.mode & 0o1777).toString(8)} UID=${process.getuid()}\n`);
     throw Error("W110_PROBE_ENVIRONMENT_INVALID");
   }
+  observation.stageCreated = true;
+  process.stdout.write("W110_STAGE_CREATED\n");
   stage = result;
   const victim = path.join(parent, `w110-private-victim-${process.pid}`);
   fs.mkdirSync(victim, { mode: 0o700 });
@@ -53,7 +54,7 @@ fs.mkdtempSync = function (prefix, ...args) {
   process.stdout.write("W110_PRIVATE_VICTIM_CREATED\n");
   if (postCreateDrift) fs.chmodSync(parent, 0o777);
   const deniedRead = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", "/usr/bin/test", "-r", victimSentinel], { timeout: 5000 });
-  if (deniedRead.status === 0) throw Error("W110_OTHER_UID_CAN_ALREADY_READ_VICTIM");
+  if (deniedRead.status !== 1) throw Error("W110_OTHER_UID_PRIVATE_READ_PROBE_INVALID");
   const mover = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", process.execPath,
     path.join(__dirname, "issue-65-w110-foreign-uid-mover.js"), stage, victim],
   { timeout: 5000, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } });
@@ -63,6 +64,7 @@ fs.mkdtempSync = function (prefix, ...args) {
   victimSentinel = path.join(stage, "protected-synthetic-sentinel");
   swapped = fs.existsSync(victimSentinel);
   observation.swapped = swapped;
+  observation.victimSentinel = victimSentinel;
   process.stdout.write(`W110_FOREIGN_UID_SWAP=${swapped}\n`);
   return result;
 };
