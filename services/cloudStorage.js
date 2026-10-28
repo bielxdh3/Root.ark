@@ -532,10 +532,11 @@ function createCloudStorage(options = {}) {
       || !/^[a-f0-9]{64}$/.test(expectedSha256))) {
       throw cloudError("configuration", "Invalid bounded ZK ciphertext upload");
     }
-    // Preserve the historical POSIX legacy stream behavior; bounded ZK copies
-    // and Windows uploads require ancestor validation before the first stat.
-    const guardSourceParent = process.platform === "win32" || bound !== undefined
-      ? pinUploadSourceParent(localPath) : () => {};
+    // Legacy streaming does not pin its ciphertext bytes, but it still must
+    // authorize the source pathname's ancestry before opening a descriptor.
+    // A foreign UID may otherwise substitute an ancestor symlink and upload
+    // a root-readable file outside the selected legacy upload directory.
+    const guardSourceParent = pinUploadSourceParent(localPath);
     if (!guardSourceParent) return null;
     if (bound !== undefined && process.platform === "win32") {
       // A caller-created staging directory is not trusted just because its
