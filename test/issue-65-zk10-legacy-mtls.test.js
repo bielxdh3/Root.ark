@@ -24,6 +24,7 @@ const { signOwnerCutover, digestOwnerCutover, buildSparseEnrollmentProof,
 const { createZk10LegacyCutoverFence, ZK10_HEAD_DOMAIN, ZK10_PROOF_DOMAIN,
   ZK10_WITNESS_DOMAIN, isAuthenticZk10LegacyCutoverFence } =
   require("../src/services/zk10LegacyCutoverFence");
+const { runZk10LegacyWebDavOperation } = require("../src/services/zk10LegacyWebDavRouteGuard");
 
 const b64 = (v) => Buffer.from(v).toString("base64url");
 const ID = (n) => b64(Buffer.alloc(16, n));
@@ -342,6 +343,23 @@ function httpJson(port, route, method = "GET", body, token) {
   });
 }
 
+function httpWebDavRead(port, token) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: "127.0.0.1", port,
+      path: "/dav/legacy-object", method: "GET",
+      headers: { authorization: "Bearer " + token },
+      signal: AbortSignal.timeout(10000) }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => resolve({ status: res.statusCode,
+        body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 test("ZK10 DEV-OFF real Express login/JWT → signed never_enrolled mTLS → durable Sync and post-finish lease release", {
   timeout: 90000,
 }, async (t) => {
@@ -403,6 +421,12 @@ test("ZK10 DEV-OFF real Express login/JWT → signed never_enrolled mTLS → dur
       qrcode: {}, requirePermission: permission,
       sessionCookieOptions: { httpOnly: true, sameSite: "lax" },
     });
+    // Exercise the exact WebDAV boundary helper through real JWT auth and
+    // the genuine signed mTLS adapter; main server still has no owner bootstrap.
+    app.get("/dav/legacy-object", authenticate, (req, res) =>
+      runZk10LegacyWebDavOperation({ req, res, strict: true,
+        legacyCutoverFence: fence, operation: "webdav:get" },
+      () => res.status(200).send("legacy-read-only-object")));
     const { ready } = registerSyncRoutes({ app, authenticate,
       requirePermission: permission, storagePath,
       legacyCutoverStrict: true, legacyCutoverFence: fence,
@@ -448,6 +472,9 @@ test("ZK10 DEV-OFF real Express login/JWT → signed never_enrolled mTLS → dur
   const enabled = await start(fence);
   const alice = await login(enabled.port, "alice", "alice-test-only");
   const bob = await login(enabled.port, "bob", "bob-test-only");
+  assert.deepEqual(await httpWebDavRead(enabled.port, alice),
+    { status: 200, body: "legacy-read-only-object" },
+    "signed never_enrolled lease admits a read until HTTP response finishes");
   assert.equal((await httpJson(enabled.port, "/sync/v1/objects", "GET", undefined, alice)).status, 200);
   await awaitRelease(f.state.admittedCount);
   const operation = createOperation({ operation: "create", objectId: "http-signed-object",
@@ -480,6 +507,10 @@ test("ZK10 DEV-OFF real Express login/JWT → signed never_enrolled mTLS → dur
     "GET", undefined, alice);
   assert.equal(blocked.status, 403);
   assert.equal(blocked.body.code, "ZK10_LEGACY_ENFORCED");
+  assert.equal((await httpWebDavRead(enabled.port, alice)).status, 403,
+    "signed protected_enforced must close the legacy WebDAV read path");
+  assert.equal((await httpWebDavRead(enabled.port, bob)).status, 200,
+    "another verified never_enrolled account remains readable");
   const blockedResume = await httpJson(enabled.port,
     "/sync/v1/devices/device-a/resume", "POST", { password: "alice-test-only" }, alice);
   assert.equal(blockedResume.status, 403, "resume must not reopen legacy writes after cutover");

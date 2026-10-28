@@ -80,6 +80,7 @@ const { parseIndependentCatalogConnectOrigins } = require("./src/zk1-catalog-con
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
+const { runZk10LegacyWebDavOperation } = require("./src/services/zk10LegacyWebDavRouteGuard");
 const { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
@@ -11048,58 +11049,76 @@ function sendWebDavOptions(req, res) {
 }
 
 function registerWebDavRoutes() {
-  recoverWebDavMoveJournals();
-  resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message));
-  if (!webDavReconciliationTimer) {
-    webDavReconciliationTimer = setInterval(() => resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)), WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
-    server.once("close", () => clearInterval(webDavReconciliationTimer));
+  const requestedZk10Cutover = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+  const strictZk10WebDav = requestedZk10Cutover !== "" && requestedZk10Cutover !== "0"
+    && requestedZk10Cutover !== "off";
+  // No production account-UUID + independently retained signed authority is
+  // bootstrapped into server.js. A strict opt-in must block legacy WebDAV
+  // until a real server-owned authority is attached; never trust Basic/JWT.
+  const webDavLegacyFence = null;
+  // Reconciliation can write/delete cloud objects without a request or a
+  // verified owner lease. A strict cutover therefore suspends this entire
+  // legacy background path pending an independently guarded job protocol.
+  if (!strictZk10WebDav) {
+    recoverWebDavMoveJournals();
+    resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message));
+    if (!webDavReconciliationTimer) {
+      webDavReconciliationTimer = setInterval(() => resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)), WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
+      server.once("close", () => clearInterval(webDavReconciliationTimer));
+    }
   }
-  app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) => {
-    const transactionId = canonicalWebDavMoveTransactionId(req.params.transactionId);
-    if (!transactionId) return res.status(404).send("Not found");
-    const journalPath = webDavMoveJournalPath(transactionId);
-    if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
-    let journal;
-    try { journal = readWebDavMoveJournal(journalPath); } catch { return res.status(409).send("Status unavailable"); }
-    if (!isSafeWebDavMoveJournal(journal)) return res.status(409).send("Status unavailable");
-    const cloud = journal.cloud || {};
-    return res.json({ transactionId: journal.transactionId, phase: journal.phase, state: cloud.state || journal.phase, provider: cloud.provider || null, attempts: cloud.attempts || 0, maxAttempts: cloud.maxAttempts || WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS, lastAttemptAt: cloud.lastAttemptAt || null, nextAttemptAt: cloud.nextAttemptAt || null, failureCategory: cloud.failureCategory || null, completedAt: cloud.completedAt || null, terminalAt: cloud.terminalAt || null, transitions: Array.isArray(cloud.transitions) ? cloud.transitions : [] });
-  });
+  app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) =>
+    runZk10LegacyWebDavOperation({ req, res, strict: strictZk10WebDav,
+      legacyCutoverFence: webDavLegacyFence, operation: "webdav:status" }, () => {
+      const transactionId = canonicalWebDavMoveTransactionId(req.params.transactionId);
+      if (!transactionId) return res.status(404).send("Not found");
+      const journalPath = webDavMoveJournalPath(transactionId);
+      if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
+      let journal;
+      try { journal = readWebDavMoveJournal(journalPath); } catch { return res.status(409).send("Status unavailable"); }
+      if (!isSafeWebDavMoveJournal(journal)) return res.status(409).send("Status unavailable");
+      const cloud = journal.cloud || {};
+      return res.json({ transactionId: journal.transactionId, phase: journal.phase, state: cloud.state || journal.phase, provider: cloud.provider || null, attempts: cloud.attempts || 0, maxAttempts: cloud.maxAttempts || WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS, lastAttemptAt: cloud.lastAttemptAt || null, nextAttemptAt: cloud.nextAttemptAt || null, failureCategory: cloud.failureCategory || null, completedAt: cloud.completedAt || null, terminalAt: cloud.terminalAt || null, transitions: Array.isArray(cloud.transitions) ? cloud.transitions : [] });
+    }));
   const handler = async (req, res) => {
     try {
       if (req.method === "OPTIONS") return sendWebDavOptions(req, res);
       if (req.headers.origin && req.headers.origin !== getExpectedOrigin(req)) return res.status(403).send("Origin denied");
       if (!await authenticateWebDavRequest(req, res)) return;
 
-      const segments = parseWebDavSegments(req);
-      if (!segments) return res.status(404).send("Not found");
+      return await runZk10LegacyWebDavOperation({ req, res,
+        strict: strictZk10WebDav, legacyCutoverFence: webDavLegacyFence,
+        operation: `webdav:${req.method.toLowerCase()}` }, async () => {
+          const segments = parseWebDavSegments(req);
+          if (!segments) return res.status(404).send("Not found");
 
-      if (req.method === "PROPFIND") return webDavPropfindRateLimit(req, res, (error) => {
-        const sendFailure = (failure) => {
-          auditLog("webdav.error", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
-            error: failure.message,
-            path: getSafeWebDavAuditPath(req),
+          if (req.method === "PROPFIND") return webDavPropfindRateLimit(req, res, (error) => {
+            const sendFailure = (failure) => {
+              auditLog("webdav.error", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
+                error: failure.message,
+                path: getSafeWebDavAuditPath(req),
+              });
+              return res.status(failure.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
+            };
+            if (error) return sendFailure(error);
+            return sendWebDavPropfind(req, res, segments).catch(sendFailure);
           });
-          return res.status(failure.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
-        };
-        if (error) return sendFailure(error);
-        return sendWebDavPropfind(req, res, segments).catch(sendFailure);
+          if (req.method === "GET") return sendWebDavFile(req, res, segments, false);
+          if (req.method === "HEAD") return sendWebDavFile(req, res, segments, true);
+          if (req.method === "PUT") return handleWebDavPut(req, res, segments);
+          if (req.method === "MKCOL") return handleWebDavMkcol(req, res, segments);
+
+          if (req.method === "DELETE") {
+            auditLog("webdav.delete", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, "delete", "failure", {
+              reason: WEBDAV_ALLOW_DELETE ? "not_implemented" : "disabled",
+            });
+            return res.status(405).send("DELETE is disabled for WebDAV MVP");
+          }
+
+          if (req.method === "MOVE") return handleWebDavMove(req, res, segments);
+          if (req.method === "LOCK" || req.method === "UNLOCK") return res.status(501).send("WebDAV locking is not supported in this MVP");
+          return res.status(405).send("Method not allowed");
       });
-      if (req.method === "GET") return sendWebDavFile(req, res, segments, false);
-      if (req.method === "HEAD") return sendWebDavFile(req, res, segments, true);
-      if (req.method === "PUT") return handleWebDavPut(req, res, segments);
-      if (req.method === "MKCOL") return handleWebDavMkcol(req, res, segments);
-
-      if (req.method === "DELETE") {
-        auditLog("webdav.delete", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, "delete", "failure", {
-          reason: WEBDAV_ALLOW_DELETE ? "not_implemented" : "disabled",
-        });
-        return res.status(405).send("DELETE is disabled for WebDAV MVP");
-      }
-
-      if (req.method === "MOVE") return handleWebDavMove(req, res, segments);
-      if (req.method === "LOCK" || req.method === "UNLOCK") return res.status(501).send("WebDAV locking is not supported in this MVP");
-      return res.status(405).send("Method not allowed");
     } catch (error) {
       auditLog("webdav.error", getAuditActor(req, "anonymous"), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
         error: error.message,
