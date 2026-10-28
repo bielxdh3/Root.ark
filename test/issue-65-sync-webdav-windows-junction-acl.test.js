@@ -10,6 +10,8 @@ const test = require("node:test");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
 const { createWindowsLocalWebDavAclVerifier } =
   require("../services/chunkUploadWindowsAcl");
+const { createAclFailureDiagnostic } =
+  require("../scripts/acl-test-failure-diagnostic");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
@@ -173,6 +175,7 @@ test("Windows native ACL worker initialization leaves the Node event loop respon
   const file = path.join(root, "file.ct");
   fs.writeFileSync(file, "DISPOSABLE_BOUNDED_CIPHERTEXT");
   const verifier = createWindowsLocalWebDavAclVerifier();
+  const diagnostic = createAclFailureDiagnostic(t, "WEB_DAV_COLD");
   t.after(() => {
     verifier.stop();
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -198,9 +201,12 @@ test("Windows native ACL worker initialization leaves the Node event loop respon
   } finally {
     clearInterval(interval);
   }
-  assert.ok(beats >= 12, `event loop must advance during cold native ACL checks: ${beats} ticks`);
-  assert.ok(worstLag < 275,
-    `cold native ACL worker must not block the Node event loop: ${worstLag}ms`);
+  diagnostic.stage("INSUFFICIENT_TICKS");
+  await diagnostic.run(() => assert.ok(beats >= 12,
+    `event loop must advance during cold native ACL checks: ${beats} ticks`));
+  diagnostic.stage("EVENT_LOOP_STALL");
+  await diagnostic.run(() => assert.ok(worstLag < 275,
+    `cold native ACL worker must not block the Node event loop: ${worstLag}ms`));
 });
 
 test("Windows local WebDAV concurrent ACL checks leave the Node event loop responsive", {

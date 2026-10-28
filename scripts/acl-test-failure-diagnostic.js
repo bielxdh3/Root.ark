@@ -3,6 +3,8 @@
 // Security-sensitive Windows ACL test telemetry: fixed categorical vocabulary
 // only. Never expose PowerShell stderr/stdout, paths, SIDs, ACEs or exception
 // messages to the hosted canonical test log.
+const { createHash } = require("node:crypto");
+const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 const CASES = Object.freeze({
   LEGACY_GENERIC_ACE: {
     file: "test/issue-65-legacy-deterministic-evidence-manifest.test.js",
@@ -26,6 +28,11 @@ const CASES = Object.freeze({
     file: "test/issue-65-sync-atomic-private-acl.test.js",
     title: "a newly unsafe ACL after rename quarantines the lock instead of allowing a retry",
     stages: ["START", "PRIVATE_ROOT", "REGISTRY_OPEN", "RENAME_HOOK", "ENROLL_CHECK", "FENCING_ASSERT"],
+  },
+  WEB_DAV_COLD: {
+    file: "test/issue-65-sync-webdav-windows-junction-acl.test.js",
+    title: "Windows native ACL worker initialization leaves the Node event loop responsive",
+    stages: ["INSUFFICIENT_TICKS", "EVENT_LOOP_STALL"],
   },
 });
 const TRUST = new Set(["UNKNOWN", "INHERITED", "PROTECTED", "UNTRUSTED_ADDED", "REJECTED", "ACCEPTED", "QUARANTINED"]);
@@ -72,7 +79,15 @@ function parseAclFailureDiagnostic(line, pending) {
   const [, caseId, stage, code, trust] = match;
   const config = CASES[caseId];
   if (!config || !config.stages.includes(stage) || !ERRORS.has(code) || !TRUST.has(trust)
-    || pending.name !== config.title || pending.path !== config.file) return null;
+    || (caseId === "WEB_DAV_COLD" && (code !== "ASSERTION" || trust !== "UNKNOWN"))) return null;
+  const hasText = pending.name !== undefined || pending.path !== undefined;
+  const hasHashes = pending.nameHash !== undefined || pending.pathHash !== undefined;
+  // Release gate retains exact public text; canonical runner retains only
+  // hashes. Mixed identities must never launder a forged test attribution.
+  const matched = hasText !== hasHashes && (hasText
+    ? pending.name === config.title && pending.path === config.file
+    : pending.nameHash === hash(config.title) && pending.pathHash === hash(config.file));
+  if (!matched) return null;
   return { stage, code, trust };
 }
 

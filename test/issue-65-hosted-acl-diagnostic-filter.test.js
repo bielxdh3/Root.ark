@@ -33,11 +33,9 @@ test("ACL stage parser requires exact non-secret TAP title and test file instead
   ]) assert.equal(parseAclFailureDiagnostic(diagnostic, pending), null);
 });
 
-test("hosted diagnostics compare public TAP identities directly without a cryptographic password hash", () => {
-  for (const relative of ["../scripts/release-gate-acl-diagnostics.js", "../scripts/acl-test-failure-diagnostic.js"]) {
-    const source = fs.readFileSync(path.join(__dirname, relative), "utf8");
-    assert.doesNotMatch(source, /createHash|node:crypto|nameHash|pathHash|sha256/i);
-  }
+test("hosted release gate keeps public test identities rather than accepting caller-supplied hashes", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../scripts/release-gate-acl-diagnostics.js"), "utf8");
+  assert.doesNotMatch(source, /createHash|node:crypto|nameHash|pathHash|sha256/i);
   const nearCollision = failure({ name: `${title}!`, location: `D:\\a\\Root.ark\\Root.ark\\${file.replace(/\//g, "\\")}:689:1` });
   assert.deepEqual(extractHostedAclFailureDiagnostics(nearCollision), []);
   assert.deepEqual(extractHostedAclFailureDiagnostics(failure({ name: title.replace("cannot", "can") })), []);
