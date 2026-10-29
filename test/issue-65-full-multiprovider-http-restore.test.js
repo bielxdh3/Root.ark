@@ -789,11 +789,12 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   });
 
   await t.test("independent provider signatures are rechecked after slow final owner callback", async () => {
-    const now = Math.floor(Date.now() / 1000);
-    // A one-second attestation window is flaky under CI load: the first
-    // remote GETs may straddle the next wall-clock second and fail before
-    // the final owner callback is ever reached. The expiry must be crossed
-    // INSIDE that callback so this tests post-callback revalidation.
+    // The domain signatures are valid for every initial cloud GET. Cross
+    // their expiry *inside* the third owner callback, irrespective of CI
+    // scheduling and the granularity of whole-second signed timestamps.
+    let clockMs = Date.now();
+    t.mock.method(Date, "now", () => clockMs);
+    const now = Math.floor(clockMs / 1000);
     const expiresAt = now + 4;
     const shortReaders = readers.map((reader) => {
       const { signature: ignored, ...statement } = reader.domainAttestation;
@@ -803,11 +804,30 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       }) };
     });
     let checks = 0;
+    let initiallyVerified = false;
+    let rejectedExpiredAfterCallback = false;
+    let expiredDuringOwnerCallback = false;
+    const verifyDomains = Zk1ExternallyPinnedProviderDomains.prototype.verify;
+    t.mock.method(Zk1ExternallyPinnedProviderDomains.prototype, "verify",
+      function (options) {
+        try {
+          const result = verifyDomains.call(this, options);
+          if (this === providerDomainPinset && checks < 3) initiallyVerified = true;
+          return result;
+        } catch (error) {
+          if (this === providerDomainPinset && expiredDuringOwnerCallback && checks === 3
+            && options.nowSeconds > expiresAt
+            && error.message === "ZK_PROVIDER_DOMAIN_UNVERIFIED") {
+            rejectedExpiredAfterCallback = true;
+          }
+          throw error;
+        }
+      });
     const slow = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
       assertCurrentAuthorization: async (...args) => {
         if (++checks === 3) {
-          await new Promise((done) => setTimeout(done,
-            Math.max(0, (expiresAt + 1) * 1000 - Date.now())));
+          clockMs = (expiresAt + 1) * 1000;
+          expiredDuringOwnerCallback = true;
         }
         return directGatewayPins.assertCurrentAuthorization(...args);
       },
@@ -815,6 +835,12 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     await assert.rejects(slow.restoreExact({ ...recoverInput, readers: shortReaders }),
       /ZK_MULTIPROVIDER_RESTORE_DENIED/,
       "provider attestation expiry during owner callback must fail closed");
+    assert.equal(initiallyVerified, true,
+      "all administrator signatures must be valid before the final owner callback");
+    assert.equal(expiredDuringOwnerCallback, true,
+      "the expiry attack must occur inside the third owner authorization callback");
+    assert.equal(rejectedExpiredAfterCallback, true,
+      "the real provider-domain verifier must reject expired signatures before another owner callback");
     assert.equal(checks, 3);
   });
 
