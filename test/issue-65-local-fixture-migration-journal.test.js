@@ -585,3 +585,26 @@ test("Windows foreign-MODIFY fixture target cannot redirect the stage write afte
   assert.equal(fs.existsSync(outsideStage), false,
     "foreign-modifiable target must never redirect even a failed stage write outside the fixture");
 });
+
+test("Windows fixture refuses post-admission foreign Modify DACL granted at a migration checkpoint", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const f = fixture(t);
+  let widened = false;
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+    onCheckpoint(phase) {
+      if (phase !== "journal-created") return;
+      // The original full-tree native check has already accepted this private
+      // fixture. Widen permissions without changing any directory inode.
+      execFileSync("C:\\Windows\\System32\\icacls.exe",
+        [f.dir, "/grant", "*S-1-5-32-545:(OI)(CI)M"],
+        { windowsHide: true, stdio: "ignore", timeout: 12000 });
+      widened = true;
+    },
+  }), /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+  "a live foreign Modify ACE must revoke fixture write authority after initial admission");
+  assert.equal(widened, true, "test must change real NTFS DACL after journal creation");
+  assert.equal(fs.existsSync(f.target), false,
+    "ciphertext target must not be published after DACL widening");
+  assert.equal(fs.existsSync(path.join(f.dir, "target", ".operation1.stage")), false);
+});

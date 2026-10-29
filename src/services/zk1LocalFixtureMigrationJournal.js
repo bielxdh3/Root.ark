@@ -20,6 +20,41 @@ const KINDS = ["versions", "backups", "trash", "links", "derived", "retention"];
 const PHASES = new Set(["planned", "committed", "rollback-pending", "rolled-back"]);
 const MAX_BYTES = 16 * 1024 * 1024;
 
+// The Windows ACL verifier must be fresh at every filesystem checkpoint, but
+// compiling its signed-down native C# in a new PowerShell per guard is both
+// slow and vulnerable to 12-second cold-start contention. Keep one isolated
+// resident worker and recheck the complete private fixture tree each time.
+// A failed/expired check invalidates the worker; no cached approval survives.
+let windowsFixtureVerifier;
+let windowsFixtureVerifierIdle;
+function assertCurrentWindowsFixtureAcl(root) {
+  if (windowsFixtureVerifierIdle) {
+    clearTimeout(windowsFixtureVerifierIdle);
+    windowsFixtureVerifierIdle = null;
+  }
+  try {
+    if (!windowsFixtureVerifier) {
+      const { createWindowsSynchronousPrivateAclVerifier } =
+        require("./zk1WindowsSynchronousPrivateAclVerifier");
+      windowsFixtureVerifier = createWindowsSynchronousPrivateAclVerifier();
+    }
+    // The existing synchronous verifier's private-directory role delegates
+    // to the resident native full-tree action, not a shallow pathname stat.
+    windowsFixtureVerifier.verify(root);
+  } catch (_) {
+    windowsFixtureVerifier?.stop();
+    windowsFixtureVerifier = null;
+    refuse();
+  } finally {
+    windowsFixtureVerifierIdle = setTimeout(() => {
+      windowsFixtureVerifier?.stop();
+      windowsFixtureVerifier = null;
+      windowsFixtureVerifierIdle = null;
+    }, 30000);
+    windowsFixtureVerifierIdle.unref();
+  }
+}
+
 function refuse() {
   const error = new Error("LOCAL_FIXTURE_MIGRATION_REFUSED");
   error.code = error.message;
@@ -101,10 +136,10 @@ function safeRoot(dir, mode) {
     // checkpoint callback (or another OS principal) may widen access after
     // the initial admission; a subsequent pathname write would then trust a
     // fixture tree that other users can replace. Revalidate live authority.
-    // The synchronous full-tree Windows verifier is already mandatory at
-    // entry. A separate Windows revalidation design needs a resident native
-    // verifier; spawning/recompiling PowerShell for every guard would make
-    // ordinary checkpoints unusable and has no validated time bound.
+    // The initial full-tree Windows admission remains mandatory; a resident
+    // native verifier performs a NEW full-tree check on every guard without
+    // recompiling PowerShell. No initial DACL verdict is cached.
+    if (process.platform === "win32") assertCurrentWindowsFixtureAcl(root);
     if (process.platform !== "win32") {
       try { assertPrivateSqliteDirectory(path.join(root, "_fixture_guard")); }
       catch (_) { refuse(); }
