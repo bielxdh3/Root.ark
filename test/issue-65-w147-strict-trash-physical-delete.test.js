@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
-const child = path.join(__dirname, "support", "w147-trash-provider-child.cjs");
+const child = path.join(__dirname, "../lab/issue-65-test-processes", "w147-trash-provider-child.cjs");
 function run(root, phase, strict, itemType) {
   const proc = spawnSync(process.execPath, [child, phase, itemType], {
     cwd: root, encoding: "utf8", windowsHide: true, timeout: 20000,

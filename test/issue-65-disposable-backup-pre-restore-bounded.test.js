@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const { inspectZk1DisposableBackupPreRestore } =
   require("../src/services/zk1DisposableBackupPreRestore");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
@@ -65,6 +65,50 @@ test("disposable backup marker read cannot allocate inode bytes appended after f
   assert.ok(boundedReads.every(({ length, position }) => length >= 1
     && position >= 0 && position + length <= Buffer.byteLength("rootark-zk-backup-fixture-v1\n")),
   "each positional FD read stays within the initially pinned size");
+});
+
+test("disposable fixture swapped to FIFO at native open refuses without hanging", (t) => {
+  if (process.platform !== "linux") return t.skip("requires native Linux FIFO semantics");
+  const root = privateFixture(t);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const name of ["versions", "copies", "envelopes"])
+    fs.mkdirSync(path.join(root, name));
+  const marker = path.join(root, ".rootark-disposable-fixture");
+  fs.writeFileSync(marker, "rootark-zk-backup-fixture-v1\n");
+  for (const name of ["manifest.json", "backup-index.json", "owner-authorization.json"])
+    fs.writeFileSync(path.join(root, name), "{}");
+  // A fixture must contain EXACTLY its allowed entries; stage the FIFO in a
+  // separate temporary name and move it into the marker pathname at open.
+  const fifo = path.join(os.tmpdir(),
+    "rootark-zk65-marker-fifo-" + crypto.randomBytes(12).toString("hex"));
+  t.after(() => { try { fs.unlinkSync(fifo); } catch {} });
+  const make = spawnSync("mkfifo", [fifo], { encoding: "utf8", timeout: 2000 });
+  assert.equal(make.status, 0, make.stderr);
+  const child = [
+    'const fs = require("node:fs"); const path = require("node:path");',
+    'const [root, marker, fifo, modulePath] = process.argv.slice(1);',
+    'let swapped = false; const open = fs.openSync;',
+    'fs.openSync = function(target, ...args) {',
+    '  if (target === marker && !swapped) {',
+    '    fs.renameSync(marker, marker + ".original");',
+    '    fs.renameSync(fifo, marker); swapped = true;',
+    '  }',
+    '  return open.call(fs, target, ...args);',
+    '};',
+    'const { inspectZk1DisposableBackupPreRestore } = require(modulePath);',
+    'const report = inspectZk1DisposableBackupPreRestore({ fixtureDir: root,',
+    '  expectedCompartmentId: "compartment1", checkpoint: { epoch: 0, revision: 0 } });',
+    'if (!swapped || report.fixtureVerified) {',
+    '  process.stderr.write("WRONG_RESULT " + JSON.stringify({ swapped, report }));',
+    '  process.exitCode = 2;',
+    '} else process.stdout.write("FIFO_REFUSED_WITHOUT_BLOCKING");',
+  ].join("\n");
+  const outcome = spawnSync(process.execPath, ["-e", child, root, marker, fifo,
+    require.resolve("../src/services/zk1DisposableBackupPreRestore")],
+  { encoding: "utf8", timeout: 2500 });
+  assert.equal(outcome.status, 0,
+    "fixture must refuse swapped FIFO without blocking: " + outcome.error + " " + outcome.stderr);
+  assert.match(outcome.stdout, /FIFO_REFUSED_WITHOUT_BLOCKING/);
 });
 
 test("disposable backup bounded FD reads preserve a valid signed fixture", (t) => {

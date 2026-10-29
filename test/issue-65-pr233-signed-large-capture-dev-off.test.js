@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -95,6 +95,42 @@ test("actual held writable FD A→B→A mutation during pinned capture cannot fa
   assert.equal(attacked, true);
   assert.deepEqual(fs.readFileSync(f.sourcePath), original);
   assert.equal(fs.statSync(f.sourcePath, { bigint: true }).ino, inode);
+});
+
+test("source swapped for a real FIFO at open is denied without blocking the server", (t) => {
+  if (process.platform !== "linux") return t.skip("requires native Linux FIFO");
+  const f = fixture(t);
+  const fifoPath = f.sourcePath + ".fifo";
+  const mkfifo = spawnSync("mkfifo", [fifoPath], { encoding: "utf8", timeout: 2000 });
+  assert.equal(mkfifo.status, 0, mkfifo.stderr);
+  const child = [
+    'const fs = require("node:fs"); const crypto = require("node:crypto");',
+    'const [sourcePath, fifo, pub, signed, expected, modulePath] = process.argv.slice(1);',
+    'let swapped = false; const originalOpen = fs.openSync;',
+    'fs.openSync = function (target, ...args) {',
+    '  if (target === sourcePath && !swapped) {',
+    '    fs.renameSync(sourcePath, sourcePath + ".original");',
+    '    fs.renameSync(fifo, sourcePath); swapped = true;',
+    '  }',
+    '  return originalOpen.call(fs, target, ...args);',
+    '};',
+    'const { verifyDevOffSignedLargeCapture } = require(modulePath);',
+    'verifyDevOffSignedLargeCapture({ sourcePath, signedClaim: JSON.parse(signed),',
+    '  expected: JSON.parse(expected), pinnedOwnerPublicKey: crypto.createPublicKey(',
+    '    Buffer.from(pub, "base64").toString("utf8")),',
+    '}).then(() => { process.stderr.write("BAD_SUCCESS"); process.exitCode = 2; },',
+    '  (e) => { if (swapped && e.message === "ZK_DEV_OFF_CAPTURE_UNAVAILABLE")',
+    '    process.stdout.write("FIFO_REFUSED_WITHOUT_BLOCKING");',
+    '    else { process.stderr.write("BAD_REFUSAL " + e); process.exitCode = 3; } });',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["-e", child, f.sourcePath, fifoPath,
+    Buffer.from(f.publicKey.export({ type: "spki", format: "pem" })).toString("base64"),
+    JSON.stringify(f.signedClaim), JSON.stringify(f.expected),
+    require.resolve("../src/services/zk1DevOffSignedLargeCloudCapture")],
+  { encoding: "utf8", timeout: 2500 });
+  assert.equal(result.status, 0,
+    "capture must not block on FIFO swap: " + result.error + " " + result.stderr);
+  assert.match(result.stdout, /FIFO_REFUSED_WITHOUT_BLOCKING/);
 });
 
 test("signature, independently expected scope/object/revision, replay-floor mismatch and expiry all deny before capture", async (t) => {

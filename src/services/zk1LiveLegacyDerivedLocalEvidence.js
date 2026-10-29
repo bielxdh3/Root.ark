@@ -60,7 +60,11 @@ function inspectZk1LiveLegacyDerivedLocalEvidence({ tempDir, runSecret }) {
         visited.add(id);
         let fd;
         try {
-          fd = fs.openSync(full, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+          // lstat is not atomic with open: a different local principal may
+          // replace a regular file with a FIFO after enumeration. Do not let
+          // that switch hang this observation process at the native open.
+          fd = fs.openSync(full, fs.constants.O_RDONLY
+            | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
           if (!same(candidate, fs.fstatSync(fd, { bigint: true }))) deny();
           // A writer may grow this inode after fstat. readFileSync(fd) can
           // allocate the new size before our post-read identity check rejects

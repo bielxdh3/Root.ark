@@ -150,6 +150,43 @@ function scan(f) {
 }
 function section(report, name) { return report.sections[name]; }
 
+test("legacy evidence readback cannot hang if source is swapped for a real FIFO at open", async (t) => {
+  if (process.platform !== "linux") return t.skip("requires native Linux FIFO");
+  const f = await fixture(t);
+  const target = path.join(f.uploads, "nested", "source.bin");
+  const fifo = path.join(os.tmpdir(), "zk65-evidence-fifo-" + crypto.randomBytes(12).toString("hex"));
+  t.after(() => { try { fs.unlinkSync(fifo); } catch {} });
+  const make = spawnSync("mkfifo", [fifo], { encoding: "utf8", timeout: 2000 });
+  assert.equal(make.status, 0, make.stderr);
+  const child = [
+    'const fs = require("node:fs");',
+    'const [database, uploads, temp, trash, backups, target, fifo, modulePath] = process.argv.slice(1);',
+    'let swapped = false; const nativeOpen = fs.openSync;',
+    'fs.openSync = function(p, ...args) {',
+    '  if (p === target && !swapped) {',
+    '    fs.renameSync(target, target + ".old");',
+    '    fs.renameSync(fifo, target); swapped = true;',
+    '  }',
+    '  return nativeOpen.call(fs, p, ...args);',
+    '};',
+    'const {inspectZk1LegacyEvidenceManifest} = require(modulePath);',
+    'inspectZk1LegacyEvidenceManifest({ optIn:true, databasePath:database,',
+    '  uploadsDir:uploads, tempDir:temp, trashDir:trash, backupsDir:backups }).then(',
+    '  (report) => { if (swapped && report.sections.uploads.status === "UNKNOWN")',
+    '    process.stdout.write("FIFO_SOURCE_REFUSED");',
+    '    else { process.stderr.write("FALSE_PROOF"); process.exitCode = 2; }',
+    '  }, (err) => { if (swapped) process.stdout.write("FIFO_SOURCE_REFUSED");',
+    '    else { process.stderr.write("NO_SOURCE_ATTACK " + err); process.exitCode = 3; } });',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["-e", child,
+    f.databasePath, f.uploads, f.temp, f.trash, f.backups, target, fifo,
+    require.resolve("../src/services/zk1LegacyEvidenceManifest")],
+  { encoding: "utf8", timeout: 5000 });
+  assert.equal(result.status, 0,
+    "native legacy source FIFO race must not block: " + result.error + " " + result.stderr);
+  assert.match(result.stdout, /FIFO_SOURCE_REFUSED/);
+});
+
 test("real SQLite, nested revisions, trash, preview and ZIP produce repeatable byte evidence", async (t) => {
   const f = await fixture(t);
   const before = fs.readFileSync(f.databasePath);

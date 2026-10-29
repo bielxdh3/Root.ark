@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyReferencePreflight: inspect } =
   require("../src/services/zk1LiveLegacyReferencePreflight");
@@ -54,6 +56,44 @@ function scan(f, overrides = {}) {
 function denied(f, overrides) {
   assert.throws(() => scan(f, overrides), /ZK_LIVE_LEGACY_INVENTORY_UNAVAILABLE/);
 }
+
+test("local reference inventory must refuse real FIFO replacement at file-open without blocking", (t) => {
+  if (process.platform !== "linux") return t.skip("requires real Linux FIFO");
+  const f = fixture(t);
+  const fifo = path.join(os.tmpdir(), "zk65-reference-fifo-" + crypto.randomBytes(12).toString("hex"));
+  t.after(() => { try { fs.unlinkSync(fifo); } catch {} });
+  const mkfifo = spawnSync("mkfifo", [fifo], { timeout: 2000, encoding: "utf8" });
+  assert.equal(mkfifo.status, 0, mkfifo.stderr);
+  const child = [
+    'const fs = require("node:fs");',
+    'const { DatabaseSync } = require("node:sqlite");',
+    'const [uploads, database, target, fifo, modulePath] = process.argv.slice(1);',
+    'const realOpen = fs.openSync; let swapped = false;',
+    'fs.openSync = function(p, ...args) {',
+    '  if (!swapped && p === target) {',
+    '    fs.renameSync(target, target + ".old");',
+    '    fs.renameSync(fifo, target); swapped = true;',
+    '  }',
+    '  return realOpen.call(fs, p, ...args);',
+    '};',
+    'const { inspectZk1LiveLegacyLocalReferenceEvidence } = require(modulePath);',
+    'const db = new DatabaseSync(database, { readOnly: true });',
+    'try { inspectZk1LiveLegacyLocalReferenceEvidence({uploadsDir:uploads,db,runSecret:Buffer.alloc(32, 0x42)});',
+    '  process.stderr.write("UNSAFE_SUCCESS"); process.exitCode = 2;',
+    '} catch (e) {',
+    '  if (!swapped || e.message !== "ZK_LIVE_LEGACY_LOCAL_REFERENCES_UNAVAILABLE") {',
+    '    process.stderr.write("BAD_REFUSAL " + e); process.exitCode = 3;',
+    '  } else process.stdout.write("FIFO_REFUSED_WITHOUT_BLOCKING");',
+    '} finally { db.close(); }',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["-e", child, f.uploadsDir,
+    f.databasePath, f.current, fifo,
+    require.resolve("../src/services/zk1LiveLegacyLocalReferenceEvidence")],
+  { encoding: "utf8", timeout: 2500 });
+  assert.equal(result.status, 0,
+    "native local reference FIFO swap must be bounded: " + result.error + " " + result.stderr);
+  assert.match(result.stdout, /FIFO_REFUSED_WITHOUT_BLOCKING/);
+});
 
 test("opt-in real SQLite derived index and historical-version bytes yield only partial opaque local evidence", (t) => {
   const f = fixture(t);

@@ -163,10 +163,18 @@ class Zk1LegacyArchiveStageWitness {
     this.bootstrapNew = bootstrapNew;
     assertPrivateSqliteAuthorityDirectory(filename);
     if (bootstrapNew) {
-      if (fs.existsSync(filename)) deny();
-      const fd = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
-        | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
-      fs.closeSync(fd);
+      // The path's earlier absence is not security evidence. Exclusivity is
+      // enforced by a single native O_CREAT|O_EXCL open; EEXIST or any race
+      // becomes the same fail-closed witness refusal.
+      let fd;
+      try {
+        fd = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
+          | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+        fs.closeSync(fd);
+      } catch (_) {
+        if (fd !== undefined) { try { fs.closeSync(fd); } catch (_) { /* denied */ } }
+        deny();
+      }
     }
     assertPrivateSqliteFile(filename);
     assertSafeSqliteSidecars(filename, deny);

@@ -94,7 +94,7 @@ function proveForeignUidCanRenamePrivateChild(unsafe) {
       { timeout: 5000 });
     assert.equal(noRead.status, 1, "real foreign UID must be unable to read the private sentinel");
     const mover = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", process.execPath,
-      path.join(__dirname, "support/issue-65-w110-foreign-uid-mover.js"), stage, victim],
+      path.join(__dirname, "../lab/issue-65-test-processes/issue-65-w110-foreign-uid-mover.js"), stage, victim],
     { timeout: 5000, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } });
     assert.equal(mover.status, 0, "real foreign UID must successfully rename both private child directories");
     assert.equal(mover.stdout.trim(), "FOREIGN_UID_RENAMED");

@@ -102,7 +102,11 @@ function fileBytes(target, budget) {
     throw Error("unsafe file");
   let fd;
   try {
-    fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    // A valid lstat is not a reservation. A replaceable source can become
+    // a FIFO before native open, so make that open NONBLOCK and compare the
+    // pinned descriptor before reading historical bytes.
+    fd = fs.openSync(target, fs.constants.O_RDONLY
+      | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
     if (!stable(before, fs.fstatSync(fd, { bigint: true }))) throw Error("race opening");
     // readFileSync(fd) may continue allocating as a concurrent writer grows
     // the file past the size we validated. Read at most the initial size.

@@ -147,12 +147,17 @@ async function verifyDevOffSignedLargeCapture(input = {}) {
   consumed.add(replay);
   try {
     if (typeof request.sourcePath !== "string" || !path.isAbsolute(request.sourcePath)) fail();
+    // Never open a previously checked pathname with blocking flags: a
+    // different local principal can replace a regular file with a FIFO in
+    // that gap. Pin a nonblocking descriptor FIRST, then validate its inode
+    // against the still-regular pathname before reading any source bytes.
+    sourceFd = fs.openSync(request.sourcePath, fs.constants.O_RDONLY
+      | (fs.constants.O_NONBLOCK || 0)
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+    const opened = fs.fstatSync(sourceFd, { bigint: true });
     const named = fs.lstatSync(request.sourcePath, { bigint: true });
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n
       || named.size !== BigInt(claim.byte_length)) fail();
-    sourceFd = fs.openSync(request.sourcePath, fs.constants.O_RDONLY
-      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
-    const opened = fs.fstatSync(sourceFd, { bigint: true });
     if (!sameSource(opened, named)
       || !sameSource(opened, fs.lstatSync(request.sourcePath, { bigint: true }))) fail();
 

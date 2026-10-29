@@ -88,7 +88,10 @@ function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret,
       seenFiles.add(inode);
       totalBytes += before.size;
       if (totalBytes > BigInt(MAX_TOTAL_BYTES)) deny();
-      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      // Enumeration and native open are separate steps. A raced FIFO must
+      // fail identity validation rather than block this bounded preflight.
+      fd = fs.openSync(file, fs.constants.O_RDONLY
+        | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
       if (!same(before, fs.fstatSync(fd, { bigint: true }))) deny();
       // Pin the allocation to the pre-open size, not a writer-grown inode.
       const data = Buffer.alloc(Number(before.size));

@@ -154,12 +154,16 @@ function readRegular(file, maxSize, expectedFailure = "UNSAFE_FIXTURE_ENTRY", ve
   let descriptor;
   try {
     verifyBoundary();
+    // Open the object before inspecting its name, and never permit a FIFO
+    // swapped at that boundary to block a supposedly read-only backup audit.
+    // Validate the opened descriptor against lstat before consuming bytes.
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY
+      | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+    verifyBoundary();
     const before = fs.lstatSync(file, { bigint: true });
     verifyBoundary();
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
       || before.size > BigInt(maxSize)) deny(expectedFailure);
-    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    verifyBoundary();
     const opened = fs.fstatSync(descriptor, { bigint: true });
     if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== before.dev
       || opened.ino !== before.ino || opened.size !== before.size

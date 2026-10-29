@@ -49,7 +49,7 @@ async function start(root, port, password, strict) {
     ROOTARK_ZK10_SYNC_CUTOVER_STRICT: strict, CLOUD_STORAGE_PROVIDER: "local",
     BACKUP_ENABLED: "true", BACKUP_AUTO_ENABLED: "false",
     ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: password.repeat(3).slice(0, 72) };
-  const child = spawn(process.execPath, [path.join(__dirname, "support", "w147-strict-backup-http-server.cjs")], {
+  const child = spawn(process.execPath, [path.join(__dirname, "../lab/issue-65-test-processes", "w147-strict-backup-http-server.cjs")], {
     cwd: root, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
   child.diagnostics = "";

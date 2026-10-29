@@ -4,10 +4,50 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
 const { inspectZk1LiveLegacyDerivedLocalEvidence } = require("../src/services/zk1LiveLegacyDerivedLocalEvidence");
 const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 
 const runSecret = Buffer.alloc(32, 0x42);
+
+test("derived local inventory must not block when a scanned file becomes an actual FIFO at open", (t) => {
+  if (process.platform !== "linux") return t.skip("native Linux FIFO required");
+  const directory = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-derived-fifo-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const target = path.join(directory, "artifact.bin");
+  fs.writeFileSync(target, "signed-only-observation");
+  const fifo = path.join(os.tmpdir(), "zk65-derived-fifo-" + crypto.randomBytes(12).toString("hex"));
+  t.after(() => { try { fs.unlinkSync(fifo); } catch {} });
+  const created = spawnSync("mkfifo", [fifo], { encoding: "utf8", timeout: 2000 });
+  assert.equal(created.status, 0, created.stderr);
+  const script = [
+    'const fs = require("node:fs");',
+    'const [root, target, fifo, modulePath] = process.argv.slice(1);',
+    'const original = fs.openSync; let raced = false;',
+    'fs.openSync = function(p, ...args) {',
+    '  if (p === target && !raced) {',
+    '    fs.renameSync(target, target + ".old"); fs.renameSync(fifo, target); raced = true;',
+    '  }',
+    '  return original.call(fs, p, ...args);',
+    '};',
+    'const {inspectZk1LiveLegacyDerivedLocalEvidence} = require(modulePath);',
+    'try { inspectZk1LiveLegacyDerivedLocalEvidence({tempDir:root,runSecret:Buffer.alloc(32,0x42)});',
+    '  process.stderr.write("UNEXPECTED_SUCCESS"); process.exitCode = 2;',
+    '} catch (err) {',
+    '  if (!raced || err.message !== "ZK_LEGACY_DERIVED_INVENTORY_UNAVAILABLE") {',
+    '    process.stderr.write("WRONG_ERROR "+err.message); process.exitCode = 3;',
+    '  } else process.stdout.write("FIFO_DENIED_WITHOUT_STALL");',
+    '}',
+  ].join("\n");
+  const outcome = spawnSync(process.execPath, ["-e", script, directory, target, fifo,
+    require.resolve("../src/services/zk1LiveLegacyDerivedLocalEvidence")],
+  { encoding: "utf8", timeout: 2500 });
+  assert.equal(outcome.status, 0,
+    "FIFO swap must refuse without hanging: " + outcome.error + " " + outcome.stderr);
+  assert.match(outcome.stdout, /FIFO_DENIED_WITHOUT_STALL/);
+});
 
 test("derived local observation includes only the stable bounded source bytes", (t) => {
   const directory = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-derived-stable-"));

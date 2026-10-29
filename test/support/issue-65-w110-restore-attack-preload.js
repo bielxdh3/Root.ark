@@ -56,7 +56,7 @@ fs.mkdtempSync = function (prefix, ...args) {
   const deniedRead = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", "/usr/bin/test", "-r", victimSentinel], { timeout: 5000 });
   if (deniedRead.status !== 1) throw Error("W110_OTHER_UID_PRIVATE_READ_PROBE_INVALID");
   const mover = spawnSync("/usr/sbin/runuser", ["-u", "nobody", "--", process.execPath,
-    path.join(__dirname, "issue-65-w110-foreign-uid-mover.js"), stage, victim],
+    path.join(__dirname, "../../lab/issue-65-test-processes/issue-65-w110-foreign-uid-mover.js"), stage, victim],
   { timeout: 5000, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } });
   process.stdout.write(`W110_MOVER_EXIT=${mover.status} SIGNAL=${mover.signal || "NONE"} STDERR_BYTES=${mover.stderr?.length || 0}\n`);
   if (mover.status !== 0 || mover.stdout.trim() !== "FOREIGN_UID_RENAMED")

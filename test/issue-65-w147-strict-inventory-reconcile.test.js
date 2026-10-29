@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
-const child = path.join(__dirname, "support", "w147-inventory-reconciliation-child.cjs");
+const child = path.join(__dirname, "../lab/issue-65-test-processes", "w147-inventory-reconciliation-child.cjs");
 function run(root, phase, strict) {
   const proc = spawnSync(process.execPath, [child, phase], {
     cwd: root, encoding: "utf8", timeout: 30000, windowsHide: true,

@@ -739,11 +739,24 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       },
     };
     const offlineWitnessDb = path.join(folder, 'independent-offline-forgery.sqlite');
-    const offlineWitness = new Zk1LegacyArchiveStageWitness({
-      filename: offlineWitnessDb,
-      bootstrapNew: true, privateKey: witnessSigner.privateKey,
-      witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
-      operatorPins: readback.operatorPins, trustedOwnerWitness });
+    // A pathname existence probe cannot reserve a SQLite witness filename.
+    // The native O_CREAT|O_EXCL open is the one atomic bootstrap authority.
+    const oldExists = fs.existsSync;
+    let prematureNameChecks = 0;
+    fs.existsSync = function(name, ...args) {
+      if (name === offlineWitnessDb) prematureNameChecks++;
+      return oldExists.call(fs, name, ...args);
+    };
+    let offlineWitness;
+    try {
+      offlineWitness = new Zk1LegacyArchiveStageWitness({
+        filename: offlineWitnessDb,
+        bootstrapNew: true, privateKey: witnessSigner.privateKey,
+        witnessPublicKey: witnessSigner.publicKey, trustedScope: options.scope,
+        operatorPins: readback.operatorPins, trustedOwnerWitness });
+    } finally { fs.existsSync = oldExists; }
+    assert.equal(prematureNameChecks, 0,
+      'witness bootstrap must atomically create its new ledger without check-then-open');
     try {
       const forgedSubjectRaw = Buffer.from(await z.encodeDeterministic({
         ...subject, owner_revision: subject.owner_revision + 9,

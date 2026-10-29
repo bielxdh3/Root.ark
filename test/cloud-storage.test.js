@@ -252,13 +252,21 @@ test("Google Drive keeps backslash and apostrophe inside exact list and inventor
   assert.deepEqual(literals(calls[1]), [parent, "rootArkKey"]);
 });
 
-test("provider selection and configuration failures have stable categories", async () => {
+test("provider selection and configuration failures have stable categories", async (t) => {
   const unsupported = createCloudStorage({ provider: "ftp" });
   await assert.rejects(unsupported.list("root"), { code: "unsupported_provider" });
   const s3 = createCloudStorage({ provider: "s3", createS3Client: async () => ({}) });
   await assert.rejects(s3.list("root"), { code: "configuration" });
   const drive = createCloudStorage({ provider: "gdrive", createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [] } }) } }) });
-  await assert.rejects(drive.upload(__filename, "root", "file.txt"), { code: "configuration" });
+  // The caller's repository tree may be mounted through an untrusted /mnt
+  // ancestor on Linux. Exercise provider configuration after selecting an
+  // independently private source, not by bypassing the source-path fence.
+  const privateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-config-"));
+  t.after(() => fs.rmSync(privateRoot, { recursive: true, force: true }));
+  if (process.platform !== "win32") fs.chmodSync(privateRoot, 0o700);
+  const privateSource = path.join(privateRoot, "source.txt");
+  fs.writeFileSync(privateSource, "provider-config-only", { flag: "wx", mode: 0o600 });
+  await assert.rejects(drive.upload(privateSource, "root", "file.txt"), { code: "configuration" });
 });
 
 test("key containment normalizes separators and rejects empty or absolute segments", () => {
@@ -699,10 +707,23 @@ test("filename separators are rejected for object operations", async () => {
   await assert.rejects(storage.remove("folder", "nested\\item.bin"), { code: "invalid_path" });
 });
 
-test("upload of a missing local file is a no-op", async () => {
+test("upload of a missing local file under a trusted private parent is a no-op", async (t) => {
   let created = 0;
   const storage = createCloudStorage({ provider: "s3", s3: { bucket: "bucket" }, createS3Client: async () => { created += 1; return { send: async () => ({}) }; } });
-  assert.equal(await storage.upload(path.join(os.tmpdir(), "rootark-missing-file"), "root", "item.bin"), null);
+  const privateParent = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-missing-private-"));
+  t.after(() => fs.rmSync(privateParent, { recursive: true, force: true }));
+  if (process.platform !== "win32") fs.chmodSync(privateParent, 0o700);
+  assert.equal(await storage.upload(path.join(privateParent, "absent.bin"), "root", "item.bin"), null);
+  assert.equal(created, 0);
+});
+
+test("missing upload path cannot bypass untrusted POSIX source-parent validation", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX sticky public TEMP trust boundary");
+  let created = 0;
+  const storage = createCloudStorage({ provider: "s3", s3: { bucket: "bucket" }, createS3Client: async () => { created += 1; return { send: async () => ({}) }; } });
+  await assert.rejects(
+    storage.upload(path.join(os.tmpdir(), "rootark-missing-file"), "root", "item.bin"),
+    { code: "invalid_path" });
   assert.equal(created, 0);
 });
 
