@@ -11419,7 +11419,18 @@ app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermissio
 });
 
 
+function denyStrictLegacyVersionMutation(res) {
+  // JWT permissions do not establish an owner-signed account-wide cutover.
+  // Recheck after every asynchronous boundary and before local/cloud writes.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
+  if (denyStrictLegacyVersionMutation(res)) return;
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -11431,7 +11442,8 @@ app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requ
   if (!isExistingFile(filePath)) {
     if (!isCloudStorageEnabled()) return res.status(404).json({ error: "Arquivo nao encontrado" });
     if (!consumeCloudMetadataRateLimit(req, res)) return;
-    await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+    await ensureCloudFileCached(folder.id, name, filePath, "uploads",
+      () => !isFileInTrash(folder.id, name) && !isZk10LegacyBackupStrict());
   }
   if (!refreshAuthenticatedUser(req, res)) return;
   const currentFolder = getFolderById(folder.id);
@@ -11440,6 +11452,7 @@ app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requ
   if (!isFolderAvailable(currentFolder.id) || isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
   if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (denyStrictLegacyVersionMutation(res)) return;
   const currentFolderWithPaths = { ...currentFolder, ...ensureFolderDirectories(currentFolder.id) };
   const { history } = ensureVersionHistory(currentFolderWithPaths, name, normalizeFilePermissionEntry(getFilePermissionEntry(currentFolder.id, name)).owner, "Versao inicial");
   return res.json({ folderId: folder.id, fileName: name, currentVersion: history.currentVersion });
@@ -11567,6 +11580,7 @@ app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, require
 });
 
 app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
+  if (denyStrictLegacyVersionMutation(res)) return;
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -11581,6 +11595,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
   if (!hasFileEditAccess(req, folder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
 
   return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (denyStrictLegacyVersionMutation(res)) return;
     if (!refreshAuthenticatedUser(req, res)) return;
     let currentFolder = getReadableFolderOrRespond(req, res, folder.id);
     if (!currentFolder) return;
@@ -11599,9 +11614,11 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 
     const currentPath = path.join(currentFolder.uploadDir, name);
     const targetPath = path.join(currentFolder.uploadDir, target.storedAs);
-    await ensureCloudFileCached(currentFolder.id, name, currentPath, "uploads", () => !isFileInTrash(currentFolder.id, name));
+    await ensureCloudFileCached(currentFolder.id, name, currentPath, "uploads",
+      () => !isFileInTrash(currentFolder.id, name) && !isZk10LegacyBackupStrict());
     if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
-    await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads", () => !isFileInTrash(currentFolder.id, name), name);
+    await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads",
+      () => !isFileInTrash(currentFolder.id, name) && !isZk10LegacyBackupStrict(), name);
     if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     if (!refreshAuthenticatedUser(req, res)) return;
     currentFolder = getReadableFolderOrRespond(req, res, currentFolder.id);
@@ -11611,6 +11628,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
     if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
+    if (denyStrictLegacyVersionMutation(res)) return;
 
     let restoreStagePath = null;
     let archivedPath = null;
@@ -11624,6 +11642,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
       const archivedName = getStoredVersionName(name, oldCurrentVersion);
       archivedPath = path.join(currentFolder.uploadDir, archivedName);
       if (fs.existsSync(archivedPath)) return res.status(409).json({ error: "Arquivo de versao atual ja existe" });
+      if (denyStrictLegacyVersionMutation(res)) return;
       const projectedNewVersion = oldCurrentVersion + 1;
       if (isCloudStorageEnabled()) {
         cloudMutationPreparation = prepareCloudUploadMutations(currentFolder.id, getRestoredVersionCloudMutationNames(
@@ -11691,6 +11710,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 });
 
 app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), async (req, res) => {
+  if (denyStrictLegacyVersionMutation(res)) return;
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -11702,6 +11722,7 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
   }
 
   return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (denyStrictLegacyVersionMutation(res)) return;
     if (!refreshAuthenticatedUser(req, res)) return;
     if (!req.user?.permissions?.delete) return res.status(403).json({ error: "Permissao negada: delete" });
     const currentFolder = getReadableFolderOrRespond(req, res, folder.id);
@@ -11717,6 +11738,7 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
     if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
     if (versionNumber === history.currentVersion) return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
 
+    if (denyStrictLegacyVersionMutation(res)) return;
     const cloudDeletePreparation = prepareCloudUploadAbsenceMutations(currentFolder.id, name, [target.storedAs]);
     try {
       fs.rmSync(path.join(currentFolder.uploadDir, target.storedAs), { force: true });
