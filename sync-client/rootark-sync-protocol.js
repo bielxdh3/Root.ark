@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
-const { isValidIdempotencyKey } = require("./rootark-sync-authorization");
+const { isValidIdempotencyKey, assertAuthorizationEnvelopeBinding } = require("./rootark-sync-authorization");
 
 const PROTOCOL_VERSION = 2;
 const MAX_ID_LENGTH = 160;
@@ -213,6 +213,9 @@ function decodeMovePayload(plaintext, fileKey) {
 }
 
 function createOperation(input = {}) {
+  // Encryption must precede signing. An externally provided proof cannot
+  // authorize the freshly encrypted bytes from this constructor.
+  if (Object.hasOwn(input, "authorization")) fail("Do not supply authorization to the encryption constructor", "authorization_scope");
   const operation = String(input.operation || "");
   if (!OPERATIONS.has(operation)) fail("Invalid sync operation");
   const objectId = id(input.objectId || crypto.randomUUID(), "objectId");
@@ -242,7 +245,6 @@ function createOperation(input = {}) {
   };
   const plaintext = input.plaintext === undefined ? Buffer.from("{}", "utf8") : input.plaintext;
   Object.assign(result, encryptPayload(result, plaintext, input.fileKey));
-  if (input.authorization !== undefined) result.authorization = normalizeAuthorization(input.authorization);
   return result;
 }
 
@@ -253,11 +255,14 @@ function validateOperationInternal(input, requireFreshAuthorization) {
   for (const field of OPERATION_FIELDS) {
     if (!OPTIONAL_OPERATION_FIELDS.has(field) && !Object.hasOwn(input, field)) fail(`Missing operation field: ${field}`);
   }
-  const operation = createOperation({ ...input, authorization: undefined,
+  const { authorization: _authorization, ...unsignedInput } = input;
+  const operation = createOperation({ ...unsignedInput,
     plaintext: Buffer.alloc(0), fileKey: Buffer.alloc(32) });
-  if (input.authorization !== undefined) {
+  if (Object.hasOwn(input, "authorization")) {
     operation.authorization = normalizeAuthorizationShape(input.authorization,
       requireFreshAuthorization);
+    assertAuthorizationEnvelopeBinding(operation.authorization, { ...operation,
+      ciphertext: input.ciphertext, nonce: input.nonce, tag: input.tag, aad: input.aad });
   }
   if (input.tombstone !== operation.tombstone) fail("Invalid tombstone flag");
   if (!operation.metadata.path) fail("Operation metadata.path is required");
@@ -275,6 +280,15 @@ function validateOperationInternal(input, requireFreshAuthorization) {
 }
 
 function validateOperation(input) {
+  return validateOperationInternal(input, true);
+}
+
+// Trusted mode selection belongs to the caller, never the incoming proof's
+// presence. This validates shape/digest binding, NOT a signature or device.
+function validateFreshSignedOperation(input) {
+  if (!input || !Object.hasOwn(input, "authorization")) {
+    fail("Fresh signed operation requires device authorization", "authorization_required");
+  }
   return validateOperationInternal(input, true);
 }
 
@@ -306,6 +320,7 @@ module.exports = {
   normalizeAuthorization,
   safeRelativePath,
   validateOperation,
+  validateFreshSignedOperation,
   validateStoredOperation,
   OPTIONAL_OPERATION_FIELDS,
 };

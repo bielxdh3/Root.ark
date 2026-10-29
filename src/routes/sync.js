@@ -4,7 +4,8 @@ const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
+const { PROTOCOL_VERSION, compareRevisions, validateOperation,
+  validateFreshSignedOperation } = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
@@ -862,7 +863,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (Object.hasOwn(payload, "plaintext") || Object.hasOwn(payload, "fileKey")) return errorResponse(res, 400, "Plaintext and keys are not accepted");
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
-    try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
+    // Only trusted server configuration may select signed ingress. A request
+    // cannot choose the legacy parser by omitting its proof. The co-located
+    // transaction still independently verifies Ed25519 and current revocation.
+    try { operation = atomicDeviceRegistry
+      ? validateFreshSignedOperation(payload) : validateOperation(payload); }
+    catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
     // Safe rollout: old unsigned development writes may remain available when
     // no device auth is required. A signed envelope OR a route configured for
     // device authorization must fail closed until an operator explicitly

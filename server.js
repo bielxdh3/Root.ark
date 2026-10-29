@@ -12606,7 +12606,18 @@ app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
   }, res);
 });
 
+function denyStrictLegacyMove(res) {
+  // A legacy folder ACL cannot authorize a physical cross-folder move after
+  // STRICT owner/object cutover. Do not rename first and roll it back later.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.put("/move", moveRateLimit, authenticate, async (req, res) => {
+  if (denyStrictLegacyMove(res)) return;
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const fromFolder = getAccessibleFolderRecordOrRespond(req, res, req.body.fromFolderId);
@@ -12654,6 +12665,9 @@ app.put("/move", moveRateLimit, authenticate, async (req, res) => {
     const oldStoredNames = getVersionHistory(sourceFolder.id, name).versions
       .map((version) => path.basename(version.storedAs || ""))
       .filter(Boolean);
+    // A mode change can happen during the awaited cache/authorization work.
+    // Recheck at the physical sink before issuing even a transient rename.
+    if (denyStrictLegacyMove(res)) return;
     try {
       await fs.promises.rename(sourcePath, destinationPath);
     } catch {

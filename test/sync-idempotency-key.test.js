@@ -43,8 +43,11 @@ test("17-character idempotency key is accepted by the operation validator", asyn
   const operation = operationFor();
   const proof = await proofFor(operation, "abcdefghijklmnopq");
   assert.equal(proof.idempotencyKey, "abcdefghijklmnopq");
-  const result = protocol.createOperation({ ...operation, authorization: proof, plaintext: Buffer.from("payload"), fileKey: crypto.randomBytes(32) });
+  // A signed proof must be attached to the ORIGINAL encrypted bytes. Reusing
+  // it with a new createOperation() encryption would bind stale ciphertext.
+  const result = protocol.validateFreshSignedOperation({ ...operation, authorization: proof });
   assert.equal(result.authorization.idempotencyKey, "abcdefghijklmnopq");
+  assert.equal(await verifyAuthorizationProof(result.authorization, result, trustedAlice), true);
 });
 
 test("every idempotency key length from 16 to 40 is accepted", async () => {
