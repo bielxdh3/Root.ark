@@ -1,27 +1,18 @@
 "use strict";
 // Separate OS process running W62's exact DEV-OFF client, over real pinned mTLS.
 const crypto = require("node:crypto");
-const fs = require("node:fs");
 const https = require("node:https");
-const path = require("node:path");
+const { createPinnedLabClientTls } = require("./pinned-mtls-client");
 const { createZk10ExternalOwnerCutoverCasClient } =
   require("../../src/services/zk10ExternalOwnerCutoverCasClient");
 let client;
 if (process.send) process.send({ type: "client-ready" });
 function exchange(config, route, body) {
   return new Promise((resolve, reject) => {
-    const read = (name) => fs.readFileSync(path.join(config.certDir, name));
     const bytes = Buffer.from(JSON.stringify(body));
     const req = https.request({
       hostname: "127.0.0.1", port: config.port, path: route, method: "POST",
-      ca: read("ca.pem"), cert: read("client.pem"), key: read("client.key"),
-      minVersion: "TLSv1.3", maxVersion: "TLSv1.3", rejectUnauthorized: true,
-      checkServerIdentity: (hostname, cert) => {
-        const failure = require("node:tls").checkServerIdentity(hostname, cert);
-        if (failure) return failure;
-        if (new crypto.X509Certificate(cert.raw).fingerprint256 !== config.serverPin)
-          return Error("ZK10_PEER_PIN_MISMATCH");
-      },
+      ...createPinnedLabClientTls(config.certDir, "client", config.serverPin),
       headers: { "content-type": "application/json", "content-length": bytes.length },
       timeout: 4000,
     }, (res) => {

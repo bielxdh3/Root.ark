@@ -14,6 +14,7 @@ const { generateNativeFixtureCertificates } =
 const { privateAuthorityDirectory } =
   require("../../test/support/issue-65-private-authority-directory");
 const { createZk10Pg18Operator } = require("./operator");
+const { createPinnedLabClientTls } = require("./pinned-mtls-client");
 
 const accountId = Buffer.alloc(16, 1).toString("base64url");
 const zkAccountId = Buffer.alloc(16, 2).toString("base64url");
@@ -190,10 +191,8 @@ test("real PostgreSQL18 CAS, separate mTLS client PIDs, lost ACK, operator+PG re
     const body = Buffer.from("{}");
     const request = https.request({
       hostname: "127.0.0.1", port, method: "POST",
-      path: "/v1/zk10/current", ca: fs.readFileSync(path.join(dir, "ca.pem")),
-      cert: fs.readFileSync(path.join(dir, "foreign.pem")),
-      key: fs.readFileSync(path.join(dir, "foreign.key")),
-      minVersion: "TLSv1.3", maxVersion: "TLSv1.3", rejectUnauthorized: true,
+      path: "/v1/zk10/current",
+      ...createPinnedLabClientTls(dir, "foreign", serverPin),
       headers: { "content-type": "application/json", "content-length": body.length },
     }, (response) => { response.resume(); resolve(response.statusCode); });
     request.on("error", reject); request.end(body);
