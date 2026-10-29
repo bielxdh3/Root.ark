@@ -12219,7 +12219,18 @@ app.get("/preview/text/:scope/:name", authenticate, async (req, res) => {
 });
 
 app.get("/approve/:name", approveRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+function denyStrictLegacyApproval(res) {
+  // A JWT approver cannot revive legacy plaintext while owner/object cutover
+  // lacks independently authenticated, account-wide admission.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("approve"), async (req, res) => {
+  if (denyStrictLegacyApproval(res)) return;
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
@@ -12263,6 +12274,9 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
 
       const uploadedBy = refreshedPendingEntry.uploadedBy || null;
       const pendingTempPath = path.join(folder.tempDir, name);
+      // Recheck immediately before committing the physical promotion, after
+      // any asynchronous staging or authorization refresh has completed.
+      if (denyStrictLegacyApproval(res)) return;
       const cloudMutations = isCloudStorageEnabled()
         ? prepareCloudUploadMutations(folder.id, getApprovedFileCloudMutationNames(folder, name, pendingTempPath))
         : { queued: false, rollback() {} };
