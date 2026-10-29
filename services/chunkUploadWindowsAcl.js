@@ -1,5 +1,12 @@
 const { execFileSync } = require("node:child_process");
 
+// This verifier is the final authority for protected on-disk ciphertext and
+// its co-located device registry. Executing a PATH-selected powershell.exe
+// lets a local attacker substitute a no-op binary returning exit status 0,
+// silently approving arbitrary NTFS ACLs. Pin ALL native ACL actions to
+// Windows PowerShell's canonical system executable, including create/sddl.
+const TRUSTED_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+
 const NATIVE_ACL = String.raw`
 using System;
 using System.Collections.Generic;
@@ -8,6 +15,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Threading;
 
 public static class RootarkChunkAclNative {
   const uint OWNER_SECURITY_INFORMATION = 0x1;
@@ -98,11 +106,37 @@ public static class RootarkChunkAclNative {
     foreach (string sid in trusted) if (!fullControl.Contains(sid)) throw new InvalidOperationException("Trusted principal lacks full control in chunk staging tree");
   }
 
+  // Authority signing keys, CA bundles and the bootstrap JSON can be loaded
+  // from an operator-owned inherited (but safe) DACL. Do not demand a special
+  // protected staging root. Reject ANY nontrusted ALLOW ACE on the leaf:
+  // reading an Ed25519 private key is already an authority compromise.
+  static void AssertAuthorityFile(string file, string[] trusted) {
+    AssertTrustedOwnerAndSafeAncestors(file, trusted);
+    FileAttributes attributes = File.GetAttributes(file);
+    if ((attributes & FileAttributes.Directory) != 0 || (attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("Authority file is a reparse point");
+    RawSecurityDescriptor descriptor = ReadDescriptor(file);
+    if (descriptor.Owner == null || !IsTrusted(descriptor.Owner.Value, trusted)
+      || descriptor.DiscretionaryAcl == null) throw new InvalidOperationException("Untrusted authority file owner or DACL");
+    foreach (GenericAce entry in descriptor.DiscretionaryAcl) {
+      QualifiedAce ace = entry as QualifiedAce;
+      if (ace == null || ace.SecurityIdentifier == null) throw new InvalidOperationException("Unverifiable authority ACE");
+      if (ace.AceQualifier == AceQualifier.AccessAllowed && !IsTrusted(ace.SecurityIdentifier.Value, trusted))
+        throw new InvalidOperationException("Untrusted authority file ACE");
+    }
+  }
+
   public static string Ensure(string root, string action) {
     root = Path.GetFullPath(root);
     string currentSid = WindowsIdentity.GetCurrent().User.Value;
     string[] trusted = new string[] { currentSid, "S-1-5-18", "S-1-5-32-544" };
     if (action == "sddl") return ReadSddl(root);
+    if (action == "verify-authority") {
+      // No UNC/server path or alternate device namespace for signing keys.
+      if (root.StartsWith(@"\\", StringComparison.Ordinal) || !Path.IsPathRooted(root))
+        throw new InvalidOperationException("Authority path must be local");
+      AssertAuthorityFile(root, trusted);
+      return String.Empty;
+    }
     AssertTrustedOwnerAndSafeAncestors(root, trusted);
     if (action == "create") {
       if (!Directory.Exists(root)) {
@@ -123,19 +157,36 @@ public static class RootarkChunkAclNative {
       return String.Empty;
     }
     if (action == "verify") {
-      AssertDirectoryNoReparse(root);
-      AssertRestrictedItem(root, true, trusted);
-      Stack<string> pending = new Stack<string>();
-      pending.Push(root);
-      while (pending.Count > 0) {
-        string directory = pending.Pop();
-        foreach (string entry in Directory.GetFileSystemEntries(directory)) {
-          FileAttributes attributes = File.GetAttributes(entry);
-          AssertRestrictedItem(entry, false, trusted);
-          if ((attributes & FileAttributes.Directory) != 0) pending.Push(entry);
+      // Concurrent trusted SQLite writers may delete transient WAL/SHM files
+      // after enumeration but before the ACL query. Restart the ENTIRE scan,
+      // including ancestry and root, only for positively identified absence;
+      // never retry an unsafe DACL, reparse point, or access-denied result.
+      for (int attempt = 0; attempt < 4; attempt++) {
+        try {
+          AssertTrustedOwnerAndSafeAncestors(root, trusted);
+          AssertDirectoryNoReparse(root);
+          AssertRestrictedItem(root, true, trusted);
+          Stack<string> pending = new Stack<string>();
+          pending.Push(root);
+          while (pending.Count > 0) {
+            string directory = pending.Pop();
+            foreach (string entry in Directory.GetFileSystemEntries(directory)) {
+              FileAttributes attributes = File.GetAttributes(entry);
+              AssertRestrictedItem(entry, false, trusted);
+              if ((attributes & FileAttributes.Directory) != 0) pending.Push(entry);
+            }
+          }
+          return ReadSddl(root);
+        } catch (FileNotFoundException) {
+          if (attempt == 3) throw;
+        } catch (DirectoryNotFoundException) {
+          if (attempt == 3) throw;
+        } catch (Win32Exception error) {
+          if ((error.NativeErrorCode != 2 && error.NativeErrorCode != 3) || attempt == 3) throw;
         }
+        Thread.Sleep(10 * (attempt + 1));
       }
-      return ReadSddl(root);
+      throw new InvalidOperationException("Chunk staging tree changed during ACL verification");
     }
     throw new InvalidOperationException("Invalid chunk ACL operation");
   }
@@ -147,7 +198,9 @@ function runAclScript(rootDir, action) {
   const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
-    return execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true }).trim();
+    // Pin every ACL action, not only authority verification, while retaining
+    // the existing bounded subprocess execution and output limits.
+    return execFileSync(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: 12000, maxBuffer: 32 * 1024 }).trim();
   } catch (error) {
     const detail = String(error.stdout || error.stderr || "").match(/Untrusted principal can replace[^"_<\r\n]*/)?.[0];
     throw new Error(detail || "Windows chunk staging ACL validation failed");
@@ -169,4 +222,10 @@ function getWindowsChunkAclDescriptor(rootDir) {
   return runAclScript(rootDir, "sddl");
 }
 
-module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor };
+function verifyWindowsAuthorityFilePath(filename) {
+  if (process.platform !== "win32") return;
+  runAclScript(filename, "verify-authority");
+}
+
+module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
+  verifyWindowsAuthorityFilePath };
