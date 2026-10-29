@@ -12,7 +12,7 @@ const test = require("node:test");
 const unzipper = require("unzipper");
 
 const ROOT = path.resolve(__dirname, "..");
-const CHILD = path.join(__dirname, "support", "w147-strict-backup-child.cjs");
+const CHILD = path.join(__dirname, "..", "lab", "issue-65-test-processes", "w147-strict-backup-child.cjs");
 function request(port, route, { method = "GET", headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, path: route, method, headers,

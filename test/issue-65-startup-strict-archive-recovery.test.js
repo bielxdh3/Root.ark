@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const { spawnSync } = require("node:child_process");
-const CHILD = path.join(__dirname, "support", "issue-65-startup-cleanup-child.cjs");
+const CHILD = path.join(__dirname, "..", "lab", "issue-65-test-processes", "issue-65-startup-cleanup-child.cjs");
 
 function run(strict, flip = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-startup-cleanup-"));

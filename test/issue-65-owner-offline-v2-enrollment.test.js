@@ -633,6 +633,29 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
+    // The owner also must not create a fresh CEK grant after the signed
+    // approval expires while the real file AEAD open is pending.
+    const originalWallClock = Date.now;
+    let ownerDecryptFinished = false;
+    subtle.decrypt = async function (...args) {
+      const result = await realDecrypt.apply(this, args);
+      ownerDecryptFinished = true;
+      Date.now = () => (signedCommittedHead.expires_at + 2) * 1000;
+      return result;
+    };
+    try {
+      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+        ownerPrivateKey: owner.privateKey, ownerHeldCek,
+        metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
+        authority: publicAuthority,
+      }), /ZK_OWNER_FILE_CEK_DENIED/,
+      "A must refuse CEK rewrap after authorization expires during real file AEAD open");
+    } finally {
+      Date.now = originalWallClock;
+      delete subtle.decrypt;
+    }
+    assert.equal(ownerDecryptFinished, true,
+      "test must reach the genuine file AEAD before expiring the grant");
     for (const label of ["request", "metadata", "head", "opened envelope"]) {
       let accessed = 0;
       const accessor = { enumerable: true, configurable: true,
@@ -679,6 +702,26 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
       nowSeconds: now + 9, ...overrides,
     });
+    // Expire the real signed authorization at the last awaited HPKE operation.
+    // A previously approved CEK must not escape after the time-bound grant dies.
+    const realHpkeOpen = z.hpkeOpen;
+    const realDateNow = Date.now;
+    let hpkeFinishedBeforeExpiry = false;
+    z.hpkeOpen = async (...args) => {
+      const result = await realHpkeOpen(...args);
+      hpkeFinishedBeforeExpiry = true;
+      Date.now = () => (envelope.core.expires_at + 2) * 1000;
+      return result;
+    };
+    try {
+      await assert.rejects(open(), /ZK_OWNER_FILE_CEK_DENIED/,
+        "B cannot release a CEK after expiry during real HPKE open");
+    } finally {
+      z.hpkeOpen = realHpkeOpen;
+      Date.now = realDateNow;
+    }
+    assert.equal(hpkeFinishedBeforeExpiry, true,
+      "test must reach actual HPKE decrypt before the clock changes");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
     const decrypted = await content.decryptFile({

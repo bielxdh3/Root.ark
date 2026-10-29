@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
-const CHILD = path.join(__dirname, "support", "w147-strict-backup-child.cjs");
+const CHILD = path.join(__dirname, "..", "lab", "issue-65-test-processes", "w147-strict-backup-child.cjs");
 function run(root, action, strict, id) {
   const proc = spawnSync(process.execPath, [CHILD, action, ...(id ? [id] : [])], {
     cwd: root,

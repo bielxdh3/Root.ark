@@ -113,6 +113,10 @@ const b64 = (v) => Buffer.from(v).toString("base64url");
 const sha = (v) => crypto.createHash("sha256").update(v).digest();
 function compare(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, b); }
 function positive(v) { if (!Number.isSafeInteger(v) || v < 1) deny(); return v; }
+function requireUnexpiredAtRelease(expiresAt) {
+  if (!Number.isSafeInteger(expiresAt)
+    || Math.floor(Date.now() / 1000) > expiresAt) deny();
+}
 function metadataCopy(meta) {
   exact(meta, META);
   for (const n of ["account_id", "keyring_id", "object_id", "version_id"])
@@ -286,7 +290,8 @@ async function sealOwnerAuthorizedFileCek(input) {
     const core = { schema: FORMAT, ...await binding({
       metadata: stable.metadata, revision: stable.objectRevision,
       ciphertext: stable.ciphertext, ciphertextRoot: stable.ciphertextRoot, authority: trusted }),
-      nonce: b64(crypto.randomBytes(16)), expires_at: trusted.expiresAt };
+      nonce: b64(crypto.randomBytes(16)),
+      expires_at: Math.min(trusted.expiresAt, a.approval.expires_at) };
     exact(core, CORE);
     if (!compare(from64(core.hpke_public_key, 32), ownerApprovedHpkePublicKey)) deny();
     const context = Buffer.from(await z.encodeDeterministic(core));
@@ -296,6 +301,9 @@ async function sealOwnerAuthorizedFileCek(input) {
       info: Buffer.concat([INFO, context]), aad: Buffer.concat([AAD, context]) });
     const message = Buffer.concat([DOMAIN, await z.encodeDeterministic({
       core, enc: sealed.enc, ciphertext: sealed.ciphertext })]);
+    // AEAD and HPKE are asynchronous. The signed approval can expire while
+    // the owner holds the CEK; gate its final export using the real wall clock.
+    requireUnexpiredAtRelease(core.expires_at);
     return Object.freeze({ schema: FORMAT, core, enc: b64(sealed.enc),
       ciphertext: b64(sealed.ciphertext),
       owner_signature: b64(crypto.sign(null, message, stable.ownerPrivateKey)),
@@ -350,6 +358,10 @@ async function openOwnerAuthorizedFileCek(input) {
       enc, ciphertext, info: Buffer.concat([INFO, context]),
       aad: Buffer.concat([AAD, context]) }));
     if (cek.length !== 32) deny();
+    // Last use: reject a now-expired owner approval/receipt before returning
+    // plaintext-equivalent CEK bytes to B, even if HPKE was valid at entry.
+    requireUnexpiredAtRelease(Math.min(core.expires_at,
+      a.approval.expires_at, a.committedReceipt.expires_at));
     return Object.freeze({ cek: Buffer.from(cek), authorizesProductionRestore: false,
       externalCustodyProven: false });
   } catch (_) { deny(); }

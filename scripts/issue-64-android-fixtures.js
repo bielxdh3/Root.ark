@@ -121,7 +121,9 @@ async function captureSync(responses) {
     responses["sync.post.201"] = created;
 
     responses["sync.post.409.replay"] = expectStatus(await call(base, "POST", "/sync/v1/objects", createBody), 409, "replay");
-    responses["sync.post.400.invalid"] = expectStatus(await call(base, "POST", "/sync/v1/objects", { foo: 1 }), 400, "invalid");
+    // Strict enrolled-device ingress denies missing proof before parsing an
+    // attacker-controlled operation, including malformed unsigned payloads.
+    responses["sync.post.403.invalid"] = expectStatus(await call(base, "POST", "/sync/v1/objects", { foo: 1 }), 403, "invalid");
     responses["sync.list.200"] = expectStatus(await call(base, "GET", "/sync/v1/objects", undefined), 200, "list");
     responses["sync.get.200"] = expectStatus(await call(base, "GET", "/sync/v1/objects/fixture-object-1", undefined), 200, "get");
     responses["sync.get.404"] = expectStatus(await call(base, "GET", "/sync/v1/objects/missing-object", undefined), 404, "get missing");
