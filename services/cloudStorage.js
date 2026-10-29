@@ -135,13 +135,14 @@ function sameUploadSource(left, right) {
 function openVerifiedLegacyUpload(localPath, expectedIdentity = null) {
   let fd;
   try {
-    const named = fs.lstatSync(localPath, { bigint: true });
-    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n) {
-      throw new Error("unsafe upload source");
-    }
+    // Open first and check the actual descriptor before any pathname metadata
+    // lookup. A checked regular file can otherwise be swapped for a FIFO,
+    // hanging this synchronous O_RDONLY open before our fstat can reject it.
     fd = fs.openSync(localPath, fs.constants.O_RDONLY
-      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0)
+      | (fs.constants.O_NONBLOCK || 0));
     const opened = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(localPath, { bigint: true });
     const same = (a, b) => a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
       && a.dev === b.dev && a.ino === b.ino && a.size === b.size
       && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
@@ -542,16 +543,15 @@ function createCloudStorage(options = {}) {
     const cloudKey = objectKey(folderId, fileName, area);
     let boundedBytes = null;
     if (bound !== undefined) {
-      const stat = fs.lstatSync(localPath, { bigint: true });
-      if (stat.size !== BigInt(bound) || !sameUploadSource(stat, initialSource)) {
-        throw cloudError("configuration", "Ciphertext staging file is not an exact private upload");
-      }
       guardSourceParent();
       const fd = fs.openSync(localPath,
-        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_CLOEXEC || 0) | (fs.constants.O_NONBLOCK || 0));
       try {
         const opened = fs.fstatSync(fd, { bigint: true });
-        if (opened.size !== BigInt(bound) || !sameUploadSource(opened, stat)
+        const stat = fs.lstatSync(localPath, { bigint: true });
+        if (stat.size !== BigInt(bound) || !sameUploadSource(stat, initialSource)
+          || opened.size !== BigInt(bound) || !sameUploadSource(opened, stat)
           || !sameUploadSource(opened, initialSource)) {
           throw cloudError("configuration", "Bounded ciphertext staging file changed identity");
         }

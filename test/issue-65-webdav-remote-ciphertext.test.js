@@ -147,6 +147,38 @@ test("real mTLS HTTPS WebDAV PUT/GET is bounded, pinned and nonauthoritative", a
   assert.equal(f.requests.length, 3, "invalid ZK commitment cannot send bytes");
 });
 
+test("WebDAV corrupted GET is rejected before writing unauthenticated bytes to disk", async (t) => {
+  const f = await fixture(t);
+  const { publisher, verifier } = await f.makePair();
+  await publisher.publishExact(f.pubInput);
+  f.setMode("corrupt");
+  const originalOpen = fs.openSync;
+  const originalWrite = fs.writeSync;
+  const ciphertextDescriptors = new Set();
+  let ciphertextWrites = 0;
+  fs.openSync = function (filename, flags, ...rest) {
+    const fd = originalOpen.call(this, filename, flags, ...rest);
+    if (typeof filename === "string" && path.basename(filename) === "ciphertext.ct"
+      && (flags & fs.constants.O_EXCL)) ciphertextDescriptors.add(fd);
+    return fd;
+  };
+  fs.writeSync = function (fd, ...args) {
+    if (ciphertextDescriptors.has(fd)) ciphertextWrites++;
+    return originalWrite.call(this, fd, ...args);
+  };
+  try {
+    await assert.rejects(verifier.verifyExact(f.readInput), /ZK_CLOUD_READBACK_UNAVAILABLE/);
+    assert.equal(ciphertextWrites, 0,
+      "a forged successful HTTPS response must never reach the private ciphertext file");
+    f.setMode("normal");
+    assert.equal((await verifier.verifyExact(f.readInput)).readbackMatched, true);
+    assert.ok(ciphertextWrites > 0, "an authenticated response still writes its expected bytes");
+  } finally {
+    fs.openSync = originalOpen;
+    fs.writeSync = originalWrite;
+  }
+});
+
 test("WebDAV rejects insecure/ambiguous setup, wrong pin, foreign context and path traversal", async (t) => {
   const f = await fixture(t);
   const invalid = [

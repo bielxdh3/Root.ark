@@ -103,6 +103,79 @@ function durableFixture(directory) {
     targets, readers, identities, publication, verification };
 }
 
+test("signed sidecar recovery cannot block opening a FIFO after a checked regular file", {
+  skip: process.platform !== "linux",
+}, (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-fifo-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const child = String.raw`
+    const crypto = require('node:crypto');
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const cp = require('node:child_process');
+    const { publishSignedCatalogSidecars, recoverSignedCatalogSidecar } =
+      require('./src/services/zk1CloudSignedCatalogSidecar');
+    const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
+      spkiFingerprint } = require('./src/services/zk1ExternallyPinnedProviderDomains');
+    const PROVIDERS = ['s3','gdrive','webdav'];
+    const b64 = (value) => Buffer.from(value).toString('base64url');
+    const sha = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    const durableFixture = ` + durableFixture.toString() + String.raw`;
+    (async () => {
+      const f = durableFixture(process.argv[1]);
+      await publishSignedCatalogSidecars(f.publication);
+      const original = fs.lstatSync;
+      let swapped = false;
+      fs.lstatSync = function(file, ...args) {
+        const stat = original.call(this,file,...args);
+        if (!swapped && typeof file === 'string'
+          && /^catalog-\d+\.ct$/.test(path.basename(file))) {
+          swapped = true;
+          fs.unlinkSync(file);
+          cp.execFileSync('mkfifo',[file]);
+        }
+        return stat;
+      };
+      try { await recoverSignedCatalogSidecar(f.verification); }
+      catch (_) {}
+      process.exit(swapped ? 0 : 4);
+    })().catch(() => process.exit(5));
+  `;
+  const outcome = spawnSync(process.execPath, ["-e", child, dir], {
+    cwd: path.resolve(__dirname, ".."), timeout: 10000, encoding: "utf8", windowsHide: true,
+  });
+  assert.equal(outcome.status, 0,
+    `recovered sidecar must not hang on a FIFO (signal=${outcome.signal}, error=${outcome.error?.code}, stderr=${outcome.stderr})`);
+});
+
+test("signed catalog quorum uses distinct exclusive leaves under one private recovery root", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-staging-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const destinations = [];
+  const readers = fixture.verification.readers.map((target) => ({ ...target,
+    cloudReader: { ...target.cloudReader,
+      async download(...args) {
+        destinations.push(args[2]);
+        return target.cloudReader.download(...args);
+      },
+    },
+  }));
+  const result = await verifyPublishedSignedCatalogSidecars({
+    ...fixture.verification, readers,
+  });
+  assert.equal(result.matchingCount, 2);
+  assert.equal(destinations.length, 2);
+  assert.notEqual(destinations[0], destinations[1],
+    "separate providers must never share a local output file");
+  assert.equal(path.dirname(destinations[0]), path.dirname(destinations[1]),
+    "one native ACL-verified root must serve the same bounded recovery attempt");
+  assert.equal(fs.existsSync(path.dirname(destinations[0])), false,
+    "all temporary provider leaves must be removed after the operation");
+});
+
 test("signed sidecar publishes exact pinned bytes through physical S3 and Drive bounded upload", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-physical-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));

@@ -149,20 +149,23 @@ class Zk1CloudCiphertextReadbackVerifier {
         () => true, { maxBytes: total,
           ...(this.#s3Version === null ? {} : { providerVersionId: this.#s3Version }),
           ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
+          ...(this.#expectedProvider === "webdav"
+            ? { expectedSha256: expectedSha.toString("hex") } : {}),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (downloaded !== true) fail();
       const identity = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());
       if (identity !== this.#expectedContext) fail();
       // Node's ordinary numeric inode/file IDs can round adjacent 64-bit
       // Windows identities to the same Number. Keep every comparison bigint.
-      const stat = fs.lstatSync(destination, { bigint: true });
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
-        || stat.size !== BigInt(total)) fail();
       const fd = fs.openSync(destination,
-        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_CLOEXEC || 0) | (fs.constants.O_NONBLOCK || 0));
       let contents;
       try {
         const opened = fs.fstatSync(fd, { bigint: true });
+        const stat = fs.lstatSync(destination, { bigint: true });
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+          || stat.size !== BigInt(total)) fail();
         if (!opened.isFile() || opened.size !== BigInt(total) || opened.nlink !== 1n
           || opened.dev !== stat.dev || opened.ino !== stat.ino) fail();
         // A size/identity check does not constrain readFileSync(fd): another
