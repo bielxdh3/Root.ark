@@ -12506,7 +12506,18 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   }, res);
 });
 
+function denyStrictLegacyRename(res) {
+  // Legacy ACLs cannot establish an independently attested owner/object
+  // cutover. Do not even issue a transient filesystem rename under STRICT.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
+  if (denyStrictLegacyRename(res)) return;
   const rawOldName = typeof req.body.oldName === "string" ? req.body.oldName.trim() : "";
   const rawNewName = typeof req.body.newName === "string" ? req.body.newName.trim() : "";
   const oldName = path.basename(rawOldName);
@@ -12557,6 +12568,9 @@ app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
       .filter(Boolean);
     if (fs.existsSync(newPath)) return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
 
+    // The asynchronous file cache/ACL refresh above may outlive the original
+    // request admission. Recheck immediately before dispatching native I/O.
+    if (denyStrictLegacyRename(res)) return;
     try {
       await fs.promises.rename(oldPath, newPath);
     } catch {
