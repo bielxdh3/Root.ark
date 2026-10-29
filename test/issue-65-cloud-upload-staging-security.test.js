@@ -36,7 +36,7 @@ function s3() {
     } }) }) };
 }
 
-test("bounded S3 refuses same-inode rewrite between stat and open before provider PUT", async (t) => {
+test("bounded S3 refuses same-inode rewrite at FD open before provider PUT", async (t) => {
   const root = stage(t);
   const source = path.join(root, "sealed.ct");
   const trusted = Buffer.alloc(64, 0x41);
