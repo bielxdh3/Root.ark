@@ -149,6 +149,8 @@ class Zk1CloudCiphertextReadbackVerifier {
         () => true, { maxBytes: total,
           ...(this.#s3Version === null ? {} : { providerVersionId: this.#s3Version }),
           ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
+          ...(this.#expectedProvider === "webdav"
+            ? { expectedSha256: expectedSha.toString("hex") } : {}),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (downloaded !== true) fail();
       const identity = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());

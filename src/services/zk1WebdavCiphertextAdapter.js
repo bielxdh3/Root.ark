@@ -336,11 +336,16 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
           const objectKey = key(folder, name, area);
           const expectedEtag = opts && Object.hasOwn(opts, "expectedEtag")
             ? opts.expectedEtag : null;
+          const expectedSha256 = opts && Object.hasOwn(opts, "expectedSha256")
+            ? opts.expectedSha256 : null;
           const boundedLengthOnly = opts?.boundedLengthOnly === true;
           ensure(opts && Object.getPrototypeOf(opts) === Object.prototype
             && Reflect.ownKeys(opts).length === (opts.abortSignal === undefined ? 1 : 2)
               + (expectedEtag === null ? 0 : 1) + (boundedLengthOnly ? 1 : 0)
+              + (expectedSha256 === null ? 0 : 1)
             && (expectedEtag === null || validEtag(expectedEtag))
+            && (expectedSha256 === null || (typeof expectedSha256 === "string"
+              && /^[a-f0-9]{64}$/.test(expectedSha256)))
             && Number.isSafeInteger(opts.maxBytes) && opts.maxBytes >= 1
             && opts.maxBytes <= MAX_BYTES && typeof destination === "string"
             && (opts.abortSignal === undefined || opts.abortSignal instanceof AbortSignal)
@@ -357,6 +362,11 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
           const bytes = await transfer("GET", objectKey, null, opts.maxBytes,
             opts.abortSignal, expectedEtag, boundedLengthOnly);
           ensure(!opts.abortSignal?.aborted && allowWrite() === true);
+          // A pinned readback digest is available before the GET. Reject a
+          // forged successful HTTPS response before it touches the local FD.
+          if (expectedSha256 !== null) ensure(crypto.timingSafeEqual(
+            crypto.createHash("sha256").update(bytes).digest(),
+            Buffer.from(expectedSha256, "hex")));
           writeExclusive(destination, bytes, parent);
           return true;
         } catch (_) { throw unavailable(); }
