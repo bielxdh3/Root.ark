@@ -84,6 +84,53 @@ test("opt-in disposable migration verifies independent ciphertext copy while pre
   assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
 });
 
+test("migration stops if its private fixture becomes writable to another POSIX principal during a checkpoint", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const f = fixture(t);
+  let permissionChanged = false;
+  try {
+    assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+      onCheckpoint(phase) {
+        if (phase !== "journal-created") return;
+        fs.chmodSync(f.dir, 0o777);
+        permissionChanged = true;
+      },
+    }), /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+    "changing only permissions preserves inode/dev yet must invalidate write authority");
+    assert.equal(permissionChanged, true, "adversary must widen the real fixture permissions");
+    assert.equal(fs.existsSync(f.target), false,
+      "no target ciphertext must be published after ownership boundary is revoked");
+    assert.equal(fs.existsSync(path.join(f.dir, "target", ".operation1.stage")), false);
+  } finally {
+    fs.chmodSync(f.dir, 0o700);
+  }
+});
+
+test("migration refuses a private POSIX fixture exposed as 0755 after journal creation", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const f = fixture(t);
+  let widenedToReadable = false;
+  try {
+    assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+      onCheckpoint(phase) {
+        if (phase !== "journal-created") return;
+        fs.chmodSync(f.dir, 0o755);
+        widenedToReadable = true;
+      },
+    }), /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+    "a 0700 -> 0755 owner-directory transition preserves inode but violates private fixture admission");
+    assert.equal(widenedToReadable, true, "the chmod must occur after journal creation");
+    assert.equal(fs.statSync(f.dir).mode & 0o777, 0o755);
+    assert.equal(fs.existsSync(f.target), false,
+      "no target ciphertext may be published after privacy is lost");
+    assert.equal(fs.existsSync(path.join(f.dir, "target", ".operation1.stage")), false);
+  } finally {
+    fs.chmodSync(f.dir, 0o700);
+  }
+});
+
 test("disposable migration source never allocates bytes appended after descriptor fstat", async (t) => {
   const f = fixture(t);
   const outcome = await withInodeGrowthAfterFstat({

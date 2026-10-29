@@ -97,8 +97,25 @@ function safeRoot(dir, mode) {
   const marker = readRegular(path.join(root, MARKER), 128).toString("utf8");
   if (marker !== "rootark-zk-local-fixture-v1\n") refuse();
   function guard() {
+    // An inode can retain dev/ino while its owner or ACL is changed. A
+    // checkpoint callback (or another OS principal) may widen access after
+    // the initial admission; a subsequent pathname write would then trust a
+    // fixture tree that other users can replace. Revalidate live authority.
+    // The synchronous full-tree Windows verifier is already mandatory at
+    // entry. A separate Windows revalidation design needs a resident native
+    // verifier; spawning/recompiling PowerShell for every guard would make
+    // ordinary checkpoints unusable and has no validated time bound.
+    if (process.platform !== "win32") {
+      try { assertPrivateSqliteDirectory(path.join(root, "_fixture_guard")); }
+      catch (_) { refuse(); }
+    }
+    const owner = process.platform === "win32" ? null : process.getuid();
     for (const [name, identity] of pinned) {
-      if (!sameFile(directory(name), identity)) refuse();
+      const current = directory(name);
+      if (!sameFile(current, identity)) refuse();
+      if (owner !== null && (name === root || name.startsWith(`${root}${path.sep}`))
+        && (current.uid !== owner
+          || (name === root ? (current.mode & 0o077) !== 0 : (current.mode & 0o022) !== 0))) refuse();
     }
   }
   guard();
