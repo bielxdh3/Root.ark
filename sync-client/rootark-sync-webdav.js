@@ -7,6 +7,8 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
+const { verifyWindowsLocalWebDavTree, createWindowsLocalWebDavAclVerifier } =
+  require("../services/chunkUploadWindowsAcl");
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 function isLoopback(host) {
@@ -32,6 +34,76 @@ function sameOrBelow(candidate, parent) {
   const a = compare(left);
   const b = compare(right);
   return a === b || a.startsWith(`${b}${path.sep}`);
+}
+
+function assertPosixTrustedBridgePath(rootDir, targetPath, allowMissingLeaf = true,
+  createMissingDirectories = false) {
+  // Deny directory replacement by a different local UID before a pathname
+  // open or journal rename. The bridge owner and root remain trusted actors;
+  // this is an ownership/mode gate, not descriptor-relative openat2.
+  if (process.platform === "win32") return;
+  const uid = process.getuid?.();
+  if (!Number.isSafeInteger(uid)) throw new Error("POSIX bridge owner unavailable");
+  const trusted = (owner) => owner === BigInt(uid) || owner === 0n;
+  const root = path.resolve(rootDir);
+  const target = path.resolve(targetPath);
+  if (!sameOrBelow(target, root)) throw new Error("Untrusted bridge path");
+  const filesystemRoot = path.parse(target).root;
+  const segments = path.relative(filesystemRoot, target).split(path.sep).filter(Boolean);
+  let current = filesystemRoot;
+  for (let index = -1; index < segments.length; index += 1) {
+    if (index >= 0) current = path.join(current, segments[index]);
+    let stat;
+    try { stat = fs.lstatSync(current, { bigint: true }); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      if (createMissingDirectories) {
+        // Only the immediate component is created after its parent passed the
+        // owner/mode gate. Recursive mkdir can follow an untrusted ancestor.
+        fs.mkdirSync(current, { mode: 0o700 });
+        stat = fs.lstatSync(current, { bigint: true });
+      } else {
+        if (allowMissingLeaf && index === segments.length - 1) return;
+        throw error;
+      }
+    }
+    if (stat.isSymbolicLink() || !trusted(stat.uid)) throw new Error("Untrusted POSIX bridge owner or link");
+    if (!stat.isDirectory()) {
+      if (createMissingDirectories || index !== segments.length - 1 || !stat.isFile()) {
+        throw new Error("Untrusted POSIX bridge path type");
+      }
+      // An owner-trusted file can still be modified by a different UID when
+      // its group/other write bits are set. Verify the existing leaf as well
+      // as its ancestors before HTTP I/O or journal recovery.
+      if ((stat.mode & 0o022n) !== 0n) throw new Error("Untrusted POSIX bridge file mode");
+      return;
+    }
+    if ((stat.mode & 0o022n) === 0n) continue;
+    // /tmp-style sticky ancestors can host a private bridge directory. A
+    // different UID cannot rename that trusted-owned child under sticky rules.
+    // The exception never applies to the bridge root or its descendants.
+    const aboveRoot = current !== root && sameOrBelow(root, current);
+    const next = index + 1 < segments.length ? path.join(current, segments[index + 1]) : null;
+    if (!aboveRoot || stat.uid !== 0n || (stat.mode & 0o1000n) === 0n || !next) {
+      throw new Error("Untrusted writable POSIX bridge ancestor");
+    }
+    let child;
+    try { child = fs.lstatSync(next, { bigint: true }); }
+    catch (error) {
+      if (!createMissingDirectories || error.code !== "ENOENT") throw error;
+      // Sticky root-owned /tmp protects only an owner-owned entry. Create the
+      // immediate missing entry with O_EXCL-equivalent mkdir before proceeding.
+      fs.mkdirSync(next, { mode: 0o700 });
+      child = fs.lstatSync(next, { bigint: true });
+    }
+    if (child.isSymbolicLink() || !trusted(child.uid)) {
+      throw new Error("Untrusted POSIX sticky ancestor child");
+    }
+  }
+}
+
+function createPosixTrustedBridgeDirectory(rootDir, directory) {
+  assertPosixTrustedBridgePath(rootDir, directory, false, true);
 }
 
 async function rejectSymlinks(rootDir, targetPath, allowMissing = true) {
@@ -94,7 +166,15 @@ function xml(value) {
 }
 
 function writeResponse(res, status, body = "", headers = {}) {
-  res.writeHead(status, { "Cache-Control": "no-store", ...headers });
+  // A WebDAV error can contain a rejected caller-controlled path. Browsers
+  // must not treat that text as HTML via MIME sniffing. Successful PROPFIND
+  // explicitly overrides this default with the required XML media type.
+  res.writeHead(status, {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Type": "text/plain; charset=utf-8",
+    ...headers,
+  });
   res.end(body);
 }
 
@@ -110,23 +190,94 @@ class LocalSyncWebDavBridge {
     this.protocolJournal = options.protocolJournal || null;
     this.toProtocolOperation = options.toProtocolOperation || null;
     this.onOperation = options.onOperation || (options.journal ? (operation) => options.journal.enqueue(operation) : null);
+    this.windowsAclVerifier = null;
+    this.starting = false;
+    this.startSettled = null;
+    this.listenPending = false;
+    this.stopRequested = false;
+    this.stopping = false;
+    this.stopSettled = null;
     if (!this.token) throw new Error("Local WebDAV bridge bearer token is required");
     if (!isLoopback(this.host)) throw new Error("Local WebDAV bridge must bind to loopback");
     this.server = http.createServer((req, res) => this.handle(req, res));
   }
 
   async start() {
-    await fsp.mkdir(this.rootDir, { recursive: true });
-    await rejectSymlinks(this.rootDir, this.rootDir, false);
-    await fsp.mkdir(this.trashDir, { recursive: true });
-    await rejectSymlinks(this.rootDir, this.trashDir, false);
-    if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
-    await this.recoverPending();
-    await new Promise((resolve, reject) => {
-      this.server.once("error", reject);
-      this.server.listen(this.port, this.host, resolve);
-    });
-    return this.address();
+    // Reject repeated and concurrent starts BEFORE any await or replacement
+    // of the bridge's long-lived native ACL subprocess.
+    if (this.starting || this.stopping || this.server.listening) {
+      throw new Error("Local WebDAV bridge is already starting or listening");
+    }
+    this.starting = true;
+    this.stopRequested = false;
+    let settleStart;
+    this.startSettled = new Promise((resolve) => { settleStart = resolve; });
+    try {
+      if (process.platform === "win32") {
+        await fsp.mkdir(this.rootDir, { recursive: true });
+      } else {
+        if (!sameOrBelow(this.trashDir, this.rootDir) || this.trashDir === this.rootDir) {
+          throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
+        }
+        createPosixTrustedBridgeDirectory(this.rootDir, this.rootDir);
+      }
+      await rejectSymlinks(this.rootDir, this.rootDir, false);
+      assertPosixTrustedBridgePath(this.rootDir, this.rootDir, false);
+      // Reject an unsafe root before creating trash/journal state or replaying
+      // pending mutations. Runtime requests repeat this check because a trusted
+      // actor might later introduce a subtree with a permissive inherited ACL.
+      if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
+      if (process.platform === "win32") await fsp.mkdir(this.trashDir, { recursive: true });
+      else createPosixTrustedBridgeDirectory(this.rootDir, this.trashDir);
+      await rejectSymlinks(this.rootDir, this.trashDir, false);
+      assertPosixTrustedBridgePath(this.rootDir, this.trashDir, false);
+      if (process.platform === "win32") verifyWindowsLocalWebDavTree(this.rootDir);
+      if (this.trashDir === this.rootDir) throw Object.assign(new Error("Trash directory must be below bridge root"), { statusCode: 400 });
+      await this.recoverPending();
+      if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
+      if (process.platform === "win32") {
+        this.windowsAclVerifier = createWindowsLocalWebDavAclVerifier();
+        // Compile/prime the long-lived native ACL worker before accepting
+        // HTTP. Its first use otherwise puts variable PowerShell Add-Type
+        // startup latency on the first authenticated request. This is a
+        // FRESH native check, not a cached ACL approval for later requests.
+        await this.windowsAclVerifier.verify(this.rootDir);
+      }
+      // stop() may cancel the async native warm-up without waiting for it;
+      // prohibit a late listener after such a cancellation. No await occurs
+      // between this cancellation fence and issuing listen.
+      if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
+      this.listenPending = true;
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          this.server.off("error", onError);
+          reject(error);
+        };
+        this.server.once("error", onError);
+        try {
+          this.server.listen(this.port, this.host, () => {
+            this.server.off("error", onError);
+            resolve();
+          });
+        } catch (error) {
+          this.server.off("error", onError);
+          reject(error);
+        }
+      });
+      if (this.stopRequested) throw new Error("Local WebDAV bridge start cancelled by stop");
+      return this.address();
+    } catch (error) {
+      // Failed listen/start must not retain a verifier that a caller has no
+      // reason to stop, including when the underlying server throws.
+      this.windowsAclVerifier?.stop();
+      this.windowsAclVerifier = null;
+      throw error;
+    } finally {
+      this.listenPending = false;
+      this.starting = false;
+      settleStart();
+      this.startSettled = null;
+    }
   }
 
   address() { return this.server.address(); }
@@ -147,6 +298,11 @@ class LocalSyncWebDavBridge {
       const destination = await this.target(destinationPath);
       const source = sourcePath ? await this.target(sourcePath) : null;
       const backup = operation.trash ? path.resolve(this.rootDir, operation.trash) : null;
+      // Journal replay can rename files before the HTTP request guard runs.
+      // The same POSIX ancestry boundary must hold during recovery.
+      assertPosixTrustedBridgePath(this.rootDir, destination);
+      if (source) assertPosixTrustedBridgePath(this.rootDir, source);
+      if (backup) assertPosixTrustedBridgePath(this.rootDir, backup);
       if (backup) await rejectSymlinks(this.rootDir, backup, true);
       const backupExists = backup ? await fsp.lstat(backup).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)) : false;
       const destinationExists = await fsp.lstat(destination).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error));
@@ -213,8 +369,26 @@ class LocalSyncWebDavBridge {
   }
 
   async stop() {
-    if (!this.server.listening) return;
-    await new Promise((resolve) => this.server.close(resolve));
+    if (this.stopping) return this.stopSettled;
+    this.stopping = true;
+    this.stopRequested = true;
+    let settleStop;
+    this.stopSettled = new Promise((resolve) => { settleStop = resolve; });
+    try {
+      // Pre-listen recovery may be unbounded, or may itself await stop().
+      // Cancel immediately in that phase; the start's post-recovery guard
+      // prevents a later listener or native worker. Once listen was issued,
+      // wait for its outcome so stop cannot return with a late HTTP listener.
+      if (this.listenPending && this.startSettled) await this.startSettled;
+      this.windowsAclVerifier?.stop();
+      this.windowsAclVerifier = null;
+      if (!this.server.listening) return;
+      await new Promise((resolve) => this.server.close(resolve));
+    } finally {
+      this.stopping = false;
+      settleStop();
+      this.stopSettled = null;
+    }
   }
 
   authorized(req) {
@@ -231,6 +405,24 @@ class LocalSyncWebDavBridge {
     if (sameOrBelow(target, this.trashDir)) throw Object.assign(new Error("Internal trash path is not accessible"), { statusCode: 400 });
     const parent = await canonicalPath(this.rootDir, path.dirname(target), false);
     return path.join(parent, path.basename(target));
+  }
+
+  async verifyWindowsItem(target) {
+    // One framed native check verifies the selected leaf (if present) and
+    // its private parent. A missing leaf still needs a trusted parent before
+    // PUT/MKCOL. Pin inode identity across the asynchronous ACL lookup.
+    const original = await fsp.lstat(target, { bigint: true }).catch((error) =>
+      error.code === "ENOENT" ? null : Promise.reject(error));
+    if (original?.isFile()) await this.windowsAclVerifier.verifyFile(target);
+    else await this.windowsAclVerifier.verify(original ? target : path.dirname(target));
+    if (original) {
+      const current = await fsp.lstat(target, { bigint: true });
+      if (current.dev !== original.dev || current.ino !== original.ino
+        || current.isDirectory() !== original.isDirectory()
+        || current.isFile() !== original.isFile()) {
+        throw new Error("Bridge item identity changed during ACL verification");
+      }
+    }
   }
 
   async body(req) {
@@ -260,6 +452,25 @@ class LocalSyncWebDavBridge {
       safeSegments(String(req.url || "/").split("?", 1)[0]);
       const parsed = new URL(req.url, "http://localhost");
       const target = await this.target(parsed.pathname);
+      if (process.platform !== "win32") {
+        try { assertPosixTrustedBridgePath(this.rootDir, target); }
+        catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+      }
+      if (process.platform === "win32") {
+        // NTFS O_NOFOLLOW protects the leaf but not an ancestor junction.
+        // A transient swap can open an outside-root inode, restore the safe
+        // pathname, then pass every later lstat/fstat comparison. An untrusted
+        // local SID with Modify/DELETE_CHILD on ANY ancestor or descendant
+        // could race an authenticated request. Startup proves the full tree;
+        // each request revalidates the selected leaf (if present), its parent,
+        // and ALL ancestors without rescanning unrelated data.
+        // This excludes actors
+        // with trusted owner/admin privileges; no pathname recheck solves that.
+        try {
+          await this.verifyWindowsItem(target);
+        }
+        catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+      }
       if (req.method === "OPTIONS") return writeResponse(res, 204, "", { DAV: "1", Allow: "OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, MOVE, DELETE" });
       if (req.method === "PROPFIND") {
         const depth = String(req.headers.depth || "0");
@@ -268,17 +479,82 @@ class LocalSyncWebDavBridge {
         if (depth === "1" && (await fsp.lstat(target)).isDirectory()) {
           for (const entry of await fsp.readdir(target, { withFileTypes: true })) {
             if (entry.isSymbolicLink()) continue;
-            results.push(await this.properties(path.join(target, entry.name), `${parsed.pathname.replace(/\/$/, "")}/${entry.name}`));
+            const child = path.join(target, entry.name);
+            if (process.platform !== "win32") {
+              try { assertPosixTrustedBridgePath(this.rootDir, child, false); }
+              catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+            }
+            results.push(await this.properties(child, `${parsed.pathname.replace(/\/$/, "")}/${entry.name}`));
           }
         }
         return writeResponse(res, 207, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${results.join("")}</d:multistatus>`, { "Content-Type": "application/xml; charset=utf-8" });
       }
       if (["GET", "HEAD"].includes(req.method)) {
-        const stats = await fsp.lstat(target);
-        if (!stats.isFile()) return writeResponse(res, 405, "Not a file");
-        res.writeHead(200, { "Content-Length": stats.size, "Cache-Control": "no-store" });
-        if (req.method === "HEAD") return res.end();
-        return fs.createReadStream(target).pipe(res);
+        // Opening a pathname only when the stream begins would let a local
+        // rename/symlink swap serve a different file than the one authorized.
+        // Pin a regular, single-link inode before emitting success headers;
+        // close only that descriptor, never reopen the mutable pathname.
+        let fd;
+        try {
+          // A pathname can be swapped for a FIFO between admission checks
+          // and open. Blocking O_RDONLY would freeze this HTTP event loop.
+          // Pin a nonblocking FD *before* trusting any pathname stat, then
+          // authorize only the same regular inode after its identity recheck.
+          fd = fs.openSync(target, fs.constants.O_RDONLY
+            | (fs.constants.O_NONBLOCK || 0)
+            | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+          const opened = fs.fstatSync(fd, { bigint: true });
+          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n) {
+            return writeResponse(res, 405, "Not a regular file");
+          }
+          const named = fs.lstatSync(target, { bigint: true });
+          const again = fs.lstatSync(target, { bigint: true });
+          const same = (a, b) => a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
+            && a.dev === b.dev && a.ino === b.ino && a.size === b.size
+            && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+          if (!same(named, opened) || !same(opened, again)
+            || opened.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw Object.assign(new Error("WebDAV source identity changed"), { statusCode: 409 });
+          }
+          await rejectSymlinks(this.rootDir, target, false);
+          res.writeHead(200, {
+            "Content-Length": Number(opened.size), "Cache-Control": "no-store",
+            "Content-Type": "application/octet-stream", "X-Content-Type-Options": "nosniff",
+          });
+          if (req.method === "HEAD") {
+            fs.closeSync(fd);
+            fd = undefined;
+            return res.end();
+          }
+          if (opened.size === 0n) {
+            fs.closeSync(fd);
+            fd = undefined;
+            return res.end();
+          }
+          // A foreign UID may retain an old writable descriptor even after
+          // the owner makes this inode read-only. A later append must never
+          // overrun the already advertised HTTP Content-Length and corrupt
+          // the framing of a subsequent response on this connection.
+          const stream = fs.createReadStream(null, {
+            fd, autoClose: true, start: 0, end: Number(opened.size) - 1,
+          });
+          fd = undefined;
+          let sent = 0;
+          stream.on("data", (chunk) => { sent += chunk.length; });
+          stream.once("end", () => {
+            // Shrinking the same inode is the dual of append: pipe() would
+            // finish a short Content-Length body and leave keep-alive waiting
+            // for attacker-controlled bytes from a subsequent HTTP response.
+            if (sent !== Number(opened.size)) res.destroy();
+          });
+          // pipe() only unpipes on client abort; it does not guarantee the
+          // source ReadStream closes its pinned FD before end-of-file.
+          res.once("close", () => stream.destroy());
+          stream.once("error", () => res.destroy());
+          return stream.pipe(res);
+        } finally {
+          if (fd !== undefined) fs.closeSync(fd);
+        }
       }
       if (req.method === "PUT") {
         if (target === this.rootDir) return writeResponse(res, 400, "Invalid target");
@@ -306,22 +582,53 @@ class LocalSyncWebDavBridge {
         let staged = false;
         let installed = false;
         let protocolQueued = false;
+        let ownedTemporary = null;
+        const stillOwned = (named) => ownedTemporary && named.isFile()
+          && !named.isSymbolicLink() && named.nlink === 1n
+          && named.dev === ownedTemporary.dev && named.ino === ownedTemporary.ino;
         try {
-          await fsp.writeFile(temporary, data, { mode: 0o600 });
+          // O_EXCL is essential even with a random basename: a preexisting
+          // collision must never be truncated, and its owner never becomes us.
+          const handle = await fsp.open(temporary, "wx", 0o600);
+          try {
+            const created = await handle.stat({ bigint: true });
+            if (!created.isFile() || created.nlink !== 1n) throw new Error("Unsafe PUT staging file");
+            ownedTemporary = { dev: created.dev, ino: created.ino };
+            await handle.writeFile(data);
+            const written = await handle.stat({ bigint: true });
+            if (!stillOwned(written) || written.size !== BigInt(data.length)) {
+              throw new Error("PUT staging file identity changed");
+            }
+          } finally { await handle.close(); }
+          if (!stillOwned(await fsp.lstat(temporary, { bigint: true }))) {
+            throw new Error("PUT staging pathname changed");
+          }
           if (backup) {
             await rejectSymlinks(this.rootDir, backup, true);
             await fsp.rename(target, backup);
             staged = true;
             await this.updateJournal(operationId, { phase: "staged" });
           }
+          if (!stillOwned(await fsp.lstat(temporary, { bigint: true }))) {
+            throw new Error("PUT staging pathname changed");
+          }
           await fsp.rename(temporary, target);
+          ownedTemporary = null;
           installed = true;
           await this.updateJournal(operationId, { phase: "source-moved" });
           protocolQueued = await this.enqueueProtocol(operation);
           if (protocolQueued) await this.updateJournal(operationId, { phase: "protocol-queued" });
           try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
         } catch (error) {
-          await fsp.rm(temporary, { force: true }).catch(() => {});
+          // A failed O_EXCL open or replaced pathname is not ours to remove.
+          // Check the opened inode, not merely the predictable temporary name.
+          if (ownedTemporary) {
+            try {
+              if (stillOwned(await fsp.lstat(temporary, { bigint: true }))) {
+                await fsp.unlink(temporary);
+              }
+            } catch (_) { /* missing or inaccessible: never delete an unverified name */ }
+          }
           if (error.protocolQueueUncertain) return writeResponse(res, existing ? 204 : 201);
           if (protocolQueued) return writeResponse(res, existing ? 204 : 201);
           if (installed) await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
@@ -332,8 +639,20 @@ class LocalSyncWebDavBridge {
       }
       if (req.method === "MKCOL") {
         if (target === this.rootDir) return writeResponse(res, 405, "Already exists");
-        await fsp.mkdir(target, { recursive: false });
+        // MKCOL must never inherit a permissive process umask (including
+        // umask 000): otherwise another local UID can write under this
+        // authenticated WebDAV collection without presenting the bearer.
+        await fsp.mkdir(target, { recursive: false, mode: 0o700 });
         await rejectSymlinks(this.rootDir, target, false);
+        if (process.platform !== "win32") {
+          assertPosixTrustedBridgePath(this.rootDir, target, false);
+          const created = await fsp.lstat(target, { bigint: true });
+          if (!created.isDirectory() || created.isSymbolicLink()
+            || created.uid !== BigInt(process.getuid())
+            || (created.mode & 0o777n) !== 0o700n) {
+            throw Object.assign(new Error("Untrusted POSIX MKCOL owner or mode"), { statusCode: 503 });
+          }
+        }
         return writeResponse(res, 201);
       }
       if (req.method === "MOVE") return await this.move(req, res, target, parsed);
@@ -356,6 +675,10 @@ class LocalSyncWebDavBridge {
   async move(req, res, source, parsed) {
     if (source === this.rootDir) return writeResponse(res, 400, "Cannot move root");
     const destination = await this.destination(req);
+    if (process.platform !== "win32") {
+      try { assertPosixTrustedBridgePath(this.rootDir, destination.target); }
+      catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
+    }
     if (destination.target === source) return writeResponse(res, 400, "Source and destination are identical");
     let existingTarget = destination.target;
     let destinationTarget = destination.target;
@@ -375,6 +698,10 @@ class LocalSyncWebDavBridge {
         destinationTarget = path.join(canonicalParent, path.basename(destination.target));
       }
       destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
+      // The Destination header can select a different directory than the
+      // authenticated source; its ancestry must be independently trusted.
+      try { await this.verifyWindowsItem(destinationTarget); }
+      catch { return writeResponse(res, 503, "Untrusted bridge storage"); }
     }
     if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
     if (existingStats && (await fsp.lstat(source)).isDirectory() !== existingStats.isDirectory()) return writeResponse(res, 409, "Cannot overwrite a file with a collection or vice versa");

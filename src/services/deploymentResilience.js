@@ -2,7 +2,8 @@
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const { canonicalJson, validateOperation } = require("../../sync-client/rootark-sync-protocol");
+const { canonicalJson, validateStoredOperation } = require("../../sync-client/rootark-sync-protocol");
+const { assertAtomicDeviceRegistry } = require("./syncAtomicDeviceRegistry");
 
 const SAFE_PROVIDER_CODES = new Set([
   "configuration", "unsupported_provider", "invalid_path", "invalid_prefix", "foreign_prefix",
@@ -99,7 +100,7 @@ function stableValue(value) {
   if (value && typeof value === "object") return Object.keys(value).sort().reduce((result, key) => {
     result[key] = stableValue(value[key]);
     return result;
-  }, {});
+  }, Object.create(null));
   return value;
 }
 
@@ -188,9 +189,13 @@ function expectedAad(record) {
 function attestCiphertextOnlyRecords(records) {
   if (!Array.isArray(records)) throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" });
   for (const record of records) {
-    assertNoProtectedSecrets(record);
+    // A signed device authorization is public proof, not a credential. Scan
+    // its contents for secrets while allowing this one protocol field itself.
+    const { authorization, ...fields } = record;
+    assertNoProtectedSecrets(fields);
+    assertNoProtectedSecrets(authorization);
     let normalized;
-    try { normalized = validateOperation(record); } catch { throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" }); }
+    try { normalized = validateStoredOperation(record); } catch { throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" }); }
     decodeBase64Url(normalized.ciphertext, "ciphertext");
     decodeBase64Url(normalized.nonce, "nonce");
     decodeBase64Url(normalized.tag, "tag");
@@ -204,6 +209,9 @@ function attestCiphertextOnlySyncState(state) {
   if (!state || ![1, 2].includes(state.version) || !state.users || typeof state.users !== "object") {
     throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" });
   }
+  // An opt-in co-located registry contains only public Ed25519 keys and
+  // revocation epochs. Reject unexpected fields or secrets in that section.
+  if (Object.hasOwn(state, "deviceRegistry")) assertAtomicDeviceRegistry(state.deviceRegistry);
   const records = [];
   for (const user of Object.values(state.users)) {
     if (!user || typeof user !== "object" || !user.objects || typeof user.objects !== "object") {

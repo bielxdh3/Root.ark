@@ -1,4 +1,5 @@
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 
 // This verifier is the final authority for protected on-disk ciphertext and
 // its co-located device registry. Executing a PATH-selected powershell.exe
@@ -137,6 +138,27 @@ public static class RootarkChunkAclNative {
       AssertAuthorityFile(root, trusted);
       return String.Empty;
     }
+    if (action == "verify-bridge-directory") {
+      // The full tree is verified at bridge startup. At each request, pin the
+      // ACL trust boundary for the specific directory containing the target;
+      // scanning every unrelated file would make GET O(total tree size).
+      AssertTrustedOwnerAndSafeAncestors(root, trusted);
+      AssertDirectoryNoReparse(root);
+      AssertRestrictedItem(root, false, trusted);
+      return String.Empty;
+    }
+    if (action == "verify-bridge-file") {
+      // The parent must remain a trusted directory, and the leaf must not
+      // acquire a writable/readable foreign ACE after the startup tree scan.
+      AssertTrustedOwnerAndSafeAncestors(root, trusted);
+      string parent = Path.GetDirectoryName(root);
+      AssertDirectoryNoReparse(parent);
+      AssertRestrictedItem(parent, false, trusted);
+      if ((File.GetAttributes(root) & FileAttributes.Directory) != 0)
+        throw new InvalidOperationException("Bridge leaf must be a file");
+      AssertRestrictedItem(root, false, trusted);
+      return String.Empty;
+    }
     AssertTrustedOwnerAndSafeAncestors(root, trusted);
     if (action == "create") {
       if (!Directory.Exists(root)) {
@@ -156,7 +178,7 @@ public static class RootarkChunkAclNative {
       AssertDirectoryNoReparse(root);
       return String.Empty;
     }
-    if (action == "verify") {
+    if (action == "verify" || action == "verify-bridge") {
       // Concurrent trusted SQLite writers may delete transient WAL/SHM files
       // after enumeration but before the ACL query. Restart the ENTIRE scan,
       // including ancestry and root, only for positively identified absence;
@@ -165,7 +187,11 @@ public static class RootarkChunkAclNative {
         try {
           AssertTrustedOwnerAndSafeAncestors(root, trusted);
           AssertDirectoryNoReparse(root);
-          AssertRestrictedItem(root, true, trusted);
+          // Existing user-selected WebDAV roots can inherit a safe DACL from
+          // a private parent. Require identical trusted principals/full access
+          // on every item, but do not demand a protected root ACL for this
+          // bridge-only mode. The original "verify" contract remains strict.
+          AssertRestrictedItem(root, action == "verify", trusted);
           Stack<string> pending = new Stack<string>();
           pending.Push(root);
           while (pending.Count > 0) {
@@ -193,9 +219,18 @@ public static class RootarkChunkAclNative {
 }
 `;
 
+// Windows CreateProcess limits the *entire* argv command line to 32,767
+// characters. Base64-encoding the full C# source plus a long owner-private
+// path can exceed that limit even though the ACL itself is perfectly valid.
+// The bridge verifier already compiles this exact comment/blank-free source;
+// reuse it for the one-shot pinned PowerShell invocations, without removing
+// a single native security check or changing the fail-closed behavior.
+const COMPACT_NATIVE_ACL = NATIVE_ACL.replace(/^[ \t]*\/\/[^\r\n]*\r?\n/gm, "")
+  .replace(/^[ \t]*\r?\n/gm, "");
+
 function runAclScript(rootDir, action) {
   const escapedRoot = rootDir.replace(/'/g, "''");
-  const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
+  const script = `Add-Type -TypeDefinition @'\n${COMPACT_NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
     // Pin every ACL action, not only authority verification, while retaining
@@ -217,6 +252,178 @@ function verifyWindowsChunkUploadTree(rootDir) {
   runAclScript(rootDir, "verify");
 }
 
+function verifyWindowsLocalWebDavTree(rootDir) {
+  if (process.platform !== "win32") return;
+  runAclScript(rootDir, "verify-bridge");
+}
+
+function verifyWindowsLocalWebDavDirectory(directory) {
+  if (process.platform !== "win32") return;
+  runAclScript(directory, "verify-bridge-directory");
+}
+
+// A bridge owns one long-lived, isolated PowerShell subprocess. Compile the
+// native ACL verifier ONCE, then perform a fresh native ACL lookup for EACH
+// request. The pipe is private to the child process; no PATH lookup, shell,
+// temporary script, TTL, optimistic cache, or skipped check is involved.
+// A single worker and at most 16 waiting requests bound native admission.
+function createWindowsLocalWebDavAclVerifier() {
+  if (process.platform !== "win32") {
+    return { verify: async () => {}, verifyFile: async () => {}, stop: () => {} };
+  }
+  // Windows CreateProcess has a 32K command-line limit. The native source is
+  // shared with the one-shot verifier; omit comment-only/blank C# lines from
+  // this EncodedCommand rather than weakening checks or spawning per request.
+  const script = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n${COMPACT_NATIVE_ACL}\n'@\n` + String.raw`
+[Console]::Out.WriteLine('READY')
+[Console]::Out.Flush()
+while ($true) {
+  $line = [Console]::ReadLine()
+  if ($null -eq $line) { break }
+  if ($line.Length -gt 131072) { break }
+  $parts = $line.Split('|')
+  if ($parts.Length -ne 3 -or $parts[0] -cnotmatch '^[a-f0-9]{32}$' -or ($parts[1] -cne 'D' -and $parts[1] -cne 'F')) { break }
+  $nonce = $parts[0]
+  try {
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $item = $utf8.GetString([Convert]::FromBase64String($parts[2]))
+    $action = if ($parts[1] -ceq 'F') { 'verify-bridge-file' } else { 'verify-bridge-directory' }
+    [void][RootarkChunkAclNative]::Ensure($item, $action)
+    [Console]::Out.WriteLine($nonce + '|OK')
+  } catch {
+    [Console]::Out.WriteLine($nonce + '|DENY')
+  }
+  [Console]::Out.Flush()
+}
+`;
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const MAX_WAITING = 16;
+  const CHECK_DEADLINE_MS = 12000;
+  let closed = false;
+  let worker = null;
+  let ready = false;
+  let output = "";
+  let errorOutput = "";
+  let active = null;
+  const queue = [];
+  const rejectCheck = () => new Error("Windows bridge ACL validation failed");
+
+  function finish(job, error) {
+    if (job.finished) return;
+    job.finished = true;
+    clearTimeout(job.timer);
+    if (error) job.reject(rejectCheck());
+    else job.resolve();
+  }
+  function failWorker() {
+    const old = worker;
+    worker = null;
+    ready = false;
+    output = "";
+    errorOutput = "";
+    if (old) {
+      old.stdout.removeAllListeners("data");
+      old.stderr.removeAllListeners("data");
+      old.kill();
+    }
+    if (active) { finish(active, true); active = null; }
+    while (queue.length) finish(queue.shift(), true);
+  }
+  function sendNext() {
+    if (!ready || !worker || active || closed) return;
+    let next;
+    do { next = queue.shift(); } while (next?.finished);
+    if (!next) return;
+    active = next;
+    const nonce = crypto.randomBytes(16).toString("hex");
+    next.nonce = nonce;
+    const bytes = Buffer.from(next.directory, "utf8").toString("base64");
+    try {
+      if (!worker.stdin.write(nonce + "|" + next.kind + "|" + bytes + "\n")) {
+        // Pipe backpressure is bounded by one in-flight request. The response
+        // cannot authorize a read without an exact matching nonce either way.
+      }
+    } catch (_) { failWorker(); }
+  }
+  function onLine(line) {
+    if (!ready) {
+      if (line !== "READY") return failWorker();
+      ready = true;
+      return sendNext();
+    }
+    if (!active || line !== active.nonce + "|OK" && line !== active.nonce + "|DENY") {
+      return failWorker();
+    }
+    const job = active;
+    active = null;
+    finish(job, line.endsWith("|DENY"));
+    sendNext();
+  }
+  function startWorker() {
+    if (worker || closed) return;
+    try {
+      const child = spawn(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive",
+        "-OutputFormat", "Text", "-EncodedCommand", encoded], {
+        windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+      });
+      worker = child;
+      ready = false;
+      output = "";
+      errorOutput = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (data) => {
+        if (worker !== child) return;
+        output += data;
+        if (output.length > 4096) return failWorker();
+        let index;
+        while (worker === child && (index = output.indexOf("\n")) !== -1) {
+          const line = output.slice(0, index).replace(/\r$/, "");
+          output = output.slice(index + 1);
+          onLine(line);
+        }
+      });
+      child.stderr.on("data", (data) => {
+        if (worker !== child) return;
+        errorOutput += data.toString("utf8");
+        // Windows PowerShell writes only this empty CLIXML prologue to its
+        // redirected error stream on successful native console startup.
+        // Any actual error record or unexpected stderr content kills the
+        // authority subprocess and denies all outstanding requests.
+        const harmlessHeader = "#< CLIXML\r\n";
+        if (!harmlessHeader.startsWith(errorOutput)
+          && errorOutput !== harmlessHeader) failWorker();
+      });
+      child.stdin.on("error", () => { if (worker === child) failWorker(); });
+      child.on("error", () => { if (worker === child) failWorker(); });
+      child.on("exit", () => { if (worker === child) failWorker(); });
+    } catch (_) { failWorker(); }
+  }
+  function enqueue(directory, kind) {
+      if (closed || typeof directory !== "string" || !directory.length
+        || Buffer.byteLength(directory, "utf8") > 65000
+        || queue.length >= MAX_WAITING) return Promise.reject(rejectCheck());
+      return new Promise((resolve, reject) => {
+        const job = { directory, kind, resolve, reject, nonce: "", finished: false };
+        job.timer = setTimeout(() => {
+          // If the child is blocked or its output is missing/ambiguous, fail
+          // ALL unfinished checks, kill it, and never accept a late response.
+          failWorker();
+        }, CHECK_DEADLINE_MS);
+        queue.push(job);
+        startWorker();
+        sendNext();
+      });
+  }
+  return {
+    verify(directory) { return enqueue(directory, "D"); },
+    verifyFile(filename) { return enqueue(filename, "F"); },
+    stop() {
+      closed = true;
+      failWorker();
+    },
+  };
+}
+
 function getWindowsChunkAclDescriptor(rootDir) {
   if (process.platform !== "win32") throw new Error("Windows ACL inspection is only available on Windows");
   return runAclScript(rootDir, "sddl");
@@ -228,4 +435,5 @@ function verifyWindowsAuthorityFilePath(filename) {
 }
 
 module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
-  verifyWindowsAuthorityFilePath, NATIVE_ACL, TRUSTED_POWERSHELL };
+  verifyWindowsAuthorityFilePath, verifyWindowsLocalWebDavTree, verifyWindowsLocalWebDavDirectory,
+  createWindowsLocalWebDavAclVerifier, NATIVE_ACL, TRUSTED_POWERSHELL };

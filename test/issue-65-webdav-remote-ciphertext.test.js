@@ -415,6 +415,27 @@ test("WebDAV remote errors, redirect, truncated/oversized/corrupt data fail clos
   }
 });
 
+test("Windows private cloud ACL admits long protected path but rejects an embedded junction", async (t) => {
+  if (process.platform !== "win32") return t.skip("native Windows ACL command-line regression");
+  const root = await createZk1PrivateCloudStagingDirectory("rootark-zk1-webdav-parent-race-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const authorized = path.join(root, "authorized-ordinary-directory");
+  // This owner-private path is long enough to exceed Windows CreateProcess's
+  // command-line limit if a full native C# verifier is base64-encoded inline.
+  await checkWindowsPrivateCloudDirectory(authorized, "create");
+  await checkWindowsPrivateCloudDirectory(authorized, "verify");
+  const foreign = path.join(root, "foreign");
+  fs.mkdirSync(foreign);
+  const marker = path.join(foreign, "keep.txt");
+  fs.writeFileSync(marker, "untouched", { flag: "wx" });
+  fs.symlinkSync(foreign, path.join(authorized, "junction"), "junction");
+  await assert.rejects(checkWindowsPrivateCloudDirectory(authorized, "verify"),
+    /Unverifiable private cloud directory/,
+  "the same native ACL verifier must still deny untrusted reparse points");
+  assert.equal(fs.readFileSync(marker, "utf8"), "untouched");
+  assert.equal(fs.existsSync(path.join(foreign, "ciphertext.ct")), false);
+});
+
 test("WebDAV must reject download parent replaced by a junction or fresh directory during GET", async (t) => {
   const f = await fixture(t);
   const { publisher, reader, writer } = await f.makePair();

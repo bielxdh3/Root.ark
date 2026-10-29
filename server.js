@@ -631,14 +631,14 @@ function getCreatedUserSessionVersion(username) {
   return Object.hasOwn(generations, username) ? generations[username] + 1 : 0;
 }
 
-function saveUsers(users) {
+function saveUsers(users, options = {}) {
   const passwordHashesToValidate = trustedUserPasswordHashes === null
     ? users
     : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
   if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
     throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
   }
-  if (shouldUseDatabase()) usersRepository.saveUsers(users);
+  if (shouldUseDatabase()) usersRepository.saveUsers(users, options);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
     const temporaryFile = `${USERS_FILE}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
@@ -651,6 +651,13 @@ function saveUsers(users) {
     }
   }
   trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
+}
+
+function commitSyncResumeProof(claim) {
+  if (!shouldUseDatabase() || shouldWriteLegacyJson()) {
+    throw new Error("Sync 2FA resume requires one authoritative SQLite account store");
+  }
+  return usersRepository.commitSyncResumeProof(claim);
 }
 
 function getBasePermissions() {
@@ -4034,7 +4041,7 @@ function normalizeFilePermissionEntry(entry) {
   };
 }
 
-function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, ...user }) {
+function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, storageRevision, ...user }) {
   return user;
 }
 
@@ -6067,6 +6074,10 @@ wss.on("connection", (socket, req) => {
 
 const requirePermission = createRequirePermission();
 
+if (process.env.SYNC_ATOMIC_DEVICE_REGISTRY !== undefined
+  && !["true", "false"].includes(process.env.SYNC_ATOMIC_DEVICE_REGISTRY)) {
+  throw new Error("SYNC_ATOMIC_DEVICE_REGISTRY must be explicitly true or false");
+}
 registerSyncRoutes({
   app,
   authenticate,
@@ -6074,10 +6085,13 @@ registerSyncRoutes({
   storagePath: process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json",
   requireDeviceAuthorization: true,
   deviceRegistryPath: process.env.SYNC_DEVICE_REGISTRY || "",
+  atomicDeviceRegistry: process.env.SYNC_ATOMIC_DEVICE_REGISTRY === "true",
   auditLog,
   bcrypt,
   loadUsers,
   saveUsers,
+  commitSyncResumeProof: shouldUseDatabase() && !shouldWriteLegacyJson()
+    ? commitSyncResumeProof : null,
   getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 
@@ -6227,7 +6241,7 @@ app.post("/users", authenticate, requirePermission("manageUsers"), async (req, r
     sessionVersion: getCreatedUserSessionVersion(username),
   });
 
-  saveUsers(users);
+  saveUsers(users, { allowRecreateUsernames: [username] });
   auditLog("user.created", getAuditActor(req), { type: "user", id: username }, "created", "success", {
     role: role || "user",
     permissions: finalPermissions,
@@ -6315,7 +6329,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   }
 
   if (shouldWriteLegacyJson()) rememberUserGenerations(users);
-  saveUsers(filtered);
+  saveUsers(filtered, { expectedDeletedUsers: users.filter((u) => u.username === req.params.username) });
   removeUserFromFilePermissions(req.params.username);
   removeUserFromFolderPermissions(req.params.username);
   auditLog("user.deleted", getAuditActor(req), { type: "user", id: req.params.username }, "deleted", "success", {

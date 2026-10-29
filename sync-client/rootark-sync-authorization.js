@@ -48,9 +48,10 @@ function exact(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !PROOF_FIELDS.includes(key)) || PROOF_FIELDS.some((key) => !Object.hasOwn(value, key))) fail("Invalid authorization schema");
 }
 
-function proofCore(operation, options) {
-  const expiresAt = Number(options.expiresAt || Date.now() + 5 * 60 * 1000);
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) fail("Authorization expired");
+function proofCore(operation, options, requireFresh = true) {
+  const expiresAt = options.expiresAt === undefined ? Date.now() + 5 * 60 * 1000 : options.expiresAt;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0
+    || (requireFresh && expiresAt <= Date.now())) fail("Authorization expired");
   const replayId = options.replayId || crypto.randomBytes(16).toString("base64url");
   const idempotencyKey = options.idempotencyKey === undefined ? generateIdempotencyKey() : options.idempotencyKey;
   if (!isValidIdempotencyKey(idempotencyKey)) fail("Invalid device authorization");
@@ -95,14 +96,31 @@ async function createAuthorizationProof(operation, options = {}) {
   return core;
 }
 
-async function verifyAuthorizationProof(proof, operation, expected = {}) {
+async function verifyAuthorizationProofInternal(proof, operation, expected, requireFresh) {
   exact(proof);
   const normalized = { ...proof };
   if (!isValidIdempotencyKey(normalized.idempotencyKey)) fail("Invalid device authorization");
   if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
-  if (normalized.expiresAt < Date.now()) fail("Authorization expired", "authorization_expired");
+  if (!Number.isSafeInteger(normalized.expiresAt) || normalized.expiresAt <= 0) fail("Invalid authorization expiry");
+  if (requireFresh && normalized.expiresAt <= Date.now()) fail("Authorization expired", "authorization_expired");
   if (normalized.protocolVersion !== operation.protocolVersion || normalized.username !== expected.username || normalized.deviceId !== operation.deviceId) fail("Authorization scope mismatch", "authorization_scope");
-  const expectedCore = proofCore(operation, { username: normalized.username, publicKey: normalized.publicKey, expiresAt: normalized.expiresAt, replayId: normalized.replayId, idempotencyKey: normalized.idempotencyKey });
+  const pins = expected.trustedDevicePublicKeys;
+  const pinned = pins && typeof pins === "object" && !Array.isArray(pins)
+    && Object.hasOwn(pins, normalized.deviceId) ? pins[normalized.deviceId] : null;
+  // A signed envelope proves control of the *supplied* key. Authorization
+  // always requires an independently provisioned device-to-key binding.
+  // Do not permit callers to omit the pin option and silently downgrade
+  // this public verification API into self-enrollment.
+  if (typeof pinned !== "string" || pinned !== normalized.publicKey) {
+    fail("Device signing key is not trusted", "authorization_device_untrusted");
+  }
+  if (expected.revokedDeviceIds !== undefined) {
+    if (!Array.isArray(expected.revokedDeviceIds)
+      || expected.revokedDeviceIds.includes(normalized.deviceId)) {
+      fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
+    }
+  }
+  const expectedCore = proofCore(operation, { username: normalized.username, publicKey: normalized.publicKey, expiresAt: normalized.expiresAt, replayId: normalized.replayId, idempotencyKey: normalized.idempotencyKey }, requireFresh);
   for (const field of ["operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
     if (JSON.stringify(normalized[field]) !== JSON.stringify(expectedCore[field])) fail("Authorization payload mismatch", "authorization_scope");
   }
@@ -111,4 +129,15 @@ async function verifyAuthorizationProof(proof, operation, expected = {}) {
   return true;
 }
 
-module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof };
+function verifyAuthorizationProof(proof, operation, expected = {}) {
+  return verifyAuthorizationProofInternal(proof, operation, expected, true);
+}
+
+// Only for reading an operation already admitted by the sync inventory. Keep
+// signature, independent device pin, scope and current revocation checks; a
+// historical expiry cannot be replayed through the fresh ingress verifier.
+function verifyHistoricalAuthorizationProof(proof, operation, expected = {}) {
+  return verifyAuthorizationProofInternal(proof, operation, expected, false);
+}
+
+module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof, verifyHistoricalAuthorizationProof };
