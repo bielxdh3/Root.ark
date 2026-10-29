@@ -496,13 +496,18 @@ class LocalSyncWebDavBridge {
         // close only that descriptor, never reopen the mutable pathname.
         let fd;
         try {
-          const named = fs.lstatSync(target, { bigint: true });
-          if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n) {
-            return writeResponse(res, 405, "Not a regular file");
-          }
+          // A pathname can be swapped for a FIFO between admission checks
+          // and open. Blocking O_RDONLY would freeze this HTTP event loop.
+          // Pin a nonblocking FD *before* trusting any pathname stat, then
+          // authorize only the same regular inode after its identity recheck.
           fd = fs.openSync(target, fs.constants.O_RDONLY
+            | (fs.constants.O_NONBLOCK || 0)
             | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
           const opened = fs.fstatSync(fd, { bigint: true });
+          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n) {
+            return writeResponse(res, 405, "Not a regular file");
+          }
+          const named = fs.lstatSync(target, { bigint: true });
           const again = fs.lstatSync(target, { bigint: true });
           const same = (a, b) => a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
             && a.dev === b.dev && a.ino === b.ino && a.size === b.size
