@@ -123,6 +123,55 @@ test("revocation committed before sync put must fence operation across authoriza
     expectedEpoch: 2 }), { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" }, "revoked ID must not silently re-enroll");
 });
 
+test("strict HTTP store denies missing and forged device proof before any ciphertext commit", async (t) => {
+  configureStrictSqliteAuthority(t);
+  const directory = await isolatedRegistryDirectory("rootark-sync-http-proof-guard-");
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const storagePath = path.join(directory, "objects.json");
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const attacker = crypto.generateKeyPairSync("ed25519");
+  const exportKey = (key) => key.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const app = express();
+  app.use(express.json());
+  const routes = registerSyncRoutes({ app, storagePath,
+    atomicDeviceRegistry: true, requireDeviceAuthorization: true,
+    authenticate: (req, _res, next) => { req.user = { username: "alice", sessionVersion: 0,
+      permissions: { upload: true, delete: true } }; next(); },
+    requirePermission: () => (_req, _res, next) => next() });
+  await routes.ready;
+  await routes.store.enrollDevice({ username: "alice", deviceId: "device-a",
+    publicKey: exportKey(owner), expectedEpoch: 0 });
+  const server = await new Promise((resolve) => {
+    const listening = app.listen(0, "127.0.0.1", () => resolve(listening));
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const make = (suffix) => createOperation({ operation: "create", objectId: `object-${suffix}`,
+    fileId: `file-${suffix}`, versionId: `version-${suffix}`,
+    operationId: `operation-${suffix}`, deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: `${suffix}.txt` }, plaintext: Buffer.from("opaque"),
+    fileKey: crypto.randomBytes(32) });
+
+  const unsigned = make("unsigned");
+  assert.equal(await post(server.address().port, unsigned), 403);
+  const forged = make("forged");
+  forged.authorization = await createAuthorizationProof(forged, { username: "alice",
+    privateKey: attacker.privateKey, publicKey: exportKey(attacker) });
+  assert.equal(await post(server.address().port, forged), 403);
+  assert.deepEqual(routes.store.list("alice"), [],
+    "neither missing nor attacker-signed proof may persist ciphertext");
+
+  const authorized = make("authorized");
+  authorized.authorization = await createAuthorizationProof(authorized, { username: "alice",
+    privateKey: owner.privateKey, publicKey: exportKey(owner) });
+  assert.equal(await post(server.address().port, authorized), 201);
+  assert.deepEqual(routes.store.list("alice").map((entry) => entry.objectId), [authorized.objectId]);
+  const legacyProcess = await new SyncObjectStore(storagePath).open();
+  await assert.rejects(legacyProcess.put("alice", make("unsigned-downgrade")),
+    { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" },
+    "an unsigned legacy process sharing the protected store cannot downgrade it");
+});
+
 test("strict co-located mode rejects an external registry or callback and refuses unmigrated stores", async (t) => {
   const directory = await isolatedRegistryDirectory("rootark-sync-registry-strict-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
