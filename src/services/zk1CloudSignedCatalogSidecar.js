@@ -217,29 +217,34 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   const limit = deadline || createZk1ProviderDeadline({ deadlineMs, parentSignal: abortSignal });
   const address = copyAddress(scope, operationId);
   const recovered = [];
+  // One owner-verified private root is sufficient for one recovery attempt.
+  // Keep each provider's bytes in a distinct exclusive file within that root:
+  // repeated native ACL subprocesses during sequential GETs can exhaust the
+  // unchanged shared provider deadline under Windows load.
+  let stageDir;
   try {
-  for (const target of pinned) {
-    let dir;
+  for (const [index, target] of pinned.entries()) {
     try {
       if (await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context) deny();
-      dir = process.platform === "win32"
+      if (!stageDir) stageDir = process.platform === "win32"
         ? await limit.run(() => createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-read-"))
         : fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
-      const destination = path.join(dir, "catalog.ct");
+      const destination = path.join(stageDir, `catalog-${index}.ct`);
       const received = await limit.run((signal) => target.adapter.download(address.folder, address.name,
         destination, "uploads", () => !signal.aborted,
         { maxBytes: MAX, boundedLengthOnly: true, ...(target.driveFileId === null ? {}
           : { providerFileId: target.driveFileId }), abortSignal: signal }));
       if (received !== true || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
         || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
-      const info = fs.lstatSync(destination, { bigint: true });
-      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n
-        || info.size < 1n || info.size > BigInt(MAX)) deny();
       const fd = fs.openSync(destination,
-        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_CLOEXEC || 0) | (fs.constants.O_NONBLOCK || 0));
       let data;
       try {
         const opened = fs.fstatSync(fd, { bigint: true });
+        const info = fs.lstatSync(destination, { bigint: true });
+        if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n
+          || info.size < 1n || info.size > BigInt(MAX)) deny();
         if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== info.dev
           || opened.ino !== info.ino || opened.size !== info.size) deny();
         // A hostile writer may grow the same inode after fstat. Reading an
@@ -271,7 +276,6 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
       if (limit.signal.aborted) deny();
       // An unavailable or corrupt provider is excluded from quorum.
     }
-    finally { if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
   }
   const groups = new Map();
   for (const item of recovered) {
@@ -301,7 +305,10 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
     signaturesVerifiedBySidecar: false, authorizesIo: false,
     observationalOnly: true, coherentProviderIdentityQuorumProven: false,
     crossProviderAtomicFenceProven: false });
-  } finally { if (!deadline) limit.close(); }
+  } finally {
+    try { if (stageDir) fs.rmSync(stageDir, { recursive: true, force: true, maxRetries: 5 }); }
+    finally { if (!deadline) limit.close(); }
+  }
 }
 
 // Read-only reconciliation after a lost PUT acknowledgement or after a process

@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -56,6 +57,134 @@ test("bounded S3 refuses same-inode rewrite between stat and open before provide
   } finally { fs.openSync = open; }
   assert.equal(injected, true);
   assert.equal(writes.length, 0);
+});
+
+test("legacy cloud upload cannot block on a FIFO substituted between file check and open", {
+  skip: process.platform !== "linux",
+}, (t) => {
+  const root = stage(t);
+  const source = path.join(root, "legacy.ct");
+  fs.writeFileSync(source, "original ciphertext", { flag: "wx", mode: 0o600 });
+  // Isolate the blocking syscall in a disposable child. Before FD-first
+  // validation, an attacker can replace a checked regular file with a FIFO,
+  // causing the synchronous O_RDONLY open to hang the server indefinitely.
+  const child = String.raw`
+    const fs = require('node:fs');
+    const cp = require('node:child_process');
+    const source = process.argv[1];
+    const resilience = require.resolve('./src/services/deploymentResilience');
+    require.cache[resilience] = { id: resilience, filename: resilience,
+      loaded: true, exports: { normalizeProviderError: (e) => e } };
+    const { createCloudStorage } = require('./services/cloudStorage');
+    const original = fs.lstatSync;
+    let attacked = false;
+    fs.lstatSync = function (name, ...args) {
+      const result = original.call(this, name, ...args);
+      if (!attacked && name === source) {
+        attacked = true;
+        fs.unlinkSync(source);
+        cp.execFileSync('mkfifo', [source]);
+      }
+      return result;
+    };
+    const cloud = createCloudStorage({ provider: 'gdrive',
+      gdrive: { folderId: 'disposable' }, createGoogleDriveClient: async () => {
+        throw new Error('provider must never be contacted');
+      } });
+    cloud.upload(source, 'folder', 'legacy.ct').then(
+      () => process.exit(3),
+      (error) => process.exit(error.code === 'invalid_path' ? 0 : 4));
+  `;
+  const outcome = spawnSync(process.execPath, ["-e", child, source], {
+    cwd: path.resolve(__dirname, ".."), timeout: 3000,
+    encoding: "utf8", windowsHide: true,
+  });
+  assert.equal(outcome.status, 0,
+    `a replaced FIFO must reject promptly (signal=${outcome.signal}, error=${outcome.error?.code})`);
+});
+
+test("bounded ZK cloud upload cannot block on a FIFO substituted between file check and open", {
+  skip: process.platform !== "linux",
+}, (t) => {
+  const root = stage(t);
+  const source = path.join(root, "bounded.ct");
+  const trusted = Buffer.from("trusted bounded ciphertext");
+  fs.writeFileSync(source, trusted, { flag: "wx", mode: 0o600 });
+  const child = String.raw`
+    const fs = require('node:fs');
+    const cp = require('node:child_process');
+    const crypto = require('node:crypto');
+    const source = process.argv[1];
+    const resilience = require.resolve('./src/services/deploymentResilience');
+    require.cache[resilience] = { id: resilience, filename: resilience,
+      loaded: true, exports: { normalizeProviderError: (e) => e } };
+    const { createCloudStorage } = require('./services/cloudStorage');
+    const original = fs.lstatSync;
+    let attacked = false;
+    fs.lstatSync = function (name, ...args) {
+      const result = original.call(this, name, ...args);
+      if (!attacked && name === source) {
+        attacked = true;
+        fs.unlinkSync(source);
+        cp.execFileSync('mkfifo', [source]);
+      }
+      return result;
+    };
+    const cloud = createCloudStorage({ provider: 'gdrive',
+      gdrive: { folderId: 'disposable' }, createGoogleDriveClient: async () => {
+        throw new Error('provider must never be contacted');
+      } });
+    cloud.upload(source, 'folder', 'bounded.ct', 'uploads', {
+      zk1BoundedBytes: 26,
+      zk1ExpectedSha256: crypto.createHash('sha256').update('trusted bounded ciphertext').digest('hex'),
+      providerFileId: 'pinned',
+    }).then(() => process.exit(3), () => process.exit(0));
+  `;
+  const outcome = spawnSync(process.execPath, ["-e", child, source], {
+    cwd: path.resolve(__dirname, ".."), timeout: 3000, encoding: "utf8", windowsHide: true,
+  });
+  assert.equal(outcome.status, 0,
+    `a substituted FIFO must deny bounded capture promptly (signal=${outcome.signal}, error=${outcome.error?.code})`);
+});
+
+test("WebDAV ciphertext upload cannot block on a FIFO substituted before opening source", {
+  skip: process.platform !== "linux",
+}, (t) => {
+  const root = stage(t);
+  const source = path.join(root, "webdav.ct");
+  fs.writeFileSync(source, "authenticated ciphertext", { flag: "wx", mode: 0o600 });
+  const child = String.raw`
+    const fs = require('node:fs');
+    const cp = require('node:child_process');
+    const crypto = require('node:crypto');
+    const source = process.argv[1];
+    process.env.NODE_ENV = 'development';
+    const { createZk1WebdavCiphertextAdapter } = require('./src/services/zk1WebdavCiphertextAdapter');
+    const writer = createZk1WebdavCiphertextAdapter({ developmentOnlyOptIn: true,
+      endpoint: 'https://127.0.0.1:1/dav', namespace: 'disposable_fixture',
+      ca: '-----BEGIN CERTIFICATE-----', serverFingerprint256: '0'.repeat(64) });
+    const original = fs.lstatSync;
+    let attacked = false;
+    fs.lstatSync = function (name, ...args) {
+      const result = original.call(this, name, ...args);
+      if (!attacked && name === source) {
+        attacked = true;
+        fs.unlinkSync(source);
+        cp.execFileSync('mkfifo', [source]);
+      }
+      return result;
+    };
+    writer.upload(source, 'zk1-' + 'a'.repeat(64), 'b'.repeat(22) + '.ct', 'uploads', {
+      zk1BoundedBytes: 24,
+      zk1ExpectedSha256: crypto.createHash('sha256').update('authenticated ciphertext').digest('hex'),
+    }).then(() => process.exit(3), (error) => process.exit(
+      error.code === 'ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE' ? 0 : 4));
+  `;
+  const outcome = spawnSync(process.execPath, ["-e", child, source], {
+    cwd: path.resolve(__dirname, ".."), timeout: 3000, encoding: "utf8", windowsHide: true,
+  });
+  assert.equal(outcome.status, 0,
+    `a replaced WebDAV source FIFO must reject promptly (signal=${outcome.signal}, error=${outcome.error?.code})`);
 });
 
 test("S3 refuses a source whose ancestor is a Windows junction before first stat", async (t) => {

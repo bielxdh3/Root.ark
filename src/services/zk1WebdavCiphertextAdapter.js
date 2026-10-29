@@ -89,15 +89,15 @@ function verifyParent(pin) {
 
 function readBoundedFile(source, length) {
   const parent = pinParent(source);
-  const namedBefore = fs.lstatSync(source, { bigint: true });
-  ensure(namedBefore.isFile() && !namedBefore.isSymbolicLink()
-    && namedBefore.nlink === 1n && namedBefore.size === BigInt(length));
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
-    | (fs.constants.O_CLOEXEC || 0);
+    | (fs.constants.O_CLOEXEC || 0) | (fs.constants.O_NONBLOCK || 0);
   const fd = fs.openSync(source, flags);
   try {
     verifyParent(parent);
     const before = fs.fstatSync(fd, { bigint: true });
+    const namedBefore = fs.lstatSync(source, { bigint: true });
+    ensure(namedBefore.isFile() && !namedBefore.isSymbolicLink()
+      && namedBefore.nlink === 1n && namedBefore.size === BigInt(length));
     ensure(before.isFile() && !before.isSymbolicLink() && before.nlink === 1n
       && before.size === BigInt(length) && before.dev === namedBefore.dev
       && before.ino === namedBefore.ino);
