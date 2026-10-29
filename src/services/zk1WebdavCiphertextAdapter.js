@@ -344,6 +344,11 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
               + (expectedEtag === null ? 0 : 1) + (boundedLengthOnly ? 1 : 0)
               + (expectedSha256 === null ? 0 : 1)
             && (expectedEtag === null || validEtag(expectedEtag))
+            // Exact-length opaque ciphertext must have an independently
+            // committed hash before any GET. Only sidecar discovery may lack
+            // an upfront hash: it stays observational and is parsed/checked
+            // in the caller's private bounded staging directory.
+            && (boundedLengthOnly || expectedSha256 !== null)
             && (expectedSha256 === null || (typeof expectedSha256 === "string"
               && /^[a-f0-9]{64}$/.test(expectedSha256)))
             && Number.isSafeInteger(opts.maxBytes) && opts.maxBytes >= 1

@@ -147,6 +147,29 @@ test("real mTLS HTTPS WebDAV PUT/GET is bounded, pinned and nonauthoritative", a
   assert.equal(f.requests.length, 3, "invalid ZK commitment cannot send bytes");
 });
 
+test("direct fixed-length WebDAV GET requires a publisher-pinned digest before network or disk", async (t) => {
+  const f = await fixture(t);
+  const { publisher, reader } = await f.makePair();
+  await publisher.publishExact(f.pubInput);
+  const staging = await createZk1PrivateCloudStagingDirectory("rootark-zk1-webdav-digest-admission-");
+  t.after(() => fs.rmSync(staging, { recursive: true, force: true, maxRetries: 5 }));
+  const destination = path.join(staging, "ciphertext.ct");
+  const { folder, name } = zk1CloudCopyAddress({
+    scope: f.pubInput.scope, operationId: f.pubInput.operationId,
+  });
+  const before = f.requests.length;
+  await assert.rejects(reader.download(folder, name, destination, "uploads", () => true,
+    { maxBytes: f.ciphertext.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+  assert.equal(f.requests.length, before,
+    "a fixed-length download without independent digest must not issue HTTPS GET");
+  assert.equal(fs.existsSync(destination), false,
+    "uncommitted network ciphertext must not reach a local file");
+  assert.equal(await reader.download(folder, name, destination, "uploads", () => true,
+    { maxBytes: f.ciphertext.length,
+      expectedSha256: crypto.createHash("sha256").update(f.ciphertext).digest("hex") }), true);
+  assert.deepEqual(fs.readFileSync(destination), f.ciphertext);
+});
+
 test("WebDAV corrupted GET is rejected before writing unauthenticated bytes to disk", async (t) => {
   const f = await fixture(t);
   const { publisher, verifier } = await f.makePair();
@@ -424,7 +447,9 @@ test("WebDAV must reject download parent replaced by a junction or fresh directo
         }
       }
       return true;
-    }, { maxBytes: f.ciphertext.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+    }, { maxBytes: f.ciphertext.length,
+      expectedSha256: crypto.createHash("sha256").update(f.ciphertext).digest("hex") }),
+    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
     assert.equal(checked, 2, "authorization must be rechecked after the network operation");
     assert.equal(fs.existsSync(destination), false,
       "a changed parent cannot redirect opaque ciphertext outside its pinned directory");
@@ -461,7 +486,9 @@ test("POSIX WebDAV refuses foreign-writable destination and source ancestors bef
   for (const directory of [root, privateChild]) {
     const destination = path.join(directory, "ciphertext.ct");
     await assert.rejects(reader.download(folder, name, destination, "uploads", () => true,
-      { maxBytes: f.ciphertext.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+      { maxBytes: f.ciphertext.length,
+        expectedSha256: crypto.createHash("sha256").update(f.ciphertext).digest("hex") }),
+    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
     assert.equal(fs.existsSync(destination), false);
   }
   const source = path.join(privateChild, "staged.ct");
@@ -516,7 +543,9 @@ test("Windows WebDAV never writes ciphertext through a swapped and restored pare
   let outcome;
   try {
     outcome = await reader.download(folder, name, destination, "uploads", () => true,
-      { maxBytes: f.ciphertext.length }).then(() => "acknowledged", (error) => error.code);
+      { maxBytes: f.ciphertext.length,
+        expectedSha256: crypto.createHash("sha256").update(f.ciphertext).digest("hex") })
+      .then(() => "acknowledged", (error) => error.code);
   } finally { fs.openSync = originalOpen; }
   assert.equal(fs.existsSync(outside), false, "no network bytes may reach the foreign inode");
   assert.equal(outcome, "ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE",
