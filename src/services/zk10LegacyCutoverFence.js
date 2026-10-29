@@ -16,6 +16,7 @@ const {
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk10/account-authority-head/v1\0");
 const PROOF_DOMAIN = Buffer.from("Root.ark/zk10/account-legacy-admission/v1\0");
 const WITNESS_DOMAIN = Buffer.from("Root.ark/zk10/account-current-floor/v1\0");
+const EXTERNAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk10/external-floor-current/v1\0");
 const HEAD_FIELDS = ["type", "sequence", "previous_head_digest", "enrollment_root"];
 const ADMISSION_FIELDS = ["type", "sequence", "head_digest", "immutable_account_id",
   "identity_digest", "operation", "challenge", "nonce", "status",
@@ -23,6 +24,9 @@ const ADMISSION_FIELDS = ["type", "sequence", "head_digest", "immutable_account_
   "lease_expires_at_ms"];
 const CURRENT_FIELDS = ["type", "sequence", "head_digest", "immutable_account_id",
   "identity_digest", "status", "nonce", "issued_at_ms", "expires_at_ms"];
+const EXTERNAL_FLOOR_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
+  "immutable_account_id", "identity_digest", "operation", "nonce", "lease_id",
+  "lease_expires_at_ms", "issued_at_ms", "expires_at_ms"];
 const FINGERPRINT = /^(?:[a-f0-9]{2}:){31}[a-f0-9]{2}$/i;
 const OPER = /^[a-z][a-z0-9:_-]{0,63}$/;
 const NATIVE_CRYPTO_VERIFY = crypto.verify;
@@ -30,6 +34,7 @@ const NATIVE_HTTPS_REQUEST = https.request;
 const NATIVE_NOW = Date.now.bind(Date);
 const branded = new WeakSet();
 const authenticFences = new WeakSet();
+const EXTERNAL_FLOOR_REQUIRED = Symbol("zk10-live-external-floor-required");
 
 function unavailable() {
   const error = new Error("ZK10_CURRENT_AUTHORITY_UNAVAILABLE");
@@ -163,7 +168,12 @@ function pinnedTransport(settings, route) {
 
 function createZk10LegacyCutoverFence({ resolveDurableAccountIdentity,
   independentlyPinnedOwnerRoots, independentlyPinnedIdentityBindings,
-  independentlyRetainedFloor, authority, witness } = {}) {
+  independentlyRetainedFloor, authority, witness, independentFloor } = {},
+activation = null) {
+  // Historical DEV-OFF consumers cannot smuggle an unverified floor into the
+  // live admission path. Only the separate explicit production-gated factory
+  // enables a third, independently pinned and nonce-signed live check.
+  if (activation !== EXTERNAL_FLOOR_REQUIRED && independentFloor !== undefined) unavailable();
   if (typeof resolveDurableAccountIdentity !== "function"
     || !(independentlyPinnedOwnerRoots instanceof Map)
     || !(independentlyPinnedIdentityBindings instanceof Map)) unavailable();
@@ -202,6 +212,22 @@ function createZk10LegacyCutoverFence({ resolveDurableAccountIdentity,
   if (spkiHash(pinnedAuthority.signingKey) === spkiHash(pinnedWitness.signingKey)
     || (pinnedAuthority.endpoint === pinnedWitness.endpoint
       && pinnedAuthority.pin === pinnedWitness.pin)) unavailable();
+  let pinnedExternalFloor = null;
+  if (activation === EXTERNAL_FLOOR_REQUIRED) {
+    try {
+      pinnedExternalFloor = pinnedTransport(independentFloor,
+        "/v1/zk10/external-floor/current");
+    } catch (_) { unavailable(); }
+  }
+  if (pinnedExternalFloor) {
+    const peers = [pinnedAuthority, pinnedWitness, pinnedExternalFloor];
+    if (new Set(peers.map((peer) => peer.endpoint)).size !== 3
+      || new Set(peers.map((peer) => peer.pin)).size !== 3
+      || new Set(peers.map((peer) => spkiHash(peer.signingKey))).size !== 3
+      || [...roots.values()].some((owner) =>
+        spkiHash(owner.publicKey) === spkiHash(pinnedExternalFloor.signingKey)))
+      unavailable();
+  }
 
   async function verifyCurrentAccountLegacyPolicy({ immutableAccountId,
     serverAccountIdentity, authenticatedUsername, operation, signal, freshChallenge }) {
@@ -278,16 +304,50 @@ function createZk10LegacyCutoverFence({ resolveDurableAccountIdentity,
         request, signal), ["current"]);
       const trustedCurrent = verifySigned(current.current, CURRENT_FIELDS,
         WITNESS_DOMAIN, pinnedWitness.signingKey);
+      // Ed25519 authenticates bytes, not their JavaScript types. Comparisons
+      // against a signed string such as "invalid-date" evaluate as NaN/false.
+      // Validate numeric timestamps and retain a live witness proof through
+      // the full authority lease before allowing any legacy callback.
+      const witnessCheckedAt = boundedMs(NATIVE_NOW(), 1, Number.MAX_SAFE_INTEGER);
+      boundedMs(trustedCurrent.issued_at_ms, witnessCheckedAt - 30_000,
+        witnessCheckedAt + 1_000);
+      boundedMs(trustedCurrent.expires_at_ms,
+        Math.max(witnessCheckedAt + 1, admission.lease_expires_at_ms),
+        witnessCheckedAt + 10_000);
       if (trustedCurrent.type !== "rootark-zk10-account-current-floor/v1"
         || trustedCurrent.sequence !== sequence || trustedCurrent.head_digest !== digest
         || trustedCurrent.immutable_account_id !== uuid
         || trustedCurrent.identity_digest !== identityDigest
         || trustedCurrent.status !== admission.status
         || trustedCurrent.nonce !== nonce
-        || trustedCurrent.expires_at_ms < boundedMs(NATIVE_NOW(), 1, Number.MAX_SAFE_INTEGER)
-        || trustedCurrent.expires_at_ms > at + 10_000
-        || trustedCurrent.issued_at_ms < at - 30_000
-        || trustedCurrent.issued_at_ms > at + 1_000) unavailable();
+        || trustedCurrent.issued_at_ms >= trustedCurrent.expires_at_ms) unavailable();
+      if (pinnedExternalFloor) {
+        // The third self-hosted custodian signs its own live monotonic floor,
+        // under a fresh challenge and the exact active authority lease. A
+        // copied local SQLite/JSON minimum or a replayed signed old head is
+        // never sufficient to open this admission path.
+        const externalReply = exact(await pinnedExternalFloor.call(
+          pinnedExternalFloor.route, { ...request,
+            lease_id: admission.lease_id,
+            lease_expires_at_ms: admission.lease_expires_at_ms }, signal), ["floor"]);
+        const external = verifySigned(externalReply.floor,
+          EXTERNAL_FLOOR_FIELDS, EXTERNAL_FLOOR_DOMAIN, pinnedExternalFloor.signingKey);
+        const checkedAt = boundedMs(NATIVE_NOW(), 1, Number.MAX_SAFE_INTEGER);
+        boundedMs(external.issued_at_ms, checkedAt - 30_000, checkedAt + 1_000);
+        boundedMs(external.expires_at_ms,
+          Math.max(checkedAt + 1, admission.lease_expires_at_ms),
+          checkedAt + 10_000);
+        if (external.type !== "rootark-zk10-external-floor-current/v1"
+          || external.sequence !== sequence || external.head_digest !== digest
+          || external.enrollment_root !== root
+          || external.immutable_account_id !== uuid
+          || external.identity_digest !== identityDigest
+          || external.operation !== operation || external.nonce !== nonce
+          || external.lease_id !== admission.lease_id
+          || external.lease_expires_at_ms !== admission.lease_expires_at_ms
+          || external.lease_expires_at_ms <= checkedAt + 100
+          || external.issued_at_ms >= external.expires_at_ms) unavailable();
+      }
       const result = Object.freeze({ status: admission.status, immutableAccountId: uuid,
         operation, leaseId: admission.lease_id,
         leaseExpiresAtMs: admission.lease_expires_at_ms });
@@ -359,12 +419,18 @@ function createZk10LegacyCutoverFence({ resolveDurableAccountIdentity,
   return fence;
 }
 
+function createZk10ExternallyAttestedLegacyFence(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) unavailable();
+  return createZk10LegacyCutoverFence(config, EXTERNAL_FLOOR_REQUIRED);
+}
+
 function isAuthenticZk10LegacyCutoverFence(value) {
   return value !== null && typeof value === "object" && authenticFences.has(value);
 }
-module.exports = { createZk10LegacyCutoverFence,
+module.exports = { createZk10LegacyCutoverFence, createZk10ExternallyAttestedLegacyFence,
   isAuthenticZk10LegacyCutoverFence,
   // Only useful for producing signed disposable fixture packets, not an I/O grant.
   ZK10_HEAD_DOMAIN: HEAD_DOMAIN, ZK10_PROOF_DOMAIN: PROOF_DOMAIN,
-  ZK10_WITNESS_DOMAIN: WITNESS_DOMAIN, ZK10_HEAD_FIELDS: HEAD_FIELDS,
+  ZK10_WITNESS_DOMAIN: WITNESS_DOMAIN, ZK10_EXTERNAL_FLOOR_DOMAIN: EXTERNAL_FLOOR_DOMAIN,
+  ZK10_HEAD_FIELDS: HEAD_FIELDS,
   ZK10_ADMISSION_FIELDS: ADMISSION_FIELDS, ZK10_CURRENT_FIELDS: CURRENT_FIELDS };

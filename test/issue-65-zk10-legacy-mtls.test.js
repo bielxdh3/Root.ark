@@ -22,7 +22,8 @@ const { privateAuthorityDirectory } = require("./support/issue-65-private-author
 const { signOwnerCutover, digestOwnerCutover, buildSparseEnrollmentProof,
   signatureBytes } = require("../src/crypto/rootark-zk10-account-cutover-v1");
 const { createZk10LegacyCutoverFence, ZK10_HEAD_DOMAIN, ZK10_PROOF_DOMAIN,
-  ZK10_WITNESS_DOMAIN, isAuthenticZk10LegacyCutoverFence } =
+  ZK10_WITNESS_DOMAIN, ZK10_EXTERNAL_FLOOR_DOMAIN,
+  createZk10ExternallyAttestedLegacyFence, isAuthenticZk10LegacyCutoverFence } =
   require("../src/services/zk10LegacyCutoverFence");
 const { runZk10LegacyWebDavOperation } = require("../src/services/zk10LegacyWebDavRouteGuard");
 
@@ -52,7 +53,7 @@ function closeServer(server) {
 async function fixture(t) {
   const dir = privateAuthorityDirectory("zk65-zk10-mtls-");
   generateNativeFixtureCertificates(dir, { caSubject: "ZK10 test-only CA",
-    servers: ["authority", "witness"], clients: ["client", "foreign"] });
+    servers: ["authority", "witness", "custodian"], clients: ["client", "foreign"] });
   const read = (f) => fs.readFileSync(path.join(dir, f));
   const ca = read("ca.pem");
   const clientCert = read("client.pem");
@@ -60,6 +61,7 @@ async function fixture(t) {
   const clientPin = new crypto.X509Certificate(clientCert).fingerprint256;
   const authorityKeys = crypto.generateKeyPairSync("ed25519");
   const witnessKeys = crypto.generateKeyPairSync("ed25519");
+  const custodianKeys = crypto.generateKeyPairSync("ed25519");
   const ownerKeys = crypto.generateKeyPairSync("ed25519");
   const username = "alice";
   const entries = [];
@@ -69,7 +71,13 @@ async function fixture(t) {
     witnessRollback: false, unavailable: false, forceEnrolledAsNegative: false,
     authorityRollback: false, witnessFalseStatus: false, replayChallenge: false,
     badHeadSignature: false,
-    releaseCount: 0, admittedCount: 0, onRelease: null };
+    releaseCount: 0, admittedCount: 0, onRelease: null,
+    custodianUnavailable: false, custodianWrongSignature: false,
+    custodianWrongHead: false, custodianReplayNonce: false,
+    custodianShortExpiry: false,
+    witnessShortExpiry: false, custodianResponseDelayMs: 0, leaseDurationMs: 3000,
+    custodianIssuedAtOverride: undefined, custodianExpiresAtOverride: undefined,
+    witnessIssuedAtOverride: undefined, witnessExpiresAtOverride: undefined };
   const signedHead = (root) => {
     const previous = heads.length ? headDigest(heads[heads.length - 1]) : "0".repeat(64);
     heads.push(sign({ type: "rootark-zk10-account-authority-head/v1",
@@ -91,7 +99,7 @@ async function fixture(t) {
     signedHead(buildSparseEnrollmentProof(entries, ID(1)).root);
     return true;
   }
-  function accept(req, res, handler) {
+  function accept(req, res, handler, delayMs = () => 0) {
     if (!req.socket.authorized || req.socket.getProtocol() !== "TLSv1.3"
       || req.socket.getPeerCertificate()?.fingerprint256 !== clientPin) {
       res.writeHead(403); res.end(); return;
@@ -108,7 +116,9 @@ async function fixture(t) {
         const result = handler(req.url, JSON.parse(Buffer.concat(parts).toString("utf8")));
         const body = Buffer.from(JSON.stringify(result));
         res.writeHead(200, { "content-type": "application/json", "content-length": body.length });
-        res.end(body);
+        const delay = delayMs();
+        if (delay > 0) setTimeout(() => res.end(body), delay);
+        else res.end(body);
       } catch (_) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end('{"error":"DENIED"}');
@@ -149,7 +159,8 @@ async function fixture(t) {
         owner_statement_history: enrolled && !state.forceEnrolledAsNegative
           ? [ownerStatement] : [], owner_rotations: [],
         siblings: state.badProof ? proof.siblings.map(() => SHA(3)) : proof.siblings,
-        lease_id: lease, issued_at_ms: now, lease_expires_at_ms: now + 3000 };
+        lease_id: lease, issued_at_ms: now,
+        lease_expires_at_ms: now + state.leaseDurationMs };
       const signed = sign(payload, state.badAuthoritySig
         ? crypto.generateKeyPairSync("ed25519").privateKey : authorityKeys.privateKey,
       ZK10_PROOF_DOMAIN);
@@ -171,15 +182,44 @@ async function fixture(t) {
         status: state.witnessFalseStatus ? "never_enrolled"
           : entries.some((r) => r.accountId === request.immutable_account_id)
           ? "protected_enforced" : "never_enrolled",
-        nonce: request.nonce, issued_at_ms: at,
-        expires_at_ms: at + 3000 }, state.badWitnessSig
+        nonce: request.nonce,
+        issued_at_ms: state.witnessIssuedAtOverride === undefined
+          ? at : state.witnessIssuedAtOverride,
+        expires_at_ms: state.witnessExpiresAtOverride === undefined
+          ? at + (state.witnessShortExpiry ? 500 : 3000)
+          : state.witnessExpiresAtOverride }, state.badWitnessSig
         ? crypto.generateKeyPairSync("ed25519").privateKey : witnessKeys.privateKey,
       ZK10_WITNESS_DOMAIN) };
     }));
+  const custodianServer = https.createServer({ key: read("custodian.key"),
+    cert: read("custodian.pem"), ca, requestCert: true,
+    rejectUnauthorized: true, minVersion: "TLSv1.3" }, (req, res) => accept(req, res,
+    (route, request) => {
+      if (route !== "/v1/zk10/external-floor/current" || state.custodianUnavailable)
+        throw Error("floor unavailable");
+      const at = Date.now();
+      return { floor: sign({ type: "rootark-zk10-external-floor-current/v1",
+        sequence: state.custodianWrongHead ? heads.length - 1 : heads.length,
+        head_digest: headDigest(heads[heads.length - 1]),
+        enrollment_root: heads[heads.length - 1].enrollment_root,
+        immutable_account_id: request.immutable_account_id,
+        identity_digest: request.identity_digest, operation: request.operation,
+        nonce: state.custodianReplayNonce ? b64(Buffer.alloc(32, 3)) : request.nonce,
+        lease_id: request.lease_id, lease_expires_at_ms: request.lease_expires_at_ms,
+        issued_at_ms: state.custodianIssuedAtOverride === undefined
+          ? at : state.custodianIssuedAtOverride,
+        expires_at_ms: state.custodianExpiresAtOverride === undefined
+          ? (state.custodianShortExpiry ? request.lease_expires_at_ms - 100 : at + 3000)
+          : state.custodianExpiresAtOverride,
+      }, state.custodianWrongSignature
+        ? witnessKeys.privateKey : custodianKeys.privateKey, ZK10_EXTERNAL_FLOOR_DOMAIN) };
+    }, () => state.custodianResponseDelayMs));
   const authorityPort = await onServer(authorityServer);
   const witnessPort = await onServer(witnessServer);
+  const custodianPort = await onServer(custodianServer);
   t.after(async () => {
-    await Promise.all([closeServer(authorityServer), closeServer(witnessServer)]);
+    await Promise.all([closeServer(authorityServer), closeServer(witnessServer),
+      closeServer(custodianServer)]);
     fs.rmSync(dir, { recursive: true, force: true });
   });
   const endpoints = [
@@ -205,9 +245,80 @@ async function fixture(t) {
       enrollmentRoot: null },
     authority: endpoints[0], witness: endpoints[1], ...overrides,
   });
-  return { state, cutover, makeFence, endpoints, leases, username,
+  const independentFloor = { endpoint: `https://127.0.0.1:${custodianPort}/`,
+    ca, clientCert, clientKey,
+    serverFingerprint256: new crypto.X509Certificate(read("custodian.pem")).fingerprint256,
+    signingPublicKey: custodianKeys.publicKey };
+  const makeAttestedFence = (overrides = {}) =>
+    createZk10ExternallyAttestedLegacyFence({
+      resolveDurableAccountIdentity: async (user) => ({
+        immutableAccountId: Buffer.alloc(16, user === "alice" ? 1 : 6),
+        serverAccountIdentity: { durableUserId: Buffer.alloc(16, user === "alice" ? 2 : 7),
+          authenticatedUsername: user } }),
+      independentlyPinnedOwnerRoots: new Map([[ID(1), {
+        publicKey: ownerKeys.publicKey, canonicalZkAccountId: ID(9) }]]),
+      independentlyPinnedIdentityBindings: new Map([
+        ["alice", { immutableAccountId: ID(1), durableUserId: ID(2) }],
+        ["bob", { immutableAccountId: ID(6), durableUserId: ID(7) }],
+      ]),
+      independentlyRetainedFloor: { sequence: 0, digest: "0".repeat(64),
+        enrollmentRoot: null },
+      authority: endpoints[0], witness: endpoints[1], independentFloor,
+      ...overrides,
+    });
+  return { state, cutover, makeFence, makeAttestedFence, independentFloor,
+    endpoints, leases, username,
     ownerPublicKey: ownerKeys.publicKey };
 }
+
+test("ZK10 production-bound admission requires third live pinned external floor", {
+  timeout: 90000,
+}, async (t) => {
+  const f = await fixture(t);
+  assert.throws(() => f.makeAttestedFence({ independentFloor: undefined }),
+    { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" });
+  assert.throws(() => f.makeAttestedFence({ independentFloor: f.endpoints[1] }),
+    { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" }, "cannot recycle witness custody");
+  assert.throws(() => f.makeAttestedFence({ independentFloor: {
+    ...f.independentFloor, signingPublicKey: f.ownerPublicKey,
+  } }), { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" },
+  "owner signing key cannot double as external monotonic floor custody");
+  const fence = f.makeAttestedFence();
+  let callbacks = 0;
+  const exercise = () => fence.withCurrentAccountLegacyPolicy({
+    authenticatedUsername: "alice", operation: "sync:get",
+  }, async ({ assertActive }) => {
+    callbacks += 1;
+    assertActive();
+    return "GRANTED";
+  });
+  assert.equal(await exercise(), "GRANTED");
+  for (const flag of ["custodianWrongSignature", "custodianWrongHead",
+    "custodianReplayNonce", "custodianUnavailable", "custodianShortExpiry",
+    "witnessShortExpiry"]) {
+    f.state[flag] = true;
+    await assert.rejects(exercise(), { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" }, flag);
+    f.state[flag] = false;
+  }
+  for (const flag of ["custodianIssuedAtOverride", "custodianExpiresAtOverride",
+    "witnessIssuedAtOverride", "witnessExpiresAtOverride"]) {
+    for (const value of ["invalid-date", "1730000000000", null, 1.5]) {
+      f.state[flag] = value;
+      await assert.rejects(exercise(), { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" },
+        `signed ${flag}=${String(value)} must be a bounded safe integer`);
+    }
+    f.state[flag] = undefined;
+  }
+  f.state.leaseDurationMs = 900;
+  f.state.custodianResponseDelayMs = 1200;
+  await assert.rejects(exercise(), { code: "ZK10_CURRENT_AUTHORITY_UNAVAILABLE" },
+    "expired lease after signed remote response must never invoke the callback");
+  assert.equal(callbacks, 1, "only the initial admitted request can enter the callback");
+  f.state.leaseDurationMs = 3000;
+  f.state.custodianResponseDelayMs = 0;
+  assert.equal(f.cutover(), true);
+  await assert.rejects(exercise(), { code: "ZK10_LEGACY_ENFORCED" });
+});
 
 test("ZK10 real TLS1.3/mTLS CURRENT, signed negative proof, monotonic cutover and leases", {
   timeout: 90000,
