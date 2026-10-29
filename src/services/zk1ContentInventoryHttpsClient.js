@@ -115,7 +115,7 @@ function parseJson(bytes) {
   catch (_) { fail(); }
 }
 
-function requestJson({ url, ca, clientKey, clientCert, serverFingerprint, idleTimeoutMs,
+function requestJson({ url, secureContext, serverFingerprint, idleTimeoutMs,
   wallTimeoutMs, route, body, responseLimit }) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -139,9 +139,7 @@ function requestJson({ url, ca, clientKey, clientCert, serverFingerprint, idleTi
         path: route,
         method: "POST",
         agent: false,
-        ca,
-        cert: clientCert,
-        key: clientKey,
+        secureContext,
         rejectUnauthorized: true,
         minVersion: "TLSv1.3",
         servername: net.isIP(url.hostname) ? "" : url.hostname,
@@ -237,6 +235,15 @@ function createZk1ContentInventoryHttpsClient({
         inventoryPublicKey))) fail();
   const serverFingerprint = serverFingerprint256.toUpperCase();
   const signerKeyId = copyBytes(inventorySignerKeyId, 16);
+  // Create the isolated TLS authority at enrollment. Passing caller-owned
+  // mutable PEM buffers to each later request would let a different principal
+  // or CA replace this client's mTLS identity after construction.
+  let secureContext;
+  try {
+    secureContext = tls.createSecureContext({
+      ca, cert: clientCert, key: clientKey, minVersion: "TLSv1.3",
+    });
+  } catch (_) { fail(); }
 
   function verifySnapshotResponse(response, { scope, nonce, requested: entry, minimumHead,
     minimumSnapshot, committedProofChain }) {
@@ -288,9 +295,7 @@ function createZk1ContentInventoryHttpsClient({
     if (body.length < 1 || body.length > requestLimit) fail();
     return requestJson({
       url,
-      ca,
-      clientKey,
-      clientCert,
+      secureContext,
       serverFingerprint,
       idleTimeoutMs,
       wallTimeoutMs,

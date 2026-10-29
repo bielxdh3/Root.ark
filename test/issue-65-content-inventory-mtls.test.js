@@ -759,6 +759,54 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
   });
 
+  await t.test("mTLS authority is pinned when client is created despite mutable PEM buffers", async (child) => {
+    const h = await harness(child);
+    const original = tls.clients.reader;
+    const foreign = tls.clients.unlisted;
+    function padded(source, another) {
+      const length = Math.max(source.length, another.length) + 32;
+      return Buffer.concat([Buffer.from(source), Buffer.alloc(length - source.length, 10)]);
+    }
+    function overwrite(target, source) {
+      target.fill(10);
+      source.copy(target);
+    }
+    const cert = padded(original.cert, foreign.cert);
+    const key = padded(original.key, foreign.key);
+    const client = createZk1ContentInventoryHttpsClient({
+      endpoint: `https://localhost:${h.port}`, ca: tls.ca, clientCert: cert, clientKey: key,
+      serverFingerprint256: tls.serverFingerprint256,
+      inventoryPublicKey: h.signer.publicKey,
+      inventorySignerKeyId: h.signerKeyId,
+    });
+    // A caller holding the original file buffers can replace the authorized
+    // reader certificate with an unlisted principal after enrollment.
+    overwrite(cert, foreign.cert);
+    overwrite(key, foreign.key);
+    const genesis = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: genesis.root });
+    const query = () => ({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(operation),
+      minimumHead: { sequence: 0, root: genesis.root },
+    });
+    const response = await client.getSnapshot(query());
+    assert.equal(response.outcome, "ABSENT");
+    assert.equal(response.authorizesIo, false);
+
+    const ca = padded(tls.ca, tls.untrustedCa);
+    const caClient = createZk1ContentInventoryHttpsClient({
+      endpoint: `https://localhost:${h.port}`, ca,
+      clientCert: original.cert, clientKey: original.key,
+      serverFingerprint256: tls.serverFingerprint256,
+      inventoryPublicKey: h.signer.publicKey,
+      inventorySignerKeyId: h.signerKeyId,
+    });
+    overwrite(ca, tls.untrustedCa);
+    const caResponse = await caClient.getSnapshot(query());
+    assert.equal(caResponse.outcome, "ABSENT",
+      "CA trust must also stay pinned to the original TLS authority");
+  });
+
   await t.test("wrong server pin, wrong Ed25519 signer, and stale floor fail closed", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();
