@@ -96,21 +96,22 @@ function directory(target) {
   return stat;
 }
 function fileBytes(target, budget) {
-  const before = fs.lstatSync(target, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
-    || before.size > BigInt(MAX_FILE) || before.size > BigInt(budget.left))
-    throw Error("unsafe file");
   let fd;
   try {
-    // A valid lstat is not a reservation. A replaceable source can become
-    // a FIFO before native open, so make that open NONBLOCK and compare the
-    // pinned descriptor before reading historical bytes.
+    // Open a nonblocking, no-follow descriptor before trusting mutable leaf
+    // metadata. An earlier lstat can race a replacement FIFO or different
+    // inode; only the opened regular inode and its matching name are evidence.
     fd = fs.openSync(target, fs.constants.O_RDONLY
       | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
-    if (!stable(before, fs.fstatSync(fd, { bigint: true }))) throw Error("race opening");
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(target, { bigint: true });
+    if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n
+      || opened.size > BigInt(MAX_FILE) || opened.size > BigInt(budget.left)
+      || !named.isFile() || named.isSymbolicLink() || !stable(opened, named))
+      throw Error("race opening");
     // readFileSync(fd) may continue allocating as a concurrent writer grows
     // the file past the size we validated. Read at most the initial size.
-    const content = Buffer.alloc(Number(before.size));
+    const content = Buffer.alloc(Number(opened.size));
     let offset = 0;
     while (offset < content.length) {
       const length = Math.min(16 * 1024, content.length - offset);
@@ -118,8 +119,8 @@ function fileBytes(target, budget) {
       if (count <= 0 || count > length) throw Error("short or invalid read");
       offset += count;
     }
-    if (!stable(before, fs.fstatSync(fd, { bigint: true }))
-      || !stable(before, fs.lstatSync(target, { bigint: true })))
+    if (!stable(opened, fs.fstatSync(fd, { bigint: true }))
+      || !stable(opened, fs.lstatSync(target, { bigint: true })))
       throw Error("race reading");
     budget.left -= content.length;
     return content;

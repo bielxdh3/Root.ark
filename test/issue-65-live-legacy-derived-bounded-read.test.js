@@ -49,6 +49,30 @@ test("derived local inventory must not block when a scanned file becomes an actu
   assert.match(outcome.stdout, /FIFO_DENIED_WITHOUT_STALL/);
 });
 
+test("derived local reader opens the leaf before trusting its mutable name", (t) => {
+  const directory = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-derived-fd-first-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const target = path.join(directory, "artifact.bin");
+  fs.writeFileSync(target, "stable");
+  const nativeOpen = fs.openSync;
+  const nativeLstat = fs.lstatSync;
+  let pinned = false, premature = 0;
+  fs.openSync = function (name, ...args) {
+    if (name === target) pinned = true;
+    return nativeOpen.call(fs, name, ...args);
+  };
+  fs.lstatSync = function (name, ...args) {
+    if (name === target && !pinned) premature++;
+    return nativeLstat.call(fs, name, ...args);
+  };
+  let result;
+  try { result = inspectZk1LiveLegacyDerivedLocalEvidence({ tempDir: directory, runSecret }); }
+  finally { fs.openSync = nativeOpen; fs.lstatSync = nativeLstat; }
+  assert.equal(result.potentialDerivedReferences, 1);
+  assert.equal(pinned, true);
+  assert.equal(premature, 0, "a mutable leaf lstat must not precede its nonblocking FD");
+});
+
 test("derived local observation includes only the stable bounded source bytes", (t) => {
   const directory = fs.mkdtempSync(path.join(canonicalTestTemp(), "zk65-derived-stable-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));

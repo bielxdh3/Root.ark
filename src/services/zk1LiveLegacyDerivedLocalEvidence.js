@@ -39,37 +39,42 @@ function inspectZk1LiveLegacyDerivedLocalEvidence({ tempDir, runSecret }) {
     function scan(folder, prefix, depth = 0) {
       if (depth > 16) deny();
       const before = directory(folder);
-      const names = fs.readdirSync(folder).sort();
+      const names = fs.readdirSync(folder, { withFileTypes: true })
+        .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
       entriesVisited += names.length;
       if (entriesVisited > MAX_ENTRIES
-        || new Set(names.map((name) => name.toLowerCase())).size !== names.length) deny();
-      for (const name of names) {
+        || new Set(names.map((entry) => entry.name.toLowerCase())).size !== names.length) deny();
+      for (const entry of names) {
+        const name = entry.name;
         if (!name || name === "." || name === ".." || name.endsWith(".") || name.endsWith(" ")
           || /[\\/\x00-\x1f<>:"|?*]/.test(name)) deny();
         const full = path.join(folder, name);
-        const candidate = fs.lstatSync(full, { bigint: true });
-        if (candidate.isSymbolicLink()) deny();
-        if (candidate.isDirectory()) {
+        // Dirent is only a routing hint. Directory traversal rechecks the
+        // named directory; file admission instead pins a nonblocking FD first.
+        if (entry.isDirectory()) {
           scan(full, prefix + name + "/", depth + 1);
           continue;
         }
-        if (!candidate.isFile() || candidate.nlink !== 1n
-          || candidate.size > BigInt(MAX_FILE_BYTES)) deny();
-        const id = candidate.dev + ":" + candidate.ino;
-        if (visited.has(id)) deny();
-        visited.add(id);
+        if (!entry.isFile()) deny();
         let fd;
         try {
-          // lstat is not atomic with open: a different local principal may
-          // replace a regular file with a FIFO after enumeration. Do not let
-          // that switch hang this observation process at the native open.
+          // No leaf lstat before native open: an attacker may substitute a FIFO
+          // or inode between enumeration and access. Pin first, then validate.
           fd = fs.openSync(full, fs.constants.O_RDONLY
             | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
-          if (!same(candidate, fs.fstatSync(fd, { bigint: true }))) deny();
+          const opened = fs.fstatSync(fd, { bigint: true });
+          const candidate = fs.lstatSync(full, { bigint: true });
+          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n
+            || opened.size > BigInt(MAX_FILE_BYTES)
+            || !candidate.isFile() || candidate.isSymbolicLink()
+            || !same(opened, candidate)) deny();
+          const id = opened.dev + ":" + opened.ino;
+          if (visited.has(id)) deny();
+          visited.add(id);
           // A writer may grow this inode after fstat. readFileSync(fd) can
           // allocate the new size before our post-read identity check rejects
           // it; only read the already-pinned (<= MAX_FILE_BYTES) byte budget.
-          const bytes = Buffer.alloc(Number(candidate.size));
+          const bytes = Buffer.alloc(Number(opened.size));
           let offset = 0;
           while (offset < bytes.length) {
             const count = fs.readSync(fd, bytes, offset,
@@ -77,15 +82,15 @@ function inspectZk1LiveLegacyDerivedLocalEvidence({ tempDir, runSecret }) {
             if (count <= 0 || count > bytes.length - offset) deny();
             offset += count;
           }
-          if (BigInt(bytes.length) !== candidate.size
-            || !same(candidate, fs.fstatSync(fd, { bigint: true }))
-            || !same(candidate, stat(full, false))) deny();
+          if (BigInt(bytes.length) !== opened.size
+            || !same(opened, fs.fstatSync(fd, { bigint: true }))
+            || !same(opened, stat(full, false))) deny();
           count++;
           size += bytes.length;
           if (count > MAX_ENTRIES || size > MAX_BYTES) deny();
           mac.update(JSON.stringify([prefix + name, bytes.length,
             crypto.createHash("sha256").update(bytes).digest("hex")]) + "\n");
-          snapshots.push([full, candidate]);
+          snapshots.push([full, opened]);
         } finally { if (fd !== undefined) fs.closeSync(fd); }
       }
       if (!same(before, directory(folder))) deny();

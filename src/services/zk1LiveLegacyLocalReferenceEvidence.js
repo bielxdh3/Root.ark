@@ -80,19 +80,20 @@ function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret,
   function inspectFile(file, key) {
     let before, fd;
     try {
-      before = fs.lstatSync(file, { bigint: true });
+      // Trust only an already-opened, bounded regular descriptor. A named
+      // lstat made before native open cannot authorize the inode that opens.
+      fd = fs.openSync(file, fs.constants.O_RDONLY
+        | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+      before = fs.fstatSync(fd, { bigint: true });
+      const named = fs.lstatSync(file, { bigint: true });
       if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
-        || before.size > BigInt(MAX_FILE_BYTES)) deny();
+        || before.size > BigInt(MAX_FILE_BYTES)
+        || !named.isFile() || named.isSymbolicLink() || !same(before, named)) deny();
       const inode = `${before.dev}:${before.ino}`;
       if (seenFiles.has(inode)) deny();
       seenFiles.add(inode);
       totalBytes += before.size;
       if (totalBytes > BigInt(MAX_TOTAL_BYTES)) deny();
-      // Enumeration and native open are separate steps. A raced FIFO must
-      // fail identity validation rather than block this bounded preflight.
-      fd = fs.openSync(file, fs.constants.O_RDONLY
-        | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
-      if (!same(before, fs.fstatSync(fd, { bigint: true }))) deny();
       // Pin the allocation to the pre-open size, not a writer-grown inode.
       const data = Buffer.alloc(Number(before.size));
       let offset = 0;

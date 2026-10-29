@@ -187,6 +187,31 @@ test("legacy evidence readback cannot hang if source is swapped for a real FIFO 
   assert.match(result.stdout, /FIFO_SOURCE_REFUSED/);
 });
 
+test("legacy byte reader pins a descriptor before checking the mutable source name", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.uploads, "nested", "source.bin");
+  const nativeOpen = fs.openSync;
+  const nativeLstat = fs.lstatSync;
+  let pinned = false, beforeOpenChecks = 0;
+  fs.openSync = function (name, ...args) {
+    if (name === target) pinned = true;
+    return nativeOpen.call(fs, name, ...args);
+  };
+  fs.lstatSync = function (name, ...args) {
+    if (name === target && !pinned && /\bfileBytes\b/.test(new Error().stack || "")) {
+      beforeOpenChecks++;
+    }
+    return nativeLstat.call(fs, name, ...args);
+  };
+  let report;
+  try { report = await scan(f); }
+  finally { fs.openSync = nativeOpen; fs.lstatSync = nativeLstat; }
+  assert.equal(report.sections.uploads.status, "PROVEN");
+  assert.equal(pinned, true);
+  assert.equal(beforeOpenChecks, 0,
+    "source-name metadata cannot authorize opening before a pinned nonblocking descriptor exists");
+});
+
 test("real SQLite, nested revisions, trash, preview and ZIP produce repeatable byte evidence", async (t) => {
   const f = await fixture(t);
   const before = fs.readFileSync(f.databasePath);

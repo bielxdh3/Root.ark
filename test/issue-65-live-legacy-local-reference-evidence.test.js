@@ -95,6 +95,30 @@ test("local reference inventory must refuse real FIFO replacement at file-open w
   assert.match(result.stdout, /FIFO_REFUSED_WITHOUT_BLOCKING/);
 });
 
+test("local reference file reader never trusts a pre-open leaf stat", (t) => {
+  const f = fixture(t);
+  const originalOpen = fs.openSync;
+  const originalLstat = fs.lstatSync;
+  let pinned = false, unsafeFileReaderChecks = 0;
+  fs.openSync = function (name, ...args) {
+    if (name === f.current) pinned = true;
+    return originalOpen.call(fs, name, ...args);
+  };
+  fs.lstatSync = function (name, ...args) {
+    if (name === f.current && !pinned && /\binspectFile\b/.test(new Error().stack || "")) {
+      unsafeFileReaderChecks++;
+    }
+    return originalLstat.call(fs, name, ...args);
+  };
+  let report;
+  try { report = scan(f); }
+  finally { fs.openSync = originalOpen; fs.lstatSync = originalLstat; }
+  assert.equal(report.legacy.localReferenceEvidence.localFiles, 2);
+  assert.equal(pinned, true);
+  assert.equal(unsafeFileReaderChecks, 0,
+    "inside the file reader, no named inode check may precede its pinned FD");
+});
+
 test("opt-in real SQLite derived index and historical-version bytes yield only partial opaque local evidence", (t) => {
   const f = fixture(t);
   const before = [fs.readFileSync(f.databasePath), fs.readFileSync(f.current), fs.readFileSync(f.history)];
