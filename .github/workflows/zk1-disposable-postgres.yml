@@ -1,0 +1,64 @@
+name: ZK-1 Disposable PostgreSQL 18
+
+# Runs on stacked #65 draft PRs as well as changes targeting main. No database
+# credentials, protected environments or privileged tokens are used.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/zk1-disposable-postgres.yml'
+      - 'db/zk1-gate-authority.sql'
+      - 'lab/issue-65-pg18-ci/**'
+      - 'src/services/zk1*'
+      - 'src/routes/zk1*'
+      - 'src/crypto/rootark-zk-*'
+      - 'src/crypto/rootark-zk1-*'
+      - 'sync-client/rootark-sync-zk1-physical-binding.js'
+      - 'public/client/rootark-zk1*'
+      - 'test/issue-65-*'
+      - 'test/support/issue-65-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zk1-disposable-pg18-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  disposable-postgres-18:
+    name: PostgreSQL 18 real SQL roles, sealed ciphertext, approval replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout triggering revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Pull pinned disposable PostgreSQL 18 image
+        run: docker pull postgres:18.6-alpine3.24
+
+      - name: Validate no-SKIP enforcement and safe exact-ID cleanup
+        run: node --test test/issue-65-disposable-pg-ci.test.js
+
+      - name: Real PostgreSQL shared gate, restricted role and physical sealing
+        run: node lab/issue-65-pg18-ci/run-shared-gate-postgres.js
+
+      - name: Real PostgreSQL approval replay and cryptographic release checks
+        run: node lab/issue-65-pg18-ci/run-approval-replay-postgres.js
+
+      - name: Ensure disposable suites did not mutate tracked source
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
