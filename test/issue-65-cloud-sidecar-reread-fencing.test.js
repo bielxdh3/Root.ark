@@ -207,7 +207,11 @@ test("signed sidecar publishes exact pinned bytes through physical S3 and Drive 
       const result = await client.upload(source, folder, name, area, options);
       assert.match(options.zk1ExpectedSha256, /^[a-f0-9]{64}$/,
         "the signed wire digest must be carried to the physical provider adapter");
-      assert.equal(options.zk1ExpectedSha256, sha(fs.readFileSync(source)));
+      // Check the bytes the SDK actually received. Rereading the staging
+      // pathname after an async upload could observe a different inode.
+      const transmitted = writer.provider === "s3" ? uploads.s3 : uploads.gdrive;
+      assert.equal(transmitted.length, 1);
+      assert.equal(options.zk1ExpectedSha256, sha(transmitted[0]));
       return { ...result, key: originalKey(folder, name, area) };
     };
   }
