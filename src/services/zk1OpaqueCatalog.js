@@ -373,15 +373,25 @@ class Zk1OpaqueCatalog {
   verifyPhysicalVersions(key, pages) {
     const rows = this.store.db.prepare("SELECT id,revision,epoch,ciphertext,ciphertext_digest FROM zk_content_version WHERE scope=? ORDER BY id COLLATE BINARY,revision").all(key);
     const listed = pages.flat();
-    if (rows.length !== listed.length || rows.length > MAX_ENTRIES) fail("ZK_CATALOG_UNAVAILABLE");
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].id !== listed[i].object_id
-        || rows[i].revision !== listed[i].revision || rows[i].epoch !== listed[i].epoch
-        || !Buffer.isBuffer(rows[i].ciphertext)
-        || !same(crypto.createHash("sha256").update(rows[i].ciphertext).digest(), rows[i].ciphertext_digest)
-        || !same(rows[i].ciphertext_digest, listed[i].ciphertext_digest)) {
+    // The signed snapshot is immutable, but a later authorized PUT can add a
+    // physical version before a lost CAS ACK is reconciled. Every version in
+    // the signed snapshot must still exist with identical bytes and epoch.
+    // Newer physical rows must also have intact ciphertext digests; the NEXT
+    // signed commit independently requires exact full-inventory equality.
+    if (rows.length < listed.length || rows.length > MAX_ENTRIES) fail("ZK_CATALOG_UNAVAILABLE");
+    const physical = new Map();
+    for (const row of rows) {
+      const version = row.id + ":" + row.revision;
+      if (physical.has(version) || !Buffer.isBuffer(row.ciphertext)
+        || !same(crypto.createHash("sha256").update(row.ciphertext).digest(), row.ciphertext_digest)) {
         fail("ZK_CATALOG_UNAVAILABLE");
       }
+      physical.set(version, row);
+    }
+    for (const entry of listed) {
+      const row = physical.get(entry.object_id + ":" + entry.revision);
+      if (!row || row.epoch !== entry.epoch
+        || !same(row.ciphertext_digest, entry.ciphertext_digest)) fail("ZK_CATALOG_UNAVAILABLE");
     }
   }
   async reconcileMissing(key, current, auth) {
@@ -560,7 +570,9 @@ class Zk1OpaqueCatalog {
         validateHeader(header, this.store.trustedScope);
         const totalVersions = this.store.db.prepare(
           "SELECT COUNT(*) AS n FROM zk_content_version WHERE scope=?").get(key).n;
-        if (totalVersions !== header.total_count) fail("ZK_CATALOG_UNAVAILABLE");
+        // The head attests its own snapshot. A physical PUT after that head
+        // can remain pending until the next signed catalog commit.
+        if (totalVersions < header.total_count) fail("ZK_CATALOG_UNAVAILABLE");
         if (header.sequence !== current.sequence || header.manifest_revision > auth.request.manifest_revision
           || page >= Math.max(1, header.page_digests.length)) fail("ZK_CATALOG_CONFLICT");
         const signer = auth.verifiedHeadManifest.devices.find((device) =>
