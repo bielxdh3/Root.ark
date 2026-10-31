@@ -45,6 +45,18 @@ runDisposablePgLab("gate", async (fixture) => {
       ROOTARK_ZK1_ADMISSION_ISSUER_PG_URL: issuerUrl }, maxBuffer: 8 * 1024 * 1024,
   });
   if (result.error || result.status !== 0) {
+    // Surface only bounded TAP failure names/codes from the disposable test.
+    // Never dump child stderr, connection strings, SQL parameters or pg URLs.
+    const failureLines = String(result.stdout || "").split(/\r?\n/)
+      .filter((line) => /^not ok \d+ - /.test(line)
+        || /^\s+(?:failureType|code): ['"]?[A-Z_a-z0-9]+['"]?$/.test(line))
+      .slice(0, 24).map((line) => line.trim()
+        .replace(/[^A-Za-z0-9 ,().:/_+=>-]/g, "?").slice(0, 180));
+    process.stderr.write("ZK65_SYNC_PG_BATCH_TAP_FAILURES "
+      + (failureLines.length ? failureLines.join(" | ") : "none-reported") + "\n");
+    if (result.error?.code === "ETIMEDOUT") {
+      process.stderr.write("ZK65_SYNC_PG_BATCH_CHILD_TIMEOUT\n");
+    }
     throw Error("ZK65_SYNC_PG_BATCH_FAILED: test run rejected (no database credentials emitted)");
   }
   const summary = checkCompleteTap(String(result.stdout || ""));
