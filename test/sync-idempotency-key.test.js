@@ -43,8 +43,13 @@ test("17-character idempotency key is accepted by the operation validator", asyn
   const operation = operationFor();
   const proof = await proofFor(operation, "abcdefghijklmnopq");
   assert.equal(proof.idempotencyKey, "abcdefghijklmnopq");
-  const result = protocol.createOperation({ ...operation, authorization: proof, plaintext: Buffer.from("payload"), fileKey: crypto.randomBytes(32) });
-  assert.equal(result.authorization.idempotencyKey, "abcdefghijklmnopq");
+  // Validate the proof directly: re-encrypting a signed operation with a new
+  // file key cannot legally carry the old signature into a new ciphertext.
+  const normalized = protocol.normalizeAuthorization(proof);
+  assert.equal(normalized.idempotencyKey, "abcdefghijklmnopq");
+  assert.throws(() => protocol.createOperation({ ...operation, authorization: proof,
+    plaintext: Buffer.from("payload"), fileKey: crypto.randomBytes(32) }),
+  { code: "authorization_scope" });
 });
 
 test("every idempotency key length from 16 to 40 is accepted", async () => {

@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
-const { isValidIdempotencyKey } = require("./rootark-sync-authorization");
+const { isValidIdempotencyKey, assertAuthorizationEnvelopeBinding } = require("./rootark-sync-authorization");
 
 const PROTOCOL_VERSION = 2;
 const MAX_ID_LENGTH = 160;
@@ -27,6 +27,8 @@ const OPERATION_FIELDS = Object.freeze([
   "tombstone", "ciphertext", "nonce", "tag", "aad", "authorization",
 ]);
 const OPTIONAL_OPERATION_FIELDS = new Set(["authorization"]);
+const REQUIRED_LEGACY_OPERATION_FIELDS = Object.freeze(OPERATION_FIELDS.filter(
+  (field) => field !== "authorization"));
 const AUTHORIZATION_FIELDS = Object.freeze([
   "schemaVersion", "type", "suite", "protocolVersion", "username", "deviceId", "operationId",
   "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch",
@@ -213,6 +215,11 @@ function decodeMovePayload(plaintext, fileKey) {
 }
 
 function createOperation(input = {}) {
+  // A freshly encrypted ciphertext cannot reuse a previously attached
+  // authorization; encrypt first, sign exactly these bytes second.
+  if (Object.hasOwn(input, "authorization")) {
+    fail("Do not supply authorization to the encryption constructor", "authorization_scope");
+  }
   const operation = String(input.operation || "");
   if (!OPERATIONS.has(operation)) fail("Invalid sync operation");
   const objectId = id(input.objectId || crypto.randomUUID(), "objectId");
@@ -242,22 +249,36 @@ function createOperation(input = {}) {
   };
   const plaintext = input.plaintext === undefined ? Buffer.from("{}", "utf8") : input.plaintext;
   Object.assign(result, encryptPayload(result, plaintext, input.fileKey));
-  if (input.authorization !== undefined) result.authorization = normalizeAuthorization(input.authorization);
   return result;
 }
 
-function validateOperationInternal(input, requireFreshAuthorization) {
+function validateOperationInternal(input, requireFreshAuthorization, requireSignedAuthorization = false) {
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("Invalid operation");
   if (input.protocolVersion !== PROTOCOL_VERSION) fail("Unsupported sync protocol version", "invalid_protocol_version");
   assertExactKeys(input, OPERATION_FIELDS, "operation");
-  for (const field of OPERATION_FIELDS) {
-    if (!OPTIONAL_OPERATION_FIELDS.has(field) && !Object.hasOwn(input, field)) fail(`Missing operation field: ${field}`);
+  // Required fields depend ONLY on the trusted entry point, never on whether
+  // an untrusted request elects to send its optional proof. This is the
+  // protected-route fail-closed boundary even if a caller skips a precheck.
+  const mandatory = requireSignedAuthorization
+    ? OPERATION_FIELDS : REQUIRED_LEGACY_OPERATION_FIELDS;
+  for (const field of mandatory) {
+    if (!Object.hasOwn(input, field)) {
+      fail(`Missing operation field: ${field}`,
+        requireSignedAuthorization && field === "authorization"
+          ? "authorization_required" : "invalid_operation");
+    }
   }
-  const operation = createOperation({ ...input, authorization: undefined,
+  const { authorization: _authorization, ...unsignedInput } = input;
+  const operation = createOperation({ ...unsignedInput,
     plaintext: Buffer.alloc(0), fileKey: Buffer.alloc(32) });
-  if (input.authorization !== undefined) {
+  if (Object.hasOwn(input, "authorization")) {
     operation.authorization = normalizeAuthorizationShape(input.authorization,
       requireFreshAuthorization);
+    // Signed fields/digests must match the supplied envelope BEFORE a caller
+    // has a chance to treat this normalized operation as signed data.
+    // Device signature and revocation are checked separately by the store.
+    assertAuthorizationEnvelopeBinding(operation.authorization, { ...operation,
+      ciphertext: input.ciphertext, nonce: input.nonce, tag: input.tag, aad: input.aad });
   }
   if (input.tombstone !== operation.tombstone) fail("Invalid tombstone flag");
   if (!operation.metadata.path) fail("Operation metadata.path is required");
@@ -276,6 +297,12 @@ function validateOperationInternal(input, requireFreshAuthorization) {
 
 function validateOperation(input) {
   return validateOperationInternal(input, true);
+}
+
+// Trusted route configuration selects protected ingress. The incoming
+// payload's own choice to include/omit proof MUST NEVER downgrade the mode.
+function validateFreshSignedOperation(input) {
+  return validateOperationInternal(input, true, true);
 }
 
 // A persisted record's authorization was checked at ingress. Its historical
@@ -306,6 +333,7 @@ module.exports = {
   normalizeAuthorization,
   safeRelativePath,
   validateOperation,
+  validateFreshSignedOperation,
   validateStoredOperation,
   OPTIONAL_OPERATION_FIELDS,
 };

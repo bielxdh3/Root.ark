@@ -115,6 +115,13 @@ function closeDb() {
   dbInstance = null;
 }
 
+// Read-only introspection for isolated SQLite integration fixtures. This
+// deliberately never opens or closes a connection: tests must refuse to
+// mutate a shared/pre-existing account database in the current process.
+function getOpenDatabasePath() {
+  return dbInstance ? observedPath : null;
+}
+
 function safeJsonParse(value, fallback) {
   if (value === null || value === undefined || value === "") return fallback;
   try {
@@ -149,6 +156,7 @@ module.exports = {
   ROOT_DIR,
   DEFAULT_DATABASE_PATH,
   closeDb,
+  getOpenDatabasePath,
   getDatabasePath,
   getDb,
   isDbEnabled,
