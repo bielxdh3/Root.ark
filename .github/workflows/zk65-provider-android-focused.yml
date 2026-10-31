@@ -85,5 +85,8 @@ jobs:
         run: gradle --no-daemon :core:test
       - name: Verify Kotlin tests did not change tracked files
         run: git diff --exit-code
+      - name: Diagnose Gradle-generated untracked paths without reading contents
+        shell: bash
+        run: git ls-files --others --exclude-standard | head -n 30
       - name: Verify Kotlin tests did not create untracked files
         run: test -z "$(git status --porcelain)"
