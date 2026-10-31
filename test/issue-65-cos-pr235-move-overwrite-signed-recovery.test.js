@@ -468,8 +468,8 @@ for (const phase of ["source-moved", "protocol-queued"]) {
     const translatedBefore = f.state.translations;
     const startedPort = await f.start();
     assert.ok(Number.isInteger(startedPort));
-    assert.equal(f.state.policyChecks, policyBefore,
-      "historically committed TWO-receipt LOCAL outbox must not reauthorize revoked device");
+    assert.equal(f.state.policyChecks, policyBefore + 2,
+      "historical replay must authenticate BOTH pinned Ed25519 envelopes without a fresh write grant");
     assert.equal(f.state.translations, translatedBefore,
       "replay must not re-encrypt, re-sign or enqueue a duplicate");
     const recovered = await f.reopen();
@@ -517,7 +517,8 @@ for (const phase of ["source-moved", "protocol-queued"]) {
     }, "valid inode and signed receipts must NOT conceal changed physical MOVE payload");
     assert.equal(f.state.current, null,
       "failed cold start must not leave an active HTTP listener");
-    assert.equal(f.state.policyChecks, policyBefore);
+    assert.equal(f.state.policyChecks, policyBefore + 2,
+      "tampered physical MOVE still must authenticate BOTH historical signed envelopes");
     assert.equal(f.state.translations, translatedBefore);
     assert.deepEqual(await fsp.readFile(f.localPath), frozenLocal,
       "rejected recovery cannot claim a fresh protocol-queued/seen mutation");
@@ -566,8 +567,8 @@ test("LOCAL-ONLY direct recovery >8 MiB: signed MOVE witness is NOT remote-sync-
   const beforeTranslation = f.state.translations;
   const port = await f.start();
   assert.ok(Number.isInteger(port));
-  assert.equal(f.state.policyChecks, beforePolicy,
-    "only existing committed exact-envelope receipts permit replay");
+  assert.equal(f.state.policyChecks, beforePolicy + 2,
+    "local-only replay must authenticate BOTH historical envelopes without new write admission");
   assert.equal(f.state.translations, beforeTranslation);
   const reopened = await f.reopen();
   assert.deepEqual(reopened.local.pending(), []);
