@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
@@ -16,8 +17,17 @@ function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-posix-webdav-"));
   const root = path.join(dir, "bridge");
   fs.mkdirSync(root, { mode: 0o700 });
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  return { dir, root };
+  const bridges = [];
+  // Node test hooks run in registration order. Removing the fixture before
+  // bridge.stop() would erase its live root-owner lock and correctly trigger
+  // "lifetime lock was replaced; preserving foreign evidence" on teardown.
+  // Never weaken the production identity check to accommodate an unsafe test
+  // cleanup order: stop each owned bridge BEFORE removing its directory.
+  t.after(async () => {
+    for (const bridge of bridges.reverse()) await bridge.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return { dir, root, track(bridge) { bridges.push(bridge); return bridge; } };
 }
 function request(port, relative, method = "GET", body = null, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -32,20 +42,19 @@ function request(port, relative, method = "GET", body = null, headers = {}) {
     req.end(body);
   });
 }
-async function bridgeFor(t, root) {
-  const bridge = new LocalSyncWebDavBridge({ rootDir: root, port: 0, token: TOKEN });
+async function bridgeFor(track, root) {
+  const bridge = track(new LocalSyncWebDavBridge({ rootDir: root, port: 0, token: TOKEN }));
   await bridge.start();
-  t.after(() => bridge.stop());
   return bridge;
 }
 
 test("POSIX owner-only bridge supports bearer GET HEAD PUT and MOVE through sticky /tmp", {
   skip: !LINUX,
 }, async (t) => {
-  const { root } = fixture(t);
+  const { root, track } = fixture(t);
   fs.mkdirSync(path.join(root, "nested"), { mode: 0o700 });
   fs.writeFileSync(path.join(root, "nested", "safe.txt"), "SAFE");
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const port = bridge.address().port;
   assert.deepEqual(await request(port, "/nested/safe.txt"), { status: 200, body: "SAFE" });
   assert.deepEqual(await request(port, "/nested/safe.txt", "HEAD"), { status: 200, body: "" });
@@ -62,12 +71,12 @@ test("POSIX owner-only bridge supports bearer GET HEAD PUT and MOVE through stic
 test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and journal replay", {
   skip: !LINUX,
 }, async (t) => {
-  const { root } = fixture(t);
+  const { root, track } = fixture(t);
   const nested = path.join(root, "nested");
   fs.mkdirSync(nested, { mode: 0o700 });
   const leaf = path.join(nested, "unsafe.txt");
   fs.writeFileSync(leaf, "ORIGINAL");
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const port = bridge.address().port;
   assert.equal((await request(port, "/nested/unsafe.txt")).status, 200);
   for (const mode of [0o666, 0o660]) {
@@ -82,13 +91,6 @@ test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and jo
     assert.equal((await request(port, "/nested/", "PROPFIND", null, { depth: "1" })).status, 503,
       "Depth:1 cannot expose a sibling file without its own mode check");
     assert.equal(fs.readFileSync(leaf, "utf8"), "ORIGINAL");
-    const recovering = new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN, port: 0,
-      journal: { async recover() { return [{ operationId: "untrusted-leaf-recovery",
-        kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; } } });
-    t.after(() => recovering.stop());
-    await assert.rejects(recovering.start(), /Untrusted POSIX bridge file mode/,
-      "journal replay must refuse an existing untrusted file before any mutation");
-    assert.equal(recovering.server.listening, false);
   }
   fs.chmodSync(leaf, 0o644);
   assert.deepEqual(await request(port, "/nested/unsafe.txt"), { status: 200, body: "ORIGINAL" });
@@ -96,28 +98,50 @@ test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and jo
   assert.equal((await request(port, "/nested/", "PROPFIND", null, { depth: "1" })).status, 207);
   assert.equal((await request(port, "/nested/unsafe.txt", "PUT", "RECOVERED")).status, 204);
   assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  // Recovery needs exclusive lifetime ownership. A second concurrent bridge
+  // would be refused by the real root lock before POSIX leaf validation.
+  await bridge.stop();
+  fs.chmodSync(leaf, 0o666);
+  const recovering = track(new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN, port: 0,
+    journal: { async recover() { return [{ operationId: "untrusted-leaf-recovery",
+      kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; } } }));
+  await assert.rejects(recovering.start(), /Untrusted POSIX bridge file mode/,
+    "exclusive startup must refuse untrusted recovery leaf before modifying it");
+  assert.equal(recovering.server.listening, false);
+  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  fs.chmodSync(leaf, 0o644);
+  const stat = fs.lstatSync(leaf, { bigint: true });
+  const previousIdentity = { dev: String(stat.dev), ino: String(stat.ino), type: "file" };
   const marked = [];
-  const recoveringSafe = new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN, port: 0,
+  const recoveringSafe = track(new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN, port: 0,
     journal: { async recover() { return [{ operationId: "trusted-leaf-recovery",
-      kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; },
-    async markSeen(id) { marked.push(id); } } });
-  t.after(() => recoveringSafe.stop());
+      kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: true,
+      previousIdentity }]; },
+    async markSeen(id) { marked.push(id); } } }));
   await recoveringSafe.start();
   assert.deepEqual(marked, ["trusted-leaf-recovery"],
-    "trusted existing leaf may be checked during safe journal recovery");
+    "genuine previous inode proves prepared overwrite never applied");
   assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
   await recoveringSafe.stop();
+  // Previously, an impossible prepared PUT with existed:false and an
+  // already-occupied destination was falsely acknowledged as safe recovery.
+  const ambiguous = track(new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN,
+    journal: { async recover() { return [{ operationId: "ambiguous-prepared-put",
+      kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; } } }));
+  await assert.rejects(ambiguous.start(),
+    { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
 });
 
 test("POSIX different local UID can change 0666 file, but HTTP must deny it until made private", {
   skip: !LINUX || process.getuid?.() !== 0,
 }, async (t) => {
-  const { dir, root } = fixture(t);
+  const { dir, root, track } = fixture(t);
   const nested = path.join(root, "nested");
   fs.mkdirSync(nested, { mode: 0o755 });
   const leaf = path.join(nested, "unsafe.txt");
   fs.writeFileSync(leaf, "OWNER_ORIGINAL");
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const port = bridge.address().port;
   assert.equal((await request(port, "/nested/unsafe.txt")).body, "OWNER_ORIGINAL");
   // Root's fixture is deliberately traversable but not directory-writable.
@@ -144,12 +168,12 @@ test("POSIX different local UID can change 0666 file, but HTTP must deny it unti
 test("POSIX MKCOL stays 0700 under umask 000 and denies real foreign UID writes", {
   skip: !LINUX,
 }, async (t) => {
-  const { dir, root } = fixture(t);
+  const { dir, root, track } = fixture(t);
   // Allow the lower UID to traverse every ordinary ancestor, but never to
   // modify one. /tmp itself is root-owned sticky, as in production.
   fs.chmodSync(dir, 0o755);
   fs.chmodSync(root, 0o755);
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const port = bridge.address().port;
   const previousUmask = process.umask(0);
   let response;
@@ -188,7 +212,7 @@ test("POSIX MKCOL stays 0700 under umask 000 and denies real foreign UID writes"
 });
 
 test("POSIX writable root, ancestor and nested directory fail closed", { skip: !LINUX }, async (t) => {
-  const { dir, root } = fixture(t);
+  const { dir, root, track } = fixture(t);
   const nested = path.join(root, "nested");
   fs.mkdirSync(nested, { mode: 0o700 });
   fs.writeFileSync(path.join(nested, "safe.txt"), "SAFE");
@@ -202,7 +226,7 @@ test("POSIX writable root, ancestor and nested directory fail closed", { skip: !
   await assert.rejects(new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN }).start(),
     /Untrusted writable POSIX bridge ancestor/);
   fs.chmodSync(root, 0o700);
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const port = bridge.address().port;
   fs.chmodSync(nested, 0o770);
   assert.equal((await request(port, "/nested/safe.txt")).status, 503);
@@ -234,7 +258,7 @@ test("POSIX writable root, ancestor and nested directory fail closed", { skip: !
 test("POSIX separate UID symlink swap before native leaf open cannot leak outside secret", {
   skip: !LINUX || process.getuid?.() !== 0,
 }, async (t) => {
-  const { dir, root } = fixture(t);
+  const { dir, root, track } = fixture(t);
   const nested = path.join(root, "nested");
   const parked = path.join(root, "parked");
   const foreign = path.join(dir, "foreign");
@@ -259,7 +283,7 @@ test("POSIX separate UID symlink swap before native leaf open cannot leak outsid
   const attacker = (mode) => execFileSync("/usr/sbin/runuser",
     ["-u", "nobody", "--", process.execPath, attackerScript,
       root, nested, parked, foreign, secret, mode], { timeout: 10000 });
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const port = bridge.address().port;
   assert.equal((await request(port, "/nested/payload.txt")).body, "INSIDE");
   fs.chmodSync(dir, 0o755);
@@ -309,7 +333,7 @@ test("POSIX separate UID symlink swap before native leaf open cannot leak outsid
 test("POSIX pinned GET uses the opened inode despite a trusted after-open directory swap", {
   skip: !LINUX,
 }, async (t) => {
-  const { dir, root } = fixture(t);
+  const { dir, root, track } = fixture(t);
   const nested = path.join(root, "nested");
   const parked = path.join(root, "parked");
   const foreign = path.join(dir, "foreign");
@@ -318,7 +342,7 @@ test("POSIX pinned GET uses the opened inode despite a trusted after-open direct
   const leaf = path.join(nested, "sample.txt");
   fs.writeFileSync(leaf, "SAFE_OPENED_INODE");
   fs.writeFileSync(path.join(foreign, "sample.txt"), "OUTSIDE_SENTINEL");
-  const bridge = await bridgeFor(t, root);
+  const bridge = await bridgeFor(track, root);
   const originalOpen = fs.openSync;
   let swapped = false;
   fs.openSync = function (name, ...args) {
@@ -413,13 +437,12 @@ test("POSIX startup must not create trash under other-UID symlink or outside bri
 test("POSIX startup creates private nested root and trash through trusted parents", {
   skip: !LINUX,
 }, async (t) => {
-  const { dir } = fixture(t);
+  const { dir, track } = fixture(t);
   const root = path.join(dir, "new", "deep", "bridge");
   const trashDir = path.join(root, ".rootark-trash", "new", "deep");
   assert.equal(fs.existsSync(root), false);
-  const bridge = new LocalSyncWebDavBridge({ rootDir: root, trashDir, token: TOKEN });
+  const bridge = track(new LocalSyncWebDavBridge({ rootDir: root, trashDir, token: TOKEN }));
   await bridge.start();
-  t.after(() => bridge.stop());
   assert.equal(fs.statSync(root).mode & 0o077, 0);
   assert.equal(fs.statSync(path.join(dir, "new")).mode & 0o077, 0);
   assert.equal(fs.statSync(trashDir).mode & 0o077, 0);
@@ -437,12 +460,63 @@ test("POSIX startup can create a new owner-only root directly below sticky /tmp"
 }, async (t) => {
   const root = path.join(os.tmpdir(), `rootark-posix-new-sticky-${crypto.randomUUID()}`);
   assert.equal(fs.existsSync(root), false);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: TOKEN });
+  t.after(async () => {
+    await bridge.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   await bridge.start();
-  t.after(() => bridge.stop());
   assert.equal(fs.statSync(root).mode & 0o077, 0);
   assert.equal(fs.statSync(path.join(root, ".rootark-trash")).mode & 0o077, 0);
   assert.equal((await request(bridge.address().port, "/created.txt", "PUT", "OK")).status, 201);
   assert.equal((await request(bridge.address().port, "/created.txt")).body, "OK");
+});
+
+test("POSIX namespace fsync refuses a swapped symlink parent before acknowledging PUT", {
+  skip: !LINUX,
+  timeout: 30000,
+}, async (t) => {
+  const { dir, root, track } = fixture(t);
+  const nested = path.join(root, "nested");
+  const parked = path.join(root, "parked");
+  const foreign = path.join(dir, "foreign");
+  fs.mkdirSync(nested, { mode: 0o700 });
+  const originalParent = fs.lstatSync(nested, { bigint: true });
+  fs.mkdirSync(foreign, { mode: 0o700 });
+  const sentinel = path.join(foreign, "sentinel.txt");
+  fs.writeFileSync(sentinel, "UNRELATED_FOREIGN_BYTES", { mode: 0o600 });
+  const bridge = await bridgeFor(track, root);
+  const originalOpen = fsp.open;
+  let swapped = false;
+  fsp.open = async function (name, flags, ...rest) {
+    if (name !== nested || swapped) return originalOpen.call(fsp, name, flags, ...rest);
+    // Real same-UID directory exchange at the exact namespace durability
+    // boundary. The previous pathname-only open followed this symlink and
+    // returned a false successful fsync of an unrelated directory.
+    swapped = true;
+    fs.renameSync(nested, parked);
+    let linked = false;
+    try {
+      fs.symlinkSync(foreign, nested, "dir");
+      linked = true;
+      return await originalOpen.call(fsp, name, flags, ...rest);
+    }
+    finally {
+      if (linked) fs.unlinkSync(nested);
+      fs.renameSync(parked, nested);
+    }
+  };
+  let response;
+  try { response = await request(bridge.address().port, "/nested/new.txt", "PUT", "NEW_BYTES"); }
+  finally { fsp.open = originalOpen; }
+  assert.equal(swapped, true, "the actual directory fsync open must be reached");
+  assert.ok(response.status < 200 || response.status >= 300,
+    "a changed namespace parent must not receive a successful durability ACK");
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "UNRELATED_FOREIGN_BYTES");
+  const restored = fs.lstatSync(nested, { bigint: true });
+  assert.equal(restored.isDirectory(), true);
+  assert.equal(restored.dev, originalParent.dev);
+  assert.equal(restored.ino, originalParent.ino);
+  assert.equal(fs.existsSync(path.join(nested, "new.txt")), false,
+    "a failed namespace fsync must not leave an acknowledged new object");
 });

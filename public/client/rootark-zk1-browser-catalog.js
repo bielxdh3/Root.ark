@@ -277,6 +277,12 @@
     number(header.epoch, 1);
     number(header.issued_at);
     if (header.signer_device_id !== signerGrant.device_id
+      || header.manifest_revision !== signerGrant.manifest_revision
+      || !equal(header.manifest_digest, from64(signerGrant.manifest_digest, 32))
+      || header.epoch !== signerGrant.current_epoch
+      || number(signerGrant.enrolled_epoch, 1) > header.epoch
+      || (signerGrant.revoked_at_epoch !== null
+        && number(signerGrant.revoked_at_epoch, 1) <= header.epoch)
       || header.manifest_revision > pinnedHead.revision
       || (header.manifest_revision === pinnedHead.revision
         && !equal(header.manifest_digest, bytes(pinnedHead.digest, 32)))
@@ -382,43 +388,85 @@
         "independentAuthoritySpkiHash", "pinnedCatalogHead", "origin", "fetchImpl",
         "assertLive", "indexedDBImpl", "nowSeconds"]);
       const { trust, assertLive } = input;
-      if (typeof assertLive !== "function" || typeof input.fetchImpl !== "function"
-        || typeof input.origin !== "string" || !/^https?:\/\//.test(input.origin)
+      const signedGrantFields = [...GRANT, "signature"];
+      // Snapshot the signer before any owner-floor/crypto/network await. The
+      // historical identity must not be replaced between verification and GET.
+      exact(input.signerGrant, signedGrantFields);
+      exact(trust.signedDeviceGrant, signedGrantFields);
+      const signerGrant = Object.fromEntries(signedGrantFields.map((name) =>
+        [name, input.signerGrant[name]]));
+      const activeGrant = Object.fromEntries(signedGrantFields.map((name) =>
+        [name, trust.signedDeviceGrant[name]]));
+      const pinnedHead = { revision: trust.pinnedCurrentHead.revision,
+        digest: bytes(trust.pinnedCurrentHead.digest, 32), epoch: trust.pinnedCurrentHead.epoch };
+      // Every identity and transport input that crosses WebCrypto/HTTP awaits
+      // is captured here. Otherwise a caller could validate pinned CAS key A
+      // and replace input.catalogAuthorityKey with attacker key B mid-fetch.
+      const ownerPublicKey = trust.ownerPublicKey;
+      const independentOwnerSpkiSha256 = bytes(trust.independentOwnerSpkiSha256, 32);
+      const ownerHistoryCheckpoint = trust.ownerHistoryCheckpoint;
+      const previousOwnerHistoryProof = trust.previousOwnerHistoryProof;
+      const catalogAuthorityKey = input.catalogAuthorityKey;
+      const independentAuthoritySpkiHash = bytes(input.independentAuthoritySpkiHash, 32);
+      const devicePrivateKey = input.devicePrivateKey;
+      const fetchImpl = input.fetchImpl;
+      const origin = input.origin;
+      const indexedDBImpl = input.indexedDBImpl;
+      const nowSeconds = input.nowSeconds;
+      const pinnedCatalogHead = { sequence: input.pinnedCatalogHead.sequence,
+        digest: input.pinnedCatalogHead.digest };
+      if (typeof assertLive !== "function" || typeof fetchImpl !== "function"
+        || typeof origin !== "string" || !/^https?:\/\//.test(origin)
         || (typeof location === "object" && location.origin
-          && input.origin !== location.origin + "/")) deny();
-      keyCheck(trust.ownerPublicKey, "public");
-      keyCheck(input.catalogAuthorityKey, "public");
-      keyCheck(input.devicePrivateKey, "private");
-      const actualSpki = new Uint8Array(await webCrypto.subtle.exportKey("spki", input.catalogAuthorityKey));
-      if (!equal(await hash(actualSpki), bytes(input.independentAuthoritySpkiHash, 32))) deny();
-      if (!trust.ownerHistoryCheckpoint) deny();
-      await trustFloor.assertCurrent({ ownerPublicKey: trust.ownerPublicKey,
-        independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
-        pinnedCurrentHead: trust.pinnedCurrentHead,
-        signedDeviceGrant: trust.signedDeviceGrant,
-        ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
-        previousOwnerHistoryProof: trust.previousOwnerHistoryProof });
+          && origin !== location.origin + "/")) deny();
+      keyCheck(ownerPublicKey, "public");
+      keyCheck(catalogAuthorityKey, "public");
+      keyCheck(devicePrivateKey, "private");
+      const actualSpki = new Uint8Array(await webCrypto.subtle.exportKey("spki", catalogAuthorityKey));
+      if (!equal(await hash(actualSpki), independentAuthoritySpkiHash)) deny();
+      if (!ownerHistoryCheckpoint) deny();
+      await trustFloor.assertCurrent({ ownerPublicKey,
+        independentOwnerSpkiSha256,
+        pinnedCurrentHead: pinnedHead,
+        signedDeviceGrant: activeGrant,
+        ownerHistoryCheckpoint, previousOwnerHistoryProof });
       assertLive();
-      await grantCheck(trust.signedDeviceGrant, trust.ownerPublicKey, trust.pinnedCurrentHead);
-      await grantCheck(input.signerGrant, trust.ownerPublicKey, trust.pinnedCurrentHead);
-      const scope = scopeOf(trust.signedDeviceGrant);
-      if (!Object.keys(scope).every((k) => scope[k] === input.signerGrant[k])) deny();
+      await grantCheck(activeGrant, ownerPublicKey, pinnedHead);
+      const signerIsCurrent = signerGrant.manifest_revision === pinnedHead.revision
+        && signerGrant.manifest_digest === to64(pinnedHead.digest)
+        && signerGrant.current_epoch === pinnedHead.epoch;
+      if (signerIsCurrent) {
+        await grantCheck(signerGrant, ownerPublicKey, pinnedHead);
+      } else {
+        // A revoked historical signer can authenticate an OLD immutable head,
+        // never this session's new read authorization. Require the owner's
+        // branded and verified predecessor checkpoint, not server history.
+        if (!trustFloor.verifyHistoricalSignerGrant) deny();
+        await trustFloor.verifyHistoricalSignerGrant({
+          ownerPublicKey, independentOwnerSpkiSha256,
+          pinnedCurrentHead: pinnedHead, signedDeviceGrant: activeGrant,
+          ownerHistoryCheckpoint, previousOwnerHistoryProof,
+          historicalSignerGrant: signerGrant,
+        });
+      }
+      const scope = scopeOf(activeGrant);
+      if (!Object.keys(scope).every((k) => scope[k] === signerGrant[k])) deny();
       const challenge = webCrypto.getRandomValues(new Uint8Array(32));
       const ownKey = await webCrypto.subtle.importKey("raw",
-        from64(trust.signedDeviceGrant.authorization_public_key, 32),
+        from64(activeGrant.authorization_public_key, 32),
         "Ed25519", false, ["verify"]);
-      const proof = await webCrypto.subtle.sign("Ed25519", input.devicePrivateKey, challenge);
+      const proof = await webCrypto.subtle.sign("Ed25519", devicePrivateKey, challenge);
       if (!await webCrypto.subtle.verify("Ed25519", ownKey, proof, challenge)) deny();
-      const clock = typeof input.nowSeconds === "function"
-        ? input.nowSeconds : () => input.nowSeconds;
+      const clock = typeof nowSeconds === "function"
+        ? nowSeconds : () => nowSeconds;
       const initialNow = number(clock(), 0);
-      const floor = input.pinnedCatalogHead;
+      const floor = pinnedCatalogHead;
       exact(floor, ["sequence", "digest"]);
       number(floor.sequence, 0, MAX_CATALOG_HEADS);
       from64(floor.digest, 32);
       if (floor.sequence === 0 && floor.digest !== to64(EMPTY)) deny();
       const keyId = to64(await hash(actualSpki));
-      const dbFloor = readFloor(scope, keyId, input.indexedDBImpl);
+      const dbFloor = readFloor(scope, keyId, indexedDBImpl);
       const previous = await indexedFloor(dbFloor);
       assertLive();
       if (previous && (previous.sequence > floor.sequence
@@ -431,14 +479,14 @@
       let header = null;
       for (let index = 0; index < MAX_VERSIONS / PAGE_SIZE; index++) {
         const now = number(clock(), initialNow);
-        const wire = await signedCatalogRead({ scope, signerKey: input.devicePrivateKey,
-          deviceId: trust.signedDeviceGrant.device_id, head: trust.pinnedCurrentHead,
+        const wire = await signedCatalogRead({ scope, signerKey: devicePrivateKey,
+          deviceId: activeGrant.device_id, head: pinnedHead,
           sequence: floor.sequence, digest: from64(floor.digest, 32), page: index, now });
         assertLive();
-        const response = await readJson(input.fetchImpl, input.origin + "zk-1/v1/catalog/read",
+        const response = await readJson(fetchImpl, origin + "zk-1/v1/catalog/read",
           wire, assertLive);
-        const verified = await verifyPage({ response, scope, signerGrant: input.signerGrant,
-          pinnedHead: trust.pinnedCurrentHead, authorityKey: input.catalogAuthorityKey,
+        const verified = await verifyPage({ response, scope, signerGrant,
+          pinnedHead, authorityKey: catalogAuthorityKey,
           requestNonce: from64(wire.authorization.nonce, 32),
           expectedSequence: floor.sequence, expectedDigest: from64(floor.digest, 32),
           index, now });
@@ -459,10 +507,10 @@
       assertLive();
       const deltaPages = Array.from({ length: pageDigests.length }, (_, i) => i)
         .filter((index) => !previous || previous.pageDigests[index] !== pageDigests[index]);
-      const context = Object.freeze({ scope, signerKey: input.devicePrivateKey,
-        deviceId: trust.signedDeviceGrant.device_id, head: trust.pinnedCurrentHead,
+      const context = Object.freeze({ scope, signerKey: devicePrivateKey,
+        deviceId: activeGrant.device_id, head: pinnedHead,
         catalogDigest: from64(next.digest, 32), sequence: next.sequence,
-        origin: input.origin, fetchImpl: input.fetchImpl, assertLive, nowSeconds: clock });
+        origin, fetchImpl, assertLive, nowSeconds: clock });
       const result = Object.freeze({ sequence: next.sequence,
         catalogDigest: next.digest, totalCount: entries.length,
         pageDigests: Object.freeze(pageDigests),

@@ -118,11 +118,16 @@ test("Phase 12 local bridge is loopback bearer protected, contained, and trash-b
 
 test("Phase 16 WebDAV overwrite is recoverable, journaled, and protects configured trash", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-");
+  const privateJournalDir = createPrivateAuthorityFixture("rootark-phase16-webdav-journal-");
   const trashDir = path.join(dir, "private-trash");
-  const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
+  const journal = await new SyncJournal(path.join(privateJournalDir, "journal.json")).open();
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, trashDir, token: "phase16-token", journal });
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    await bridge.stop();
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rm(privateJournalDir, { recursive: true, force: true });
+  });
   const headers = { authorization: "Bearer phase16-token" };
   const port = bridge.address().port;
   await request(port, "/source.txt", { method: "PUT", headers, body: Buffer.from("source") });
@@ -143,61 +148,129 @@ test("Phase 16 WebDAV overwrite is recoverable, journaled, and protects configur
   assert.equal(fs.existsSync(path.join(dir, "destination-dir", "old.txt")), false);
 });
 
-test("Phase 16 WebDAV rename and journal failures leave both paths unchanged", async (t) => {
+test("Phase 16 WebDAV exclusive publication and journal failures restore both full files", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-phase16-rollback-");
-  const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
+  const privateJournalDir = createPrivateAuthorityFixture("rootark-phase16-rollback-journal-");
+  const journal = await new SyncJournal(path.join(privateJournalDir, "journal.json")).open();
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, token: "phase16-token", journal });
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    await bridge.stop();
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rm(privateJournalDir, { recursive: true, force: true });
+  });
   const headers = { authorization: "Bearer phase16-token" };
   const port = bridge.address().port;
-  await request(port, "/source.txt", { method: "PUT", headers, body: Buffer.from("source") });
-  await request(port, "/destination.txt", { method: "PUT", headers, body: Buffer.from("destination") });
-  const originalRename = fsp.rename;
-  fsp.rename = async (from, to) => { if (from === path.join(dir, "source.txt")) throw new Error("induced rename failure"); return originalRename(from, to); };
+  const sourceBytes = Buffer.from("SOURCE_CONTENT_".repeat(48));
+  const destinationBytes = Buffer.from("DESTINATION_CONTENT_".repeat(40));
+  assert.ok(sourceBytes.length > 500 && destinationBytes.length > 500);
+  assert.equal((await request(port, "/source.txt", { method: "PUT", headers, body: sourceBytes })).status, 201);
+  assert.equal((await request(port, "/destination.txt", { method: "PUT", headers, body: destinationBytes })).status, 201);
+  const originalLink = fsp.link;
+  let rejectedPublication = 0;
+  fsp.link = async (from, to) => {
+    if (from === path.join(dir, "source.txt") && to === path.join(dir, "destination.txt")) {
+      rejectedPublication += 1;
+      throw new Error("induced exclusive MOVE publication failure");
+    }
+    return originalLink(from, to);
+  };
   try {
     assert.equal((await request(port, "/source.txt", { method: "MOVE", headers: { ...headers, destination: `http://127.0.0.1:${port}/destination.txt` } })).status, 500);
-  } finally { fsp.rename = originalRename; }
-  assert.equal((await request(port, "/source.txt", { method: "GET", headers })).body.toString(), "source");
-  assert.equal((await request(port, "/destination.txt", { method: "GET", headers })).body.toString(), "destination");
+  } finally { fsp.link = originalLink; }
+  assert.equal(rejectedPublication, 1, "the real file MOVE must reach the exclusive source-to-destination hard link");
+  assert.deepEqual((await request(port, "/source.txt", { method: "GET", headers })).body, sourceBytes);
+  assert.deepEqual((await request(port, "/destination.txt", { method: "GET", headers })).body, destinationBytes);
+  assert.deepEqual(await fsp.readFile(path.join(dir, "source.txt")), sourceBytes);
+  assert.deepEqual(await fsp.readFile(path.join(dir, "destination.txt")), destinationBytes);
 
+  // Lifetime root/journal locks prohibit two live owners of the same root.
+  // This is a sequential failure-mode test, not a concurrent-owner test.
+  await bridge.stop();
   const journalFailure = new LocalSyncWebDavBridge({ rootDir: dir, token: "phase16-token", journal, onOperation: async () => { throw new Error("journal failure"); } });
   await journalFailure.start();
   const secondSource = path.join(dir, "second-source.txt");
   const secondDestination = path.join(dir, "second-destination.txt");
-  await fsp.writeFile(secondSource, "second-source");
-  await fsp.writeFile(secondDestination, "second-destination");
+  const secondSourceBytes = Buffer.from("SECOND_SOURCE_CONTENT_".repeat(33));
+  const secondDestinationBytes = Buffer.from("SECOND_DESTINATION_CONTENT_".repeat(30));
+  assert.ok(secondSourceBytes.length > 500 && secondDestinationBytes.length > 500);
+  await fsp.writeFile(secondSource, secondSourceBytes);
+  await fsp.writeFile(secondDestination, secondDestinationBytes);
   const secondPort = journalFailure.address().port;
   assert.equal((await request(secondPort, "/second-source.txt", { method: "MOVE", headers: { ...headers, destination: `http://127.0.0.1:${secondPort}/second-destination.txt` } })).status, 500);
   await journalFailure.stop();
-  assert.equal(await fsp.readFile(secondSource, "utf8"), "second-source");
-  assert.equal(await fsp.readFile(secondDestination, "utf8"), "second-destination");
+  assert.deepEqual(await fsp.readFile(secondSource), secondSourceBytes);
+  assert.deepEqual(await fsp.readFile(secondDestination), secondDestinationBytes);
 });
 
-test("Phase 16 WebDAV journal recovery resolves a staged completed move", async (t) => {
+test("Phase 16 WebDAV staged MOVE restores only identity-proven backup; ambiguity fails closed", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-phase16-recovery-");
+  const privateJournalDir = createPrivateAuthorityFixture("rootark-phase16-recovery-journal-");
   const trashDir = path.join(dir, "configured-trash");
-  const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
+  const journal = await new SyncJournal(path.join(privateJournalDir, "journal.json")).open();
   const backup = path.join(trashDir, "staged-recovery.txt");
   await fsp.mkdir(trashDir, { recursive: true });
-  await fsp.writeFile(backup, "recover");
-  await journal.enqueue({ operationId: "recover-1", kind: "move", source: "/source.txt", destination: "/restored.txt", trash: path.relative(dir, backup), phase: "staged" });
+  const source = path.join(dir, "source.txt");
+  const sourceBytes = Buffer.from("staged-source-still-present");
+  const previousDestinationBytes = Buffer.from("recover");
+  await fsp.writeFile(source, sourceBytes);
+  await fsp.writeFile(backup, previousDestinationBytes);
+  const durableIdentity = (stat) => ({
+    dev: String(stat.dev), ino: String(stat.ino), type: stat.isFile() ? "file" : "directory",
+  });
+  const sourceIdentity = durableIdentity(await fsp.lstat(source, { bigint: true }));
+  const previousDestinationIdentity = durableIdentity(await fsp.lstat(backup, { bigint: true }));
+  await journal.enqueue({
+    operationId: "recover-1", kind: "move", journalType: "webdav-mutation",
+    source: "/source.txt", destination: "/restored.txt",
+    trash: path.relative(dir, backup), sourceIdentity, previousDestinationIdentity,
+    phase: "staged",
+  });
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, trashDir, token: "phase16-token", journal });
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
-  assert.equal((await fsp.readFile(path.join(dir, "restored.txt"), "utf8")), "recover");
+  t.after(async () => {
+    await bridge.stop();
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rm(privateJournalDir, { recursive: true, force: true });
+  });
+  assert.deepEqual(await fsp.readFile(path.join(dir, "restored.txt")), previousDestinationBytes);
+  assert.deepEqual(await fsp.readFile(source), sourceBytes,
+    "staged MOVE cannot delete a source it has not yet published");
+  assert.equal(fs.existsSync(backup), false, "successfully restored backup must be unlinked");
+  const restored = await fsp.lstat(path.join(dir, "restored.txt"), { bigint: true });
+  assert.deepEqual(durableIdentity(restored), previousDestinationIdentity,
+    "restored destination must still be the genuine backed-up inode");
   assert.deepEqual(await journal.recover(), []);
 
   const unresolvedBackup = path.join(trashDir, "unresolved.txt");
-  await fsp.writeFile(unresolvedBackup, "backup");
+  const foreignBackupBytes = Buffer.from("FOREIGN_BACKUP_MUST_SURVIVE_".repeat(25));
+  const foreignDestinationBytes = Buffer.from("FOREIGN_OCCUPIED_TARGET_MUST_SURVIVE_".repeat(21));
+  await fsp.writeFile(unresolvedBackup, foreignBackupBytes);
   const unresolvedSource = path.join(dir, "unresolved-source.txt");
-  await fsp.writeFile(unresolvedSource, "source");
-  await fsp.rename(unresolvedSource, path.join(dir, "unresolved.txt"));
-  await journal.enqueue({ operationId: "recover-2", kind: "move", source: "/unresolved-source.txt", destination: "/unresolved.txt", trash: path.relative(dir, unresolvedBackup), phase: "staged" });
-  await bridge.recoverPending();
-  assert.deepEqual(await journal.recover(), []);
-  assert.equal(await fsp.readFile(path.join(dir, "unresolved.txt"), "utf8"), "source");
-  assert.equal(await fsp.readFile(unresolvedBackup, "utf8"), "backup");
+  await fsp.writeFile(unresolvedSource, "source-which-is-not-present-anymore");
+  const unresolvedSourceIdentity = durableIdentity(await fsp.lstat(unresolvedSource, { bigint: true }));
+  await fsp.unlink(unresolvedSource);
+  const unresolvedTarget = path.join(dir, "unresolved.txt");
+  await fsp.writeFile(unresolvedTarget, foreignDestinationBytes);
+  const unresolvedEntry = {
+    operationId: "recover-2", kind: "move", journalType: "webdav-mutation",
+    source: "/unresolved-source.txt", destination: "/unresolved.txt",
+    trash: path.relative(dir, unresolvedBackup), phase: "staged",
+    sourceIdentity: unresolvedSourceIdentity,
+    previousDestinationIdentity: durableIdentity(await fsp.lstat(unresolvedBackup, { bigint: true })),
+  };
+  await journal.enqueue(unresolvedEntry);
+  await assert.rejects(bridge.recoverPending(),
+    { code: "WEBDAV_RECOVERY_INDETERMINATE" },
+    "missing source and foreign occupied target cannot be accepted as completed MOVE");
+  assert.deepEqual(await journal.recover(), [unresolvedEntry],
+    "ambiguous staged mutation must remain pending for manual reconciliation");
+  const independentlyReopenedJournal = await new SyncJournal(journal.filePath).open();
+  assert.deepEqual(await independentlyReopenedJournal.recover(), [unresolvedEntry],
+    "indeterminate status must remain durable after a real journal reopen");
+  assert.equal(fs.existsSync(unresolvedSource), false);
+  assert.deepEqual(await fsp.readFile(unresolvedTarget), foreignDestinationBytes);
+  assert.deepEqual(await fsp.readFile(unresolvedBackup), foreignBackupBytes);
 });
 
 test("Phase 12 server route stores opaque records and rejects conflict/replay", async (t) => {

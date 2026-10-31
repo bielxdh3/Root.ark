@@ -144,6 +144,64 @@
       return { key: JSON.stringify(SCOPE.map((name) => grant[name])), candidate };
     } catch (_) { deny(); }
   }
+  // Authenticate a PRIOR owner-issued signer grant strictly for verifying an
+  // immutable historical record. This is deliberately not a device admission
+  // capability: only the separately checked CURRENT grant may sign new IO.
+  async function verifyHistoricalSignerGrant(input) {
+    try {
+      exact(input, [...ANCHOR, "previousOwnerHistoryProof", "historicalSignerGrant"]);
+      // Do not export a bypassable standalone verifier: a branded OLD proof
+      // proves nothing about the currently selected owner's history without
+      // the corresponding owner-signed CURRENT link.
+      if (input.ownerHistoryCheckpoint === null) deny();
+      const { historicalSignerGrant, ...anchor } = input;
+      // The predecessor must be a genuinely branded, owner-signed checkpoint
+      // incorporated by the currently pinned checkpoint under this owner key.
+      const { candidate } = await verifyExternalAnchor(anchor);
+      if (!input.previousOwnerHistoryProof
+        || !ownerHistory?.checkCandidateHeadAgainstCheckpoint) deny();
+      exact(historicalSignerGrant, WIRE);
+      const grant = Object.fromEntries(WIRE.map((name) =>
+        [name, historicalSignerGrant[name]]));
+      const prior = input.previousOwnerHistoryProof;
+      if (grant.schema !== GRANT_SCHEMA
+        || !SCOPE.every((name) => grant[name] === input.signedDeviceGrant[name])
+        || !Number.isSafeInteger(grant.manifest_revision)
+        || grant.manifest_revision < 1 || grant.manifest_revision >= candidate.revision
+        || !Number.isSafeInteger(grant.current_epoch)
+        // V1 owner checkpoints authenticate revision+digest but NOT the epoch
+        // or V2 roster. Never infer a prior authorized epoch equal to today's
+        // from a predecessor checkpoint. Same-epoch historical reendorsement
+        // requires a future independently pinned V2 membership proof.
+        || grant.current_epoch < 1 || grant.current_epoch >= candidate.epoch
+        || !Number.isSafeInteger(grant.enrolled_epoch)
+        || grant.enrolled_epoch < 1 || grant.enrolled_epoch > grant.current_epoch
+        || (grant.revoked_at_epoch !== null
+          && (!Number.isSafeInteger(grant.revoked_at_epoch)
+            || grant.revoked_at_epoch <= grant.current_epoch))
+        || prior.revision !== grant.manifest_revision
+        || prior.manifestDigest !== grant.manifest_digest) deny();
+      from64(grant.manifest_digest, 32);
+      from64(grant.authorization_key_id, 16);
+      from64(grant.authorization_public_key, 32);
+      if (typeof grant.device_id !== "string" || !grant.device_id
+        || grant.device_id.length > 64 || /[\u0000-\u001f\u007f]/.test(grant.device_id)) deny();
+      await ownerHistory.checkCandidateHeadAgainstCheckpoint({
+        verifiedCheckpoint: prior, headRevision: grant.manifest_revision,
+        headDigest: from64(grant.manifest_digest, 32),
+      });
+      const message = new TextEncoder().encode(JSON.stringify(
+        Object.fromEntries(GRANT.map((name) => [name, grant[name]]))));
+      if (message.byteLength > 2048) deny();
+      const signed = new Uint8Array(DOMAIN.byteLength + message.byteLength);
+      signed.set(DOMAIN); signed.set(message, DOMAIN.byteLength);
+      if (!await webCrypto.subtle.verify("Ed25519", input.ownerPublicKey,
+        from64(grant.signature, 64), signed)) deny();
+      return Object.freeze({ historicalSignerAuthenticated: true,
+        authorizesProtectedIo: false, authorizesNewOperations: false,
+        independentRollbackProof: false });
+    } catch (_) { deny(); }
+  }
   async function withFloor(input, operation, indexedDBImpl =
     typeof indexedDB === "object" ? indexedDB : undefined) {
     const { key, candidate } = await verifyExternalAnchor(input);
@@ -197,6 +255,7 @@
     // Verification primitive for synthetic callers; it does not read or
     // establish a floor and cannot authorize any browser I/O by itself.
     verifyExternalAnchor,
+    verifyHistoricalSignerGrant,
     provisionOffline(input) { return withFloor(input, "provision"); },
     assertCurrent(input) { return withFloor(input, "assert"); },
   });

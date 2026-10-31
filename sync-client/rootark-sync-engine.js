@@ -12,7 +12,7 @@ const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
-const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock"]);
+const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
@@ -22,11 +22,108 @@ function signedEnvelopeDigest(operation) {
   return crypto.createHash("sha256")
     .update(protocol.canonicalJson(operation), "utf8").digest("hex");
 }
+
+const ATOMIC_ADMISSION_DOMAIN = "rootark-sync-atomic-batch-witness-v1\0";
+function pinnedAtomicWitnessKey(value) {
+  if (value == null) return null;
+  let key;
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    key = crypto.createPublicKey({ key: Buffer.from(value), format: "der", type: "spki" });
+  } else if (typeof value === "string" && /^[A-Za-z0-9_-]{40,512}$/.test(value)) {
+    const der = Buffer.from(value, "base64url");
+    if (der.toString("base64url") !== value) {
+      fail("Atomic batch witness key is not canonical", "authorization_required");
+    }
+    key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+  } else {
+    key = crypto.createPublicKey(value);
+  }
+  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+    fail("Atomic batch witness pin must be an Ed25519 public key",
+      "authorization_required");
+  }
+  return key;
+}
+function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope) {
+  // Client-signed envelopes echoed by the server are NOT evidence that the
+  // server committed them. Only a separate pinned witness can attest the
+  // exact physical store head AFTER the two operations become durable.
+  if (!trustedWitnessKey) fail("Independent atomic batch witness is unavailable",
+    "sync_atomic_batch_indeterminate");
+  const receipt = response?.atomicAdmission;
+  const statement = receipt?.statement;
+  const required = ["version", "scope", "nonce", "operationIds", "envelopeDigests",
+    "commitId", "storeHeadSha256", "fencingEpoch", "physicalDurable"];
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+    || Object.keys(receipt).sort().join(",") !== ["signature", "statement"].sort().join(",")
+    || !statement || typeof statement !== "object" || Array.isArray(statement)
+    || Object.keys(statement).sort().join(",") !== required.sort().join(",")
+    || statement.version !== 1 || statement.scope !== trustedScope
+    || statement.physicalDurable !== true
+    || typeof statement.nonce !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/.test(statement.nonce)
+    || !Number.isSafeInteger(statement.fencingEpoch) || statement.fencingEpoch < 1
+    || typeof statement.commitId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(statement.commitId)
+    || typeof statement.storeHeadSha256 !== "string"
+    || !/^[a-f0-9]{64}$/.test(statement.storeHeadSha256)
+    || !Array.isArray(statement.operationIds) || statement.operationIds.length !== 2
+    || !Array.isArray(statement.envelopeDigests) || statement.envelopeDigests.length !== 2
+    || operations.some((operation, index) =>
+      statement.operationIds[index] !== operation.operationId
+      || statement.envelopeDigests[index] !== signedEnvelopeDigest(operation))
+    || typeof receipt.signature !== "string"
+    || !/^[A-Za-z0-9_-]{86}$/.test(receipt.signature)) {
+    fail("Atomic batch lacks an exact independent durable admission receipt",
+      "sync_atomic_batch_indeterminate");
+  }
+  const signature = Buffer.from(receipt.signature, "base64url");
+  if (signature.length !== 64
+    || signature.toString("base64url") !== receipt.signature
+    || !crypto.verify(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
+      + protocol.canonicalJson(statement), "utf8"), trustedWitnessKey, signature)) {
+    fail("Independent atomic batch witness signature invalid",
+      "sync_atomic_batch_indeterminate");
+  }
+}
 function envelopeCopy(operation) {
   // Detach incoming JSON from transport/callback-owned mutable references.
   // An async key resolver must never be able to swap an already-verified
   // signed envelope before the filesystem is changed.
   return JSON.parse(protocol.canonicalJson(operation));
+}
+
+function signedWebDavEventId(operation) {
+  // Only an exact deterministic WebDAV operation ID can group two pending
+  // signed envelopes. Never infer batch ownership from adjacent array order
+  // alone, an untrusted metadata field or a caller-selected operation ID.
+  if (!operation || typeof operation !== "object"
+    || !Object.hasOwn(operation, "authorization")
+    || !["delete", "move"].includes(operation.operation)
+    || typeof operation.operationId !== "string"
+    || typeof operation.metadata?.path !== "string") return null;
+  const parts = /^webdav-(.+)-([a-f0-9]{24})$/.exec(operation.operationId);
+  if (!parts || parts[1].length > 100) return null;
+  const digest = crypto.createHash("sha256")
+    .update(`${operation.operation}:${operation.metadata.path}`)
+    .digest("hex").slice(0, 24);
+  return parts[2] === digest ? parts[1] : null;
+}
+
+function assertAtomicSignedOverwritePair(deleted, moved) {
+  const event = signedWebDavEventId(deleted);
+  if (!event || event !== signedWebDavEventId(moved)
+    || deleted.operation !== "delete" || moved.operation !== "move"
+    || deleted.metadata.path !== moved.metadata.path
+    || !moved.metadata.sourcePath || deleted.deviceId !== moved.deviceId
+    || deleted.compartmentId !== moved.compartmentId
+    || deleted.keyEpoch !== moved.keyEpoch
+    || deleted.objectId === moved.objectId || deleted.fileId === moved.fileId
+    || deleted.operationId === moved.operationId
+    || deleted.authorization.replayId === moved.authorization.replayId
+    || deleted.authorization.idempotencyKey === moved.authorization.idempotencyKey) {
+    fail("Signed WebDAV overwrite batch identity or order mismatch", "authorization_rejected");
+  }
+  return true;
 }
 
 function fail(message, code = "sync_engine_error") {
@@ -258,6 +355,22 @@ class SyncEngine {
     // device policy. Config snapshots and the local journal are not authority.
     this.currentDeviceAuthorization = options.currentDeviceAuthorization || null;
     this.requireCurrentOutgoingAuthorization = options.requireCurrentOutgoingAuthorization === true;
+    // Must be supplied from an independent, trusted owner-pinned source.
+    // NEVER accept a key sent by the sync server or serialized in the journal.
+    this.atomicBatchWitnessPublicKey = pinnedAtomicWitnessKey(options.atomicBatchWitnessPublicKey);
+    this.atomicBatchWitnessReadback = options.atomicBatchWitnessReadback || null;
+    this.atomicBatchWitnessScope = options.atomicBatchWitnessScope || null;
+    if (this.atomicBatchWitnessScope !== null
+      && (typeof this.atomicBatchWitnessScope !== "string"
+        || !/^[A-Za-z0-9._:-]{1,256}$/.test(this.atomicBatchWitnessScope))) {
+      fail("Atomic batch witness scope must be a trusted account/store identifier",
+        "authorization_required");
+    }
+    if (this.atomicBatchWitnessReadback !== null
+      && typeof this.atomicBatchWitnessReadback !== "function") {
+      fail("Independent atomic batch witness readback must be a function",
+        "authorization_required");
+    }
     if ((options.currentDeviceAuthorization != null && typeof options.currentDeviceAuthorization !== "function")
       || (this.requireCurrentOutgoingAuthorization && !this.currentDeviceAuthorization)) {
       fail("Current device authorization callback is required", "authorization_required");
@@ -396,11 +509,15 @@ class SyncEngine {
   }
 
   async verifyIncomingOperation(operation, { preObserve = true } = {}) {
-    // A permissive or incorrectly wired verifier must not turn strict client
-    // mode into unsigned legacy sync. Mandatory proof presence is local policy,
-    // independent of any callback result or server-provided record fields.
-    if (this.requireAuthorization && !operation.authorization) {
-      fail("Remote sync device authorization is required", "remote_authorization_rejected");
+    // Strict mode is local policy, never a request-controlled proof opt-in.
+    // Historical expiry is allowed only for a structurally bound SIGNED
+    // record; the trusted verifier below must still check key and revocation.
+    if (this.requireAuthorization) {
+      if (!operation || !Object.hasOwn(operation, "authorization")) {
+        fail("Remote sync device authorization is required", "remote_authorization_rejected");
+      }
+      try { protocol.validateStoredOperation(operation); }
+      catch { fail("Remote sync device authorization is invalid", "remote_authorization_rejected"); }
     }
     const digest = signedEnvelopeDigest(operation);
     // A valid signer can sign two different envelopes using one operation ID.
@@ -500,6 +617,13 @@ class SyncEngine {
   }
 
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    // No pull/reconciliation entry point may separately advance a member of
+    // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
+    // or out-of-scope sweep is not a two-envelope atomic admission receipt.
+    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
+      fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
+        "sync_atomic_batch_indeterminate");
+    }
     const tombstone = Boolean(operation.tombstone || operation.operation === "delete");
     const directoryMove = operation.operation === "update" && operation.metadata?.contentType === "inode/directory";
     if ((operation.operation !== "move" && !directoryMove && !tombstone)
@@ -661,8 +785,17 @@ class SyncEngine {
         fail("Current sync device authorization rejected", "authorization_rejected");
       }
     }
-    // No await after the strict synchronous policy decision. HTTP dispatch
-    // runs here, before any queued revocation microtask can execute.
+    // Local journals and translation callbacks are NOT an authorization
+    // authority. Enforce the mandatory signed-envelope boundary at every
+    // action (journal enqueue or HTTP dispatch), not just during creation.
+    // Build-time pre-sign current-device checks intentionally have no action.
+    if (authorizedAction && this.requireAuthorization) {
+      try { protocol.validateFreshSignedOperation(operation); }
+      catch { fail("Fresh outgoing sync device authorization is required",
+        "authorization_required"); }
+    }
+    // No await after the strict synchronous policy + signed-envelope checks.
+    // HTTP dispatch runs here, before a queued revocation microtask can run.
     if (authorizedAction) return authorizedAction();
   }
 
@@ -692,10 +825,14 @@ class SyncEngine {
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
     const kind = String(event.kind || "");
     if (!["put", "move", "delete"].includes(kind)) fail("Unsupported WebDAV mutation", "invalid_webdav_mutation");
-    const operationPrefix = `webdav-${event.operationId}-`;
-    const pendingForEvent = (await this.journal.recover()).filter((operation) => typeof operation.operationId === "string" && operation.operationId.startsWith(operationPrefix));
+    const operationPrefixes = [`webdav-${event.operationId}-`,
+      `webdavsolo-${event.operationId}-`];
+    const pendingForEvent = (await this.journal.recover()).filter((operation) =>
+      typeof operation.operationId === "string"
+        && operationPrefixes.some((prefix) => operation.operationId.startsWith(prefix)));
     if (pendingForEvent.length) return pendingForEvent;
-    if (this.journal.state?.seen?.some((operationId) => typeof operationId === "string" && operationId.startsWith(operationPrefix))) return [];
+    if (this.journal.state?.seen?.some((operationId) => typeof operationId === "string"
+      && operationPrefixes.some((prefix) => operationId.startsWith(prefix)))) return [];
     const requestedSourcePath = normalizeWebDavPath(event.source || event.path);
     const requestedDestinationPath = normalizeWebDavPath(event.destination || event.path || event.source);
     const current = await this.scanFiles();
@@ -726,7 +863,18 @@ class SyncEngine {
     const destinationPath = canonicalMapPath(requestedDestinationPath, current, snapshotFiles);
     const operations = [];
     const mappedSourcePaths = new Set();
-    const stableOperationId = (relativePath) => `webdav-${event.operationId}-${crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 24)}`;
+    const stableOperationId = (verbAndPath) => {
+      // Standalone DELETE has distinct Ed25519-bound ID namespace. A legacy
+      // `webdav-` DELETE alone is ambiguous with a displaced-target tombstone
+      // from an atomic overwrite and must never be pushed by itself after a
+      // local journal manifest was deleted/corrupted. The same applies to an
+      // orphaned atomic MOVE if its DELETE and group manifest were stripped.
+      const soloDelete = kind === "delete" && verbAndPath.startsWith("delete:");
+      const soloMove = kind === "move" && !event.previousDestinationIdentity
+        && verbAndPath.startsWith("move:");
+      return `${soloDelete || soloMove ? "webdavsolo" : "webdav"}-${event.operationId}-${crypto.createHash("sha256")
+        .update(verbAndPath).digest("hex").slice(0, 24)}`;
+    };
     const identityFor = (relativePath, prior) => {
       const deletedPrior = snapshotFiles[relativePath]?.deleted ? snapshotFiles[relativePath] : null;
       const identitySeed = deletedPrior ? crypto.randomUUID().replace(/-/g, "")
@@ -953,9 +1101,257 @@ class SyncEngine {
     return this.withMutationLock(() => this._pushPending(summary));
   }
 
+  async pushAtomicSignedOverwritePair(pending, summary) {
+    if (!this.requireAuthorization || !this.requireCurrentOutgoingAuthorization
+      || typeof this.currentDeviceAuthorization !== "function"
+      || typeof this.adapter.pushBatch !== "function"
+      || typeof this.journal.markSeenMany !== "function"
+      || !this.atomicBatchWitnessPublicKey
+      || !this.atomicBatchWitnessReadback || !this.atomicBatchWitnessScope) {
+      fail("Atomic protected WebDAV remote batch transport unavailable",
+        "sync_atomic_batch_unavailable");
+    }
+    // A persisted batch can be older than the device grant that admitted it.
+    // Historical readback MUST NOT turn an expired/revoked grant into a new
+    // POST. Structural validation is enough to identify immutable bytes for
+    // an independently signed physical witness; live policy is still required
+    // by assertOutgoingAuthorized before EVERY new network write.
+    const [deleted, moved] = pending.map((entry) =>
+      protocol.validateStoredOperation(entry));
+    if (!deleted.authorization || !moved.authorization) {
+      fail("Atomic protected WebDAV batch lacks original signed envelopes",
+        "sync_atomic_batch_indeterminate");
+    }
+    assertAtomicSignedOverwritePair(deleted, moved);
+    if (![deleted, moved].every((entry) => this.operationIsSelected(entry))) {
+      fail("Atomic WebDAV destination selection cannot split the batch",
+        "sync_atomic_batch_unavailable");
+    }
+    const digests = [deleted, moved].map(signedEnvelopeDigest);
+    let response;
+    const expiredBeforeRequest = [deleted, moved].some((entry) =>
+      entry.authorization.expiresAt <= Date.now());
+    let uncertainRequest = expiredBeforeRequest
+      ? Object.assign(new Error("Historical signed batch requires read-only witness"),
+        { code: "authorization_required" }) : null;
+    if (!expiredBeforeRequest) try {
+      // The second member's async authorizeOutgoing() can outlive the first
+      // member's expiry or current revocation decision. Recheck BOTH signed
+      // envelopes and the synchronous owner-trusted policy in one no-await
+      // window immediately before beginning the single remote batch POST.
+      const dispatchIfBothStillFresh = () => {
+        for (const member of [deleted, moved]) {
+          try { protocol.validateFreshSignedOperation(member); }
+          catch { fail("Atomic batch member expired before dispatch", "authorization_required"); }
+          let current;
+          try { current = this.currentDeviceAuthorization(member); }
+          catch { fail("Atomic batch current device grant unavailable", "authorization_rejected"); }
+          if (current !== true) {
+            try {
+              if (current && typeof current.then === "function") {
+                Promise.resolve(current).catch(() => {});
+              }
+            } catch { /* a broken policy is a denial */ }
+            fail("Atomic batch device grant changed before dispatch", "authorization_rejected");
+          }
+        }
+        return this.adapter.pushBatch([deleted, moved]);
+      };
+      // The final synchronous current-policy checks begin ONE network
+      // request. Remote registry must fence BOTH signatures under one lock.
+      response = await this.assertOutgoingAuthorized(deleted, () =>
+        this.assertOutgoingAuthorized(moved, () =>
+          dispatchIfBothStillFresh()));
+    } catch (error) {
+      // A 409 or a dropped ACK may mean the remote atomic transaction was
+      // committed, or may mean neither write happened. A plain LIST echo of
+      // the two envelopes proves neither signed server admission nor durable
+      // physical custody. Never fabricate a successful pair ACK from LIST.
+      // Preserve both pending until independently signed atomic admission
+      // readback proves the exact pair; no remote-wins partial repair. A
+      // genuine commit followed by a lost HTTP ACK can return 409 on retry.
+      // That must be checked with a fresh direct witness challenge, not kept
+      // in a permanent 409 loop.
+      if (transient(error) || [403, 409, 423, 503].includes(error?.status)
+        || ["authorization_rejected", "authorization_required"].includes(error?.code)) {
+        // Revocation and current-policy denial prohibit another write, not
+        // the separate read-only verification of an old physical commit.
+        // A remote denial after previous admission may also arrive after
+        // an earlier lost ACK; only the separate witness can disambiguate.
+        uncertainRequest = error;
+      }
+      else fail("Atomic signed WebDAV remote batch outcome indeterminate",
+        "sync_atomic_batch_indeterminate");
+    }
+    if (!uncertainRequest && (!Array.isArray(response?.objects) || response.objects.length !== 2
+      || response.objects.some((entry, index) => {
+        try {
+          return signedEnvelopeDigest(protocol.validateStoredOperation(entry)) !== digests[index];
+        } catch { return true; }
+      }))) {
+      fail("Atomic signed WebDAV remote batch lacks exact two-envelope ACK",
+        "sync_atomic_batch_indeterminate");
+    }
+    // A successful HTTP status (including an exact two-envelope echo) does
+    // not authenticate remote fsync, CAS fencing, or physical admission.
+    // In the absence of an independent signed durable witness, keep BOTH
+    // original operations pending and never persist an invented success.
+    // Fresh unpredictable challenge goes DIRECTLY to the independent witness
+    // AFTER HTTP admission. A cached receipt in the sync server's response
+    // can be replayed after the server rolls its physical state backwards.
+    // The readback transport must independently attest its current durable
+    // head/floor, not fetch unsigned LIST or re-sign the server's JSON.
+    const witnessNonce = crypto.randomBytes(32).toString("base64url");
+    let witnessed;
+    try {
+      witnessed = await this.atomicBatchWitnessReadback({
+        scope: this.atomicBatchWitnessScope,
+        nonce: witnessNonce,
+        operationIds: [deleted.operationId, moved.operationId],
+        envelopeDigests: digests,
+      });
+    } catch {
+      if (uncertainRequest && transient(uncertainRequest)) {
+        summary.offline = true;
+        return;
+      }
+      fail("Independent atomic admission readback unavailable",
+        "sync_atomic_batch_indeterminate");
+    }
+    if (witnessed?.statement?.nonce !== witnessNonce) {
+      if (uncertainRequest && transient(uncertainRequest) && !witnessed) {
+        summary.offline = true;
+        return;
+      }
+      fail("Independent atomic admission readback nonce mismatch",
+        "sync_atomic_batch_indeterminate");
+    }
+    // The independent readback callback returns the receipt itself, not the
+    // sync server's unsigned HTTP payload. Keep that distinction explicit:
+    // accepting a server-supplied `atomicAdmission` would undermine the
+    // separate witness and a valid direct receipt must not be rejected.
+    verifyAtomicBatchAdmission({ atomicAdmission: witnessed }, [deleted, moved],
+      this.atomicBatchWitnessPublicKey, this.atomicBatchWitnessScope);
+    // Remote admission is one transaction. Local advancement may still crash;
+    // keep BOTH original outbox entries pending until one atomic markSeenMany
+    // after the verified response and local snapshot are durably written.
+    let moveHash = null;
+    let historicalKeyUnavailable = false;
+    try {
+      moveHash = await this.hashPendingPayload(moved);
+    } catch (error) {
+      // A cryptographically verified PHYSICAL historical admission is not a
+      // new decrypt permission. After rekey or device revocation the old file
+      // key can be unavailable; that must not make a previously committed
+      // remote pair forever unacknowledgeable. Never invent a new plaintext
+      // hash: rememberOperation may only carry forward a previously trusted
+      // snapshot hash, if one exists. Any other error still fails closed.
+      if (!["authorization_rejected", "stale_key_epoch", "key_unavailable"].includes(error?.code)) {
+        throw error;
+      }
+      historicalKeyUnavailable = true;
+    }
+    const observed = [deleted, moved].map((entry, index) =>
+      this.localAdmissionDigestIfFresh(entry) === digests[index] ? digests[index] : null);
+    for (let index = 0; index < pending.length; index++) {
+      if (observed[index]) await this.journal.observeAdmission(pending[index].operationId, observed[index]);
+    }
+    this.rememberOperation(deleted);
+    this.rememberOperation(moved, moveHash);
+    if (historicalKeyUnavailable) {
+      // Even a previously trusted source hash cannot certify CURRENT local
+      // bytes after the file key becomes unavailable. Preserve the signed
+      // remote admission, but make local content identity explicitly unknown.
+      this.snapshot.files[moved.metadata.path].hash = null;
+    }
+    await this.persistSnapshot();
+    await this.journal.markSeenMany(pending.map((entry, index) => ({
+      operationId: entry.operationId, admittedDigest: observed[index],
+    })));
+    summary.pushed += 2;
+  }
+
   async _pushPending(summary) {
-    for (const original of await this.journal.recover()) {
+    const recovered = await this.journal.recover();
+    // The journal's durable group manifest—not adjacency—is the local
+    // evidence that the DELETE and MOVE entered the outbox together.
+    // enqueueMany can leave unrelated records between two group members.
+    const groups = typeof this.journal.atomicSignedGroups === "function"
+      ? this.journal.atomicSignedGroups() : {};
+    const groupedById = new Map();
+    const pendingById = new Map(recovered.map((item) => [item.operationId, item]));
+    for (const [eventId, pair] of Object.entries(groups)) {
+      if (!pair || typeof pair.deleteId !== "string" || typeof pair.moveId !== "string"
+        || groupedById.has(pair.deleteId) || groupedById.has(pair.moveId)
+        || !pendingById.has(pair.deleteId) || !pendingById.has(pair.moveId)
+        || signedWebDavEventId(pendingById.get(pair.deleteId)) !== eventId
+        || signedWebDavEventId(pendingById.get(pair.moveId)) !== eventId) {
+        fail("Atomic signed WebDAV outbox group has missing/mismatched member",
+          "sync_atomic_batch_indeterminate");
+      }
+      assertAtomicSignedOverwritePair(pendingById.get(pair.deleteId),
+        pendingById.get(pair.moveId));
+      groupedById.set(pair.deleteId, pair);
+      groupedById.set(pair.moveId, pair);
+    }
+    // Old local outboxes can contain two valid-looking WebDAV envelopes
+    // admitted separately before group provenance existed. Detect pairs
+    // across the ENTIRE queue; never let an intervening unrelated item cause
+    // the DELETE to escape via adapter.push. Without durable enqueueMany
+    // provenance there is no safe automatic remote transaction to infer.
+    const ungroupedCandidates = new Map();
+    for (const operation of recovered) {
+      const event = signedWebDavEventId(operation);
+      if (!event || groupedById.has(operation.operationId)) continue;
+      const candidates = ungroupedCandidates.get(event) || [];
+      candidates.push(operation);
+      ungroupedCandidates.set(event, candidates);
+    }
+    if ([...ungroupedCandidates.values()].some((candidates) => candidates.length > 1)) {
+      fail("Unproven historical atomic WebDAV outbox group",
+        "sync_atomic_batch_indeterminate");
+    }
+    const pushedGroups = new Set();
+    for (let index = 0; index < recovered.length; index += 1) {
+      const original = recovered[index];
       if (this.journal.hasSeen(original.operationId)) continue;
+      const group = groupedById.get(original.operationId);
+      if (group) {
+        if (pushedGroups.has(group.deleteId)) continue;
+        await this.pushAtomicSignedOverwritePair([
+          pendingById.get(group.deleteId), pendingById.get(group.moveId),
+        ], summary);
+        pushedGroups.add(group.deleteId);
+        if (summary.offline) break;
+        continue;
+      }
+      const next = recovered[index + 1];
+      const event = signedWebDavEventId(original);
+      if (event && next && signedWebDavEventId(next) === event) {
+        // Two adjacent lookalikes are not proof of one fsynced group.
+        fail("Unproven atomic WebDAV journal batch provenance",
+          "sync_atomic_batch_indeterminate");
+      }
+      // A prior version may have acknowledged DELETE but crashed before the
+      // companion MOVE. Such legacy partial evidence must NOT send MOVE as a
+      // standalone remote write; only manual independent reconciliation can
+      // determine whether the DELETE was ever committed remotely.
+      if (event && original.operation === "move") {
+        // An old `webdav-` MOVE can be the surviving half of a tampered
+        // overwrite batch. Its signature says MOVE, not that a destination
+        // tombstone was never required. Only new `webdavsolo-` IDs may be
+        // independently dispatched without a durable group manifest.
+        fail("Ambiguous legacy WebDAV MOVE cannot be remotely committed alone",
+          "sync_atomic_batch_indeterminate");
+      }
+      if (event && original.operation === "delete") {
+        // The only secure standalone WebDAV DELETE namespace is the new
+        // signed `webdavsolo-` variant. Old `webdav-` DELETE IDs could be a
+        // missing half of a poisoned DELETE+MOVE journal; presence/absence of
+        // locally editable manifest or seen IDs is not cryptographic proof.
+        fail("Ambiguous legacy WebDAV DELETE cannot be remotely committed alone",
+          "sync_atomic_batch_indeterminate");
+      }
       let pending = original;
       if (pending.journalType === "webdav-mutation") {
         if (!this.translateWebDavOperation) continue;
@@ -1542,6 +1938,14 @@ class SyncEngine {
   }
 
   async _pullRemote(summary) {
+    // A remotely visible single side of a just-committed/lost-ACK pair must
+    // NOT consume that local pending ID via _apply, markSeen or the excluded-
+    // path reconciliation path. Recover the atomic pair through its outbound
+    // transaction/readback first; never split a journal group in pullRemote.
+    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
+      fail("Remote pull blocked by pending atomic signed WebDAV batch",
+        "sync_atomic_batch_indeterminate");
+    }
     let result;
     try {
       result = await this.adapter.list();

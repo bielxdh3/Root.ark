@@ -15,12 +15,14 @@ const { createPrivateAuthorityFixture } =
 
 test("local WebDAV GET/HEAD preserves empty and nonempty HTTP framing", async (t) => {
   const root = createPrivateAuthorityFixture("zk65-w106-empty-get-");
-  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   fs.writeFileSync(path.join(root, "empty.ct"), "", { flag: "wx", mode: 0o600 });
   fs.writeFileSync(path.join(root, "normal.ct"), "VERIFIED", { flag: "wx", mode: 0o600 });
   const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "w106-empty", port: 0 });
+  t.after(async () => {
+    try { await bridge.stop(); }
+    finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }); }
+  });
   await bridge.start();
-  t.after(async () => bridge.stop());
   for (const [name, method, expected] of [
     ["empty.ct", "GET", ""], ["empty.ct", "HEAD", ""],
     ["normal.ct", "GET", "VERIFIED"], ["normal.ct", "HEAD", ""],
@@ -44,12 +46,14 @@ test("local WebDAV GET/HEAD preserves empty and nonempty HTTP framing", async (t
 
 test("local WebDAV closes a keep-alive HTTP response if the pinned FD is truncated", async (t) => {
   const root = createPrivateAuthorityFixture("zk65-w106-short-get-");
-  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   const source = path.join(root, "short.ct");
   fs.writeFileSync(source, "12345678", { flag: "wx", mode: 0o600 });
   const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "w106-short", port: 0 });
+  t.after(async () => {
+    try { await bridge.stop(); }
+    finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }); }
+  });
   await bridge.start();
-  t.after(async () => bridge.stop());
   const native = fs.createReadStream;
   let attacked = false;
   fs.createReadStream = function (name, options) {

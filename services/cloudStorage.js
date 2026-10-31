@@ -135,13 +135,14 @@ function sameUploadSource(left, right) {
 function openVerifiedLegacyUpload(localPath, expectedIdentity = null) {
   let fd;
   try {
-    const named = fs.lstatSync(localPath, { bigint: true });
-    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n) {
-      throw new Error("unsafe upload source");
-    }
+    // Open first and check the actual descriptor before any pathname metadata
+    // lookup. A checked regular file can otherwise be swapped for a FIFO,
+    // hanging this synchronous O_RDONLY open before our fstat can reject it.
     fd = fs.openSync(localPath, fs.constants.O_RDONLY
-      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0)
+      | (fs.constants.O_NONBLOCK || 0));
     const opened = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(localPath, { bigint: true });
     const same = (a, b) => a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
       && a.dev === b.dev && a.ino === b.ino && a.size === b.size
       && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
@@ -549,26 +550,28 @@ function createCloudStorage(options = {}) {
       }
     }
     guardSourceParent();
-    // The initial path check is an authorization boundary, not just an
-    // existence probe. An attacker can rename a parent directory after this
-    // stat and before the upload's later FD open. Retain the original inode
-    // instead of silently authorizing whichever file now occupies the name.
-    const initialSource = fs.statSync(localPath, { throwIfNoEntry: false, bigint: true });
-    if (!initialSource?.isFile()) return null;
-    const cloudKey = objectKey(folderId, fileName, area);
+    // Bounded ciphertext is authorized by its pinned FD and the publisher's
+    // independent SHA-256 commitment. Do not authorize a pathname via stat
+    // and then open that pathname a second time across a race window.
+    let initialSource = null;
     let boundedBytes = null;
     if (bound !== undefined) {
-      const stat = fs.lstatSync(localPath, { bigint: true });
-      if (stat.size !== BigInt(bound) || !sameUploadSource(stat, initialSource)) {
-        throw cloudError("configuration", "Ciphertext staging file is not an exact private upload");
-      }
       guardSourceParent();
-      const fd = fs.openSync(localPath,
-        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      let fd;
+      try {
+        fd = fs.openSync(localPath,
+          fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_CLOEXEC || 0) | (fs.constants.O_NONBLOCK || 0));
+      } catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "EISDIR") return null;
+        throw error;
+      }
       try {
         const opened = fs.fstatSync(fd, { bigint: true });
-        if (opened.size !== BigInt(bound) || !sameUploadSource(opened, stat)
-          || !sameUploadSource(opened, initialSource)) {
+        if (!opened.isFile()) return null;
+        const stat = fs.lstatSync(localPath, { bigint: true });
+        if (stat.size !== BigInt(bound) || opened.size !== BigInt(bound)
+          || !sameUploadSource(opened, stat)) {
           throw cloudError("configuration", "Bounded ciphertext staging file changed identity");
         }
         // The source may grow after fstat while another process still holds
@@ -598,7 +601,13 @@ function createCloudStorage(options = {}) {
           throw cloudError("configuration", "Bounded ciphertext digest mismatch");
         }
       } finally { fs.closeSync(fd); }
+    } else {
+      // Legacy streaming preserves the original missing-file behavior and
+      // checks this identity against the stream's independently opened FD.
+      initialSource = fs.statSync(localPath, { throwIfNoEntry: false, bigint: true });
+      if (!initialSource?.isFile()) return null;
     }
+    const cloudKey = objectKey(folderId, fileName, area);
     const legacyStreams = [];
     let initialLegacy = null;
     let firstLegacyBody = false;

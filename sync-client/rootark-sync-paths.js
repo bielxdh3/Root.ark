@@ -4,7 +4,7 @@ const DOS_RESERVED = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$/i
 const INTERNAL = new Set([
   ".rootark-trash", ".rootark-sync", ".rootark-sync-state.json",
   ".rootark-sync.json", ".rootark-sync-journal.json", ".rootark-sync-index.json",
-  ".rootark-sync.lock",
+  ".rootark-sync.lock", ".rootark-webdav-owner.lock",
 ]);
 const INTERNAL_PREFIXES = [".rootark-sync-lock-init-"];
 

@@ -60,6 +60,68 @@ function fileKeyResolver(master, fallbackEpoch) {
   return (operation) => crypto.createHmac("sha256", master).update(`${operation.fileId || operation.objectId}\0${operation.keyEpoch || fallbackEpoch}`, "utf8").digest();
 }
 
+function trustedAtomicBatchWitnessOptions(options, strictHistorical) {
+  // The remote DELETE+MOVE witness may be supplied only by the embedding
+  // trusted process, never by .rootark-sync.json or a remote response. A
+  // configured URL, signature or physicalDurable boolean is not a witness.
+  if (!Object.hasOwn(options, "trustedAtomicBatchWitness")) return {};
+  const supplied = options.trustedAtomicBatchWitness;
+  if (!strictHistorical || !supplied || typeof supplied !== "object"
+    || Array.isArray(supplied)
+    || Object.keys(supplied).sort().join(",")
+      !== ["pinnedPublicKey", "scope", "readback"].sort().join(",")
+    || typeof supplied.readback !== "function"
+    || typeof supplied.scope !== "string"
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(supplied.scope)
+    || !supplied.pinnedPublicKey) {
+    throw new Error("Atomic batch witness requires strict externally pinned readback");
+  }
+  // Validate at construction using the engine's existing strict Ed25519
+  // SPKI verifier. Capture all references now; config cannot replace them.
+  const readback = supplied.readback;
+  return {
+    atomicBatchWitnessPublicKey: Buffer.isBuffer(supplied.pinnedPublicKey)
+      || supplied.pinnedPublicKey instanceof Uint8Array
+      ? Buffer.from(supplied.pinnedPublicKey) : supplied.pinnedPublicKey,
+    atomicBatchWitnessScope: supplied.scope,
+    atomicBatchWitnessReadback: ({ scope, nonce, operationIds, envelopeDigests }) =>
+      readback({ scope, nonce, operationIds: [...operationIds],
+        envelopeDigests: [...envelopeDigests] }),
+  };
+}
+
+function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy) {
+  // The mutable sync config and device-key environment cannot enroll a new
+  // device or silently retarget the externally provisioned owner's account.
+  // This local check is NOT the missing immutable account/store ID or a
+  // substitute for independently retained physical witness/CAS evidence.
+  const deviceId = config?.deviceId;
+  const pins = independentlyPinnedPolicy?.trustedDevicePublicKeys;
+  // A pinned public-key STRING is insufficient if the process holds a
+  // different private key. Verify the exact Ed25519 signing key before any
+  // network request or disk journal is opened in strict mode.
+  let derivedPublicSpki = null;
+  if (config?.privateKey instanceof crypto.KeyObject
+    && config.privateKey.type === "private"
+    && config.privateKey.asymmetricKeyType === "ed25519") {
+    derivedPublicSpki = crypto.createPublicKey(config.privateKey)
+      .export({ type: "spki", format: "der" }).toString("base64url");
+  }
+  if (typeof config?.username !== "string"
+    || typeof deviceId !== "string" || !deviceId
+    || typeof config?.publicKey !== "string"
+    || config.username !== independentlyPinnedPolicy?.username
+    || !pins || typeof pins !== "object" || Array.isArray(pins)
+    || !Object.hasOwn(pins, deviceId)
+    || pins[deviceId] !== config.publicKey
+    || derivedPublicSpki !== config.publicKey
+    || !Array.isArray(independentlyPinnedPolicy.revokedDeviceIds)
+    || independentlyPinnedPolicy.revokedDeviceIds.includes(deviceId)) {
+    throw new Error("Strict Sync v2 device identity differs from externally pinned owner policy");
+  }
+  return true;
+}
+
 async function start(options = {}) {
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
@@ -92,6 +154,9 @@ async function start(options = {}) {
   const independentlyPinnedDevicePolicy = strictHistorical
     ? strictBinding.snapshotLocalDevicePolicy(
       options.trustedHistoricalAdmission.localTrustedDevicePolicy) : null;
+  if (strictHistorical) {
+    assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedDevicePolicy);
+  }
   const currentlyTrustedDevice = strictHistorical ? (deviceId) => {
     // Only the operator-injected callback can supply the current policy.
     // Recheck synchronously at the final decision, not before awaited crypto.
@@ -128,6 +193,7 @@ async function start(options = {}) {
       },
     };
   })() : null;
+  const atomicWitness = trustedAtomicBatchWitnessOptions(options, strictHistorical);
   const strictVerifier = strictHistorical
     ? strictBinding.verifySyncV2HistoricalWitnessAdmission : null;
   const adapter = createOpaqueSyncAdapter({
@@ -135,6 +201,7 @@ async function start(options = {}) {
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
   });
   const engine = await new SyncEngine({
+    ...atomicWitness,
     rootDir: config.localFolder,
     adapter,
     selectedPaths: config.selectedPaths,
@@ -231,4 +298,5 @@ if (require.main === module) {
   else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once");
 }
 
-module.exports = { fileKeyResolver, start };
+module.exports = { fileKeyResolver, trustedAtomicBatchWitnessOptions,
+  assertPinnedStrictLocalDeviceIdentity, start };
