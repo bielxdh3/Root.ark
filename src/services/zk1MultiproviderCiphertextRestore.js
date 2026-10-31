@@ -271,6 +271,10 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
         ...(target.driveId === null ? {} : { providerFileId: target.driveId }),
         ...(target.providerVersionId === null ? {} : { providerVersionId: target.providerVersionId }),
         ...(target.providerEtag === null ? {} : { expectedEtag: target.providerEtag }),
+        // The WebDAV transport rejects ALL exact ciphertext GETs without a
+        // digest pinned before network I/O; never switch to length-only mode.
+        ...(target.provider === "webdav"
+          ? { expectedSha256: operation.ciphertext_sha256.toString("hex") } : {}),
         abortSignal: signal }));
     if (ok !== true || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();

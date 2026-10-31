@@ -451,9 +451,23 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
 
   await t.test("owner Ed25519 pins exact S3 version, WebDAV ETag and Drive ID across fallback and restart", async () => {
     const pinnedReaders = readers.map((reader) => ({ ...reader }));
+    const signedWebdav = pinnedReaders[2].cloudReader;
+    let hashPinnedWebdavDownloads = 0;
+    pinnedReaders[2].cloudReader = { ...signedWebdav,
+      async download(...args) {
+        // A real WebDAV GET must receive the independently signed ciphertext
+        // SHA before transport, not merely discover it after staged readback.
+        assert.equal(args[5]?.expectedSha256, operation.ciphertext_sha256.toString("hex"));
+        assert.notEqual(args[5]?.boundedLengthOnly, true);
+        hashPinnedWebdavDownloads++;
+        return signedWebdav.download(...args);
+      },
+    };
     const request = { ...recoverInput, readers: pinnedReaders, minimumMatchingProviders: 3 };
     const fullyPinned = await gateway.restoreExact(request);
     assert.deepEqual(fullyPinned.ciphertext, ciphertext);
+    assert.equal(hashPinnedWebdavDownloads, 1,
+      "the real 3/3 provider quorum requires one WebDAV digest-pinned GET");
     assert.equal(fullyPinned.ownerSignedProviderVersionsVerified, true);
     assert.deepEqual(fullyPinned.verifiedProviders.map((entry) => entry.provider),
       ["s3", "gdrive", "webdav"]);
