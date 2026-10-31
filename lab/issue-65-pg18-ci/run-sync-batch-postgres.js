@@ -58,6 +58,17 @@ runDisposablePgLab("gate", async (fixture) => {
       });
     process.stderr.write("ZK65_SYNC_PG_BATCH_TAP_FAILURES "
       + (failureLines.length ? failureLines.join(" | ") : "none-reported") + "\n");
+    // If the child fails before any tests register, preserve ONLY the
+    // allowlisted error class and numeric source location. A raw Node stack
+    // can contain SQL parameters, credentials or untrusted test case labels.
+    const rawDiagnostic = String(result.stdout || "") + "\n" + String(result.stderr || "");
+    const fileLine = /sync-batch-pg18\.integration\.cjs:(\d+)(?::\d+)?/.exec(rawDiagnostic);
+    const errorClass = /\b(SyntaxError|ReferenceError|TypeError|MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND|ERR_TEST_FAILURE)\b/
+      .exec(rawDiagnostic);
+    if (fileLine || errorClass) {
+      process.stderr.write("ZK65_SYNC_PG_BATCH_SAFE_DIAG class="
+        + (errorClass?.[1] || "UNKNOWN") + " line=" + (fileLine?.[1] || "none") + "\n");
+    }
     if (result.error?.code === "ETIMEDOUT") {
       process.stderr.write("ZK65_SYNC_PG_BATCH_CHILD_TIMEOUT\n");
     }
