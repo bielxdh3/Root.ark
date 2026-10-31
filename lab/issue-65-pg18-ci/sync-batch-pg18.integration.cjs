@@ -1488,10 +1488,10 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
     operationIds: operations.map((op) => op.operationId),
     envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")) };
   function send(body, credential = client, route = "/v2/sync-atomic/sql-observe",
-    tlsOverride = {}) {
+    tlsOverride = {}, targetServer = server) {
     return new Promise((resolve, reject) => {
       const data = Buffer.from(JSON.stringify(body));
-      const request = https.request({ host: "127.0.0.1", port: server.address().port,
+      const request = https.request({ host: "127.0.0.1", port: targetServer.address().port,
         path: route, method: "POST", ca: read("ca.pem"), ...credential,
         agent: false, rejectUnauthorized: true, minVersion: "TLSv1.3", timeout: 5000,
         headers: { "content-type": "application/json", "content-length": String(data.length) },
@@ -1555,6 +1555,44 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   assert.equal(revoked.status, 503);
   assert.equal(Object.hasOwn(revoked.body, "commitId"), false,
     "revoked device cannot be read back over mTLS as an authorized physical ACK");
+
+  // A blocked PG connection must not pin an HTTP response forever or create
+  // unbounded work via retries. Expiration does NOT cancel or release a
+  // database operation until it genuinely settles.
+  let stalledConnectAttempts = 0;
+  const stalled = createZk1SyncAtomicSqlReadbackHttpsServer({
+    key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
+    attestorPool: { connect: () => {
+      stalledConnectAttempts += 1;
+      return new Promise(() => {});
+    } },
+    principals: { [fingerprint]: [{ scope: f.scope, accountId, storeId }] },
+    observationTimeoutMs: 80,
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    stalled.once("error", onError);
+    stalled.listen(0, "127.0.0.1", () => {
+      stalled.off("error", onError);
+      resolve();
+    });
+  });
+  t.after(() => new Promise((resolve) => stalled.close(resolve)));
+  for (let i = 0; i < 8; i++) {
+    const unavailable = await send(challenge, client,
+      "/v2/sync-atomic/sql-observe", {}, stalled);
+    assert.equal(unavailable.status, 503);
+    assert.equal(unavailable.body.error, "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE");
+    assert.equal(Object.hasOwn(unavailable.body, "commitId"), false);
+  }
+  const deniedAfterCap = await send(challenge, client,
+    "/v2/sync-atomic/sql-observe", {}, stalled);
+  assert.equal(deniedAfterCap.status, 503);
+  assert.equal(deniedAfterCap.body.error, "SYNC_ATOMIC_SQL_OBSERVE_BUSY",
+    "timed-out SQL requests must keep consuming the bounded pending quota");
+  assert.equal(stalledConnectAttempts, 8,
+    "retries cannot allocate more PostgreSQL connections after the pending cap");
+  assert.equal(Object.hasOwn(deniedAfterCap.body, "clientAckAuthorized"), false);
 });
 
 test("independent readback rejects revocation and runtime impersonation", async () => {
