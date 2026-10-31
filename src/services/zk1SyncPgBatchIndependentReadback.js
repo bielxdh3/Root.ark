@@ -202,7 +202,7 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
     verifyLatestSignedPair({ scope, commitId } = {}) {
       return inspectSignedPair({ scope, commitId });
     },
-    verifyCurrentSignedPair(input = {}) {
+    async verifyCurrentSignedPair(input = {}) {
       // Capture the challenge once. A getter/Proxy cannot retarget the
       // requested pair between look-up, verification and final return.
       let request;
