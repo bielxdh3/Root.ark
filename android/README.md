@@ -1,6 +1,6 @@
 # Root.ark Android client (scaffold)
 
-Status: **scaffold only, not compiled or run in the environment where it was written.** This directory is step 1 of the native Android client tracked in issue #64. It implements no UI, no key storage, no networking, and no sync engine. It is not an approved release, and the design gates in `docs/architecture/android-client-architecture.md` remain open.
+Status: **scaffold only; the pure Kotlin/JVM core has been compiled and tested in hosted Ubuntu CI.** This directory is step 1 of the native Android client tracked in issue #64. It implements no UI, no key storage, no networking, and no sync engine. The Android application module has not been built. It is not an approved release, and the design gates in `docs/architecture/android-client-architecture.md` remain open.
 
 ## Layout
 
@@ -44,9 +44,9 @@ node --test --test-reporter=tap test/issue-64-android-contract.test.js
 - Wire models: every field of the Kotlin data classes in `core/src/main/kotlin/dev/rootark/core/sync/` must match a real server response in `core/src/test/resources/server-responses.json` (names, nullability, JSON types).
 - The fixture is captured by calling the real route handlers in-process. Refresh it with `node scripts/issue-64-android-fixtures.js --write`. The contract test fails if the committed fixture drifts from a fresh capture.
 
-## Not verified
+## Verification and remaining gaps
 
-- Nothing in `android/` has been compiled. No JDK, Gradle, or Kotlin compiler was available when this scaffold was written, so the Kotlin sources and Gradle scripts are unverified until `./gradlew :core:test` passes on a machine with JDK 17.
-- The Kotlin tests have not been executed. Only the Node contract test has been run.
+- The `ZK65 Provider and Android Focused Regression` workflow runs `gradle --no-daemon :core:test` with pinned Gradle 8.10.2 and Temurin JDK 17 on hosted Ubuntu. The initial real run exposed a stale signed-DELETE tombstone assertion; after correction, the hosted core build and **51 JVM tests** passed. These actually compile the Kotlin core and deserialize the committed HTTP response fixture, rather than merely scanning source text.
+- The Node route/fixture contracts are additionally exercised on hosted Ubuntu and Windows. Neither these checks nor the Kotlin core tests compile, exercise or certify the Android application module.
 - No secure key storage, cryptographic envelope, or metadata protocol is implemented. The protected-metadata protocol gap is documented in the architecture doc and is a blocker for protected Android content.
 - The HTTP client (`RootArkApi` implementation) and the 2FA UI flow are not implemented; only the wire models and interface exist.
