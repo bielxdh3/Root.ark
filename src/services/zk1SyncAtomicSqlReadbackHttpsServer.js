@@ -15,21 +15,18 @@ const OP = /^[A-Za-z0-9._:-]{1,160}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_BODY = 4096;
 
-function fail(stage = 0) {
-  throw Object.assign(new Error("SYNC_ATOMIC_SQL_OBSERVE_INVALID"),
-    { safeDiagnosticStage: stage });
-}
-function exact(value, keys, stage = 0) {
+function fail() { throw new Error("SYNC_ATOMIC_SQL_OBSERVE_INVALID"); }
+function exact(value, keys) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
     || Reflect.ownKeys(value).length !== keys.length
-    || keys.some((key) => !Object.hasOwn(value, key))) fail(stage);
+    || keys.some((key) => !Object.hasOwn(value, key))) fail();
 }
-function binding(value, stage = 0) {
-  exact(value, ["scope", "accountId", "storeId"], stage);
+function binding(value) {
+  exact(value, ["scope", "accountId", "storeId"]);
   if (typeof value.scope !== "string" || !SCOPE.test(value.scope)
     || typeof value.accountId !== "string" || !UUID.test(value.accountId)
-    || typeof value.storeId !== "string" || !UUID.test(value.storeId)) fail(stage);
+    || typeof value.storeId !== "string" || !UUID.test(value.storeId)) fail();
   return [value.scope, value.accountId, value.storeId].join("\0");
 }
 function grantsFor(principals) {
@@ -56,32 +53,32 @@ function respond(res, status, payload) {
   res.end(bytes);
 }
 async function bodyOf(req) {
-  if (req.headers["content-type"] !== "application/json") fail(1);
+  if (req.headers["content-type"] !== "application/json") fail();
   const provided = req.headers["content-length"];
   if (provided !== undefined && (!/^\d+$/.test(provided)
-    || Number(provided) < 1 || Number(provided) > MAX_BODY)) fail(2);
+    || Number(provided) < 1 || Number(provided) > MAX_BODY)) fail();
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY) fail(3);
+    if (size > MAX_BODY) fail();
     chunks.push(chunk);
   }
-  if (!size) fail(3);
+  if (!size) fail();
   let value;
   try { value = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
-  catch { fail(4); }
+  catch { fail(); }
   exact(value, ["scope", "accountId", "storeId", "nonce",
-    "operationIds", "envelopeDigests"], 5);
-  binding({ scope: value.scope, accountId: value.accountId, storeId: value.storeId }, 6);
+    "operationIds", "envelopeDigests"]);
+  binding({ scope: value.scope, accountId: value.accountId, storeId: value.storeId });
   if (typeof value.nonce !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.nonce)
     || Buffer.from(value.nonce, "base64url").length !== 32
-    || Buffer.from(value.nonce, "base64url").toString("base64url") !== value.nonce) fail(7);
+    || Buffer.from(value.nonce, "base64url").toString("base64url") !== value.nonce) fail();
   if (!Array.isArray(value.operationIds) || value.operationIds.length !== 2
     || value.operationIds.some((item) => typeof item !== "string" || !OP.test(item))
-    || value.operationIds[0] === value.operationIds[1]) fail(8);
+    || value.operationIds[0] === value.operationIds[1]) fail();
   if (!Array.isArray(value.envelopeDigests) || value.envelopeDigests.length !== 2
-    || value.envelopeDigests.some((item) => typeof item !== "string" || !DIGEST.test(item))) fail(9);
+    || value.envelopeDigests.some((item) => typeof item !== "string" || !DIGEST.test(item))) fail();
   return value;
 }
 
@@ -109,7 +106,11 @@ function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
     active.add(fingerprint);
     try {
       const challenge = await bodyOf(req);
-      const accountStore = binding(challenge);
+      // bodyOf validates all six challenge fields; authorization binds only
+      // the exact immutable identity tuple, never the request's other fields.
+      const accountStore = binding({
+        scope: challenge.scope, accountId: challenge.accountId, storeId: challenge.storeId,
+      });
       if (!grants.get(fingerprint).has(accountStore)) {
         return respond(res, 403, { error: "FORBIDDEN" });
       }
@@ -142,8 +143,6 @@ function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
         clientAckAuthorized: false });
     } catch (reason) {
       if (reason?.message === "SYNC_ATOMIC_SQL_OBSERVE_INVALID") {
-        // Local-only numeric diagnostic for tests; never include it in HTTP.
-        server.emit("zk65:invalid-stage", reason.safeDiagnosticStage || 0);
         return respond(res, 400, { error: "INVALID_REQUEST" });
       }
       return respond(res, 503, { error: "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE" });
