@@ -81,6 +81,9 @@ async function snapshotPinnedJournal(filename, priorIdentity = null) {
 
 async function fixture(t, { batchResponse, witnessResponse, casResponse,
   missingCapability = false, interleaved = false,
+  missingWitnessKey = false, missingWitnessReadback = false,
+  missingCasKey = false, missingCasReadback = false,
+  onWitnessChallenge = null,
   deleteExpiresInMs = 120000 } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
   t.after(async () => {
@@ -195,16 +198,17 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
     fileKeyResolver: async () => fileKey,
     requireAuthorization: true,
     requireCurrentOutgoingAuthorization: true,
-    atomicBatchWitnessPublicKey: witnessPublicKey,
+    atomicBatchWitnessPublicKey: missingWitnessKey ? null : witnessPublicKey,
     atomicBatchWitnessScope: "alice:store",
-    atomicBatchWitnessReadback: async (challenge) => {
+    atomicBatchWitnessReadback: missingWitnessReadback ? null : async (challenge) => {
+      if (onWitnessChallenge) onWitnessChallenge(challenge);
       lastWitnessReceipt = witnessResponse
         ? witnessResponse(challenge, { deleted, moved, receiptFor })
         : receiptFor([deleted, moved], { nonce: challenge.nonce });
       return lastWitnessReceipt;
     },
-    atomicBatchCasFloorPublicKey: casPublicKey,
-    atomicBatchCasFloorReadback: async (challenge) => casResponse
+    atomicBatchCasFloorPublicKey: missingCasKey ? null : casPublicKey,
+    atomicBatchCasFloorReadback: missingCasReadback ? null : async (challenge) => casResponse
       ? casResponse(challenge, { deleted, moved, receiptFor, casFloorFor, lastWitnessReceipt })
       : casFloorFor(lastWitnessReceipt, challenge.nonce),
     currentDeviceAuthorization: () => true,
@@ -255,6 +259,35 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
     },
   };
 }
+
+test("an async witness cannot repin the CAS signer, owner scope or readback callbacks", {
+  timeout: 120000,
+}, async (t) => {
+  let attempts = 0;
+  const f = await fixture(t, {
+    onWitnessChallenge: (challenge) => {
+      assert.equal(challenge.scope, "alice:store");
+      for (const [field, replacement] of [
+        ["atomicBatchCasFloorPublicKey", f.engine.atomicBatchWitnessPublicKey],
+        ["atomicBatchWitnessPublicKey", f.engine.atomicBatchCasFloorPublicKey],
+        ["atomicBatchWitnessScope", "mallory:store"],
+        ["atomicBatchWitnessReadback", async () => null],
+        ["atomicBatchCasFloorReadback", async () => null],
+      ]) {
+        assert.throws(() => { f.engine[field] = replacement; }, TypeError,
+          `${field} must remain nonwritable during awaited witness readback`);
+        assert.throws(() => {
+          Object.defineProperty(f.engine, field, { value: replacement });
+        }, TypeError, `${field} must remain nonconfigurable`);
+        attempts++;
+      }
+    },
+  });
+  await f.engine._pushPending(f.summary());
+  assert.equal(attempts, 5);
+  assert.equal(f.engine.atomicBatchWitnessScope, "alice:store");
+  assert.deepEqual(await (await f.reread()).recover(), []);
+});
 
 test("signed pair plus separate pinned synthetic admission witness ACKs both in one transaction", {
   timeout: 120000,
@@ -310,6 +343,8 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
   test("no false durable batch ACK with " + mode, { timeout: 120000 }, async (t) => {
     const f = await fixture(t, {
       batchResponse: (pair) => ({ objects: exact(pair) }),
+      missingWitnessKey: mode === "missing-trusted-witness-key",
+      missingWitnessReadback: mode === "missing-independent-readback",
       witnessResponse: (challenge, ctx) => {
         if (mode === "only-signed-echo") return null;
         if (mode === "other-operation-witness") return ctx.receiptFor(
@@ -346,12 +381,6 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
         return forged;
       },
     });
-    if (mode === "missing-trusted-witness-key") {
-      f.engine.atomicBatchWitnessPublicKey = null;
-    }
-    if (mode === "missing-independent-readback") {
-      f.engine.atomicBatchWitnessReadback = null;
-    }
     await assert.rejects(f.engine._pushPending(f.summary()),
       { code: mode === "missing-trusted-witness-key" || mode === "missing-independent-readback"
         ? "sync_atomic_batch_unavailable" : "sync_atomic_batch_indeterminate" });
@@ -369,6 +398,8 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
   test("no protected batch ACK without fresh independently signed CAS floor: " + mode,
     { timeout: 120000 }, async (t) => {
       const f = await fixture(t, {
+        missingCasKey: mode === "missing-cas-key",
+        missingCasReadback: mode === "missing-cas-readback",
         casResponse: (challenge, { casFloorFor, lastWitnessReceipt }) => {
           assert.ok(lastWitnessReceipt, "CAS readback must follow signed witness verification");
           assert.notEqual(challenge.nonce, lastWitnessReceipt.statement.nonce,
@@ -402,8 +433,6 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
           return result;
         },
       });
-      if (mode === "missing-cas-key") f.engine.atomicBatchCasFloorPublicKey = null;
-      if (mode === "missing-cas-readback") f.engine.atomicBatchCasFloorReadback = null;
       await assert.rejects(f.engine._pushPending(f.summary()), {
         code: mode.startsWith("missing-cas-") && mode !== "missing-cas-floor"
           ? "sync_atomic_batch_unavailable" : "sync_atomic_batch_indeterminate",
@@ -490,18 +519,16 @@ test("lost HTTP ACK then 409 can recover ONLY through fresh independent signed b
 }, async (t) => {
   // The signed fixture models a trusted independent physical readback, not
   // real remote storage. The server's POST response is deliberately absent.
+  let challenged = 0;
   const f = await fixture(t, {
     batchResponse: () => { throw Object.assign(new Error("already committed"),
       { status: 409, code: "sync_conflict" }); },
+    onWitnessChallenge: (challenge) => {
+      challenged++;
+      assert.deepEqual(challenge.operationIds,
+        [f.deleted.operationId, f.moved.operationId]);
+    },
   });
-  const originalReadback = f.engine.atomicBatchWitnessReadback;
-  let challenged = 0;
-  f.engine.atomicBatchWitnessReadback = async (challenge) => {
-    challenged++;
-    assert.deepEqual(challenge.operationIds,
-      [f.deleted.operationId, f.moved.operationId]);
-    return originalReadback(challenge);
-  };
   const summary = f.summary();
   await f.engine._pushPending(summary);
   assert.equal(challenged, 1, "409 requires ONE fresh direct witness challenge");
