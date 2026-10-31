@@ -6,11 +6,56 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const fsConstants = fs.constants;
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { SyncJournal } = require("../sync-client/rootark-sync-journal");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
+
+const PINNED_JOURNAL_EVIDENCE = new WeakMap();
+async function readPinnedJournal(filename, previousEvidence = null) {
+  // Reopen the independently persisted journal via a no-follow descriptor.
+  // A pathname-only read after a cold-open failure could inspect a different
+  // inode, giving false evidence that a rejected file was preserved. When
+  // comparing snapshots, also bind the new handle to the PREVIOUS fd identity.
+  const pinnedBefore = previousEvidence === null ? null
+    : PINNED_JOURNAL_EVIDENCE.get(previousEvidence);
+  if (previousEvidence !== null) {
+    assert.ok(pinnedBefore, "comparison requires earlier pinned physical evidence");
+  }
+  const handle = await fsp.open(filename,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+  try {
+    const before = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(filename, { bigint: true });
+    assert.equal(before.isFile(), true);
+    assert.equal(before.nlink, 1n);
+    if (pinnedBefore) {
+      assert.equal(before.dev, pinnedBefore.dev,
+        "rejected journal open may not replace the original evidence device");
+      assert.equal(before.ino, pinnedBefore.ino,
+        "rejected journal open may not replace the original evidence inode");
+    }
+    assert.equal(namedBefore.isFile(), true);
+    assert.equal(namedBefore.dev, before.dev);
+    assert.equal(namedBefore.ino, before.ino);
+    const data = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(filename, { bigint: true });
+    for (const observed of [after, namedAfter]) {
+      assert.equal(observed.isFile(), true);
+      assert.equal(observed.nlink, 1n);
+      assert.equal(observed.dev, before.dev);
+      assert.equal(observed.ino, before.ino);
+      assert.equal(observed.size, BigInt(data.length));
+    }
+    assert.equal(before.size, after.size,
+      "journal evidence must not be resized during descriptor readback");
+    PINNED_JOURNAL_EVIDENCE.set(data, { dev: before.dev, ino: before.ino });
+    return data;
+  } finally { await handle.close(); }
+}
 
 async function baseFixture(t) {
   const root = createPrivateAuthorityFixture("cos-journal-open-");
@@ -20,7 +65,7 @@ async function baseFixture(t) {
   await journal.enqueue({ operationId: "pending-physical", phase: "prepared" });
   await journal.enqueue({ operationId: "seen-physical", phase: "prepared" });
   await journal.markSeen("seen-physical");
-  const bytes = await fsp.readFile(filename);
+  const bytes = await readPinnedJournal(filename);
   const state = JSON.parse(bytes);
   assert.equal(state.pending.length, 1);
   assert.deepEqual(state.seen, ["seen-physical"]);
@@ -64,12 +109,12 @@ for (const scenario of [
     } finally {
       await handle.close();
     }
-    const before = await fsp.readFile(filename);
+    const before = await readPinnedJournal(filename);
     assert.deepEqual(before, poisoned);
     await assert.rejects(new SyncJournal(filename).open(),
       /Invalid sync journal/i,
       "malformed durable evidence must be refused before any mutation or replay");
-    assert.deepEqual(await fsp.readFile(filename), before,
+    assert.deepEqual(await readPinnedJournal(filename, before), before,
       "rejected open must preserve all original disk evidence for diagnosis");
   });
 }
@@ -83,7 +128,7 @@ test("valid disjoint pending and seen durable IDs reopen exactly without repair"
     [{ operationId: "pending-physical", phase: "prepared" }]);
   assert.equal(reopened.hasSeen("seen-physical"), true);
   assert.equal(reopened.hasSeen("pending-physical"), false);
-  assert.deepEqual(await fsp.readFile(filename), bytes,
+  assert.deepEqual(await readPinnedJournal(filename, bytes), bytes,
     "fresh open must not rewrite or touch intact journal bytes");
   assert.equal(fs.statSync(filename).isFile(), true);
 });
@@ -103,7 +148,7 @@ test("new admissions refuse IDs that would make their own durable journal unreop
       { operationId, phase: "prepared" },
     ]), /valid operationId/i);
   }
-  assert.deepEqual(await fsp.readFile(filename), bytes,
+  assert.deepEqual(await readPinnedJournal(filename, bytes), bytes,
     "rejected malformed admissions must not persist poison or partial batches");
   const recovered = await new SyncJournal(filename).open();
   assert.deepEqual(recovered.pending(),
@@ -131,7 +176,7 @@ for (const scenario of [
     await assert.rejects(journal.update("pending-physical", {
       signedOutboxReceipts: scenario[1],
     }), /Invalid protected WebDAV signed receipt binding/i);
-    assert.deepEqual(await fsp.readFile(filename), bytes);
+    assert.deepEqual(await readPinnedJournal(filename, bytes), bytes);
     assert.deepEqual(journal.pending(), [{ operationId: "pending-physical", phase: "prepared" }]);
 
     // Tamper disk independently, then test a NEW instance; a runtime
@@ -146,7 +191,7 @@ for (const scenario of [
     } finally { await handle.close(); }
     await assert.rejects(new SyncJournal(filename).open(),
       /Invalid sync journal operationId partition/i);
-    assert.deepEqual(await fsp.readFile(filename), poisoned,
+    assert.deepEqual(await readPinnedJournal(filename, bytes), poisoned,
       "invalid signed witness evidence must be preserved for manual diagnosis");
   });
 }
@@ -163,7 +208,7 @@ test("update and replace refuse to persist invalid pending partitions or orphan 
     () => journal.replace("pending-physical", { operationId: "seen-physical" }),
   ]) {
     await assert.rejects(attempt(), /Invalid sync journal operationId partition/);
-    assert.deepEqual(await fsp.readFile(filename), bytes,
+    assert.deepEqual(await readPinnedJournal(filename, bytes), bytes,
       "invalid in-memory update may not publish unreopenable journal bytes");
     assert.deepEqual(journal.pending(), [{ operationId: "pending-physical", phase: "prepared" }]);
   }
@@ -171,12 +216,12 @@ test("update and replace refuse to persist invalid pending partitions or orphan 
   const signed = { operationId: "signed-pending", operation: "create",
     authorization: { signature: "test-only-signed-receipt" } };
   await journal.enqueue(signed);
-  const signedBytes = await fsp.readFile(filename);
+  const signedBytes = await readPinnedJournal(filename);
   const digest = journal.durableSignedReceiptDigest("signed-pending");
   assert.match(digest, /^[a-f0-9]{64}$/);
   await assert.rejects(journal.update("signed-pending", { operation: "delete" }),
     /Invalid durable signed outbox receipt journal/);
-  assert.deepEqual(await fsp.readFile(filename), signedBytes);
+  assert.deepEqual(await readPinnedJournal(filename, signedBytes), signedBytes);
   assert.equal(journal.durableSignedReceiptDigest("signed-pending"), digest);
   const reopened = await new SyncJournal(filename).open();
   assert.equal(reopened.durableSignedReceiptDigest("signed-pending"), digest);
@@ -211,7 +256,7 @@ test("signed MOVE cannot persist a receipt without its physical content witness"
   await assert.rejects(journal.update("pending-physical", {
     kind: "move", signedOutboxReceipts: receipts,
   }), /Invalid protected WebDAV signed receipt binding/);
-  assert.deepEqual(await fsp.readFile(filename), bytes);
+  assert.deepEqual(await readPinnedJournal(filename, bytes), bytes);
 
   // A separate cold-open failure proves that poisoned durable JSON cannot
   // be laundered through a fresh recovery process.
@@ -226,7 +271,7 @@ test("signed MOVE cannot persist a receipt without its physical content witness"
   } finally { await handle.close(); }
   await assert.rejects(new SyncJournal(filename).open(),
     /Invalid sync journal operationId partition/);
-  assert.deepEqual(await fsp.readFile(filename), poisoned);
+  assert.deepEqual(await readPinnedJournal(filename, bytes), poisoned);
 
   // A fresh independent fixture exercises the valid complete pair.
   const second = await baseFixture(t);
@@ -247,7 +292,7 @@ test("atomic DELETE+MOVE markSeenMany refuses partial ACK and durably acknowledg
     { operationId: "webdav-atomic-delete", operation: "delete" },
     { operationId: "webdav-atomic-move", operation: "move" },
   ]);
-  const before = await fsp.readFile(filename);
+  const before = await readPinnedJournal(filename);
   const first = { operationId: "webdav-atomic-delete", admittedDigest: "a".repeat(64) };
   const second = { operationId: "webdav-atomic-move", admittedDigest: "b".repeat(64) };
   for (const invalid of [
@@ -256,7 +301,7 @@ test("atomic DELETE+MOVE markSeenMany refuses partial ACK and durably acknowledg
   ]) {
     await assert.rejects(journal.markSeenMany(invalid),
       /Invalid atomic sync batch acknowledgement|requires both pending envelopes/);
-    assert.deepEqual(await fsp.readFile(filename), before,
+    assert.deepEqual(await readPinnedJournal(filename, before), before,
       "an invalid half-ACK cannot commit the first destructive operation alone");
   }
   await journal.markSeenMany([first, second]);
