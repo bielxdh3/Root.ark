@@ -1457,7 +1457,7 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
       + (server ? "subjectAltName=DNS:localhost,IP:127.0.0.1\n" : ""),
     { mode: 0o600, flag: "wx" });
     openssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem",
-      "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem",
+      "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem`,
       "-days", "1", "-extfile", `${name}.ext`);
   }
   makeCert("server", "serverAuth", true);
