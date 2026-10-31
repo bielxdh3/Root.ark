@@ -91,7 +91,13 @@ function runFocusedEdgeCases() {
   for (const file of EDGE_FILES) {
     if (!fs.statSync(path.join(root, file)).isFile()) throw new Error("Missing focused Edge test file");
   }
-  const result = spawnSync(process.execPath, ["--test", "--test-reporter=tap", ...EDGE_FILES], {
+  // Each file can launch real Edge/CDP processes. Running all five in parallel
+  // overloads small Windows CI runners and can misreport resource starvation as
+  // a cryptographic failure. Keep every required real E2E case, but serialize
+  // the five test files (each test's own timeout/negative assertions stay live).
+  const result = spawnSync(process.execPath, [
+    "--test", "--test-reporter=tap", "--test-concurrency=1", ...EDGE_FILES,
+  ], {
     cwd: root, windowsHide: true, encoding: "utf8", maxBuffer: 32 * 1024 * 1024,
   });
   // Never reproduce untrusted child logs here: test failures may include local
