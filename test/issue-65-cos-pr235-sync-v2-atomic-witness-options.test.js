@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { trustedAtomicBatchWitnessOptions,
   assertPinnedStrictLocalDeviceIdentity } = require("../sync-client/rootark-sync-v2");
+const DENIED_UNTRUSTED_WITNESS = /(?:independently pinned readback and external CAS floor|immutable canonical owner authority options)/;
 
 function trustedFixture() {
   const keys = crypto.generateKeyPairSync("ed25519");
@@ -32,10 +33,10 @@ test("config-only or legacy admission cannot enable the atomic batch witness", (
   const trusted = trustedFixture();
   assert.throws(() => trustedAtomicBatchWitnessOptions({
     trustedAtomicBatchWitness: trusted,
-  }, false), /independently pinned readback and external CAS floor/);
+  }, false), DENIED_UNTRUSTED_WITNESS);
   assert.throws(() => trustedAtomicBatchWitnessOptions({
     trustedAtomicBatchWitness: null,
-  }, true), /independently pinned readback and external CAS floor/);
+  }, true), DENIED_UNTRUSTED_WITNESS);
 });
 
 test("external atomic witness requires a complete independent key, scope and readback", () => {
@@ -50,7 +51,7 @@ test("external atomic witness requires a complete independent key, scope and rea
   ]) {
     assert.throws(() => trustedAtomicBatchWitnessOptions({
       trustedAtomicBatchWitness: { ...trustedFixture(), ...changed },
-    }, true), /independently pinned readback and external CAS floor/);
+    }, true), DENIED_UNTRUSTED_WITNESS);
   }
 });
 
