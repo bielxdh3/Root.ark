@@ -229,7 +229,8 @@ test("signed pair plus separate pinned synthetic admission witness ACKs both in 
 });
 
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
-  "other-account-witness", "missing-trusted-witness-key",
+  "other-account-witness", "wrong-envelope-digest", "not-physically-durable",
+  "zero-fencing-epoch", "invalid-store-head", "missing-trusted-witness-key",
   "missing-independent-readback", "replayed-old-witness-nonce"]) {
   test("no false durable batch ACK with " + mode, { timeout: 120000 }, async (t) => {
     const f = await fixture(t, {
@@ -241,6 +242,18 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
             operationIds: ["other-operation-id", ctx.moved.operationId] });
         if (mode === "other-account-witness") return ctx.receiptFor(
           [ctx.deleted, ctx.moved], { nonce: challenge.nonce, scope: "mallory:store" });
+        // These statements carry a VALID signature by the pinned test key.
+        // Signature validity alone must not authorize false physical or
+        // mismatched signed-envelope claims.
+        if (mode === "wrong-envelope-digest") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce,
+            envelopeDigests: ["0".repeat(64), challenge.envelopeDigests[1]] });
+        if (mode === "not-physically-durable") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, physicalDurable: false });
+        if (mode === "zero-fencing-epoch") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, fencingEpoch: 0 });
+        if (mode === "invalid-store-head") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, storeHeadSha256: "0" });
         if (mode === "replayed-old-witness-nonce") return ctx.receiptFor(
           [ctx.deleted, ctx.moved], { nonce: crypto.randomBytes(32).toString("base64url") });
         const forged = ctx.receiptFor([ctx.deleted, ctx.moved], { nonce: challenge.nonce });
