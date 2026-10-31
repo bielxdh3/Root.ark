@@ -18,11 +18,18 @@ const equal = (one, two) => Buffer.isBuffer(one) && Buffer.isBuffer(two)
 
 function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
   if (!attestorPool || typeof attestorPool.connect !== "function") throw error();
-  return Object.freeze({
-    async verifyLatestSignedPair({ scope, commitId } = {}) {
+  async function inspectSignedPair({ scope, commitId, operationIds = null,
+    envelopeDigests = null } = {}) {
       if (typeof scope !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(scope)
-        || typeof commitId !== "string"
-        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(commitId)) {
+        || (operationIds === null
+          ? (typeof commitId !== "string"
+            || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(commitId))
+          : (commitId !== null || !Array.isArray(operationIds) || operationIds.length !== 2
+            || operationIds.some((id) => typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(id))
+            || operationIds[0] === operationIds[1]
+            || !Array.isArray(envelopeDigests) || envelopeDigests.length !== 2
+            || envelopeDigests.some((digest) => typeof digest !== "string"
+              || !/^[a-f0-9]{64}$/.test(digest))))) {
         throw error();
       }
       let client;
@@ -62,6 +69,23 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
           || privilege.fsync !== "on"
           || privilege.full_page_writes !== "on") throw error();
         if (await hasUnexpectedProtectedDml(client)) throw error();
+        if (operationIds !== null) {
+          // Resolve the current physical SQL batch from the two exact signed
+          // envelopes in ONE read-only REPEATABLE READ snapshot. A caller's
+          // commitId or an untrusted HTTP ACK must never select the batch.
+          const resolved = await client.query(`SELECT m.commit_id
+            FROM zk1_sync_batch.batch_commit m
+            JOIN zk1_sync_batch.scope_head h ON h.scope=m.scope
+              AND h.sequence=m.sequence AND h.head=m.head
+            WHERE m.scope=$1 AND m.delete_id=$2 AND m.move_id=$3
+              AND m.delete_digest=pg_catalog.decode($4,'hex')
+              AND m.move_digest=pg_catalog.decode($5,'hex')`, [
+            scope, ...operationIds, ...envelopeDigests,
+          ]);
+          if (resolved.rowCount !== 1) throw error();
+          commitId = resolved.rows[0].commit_id;
+          if (typeof commitId !== "string") throw error();
+        }
         const evidence = await client.query(`SELECT m.*, h.sequence AS latest_sequence,
           h.head AS latest_head, p.username, p.compartment_id, p.key_epoch,
           p.enabled,p.allow_delete,p.policy_epoch AS current_epoch
@@ -111,6 +135,9 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
           operations.push(op);
         }
         const [deleted, moved] = operations;
+        if (operationIds !== null && operations.some((op, i) =>
+          op.operationId !== operationIds[i]
+          || originalRows.rows[i].envelope_digest.toString("hex") !== envelopeDigests[i])) throw error();
         if (deleted.operation !== "delete" || moved.operation !== "move"
           || !verifyWebdavOverwriteProvenance(deleted, moved)
           || !deleted.tombstone || moved.tombstone
@@ -170,6 +197,23 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
       } finally {
         client?.release?.();
       }
+  }
+  return Object.freeze({
+    verifyLatestSignedPair({ scope, commitId } = {}) {
+      return inspectSignedPair({ scope, commitId });
+    },
+    verifyCurrentSignedPair(input = {}) {
+      // Capture the challenge once. A getter/Proxy cannot retarget the
+      // requested pair between look-up, verification and final return.
+      let request;
+      try {
+        request = JSON.parse(protocol.canonicalJson(input));
+        if (!request || typeof request !== "object" || Array.isArray(request)
+          || Object.keys(request).sort().join(",")
+            !== ["scope", "operationIds", "envelopeDigests"].sort().join(",")) throw error();
+      } catch { throw error(); }
+      return inspectSignedPair({ scope: request.scope, commitId: null,
+        operationIds: request.operationIds, envelopeDigests: request.envelopeDigests });
     },
   });
 }
