@@ -379,6 +379,101 @@ test("lost network ACK with missing independent witness remains offline and BOTH
   await f.assertBothPending();
 });
 
+test("expired already-admitted signed pair is readback-only: never POST or re-sign", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await fixture(t);
+  const expiresAt = Math.min(f.deleted.authorization.expiresAt,
+    f.moved.authorization.expiresAt);
+  const realNow = Date.now;
+  f.engine.adapter.pushBatch = () => { throw new Error("EXPIRED_MUST_NEVER_POST"); };
+  try {
+    // Simulate recovery after the original, genuinely signed pair expires.
+    // The journal's original Ed25519 bytes are not rewritten or re-signed.
+    Date.now = () => expiresAt + 1;
+    const summary = f.summary();
+    await f.engine._pushPending(summary);
+    assert.equal(summary.pushed, 2);
+    assert.equal(summary.offline, false);
+  } finally { Date.now = realNow; }
+  assert.equal(f.events.length, 0, "historical confirmation cannot issue POST");
+  const disk = await f.reread();
+  assert.deepEqual(await disk.recover(), []);
+  assert.equal(disk.hasSeen(f.deleted.operationId), true);
+  assert.equal(disk.hasSeen(f.moved.operationId), true);
+});
+
+test("revoked signed pair can verify historical receipt but cannot issue another write", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await fixture(t);
+  f.engine.currentDeviceAuthorization = () => false;
+  f.engine.adapter.pushBatch = () => { throw new Error("REVOKED_MUST_NEVER_POST"); };
+  const summary = f.summary();
+  await f.engine._pushPending(summary);
+  assert.equal(summary.pushed, 2);
+  assert.equal(f.events.length, 0);
+  assert.deepEqual((await f.reread()).pending(), []);
+});
+
+test("historical batch readback survives revoked file-key access and rotated epoch", {
+  timeout: 120000,
+}, async (t) => {
+  for (const condition of ["revoked-file-key", "rotated-epoch"]) {
+    await t.test(condition, async (innerT) => {
+      const f = await fixture(innerT);
+      f.engine.currentDeviceAuthorization = () => false;
+      f.engine.adapter.pushBatch = () => { throw new Error("HISTORICAL_MUST_NEVER_POST"); };
+      if (condition === "revoked-file-key") f.engine.authorize = async () => false;
+      else f.engine.keyEpoch = "epoch-rotated";
+      const summary = f.summary();
+      await f.engine._pushPending(summary);
+      assert.equal(summary.pushed, 2);
+      assert.equal(f.events.length, 0);
+      const disk = await f.reread();
+      assert.deepEqual(disk.pending(), []);
+      assert.equal(disk.hasSeen(f.deleted.operationId), true);
+      assert.equal(disk.hasSeen(f.moved.operationId), true);
+      assert.equal(f.engine.snapshot.files[f.moved.metadata.path].hash || null, null,
+        "historical ACK without current key must never fabricate plaintext hash");
+    });
+  }
+});
+
+test("remote device revocation 403 after lost ACK needs independent historical witness", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await fixture(t, {
+    batchResponse: () => { throw Object.assign(new Error("device revoked on remote"),
+      { status: 403, code: "remote_forbidden" }); },
+  });
+  const summary = f.summary();
+  await f.engine._pushPending(summary);
+  assert.equal(summary.pushed, 2);
+  assert.deepEqual(f.events.map((entry) => entry.kind), ["batch"]);
+  assert.deepEqual((await f.reread()).pending(), []);
+});
+
+test("revoked or expired batch WITHOUT physical witness retains both original pending operations", {
+  timeout: 120000,
+}, async (t) => {
+  for (const condition of ["revoked", "expired"]) {
+    await t.test(condition, async (innerT) => {
+      const f = await fixture(innerT, { witnessResponse: () => null });
+      const realNow = Date.now;
+      f.engine.adapter.pushBatch = () => { throw new Error("UNAUTHORIZED_POST"); };
+      try {
+        if (condition === "revoked") f.engine.currentDeviceAuthorization = () => false;
+        else Date.now = () => f.deleted.authorization.expiresAt + 1;
+        await assert.rejects(f.engine._pushPending(f.summary()),
+          { code: "sync_atomic_batch_indeterminate" });
+      } finally { Date.now = realNow; }
+      assert.equal(f.events.length, 0);
+      await f.assertBothPending();
+    });
+  }
+});
+
 test("independently signed standalone WebDAV DELETE uses distinct cryptographic ID namespace and one ordinary push", {
   timeout: 120000,
 }, async (t) => {

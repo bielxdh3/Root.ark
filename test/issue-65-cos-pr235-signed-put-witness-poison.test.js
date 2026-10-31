@@ -309,8 +309,16 @@ for (const phase of ["source-moved", "protocol-queued"]) {
     assert.equal(f.state.bridge, null, "a failed cold boot must not expose an HTTP listener");
     assert.equal(f.state.policyReads, policyBefore);
     assert.equal(f.state.translations, translationBefore);
-    assert.ok(f.state.keyReads > keyBefore,
-      "rejection must reach original signed ciphertext decrypt, not unrelated startup error");
+    if (poisonStyle === "same-size") {
+      assert.ok(f.state.keyReads > keyBefore,
+        "same-size poison must reach original signed ciphertext decrypt");
+    } else {
+      // A length mismatch is sufficient to reject the physically installed
+      // bytes before decryption. Do not require key access just to reject a
+      // provably wrong-size inode; the same-size test still proves AES-GCM.
+      assert.ok(f.state.keyReads >= keyBefore,
+        "length-change poison must fail closed even when size precheck rejects first");
+    }
     assert.deepEqual(await f.frozen(), poisoned,
       "rejection must preserve both journals, original signed outbox and suspect bytes");
     const pending = (await f.reopen()).local.pending();

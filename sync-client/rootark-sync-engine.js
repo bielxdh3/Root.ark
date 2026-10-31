@@ -1112,8 +1112,17 @@ class SyncEngine {
       fail("Atomic protected WebDAV remote batch transport unavailable",
         "sync_atomic_batch_unavailable");
     }
+    // A persisted batch can be older than the device grant that admitted it.
+    // Historical readback MUST NOT turn an expired/revoked grant into a new
+    // POST. Structural validation is enough to identify immutable bytes for
+    // an independently signed physical witness; live policy is still required
+    // by assertOutgoingAuthorized before EVERY new network write.
     const [deleted, moved] = pending.map((entry) =>
-      protocol.validateFreshSignedOperation(entry));
+      protocol.validateStoredOperation(entry));
+    if (!deleted.authorization || !moved.authorization) {
+      fail("Atomic protected WebDAV batch lacks original signed envelopes",
+        "sync_atomic_batch_indeterminate");
+    }
     assertAtomicSignedOverwritePair(deleted, moved);
     if (![deleted, moved].every((entry) => this.operationIsSelected(entry))) {
       fail("Atomic WebDAV destination selection cannot split the batch",
@@ -1121,8 +1130,12 @@ class SyncEngine {
     }
     const digests = [deleted, moved].map(signedEnvelopeDigest);
     let response;
-    let uncertainRequest = null;
-    try {
+    const expiredBeforeRequest = [deleted, moved].some((entry) =>
+      entry.authorization.expiresAt <= Date.now());
+    let uncertainRequest = expiredBeforeRequest
+      ? Object.assign(new Error("Historical signed batch requires read-only witness"),
+        { code: "authorization_required" }) : null;
+    if (!expiredBeforeRequest) try {
       // The final synchronous current-policy checks begin ONE network
       // request. Remote registry must fence BOTH signatures under one lock.
       response = await this.assertOutgoingAuthorized(deleted, () =>
@@ -1138,7 +1151,14 @@ class SyncEngine {
       // genuine commit followed by a lost HTTP ACK can return 409 on retry.
       // That must be checked with a fresh direct witness challenge, not kept
       // in a permanent 409 loop.
-      if (transient(error) || error?.status === 409) uncertainRequest = error;
+      if (transient(error) || [403, 409, 423, 503].includes(error?.status)
+        || ["authorization_rejected", "authorization_required"].includes(error?.code)) {
+        // Revocation and current-policy denial prohibit another write, not
+        // the separate read-only verification of an old physical commit.
+        // A remote denial after previous admission may also arrive after
+        // an earlier lost ACK; only the separate witness can disambiguate.
+        uncertainRequest = error;
+      }
       else fail("Atomic signed WebDAV remote batch outcome indeterminate",
         "sync_atomic_batch_indeterminate");
     }
@@ -1194,7 +1214,22 @@ class SyncEngine {
     // Remote admission is one transaction. Local advancement may still crash;
     // keep BOTH original outbox entries pending until one atomic markSeenMany
     // after the verified response and local snapshot are durably written.
-    const moveHash = await this.hashPendingPayload(moved);
+    let moveHash = null;
+    let historicalKeyUnavailable = false;
+    try {
+      moveHash = await this.hashPendingPayload(moved);
+    } catch (error) {
+      // A cryptographically verified PHYSICAL historical admission is not a
+      // new decrypt permission. After rekey or device revocation the old file
+      // key can be unavailable; that must not make a previously committed
+      // remote pair forever unacknowledgeable. Never invent a new plaintext
+      // hash: rememberOperation may only carry forward a previously trusted
+      // snapshot hash, if one exists. Any other error still fails closed.
+      if (!["authorization_rejected", "stale_key_epoch", "key_unavailable"].includes(error?.code)) {
+        throw error;
+      }
+      historicalKeyUnavailable = true;
+    }
     const observed = [deleted, moved].map((entry, index) =>
       this.localAdmissionDigestIfFresh(entry) === digests[index] ? digests[index] : null);
     for (let index = 0; index < pending.length; index++) {
@@ -1202,6 +1237,12 @@ class SyncEngine {
     }
     this.rememberOperation(deleted);
     this.rememberOperation(moved, moveHash);
+    if (historicalKeyUnavailable) {
+      // Even a previously trusted source hash cannot certify CURRENT local
+      // bytes after the file key becomes unavailable. Preserve the signed
+      // remote admission, but make local content identity explicitly unknown.
+      this.snapshot.files[moved.metadata.path].hash = null;
+    }
     await this.persistSnapshot();
     await this.journal.markSeenMany(pending.map((entry, index) => ({
       operationId: entry.operationId, admittedDigest: observed[index],
