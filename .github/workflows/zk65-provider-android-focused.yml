@@ -11,11 +11,15 @@ on:
       - 'sync-client/rootark-sync-protocol.js'
       - 'sync-client/rootark-sync-paths.js'
       - 'sync-client/rootark-sync-authorization.js'
+      - 'sync-client/rootark-sync-engine.js'
+      - 'sync-client/rootark-sync-v2.js'
       - 'src/routes/sync.js'
       - 'src/routes/auth.js'
       - 'scripts/issue-64-android-fixtures.js'
       - 'test/issue-65-full-multiprovider-http-restore.test.js'
       - 'test/issue-64-android-contract.test.js'
+      - 'test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js'
+      - 'test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js'
       - 'android/core/**'
       - 'android/build.gradle.kts'
       - 'android/settings.gradle.kts'
@@ -31,7 +35,7 @@ concurrency:
 
 jobs:
   focused-real-transport-contracts:
-    name: Signed WebDAV 3-provider quorum and Android real routes (${{ matrix.os }})
+    name: WebDAV TLS, Android wire and atomic CAS floor denials (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -51,8 +55,8 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
-      - name: Real signed remote-provider TLS quorum and Android live route fixtures
-        run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js
+      - name: Real signed remote-provider TLS, Android routes and atomic CAS floor negatives
+        run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js
       - name: Verify tests did not change repository files
         run: git diff --exit-code
       - name: Verify tests did not create untracked files
