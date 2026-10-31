@@ -32,6 +32,16 @@ function assertSameSignedEnvelopes(actual, expected, message) {
   assert.equal(protocol.canonicalJson(actual), protocol.canonicalJson(expected), message);
 }
 
+test("a CAS floor cannot impersonate the independent witness with the same Ed25519 key", () => {
+  const key = crypto.generateKeyPairSync("ed25519").publicKey
+    .export({ type: "spki", format: "der" });
+  assert.throws(() => new SyncEngine({
+    adapter: { push() {}, list() {} },
+    atomicBatchWitnessPublicKey: key,
+    atomicBatchCasFloorPublicKey: Buffer.from(key),
+  }), { code: "authorization_required" });
+});
+
 async function snapshotPinnedJournal(filename, priorIdentity = null) {
   const handle = await fsp.open(filename,
     fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
@@ -69,7 +79,7 @@ async function snapshotPinnedJournal(filename, priorIdentity = null) {
   }
 }
 
-async function fixture(t, { batchResponse, witnessResponse,
+async function fixture(t, { batchResponse, witnessResponse, casResponse,
   missingCapability = false, interleaved = false,
   deleteExpiresInMs = 120000 } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
@@ -82,6 +92,8 @@ async function fixture(t, { batchResponse, witnessResponse,
   const signing = crypto.generateKeyPairSync("ed25519");
   const witness = crypto.generateKeyPairSync("ed25519");
   const witnessPublicKey = witness.publicKey.export({ type: "spki", format: "der" });
+  const casSigner = crypto.generateKeyPairSync("ed25519");
+  const casPublicKey = casSigner.publicKey.export({ type: "spki", format: "der" });
   const receiptFor = (pair, overrides = {}) => {
     const statement = {
       version: 1,
@@ -98,6 +110,22 @@ async function fixture(t, { batchResponse, witnessResponse,
     return { statement, signature: crypto.sign(null,
       Buffer.from("rootark-sync-atomic-batch-witness-v1\0"
         + protocol.canonicalJson(statement)), witness.privateKey).toString("base64url") };
+  };
+  const casFloorFor = (receipt, nonce, overrides = {}) => {
+    const statement = {
+      version: 1,
+      scope: "alice:store",
+      nonce,
+      commitId: receipt.statement.commitId,
+      storeHeadSha256: receipt.statement.storeHeadSha256,
+      fencingEpoch: receipt.statement.fencingEpoch,
+      sequence: 1,
+      current: true,
+      ...overrides,
+    };
+    return { statement, signature: crypto.sign(null,
+      Buffer.from("rootark-sync-atomic-batch-external-cas-floor-v1\0"
+        + protocol.canonicalJson(statement)), casSigner.privateKey).toString("base64url") };
   };
   const publicKey = signing.publicKey.export({ type: "spki", format: "der" })
     .toString("base64url");
@@ -160,6 +188,7 @@ async function fixture(t, { batchResponse, witnessResponse,
   const adapter = { list: async () => ({ objects: [] }), push };
   if (!missingCapability) adapter.pushBatch = pushBatch;
   const journal = await new SyncJournal(journalPath).open();
+  let lastWitnessReceipt;
   const engine = new SyncEngine({
     rootDir: root, snapshotPath, journal, adapter,
     deviceId: DEVICE, keyEpoch: "epoch-1", compartmentId: "private",
@@ -168,9 +197,16 @@ async function fixture(t, { batchResponse, witnessResponse,
     requireCurrentOutgoingAuthorization: true,
     atomicBatchWitnessPublicKey: witnessPublicKey,
     atomicBatchWitnessScope: "alice:store",
-    atomicBatchWitnessReadback: async (challenge) => witnessResponse
-      ? witnessResponse(challenge, { deleted, moved, receiptFor })
-      : receiptFor([deleted, moved], { nonce: challenge.nonce }),
+    atomicBatchWitnessReadback: async (challenge) => {
+      lastWitnessReceipt = witnessResponse
+        ? witnessResponse(challenge, { deleted, moved, receiptFor })
+        : receiptFor([deleted, moved], { nonce: challenge.nonce });
+      return lastWitnessReceipt;
+    },
+    atomicBatchCasFloorPublicKey: casPublicKey,
+    atomicBatchCasFloorReadback: async (challenge) => casResponse
+      ? casResponse(challenge, { deleted, moved, receiptFor, casFloorFor, lastWitnessReceipt })
+      : casFloorFor(lastWitnessReceipt, challenge.nonce),
     currentDeviceAuthorization: () => true,
     authorizeOutgoing: async () => true,
     authorize: async () => true,
@@ -207,7 +243,7 @@ async function fixture(t, { batchResponse, witnessResponse,
   assert.equal(events.length, 0);
   return {
     root, journalPath, journal, engine, events, deleted, moved, signed, unrelated,
-    receiptFor,
+    receiptFor, casFloorFor,
     adapter, summary: () => ({ pushed: 0, conflicts: [], offline: false }),
     async reread() { return new SyncJournal(journalPath).open(); },
     async assertBothPending() {
@@ -269,7 +305,8 @@ test("signed pair plus separate pinned synthetic admission witness ACKs both in 
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
   "other-account-witness", "wrong-envelope-digest", "not-physically-durable",
   "zero-fencing-epoch", "invalid-store-head", "missing-trusted-witness-key",
-  "missing-independent-readback", "replayed-old-witness-nonce"]) {
+  "missing-independent-readback", "replayed-old-witness-nonce",
+  "witness-switching-nonce-getter"]) {
   test("no false durable batch ACK with " + mode, { timeout: 120000 }, async (t) => {
     const f = await fixture(t, {
       batchResponse: (pair) => ({ objects: exact(pair) }),
@@ -294,6 +331,16 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
           [ctx.deleted, ctx.moved], { nonce: challenge.nonce, storeHeadSha256: "0" });
         if (mode === "replayed-old-witness-nonce") return ctx.receiptFor(
           [ctx.deleted, ctx.moved], { nonce: crypto.randomBytes(32).toString("base64url") });
+        if (mode === "witness-switching-nonce-getter") {
+          const oldNonce = crypto.randomBytes(32).toString("base64url");
+          const receipt = ctx.receiptFor([ctx.deleted, ctx.moved], { nonce: oldNonce });
+          let reads = 0;
+          Object.defineProperty(receipt.statement, "nonce", {
+            enumerable: true,
+            get: () => ++reads === 1 ? challenge.nonce : oldNonce,
+          });
+          return receipt;
+        }
         const forged = ctx.receiptFor([ctx.deleted, ctx.moved], { nonce: challenge.nonce });
         forged.signature = Buffer.alloc(64, 42).toString("base64url");
         return forged;
@@ -313,6 +360,58 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
         ? [] : ["batch"]);
     await f.assertBothPending();
   });
+}
+
+for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floor",
+  "forged-cas-floor", "cas-stale-current-head", "cas-wrong-commit",
+  "cas-old-epoch", "cas-not-current", "cas-wrong-scope", "cas-replayed-nonce",
+  "cas-switching-head-getter"]) {
+  test("no protected batch ACK without fresh independently signed CAS floor: " + mode,
+    { timeout: 120000 }, async (t) => {
+      const f = await fixture(t, {
+        casResponse: (challenge, { casFloorFor, lastWitnessReceipt }) => {
+          assert.ok(lastWitnessReceipt, "CAS readback must follow signed witness verification");
+          assert.notEqual(challenge.nonce, lastWitnessReceipt.statement.nonce,
+            "CAS current-head challenge must not reuse witness challenge");
+          if (mode === "missing-cas-floor") return null;
+          const changes = {
+            "cas-stale-current-head": { storeHeadSha256: sha256("new-latest-head") },
+            "cas-wrong-commit": { commitId: "different-commit-123456789" },
+            "cas-old-epoch": { fencingEpoch: lastWitnessReceipt.statement.fencingEpoch + 1 },
+            "cas-not-current": { current: false },
+            "cas-wrong-scope": { scope: "mallory:store" },
+            "cas-replayed-nonce": { nonce: crypto.randomBytes(32).toString("base64url") },
+          };
+          const result = casFloorFor(lastWitnessReceipt, challenge.nonce,
+            changes[mode] || {});
+          if (mode === "forged-cas-floor") {
+            result.signature = Buffer.alloc(64, 55).toString("base64url");
+          }
+          if (mode === "cas-switching-head-getter") {
+            const staleHead = sha256("stale-signed-cas-head");
+            const signedForOldHead = casFloorFor(lastWitnessReceipt, challenge.nonce,
+              { storeHeadSha256: staleHead });
+            let reads = 0;
+            Object.defineProperty(signedForOldHead.statement, "storeHeadSha256", {
+              enumerable: true,
+              get: () => ++reads === 1
+                ? lastWitnessReceipt.statement.storeHeadSha256 : staleHead,
+            });
+            return signedForOldHead;
+          }
+          return result;
+        },
+      });
+      if (mode === "missing-cas-key") f.engine.atomicBatchCasFloorPublicKey = null;
+      if (mode === "missing-cas-readback") f.engine.atomicBatchCasFloorReadback = null;
+      await assert.rejects(f.engine._pushPending(f.summary()), {
+        code: mode.startsWith("missing-cas-") && mode !== "missing-cas-floor"
+          ? "sync_atomic_batch_unavailable" : "sync_atomic_batch_indeterminate",
+      });
+      assert.deepEqual(f.events.map((event) => event.kind),
+        ["missing-cas-key", "missing-cas-readback"].includes(mode) ? [] : ["batch"]);
+      await f.assertBothPending();
+    });
 }
 
 test("interleaved signed DELETE and MOVE still use exactly ONE remote batch, never individual DELETE", {
