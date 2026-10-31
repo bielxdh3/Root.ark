@@ -304,3 +304,50 @@ test("positive revoked replay: valid signed MOVE preserves original inode, exact
   assert.equal(response.status, 200);
   assert.deepEqual(response.body, ORIGINAL);
 });
+
+test("cold signed MOVE refuses forged signature even when BOTH durable local journal digests are rewritten", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await setup(t);
+  const proof = await prepareRealDurableMove(f);
+  const fake = clone(proof.signed);
+  fake.authorization.signature = crypto.randomBytes(64).toString("base64url");
+  assert.notEqual(fake.authorization.signature, proof.signed.authorization.signature);
+  const forgedDigest = digest(protocol.canonicalJson(fake));
+  const outbox = JSON.parse(await fsp.readFile(f.outboxPath, "utf8"));
+  const location = outbox.pending.findIndex((entry) =>
+    entry.operationId === proof.signed.operationId);
+  assert.ok(location >= 0, "original signed MOVE must still be present on disk");
+  outbox.pending[location] = fake;
+  outbox.committedSigned[proof.signed.operationId] = forgedDigest;
+  const local = JSON.parse(await fsp.readFile(f.localPath, "utf8"));
+  assert.equal(local.pending.length, 1);
+  local.pending[0].signedOutboxReceipts = [{
+    operationId: proof.signed.operationId, digest: forgedDigest,
+  }];
+  for (const [filename, body] of [[f.localPath, local], [f.outboxPath, outbox]]) {
+    const handle = await fsp.open(filename, "r+");
+    try {
+      await handle.truncate(0);
+      await handle.writeFile(JSON.stringify(body) + "\n");
+      await handle.sync();
+    } finally { await handle.close(); }
+  }
+  const forgedLocal = await new SyncJournal(f.localPath).open();
+  const forgedOutbox = await new SyncJournal(f.outboxPath).open();
+  assert.equal(forgedLocal.pending()[0].signedOutboxReceipts[0].digest, forgedDigest);
+  assert.equal(forgedOutbox.durableSignedReceiptDigest(fake.operationId), forgedDigest);
+  assert.deepEqual(fs.readFileSync(proof.target), ORIGINAL,
+    "attack does NOT break AES-GCM or physical inode, only the Ed25519 signature");
+  const beforeLocal = await fsp.readFile(f.localPath);
+  const beforeOutbox = await fsp.readFile(f.outboxPath);
+  f.state.revoked = true;
+  f.state.forbidTranslation = true;
+  const beforeTranslate = f.state.translatorReads;
+  await assert.rejects(f.start(), { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+  assert.equal(f.state.translatorReads, beforeTranslate);
+  assert.deepEqual(await fsp.readFile(f.localPath), beforeLocal);
+  assert.deepEqual(await fsp.readFile(f.outboxPath), beforeOutbox);
+  assert.equal((await new SyncJournal(f.localPath).open()).hasSeen(proof.move.operationId), false);
+  sameInode(exactInode(proof.target), proof.sourceIdentity);
+});
