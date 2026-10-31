@@ -6,6 +6,7 @@ const path = require("node:path");
 const protocol = require("./rootark-sync-protocol");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { SyncEngine } = require("./rootark-sync-engine");
+const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { createAuthorizationProof, verifyAuthorizationProof,
   verifyHistoricalAuthorizationProof } = require("./rootark-sync-authorization");
@@ -69,7 +70,8 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical,
   if (!Object.hasOwn(options, "trustedAtomicBatchWitness")) return {};
   const supplied = options.trustedAtomicBatchWitness;
   const requiredFields = ["pinnedPublicKey", "scope", "readback", "ownerIdentity",
-    "casPinnedPublicKey", "casReadback"];
+    "casPinnedPublicKey", "casReadback", "ownerProvisionerPublicKey",
+    "ownerProvisioning", "ownerProvisionDigest"];
   let pinned;
   let suppliedIdentity = null;
   try {
@@ -115,8 +117,19 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical,
     || !pinned.pinnedPublicKey || !pinned.casPinnedPublicKey) {
     throw new Error("Atomic batch witness requires independently pinned readback and external CAS floor");
   }
-  // Validate at construction using the engine's existing strict Ed25519
-  // SPKI verifier. Capture all references now; config cannot replace them.
+  // The identity must be signed by a third owner-pinned Ed25519 root. Checking
+  // equality against a caller-supplied UUID object without its provenance is
+  // insufficient, even if the physical witness and CAS sign matching UUIDs.
+  const provision = verifyPinnedAtomicOwnerProvision({
+    identity: suppliedIdentity, scope: pinned.scope,
+    provisionerPublicKey: pinned.ownerProvisionerPublicKey,
+    provisioning: pinned.ownerProvisioning,
+    expectedDigest: pinned.ownerProvisionDigest,
+    witnessPublicKey: pinned.pinnedPublicKey,
+    casPublicKey: pinned.casPinnedPublicKey,
+  });
+  // Validate again inside SyncEngine so direct callers cannot bypass the
+  // trusted embedding wrapper. Capture every reference now.
   const readback = pinned.readback;
   const casReadback = pinned.casReadback;
   const identity = Object.freeze(suppliedIdentity);
@@ -126,6 +139,9 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical,
       ? Buffer.from(pinned.pinnedPublicKey) : pinned.pinnedPublicKey,
     atomicBatchWitnessScope: pinned.scope,
     atomicBatchOwnerIdentity: identity,
+    atomicBatchOwnerProvisionerPublicKey: provision.publicKey,
+    atomicBatchOwnerProvisioning: provision.provisioning,
+    atomicBatchOwnerProvisionDigest: pinned.ownerProvisionDigest,
     atomicBatchCasFloorPublicKey: Buffer.isBuffer(pinned.casPinnedPublicKey)
       || pinned.casPinnedPublicKey instanceof Uint8Array
       ? Buffer.from(pinned.casPinnedPublicKey) : pinned.casPinnedPublicKey,

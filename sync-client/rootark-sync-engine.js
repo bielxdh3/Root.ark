@@ -7,6 +7,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const protocol = require("./rootark-sync-protocol");
+const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
@@ -458,6 +459,22 @@ class SyncEngine {
       fail("Independent atomic batch witness readback must be a function",
         "authorization_required");
     }
+    const ownerProvision = (witnessPublicKey || witnessReadback || witnessScope
+      || ownerIdentity || casFloorPublicKey || casFloorReadback)
+      ? verifyPinnedAtomicOwnerProvision({
+        identity: ownerIdentity,
+        scope: witnessScope,
+        provisionerPublicKey: options.atomicBatchOwnerProvisionerPublicKey,
+        provisioning: options.atomicBatchOwnerProvisioning,
+        expectedDigest: options.atomicBatchOwnerProvisionDigest,
+        witnessPublicKey, casPublicKey: casFloorPublicKey,
+      }) : null;
+    if (ownerProvision && [witnessPublicKey, casFloorPublicKey].some((key) =>
+      key && key.export({ type: "spki", format: "der" }).equals(
+        ownerProvision.publicKey.export({ type: "spki", format: "der" })))) {
+      fail("Owner provisioner, witness and CAS must have distinct pinned keys",
+        "authorization_required");
+    }
     // Never let an async callback swap the signer, CAS identity, scope or
     // direct-readback function after construction. Ordinary instance fields
     // would allow a witness callback to mutate `this.*` between awaited
@@ -467,6 +484,7 @@ class SyncEngine {
       atomicBatchWitnessReadback: { value: witnessReadback },
       atomicBatchWitnessScope: { value: witnessScope },
       atomicBatchOwnerIdentity: { value: ownerIdentity },
+      atomicBatchOwnerProvisionerPublicKey: { value: ownerProvision?.publicKey || null },
       atomicBatchCasFloorPublicKey: { value: casFloorPublicKey },
       atomicBatchCasFloorReadback: { value: casFloorReadback },
     });
