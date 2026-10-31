@@ -17,6 +17,39 @@ const { createPrivateAuthorityFixture } =
 
 const TOKEN = "cos-pr235-private-namespace-test";
 
+async function readPinnedEvidence(filename, expectedStat) {
+  // A pathname-only read after rejecting hardlink aliasing or MOVE could
+  // inspect a substituted inode with identical content. Keep the expected
+  // physical file open while checking its bytes and pathname identity.
+  const handle = await fsp.open(filename,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const before = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(filename, { bigint: true });
+    for (const observed of [before, namedBefore]) {
+      assert.equal(observed.isFile(), true);
+      assert.equal(observed.dev, expectedStat.dev);
+      assert.equal(observed.ino, expectedStat.ino);
+      assert.equal(observed.nlink, expectedStat.nlink);
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(filename, { bigint: true });
+    for (const observed of [after, namedAfter]) {
+      assert.equal(observed.isFile(), true);
+      assert.equal(observed.dev, before.dev);
+      assert.equal(observed.ino, before.ino);
+      assert.equal(observed.nlink, before.nlink);
+      assert.equal(observed.size, BigInt(bytes.length));
+    }
+    assert.equal(before.size, after.size,
+      "the pinned inode must not be resized during readback");
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
 async function request(bridge, method, route, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
@@ -283,11 +316,11 @@ test("a legacy bridge also rejects shared journal inodes aliased under separate 
   const before = await fsp.lstat(first, { bigint: true });
   assert.equal(before.nlink, 2n);
   assert.equal((await fsp.lstat(second, { bigint: true })).ino, before.ino);
-  const disk = await fsp.readFile(first);
+  const disk = await readPinnedEvidence(first, before);
   bridge = new LocalSyncWebDavBridge({ rootDir: root, journal, token: TOKEN });
   await assert.rejects(bridge.start(), /Untrusted WebDAV journal inode or link count/i);
-  assert.deepEqual(await fsp.readFile(first), disk);
-  assert.deepEqual(await fsp.readFile(second), disk);
+  assert.deepEqual(await readPinnedEvidence(first, before), disk);
+  assert.deepEqual(await readPinnedEvidence(second, before), disk);
   await assert.rejects(fsp.lstat(first + ".webdav-owner.lock"), { code: "ENOENT" });
   await assert.rejects(fsp.lstat(path.join(root, ".rootark-webdav-owner.lock")),
     { code: "ENOENT" });
@@ -328,7 +361,8 @@ test("MOVE validates original Destination path before URL dot-segment normalizat
     assert.equal(reply.status, 400,
       "raw normalized/relative Destination must fail before journal admission");
     assert.equal(admissions, 0);
-    assert.equal(await fsp.readFile(sourcePath, "utf8"), sourceContent);
+    assert.deepEqual(await readPinnedEvidence(sourcePath, original),
+      Buffer.from(sourceContent, "utf8"));
     assert.equal((await fsp.lstat(sourcePath, { bigint: true })).ino, original.ino);
     assert.equal(fs.existsSync(path.join(root, "target.txt")), false);
     assert.deepEqual(await fsp.readdir(path.join(root, ".rootark-trash")), []);
