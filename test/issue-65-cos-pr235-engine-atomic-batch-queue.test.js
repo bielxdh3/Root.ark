@@ -303,6 +303,8 @@ test("409 followed by fake LIST echo of both signed envelopes NEVER fabricates a
   const f = await fixture(t, {
     batchResponse: () => { throw Object.assign(new Error("replayed batch"),
       { status: 409, code: "sync_conflict" }); },
+    // A server-only echo is not a signed independent physical witness.
+    witnessResponse: () => null,
   });
   let readbacks = 0;
   f.adapter.list = async () => {
@@ -323,10 +325,56 @@ test("409 with only one exact remote member retains BOTH signed pending envelope
   const f = await fixture(t, {
     batchResponse: () => { throw Object.assign(new Error("batch rejected"),
       { status: 409, code: "sync_conflict" }); },
+    witnessResponse: () => null,
   });
   f.adapter.list = async () => ({ objects: [f.deleted] });
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
+  assert.deepEqual(f.events.map((entry) => entry.kind), ["batch"]);
+  await f.assertBothPending();
+});
+
+test("lost HTTP ACK then 409 can recover ONLY through fresh independent signed batch readback", {
+  timeout: 120000,
+}, async (t) => {
+  // The signed fixture models a trusted independent physical readback, not
+  // real remote storage. The server's POST response is deliberately absent.
+  const f = await fixture(t, {
+    batchResponse: () => { throw Object.assign(new Error("already committed"),
+      { status: 409, code: "sync_conflict" }); },
+  });
+  const originalReadback = f.engine.atomicBatchWitnessReadback;
+  let challenged = 0;
+  f.engine.atomicBatchWitnessReadback = async (challenge) => {
+    challenged++;
+    assert.deepEqual(challenge.operationIds,
+      [f.deleted.operationId, f.moved.operationId]);
+    return originalReadback(challenge);
+  };
+  const summary = f.summary();
+  await f.engine._pushPending(summary);
+  assert.equal(challenged, 1, "409 requires ONE fresh direct witness challenge");
+  assert.deepEqual(f.events.map((event) => event.kind), ["batch"]);
+  assert.equal(summary.pushed, 2);
+  assert.equal(summary.offline, false);
+  const disk = await f.reread();
+  assert.deepEqual(await disk.recover(), []);
+  assert.equal(disk.hasSeen(f.deleted.operationId), true);
+  assert.equal(disk.hasSeen(f.moved.operationId), true);
+});
+
+test("lost network ACK with missing independent witness remains offline and BOTH pending", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await fixture(t, {
+    batchResponse: () => { throw Object.assign(new Error("connection lost"),
+      { code: "ETIMEDOUT" }); },
+    witnessResponse: () => null,
+  });
+  const summary = f.summary();
+  await f.engine._pushPending(summary);
+  assert.equal(summary.offline, true);
+  assert.equal(summary.pushed, 0);
   assert.deepEqual(f.events.map((entry) => entry.kind), ["batch"]);
   await f.assertBothPending();
 });
@@ -497,13 +545,12 @@ test("transient network failure during batch retains both durable entries and ne
       throw Object.assign(Error("simulated network disconnect after batch attempt"),
         { code: "ETIMEDOUT" });
     },
+    witnessResponse: () => null,
   });
   const summary = f.summary();
-  try {
-    await f.engine._pushPending(summary);
-  } catch (error) {
-    assert.equal(error.code, "ETIMEDOUT");
-  }
+  await f.engine._pushPending(summary);
+  assert.equal(summary.offline, true);
+  assert.equal(summary.pushed, 0);
   assert.deepEqual(f.events.map((item) => item.kind), ["batch"]);
   await f.assertBothPending();
 });

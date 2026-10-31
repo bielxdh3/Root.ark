@@ -1121,6 +1121,7 @@ class SyncEngine {
     }
     const digests = [deleted, moved].map(signedEnvelopeDigest);
     let response;
+    let uncertainRequest = null;
     try {
       // The final synchronous current-policy checks begin ONE network
       // request. Remote registry must fence BOTH signatures under one lock.
@@ -1133,17 +1134,20 @@ class SyncEngine {
       // the two envelopes proves neither signed server admission nor durable
       // physical custody. Never fabricate a successful pair ACK from LIST.
       // Preserve both pending until independently signed atomic admission
-      // receipts/floor readback exist; no remote-wins partial repair.
-      if (transient(error)) { summary.offline = true; return; }
-      fail("Atomic signed WebDAV remote batch outcome indeterminate",
+      // readback proves the exact pair; no remote-wins partial repair. A
+      // genuine commit followed by a lost HTTP ACK can return 409 on retry.
+      // That must be checked with a fresh direct witness challenge, not kept
+      // in a permanent 409 loop.
+      if (transient(error) || error?.status === 409) uncertainRequest = error;
+      else fail("Atomic signed WebDAV remote batch outcome indeterminate",
         "sync_atomic_batch_indeterminate");
     }
-    if (!Array.isArray(response?.objects) || response.objects.length !== 2
+    if (!uncertainRequest && (!Array.isArray(response?.objects) || response.objects.length !== 2
       || response.objects.some((entry, index) => {
         try {
           return signedEnvelopeDigest(protocol.validateStoredOperation(entry)) !== digests[index];
         } catch { return true; }
-      })) {
+      }))) {
       fail("Atomic signed WebDAV remote batch lacks exact two-envelope ACK",
         "sync_atomic_batch_indeterminate");
     }
@@ -1166,10 +1170,18 @@ class SyncEngine {
         envelopeDigests: digests,
       });
     } catch {
+      if (uncertainRequest && transient(uncertainRequest)) {
+        summary.offline = true;
+        return;
+      }
       fail("Independent atomic admission readback unavailable",
         "sync_atomic_batch_indeterminate");
     }
     if (witnessed?.statement?.nonce !== witnessNonce) {
+      if (uncertainRequest && transient(uncertainRequest) && !witnessed) {
+        summary.offline = true;
+        return;
+      }
       fail("Independent atomic admission readback nonce mismatch",
         "sync_atomic_batch_indeterminate");
     }
