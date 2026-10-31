@@ -4,6 +4,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const https = require("node:https");
+const { execFileSync } = require("node:child_process");
 const { Pool } = require("pg");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
@@ -13,6 +17,10 @@ const { createZk1SyncPgIndependentAdmissionIssuer } =
   require("../../src/services/zk1SyncPgIndependentAdmissionIssuer");
 const { createZk1SyncPgBatchIndependentReadback } =
   require("../../src/services/zk1SyncPgBatchIndependentReadback");
+const { createZk1SyncAtomicSqlReadbackHttpsServer } =
+  require("../../src/services/zk1SyncAtomicSqlReadbackHttpsServer");
+const { createPrivateAuthorityFixture } =
+  require("../../test/support/issue-65-private-authority-fixture");
 const { hasUnexpectedProtectedDml } =
   require("../../src/services/zk1SyncPgProtectedRoleAudit");
 
@@ -1326,8 +1334,36 @@ test("PG18 read-only current signed pair resolves a lost ACK by exact signed env
     operationIds: operations.map((op) => op.operationId),
     envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
   };
+  const uniqueCurrent = await attestor.query(`SELECT m.commit_id FROM zk1_sync_batch.batch_commit m
+    JOIN zk1_sync_batch.scope_head h ON h.scope=m.scope
+      AND h.sequence=m.sequence AND h.head=m.head
+    WHERE m.scope=$1 AND m.delete_id=$2 AND m.move_id=$3
+      AND m.delete_digest=pg_catalog.decode($4,'hex')
+      AND m.move_digest=pg_catalog.decode($5,'hex')`, [
+    f.scope, ...request.operationIds, ...request.envelopeDigests,
+  ]);
+  assert.equal(uniqueCurrent.rowCount, 1,
+    "real PG18 exact-pair current-head lookup must select precisely one commit");
+  assert.equal(uniqueCurrent.rows[0].commit_id, committed.commitId);
   const original = structuredClone(request);
-  const evidence = await readback.verifyCurrentSignedPair(request);
+  let queryCount = 0;
+  const instrumentedAttestor = createZk1SyncPgBatchIndependentReadback({
+    attestorPool: { connect: async () => {
+      const connection = await attestor.connect();
+      return { query: async (...args) => {
+        queryCount += 1;
+        return connection.query(...args);
+      }, release: () => connection.release() };
+    } },
+  });
+  let evidence;
+  try { evidence = await instrumentedAttestor.verifyCurrentSignedPair(request); }
+  catch {
+    // Only generic numeric query-stage diagnostics are exposed by the lab
+    // runner; never print SQL parameters, scope names or DB credentials.
+    const code = `ZK65_SQL_CURRENT_STAGE_${queryCount}`;
+    throw Object.assign(new Error(code), { code });
+  }
   assert.equal(evidence.localPgRowsConsistent, true);
   assert.equal(evidence.witnessVerified, false);
   assert.equal(evidence.clientAckAuthorized, false);
@@ -1398,6 +1434,121 @@ test("PG18 current pair accepts legitimate dotted and colon WebDAV signed event 
     assert.equal(proof.localPgRowsConsistent, true);
     assert.equal(proof.clientAckAuthorized, false);
   }
+});
+
+test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS without authorizing ACK", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await fixture();
+  const operations = await f.signedPair({ eventId: "tls.real:batch" });
+  const committed = await commitTestBatch(f, operations);
+  const directory = createPrivateAuthorityFixture("zk65-sql-mtls-");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const openssl = (...args) => execFileSync("openssl", args, {
+    cwd: directory, windowsHide: true, stdio: "ignore", timeout: 30000,
+  });
+  openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", "ca.key", "-out", "ca.pem", "-subj", "/CN=zk65 SQL fixture CA", "-days", "1");
+  function makeCert(name, usage, server = false) {
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`,
+      "-out", `${name}.csr`, "-subj", `/CN=${server ? "localhost" : name}`);
+    fs.writeFileSync(path.join(directory, `${name}.ext`),
+      `extendedKeyUsage=${usage}\nkeyUsage=digitalSignature,keyEncipherment\n`
+      + (server ? "subjectAltName=DNS:localhost,IP:127.0.0.1\n" : ""),
+    { mode: 0o600, flag: "wx" });
+    openssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem",
+      "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem",
+      "-days", "1", "-extfile", `${name}.ext`);
+  }
+  makeCert("server", "serverAuth", true);
+  makeCert("reader", "clientAuth");
+  makeCert("unlisted", "clientAuth");
+  const read = (name) => fs.readFileSync(path.join(directory, name));
+  const client = { key: read("reader.key"), cert: read("reader.pem") };
+  const otherClient = { key: read("unlisted.key"), cert: read("unlisted.pem") };
+  const fingerprint = new crypto.X509Certificate(client.cert).fingerprint256;
+  const accountId = crypto.randomUUID();
+  const storeId = crypto.randomUUID();
+  const server = createZk1SyncAtomicSqlReadbackHttpsServer({
+    key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
+    attestorPool: attestor,
+    principals: { [fingerprint]: [{ scope: f.scope, accountId, storeId }] },
+  });
+  await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", (err) =>
+    err ? reject(err) : resolve()));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const challenge = { scope: f.scope, accountId, storeId,
+    nonce: crypto.randomBytes(32).toString("base64url"),
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")) };
+  function send(body, credential = client, route = "/v2/sync-atomic/sql-observe",
+    tlsOverride = {}) {
+    return new Promise((resolve, reject) => {
+      const data = Buffer.from(JSON.stringify(body));
+      const request = https.request({ host: "127.0.0.1", port: server.address().port,
+        path: route, method: "POST", ca: read("ca.pem"), ...credential,
+        agent: false, rejectUnauthorized: true, minVersion: "TLSv1.3", timeout: 5000,
+        headers: { "content-type": "application/json", "content-length": String(data.length) },
+        ...tlsOverride },
+      (response) => {
+        const parts = [];
+        response.on("data", (part) => parts.push(part));
+        response.on("end", () => {
+          try { resolve({ status: response.statusCode,
+            body: JSON.parse(Buffer.concat(parts).toString("utf8")),
+            headers: response.headers }); }
+          catch (e) { reject(e); }
+        });
+      });
+      request.on("error", reject);
+      request.on("timeout", () => request.destroy(new Error("SQL_MTLS_TIMEOUT")));
+      request.end(data);
+    });
+  }
+  const observed = await send(challenge);
+  assert.equal(observed.status, 200);
+  assert.equal(observed.headers["cache-control"], "no-store");
+  assert.equal(observed.body.kind, "SYNC_ATOMIC_SQL_ROWS_ONLY_DEV_OFF");
+  assert.equal(observed.body.commitId, committed.commitId);
+  assert.equal(observed.body.storeHeadSha256, committed.storeHeadSha256);
+  assert.equal(observed.body.nonce, challenge.nonce);
+  assert.equal(observed.body.localPgRowsConsistent, true);
+  assert.equal(observed.body.physicalDurable, false);
+  assert.equal(observed.body.witnessVerified, false);
+  assert.equal(observed.body.clientAckAuthorized, false);
+  assert.equal(Object.hasOwn(observed.body, "statement"), false);
+  assert.equal(Object.hasOwn(observed.body, "signature"), false);
+  assert.equal(Object.hasOwn(observed.body, "atomicAdmission"), false);
+  await assert.rejects(send(challenge, {}),
+    "client TLS certificates must be mandatory at the handshake boundary");
+  await assert.rejects(send(challenge, client, "/v2/sync-atomic/sql-observe",
+    { minVersion: "TLSv1.2", maxVersion: "TLSv1.2" }),
+  "TLS 1.2 cannot negotiate the mTLS observer service");
+  for (const [bad, credential, expected] of [
+    [challenge, otherClient, 403],
+    [{ ...challenge, accountId: crypto.randomUUID() }, client, 403],
+    [{ ...challenge, storeId: crypto.randomUUID() }, client, 403],
+    [{ ...challenge, nonce: "invalid" }, client, 400],
+    [{ ...challenge, envelopeDigests: ["0".repeat(64), challenge.envelopeDigests[1]] }, client, 503],
+    [{ ...challenge, clientAckAuthorized: true }, client, 400],
+    [{ ...challenge, padding: "x".repeat(4097) }, client, 400],
+  ]) {
+    const denied = await send(bad, credential);
+    assert.equal(denied.status, expected);
+    assert.equal(denied.headers["cache-control"], "no-store");
+    assert.equal(Object.hasOwn(denied.body, "commitId"), false);
+  }
+  assert.equal((await send(challenge, client, "/v2/sync-atomic/witness/readback")).status, 404,
+    "SQL-only endpoint must not impersonate a physical witness route");
+  const repeat = await send(challenge);
+  assert.equal(repeat.status, 200, "replayed read-only SQL observation is not a consumed admission");
+  assert.equal(repeat.body.clientAckAuthorized, false);
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  const revoked = await send(challenge);
+  assert.equal(revoked.status, 503);
+  assert.equal(Object.hasOwn(revoked.body, "commitId"), false,
+    "revoked device cannot be read back over mTLS as an authorized physical ACK");
 });
 
 test("independent readback rejects revocation and runtime impersonation", async () => {
