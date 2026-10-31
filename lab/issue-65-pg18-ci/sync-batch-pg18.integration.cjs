@@ -1317,6 +1317,89 @@ test("attestor reader can inspect committed marker, state and signed originals w
   assert.deepEqual(proof.operationIds, operations.map((op) => op.operationId));
 });
 
+test("PG18 read-only current signed pair resolves a lost ACK by exact signed envelopes without trusting commitId", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const committed = await commitTestBatch(f, operations);
+  const request = {
+    scope: f.scope,
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
+  };
+  const original = structuredClone(request);
+  const evidence = await readback.verifyCurrentSignedPair(request);
+  assert.equal(evidence.localPgRowsConsistent, true);
+  assert.equal(evidence.witnessVerified, false);
+  assert.equal(evidence.clientAckAuthorized, false);
+  assert.equal(evidence.commitId, committed.commitId);
+  assert.equal(evidence.head, committed.storeHeadSha256);
+  assert.deepEqual(evidence.operationIds, request.operationIds);
+  assert.deepEqual(evidence.envelopeDigests, request.envelopeDigests);
+  await assert.rejects(createZk1SyncPgBatchIndependentReadback({ attestorPool: runtime })
+    .verifyCurrentSignedPair(request),
+  { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+  "runtime role cannot impersonate the independent read-only attestor");
+  const other = await fixture();
+  for (const forged of [
+    { ...request, scope: other.scope },
+    { ...request, operationIds: [...request.operationIds].reverse() },
+    { ...request, operationIds: [request.operationIds[0], request.operationIds[0]] },
+    { ...request, operationIds: [crypto.randomUUID(), request.operationIds[1]] },
+    { ...request, envelopeDigests: [...request.envelopeDigests].reverse() },
+    { ...request, envelopeDigests: ["0".repeat(64), request.envelopeDigests[1]] },
+    { ...request, envelopeDigests: [request.envelopeDigests[0].toUpperCase(), request.envelopeDigests[1]] },
+    { ...request, envelopeDigests: [request.envelopeDigests[0], "g".repeat(64)] },
+    { ...request, operationIds: [request.operationIds[0]] },
+    { ...request, operationIds: ["x".repeat(161), request.operationIds[1]] },
+    { ...request, commitId: committed.commitId },
+    { ...request, clientAckAuthorized: true },
+  ]) {
+    await assert.rejects(readback.verifyCurrentSignedPair(forged),
+      { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+      "caller-supplied pair, scope or trust flags cannot select a signed readback");
+  }
+  assert.deepEqual(request, original, "verified readback must never mutate challenge bytes");
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  await assert.rejects(readback.verifyCurrentSignedPair(request),
+    { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+    "current revocation must defeat a previously committed SQL row readback");
+});
+
+test("PG18 latest-pair resolver refuses rolled-back physical SQL head without treating rows as a witness", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const request = {
+    scope: f.scope,
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
+  };
+  const committed = await commitTestBatch(f, operations);
+  assert.equal((await readback.verifyCurrentSignedPair(request)).commitId, committed.commitId);
+  await admin.query(`UPDATE zk1_sync_batch.scope_head
+    SET sequence=0,head=decode(repeat('00',32),'hex') WHERE scope=$1`, [f.scope]);
+  await assert.rejects(readback.verifyCurrentSignedPair(request),
+    { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+    "SQL head mismatch must deny rather than re-sign a stale committed marker");
+});
+
+test("PG18 current pair accepts legitimate dotted and colon WebDAV signed event IDs", async () => {
+  for (const eventId of ["evt.one", "evt:two", "evt.three:four"]) {
+    const f = await fixture();
+    const operations = await f.signedPair({ eventId });
+    assert.ok(operations.every((op) => op.operationId.includes(eventId)));
+    const committed = await commitTestBatch(f, operations);
+    const proof = await readback.verifyCurrentSignedPair({
+      scope: f.scope,
+      operationIds: operations.map((op) => op.operationId),
+      envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
+    });
+    assert.equal(proof.commitId, committed.commitId);
+    assert.equal(proof.localPgRowsConsistent, true);
+    assert.equal(proof.clientAckAuthorized, false);
+  }
+});
+
 test("independent readback rejects revocation and runtime impersonation", async () => {
   const f = await fixture();
   const operations = await f.signedPair();
