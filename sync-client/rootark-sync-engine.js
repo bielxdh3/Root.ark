@@ -105,6 +105,7 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
     || !statement || typeof statement !== "object" || Array.isArray(statement)
     || Object.keys(statement).sort().join(",") !== keys.sort().join(",")
     || statement.version !== 1 || statement.scope !== trustedScope
+    || statement.scope !== witnessStatement.scope
     || statement.nonce !== expectedNonce || statement.current !== true
     || !Number.isSafeInteger(statement.sequence) || statement.sequence < 1
     || statement.commitId !== witnessStatement.commitId
@@ -395,33 +396,44 @@ class SyncEngine {
     this.requireCurrentOutgoingAuthorization = options.requireCurrentOutgoingAuthorization === true;
     // Must be supplied from an independent, trusted owner-pinned source.
     // NEVER accept a key sent by the sync server or serialized in the journal.
-    this.atomicBatchWitnessPublicKey = pinnedAtomicWitnessKey(options.atomicBatchWitnessPublicKey);
-    this.atomicBatchWitnessReadback = options.atomicBatchWitnessReadback || null;
-    this.atomicBatchWitnessScope = options.atomicBatchWitnessScope || null;
-    this.atomicBatchCasFloorPublicKey = pinnedAtomicWitnessKey(options.atomicBatchCasFloorPublicKey);
-    this.atomicBatchCasFloorReadback = options.atomicBatchCasFloorReadback || null;
-    if (this.atomicBatchCasFloorReadback !== null
-      && typeof this.atomicBatchCasFloorReadback !== "function") {
+    const witnessPublicKey = pinnedAtomicWitnessKey(options.atomicBatchWitnessPublicKey);
+    const witnessReadback = options.atomicBatchWitnessReadback || null;
+    const witnessScope = options.atomicBatchWitnessScope || null;
+    const casFloorPublicKey = pinnedAtomicWitnessKey(options.atomicBatchCasFloorPublicKey);
+    const casFloorReadback = options.atomicBatchCasFloorReadback || null;
+    if (casFloorReadback !== null
+      && typeof casFloorReadback !== "function") {
       fail("Independent external CAS floor reader must be a function",
         "authorization_required");
     }
-    if (this.atomicBatchWitnessPublicKey && this.atomicBatchCasFloorPublicKey
-      && this.atomicBatchWitnessPublicKey.export({ type: "spki", format: "der" })
-        .equals(this.atomicBatchCasFloorPublicKey.export({ type: "spki", format: "der" }))) {
+    if (witnessPublicKey && casFloorPublicKey
+      && witnessPublicKey.export({ type: "spki", format: "der" })
+        .equals(casFloorPublicKey.export({ type: "spki", format: "der" }))) {
       fail("External CAS floor and physical witness require distinct pinned keys",
         "authorization_required");
     }
-    if (this.atomicBatchWitnessScope !== null
-      && (typeof this.atomicBatchWitnessScope !== "string"
-        || !/^[A-Za-z0-9._:-]{1,256}$/.test(this.atomicBatchWitnessScope))) {
+    if (witnessScope !== null
+      && (typeof witnessScope !== "string"
+        || !/^[A-Za-z0-9._:-]{1,256}$/.test(witnessScope))) {
       fail("Atomic batch witness scope must be a trusted account/store identifier",
         "authorization_required");
     }
-    if (this.atomicBatchWitnessReadback !== null
-      && typeof this.atomicBatchWitnessReadback !== "function") {
+    if (witnessReadback !== null
+      && typeof witnessReadback !== "function") {
       fail("Independent atomic batch witness readback must be a function",
         "authorization_required");
     }
+    // Never let an async callback swap the signer, CAS identity, scope or
+    // direct-readback function after construction. Ordinary instance fields
+    // would allow a witness callback to mutate `this.*` between awaited
+    // signature checks and silently defeat the separate-authority contract.
+    Object.defineProperties(this, {
+      atomicBatchWitnessPublicKey: { value: witnessPublicKey },
+      atomicBatchWitnessReadback: { value: witnessReadback },
+      atomicBatchWitnessScope: { value: witnessScope },
+      atomicBatchCasFloorPublicKey: { value: casFloorPublicKey },
+      atomicBatchCasFloorReadback: { value: casFloorReadback },
+    });
     if ((options.currentDeviceAuthorization != null && typeof options.currentDeviceAuthorization !== "function")
       || (this.requireCurrentOutgoingAuthorization && !this.currentDeviceAuthorization)) {
       fail("Current device authorization callback is required", "authorization_required");
