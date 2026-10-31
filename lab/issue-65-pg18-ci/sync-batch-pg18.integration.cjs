@@ -13,6 +13,8 @@ const { createZk1SyncPgIndependentAdmissionIssuer } =
   require("../../src/services/zk1SyncPgIndependentAdmissionIssuer");
 const { createZk1SyncPgBatchIndependentReadback } =
   require("../../src/services/zk1SyncPgBatchIndependentReadback");
+const { hasUnexpectedProtectedDml } =
+  require("../../src/services/zk1SyncPgProtectedRoleAudit");
 
 if (!process.env.ROOTARK_ZK1_TEST_PG_URL || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
   || !process.env.ROOTARK_ZK1_VERIFIER_PG_URL
@@ -131,6 +133,28 @@ test("PG18 scope accepts 256 ASCII characters and rejects 257 without invalid SQ
   const actual = await admin.query(`SELECT scope FROM zk1_sync_batch.scope_policy WHERE scope=$1`,
     [maxScope]);
   assert.equal(actual.rowCount, 1);
+});
+
+test("PG18 independent roles satisfy complete live table-and-column DML auditor", async () => {
+  for (const [role, pool, opts] of [
+    ["READER", attestor, {}],
+    ["VERIFIER", verifier, {}],
+    ["ISSUER", issuer, { allowTicketInsert: true }],
+  ]) {
+    const client = await pool.connect();
+    try {
+      let unsafe;
+      try { unsafe = await hasUnexpectedProtectedDml(client, opts); }
+      catch (error) {
+        throw Object.assign(new Error("live protected role audit query rejected"),
+          { code: "PG_MATRIX_" + role + "_" + String(error?.code || "UNKNOWN") });
+      }
+      if (unsafe) {
+        throw Object.assign(new Error("live protected role audit detected DML"),
+          { code: "PG_MATRIX_" + role + "_FORBIDDEN" });
+      }
+    } finally { client.release(); }
+  }
 });
 
 test("PG18 atomic batch persists 2 original signed envelopes, ciphertext, state and one chained marker", async () => {
