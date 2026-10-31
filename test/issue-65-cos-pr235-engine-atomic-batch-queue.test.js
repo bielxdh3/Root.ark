@@ -32,7 +32,8 @@ function assertSameSignedEnvelopes(actual, expected, message) {
 }
 
 async function fixture(t, { batchResponse, witnessResponse,
-  missingCapability = false, interleaved = false } = {}) {
+  missingCapability = false, interleaved = false,
+  deleteExpiresInMs = 120000 } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
   t.after(async () => {
     await fsp.rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -82,7 +83,7 @@ async function fixture(t, { batchResponse, witnessResponse,
     });
     operation.authorization = await createAuthorizationProof(operation, {
       username: "alice", privateKey: signing.privateKey, publicKey,
-      expiresAt: Date.now() + 120000,
+      expiresAt: Date.now() + (verb === "delete" ? deleteExpiresInMs : 120000),
     });
     assert.equal(await verifyAuthorizationProof(operation.authorization, operation, {
       username: "alice",
@@ -473,6 +474,43 @@ test("revoked or expired batch WITHOUT physical witness retains both original pe
     });
   }
 });
+
+for (const condition of ["expired DELETE", "revoked DELETE"]) {
+  test("delayed MOVE authorization cannot dispatch batch after " + condition, {
+    timeout: 120000,
+  }, async (t) => {
+    const f = await fixture(t, {
+      deleteExpiresInMs: 30000,
+      witnessResponse: () => null,
+    });
+    const realNow = Date.now;
+    let moveAuthChecks = 0;
+    f.engine.authorizeOutgoing = async (operation) => {
+      if (operation.operation === "move") {
+        moveAuthChecks++;
+        // Change the first member's authority AFTER its awaited local check,
+        // but BEFORE the MOVE's final synchronous network dispatch gate.
+        if (condition === "expired DELETE") {
+          Date.now = () => f.deleted.authorization.expiresAt + 1;
+          assert.ok(Date.now() < f.moved.authorization.expiresAt,
+            "MOVE remains fresh while DELETE alone has expired");
+        } else {
+          f.engine.currentDeviceAuthorization = (member) => member.operation !== "delete";
+        }
+      }
+      return true;
+    };
+    try {
+      await assert.rejects(f.engine._pushPending(f.summary()),
+        { code: "sync_atomic_batch_indeterminate" });
+    } finally { Date.now = realNow; }
+    assert.equal(moveAuthChecks, 1,
+      "adversarial change must occur inside the second asynchronous authorization");
+    assert.equal(f.events.length, 0,
+      "do not dispatch either denied DELETE or otherwise-fresh MOVE to the network");
+    await f.assertBothPending();
+  });
+}
 
 test("independently signed standalone WebDAV DELETE uses distinct cryptographic ID namespace and one ordinary push", {
   timeout: 120000,

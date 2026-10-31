@@ -1136,11 +1136,33 @@ class SyncEngine {
       ? Object.assign(new Error("Historical signed batch requires read-only witness"),
         { code: "authorization_required" }) : null;
     if (!expiredBeforeRequest) try {
+      // The second member's async authorizeOutgoing() can outlive the first
+      // member's expiry or current revocation decision. Recheck BOTH signed
+      // envelopes and the synchronous owner-trusted policy in one no-await
+      // window immediately before beginning the single remote batch POST.
+      const dispatchIfBothStillFresh = () => {
+        for (const member of [deleted, moved]) {
+          try { protocol.validateFreshSignedOperation(member); }
+          catch { fail("Atomic batch member expired before dispatch", "authorization_required"); }
+          let current;
+          try { current = this.currentDeviceAuthorization(member); }
+          catch { fail("Atomic batch current device grant unavailable", "authorization_rejected"); }
+          if (current !== true) {
+            try {
+              if (current && typeof current.then === "function") {
+                Promise.resolve(current).catch(() => {});
+              }
+            } catch { /* a broken policy is a denial */ }
+            fail("Atomic batch device grant changed before dispatch", "authorization_rejected");
+          }
+        }
+        return this.adapter.pushBatch([deleted, moved]);
+      };
       // The final synchronous current-policy checks begin ONE network
       // request. Remote registry must fence BOTH signatures under one lock.
       response = await this.assertOutgoingAuthorized(deleted, () =>
         this.assertOutgoingAuthorized(moved, () =>
-          this.adapter.pushBatch([deleted, moved])));
+          dispatchIfBothStillFresh()));
     } catch (error) {
       // A 409 or a dropped ACK may mean the remote atomic transaction was
       // committed, or may mean neither write happened. A plain LIST echo of
