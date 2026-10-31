@@ -104,18 +104,19 @@ async function fixture(t) {
   }
   assert.equal(await verifySigned(signed), true,
     "fixture must use real Ed25519 authorization, not decorative signature fields");
-  const state = { revoked: false, policyReads: 0, translations: 0 };
+  const state = { revoked: false, keyRemoved: false, policyReads: 0, translations: 0 };
   function policy() {
     state.policyReads += 1;
     return { username: "alice",
-      trustedDevicePublicKeys: { "device-a": publicKey },
+      trustedDevicePublicKeys: state.keyRemoved ? {} : { "device-a": publicKey },
       revokedDeviceIds: state.revoked ? ["device-a"] : [] };
   }
-  function bridge(journal, protocolJournal, translate = async () => signed) {
+  function bridge(journal, protocolJournal, translate = async () => signed, opts = {}) {
     return new LocalSyncWebDavBridge({
       rootDir: root, token: "signed-receipt-test-private-only",
       journal, protocolJournal, requireSignedProtocolIngress: true,
       trustedProtocolPolicy: policy, resolveProtectedFileKey: async () => fileKey,
+      ...opts,
       toProtocolOperation: async (eventRecord) => {
         state.translations += 1;
         return translate(eventRecord);
@@ -132,7 +133,7 @@ async function fixture(t) {
       installed: physicalIdentity(await fsp.lstat(target, { bigint: true })) };
   }
   return { parent, root, target, mutationPath, outboxPath, mutation, outbox,
-    event: onDiskEvent, signed, signedId, sign, verifySigned,
+    event: onDiskEvent, signed, signedId, sign, verifySigned, publicKey,
     state, bridge, reopen, evidence };
 }
 
@@ -179,8 +180,8 @@ test("genuine signed outbox fsync with lost local ACK safely recovers under revo
   const restarted = f.bridge(first.mutation, first.outbox,
     async () => { throw new Error("no fresh signing allowed for durable replay"); });
   await restarted.recoverPending();
-  assert.equal(f.state.policyReads, reads,
-    "only identical prior committed envelope bypasses the fresh policy lookup");
+  assert.equal(f.state.policyReads, reads + 1,
+    "historical ACK must read the independent key pin without renewing revoked authorization");
   assert.equal(f.state.translations, translations);
   const after = await f.reopen();
   assert.deepEqual(after.mutation.pending(), []);
@@ -202,10 +203,60 @@ test("source-moved with genuine persisted outbox and receipt is recovered withou
   await f.bridge((await f.reopen()).mutation, (await f.reopen()).outbox,
     () => { throw new Error("never translate already signed outbox"); }).recoverPending();
   const after = await f.reopen();
-  assert.equal(f.state.policyReads, priorReads);
+  assert.equal(f.state.policyReads, priorReads + 1,
+    "cold recovery authenticates historical Ed25519 bytes against a trusted pin");
   assert.deepEqual(after.mutation.pending(), []);
   assert.equal(after.mutation.hasSeen(f.event.operationId), true);
   assert.deepEqual(after.outbox.pending(), diskShape([f.signed]));
+});
+
+test("historical recovery without independently retained signing-key pin must quarantine", {
+  timeout: LIMIT,
+}, async (t) => {
+  const f = await fixture(t);
+  await exactAdmission(f);
+  f.state.revoked = true;
+  f.state.keyRemoved = true;
+  const beforeTranslations = f.state.translations;
+  const pair = await f.reopen();
+  await assertDeniedUnchanged(f, () => f.bridge(pair.mutation, pair.outbox).recoverPending(),
+    { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+  assert.equal(f.state.translations, beforeTranslations,
+    "missing historical pin cannot be repaired by freshly signing revoked operation");
+  assert.equal((await f.reopen()).mutation.hasSeen(f.event.operationId), false);
+});
+
+test("owner-retained historical device pin recovers revoked/rotated signing key without fresh admission", {
+  timeout: LIMIT,
+}, async (t) => {
+  const f = await fixture(t);
+  await exactAdmission(f);
+  f.state.revoked = true;
+  f.state.keyRemoved = true; // current policy has discarded historical key
+  const previousCurrentReads = f.state.policyReads;
+  const previousTranslations = f.state.translations;
+  let trustedHistoricalReads = 0;
+  const pair = await f.reopen();
+  await f.bridge(pair.mutation, pair.outbox, async () => {
+    throw new Error("historical verification must never invoke new encryption/signing");
+  }, {
+    trustedHistoricalProtocolPolicy: () => {
+      trustedHistoricalReads += 1;
+      // The external owner retains the signing key independently of the
+      // current admission registry and of BOTH attacker-writable journals.
+      return { username: "alice", trustedDevicePublicKeys: {
+        "device-a": f.publicKey,
+      } };
+    },
+  }).recoverPending();
+  assert.equal(trustedHistoricalReads, 1);
+  assert.equal(f.state.policyReads, previousCurrentReads,
+    "read-only historical pin lookup must not request a current device grant");
+  assert.equal(f.state.translations, previousTranslations);
+  const reopened = await f.reopen();
+  assert.deepEqual(reopened.mutation.pending(), []);
+  assert.equal(reopened.mutation.hasSeen(f.event.operationId), true);
+  assert.deepEqual(reopened.outbox.pending(), diskShape([f.signed]));
 });
 
 test("protocol-queued claim with no durable signed outbox cannot be promoted by a stale policy", {
@@ -333,6 +384,64 @@ test("outbox replaced by internally consistent different VALID signed envelope w
   assert.deepEqual((await disk(f.mutationPath)).pending()[0].signedOutboxReceipts,
     [receipt(f.signed)], "independent local witness must not be overwritten");
 });
+
+for (const attack of ["forged signature", "attacker-signed unpinned key"]) {
+test(attack + " with BOTH local journal digests rewritten cannot ACK physical PUT", {
+  timeout: LIMIT,
+}, async (t) => {
+  const f = await fixture(t);
+  await exactAdmission(f);
+  const fake = diskShape(f.signed);
+  if (attack === "forged signature") {
+    fake.authorization.signature = crypto.randomBytes(64).toString("base64url");
+  } else {
+    const rogue = crypto.generateKeyPairSync("ed25519");
+    fake.authorization = await createAuthorizationProof(fake, {
+      username: "alice", privateKey: rogue.privateKey,
+      publicKey: rogue.publicKey.export({ type: "spki", format: "der" })
+        .toString("base64url"),
+    });
+    assert.equal(await verifyAuthorizationProof(fake.authorization, fake, {
+      username: "alice", trustedDevicePublicKeys: {
+        "device-a": fake.authorization.publicKey,
+      }, revokedDeviceIds: [],
+    }), true, "attacker signature is real, but its key is not independently pinned");
+  }
+  assert.notEqual(fake.authorization.signature, f.signed.authorization.signature);
+  const fakeReceipt = receipt(fake);
+  // This adversary controls both local journals, including their own SHA
+  // fields, but NOT the independent device key pin or signer private key.
+  const rawOutbox = JSON.parse(await fsp.readFile(f.outboxPath, "utf8"));
+  rawOutbox.pending = [fake];
+  rawOutbox.committedSigned[f.signedId] = fakeReceipt.digest;
+  const rawMutation = JSON.parse(await fsp.readFile(f.mutationPath, "utf8"));
+  rawMutation.pending[0].signedOutboxReceipts = [fakeReceipt];
+  for (const [filename, value] of [[f.outboxPath, rawOutbox],
+    [f.mutationPath, rawMutation]]) {
+    const handle = await fsp.open(filename, "r+");
+    try {
+      await handle.truncate(0);
+      await handle.writeFile(JSON.stringify(value) + "\n");
+      await handle.sync();
+    } finally { await handle.close(); }
+  }
+  const forged = await f.reopen();
+  assert.deepEqual(forged.outbox.pending(), [fake]);
+  assert.deepEqual(forged.mutation.pending()[0].signedOutboxReceipts, [fakeReceipt]);
+  assert.equal(forged.outbox.durableSignedReceiptDigest(f.signedId), fakeReceipt.digest);
+  assert.deepEqual(await fsp.readFile(f.target), BYTES,
+    "the ciphertext decrypts and physical bytes are intact: only signature is forged");
+  f.state.revoked = true;
+  const translations = f.state.translations;
+  await assertDeniedUnchanged(f,
+    () => f.bridge(forged.mutation, forged.outbox, () => {
+      throw new Error("attacker must not cause fresh retranslation");
+    }).recoverPending(), { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+  assert.equal(f.state.translations, translations);
+  assert.equal((await f.reopen()).mutation.pending().length, 1);
+  assert.equal((await f.reopen()).mutation.hasSeen(f.event.operationId), false);
+});
+}
 
 for (const poison of [
   { label: "different valid SHA digest", change: (f) => [{

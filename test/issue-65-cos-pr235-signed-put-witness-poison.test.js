@@ -247,8 +247,8 @@ for (const phase of ["source-moved", "protocol-queued"]) {
     f.state.noNewTranslation = true;
     const port = await f.start();
     assert.ok(Number.isInteger(port));
-    assert.equal(f.state.policyReads, beforePolicy,
-      "already committed exact receipt must not reauthorize revoked signer");
+    assert.equal(f.state.policyReads, beforePolicy + 1,
+      "historical proof must verify an independent device key pin without reauthorizing writes");
     assert.equal(f.state.translations, beforeTranslations,
       "must not mint a new signed envelope with same operation ID");
     assert.ok(f.state.keyReads > beforeKey,
@@ -307,7 +307,9 @@ for (const phase of ["source-moved", "protocol-queued"]) {
     await assert.rejects(() => f.start(), { code: "WEBDAV_RECOVERY_INDETERMINATE" },
       "independently signed AES-GCM plaintext MUST defeat matched local-only SHA and bytes");
     assert.equal(f.state.bridge, null, "a failed cold boot must not expose an HTTP listener");
-    assert.equal(f.state.policyReads, policyBefore);
+    assert.ok(f.state.policyReads === policyBefore
+      || f.state.policyReads === policyBefore + 1,
+    "physical size precheck may reject before historical pin lookup; no new grant is issued");
     assert.equal(f.state.translations, translationBefore);
     if (poisonStyle === "same-size") {
       assert.ok(f.state.keyReads > keyBefore,

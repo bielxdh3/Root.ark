@@ -9,7 +9,8 @@ const path = require("node:path");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal } = require("./rootark-sync-journal");
 const protocol = require("./rootark-sync-protocol");
-const { verifyAuthorizationProof } = require("./rootark-sync-authorization");
+const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
+  require("./rootark-sync-authorization");
 const { verifyWindowsLocalWebDavTree, createWindowsLocalWebDavAclVerifier } =
   require("../services/chunkUploadWindowsAcl");
 
@@ -339,6 +340,17 @@ class LocalSyncWebDavBridge {
     // provider: its direct journal path bypasses SyncEngine.buildOperation().
     this.requireSignedProtocolIngress = options.requireSignedProtocolIngress === true;
     this.trustedProtocolPolicy = options.trustedProtocolPolicy || null;
+    // Optional independent, operator-retained HISTORICAL key registry. A
+    // revoked/rotated device may disappear from the current admission policy,
+    // but a previously signed durable operation still needs cryptographic
+    // authentication during cold recovery. Never load this from either
+    // locally writable journal or from the envelope's publicKey field.
+    this.trustedHistoricalProtocolPolicy = options.trustedHistoricalProtocolPolicy
+      === undefined ? this.trustedProtocolPolicy : options.trustedHistoricalProtocolPolicy;
+    if (this.trustedHistoricalProtocolPolicy !== null
+      && typeof this.trustedHistoricalProtocolPolicy !== "function") {
+      throw new Error("Historical protected WebDAV device keys need a trusted policy provider");
+    }
     // A trusted device key only proves who signed the ciphertext. Decrypting
     // through an independently provisioned file key also proves WHICH bytes
     // that device authorized for this particular physical WebDAV mutation.
@@ -895,6 +907,7 @@ class LocalSyncWebDavBridge {
       }
       let applied = false;
       let verifiedSignedPut = false;
+      let verifiedHistoricalOutbox = false;
       if (operation.kind === "move") {
         if (["source-moved", "protocol-queued"].includes(operation.phase)) {
           if (sourceExists || !destinationExists
@@ -917,6 +930,8 @@ class LocalSyncWebDavBridge {
               { code: "WEBDAV_RECOVERY_INDETERMINATE" });
           }
           if (this.requireSignedProtocolIngress && this.hasPreviouslyCommittedSignedOutbox(operation)) {
+            await this.verifyHistoricallyAuthenticatedOutbox(operation);
+            verifiedHistoricalOutbox = true;
             // For an already admitted signed PUT, compare the ORIGINAL
             // encrypted envelope before trusting any attacker-editable local
             // size/hash witness. Both checks run inside the signed verifier.
@@ -945,6 +960,9 @@ class LocalSyncWebDavBridge {
       if (applied) {
         if (this.requireSignedProtocolIngress) {
           if (this.hasPreviouslyCommittedSignedOutbox(operation)) {
+            if (!verifiedHistoricalOutbox) {
+              await this.verifyHistoricallyAuthenticatedOutbox(operation);
+            }
             if (operation.kind === "put" && !verifiedSignedPut) {
               await this.verifyRecoveredSignedPutContent(destination, operation);
             } else if (operation.kind === "move") {
@@ -1082,6 +1100,52 @@ class LocalSyncWebDavBridge {
       ids.add(receipt.operationId);
     }
     return ids.has(expectedId) && (!overwrittenMove || ids.has(companionId));
+  }
+
+  async verifyHistoricallyAuthenticatedOutbox(event) {
+    // Two LOCAL journal digests can be rewritten together by an attacker.
+    // Their matching hashes are NOT an Ed25519 proof of past admission.
+    // Historical expiry/revocation must not require a NEW grant, but every
+    // recovered signed envelope must still authenticate against an
+    // independently provisioned trusted device-key pin.
+    try {
+      if (!this.hasPreviouslyCommittedSignedOutbox(event)
+        || typeof this.trustedHistoricalProtocolPolicy !== "function") {
+        throw new Error("Missing original signed outbox or independent policy");
+      }
+      const pending = this.protocolJournal.pending();
+      for (const receipt of event.signedOutboxReceipts) {
+        const entries = pending.filter((item) => item.operationId === receipt.operationId);
+        if (entries.length !== 1
+          || crypto.createHash("sha256").update(protocol.canonicalJson(entries[0]))
+            .digest("hex") !== receipt.digest) {
+          throw new Error("Historical signed envelope digest mismatch");
+        }
+        const signed = protocol.validateStoredOperation(entries[0]);
+        assertSignedWebDavEventBinding(event, signed);
+        // The same operator-trusted policy provider used at ingress is the
+        // source of the device's PINNED public key. Do NOT consult its live
+        // revocation decision as a new authorization for historical ACK.
+        const pinned = this.trustedHistoricalProtocolPolicy(signed);
+        const keys = pinned?.trustedDevicePublicKeys;
+        if (!pinned || typeof pinned !== "object"
+          || typeof pinned.then === "function"
+          || pinned.username !== signed.authorization?.username
+          || !keys || typeof keys !== "object" || Array.isArray(keys)
+          || !Object.hasOwn(keys, signed.deviceId)
+          || keys[signed.deviceId] !== signed.authorization.publicKey) {
+          throw new Error("Historical device key not independently pinned");
+        }
+        // Check cryptographic authenticity, original scope and ciphertext
+        // binding without accepting an expired grant as permission to write.
+        await verifyHistoricalAuthorizationProof(signed.authorization, signed, {
+          username: pinned.username, trustedDevicePublicKeys: keys,
+        });
+      }
+    } catch {
+      throw Object.assign(new Error("WebDAV historical signed outbox authenticity indeterminate"),
+        { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+    }
   }
 
   async enqueueProtocol(operation) {

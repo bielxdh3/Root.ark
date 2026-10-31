@@ -288,8 +288,8 @@ test("positive revoked replay: valid signed MOVE preserves original inode, exact
   assert.ok(restarted.address()?.port > 0);
   assert.equal(f.state.translatorReads, translationsBefore,
     "replay must not mint a second signed operation");
-  assert.equal(f.state.policyReads, policyBefore,
-    "historically signed durable MOVE should not require a fresh revoked grant");
+  assert.equal(f.state.policyReads, policyBefore + 1,
+    "historical MOVE requires read-only pinned key verification, never a fresh grant");
   sameInode(exactInode(proof.target), proof.sourceIdentity);
   assert.deepEqual(fs.readFileSync(proof.target), ORIGINAL);
   const local = await new SyncJournal(f.localPath).open();
