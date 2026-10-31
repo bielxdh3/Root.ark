@@ -56,6 +56,11 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.device_grant','UPDATE') AS grant_write,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_policy','UPDATE') AS policy_write,
           pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.object_state','ciphertext','UPDATE') AS ciphertext_write,
+          (SELECT COALESCE(pg_catalog.bool_or(
+            pg_catalog.has_function_privilege(current_user, f.oid, 'EXECUTE')),false)
+            FROM pg_catalog.pg_proc f
+            JOIN pg_catalog.pg_namespace n ON n.oid=f.pronamespace
+            WHERE n.nspname='zk1_sync_batch' AND f.prosecdef) AS definer_execute,
           current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes
           FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
         const privilege = privileges.rows[0];
@@ -65,7 +70,7 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
           || privilege.object_write || privilege.object_insert || privilege.object_delete
           || privilege.object_truncate || privilege.head_delete || privilege.head_truncate
           || privilege.marker_write || privilege.head_write || privilege.grant_write
-          || privilege.policy_write || privilege.ciphertext_write
+          || privilege.policy_write || privilege.ciphertext_write || privilege.definer_execute
           || privilege.fsync !== "on"
           || privilege.full_page_writes !== "on") throw error();
         if (await hasUnexpectedProtectedDml(client)) throw error();
