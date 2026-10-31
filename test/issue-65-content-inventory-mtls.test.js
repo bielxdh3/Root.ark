@@ -759,6 +759,54 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
   });
 
+  await t.test("mTLS authority is pinned when client is created despite mutable PEM buffers", async (child) => {
+    const h = await harness(child);
+    const original = tls.clients.reader;
+    const foreign = tls.clients.unlisted;
+    function padded(source, another) {
+      const length = Math.max(source.length, another.length) + 32;
+      return Buffer.concat([Buffer.from(source), Buffer.alloc(length - source.length, 10)]);
+    }
+    function overwrite(target, source) {
+      target.fill(10);
+      source.copy(target);
+    }
+    const cert = padded(original.cert, foreign.cert);
+    const key = padded(original.key, foreign.key);
+    const client = createZk1ContentInventoryHttpsClient({
+      endpoint: `https://localhost:${h.port}`, ca: tls.ca, clientCert: cert, clientKey: key,
+      serverFingerprint256: tls.serverFingerprint256,
+      inventoryPublicKey: h.signer.publicKey,
+      inventorySignerKeyId: h.signerKeyId,
+    });
+    // A caller holding the original file buffers can replace the authorized
+    // reader certificate with an unlisted principal after enrollment.
+    overwrite(cert, foreign.cert);
+    overwrite(key, foreign.key);
+    const genesis = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: genesis.root });
+    const query = () => ({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(operation),
+      minimumHead: { sequence: 0, root: genesis.root },
+    });
+    const response = await client.getSnapshot(query());
+    assert.equal(response.outcome, "ABSENT");
+    assert.equal(response.authorizesIo, false);
+
+    const ca = padded(tls.ca, tls.untrustedCa);
+    const caClient = createZk1ContentInventoryHttpsClient({
+      endpoint: `https://localhost:${h.port}`, ca,
+      clientCert: original.cert, clientKey: original.key,
+      serverFingerprint256: tls.serverFingerprint256,
+      inventoryPublicKey: h.signer.publicKey,
+      inventorySignerKeyId: h.signerKeyId,
+    });
+    overwrite(ca, tls.untrustedCa);
+    const caResponse = await caClient.getSnapshot(query());
+    assert.equal(caResponse.outcome, "ABSENT",
+      "CA trust must also stay pinned to the original TLS authority");
+  });
+
   await t.test("wrong server pin, wrong Ed25519 signer, and stale floor fail closed", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();
@@ -1007,6 +1055,27 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const h = await harness(child);
     let requests = 0;
     let secureConnections = 0;
+    const startedAt = process.hrtime.bigint();
+    const events = [];
+    const socketIds = new WeakMap();
+    const closedSockets = new Set();
+    const nonces = {
+      idle: crypto.randomBytes(32),
+      drip: crypto.randomBytes(32),
+      fresh: crypto.randomBytes(32),
+    };
+    const labelsByNonce = new Map(Object.entries(nonces).map(([label, nonce]) =>
+      [nonce.toString("base64url"), label]));
+    const admitted = new Map();
+    const rejectedAt = new Map();
+    const clientStartedAt = new Map();
+    const dripWrites = [];
+    const record = (event, label = null, socket = null) => events.push({
+      event, label, socketId: socket ? (socketIds.get(socket) ?? null) : null,
+      elapsedMs: Number(process.hrtime.bigint() - startedAt) / 1e6,
+    });
+    const safeTrace = () => JSON.stringify(events.map(({ event, label, socketId, elapsedMs }) =>
+      ({ event, label, socketId, elapsedMs: Math.round(elapsedMs * 100) / 100 })));
     const dripServer = https.createServer({
       key: tls.serverKey,
       cert: tls.serverCert,
@@ -1017,22 +1086,73 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       maxHeaderSize: 8192,
     }, async (request, response) => {
       requests += 1;
-      if (requests === 1) return;
-      if (requests === 2) {
+      record("http-request", null, request.socket);
+      request.once("aborted", () => record("http-request-aborted", null, request.socket));
+      response.once("close", () => record("http-response-closed", null, request.socket));
+      // Match the actual client attempt, not the HTTP arrival ordinal. A TLS
+      // handshake may exhaust the absolute deadline before HTTP admission.
+      let body;
+      try {
+        const parts = [];
+        let size = 0;
+        for await (const part of request) {
+          size += part.length;
+          if (size > 4096) throw new Error("oversized diagnostic request");
+          parts.push(part);
+        }
+        body = JSON.parse(Buffer.concat(parts, size).toString("utf8"));
+      } catch (_) {
+        record("http-body-unavailable", null, request.socket);
+        response.destroy();
+        return;
+      }
+      const label = labelsByNonce.get(body.nonce);
+      record("http-admitted", label || "unknown", request.socket);
+      if (!label || admitted.has(label)) {
+        response.destroy();
+        return;
+      }
+      admitted.set(label, {
+        socketId: socketIds.get(request.socket),
+        time: process.hrtime.bigint(),
+      });
+      if (label === "idle") return;
+      if (label === "drip") {
         response.writeHead(200, { "content-type": "application/json", "transfer-encoding": "chunked" });
         const prefix = Buffer.from('{"status":"snapshot","snapshotBase64":"');
         let offset = 0;
         const drip = setInterval(() => {
-          if (offset < prefix.length) response.write(prefix.subarray(offset, offset + 1));
-          else response.write("A");
+          const socket = request.socket;
+          const socketAlive = !socket.destroyed && socket.writable && !response.destroyed;
+          if (!socketAlive) {
+            record("drip-socket-closed-before-write", label, socket);
+            return;
+          }
+          const chunk = offset < prefix.length ? prefix.subarray(offset, offset + 1) : "A";
+          const write = {
+            time: process.hrtime.bigint(),
+            socketId: socketIds.get(socket),
+            socketAlive,
+            bytesBefore: socket.bytesWritten,
+            flushedAt: null,
+            bytesAfter: null,
+          };
+          dripWrites.push(write);
+          response.write(chunk, (error) => {
+            if (error) {
+              record("drip-write-error", label, socket);
+              return;
+            }
+            write.flushedAt = process.hrtime.bigint();
+            write.bytesAfter = socket.bytesWritten;
+            record(`drip-flushed-${dripWrites.indexOf(write) + 1}`, label, socket);
+          });
+          record(`drip-write-${dripWrites.length}`, label, socket);
           offset += 1;
         }, 35);
         response.on("close", () => clearInterval(drip));
         return;
       }
-      const parts = [];
-      for await (const part of request) parts.push(part);
-      const body = JSON.parse(Buffer.concat(parts).toString("utf8"));
       const snapshot = await h.ledger.getSnapshot({ nonce: Buffer.from(body.nonce, "base64url") });
       const bytes = Buffer.from(JSON.stringify({
         status: "snapshot",
@@ -1042,9 +1162,19 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         "content-type": "application/json",
         "content-length": String(bytes.length),
       });
+      record("fresh-response", label, request.socket);
       response.end(bytes);
     });
-    dripServer.on("secureConnection", () => { secureConnections += 1; });
+    dripServer.on("secureConnection", (socket) => {
+      secureConnections += 1;
+      const socketId = secureConnections;
+      socketIds.set(socket, socketId);
+      record("tls-secure", null, socket);
+      socket.once("close", () => {
+        closedSockets.add(socketId);
+        record("tls-closed", null, socket);
+      });
+    });
     const port = await listen(dripServer);
     child.after(() => drainZk1ContentInventoryHttpsServer(dripServer));
     const client = h.makeClient("reader", {
@@ -1059,14 +1189,64 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       requested: requested(operation),
       minimumHead: { sequence: 0, root: genesis.root },
     };
-    await assert.rejects(client.getSnapshot({ ...query, nonce: crypto.randomBytes(32) }),
-      { code: "INVENTORY_HTTP_UNAVAILABLE" }, "idle response must be bounded");
-    await assert.rejects(client.getSnapshot({ ...query, nonce: crypto.randomBytes(32) }),
-      { code: "INVENTORY_HTTP_UNAVAILABLE" });
-    const fresh = await client.getSnapshot({ ...query, nonce: crypto.randomBytes(32) });
-    assert.equal(fresh.outcome, "ABSENT");
-    assert.equal(requests, 3);
-    assert.equal(secureConnections, 3, "requests after both timeouts must use fresh TLS connections");
+    const attempt = async (label) => {
+      clientStartedAt.set(label, process.hrtime.bigint());
+      record("client-start", label);
+      try {
+        const result = await client.getSnapshot({ ...query, nonce: nonces[label] });
+        record("client-success", label);
+        return result;
+      } catch (error) {
+        rejectedAt.set(label, process.hrtime.bigint());
+        record("client-rejected", label);
+        throw error;
+      }
+    };
+    try {
+      await assert.rejects(attempt("idle"),
+        { code: "INVENTORY_HTTP_UNAVAILABLE" }, "idle response must be bounded");
+      assert.ok(admitted.has("idle") && admitted.get("idle").time <= rejectedAt.get("idle"),
+        "idle timeout must follow real HTTP admission");
+      await assert.rejects(attempt("drip"), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+      assert.ok(admitted.has("drip") && admitted.get("drip").time <= rejectedAt.get("drip"),
+        "slow-drip timeout must follow real HTTP admission");
+      const dripEnd = rejectedAt.get("drip");
+      const dripStart = clientStartedAt.get("drip");
+      const elapsedMs = (dripEnd - dripStart) / 1000000n;
+      assert.ok(elapsedMs >= 250n,
+        `slow-drip must reach the 260ms absolute deadline, not idle120 (${elapsedMs}ms)`);
+      const sentBeforeTimeout = dripWrites.filter(({ time, flushedAt, socketAlive,
+        bytesBefore, bytesAfter }) =>
+        time <= dripEnd && flushedAt !== null && flushedAt <= dripEnd
+        && socketAlive && bytesAfter > bytesBefore);
+      assert.ok(sentBeforeTimeout.length >= 2,
+        "absolute slow-drip requires at least two flushed writes on a live TLS socket before timeout");
+      assert.ok(sentBeforeTimeout.every(({ socketId }) => socketId === admitted.get("drip").socketId),
+        "all slow-drip bytes must use the admitted request's physical TLS socket");
+      assert.ok(sentBeforeTimeout[0].time - admitted.get("drip").time >= 20000000n,
+        "slow-drip must start after a real interval following HTTP admission");
+      for (let i = 1; i < sentBeforeTimeout.length; i += 1) {
+        assert.ok(sentBeforeTimeout[i].time - sentBeforeTimeout[i - 1].time >= 20000000n,
+          "slow-drip writes must be genuinely spaced, not sent in one burst");
+        assert.ok(sentBeforeTimeout[i].time - sentBeforeTimeout[i - 1].time < 120000000n,
+          "each consecutive slow-drip write must be less than idle120ms apart");
+      }
+      assert.ok(dripEnd - sentBeforeTimeout[sentBeforeTimeout.length - 1].time < 120000000n,
+        "slow-drip traffic must remain active inside idle120ms when the wall deadline fires");
+      const fresh = await attempt("fresh");
+      assert.equal(fresh.outcome, "ABSENT");
+      assert.equal(requests, 3, "exactly three actual HTTP admissions are required");
+      assert.equal(secureConnections, 3, "each attempt must use a separate real TLS connection");
+      const sockets = ["idle", "drip", "fresh"].map((label) => admitted.get(label).socketId);
+      assert.ok(sockets.every((id) => Number.isSafeInteger(id) && id > 0),
+        "each HTTP admission must belong to an authenticated TLS socket");
+      assert.equal(new Set(sockets).size, 3, "no TLS connection may be reused");
+      assert.ok(closedSockets.has(sockets[0]) && closedSockets.has(sockets[1]),
+        "both timed-out TLS sockets must have physically closed");
+    } catch (error) {
+      child.diagnostic(`sanitized mTLS slow-drip events: ${safeTrace()}`);
+      throw error;
+    }
   });
 
   await t.test("chunked client responses are size-limited before JSON accumulation", async (child) => {

@@ -33,7 +33,21 @@ test("real other-UID retained-FD A-B-A corrupts legacy stream but not authentica
   assert.equal(original.length, injected.length);
   fs.writeFileSync(source, original, { flag: "wx", mode: 0o666 });
   fs.chmodSync(source, 0o666);
-  const inode = fs.statSync(source).ino;
+  // Pin the original inode before the other UID receives a writable handle.
+  // Assertions must not reopen an attacker-controlled pathname after a race.
+  const verifiedFd = fs.openSync(source, fs.constants.O_RDONLY);
+  t.after(() => fs.closeSync(verifiedFd));
+  const inode = fs.fstatSync(verifiedFd).ino;
+  const readPinned = () => {
+    const bytes = Buffer.alloc(original.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(verifiedFd, bytes, offset, bytes.length - offset, offset);
+      assert.ok(count > 0, "pinned source truncated");
+      offset += count;
+    }
+    return bytes;
+  };
   const child = spawn("runuser", ["-u", "nobody", "--", process.execPath, "-e", `
     const fs = require("node:fs");
     const fd = fs.openSync(process.argv[1], "r+");
@@ -80,7 +94,7 @@ test("real other-UID retained-FD A-B-A corrupts legacy stream but not authentica
   const legacy = await driver.upload(source, "folder", "ciphertext.ct");
   assert.equal(legacy.id, "legacy");
   assert.deepEqual(remote[0], injected, "historical legacy streaming remains mutable and NOT verified");
-  assert.deepEqual(fs.readFileSync(source), original);
+  assert.deepEqual(readPinned(), original);
 
   const verified = await driver.upload(source, "folder", "ciphertext.ct", "uploads", {
     providerFileId: "pinned", zk1BoundedBytes: original.length,
@@ -88,7 +102,7 @@ test("real other-UID retained-FD A-B-A corrupts legacy stream but not authentica
   });
   assert.equal(verified.id, "pinned");
   assert.deepEqual(remote[1], original, "SDK only gets authenticated detached ciphertext");
-  assert.deepEqual(fs.readFileSync(source), original);
+  assert.deepEqual(readPinned(), original);
   assert.equal(fs.statSync(source).ino, inode, "same inode was retained throughout");
 
   await command("mutate");
@@ -98,5 +112,5 @@ test("real other-UID retained-FD A-B-A corrupts legacy stream but not authentica
   }), { code: "configuration" });
   assert.equal(remote.length, 2, "independent digest mismatch denies BEFORE a provider write");
   await command("restore");
-  assert.deepEqual(fs.readFileSync(source), original);
+  assert.deepEqual(readPinned(), original);
 });
