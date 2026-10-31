@@ -7,12 +7,21 @@ on:
     paths:
       - '.github/workflows/zk1-disposable-postgres.yml'
       - 'db/zk1-gate-authority.sql'
+      - 'db/zk1-sync-pg-atomic-batch.sql'
+      - 'db/zk1-sync-pg-atomic-batch-roles.sql'
+      - 'db/zk1-sync-pg-atomic-batch-admission.sql'
       - 'lab/issue-65-pg18-ci/**'
       - 'src/services/zk1*'
       - 'src/routes/zk1*'
       - 'src/crypto/rootark-zk-*'
       - 'src/crypto/rootark-zk1-*'
       - 'sync-client/rootark-sync-zk1-physical-binding.js'
+      - 'sync-client/rootark-sync-v2.js'
+      - 'sync-client/rootark-sync-engine.js'
+      - 'sync-client/rootark-sync-authorization.js'
+      - 'sync-client/rootark-sync-protocol.js'
+      - 'src/routes/sync.js'
+      - 'public/client/rootark-sync-adapter.js'
       - 'public/client/rootark-zk1*'
       - 'test/issue-65-*'
       - 'test/support/issue-65-*'
@@ -57,6 +66,9 @@ jobs:
 
       - name: Real PostgreSQL approval replay and cryptographic release checks
         run: node lab/issue-65-pg18-ci/run-approval-replay-postgres.js
+
+      - name: Real PostgreSQL 18 atomic signed DELETE+MOVE (DEV-OFF, separate authority)
+        run: node lab/issue-65-pg18-ci/run-sync-batch-postgres.js
 
       - name: Ensure disposable suites did not mutate tracked source
         run: |
