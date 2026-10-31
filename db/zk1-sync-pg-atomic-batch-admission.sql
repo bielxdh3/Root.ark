@@ -32,6 +32,12 @@ CREATE TABLE zk1_sync_batch.admission_ticket (
 CREATE UNIQUE INDEX admission_ticket_active_pair ON zk1_sync_batch.admission_ticket
   (scope,sequence,policy_epoch,previous_head,delete_digest,move_digest)
   WHERE superseded=false;
+-- Bounded range scans under the authority lock, rather than a full retained
+-- audit-history scan on each issuance or operator maintenance pass.
+CREATE INDEX admission_ticket_recent_issuance
+  ON zk1_sync_batch.admission_ticket(scope,issued_at);
+CREATE INDEX admission_ticket_old_expiration
+  ON zk1_sync_batch.admission_ticket(expires_at,ticket_id);
 CREATE FUNCTION zk1_sync_batch.supersede_expired_admission_ticket()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog AS $body$
@@ -70,6 +76,10 @@ BEGIN
     RAISE EXCEPTION 'admission expired while waiting for authority lock'
       USING ERRCODE='23514';
   END IF;
+  -- Final issuance timestamp and TTL are owned by the DB after serialization:
+  -- an INSERT-only credential must never antedate the rolling quota window.
+  NEW.issued_at := clock_timestamp();
+  NEW.expires_at := NEW.issued_at + interval '30 seconds';
   UPDATE zk1_sync_batch.admission_ticket SET superseded=true
     WHERE scope=NEW.scope AND sequence=NEW.sequence
       AND policy_epoch=NEW.policy_epoch AND previous_head=NEW.previous_head

@@ -300,6 +300,37 @@ test("PG18 issuer credential cannot mint stale head or epoch tickets independent
   assert.equal(committed.clientAckAuthorized, false);
 });
 
+test("PG18 ticket issue time and 30-second TTL are stamped by database AFTER authority fencing", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const original = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket])).rows[0];
+  const chosen = crypto.randomUUID();
+  const response = await issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,sequence,
+     previous_head,delete_digest,move_digest,issued_at,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+      clock_timestamp()-interval '2 seconds',clock_timestamp()+interval '27 seconds')`, [
+    chosen, original.scope, original.username, original.device_id, original.public_key,
+    original.policy_epoch, original.sequence, original.previous_head,
+    crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  assert.equal(response.rowCount, 1);
+  const verified = await admin.query(`SELECT
+    abs(extract(epoch FROM (issued_at-clock_timestamp()))) AS issued_age_s,
+    extract(epoch FROM (expires_at-issued_at)) AS ttl_s
+    FROM zk1_sync_batch.admission_ticket WHERE ticket_id=$1`, [chosen]);
+  assert.equal(verified.rowCount, 1);
+  assert.ok(Number(verified.rows[0].issued_age_s) < 5,
+    "client chosen backdated issuance must not enter the rolling window");
+  assert.equal(Number(verified.rows[0].ttl_s), 30);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+});
+
 test("PG18 owner-only bounded seven-day ticket pruning preserves recent authorization and replay history", async () => {
   const old = await fixture();
   const pairOld = await old.signedPair();
