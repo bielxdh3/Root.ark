@@ -6,12 +6,16 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const http = require("node:http");
 const https = require("node:https");
+const { performance } = require("node:perf_hooks");
 const { execFileSync } = require("node:child_process");
 const { createZk1PrivateCloudStagingDirectory } =
   require("../src/services/zk1PrivateCloudStagingDirectory");
 const { checkWindowsPrivateCloudDirectory } =
   require("../src/services/zk1WindowsPrivateCloudAcl");
+const { verifyWindowsChunkUploadTree } =
+  require("../services/chunkUploadWindowsAcl");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { createZk1WebdavCiphertextAdapter } =
@@ -430,7 +434,7 @@ test("Windows private cloud ACL admits long protected path but rejects an embedd
   fs.writeFileSync(marker, "untouched", { flag: "wx" });
   fs.symlinkSync(foreign, path.join(authorized, "junction"), "junction");
   await assert.rejects(checkWindowsPrivateCloudDirectory(authorized, "verify"),
-    /Unverifiable private cloud directory/,
+    /(?:Unverifiable private cloud directory|Windows bridge ACL validation failed)/,
   "the same native ACL verifier must still deny untrusted reparse points");
   assert.equal(fs.readFileSync(marker, "utf8"), "untouched");
   assert.equal(fs.existsSync(path.join(foreign, "ciphertext.ct")), false);
@@ -580,11 +584,44 @@ test("Windows WebDAV private ACL verification does not block the Node event loop
   if (process.platform !== "win32") return t.skip("native Windows ACL subprocess contract");
   const directory = await createZk1PrivateCloudStagingDirectory("rootark-zk1-webdav-async-acl-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
-  let heartbeat = false;
-  const ping = new Promise((resolve) => setTimeout(() => { heartbeat = true; resolve(); }, 0));
-  await checkWindowsPrivateCloudDirectory(directory, "verify");
-  assert.equal(heartbeat, true, "native ACL verification must not block unrelated HTTP requests");
-  await ping;
+  // A warm native ACL verification can finish in 3-5 ms, before even a
+  // setTimeout(0) executes. Require REAL work in the resident native scanner
+  // and observe an unrelated local HTTP response while that scan is pending.
+  // Files inherit the root's native-created restrictive ACL; no mock verdicts.
+  for (let i = 0; i < 256; i++) {
+    fs.writeFileSync(path.join(directory, `ciphertext-${i}.ct`), "opaque");
+  }
+  const server = http.createServer((_req, res) => { res.writeHead(204); res.end(); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = `http://127.0.0.1:${server.address().port}/heartbeat`;
+  const probe = async (check) => {
+    let aclDoneAt = null, heartbeatAt = null;
+    const verification = Promise.resolve().then(check).then(() => {
+      aclDoneAt = performance.now();
+    });
+    const ping = new Promise((resolve, reject) => setImmediate(() => {
+      const request = http.get(address, (res) => {
+        if (res.statusCode !== 204) {
+          res.resume();
+          reject(new Error("Local heartbeat HTTP status was not 204"));
+          return;
+        }
+        res.resume();
+        res.once("end", () => { heartbeatAt = performance.now(); resolve(); });
+        res.once("error", reject);
+      });
+      request.once("error", reject);
+    }));
+    await Promise.all([verification, ping]);
+    return heartbeatAt < aclDoneAt;
+  };
+  assert.equal(await probe(() => checkWindowsPrivateCloudDirectory(directory, "verify")), true,
+    "real async native ACL scan must overlap an independently served HTTP heartbeat");
+  // Falsifiability control: the same REAL native Windows ACL authority, but
+  // invoked synchronously, must NOT be mistaken for event-loop responsiveness.
+  assert.equal(await probe(() => verifyWindowsChunkUploadTree(directory)), false,
+    "a synchronous native ACL scan must prevent the HTTP heartbeat until completion");
 });
 
 test("WebDAV stalled HTTPS peer is terminated at the 15-second deadline", async (t) => {

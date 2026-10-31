@@ -4,13 +4,15 @@ const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
+const { PROTOCOL_VERSION, compareRevisions, validateOperation,
+  validateFreshSignedOperation } = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
 const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCodeAsync, verifyTotp } = require("../services/totp");
 const { authorizationDigest } = require("../services/syncResumeAccountProof");
 const { createSyncSqliteAccountWriteFence } = require("../services/syncSqliteAccountWriteFence");
+const { createZk10HttpResponseLeaseGuard } = require("../services/zk10LegacyHttpResponseLease");
 const {
   MAX_DEVICES, assertAtomicDeviceRegistry, emptyAtomicDeviceRegistry, invalidRegistry,
   validIdentifier, validPublicKey,
@@ -703,7 +705,7 @@ const RESUME_TRACKED_USERS_MAX = 10000;
 // Same public placeholder hash used by the auth route so unknown users cost one bcrypt compare too.
 const DUMMY_PASSWORD_HASH = "$2a$10$C8U56P8wZK.G7zWKmqF88e3f64PIxJ1xdTJN9WxiHcSVkYCfaSeDG";
 
-function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", atomicDeviceRegistry = false, burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, commitSyncResumeProof = null, getTotpKey = null }) {
+function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", atomicDeviceRegistry = false, burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, commitSyncResumeProof = null, getTotpKey = null, legacyCutoverStrict = false, legacyCutoverFence = null }) {
   if (typeof atomicDeviceRegistry !== "boolean") {
     throw Object.assign(new Error("Invalid atomic sync device registry mode"), {
       code: "SYNC_ATOMIC_DEVICE_CONFIGURATION",
@@ -715,6 +717,95 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     });
   }
   const persistUnderAccountFence = atomicDeviceRegistry ? createSyncSqliteAccountWriteFence() : null;
+  // EXPERIMENTAL ROUTE CONTRACT, NOT A PRODUCTION ZK10 CUTOVER.
+  // Default OFF because no immutable, externally witnessed account-wide
+  // enrollment authority has been connected at application boot. This mode
+  // cannot be promoted to production by toggling an env flag: switching it
+  // back off after protected_enforced is an account downgrade. A production
+  // bootstrap MUST always enforce remotely authenticated enrollment/negative
+  // membership on every account, independent of any operator-local toggle.
+  // A JWT, username, client header or local protected flag is never proof.
+  const requestedStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+  const strictLegacyCutover = legacyCutoverStrict === true
+    || (requestedStrict !== "" && requestedStrict !== "0" && requestedStrict !== "off");
+  const fenceLegacySync = (operation, handler) => async (req, res) => {
+    if (!strictLegacyCutover) return handler(req, res);
+    // This capability must be supplied ONLY by server bootstrap after it
+    // verifies the immutable account-UUID mapping, owner-signed CURRENT
+    // account-wide protected_enforced/migration head or a CURRENT authenticated
+    // never-enrolled nonmembership proof, independent external monotonic floor
+    // and custody. Its with... method must hold the external write/read fence
+    // throughout the callback, not issue an unprotected stale allow verdict.
+    // Reject structurally compatible fakes. The independently implemented
+    // authority factory must own an unforgeable module-private WeakSet brand,
+    // and must explicitly attest that this capability came from that factory.
+    // Until that owner-signed external verifier is actually present, strict
+    // mode must not execute ANY legacy handler, even with a supplied object.
+    let authentic = false;
+    try {
+      const { isAuthenticZk10LegacyCutoverFence } =
+        require("../services/zk10LegacyCutoverFence");
+      authentic = typeof isAuthenticZk10LegacyCutoverFence === "function"
+        && isAuthenticZk10LegacyCutoverFence(legacyCutoverFence) === true;
+    } catch { /* uninstalled/unavailable external verifier is denial */ }
+    const authorize = legacyCutoverFence?.withCurrentAccountLegacyPolicy;
+    if (!authentic || typeof authorize !== "function") {
+      return errorResponse(res, 503, "ZK10 external cutover authority unavailable",
+        { code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE" });
+    }
+    let invoked = false;
+    try {
+      await authorize.call(legacyCutoverFence, Object.freeze({
+        authenticatedUsername: req.user.username, operation,
+      }), async (lease) => {
+        if (invoked) throw new Error("ZK10 authorization callback invoked twice");
+        invoked = true;
+        // Callback admission is restricted to a fresh authenticated negative
+        // membership proof. W117's protected_enforced MUST throw before this
+        // callback; a signed future migration window needs its own explicit
+        // operation-specific contract and is not implicitly treated as legacy.
+        if (lease?.status !== "never_enrolled"
+          || typeof lease.assertActive !== "function"
+          || typeof lease.immutableAccountId !== "string") {
+          throw new Error("ZK10 verified never-enrolled lease missing");
+        }
+        lease.assertActive();
+        // Arm BEFORE handler invocation: a streaming handler may keep its
+        // Promise unresolved while the external signed lease expires.
+        const responseGuard = createZk10HttpResponseLeaseGuard(res, lease.signal,
+          lease.assertActive);
+        try {
+          lease.assertActive();
+          const result = await handler(req, res, lease);
+          // A handler may return after headers/chunks but before HTTP finish.
+          // Never release the external legacy lease at handler return.
+          await responseGuard.waitForFinish();
+          lease.assertActive();
+          return result;
+        } finally {
+          // A handler throwing after it sent headers must never leave a stream
+          // emitting bytes after its lease is released.
+          if (res.headersSent && !res.writableFinished && !res.destroyed) res.destroy();
+          responseGuard.disarm();
+        }
+      });
+      if (!invoked && !res.headersSent) {
+        return errorResponse(res, 503, "ZK10 cutover authorization was not established",
+          { code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE" });
+      }
+    } catch (error) {
+      if (res.headersSent || res.destroyed) return;
+      // A trusted external verifier can distinguish a signed and CURRENT
+      // protected cutover (403) from unknown/stale/unreachable authority (503).
+      // An ordinary error is NEVER proof that an account was never enrolled.
+      if (error?.code === "ZK10_LEGACY_ENFORCED") {
+        return errorResponse(res, 403, "Legacy Sync disabled by owner cutover",
+          { code: "ZK10_LEGACY_ENFORCED" });
+      }
+      return errorResponse(res, 503, "ZK10 external cutover authority unavailable",
+        { code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE" });
+    }
+  };
   const audit = (eventType, req, deviceId, action, result, details = {}) => {
     if (typeof auditLog !== "function") return;
     auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
@@ -762,7 +853,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (Number.isSafeInteger(length) && length > MAX_REQUEST_BYTES) return errorResponse(res, 413, "Sync payload too large");
     next();
   };
-  const write = async (req, res, input) => {
+  const write = async (req, res, input, lease = null) => {
     try { await ready; } catch {
       return errorResponse(res, 503, "Sync atomic registry unavailable",
         { code: "SYNC_ATOMIC_REGISTRY_UNAVAILABLE" });
@@ -772,7 +863,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (Object.hasOwn(payload, "plaintext") || Object.hasOwn(payload, "fileKey")) return errorResponse(res, 400, "Plaintext and keys are not accepted");
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
-    try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
+    // Only trusted server configuration may select signed ingress. A request
+    // cannot choose the legacy parser by omitting its proof. The co-located
+    // transaction still independently verifies Ed25519 and current revocation.
+    try { operation = atomicDeviceRegistry
+      ? validateFreshSignedOperation(payload) : validateOperation(payload); }
+    catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
     // Safe rollout: old unsigned development writes may remain available when
     // no device auth is required. A signed envelope OR a route configured for
     // device authorization must fail closed until an operator explicitly
@@ -798,6 +894,10 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     }
     let result;
     try {
+      // A cutover observed while validating the operation must prevent the
+      // storage call; the external authority MUST hold an atomic write lease
+      // across store.put and not authorize a concurrent account cutover.
+      lease?.assertActive();
       result = persistUnderAccountFence
         ? await persistUnderAccountFence(req.user, operation, () => store.put(req.user.username, operation))
         : await store.put(req.user.username, operation);
@@ -818,6 +918,9 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       }
       throw error;
     }
+    // In particular, stale/conflict responses can contain server-readable
+    // legacy metadata. Do not emit them after a bounded lease has expired.
+    lease?.assertActive();
     if (result.kind === "paused") {
       if (result.newlyPaused) audit("sync.burst.paused", req, result.deviceId, "paused", "partial", { limit: result.limit, windowMs: result.windowMs });
       return errorResponse(res, 423, "sync_burst_paused", { code: "sync_burst_paused", deviceId: result.deviceId });
@@ -828,33 +931,43 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     return res.status(req.method === "POST" ? 201 : 200).json(publicRecord(result.record));
   };
 
-  app.get("/sync/v1/objects", authenticate, requirePermission("listFiles"), async (req, res) => {
+  app.get("/sync/v1/objects", authenticate, requirePermission("listFiles"), fenceLegacySync("list", async (req, res, lease) => {
     await ready;
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     try {
-      res.json({ protocolVersion: PROTOCOL_VERSION, objects: store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null) });
+      lease?.assertActive();
+      const objects = store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null);
+      lease?.assertActive();
+      res.json({ protocolVersion: PROTOCOL_VERSION, objects });
     } catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
-  });
-  app.get("/sync/v1/objects/:objectId", authenticate, requirePermission("listFiles"), async (req, res) => {
+  }));
+  app.get("/sync/v1/objects/:objectId", authenticate, requirePermission("listFiles"), fenceLegacySync("read", async (req, res, lease) => {
     await ready;
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     let objects;
     try { objects = store.list(req.user.username, req.params.objectId); }
     catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
     if (!objects.length) return errorResponse(res, 404, "Sync object not found");
+    lease?.assertActive();
     res.json(objects[0]);
-  });
-  app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"), (req, res) => write(req, res));
-  app.put("/sync/v1/objects/:objectId", sizeGuard, authenticate, requirePermission("upload"), (req, res) => {
+  }));
+  app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"),
+    fenceLegacySync("write", (req, res, lease) => write(req, res, undefined, lease)));
+  app.put("/sync/v1/objects/:objectId", sizeGuard, authenticate, requirePermission("upload"), fenceLegacySync("write", (req, res, lease) => {
     if (req.body?.objectId && req.body.objectId !== req.params.objectId) return errorResponse(res, 400, "Object id mismatch");
-    return write(req, res);
-  });
-  app.delete("/sync/v1/objects/:objectId", sizeGuard, authenticate, requirePermission("upload"), (req, res) => {
+    return write(req, res, undefined, lease);
+  }));
+  app.delete("/sync/v1/objects/:objectId", sizeGuard, authenticate, requirePermission("upload"), fenceLegacySync("write", (req, res, lease) => {
     if (req.body?.objectId && req.body.objectId !== req.params.objectId) return errorResponse(res, 400, "Object id mismatch");
-    return write(req, res, { ...req.body, objectId: req.params.objectId, operation: "delete", tombstone: true });
-  });
-  app.post("/sync/v1/devices/:deviceId/resume", authenticate, requirePermission("upload"), async (req, res) => {
+    return write(req, res, { ...req.body, objectId: req.params.objectId, operation: "delete", tombstone: true }, lease);
+  }));
+  // Resume is a legacy WRITE endpoint too: it persists pause transitions,
+  // replay-resistant 2FA intent and account-store proof consumption. Cover
+  // the entire async lifecycle, including its final response, with the same
+  // externally held account lease as legacy object writes.
+  app.post("/sync/v1/devices/:deviceId/resume", authenticate, requirePermission("upload"), fenceLegacySync("resume", async (req, res, lease) => {
     await ready;
+    lease?.assertActive();
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     const deviceId = req.params.deviceId;
     if (!deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) return errorResponse(res, 400, "Invalid sync device id");
@@ -882,8 +995,10 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     };
     try {
       const snapshot = await findUser(username);
+      lease?.assertActive();
       const hasPassword = Boolean(snapshot && !snapshot.disabled && typeof snapshot.password === "string" && snapshot.password);
       const matches = await bcrypt.compare(body.password, hasPassword ? snapshot.password : DUMMY_PASSWORD_HASH);
+      lease?.assertActive();
       if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
       if (!hasPassword || !matches) return fail("reauth_failed");
       const checkedHash = snapshot.password;
@@ -903,7 +1018,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
         // A recovery code is irreversibly consumed by saveUsers below. Refuse
         // to spend it if the sync store cannot currently commit a durable write.
-        try { await store.assertWritable(); } catch {
+        try { lease?.assertActive(); await store.assertWritable(); lease?.assertActive(); } catch {
           return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
             store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
         }
@@ -923,6 +1038,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         let proof = null;
         if (!pending) {
           try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+          lease?.assertActive();
           if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
           if (!proof) return fail("second_factor_failed");
         }
@@ -948,6 +1064,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           };
           stagedResume.codeMac = resumeCodeMac(key, username, deviceId, pauseFence, body.code, stagedResume);
           // Prepare an immutable durable intent *before* spending the factor.
+          lease?.assertActive();
           try { await store.stageResume(username, stagedResume); } catch (error) {
             // A concurrent valid factor cannot overtake an already staged
             // single-use proof, even if both verified before the first commit.
@@ -962,6 +1079,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         // can be obsolete after administrative revocation or password rotation.
         let accountCommit;
         try {
+          lease?.assertActive();
           accountCommit = commitSyncResumeProof({
             username, passwordHash: checkedHash, sessionVersion: checkedSessionVersion,
             secretDigest: stagedResume.secretDigest,
@@ -979,6 +1097,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       // it stays paused and the MAC-bound intent survives restart for retry.
       let wasPaused;
       try {
+        lease?.assertActive();
         ({ wasPaused } = stagedResume
           ? await store.finishStagedResume(username, stagedResume)
           : await store.resumeDevice(username, deviceId));
@@ -988,12 +1107,13 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       }
       state.count = 0;
       if (wasPaused) audit("sync.device.resumed", req, deviceId, "resumed", "success", {});
+      lease?.assertActive();
       return res.json({ protocolVersion: PROTOCOL_VERSION, deviceId, paused: false, wasPaused });
     } finally {
       // Releases the reservation. An internal error is not counted as a wrong password.
       state.pending -= 1;
     }
-  });
+  }));
   return { store, ready };
 }
 

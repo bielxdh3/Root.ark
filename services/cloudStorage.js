@@ -497,31 +497,47 @@ function createCloudStorage(options = {}) {
   }
   async function upload(localPath, folderId, fileName, area = "uploads", uploadOptions = {}) {
     assertProvider(); if (!enabled()) return null;
-    const bound = uploadOptions?.zk1BoundedBytes;
     // The legacy path is intentionally still supported, but must never
     // silently accept a partial ZK/verified-integrity opt-in. The hash comes
     // from the caller's independent ciphertext commitment, not this live FD.
-    const zk1Selected = bound !== undefined
-      || uploadOptions?.zk1ExpectedSha256 !== undefined
-      || (uploadOptions && typeof uploadOptions === "object"
-        && Reflect.ownKeys(uploadOptions).some((name) =>
-          typeof name === "string" && name.startsWith("zk1")));
-    if (zk1Selected && (!uploadOptions
-      || typeof uploadOptions !== "object" || Array.isArray(uploadOptions)
-      || !Object.hasOwn(uploadOptions, "zk1BoundedBytes")
-      || !Object.hasOwn(uploadOptions, "zk1ExpectedSha256")
+    const optionReflectable = uploadOptions !== null
+      && (typeof uploadOptions === "object" || typeof uploadOptions === "function");
+    const optionObject = optionReflectable && !Array.isArray(uploadOptions)
+      && typeof uploadOptions === "object";
+    const optionKeys = optionReflectable ? Reflect.ownKeys(uploadOptions) : [];
+    // Do not invoke a getter to decide whether the protected contract was
+    // selected. Its digest and Drive target must be own data properties whose
+    // primitive values can be pinned once before the first asynchronous step.
+    const zk1Selected = optionReflectable && (
+      "zk1BoundedBytes" in uploadOptions || "zk1ExpectedSha256" in uploadOptions
+      || optionKeys.some((name) => typeof name === "string" && name.startsWith("zk1")));
+    const props = zk1Selected ? Object.getOwnPropertyDescriptors(uploadOptions) : null;
+    const ownData = (key) => Object.hasOwn(props, key)
+      && Object.hasOwn(props[key], "value");
+    const bound = zk1Selected && ownData("zk1BoundedBytes")
+      ? props.zk1BoundedBytes.value : undefined;
+    const expectedSha256 = zk1Selected && ownData("zk1ExpectedSha256")
+      ? props.zk1ExpectedSha256.value : undefined;
+    const selectedDriveId = zk1Selected && ownData("providerFileId")
+      ? props.providerFileId.value : undefined;
+    if (zk1Selected && (!optionObject
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(uploadOptions))
+      || !ownData("zk1BoundedBytes") || !ownData("zk1ExpectedSha256")
       || !Number.isSafeInteger(bound) || bound < 1 || bound > 16 * 1024 * 1024
-      || Reflect.ownKeys(uploadOptions).some((key) => ![
+      || optionKeys.some((key) => ![
         "providerFileId", "zk1BoundedBytes", "zk1ExpectedSha256",
       ].includes(key))
-      || typeof uploadOptions.zk1ExpectedSha256 !== "string"
-      || !/^[a-f0-9]{64}$/.test(uploadOptions.zk1ExpectedSha256))) {
+      || (Object.hasOwn(props, "providerFileId")
+        && (!ownData("providerFileId") || typeof selectedDriveId !== "string"))
+      || typeof expectedSha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(expectedSha256))) {
       throw cloudError("configuration", "Invalid bounded ZK ciphertext upload");
     }
-    // Preserve the historical POSIX legacy stream behavior; bounded ZK copies
-    // and Windows uploads require ancestor validation before the first stat.
-    const guardSourceParent = process.platform === "win32" || bound !== undefined
-      ? pinUploadSourceParent(localPath) : () => {};
+    // Legacy streaming does not pin its ciphertext bytes, but it still must
+    // authorize the source pathname's ancestry before opening a descriptor.
+    // A foreign UID may otherwise substitute an ancestor symlink and upload
+    // a root-readable file outside the selected legacy upload directory.
+    const guardSourceParent = pinUploadSourceParent(localPath);
     if (!guardSourceParent) return null;
     if (bound !== undefined && process.platform === "win32") {
       // A caller-created staging directory is not trusted just because its
@@ -581,7 +597,7 @@ function createCloudStorage(options = {}) {
         // its signed root. Compare that trusted digest with the detached bytes
         // before either SDK can receive the body.
         if (crypto.createHash("sha256").update(boundedBytes).digest("hex")
-            !== uploadOptions.zk1ExpectedSha256) {
+            !== expectedSha256) {
           throw cloudError("configuration", "Bounded ciphertext digest mismatch");
         }
       } finally { fs.closeSync(fd); }
@@ -645,7 +661,8 @@ function createCloudStorage(options = {}) {
       return { provider, key: cloudKey,
         ...(versionId === undefined ? {} : { versionId }) };
     }
-    const providerFileId = String(uploadOptions?.providerFileId || "").trim();
+    const providerFileId = zk1Selected ? (selectedDriveId || "")
+      : String(uploadOptions?.providerFileId || "").trim();
     if (providerFileId) {
       if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
       guardSourceParent();

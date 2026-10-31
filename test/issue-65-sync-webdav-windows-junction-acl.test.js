@@ -6,10 +6,13 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const test = require("node:test");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
 const { createWindowsLocalWebDavAclVerifier } =
   require("../services/chunkUploadWindowsAcl");
+const { createAclFailureDiagnostic } =
+  require("../scripts/acl-test-failure-diagnostic");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
@@ -173,34 +176,130 @@ test("Windows native ACL worker initialization leaves the Node event loop respon
   const file = path.join(root, "file.ct");
   fs.writeFileSync(file, "DISPOSABLE_BOUNDED_CIPHERTEXT");
   const verifier = createWindowsLocalWebDavAclVerifier();
+  const diagnostic = createAclFailureDiagnostic(t, "WEB_DAV_COLD");
   t.after(() => {
     verifier.stop();
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   let beats = 0;
   let worstLag = 0;
-  let previous = Date.now();
-  const interval = setInterval(() => {
-    const now = Date.now();
-    worstLag = Math.max(worstLag, now - previous);
-    previous = now;
-    beats += 1;
-  }, 20);
+  let minActualTickSpacingMs = Infinity;
+  // The node:test timeout is 45s. Keep an independent deadline that can
+  // settle a hung native ACL batch and run cleanup while the test is alive.
+  const nativeCheckDeadlineMs = 30_000;
+  const cpuStarted = process.cpuUsage();
+  let immediateCycles = 0;
+  let timerCycles = 0;
+  const heartbeatStarted = performance.now();
+  let previous = heartbeatStarted;
+  let nextDue = heartbeatStarted + 20;
+  let heartbeatTimer = null;
+  let heartbeatImmediate = null;
+  let heartbeatStopped = false;
+  let nativeDeadlineTimer = null;
+  let fixedWindowTimer = null;
+  let nativeDeadlineExpired = false;
+  // Windows Node22 may coalesce setInterval(20) to ~31ms even with a responsive
+  // event loop. Observe only genuinely executed callbacks >=20ms apart, using
+  // a bounded coarse timeout and yielding only in the final 7ms of a deadline.
+  // No synthetic ticks, catch-up credit, or shifted first-320ms window.
+  function heartbeat() {
+    if (heartbeatStopped) return;
+    const now = performance.now();
+    // A stalled native worker must never keep a self-scheduling immediate
+    // loop alive past the independent deadline, even if its promise hangs.
+    if (now - heartbeatStarted >= nativeCheckDeadlineMs) {
+      heartbeatStopped = true;
+      return;
+    }
+    if (now >= nextDue) {
+      const actualSpacing = now - previous;
+      worstLag = Math.max(worstLag, actualSpacing);
+      minActualTickSpacingMs = Math.min(minActualTickSpacingMs, actualSpacing);
+      previous = now;
+      nextDue = now + 20;
+      if (now - heartbeatStarted <= 320) beats += 1;
+    }
+    // Only the first 320ms needs 20ms-accurate callbacks. Keep observing
+    // real event-loop gaps during the native checks without spinning
+    // setImmediate for potentially tens of seconds on a Windows runner.
+    if (now - heartbeatStarted > 320) {
+      timerCycles += 1;
+      heartbeatTimer = setTimeout(heartbeat, 25);
+      return;
+    }
+    const remaining = nextDue - performance.now();
+    if (remaining > 7) {
+      timerCycles += 1;
+      heartbeatTimer = setTimeout(heartbeat, Math.max(1, Math.floor(remaining - 7)));
+    } else {
+      immediateCycles += 1;
+      heartbeatImmediate = setImmediate(heartbeat);
+    }
+  }
+  heartbeat();
   try {
+    const deadline = new Promise((_, reject) => {
+      nativeDeadlineTimer = setTimeout(() => {
+        nativeDeadlineExpired = true;
+        reject(new assert.AssertionError({
+          message: "native Windows ACL checks exceeded the independent 30s deadline",
+          actual: "pending", expected: "settled", operator: "strictEqual",
+        }));
+        // Reject queued native checks and stop the worker even when its
+        // promises would otherwise keep the heartbeat/test pending forever.
+        verifier.stop();
+      }, nativeCheckDeadlineMs);
+    });
     // This includes cold Add-Type compilation; it MUST remain asynchronous.
     // A fixed independent observation window prevents a very fast native
     // worker from falsely failing the 12-tick responsiveness assertion.
     // The ACL checks still run concurrently and must ALL complete successfully.
-    await Promise.all([
-      Promise.all(Array.from({ length: 12 }, () => verifier.verifyFile(file))),
-      new Promise((resolve) => setTimeout(resolve, 320)),
-    ]);
+    const nativeChecks = Promise.all(Array.from({ length: 12 }, () => verifier.verifyFile(file)));
+    const fixedWindow = new Promise((resolve) => {
+      fixedWindowTimer = setTimeout(resolve, 320);
+    });
+    // Negative control: a synchronous stall AFTER all twelve native checks are
+    // queued must fail the actual heartbeat gate. Never run this in normal CI.
+    if (process.env.ROOTARK_W189_SYNC_BLOCK_MS !== undefined) {
+      assert.equal(process.env.ROOTARK_W189_SYNC_BLOCK_MS, "400");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+    }
+    await Promise.race([Promise.all([nativeChecks, fixedWindow]), deadline]);
+    // Separate negative control: the old heartbeat falsely passed if the
+    // thread blocked AFTER 12 real ticks but BEFORE its timer was cancelled.
+    // This deliberate late stall must be detected by the final gap sample.
+    if (process.env.ROOTARK_W189_LATE_SYNC_BLOCK_MS !== undefined) {
+      assert.equal(process.env.ROOTARK_W189_LATE_SYNC_BLOCK_MS, "400");
+      // A failed precondition is inconclusive; it is not proof that the
+      // deliberately injected late stall was detected by the heartbeat.
+      t.diagnostic(`W189_LATE_STALL_PRECONDITION first320Ticks=${beats} elapsedMs=${Math.round(performance.now() - heartbeatStarted)}`);
+      assert.ok(beats >= 12, "late-stall control requires 12 genuine first-window ticks");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+    }
   } finally {
-    clearInterval(interval);
+    // A late synchronous stall can happen AFTER the final 320ms callback but
+    // BEFORE this cleanup. Sample the real tail gap before cancelling timers;
+    // otherwise >=12 good callbacks can conceal a subsequent 400ms block.
+    worstLag = Math.max(worstLag, performance.now() - previous);
+    heartbeatStopped = true;
+    clearTimeout(heartbeatTimer);
+    clearImmediate(heartbeatImmediate);
+    clearTimeout(nativeDeadlineTimer);
+    clearTimeout(fixedWindowTimer);
+    verifier.stop();
+    const cpu = process.cpuUsage(cpuStarted);
+    const cpuMs = (cpu.user + cpu.system) / 1000;
+    t.diagnostic(`W189_HEARTBEAT_V1 first320Ticks=${beats} observedMs=${Math.round(performance.now() - heartbeatStarted)} cpuMs=${Math.round(cpuMs)} immediateCycles=${immediateCycles} timerCycles=${timerCycles} worstLagMs=${Math.round(worstLag)} nativeDeadlineMs=${nativeCheckDeadlineMs} deadlineExpired=${nativeDeadlineExpired}`);
   }
-  assert.ok(beats >= 12, `event loop must advance during cold native ACL checks: ${beats} ticks`);
-  assert.ok(worstLag < 275,
-    `cold native ACL worker must not block the Node event loop: ${worstLag}ms`);
+  diagnostic.stage("INSUFFICIENT_TICKS");
+  await diagnostic.run(() => assert.ok(beats >= 12,
+    `event loop must advance during cold native ACL checks: ${beats} ticks`));
+  diagnostic.stage("EVENT_LOOP_STALL");
+  await diagnostic.run(() => assert.ok(worstLag < 275,
+    `cold native ACL worker must not block the Node event loop: ${worstLag}ms`));
+  assert.ok(Number.isFinite(minActualTickSpacingMs) && minActualTickSpacingMs >= 19.5,
+    "cold worker heartbeat must count actual callbacks >=20ms apart, never fabricated ticks");
 });
 
 test("Windows local WebDAV concurrent ACL checks leave the Node event loop responsive", {

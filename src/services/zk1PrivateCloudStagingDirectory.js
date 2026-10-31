@@ -1,6 +1,9 @@
 "use strict";
 
 const crypto = require("node:crypto");
+// Snapshot the native RNG at module load. A later mutation of the shared
+// node:crypto exports must not choose a predictable private staging basename.
+const NATIVE_RANDOM_BYTES = crypto.randomBytes;
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -16,7 +19,7 @@ async function createZk1PrivateCloudStagingDirectory(prefix) {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   }
   const root = path.join(process.env.LOCALAPPDATA || os.homedir(),
-    `${prefix}${crypto.randomBytes(16).toString("hex")}`);
+    `${prefix}${NATIVE_RANDOM_BYTES(16).toString("hex")}`);
   await checkWindowsPrivateCloudDirectory(root, "create");
   return root;
 }

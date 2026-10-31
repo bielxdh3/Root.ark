@@ -96,7 +96,7 @@ class ServerWireFixtureTest {
     fun errorBodiesCarryOnlyTheErrorText() {
         assertEquals(404, status("sync.get.404"))
         assertEquals("Sync object not found", body("sync.get.404").getString("error"))
-        assertEquals(400, status("sync.post.400.invalid"))
+        assertEquals(403, status("sync.post.403.invalid"))
     }
 
     @Test

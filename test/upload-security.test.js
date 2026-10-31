@@ -52,7 +52,7 @@ test("dead-owner quota test preload is inert outside the test environment", () =
   assert.equal(result.status, 0, result.stderr || "production preload changed the quota factory");
 });
 
-test("release gate reports a sanitized failing test and skips redundant full tests after a required failure", () => {
+test("release gate reports categorical failed-child telemetry and skips redundant full tests", () => {
   const vm = require("node:vm");
   const { createRequire } = require("node:module");
   const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
@@ -79,14 +79,16 @@ test("release gate reports a sanitized failing test and skips redundant full tes
   }, { filename: gatePath });
   const output = printed.join("\n");
   assert.match(output, /FAIL: Upload security boundary — exit 1/);
-  assert.match(output, /a second startup rejects ambiguous quota owner/, "the exact failing test is visible in CI");
-  assert.doesNotMatch(output, /synthetic-sensitive-fixture|test-secret-value|c2Vuc2l0aXZl|synthetic-refresh-key|synthetic-access-key/, "raw test output cannot leak any fixture secrets");
-  assert.match(output, /\[REDACTED\]/, "sensitive diagnostic text is redacted rather than silently dropped");
+  assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=none reporter=none/,
+    "only allowlisted child status metadata is visible in CI");
+  assert.match(output, /raw output withheld/);
+  assert.doesNotMatch(output, /a second startup rejects ambiguous quota owner|synthetic-sensitive-fixture|test-secret-value|c2Vuc2l0aXZl|synthetic-refresh-key|synthetic-access-key|bearer/i,
+    "neither arbitrary failing test names nor fixture secrets may be logged");
   assert.equal(calls.some(({ args }) => /(?:^|\s)(?:npm(?:\.cmd)?\s+test|test(?:\s|$))/.test(args.join(" "))), false, "no expensive canonical npm test after an earlier hard failure on Windows or POSIX");
   assert.equal(simulatedProcess.exitCode, 1, "the gate still fails closed");
 });
 
-test("release gate emits a bounded redacted TAP failure from canonical npm test on Windows", () => {
+test("release gate emits bounded categorical TAP failure metadata from canonical npm test on Windows", () => {
   const vm = require("node:vm");
   const { createRequire } = require("node:module");
   const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
@@ -115,37 +117,44 @@ test("release gate emits a bounded redacted TAP failure from canonical npm test 
   const output = printed.join("\n");
   assert.ok(commands.some((line) => /(?:^|\s)(?:npm(?:\.cmd)?\s+)?test -- --test-reporter=tap(?:\s|$)/.test(line)), "canonical npm still runs every test with a deterministic TAP reporter");
   assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
-  assert.match(output, /not ok 327 - a concurrent upload boundary failed/);
-  assert.match(output, /# fail 1/);
+  assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=327:327 reporter=tap/);
+  assert.match(output, /raw output withheld/);
+  assert.doesNotMatch(output, /not ok 327|a concurrent upload boundary failed|# fail 1/,
+    "arbitrary TAP names and raw counters are never copied into CI logs");
   assert.doesNotMatch(output, new RegExp(secret), "TAP and stderr secrets are not printed");
   assert.ok(output.length < 5000, "CI failure log stays bounded");
   assert.equal(simulatedProcess.exitCode, 1);
 });
 
-test("release gate keeps early failing TAP names without printing secrets after long diagnostics", () => {
+test("release gate preserves early TAP failure ordinals, not names, after long diagnostics", () => {
   const vm = require("node:vm");
   const { createRequire } = require("node:module");
   const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
   const gateRequire = createRequire(gatePath);
   const printed = [];
   const secret = "synthetic-early-failure-secret";
+  const simulatedProcess = { execPath: process.execPath, exitCode: 0 };
   const names = Array.from({ length: 7 }, (_, i) =>
     `not ok ${i + 1} - WebDAV failure ${i + 1} token=${secret}`);
   const trailing = Array.from({ length: 40 }, (_, i) => `  error: synthetic error detail ${i}`);
   vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
     __dirname: path.dirname(gatePath),
-    process: { execPath: process.execPath, exitCode: 0 },
+    process: simulatedProcess,
     console: { log: (line) => printed.push(String(line)) },
     require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) =>
       isCanonicalNpmTestInvocation(executable, args)
-        ? { status: 1, stdout: `${names.join("\n")}\n${trailing.join("\n")}\n# fail 7\n`, stderr: "" }
+        ? { status: 1, stdout: `TAP version 13\n${names.join("\n")}\n${trailing.join("\n")}\n# fail 7\n`, stderr: "" }
         : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
   }, { filename: gatePath });
   const output = printed.join("\n");
-  for (let i = 1; i <= 7; i++) assert.match(output, new RegExp(`not ok ${i} - WebDAV failure ${i}`));
-  assert.match(output, /# fail 7/);
+  assert.match(output, /FAIL: final-head canonical npm test — exit 1/);
+  assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=1:7 reporter=tap/,
+    "bounded first/last TAP ordinals remain visible without test names");
+  assert.match(output, /raw output withheld/);
+  assert.doesNotMatch(output, /not ok|WebDAV failure|# fail 7|synthetic error detail/);
   assert.doesNotMatch(output, new RegExp(secret));
-  assert.ok(output.length < 12000, "retained names and tail remain bounded");
+  assert.ok(output.length < 12000, "categorical metadata remains bounded");
+  assert.equal(simulatedProcess.exitCode, 1, "the canonical release gate must still fail closed");
 });
 
 test("release gate prints metadata-only failure diagnostics for unknown npm output", () => {

@@ -396,6 +396,12 @@ class SyncEngine {
   }
 
   async verifyIncomingOperation(operation, { preObserve = true } = {}) {
+    // A permissive or incorrectly wired verifier must not turn strict client
+    // mode into unsigned legacy sync. Mandatory proof presence is local policy,
+    // independent of any callback result or server-provided record fields.
+    if (this.requireAuthorization && !operation.authorization) {
+      fail("Remote sync device authorization is required", "remote_authorization_rejected");
+    }
     const digest = signedEnvelopeDigest(operation);
     // A valid signer can sign two different envelopes using one operation ID.
     // Reject a conflicting identity BEFORE mutating the filesystem or snapshot.

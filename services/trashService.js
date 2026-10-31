@@ -3,6 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const trashRepository = require("../repositories/trashRepository");
+const { assertZk10LegacyBackupNotStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 const TRASH_STORAGE_DIR = resolveRuntimePath("data", "trash");
 const REMOTE_LOCK_DIR = resolveRuntimePath("data", "trash-remote-locks");
@@ -515,8 +516,13 @@ function cancelRemoteDeletion(item, reason = "cancelled", { clock, status } = {}
 }
 
 async function processRemoteDeletion({ item, provider, clock, leaseMs, workerId, runFileLifecycleMutation, runFolderLifecycleMutation, isReplacementActive } = {}) {
+  // This is the shared physical-delete dispatcher for scheduled cleanup,
+  // authenticated trash routes and restart retry. No per-owner off-host
+  // authority can be inferred from the locally persisted trash record.
+  assertZk10LegacyBackupNotStrict();
   if (typeof provider !== "function") throw new TypeError("Remote deletion provider is required");
   const processLocked = async () => {
+    assertZk10LegacyBackupNotStrict();
     const latest = trashRepository.getTrashItem(item.id) || item;
     const latestState = remoteState(latest);
     if (latest.status === "remote_delete_pending" && latestState?.state === "cancelled") {
@@ -532,6 +538,9 @@ async function processRemoteDeletion({ item, provider, clock, leaseMs, workerId,
     if (typeof isReplacementActive === "function" && await isReplacementActive(latest)) {
       return cancelRemoteDeletion(latest, "replacement_active", { clock, status: "permanently_deleted" });
     }
+    // Replacement checks can await filesystem/provider state; a strict
+    // cutover after that await must not begin claiming or deleting the job.
+    assertZk10LegacyBackupNotStrict();
 
     const claim = claimRemoteDeletion({ item: latest, clock, leaseMs, workerId });
     if (!claim) return trashRepository.getTrashItem(item.id) || latest;
@@ -539,10 +548,15 @@ async function processRemoteDeletion({ item, provider, clock, leaseMs, workerId,
       const current = trashRepository.getTrashItem(item.id) || claim.item;
       const state = remoteState(current);
       if (current.status !== "remote_delete_pending" || !state || state.state === "cancelled") return current;
+      assertZk10LegacyBackupNotStrict();
       await provider(current);
       // Provider remove operations are idempotent; false means the object was already absent.
       return completeRemoteDeletion(current, { clock, claimToken: claim.token });
     } catch (error) {
+      // Local STRICT denial is not a failed provider DELETE. Preserve the
+      // retryable pending record and propagate the precise fail-closed code;
+      // finally still releases the physical claim lock.
+      if (error.code === "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE") throw error;
       const current = trashRepository.getTrashItem(item.id) || claim.item;
       if (failureCategory(error) === "missing_object") return completeRemoteDeletion(current, { clock, claimToken: claim.token });
       return failRemoteDeletion(current, error, { clock, claimToken: claim.token });

@@ -262,7 +262,9 @@ test("S3 fixture diagnostics distinguish bounded provider GET arrival windows", 
 });
 
 async function waitForServer(port, child) {
-  const deadline = Date.now() + 15_000;
+  // Canonical Windows runs contend with many process-isolated suites;
+  // tolerate slower disposable startup without relaxing HTTP assertions.
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("disposable server exited");
     try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
@@ -356,7 +358,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/restore-race.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: true } } },
     "root/issued-token-race.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: false } } },
   }));
-  fs.writeFileSync(path.join(dataDir, "file-versions.json"), JSON.stringify({
+  const versionFixtureHistory = {
     "root/history-only.txt": { currentVersion: 1, versions: [
       { version: 1, storedAs: "history-only.txt", size: 0 },
     ] },
@@ -411,7 +413,14 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
       { version: 1, storedAs: "issued-token-race.txt.v1", size: OBJECTS.get("rootark/uploads/root/issued-token-race.txt.v1").length },
       { version: 2, storedAs: "issued-token-race.txt", size: 0 },
     ] },
-  }));
+  };
+  // This matrix exercises authorization and provider hydration. Its allowed
+  // historical versions need the immutable upload time required by the live
+  // download route; a cache file's fresh mtime is never acceptable evidence.
+  for (const history of Object.values(versionFixtureHistory)) {
+    for (const version of history.versions) version.uploadedAt = "2026-10-05T00:00:00.000Z";
+  }
+  fs.writeFileSync(path.join(dataDir, "file-versions.json"), JSON.stringify(versionFixtureHistory));
   fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({
     "root/encrypted.txt": { encryptionLevel: "server-key", originalFilename: "encrypted.txt" },
     "root/revoke-encrypted.txt": { encryptionLevel: "server-key", originalFilename: "revoke-encrypted.txt" },
@@ -813,6 +822,19 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const authorizedSiblingVersion = await request(port, "/download/version-primary.txt/v/2", { headers: { cookie } });
   assert.equal(authorizedSiblingVersion.status, 200, "an authorized sibling version remains available when only v1 is suppressed");
   assert.equal(authorizedSiblingVersion.body, "authorized stored version fixture");
+  {
+    const historyBefore = fs.readFileSync(versionHistoryPath, "utf8");
+    const missingTimestamp = JSON.parse(historyBefore);
+    delete missingTimestamp["root/version-primary.txt"].versions[1].uploadedAt;
+    fs.writeFileSync(versionHistoryPath, JSON.stringify(missingTimestamp));
+    const remoteReadsBefore = cloud.getObjects.length;
+    const denied = await request(port, "/download/version-primary.txt/v/2", { headers: { cookie } });
+    assert.equal(denied.status, 409,
+      "missing historical timestamp must fail closed even for an authorized sibling version");
+    assert.equal(cloud.getObjects.length, remoteReadsBefore,
+      "invalid historical metadata must fail before remote hydration");
+    fs.writeFileSync(versionHistoryPath, historyBefore);
+  }
   cloud.getObjects.length = 0;
 
   const orphanPolicyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");

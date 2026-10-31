@@ -84,8 +84,8 @@
         "error": "Replay rejected"
       }
     },
-    "sync.post.400.invalid": {
-      "status": 400,
+    "sync.post.403.invalid": {
+      "status": 403,
       "body": {
         "error": "Invalid sync operation"
       }

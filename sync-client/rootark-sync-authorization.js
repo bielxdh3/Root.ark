@@ -96,6 +96,29 @@ async function createAuthorizationProof(operation, options = {}) {
   return core;
 }
 
+// Structural binding, NOT device authorization. Check that every claimed
+// identifier and encrypted-byte digest describes the actual envelope.
+// Neither the supplied key nor its signature is trusted by this check.
+function assertAuthorizationEnvelopeBinding(proof, operation) {
+  exact(proof);
+  if (!isValidIdempotencyKey(proof.idempotencyKey)) fail("Invalid device authorization");
+  if (proof.schemaVersion !== 1 || proof.type !== "rootark-sync-device-authorization-v1"
+    || proof.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
+  const expectedCore = proofCore(operation, {
+    username: proof.username, publicKey: proof.publicKey,
+    expiresAt: proof.expiresAt, replayId: proof.replayId,
+    idempotencyKey: proof.idempotencyKey,
+  }, false);
+  for (const field of ["protocolVersion", "deviceId", "operationId", "objectId", "fileId",
+    "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
+    "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
+    if (JSON.stringify(proof[field]) !== JSON.stringify(expectedCore[field])) {
+      fail("Authorization envelope binding mismatch", "authorization_scope");
+    }
+  }
+  return true;
+}
+
 async function verifyAuthorizationProofInternal(proof, operation, expected, requireFresh) {
   exact(proof);
   const normalized = { ...proof };
@@ -120,10 +143,7 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
       fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
     }
   }
-  const expectedCore = proofCore(operation, { username: normalized.username, publicKey: normalized.publicKey, expiresAt: normalized.expiresAt, replayId: normalized.replayId, idempotencyKey: normalized.idempotencyKey }, requireFresh);
-  for (const field of ["operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
-    if (JSON.stringify(normalized[field]) !== JSON.stringify(expectedCore[field])) fail("Authorization payload mismatch", "authorization_scope");
-  }
+  assertAuthorizationEnvelopeBinding(normalized, operation);
   const key = crypto.createPublicKey({ key: Buffer.from(normalized.publicKey, "base64url"), format: "der", type: "spki" });
   if (!crypto.verify(null, await signedBytes(normalized), key, Buffer.from(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
   return true;
@@ -140,4 +160,4 @@ function verifyHistoricalAuthorizationProof(proof, operation, expected = {}) {
   return verifyAuthorizationProofInternal(proof, operation, expected, false);
 }
 
-module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof, verifyHistoricalAuthorizationProof };
+module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, assertAuthorizationEnvelopeBinding, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof, verifyHistoricalAuthorizationProof };

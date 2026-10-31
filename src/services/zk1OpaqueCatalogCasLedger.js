@@ -17,7 +17,10 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
-const { assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteDirectory,
+  assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { createWindowsSynchronousPrivateAclVerifier } =
+  require("./zk1WindowsSynchronousPrivateAclVerifier");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -70,7 +73,7 @@ function scopeEquals(a, b) {
 function publicFingerprint(key) {
   return crypto.createHash("sha256").update(key.export({ type: "spki", format: "der" })).digest("hex");
 }
-function privateDir(filename) {
+function privateDir(filename, residentVerifier) {
   const folder = path.dirname(filename);
   const current = fs.lstatSync(folder);
   if (!current.isDirectory() || current.isSymbolicLink()) fail();
@@ -78,7 +81,13 @@ function privateDir(filename) {
     && (current.uid !== process.getuid() || (current.mode & 0o077) !== 0)) fail();
   // SQLite follows ancestor junctions while opening the DB and WAL/SHM paths.
   // Reject aliases even when the immediate parent itself is a real directory.
-  try { assertPrivateSqliteAuthorityDirectory(filename); } catch (_) { fail(); }
+  try {
+    if (residentVerifier) {
+      assertPrivateSqliteDirectory(filename);
+      residentVerifier.verify(folder);
+      assertPrivateSqliteDirectory(filename);
+    } else assertPrivateSqliteAuthorityDirectory(filename);
+  } catch (_) { fail(); }
 }
 function requireExistingCatalogSchema(db, identity, hasOwner) {
   // A restart must inspect the existing file read-only before switching WAL
@@ -102,6 +111,7 @@ function requireExistingCatalogSchema(db, identity, hasOwner) {
 }
 
 class Zk1OpaqueCatalogCasLedger {
+  #residentAclVerifier;
   #minimum;
   #floor;
   #ownerTrust;
@@ -111,7 +121,7 @@ class Zk1OpaqueCatalogCasLedger {
     // A local FULL commit cannot overlap a signed read or another CAS before
     // its independent floor is durably advanced and read back.
     const pending = this.#serialized.then(() => {
-      privateDir(this.filename);
+      privateDir(this.filename, this.#residentAclVerifier);
       return operation();
     });
     this.#serialized = pending.catch(() => {});
@@ -153,6 +163,8 @@ class Zk1OpaqueCatalogCasLedger {
       };
     }
     this.independentFloor = independentFloor;
+    this.#residentAclVerifier = process.platform === "win32"
+      ? createWindowsSynchronousPrivateAclVerifier() : null;
     if (publicFingerprint(this.publicKey) === publicFingerprint(this.catalogSigner)) fail();
     if (publicFingerprint(this.publicKey) === publicFingerprint(independentFloor.publicKey)
       || publicFingerprint(this.catalogSigner) === publicFingerprint(independentFloor.publicKey)) fail();
@@ -637,7 +649,7 @@ class Zk1OpaqueCatalogCasLedger {
     // the head and burning the nonce. FULL commits the complete snapshot
     // transaction before the independent Ed25519 receipt is produced.
     const transaction = this.db.transaction(() => {
-      privateDir(this.filename);
+      privateDir(this.filename, this.#residentAclVerifier);
       const current = this.#inspectSync();
       if (current.sequence !== old || !same(current.digest, previous)) fail("ZK_OPAQUE_CAS_CONFLICT");
       if (this.db.prepare("SELECT 1 FROM snapshots WHERE scope=? AND nonce=?")
@@ -680,7 +692,10 @@ class Zk1OpaqueCatalogCasLedger {
     return this.#receipt(challenge, confirmed);
     });
   }
-  close() { if (this.db.open) this.db.close(); }
+  close() {
+    this.#residentAclVerifier?.stop();
+    if (this.db.open) this.db.close();
+  }
 }
 
 module.exports = { Zk1OpaqueCatalogCasLedger };

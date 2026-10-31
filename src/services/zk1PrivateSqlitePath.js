@@ -7,6 +7,39 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+// Opening each SQLite authority with a fresh PowerShell process recompiles
+// the native ACL verifier on every admission. Keep its isolated worker warm;
+// every request still performs a NEW, synchronous native owner/DACL and
+// ancestor check before SQLite may open its database or WAL/SHM sidecars.
+let windowsAuthorityVerifier;
+let windowsAuthorityIdle;
+function checkWindowsAuthorityDirectory(directory) {
+  if (windowsAuthorityIdle) {
+    clearTimeout(windowsAuthorityIdle);
+    windowsAuthorityIdle = null;
+  }
+  if (!windowsAuthorityVerifier) {
+    const { createWindowsSynchronousPrivateAclVerifier } =
+      require("./zk1WindowsSynchronousPrivateAclVerifier");
+    windowsAuthorityVerifier = createWindowsSynchronousPrivateAclVerifier();
+  }
+  try {
+    windowsAuthorityVerifier.verify(directory);
+  } catch (error) {
+    // A failed/expired native check never authorizes this or a later call.
+    windowsAuthorityVerifier.stop();
+    windowsAuthorityVerifier = null;
+    throw new Error("Windows chunk staging ACL validation failed", { cause: error });
+  } finally {
+    windowsAuthorityIdle = setTimeout(() => {
+      windowsAuthorityVerifier?.stop();
+      windowsAuthorityVerifier = null;
+      windowsAuthorityIdle = null;
+    }, 30000);
+    windowsAuthorityIdle.unref();
+  }
+}
+
 function checkDirectory(filename) {
   let current = path.dirname(filename);
   const containing = current;
@@ -52,9 +85,7 @@ function assertPrivateSqliteAuthorityDirectory(filename) {
     // a perfectly valid earlier signed floor after restart. NTFS mode bits
     // cannot describe that right. Require a protected owner-only DACL and
     // safe ancestry before opening or creating any authority database.
-    const { verifyWindowsChunkUploadTree } =
-      require("../../services/chunkUploadWindowsAcl");
-    verifyWindowsChunkUploadTree(path.dirname(filename));
+    checkWindowsAuthorityDirectory(path.dirname(filename));
   }
 }
 

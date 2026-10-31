@@ -1,4 +1,5 @@
 let registration = null;
+const { isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 function parseBackupTime(value) {
   const match = /^(\d{2}):(\d{2})$/.exec(String(value || ""));
@@ -18,6 +19,9 @@ function isValidTimezone(value) {
 }
 
 function scheduleAutomaticBackups({ env = process.env, cron, createBackup, auditLog = () => {}, onInvalid = () => {} }) {
+  // A scheduling decision is advisory only; backupService enforces the same
+  // denial at its physical ZIP source for direct/manual/pre-restore callers.
+  if (isZk10LegacyBackupStrict(env)) return null;
   if (String(env.BACKUP_ENABLED || "true").toLowerCase() === "false" || String(env.BACKUP_AUTO_ENABLED || "true").toLowerCase() === "false") return null;
   const time = parseBackupTime(env.BACKUP_TIME || "03:00");
   if (!time) { onInvalid("BACKUP_TIME invalido. Use HH:mm."); return null; }

@@ -277,11 +277,19 @@ function enableChunkQuotaWal(database) {
 
 function ensureSafeSidecarFile(filePath) {
   let stats;
-  try {
-    stats = fs.lstatSync(filePath);
-  } catch (error) {
-    if (error.code === "ENOENT") return;
-    throw error;
+  // SQLite can unlink its transient WAL/SHM sidecars while another process
+  // performs lstat. POSIX may then report nlink=0 for the just-unlinked inode
+  // instead of ENOENT. Reinspect only that case; never admit a zero-link
+  // inode, symlink, hardlink, directory or any other unsafe replacement.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      stats = fs.lstatSync(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    if (process.platform === "win32" || stats.nlink !== 0
+      || stats.isSymbolicLink() || !stats.isFile()) break;
   }
   if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1) throw new Error("Unsafe chunk quota SQLite sidecar");
   if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) fs.chmodSync(filePath, 0o600);
