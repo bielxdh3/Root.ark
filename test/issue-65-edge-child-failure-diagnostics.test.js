@@ -29,6 +29,26 @@ test("failed Edge child yields bounded hashed top ordinal, pinned filename and t
   assert.doesNotMatch(safe, /JWT|very-private|Users|private\.key|Root\.ark|real V2|C:/i);
 });
 
+test("failing real Edge v2 archive reports only an allowlisted numeric test call-site", () => {
+  const { summarizeFailedEdgeChild } = require("../scripts/edge-child-failure-diagnostics");
+  const title = EXPECTED_EDGE_CASES[4];
+  const archiveFile = EDGE_FILES[3];
+  const location = String.raw`C:\runner\Root.ark\test\issue-65-versioned-keyring-ciphertext-archive.test.js:534:1`;
+  const output = ["TAP version 13", `# Subtest: ${title}`,
+    `not ok 28 - ${title}`, "  ---",
+    `  location: '${location}'`, "  failureType: 'testCodeFailure'",
+    `  error: '${hostile}'`, "  code: 'ERR_TEST_FAILURE'",
+    "  stack: |-",
+    `        Error: ${hostile}`,
+    String.raw`        at wait (C:\runner\Root.ark\test\issue-65-versioned-keyring-ciphertext-archive.test.js:622:11)`,
+    String.raw`        at async TestContext.<anonymous> (C:\runner\Root.ark\test\issue-65-versioned-keyring-ciphertext-archive.test.js:731:3)`,
+    "  ...", "# fail 1"].join("\n");
+  const safe = summarizeFailedEdgeChild({ status: 1, stdout: output,
+    stderr: hostile }, EDGE_FILES);
+  assert.equal(safe, `EDGE_CHILD_DIAG_V1 exit=1 spawn=none failCount=1 top=28:${sha(title)}:${sha(archiveFile)}:runtime nested=none archiveCallSite=731`);
+  assert.doesNotMatch(safe, /JWT|very-private|Root\.ark|C:|Error|stack|private\.key|runner/i);
+});
+
 test("real Node22 TAP failure schema feeds the same safe parser", () => {
   const { summarizeFailedEdgeChild } = require("../scripts/edge-child-failure-diagnostics");
   // A fixture beneath this checkout matches the hosted Node --test entrypoint.
@@ -149,11 +169,15 @@ test("synthetic Edge producer/consumer exposes nested assertion diagnostics yet 
   const cached = require.cache[target];
   const oldError = console.error;
   const logs = [];
+  let requestedNodeArguments;
   try {
     delete require.cache[target];
     Module._load = function (request, parentModule, isMain) {
       if (request === "node:child_process" && parentModule?.filename === target) {
-        return { spawnSync: () => ({ status: 1, stdout: nested, stderr: hostile }) };
+        return { spawnSync: (_binary, args) => {
+          requestedNodeArguments = args;
+          return { status: 1, stdout: nested, stderr: hostile };
+        } };
       }
       return originalLoad.call(this, request, parentModule, isMain);
     };
@@ -167,6 +191,9 @@ test("synthetic Edge producer/consumer exposes nested assertion diagnostics yet 
     if (cached) require.cache[target] = cached;
   }
   assert.deepEqual(logs, [`EDGE_CHILD_DIAG_V1 exit=1 spawn=none failCount=1 top=1:${sha(parent)}:none:runtime nested=1:${sha(parent)}:4:1:${sha(innerName)}:none:assertion`]);
+  assert.deepEqual(requestedNodeArguments, [
+    "--test", "--test-reporter=tap", "--test-concurrency=1", ...EDGE_FILES,
+  ], "serialize real Edge files without skipping or filtering any mandatory case");
   assert.doesNotMatch(logs[0], /JWT|very-private|Users|diagnostic suite|inner |private\.key/i);
 });
 

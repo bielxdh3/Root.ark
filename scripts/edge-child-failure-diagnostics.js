@@ -22,6 +22,14 @@ const SUMMARY = /^# fail (0|[1-9][0-9]{0,6})$/;
 const SPAWN_ERRORS = new Set(["EACCES", "EAGAIN", "EINTR", "EMFILE", "ENOBUFS",
   "ENOENT", "ENOMEM", "EPERM", "ETIMEDOUT", "EPIPE"]);
 const hash = (text) => createHash("sha256").update(text).digest("hex").slice(0, 24);
+const EDGE_ARCHIVE_FILE = "test/issue-65-versioned-keyring-ciphertext-archive.test.js";
+const EDGE_ARCHIVE_TITLE = "REAL Edge: authenticated signed CBOR v2 archive export/import and failure fencing";
+const EDGE_ARCHIVE_TITLE_HASH = hash(EDGE_ARCHIVE_TITLE);
+const EDGE_ARCHIVE_FILE_HASH = hash(EDGE_ARCHIVE_FILE);
+// Print only a numeric call-site from this allowlisted test, never any stack,
+// error text or runtime value. A forged TAP can mislead diagnostics but never
+// makes the actual release gate green.
+const ARCHIVE_STACK_SITE = /(?:^|[\\/])test[\\/]+issue-65-versioned-keyring-ciphertext-archive\.test\.js:([1-9]\d{0,4}):[1-9]\d{0,3}\)?$/;
 
 function categoryFor(result) {
   return result.type === "testTimeoutFailure" ? "timeout"
@@ -53,6 +61,13 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
   let group = null;
   let inner = null;
   let failCount = "unknown";
+  let archiveCallSite = null;
+  let archiveFailed = false;
+  function isArchiveHelperLine(number) {
+    return (number >= 616 && number <= 623)
+      || (number >= 643 && number <= 660)
+      || (number >= 718 && number <= 728);
+  }
   function flushNested() {
     if (!inner) return;
     if (group) {
@@ -64,6 +79,11 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
   }
   function flush() {
     if (!current) return;
+    if (current.nameHash === EDGE_ARCHIVE_TITLE_HASH
+      && current.fileHash === EDGE_ARCHIVE_FILE_HASH) {
+      archiveFailed = true;
+      if (current.archiveCallSite != null) archiveCallSite = current.archiveCallSite;
+    }
     if (failures.length >= MAX_FAILURES) overflow = true;
     else {
       failures.push(`${current.ordinal}:${current.nameHash}:${current.fileHash}:${categoryFor(current)}`);
@@ -149,13 +169,24 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
     if (kind) current.type = kind[1] === "testTimeoutFailure" ? kind[1] : "unknown";
     const code = CODE.exec(line);
     if (code) current.code = code[1] === "ERR_ASSERTION" ? code[1] : "unknown";
+    if (current.nameHash === EDGE_ARCHIVE_TITLE_HASH) {
+      const stackSite = ARCHIVE_STACK_SITE.exec(line);
+      if (stackSite) {
+        const lineNumber = Number(stackSite[1]);
+        if (lineNumber >= 535 && lineNumber <= 940
+          && !isArchiveHelperLine(lineNumber)
+          && current.archiveCallSite == null) current.archiveCallSite = lineNumber;
+      }
+    }
   }
   flushNested();
   flush();
   const top = failures.length ? failures.join(",") + (overflow ? "+" : "") : "none";
   const nested = nestedFailures.length
     ? nestedFailures.join(",") + (nestedOverflow ? "+" : "") : "none";
-  return `EDGE_CHILD_DIAG_V1 exit=${exit} spawn=${spawn} failCount=${failCount} top=${top} nested=${nested}`;
+  const archiveHint = archiveFailed
+    ? ` archiveCallSite=${archiveCallSite === null ? "none" : archiveCallSite}` : "";
+  return `EDGE_CHILD_DIAG_V1 exit=${exit} spawn=${spawn} failCount=${failCount} top=${top} nested=${nested}${archiveHint}`;
 }
 
 module.exports = { summarizeFailedEdgeChild };
