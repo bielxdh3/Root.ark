@@ -68,23 +68,38 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical,
   // configured URL, signature or physicalDurable boolean is not a witness.
   if (!Object.hasOwn(options, "trustedAtomicBatchWitness")) return {};
   const supplied = options.trustedAtomicBatchWitness;
+  const requiredFields = ["pinnedPublicKey", "scope", "readback", "ownerIdentity",
+    "casPinnedPublicKey", "casReadback"];
+  let pinned;
   let suppliedIdentity = null;
   try {
-    if (supplied?.ownerIdentity != null) {
-      suppliedIdentity = JSON.parse(protocol.canonicalJson(supplied.ownerIdentity));
+    // Read each own data property ONCE. Re-reading supplied.scope/key/readback
+    // after checking a callback-owned getter or Proxy lets the caller swap
+    // trusted authorities between validation and capture.
+    if (!supplied || typeof supplied !== "object" || Array.isArray(supplied)) {
+      throw new Error("not a strict owner supplied object");
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(supplied);
+    const names = Reflect.ownKeys(descriptors);
+    if (names.length !== requiredFields.length
+      || names.some((name) => typeof name !== "string"
+        || !requiredFields.includes(name)
+        || !Object.hasOwn(descriptors[name], "value"))) {
+      throw new Error("accessor, symbol or unknown authority property");
+    }
+    pinned = Object.fromEntries(requiredFields.map((field) =>
+      [field, descriptors[field].value]));
+    if (pinned.ownerIdentity != null) {
+      suppliedIdentity = JSON.parse(protocol.canonicalJson(pinned.ownerIdentity));
     }
   } catch {
-    throw new Error("Atomic batch witness requires immutable canonical owner identity");
+    throw new Error("Atomic batch witness requires immutable canonical owner authority options");
   }
-  if (!strictHistorical || !supplied || typeof supplied !== "object"
-    || Array.isArray(supplied)
-    || Object.keys(supplied).sort().join(",")
-      !== ["pinnedPublicKey", "scope", "readback", "ownerIdentity",
-        "casPinnedPublicKey", "casReadback"].sort().join(",")
-    || typeof supplied.readback !== "function"
-    || typeof supplied.casReadback !== "function"
-    || typeof supplied.scope !== "string"
-    || !/^[A-Za-z0-9._:-]{1,256}$/.test(supplied.scope)
+  if (!strictHistorical
+    || typeof pinned.readback !== "function"
+    || typeof pinned.casReadback !== "function"
+    || typeof pinned.scope !== "string"
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(pinned.scope)
     || !suppliedIdentity || typeof suppliedIdentity !== "object"
     || Array.isArray(suppliedIdentity)
     || Object.keys(suppliedIdentity).sort().join(",")
@@ -97,23 +112,23 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical,
     || !suppliedIdentity.compartmentId || suppliedIdentity.compartmentId.length > 512
     || (trustedLocalDevicePolicy && suppliedIdentity.username !== trustedLocalDevicePolicy.username)
     || (localCompartmentId !== null && suppliedIdentity.compartmentId !== localCompartmentId)
-    || !supplied.pinnedPublicKey || !supplied.casPinnedPublicKey) {
+    || !pinned.pinnedPublicKey || !pinned.casPinnedPublicKey) {
     throw new Error("Atomic batch witness requires independently pinned readback and external CAS floor");
   }
   // Validate at construction using the engine's existing strict Ed25519
   // SPKI verifier. Capture all references now; config cannot replace them.
-  const readback = supplied.readback;
-  const casReadback = supplied.casReadback;
+  const readback = pinned.readback;
+  const casReadback = pinned.casReadback;
   const identity = Object.freeze(suppliedIdentity);
   return {
-    atomicBatchWitnessPublicKey: Buffer.isBuffer(supplied.pinnedPublicKey)
-      || supplied.pinnedPublicKey instanceof Uint8Array
-      ? Buffer.from(supplied.pinnedPublicKey) : supplied.pinnedPublicKey,
-    atomicBatchWitnessScope: supplied.scope,
+    atomicBatchWitnessPublicKey: Buffer.isBuffer(pinned.pinnedPublicKey)
+      || pinned.pinnedPublicKey instanceof Uint8Array
+      ? Buffer.from(pinned.pinnedPublicKey) : pinned.pinnedPublicKey,
+    atomicBatchWitnessScope: pinned.scope,
     atomicBatchOwnerIdentity: identity,
-    atomicBatchCasFloorPublicKey: Buffer.isBuffer(supplied.casPinnedPublicKey)
-      || supplied.casPinnedPublicKey instanceof Uint8Array
-      ? Buffer.from(supplied.casPinnedPublicKey) : supplied.casPinnedPublicKey,
+    atomicBatchCasFloorPublicKey: Buffer.isBuffer(pinned.casPinnedPublicKey)
+      || pinned.casPinnedPublicKey instanceof Uint8Array
+      ? Buffer.from(pinned.casPinnedPublicKey) : pinned.casPinnedPublicKey,
     atomicBatchWitnessReadback: ({ scope, accountId, storeId, nonce, operationIds, envelopeDigests }) =>
       readback({ scope, accountId, storeId, nonce, operationIds: [...operationIds],
         envelopeDigests: [...envelopeDigests] }),
