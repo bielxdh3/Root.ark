@@ -109,8 +109,29 @@ async function syncBridgeNamespace(...paths) {
   if (process.platform === "win32") return;
   const parents = new Set(paths.filter(Boolean).map((name) => path.dirname(name)));
   for (const directory of parents) {
-    const handle = await fsp.open(directory, "r");
-    try { await handle.sync(); }
+    // A directory fsync is useful as a namespace witness only if the handle
+    // still refers to the intended directory. Refuse a final symlink/FIFO
+    // substitution rather than silently syncing an unrelated inode.
+    if (!Number.isInteger(fs.constants.O_DIRECTORY)
+      || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+      throw uncertainRollback("POSIX directory pinning unavailable");
+    }
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    const handle = await fsp.open(directory, flags);
+    try {
+      const opened = await handle.stat({ bigint: true });
+      const named = await fsp.lstat(directory, { bigint: true });
+      if (!opened.isDirectory() || !sameLocalEntry(opened, named)) {
+        throw uncertainRollback("WebDAV namespace parent changed before fsync");
+      }
+      await handle.sync();
+      const after = await handle.stat({ bigint: true });
+      const namedAfter = await fsp.lstat(directory, { bigint: true });
+      if (!sameLocalEntry(opened, after) || !sameLocalEntry(opened, namedAfter)) {
+        throw uncertainRollback("WebDAV namespace parent changed during fsync");
+      }
+    }
     finally { await handle.close(); }
   }
 }

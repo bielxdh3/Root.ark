@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
@@ -469,4 +470,53 @@ test("POSIX startup can create a new owner-only root directly below sticky /tmp"
   assert.equal(fs.statSync(path.join(root, ".rootark-trash")).mode & 0o077, 0);
   assert.equal((await request(bridge.address().port, "/created.txt", "PUT", "OK")).status, 201);
   assert.equal((await request(bridge.address().port, "/created.txt")).body, "OK");
+});
+
+test("POSIX namespace fsync refuses a swapped symlink parent before acknowledging PUT", {
+  skip: !LINUX,
+  timeout: 30000,
+}, async (t) => {
+  const { dir, root, track } = fixture(t);
+  const nested = path.join(root, "nested");
+  const parked = path.join(root, "parked");
+  const foreign = path.join(dir, "foreign");
+  fs.mkdirSync(nested, { mode: 0o700 });
+  const originalParent = fs.lstatSync(nested, { bigint: true });
+  fs.mkdirSync(foreign, { mode: 0o700 });
+  const sentinel = path.join(foreign, "sentinel.txt");
+  fs.writeFileSync(sentinel, "UNRELATED_FOREIGN_BYTES", { mode: 0o600 });
+  const bridge = await bridgeFor(track, root);
+  const originalOpen = fsp.open;
+  let swapped = false;
+  fsp.open = async function (name, flags, ...rest) {
+    if (name !== nested || swapped) return originalOpen.call(fsp, name, flags, ...rest);
+    // Real same-UID directory exchange at the exact namespace durability
+    // boundary. The previous pathname-only open followed this symlink and
+    // returned a false successful fsync of an unrelated directory.
+    swapped = true;
+    fs.renameSync(nested, parked);
+    let linked = false;
+    try {
+      fs.symlinkSync(foreign, nested, "dir");
+      linked = true;
+      return await originalOpen.call(fsp, name, flags, ...rest);
+    }
+    finally {
+      if (linked) fs.unlinkSync(nested);
+      fs.renameSync(parked, nested);
+    }
+  };
+  let response;
+  try { response = await request(bridge.address().port, "/nested/new.txt", "PUT", "NEW_BYTES"); }
+  finally { fsp.open = originalOpen; }
+  assert.equal(swapped, true, "the actual directory fsync open must be reached");
+  assert.ok(response.status < 200 || response.status >= 300,
+    "a changed namespace parent must not receive a successful durability ACK");
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "UNRELATED_FOREIGN_BYTES");
+  const restored = fs.lstatSync(nested, { bigint: true });
+  assert.equal(restored.isDirectory(), true);
+  assert.equal(restored.dev, originalParent.dev);
+  assert.equal(restored.ino, originalParent.ino);
+  assert.equal(fs.existsSync(path.join(nested, "new.txt")), false,
+    "a failed namespace fsync must not leave an acknowledged new object");
 });
