@@ -25,6 +25,44 @@ const TOKEN = "cos-pr235-signed-http-durable-e2e-only";
 const BYTES = Buffer.from("AUTHORIZED_HTTP_PAYLOAD_".repeat(32));
 const TIMEOUT = 120_000;
 function sha(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
+
+async function readPinnedOutboxEvidence(filename, previousIdentity = null) {
+  // A self-consistent poisoned receipt may be on disk after a rejected
+  // restart; comparing pathname reads alone does not prove it was untouched.
+  const handle = await fsp.open(filename,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const before = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(filename, { bigint: true });
+    assert.equal(before.isFile(), true);
+    assert.equal(before.nlink, 1n);
+    assert.equal(namedBefore.isFile(), true);
+    for (const stat of [namedBefore]) {
+      assert.equal(stat.dev, before.dev);
+      assert.equal(stat.ino, before.ino);
+      assert.equal(stat.nlink, before.nlink);
+    }
+    if (previousIdentity) {
+      assert.equal(before.dev, previousIdentity.dev);
+      assert.equal(before.ino, previousIdentity.ino);
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(filename, { bigint: true });
+    for (const stat of [after, namedAfter]) {
+      assert.equal(stat.isFile(), true);
+      assert.equal(stat.dev, before.dev);
+      assert.equal(stat.ino, before.ino);
+      assert.equal(stat.nlink, before.nlink);
+      assert.equal(stat.size, BigInt(bytes.length));
+    }
+    assert.equal(before.size, after.size);
+    return { bytes, identity: { dev: before.dev, ino: before.ino } };
+  } finally {
+    await handle.close();
+  }
+}
+
 function boundId(event, verb, relative) {
   const prefix = (event.kind === "delete" && verb === "delete")
     || (event.kind === "move" && verb === "move" && !event.previousDestinationIdentity)
@@ -381,13 +419,15 @@ test("previously committed local digest rejects an outbox with the same operatio
     await poisonedHandle.writeFile(JSON.stringify(poisoned) + "\n", "utf8");
     await poisonedHandle.sync();
   } finally { await poisonedHandle.close(); }
-  const onDiskPoison = await fsp.readFile(f.outboxPath);
+  const poisonedEvidence = await readPinnedOutboxEvidence(f.outboxPath);
+  const onDiskPoison = poisonedEvidence.bytes;
   const selfConsistentOutbox = await new SyncJournal(f.outboxPath).open();
   assert.equal(selfConsistentOutbox.durableSignedReceiptDigest(id), poisonedDigest,
     "the attack must reach a real self-consistent durable signed receipt");
 
   await assert.rejects(f.start(), /Committed WebDAV protocol outbox receipt missing/i);
-  assert.deepEqual(await fsp.readFile(f.outboxPath), onDiskPoison,
+  assert.deepEqual((await readPinnedOutboxEvidence(
+    f.outboxPath, poisonedEvidence.identity)).bytes, onDiskPoison,
     "rejected recovery must not rewrite or silently cleanse foreign outbox bytes");
   const after = await f.reopen();
   assert.deepEqual((await after.local.recover())[0], pending,
