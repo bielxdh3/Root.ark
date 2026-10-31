@@ -19,6 +19,14 @@ Each certificate is allowed only its operator-injected exact
 `scope/accountId/storeId` tuples. It accepts the original pair IDs/digests and
 a fresh 32-byte nonce, limits request bytes, concurrent requests, headers,
 TLS handshake time and connections, and returns only SQL observation evidence.
+The trusted server operator sets a bounded observation deadline (six seconds by
+default); a deadline sends HTTP 503 but **does not cancel** an in-flight SQL
+read. Up to eight unresolved readbacks can exist; their slots remain occupied
+after HTTP timeout until the actual readback settles, preventing unbounded
+connections under a hung database at the cost of failing closed until recovery.
+The PostgreSQL pool must independently configure connection/query timeouts and
+the operator must restart an isolated failed observer when required. No caller
+can override this deadline from its request body.
 There is no writable database credential, issuer ticket endpoint, encryption
 key or Ed25519 signer in this service. It must never be mounted in the normal
 Root.ark HTTP server or exposed by mutable sync JSON configuration.

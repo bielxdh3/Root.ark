@@ -14,6 +14,8 @@ const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
 const OP = /^[A-Za-z0-9._:-]{1,160}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_BODY = 4096;
+const MAX_PENDING_READS = 8;
+const DEFAULT_OBSERVE_TIMEOUT_MS = 6000;
 
 function fail() { throw new Error("SYNC_ATOMIC_SQL_OBSERVE_INVALID"); }
 function exact(value, keys) {
@@ -83,12 +85,18 @@ async function bodyOf(req) {
 }
 
 function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
-  attestorPool, principals } = {}) {
+  attestorPool, principals, observationTimeoutMs = DEFAULT_OBSERVE_TIMEOUT_MS } = {}) {
   if (!key || !cert || !clientCa || !attestorPool
-    || typeof attestorPool.connect !== "function") fail();
+    || typeof attestorPool.connect !== "function"
+    || !Number.isSafeInteger(observationTimeoutMs)
+    || observationTimeoutMs < 50 || observationTimeoutMs > 7000) fail();
   const grants = grantsFor(principals);
   const readback = createZk1SyncPgBatchIndependentReadback({ attestorPool });
   const active = new Set();
+  // A timeout ends the HTTP observation, NOT the underlying PostgreSQL call.
+  // Retain unresolved work in a bounded set until it really settles, so an
+  // unavailable attestor cannot accumulate unlimited queued connections.
+  const pendingReads = new Set();
   const server = https.createServer({ key, cert, ca: clientCa,
     requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3",
     handshakeTimeout: 3000 }, async (req, res) => {
@@ -114,10 +122,26 @@ function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
       if (!grants.get(fingerprint).has(accountStore)) {
         return respond(res, 403, { error: "FORBIDDEN" });
       }
-      const observed = await readback.verifyCurrentSignedPair({
+      if (pendingReads.size >= MAX_PENDING_READS) {
+        return respond(res, 503, { error: "SYNC_ATOMIC_SQL_OBSERVE_BUSY" });
+      }
+      const inFlight = Promise.resolve().then(() => readback.verifyCurrentSignedPair({
         scope: challenge.scope, operationIds: challenge.operationIds,
         envelopeDigests: challenge.envelopeDigests,
-      });
+      }));
+      pendingReads.add(inFlight);
+      inFlight.then(() => pendingReads.delete(inFlight),
+        () => pendingReads.delete(inFlight));
+      let timeout;
+      let observed;
+      try {
+        observed = await Promise.race([inFlight, new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("SQL_OBSERVATION_TIMEOUT")),
+            observationTimeoutMs);
+        })]);
+      } finally {
+        clearTimeout(timeout);
+      }
       if (!observed || observed.scope !== challenge.scope
         || observed.localPgRowsConsistent !== true
         || observed.witnessVerified !== false || observed.clientAckAuthorized !== false
