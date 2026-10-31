@@ -9,7 +9,7 @@ const PROTECTED_TABLE_COUNT = 7;
 async function hasUnexpectedProtectedDml(client, { allowTicketInsert = false } = {}) {
   const result = await client.query(`SELECT
       pg_catalog.count(DISTINCT c.oid)::integer AS table_count,
-      pg_catalog.coalesce(pg_catalog.bool_or(
+      COALESCE(pg_catalog.bool_or(
         pg_catalog.has_table_privilege(current_user,c.oid,'UPDATE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'DELETE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'TRUNCATE')
