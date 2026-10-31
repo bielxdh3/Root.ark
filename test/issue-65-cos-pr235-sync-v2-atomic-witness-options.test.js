@@ -112,6 +112,37 @@ test("external atomic witness rejects owner or compartment mismatches from trust
     { username: "alice" }, "private"), {});
 });
 
+test("trusted atomic witness rejects getter authority swaps before construction", () => {
+  for (const key of ["scope", "pinnedPublicKey", "casPinnedPublicKey",
+    "readback", "casReadback", "ownerIdentity"]) {
+    const supplied = trustedFixture();
+    Object.defineProperty(supplied, key, {
+      enumerable: true, configurable: true,
+      get: () => { throw new Error("SHOULD_NOT_READ_ACCESSOR"); },
+    });
+    assert.throws(() => trustedAtomicBatchWitnessOptions({
+      trustedAtomicBatchWitness: supplied,
+    }, true), /immutable canonical owner authority options/);
+  }
+});
+
+test("trusted atomic witness captures one Proxy descriptor snapshot, not mutable get traps", () => {
+  const original = trustedFixture();
+  let getTraps = 0;
+  const supplied = new Proxy(original, {
+    get(target, prop, receiver) {
+      getTraps++;
+      if (prop === "scope") return "mallory:store";
+      if (prop === "readback") return async () => { throw Error("SWAPPED_CALLBACK"); };
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+  const opts = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: supplied }, true);
+  assert.equal(getTraps, 0, "capture must use only own property descriptors");
+  assert.equal(opts.atomicBatchWitnessScope, "alice:store");
+  assert.equal(opts.atomicBatchOwnerIdentity.username, "alice");
+});
+
 test("strict Sync v2 checks owner-pinned local device identity before opening the engine", () => {
   const signing = crypto.generateKeyPairSync("ed25519");
   const pinnedDeviceSpki = signing.publicKey

@@ -122,6 +122,18 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
       Buffer.from("rootark-sync-atomic-batch-witness-v2\0"
         + protocol.canonicalJson(statement)), witness.privateKey).toString("base64url") };
   };
+  const legacyReceiptFor = (pair, nonce, oldDomainWithV2Shape = false) => {
+    const { statement } = receiptFor(pair, { nonce,
+      ...(oldDomainWithV2Shape ? {} : { version: 1 }) });
+    if (!oldDomainWithV2Shape) {
+      for (const key of ["accountId", "storeId", "username", "compartmentId"]) {
+        delete statement[key];
+      }
+    }
+    return { statement, signature: crypto.sign(null,
+      Buffer.from("rootark-sync-atomic-batch-witness-v1\0"
+        + protocol.canonicalJson(statement)), witness.privateKey).toString("base64url") };
+  };
   const casFloorFor = (receipt, nonce, overrides = {}) => {
     const statement = {
       version: 2,
@@ -138,6 +150,17 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
     };
     return { statement, signature: crypto.sign(null,
       Buffer.from("rootark-sync-atomic-batch-external-cas-floor-v2\0"
+        + protocol.canonicalJson(statement)), casSigner.privateKey).toString("base64url") };
+  };
+  const legacyCasFloorFor = (receipt, nonce, oldDomainWithV2Shape = false) => {
+    const { statement } = casFloorFor(receipt, nonce,
+      oldDomainWithV2Shape ? {} : { version: 1 });
+    if (!oldDomainWithV2Shape) {
+      delete statement.accountId;
+      delete statement.storeId;
+    }
+    return { statement, signature: crypto.sign(null,
+      Buffer.from("rootark-sync-atomic-batch-external-cas-floor-v1\0"
         + protocol.canonicalJson(statement)), casSigner.privateKey).toString("base64url") };
   };
   const publicKey = signing.publicKey.export({ type: "spki", format: "der" })
@@ -215,13 +238,14 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
     atomicBatchWitnessReadback: missingWitnessReadback ? null : async (challenge) => {
       if (onWitnessChallenge) onWitnessChallenge(challenge);
       lastWitnessReceipt = witnessResponse
-        ? witnessResponse(challenge, { deleted, moved, receiptFor })
+        ? witnessResponse(challenge, { deleted, moved, receiptFor, legacyReceiptFor })
         : receiptFor([deleted, moved], { nonce: challenge.nonce });
       return lastWitnessReceipt;
     },
     atomicBatchCasFloorPublicKey: missingCasKey ? null : casPublicKey,
     atomicBatchCasFloorReadback: missingCasReadback ? null : async (challenge) => casResponse
-      ? casResponse(challenge, { deleted, moved, receiptFor, casFloorFor, lastWitnessReceipt })
+      ? casResponse(challenge, { deleted, moved, receiptFor, casFloorFor,
+        legacyCasFloorFor, lastWitnessReceipt })
       : casFloorFor(lastWitnessReceipt, challenge.nonce),
     currentDeviceAuthorization: () => true,
     authorizeOutgoing: async () => true,
@@ -352,6 +376,7 @@ test("signed pair plus separate pinned synthetic admission witness ACKs both in 
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
   "other-account-witness", "other-immutable-account-id", "other-immutable-store-id",
   "other-username-witness", "other-compartment-witness", "legacy-v1-witness",
+  "legacy-v1-domain-v2-witness",
   "wrong-envelope-digest", "not-physically-durable",
   "zero-fencing-epoch", "invalid-store-head", "missing-trusted-witness-key",
   "missing-independent-readback", "replayed-old-witness-nonce",
@@ -376,8 +401,10 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
           [ctx.deleted, ctx.moved], { nonce: challenge.nonce, username: "mallory" });
         if (mode === "other-compartment-witness") return ctx.receiptFor(
           [ctx.deleted, ctx.moved], { nonce: challenge.nonce, compartmentId: "other" });
-        if (mode === "legacy-v1-witness") return ctx.receiptFor(
-          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, version: 1 });
+        if (mode === "legacy-v1-witness") return ctx.legacyReceiptFor(
+          [ctx.deleted, ctx.moved], challenge.nonce);
+        if (mode === "legacy-v1-domain-v2-witness") return ctx.legacyReceiptFor(
+          [ctx.deleted, ctx.moved], challenge.nonce, true);
         // These statements carry a VALID signature by the pinned test key.
         // Signature validity alone must not authorize false physical or
         // mismatched signed-envelope claims.
@@ -421,13 +448,14 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
   "forged-cas-floor", "cas-stale-current-head", "cas-wrong-commit",
   "cas-old-epoch", "cas-not-current", "cas-wrong-scope", "cas-replayed-nonce",
   "cas-other-immutable-account-id", "cas-other-immutable-store-id", "cas-legacy-v1",
+  "cas-legacy-v1-domain-v2-shape",
   "cas-switching-head-getter"]) {
   test("no protected batch ACK without fresh independently signed CAS floor: " + mode,
     { timeout: 120000 }, async (t) => {
       const f = await fixture(t, {
         missingCasKey: mode === "missing-cas-key",
         missingCasReadback: mode === "missing-cas-readback",
-        casResponse: (challenge, { casFloorFor, lastWitnessReceipt }) => {
+        casResponse: (challenge, { casFloorFor, legacyCasFloorFor, lastWitnessReceipt }) => {
           assert.ok(lastWitnessReceipt, "CAS readback must follow signed witness verification");
           assert.notEqual(challenge.nonce, lastWitnessReceipt.statement.nonce,
             "CAS current-head challenge must not reuse witness challenge");
@@ -441,8 +469,11 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
             "cas-replayed-nonce": { nonce: crypto.randomBytes(32).toString("base64url") },
             "cas-other-immutable-account-id": { accountId: OTHER_ACCOUNT_ID },
             "cas-other-immutable-store-id": { storeId: OTHER_STORE_ID },
-            "cas-legacy-v1": { version: 1 },
           };
+          if (mode === "cas-legacy-v1") return legacyCasFloorFor(
+            lastWitnessReceipt, challenge.nonce);
+          if (mode === "cas-legacy-v1-domain-v2-shape") return legacyCasFloorFor(
+            lastWitnessReceipt, challenge.nonce, true);
           const result = casFloorFor(lastWitnessReceipt, challenge.nonce,
             changes[mode] || {});
           if (mode === "forged-cas-floor") {
