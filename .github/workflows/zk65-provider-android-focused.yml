@@ -27,7 +27,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # The rolling windows-latest image may select VS 18 / Python 3.15,
+        # unsupported by the locked better-sqlite3/node-gyp toolchain. Pin a
+        # real Windows runner with VS 2022 instead of skipping native builds.
+        os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
