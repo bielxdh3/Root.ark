@@ -24,6 +24,7 @@ function signedEnvelopeDigest(operation) {
 }
 
 const ATOMIC_ADMISSION_DOMAIN = "rootark-sync-atomic-batch-witness-v1\0";
+const ATOMIC_CAS_FLOOR_DOMAIN = "rootark-sync-atomic-batch-external-cas-floor-v1\0";
 function pinnedAtomicWitnessKey(value) {
   if (value == null) return null;
   let key;
@@ -82,6 +83,43 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     || !crypto.verify(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
       + protocol.canonicalJson(statement), "utf8"), trustedWitnessKey, signature)) {
     fail("Independent atomic batch witness signature invalid",
+      "sync_atomic_batch_indeterminate");
+  }
+}
+function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
+  trustedScope, expectedNonce) {
+  // An independent, off-host CAS reader must attest the CURRENT retained
+  // physical head with a separate pinned signer. A new witness nonce alone
+  // cannot distinguish a re-signed stale head after physical rollback.
+  // Detach any callback-owned objects/getters before checking fields or
+  // verifying bytes; an accessor must not swap a value between comparison
+  // against the physical witness and Ed25519 verification.
+  let detached;
+  try { detached = JSON.parse(protocol.canonicalJson(floor)); }
+  catch { fail("External CAS floor is not canonical JSON", "sync_atomic_batch_indeterminate"); }
+  const statement = detached?.statement;
+  const keys = ["version", "scope", "nonce", "commitId", "storeHeadSha256",
+    "fencingEpoch", "sequence", "current"];
+  if (!trustedCasKey || !detached || typeof detached !== "object" || Array.isArray(detached)
+    || Object.keys(detached).sort().join(",") !== ["statement", "signature"].sort().join(",")
+    || !statement || typeof statement !== "object" || Array.isArray(statement)
+    || Object.keys(statement).sort().join(",") !== keys.sort().join(",")
+    || statement.version !== 1 || statement.scope !== trustedScope
+    || statement.nonce !== expectedNonce || statement.current !== true
+    || !Number.isSafeInteger(statement.sequence) || statement.sequence < 1
+    || statement.commitId !== witnessStatement.commitId
+    || statement.storeHeadSha256 !== witnessStatement.storeHeadSha256
+    || statement.fencingEpoch !== witnessStatement.fencingEpoch
+    || typeof detached.signature !== "string"
+    || !/^[A-Za-z0-9_-]{86}$/.test(detached.signature)) {
+    fail("External CAS floor does not attest the same current batch head",
+      "sync_atomic_batch_indeterminate");
+  }
+  const signature = Buffer.from(detached.signature, "base64url");
+  if (signature.length !== 64 || signature.toString("base64url") !== detached.signature
+    || !crypto.verify(null, Buffer.from(ATOMIC_CAS_FLOOR_DOMAIN
+      + protocol.canonicalJson(statement), "utf8"), trustedCasKey, signature)) {
+    fail("External CAS current floor signature invalid",
       "sync_atomic_batch_indeterminate");
   }
 }
@@ -360,6 +398,19 @@ class SyncEngine {
     this.atomicBatchWitnessPublicKey = pinnedAtomicWitnessKey(options.atomicBatchWitnessPublicKey);
     this.atomicBatchWitnessReadback = options.atomicBatchWitnessReadback || null;
     this.atomicBatchWitnessScope = options.atomicBatchWitnessScope || null;
+    this.atomicBatchCasFloorPublicKey = pinnedAtomicWitnessKey(options.atomicBatchCasFloorPublicKey);
+    this.atomicBatchCasFloorReadback = options.atomicBatchCasFloorReadback || null;
+    if (this.atomicBatchCasFloorReadback !== null
+      && typeof this.atomicBatchCasFloorReadback !== "function") {
+      fail("Independent external CAS floor reader must be a function",
+        "authorization_required");
+    }
+    if (this.atomicBatchWitnessPublicKey && this.atomicBatchCasFloorPublicKey
+      && this.atomicBatchWitnessPublicKey.export({ type: "spki", format: "der" })
+        .equals(this.atomicBatchCasFloorPublicKey.export({ type: "spki", format: "der" }))) {
+      fail("External CAS floor and physical witness require distinct pinned keys",
+        "authorization_required");
+    }
     if (this.atomicBatchWitnessScope !== null
       && (typeof this.atomicBatchWitnessScope !== "string"
         || !/^[A-Za-z0-9._:-]{1,256}$/.test(this.atomicBatchWitnessScope))) {
@@ -1107,7 +1158,8 @@ class SyncEngine {
       || typeof this.adapter.pushBatch !== "function"
       || typeof this.journal.markSeenMany !== "function"
       || !this.atomicBatchWitnessPublicKey
-      || !this.atomicBatchWitnessReadback || !this.atomicBatchWitnessScope) {
+      || !this.atomicBatchWitnessReadback || !this.atomicBatchWitnessScope
+      || !this.atomicBatchCasFloorPublicKey || !this.atomicBatchCasFloorReadback) {
       fail("Atomic protected WebDAV remote batch transport unavailable",
         "sync_atomic_batch_unavailable");
     }
@@ -1218,7 +1270,11 @@ class SyncEngine {
       fail("Independent atomic admission readback unavailable",
         "sync_atomic_batch_indeterminate");
     }
-    if (witnessed?.statement?.nonce !== witnessNonce) {
+    let detachedWitness;
+    try { detachedWitness = JSON.parse(protocol.canonicalJson(witnessed)); }
+    catch { fail("Independent witness receipt is not canonical JSON",
+      "sync_atomic_batch_indeterminate"); }
+    if (detachedWitness?.statement?.nonce !== witnessNonce) {
       if (uncertainRequest && transient(uncertainRequest) && !witnessed) {
         summary.offline = true;
         return;
@@ -1230,8 +1286,29 @@ class SyncEngine {
     // sync server's unsigned HTTP payload. Keep that distinction explicit:
     // accepting a server-supplied `atomicAdmission` would undermine the
     // separate witness and a valid direct receipt must not be rejected.
-    verifyAtomicBatchAdmission({ atomicAdmission: witnessed }, [deleted, moved],
+    verifyAtomicBatchAdmission({ atomicAdmission: detachedWitness }, [deleted, moved],
       this.atomicBatchWitnessPublicKey, this.atomicBatchWitnessScope);
+    // An independently retained CAS floor must independently sign a second
+    // fresh challenge AFTER witness verification. Only an exact current
+    // physical head can authorize a local ACK; never use a journal/PG row or
+    // the original sync HTTP response as this readback.
+    const verifiedWitnessStatement = detachedWitness.statement;
+    const floorNonce = crypto.randomBytes(32).toString("base64url");
+    let floor;
+    try {
+      floor = await this.atomicBatchCasFloorReadback({
+        scope: this.atomicBatchWitnessScope,
+        nonce: floorNonce,
+        commitId: verifiedWitnessStatement.commitId,
+        storeHeadSha256: verifiedWitnessStatement.storeHeadSha256,
+        fencingEpoch: verifiedWitnessStatement.fencingEpoch,
+      });
+    } catch {
+      fail("Independent external CAS floor unavailable",
+        "sync_atomic_batch_indeterminate");
+    }
+    verifyAtomicBatchCasFloor(floor, verifiedWitnessStatement,
+      this.atomicBatchCasFloorPublicKey, this.atomicBatchWitnessScope, floorNonce);
     // Remote admission is one transaction. Local advancement may still crash;
     // keep BOTH original outbox entries pending until one atomic markSeenMany
     // after the verified response and local snapshot are durably written.

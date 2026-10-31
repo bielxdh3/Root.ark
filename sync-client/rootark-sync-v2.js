@@ -69,24 +69,32 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical) {
   if (!strictHistorical || !supplied || typeof supplied !== "object"
     || Array.isArray(supplied)
     || Object.keys(supplied).sort().join(",")
-      !== ["pinnedPublicKey", "scope", "readback"].sort().join(",")
+      !== ["pinnedPublicKey", "scope", "readback",
+        "casPinnedPublicKey", "casReadback"].sort().join(",")
     || typeof supplied.readback !== "function"
+    || typeof supplied.casReadback !== "function"
     || typeof supplied.scope !== "string"
     || !/^[A-Za-z0-9._:-]{1,256}$/.test(supplied.scope)
-    || !supplied.pinnedPublicKey) {
-    throw new Error("Atomic batch witness requires strict externally pinned readback");
+    || !supplied.pinnedPublicKey || !supplied.casPinnedPublicKey) {
+    throw new Error("Atomic batch witness requires independently pinned readback and external CAS floor");
   }
   // Validate at construction using the engine's existing strict Ed25519
   // SPKI verifier. Capture all references now; config cannot replace them.
   const readback = supplied.readback;
+  const casReadback = supplied.casReadback;
   return {
     atomicBatchWitnessPublicKey: Buffer.isBuffer(supplied.pinnedPublicKey)
       || supplied.pinnedPublicKey instanceof Uint8Array
       ? Buffer.from(supplied.pinnedPublicKey) : supplied.pinnedPublicKey,
     atomicBatchWitnessScope: supplied.scope,
+    atomicBatchCasFloorPublicKey: Buffer.isBuffer(supplied.casPinnedPublicKey)
+      || supplied.casPinnedPublicKey instanceof Uint8Array
+      ? Buffer.from(supplied.casPinnedPublicKey) : supplied.casPinnedPublicKey,
     atomicBatchWitnessReadback: ({ scope, nonce, operationIds, envelopeDigests }) =>
       readback({ scope, nonce, operationIds: [...operationIds],
         envelopeDigests: [...envelopeDigests] }),
+    atomicBatchCasFloorReadback: ({ scope, nonce, commitId, storeHeadSha256, fencingEpoch }) =>
+      casReadback({ scope, nonce, commitId, storeHeadSha256, fencingEpoch }),
   };
 }
 
