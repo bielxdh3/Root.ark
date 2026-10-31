@@ -1489,6 +1489,10 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
     attestorPool: countingAttestor,
     principals: { [fingerprint]: [{ scope: f.scope, accountId, storeId }] },
   });
+  let rejectedAtStage = 0;
+  server.on("zk65:invalid-stage", (safeStage) => {
+    rejectedAtStage = safeStage;
+  });
   await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", (err) =>
     err ? reject(err) : resolve()));
   t.after(() => new Promise((resolve) => server.close(resolve)));
@@ -1543,7 +1547,8 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
     ];
     const invalidShapeBits = shapeChecks.reduce((mask, good, i) => mask | (good ? 0 : (1 << i)), 0);
     stage = observed.status === 400
-      ? (observedSqlQueries === 0 ? 110400000 + invalidShapeBits : 1104001)
+      ? (observedSqlQueries === 0
+        ? 110400000 + rejectedAtStage * 4096 + invalidShapeBits : 1104001)
       : observed.status === 403 ? 110403
       : observed.status === 503
         ? (problem === "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE" ? 1105031
