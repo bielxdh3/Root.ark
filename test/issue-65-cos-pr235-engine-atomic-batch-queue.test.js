@@ -8,6 +8,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const protocol = require("../sync-client/rootark-sync-protocol");
@@ -29,6 +30,43 @@ function assertSameSignedEnvelopes(actual, expected, message) {
   // into plain JSON objects. Equality of the entire canonical encoding still
   // checks every signed byte (including AAD, ciphertext and Ed25519 proof).
   assert.equal(protocol.canonicalJson(actual), protocol.canonicalJson(expected), message);
+}
+
+async function snapshotPinnedJournal(filename, priorIdentity = null) {
+  const handle = await fsp.open(filename,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const before = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(filename, { bigint: true });
+    assert.equal(before.isFile(), true);
+    assert.equal(before.nlink, 1n);
+    for (const observed of [namedBefore]) {
+      assert.equal(observed.isFile(), true);
+      assert.equal(observed.dev, before.dev);
+      assert.equal(observed.ino, before.ino);
+      assert.equal(observed.nlink, before.nlink);
+    }
+    if (priorIdentity) {
+      assert.equal(before.dev, priorIdentity.dev,
+        "the poisoned journal must keep its original device");
+      assert.equal(before.ino, priorIdentity.ino,
+        "the poisoned journal must keep its original inode");
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(filename, { bigint: true });
+    for (const observed of [after, namedAfter]) {
+      assert.equal(observed.isFile(), true);
+      assert.equal(observed.dev, before.dev);
+      assert.equal(observed.ino, before.ino);
+      assert.equal(observed.nlink, before.nlink);
+      assert.equal(observed.size, BigInt(bytes.length));
+    }
+    assert.equal(before.size, after.size);
+    return { bytes, identity: { dev: before.dev, ino: before.ino } };
+  } finally {
+    await handle.close();
+  }
 }
 
 async function fixture(t, { batchResponse, witnessResponse,
@@ -569,12 +607,16 @@ test("legacy signed WebDAV DELETE orphan after local journal group deletion must
     await handle.writeFile(bytes);
     await handle.sync();
   } finally { await handle.close(); }
+  const evidence = await snapshotPinnedJournal(f.journalPath);
+  assert.deepEqual(evidence.bytes, bytes,
+    "the forged orphan DELETE must be persisted in the original journal inode");
   f.engine.journal = await new SyncJournal(f.journalPath).open();
   assertSameSignedEnvelopes(f.engine.journal.pending(), [f.deleted]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
   assert.equal(f.events.length, 0, "orphaned DELETE may not reach adapter.push");
-  assert.deepEqual(await fsp.readFile(f.journalPath), bytes,
+  assert.deepEqual((await snapshotPinnedJournal(
+    f.journalPath, evidence.identity)).bytes, bytes,
     "fail closed with original suspicious evidence preserved on disk");
 });
 
@@ -590,12 +632,16 @@ test("legacy signed WebDAV MOVE orphan after missing DELETE and group must NEVER
   const handle = await fsp.open(f.journalPath, "r+");
   try { await handle.truncate(0); await handle.writeFile(bytes); await handle.sync(); }
   finally { await handle.close(); }
+  const evidence = await snapshotPinnedJournal(f.journalPath);
+  assert.deepEqual(evidence.bytes, bytes,
+    "the forged orphan MOVE must be persisted in the original journal inode");
   f.engine.journal = await new SyncJournal(f.journalPath).open();
   assertSameSignedEnvelopes(f.engine.journal.pending(), [f.moved]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
   assert.equal(f.events.length, 0, "orphaned MOVE cannot be dispatched without old-target tombstone");
-  assert.deepEqual(await fsp.readFile(f.journalPath), bytes);
+  assert.deepEqual((await snapshotPinnedJournal(
+    f.journalPath, evidence.identity)).bytes, bytes);
 });
 
 test("new authenticated webdavsolo MOVE remains a legal standalone non-overwrite sync operation", {
