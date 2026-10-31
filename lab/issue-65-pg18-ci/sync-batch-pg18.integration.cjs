@@ -253,6 +253,11 @@ test("PG18 INSERT-only issuer cannot bypass ticket uniqueness or create future-l
   const farFuture = new Date(Date.now() + 86400000);
   await assert.rejects(submit({ issuedAt: farFuture,
     expiresAt: new Date(farFuture.valueOf() + 30000) }), { code: "23514" });
+  const staleIssue = new Date(Date.now() - 90000);
+  await assert.rejects(submit({ issuedAt: staleIssue,
+    expiresAt: new Date(staleIssue.valueOf() + 120000) }), { code: "23514" });
+  await assert.rejects(submit({ issuedAt: new Date(),
+    expiresAt: new Date(Date.now() + 3000) }), { code: "23514" });
   await assert.rejects(submit({ expiresAt: new Date(Date.now() + 60000) }),
     { code: "23514" });
   await assert.rejects(submit(), { code: "23505" },
@@ -396,6 +401,39 @@ test("PG18 stolen issuer INSERT privilege is capped at 128 live distinct pair ha
   assert.equal(committed.clientAckAuthorized, false);
   assert.equal(before.seen.length, 0);
   assert.equal((await f.state()).seen.length, 2);
+});
+
+test("PG18 one-minute issued-ticket quota survives expiry and cannot be bypassed by fake issuer digests", async () => {
+  const f = await fixture();
+  const original = await f.signedPair();
+  const live = await mintTestAdmission(f, original);
+  const template = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [live])).rows[0];
+  const insert = () => issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,sequence,
+     previous_head,delete_digest,move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+      clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), template.scope, template.username, template.device_id,
+    template.public_key, template.policy_epoch, template.sequence,
+    template.previous_head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  for (let batch = 0; batch < 2; batch++) {
+    for (let i = batch ? 0 : 1; i < 128; i++) await insert();
+    await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+      SET issued_at=clock_timestamp()-interval '30 seconds',
+          expires_at=clock_timestamp()-interval '1 second'
+      WHERE scope=$1 AND expires_at > clock_timestamp()`, [f.scope]);
+  }
+  const count = await admin.query(`SELECT count(*)::integer AS total
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1
+      AND issued_at >= clock_timestamp()-interval '1 minute'`, [f.scope]);
+  assert.equal(count.rows[0].total, 256);
+  await assert.rejects(insert(), { code: "23514" },
+    "expired but recent ticket handles must still count toward issuer budget");
+  const current = await f.state();
+  assert.equal(current.markers.length, 0);
+  assert.equal(current.seen.length, 0);
 });
 
 test("PG18 concurrent duplicate ticket requests cannot flood live same-pair handles", async () => {

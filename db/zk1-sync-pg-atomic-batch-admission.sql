@@ -38,13 +38,15 @@ SET search_path = pg_catalog AS $body$
 DECLARE
   active_head record;
   live_count bigint;
+  issued_recently bigint;
 BEGIN
   -- INSERT-only credentials must not bypass the active-pair uniqueness by
   -- supplying superseded=true, pre-consumed handles or far-future issuance.
   IF NEW.superseded IS DISTINCT FROM FALSE
     OR NEW.consumed IS DISTINCT FROM FALSE
     OR NEW.issued_at > clock_timestamp() + interval '1 second'
-    OR NEW.issued_at < clock_timestamp() - interval '2 minutes'
+    OR NEW.issued_at < clock_timestamp() - interval '5 seconds'
+    OR NEW.expires_at < NEW.issued_at + interval '25 seconds'
     OR NEW.expires_at > NEW.issued_at + interval '31 seconds'
     OR NEW.expires_at <= clock_timestamp() THEN
     RAISE EXCEPTION 'invalid admission ticket lifecycle' USING ERRCODE='23514';
@@ -60,6 +62,13 @@ BEGIN
     OR NEW.previous_head IS DISTINCT FROM active_head.head
     OR NEW.policy_epoch IS DISTINCT FROM active_head.policy_epoch THEN
     RAISE EXCEPTION 'missing admission scope head' USING ERRCODE='23514';
+  END IF;
+  -- A contender may have waited behind a long-held scope lock; use the DB
+  -- clock again AFTER the lock, never inserting an already-expired handle.
+  IF NEW.issued_at < clock_timestamp() - interval '5 seconds'
+    OR NEW.expires_at <= clock_timestamp() THEN
+    RAISE EXCEPTION 'admission expired while waiting for authority lock'
+      USING ERRCODE='23514';
   END IF;
   UPDATE zk1_sync_batch.admission_ticket SET superseded=true
     WHERE scope=NEW.scope AND sequence=NEW.sequence
@@ -77,6 +86,15 @@ BEGIN
       AND expires_at > clock_timestamp();
   IF live_count >= 128 THEN
     RAISE EXCEPTION 'scope admission ticket limit reached' USING ERRCODE='23514';
+  END IF;
+  -- Expiring or superseding tickets does not reset the issuance budget. A
+  -- stolen INSERT-only issuer credential cannot evade this rolling bound by
+  -- issuing near-expiry handles or generating many distinct fake digests.
+  SELECT count(*) INTO issued_recently FROM zk1_sync_batch.admission_ticket
+    WHERE scope=NEW.scope
+      AND issued_at >= clock_timestamp() - interval '1 minute';
+  IF issued_recently >= 256 THEN
+    RAISE EXCEPTION 'scope admission issue rate exceeded' USING ERRCODE='23514';
   END IF;
   RETURN NEW;
 END $body$;
