@@ -97,6 +97,9 @@ function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
   // Retain unresolved work in a bounded set until it really settles, so an
   // unavailable attestor cannot accumulate unlimited queued connections.
   const pendingReads = new Set();
+  // A timed-out fingerprint must not monopolize all pending slots by retrying:
+  // its first unresolved query continues to consume that principal's quota.
+  const pendingByFingerprint = new Map();
   const server = https.createServer({ key, cert, ca: clientCa,
     requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3",
     handshakeTimeout: 3000 }, async (req, res) => {
@@ -108,7 +111,8 @@ function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
     if (req.method !== "POST" || req.url !== ROUTE) {
       return respond(res, 404, { error: "NOT_FOUND" });
     }
-    if (active.has(fingerprint) || active.size >= 8) {
+    if (active.has(fingerprint) || pendingByFingerprint.has(fingerprint)
+      || active.size >= 8) {
       return respond(res, 503, { error: "SYNC_ATOMIC_SQL_OBSERVE_BUSY" });
     }
     active.add(fingerprint);
@@ -130,8 +134,14 @@ function createZk1SyncAtomicSqlReadbackHttpsServer({ key, cert, clientCa,
         envelopeDigests: challenge.envelopeDigests,
       }));
       pendingReads.add(inFlight);
-      inFlight.then(() => pendingReads.delete(inFlight),
-        () => pendingReads.delete(inFlight));
+      pendingByFingerprint.set(fingerprint, inFlight);
+      const settled = () => {
+        pendingReads.delete(inFlight);
+        if (pendingByFingerprint.get(fingerprint) === inFlight) {
+          pendingByFingerprint.delete(fingerprint);
+        }
+      };
+      inFlight.then(settled, settled);
       let timeout;
       let observed;
       try {

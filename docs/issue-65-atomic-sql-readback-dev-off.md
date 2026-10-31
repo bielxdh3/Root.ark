@@ -24,6 +24,8 @@ default); a deadline sends HTTP 503 but **does not cancel** an in-flight SQL
 read. Up to eight unresolved readbacks can exist; their slots remain occupied
 after HTTP timeout until the actual readback settles, preventing unbounded
 connections under a hung database at the cost of failing closed until recovery.
+Each client-certificate fingerprint is also limited to one unresolved query;
+retries from one stalled certificate cannot consume another principal's slot.
 The PostgreSQL pool must independently configure connection/query timeouts and
 the operator must restart an isolated failed observer when required. No caller
 can override this deadline from its request body.
