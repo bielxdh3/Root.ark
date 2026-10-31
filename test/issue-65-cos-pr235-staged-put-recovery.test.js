@@ -56,6 +56,62 @@ function sameIdentity(actual, previous) {
     && actual.isFile() && previous.isFile();
 }
 
+function assertPinnedBytes(filename, expectedIdentity, expectedUtf8) {
+  // Keep the original inode fixed throughout both the byte comparison and
+  // the pathname identity checks. Matching text from a replaced inode is not
+  // sufficient proof that recovery preserved the physical evidence.
+  const fd = fs.openSync(filename,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const before = fs.fstatSync(fd, { bigint: true });
+    const namedBefore = fs.lstatSync(filename, { bigint: true });
+    assert.equal(sameIdentity(before, expectedIdentity), true,
+      "opened descriptor must name the expected original inode");
+    assert.equal(sameIdentity(namedBefore, before), true,
+      "pathname must name the pinned descriptor, not a replacement");
+    const expected = Buffer.from(expectedUtf8, "utf8");
+    assert.equal(before.size, BigInt(expected.length));
+    const data = Buffer.alloc(expected.length);
+    let offset = 0;
+    while (offset < data.length) {
+      const length = fs.readSync(fd, data, offset, data.length - offset, offset);
+      assert.ok(length > 0, "pinned read must not end prematurely");
+      offset += length;
+    }
+    const after = fs.fstatSync(fd, { bigint: true });
+    const namedAfter = fs.lstatSync(filename, { bigint: true });
+    assert.equal(sameIdentity(after, before), true);
+    assert.equal(sameIdentity(namedAfter, before), true);
+    for (const property of ["size", "mtimeNs", "ctimeNs"]) {
+      assert.equal(after[property], before[property],
+        `descriptor ${property} must not change while reading`);
+      assert.equal(namedAfter[property], after[property],
+        `path ${property} must still match the descriptor`);
+    }
+    assert.deepEqual(data, expected);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function createExclusiveAndStat(filename, text) {
+  const fd = fs.openSync(filename,
+    fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR
+      | (fs.constants.O_NOFOLLOW || 0), 0o600);
+  try {
+    const bytes = Buffer.from(text, "utf8");
+    let offset = 0;
+    while (offset < bytes.length) {
+      const length = fs.writeSync(fd, bytes, offset, bytes.length - offset, offset);
+      assert.ok(length > 0, "exclusive evidence write must make progress");
+      offset += length;
+    }
+    return fs.fstatSync(fd, { bigint: true });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 async function setup(t) {
   const parent = createPrivateAuthorityFixture("cos-pr235-staged-");
   const root = path.join(parent, "bridge");
@@ -130,7 +186,7 @@ async function stagedHttpOperation(t) {
     const backupStat = fs.lstatSync(backup, { bigint: true });
     assert.equal(sameIdentity(backupStat, f.originalStat), true,
       "the true old inode must be physically linked in trash");
-    assert.equal(fs.readFileSync(backup, "utf8"), ORIGINAL);
+    assertPinnedBytes(backup, f.originalStat, ORIGINAL);
     assert.equal(fs.existsSync(f.target), false);
 
     const reopened = await new SyncJournal(f.journalPath).open();
@@ -165,9 +221,7 @@ test("real staged HTTP overwrite restores exact previous inode via independently
   const f = await stagedHttpOperation(t);
   try {
     await f.recovery.recoverPending();
-    assert.equal(fs.readFileSync(f.target, "utf8"), ORIGINAL);
-    assert.equal(sameIdentity(fs.lstatSync(f.target, { bigint: true }),
-      f.originalStat), true, "recovery must restore the real original inode");
+    assertPinnedBytes(f.target, f.originalStat, ORIGINAL);
     assert.equal(fs.existsSync(f.backup), false,
       "exclusive hard-link restoration must consume only the verified backup");
     assert.deepEqual(await f.reopened.recover(), []);
@@ -177,9 +231,7 @@ test("real staged HTTP overwrite restores exact previous inode via independently
       "markSeen must itself survive a second independent disk reopen");
     assert.deepEqual(await reopenedAgain.recover(), []);
     await settleOriginalRequest(f);
-    assert.equal(fs.readFileSync(f.target, "utf8"), ORIGINAL);
-    assert.equal(sameIdentity(fs.lstatSync(f.target, { bigint: true }),
-      f.originalStat), true);
+    assertPinnedBytes(f.target, f.originalStat, ORIGINAL);
   } finally {
     f.resume.resolve();
     await f.request.catch(() => {});
@@ -193,23 +245,23 @@ test("real staged HTTP overwrite refuses substituted backup, preserving foreign 
   const preserved = path.join(f.root, "preserved-original-outside-trash.txt");
   try {
     fs.renameSync(f.backup, preserved);
-    fs.writeFileSync(f.backup, FOREIGN_BACKUP, { flag: "wx", mode: 0o600 });
-    assert.notEqual(fs.lstatSync(f.backup, { bigint: true }).ino, f.originalStat.ino);
+    const foreignBackupStat = createExclusiveAndStat(f.backup, FOREIGN_BACKUP);
+    assert.notEqual(foreignBackupStat.ino, f.originalStat.ino);
     await assert.rejects(f.recovery.recoverPending(),
       { code: "WEBDAV_RECOVERY_INDETERMINATE" });
-    assert.equal(fs.readFileSync(f.backup, "utf8"), FOREIGN_BACKUP);
-    assert.equal(fs.readFileSync(preserved, "utf8"), ORIGINAL);
+    assertPinnedBytes(f.backup, foreignBackupStat, FOREIGN_BACKUP);
+    assertPinnedBytes(preserved, f.originalStat, ORIGINAL);
     assert.equal(fs.existsSync(f.target), false);
     assert.equal(f.reopened.hasSeen(f.operationId), false);
     assert.equal((await f.reopened.recover())[0].phase, "staged");
     // Occupy the destination before allowing the original suspended HTTP
     // request to terminate; otherwise it could continue publishing after
     // this assertion and misrepresent a crashed-process snapshot.
-    fs.writeFileSync(f.target, FOREIGN_TARGET, { flag: "wx", mode: 0o600 });
+    const occupiedStat = createExclusiveAndStat(f.target, FOREIGN_TARGET);
     await settleOriginalRequest(f);
-    assert.equal(fs.readFileSync(f.target, "utf8"), FOREIGN_TARGET);
-    assert.equal(fs.readFileSync(f.backup, "utf8"), FOREIGN_BACKUP);
-    assert.equal(fs.readFileSync(preserved, "utf8"), ORIGINAL);
+    assertPinnedBytes(f.target, occupiedStat, FOREIGN_TARGET);
+    assertPinnedBytes(f.backup, foreignBackupStat, FOREIGN_BACKUP);
+    assertPinnedBytes(preserved, f.originalStat, ORIGINAL);
   } finally {
     f.resume.resolve();
     await f.request.catch(() => {});
@@ -221,20 +273,16 @@ test("real staged HTTP overwrite refuses occupied destination without overwritin
 }, async (t) => {
   const f = await stagedHttpOperation(t);
   try {
-    fs.writeFileSync(f.target, FOREIGN_TARGET, { flag: "wx", mode: 0o600 });
-    const foreignStat = fs.lstatSync(f.target, { bigint: true });
+    const foreignStat = createExclusiveAndStat(f.target, FOREIGN_TARGET);
     await assert.rejects(f.recovery.recoverPending(),
       { code: "WEBDAV_RECOVERY_INDETERMINATE" });
-    assert.equal(fs.readFileSync(f.target, "utf8"), FOREIGN_TARGET);
-    assert.equal(fs.lstatSync(f.target, { bigint: true }).ino, foreignStat.ino);
-    assert.equal(fs.readFileSync(f.backup, "utf8"), ORIGINAL);
-    assert.equal(sameIdentity(fs.lstatSync(f.backup, { bigint: true }),
-      f.originalStat), true);
+    assertPinnedBytes(f.target, foreignStat, FOREIGN_TARGET);
+    assertPinnedBytes(f.backup, f.originalStat, ORIGINAL);
     assert.equal(f.reopened.hasSeen(f.operationId), false);
     assert.equal((await f.reopened.recover())[0].phase, "staged");
     await settleOriginalRequest(f);
-    assert.equal(fs.readFileSync(f.target, "utf8"), FOREIGN_TARGET);
-    assert.equal(fs.readFileSync(f.backup, "utf8"), ORIGINAL);
+    assertPinnedBytes(f.target, foreignStat, FOREIGN_TARGET);
+    assertPinnedBytes(f.backup, f.originalStat, ORIGINAL);
   } finally {
     f.resume.resolve();
     await f.request.catch(() => {});
