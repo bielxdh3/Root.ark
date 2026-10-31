@@ -1,0 +1,49 @@
+name: ZK65 Provider and Android Focused Regression
+
+# An additional genuine hosted test boundary; never replaces or relaxes the
+# canonical release-gate, full Ubuntu/Windows tests or PostgreSQL 18 checks.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/zk65-provider-android-focused.yml'
+      - 'src/services/zk1MultiproviderCiphertextRestore.js'
+      - 'src/services/zk1WebdavCiphertextAdapter.js'
+      - 'scripts/issue-64-android-fixtures.js'
+      - 'test/issue-65-full-multiprovider-http-restore.test.js'
+      - 'test/issue-64-android-contract.test.js'
+      - 'android/core/src/test/resources/server-responses.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zk65-provider-android-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  focused-real-transport-contracts:
+    name: Signed WebDAV 3-provider quorum and Android real routes (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Real signed remote-provider TLS quorum and Android live route fixtures
+        run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js
+      - name: Verify tests did not change repository files
+        run: git diff --exit-code
+      - name: Verify tests did not create untracked files
+        shell: bash
+        run: test -z "$(git status --porcelain)"
