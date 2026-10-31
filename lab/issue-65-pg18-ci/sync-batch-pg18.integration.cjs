@@ -1509,19 +1509,31 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   }
   stage = 10;
   const observed = await send(challenge);
-  stage = 11;
+  stage = 110;
   assert.equal(observed.status, 200);
+  stage = 111;
   assert.equal(observed.headers["cache-control"], "no-store");
+  stage = 112;
   assert.equal(observed.body.kind, "SYNC_ATOMIC_SQL_ROWS_ONLY_DEV_OFF");
+  stage = 113;
   assert.equal(observed.body.commitId, committed.commitId);
+  stage = 114;
   assert.equal(observed.body.storeHeadSha256, committed.storeHeadSha256);
+  stage = 115;
   assert.equal(observed.body.nonce, challenge.nonce);
+  stage = 116;
   assert.equal(observed.body.localPgRowsConsistent, true);
+  stage = 117;
   assert.equal(observed.body.physicalDurable, false);
+  stage = 118;
   assert.equal(observed.body.witnessVerified, false);
+  stage = 119;
   assert.equal(observed.body.clientAckAuthorized, false);
+  stage = 120;
   assert.equal(Object.hasOwn(observed.body, "statement"), false);
+  stage = 121;
   assert.equal(Object.hasOwn(observed.body, "signature"), false);
+  stage = 122;
   assert.equal(Object.hasOwn(observed.body, "atomicAdmission"), false);
   stage = 20;
   await assert.rejects(send(challenge, {}),
@@ -1750,4 +1762,42 @@ test("P1 adversarial RED requirement: verifier direct SQL state/head/marker/seen
   const after = await f.state();
   assert.deepEqual(after, before,
     "direct SQL attack cannot change physical state or authoritative marker");
+});
+
+test("PG18 attestor rejects accidental SECURITY DEFINER EXECUTE grants even with no table DML", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const result = await commitTestBatch(f, operations);
+  const signature = "zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)";
+  const baseline = await attestor.query(`SELECT
+    pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+  [signature]);
+  assert.equal(baseline.rows[0].allowed, false);
+  let granted = false;
+  try {
+    await admin.query(`GRANT EXECUTE ON FUNCTION
+      zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+      TO zk1_sync_batch_attestor_reader`);
+    granted = true;
+    const observed = await attestor.query(`SELECT
+      pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+    [signature]);
+    assert.equal(observed.rows[0].allowed, true,
+      "test must establish that a SECURITY DEFINER write capability became effective");
+    await assert.rejects(readback.verifyLatestSignedPair({
+      scope: f.scope, commitId: result.commitId,
+    }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+    "read-only attestor must fail closed on accidental owner-function authority");
+  } finally {
+    if (granted) {
+      await admin.query(`REVOKE EXECUTE ON FUNCTION
+        zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+        FROM zk1_sync_batch_attestor_reader`);
+    }
+  }
+  const restored = await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: result.commitId,
+  });
+  assert.equal(restored.localPgRowsConsistent, true);
+  assert.equal(restored.clientAckAuthorized, false);
 });
