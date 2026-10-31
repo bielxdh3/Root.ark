@@ -752,8 +752,15 @@ class LocalSyncWebDavBridge {
     // A seen-only digest with no retained envelope cannot prove those bytes:
     // intentionally require manual reconciliation rather than false ACK.
     try {
+      // Signed ID namespace also proves the overwrite distinction: solo
+      // MOVE uses webdavsolo-, displaced destination requires webdav- and
+      // a distinct DELETE. A mismatched backup/identity fails closed.
+      const overwritten = Boolean(operation.previousDestinationIdentity);
+      if (overwritten !== Boolean(operation.trash)) {
+        throw new Error("MOVE recovery overwrite identity and backup disagree");
+      }
       const relative = boundWebDavRelativePath(operation.destination);
-      const signedId = `webdav-${operation.operationId}-${crypto.createHash("sha256")
+      const signedId = `${overwritten ? "webdav" : "webdavsolo"}-${operation.operationId}-${crypto.createHash("sha256")
         .update(`move:${relative}`).digest("hex").slice(0, 24)}`;
       const witness = operation.signedOutboxReceipts?.find((item) =>
         item.operationId === signedId);
