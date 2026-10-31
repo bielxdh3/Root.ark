@@ -1173,7 +1173,11 @@ class SyncEngine {
       fail("Independent atomic admission readback nonce mismatch",
         "sync_atomic_batch_indeterminate");
     }
-    verifyAtomicBatchAdmission(witnessed, [deleted, moved],
+    // The independent readback callback returns the receipt itself, not the
+    // sync server's unsigned HTTP payload. Keep that distinction explicit:
+    // accepting a server-supplied `atomicAdmission` would undermine the
+    // separate witness and a valid direct receipt must not be rejected.
+    verifyAtomicBatchAdmission({ atomicAdmission: witnessed }, [deleted, moved],
       this.atomicBatchWitnessPublicKey, this.atomicBatchWitnessScope);
     // Remote admission is one transaction. Local advancement may still crash;
     // keep BOTH original outbox entries pending until one atomic markSeenMany
