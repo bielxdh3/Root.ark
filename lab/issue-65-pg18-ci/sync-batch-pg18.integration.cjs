@@ -1558,7 +1558,19 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
 
   // A blocked PG connection must not pin an HTTP response forever or create
   // unbounded work via retries. Expiration does NOT cancel or release a
-  // database operation until it genuinely settles.
+  // database operation until it genuinely settles. Multiple independently
+  // pinned client certificates prove one credential cannot starve the others.
+  const stalledClients = [client];
+  for (let i = 1; i < 8; i++) {
+    makeCert(`stalled-reader-${i}`, "clientAuth");
+    stalledClients.push({
+      key: read(`stalled-reader-${i}.key`),
+      cert: read(`stalled-reader-${i}.pem`),
+    });
+  }
+  const stalledPrincipals = Object.fromEntries(stalledClients.map((identity) =>
+    [new crypto.X509Certificate(identity.cert).fingerprint256,
+      [{ scope: f.scope, accountId, storeId }]]));
   let stalledConnectAttempts = 0;
   const stalled = createZk1SyncAtomicSqlReadbackHttpsServer({
     key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
@@ -1566,7 +1578,7 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
       stalledConnectAttempts += 1;
       return new Promise(() => {});
     } },
-    principals: { [fingerprint]: [{ scope: f.scope, accountId, storeId }] },
+    principals: stalledPrincipals,
     observationTimeoutMs: 80,
   });
   await new Promise((resolve, reject) => {
@@ -1578,12 +1590,20 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
     });
   });
   t.after(() => new Promise((resolve) => stalled.close(resolve)));
-  for (let i = 0; i < 8; i++) {
-    const unavailable = await send(challenge, client,
+  for (let i = 0; i < stalledClients.length; i++) {
+    const unavailable = await send(challenge, stalledClients[i],
       "/v2/sync-atomic/sql-observe", {}, stalled);
     assert.equal(unavailable.status, 503);
     assert.equal(unavailable.body.error, "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE");
     assert.equal(Object.hasOwn(unavailable.body, "commitId"), false);
+    if (i === 0) {
+      const samePeer = await send(challenge, stalledClients[0],
+        "/v2/sync-atomic/sql-observe", {}, stalled);
+      assert.equal(samePeer.status, 503);
+      assert.equal(samePeer.body.error, "SYNC_ATOMIC_SQL_OBSERVE_BUSY",
+        "same certificate cannot fill all pending PG slots after HTTP timeout");
+      assert.equal(stalledConnectAttempts, 1);
+    }
   }
   const deniedAfterCap = await send(challenge, client,
     "/v2/sync-atomic/sql-observe", {}, stalled);
