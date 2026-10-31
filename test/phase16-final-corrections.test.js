@@ -1232,8 +1232,14 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
     rootDir: root, token: "webdav-journal-sync-token", journal: transactionJournal, protocolJournal,
     toProtocolOperation: async () => operation,
   });
+  let recoveredBridge = null;
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    try {
+      if (recoveredBridge) await recoveredBridge.stop();
+      await bridge.stop();
+    } finally { await fsp.rm(dir, { recursive: true, force: true }); }
+  });
 
   const originalOpen = fsp.open;
   let injectDirectorySyncFailure = true;
@@ -1299,12 +1305,11 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
   const reopenedProtocolJournal = await new SyncJournal(protocolPath).open();
   assert.deepEqual(reopenedProtocolJournal.pending(), []);
   const recoveredTransactionJournal = await new SyncJournal(transactionPath).open();
-  const recoveredBridge = new LocalSyncWebDavBridge({
+  recoveredBridge = new LocalSyncWebDavBridge({
     rootDir: root, token: "webdav-journal-sync-token", journal: recoveredTransactionJournal,
     protocolJournal: reopenedProtocolJournal, toProtocolOperation: async () => operation,
   });
   await recoveredBridge.start();
-  t.after(async () => { await recoveredBridge.stop(); });
   assert.deepEqual(await recoveredTransactionJournal.recover(), []);
   assert.deepEqual(reopenedProtocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);
   const recovered = reopenedProtocolJournal.pending()[0];

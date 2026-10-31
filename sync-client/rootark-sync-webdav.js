@@ -894,6 +894,7 @@ class LocalSyncWebDavBridge {
         continue;
       }
       let applied = false;
+      let verifiedSignedPut = false;
       if (operation.kind === "move") {
         if (["source-moved", "protocol-queued"].includes(operation.phase)) {
           if (sourceExists || !destinationExists
@@ -915,7 +916,16 @@ class LocalSyncWebDavBridge {
             throw Object.assign(new Error("WebDAV PUT recovery installation is ambiguous"),
               { code: "WEBDAV_RECOVERY_INDETERMINATE" });
           }
-          applied = await this.verifyRecoveredPutBytes(destination, operation);
+          if (this.requireSignedProtocolIngress && this.hasPreviouslyCommittedSignedOutbox(operation)) {
+            // For an already admitted signed PUT, compare the ORIGINAL
+            // encrypted envelope before trusting any attacker-editable local
+            // size/hash witness. Both checks run inside the signed verifier.
+            await this.verifyRecoveredSignedPutContent(destination, operation);
+            verifiedSignedPut = true;
+            applied = true;
+          } else {
+            applied = await this.verifyRecoveredPutBytes(destination, operation);
+          }
         } else if (operation.phase === "prepared" && destinationExists) {
           throw Object.assign(new Error("WebDAV prepared PUT cannot prove installation"),
             { code: "WEBDAV_RECOVERY_INDETERMINATE" });
@@ -935,7 +945,7 @@ class LocalSyncWebDavBridge {
       if (applied) {
         if (this.requireSignedProtocolIngress) {
           if (this.hasPreviouslyCommittedSignedOutbox(operation)) {
-            if (operation.kind === "put") {
+            if (operation.kind === "put" && !verifiedSignedPut) {
               await this.verifyRecoveredSignedPutContent(destination, operation);
             } else if (operation.kind === "move") {
               await this.verifyRecoveredSignedMoveContent(destination, operation);
@@ -952,6 +962,19 @@ class LocalSyncWebDavBridge {
             // outbox receipt is not evidence of a successful admission.
             throw Object.assign(new Error("Committed WebDAV protocol outbox receipt missing"),
               { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+          }
+          // If an independently persisted mutation receipt points to an ID
+          // whose durable outbox digest was substituted, never reinterpret
+          // that already-admitted physical mutation as a fresh request.
+          // A genuinely missing outbox may still require current authority;
+          // a present but different digest is proof of conflict.
+          for (const receipt of Array.isArray(operation.signedOutboxReceipts)
+            ? operation.signedOutboxReceipts : []) {
+            const stored = this.protocolJournal?.durableSignedReceiptDigest?.(receipt.operationId);
+            if (stored && stored !== receipt.digest) {
+              throw Object.assign(new Error("WebDAV signed outbox receipt conflicts with physical admission"),
+                { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+            }
           }
         }
         const protocolQueued = await this.enqueueProtocol(operation);

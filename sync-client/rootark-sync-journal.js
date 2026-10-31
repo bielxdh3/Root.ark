@@ -46,6 +46,9 @@ function signedWebDavEventId(operation) {
 function atomicSignedWebDavPair(operations) {
   if (!Array.isArray(operations) || operations.length !== 2) return null;
   const [deleted, moved] = operations;
+  // A torn/corrupted outbox can still name both IDs in its durable manifest.
+  // Missing members are an invalid group, not an uncaught TypeError.
+  if (!deleted || typeof deleted !== "object" || !moved || typeof moved !== "object") return null;
   const event = signedWebDavEventId(deleted);
   if (!event || deleted.operation !== "delete" || moved.operation !== "move"
     || signedWebDavEventId(moved) !== event

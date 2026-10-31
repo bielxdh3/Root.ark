@@ -184,6 +184,9 @@ test("Phase 16 WebDAV exclusive publication and journal failures restore both fu
   assert.deepEqual(await fsp.readFile(path.join(dir, "source.txt")), sourceBytes);
   assert.deepEqual(await fsp.readFile(path.join(dir, "destination.txt")), destinationBytes);
 
+  // Lifetime root/journal locks prohibit two live owners of the same root.
+  // This is a sequential failure-mode test, not a concurrent-owner test.
+  await bridge.stop();
   const journalFailure = new LocalSyncWebDavBridge({ rootDir: dir, token: "phase16-token", journal, onOperation: async () => { throw new Error("journal failure"); } });
   await journalFailure.start();
   const secondSource = path.join(dir, "second-source.txt");

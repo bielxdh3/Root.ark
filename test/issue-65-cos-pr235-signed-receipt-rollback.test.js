@@ -282,10 +282,12 @@ test("same signed operationId with a second valid Ed25519 envelope cannot replac
     "signed operation cannot be replaced by valid alternative or unsigned collision");
   f.state.revoked = true;
   const pair = await f.reopen();
-  await f.bridge(pair.mutation, pair.outbox, () => {
+  // A seen-only digest is insufficient once the original encrypted envelope
+  // has been purged: retain the physical mutation for manual reconciliation.
+  await assertDeniedUnchanged(f, () => f.bridge(pair.mutation, pair.outbox, () => {
     throw new Error("seen exact signed outbox must not be retranslated");
-  }).recoverPending();
-  assert.deepEqual((await disk(f.mutationPath)).pending(), []);
+  }).recoverPending(), { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+  assert.equal((await disk(f.mutationPath)).pending().length, 1);
   assert.equal((await disk(f.outboxPath)).durableSignedReceiptDigest(f.signedId),
     receipt(f.signed).digest);
 });

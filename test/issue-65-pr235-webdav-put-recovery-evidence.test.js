@@ -16,7 +16,12 @@ function fixture(t, operation) {
   const parent = createPrivateAuthorityFixture("webdav-replay-pin-");
   const root = path.join(parent, "private");
   fs.mkdirSync(root, { mode: 0o700 });
-  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+  const shutdown = [];
+  t.after(async () => {
+    // The root must outlive the bridge's filesystem ownership release.
+    try { for (const stop of shutdown) await stop(); }
+    finally { fs.rmSync(parent, { recursive: true, force: true }); }
+  });
   const queued = [];
   const seen = [];
   const journal = {
@@ -29,7 +34,8 @@ function fixture(t, operation) {
     toProtocolOperation: async (item) => ({ operationId: item.operationId,
       operation: item.kind }),
   });
-  return { root, bridge, queued, seen, operation };
+  return { root, bridge, queued, seen, operation,
+    registerShutdown: (stop) => shutdown.push(stop) };
 }
 
 function bindSyntheticInodeWitness(f) {
@@ -112,7 +118,7 @@ test("prepared PUT with no target has no bytes to replay and never enqueues", as
 test("real authenticated HTTP PUT records immutable byte count and SHA for restart", {
   timeout: 120000,
 }, async (t) => {
-  const { root, bridge: recoveryBridge, queued, seen } = fixture(t, put("prepared"));
+  const { root, bridge: recoveryBridge, queued, seen, registerShutdown } = fixture(t, put("prepared"));
   const recorded = [];
   const mutationJournal = {
     enqueue: async (item) => { recorded.push({ ...item }); },
@@ -124,7 +130,7 @@ test("real authenticated HTTP PUT records immutable byte count and SHA for resta
   };
   const live = new LocalSyncWebDavBridge({ rootDir: root, token: "test-only-http-put",
     journal: mutationJournal, port: 0 });
-  t.after(() => live.stop());
+  registerShutdown(() => live.stop());
   await live.start();
   const content = Buffer.from("PAYLOAD_SIGNED_IN_LOCAL_MUTATION_JOURNAL");
   const response = await new Promise((resolve, reject) => {
