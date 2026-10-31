@@ -1526,7 +1526,24 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   if (observed.status !== 200) {
     // Only a finite, non-sensitive diagnostic code is allowed in hosted CI.
     const problem = observed.body?.error;
-    stage = observed.status === 400 ? (observedSqlQueries === 0 ? 1104000 : 1104001)
+    const nonceBytes = Buffer.from(challenge.nonce, "base64url");
+    const shapeChecks = [
+      Buffer.byteLength(JSON.stringify(challenge), "utf8") <= 4096,
+      Object.keys(challenge).length === 6,
+      /^[A-Za-z0-9._:-]{1,256}$/.test(challenge.scope),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challenge.accountId),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challenge.storeId),
+      /^[A-Za-z0-9_-]{43}$/.test(challenge.nonce),
+      nonceBytes.length === 32 && nonceBytes.toString("base64url") === challenge.nonce,
+      challenge.operationIds.length === 2,
+      challenge.operationIds.every((id) => /^[A-Za-z0-9._:-]{1,160}$/.test(id)),
+      challenge.operationIds[0] !== challenge.operationIds[1],
+      challenge.envelopeDigests.length === 2,
+      challenge.envelopeDigests.every((digest) => /^[a-f0-9]{64}$/.test(digest)),
+    ];
+    const invalidShapeBits = shapeChecks.reduce((mask, good, i) => mask | (good ? 0 : (1 << i)), 0);
+    stage = observed.status === 400
+      ? (observedSqlQueries === 0 ? 110400000 + invalidShapeBits : 1104001)
       : observed.status === 403 ? 110403
       : observed.status === 503
         ? (problem === "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE" ? 1105031
