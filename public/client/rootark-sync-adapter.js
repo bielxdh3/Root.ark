@@ -159,6 +159,31 @@
         const deleteRequest = normalized.operation === "delete";
         return request(`/sync/v1/objects${deleteRequest ? `/${encodeURIComponent(normalized.objectId)}` : ""}`, { method: deleteRequest ? "DELETE" : "POST", body: JSON.stringify(normalized) });
       },
+      // The protected overwrite handshake must be ONE remote transaction.
+      // Two consecutive push() calls would delete the displaced destination
+      // before a separately rejected MOVE; callers must use this endpoint
+      // only when their store/authority actually supports atomic batch CAS.
+      pushBatch: (envelopes) => {
+        if (!Array.isArray(envelopes) || envelopes.length !== 2) {
+          fail("Protected compound sync requires exactly two signed operations");
+        }
+        const [deleted, moved] = envelopes.map((entry) => assertOpaqueEnvelope(entry));
+        if (deleted.operation !== "delete" || moved.operation !== "move"
+          || !deleted.authorization || !moved.authorization
+          || deleted.metadata.path !== moved.metadata.path
+          || deleted.compartmentId !== moved.compartmentId
+          || deleted.keyEpoch !== moved.keyEpoch
+          || deleted.objectId === moved.objectId || deleted.fileId === moved.fileId
+          || deleted.operationId === moved.operationId
+          || deleted.deviceId !== moved.deviceId
+          || deleted.authorization.replayId === moved.authorization.replayId
+          || deleted.authorization.idempotencyKey === moved.authorization.idempotencyKey) {
+          fail("Invalid authenticated DELETE-before-MOVE transaction");
+        }
+        return request("/sync/v1/objects/batch", {
+          method: "POST", body: JSON.stringify({ operations: [deleted, moved] }),
+        });
+      },
       validate: assertOpaqueEnvelope,
       normalize: assertOpaqueEnvelope,
       protocolVersion: PROTOCOL_VERSION,

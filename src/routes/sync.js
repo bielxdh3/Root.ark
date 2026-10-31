@@ -4,7 +4,8 @@ const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
+const { PROTOCOL_VERSION, compareRevisions, validateOperation,
+  validateFreshSignedOperation } = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
@@ -48,9 +49,13 @@ async function syncDirectory(directory) {
   }
 }
 
-async function renameWithRetry(source, destination) {
+async function renameWithRetry(source, destination, beforeRename = null) {
   for (let attempt = 1; attempt <= WINDOWS_RENAME_MAX_ATTEMPTS; attempt += 1) {
     try {
+      // The optional strict-batch authorization check runs synchronously
+      // immediately before EACH rename attempt, including after a Windows
+      // EPERM retry delay. No await separates this check from fs.rename().
+      if (beforeRename) beforeRename();
       await fs.rename(source, destination);
       return;
     } catch (error) {
@@ -82,6 +87,12 @@ function atomicDeviceEpochError() {
   });
 }
 
+function signedBatchFailure(kind, current = null) {
+  return Object.assign(new Error("Atomic signed Sync batch rejected"), {
+    code: "SYNC_SIGNED_BATCH_REJECTED", kind, current,
+  });
+}
+
 // JSON records are ordinary objects after JSON.parse: reserved account,
 // operation, and object identifiers must never resolve inherited properties
 // or invoke the __proto__ setter while persisting tenant-owned entries.
@@ -102,12 +113,15 @@ function ensureOwnMap(record, key) {
   return value;
 }
 
-async function durableWrite(filePath, value, requirePrivateStorage = false) {
+async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
   const directory = path.dirname(filePath);
   if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
   else await fs.mkdir(directory, { recursive: true });
-  const temporary = `${filePath}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
-  const handle = await fs.open(temporary, "w", 0o600);
+  // A pre-planted temporary symlink/hardlink must never be truncated before
+  // private-storage and inode checks. Random UUID names plus O_EXCL preserve
+  // the original file on collisions, including across process restarts.
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const handle = await fs.open(temporary, "wx", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
     await handle.sync();
@@ -117,7 +131,7 @@ async function durableWrite(filePath, value, requirePrivateStorage = false) {
   let renamed = false;
   try {
     if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
-    await renameWithRetry(temporary, filePath);
+    await renameWithRetry(temporary, filePath, beforeRename);
     renamed = true;
     if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
   } catch (error) {
@@ -379,7 +393,7 @@ class SyncObjectStore {
     return this;
   }
 
-  async transact(mutator) {
+  async transact(mutator, { beforeRename = null } = {}) {
     let result;
     // A failed mutator or fsync must reject its own caller, but must not
     // permanently poison every later transaction on this store instance.
@@ -393,7 +407,7 @@ class SyncObjectStore {
         const next = JSON.parse(JSON.stringify(await this.readCurrentState()));
         result = await mutator(next);
         try {
-          await durableWrite(this.filePath, next, this.atomicDeviceRegistry);
+          await durableWrite(this.filePath, next, this.atomicDeviceRegistry, beforeRename);
         } catch (error) {
           if (error?.syncCommitIndeterminate === true) this.commitIndeterminate = true;
           throw error;
@@ -479,6 +493,16 @@ class SyncObjectStore {
   }
 
   async put(username, input) {
+    let protectedWritePrepared = false;
+    const assertProtectedFreshBeforeRename = () => {
+      // File fsync happens after the last awaited verifier. A device grant
+      // can expire during fsync; check again at the physical rename barrier
+      // under the same cross-process writer lock. A defensive burst pause
+      // never stores a protected object and must remain durable on expiry.
+      if (protectedWritePrepared && input.authorization.expiresAt <= Date.now()) {
+        throw atomicDeviceAuthError();
+      }
+    };
     return this.transact(async (next) => {
       // A signed Sync v2 operation is protected data, even when a legacy
       // route/worker forgot to request device authorization. A separate
@@ -566,8 +590,136 @@ class SyncObjectStore {
         // signed authorization expired while applying the bounded mutation.
         throw atomicDeviceAuthError();
       }
+      protectedWritePrepared = this.atomicDeviceRegistry;
       return { kind: "stored", record };
-    });
+    }, { beforeRename: assertProtectedFreshBeforeRename });
+  }
+
+  // DEV-OFF bounded compound Sync v2 mutation: the account SQLite writer
+  // fence is held by the HTTP caller, and transact() owns ONE cross-process
+  // file writer lock, ONE fresh registry snapshot and ONE durableWrite.
+  // Do not call put() twice: the first DELETE must never outlive a failed MOVE.
+  async putSignedBatch(username, inputs) {
+    if (!this.atomicDeviceRegistry) throw invalidRegistry();
+    if (!Array.isArray(inputs) || inputs.length !== 2) throw signedBatchFailure("invalid");
+    // The trusted atomic-registry feature flag is authoritative; unsigned
+    // or expired batch envelopes are invalid regardless of caller metadata.
+    const [deleted, moved] = inputs.map((input) => validateFreshSignedOperation(input));
+    if (deleted.operation !== "delete" || moved.operation !== "move"
+      || !deleted.tombstone || moved.tombstone
+      || deleted.deviceId !== moved.deviceId
+      // These signed envelopes describe ONE destination replacement, not
+      // an unrelated delete plus an unrelated move.
+      || deleted.metadata.path !== moved.metadata.path
+      || deleted.compartmentId !== moved.compartmentId
+      || deleted.keyEpoch !== moved.keyEpoch
+      || deleted.objectId === moved.objectId
+      || deleted.fileId === moved.fileId
+      || deleted.operationId === moved.operationId
+      || !deleted.authorization || !moved.authorization
+      || deleted.authorization.replayId === moved.authorization.replayId
+      || deleted.authorization.idempotencyKey === moved.authorization.idempotencyKey) {
+      throw signedBatchFailure("invalid");
+    }
+    const assertSignedBatchFresh = () => {
+      // Run again after temporary-file fsync, immediately before physical
+      // rename under the SAME exclusive writer lock. Expiry during the
+      // awaited durableWrite must not turn into a destructive batch commit.
+      const now = Date.now();
+      if (deleted.authorization.expiresAt <= now || moved.authorization.expiresAt <= now) {
+        throw atomicDeviceAuthError();
+      }
+    };
+    return this.transact(async (next) => {
+      const registry = assertAtomicDeviceRegistry(next.deviceRegistry);
+      const committedUser = this.user(next, username);
+      // Keep the destructive batch staged until BOTH revisions and burst
+      // checks pass; a rejected MOVE must never leave the DELETE committed.
+      const user = JSON.parse(JSON.stringify(committedUser));
+      // Rebind the common signed destination to the actual DELETE target
+      // freshly loaded inside the same exclusive writer transaction.
+      const destination = ownRecord(user.objects, deleted.objectId);
+      if (!destination || destination.metadata?.path !== deleted.metadata.path
+        || moved.metadata.path !== destination.metadata.path
+        || moved.compartmentId !== destination.compartmentId
+        || deleted.keyEpoch !== destination.keyEpoch) {
+        throw signedBatchFailure("conflict", destination || null);
+      }
+      const at = this.now();
+      const records = [];
+      for (const input of [deleted, moved]) {
+        // Repeat verification for BOTH operations against the same registry
+        // loaded INSIDE the exclusive writer lock, after any prior revoke.
+        const device = ownRecord(ownRecord(registry.devices, username), input.deviceId);
+        if (!device || device.revokedAtEpoch !== null) throw atomicDeviceAuthError();
+        try {
+          if (await verifyAuthorizationProof(input.authorization, input, {
+            username, trustedDevicePublicKeys: { [input.deviceId]: device.publicKey },
+          }) !== true) throw atomicDeviceAuthError();
+        } catch { throw atomicDeviceAuthError(); }
+        if (!Number.isSafeInteger(input.authorization.expiresAt)
+          || input.authorization.expiresAt <= Date.now()) throw atomicDeviceAuthError();
+        if (ownRecord(user.seen, input.operationId)) throw signedBatchFailure("replay");
+        const current = ownRecord(user.objects, input.objectId) || null;
+        if (!current || !input.baseRevision
+          || compareRevisions(input.baseRevision, current.revision) !== 0) {
+          throw signedBatchFailure("conflict", current);
+        }
+        if (compareRevisions(input.revision, current.revision) <= 0) {
+          throw signedBatchFailure("stale", current);
+        }
+        // A signed MOVE must move the same object from its actual current
+        // source, not smuggle a new file or compartment under an old revision.
+        if (input.fileId !== current.fileId
+          || input.compartmentId !== current.compartmentId
+          || input.keyEpoch !== current.keyEpoch
+          || (input.operation === "move" && current.tombstone === true)
+          || (input.operation === "move" && input.metadata.sourcePath !== current.metadata?.path)
+          || (input.operation === "delete" && input.metadata.path !== current.metadata?.path)) {
+          throw signedBatchFailure("conflict", current);
+        }
+        if (isPausedDevice(user, input.deviceId)) {
+          return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
+        }
+        const burst = this.recordDurableBurst(user, input.deviceId, input.objectId, at);
+        if (burst.exceeded) {
+          // Persist the sticky protective pause and attempt counters ONLY,
+          // never the staged object/seen/version changes of either member.
+          setOwnRecord(committedUser, "burstCounters", user.burstCounters);
+          setOwnRecord(ensureOwnMap(committedUser, "pausedDevices"),
+            pausedKey(input.deviceId), {
+              pausedAt: new Date(at).toISOString(),
+              pauseNonce: crypto.randomUUID(),
+              reason: burst.objectExceeded ? "object_burst" : "destructive_burst",
+              limit: burst.limit, windowMs: burst.windowMs,
+            });
+          return { kind: "paused", newlyPaused: true, deviceId: input.deviceId,
+            limit: burst.limit, windowMs: burst.windowMs, objectLimit: burst.objectLimit };
+        }
+        const record = publicRecord(input);
+        setOwnRecord(user.objects, input.objectId, record);
+        const previousVersions = ownRecord(user.versions, input.objectId) || [];
+        const previousTimes = ownRecord(user.versionTimes, input.objectId) || [];
+        const padding = Array(Math.max(0, previousVersions.length - previousTimes.length)).fill(0);
+        const pruned = pruneObjectHistory([...previousVersions, record],
+          [...padding, ...previousTimes, at], at - this.retentionMs,
+          ownRecord(user, "pausedDevices") || {});
+        setOwnRecord(user.versions, input.objectId, pruned.versions);
+        setOwnRecord(user.versionTimes, input.objectId, pruned.times);
+        setOwnRecord(user.revisions, input.objectId, input.revision);
+        setOwnRecord(user.seen, input.operationId, true);
+        const seenIds = Object.keys(user.seen);
+        for (const oldId of seenIds.slice(0, Math.max(0, seenIds.length - MAX_SEEN_OPERATIONS))) {
+          delete user.seen[oldId];
+        }
+        records.push(record);
+      }
+      // The signatures may have expired during the second verifier's awaits.
+      // No await remains before transact()'s single durableWrite.
+      assertSignedBatchFresh();
+      setOwnRecord(next.users, username, user);
+      return records;
+    }, { beforeRename: assertSignedBatchFresh });
   }
 
   // These methods are for server-owned, already-authorized enrollment and
@@ -772,7 +924,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (Object.hasOwn(payload, "plaintext") || Object.hasOwn(payload, "fileKey")) return errorResponse(res, 400, "Plaintext and keys are not accepted");
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
-    try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
+    // The trusted server-side registry setting, never an untrusted proof's
+    // optional presence, determines whether signed ingress is mandatory.
+    // The store still independently checks device signatures and revocation.
+    try { operation = atomicDeviceRegistry
+      ? validateFreshSignedOperation(payload) : validateOperation(payload); }
+    catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
     // Safe rollout: old unsigned development writes may remain available when
     // no device auth is required. A signed envelope OR a route configured for
     // device authorization must fail closed until an operator explicitly
@@ -816,6 +973,10 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       if (error?.code === "SYNC_COMMIT_INDETERMINATE" || store.commitIndeterminate) {
         return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
       }
+      if (error?.code === "SYNC_STORE_LOCK_BUSY") {
+        return errorResponse(res, 503, "Sync writer lock unavailable",
+          { code: "SYNC_STORE_LOCK_BUSY" });
+      }
       throw error;
     }
     if (result.kind === "paused") {
@@ -845,6 +1006,103 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     res.json(objects[0]);
   });
   app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"), (req, res) => write(req, res));
+  app.post("/sync/v1/objects/batch", sizeGuard, authenticate, requirePermission("upload"), async (req, res) => {
+    // Never silently downgrade a signed compound mutation to two legacy PUTs.
+    if (!atomicDeviceRegistry || !persistUnderAccountFence) {
+      return errorResponse(res, 503, "Protected Sync v2 requires atomic device registry",
+        { code: "SYNC_PROTECTED_ATOMIC_REQUIRED" });
+    }
+    try { await ready; } catch {
+      return errorResponse(res, 503, "Sync atomic registry unavailable",
+        { code: "SYNC_ATOMIC_REGISTRY_UNAVAILABLE" });
+    }
+    const body = req.body;
+    if (!body || typeof body !== "object" || Array.isArray(body)
+      || Reflect.ownKeys(body).length !== 1 || !Object.hasOwn(body, "operations")
+      || !Array.isArray(body.operations) || body.operations.length !== 2) {
+      return errorResponse(res, 400, "Invalid atomic sync batch");
+    }
+    // The application installs express.json({ limit: "9mb" }) for all Sync
+    // routes. Also bound the aggregate parsed JSON, NOT each of the two
+    // ciphertext envelopes separately, even under an alternate parser or
+    // transfer without Content-Length.
+    let aggregateBytes;
+    try { aggregateBytes = Buffer.byteLength(JSON.stringify(body), "utf8"); }
+    catch { return errorResponse(res, 400, "Invalid atomic sync batch"); }
+    if (aggregateBytes > MAX_REQUEST_BYTES) {
+      return errorResponse(res, 413, "Sync payload too large");
+    }
+    let operations;
+    try {
+      operations = body.operations.map((payload) => {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)
+          || Object.hasOwn(payload, "plaintext") || Object.hasOwn(payload, "fileKey")
+          || (typeof payload.ciphertext === "string"
+            && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES)) {
+          throw signedBatchFailure("invalid");
+        }
+        return validateFreshSignedOperation(payload);
+      });
+    } catch (error) {
+      return errorResponse(res, error?.code?.startsWith("authorization") ? 403 : 400,
+        "Invalid atomic sync batch");
+    }
+    const [deleted, moved] = operations;
+    if (deleted.operation !== "delete" || moved.operation !== "move"
+      || !deleted.authorization || !moved.authorization
+      || deleted.metadata.path !== moved.metadata.path
+      || deleted.compartmentId !== moved.compartmentId
+      || deleted.keyEpoch !== moved.keyEpoch
+      || deleted.operationId === moved.operationId
+      || deleted.objectId === moved.objectId
+      || deleted.fileId === moved.fileId
+      || deleted.deviceId !== moved.deviceId
+      || deleted.authorization.replayId === moved.authorization.replayId
+      || deleted.authorization.idempotencyKey === moved.authorization.idempotencyKey) {
+      return errorResponse(res, 400, "Invalid atomic sync batch");
+    }
+    if (req.user?.permissions?.delete !== true) {
+      return errorResponse(res, 403, "Sync delete permission required");
+    }
+    let outcome;
+    try {
+      outcome = await persistUnderAccountFence(req.user, deleted,
+        () => store.putSignedBatch(req.user.username, operations));
+    } catch (error) {
+      if (error?.code === "SYNC_SIGNED_BATCH_REJECTED") {
+        if (error.kind === "paused") return errorResponse(res, 423, "sync_burst_paused",
+          { code: "sync_burst_paused" });
+        if (error.kind === "invalid") return errorResponse(res, 400, "Invalid atomic sync batch");
+        return errorResponse(res, 409, "Atomic sync batch conflict");
+      }
+      if (error?.code === "SYNC_ATOMIC_DEVICE_AUTH_REJECTED"
+        || error?.code === "SYNC_ATOMIC_ACCOUNT_AUTH_REJECTED") {
+        return errorResponse(res, 403, "Sync device authorization rejected");
+      }
+      if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
+        return errorResponse(res, 503, "Sync account authorization unavailable");
+      }
+      if (error?.code === "SYNC_COMMIT_INDETERMINATE" || store.commitIndeterminate) {
+        return errorResponse(res, 503, "sync_commit_indeterminate",
+          { code: "SYNC_COMMIT_INDETERMINATE" });
+      }
+      if (error?.code === "SYNC_STORE_LOCK_BUSY") {
+        return errorResponse(res, 503, "Sync writer lock unavailable",
+          { code: "SYNC_STORE_LOCK_BUSY" });
+      }
+      throw error;
+    }
+    if (outcome?.kind === "paused") {
+      if (outcome.newlyPaused) {
+        audit("sync.burst.paused", req, outcome.deviceId, "paused", "partial",
+          { limit: outcome.limit, windowMs: outcome.windowMs });
+      }
+      return errorResponse(res, 423, "sync_burst_paused",
+        { code: "sync_burst_paused", deviceId: outcome.deviceId });
+    }
+    return res.status(200).json({ protocolVersion: PROTOCOL_VERSION,
+      objects: outcome.map(publicRecord) });
+  });
   app.put("/sync/v1/objects/:objectId", sizeGuard, authenticate, requirePermission("upload"), (req, res) => {
     if (req.body?.objectId && req.body.objectId !== req.params.objectId) return errorResponse(res, 400, "Object id mismatch");
     return write(req, res);
