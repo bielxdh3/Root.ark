@@ -22,6 +22,7 @@ const { createPrivateAuthorityFixture } = require("./support/issue-65-private-au
 const BYTES = Buffer.from("AUTHORIZED_PHYSICAL_PUT_SAME_DEVICE_SIGNED_RECEIPT");
 const LIMIT = 45_000;
 const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const diskShape = (value) => JSON.parse(JSON.stringify(value));
 const receipt = (signed) => ({
   operationId: signed.operationId, digest: sha(protocol.canonicalJson(signed)),
 });
@@ -146,7 +147,7 @@ async function exactAdmission(f) {
   assert.deepEqual(pending[0].signedOutboxReceipts, [receipt(f.signed)],
     "local receipt must derive from the exact verified signature and ciphertext");
   assert.equal(pair.outbox.durableSignedReceiptDigest(f.signedId), receipt(f.signed).digest);
-  assert.deepEqual(pair.outbox.pending(), [f.signed],
+  assert.deepEqual(pair.outbox.pending(), diskShape([f.signed]),
     "signed envelope must survive a distinct disk journal reopen");
   return pair;
 }
@@ -158,7 +159,8 @@ async function assertDeniedUnchanged(f, action, match) {
   const after = await f.evidence();
   assert.deepEqual(after, before,
     "denial must preserve signed outbox, mutation journal and physical bytes");
-  assert.deepEqual((await disk(f.mutationPath)).pending(), [phase]);
+  assert.deepEqual((await disk(f.mutationPath)).pending(),
+    JSON.parse(JSON.stringify([phase])));
 }
 
 test("genuine signed outbox fsync with lost local ACK safely recovers under revoked policy", {
@@ -183,10 +185,10 @@ test("genuine signed outbox fsync with lost local ACK safely recovers under revo
   const after = await f.reopen();
   assert.deepEqual(after.mutation.pending(), []);
   assert.equal(after.mutation.hasSeen(f.event.operationId), true);
-  assert.deepEqual(after.outbox.pending(), [f.signed]);
+  assert.deepEqual(after.outbox.pending(), diskShape([f.signed]));
   assert.deepEqual(await fsp.readFile(f.target), BYTES);
   await f.bridge(after.mutation, after.outbox).recoverPending();
-  assert.deepEqual((await disk(f.outboxPath)).pending(), [f.signed],
+  assert.deepEqual((await disk(f.outboxPath)).pending(), diskShape([f.signed]),
     "later recovery cannot replay an already acknowledged signed envelope");
 });
 
@@ -203,7 +205,7 @@ test("source-moved with genuine persisted outbox and receipt is recovered withou
   assert.equal(f.state.policyReads, priorReads);
   assert.deepEqual(after.mutation.pending(), []);
   assert.equal(after.mutation.hasSeen(f.event.operationId), true);
-  assert.deepEqual(after.outbox.pending(), [f.signed]);
+  assert.deepEqual(after.outbox.pending(), diskShape([f.signed]));
 });
 
 test("protocol-queued claim with no durable signed outbox cannot be promoted by a stale policy", {
@@ -264,7 +266,7 @@ test("same signed operationId with a second valid Ed25519 envelope cannot replac
     "the second fully signed encryption must contain different canonical bytes");
   await assertDeniedUnchanged(f, () => f.outbox.enqueue(alternate),
     { code: "sync_journal_operation_conflict" });
-  assert.deepEqual((await disk(f.outboxPath)).pending(), [f.signed]);
+  assert.deepEqual((await disk(f.outboxPath)).pending(), diskShape([f.signed]));
   await f.outbox.markSeen(f.signedId);
   const acknowledged = await disk(f.outboxPath);
   assert.deepEqual(acknowledged.pending(), []);
@@ -300,7 +302,7 @@ test("outbox replaced by internally consistent different VALID signed envelope w
   assert.notEqual(receipt(alternate).digest, receipt(f.signed).digest);
   const raw = JSON.parse(await fsp.readFile(f.outboxPath, "utf8"));
   assert.equal(raw.pending.length, 1);
-  assert.deepEqual(raw.pending[0], f.signed);
+  assert.deepEqual(raw.pending[0], diskShape(f.signed));
   assert.equal(raw.committedSigned[f.signedId], receipt(f.signed).digest);
   // Deliberate hostile disk rollback/substitution, not an authorized second
   // enqueue. Both the signed envelope AND its local outbox digest are changed
@@ -314,7 +316,7 @@ test("outbox replaced by internally consistent different VALID signed envelope w
     await handle.sync();
   } finally { await handle.close(); }
   const outbox = await disk(f.outboxPath);
-  assert.deepEqual(outbox.pending(), [alternate]);
+  assert.deepEqual(outbox.pending(), diskShape([alternate]));
   assert.equal(outbox.durableSignedReceiptDigest(f.signedId), receipt(alternate).digest,
     "attacker's outbox must be internally self-consistent, not rejected at parse");
   const pair = await f.reopen();
@@ -351,7 +353,7 @@ for (const poison of [
     await assertDeniedUnchanged(f, () => f.bridge(pair.mutation, pair.outbox).recoverPending(),
       { code: "WEBDAV_RECOVERY_INDETERMINATE" });
     assert.equal(f.state.policyReads, observations);
-    assert.deepEqual((await disk(f.outboxPath)).pending(), [f.signed],
+    assert.deepEqual((await disk(f.outboxPath)).pending(), diskShape([f.signed]),
       "bad local witness must never erase signed outbox evidence");
   });
 }
@@ -373,7 +375,7 @@ test("legacy local mutation with no signedOutboxReceipts cannot claim prior sign
   await assertDeniedUnchanged(f, () => f.bridge(pair.mutation, pair.outbox).recoverPending(),
     { code: "WEBDAV_RECOVERY_INDETERMINATE" });
   assert.equal(f.state.policyReads, reads);
-  assert.deepEqual((await disk(f.outboxPath)).pending(), [f.signed]);
+  assert.deepEqual((await disk(f.outboxPath)).pending(), diskShape([f.signed]));
 });
 
 test("SyncJournal refuses malformed cross-journal receipt lists before durable mutation", {

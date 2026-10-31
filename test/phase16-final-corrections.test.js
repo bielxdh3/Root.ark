@@ -752,7 +752,9 @@ test("WebDAV MOVE rejects a Windows case-only rename before changing the source"
   assert.equal(moved.status, 400);
   assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "case-only source");
   assert.deepEqual(await fsp.readdir(path.join(root, ".rootark-trash")), []);
-  assert.deepEqual((await fsp.readdir(root)).filter((name) => name !== ".rootark-trash"), ["source.txt"]);
+  assert.deepEqual((await fsp.readdir(root)).filter((name) =>
+    ![".rootark-trash", ".rootark-webdav-owner.lock"].includes(name)),
+  ["source.txt"], "an internal exclusive-owner lock is not another user document");
   assert.deepEqual(await transactionJournal.recover(), []);
   assert.deepEqual(await protocolJournal.recover(), []);
 });
@@ -1193,7 +1195,8 @@ test("WebDAV recovery clears staged transactions after a failed update rolls bac
       ...(method === "PUT" ? { body: Buffer.from("replacement") } : {}),
     });
     assert.equal(response.status, 500);
-    assert.equal(journal.pending()[0].phase, "staged");
+    assert.deepEqual(journal.pending(), [],
+      "a fully restored PUT/MOVE must not retain a speculative staged journal entry");
     assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "original destination");
     if (method === "MOVE") assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "original source");
 
@@ -1264,7 +1267,7 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
   assert.equal(observedRenamedOperation, true);
   assert.equal(response.status, 503,
     "a failed outbox directory fsync cannot be acknowledged as a durable HTTP success");
-  assert.match(response.body, /protocol durability unverified/i);
+  assert.match(response.body.toString("utf8"), /protocol durability unverified/i);
   assert.equal(await fsp.stat(path.join(root, "source.txt")).then(() => true, () => false), false);
   assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "committed despite fsync error");
   assert.deepEqual(protocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);

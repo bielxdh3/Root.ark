@@ -235,7 +235,7 @@ async function expectIndeterminatePreserved(f, { unsafePath = false } = {}) {
     // recovery-specific error wrapping. Unrelated fixture/runtime errors are
     // never counted as a valid security rejection.
     if (error?.code === "WEBDAV_RECOVERY_INDETERMINATE") return true;
-    return unsafePath && /symlink|unsafe path|untrusted bridge path|outside root/i.test(
+    return unsafePath && /symlink|unsafe path|untrusted (?:posix )?bridge (?:owner or link|path)|outside root/i.test(
       String(error?.message || ""));
   }, "insufficient disk witness must fail closed with no protocol translation");
   assert.equal(translations, 0, "no speculative encrypted/protocol operation");
@@ -280,7 +280,8 @@ for (const spec of [
             const name = spec.kind === "move" && spec.phase === "prepared"
               ? f.source : f.destination;
             assert.equal(await fsp.readFile(name, "utf8"),
-              spec.kind === "move" ? BODY.toString() : ORIGINAL.toString(),
+              spec.kind === "move" && spec.phase === "prepared"
+                ? BODY.toString() : ORIGINAL.toString(),
               "prepared/staged abort restores physical state, not a completed mutation");
           }
           if (spec.kind === "move") {

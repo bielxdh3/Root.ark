@@ -24,6 +24,12 @@ const SOURCE = "source.ct";
 const DEVICE = "device-a";
 const sha256 = (input) => crypto.createHash("sha256").update(input).digest("hex");
 const exact = (input) => JSON.parse(protocol.canonicalJson(input));
+function assertSameSignedEnvelopes(actual, expected, message) {
+  // Durable journal reloads turn the canonical null-prototype signed fields
+  // into plain JSON objects. Equality of the entire canonical encoding still
+  // checks every signed byte (including AAD, ciphertext and Ed25519 proof).
+  assert.equal(protocol.canonicalJson(actual), protocol.canonicalJson(expected), message);
+}
 
 async function fixture(t, { batchResponse, witnessResponse,
   missingCapability = false, interleaved = false } = {}) {
@@ -107,7 +113,7 @@ async function fixture(t, { batchResponse, witnessResponse,
   };
   const pushBatch = async (pair) => {
     events.push({ kind: "batch", pair: exact(pair) });
-    assert.deepEqual(pair, [deleted, moved],
+    assertSameSignedEnvelopes(pair, [deleted, moved],
       "actual transport must receive the exact signed DELETE then MOVE in order");
     return batchResponse ? batchResponse(pair, { signed, deleted, moved, receiptFor })
       : { objects: exact(pair) };
@@ -155,7 +161,7 @@ async function fixture(t, { batchResponse, witnessResponse,
     await journal.enqueueMany([deleted, moved]); // actual disk+fsync commit
   }
   const fresh = await new SyncJournal(journalPath).open();
-  assert.deepEqual(await fresh.recover(), interleaved
+  assertSameSignedEnvelopes(await fresh.recover(), interleaved
     ? [deleted, unrelated, moved] : [deleted, moved],
     "two independently authenticated envelopes must both exist durably");
   assert.deepEqual(fresh.state.seen, []);
@@ -167,7 +173,7 @@ async function fixture(t, { batchResponse, witnessResponse,
     async reread() { return new SyncJournal(journalPath).open(); },
     async assertBothPending() {
       const disk = await new SyncJournal(journalPath).open();
-      assert.deepEqual(await disk.recover(), [deleted, moved],
+      assertSameSignedEnvelopes(await disk.recover(), [deleted, moved],
         "failed batch must retain BOTH exact signed envelopes");
       assert.equal(disk.hasSeen(deleted.operationId), false);
       assert.equal(disk.hasSeen(moved.operationId), false);
@@ -370,7 +376,7 @@ test("legacy signed WebDAV DELETE orphan after local journal group deletion must
     await handle.sync();
   } finally { await handle.close(); }
   f.engine.journal = await new SyncJournal(f.journalPath).open();
-  assert.deepEqual(f.engine.journal.pending(), [f.deleted]);
+  assertSameSignedEnvelopes(f.engine.journal.pending(), [f.deleted]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
   assert.equal(f.events.length, 0, "orphaned DELETE may not reach adapter.push");
@@ -391,7 +397,7 @@ test("legacy signed WebDAV MOVE orphan after missing DELETE and group must NEVER
   try { await handle.truncate(0); await handle.writeFile(bytes); await handle.sync(); }
   finally { await handle.close(); }
   f.engine.journal = await new SyncJournal(f.journalPath).open();
-  assert.deepEqual(f.engine.journal.pending(), [f.moved]);
+  assertSameSignedEnvelopes(f.engine.journal.pending(), [f.moved]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
   assert.equal(f.events.length, 0, "orphaned MOVE cannot be dispatched without old-target tombstone");

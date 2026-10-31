@@ -513,14 +513,14 @@ test("real HTTP rejects different signed envelope reusing canonical durable oper
     "must verify valid authenticated bytes before reaching durable duplicate ID");
   assert.equal((await request(port, "GET", "/collision.txt")).status, 404);
   let disk = await f.reopen();
-  assert.deepEqual(await disk.outbox.recover(), [seeded],
+  assert.deepEqual(await disk.outbox.recover(), JSON.parse(JSON.stringify([seeded])),
     "conflict cannot replace previously persisted signed envelope");
   assert.deepEqual(await disk.local.recover(), []);
   await f.stop();
   disk = await f.reopen();
   await assert.rejects(disk.outbox.enqueue(f.signed[0]),
     { code: "sync_journal_operation_conflict" });
-  assert.deepEqual((await f.reopen()).outbox.pending(), [seeded]);
+  assert.deepEqual((await f.reopen()).outbox.pending(), JSON.parse(JSON.stringify([seeded])));
 });
 
 for (const verb of ["PUT", "MOVE"]) {

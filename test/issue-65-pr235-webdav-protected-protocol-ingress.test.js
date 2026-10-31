@@ -74,7 +74,9 @@ function unsigned(label, options = {}) {
   const encryptedBytes = operationKind === "move"
     ? protocol.encodeMovePayload(plaintext, fileKey) : plaintext;
   const metadata = { path: relativePath };
-  if (event.kind === "put") metadata.size = event.putBytes;
+  if (event.kind === "put" && ["create", "update"].includes(operationKind)) {
+    metadata.size = event.putBytes;
+  }
   if (operationKind === "move") metadata.sourcePath = event.source.slice(1);
   const operation = protocol.createOperation({
     operation: operationKind,
@@ -282,6 +284,10 @@ test("late revocation after verifying both signed MOVE batch entries cancels the
   const event = {
     journalType: "webdav-mutation", kind: "move", operationId: "move-batch",
     source: "/source.txt", destination: "/target.txt",
+    // Two signed operations are valid only for a physical destination
+    // replacement; a non-overwrite MOVE requires exactly one signed entry.
+    previousDestinationIdentity: { dev: "1", ino: "1", type: "file" },
+    trash: "/.rootark-trash/previous-target",
   };
   const bytes = Buffer.from("signed MOVE batch destination bytes");
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-signed-move-batch-"));

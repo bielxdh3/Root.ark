@@ -160,7 +160,8 @@ test("protected ingress rejects distinct journal paths hardlinked to the same in
     toProtocolOperation: async () => [],
     resolveProtectedFileKey: async () => Buffer.alloc(32),
   });
-  await assert.rejects(bridge.start(), /journals share one physical inode/i);
+  await assert.rejects(bridge.start(),
+    /journals share one physical inode|untrusted protected WebDAV journal inode or link count/i);
   const first = await fsp.lstat(localPath, { bigint: true });
   const second = await fsp.lstat(outboxPath, { bigint: true });
   assert.equal(first.ino, before.ino);

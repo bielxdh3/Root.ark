@@ -118,11 +118,16 @@ test("Phase 12 local bridge is loopback bearer protected, contained, and trash-b
 
 test("Phase 16 WebDAV overwrite is recoverable, journaled, and protects configured trash", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-");
+  const privateJournalDir = createPrivateAuthorityFixture("rootark-phase16-webdav-journal-");
   const trashDir = path.join(dir, "private-trash");
-  const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
+  const journal = await new SyncJournal(path.join(privateJournalDir, "journal.json")).open();
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, trashDir, token: "phase16-token", journal });
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    await bridge.stop();
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rm(privateJournalDir, { recursive: true, force: true });
+  });
   const headers = { authorization: "Bearer phase16-token" };
   const port = bridge.address().port;
   await request(port, "/source.txt", { method: "PUT", headers, body: Buffer.from("source") });
@@ -145,10 +150,15 @@ test("Phase 16 WebDAV overwrite is recoverable, journaled, and protects configur
 
 test("Phase 16 WebDAV exclusive publication and journal failures restore both full files", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-phase16-rollback-");
-  const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
+  const privateJournalDir = createPrivateAuthorityFixture("rootark-phase16-rollback-journal-");
+  const journal = await new SyncJournal(path.join(privateJournalDir, "journal.json")).open();
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, token: "phase16-token", journal });
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    await bridge.stop();
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rm(privateJournalDir, { recursive: true, force: true });
+  });
   const headers = { authorization: "Bearer phase16-token" };
   const port = bridge.address().port;
   const sourceBytes = Buffer.from("SOURCE_CONTENT_".repeat(48));
@@ -192,8 +202,9 @@ test("Phase 16 WebDAV exclusive publication and journal failures restore both fu
 
 test("Phase 16 WebDAV staged MOVE restores only identity-proven backup; ambiguity fails closed", async (t) => {
   const dir = createPrivateAuthorityFixture("rootark-phase16-recovery-");
+  const privateJournalDir = createPrivateAuthorityFixture("rootark-phase16-recovery-journal-");
   const trashDir = path.join(dir, "configured-trash");
-  const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
+  const journal = await new SyncJournal(path.join(privateJournalDir, "journal.json")).open();
   const backup = path.join(trashDir, "staged-recovery.txt");
   await fsp.mkdir(trashDir, { recursive: true });
   const source = path.join(dir, "source.txt");
@@ -214,7 +225,11 @@ test("Phase 16 WebDAV staged MOVE restores only identity-proven backup; ambiguit
   });
   const bridge = new LocalSyncWebDavBridge({ rootDir: dir, trashDir, token: "phase16-token", journal });
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    await bridge.stop();
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rm(privateJournalDir, { recursive: true, force: true });
+  });
   assert.deepEqual(await fsp.readFile(path.join(dir, "restored.txt")), previousDestinationBytes);
   assert.deepEqual(await fsp.readFile(source), sourceBytes,
     "staged MOVE cannot delete a source it has not yet published");

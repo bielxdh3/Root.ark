@@ -219,7 +219,7 @@ async function realSignedUnacknowledgedPut(t, phase) {
   assert.deepEqual(event.installedIdentity,
     identity(await fsp.lstat(f.target, { bigint: true })));
   assert.deepEqual(await fsp.readFile(f.target), ORIGINAL);
-  assert.deepEqual(proof.outbox.pending(), f.signed,
+  assert.deepEqual(proof.outbox.pending(), JSON.parse(JSON.stringify(f.signed)),
     "the outbox must actually survive an independent on-disk journal reopen");
   const originalSigned = proof.outbox.pending()[0];
   assert.equal(await verifyAuthorizationProof(originalSigned.authorization, originalSigned,

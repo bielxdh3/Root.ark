@@ -72,7 +72,8 @@ test("two real Ed25519-signed DELETE then MOVE envelopes use ONE remote atomic P
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.redirect, "error");
   assert.equal(calls[0].options.headers["Content-Type"], "application/json");
-  assert.deepEqual(JSON.parse(calls[0].options.body), { operations: [deleted, moved] },
+  assert.deepEqual(JSON.parse(calls[0].options.body),
+    JSON.parse(JSON.stringify({ operations: [deleted, moved] })),
     "retain exact signature, nonce, AAD and ciphertext in one POST body");
 });
 

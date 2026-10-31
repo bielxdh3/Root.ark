@@ -14,6 +14,14 @@ const { SyncJournal } = require("../sync-client/rootark-sync-journal");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
+function assertSameSignedEnvelopes(actual, expected, message) {
+  // Signed envelopes are canonicalized with null-prototype nested objects;
+  // JSON disk reloads restore plain objects. Compare the complete canonical
+  // bytes (authorization signature, ciphertext, AAD, IDs and revisions), not
+  // JavaScript prototypes or just operation IDs.
+  assert.equal(protocol.canonicalJson(actual), protocol.canonicalJson(expected), message);
+}
+
 async function fixture(t) {
   const root = createPrivateAuthorityFixture("cos-atomic-journal-");
   const filename = path.join(root, "protocol-outbox.json");
@@ -68,7 +76,7 @@ test("a signed DELETE + MOVE atomic group survives interleaved fsync and cannot 
   await f.journal.enqueue(f.unrelated);
   await f.journal.enqueueMany([f.deleted, f.moved]);
   const cold = await new SyncJournal(f.filename).open();
-  assert.deepEqual(cold.pending(), [f.deleted, f.unrelated, f.moved]);
+  assertSameSignedEnvelopes(cold.pending(), [f.deleted, f.unrelated, f.moved]);
   assert.deepEqual(cold.atomicSignedGroups(), {
     [f.event]: { deleteId: f.deleted.operationId, moveId: f.moved.operationId },
   });
@@ -83,7 +91,7 @@ test("a signed DELETE + MOVE atomic group survives interleaved fsync and cannot 
     { operationId: f.deleted.operationId }, { operationId: f.moved.operationId },
   ]);
   const after = await new SyncJournal(f.filename).open();
-  assert.deepEqual(after.pending(), [f.unrelated]);
+  assertSameSignedEnvelopes(after.pending(), [f.unrelated]);
   assert.equal(after.hasSeen(f.deleted.operationId), true);
   assert.equal(after.hasSeen(f.moved.operationId), true);
   assert.deepEqual(after.atomicSignedGroups(), {});

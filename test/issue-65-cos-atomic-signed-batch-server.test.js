@@ -212,6 +212,41 @@ test("proof expiry after staging fsync but before rename cancels the entire sign
   assert.equal(await f.onDisk(), before, "no partial or total destructive batch commit");
 });
 
+test("single protected DELETE expiring during fsync must not pass the final rename fence", async (t) => {
+  const f = await fixture(t);
+  const operation = await f.make("delete", "a", 2, "single-fsync-expiry");
+  const before = await f.onDisk();
+  const originalOpen = fs.open;
+  const originalRename = fs.rename;
+  const originalNow = Date.now;
+  let afterSync = false;
+  let renamed = false;
+  try {
+    fs.open = async function (...args) {
+      const handle = await originalOpen.apply(this, args);
+      if (typeof args[0] === "string" && args[0].startsWith(f.storagePath + ".tmp-")) {
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => { await sync(); afterSync = true; };
+      }
+      return handle;
+    };
+    fs.rename = async function (...args) {
+      if (args[1] === f.storagePath) renamed = true;
+      return originalRename.apply(this, args);
+    };
+    Date.now = () => afterSync ? operation.authorization.expiresAt + 1 : originalNow();
+    const reply = await f.send("/sync/v1/objects", operation);
+    assert.equal(reply.status, 403);
+  } finally {
+    Date.now = originalNow;
+    fs.open = originalOpen;
+    fs.rename = originalRename;
+  }
+  assert.equal(afterSync, true, "the uncommitted temporary store file reached fsync");
+  assert.equal(renamed, false, "expired single-device grant cannot rename protected data");
+  assert.equal(await f.onDisk(), before, "expired single DELETE cannot persist or become seen");
+});
+
 test("9 MiB aggregate request cap rejects two individually bounded signed ciphertexts", async (t) => {
   const f = await fixture(t);
   const bytes = Buffer.alloc(4 * 1024 * 1024, 0x6b);
