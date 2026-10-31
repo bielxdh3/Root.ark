@@ -82,7 +82,8 @@ BEGIN
   -- by the DB owner's SECURITY DEFINER procedure, not caller-controlled SQL.
   IF p_scope IS NULL OR p_username IS NULL OR p_ticket IS NULL
     OR p_delete IS NULL OR p_move IS NULL
-    OR p_scope !~ '^[A-Za-z0-9._:-]{1,256}$'
+    OR length(p_scope) NOT BETWEEN 1 AND 256
+    OR p_scope !~ '^[A-Za-z0-9._:-]+$'
     OR length(p_username) NOT BETWEEN 1 AND 512
     OR octet_length(p_delete) + octet_length(p_move) > 9437184 THEN
     RAISE EXCEPTION 'invalid admission envelope' USING ERRCODE='23514';

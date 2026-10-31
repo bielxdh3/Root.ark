@@ -119,6 +119,20 @@ async function fixture() {
   return { scope, username, signedPair, state, publicKey };
 }
 
+test("PG18 scope accepts 256 ASCII characters and rejects 257 without invalid SQL regex", async () => {
+  const maxScope = "s".repeat(256);
+  await admin.query(`INSERT INTO zk1_sync_batch.scope_policy
+    (scope,username,compartment_id,key_epoch,enabled,allow_delete)
+    VALUES ($1,'fixture','private','epoch-1',true,true)`, [maxScope]);
+  await assert.rejects(admin.query(`INSERT INTO zk1_sync_batch.scope_policy
+    (scope,username,compartment_id,key_epoch,enabled,allow_delete)
+    VALUES ($1,'fixture','private','epoch-1',true,true)`, ["s".repeat(257)]),
+  { code: "23514" });
+  const actual = await admin.query(`SELECT scope FROM zk1_sync_batch.scope_policy WHERE scope=$1`,
+    [maxScope]);
+  assert.equal(actual.rowCount, 1);
+});
+
 test("PG18 atomic batch persists 2 original signed envelopes, ciphertext, state and one chained marker", async () => {
   const f = await fixture();
   const operations = await f.signedPair();

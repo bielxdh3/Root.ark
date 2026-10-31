@@ -11,7 +11,9 @@ CREATE SCHEMA IF NOT EXISTS zk1_sync_batch;
 REVOKE ALL ON SCHEMA zk1_sync_batch FROM PUBLIC;
 
 CREATE TABLE zk1_sync_batch.scope_policy (
-  scope text PRIMARY KEY CHECK (scope ~ '^[A-Za-z0-9._:-]{1,256}$'),
+  -- PostgreSQL ARE bounds must not exceed 255; enforce 256 via length.
+  scope text PRIMARY KEY CHECK (length(scope) BETWEEN 1 AND 256
+    AND scope ~ '^[A-Za-z0-9._:-]+$'),
   username text NOT NULL CHECK (length(username) BETWEEN 1 AND 512),
   compartment_id text NOT NULL CHECK (compartment_id ~ '^[A-Za-z0-9._:-]{1,160}$'),
   key_epoch text NOT NULL CHECK (key_epoch ~ '^[A-Za-z0-9._:-]{1,160}$'),
