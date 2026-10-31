@@ -23,6 +23,10 @@ const BYTES = Buffer.from("REAL_ENCRYPTED_MOVE_SOURCE_PAYLOAD_FOR_ATOMIC_QUEUE")
 const TARGET = "destination.ct";
 const SOURCE = "source.ct";
 const DEVICE = "device-a";
+const ACCOUNT_ID = "ca628a48-765e-4b0d-a746-3bc67d53e3b1";
+const STORE_ID = "d95a7868-857c-4213-a5ad-3c10374b4fa7";
+const OTHER_ACCOUNT_ID = "ffef1473-eb42-48a4-9c7e-2d9e7c458211";
+const OTHER_STORE_ID = "ad112afc-ff8e-4803-9f5c-b517cc778588";
 const sha256 = (input) => crypto.createHash("sha256").update(input).digest("hex");
 const exact = (input) => JSON.parse(protocol.canonicalJson(input));
 function assertSameSignedEnvelopes(actual, expected, message) {
@@ -99,8 +103,12 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   const casPublicKey = casSigner.publicKey.export({ type: "spki", format: "der" });
   const receiptFor = (pair, overrides = {}) => {
     const statement = {
-      version: 1,
+      version: 2,
       scope: "alice:store",
+      accountId: ACCOUNT_ID,
+      storeId: STORE_ID,
+      username: "alice",
+      compartmentId: "private",
       nonce: overrides.nonce || crypto.randomBytes(32).toString("base64url"),
       operationIds: pair.map((entry) => entry.operationId),
       envelopeDigests: pair.map((entry) => sha256(protocol.canonicalJson(entry))),
@@ -111,13 +119,15 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
       ...overrides,
     };
     return { statement, signature: crypto.sign(null,
-      Buffer.from("rootark-sync-atomic-batch-witness-v1\0"
+      Buffer.from("rootark-sync-atomic-batch-witness-v2\0"
         + protocol.canonicalJson(statement)), witness.privateKey).toString("base64url") };
   };
   const casFloorFor = (receipt, nonce, overrides = {}) => {
     const statement = {
-      version: 1,
+      version: 2,
       scope: "alice:store",
+      accountId: ACCOUNT_ID,
+      storeId: STORE_ID,
       nonce,
       commitId: receipt.statement.commitId,
       storeHeadSha256: receipt.statement.storeHeadSha256,
@@ -127,7 +137,7 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
       ...overrides,
     };
     return { statement, signature: crypto.sign(null,
-      Buffer.from("rootark-sync-atomic-batch-external-cas-floor-v1\0"
+      Buffer.from("rootark-sync-atomic-batch-external-cas-floor-v2\0"
         + protocol.canonicalJson(statement)), casSigner.privateKey).toString("base64url") };
   };
   const publicKey = signing.publicKey.export({ type: "spki", format: "der" })
@@ -200,6 +210,8 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
     requireCurrentOutgoingAuthorization: true,
     atomicBatchWitnessPublicKey: missingWitnessKey ? null : witnessPublicKey,
     atomicBatchWitnessScope: "alice:store",
+    atomicBatchOwnerIdentity: { accountId: ACCOUNT_ID, storeId: STORE_ID,
+      username: "alice", compartmentId: "private" },
     atomicBatchWitnessReadback: missingWitnessReadback ? null : async (challenge) => {
       if (onWitnessChallenge) onWitnessChallenge(challenge);
       lastWitnessReceipt = witnessResponse
@@ -271,6 +283,8 @@ test("an async witness cannot repin the CAS signer, owner scope or readback call
         ["atomicBatchCasFloorPublicKey", f.engine.atomicBatchWitnessPublicKey],
         ["atomicBatchWitnessPublicKey", f.engine.atomicBatchCasFloorPublicKey],
         ["atomicBatchWitnessScope", "mallory:store"],
+        ["atomicBatchOwnerIdentity", { accountId: OTHER_ACCOUNT_ID,
+          storeId: OTHER_STORE_ID, username: "mallory", compartmentId: "private" }],
         ["atomicBatchWitnessReadback", async () => null],
         ["atomicBatchCasFloorReadback", async () => null],
       ]) {
@@ -284,7 +298,7 @@ test("an async witness cannot repin the CAS signer, owner scope or readback call
     },
   });
   await f.engine._pushPending(f.summary());
-  assert.equal(attempts, 5);
+  assert.equal(attempts, 6);
   assert.equal(f.engine.atomicBatchWitnessScope, "alice:store");
   assert.deepEqual(await (await f.reread()).recover(), []);
 });
@@ -336,7 +350,9 @@ test("signed pair plus separate pinned synthetic admission witness ACKs both in 
 });
 
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
-  "other-account-witness", "wrong-envelope-digest", "not-physically-durable",
+  "other-account-witness", "other-immutable-account-id", "other-immutable-store-id",
+  "other-username-witness", "other-compartment-witness", "legacy-v1-witness",
+  "wrong-envelope-digest", "not-physically-durable",
   "zero-fencing-epoch", "invalid-store-head", "missing-trusted-witness-key",
   "missing-independent-readback", "replayed-old-witness-nonce",
   "witness-switching-nonce-getter"]) {
@@ -352,6 +368,16 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
             operationIds: ["other-operation-id", ctx.moved.operationId] });
         if (mode === "other-account-witness") return ctx.receiptFor(
           [ctx.deleted, ctx.moved], { nonce: challenge.nonce, scope: "mallory:store" });
+        if (mode === "other-immutable-account-id") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, accountId: OTHER_ACCOUNT_ID });
+        if (mode === "other-immutable-store-id") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, storeId: OTHER_STORE_ID });
+        if (mode === "other-username-witness") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, username: "mallory" });
+        if (mode === "other-compartment-witness") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, compartmentId: "other" });
+        if (mode === "legacy-v1-witness") return ctx.receiptFor(
+          [ctx.deleted, ctx.moved], { nonce: challenge.nonce, version: 1 });
         // These statements carry a VALID signature by the pinned test key.
         // Signature validity alone must not authorize false physical or
         // mismatched signed-envelope claims.
@@ -394,6 +420,7 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
 for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floor",
   "forged-cas-floor", "cas-stale-current-head", "cas-wrong-commit",
   "cas-old-epoch", "cas-not-current", "cas-wrong-scope", "cas-replayed-nonce",
+  "cas-other-immutable-account-id", "cas-other-immutable-store-id", "cas-legacy-v1",
   "cas-switching-head-getter"]) {
   test("no protected batch ACK without fresh independently signed CAS floor: " + mode,
     { timeout: 120000 }, async (t) => {
@@ -412,6 +439,9 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
             "cas-not-current": { current: false },
             "cas-wrong-scope": { scope: "mallory:store" },
             "cas-replayed-nonce": { nonce: crypto.randomBytes(32).toString("base64url") },
+            "cas-other-immutable-account-id": { accountId: OTHER_ACCOUNT_ID },
+            "cas-other-immutable-store-id": { storeId: OTHER_STORE_ID },
+            "cas-legacy-v1": { version: 1 },
           };
           const result = casFloorFor(lastWitnessReceipt, challenge.nonce,
             changes[mode] || {});

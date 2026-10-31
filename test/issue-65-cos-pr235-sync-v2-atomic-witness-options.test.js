@@ -12,6 +12,11 @@ function trustedFixture() {
   return {
     pinnedPublicKey: keys.publicKey.export({ type: "spki", format: "der" }),
     scope: "alice:store",
+    ownerIdentity: {
+      accountId: "ca628a48-765e-4b0d-a746-3bc67d53e3b1",
+      storeId: "d95a7868-857c-4213-a5ad-3c10374b4fa7",
+      username: "alice", compartmentId: "private",
+    },
     readback: async () => null,
     casPinnedPublicKey: casKeys.publicKey.export({ type: "spki", format: "der" }),
     casReadback: async () => null,
@@ -38,6 +43,10 @@ test("external atomic witness requires a complete independent key, scope and rea
     { readback: null }, { pinnedPublicKey: null }, { scope: "../unsafe" },
     { scope: "alice:store", remotePhysicalDurable: true },
     { casReadback: null }, { casPinnedPublicKey: null },
+    { ownerIdentity: null },
+    { ownerIdentity: { ...trustedFixture().ownerIdentity, storeId: "not-a-uuid" } },
+    { ownerIdentity: { ...trustedFixture().ownerIdentity, accountId: "not-a-uuid" } },
+    { ownerIdentity: { ...trustedFixture().ownerIdentity, extra: true } },
   ]) {
     assert.throws(() => trustedAtomicBatchWitnessOptions({
       trustedAtomicBatchWitness: { ...trustedFixture(), ...changed },
@@ -58,7 +67,8 @@ test("trusted batch witness snapshots owner key and keeps challenge arrays isola
     received = challenge;
     return null;
   };
-  const opts = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted }, true);
+  const opts = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
+    true, { username: "alice" }, "private");
   const pinnedCopy = Buffer.from(opts.atomicBatchWitnessPublicKey);
   const casPinnedCopy = Buffer.from(opts.atomicBatchCasFloorPublicKey);
   trusted.pinnedPublicKey.fill(0);
@@ -66,8 +76,15 @@ test("trusted batch witness snapshots owner key and keeps challenge arrays isola
   assert.deepEqual(opts.atomicBatchWitnessPublicKey, pinnedCopy);
   assert.deepEqual(opts.atomicBatchCasFloorPublicKey, casPinnedCopy);
   assert.equal(opts.atomicBatchWitnessScope, "alice:store");
+  assert.equal(Object.isFrozen(opts.atomicBatchOwnerIdentity), true);
+  assert.equal(opts.atomicBatchOwnerIdentity.accountId,
+    "ca628a48-765e-4b0d-a746-3bc67d53e3b1");
+  trusted.ownerIdentity.storeId = "ad112afc-ff8e-4803-9f5c-b517cc778588";
+  assert.equal(opts.atomicBatchOwnerIdentity.storeId,
+    "d95a7868-857c-4213-a5ad-3c10374b4fa7");
   const challenge = {
-    scope: "alice:store", nonce: "challenge-nonce",
+    scope: "alice:store", accountId: opts.atomicBatchOwnerIdentity.accountId,
+    storeId: opts.atomicBatchOwnerIdentity.storeId, nonce: "challenge-nonce",
     operationIds: ["delete-id", "move-id"],
     envelopeDigests: ["delete-digest", "move-digest"],
   };
@@ -76,11 +93,23 @@ test("trusted batch witness snapshots owner key and keeps challenge arrays isola
   assert.deepEqual(challenge.envelopeDigests, ["delete-digest", "move-digest"]);
   assert.equal(received.nonce, challenge.nonce);
   const floorChallenge = {
-    scope: "alice:store", nonce: "second-nonce", commitId: "commit-1",
+    scope: "alice:store", accountId: opts.atomicBatchOwnerIdentity.accountId,
+    storeId: opts.atomicBatchOwnerIdentity.storeId,
+    nonce: "second-nonce", commitId: "commit-1",
     storeHeadSha256: "a".repeat(64), fencingEpoch: 3,
   };
   await opts.atomicBatchCasFloorReadback(floorChallenge);
   assert.deepEqual(received, floorChallenge);
+});
+
+test("external atomic witness rejects owner or compartment mismatches from trusted local policy", () => {
+  const trusted = trustedFixture();
+  assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
+    true, { username: "mallory" }, "private"), /external CAS floor/);
+  assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
+    true, { username: "alice" }, "other-compartment"), /external CAS floor/);
+  assert.deepEqual(trustedAtomicBatchWitnessOptions({}, true,
+    { username: "alice" }, "private"), {});
 });
 
 test("strict Sync v2 checks owner-pinned local device identity before opening the engine", () => {
