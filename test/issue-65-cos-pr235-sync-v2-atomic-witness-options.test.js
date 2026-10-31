@@ -3,7 +3,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { trustedAtomicBatchWitnessOptions } = require("../sync-client/rootark-sync-v2");
+const { trustedAtomicBatchWitnessOptions,
+  assertPinnedStrictLocalDeviceIdentity } = require("../sync-client/rootark-sync-v2");
 
 function trustedFixture() {
   const keys = crypto.generateKeyPairSync("ed25519");
@@ -63,4 +64,47 @@ test("trusted batch witness snapshots owner key and keeps challenge arrays isola
   assert.deepEqual(challenge.operationIds, ["delete-id", "move-id"]);
   assert.deepEqual(challenge.envelopeDigests, ["delete-digest", "move-digest"]);
   assert.equal(received.nonce, challenge.nonce);
+});
+
+test("strict Sync v2 checks owner-pinned local device identity before opening the engine", () => {
+  const signing = crypto.generateKeyPairSync("ed25519");
+  const pinnedDeviceSpki = signing.publicKey
+    .export({ type: "spki", format: "der" }).toString("base64url");
+  const policy = {
+    username: "alice",
+    trustedDevicePublicKeys: { "device-a": pinnedDeviceSpki },
+    revokedDeviceIds: [],
+  };
+  const config = {
+    username: "alice", deviceId: "device-a",
+    publicKey: pinnedDeviceSpki, privateKey: signing.privateKey,
+  };
+  assert.equal(assertPinnedStrictLocalDeviceIdentity(config, policy), true);
+  for (const altered of [
+    { username: "mallory" },
+    { deviceId: "other-device" },
+    { publicKey: "locally-replaced-signing-key" },
+    { deviceId: "__proto__" },
+  ]) {
+    assert.throws(() => assertPinnedStrictLocalDeviceIdentity(
+      { ...config, ...altered }, policy), /externally pinned owner policy/);
+  }
+  assert.throws(() => assertPinnedStrictLocalDeviceIdentity(config, {
+    ...policy, revokedDeviceIds: ["device-a"],
+  }), /externally pinned owner policy/);
+  assert.throws(() => assertPinnedStrictLocalDeviceIdentity(config, {
+    ...policy,
+    trustedDevicePublicKeys: Object.create({ "device-a": config.publicKey }),
+  }), /externally pinned owner policy/,
+  "inherited device entries are never trusted owner pins");
+  assert.throws(() => assertPinnedStrictLocalDeviceIdentity(config, {
+    ...policy, username: "mallory",
+  }), /externally pinned owner policy/);
+  assert.throws(() => assertPinnedStrictLocalDeviceIdentity({
+    ...config, privateKey: crypto.generateKeyPairSync("ed25519").privateKey,
+  }, policy), /externally pinned owner policy/,
+  "an attacker cannot supply the pinned public key with a different private key");
+  assert.throws(() => assertPinnedStrictLocalDeviceIdentity({
+    ...config, privateKey: null,
+  }, policy), /externally pinned owner policy/);
 });

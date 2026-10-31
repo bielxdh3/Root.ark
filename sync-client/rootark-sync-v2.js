@@ -90,6 +90,38 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical) {
   };
 }
 
+function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy) {
+  // The mutable sync config and device-key environment cannot enroll a new
+  // device or silently retarget the externally provisioned owner's account.
+  // This local check is NOT the missing immutable account/store ID or a
+  // substitute for independently retained physical witness/CAS evidence.
+  const deviceId = config?.deviceId;
+  const pins = independentlyPinnedPolicy?.trustedDevicePublicKeys;
+  // A pinned public-key STRING is insufficient if the process holds a
+  // different private key. Verify the exact Ed25519 signing key before any
+  // network request or disk journal is opened in strict mode.
+  let derivedPublicSpki = null;
+  if (config?.privateKey instanceof crypto.KeyObject
+    && config.privateKey.type === "private"
+    && config.privateKey.asymmetricKeyType === "ed25519") {
+    derivedPublicSpki = crypto.createPublicKey(config.privateKey)
+      .export({ type: "spki", format: "der" }).toString("base64url");
+  }
+  if (typeof config?.username !== "string"
+    || typeof deviceId !== "string" || !deviceId
+    || typeof config?.publicKey !== "string"
+    || config.username !== independentlyPinnedPolicy?.username
+    || !pins || typeof pins !== "object" || Array.isArray(pins)
+    || !Object.hasOwn(pins, deviceId)
+    || pins[deviceId] !== config.publicKey
+    || derivedPublicSpki !== config.publicKey
+    || !Array.isArray(independentlyPinnedPolicy.revokedDeviceIds)
+    || independentlyPinnedPolicy.revokedDeviceIds.includes(deviceId)) {
+    throw new Error("Strict Sync v2 device identity differs from externally pinned owner policy");
+  }
+  return true;
+}
+
 async function start(options = {}) {
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
@@ -122,6 +154,9 @@ async function start(options = {}) {
   const independentlyPinnedDevicePolicy = strictHistorical
     ? strictBinding.snapshotLocalDevicePolicy(
       options.trustedHistoricalAdmission.localTrustedDevicePolicy) : null;
+  if (strictHistorical) {
+    assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedDevicePolicy);
+  }
   const currentlyTrustedDevice = strictHistorical ? (deviceId) => {
     // Only the operator-injected callback can supply the current policy.
     // Recheck synchronously at the final decision, not before awaited crypto.
@@ -263,4 +298,5 @@ if (require.main === module) {
   else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once");
 }
 
-module.exports = { fileKeyResolver, trustedAtomicBatchWitnessOptions, start };
+module.exports = { fileKeyResolver, trustedAtomicBatchWitnessOptions,
+  assertPinnedStrictLocalDeviceIdentity, start };
