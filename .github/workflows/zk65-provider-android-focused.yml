@@ -8,10 +8,15 @@ on:
       - '.github/workflows/zk65-provider-android-focused.yml'
       - 'src/services/zk1MultiproviderCiphertextRestore.js'
       - 'src/services/zk1WebdavCiphertextAdapter.js'
+      - 'sync-client/rootark-sync-protocol.js'
+      - 'sync-client/rootark-sync-paths.js'
       - 'scripts/issue-64-android-fixtures.js'
       - 'test/issue-65-full-multiprovider-http-restore.test.js'
       - 'test/issue-64-android-contract.test.js'
-      - 'android/core/src/test/resources/server-responses.json'
+      - 'android/core/**'
+      - 'android/build.gradle.kts'
+      - 'android/settings.gradle.kts'
+      - 'android/gradle.properties'
   workflow_dispatch:
 
 permissions:
@@ -49,4 +54,29 @@ jobs:
         run: git diff --exit-code
       - name: Verify tests did not create untracked files
         shell: bash
+        run: test -z "$(git status --porcelain)"
+
+  kotlin-server-wire-contracts:
+    name: Kotlin JVM real fixture deserialization and portable paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # The scaffold has no checked-in wrapper. Use a pinned Gradle binary,
+      # rather than trusting an unversioned runner installation.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Compile Kotlin and deserialize captured server responses in JVM
+        working-directory: android
+        run: gradle --no-daemon :core:test
+      - name: Verify Kotlin tests did not change tracked files
+        run: git diff --exit-code
+      - name: Verify Kotlin tests did not create untracked files
         run: test -z "$(git status --porcelain)"
