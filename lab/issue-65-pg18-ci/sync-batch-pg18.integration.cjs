@@ -1510,6 +1510,16 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   stage = 10;
   const observed = await send(challenge);
   stage = 110;
+  if (observed.status !== 200) {
+    // Only a finite, non-sensitive diagnostic code is allowed in hosted CI.
+    const problem = observed.body?.error;
+    stage = observed.status === 400 ? 110400
+      : observed.status === 403 ? 110403
+      : observed.status === 503
+        ? (problem === "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE" ? 1105031
+          : problem === "SYNC_ATOMIC_SQL_OBSERVE_BUSY" ? 1105032 : 1105039)
+        : 110999;
+  }
   assert.equal(observed.status, 200);
   stage = 111;
   assert.equal(observed.headers["cache-control"], "no-store");
