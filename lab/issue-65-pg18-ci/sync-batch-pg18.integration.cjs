@@ -1471,9 +1471,22 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   const fingerprint = new crypto.X509Certificate(client.cert).fingerprint256;
   const accountId = crypto.randomUUID();
   const storeId = crypto.randomUUID();
+  let observedSqlQueries = 0;
+  const countingAttestor = {
+    connect: async () => {
+      const connection = await attestor.connect();
+      return {
+        query: (...args) => {
+          observedSqlQueries += 1;
+          return connection.query(...args);
+        },
+        release: () => connection.release(),
+      };
+    },
+  };
   const server = createZk1SyncAtomicSqlReadbackHttpsServer({
     key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
-    attestorPool: attestor,
+    attestorPool: countingAttestor,
     principals: { [fingerprint]: [{ scope: f.scope, accountId, storeId }] },
   });
   await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", (err) =>
@@ -1513,7 +1526,7 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   if (observed.status !== 200) {
     // Only a finite, non-sensitive diagnostic code is allowed in hosted CI.
     const problem = observed.body?.error;
-    stage = observed.status === 400 ? 110400
+    stage = observed.status === 400 ? (observedSqlQueries === 0 ? 1104000 : 1104001)
       : observed.status === 403 ? 110403
       : observed.status === 503
         ? (problem === "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE" ? 1105031
