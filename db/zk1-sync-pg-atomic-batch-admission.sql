@@ -20,11 +20,50 @@ CREATE TABLE zk1_sync_batch.admission_ticket (
   move_digest bytea NOT NULL CHECK (octet_length(move_digest)=32),
   expires_at timestamptz NOT NULL,
   consumed boolean NOT NULL DEFAULT false,
+  superseded boolean NOT NULL DEFAULT false,
   issued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  UNIQUE(scope,sequence,delete_digest,move_digest),
   CHECK (expires_at > issued_at),
   CHECK (expires_at <= issued_at + interval '2 minutes')
 );
+
+-- Bound issuance even when the same valid Ed25519 pair is retried many times.
+-- Only an EXPIRED, UNCONSUMED ticket may be superseded for reissue; retain
+-- it for audit/replay rejection. The issuer still has INSERT ONLY privileges.
+CREATE UNIQUE INDEX admission_ticket_active_pair ON zk1_sync_batch.admission_ticket
+  (scope,sequence,policy_epoch,previous_head,delete_digest,move_digest)
+  WHERE superseded=false;
+CREATE FUNCTION zk1_sync_batch.supersede_expired_admission_ticket()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog AS $body$
+BEGIN
+  -- INSERT-only credentials must not bypass the active-pair uniqueness by
+  -- supplying superseded=true, pre-consumed handles or far-future issuance.
+  IF NEW.superseded IS DISTINCT FROM FALSE
+    OR NEW.consumed IS DISTINCT FROM FALSE
+    OR NEW.issued_at > clock_timestamp() + interval '1 second'
+    OR NEW.issued_at < clock_timestamp() - interval '2 minutes'
+    OR NEW.expires_at > NEW.issued_at + interval '31 seconds'
+    OR NEW.expires_at <= clock_timestamp() THEN
+    RAISE EXCEPTION 'invalid admission ticket lifecycle' USING ERRCODE='23514';
+  END IF;
+  -- Same lock order as commit_admitted_pair: scope_head then ticket. Concurrent
+  -- retry/commit/revocation therefore cannot bypass expiry, CAS or fencing.
+  PERFORM 1 FROM zk1_sync_batch.scope_head
+    WHERE scope=NEW.scope FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'missing admission scope head' USING ERRCODE='23514';
+  END IF;
+  UPDATE zk1_sync_batch.admission_ticket SET superseded=true
+    WHERE scope=NEW.scope AND sequence=NEW.sequence
+      AND policy_epoch=NEW.policy_epoch AND previous_head=NEW.previous_head
+      AND delete_digest=NEW.delete_digest AND move_digest=NEW.move_digest
+      AND superseded=false AND consumed=false
+      AND expires_at <= clock_timestamp();
+  RETURN NEW;
+END $body$;
+CREATE TRIGGER supersede_expired_admission_ticket
+BEFORE INSERT ON zk1_sync_batch.admission_ticket FOR EACH ROW
+EXECUTE FUNCTION zk1_sync_batch.supersede_expired_admission_ticket();
 
 CREATE FUNCTION zk1_sync_batch.commit_admitted_pair(
   p_scope text, p_username text, p_ticket uuid,
@@ -130,6 +169,7 @@ BEGIN
   SELECT * INTO r FROM zk1_sync_batch.admission_ticket
     WHERE ticket_id=p_ticket AND scope=p_scope FOR UPDATE;
   IF NOT FOUND OR r.consumed IS DISTINCT FROM FALSE
+    OR r.superseded IS DISTINCT FROM FALSE
     OR r.expires_at <= clock_timestamp()
     OR r.username IS DISTINCT FROM p_username
     OR r.device_id IS DISTINCT FROM d->>'deviceId'

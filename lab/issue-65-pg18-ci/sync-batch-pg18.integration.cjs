@@ -149,6 +149,197 @@ test("PG18 atomic batch persists 2 original signed envelopes, ciphertext, state 
     SET ciphertext=decode('00','hex') WHERE scope=$1`, [f.scope]));
 });
 
+test("PG18 expired pending ticket can be reissued for the SAME signed pair without replay or stale ACK", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const expiredTicket = await mintTestAdmission(f, pair);
+  // Disposable DB operator advances only this ticket's expiry. The original
+  // Ed25519 envelopes remain fresh; no client-side clock mocking or waiting.
+  const expired = await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+    SET issued_at=clock_timestamp() - interval '90 seconds',
+        expires_at=clock_timestamp() - interval '60 seconds'
+    WHERE ticket_id=$1 AND consumed=false
+    RETURNING expires_at < clock_timestamp() AS expired`, [expiredTicket]);
+  assert.equal(expired.rowCount, 1);
+  assert.equal(expired.rows[0].expired, true);
+  const replacement = await mintTestAdmission(f, pair);
+  assert.notEqual(replacement, expiredTicket);
+  const pre = await f.state();
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: expiredTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  assert.deepEqual(await f.state(), pre, "expired handle cannot change any committed state");
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: replacement,
+  });
+  assert.equal(committed.sequence, 1);
+  assert.equal(committed.witnessVerified, false);
+  assert.equal(committed.clientAckAuthorized, false);
+  const consumed = await admin.query(`SELECT ticket_id,consumed,superseded
+    FROM zk1_sync_batch.admission_ticket WHERE ticket_id IN ($1,$2)`,
+  [expiredTicket, replacement]);
+  assert.equal(consumed.rowCount, 2);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === expiredTicket).consumed, false);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === expiredTicket).superseded, true);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === replacement).consumed, true);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === replacement).superseded, false);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: replacement,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const after = await f.state();
+  assert.equal(after.markers.length, 1);
+  assert.equal(after.seen.length, 2);
+  assert.equal(Number(after.head.sequence), 1);
+});
+
+test("PG18 INSERT-only issuer cannot bypass ticket uniqueness or create future-lived handles", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const original = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket])).rows[0];
+  const submit = ({ consumed = false, superseded = false,
+    issuedAt = original.issued_at, expiresAt = original.expires_at } = {}) =>
+    issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+      (ticket_id,scope,username,device_id,public_key,policy_epoch,
+       sequence,previous_head,delete_digest,move_digest,expires_at,
+       consumed,superseded,issued_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [
+      crypto.randomUUID(), original.scope, original.username,
+      original.device_id, original.public_key, original.policy_epoch,
+      original.sequence, original.previous_head, original.delete_digest,
+      original.move_digest, expiresAt, consumed, superseded, issuedAt,
+    ]);
+  await assert.rejects(submit({ superseded: true }), { code: "23514" });
+  await assert.rejects(submit({ consumed: true }), { code: "23514" });
+  const farFuture = new Date(Date.now() + 86400000);
+  await assert.rejects(submit({ issuedAt: farFuture,
+    expiresAt: new Date(farFuture.valueOf() + 30000) }), { code: "23514" });
+  await assert.rejects(submit({ expiresAt: new Date(Date.now() + 60000) }),
+    { code: "23514" });
+  await assert.rejects(submit(), { code: "23505" },
+    "active signed pair must remain unique even if issuer has INSERT");
+  const count = await admin.query(`SELECT count(*)::integer AS tickets FROM
+    zk1_sync_batch.admission_ticket WHERE scope=$1`, [f.scope]);
+  assert.equal(count.rows[0].tickets, 1);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  assert.equal((await f.state()).markers.length, 1);
+});
+
+test("PG18 concurrent duplicate ticket requests cannot flood live same-pair handles", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const operator = await admin.connect();
+  let held = false;
+  let pending;
+  let issuances;
+  try {
+    await operator.query("BEGIN");
+    held = true;
+    await operator.query(`SELECT sequence FROM zk1_sync_batch.scope_head
+      WHERE scope=$1 FOR UPDATE`, [f.scope]);
+    pending = Promise.allSettled([
+      mintTestAdmission(f, pair), mintTestAdmission(f, pair),
+    ]);
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const waiting = await admin.query(`SELECT 1 FROM pg_catalog.pg_stat_activity
+        WHERE usename LIKE 'zkbatchissuer%'
+          AND wait_event_type='Lock'
+          AND query LIKE '%INSERT INTO zk1_sync_batch.admission_ticket%'
+        LIMIT 1`);
+      if (waiting.rowCount === 1) { observedLockWait = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(observedLockWait, true,
+      "duplicate issuance must genuinely wait behind scope_head row lock");
+    await operator.query("COMMIT");
+    held = false;
+    issuances = await pending;
+  } finally {
+    if (held) {
+      try { await operator.query("ROLLBACK"); } catch { /* test cleanup */ }
+    }
+    operator.release();
+    if (pending) await pending;
+  }
+  assert.equal(issuances.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(issuances.filter((r) => r.status === "rejected").length, 1);
+  assert.equal(issuances.find((r) => r.status === "rejected").reason.code,
+    "SYNC_PG_ISSUER_DENIED");
+  const ticket = issuances.find((r) => r.status === "fulfilled").value;
+  const issued = await admin.query(`SELECT COUNT(*)::integer AS live
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1 AND superseded=false`, [f.scope]);
+  assert.equal(issued.rows[0].live, 1);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const state = await f.state();
+  assert.equal(Number(state.head.sequence), 1);
+  assert.equal(state.markers.length, 1);
+  assert.equal(state.seen.length, 2);
+});
+
+test("PG18 full protected-role audit denies unlisted destructive table and column misgrants", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const before = await f.state();
+  await admin.query(`GRANT DELETE ON zk1_sync_batch.seen_envelope
+    TO zk1_sync_batch_verifier`);
+  try {
+    const effective = await verifier.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.seen_envelope','DELETE') AS granted`);
+    assert.equal(effective.rows[0].granted, true);
+    await assert.rejects(store.commitSignedOverwritePair({
+      ...f, operations: pair, admissionTicket: ticket,
+    }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    assert.deepEqual(await f.state(), before);
+  } finally {
+    await admin.query(`REVOKE DELETE ON zk1_sync_batch.seen_envelope
+      FROM zk1_sync_batch_verifier`);
+  }
+  await admin.query(`GRANT UPDATE(public_key) ON zk1_sync_batch.device_grant
+    TO zk1_sync_batch_admission_issuer`);
+  try {
+    const effective = await issuer.query(`SELECT
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.device_grant','public_key','UPDATE') AS granted`);
+    assert.equal(effective.rows[0].granted, true);
+    await assert.rejects(admissionIssuer.issueTicket({
+      ...f, operations: pair,
+    }), { code: "SYNC_PG_ISSUER_DENIED" });
+  } finally {
+    await admin.query(`REVOKE UPDATE(public_key) ON zk1_sync_batch.device_grant
+      FROM zk1_sync_batch_admission_issuer`);
+  }
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  await admin.query(`GRANT DELETE ON zk1_sync_batch.scope_policy
+    TO zk1_sync_batch_attestor_reader`);
+  try {
+    const effective = await attestor.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_policy','DELETE') AS granted`);
+    assert.equal(effective.rows[0].granted, true);
+    await assert.rejects(readback.verifyLatestSignedPair({
+      scope: f.scope, commitId: committed.commitId,
+    }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+  } finally {
+    await admin.query(`REVOKE DELETE ON zk1_sync_batch.scope_policy
+      FROM zk1_sync_batch_attestor_reader`);
+  }
+  const after = await f.state();
+  assert.equal(after.markers.length, 1);
+  assert.equal(after.seen.length, 2);
+});
+
 test("PG18 invalid second revision rolls back both writes and leaves no marker", async () => {
   const f = await fixture();
   // Sign an internally valid envelope whose signed base revision is stale.
