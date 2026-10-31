@@ -4,6 +4,7 @@
 // Durable pair provenance is distinct from signed individual operation IDs.
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fsConstants = require("node:fs").constants;
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const test = require("node:test");
@@ -111,7 +112,29 @@ test("cold open rejects missing signed MOVE while its durable atomic group still
   finally { await handle.close(); }
   await assert.rejects(new SyncJournal(f.filename).open(),
     /Invalid atomic signed WebDAV journal group/);
-  assert.deepEqual(await fsp.readFile(f.filename), bytes);
+  // Read the poisoned fixture through a pinned, no-follow descriptor after
+  // the independent cold-open rejection: an lstat/pathname readback is not
+  // stable evidence if the pathname is replaced between those two awaits.
+  const pinned = await fsp.open(f.filename,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+  try {
+    const openedBefore = await pinned.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(f.filename, { bigint: true });
+    assert.equal(openedBefore.isFile(), true);
+    assert.equal(openedBefore.nlink, 1n);
+    assert.equal(openedBefore.dev, namedBefore.dev);
+    assert.equal(openedBefore.ino, namedBefore.ino);
+    assert.deepEqual(await pinned.readFile(), bytes);
+    const openedAfter = await pinned.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(f.filename, { bigint: true });
+    for (const observed of [openedAfter, namedAfter]) {
+      assert.equal(observed.isFile(), true);
+      assert.equal(observed.nlink, 1n);
+      assert.equal(observed.dev, openedBefore.dev);
+      assert.equal(observed.ino, openedBefore.ino);
+      assert.equal(observed.size, BigInt(bytes.length));
+    }
+  } finally { await pinned.close(); }
 });
 
 test("reordered or extra signed MOVE companions are rejected without ANY journal write", {
