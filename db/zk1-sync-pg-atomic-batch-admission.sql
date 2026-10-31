@@ -45,6 +45,7 @@ DECLARE
   active_head record;
   live_count bigint;
   issued_recently bigint;
+  authority_now timestamptz;
 BEGIN
   -- INSERT-only credentials must not bypass the active-pair uniqueness by
   -- supplying superseded=true, pre-consumed handles or far-future issuance.
@@ -78,14 +79,15 @@ BEGIN
   END IF;
   -- Final issuance timestamp and TTL are owned by the DB after serialization:
   -- an INSERT-only credential must never antedate the rolling quota window.
-  NEW.issued_at := clock_timestamp();
+  authority_now := clock_timestamp();
+  NEW.issued_at := authority_now;
   NEW.expires_at := NEW.issued_at + interval '30 seconds';
   UPDATE zk1_sync_batch.admission_ticket SET superseded=true
     WHERE scope=NEW.scope AND sequence=NEW.sequence
       AND policy_epoch=NEW.policy_epoch AND previous_head=NEW.previous_head
       AND delete_digest=NEW.delete_digest AND move_digest=NEW.move_digest
       AND superseded=false AND consumed=false
-      AND expires_at <= clock_timestamp();
+      AND expires_at <= authority_now;
   -- Bound concurrently live distinct signed pairs per head. This is a DB
   -- quota, not a cryptographic proof: independently isolated issuer custody
   -- and abuse controls are still required before a real service is exposed.
@@ -93,7 +95,7 @@ BEGIN
     WHERE scope=NEW.scope AND sequence=NEW.sequence
       AND policy_epoch=NEW.policy_epoch AND previous_head=NEW.previous_head
       AND superseded=false AND consumed=false
-      AND expires_at > clock_timestamp();
+      AND expires_at > authority_now;
   IF live_count >= 128 THEN
     RAISE EXCEPTION 'scope admission ticket limit reached' USING ERRCODE='23514';
   END IF;
@@ -102,7 +104,7 @@ BEGIN
   -- issuing near-expiry handles or generating many distinct fake digests.
   SELECT count(*) INTO issued_recently FROM zk1_sync_batch.admission_ticket
     WHERE scope=NEW.scope
-      AND issued_at >= clock_timestamp() - interval '1 minute';
+      AND issued_at >= authority_now - interval '1 minute';
   IF issued_recently >= 256 THEN
     RAISE EXCEPTION 'scope admission issue rate exceeded' USING ERRCODE='23514';
   END IF;
@@ -342,11 +344,13 @@ END $body$;
 CREATE FUNCTION zk1_sync_batch.prune_expired_admission_tickets()
 RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY INVOKER
 SET search_path = pg_catalog AS $body$
-DECLARE removed integer;
+DECLARE
+  removed integer;
+  retention_cutoff timestamptz := clock_timestamp() - interval '7 days';
 BEGIN
   WITH old_handles AS (
     SELECT ticket_id FROM zk1_sync_batch.admission_ticket
-    WHERE expires_at < clock_timestamp() - interval '7 days'
+    WHERE expires_at < retention_cutoff
     ORDER BY expires_at, ticket_id LIMIT 256 FOR UPDATE SKIP LOCKED
   )
   DELETE FROM zk1_sync_batch.admission_ticket ticket
