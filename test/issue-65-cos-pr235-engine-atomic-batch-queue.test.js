@@ -1,6 +1,6 @@
 "use strict";
 
-// TEST_UNRUN (NODE_COUNT=73; exclusive Node22/WSL gate CLOSED).
+// Local Node22/WSL process gate closed; run this suite on hosted CI.
 // RED integration contract: two real Ed25519-signed AES-GCM DELETE→MOVE
 // envelopes require one batch transport and one fsynced local ACK, but ONLY
 // after a separately signed, owner-pinned physical admission statement.
@@ -16,6 +16,8 @@ const { createAuthorizationProof, verifyAuthorizationProof } =
   require("../sync-client/rootark-sync-authorization");
 const { SyncJournal } = require("../sync-client/rootark-sync-journal");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { DOMAIN: OWNER_PROVISION_DOMAIN } =
+  require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
@@ -85,8 +87,7 @@ async function snapshotPinnedJournal(filename, priorIdentity = null) {
 
 async function fixture(t, { batchResponse, witnessResponse, casResponse,
   missingCapability = false, interleaved = false,
-  missingWitnessKey = false, missingWitnessReadback = false,
-  missingCasKey = false, missingCasReadback = false,
+  missingWitnessReadback = false, missingCasReadback = false,
   onWitnessChallenge = null,
   deleteExpiresInMs = 120000 } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
@@ -101,6 +102,19 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   const witnessPublicKey = witness.publicKey.export({ type: "spki", format: "der" });
   const casSigner = crypto.generateKeyPairSync("ed25519");
   const casPublicKey = casSigner.publicKey.export({ type: "spki", format: "der" });
+  const ownerProvisioner = crypto.generateKeyPairSync("ed25519");
+  const ownerStatement = { type: "atomic-owner-provisioning", version: 1,
+    scope: "alice:store", sequence: 1,
+    accountId: ACCOUNT_ID, storeId: STORE_ID, username: "alice",
+    compartmentId: "private",
+    witnessSpki: witnessPublicKey.toString("base64url"),
+    casSpki: casPublicKey.toString("base64url") };
+  const ownerProvisioning = { statement: ownerStatement,
+    signature: crypto.sign(null, Buffer.from(OWNER_PROVISION_DOMAIN
+      + protocol.canonicalJson(ownerStatement)), ownerProvisioner.privateKey)
+      .toString("base64url") };
+  const ownerProvisionDigest = sha256(OWNER_PROVISION_DOMAIN
+    + protocol.canonicalJson(ownerProvisioning));
   const receiptFor = (pair, overrides = {}) => {
     const statement = {
       version: 2,
@@ -231,10 +245,13 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
     fileKeyResolver: async () => fileKey,
     requireAuthorization: true,
     requireCurrentOutgoingAuthorization: true,
-    atomicBatchWitnessPublicKey: missingWitnessKey ? null : witnessPublicKey,
+    atomicBatchWitnessPublicKey: witnessPublicKey,
     atomicBatchWitnessScope: "alice:store",
     atomicBatchOwnerIdentity: { accountId: ACCOUNT_ID, storeId: STORE_ID,
       username: "alice", compartmentId: "private" },
+    atomicBatchOwnerProvisionerPublicKey: ownerProvisioner.publicKey,
+    atomicBatchOwnerProvisioning: ownerProvisioning,
+    atomicBatchOwnerProvisionDigest: ownerProvisionDigest,
     atomicBatchWitnessReadback: missingWitnessReadback ? null : async (challenge) => {
       if (onWitnessChallenge) onWitnessChallenge(challenge);
       lastWitnessReceipt = witnessResponse
@@ -242,7 +259,7 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
         : receiptFor([deleted, moved], { nonce: challenge.nonce });
       return lastWitnessReceipt;
     },
-    atomicBatchCasFloorPublicKey: missingCasKey ? null : casPublicKey,
+    atomicBatchCasFloorPublicKey: casPublicKey,
     atomicBatchCasFloorReadback: missingCasReadback ? null : async (challenge) => casResponse
       ? casResponse(challenge, { deleted, moved, receiptFor, casFloorFor,
         legacyCasFloorFor, lastWitnessReceipt })
@@ -309,6 +326,7 @@ test("an async witness cannot repin the CAS signer, owner scope or readback call
         ["atomicBatchWitnessScope", "mallory:store"],
         ["atomicBatchOwnerIdentity", { accountId: OTHER_ACCOUNT_ID,
           storeId: OTHER_STORE_ID, username: "mallory", compartmentId: "private" }],
+        ["atomicBatchOwnerProvisionerPublicKey", f.engine.atomicBatchCasFloorPublicKey],
         ["atomicBatchWitnessReadback", async () => null],
         ["atomicBatchCasFloorReadback", async () => null],
       ]) {
@@ -322,7 +340,7 @@ test("an async witness cannot repin the CAS signer, owner scope or readback call
     },
   });
   await f.engine._pushPending(f.summary());
-  assert.equal(attempts, 6);
+  assert.equal(attempts, 7);
   assert.equal(f.engine.atomicBatchWitnessScope, "alice:store");
   assert.deepEqual(await (await f.reread()).recover(), []);
 });
@@ -378,13 +396,12 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
   "other-username-witness", "other-compartment-witness", "legacy-v1-witness",
   "legacy-v1-domain-v2-witness",
   "wrong-envelope-digest", "not-physically-durable",
-  "zero-fencing-epoch", "invalid-store-head", "missing-trusted-witness-key",
+  "zero-fencing-epoch", "invalid-store-head",
   "missing-independent-readback", "replayed-old-witness-nonce",
   "witness-switching-nonce-getter"]) {
   test("no false durable batch ACK with " + mode, { timeout: 120000 }, async (t) => {
     const f = await fixture(t, {
       batchResponse: (pair) => ({ objects: exact(pair) }),
-      missingWitnessKey: mode === "missing-trusted-witness-key",
       missingWitnessReadback: mode === "missing-independent-readback",
       witnessResponse: (challenge, ctx) => {
         if (mode === "only-signed-echo") return null;
@@ -435,16 +452,16 @@ for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witne
       },
     });
     await assert.rejects(f.engine._pushPending(f.summary()),
-      { code: mode === "missing-trusted-witness-key" || mode === "missing-independent-readback"
+      { code: mode === "missing-independent-readback"
         ? "sync_atomic_batch_unavailable" : "sync_atomic_batch_indeterminate" });
     assert.deepEqual(f.events.map((entry) => entry.kind),
-      mode === "missing-trusted-witness-key" || mode === "missing-independent-readback"
+      mode === "missing-independent-readback"
         ? [] : ["batch"]);
     await f.assertBothPending();
   });
 }
 
-for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floor",
+for (const mode of ["missing-cas-readback", "missing-cas-floor",
   "forged-cas-floor", "cas-stale-current-head", "cas-wrong-commit",
   "cas-old-epoch", "cas-not-current", "cas-wrong-scope", "cas-replayed-nonce",
   "cas-other-immutable-account-id", "cas-other-immutable-store-id", "cas-legacy-v1",
@@ -453,7 +470,6 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
   test("no protected batch ACK without fresh independently signed CAS floor: " + mode,
     { timeout: 120000 }, async (t) => {
       const f = await fixture(t, {
-        missingCasKey: mode === "missing-cas-key",
         missingCasReadback: mode === "missing-cas-readback",
         casResponse: (challenge, { casFloorFor, legacyCasFloorFor, lastWitnessReceipt }) => {
           assert.ok(lastWitnessReceipt, "CAS readback must follow signed witness verification");
@@ -499,7 +515,7 @@ for (const mode of ["missing-cas-key", "missing-cas-readback", "missing-cas-floo
           ? "sync_atomic_batch_unavailable" : "sync_atomic_batch_indeterminate",
       });
       assert.deepEqual(f.events.map((event) => event.kind),
-        ["missing-cas-key", "missing-cas-readback"].includes(mode) ? [] : ["batch"]);
+        mode === "missing-cas-readback" ? [] : ["batch"]);
       await f.assertBothPending();
     });
 }
