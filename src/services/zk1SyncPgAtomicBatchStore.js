@@ -11,6 +11,7 @@ const crypto = require("node:crypto");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { verifyWebdavOverwriteProvenance } = require("./zk1SyncPgWebdavProvenance");
+const { hasUnexpectedProtectedDml } = require("./zk1SyncPgProtectedRoleAudit");
 
 const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
 const MAX_SIGNED_BATCH_BYTES = 9 * 1024 * 1024;
@@ -107,6 +108,9 @@ function createZk1SyncPgAtomicBatchStore({ verifierPool } = {}) {
           || s.cipher_write || s.marker_write || s.seen_write || s.issuer_write
           || s.object_delete || s.object_truncate || s.head_delete || s.head_truncate
           || s.ticket_delete || s.ticket_truncate) {
+          throw fail("SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE");
+        }
+        if (await hasUnexpectedProtectedDml(client)) {
           throw fail("SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE");
         }
         // Read-only defense in depth before one controlled owner transaction.

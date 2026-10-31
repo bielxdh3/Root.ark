@@ -5,6 +5,7 @@
 // CAS floor, Ed25519 witness receipt or physicalDurable claim is provided.
 const crypto = require("node:crypto");
 const { verifyWebdavOverwriteProvenance } = require("./zk1SyncPgWebdavProvenance");
+const { hasUnexpectedProtectedDml } = require("./zk1SyncPgProtectedRoleAudit");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
@@ -60,6 +61,7 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
           || privilege.policy_write || privilege.ciphertext_write
           || privilege.fsync !== "on"
           || privilege.full_page_writes !== "on") throw error();
+        if (await hasUnexpectedProtectedDml(client)) throw error();
         const evidence = await client.query(`SELECT m.*, h.sequence AS latest_sequence,
           h.head AS latest_head, p.username, p.compartment_id, p.key_epoch,
           p.enabled,p.allow_delete,p.policy_epoch AS current_epoch

@@ -8,6 +8,7 @@ const crypto = require("node:crypto");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { verifyWebdavOverwriteProvenance } = require("./zk1SyncPgWebdavProvenance");
+const { hasUnexpectedProtectedDml } = require("./zk1SyncPgProtectedRoleAudit");
 
 const fail = () => Object.assign(new Error("SYNC_PG_ISSUER_DENIED"),
   { code: "SYNC_PG_ISSUER_DENIED" });
@@ -66,6 +67,7 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           || r.rolsuper || r.rolcreaterole || r.rolbypassrls
           || r.state_write || r.head_write || r.state_delete || r.state_truncate
           || r.head_delete || r.head_truncate) throw fail();
+        if (await hasUnexpectedProtectedDml(reader)) throw fail();
         const pinned = await reader.query(`SELECT p.username,p.compartment_id,p.key_epoch,
           p.enabled,p.allow_delete,p.policy_epoch,g.device_id,g.public_key,g.revoked,
           h.sequence,h.head FROM zk1_sync_batch.scope_policy p
@@ -120,6 +122,7 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           || a.head_write || a.state_write || a.marker_write
           || a.ticket_delete || a.ticket_truncate || a.state_delete
           || a.state_truncate) throw fail();
+        if (await hasUnexpectedProtectedDml(issuer, { allowTicketInsert: true })) throw fail();
         const ticket = crypto.randomUUID();
         await issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
           (ticket_id,scope,username,device_id,public_key,policy_epoch,
