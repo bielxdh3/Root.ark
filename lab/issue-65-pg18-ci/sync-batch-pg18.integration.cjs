@@ -1439,6 +1439,8 @@ test("PG18 current pair accepts legitimate dotted and colon WebDAV signed event 
 test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS without authorizing ACK", {
   timeout: 120000,
 }, async (t) => {
+  let stage = 1;
+  try {
   const f = await fixture();
   const operations = await f.signedPair({ eventId: "tls.real:batch" });
   const committed = await commitTestBatch(f, operations);
@@ -1505,7 +1507,9 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
       request.end(data);
     });
   }
+  stage = 10;
   const observed = await send(challenge);
+  stage = 11;
   assert.equal(observed.status, 200);
   assert.equal(observed.headers["cache-control"], "no-store");
   assert.equal(observed.body.kind, "SYNC_ATOMIC_SQL_ROWS_ONLY_DEV_OFF");
@@ -1519,11 +1523,14 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
   assert.equal(Object.hasOwn(observed.body, "statement"), false);
   assert.equal(Object.hasOwn(observed.body, "signature"), false);
   assert.equal(Object.hasOwn(observed.body, "atomicAdmission"), false);
+  stage = 20;
   await assert.rejects(send(challenge, {}),
     "client TLS certificates must be mandatory at the handshake boundary");
+  stage = 21;
   await assert.rejects(send(challenge, client, "/v2/sync-atomic/sql-observe",
     { minVersion: "TLSv1.2", maxVersion: "TLSv1.2" }),
   "TLS 1.2 cannot negotiate the mTLS observer service");
+  let negativeIndex = 0;
   for (const [bad, credential, expected] of [
     [challenge, otherClient, 403],
     [{ ...challenge, accountId: crypto.randomUUID() }, client, 403],
@@ -1533,22 +1540,32 @@ test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS witho
     [{ ...challenge, clientAckAuthorized: true }, client, 400],
     [{ ...challenge, padding: "x".repeat(4097) }, client, 400],
   ]) {
+    stage = 30 + negativeIndex++;
     const denied = await send(bad, credential);
     assert.equal(denied.status, expected);
     assert.equal(denied.headers["cache-control"], "no-store");
     assert.equal(Object.hasOwn(denied.body, "commitId"), false);
   }
+  stage = 40;
   assert.equal((await send(challenge, client, "/v2/sync-atomic/witness/readback")).status, 404,
     "SQL-only endpoint must not impersonate a physical witness route");
+  stage = 41;
   const repeat = await send(challenge);
   assert.equal(repeat.status, 200, "replayed read-only SQL observation is not a consumed admission");
   assert.equal(repeat.body.clientAckAuthorized, false);
+  stage = 42;
   await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
     WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
   const revoked = await send(challenge);
   assert.equal(revoked.status, 503);
   assert.equal(Object.hasOwn(revoked.body, "commitId"), false,
     "revoked device cannot be read back over mTLS as an authorized physical ACK");
+  } catch {
+    // Keep the runner's remote CI diagnostics generic: never print TLS keys,
+    // certificate bodies, SQL values, scope IDs, or request parameters.
+    const code = `ZK65_SQL_MTLS_STAGE_${stage}`;
+    throw Object.assign(new Error(code), { code });
+  }
 });
 
 test("independent readback rejects revocation and runtime impersonation", async () => {
