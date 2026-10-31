@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const protocol = require("./rootark-sync-protocol");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { SyncEngine } = require("./rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
@@ -60,21 +61,42 @@ function fileKeyResolver(master, fallbackEpoch) {
   return (operation) => crypto.createHmac("sha256", master).update(`${operation.fileId || operation.objectId}\0${operation.keyEpoch || fallbackEpoch}`, "utf8").digest();
 }
 
-function trustedAtomicBatchWitnessOptions(options, strictHistorical) {
+function trustedAtomicBatchWitnessOptions(options, strictHistorical,
+  trustedLocalDevicePolicy = null, localCompartmentId = null) {
   // The remote DELETE+MOVE witness may be supplied only by the embedding
   // trusted process, never by .rootark-sync.json or a remote response. A
   // configured URL, signature or physicalDurable boolean is not a witness.
   if (!Object.hasOwn(options, "trustedAtomicBatchWitness")) return {};
   const supplied = options.trustedAtomicBatchWitness;
+  let suppliedIdentity = null;
+  try {
+    if (supplied?.ownerIdentity != null) {
+      suppliedIdentity = JSON.parse(protocol.canonicalJson(supplied.ownerIdentity));
+    }
+  } catch {
+    throw new Error("Atomic batch witness requires immutable canonical owner identity");
+  }
   if (!strictHistorical || !supplied || typeof supplied !== "object"
     || Array.isArray(supplied)
     || Object.keys(supplied).sort().join(",")
-      !== ["pinnedPublicKey", "scope", "readback",
+      !== ["pinnedPublicKey", "scope", "readback", "ownerIdentity",
         "casPinnedPublicKey", "casReadback"].sort().join(",")
     || typeof supplied.readback !== "function"
     || typeof supplied.casReadback !== "function"
     || typeof supplied.scope !== "string"
     || !/^[A-Za-z0-9._:-]{1,256}$/.test(supplied.scope)
+    || !suppliedIdentity || typeof suppliedIdentity !== "object"
+    || Array.isArray(suppliedIdentity)
+    || Object.keys(suppliedIdentity).sort().join(",")
+      !== ["accountId", "storeId", "username", "compartmentId"].sort().join(",")
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(suppliedIdentity.accountId)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(suppliedIdentity.storeId)
+    || typeof suppliedIdentity.username !== "string"
+    || !suppliedIdentity.username || suppliedIdentity.username.length > 512
+    || typeof suppliedIdentity.compartmentId !== "string"
+    || !suppliedIdentity.compartmentId || suppliedIdentity.compartmentId.length > 512
+    || (trustedLocalDevicePolicy && suppliedIdentity.username !== trustedLocalDevicePolicy.username)
+    || (localCompartmentId !== null && suppliedIdentity.compartmentId !== localCompartmentId)
     || !supplied.pinnedPublicKey || !supplied.casPinnedPublicKey) {
     throw new Error("Atomic batch witness requires independently pinned readback and external CAS floor");
   }
@@ -82,19 +104,21 @@ function trustedAtomicBatchWitnessOptions(options, strictHistorical) {
   // SPKI verifier. Capture all references now; config cannot replace them.
   const readback = supplied.readback;
   const casReadback = supplied.casReadback;
+  const identity = Object.freeze(suppliedIdentity);
   return {
     atomicBatchWitnessPublicKey: Buffer.isBuffer(supplied.pinnedPublicKey)
       || supplied.pinnedPublicKey instanceof Uint8Array
       ? Buffer.from(supplied.pinnedPublicKey) : supplied.pinnedPublicKey,
     atomicBatchWitnessScope: supplied.scope,
+    atomicBatchOwnerIdentity: identity,
     atomicBatchCasFloorPublicKey: Buffer.isBuffer(supplied.casPinnedPublicKey)
       || supplied.casPinnedPublicKey instanceof Uint8Array
       ? Buffer.from(supplied.casPinnedPublicKey) : supplied.casPinnedPublicKey,
-    atomicBatchWitnessReadback: ({ scope, nonce, operationIds, envelopeDigests }) =>
-      readback({ scope, nonce, operationIds: [...operationIds],
+    atomicBatchWitnessReadback: ({ scope, accountId, storeId, nonce, operationIds, envelopeDigests }) =>
+      readback({ scope, accountId, storeId, nonce, operationIds: [...operationIds],
         envelopeDigests: [...envelopeDigests] }),
-    atomicBatchCasFloorReadback: ({ scope, nonce, commitId, storeHeadSha256, fencingEpoch }) =>
-      casReadback({ scope, nonce, commitId, storeHeadSha256, fencingEpoch }),
+    atomicBatchCasFloorReadback: ({ scope, accountId, storeId, nonce, commitId, storeHeadSha256, fencingEpoch }) =>
+      casReadback({ scope, accountId, storeId, nonce, commitId, storeHeadSha256, fencingEpoch }),
   };
 }
 
@@ -201,7 +225,8 @@ async function start(options = {}) {
       },
     };
   })() : null;
-  const atomicWitness = trustedAtomicBatchWitnessOptions(options, strictHistorical);
+  const atomicWitness = trustedAtomicBatchWitnessOptions(options, strictHistorical,
+    independentlyPinnedDevicePolicy, config.compartmentId || "private");
   const strictVerifier = strictHistorical
     ? strictBinding.verifySyncV2HistoricalWitnessAdmission : null;
   const adapter = createOpaqueSyncAdapter({

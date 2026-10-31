@@ -23,8 +23,31 @@ function signedEnvelopeDigest(operation) {
     .update(protocol.canonicalJson(operation), "utf8").digest("hex");
 }
 
-const ATOMIC_ADMISSION_DOMAIN = "rootark-sync-atomic-batch-witness-v1\0";
-const ATOMIC_CAS_FLOOR_DOMAIN = "rootark-sync-atomic-batch-external-cas-floor-v1\0";
+// v2 is intentionally incompatible with v1: a v1 receipt has no immutable
+// owner-provisioned account/store namespace and MUST NOT authorize new ACKs.
+const ATOMIC_ADMISSION_DOMAIN = "rootark-sync-atomic-batch-witness-v2\0";
+const ATOMIC_CAS_FLOOR_DOMAIN = "rootark-sync-atomic-batch-external-cas-floor-v2\0";
+const ATOMIC_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+function pinnedAtomicOwnerIdentity(value) {
+  if (value == null) return null;
+  // Detach option-owned getters just once. An apparent immutable identity
+  // must not be replaced between constructor validation and signed readback.
+  let identity;
+  try { identity = JSON.parse(protocol.canonicalJson(value)); }
+  catch { fail("Atomic batch owner identity is not canonical JSON", "authorization_required"); }
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)
+    || Object.keys(identity).sort().join(",")
+      !== ["accountId", "storeId", "username", "compartmentId"].sort().join(",")
+    || typeof identity.accountId !== "string" || !ATOMIC_UUID.test(identity.accountId)
+    || typeof identity.storeId !== "string" || !ATOMIC_UUID.test(identity.storeId)
+    || typeof identity.username !== "string" || !identity.username || identity.username.length > 512
+    || typeof identity.compartmentId !== "string"
+    || !identity.compartmentId || identity.compartmentId.length > 512) {
+    fail("Atomic batch requires immutable externally provisioned account/store identity",
+      "authorization_required");
+  }
+  return Object.freeze(identity);
+}
 function pinnedAtomicWitnessKey(value) {
   if (value == null) return null;
   let key;
@@ -45,7 +68,7 @@ function pinnedAtomicWitnessKey(value) {
   }
   return key;
 }
-function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope) {
+function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope, identity) {
   // Client-signed envelopes echoed by the server are NOT evidence that the
   // server committed them. Only a separate pinned witness can attest the
   // exact physical store head AFTER the two operations become durable.
@@ -53,13 +76,18 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     "sync_atomic_batch_indeterminate");
   const receipt = response?.atomicAdmission;
   const statement = receipt?.statement;
-  const required = ["version", "scope", "nonce", "operationIds", "envelopeDigests",
+  const required = ["version", "scope", "accountId", "storeId", "username",
+    "compartmentId", "nonce", "operationIds", "envelopeDigests",
     "commitId", "storeHeadSha256", "fencingEpoch", "physicalDurable"];
   if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
     || Object.keys(receipt).sort().join(",") !== ["signature", "statement"].sort().join(",")
     || !statement || typeof statement !== "object" || Array.isArray(statement)
     || Object.keys(statement).sort().join(",") !== required.sort().join(",")
-    || statement.version !== 1 || statement.scope !== trustedScope
+    || statement.version !== 2 || statement.scope !== trustedScope
+    || !identity || statement.accountId !== identity.accountId
+    || statement.storeId !== identity.storeId
+    || statement.username !== identity.username
+    || statement.compartmentId !== identity.compartmentId
     || statement.physicalDurable !== true
     || typeof statement.nonce !== "string"
     || !/^[A-Za-z0-9_-]{43}$/.test(statement.nonce)
@@ -70,7 +98,9 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     || !Array.isArray(statement.operationIds) || statement.operationIds.length !== 2
     || !Array.isArray(statement.envelopeDigests) || statement.envelopeDigests.length !== 2
     || operations.some((operation, index) =>
-      statement.operationIds[index] !== operation.operationId
+      operation.authorization?.username !== identity.username
+      || operation.compartmentId !== identity.compartmentId
+      || statement.operationIds[index] !== operation.operationId
       || statement.envelopeDigests[index] !== signedEnvelopeDigest(operation))
     || typeof receipt.signature !== "string"
     || !/^[A-Za-z0-9_-]{86}$/.test(receipt.signature)) {
@@ -87,7 +117,7 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
   }
 }
 function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
-  trustedScope, expectedNonce) {
+  trustedScope, expectedNonce, identity) {
   // An independent, off-host CAS reader must attest the CURRENT retained
   // physical head with a separate pinned signer. A new witness nonce alone
   // cannot distinguish a re-signed stale head after physical rollback.
@@ -98,13 +128,17 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
   try { detached = JSON.parse(protocol.canonicalJson(floor)); }
   catch { fail("External CAS floor is not canonical JSON", "sync_atomic_batch_indeterminate"); }
   const statement = detached?.statement;
-  const keys = ["version", "scope", "nonce", "commitId", "storeHeadSha256",
-    "fencingEpoch", "sequence", "current"];
+  const keys = ["version", "scope", "accountId", "storeId", "nonce",
+    "commitId", "storeHeadSha256", "fencingEpoch", "sequence", "current"];
   if (!trustedCasKey || !detached || typeof detached !== "object" || Array.isArray(detached)
     || Object.keys(detached).sort().join(",") !== ["statement", "signature"].sort().join(",")
     || !statement || typeof statement !== "object" || Array.isArray(statement)
     || Object.keys(statement).sort().join(",") !== keys.sort().join(",")
-    || statement.version !== 1 || statement.scope !== trustedScope
+    || statement.version !== 2 || statement.scope !== trustedScope
+    || !identity || statement.accountId !== identity.accountId
+    || statement.storeId !== identity.storeId
+    || statement.accountId !== witnessStatement.accountId
+    || statement.storeId !== witnessStatement.storeId
     || statement.scope !== witnessStatement.scope
     || statement.nonce !== expectedNonce || statement.current !== true
     || !Number.isSafeInteger(statement.sequence) || statement.sequence < 1
@@ -399,6 +433,7 @@ class SyncEngine {
     const witnessPublicKey = pinnedAtomicWitnessKey(options.atomicBatchWitnessPublicKey);
     const witnessReadback = options.atomicBatchWitnessReadback || null;
     const witnessScope = options.atomicBatchWitnessScope || null;
+    const ownerIdentity = pinnedAtomicOwnerIdentity(options.atomicBatchOwnerIdentity);
     const casFloorPublicKey = pinnedAtomicWitnessKey(options.atomicBatchCasFloorPublicKey);
     const casFloorReadback = options.atomicBatchCasFloorReadback || null;
     if (casFloorReadback !== null
@@ -431,6 +466,7 @@ class SyncEngine {
       atomicBatchWitnessPublicKey: { value: witnessPublicKey },
       atomicBatchWitnessReadback: { value: witnessReadback },
       atomicBatchWitnessScope: { value: witnessScope },
+      atomicBatchOwnerIdentity: { value: ownerIdentity },
       atomicBatchCasFloorPublicKey: { value: casFloorPublicKey },
       atomicBatchCasFloorReadback: { value: casFloorReadback },
     });
@@ -1171,6 +1207,7 @@ class SyncEngine {
       || typeof this.journal.markSeenMany !== "function"
       || !this.atomicBatchWitnessPublicKey
       || !this.atomicBatchWitnessReadback || !this.atomicBatchWitnessScope
+      || !this.atomicBatchOwnerIdentity
       || !this.atomicBatchCasFloorPublicKey || !this.atomicBatchCasFloorReadback) {
       fail("Atomic protected WebDAV remote batch transport unavailable",
         "sync_atomic_batch_unavailable");
@@ -1270,6 +1307,8 @@ class SyncEngine {
     try {
       witnessed = await this.atomicBatchWitnessReadback({
         scope: this.atomicBatchWitnessScope,
+        accountId: this.atomicBatchOwnerIdentity.accountId,
+        storeId: this.atomicBatchOwnerIdentity.storeId,
         nonce: witnessNonce,
         operationIds: [deleted.operationId, moved.operationId],
         envelopeDigests: digests,
@@ -1299,7 +1338,8 @@ class SyncEngine {
     // accepting a server-supplied `atomicAdmission` would undermine the
     // separate witness and a valid direct receipt must not be rejected.
     verifyAtomicBatchAdmission({ atomicAdmission: detachedWitness }, [deleted, moved],
-      this.atomicBatchWitnessPublicKey, this.atomicBatchWitnessScope);
+      this.atomicBatchWitnessPublicKey, this.atomicBatchWitnessScope,
+      this.atomicBatchOwnerIdentity);
     // An independently retained CAS floor must independently sign a second
     // fresh challenge AFTER witness verification. Only an exact current
     // physical head can authorize a local ACK; never use a journal/PG row or
@@ -1310,6 +1350,8 @@ class SyncEngine {
     try {
       floor = await this.atomicBatchCasFloorReadback({
         scope: this.atomicBatchWitnessScope,
+        accountId: this.atomicBatchOwnerIdentity.accountId,
+        storeId: this.atomicBatchOwnerIdentity.storeId,
         nonce: floorNonce,
         commitId: verifiedWitnessStatement.commitId,
         storeHeadSha256: verifiedWitnessStatement.storeHeadSha256,
@@ -1320,7 +1362,8 @@ class SyncEngine {
         "sync_atomic_batch_indeterminate");
     }
     verifyAtomicBatchCasFloor(floor, verifiedWitnessStatement,
-      this.atomicBatchCasFloorPublicKey, this.atomicBatchWitnessScope, floorNonce);
+      this.atomicBatchCasFloorPublicKey, this.atomicBatchWitnessScope, floorNonce,
+      this.atomicBatchOwnerIdentity);
     // Remote admission is one transaction. Local advancement may still crash;
     // keep BOTH original outbox entries pending until one atomic markSeenMany
     // after the verified response and local snapshot are durably written.
