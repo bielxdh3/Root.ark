@@ -253,6 +253,11 @@ test("PG18 INSERT-only issuer cannot bypass ticket uniqueness or create future-l
   const farFuture = new Date(Date.now() + 86400000);
   await assert.rejects(submit({ issuedAt: farFuture,
     expiresAt: new Date(farFuture.valueOf() + 30000) }), { code: "23514" });
+  const staleIssue = new Date(Date.now() - 90000);
+  await assert.rejects(submit({ issuedAt: staleIssue,
+    expiresAt: new Date(staleIssue.valueOf() + 120000) }), { code: "23514" });
+  await assert.rejects(submit({ issuedAt: new Date(),
+    expiresAt: new Date(Date.now() + 3000) }), { code: "23514" });
   await assert.rejects(submit({ expiresAt: new Date(Date.now() + 60000) }),
     { code: "23514" });
   await assert.rejects(submit(), { code: "23505" },
@@ -265,6 +270,202 @@ test("PG18 INSERT-only issuer cannot bypass ticket uniqueness or create future-l
   });
   assert.equal(committed.clientAckAuthorized, false);
   assert.equal((await f.state()).markers.length, 1);
+});
+
+test("PG18 issuer credential cannot mint stale head or epoch tickets independently of the scope lock", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const good = await mintTestAdmission(f, pair);
+  const row = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [good])).rows[0];
+  const insert = (epoch, head, sequence) => issuer.query(`INSERT INTO
+    zk1_sync_batch.admission_ticket (ticket_id,scope,username,device_id,
+      public_key,policy_epoch,sequence,previous_head,delete_digest,
+      move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), row.scope, row.username, row.device_id,
+    row.public_key, epoch, sequence, head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  const before = await f.state();
+  await assert.rejects(insert(Number(row.policy_epoch) + 1, row.previous_head,
+    row.sequence), { code: "23514" });
+  await assert.rejects(insert(row.policy_epoch, crypto.randomBytes(32),
+    row.sequence), { code: "23514" });
+  await assert.rejects(insert(row.policy_epoch, row.previous_head,
+    Number(row.sequence) + 1), { code: "23514" });
+  assert.deepEqual(await f.state(), before);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: good,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+});
+
+test("PG18 ticket issue time and 30-second TTL are stamped by database AFTER authority fencing", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const original = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket])).rows[0];
+  const chosen = crypto.randomUUID();
+  const attackerIssuedAt = new Date(Date.now() - 2000);
+  const attackerExpiresAt = new Date(attackerIssuedAt.getTime() + 30000);
+  const response = await issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,sequence,
+     previous_head,delete_digest,move_digest,issued_at,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [
+    chosen, original.scope, original.username, original.device_id, original.public_key,
+    original.policy_epoch, original.sequence, original.previous_head,
+    crypto.randomBytes(32), crypto.randomBytes(32), attackerIssuedAt, attackerExpiresAt,
+  ]);
+  assert.equal(response.rowCount, 1);
+  const verified = await admin.query(`SELECT
+    issued_at,
+    extract(epoch FROM (expires_at-issued_at)) AS ttl_s
+    FROM zk1_sync_batch.admission_ticket WHERE ticket_id=$1`, [chosen]);
+  assert.equal(verified.rowCount, 1);
+  assert.ok(new Date(verified.rows[0].issued_at).getTime() - attackerIssuedAt.getTime() >= 1500,
+    "the DB must override caller's exact backdated issue time, not merely recompute TTL");
+  assert.equal(Number(verified.rows[0].ttl_s), 30);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+});
+
+test("PG18 owner-only bounded seven-day ticket pruning preserves recent authorization and replay history", async () => {
+  const old = await fixture();
+  const pairOld = await old.signedPair();
+  const oldTicket = await mintTestAdmission(old, pairOld);
+  const recent = await fixture();
+  const pairRecent = await recent.signedPair();
+  const recentTicket = await mintTestAdmission(recent, pairRecent);
+  await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+    SET issued_at=clock_timestamp() - interval '8 days',
+        expires_at=clock_timestamp() - interval '8 days' + interval '30 seconds'
+    WHERE ticket_id=$1`, [oldTicket]);
+  for (const rolePool of [runtime, verifier, issuer, attestor]) {
+    await assert.rejects(rolePool.query(`SELECT
+      zk1_sync_batch.prune_expired_admission_tickets()`), { code: "42501" },
+    "untrusted roles must never prune admission evidence");
+  }
+  const beforeOld = await old.state();
+  const beforeRecent = await recent.state();
+  const pruned = await admin.query(`SELECT
+    zk1_sync_batch.prune_expired_admission_tickets() AS removed`);
+  assert.ok(pruned.rows[0].removed >= 1 && pruned.rows[0].removed <= 256);
+  const found = await admin.query(`SELECT ticket_id FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id IN ($1,$2)`, [oldTicket, recentTicket]);
+  assert.equal(found.rows.some((r) => r.ticket_id === oldTicket), false);
+  assert.equal(found.rows.some((r) => r.ticket_id === recentTicket), true);
+  assert.deepEqual(await old.state(), beforeOld);
+  assert.deepEqual(await recent.state(), beforeRecent);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...old, operations: pairOld, admissionTicket: oldTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const replacement = await mintTestAdmission(old, pairOld);
+  const recovered = await store.commitSignedOverwritePair({
+    ...old, operations: pairOld, admissionTicket: replacement,
+  });
+  assert.equal(recovered.sequence, 1);
+  assert.equal(recovered.clientAckAuthorized, false);
+  const committed = await store.commitSignedOverwritePair({
+    ...recent, operations: pairRecent, admissionTicket: recentTicket,
+  });
+  assert.equal(committed.sequence, 1);
+  assert.equal((await old.state()).seen.length, 2);
+  assert.equal((await recent.state()).seen.length, 2);
+});
+
+test("PG18 pruning an old consumed ticket does not erase replay evidence or allow a second signed commit", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const first = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(first.clientAckAuthorized, false);
+  const settled = await f.state();
+  await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+    SET issued_at=clock_timestamp() - interval '8 days',
+        expires_at=clock_timestamp() - interval '8 days' + interval '30 seconds'
+    WHERE ticket_id=$1 AND consumed=true`, [ticket]);
+  const removed = await admin.query(`SELECT
+    zk1_sync_batch.prune_expired_admission_tickets() AS count`);
+  assert.ok(removed.rows[0].count >= 1);
+  const absent = await admin.query(`SELECT 1 FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket]);
+  assert.equal(absent.rowCount, 0);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const retry = await mintTestAdmission(f, pair);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: retry,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  assert.deepEqual(await f.state(), settled,
+    "retention must never mutate committed ciphertext, CAS head or replay ledger");
+});
+
+test("PG18 stolen issuer INSERT privilege is capped at 128 live distinct pair handles per scope head", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const validTicket = await mintTestAdmission(f, pair);
+  const ticket = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [validTicket])).rows[0];
+  const inject = () => issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,
+     sequence,previous_head,delete_digest,move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), ticket.scope, ticket.username, ticket.device_id,
+    ticket.public_key, ticket.policy_epoch, ticket.sequence,
+    ticket.previous_head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  for (let i = 1; i < 128; i++) await inject();
+  const live = await admin.query(`SELECT count(*)::integer AS count
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1 AND consumed=false
+      AND superseded=false AND expires_at > clock_timestamp()`, [f.scope]);
+  assert.equal(live.rows[0].count, 128);
+  await assert.rejects(inject(), { code: "23514" });
+  const before = await f.state();
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: validTicket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  assert.equal(before.seen.length, 0);
+  assert.equal((await f.state()).seen.length, 2);
+});
+
+test("PG18 one-minute issued-ticket quota survives expiry and cannot be bypassed by fake issuer digests", async () => {
+  const f = await fixture();
+  const original = await f.signedPair();
+  const live = await mintTestAdmission(f, original);
+  const template = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [live])).rows[0];
+  const insert = () => issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,sequence,
+     previous_head,delete_digest,move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+      clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), template.scope, template.username, template.device_id,
+    template.public_key, template.policy_epoch, template.sequence,
+    template.previous_head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  for (let batch = 0; batch < 2; batch++) {
+    for (let i = batch ? 0 : 1; i < 128; i++) await insert();
+    await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+      SET issued_at=clock_timestamp()-interval '30 seconds',
+          expires_at=clock_timestamp()-interval '1 second'
+      WHERE scope=$1 AND expires_at > clock_timestamp()`, [f.scope]);
+  }
+  const count = await admin.query(`SELECT count(*)::integer AS total
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1
+      AND issued_at >= clock_timestamp()-interval '1 minute'`, [f.scope]);
+  assert.equal(count.rows[0].total, 256);
+  await assert.rejects(insert(), { code: "23514" },
+    "expired but recent ticket handles must still count toward issuer budget");
+  const current = await f.state();
+  assert.equal(current.markers.length, 0);
+  assert.equal(current.seen.length, 0);
 });
 
 test("PG18 concurrent duplicate ticket requests cannot flood live same-pair handles", async () => {

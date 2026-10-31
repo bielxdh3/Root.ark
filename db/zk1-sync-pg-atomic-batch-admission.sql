@@ -32,33 +32,82 @@ CREATE TABLE zk1_sync_batch.admission_ticket (
 CREATE UNIQUE INDEX admission_ticket_active_pair ON zk1_sync_batch.admission_ticket
   (scope,sequence,policy_epoch,previous_head,delete_digest,move_digest)
   WHERE superseded=false;
+-- Bounded range scans under the authority lock, rather than a full retained
+-- audit-history scan on each issuance or operator maintenance pass.
+CREATE INDEX admission_ticket_recent_issuance
+  ON zk1_sync_batch.admission_ticket(scope,issued_at);
+CREATE INDEX admission_ticket_old_expiration
+  ON zk1_sync_batch.admission_ticket(expires_at,ticket_id);
 CREATE FUNCTION zk1_sync_batch.supersede_expired_admission_ticket()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog AS $body$
+DECLARE
+  active_head record;
+  live_count bigint;
+  issued_recently bigint;
+  authority_now timestamptz;
 BEGIN
   -- INSERT-only credentials must not bypass the active-pair uniqueness by
   -- supplying superseded=true, pre-consumed handles or far-future issuance.
   IF NEW.superseded IS DISTINCT FROM FALSE
     OR NEW.consumed IS DISTINCT FROM FALSE
     OR NEW.issued_at > clock_timestamp() + interval '1 second'
-    OR NEW.issued_at < clock_timestamp() - interval '2 minutes'
+    OR NEW.issued_at < clock_timestamp() - interval '5 seconds'
+    OR NEW.expires_at < NEW.issued_at + interval '25 seconds'
     OR NEW.expires_at > NEW.issued_at + interval '31 seconds'
     OR NEW.expires_at <= clock_timestamp() THEN
     RAISE EXCEPTION 'invalid admission ticket lifecycle' USING ERRCODE='23514';
   END IF;
   -- Same lock order as commit_admitted_pair: scope_head then ticket. Concurrent
   -- retry/commit/revocation therefore cannot bypass expiry, CAS or fencing.
-  PERFORM 1 FROM zk1_sync_batch.scope_head
-    WHERE scope=NEW.scope FOR UPDATE;
-  IF NOT FOUND THEN
+  SELECT h.sequence, h.head, p.policy_epoch
+    INTO active_head FROM zk1_sync_batch.scope_head h
+    JOIN zk1_sync_batch.scope_policy p ON p.scope=h.scope
+    WHERE h.scope=NEW.scope FOR UPDATE OF h;
+  IF NOT FOUND OR active_head.sequence=9223372036854775807
+    OR NEW.sequence IS DISTINCT FROM active_head.sequence + 1
+    OR NEW.previous_head IS DISTINCT FROM active_head.head
+    OR NEW.policy_epoch IS DISTINCT FROM active_head.policy_epoch THEN
     RAISE EXCEPTION 'missing admission scope head' USING ERRCODE='23514';
   END IF;
+  -- A contender may have waited behind a long-held scope lock; use the DB
+  -- clock again AFTER the lock, never inserting an already-expired handle.
+  IF NEW.issued_at < clock_timestamp() - interval '5 seconds'
+    OR NEW.expires_at <= clock_timestamp() THEN
+    RAISE EXCEPTION 'admission expired while waiting for authority lock'
+      USING ERRCODE='23514';
+  END IF;
+  -- Final issuance timestamp and TTL are owned by the DB after serialization:
+  -- an INSERT-only credential must never antedate the rolling quota window.
+  authority_now := clock_timestamp();
+  NEW.issued_at := authority_now;
+  NEW.expires_at := NEW.issued_at + interval '30 seconds';
   UPDATE zk1_sync_batch.admission_ticket SET superseded=true
     WHERE scope=NEW.scope AND sequence=NEW.sequence
       AND policy_epoch=NEW.policy_epoch AND previous_head=NEW.previous_head
       AND delete_digest=NEW.delete_digest AND move_digest=NEW.move_digest
       AND superseded=false AND consumed=false
-      AND expires_at <= clock_timestamp();
+      AND expires_at <= authority_now;
+  -- Bound concurrently live distinct signed pairs per head. This is a DB
+  -- quota, not a cryptographic proof: independently isolated issuer custody
+  -- and abuse controls are still required before a real service is exposed.
+  SELECT count(*) INTO live_count FROM zk1_sync_batch.admission_ticket
+    WHERE scope=NEW.scope AND sequence=NEW.sequence
+      AND policy_epoch=NEW.policy_epoch AND previous_head=NEW.previous_head
+      AND superseded=false AND consumed=false
+      AND expires_at > authority_now;
+  IF live_count >= 128 THEN
+    RAISE EXCEPTION 'scope admission ticket limit reached' USING ERRCODE='23514';
+  END IF;
+  -- Expiring or superseding tickets does not reset the issuance budget. A
+  -- stolen INSERT-only issuer credential cannot evade this rolling bound by
+  -- issuing near-expiry handles or generating many distinct fake digests.
+  SELECT count(*) INTO issued_recently FROM zk1_sync_batch.admission_ticket
+    WHERE scope=NEW.scope
+      AND issued_at >= authority_now - interval '1 minute';
+  IF issued_recently >= 256 THEN
+    RAISE EXCEPTION 'scope admission issue rate exceeded' USING ERRCODE='23514';
+  END IF;
   RETURN NEW;
 END $body$;
 CREATE TRIGGER supersede_expired_admission_ticket
@@ -287,7 +336,31 @@ BEGIN
     'witnessVerified',false,'clientAckAuthorized',false);
 END $body$;
 
+-- Explicit OWNER-only bounded maintenance, never run implicitly on a user DB.
+-- A retained ticket can authorize no operation once its 30-second handle and
+-- original <=120-second signed proof have expired. Preserve the durable
+-- batch_commit / seen_envelope replay evidence; ONLY remove old ticket handles.
+-- This is an operational 7-day TTL, not an externally retained audit ledger.
+CREATE FUNCTION zk1_sync_batch.prune_expired_admission_tickets()
+RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY INVOKER
+SET search_path = pg_catalog AS $body$
+DECLARE
+  removed integer;
+  retention_cutoff timestamptz := clock_timestamp() - interval '7 days';
+BEGIN
+  WITH old_handles AS (
+    SELECT ticket_id FROM zk1_sync_batch.admission_ticket
+    WHERE expires_at < retention_cutoff
+    ORDER BY expires_at, ticket_id LIMIT 256 FOR UPDATE SKIP LOCKED
+  )
+  DELETE FROM zk1_sync_batch.admission_ticket ticket
+  USING old_handles old WHERE ticket.ticket_id=old.ticket_id;
+  GET DIAGNOSTICS removed = ROW_COUNT;
+  RETURN removed;
+END $body$;
+
 REVOKE ALL ON zk1_sync_batch.admission_ticket FROM PUBLIC;
 REVOKE ALL ON FUNCTION zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
   FROM PUBLIC;
+REVOKE ALL ON FUNCTION zk1_sync_batch.prune_expired_admission_tickets() FROM PUBLIC;
 COMMIT;
