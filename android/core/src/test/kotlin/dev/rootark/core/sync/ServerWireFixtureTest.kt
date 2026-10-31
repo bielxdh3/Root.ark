@@ -52,12 +52,20 @@ class ServerWireFixtureTest {
     }
 
     @Test
-    fun tombstoneHasEmptyCiphertextNotNull() {
+    fun tombstoneHasEmptyCiphertextAndPreservesSignedAuthorization() {
         val delete = body("sync.delete.200").toRecord()
         assertEquals(SyncOperationType.DELETE, delete.operation)
         assertEquals(true, delete.tombstone)
         assertEquals("", delete.ciphertext)
-        assertNull(delete.authorization)
+        // A successful signed DELETE remains authenticated even though it
+        // carries no ciphertext. Nulling the proof would silently discard
+        // the owner's device signature from the server's tombstone.
+        val proof = assertNotNull(delete.authorization, "signed DELETE must retain device proof")
+        assertEquals("rootark-sync-device-authorization-v1", proof.type)
+        assertEquals(delete.operationId, proof.operationId)
+        assertEquals(delete.deviceId, proof.deviceId)
+        assertEquals("delete", proof.operation)
+        assertTrue(proof.signature.isNotEmpty())
     }
 
     @Test
