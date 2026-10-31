@@ -60,6 +60,36 @@ function fileKeyResolver(master, fallbackEpoch) {
   return (operation) => crypto.createHmac("sha256", master).update(`${operation.fileId || operation.objectId}\0${operation.keyEpoch || fallbackEpoch}`, "utf8").digest();
 }
 
+function trustedAtomicBatchWitnessOptions(options, strictHistorical) {
+  // The remote DELETE+MOVE witness may be supplied only by the embedding
+  // trusted process, never by .rootark-sync.json or a remote response. A
+  // configured URL, signature or physicalDurable boolean is not a witness.
+  if (!Object.hasOwn(options, "trustedAtomicBatchWitness")) return {};
+  const supplied = options.trustedAtomicBatchWitness;
+  if (!strictHistorical || !supplied || typeof supplied !== "object"
+    || Array.isArray(supplied)
+    || Object.keys(supplied).sort().join(",")
+      !== ["pinnedPublicKey", "scope", "readback"].sort().join(",")
+    || typeof supplied.readback !== "function"
+    || typeof supplied.scope !== "string"
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(supplied.scope)
+    || !supplied.pinnedPublicKey) {
+    throw new Error("Atomic batch witness requires strict externally pinned readback");
+  }
+  // Validate at construction using the engine's existing strict Ed25519
+  // SPKI verifier. Capture all references now; config cannot replace them.
+  const readback = supplied.readback;
+  return {
+    atomicBatchWitnessPublicKey: Buffer.isBuffer(supplied.pinnedPublicKey)
+      || supplied.pinnedPublicKey instanceof Uint8Array
+      ? Buffer.from(supplied.pinnedPublicKey) : supplied.pinnedPublicKey,
+    atomicBatchWitnessScope: supplied.scope,
+    atomicBatchWitnessReadback: ({ scope, nonce, operationIds, envelopeDigests }) =>
+      readback({ scope, nonce, operationIds: [...operationIds],
+        envelopeDigests: [...envelopeDigests] }),
+  };
+}
+
 async function start(options = {}) {
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
@@ -128,6 +158,7 @@ async function start(options = {}) {
       },
     };
   })() : null;
+  const atomicWitness = trustedAtomicBatchWitnessOptions(options, strictHistorical);
   const strictVerifier = strictHistorical
     ? strictBinding.verifySyncV2HistoricalWitnessAdmission : null;
   const adapter = createOpaqueSyncAdapter({
@@ -135,6 +166,7 @@ async function start(options = {}) {
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
   });
   const engine = await new SyncEngine({
+    ...atomicWitness,
     rootDir: config.localFolder,
     adapter,
     selectedPaths: config.selectedPaths,
@@ -231,4 +263,4 @@ if (require.main === module) {
   else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once");
 }
 
-module.exports = { fileKeyResolver, start };
+module.exports = { fileKeyResolver, trustedAtomicBatchWitnessOptions, start };
