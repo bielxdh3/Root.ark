@@ -367,8 +367,8 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
       } else {
         requireValid(copy.lineage === null);
       }
-      enteredCritical = true;
-      callbackResult = await fn(proof, assertHeld);
+      callbackResult = await fn(proof, assertHeld,
+        () => { enteredCritical = true; });
       assertHeld();
       callbackSucceeded = true;
       return callbackResult;
@@ -411,7 +411,8 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
     return this.#ordered(async () => {
       const old = this.#current(binding.scope);
       await this.#requireRetainedHead(binding.scope, old);
-      return this.#withPhysicalProof(binding, request, async (proof, assertHeld) => {
+      return this.#withPhysicalProof(binding, request,
+        async (proof, assertHeld, markCritical) => {
       assertHeld();
       requireValid(!this.#uncertain && !this.#poisoned);
       if (old.sequence > 0 && old.commitId === proof.commitId
@@ -461,6 +462,7 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
       // If the physical store advances but either durable write is ambiguous,
       // retain the committed local row and latch unavailable. Never sign an
       // older floor, repair from an untrusted writer, or claim an ACK.
+      markCritical();
       this.#uncertain = true;
       try {
         assertHeld();
@@ -497,7 +499,7 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
       return this.#withPhysicalProof(binding, {
         operationIds: current.operationIds,
         envelopeDigests: current.envelopeDigests,
-      }, async (physical, assertHeld) => {
+      }, async (physical, assertHeld, markCritical) => {
         assertHeld();
         requireValid(physical.commitId === current.commitId
           && physical.storeHeadSha256 === current.storeHeadSha256
@@ -505,6 +507,7 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         await this.#requireRetainedHead(binding.scope, current);
         assertHeld();
         requireValid(!this.#poisoned);
+        markCritical();
         const statement = {
           version: 2, scope: binding.scope, accountId: binding.accountId,
           storeId: binding.storeId, nonce: request.nonce,
