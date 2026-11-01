@@ -73,7 +73,9 @@ test("opt-in separate process denies missing activation even for a valid private
   fs.writeFileSync(configFile, "{}", { mode: 0o600 });
   const operator = runOperator(configFile, null);
   t.after(() => stopOperator(operator.child));
-  await assert.rejects(operator.ready, /operator exited/);
+  await assert.rejects(operator.ready,
+    /operator exited 1: SYNC_RETAINED_OPERATOR_DEV_OFF_DENIED/,
+    "missing activation must deny by the explicit operator gate, not an unrelated crash");
 });
 
 test("separate operator mTLS bridges the real CAS ledger and refuses external drift and lost authority", { timeout: 120_000 }, async (t) => {
@@ -166,7 +168,8 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
   secondOperator = runOperator(configFile);
   const secondPort = await secondOperator.ready;
   const nextHeads = [hash(), hash()];
-  const proposals = [writer, client("writer", secondPort)].map((peer, index) =>
+  const peers = [writer, client("writer", secondPort)];
+  const proposals = peers.map((peer, index) =>
     peer.compareAndAdvance({ scope: owner.scope,
       expectedSequence: 1, expectedHeadHash: advanced.headHash,
       sequence: 2, headHash: nextHeads[index] }));
@@ -175,6 +178,18 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
     result.status === "fulfilled" && result.value === true ? [index] : []);
   assert.equal(winners.length, 1,
     "two different authority processes cannot both win the same CAS sequence");
+  for (const [index, result] of contests.entries()) {
+    if (result.status === "rejected") {
+      assert.equal(result.reason?.code, "SYNC_ATOMIC_RETAINED_HTTPS_DEV_OFF_DENIED");
+      assert.equal(await peers[index].compareAndAdvance({ scope: owner.scope,
+        expectedSequence: 1, expectedHeadHash: advanced.headHash,
+        sequence: 2, headHash: nextHeads[index] }), false,
+      "a contending process that hit an unavailable lock must later reject the stale CAS");
+    } else if (index !== winners[0]) {
+      assert.equal(result.value, false,
+        "the other process must return a stale CAS rather than any positive value");
+    }
+  }
   const divergent = nextHeads[winners[0]];
   const heads = await Promise.all([reader.readSignedHead({ scope: owner.scope,
     nonce: nonce() }), client("reader", secondPort).readSignedHead({
