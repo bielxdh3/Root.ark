@@ -29,4 +29,21 @@ async function hasUnexpectedProtectedDml(client, { allowTicketInsert = false } =
   return !row || row.table_count !== PROTECTED_TABLE_COUNT || row.unsafe_dml !== false;
 }
 
-module.exports = { hasUnexpectedProtectedDml };
+// PostgreSQL role attributes are not inherited like table ACLs. A login can
+// SET ROLE into a powerful custom group granted WITH INHERIT FALSE, even when
+// has_table_privilege(current_user, ...) reports no destructive privilege.
+// Strict isolated operator credentials are allowed only their one designated
+// service group. Additional memberships fail closed, including transitive
+// grants and groups with SET TRUE but INHERIT FALSE.
+async function hasUnexpectedRoleMembership(client, allowedRole) {
+  if (!["zk1_sync_batch_attestor_reader", "zk1_sync_batch_admission_issuer",
+    "zk1_sync_batch_verifier"].includes(allowedRole)) return true;
+  const result = await client.query(`SELECT (session_user <> current_user OR
+      COALESCE(pg_catalog.bool_or(
+        pg_catalog.pg_has_role(current_user,r.rolname,'MEMBER')),false)) AS unexpected
+    FROM pg_catalog.pg_roles r
+    WHERE r.rolname <> current_user AND r.rolname <> $1::name`, [allowedRole]);
+  return result.rowCount !== 1 || result.rows[0].unexpected !== false;
+}
+
+module.exports = { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership };

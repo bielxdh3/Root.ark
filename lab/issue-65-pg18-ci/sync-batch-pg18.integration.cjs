@@ -27,7 +27,7 @@ const { createZk1SyncAtomicSqlReadbackHttpsServer } =
   require("../../src/services/zk1SyncAtomicSqlReadbackHttpsServer");
 const { createPrivateAuthorityFixture } =
   require("../../test/support/issue-65-private-authority-fixture");
-const { hasUnexpectedProtectedDml } =
+const { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership } =
   require("../../src/services/zk1SyncPgProtectedRoleAudit");
 
 if (!process.env.ROOTARK_ZK1_TEST_PG_URL || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
@@ -1119,6 +1119,162 @@ test("PG18 accidental direct DELETE/TRUNCATE grants make verifier, readback and 
   }
 });
 
+test("PG18 host-file, program and maintenance role grants fail closed across all protected credentials", async () => {
+  // PostgreSQL's predefined roles can bypass ordinary table ACLs: a
+  // server-side COPY TO file / PROGRAM is NOT made safe by a READ ONLY SQL
+  // transaction. Never execute those dangerous capabilities in this lab;
+  // establish the real effective GRANT, then require each authority to deny.
+  const saved = await fixture();
+  const savedPair = await saved.signedPair();
+  const committed = await commitTestBatch(saved, savedPair);
+  const waiting = await fixture();
+  const waitingPair = await waiting.signedPair();
+  const ticket = await mintTestAdmission(waiting, waitingPair);
+  const before = await waiting.state();
+  const ticketCount = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const ticketsBefore = await ticketCount();
+  const protectedRoles = [
+    ["zk1_sync_batch_attestor_reader", attestor, async () => {
+      await assert.rejects(readback.verifyLatestSignedPair({
+        scope: saved.scope, commitId: committed.commitId,
+      }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_admission_issuer", issuer, async () => {
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_verifier", verifier, async () => {
+      await assert.rejects(store.commitSignedOverwritePair({
+        ...waiting, operations: waitingPair, admissionTicket: ticket,
+      }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    }],
+  ];
+  for (const dangerousRole of ["pg_read_server_files", "pg_write_server_files",
+    "pg_execute_server_program", "pg_maintain"]) {
+    for (const [dbRole, pool, deniedAction] of protectedRoles) {
+      // Names in this loop are fixed literals above, never caller input.
+      await admin.query(`GRANT ${dangerousRole} TO ${dbRole}`);
+      try {
+        const granted = await pool.query(`SELECT
+          pg_catalog.pg_has_role(current_user,$1::name,'MEMBER') AS member`,
+        [dangerousRole]);
+        assert.equal(granted.rows[0]?.member, true,
+          `${dbRole} must actually hold the hostile ${dangerousRole} membership`);
+        await deniedAction();
+        assert.equal(await ticketCount(), ticketsBefore,
+          "a rejected authority cannot mint or consume an admission ticket");
+        assert.deepEqual(await waiting.state(), before,
+          "no privileged role misgrant may change protected SQL objects");
+      } finally {
+        await admin.query(`REVOKE ${dangerousRole} FROM ${dbRole}`);
+      }
+    }
+  }
+  const valid = await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  });
+  assert.equal(valid.localPgRowsConsistent, true,
+    "real readback must recover when all privileged grants are revoked");
+  assert.equal(valid.clientAckAuthorized, false);
+  assert.deepEqual(await waiting.state(), before);
+  const resumed = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof resumed.admissionTicket, "string",
+    "a fresh valid pair must still mint a ticket after the hostile GRANT is revoked");
+  assert.equal(await ticketCount(), ticketsBefore + 1);
+});
+
+test("PG18 NOINHERIT SET ROLE escalation and delegated superuser sessions fail protected role preflight", async () => {
+  const saved = await fixture();
+  const pair = await saved.signedPair();
+  const committed = await commitTestBatch(saved, pair);
+  const waiting = await fixture();
+  const waitingPair = await waiting.signedPair();
+  const admissionTicket = await mintTestAdmission(waiting, waitingPair);
+  const before = await waiting.state();
+  const ticketCount = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const ticketsBefore = await ticketCount();
+  const elevated = "zk65_escape_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE ROLE ${elevated} NOLOGIN`);
+  try {
+    await admin.query(`GRANT DELETE ON zk1_sync_batch.object_state TO ${elevated}`);
+    for (const [role, pool, rejected] of [
+      ["zk1_sync_batch_attestor_reader", attestor, async () => {
+        await assert.rejects(readback.verifyLatestSignedPair({
+          scope: saved.scope, commitId: committed.commitId,
+        }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      }],
+      ["zk1_sync_batch_admission_issuer", issuer, async () => {
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      }],
+      ["zk1_sync_batch_verifier", verifier, async () => {
+        await assert.rejects(store.commitSignedOverwritePair({
+          ...waiting, operations: waitingPair, admissionTicket,
+        }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+      }],
+    ]) {
+      await admin.query(`GRANT ${elevated} TO ${role} WITH INHERIT FALSE`);
+      try {
+        const membership = await pool.query(`SELECT
+          pg_catalog.pg_has_role(current_user,$1::name,'MEMBER') AS member,
+          pg_catalog.pg_has_role(current_user,$1::name,'SET') AS can_set,
+          pg_catalog.has_table_privilege(current_user,
+            'zk1_sync_batch.object_state','DELETE') AS inherited_delete`, [elevated]);
+        assert.deepEqual(membership.rows[0], {
+          member: true, can_set: true, inherited_delete: false,
+        }, "dangerous membership must be real but invisible to inherited table ACL audit");
+        await rejected();
+        assert.equal(await ticketCount(), ticketsBefore);
+        assert.deepEqual(await waiting.state(), before);
+      } finally { await admin.query(`REVOKE ${elevated} FROM ${role}`); }
+    }
+  } finally {
+    await admin.query(`REVOKE DELETE ON zk1_sync_batch.object_state FROM ${elevated}`);
+    await admin.query(`DROP ROLE ${elevated}`);
+  }
+  const privileged = await admin.connect();
+  let roleSwitched = false;
+  try {
+    await privileged.query("SET ROLE zk1_sync_batch_attestor_reader");
+    roleSwitched = true;
+    assert.equal((await privileged.query(`SELECT session_user <> current_user AS delegated`))
+      .rows[0].delegated, true);
+    assert.equal(await hasUnexpectedRoleMembership(
+      privileged, "zk1_sync_batch_attestor_reader"), true,
+    "a privileged login cannot fake a clean reader by SET ROLE then RESET ROLE");
+  } finally {
+    if (roleSwitched) await privileged.query("RESET ROLE");
+    privileged.release();
+  }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+  assert.deepEqual(await waiting.state(), before);
+  const resumed = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof resumed.admissionTicket, "string");
+  assert.equal(await ticketCount(), ticketsBefore + 1);
+});
+
 test("admission tickets are issuer-only; verifier cannot fabricate or edit them", async () => {
   const grants = await Promise.all([runtime, verifier, attestor, issuer].map((pool) =>
     pool.query(`SELECT
@@ -2018,4 +2174,46 @@ test("PG18 attestor rejects accidental SECURITY DEFINER EXECUTE grants even with
   });
   assert.equal(restored.localPgRowsConsistent, true);
   assert.equal(restored.clientAckAuthorized, false);
+});
+
+test("PG18 admission issuer rejects SECURITY DEFINER EXECUTE grants on both independent DB credentials", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const before = await f.state();
+  const signature = "zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)";
+  for (const [role, pool] of [
+    ["zk1_sync_batch_attestor_reader", attestor],
+    ["zk1_sync_batch_admission_issuer", issuer],
+  ]) {
+    const baseline = await pool.query(`SELECT
+      pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+    [signature]);
+    assert.equal(baseline.rows[0].allowed, false);
+    await admin.query(`GRANT EXECUTE ON FUNCTION
+      zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+      TO ${role}`);
+    try {
+      const effective = await pool.query(`SELECT
+        pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+      [signature]);
+      assert.equal(effective.rows[0].allowed, true,
+        `${role} must actually acquire the writer's SECURITY DEFINER capability`);
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: f.scope, username: f.username, operations,
+      }), { code: "SYNC_PG_ISSUER_DENIED" },
+      "issuer must fail closed when either DB credential can execute owner writes");
+      assert.deepEqual(await f.state(), before);
+    } finally {
+      await admin.query(`REVOKE EXECUTE ON FUNCTION
+        zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+        FROM ${role}`);
+    }
+  }
+  const issued = await admissionIssuer.issueTicket({
+    scope: f.scope, username: f.username, operations,
+  });
+  assert.equal(typeof issued.admissionTicket, "string",
+    "ticket issuance must recover after all hostile function grants are removed");
+  assert.equal(issued.clientAckAuthorized, false);
+  assert.deepEqual(await f.state(), before);
 });

@@ -8,7 +8,8 @@ const crypto = require("node:crypto");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { verifyWebdavOverwriteProvenance } = require("./zk1SyncPgWebdavProvenance");
-const { hasUnexpectedProtectedDml } = require("./zk1SyncPgProtectedRoleAudit");
+const { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership } =
+  require("./zk1SyncPgProtectedRoleAudit");
 
 const fail = () => Object.assign(new Error("SYNC_PG_ISSUER_DENIED"),
   { code: "SYNC_PG_ISSUER_DENIED" });
@@ -54,20 +55,33 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','MEMBER') AS verifier,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_admission_issuer','MEMBER') AS issuer,
           pg_catalog.pg_has_role(current_user,'pg_write_all_data','MEMBER') AS universal_writer,
-          r.rolsuper, r.rolcreaterole, r.rolbypassrls,
+          pg_catalog.pg_has_role(current_user,'pg_read_server_files','MEMBER') AS server_file_reader,
+          pg_catalog.pg_has_role(current_user,'pg_write_server_files','MEMBER') AS server_file_writer,
+          pg_catalog.pg_has_role(current_user,'pg_execute_server_program','MEMBER') AS server_program,
+          pg_catalog.pg_has_role(current_user,'pg_maintain','MEMBER') AS universal_maintainer,
+          r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','UPDATE') AS state_write,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_head','UPDATE') AS head_write,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','DELETE') AS state_delete,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','TRUNCATE') AS state_truncate,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_head','DELETE') AS head_delete,
-          pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_head','TRUNCATE') AS head_truncate
+          pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_head','TRUNCATE') AS head_truncate,
+          (SELECT COALESCE(pg_catalog.bool_or(
+            pg_catalog.has_function_privilege(current_user,f.oid,'EXECUTE')),false)
+            FROM pg_catalog.pg_proc f
+            JOIN pg_catalog.pg_namespace n ON n.oid=f.pronamespace
+            WHERE n.nspname='zk1_sync_batch' AND f.prosecdef) AS definer_execute
           FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
         const r = role.rows[0];
         if (!r?.reader || r.verifier || r.issuer || r.universal_writer
-          || r.rolsuper || r.rolcreaterole || r.rolbypassrls
+          || r.server_file_reader || r.server_file_writer || r.server_program
+          || r.universal_maintainer || r.rolsuper || r.rolcreaterole
+          || r.rolcreatedb || r.rolreplication || r.rolbypassrls
+          || r.definer_execute
           || r.state_write || r.head_write || r.state_delete || r.state_truncate
           || r.head_delete || r.head_truncate) throw fail();
-        if (await hasUnexpectedProtectedDml(reader)) throw fail();
+        if (await hasUnexpectedRoleMembership(reader, "zk1_sync_batch_attestor_reader")
+          || await hasUnexpectedProtectedDml(reader)) throw fail();
         const pinned = await reader.query(`SELECT p.username,p.compartment_id,p.key_epoch,
           p.enabled,p.allow_delete,p.policy_epoch,g.device_id,g.public_key,g.revoked,
           h.sequence,h.head FROM zk1_sync_batch.scope_policy p
@@ -104,7 +118,11 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','MEMBER') AS verifier,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_attestor_reader','MEMBER') AS reader,
           pg_catalog.pg_has_role(current_user,'pg_write_all_data','MEMBER') AS universal_writer,
-          r.rolsuper, r.rolcreaterole, r.rolbypassrls,
+          pg_catalog.pg_has_role(current_user,'pg_read_server_files','MEMBER') AS server_file_reader,
+          pg_catalog.pg_has_role(current_user,'pg_write_server_files','MEMBER') AS server_file_writer,
+          pg_catalog.pg_has_role(current_user,'pg_execute_server_program','MEMBER') AS server_program,
+          pg_catalog.pg_has_role(current_user,'pg_maintain','MEMBER') AS universal_maintainer,
+          r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','INSERT') AS ticket_insert,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','UPDATE') AS ticket_update,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_head','UPDATE') AS head_write,
@@ -113,16 +131,25 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','DELETE') AS ticket_delete,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','TRUNCATE') AS ticket_truncate,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','DELETE') AS state_delete,
-          pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','TRUNCATE') AS state_truncate
+          pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','TRUNCATE') AS state_truncate,
+          (SELECT COALESCE(pg_catalog.bool_or(
+            pg_catalog.has_function_privilege(current_user,f.oid,'EXECUTE')),false)
+            FROM pg_catalog.pg_proc f
+            JOIN pg_catalog.pg_namespace n ON n.oid=f.pronamespace
+            WHERE n.nspname='zk1_sync_batch' AND f.prosecdef) AS definer_execute
           FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
         const a = privileges.rows[0];
         if (!a?.issuer || a.verifier || a.reader || a.universal_writer
-          || a.rolsuper || a.rolcreaterole || a.rolbypassrls
+          || a.server_file_reader || a.server_file_writer || a.server_program
+          || a.universal_maintainer || a.rolsuper || a.rolcreaterole
+          || a.rolcreatedb || a.rolreplication || a.rolbypassrls
+          || a.definer_execute
           || !a.ticket_insert || a.ticket_update
           || a.head_write || a.state_write || a.marker_write
           || a.ticket_delete || a.ticket_truncate || a.state_delete
           || a.state_truncate) throw fail();
-        if (await hasUnexpectedProtectedDml(issuer, { allowTicketInsert: true })) throw fail();
+        if (await hasUnexpectedRoleMembership(issuer, "zk1_sync_batch_admission_issuer")
+          || await hasUnexpectedProtectedDml(issuer, { allowTicketInsert: true })) throw fail();
         const ticket = crypto.randomUUID();
         await issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
           (ticket_id,scope,username,device_id,public_key,policy_epoch,

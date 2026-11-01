@@ -21,6 +21,24 @@ operation IDs, invalid owner-device authorization, broken DELETE+MOVE pairing,
 stale policy and conflicting scope heads. SQL row consistency alone remains
 `witnessVerified:false` and `clientAckAuthorized:false`.
 
+The PostgreSQL role checks additionally reject membership in the server-side
+file read/write, program execution, and universal maintenance predefined roles,
+as well as CREATEDB and REPLICATION credentials. Ordinary table permissions and
+`BEGIN READ ONLY` do not remove these host-level capabilities. The independent
+reader, ticket issuer, and restricted verifier each fail closed under a real
+privileged GRANT in the disposable PG18 test; the test only exercises role
+membership and rejected operations, never server file writes or programs.
+Both issuer credentials also reject EXECUTE access to any SECURITY DEFINER
+function in the protected schema: a seemingly read-only DB role must not gain
+an owner-authorized mutation route by GRANTing a callable function. The real
+PG18 lab verifies this with independently granted and revoked function access.
+Each database credential must also have `session_user = current_user` and NO
+role memberships other than its pinned service group. A hidden `NOINHERIT`
+membership still permits a later `SET ROLE` to a more privileged owner; an
+admin session that temporarily `SET ROLE`s to appear read-only can likewise
+`RESET ROLE` to regain superuser authority. Both cases are denied in the
+disposable real-PostgreSQL grant/role-switch regression.
+
 For each nonce-bound protected pair, the adapter independently checks:
 
 1. The external physical witness's **Ed25519 signature** and the precise v2

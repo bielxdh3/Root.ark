@@ -5,7 +5,8 @@
 // CAS floor, Ed25519 witness receipt or physicalDurable claim is provided.
 const crypto = require("node:crypto");
 const { verifyWebdavOverwriteProvenance } = require("./zk1SyncPgWebdavProvenance");
-const { hasUnexpectedProtectedDml } = require("./zk1SyncPgProtectedRoleAudit");
+const { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership } =
+  require("./zk1SyncPgProtectedRoleAudit");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
@@ -44,7 +45,11 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','MEMBER') AS writer_member,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_runtime','MEMBER') AS runtime_member,
           pg_catalog.pg_has_role(current_user,'pg_write_all_data','MEMBER') AS universal_writer,
-          r.rolsuper, r.rolcreaterole, r.rolbypassrls,
+          pg_catalog.pg_has_role(current_user,'pg_read_server_files','MEMBER') AS server_file_reader,
+          pg_catalog.pg_has_role(current_user,'pg_write_server_files','MEMBER') AS server_file_writer,
+          pg_catalog.pg_has_role(current_user,'pg_execute_server_program','MEMBER') AS server_program,
+          pg_catalog.pg_has_role(current_user,'pg_maintain','MEMBER') AS universal_maintainer,
+          r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','UPDATE') AS object_write,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','INSERT') AS object_insert,
           pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','DELETE') AS object_delete,
@@ -66,14 +71,18 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
         const privilege = privileges.rows[0];
         if (!privilege || privilege.reader !== true
           || privilege.writer_member || privilege.runtime_member || privilege.universal_writer
-          || privilege.rolsuper || privilege.rolcreaterole || privilege.rolbypassrls
+          || privilege.server_file_reader || privilege.server_file_writer
+          || privilege.server_program || privilege.universal_maintainer
+          || privilege.rolsuper || privilege.rolcreaterole || privilege.rolcreatedb
+          || privilege.rolreplication || privilege.rolbypassrls
           || privilege.object_write || privilege.object_insert || privilege.object_delete
           || privilege.object_truncate || privilege.head_delete || privilege.head_truncate
           || privilege.marker_write || privilege.head_write || privilege.grant_write
           || privilege.policy_write || privilege.ciphertext_write || privilege.definer_execute
           || privilege.fsync !== "on"
           || privilege.full_page_writes !== "on") throw error();
-        if (await hasUnexpectedProtectedDml(client)) throw error();
+        if (await hasUnexpectedRoleMembership(client, "zk1_sync_batch_attestor_reader")
+          || await hasUnexpectedProtectedDml(client)) throw error();
         if (operationIds !== null) {
           // Resolve the current physical SQL batch from the two exact signed
           // envelopes in ONE read-only REPEATABLE READ snapshot. A caller's

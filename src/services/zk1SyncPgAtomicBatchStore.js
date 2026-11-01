@@ -11,7 +11,8 @@ const crypto = require("node:crypto");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { verifyWebdavOverwriteProvenance } = require("./zk1SyncPgWebdavProvenance");
-const { hasUnexpectedProtectedDml } = require("./zk1SyncPgProtectedRoleAudit");
+const { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership } =
+  require("./zk1SyncPgProtectedRoleAudit");
 
 const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
 const MAX_SIGNED_BATCH_BYTES = 9 * 1024 * 1024;
@@ -83,6 +84,10 @@ function createZk1SyncPgAtomicBatchStore({ verifierPool } = {}) {
           current_setting('synchronous_commit') AS synchronous_commit,
           r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
           pg_catalog.pg_has_role(current_user,'pg_write_all_data','MEMBER') AS universal_writer,
+          pg_catalog.pg_has_role(current_user,'pg_read_server_files','MEMBER') AS server_file_reader,
+          pg_catalog.pg_has_role(current_user,'pg_write_server_files','MEMBER') AS server_file_writer,
+          pg_catalog.pg_has_role(current_user,'pg_execute_server_program','MEMBER') AS server_program,
+          pg_catalog.pg_has_role(current_user,'pg_maintain','MEMBER') AS universal_maintainer,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','USAGE') AS verifier_role,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_runtime','MEMBER') AS runtime_member,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_admission_issuer','MEMBER') AS issuer_member,
@@ -103,6 +108,8 @@ function createZk1SyncPgAtomicBatchStore({ verifierPool } = {}) {
         if (!s || s.fsync !== "on" || s.full_page_writes !== "on"
           || s.synchronous_commit !== "on" || s.rolsuper || s.rolcreaterole
           || s.rolcreatedb || s.rolreplication || s.rolbypassrls || s.universal_writer
+          || s.server_file_reader || s.server_file_writer || s.server_program
+          || s.universal_maintainer
           || s.verifier_role !== true || s.runtime_member !== false
           || s.issuer_member !== false || s.head_write || s.object_write
           || s.cipher_write || s.marker_write || s.seen_write || s.issuer_write
@@ -110,7 +117,8 @@ function createZk1SyncPgAtomicBatchStore({ verifierPool } = {}) {
           || s.ticket_delete || s.ticket_truncate) {
           throw fail("SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE");
         }
-        if (await hasUnexpectedProtectedDml(client)) {
+        if (await hasUnexpectedRoleMembership(client, "zk1_sync_batch_verifier")
+          || await hasUnexpectedProtectedDml(client)) {
           throw fail("SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE");
         }
         // Read-only defense in depth before one controlled owner transaction.
