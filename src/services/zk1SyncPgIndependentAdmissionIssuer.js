@@ -110,7 +110,10 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool,
             pg_catalog.has_function_privilege(current_user,f.oid,'EXECUTE')),false)
             FROM pg_catalog.pg_proc f
             JOIN pg_catalog.pg_namespace n ON n.oid=f.pronamespace
-            WHERE n.nspname='zk1_sync_batch' AND f.prosecdef) AS definer_execute
+            WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+              AND n.nspname NOT LIKE 'pg_toast%'
+              AND n.nspname NOT LIKE 'pg_temp_%'
+              AND f.prosecdef) AS definer_execute
           FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
         const r = role.rows[0];
         if (!r?.reader || r.verifier || r.issuer || r.universal_writer
@@ -189,7 +192,10 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool,
             pg_catalog.has_function_privilege(current_user,f.oid,'EXECUTE')),false)
             FROM pg_catalog.pg_proc f
             JOIN pg_catalog.pg_namespace n ON n.oid=f.pronamespace
-            WHERE n.nspname='zk1_sync_batch' AND f.prosecdef) AS definer_execute
+            WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+              AND n.nspname NOT LIKE 'pg_toast%'
+              AND n.nspname NOT LIKE 'pg_temp_%'
+              AND f.prosecdef) AS definer_execute
           FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
         const a = privileges.rows[0];
         if (!a?.issuer || a.verifier || a.reader || a.universal_writer

@@ -65,7 +65,10 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
             pg_catalog.has_function_privilege(current_user, f.oid, 'EXECUTE')),false)
             FROM pg_catalog.pg_proc f
             JOIN pg_catalog.pg_namespace n ON n.oid=f.pronamespace
-            WHERE n.nspname='zk1_sync_batch' AND f.prosecdef) AS definer_execute,
+            WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+              AND n.nspname NOT LIKE 'pg_toast%'
+              AND n.nspname NOT LIKE 'pg_temp_%'
+              AND f.prosecdef) AS definer_execute,
           current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes
           FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
         const privilege = privileges.rows[0];

@@ -4,17 +4,25 @@
 // role isolation, independent custody and an external witness remain required.
 // Audit every protected table AND individual column. Table-level privilege
 // checks alone miss PostgreSQL GRANT UPDATE(column) / INSERT(column).
+// IMPORTANT: an automatically updatable VIEW in another application schema
+// runs against the underlying table using its owner's privileges by default.
+// A role with only UPDATE(view) can thus modify protected physical rows even
+// when no direct base-table DML or SECURITY DEFINER EXECUTE was granted.
+// Refuse ALL application-schema DML except the issuer's explicit ticket INSERT.
 const PROTECTED_TABLE_COUNT = 7;
 
 async function hasUnexpectedProtectedDml(client, { allowTicketInsert = false } = {}) {
   const result = await client.query(`SELECT
-      pg_catalog.count(DISTINCT c.oid)::integer AS table_count,
+      pg_catalog.count(DISTINCT c.oid) FILTER (
+        WHERE n.nspname='zk1_sync_batch' AND c.relkind IN ('r','p')
+      )::integer AS table_count,
       COALESCE(pg_catalog.bool_or(
         pg_catalog.has_table_privilege(current_user,c.oid,'UPDATE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'DELETE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'TRUNCATE')
         OR pg_catalog.has_column_privilege(current_user,c.oid,a.attnum,'UPDATE')
-        OR (NOT ($1::boolean AND c.relname='admission_ticket') AND (
+        OR (NOT ($1::boolean AND n.nspname='zk1_sync_batch'
+          AND c.relname='admission_ticket' AND c.relkind IN ('r','p')) AND (
           pg_catalog.has_table_privilege(current_user,c.oid,'INSERT')
           OR pg_catalog.has_column_privilege(current_user,c.oid,a.attnum,'INSERT')
         ))
@@ -23,8 +31,10 @@ async function hasUnexpectedProtectedDml(client, { allowTicketInsert = false } =
     JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
     JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid
       AND a.attnum > 0 AND NOT a.attisdropped
-    WHERE n.nspname='zk1_sync_batch'
-      AND c.relkind IN ('r','p')`, [allowTicketInsert]);
+    WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
+      AND c.relkind IN ('r','p','v','m','f')`, [allowTicketInsert]);
   const row = result.rows[0];
   return !row || row.table_count !== PROTECTED_TABLE_COUNT || row.unsafe_dml !== false;
 }

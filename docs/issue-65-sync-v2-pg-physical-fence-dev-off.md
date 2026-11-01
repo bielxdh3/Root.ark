@@ -32,6 +32,23 @@ Both issuer credentials also reject EXECUTE access to any SECURITY DEFINER
 function in the protected schema: a seemingly read-only DB role must not gain
 an owner-authorized mutation route by GRANTing a callable function. The real
 PG18 lab verifies this with independently granted and revoked function access.
+The preflight is intentionally wider than `zk1_sync_batch`: it rejects access
+to SECURITY DEFINER functions in **any non-system PostgreSQL application
+schema**, not only the protected schema. An owner-owned function elsewhere may
+otherwise be used to modify protected rows despite restrictive table ACLs.
+The disposable PG18 regression creates a foreign schema and an actual callable
+owner function, grants it independently to both credentials, confirms denial,
+then revokes it and confirms normal recovery.
+The shared protected DML audit also refuses INSERT/UPDATE/DELETE/TRUNCATE
+authority on **views and other relations in every non-system application
+schema**, not merely the seven protected base tables. PostgreSQL automatically
+updatable views normally access their underlying tables with their VIEW OWNER's
+rights; a direct view UPDATE grant can therefore write a protected head without
+any UPDATE permission on that base table or SECURITY DEFINER function.
+The PG18 lab creates an actual owner-rights writable view, exercises its UPDATE
+through each isolated DB credential inside a rolled-back transaction, checks
+its successful physical reachability, then confirms all three authorities deny
+the role misgrant before any admission or protected mutation.
 Each database credential must also have `session_user = current_user` and NO
 role memberships other than its pinned service group. A hidden `NOINHERIT`
 membership still permits a later `SET ROLE` to a more privileged owner; an

@@ -2218,6 +2218,165 @@ test("PG18 admission issuer rejects SECURITY DEFINER EXECUTE grants on both inde
   assert.deepEqual(await f.state(), before);
 });
 
+test("PG18 rejects owner SECURITY DEFINER functions granted from a foreign application schema", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const committed = await commitTestBatch(f, pair);
+  const pending = await fixture();
+  const pendingPair = await pending.signedPair();
+  const original = await pending.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [pending.scope])).rows[0].n);
+  const originalTickets = await countTickets();
+  const schema = "zk65_foreign_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    await admin.query(`CREATE FUNCTION ${schema}.owner_probe() RETURNS integer
+      LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'`);
+    await admin.query(`REVOKE ALL ON FUNCTION ${schema}.owner_probe() FROM PUBLIC`);
+    for (const [role, pool] of [
+      ["zk1_sync_batch_attestor_reader", attestor],
+      ["zk1_sync_batch_admission_issuer", issuer],
+    ]) {
+      await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      await admin.query(`GRANT EXECUTE ON FUNCTION ${schema}.owner_probe() TO ${role}`);
+      try {
+        const access = await pool.query(`SELECT
+          pg_catalog.has_function_privilege(current_user,
+            $1::regprocedure,'EXECUTE') AS executable`, [`${schema}.owner_probe()`]);
+        assert.equal(access.rows[0].executable, true,
+          "the test must prove that this foreign-schema owner function is callable");
+        assert.equal((await pool.query(`SELECT ${schema}.owner_probe() AS exercised`))
+          .rows[0].exercised, 1);
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: pending.scope, username: pending.username,
+          operations: await pending.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" },
+        "both independently isolated issuer credentials must reject foreign owner functions");
+        if (role === "zk1_sync_batch_attestor_reader") {
+          await assert.rejects(readback.verifyLatestSignedPair({
+            scope: f.scope, commitId: committed.commitId,
+          }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+          "independent physical SQL reader must also deny a foreign owner function");
+        }
+        assert.deepEqual(await pending.state(), original,
+          "a foreign-schema misgrant must never mutate a protected object");
+        assert.equal(await countTickets(), originalTickets,
+          "a foreign-schema misgrant must never mint an admission ticket");
+      } finally {
+        await admin.query(`REVOKE EXECUTE ON FUNCTION ${schema}.owner_probe()
+          FROM ${role}`);
+        await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
+      }
+    }
+  } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+  const restored = await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: committed.commitId,
+  });
+  assert.equal(restored.localPgRowsConsistent, true,
+    "a normal independent SQL read must recover when foreign grants are removed");
+  assert.equal(restored.clientAckAuthorized, false);
+  const ticket = await admissionIssuer.issueTicket({
+    scope: pending.scope, username: pending.username,
+    operations: await pending.signedPair(),
+  });
+  assert.equal(typeof ticket.admissionTicket, "string");
+  assert.equal(ticket.clientAckAuthorized, false);
+  assert.equal(await countTickets(), originalTickets + 1,
+    "only a clean recovered credential may mint a new ticket");
+});
+
+test("PG18 denies writable owner-rights views in foreign schemas despite no base-table DML grant", async () => {
+  const saved = await fixture();
+  const savedPair = await saved.signedPair();
+  const committed = await commitTestBatch(saved, savedPair);
+  const pending = await fixture();
+  const before = await pending.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [pending.scope])).rows[0].n);
+  const originalTickets = await countTickets();
+  const schema = "zk65_definer_view_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    // Ordinary PostgreSQL views run as the VIEW OWNER by default. A user
+    // granted only UPDATE(view) can reach the protected head even without
+    // UPDATE(scope_head) or executable SECURITY DEFINER functions.
+    await admin.query(`CREATE VIEW ${schema}.indirect_head AS
+      SELECT scope,head FROM zk1_sync_batch.scope_head`);
+    for (const [role, pool] of [
+      ["zk1_sync_batch_attestor_reader", attestor],
+      ["zk1_sync_batch_admission_issuer", issuer],
+      ["zk1_sync_batch_verifier", verifier],
+    ]) {
+      await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      await admin.query(`GRANT SELECT(scope), UPDATE(head) ON ${schema}.indirect_head TO ${role}`);
+      try {
+        const privileges = await pool.query(`SELECT
+          pg_catalog.has_table_privilege(current_user,
+            'zk1_sync_batch.scope_head','UPDATE') AS direct_write,
+          pg_catalog.has_column_privilege(current_user,
+            $1::regclass,'head','UPDATE') AS indirect_write`, [`${schema}.indirect_head`]);
+        assert.equal(privileges.rows[0].direct_write, false,
+          "this regression requires an apparently read-only direct protected role");
+        assert.equal(privileges.rows[0].indirect_write, true,
+          "the hostile view UPDATE capability must actually be granted");
+        const tx = await pool.connect();
+        let begun = false;
+        try {
+          await tx.query("BEGIN");
+          begun = true;
+          const attack = await tx.query(`UPDATE ${schema}.indirect_head
+            SET head=decode(repeat('0',64),'hex') WHERE scope=$1`, [pending.scope]);
+          assert.equal(attack.rowCount, 1,
+            "owner-rights view must really be able to mutate the protected head");
+        } finally {
+          if (begun) await tx.query("ROLLBACK");
+          tx.release();
+        }
+        assert.deepEqual(await pending.state(), before,
+          "the disposable exploit must roll back before testing the fail-closed gate");
+        if (role === "zk1_sync_batch_attestor_reader") {
+          await assert.rejects(readback.verifyLatestSignedPair({
+            scope: saved.scope, commitId: committed.commitId,
+          }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+          await assert.rejects(admissionIssuer.issueTicket({
+            scope: pending.scope, username: pending.username,
+            operations: await pending.signedPair(),
+          }), { code: "SYNC_PG_ISSUER_DENIED" });
+        } else if (role === "zk1_sync_batch_admission_issuer") {
+          await assert.rejects(admissionIssuer.issueTicket({
+            scope: pending.scope, username: pending.username,
+            operations: await pending.signedPair(),
+          }), { code: "SYNC_PG_ISSUER_DENIED" });
+        } else {
+          const verifierPair = await pending.signedPair();
+          const ticket = await mintTestAdmission(pending, verifierPair);
+          await assert.rejects(store.commitSignedOverwritePair({
+            ...pending, operations: verifierPair, admissionTicket: ticket,
+          }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+        }
+        assert.deepEqual(await pending.state(), before);
+        assert.equal(await countTickets(), originalTickets +
+          (role === "zk1_sync_batch_verifier" ? 1 : 0),
+        "an indirect view grant must not let a failed credential mint extra tickets");
+      } finally {
+        await admin.query(`REVOKE SELECT(scope), UPDATE(head)
+          ON ${schema}.indirect_head FROM ${role}`);
+        await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
+      }
+    }
+  } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+  const admissionTicket = await admissionIssuer.issueTicket({
+    scope: pending.scope, username: pending.username,
+    operations: await pending.signedPair(),
+  });
+  assert.equal(typeof admissionTicket.admissionTicket, "string");
+  assert.equal(admissionTicket.clientAckAuthorized, false);
+});
+
 test("PG18 ticket issuer lock timeout denies blocked admission without a ticket or protected mutation", async () => {
   const f = await fixture();
   const operations = await f.signedPair();
