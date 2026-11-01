@@ -90,6 +90,17 @@ The relation scan keeps base-table presence checking even for PostgreSQL
 zero-column tables: it uses a column `LEFT JOIN` and non-null-safe ACL checks,
 so a granted DELETE on a foreign relation with zero columns cannot disappear
 from the audit. A real rollback-protected PG18 DELETE regression verifies this.
+
+Schema and database **ownership** are separate destructive privileges that
+ordinary relation grants cannot revoke. The three isolated database logins
+must neither own the protected `zk1_sync_batch` schema nor the database, even
+through their one permitted service group: a schema owner can `DROP SCHEMA
+... CASCADE`, while a database owner can `DROP DATABASE` from another session
+without a direct table DELETE/TRUNCATE grant. The role audit rejects effective
+owner membership or CREATE on either container for both the current login and
+its pinned group. A disposable PG18 test temporarily transfers ownership and
+grants CREATE, asserts denial, restores the original operator owners, and
+validates healthy readback/ticket issuance. No destructive DROP is executed.
 Each database credential must also have `session_user = current_user` and NO
 role memberships other than its pinned service group. A hidden `NOINHERIT`
 membership still permits a later `SET ROLE` to a more privileged owner; an

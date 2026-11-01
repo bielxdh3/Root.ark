@@ -68,7 +68,27 @@ async function hasUnexpectedRoleMembership(client, allowedRole) {
         pg_catalog.pg_has_role(current_user,r.rolname,'MEMBER')),false)) AS unexpected
     FROM pg_catalog.pg_roles r
     WHERE r.rolname <> current_user AND r.rolname <> $1::name`, [allowedRole]);
-  return result.rowCount !== 1 || result.rows[0].unexpected !== false;
+  if (result.rowCount !== 1 || result.rows[0].unexpected !== false) return true;
+  // REVOKE ALL on protected tables cannot subtract schema/database ownership.
+  // A login that owns zk1_sync_batch directly, or via its sole pinned service
+  // group (including NOINHERIT memberships), can DROP SCHEMA ... CASCADE and
+  // destroy protected rows without table DELETE/TRUNCATE. Likewise a database
+  // owner can DROP DATABASE from another session. No isolated credential may
+  // own either authority or possess CREATE on the respective container.
+  const owner = await client.query(`SELECT
+      pg_catalog.pg_has_role(current_user,n.nspowner,'MEMBER') AS login_schema_owner,
+      pg_catalog.pg_has_role($1::name,n.nspowner,'MEMBER') AS group_schema_owner,
+      pg_catalog.has_schema_privilege(current_user,n.oid,'CREATE') AS login_schema_create,
+      pg_catalog.has_schema_privilege($1::name,n.oid,'CREATE') AS group_schema_create,
+      pg_catalog.pg_has_role(current_user,d.datdba,'MEMBER') AS login_database_owner,
+      pg_catalog.pg_has_role($1::name,d.datdba,'MEMBER') AS group_database_owner,
+      pg_catalog.has_database_privilege(current_user,d.oid,'CREATE') AS login_database_create,
+      pg_catalog.has_database_privilege($1::name,d.oid,'CREATE') AS group_database_create
+    FROM pg_catalog.pg_namespace n CROSS JOIN pg_catalog.pg_database d
+    WHERE n.nspname='zk1_sync_batch' AND d.datname=pg_catalog.current_database()`,
+  [allowedRole]);
+  const check = owner.rows[0];
+  return owner.rowCount !== 1 || !check || Object.values(check).some((value) => value !== false);
 }
 
 module.exports = { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership };
