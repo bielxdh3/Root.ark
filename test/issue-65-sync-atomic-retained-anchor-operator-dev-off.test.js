@@ -78,10 +78,11 @@ test("opt-in separate process denies missing activation even for a valid private
 
 test("separate operator mTLS bridges the real CAS ledger and refuses external drift and lost authority", { timeout: 120_000 }, async (t) => {
   const directory = createPrivateAuthorityFixture("zk65-operator-bridge-");
-  let operator, ledger;
+  let operator, secondOperator, ledger;
   t.after(async () => {
     ledger?.close();
     if (operator) await stopOperator(operator.child);
+    if (secondOperator) await stopOperator(secondOperator.child);
     fs.rmSync(directory, { recursive: true, force: true,
       maxRetries: 10, retryDelay: 100 });
   });
@@ -115,8 +116,8 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
   }), { mode: 0o600 });
   operator = runOperator(configFile);
   const port = await operator.ready;
-  const client = (role) => createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({
-    hostname: "127.0.0.1", servername: "localhost", port,
+  const client = (role, portNumber = port) => createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({
+    hostname: "127.0.0.1", servername: "localhost", port: portNumber,
     ca: read("ca.pem"), cert: read(`${role}.pem`), key: read(`${role}.key`),
     pinnedServerFingerprint: fingerprint("anchor-server"),
     anchorPublicKey: signer.publicKey,
@@ -160,12 +161,30 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
   assert.equal((await reader.readSignedHead({ scope: owner.scope,
     nonce: nonce() })).statement.headHash, advanced.headHash);
 
-  // A separately authorized writer changes the remote high-water without the
+  // Two genuinely separate processes contend for one physical SQLite CAS.
+  // Exactly one signed advance can win, even with distinct proposed heads.
+  secondOperator = runOperator(configFile);
+  const secondPort = await secondOperator.ready;
+  const nextHeads = [hash(), hash()];
+  const proposals = [writer, client("writer", secondPort)].map((peer, index) =>
+    peer.compareAndAdvance({ scope: owner.scope,
+      expectedSequence: 1, expectedHeadHash: advanced.headHash,
+      sequence: 2, headHash: nextHeads[index] }));
+  const contests = await Promise.allSettled(proposals);
+  const winners = contests.flatMap((result, index) =>
+    result.status === "fulfilled" && result.value === true ? [index] : []);
+  assert.equal(winners.length, 1,
+    "two different authority processes cannot both win the same CAS sequence");
+  const divergent = nextHeads[winners[0]];
+  const heads = await Promise.all([reader.readSignedHead({ scope: owner.scope,
+    nonce: nonce() }), client("reader", secondPort).readSignedHead({
+    scope: owner.scope, nonce: nonce() })]);
+  for (const received of heads) {
+    assert.equal(received.statement.sequence, 2);
+    assert.equal(received.statement.headHash, divergent);
+  }
+  // A separately authorized writer changed the remote high-water without a
   // local CAS transaction. Existing local rows must never authorize fallback.
-  const divergent = hash();
-  assert.equal(await writer.compareAndAdvance({ scope: owner.scope,
-    expectedSequence: 1, expectedHeadHash: advanced.headHash,
-    sequence: 2, headHash: divergent }), true);
   ledger.close();
   ledger = null;
   await assert.rejects(Zk1SyncAtomicCasFloorLedgerDevOff.open({

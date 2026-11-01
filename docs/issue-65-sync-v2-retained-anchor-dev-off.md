@@ -62,7 +62,8 @@ The runner refuses symlinked and non-private authority files and directories;
 the operator should run under a separate operating-system identity. Only
 test mode permits ephemeral port `0`. The real hosted tests launch a child
 process over mTLS and demonstrate local CAS integration, remote divergence
-denial, absent-grant denial and failure after operator termination. Their
+denial, absent-grant denial, simultaneous conflicting CAS from two real
+operator processes against one SQLite WAL, and failure after operator termination. Their
 physical-fence evidence is deliberately synthetic: separate *processes* are
 not independent *hosts*, custody or a physical durability proof.
 The endpoint is not mounted in the normal Root.ark server and no production
