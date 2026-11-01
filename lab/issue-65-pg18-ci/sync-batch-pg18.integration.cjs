@@ -2672,6 +2672,138 @@ test("PG18 rejects direct per-table MAINTAIN grants without predefined role memb
   })).localPgRowsConsistent, true);
 });
 
+test("PG18 rejects isolated login or sole-service-group ownership of protected schema and database", async () => {
+  const committedFixture = await fixture();
+  const committed = await commitTestBatch(committedFixture,
+    await committedFixture.signedPair());
+  const waiting = await fixture();
+  const before = await waiting.state();
+  const schemaOwner = (await admin.query(`SELECT
+    pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(nspowner)) AS owner_ident
+    FROM pg_catalog.pg_namespace WHERE nspname='zk1_sync_batch'`)).rows[0].owner_ident;
+  const databaseIdentity = (await admin.query(`SELECT
+    pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(datdba)) AS owner_ident,
+    pg_catalog.quote_ident(datname) AS database_ident
+    FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()`)).rows[0];
+  const authorities = [
+    ["zk1_sync_batch_attestor_reader", attestor, async () => {
+      await assert.rejects(readback.verifyLatestSignedPair({
+        scope: committedFixture.scope, commitId: committed.commitId,
+      }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_admission_issuer", issuer, async () => {
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_verifier", verifier, async () => {
+      // Tickets expire after 30s; re-mint a fresh, correctly bound admission
+      // for this negative so a stale ticket never causes a false-green deny.
+      const operations = await waiting.signedPair();
+      const ticket = await mintTestAdmission(waiting, operations);
+      await assert.rejects(store.commitSignedOverwritePair({
+        ...waiting, operations, admissionTicket: ticket,
+      }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    }],
+  ];
+  async function rejected(role, pool, deniedAction) {
+    const client = await pool.connect();
+    try {
+      assert.equal(await hasUnexpectedRoleMembership(client, role), true,
+        "a credential with protected schema/database authority must fail preflight");
+    } finally { client.release(); }
+    await deniedAction();
+    assert.deepEqual(await waiting.state(), before,
+      "a denied owner must not mutate existing protected rows");
+  }
+  // DML grants and table owners stay unchanged throughout. CREATE on schema
+  // or database alone must not be silently accepted, even via the only group
+  // the login may legitimately belong to.
+  for (const [role, pool, deny] of authorities) {
+    await admin.query(`GRANT CREATE ON SCHEMA zk1_sync_batch TO ${role}`);
+    try {
+      assert.equal((await pool.query(`SELECT pg_catalog.has_schema_privilege(
+        $1::name,'zk1_sync_batch','CREATE') AS group_create`, [role]))
+        .rows[0].group_create, true);
+      await rejected(role, pool, deny);
+    } finally {
+      await admin.query(`REVOKE CREATE ON SCHEMA zk1_sync_batch FROM ${role}`);
+    }
+    await admin.query(`GRANT CREATE ON DATABASE ${databaseIdentity.database_ident} TO ${role}`);
+    try {
+      assert.equal((await pool.query(`SELECT pg_catalog.has_database_privilege(
+        $1::name,pg_catalog.current_database(),'CREATE') AS group_create`, [role]))
+        .rows[0].group_create, true);
+      await rejected(role, pool, deny);
+    } finally {
+      await admin.query(`REVOKE CREATE ON DATABASE ${databaseIdentity.database_ident} FROM ${role}`);
+    }
+  }
+  // A schema owner can DROP SCHEMA ... CASCADE even when no table DELETE or
+  // TRUNCATE is granted. Prove actual ownership but never execute destructive
+  // DROP; restore the disposable schema to its independent operator owner.
+  for (const [role, pool, deny] of authorities) {
+    await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${role}`);
+    try {
+      const ownerCheck = await pool.query(`SELECT pg_catalog.pg_has_role(
+        $1::name,nspowner,'MEMBER') AS owns
+        FROM pg_catalog.pg_namespace WHERE nspname='zk1_sync_batch'`, [role]);
+      assert.equal(ownerCheck.rows[0].owns, true);
+      await rejected(role, pool, deny);
+    } finally {
+      await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${schemaOwner}`);
+    }
+  }
+  const readerLogin = (await attestor.query(`SELECT
+    pg_catalog.quote_ident(current_user) AS login_ident`)).rows[0].login_ident;
+  await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${readerLogin}`);
+  try {
+    assert.equal((await attestor.query(`SELECT pg_catalog.pg_has_role(
+      current_user,nspowner,'MEMBER') AS owns
+      FROM pg_catalog.pg_namespace WHERE nspname='zk1_sync_batch'`))
+      .rows[0].owns, true);
+    await rejected(...authorities[0]);
+  } finally {
+    await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${schemaOwner}`);
+  }
+  // Database ownership is a distinct destructive path: from a second DB
+  // connection, the owner may DROP DATABASE regardless of DML privileges.
+  for (const [ownerIdent, authority] of [
+    ["zk1_sync_batch_attestor_reader", authorities[0]],
+    ["zk1_sync_batch_admission_issuer", authorities[1]],
+    ["zk1_sync_batch_verifier", authorities[2]],
+    [readerLogin, authorities[0]],
+  ]) {
+    await admin.query(`ALTER DATABASE ${databaseIdentity.database_ident}
+      OWNER TO ${ownerIdent}`);
+    try {
+      assert.equal((await authority[1].query(`SELECT pg_catalog.pg_has_role(
+        current_user,d.datdba,'MEMBER') AS owns
+        FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database()`))
+        .rows[0].owns, true);
+      await rejected(...authority);
+    } finally {
+      await admin.query(`ALTER DATABASE ${databaseIdentity.database_ident}
+        OWNER TO ${databaseIdentity.owner_ident}`);
+    }
+  }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: committedFixture.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true,
+  "the legitimate reader must recover after operator ownership is restored");
+  const restored = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof restored.admissionTicket, "string");
+  assert.equal(restored.clientAckAuthorized, false);
+});
+
 test("PG18 ticket issuer lock timeout denies blocked admission without a ticket or protected mutation", async () => {
   const f = await fixture();
   const operations = await f.signedPair();
