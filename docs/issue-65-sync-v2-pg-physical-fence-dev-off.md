@@ -44,6 +44,11 @@ production bootstrap. This cryptographic manifest does not supply independent
 owner custody, revocation freshness, a nonrollbackable pin source, physical
 durability or a protected ACK. The focused Ubuntu/Windows hosted tests include
 the positive and adversarial owner-manifest contract.
+The hosted disposable PostgreSQL 18 integration additionally exercises the
+actual least-privilege SQL readback via an owner-signed manifest rather than
+raw `ownerBindings`, and requires agreement between signed and raw bindings
+before the CAS/retained-anchor path. Its signer and pins are still a synthetic
+test fixture, not proof of an independently operated registry.
 
 The PostgreSQL role checks additionally reject membership in the server-side
 file read/write, program execution, and universal maintenance predefined roles,

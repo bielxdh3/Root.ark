@@ -19,6 +19,8 @@ const { createZk1SyncPgBatchIndependentReadback } =
   require("../../src/services/zk1SyncPgBatchIndependentReadback");
 const { createZk1SyncAtomicPgPhysicalFenceDevOff } =
   require("../../src/services/zk1SyncAtomicPgPhysicalFenceDevOff");
+const { DOMAIN: OWNER_BINDINGS_DOMAIN } =
+  require("../../src/services/zk1SyncAtomicSignedOwnerBindingsDevOff");
 const { Zk1SyncAtomicCasFloorLedgerDevOff, WITNESS_DOMAIN, GENESIS } =
   require("../../src/services/zk1SyncAtomicCasFloorLedgerDevOff");
 const { Zk1SyncAtomicRetainedAnchorDevOff } =
@@ -50,6 +52,20 @@ test.after(async () => {
   await Promise.all([runtime.end(), verifier.end(), attestor.end(), issuer.end(), admin.end()]);
 });
 const hash = (input) => crypto.createHash("sha256").update(input).digest();
+
+function signedOwnerRosterFixture(bindings) {
+  // Fixture only: independently pinned statement hash, owner public key and
+  // revision MUST originate from different custody in any actual operator.
+  const key = crypto.generateKeyPairSync("ed25519");
+  const manifest = { version: 1, revision: 9, bindings };
+  const statement = Buffer.from(OWNER_BINDINGS_DOMAIN
+    + protocol.canonicalJson(manifest), "utf8");
+  return { manifest, signature: crypto.sign(null, statement,
+    key.privateKey).toString("base64url"),
+  trustedOwnerPublicKey: key.publicKey,
+  independentlyPinnedSha256: hash(statement).toString("hex"),
+  trustedMinimumRevision: 9 };
+}
 
 // TEST FIXTURE ONLY: exercise the real separate issuer implementation with
 // disposable credentials. All four pools coexist ONLY inside this one PG18
@@ -1581,6 +1597,7 @@ test("PG18 actual read-only role bridges a synthetic held v2 physical lease with
   const ownerBindings = [{ scope: challenge.scope,
     accountId: challenge.accountId, storeId: challenge.storeId,
     username: challenge.username, compartmentId: challenge.compartmentId }];
+  const signedOwnerBindingsAuthority = signedOwnerRosterFixture(ownerBindings);
   const externalPhysicalFence = { async withCurrentRead(request, continuation) {
     assert.deepEqual(request, challenge);
     let held = true;
@@ -1601,7 +1618,7 @@ test("PG18 actual read-only role bridges a synthetic held v2 physical lease with
   } };
   const adapterFor = (attestorPool) => createZk1SyncAtomicPgPhysicalFenceDevOff({
     attestorPool, externalPhysicalFence, witnessPublicKey: key.publicKey,
-    ownerBindings,
+    signedOwnerBindingsAuthority,
   });
   let signedContinuation = 0;
   const accepted = await adapterFor(attestor).withCurrentRead(challenge,
@@ -1688,6 +1705,7 @@ test("PG18 real signed DELETE+MOVE flows through DEV-OFF physical fence into loc
   const physical = createZk1SyncAtomicPgPhysicalFenceDevOff({
     attestorPool: attestor, witnessPublicKey: witnessKey.publicKey,
     ownerBindings: [owner],
+    signedOwnerBindingsAuthority: signedOwnerRosterFixture([owner]),
     externalPhysicalFence: {
       async withCurrentRead(challenge, continuation) {
         let held = true;
