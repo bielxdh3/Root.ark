@@ -102,12 +102,112 @@ async function requireExternalHead(anchor, anchorKey, scope, expected) {
     && statement.headHash === expected.headHash);
 }
 function currentOf(row) {
-  return row ? {
+  if (!row) return { sequence: 0, headHash: GENESIS };
+  let operationIds, envelopeDigests;
+  try {
+    operationIds = JSON.parse(row.operation_ids);
+    envelopeDigests = JSON.parse(row.envelope_digests);
+  } catch { throw deny(); }
+  return {
     sequence: row.sequence, headHash: row.head_hash,
     commitId: row.commit_id, storeHeadSha256: row.store_head,
     fencingEpoch: row.fencing_epoch,
-    operationIds: JSON.parse(row.operation_ids), envelopeDigests: JSON.parse(row.envelope_digests),
-  } : { sequence: 0, headHash: GENESIS };
+    operationIds, envelopeDigests,
+  };
+}
+
+function assertStorageSchema(db) {
+  // A hostile AFTER INSERT trigger can silently delete a committed link
+  // without weakening any index or column definition. No triggers belong
+  // to this deliberately fixed-schema CAS authority.
+  requireValid(!db.prepare(`SELECT 1 FROM sqlite_schema
+    WHERE type='trigger' LIMIT 1`).get());
+  const definitions = [
+    ["atomic_cas_head", ["scope", "account_id", "store_id", "sequence",
+      "head_hash", "commit_id", "store_head", "fencing_epoch",
+      "operation_ids", "envelope_digests"],
+    ["scope"]],
+    ["atomic_cas_history", ["scope", "sequence", "previous_hash", "head_hash",
+      "commit_id", "store_head", "fencing_epoch", "operation_ids",
+      "envelope_digests"],
+    ["scope,sequence", "head_hash", "scope,commit_id", "scope,store_head"]],
+  ];
+  for (const [table, names, requiredUnique] of definitions) {
+    const columns = db.pragma(`table_info("${table}")`);
+    requireValid(columns.length === names.length
+      && columns.every((column, index) => column.name === names[index]
+        // Legacy SQLite rowid tables report notnull=0 for TEXT PRIMARY KEY.
+        // The scoped PK is still checked through the unique index below.
+        && (column.notnull === 1 || (table === "atomic_cas_head"
+          && column.name === "scope" && column.pk === 1))));
+    const uniqueness = new Set();
+    for (const index of db.pragma(`index_list("${table}")`)) {
+      if (index.unique !== 1 || index.partial !== 0) continue;
+      const quoted = index.name.replace(/"/g, '""');
+      uniqueness.add(db.pragma(`index_info("${quoted}")`)
+        .map((part) => part.name).join(","));
+    }
+    requireValid(requiredUnique.every((key) => uniqueness.has(key)));
+  }
+}
+
+function auditLocalHistory(db, binding) {
+  requireValid(binding);
+  const scope = binding.scope;
+  const row = db.prepare("SELECT * FROM atomic_cas_head WHERE scope=?").get(scope);
+  let previousHash = GENESIS;
+  let previousEpoch = 0;
+  let count = 0;
+  let tip = null;
+  // Recompute every committed link, including hidden non-tip history.
+  for (const entry of db.prepare(`SELECT * FROM atomic_cas_history
+    WHERE scope=? ORDER BY sequence ASC`).iterate(scope)) {
+    count++;
+    requireValid(Number.isSafeInteger(count) && Number.isSafeInteger(entry.sequence)
+      && entry.sequence === count && entry.previous_hash === previousHash
+      && HEX.test(entry.head_hash) && HEX.test(entry.store_head)
+      && COMMIT.test(entry.commit_id)
+      && Number.isSafeInteger(entry.fencing_epoch)
+      && entry.fencing_epoch > previousEpoch);
+    let operationIds, envelopeDigests;
+    try {
+      operationIds = JSON.parse(entry.operation_ids);
+      envelopeDigests = JSON.parse(entry.envelope_digests);
+    } catch { throw deny(); }
+    assertPair({ operationIds, envelopeDigests });
+    requireValid(entry.operation_ids === protocol.canonicalJson(operationIds)
+      && entry.envelope_digests === protocol.canonicalJson(envelopeDigests));
+    const calculated = crypto.createHash("sha256").update(
+      "rootark-sync-atomic-batch-cas-chain-v1\0"
+      + protocol.canonicalJson({ scope, sequence: entry.sequence,
+        previousHash, accountId: binding.accountId, storeId: binding.storeId,
+        commitId: entry.commit_id, storeHeadSha256: entry.store_head,
+        fencingEpoch: entry.fencing_epoch, operationIds, envelopeDigests }))
+      .digest("hex");
+    requireValid(calculated === entry.head_hash);
+    previousHash = entry.head_hash;
+    previousEpoch = entry.fencing_epoch;
+    tip = { entry, operationIds, envelopeDigests };
+  }
+  if (row) {
+    requireValid(row.account_id === binding.accountId
+      && row.store_id === binding.storeId
+      && Number.isSafeInteger(row.sequence) && row.sequence >= 1
+      && HEX.test(row.head_hash) && HEX.test(row.store_head)
+      && COMMIT.test(row.commit_id) && Number.isSafeInteger(row.fencing_epoch)
+      && row.fencing_epoch >= 1);
+    const pair = currentOf(row);
+    assertPair(pair);
+    requireValid(tip && count === row.sequence && row.head_hash === previousHash
+      && row.fencing_epoch === previousEpoch
+      && tip.entry.commit_id === row.commit_id
+      && tip.entry.store_head === row.store_head
+      && same(pair.operationIds, tip.operationIds)
+      && same(pair.envelopeDigests, tip.envelopeDigests));
+  } else {
+    requireValid(count === 0);
+  }
+  return currentOf(row);
 }
 
 class Zk1SyncAtomicCasFloorLedgerDevOff {
@@ -182,7 +282,8 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         scope TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence>0),
         previous_hash TEXT NOT NULL, head_hash TEXT NOT NULL UNIQUE,
         commit_id TEXT NOT NULL, store_head TEXT NOT NULL,
-        fencing_epoch INTEGER NOT NULL, PRIMARY KEY(scope,sequence),
+        fencing_epoch INTEGER NOT NULL, operation_ids TEXT NOT NULL,
+        envelope_digests TEXT NOT NULL, PRIMARY KEY(scope,sequence),
         UNIQUE(scope,commit_id), UNIQUE(scope,store_head)
       );`);
       if (!existed) {
@@ -196,6 +297,13 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
       requireValid(identity && identity.cas_fingerprint === fingerprint(casKey)
         && identity.witness_fingerprint === fingerprint(witnessKey)
         && identity.anchor_fingerprint === fingerprint(anchorKey));
+      assertStorageSchema(this.#db);
+      // No detached historical rows may exist without an authoritative tip.
+      // Historical schema revisions lacking the signed pair columns fail
+      // closed rather than retroactively inventing missing integrity inputs.
+      requireValid(!this.#db.prepare(`SELECT 1 FROM atomic_cas_history h
+        WHERE NOT EXISTS (SELECT 1 FROM atomic_cas_head a
+          WHERE a.scope=h.scope) LIMIT 1`).get());
     } catch {
       this.#db?.close();
       throw deny();
@@ -225,31 +333,46 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         owner.set(binding.scope, binding);
       }
       const present = fs.existsSync(filename);
-      let rows = new Map();
       if (present) {
         before = assertPrivateSqliteFile(filename);
         assertPrivateSqliteAuthorityDirectory(filename);
         const observer = new Database(filename, { readonly: true,
           fileMustExist: true });
         try {
+          // The entire local history, identity and signed external tip are
+          // checked in ONE stable read-only snapshot before any writable
+          // SQLite connection can perform journal recovery or checkpointing.
+          observer.exec("BEGIN TRANSACTION");
+          assertStorageSchema(observer);
           const authority = observer.prepare(
             "SELECT * FROM atomic_cas_identity WHERE id=1").get();
           requireValid(authority
             && authority.cas_fingerprint === fingerprint(casKey)
             && authority.witness_fingerprint === fingerprint(witnessKey)
             && authority.anchor_fingerprint === fingerprint(anchorKey));
-          rows = new Map(observer.prepare(`SELECT scope,sequence,head_hash
-            FROM atomic_cas_head`).all().map((row) =>
-            [row.scope, { sequence: row.sequence, headHash: row.head_hash }]));
-          requireValid(rows.size <= owner.size);
-          for (const scope of rows.keys()) requireValid(owner.has(scope));
+          const heads = observer.prepare("SELECT scope FROM atomic_cas_head").all();
+          requireValid(heads.length <= owner.size);
+          for (const head of heads) requireValid(owner.has(head.scope));
+          requireValid(!observer.prepare(`SELECT 1 FROM atomic_cas_history h
+            WHERE NOT EXISTS (SELECT 1 FROM atomic_cas_head a
+              WHERE a.scope=h.scope) LIMIT 1`).get());
+          for (const binding of owner.values()) {
+            const current = auditLocalHistory(observer, binding);
+            await requireExternalHead(options.retainedAnchor,
+              anchorKey, binding.scope, current);
+          }
+          observer.exec("COMMIT");
+        } catch {
+          try { observer.exec("ROLLBACK"); } catch { /* no active read txn */ }
+          throw deny();
         } finally { observer.close(); }
         const afterRead = assertPrivateSqliteFile(filename);
         requireValid(before.dev === afterRead.dev && before.ino === afterRead.ino);
-      }
-      for (const scope of owner.keys()) {
-        await requireExternalHead(options.retainedAnchor, anchorKey,
-          scope, rows.get(scope) || { sequence: 0, headHash: GENESIS });
+      } else {
+        for (const scope of owner.keys()) {
+          await requireExternalHead(options.retainedAnchor, anchorKey,
+            scope, { sequence: 0, headHash: GENESIS });
+        }
       }
       if (before) {
         const afterAnchor = assertPrivateSqliteFile(filename);
@@ -269,35 +392,7 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
   }
   close() { this.#db?.close(); }
   #current(scope) {
-    const row = this.#db.prepare("SELECT * FROM atomic_cas_head WHERE scope=?").get(scope);
-    if (row) {
-      const binding = this.#bindings.get(scope);
-      requireValid(binding && row.account_id === binding.accountId
-        && row.store_id === binding.storeId
-        && Number.isSafeInteger(row.sequence) && row.sequence >= 1
-        && HEX.test(row.head_hash) && HEX.test(row.store_head)
-        && COMMIT.test(row.commit_id) && Number.isSafeInteger(row.fencing_epoch)
-        && row.fencing_epoch >= 1);
-      const pair = currentOf(row);
-      assertPair(pair);
-      const prior = this.#db.prepare(`SELECT * FROM atomic_cas_history
-        WHERE scope=? AND sequence=?`).get(scope, row.sequence);
-      requireValid(prior && prior.commit_id === row.commit_id
-        && prior.store_head === row.store_head
-        && prior.fencing_epoch === row.fencing_epoch
-        && prior.head_hash === row.head_hash && HEX.test(prior.previous_hash));
-      const calculated = crypto.createHash("sha256").update(
-        "rootark-sync-atomic-batch-cas-chain-v1\0"
-        + protocol.canonicalJson({ scope, sequence: row.sequence,
-          previousHash: prior.previous_hash, accountId: row.account_id,
-          storeId: row.store_id, commitId: row.commit_id,
-          storeHeadSha256: row.store_head,
-          fencingEpoch: row.fencing_epoch, operationIds: pair.operationIds,
-          envelopeDigests: pair.envelopeDigests })).digest("hex");
-      requireValid(calculated === row.head_hash
-        && (row.sequence > 1 || prior.previous_hash === GENESIS));
-    }
-    return currentOf(row);
+    return auditLocalHistory(this.#db, this.#bindings.get(scope));
   }
   #binding(input) {
     const scope = input?.scope;
@@ -428,6 +523,12 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         && (old.sequence === 0 || proof.fencingEpoch > old.fencingEpoch)
         && (old.sequence === 0 || (proof.commitId !== old.commitId
           && proof.storeHeadSha256 !== old.storeHeadSha256)));
+      // A correctly signed but obsolete physical head must fail before
+      // entering the irreversible SQLite/remote CAS phase. Database UNIQUE
+      // constraints remain a second independent guard against races.
+      requireValid(!this.#db.prepare(`SELECT 1 FROM atomic_cas_history
+        WHERE scope=? AND (commit_id=? OR store_head=?) LIMIT 1`).get(
+        binding.scope, proof.commitId, proof.storeHeadSha256));
       const sequence = old.sequence + 1;
       const headHash = crypto.createHash("sha256").update(
         "rootark-sync-atomic-batch-cas-chain-v1\0"
@@ -441,9 +542,12 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         assertHeld();
         requireValid(same(this.#current(binding.scope), old));
         this.#db.prepare(`INSERT INTO atomic_cas_history
-          (scope,sequence,previous_hash,head_hash,commit_id,store_head,fencing_epoch)
-          VALUES(?,?,?,?,?,?,?)`).run(binding.scope, sequence, old.headHash,
-          headHash, proof.commitId, proof.storeHeadSha256, proof.fencingEpoch);
+          (scope,sequence,previous_hash,head_hash,commit_id,store_head,
+            fencing_epoch,operation_ids,envelope_digests)
+          VALUES(?,?,?,?,?,?,?,?,?)`).run(binding.scope, sequence, old.headHash,
+          headHash, proof.commitId, proof.storeHeadSha256, proof.fencingEpoch,
+          protocol.canonicalJson(proof.operationIds),
+          protocol.canonicalJson(proof.envelopeDigests));
         this.#db.prepare(`INSERT INTO atomic_cas_head
           (scope,account_id,store_id,sequence,head_hash,commit_id,store_head,
             fencing_epoch,operation_ids,envelope_digests)
@@ -468,6 +572,13 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         assertHeld();
         tx.immediate();
         assertHeld();
+        const appended = this.#current(binding.scope);
+        requireValid(appended.sequence === sequence && appended.headHash === headHash
+          && appended.commitId === proof.commitId
+          && appended.storeHeadSha256 === proof.storeHeadSha256);
+        // A full historical scan can consume a time-bounded physical lease.
+        // Never advance the independent floor under an expired authority.
+        assertHeld();
         const accepted = await this.#retainedAnchor.compareAndAdvance({
           scope: binding.scope, expectedSequence: old.sequence,
           expectedHeadHash: old.headHash, sequence, headHash,
@@ -475,6 +586,11 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         requireValid(accepted === true);
         assertHeld();
         await this.#requireRetainedHead(binding.scope, { sequence, headHash });
+        assertHeld();
+        const retained = this.#current(binding.scope);
+        requireValid(retained.sequence === sequence && retained.headHash === headHash);
+        // Similarly, no success may escape after the final O(N) readback scan
+        // if the physical lease expired while that scan was running.
         assertHeld();
         requireValid(!this.#poisoned);
         this.#uncertain = false;

@@ -8,6 +8,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const Database = require("better-sqlite3");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
@@ -37,20 +38,25 @@ function fixture(t) {
     storeHeadSha256: crypto.randomBytes(32).toString("hex"),
     fencingEpoch: 7 };
   const anchorHead = { sequence: 0, headHash: GENESIS };
-  const effects = { badWitness: false, badLineage: false,
+  const effects = { badWitness: false, badLineage: false, forceLineage: false,
     badAnchor: false, refuseAnchor: false, loseAnchorAck: false,
     earlyFenceRelease: false, adoptedEarlyRelease: false,
     lateFenceInvocation: false, lateContinuation: null,
     swallowFenceError: false, releaseFenceError: false,
     withLease: 0, signedPhysical: 0, anchorAdvances: 0,
-    pausedAtLease: null, detachedSettled: null };
+    pausedAtLease: null, detachedSettled: null,
+    leaseProbeCount: 0, expireLeaseAtProbe: null };
   const previouslyWitnessed = new Set();
   const physicalFence = {
     withCurrentRead: async (challenge, continuation) => {
       effects.withLease++;
       if (effects.pausedAtLease) await effects.pausedAtLease;
       let held = true;
-      const lease = { assertHeld: () => held };
+      const lease = { assertHeld: () => {
+        effects.leaseProbeCount++;
+        return held && (effects.expireLeaseAtProbe === null
+          || effects.leaseProbeCount < effects.expireLeaseAtProbe);
+      } };
       try {
       const statement = { version: 2, ...binding, nonce: challenge.nonce,
         operationIds: challenge.operationIds, envelopeDigests: challenge.envelopeDigests,
@@ -61,7 +67,8 @@ function fixture(t) {
       const changed = previous && (previous.commitId !== physical.commitId
         || previous.storeHeadSha256 !== physical.storeHeadSha256);
       const physicalId = `${physical.commitId}:${physical.storeHeadSha256}`;
-      const lineage = changed && !previouslyWitnessed.has(physicalId)
+      const lineage = changed && (effects.forceLineage
+        || !previouslyWitnessed.has(physicalId))
         ? sign(effects.badLineage ? keys().privateKey : witness.privateKey,
           LINEAGE_DOMAIN, { version: 1, scope: binding.scope,
             accountId: binding.accountId, storeId: binding.storeId,
@@ -232,9 +239,17 @@ test("Sync v2 CAS denies stale forks, replay and rollback despite a freshly sign
   const second = await ledger.recordPhysicalPair(request(f));
   assert.equal(second.sequence, 2);
   assert.equal(f.anchorHead.sequence, 2);
+  const currentPhysical = { ...f.physical };
   Object.assign(f.physical, { ...old, fencingEpoch: f.physical.fencingEpoch + 1 });
+  f.effects.forceLineage = true;
   await assert.rejects(ledger.recordPhysicalPair(request(f)), deny,
-    "previous physical head cannot be freshly signed into a new CAS sequence");
+    "a previously committed physical head with valid fresh signed lineage and higher epoch cannot be re-admitted");
+  assert.equal(f.effects.anchorAdvances, 2,
+    "replayed old head must not advance the externally signed CAS floor");
+  Object.assign(f.physical, currentPhysical);
+  verifyCurrentSignature(f, await ledger.freshCurrent(challenge(f)));
+  assert.equal(f.effects.anchorAdvances, 2,
+    "a replay denied before the mutable phase cannot poison legitimate current readback");
   Object.assign(f.physical, old);
   await assert.rejects(ledger.freshCurrent(challenge(f)), deny,
     "rolled-back physical witness current cannot sign the newer head");
@@ -242,6 +257,178 @@ test("Sync v2 CAS denies stale forks, replay and rollback despite a freshly sign
   f.anchorHead.headHash = crypto.randomBytes(32).toString("hex");
   await assert.rejects(ledger.freshCurrent(challenge(f)), deny,
     "signed externally rolled-back/altered floor cannot authorize readback");
+});
+
+test("Sync v2 retained CAS tip refuses tampering with a non-tip historical link or signed pair", async (t) => {
+  for (const variant of ["prior_hash", "signed_pair", "missing_prior"]) {
+    const f = fixture(t);
+    const ledger = await f.open();
+    await ledger.recordPhysicalPair(request(f));
+    for (let i = 0; i < 2; i++) {
+      f.physical.commitId = crypto.randomUUID();
+      f.physical.storeHeadSha256 = crypto.randomBytes(32).toString("hex");
+      f.physical.fencingEpoch++;
+      await ledger.recordPhysicalPair(request(f));
+    }
+    assert.equal(f.anchorHead.sequence, 3);
+    f.close(ledger);
+    const db = new Database(f.filename, { fileMustExist: true });
+    try {
+      if (variant === "prior_hash") db.prepare(`UPDATE atomic_cas_history
+        SET previous_hash=? WHERE scope=? AND sequence=2`).run(
+        crypto.randomBytes(32).toString("hex"), f.binding.scope);
+      if (variant === "signed_pair") db.prepare(`UPDATE atomic_cas_history
+        SET operation_ids=? WHERE scope=? AND sequence=2`).run(
+        protocol.canonicalJson(["tampered.one", "tampered.two"]), f.binding.scope);
+      if (variant === "missing_prior") db.prepare(`DELETE FROM atomic_cas_history
+        WHERE scope=? AND sequence=2`).run(f.binding.scope);
+    } finally { db.close(); }
+    const before = crypto.createHash("sha256")
+      .update(fs.readFileSync(f.filename)).digest("hex");
+    await assert.rejects(f.open(), deny,
+      `signed retained current floor cannot hide a ${variant} historical corruption`);
+    const after = crypto.createHash("sha256")
+      .update(fs.readFileSync(f.filename)).digest("hex");
+    assert.equal(after, before,
+      "startup denial must not mutate the SQLite main file before readonly audit");
+    assert.equal(f.anchorHead.sequence, 3,
+      "corrupted historical evidence must not roll back external high-water");
+  }
+});
+
+test("Sync v2 refuses an old seven-column history schema or missing uniqueness before writable reopen", async (t) => {
+  for (const variant of ["legacy_schema", "weakened_unique_constraints"]) {
+    const f = fixture(t);
+    const ledger = await f.open();
+    await ledger.recordPhysicalPair(request(f));
+    f.close(ledger);
+    const db = new Database(f.filename, { fileMustExist: true });
+    try {
+      db.transaction(() => {
+        db.exec("ALTER TABLE atomic_cas_history RENAME TO historical_original");
+        if (variant === "legacy_schema") {
+          db.exec(`CREATE TABLE atomic_cas_history (
+            scope TEXT NOT NULL, sequence INTEGER NOT NULL,
+            previous_hash TEXT NOT NULL, head_hash TEXT NOT NULL UNIQUE,
+            commit_id TEXT NOT NULL, store_head TEXT NOT NULL,
+            fencing_epoch INTEGER NOT NULL, PRIMARY KEY(scope,sequence),
+            UNIQUE(scope,commit_id), UNIQUE(scope,store_head))`);
+          db.exec(`INSERT INTO atomic_cas_history
+            (scope,sequence,previous_hash,head_hash,commit_id,store_head,fencing_epoch)
+            SELECT scope,sequence,previous_hash,head_hash,commit_id,store_head,fencing_epoch
+            FROM historical_original`);
+        } else {
+          db.exec(`CREATE TABLE atomic_cas_history (
+            scope TEXT NOT NULL, sequence INTEGER NOT NULL,
+            previous_hash TEXT NOT NULL, head_hash TEXT NOT NULL UNIQUE,
+            commit_id TEXT NOT NULL, store_head TEXT NOT NULL,
+            fencing_epoch INTEGER NOT NULL, operation_ids TEXT NOT NULL,
+            envelope_digests TEXT NOT NULL, PRIMARY KEY(scope,sequence))`);
+          db.exec(`INSERT INTO atomic_cas_history SELECT * FROM historical_original`);
+        }
+        db.exec("DROP TABLE historical_original");
+      }).immediate();
+    } finally { db.close(); }
+    const before = crypto.createHash("sha256")
+      .update(fs.readFileSync(f.filename)).digest("hex");
+    await assert.rejects(f.open(), deny,
+      `${variant}: required pair columns and unique constraints must be immutable`);
+    assert.equal(crypto.createHash("sha256")
+      .update(fs.readFileSync(f.filename)).digest("hex"), before,
+    "untrusted schema must be rejected before a writable SQLite connection");
+    assert.equal(f.anchorHead.sequence, 1);
+  }
+});
+
+test("Sync v2 prevents a hostile SQLite trigger from acknowledging a missing durable history append", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  const injected = new Database(f.filename, { fileMustExist: true });
+  try {
+    injected.exec(`CREATE TRIGGER erase_atomic_cas_history_after_insert
+      AFTER INSERT ON atomic_cas_history BEGIN
+        DELETE FROM atomic_cas_history
+          WHERE scope=NEW.scope AND sequence=NEW.sequence;
+      END`);
+  } finally { injected.close(); }
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny,
+    "CAS cannot advance external high-water after SQLite trigger erased append");
+  assert.equal(f.effects.anchorAdvances, 0);
+  assert.equal(f.anchorHead.sequence, 0);
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny,
+    "ambiguous local SQLite append permanently fences the current authority");
+  f.close(ledger);
+  await assert.rejects(f.open(), deny,
+    "read-only startup must refuse unapproved SQLite triggers before writable open");
+});
+
+test("Sync v2 read-only startup denies a hostile trigger even when its retained chain is intact", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  await ledger.recordPhysicalPair(request(f));
+  f.close(ledger);
+  const injected = new Database(f.filename, { fileMustExist: true });
+  try {
+    injected.exec(`CREATE TRIGGER erase_atomic_cas_history_after_insert
+      AFTER INSERT ON atomic_cas_history BEGIN
+        DELETE FROM atomic_cas_history
+          WHERE scope=NEW.scope AND sequence=NEW.sequence;
+      END`);
+  } finally { injected.close(); }
+  const before = crypto.createHash("sha256")
+    .update(fs.readFileSync(f.filename)).digest("hex");
+  await assert.rejects(f.open(), deny,
+    "valid historical chain and matching signed high-water cannot permit an unapproved trigger");
+  assert.equal(crypto.createHash("sha256")
+    .update(fs.readFileSync(f.filename)).digest("hex"), before,
+    "read-only startup refusal must not mutate the trusted SQLite main file");
+  assert.equal(f.anchorHead.sequence, 1);
+  assert.equal(f.effects.anchorAdvances, 1);
+});
+
+test("Sync v2 expiry immediately after the appended history scan denies external CAS advance", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  // The sixth physical lease probe is after tx.immediate() plus its O(N)
+  // committed-history readback, before any off-host compareAndAdvance.
+  f.effects.expireLeaseAtProbe = 6;
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny);
+  assert.equal(f.effects.leaseProbeCount, 6);
+  assert.equal(f.effects.anchorAdvances, 0,
+    "an expired physical fence cannot advance the independent high-water");
+  assert.equal(f.anchorHead.sequence, 0);
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny,
+    "a locally committed but externally ambiguous attempt must remain quarantined");
+});
+
+test("Sync v2 expiry after signed retained readback never acknowledges a committed pair", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  // The ninth probe follows the final complete local history audit after
+  // the signed external readback, before clearing the uncertainty latch.
+  f.effects.expireLeaseAtProbe = 9;
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny);
+  assert.equal(f.effects.leaseProbeCount, 9);
+  assert.equal(f.effects.anchorAdvances, 1,
+    "the external advance may already have happened; never claim rollback");
+  await assert.rejects(ledger.freshCurrent(challenge(f)), deny,
+    "an expired fence cannot emit a positive current receipt");
+});
+
+test("Sync v2 rejects malformed current-head JSON with generic fail-closed error", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  await ledger.recordPhysicalPair(request(f));
+  const tamper = new Database(f.filename, { fileMustExist: true });
+  try {
+    tamper.prepare(`UPDATE atomic_cas_head SET operation_ids=?
+      WHERE scope=?`).run("{invalid_json", f.binding.scope);
+  } finally { tamper.close(); }
+  await assert.rejects(ledger.freshCurrent(challenge(f)), deny,
+    "corrupted head JSON cannot escape as raw SyntaxError or authorize current");
+  f.close(ledger);
+  await assert.rejects(f.open(), deny,
+    "startup must reject the corrupted head before writable authority opening");
 });
 
 test("Sync v2 refuses early-returning physical fence instead of issuing a CAS ACK", async (t) => {

@@ -81,6 +81,27 @@ readback signs a fresh nonce only while a separate physical read fence and
 signed retained high-water check both succeed. Restart with an older local
 SQLite snapshot fails against the external floor.
 
+The append history now retains the original exact canonical pair IDs and
+envelope digests for **every** sequence. Each trusted local current-head
+inspection streams and rehashes the full history from the fixed genesis,
+requiring contiguous sequences, identical predecessor hashes, increasing
+fencing epochs and agreement with the signed external tip. A tampered older
+row, deleted historical row, mismatched pair or unattached history is denied;
+this checks local history integrity, not historical physical durability.
+On existing ledgers, identity, mandatory schema columns and uniqueness,
+all historical links and the fresh signed externally retained current tip
+are verified within one SQLite **read-only transaction before** opening the
+database with write access. The service also rejects a reused historical
+physical commit or store head before entering any irreversible CAS mutation;
+SQLite uniqueness constraints remain a second guard against racing replays.
+Prior DEV-OFF ledger files without the per-entry pair columns are refused
+without automatic reconstruction: missing historical signed input cannot
+be safely inferred from the latest head. Operators must retain the old file
+and separately verify a new authority bootstrap, not silently rewrite it.
+Full-history validation is intentionally linear in retained entries; a
+bounded checkpoint and externally signed compaction contract are future
+development requirements for high-volume authorities.
+
 Its constructor **requires** a separately custody-protected
 `physicalFence.withCurrentRead` callback holding the real physical writer
 fence across verification, the SQLite transaction, the independent retained
@@ -88,7 +109,9 @@ anchor advance/readback and signing. The provider must await the complete
 continuation and return its exact result without releasing the fence first;
 the continuation also requires an externally trustworthy synchronous
 `lease.assertHeld() === true` throughout the critical section (including
-after asynchronous retained-anchor calls). This detects the common mistaken
+after each full-history audit and asynchronous retained-anchor calls).
+In particular, a physical lease expiring during an O(N) audit denies any
+subsequent external CAS advance or positive acknowledgment. This detects the common mistaken
 `try { return continuation(...); } finally { unlock(); }` pattern; an adapter
 that lies about the lease remains outside what this prototype can prove.
 An early return or release error causes fail-closed quarantine. Each changed physical head
