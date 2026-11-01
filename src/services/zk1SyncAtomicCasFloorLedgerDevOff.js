@@ -313,6 +313,7 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
   async #withPhysicalProof(binding, pair, fn, previous = null) {
     const nonce = freshNonce();
     let called = false;
+    let closed = false;
     let completed = false;
     let callbackSucceeded = false;
     let enteredCritical = false;
@@ -326,6 +327,7 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         fencingEpoch: previous.fencingEpoch,
       } : null,
     }, async (bundle, lease) => {
+      requireValid(!closed);
       requireValid(!called);
       called = true;
       try {
@@ -374,19 +376,19 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
     });
     } catch {
       // A detached continuation can outlive its lock: no positive response.
-      if (enteredCritical) {
+      closed = true;
+      if (enteredCritical || !called) {
         this.#uncertain = true;
         this.#poisoned = true;
       }
       throw deny();
     }
+    closed = true;
     if (!called || !completed || !callbackSucceeded || returned !== callbackResult) {
       // The fence must await and return the exact continuation result. An
       // early-returning provider may have committed an ambiguous local row.
-      if (called) {
-        this.#uncertain = true;
-        this.#poisoned = true;
-      }
+      this.#uncertain = true;
+      this.#poisoned = true;
       throw deny();
     }
     return returned;

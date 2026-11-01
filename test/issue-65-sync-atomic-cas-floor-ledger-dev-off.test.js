@@ -40,6 +40,7 @@ function fixture(t) {
   const effects = { badWitness: false, badLineage: false,
     badAnchor: false, refuseAnchor: false, loseAnchorAck: false,
     earlyFenceRelease: false, adoptedEarlyRelease: false,
+    lateFenceInvocation: false, lateContinuation: null,
     swallowFenceError: false, releaseFenceError: false,
     withLease: 0, signedPhysical: 0, anchorAdvances: 0,
     pausedAtLease: null, detachedSettled: null };
@@ -72,6 +73,13 @@ function fixture(t) {
             fencingEpoch: physical.fencingEpoch, physicalDurable: true })
         : null;
       const bundle = { receipt: sign(signer, WITNESS_DOMAIN, statement), lineage };
+      if (effects.lateFenceInvocation) {
+        // Callback is invoked only AFTER adapter has already returned.
+        // A truthful separately held lease would not make that safe.
+        effects.lateContinuation = () => continuation(bundle,
+          { assertHeld: () => true });
+        return undefined;
+      }
       if (effects.earlyFenceRelease) {
         // Hostile provider releases the lock without awaiting continuation.
         effects.detachedSettled = continuation(bundle, lease).then(() => true, () => false);
@@ -260,6 +268,22 @@ test("Sync v2 rejects Promise adoption that releases a physical finally lock too
   await assert.rejects(ledger.recordPhysicalPair(request(f)), deny,
     "released lease must permanently poison the in-process signing authority");
   await assert.rejects(ledger.freshCurrent(challenge(f)), deny);
+});
+
+test("Sync v2 denies delayed physical continuation after adapter returned and released queue", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  f.effects.lateFenceInvocation = true;
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny);
+  assert.equal(typeof f.effects.lateContinuation, "function");
+  await assert.rejects(f.effects.lateContinuation(), deny,
+    "a delayed valid signed receipt and positive lease probe must not bypass closed call");
+  assert.equal(f.anchorHead.sequence, 0);
+  assert.equal(f.effects.anchorAdvances, 0,
+    "callback after return must not mutate external high-water");
+  f.effects.lateFenceInvocation = false;
+  await assert.rejects(ledger.recordPhysicalPair(request(f)), deny,
+    "early adapter return permanently latches this in-process authority");
 });
 
 test("Sync v2 rejects swallowed witness failure even if fence returns undefined", async (t) => {
