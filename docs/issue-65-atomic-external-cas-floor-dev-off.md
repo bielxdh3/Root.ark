@@ -89,10 +89,19 @@ fencing epochs and agreement with the signed external tip. A tampered older
 row, deleted historical row, mismatched pair or unattached history is denied;
 this checks local history integrity, not historical physical durability.
 On existing ledgers, identity, mandatory schema columns and uniqueness,
-all historical links and the fresh signed externally retained current tip
-are verified within one SQLite **read-only transaction before** opening the
-database with write access. The service also rejects a reused historical
-physical commit or store head before entering any irreversible CAS mutation;
+all historical links are verified in one SQLite **read-only transaction before**
+opening the database with write access. Fresh signed external retained heads
+are obtained **before** entering that transaction, so a slow or unresponsive
+operator cannot pin the WAL/checkpoint. In one synchronous read-only snapshot,
+the full chain, persisted signer-identity constraints and required CAS schema
+must exactly match those signed heads before any
+writable SQLite connection is created. The post-open full-history audit also
+denies intervening changes before a usable signer can escape. The service
+never adopts a SQLite file first materialized while the signed bootstrap
+genesis check is waiting; a new file must be created with exclusive creation,
+whereas a pre-existing file must retain its inspected device/inode identity.
+It also rejects a reused historical physical commit or store head before
+entering any irreversible CAS mutation;
 SQLite uniqueness constraints remain a second guard against racing replays.
 Prior DEV-OFF ledger files without the per-entry pair columns are refused
 without automatic reconstruction: missing historical signed input cannot

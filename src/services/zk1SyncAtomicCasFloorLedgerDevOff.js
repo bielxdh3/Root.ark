@@ -16,6 +16,9 @@ const WITNESS_DOMAIN = "rootark-sync-atomic-batch-witness-v2\0";
 const CAS_DOMAIN = "rootark-sync-atomic-batch-external-cas-floor-v2\0";
 const ANCHOR_DOMAIN = "rootark-sync-atomic-batch-retained-highwater-v1\0";
 const LINEAGE_DOMAIN = "rootark-sync-atomic-batch-physical-lineage-v1\0";
+// Internal constructor preflight token: open() must never adopt a database
+// materialized during an awaited external genesis challenge.
+const OPEN_PREFLIGHT = Symbol("sync-v2-cas-open-preflight");
 const GENESIS = crypto.createHash("sha256")
   .update("rootark-sync-atomic-batch-cas-genesis-v1\0").digest("hex");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -91,15 +94,19 @@ function assertPair(value) {
     && value.envelopeDigests.every((digest) => typeof digest === "string" && HEX.test(digest)));
 }
 function same(a, b) { return protocol.canonicalJson(a) === protocol.canonicalJson(b); }
-async function requireExternalHead(anchor, anchorKey, scope, expected) {
+async function readExternalHead(anchor, anchorKey, scope) {
   const nonce = freshNonce();
   const statement = verifySigned(await anchor.readSignedHead({ scope, nonce }),
     ANCHOR_FIELDS, ANCHOR_DOMAIN, anchorKey);
   requireValid(statement.version === 1 && statement.scope === scope
     && statement.nonce === nonce && Number.isSafeInteger(statement.sequence)
-    && statement.sequence >= 0 && HEX.test(statement.headHash)
-    && statement.sequence === expected.sequence
-    && statement.headHash === expected.headHash);
+    && statement.sequence >= 0 && HEX.test(statement.headHash));
+  return { sequence: statement.sequence, headHash: statement.headHash };
+}
+async function requireExternalHead(anchor, anchorKey, scope, expected) {
+  const observed = await readExternalHead(anchor, anchorKey, scope);
+  requireValid(observed.sequence === expected.sequence
+    && observed.headHash === expected.headHash);
 }
 function currentOf(row) {
   if (!row) return { sequence: 0, headHash: GENESIS };
@@ -122,6 +129,35 @@ function assertStorageSchema(db) {
   // to this deliberately fixed-schema CAS authority.
   requireValid(!db.prepare(`SELECT 1 FROM sqlite_schema
     WHERE type='trigger' LIMIT 1`).get());
+  // Fingerprints pinned to a mutable or weakened identity table are not
+  // authoritative merely because row id=1 currently matches our keys.
+  const identityColumns = db.pragma('table_info("atomic_cas_identity")');
+  const expectedIdentity = ["id", "cas_fingerprint", "witness_fingerprint",
+    "anchor_fingerprint"];
+  requireValid(identityColumns.length === expectedIdentity.length
+    && identityColumns.every((column, index) => column.name === expectedIdentity[index]
+      && (index === 0
+        ? column.type === "INTEGER" && column.pk === 1
+        : column.type === "TEXT" && column.notnull === 1 && column.pk === 0)));
+  const identitySchema = db.prepare(`SELECT sql FROM sqlite_schema
+    WHERE type='table' AND name='atomic_cas_identity'`).get();
+  // Exact canonical DDL avoids treating a commented-out CHECK(id=1) as a
+  // real constraint. Existing authority files with weaker DDL fail closed.
+  const expectedSql = `CREATE TABLE atomic_cas_identity (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    cas_fingerprint TEXT NOT NULL, witness_fingerprint TEXT NOT NULL,
+    anchor_fingerprint TEXT NOT NULL)`;
+  const compactSql = (sql) => sql.replace(/\s+/g, " ").trim()
+    // The original multiline CREATE TABLE has whitespace before its final
+    // closing parenthesis; this does not change its CHECK/PK constraints.
+    .replace(/\s+\)/g, ")")
+    // SQLite versions may retain or elide IF NOT EXISTS in sqlite_schema.
+    // Both forms still require the SAME full canonical constraint body.
+    .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ");
+  requireValid(typeof identitySchema?.sql === "string"
+    && compactSql(identitySchema.sql) === compactSql(expectedSql));
+  const identityRows = db.prepare("SELECT id FROM atomic_cas_identity").all();
+  requireValid(identityRows.length === 1 && identityRows[0].id === 1);
   const definitions = [
     ["atomic_cas_head", ["scope", "account_id", "store_id", "sequence",
       "head_hash", "commit_id", "store_head", "fencing_epoch",
@@ -223,7 +259,8 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
   #poisoned = false;
 
   constructor({ filename, bootstrapNew = false, casPrivateKey, witnessPublicKey,
-    anchorPublicKey, ownerBindings, physicalFence, retainedAnchor } = {}) {
+    anchorPublicKey, ownerBindings, physicalFence, retainedAnchor,
+    [OPEN_PREFLIGHT]: preflight = null } = {}) {
     const casKey = assertKey(casPrivateKey, "private");
     const witnessKey = assertKey(witnessPublicKey, "public");
     const anchorKey = assertKey(anchorPublicKey, "public");
@@ -249,8 +286,16 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
     const absolute = path.resolve(filename);
     const existed = fs.existsSync(absolute);
     requireValid(existed || bootstrapNew === true);
+    requireValid(!preflight || (preflight.kind === "absent"
+      ? !existed : preflight.kind === "existing" && existed));
     try {
-      if (existed) assertPrivateSqliteFile(absolute);
+      if (existed) {
+        const inspected = assertPrivateSqliteFile(absolute);
+        if (preflight?.kind === "existing") {
+          requireValid(inspected.dev === preflight.dev
+            && inspected.ino === preflight.ino);
+        }
+      }
       else {
         ensurePrivateSqliteDirectory(absolute);
         const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
@@ -336,12 +381,21 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
       if (present) {
         before = assertPrivateSqliteFile(filename);
         assertPrivateSqliteAuthorityDirectory(filename);
+        // Demand a fresh signed external floor FIRST, with no SQLite reader
+        // open across any unbounded asynchronous provider callback.
+        const signedHeads = new Map();
+        for (const scope of owner.keys()) {
+          signedHeads.set(scope, await readExternalHead(
+            options.retainedAnchor, anchorKey, scope));
+        }
+        const afterExternal = assertPrivateSqliteFile(filename);
+        requireValid(before.dev === afterExternal.dev && before.ino === afterExternal.ino);
         const observer = new Database(filename, { readonly: true,
           fileMustExist: true });
         try {
-          // The entire local history, identity and signed external tip are
-          // checked in ONE stable read-only snapshot before any writable
-          // SQLite connection can perform journal recovery or checkpointing.
+          // The FULL trusted local chain, identities and equality to the
+          // already verified external head are checked in ONE synchronous
+          // readonly snapshot immediately before any writable connection.
           observer.exec("BEGIN TRANSACTION");
           assertStorageSchema(observer);
           const authority = observer.prepare(
@@ -357,9 +411,10 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
             WHERE NOT EXISTS (SELECT 1 FROM atomic_cas_head a
               WHERE a.scope=h.scope) LIMIT 1`).get());
           for (const binding of owner.values()) {
-            const current = auditLocalHistory(observer, binding);
-            await requireExternalHead(options.retainedAnchor,
-              anchorKey, binding.scope, current);
+            const local = auditLocalHistory(observer, binding);
+            const external = signedHeads.get(binding.scope);
+            requireValid(external && local.sequence === external.sequence
+              && local.headHash === external.headHash);
           }
           observer.exec("COMMIT");
         } catch {
@@ -379,10 +434,37 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         requireValid(before.dev === afterAnchor.dev && before.ino === afterAnchor.ino);
       }
     } catch { throw deny(); }
-    const ledger = new Zk1SyncAtomicCasFloorLedgerDevOff(options);
+    const ledger = new Zk1SyncAtomicCasFloorLedgerDevOff({ ...options,
+      [OPEN_PREFLIGHT]: before
+        ? { kind: "existing", dev: before.dev, ino: before.ino }
+        : { kind: "absent" },
+    });
     try {
+      const verifiedHeads = new Map();
       for (const binding of ledger.#bindings.values()) {
-        await ledger.#requireRetainedHead(binding.scope, ledger.#current(binding.scope));
+        const current = ledger.#current(binding.scope);
+        verifiedHeads.set(binding.scope, current);
+        await ledger.#requireRetainedHead(binding.scope, current);
+      }
+      // A remote callback can mutate the local database after its initial
+      // full-chain audit. Audit ALL identities, scopes, orphans and schema
+      // again synchronously
+      // AFTER the final await, before returning a usable signer.
+      assertStorageSchema(ledger.#db);
+      const identity = ledger.#db.prepare(
+        "SELECT * FROM atomic_cas_identity WHERE id=1").get();
+      requireValid(identity && identity.cas_fingerprint === fingerprint(
+        crypto.createPublicKey(options.casPrivateKey))
+        && identity.witness_fingerprint === fingerprint(options.witnessPublicKey)
+        && identity.anchor_fingerprint === fingerprint(options.anchorPublicKey));
+      const heads = ledger.#db.prepare("SELECT scope FROM atomic_cas_head").all();
+      requireValid(heads.length <= ledger.#bindings.size
+        && heads.every((head) => ledger.#bindings.has(head.scope)));
+      requireValid(!ledger.#db.prepare(`SELECT 1 FROM atomic_cas_history h
+        WHERE NOT EXISTS (SELECT 1 FROM atomic_cas_head a
+          WHERE a.scope=h.scope) LIMIT 1`).get());
+      for (const [scope, verified] of verifiedHeads) {
+        requireValid(same(ledger.#current(scope), verified));
       }
       return ledger;
     } catch (error) {

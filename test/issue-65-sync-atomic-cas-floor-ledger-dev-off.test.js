@@ -9,6 +9,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const Database = require("better-sqlite3");
+const { assertPrivateSqliteFile } = require("../src/services/zk1PrivateSqlitePath");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
@@ -173,6 +174,35 @@ test("Sync v2 durable CAS requires independent signed retained genesis before bo
     "no current signed floor can exist before the first independently fenced batch");
 });
 
+test("Sync v2 bootstrap never adopts a SQLite file created during the signed genesis challenge", async (t) => {
+  const f = fixture(t);
+  const readHead = f.retainedAnchor.readSignedHead;
+  let injected = false;
+  f.retainedAnchor.readSignedHead = async (challenge) => {
+    if (!injected) {
+      const attacker = new Database(f.filename);
+      try {
+        attacker.exec("CREATE TABLE intruder_marker (id INTEGER PRIMARY KEY)");
+      } finally { attacker.close(); }
+      if (process.platform !== "win32") fs.chmodSync(f.filename, 0o600);
+      assertPrivateSqliteFile(f.filename);
+      injected = true;
+    }
+    return readHead(challenge);
+  };
+  await assert.rejects(f.open(), deny,
+    "an unexpected file appearing during genesis must not be adopted or opened writable");
+  assert.equal(injected, true);
+  const verify = new Database(f.filename, { readonly: true, fileMustExist: true });
+  try {
+    const tables = verify.prepare(`SELECT name FROM sqlite_schema
+      WHERE type='table' ORDER BY name`).all().map((row) => row.name);
+    assert.deepEqual(tables, ["intruder_marker"],
+      "denial must happen before CREATE TABLE IF NOT EXISTS mutates the unexpected SQLite file");
+  } finally { verify.close(); }
+  assert.equal(f.anchorHead.sequence, 0);
+});
+
 test("Sync v2 physically witnessed pair advances SQLite and off-host high-water once; restart preserves floor", async (t) => {
   const f = fixture(t);
   const first = await f.open();
@@ -296,6 +326,142 @@ test("Sync v2 retained CAS tip refuses tampering with a non-tip historical link 
   }
 });
 
+test("Sync v2 closes read-only startup snapshot before awaiting the independent retained head", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  await ledger.recordPhysicalPair(request(f));
+  f.close(ledger);
+  const readHead = f.retainedAnchor.readSignedHead;
+  let checkpointObserved = false;
+  f.retainedAnchor.readSignedHead = async (challenge) => {
+    if (!checkpointObserved) {
+      const writer = new Database(f.filename, { fileMustExist: true });
+      try {
+        writer.pragma("busy_timeout = 0");
+        assert.equal(writer.pragma("journal_mode", { simple: true }), "wal");
+        writer.pragma("user_version = 17");
+        const observedWal = writer.pragma("wal_checkpoint(PASSIVE)");
+        assert.equal(observedWal.length, 1);
+        assert.ok(observedWal[0].log >= 1,
+          "the independent writer must have generated a real WAL frame");
+        const checkpoint = writer.pragma("wal_checkpoint(TRUNCATE)");
+        assert.equal(checkpoint.length, 1);
+        assert.equal(checkpoint[0].busy, 0,
+          "the external authority must never hold a SQLite reader that pins WAL checkpoints");
+        assert.ok(checkpoint[0].log >= 0 && checkpoint[0].checkpointed >= 0,
+          "a no-op checkpoint outside WAL cannot satisfy the preflight test");
+        checkpointObserved = true;
+      } finally { writer.close(); }
+    }
+    return readHead(challenge);
+  };
+  const reopened = await f.open();
+  assert.equal(checkpointObserved, true,
+    "a genuine WAL checkpoint must occur during signed external readback");
+  verifyCurrentSignature(f, await reopened.freshCurrent(challenge(f)));
+});
+
+test("Sync v2 rejects corruption during signed external lookup before the read-only preflight", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  await ledger.recordPhysicalPair(request(f));
+  f.close(ledger);
+  const readHead = f.retainedAnchor.readSignedHead;
+  let corrupted = false;
+  let afterCorruptionHash;
+  f.retainedAnchor.readSignedHead = async (challenge) => {
+    if (!corrupted) {
+      const writer = new Database(f.filename, { fileMustExist: true });
+      try {
+        const changed = writer.prepare(`UPDATE atomic_cas_history
+          SET previous_hash=? WHERE scope=? AND sequence=1`).run(
+          crypto.randomBytes(32).toString("hex"), f.binding.scope);
+        assert.equal(changed.changes, 1);
+        corrupted = true;
+      } finally { writer.close(); }
+      afterCorruptionHash = crypto.createHash("sha256")
+        .update(fs.readFileSync(f.filename)).digest("hex");
+    }
+    return readHead(challenge);
+  };
+  await assert.rejects(f.open(), deny,
+    "post-snapshot corruption must fail the fresh full-history audit before any usable signer escapes");
+  assert.equal(corrupted, true);
+  assert.equal(crypto.createHash("sha256")
+    .update(fs.readFileSync(f.filename)).digest("hex"), afterCorruptionHash,
+    "read-only startup must not checkpoint or mutate the corrupt file after tampering");
+  assert.equal(f.anchorHead.sequence, 1,
+    "a failed recovery cannot mutate the independently signed high-water");
+});
+
+test("Sync v2 refuses to return a signer when its second signed anchor callback corrupts local history", async (t) => {
+  const f = fixture(t);
+  const ledger = await f.open();
+  await ledger.recordPhysicalPair(request(f));
+  f.close(ledger);
+  const readHead = f.retainedAnchor.readSignedHead;
+  let lookups = 0;
+  f.retainedAnchor.readSignedHead = async (challenge) => {
+    lookups++;
+    if (lookups === 2) {
+      const writer = new Database(f.filename, { fileMustExist: true });
+      try {
+        const update = writer.prepare(`UPDATE atomic_cas_history
+          SET previous_hash=? WHERE scope=? AND sequence=1`).run(
+          crypto.randomBytes(32).toString("hex"), f.binding.scope);
+        assert.equal(update.changes, 1);
+      } finally { writer.close(); }
+    }
+    return readHead(challenge);
+  };
+  await assert.rejects(f.open(), deny,
+    "even the final post-writable signed anchor callback cannot corrupt the chain and return an authority");
+  assert.equal(lookups, 2);
+  assert.equal(f.anchorHead.sequence, 1);
+});
+
+test("Sync v2 rejects second-callback signer-identity and unauthorized-scope injections", async (t) => {
+  for (const variant of ["forged_fingerprint", "foreign_head", "orphan_history"]) {
+    const f = fixture(t);
+    const ledger = await f.open();
+    await ledger.recordPhysicalPair(request(f));
+    f.close(ledger);
+    const originalRead = f.retainedAnchor.readSignedHead;
+    let calls = 0;
+    f.retainedAnchor.readSignedHead = async (challenge) => {
+      calls++;
+      if (calls === 2) {
+        const writer = new Database(f.filename, { fileMustExist: true });
+        try {
+          if (variant === "forged_fingerprint") {
+            const updated = writer.prepare(`UPDATE atomic_cas_identity
+              SET cas_fingerprint=? WHERE id=1`).run("00".repeat(32));
+            assert.equal(updated.changes, 1);
+          } else if (variant === "foreign_head") {
+            const added = writer.prepare(`INSERT INTO atomic_cas_head
+              SELECT ?,account_id,store_id,sequence,head_hash,commit_id,
+                store_head,fencing_epoch,operation_ids,envelope_digests
+              FROM atomic_cas_head WHERE scope=?`).run("bob:foreign", f.binding.scope);
+            assert.equal(added.changes, 1);
+          } else {
+            const added = writer.prepare(`INSERT INTO atomic_cas_history
+              SELECT ?,sequence,previous_hash,?,commit_id,store_head,
+                fencing_epoch,operation_ids,envelope_digests
+              FROM atomic_cas_history WHERE scope=?`).run("bob:orphan",
+              crypto.randomBytes(32).toString("hex"), f.binding.scope);
+            assert.equal(added.changes, 1);
+          }
+        } finally { writer.close(); }
+      }
+      return originalRead(challenge);
+    };
+    await assert.rejects(f.open(), deny,
+      `${variant}: a second signed external callback cannot mutate authority identities or scopes`);
+    assert.equal(calls, 2, "the negative must reach the post-writable callback");
+    assert.equal(f.anchorHead.sequence, 1);
+  }
+});
+
 test("Sync v2 refuses an old seven-column history schema or missing uniqueness before writable reopen", async (t) => {
   for (const variant of ["legacy_schema", "weakened_unique_constraints"]) {
     const f = fixture(t);
@@ -336,6 +502,41 @@ test("Sync v2 refuses an old seven-column history schema or missing uniqueness b
     assert.equal(crypto.createHash("sha256")
       .update(fs.readFileSync(f.filename)).digest("hex"), before,
     "untrusted schema must be rejected before a writable SQLite connection");
+    assert.equal(f.anchorHead.sequence, 1);
+  }
+});
+
+test("Sync v2 refuses weakened persisted signer-identity constraints before writable open", async (t) => {
+  for (const variant of ["no_primary_key", "no_fixed_identity_check",
+    "commented_out_identity_check"]) {
+    const f = fixture(t);
+    const ledger = await f.open();
+    await ledger.recordPhysicalPair(request(f));
+    f.close(ledger);
+    const db = new Database(f.filename, { fileMustExist: true });
+    try {
+      db.transaction(() => {
+        db.exec("ALTER TABLE atomic_cas_identity RENAME TO saved_cas_identity");
+        const identityIdDefinition = variant === "no_primary_key"
+          ? "id INTEGER"
+          : variant === "commented_out_identity_check"
+            ? "id INTEGER PRIMARY KEY /* CHECK(id=1) */"
+            : "id INTEGER PRIMARY KEY";
+        db.exec(`CREATE TABLE atomic_cas_identity (
+          ${identityIdDefinition},
+          cas_fingerprint TEXT NOT NULL, witness_fingerprint TEXT NOT NULL,
+          anchor_fingerprint TEXT NOT NULL)`);
+        db.exec(`INSERT INTO atomic_cas_identity SELECT * FROM saved_cas_identity`);
+        db.exec("DROP TABLE saved_cas_identity");
+      }).immediate();
+    } finally { db.close(); }
+    const before = crypto.createHash("sha256")
+      .update(fs.readFileSync(f.filename)).digest("hex");
+    await assert.rejects(f.open(), deny,
+      `${variant}: matching signer fingerprints cannot authorize a weak identity schema`);
+    assert.equal(crypto.createHash("sha256")
+      .update(fs.readFileSync(f.filename)).digest("hex"), before,
+      "identity table must be rejected before writable recovery changes SQLite");
     assert.equal(f.anchorHead.sequence, 1);
   }
 });
