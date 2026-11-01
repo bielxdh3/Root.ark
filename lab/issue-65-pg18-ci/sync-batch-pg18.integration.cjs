@@ -19,8 +19,10 @@ const { createZk1SyncPgBatchIndependentReadback } =
   require("../../src/services/zk1SyncPgBatchIndependentReadback");
 const { createZk1SyncAtomicPgPhysicalFenceDevOff } =
   require("../../src/services/zk1SyncAtomicPgPhysicalFenceDevOff");
-const { WITNESS_DOMAIN } =
+const { Zk1SyncAtomicCasFloorLedgerDevOff, WITNESS_DOMAIN, GENESIS } =
   require("../../src/services/zk1SyncAtomicCasFloorLedgerDevOff");
+const { Zk1SyncAtomicRetainedAnchorDevOff } =
+  require("../../src/services/zk1SyncAtomicRetainedAnchorDevOff");
 const { createZk1SyncAtomicSqlReadbackHttpsServer } =
   require("../../src/services/zk1SyncAtomicSqlReadbackHttpsServer");
 const { createPrivateAuthorityFixture } =
@@ -1499,6 +1501,88 @@ test("PG18 actual read-only role bridges a synthetic held v2 physical lease with
   }), { code: "SYNC_ATOMIC_PG_FENCE_DEV_OFF_DENIED" },
   "a writer/runtime role cannot impersonate the read-only PostgreSQL witness reader");
   assert.equal(signedContinuation, 1);
+});
+
+test("PG18 real signed DELETE+MOVE flows through DEV-OFF physical fence into local CAS and signed retained anchor", async (t) => {
+  // The SQL storage/role and two SQLite ledgers are real. The physical witness
+  // is explicitly SYNTHETIC and the retained anchor shares this CI process.
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const committed = await commitTestBatch(f, operations);
+  const owner = { scope: f.scope, accountId: crypto.randomUUID(),
+    storeId: crypto.randomUUID(), username: f.username, compartmentId: "private" };
+  const witnessKey = crypto.generateKeyPairSync("ed25519");
+  const casKey = crypto.generateKeyPairSync("ed25519");
+  const anchorKey = crypto.generateKeyPairSync("ed25519");
+  const directory = createPrivateAuthorityFixture("zk65-pg-real-cas-");
+  let ledger, retained;
+  t.after(() => {
+    ledger?.close();
+    retained?.close();
+    fs.rmSync(directory, { recursive: true, force: true,
+      maxRetries: 10, retryDelay: 100 });
+  });
+  retained = new Zk1SyncAtomicRetainedAnchorDevOff({
+    filename: path.join(directory, "retained.sqlite"), bootstrapNew: true,
+    signerPrivateKey: anchorKey.privateKey,
+    ownerBindings: [{ scope: owner.scope, accountId: owner.accountId,
+      storeId: owner.storeId }],
+    trustedMinimumHeads: [{ scope: owner.scope, sequence: 0, headHash: GENESIS }],
+  });
+  const physical = createZk1SyncAtomicPgPhysicalFenceDevOff({
+    attestorPool: attestor, witnessPublicKey: witnessKey.publicKey,
+    ownerBindings: [owner],
+    externalPhysicalFence: {
+      async withCurrentRead(challenge, continuation) {
+        let held = true;
+        const statement = { version: 2, ...owner, nonce: challenge.nonce,
+          operationIds: challenge.operationIds,
+          envelopeDigests: challenge.envelopeDigests,
+          commitId: committed.commitId,
+          storeHeadSha256: committed.storeHeadSha256,
+          fencingEpoch: 7, physicalDurable: true };
+        const signature = crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+          + protocol.canonicalJson(statement)), witnessKey.privateKey)
+          .toString("base64url");
+        try {
+          return await continuation({ receipt: { statement, signature }, lineage: null },
+            { assertHeld: () => held });
+        } finally { held = false; }
+      },
+    },
+  });
+  ledger = await Zk1SyncAtomicCasFloorLedgerDevOff.open({
+    filename: path.join(directory, "local-cas.sqlite"), bootstrapNew: true,
+    casPrivateKey: casKey.privateKey,
+    witnessPublicKey: witnessKey.publicKey,
+    anchorPublicKey: anchorKey.publicKey, ownerBindings: [owner],
+    physicalFence: physical, retainedAnchor: retained,
+  });
+  const input = { scope: owner.scope, accountId: owner.accountId,
+    storeId: owner.storeId,
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) =>
+      hash(protocol.canonicalJson(op)).toString("hex")) };
+  const advanced = await ledger.recordPhysicalPair(input);
+  assert.equal(advanced.sequence, 1);
+  assert.equal(typeof advanced.headHash, "string");
+  const remote = retained.readSignedHead({ scope: owner.scope,
+    nonce: crypto.randomBytes(32).toString("base64url") });
+  assert.equal(remote.statement.sequence, 1);
+  assert.equal(remote.statement.headHash, advanced.headHash);
+  assert.deepEqual(await ledger.recordPhysicalPair(input), advanced,
+    "replaying the same physical pair must not advance a second retained head");
+  assert.equal(retained.readSignedHead({ scope: owner.scope,
+    nonce: crypto.randomBytes(32).toString("base64url") }).statement.sequence, 1);
+  await admin.query(`UPDATE zk1_sync_batch.scope_policy SET allow_delete=false
+    WHERE scope=$1`, [owner.scope]);
+  await assert.rejects(ledger.recordPhysicalPair(input),
+    { code: "SYNC_ATOMIC_CAS_DEV_OFF_UNVERIFIED" },
+    "revoking the real PG18 scope after commit defeats even an old locally signed CAS pair");
+  assert.equal(retained.readSignedHead({ scope: owner.scope,
+    nonce: crypto.randomBytes(32).toString("base64url") }).statement.sequence, 1,
+  "failed independent PG revalidation cannot append another retained head");
+  // This test validates the path but grants NO production ACK/custody claim.
 });
 
 test("PG18 latest-pair resolver refuses rolled-back physical SQL head without treating rows as a witness", async () => {

@@ -69,6 +69,14 @@ rows, and a deliberately synthetic Ed25519 lease/witness. It verifies normal
 admission, rejected username/compartment and digest changes, and rejection of
 the runtime/writer SQL credential. It still does not constitute a real physical
 barrier, host independence, or protected ACK proof.
+The same disposable PG18 lab additionally runs the actual
+`Zk1SyncAtomicCasFloorLedgerDevOff` with the new PG fence and a distinct
+Ed25519-signed SQLite retained anchor. A real persisted SQL pair advances the
+local and retained floor exactly once; identical retries cannot append again,
+and a real PostgreSQL policy revocation makes the subsequent revalidation
+fail closed without advancing the retained floor. The test uses synthetic
+physical evidence and an in-process anchor, so it proves code integration,
+**not** independent custody or physical durability.
 
 ## Open integration gates
 
