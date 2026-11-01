@@ -2309,7 +2309,8 @@ test("PG18 denies writable owner-rights views in foreign schemas despite no base
       ["zk1_sync_batch_verifier", verifier],
     ]) {
       await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
-      await admin.query(`GRANT SELECT(scope), UPDATE(head) ON ${schema}.indirect_head TO ${role}`);
+      await admin.query(`GRANT SELECT(scope,head), UPDATE(head)
+        ON ${schema}.indirect_head TO ${role}`);
       try {
         const privileges = await pool.query(`SELECT
           pg_catalog.has_table_privilege(current_user,
@@ -2326,9 +2327,13 @@ test("PG18 denies writable owner-rights views in foreign schemas despite no base
           await tx.query("BEGIN");
           begun = true;
           const attack = await tx.query(`UPDATE ${schema}.indirect_head
-            SET head=decode(repeat('0',64),'hex') WHERE scope=$1`, [pending.scope]);
+            SET head=decode(repeat('ab',32),'hex') WHERE scope=$1`, [pending.scope]);
           assert.equal(attack.rowCount, 1,
             "owner-rights view must really be able to mutate the protected head");
+          const changed = await tx.query(`SELECT encode(head,'hex') AS altered_head
+            FROM ${schema}.indirect_head WHERE scope=$1`, [pending.scope]);
+          assert.equal(changed.rows[0]?.altered_head, "ab".repeat(32),
+            "the view owner must actually change bytes in the protected row");
         } finally {
           if (begun) await tx.query("ROLLBACK");
           tx.release();
@@ -2360,7 +2365,7 @@ test("PG18 denies writable owner-rights views in foreign schemas despite no base
           (role === "zk1_sync_batch_verifier" ? 1 : 0),
         "an indirect view grant must not let a failed credential mint extra tickets");
       } finally {
-        await admin.query(`REVOKE SELECT(scope), UPDATE(head)
+        await admin.query(`REVOKE SELECT(scope,head), UPDATE(head)
           ON ${schema}.indirect_head FROM ${role}`);
         await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
       }
