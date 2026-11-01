@@ -2392,6 +2392,7 @@ test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket A
   let commitReached;
   const atCommit = new Promise((resolve) => { commitReached = resolve; });
   let settleCommit;
+  let realCommit;
   let uncertainDestroyed = 0;
   let signalRelease;
   const released = new Promise((resolve) => { signalRelease = resolve; });
@@ -2401,9 +2402,14 @@ test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket A
       query(sql, ...args) {
         if (sql === "COMMIT") {
           commitReached();
+          // Send the COMMIT to real PostgreSQL IMMEDIATELY, but withhold only
+          // its driver-visible reply. This exercises durable-but-unacknowledged
+          // admission, not an INSERT which commits only after cancellation.
+          realCommit = Promise.resolve().then(() => client.query("COMMIT"));
+          realCommit.catch(() => {});
           return new Promise((resolve, reject) => {
             settleCommit = async () => {
-              try { resolve(await client.query("COMMIT")); }
+              try { resolve(await realCommit); }
               catch (error) { reject(error); }
             };
           });
@@ -2420,7 +2426,10 @@ test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket A
     readerPool: attestor, issuerPool: deferredIssuer,
     connectTimeoutMs: 6000, operationTimeoutMs: 8000,
   });
-  const denied = assert.rejects(bounded.issueTicket(request),
+  let callerSettled = false;
+  const caller = bounded.issueTicket(request);
+  caller.then(() => { callerSettled = true; }, () => { callerSettled = true; });
+  const denied = assert.rejects(caller,
     { code: "SYNC_PG_ISSUER_DENIED" });
   let guard;
   let priorCount;
@@ -2430,16 +2439,19 @@ test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket A
         guard = setTimeout(() => reject(Error("issuer never reached COMMIT")), 12000);
       })]);
     } finally { clearTimeout(guard); }
-    await denied;
+    await realCommit;
+    assert.equal(callerSettled, false,
+      "real PostgreSQL COMMIT must finish while the caller is still awaiting its hidden reply");
     priorCount = await countTickets();
+    await denied;
   } finally {
     // Never leave a real PostgreSQL client inside an intercepted COMMIT if
     // a test assertion/guard fails: CI teardown must remain recoverable.
     if (settleCommit) await settleCommit();
     await denied;
   }
-  assert.equal(priorCount, before,
-    "a paused COMMIT must not make an uncommitted ticket visible");
+  assert.equal(priorCount, before + 1,
+    "real PostgreSQL must have durably COMMITted before its reply is delivered");
   let releaseGuard;
   try {
     await Promise.race([released, new Promise((_, reject) => {
@@ -2449,5 +2461,5 @@ test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket A
   assert.equal(uncertainDestroyed, 1,
     "a commit resumed after caller deadline must destroy its uncertain pool client");
   assert.equal(await countTickets(), before + 1,
-    "a late physical commit can persist, but must never generate a positive caller ACK");
+    "a lost reply after physical COMMIT must never generate a positive caller ACK");
 });
