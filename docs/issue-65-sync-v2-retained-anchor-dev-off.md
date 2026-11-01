@@ -36,10 +36,22 @@ denied. Tests use real `better-sqlite3`, WAL, and Ed25519, with adversarial
 reopens, two distinct SQLite connections (not an independent-host proof), historical tampering, owner
 identity drift, stale forks, and separately injected rollback minima.
 
+The separate opt-in `zk1SyncAtomicRetainedAnchorHttpsDevOff.js` transport adds
+TLS 1.3 mutual client authentication, exact certificate fingerprint scoped
+read/advance grants, server CA/hostname and certificate pin checking, and
+client-side Ed25519 receipt verification. An unsigned HTTP successful
+compare **cannot** authorize a floor: the client insists on a separate fresh
+nonce-signed head after the compare. Real TLS/SQLite/Ed25519 tests cover denied
+roles, unauthorized/foreign principals, incorrect server pin and signing pin,
+missing client certificate, stale CAS and prohibited extra protocol fields.
+The endpoint is not mounted in the normal Root.ark server and no production
+capability is enabled. Operator certificate scope grants are deployment trust
+inputs and the transport cannot prove physical bytes or owner custody.
+
 **No deployment or ACK authorization is implied.** A local SQLite file remains
 rollbackable by a privileged administrator or a stale backup. WAL/FULL is not
 proof of separate physical durability, nor does this module implement an
-off-host mTLS service, operator key custody, physical witness, fencing lease,
+independently operated mTLS service, operator key custody, physical witness, fencing lease,
 or independently persisted update of the owner's trusted minimum after each
 advance. Until those are implemented and tested, this prototype MUST NOT be
 wired to protected SyncEngine ACK or represented as a production authority.
