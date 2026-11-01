@@ -121,11 +121,16 @@ function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
     async withCurrentRead(input, continuation) {
       const challenge = challengeOf(input);
       need(typeof continuation === "function");
-      let called = false, completed = false, closed = false, inner;
+      let called = false, completed = false, callbackSucceeded = false;
+      let closed = false, inner;
       try {
         need(!pendingProviders.has(challenge.scope) && pendingProviders.size < 8);
         const provider = Promise.resolve().then(() => externalPhysicalFence.withCurrentRead(challenge,
-          async (bundle, lease) => {
+          (bundle, lease) => {
+            // The external provider may incorrectly drop the callback Promise.
+            // Attach an observer, but return the SAME rejecting promise so a
+            // well-behaved provider must still propagate the actual failure.
+            const callbackPromise = (async () => {
             need(!closed && !called);
             called = true;
             need(lease && typeof lease.assertHeld === "function");
@@ -178,8 +183,12 @@ function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
               assertHeld();
               inner = await continuation(evidence, { assertHeld });
               assertHeld();
+              callbackSucceeded = true;
               return inner;
             } finally { completed = true; }
+            })();
+            callbackPromise.catch(() => { /* prevent unhandled rejection if detached */ });
+            return callbackPromise;
           }));
         pendingProviders.set(challenge.scope, provider);
         const settleProvider = () => {
@@ -198,7 +207,7 @@ function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
           })]);
         } finally { clearTimeout(operationTimer); }
         closed = true;
-        need(called && completed && result === inner);
+        need(called && completed && callbackSucceeded && result === inner);
         return result;
       } catch {
         closed = true;

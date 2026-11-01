@@ -33,7 +33,10 @@ For each nonce-bound protected pair, the adapter independently checks:
    expired or throwing lease is denied. The wrapped `assertHeld` returns the
    exact boolean `true` expected by the CAS ledger and also checks that the
    callback has not been detached. Only one awaited continuation is allowed;
-   detached late callbacks cannot authorize a success.
+   detached late callbacks cannot authorize a success. The adapter records a
+   separate callback-success bit only after the final lease assertion, so a
+   hostile provider swallowing an SQL error or post-continuation lease failure
+   and returning an otherwise matching value cannot produce a false success.
 
 Provider and readback operations have independent finite wall-clock deadlines
 (defaults 8 seconds and 5 seconds). A timed-out PostgreSQL call is **not**

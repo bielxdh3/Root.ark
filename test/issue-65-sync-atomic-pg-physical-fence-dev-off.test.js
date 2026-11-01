@@ -186,5 +186,71 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
     continued++;
   }), DENIED, "a timed-out unresolved SQL read still occupies its scope slot");
   releasePending();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await limited.withCurrentRead(challenge, async (_bundle, lease) => {
+    assert.equal(lease.assertHeld(), true);
+    return "SETTLED_SQL_SLOT_RECOVERED";
+  }), "SETTLED_SQL_SLOT_RECOVERED",
+  "a real completed read releases its bounded pending scope slot");
   assert.equal(continued, 1);
+
+  const signedBundle = () => ({ receipt: {
+    statement: { ...physical },
+    signature: crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+      + protocol.canonicalJson(physical)), signer.privateKey).toString("base64url"),
+  }, lineage: null });
+  mode = "wrong-sql-head";
+  held = true;
+  const swallowedSqlFailure = createZk1SyncAtomicPgPhysicalFenceDevOff({
+    unsafeTestReadback: mockReadback, witnessPublicKey: signer.publicKey,
+    externalPhysicalFence: {
+      async withCurrentRead(_request, callback) {
+        try { await callback(signedBundle(), { assertHeld: () => true }); }
+        catch { /* hostile provider swallows the failed SQL proof */ }
+        return undefined;
+      },
+    },
+  });
+  await assert.rejects(swallowedSqlFailure.withCurrentRead(challenge, async () => {
+    continued++;
+    return "ILLEGAL_SQL_ACK";
+  }), DENIED, "a swallowed callback exception and undefined result cannot count as success");
+  assert.equal(continued, 1);
+
+  const droppedCallback = createZk1SyncAtomicPgPhysicalFenceDevOff({
+    unsafeTestReadback: mockReadback, witnessPublicKey: signer.publicKey,
+    externalPhysicalFence: {
+      async withCurrentRead(_request, callback) {
+        void callback(signedBundle(), { assertHeld: () => true });
+        return undefined; // does not retain, await or catch the callback Promise
+      },
+    },
+  });
+  await assert.rejects(droppedCallback.withCurrentRead(challenge, async () => {
+    continued++;
+    return "DROPPED_CALLBACK_ACK";
+  }), DENIED);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(continued, 1,
+    "a discarded rejected callback must not succeed or become an unhandled rejection");
+
+  mode = "valid";
+  const swallowedFinalLease = createZk1SyncAtomicPgPhysicalFenceDevOff({
+    unsafeTestReadback: mockReadback, witnessPublicKey: signer.publicKey,
+    externalPhysicalFence: {
+      async withCurrentRead(_request, callback) {
+        let checks = 0;
+        try { await callback(signedBundle(), {
+          // Valid through the continuation, expired at the final assertion.
+          assertHeld: () => ++checks < 4,
+        }); } catch { /* malicious provider suppresses expired lease */ }
+        return "RETURNED_IGNORING_FAILED_FINAL_LEASE";
+      },
+    },
+  });
+  await assert.rejects(swallowedFinalLease.withCurrentRead(challenge, async () => {
+    continued++;
+    return "RETURNED_IGNORING_FAILED_FINAL_LEASE";
+  }), DENIED, "an expired post-continuation lease cannot be disguised as a positive result");
+  assert.equal(continued, 2, "the callback ran, but no successful result escaped the adapter");
 });
