@@ -93,14 +93,31 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
   assert.throws(() => createZk1SyncAtomicPgPhysicalFenceDevOff({
     ...options, ownerBindings: [] }), DENIED,
   "operator identity bindings must be explicitly pinned");
+  assert.throws(() => createZk1SyncAtomicPgPhysicalFenceDevOff({
+    ...options, ownerBindings: [...ownerBindings, { ...ownerBindings[0] }] }),
+  DENIED, "a duplicated scope cannot ambiguously select an independent owner");
 
   const adapter = createZk1SyncAtomicPgPhysicalFenceDevOff(options);
-  const forgedOwner = { ...challenge, storeId: crypto.randomUUID() };
-  await assert.rejects(adapter.withCurrentRead(forgedOwner, async () => {
-    continued++;
-  }), DENIED, "an input-controlled account/store ID cannot replace operator pins");
+  for (const mismatch of [{ scope: "another:scope" },
+    { accountId: crypto.randomUUID() }, { storeId: crypto.randomUUID() },
+    { username: "another-user" }, { compartmentId: "another-compartment" }]) {
+    await assert.rejects(adapter.withCurrentRead({ ...challenge, ...mismatch }, async () => {
+      continued++;
+    }), DENIED, "input-controlled owner identities cannot replace pinned operator values");
+  }
   assert.equal(observed, 0,
     "wrong owner binding must be rejected before any physical/SQL verification");
+  const detachedRoster = [{ ...ownerBindings[0] }];
+  const immutablyPinned = createZk1SyncAtomicPgPhysicalFenceDevOff({
+    ...options, ownerBindings: detachedRoster,
+  });
+  detachedRoster[0].storeId = crypto.randomUUID();
+  assert.equal(await immutablyPinned.withCurrentRead(challenge,
+    async () => "ORIGINAL_OWNER_STILL_PINNED"),
+  "ORIGINAL_OWNER_STILL_PINNED",
+  "mutating the source config after initialization cannot retarget the owner");
+  assert.equal(observed, 1, "immutable roster admission exercised the actual readback");
+  observed = 0; // isolate the original adapter's independent test counter
   assert.equal(await adapter.withCurrentRead(challenge, async (bundle, lease) => {
     continued++;
     assert.equal(lease.assertHeld(), true);
