@@ -141,3 +141,37 @@ test("Sync v2 mTLS never accepts input injection or exposes a physical ACK endpo
   assert.equal(f.anchor.readSignedHead({ scope: f.owner.scope,
     nonce: nonce() }).statement.sequence, 0);
 });
+
+test("Sync v2 mTLS bounds total elapsed time even when a pinned peer trickles HTTP bytes", async (t) => {
+  const f = await fixture(t);
+  const dripServer = https.createServer({
+    key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
+    ca: f.base.ca, requestCert: true, rejectUnauthorized: true,
+    minVersion: "TLSv1.3",
+  }, (req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write("{");
+    // Every write refreshes Node's idle socket timeout, but must never
+    // extend the client's total operation deadline.
+    const drip = setInterval(() => {
+      if (!res.destroyed) res.write(" ");
+    }, 30);
+    res.on("close", () => clearInterval(drip));
+  });
+  await new Promise((resolve, reject) => {
+    dripServer.once("error", reject);
+    dripServer.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(async () => {
+    dripServer.closeAllConnections();
+    await new Promise((resolve) => dripServer.close(resolve));
+  });
+  const reader = f.client("reader", { port: dripServer.address().port,
+    timeoutMs: 350 });
+  const started = Date.now();
+  await assert.rejects(reader.readSignedHead({ scope: f.owner.scope,
+    nonce: nonce() }), denied);
+  assert.ok(Date.now() - started < 3000,
+    "a continuously responsive peer must not defeat the total deadline");
+});

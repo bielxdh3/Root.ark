@@ -44,6 +44,11 @@ compare **cannot** authorize a floor: the client insists on a separate fresh
 nonce-signed head after the compare. Real TLS/SQLite/Ed25519 tests cover denied
 roles, unauthorized/foreign principals, incorrect server pin and signing pin,
 missing client certificate, stale CAS and prohibited extra protocol fields.
+All mTLS requests have an absolute wall-clock deadline, including DNS/TLS
+setup and slowly streamed responses, independently of socket inactivity.
+Principal grants are static at server creation: revoking or rotating an
+operator certificate requires replacing the running service and its TLS
+sessions. This prototype has no online CRL/OCSP policy or live grant reload.
 The endpoint is not mounted in the normal Root.ark server and no production
 capability is enabled. Operator certificate scope grants are deployment trust
 inputs and the transport cannot prove physical bytes or owner custody.

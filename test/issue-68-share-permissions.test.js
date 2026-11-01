@@ -106,9 +106,14 @@ async function startFixture(t, mode, extraEnv = {}) {
   let ready = null;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`disposable server exited (${child.exitCode})`);
-    try { ready = await request(port, "/login.html"); break; } catch { await new Promise((resolve) => setTimeout(resolve, 100)); }
+    try {
+      ready = await request(port, "/login.html");
+      if (ready.status === 200) break;
+    } catch { /* A port probe may precede the actual child listener. */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert.equal(ready?.status, 200, "disposable server is ready");
+  assert.equal(ready?.status, 200,
+    `disposable server must serve its public login page (last status: ${ready?.status ?? "none"})`);
 
   // SQLite mode stores users in the database, so it uses the non-production bootstrap admin (NODE_ENV=test).
   const credentials = mode === "sqlite" ? { username: "admin", password: "admin123" } : { username: "tester", password };

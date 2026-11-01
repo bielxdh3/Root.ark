@@ -179,6 +179,9 @@ function createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({ hostname = "localh
         const req = https.request({ hostname, port, servername, ca, cert, key,
           method: "POST", path: route, agent: false, minVersion: "TLSv1.3",
           rejectUnauthorized: true,
+          // Socket inactivity alone is not a deadline: a peer can drip bytes
+          // forever, or delay DNS/TLS setup, without tripping setTimeout().
+          signal: AbortSignal.timeout(timeoutMs),
           checkServerIdentity(name, certificate) {
             const hostnameError = tls.checkServerIdentity(name, certificate);
             if (hostnameError) return hostnameError;
