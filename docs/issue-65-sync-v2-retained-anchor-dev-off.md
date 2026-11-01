@@ -61,7 +61,10 @@ only explicit separate offline bootstrap of the existing anchor is supported.
 The runner reads configuration and signing/TLS trust material through pinned
 file descriptors with stable inode checks and owner-only leaf permissions;
 Windows additionally uses the existing native ACL verifier on each file,
-not just on their parent directories. Insecure POSIX leaf permissions have a
+including the SQLite database, not just on their parent directories. The
+operator uses the resident verifier for successive private trust-file reads
+to avoid recompiling it for each certificate or key; each read still gets a
+fresh validation. Insecure POSIX leaf permissions have a
 negative startup test. The runner refuses symlinked and non-private authority
 files and directories;
 the operator should run under a separate operating-system identity. Only

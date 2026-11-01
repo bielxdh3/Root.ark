@@ -7,8 +7,10 @@ const net = require("node:net");
 const path = require("node:path");
 const { assertPrivateSqliteFile, assertPrivateSqliteAuthorityDirectory } =
   require("../src/services/zk1PrivateSqlitePath");
-const { readAuthorityPinnedFile } =
+const { createAuthorityPinnedReader } =
   require("../src/services/zk1AuthorityPinnedFile");
+const { verifyWindowsAuthorityFilePath } =
+  require("../services/chunkUploadWindowsAcl");
 const { Zk1SyncAtomicRetainedAnchorDevOff } =
   require("../src/services/zk1SyncAtomicRetainedAnchorDevOff");
 const { createZk1SyncAtomicRetainedAnchorHttpsServerDevOff } =
@@ -28,30 +30,36 @@ function operatorConfiguration(file) {
   assertPrivateSqliteAuthorityDirectory(absolute);
   // A private parent directory does not necessarily protect a leaf file's
   // Windows DACL (e.g. a granted direct READ ACE with traverse bypass).
-  // Read the same pinned inode, verifying native owner/leaf ACL and parents.
-  const config = JSON.parse(readAuthorityPinnedFile(absolute, 1024 * 1024).toString("utf8"));
-  exact(config, ["version", "host", "port", "database", "serverKey",
-    "serverCert", "clientCa", "signerKey", "ownerBindings",
-    "trustedMinimumHeads", "principals"]);
-  demand(config.version === 1 && typeof config.host === "string"
-    && net.isIP(config.host) !== 0
-    && Number.isSafeInteger(config.port) && config.port >= 0
-    && config.port <= 65535
-    && (config.port !== 0 || process.env.NODE_ENV === "test"));
-  const ownedFile = (name) => {
-    demand(typeof name === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(name)
-      && name !== "." && name !== "..");
-    return path.join(directory, name);
-  };
-  const dbFile = ownedFile(config.database);
-  assertPrivateSqliteFile(dbFile);
-  const readPrivate = (name) => readAuthorityPinnedFile(ownedFile(name), 1024 * 1024);
-  return {
-    config, dbFile, key: readPrivate(config.serverKey),
-    cert: readPrivate(config.serverCert),
-    ca: readPrivate(config.clientCa),
-    signerPrivateKey: crypto.createPrivateKey(readPrivate(config.signerKey)),
-  };
+  // Reuse one native verifier while rechecking every separate file admission.
+  const pinned = createAuthorityPinnedReader();
+  try {
+    const config = JSON.parse(pinned.read(absolute, 1024 * 1024).toString("utf8"));
+    exact(config, ["version", "host", "port", "database", "serverKey",
+      "serverCert", "clientCa", "signerKey", "ownerBindings",
+      "trustedMinimumHeads", "principals"]);
+    demand(config.version === 1 && typeof config.host === "string"
+      && net.isIP(config.host) !== 0
+      && Number.isSafeInteger(config.port) && config.port >= 0
+      && config.port <= 65535
+      && (config.port !== 0 || process.env.NODE_ENV === "test"));
+    const ownedFile = (name) => {
+      demand(typeof name === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(name)
+        && name !== "." && name !== "..");
+      return path.join(directory, name);
+    };
+    const dbFile = ownedFile(config.database);
+    assertPrivateSqliteFile(dbFile);
+    // SQLite is not a bounded small trust file, but its leaf write/delete
+    // ACL still needs the native owner-only policy before WAL is opened.
+    if (process.platform === "win32") verifyWindowsAuthorityFilePath(dbFile);
+    const readPrivate = (name) => pinned.read(ownedFile(name), 1024 * 1024);
+    return {
+      config, dbFile, key: readPrivate(config.serverKey),
+      cert: readPrivate(config.serverCert),
+      ca: readPrivate(config.clientCa),
+      signerPrivateKey: crypto.createPrivateKey(readPrivate(config.signerKey)),
+    };
+  } finally { pinned.stop(); }
 }
 
 async function main() {
