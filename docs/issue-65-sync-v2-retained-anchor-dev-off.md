@@ -49,6 +49,22 @@ setup and slowly streamed responses, independently of socket inactivity.
 Principal grants are static at server creation: revoking or rotating an
 operator certificate requires replacing the running service and its TLS
 sessions. This prototype has no online CRL/OCSP policy or live grant reload.
+The additional `scripts/zk1-sync-retained-anchor-server-dev-off.js` is a
+separately launched **opt-in process**. It requires `NODE_ENV=test` or
+`development`, `ROOTARK_SYNC_RETAINED_OPERATOR_DEV_OFF=true`, and exactly one
+absolute path to an operator-owned private JSON configuration. Its exact v1
+schema requires `version`, `host` (numeric IP), `port`, private-directory file
+basenames `database`, `serverKey`, `serverCert`, `clientCa`, `signerKey`,
+`ownerBindings`, `trustedMinimumHeads`, and certificate `principals` grants.
+It refuses to create an absent SQLite database or silently reset a minimum;
+only explicit separate offline bootstrap of the existing anchor is supported.
+The runner refuses symlinked and non-private authority files and directories;
+the operator should run under a separate operating-system identity. Only
+test mode permits ephemeral port `0`. The real hosted tests launch a child
+process over mTLS and demonstrate local CAS integration, remote divergence
+denial, absent-grant denial and failure after operator termination. Their
+physical-fence evidence is deliberately synthetic: separate *processes* are
+not independent *hosts*, custody or a physical durability proof.
 The endpoint is not mounted in the normal Root.ark server and no production
 capability is enabled. Operator certificate scope grants are deployment trust
 inputs and the transport cannot prove physical bytes or owner custody.
