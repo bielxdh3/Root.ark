@@ -76,6 +76,7 @@ function operatorConfiguration(file) {
       });
       minimumFence = { publicKey: minimumKey,
         readSignedHead: client.readSignedHead,
+        readSignedBindingHead: client.readSignedBindingHead,
         compareAndAdvance: client.compareAndAdvance };
     }
     return {
@@ -98,6 +99,7 @@ async function main() {
     ownerBindings: setup.config.ownerBindings,
     trustedMinimumHeads: setup.config.trustedMinimumHeads,
     signerPrivateKey: setup.signerPrivateKey,
+    minimumFencePublicKey: setup.minimumFence?.publicKey || null,
   });
   let server;
   try {
@@ -107,10 +109,12 @@ async function main() {
       // briefly serve even a signed stale head during operator startup.
       for (const { scope } of setup.config.ownerBindings) {
         const nonce = crypto.randomBytes(32).toString("base64url");
-        const remote = await setup.minimumFence.readSignedHead({ scope, nonce });
-        const local = anchor.readSignedHead({ scope, nonce });
+        const remote = await setup.minimumFence.readSignedBindingHead({ scope, nonce });
+        const local = anchor.readSignedBindingHead({ scope, nonce });
         demand(remote.statement.sequence === local.statement.sequence
-          && remote.statement.headHash === local.statement.headHash);
+          && remote.statement.headHash === local.statement.headHash
+          && remote.statement.accountId === local.statement.accountId
+          && remote.statement.storeId === local.statement.storeId);
       }
     }
     server = createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({

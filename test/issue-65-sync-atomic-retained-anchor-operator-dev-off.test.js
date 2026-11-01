@@ -106,6 +106,7 @@ test("dual-process minimum-fenced operator bridges CAS and denies a restored SQL
   new Zk1SyncAtomicRetainedAnchorDevOff({
     filename: database, bootstrapNew: true, signerPrivateKey: signer.privateKey,
     ownerBindings: [owner], trustedMinimumHeads: genesis,
+    minimumFencePublicKey: minimumSigner.publicKey,
   }).close();
   new Zk1SyncAtomicRetainedAnchorDevOff({
     filename: minimumDatabase, bootstrapNew: true,
@@ -114,6 +115,15 @@ test("dual-process minimum-fenced operator bridges CAS and denies a restored SQL
   }).close();
   const originalPrefix = path.join(directory, "primary-genesis-snapshot.sqlite");
   fs.copyFileSync(database, originalPrefix);
+  for (const minimumFencePublicKey of [null,
+    crypto.generateKeyPairSync("ed25519").publicKey]) {
+    assert.throws(() => new Zk1SyncAtomicRetainedAnchorDevOff({
+      filename: database, bootstrapNew: false, signerPrivateKey: signer.privateKey,
+      ownerBindings: [owner], trustedMinimumHeads: genesis,
+      minimumFencePublicKey,
+    }), { code: "SYNC_ATOMIC_RETAINED_ANCHOR_DEV_OFF_DENIED" },
+    "an existing v2 authority must reject v1 fallback or re-pinning another minimum key");
+  }
   fs.writeFileSync(path.join(directory, "signer.key"),
     signer.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
   fs.writeFileSync(path.join(directory, "minimum-signer.key"),
@@ -165,6 +175,16 @@ test("dual-process minimum-fenced operator bridges CAS and denies a restored SQL
   }
   operator = runOperator(configFile);
   const port = await operator.ready;
+  const downgradedConfig = JSON.parse(fs.readFileSync(configFile, "utf8"));
+  downgradedConfig.version = 1;
+  delete downgradedConfig.minimumFence;
+  const downgradedFile = path.join(directory, "operator-downgrade.json");
+  fs.writeFileSync(downgradedFile, JSON.stringify(downgradedConfig), { mode: 0o600 });
+  const downgradedOperator = runOperator(downgradedFile);
+  t.after(() => stopOperator(downgradedOperator.child));
+  await assert.rejects(downgradedOperator.ready,
+    /operator exited 1: SYNC_RETAINED_OPERATOR_DEV_OFF_DENIED/,
+    "a v1 operator must never open a v2 minimum-fenced database");
   const client = (role, portNumber = port) => createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({
     hostname: "127.0.0.1", servername: "localhost", port: portNumber,
     ca: read("ca.pem"), cert: read(`${role}.pem`), key: read(`${role}.key`),
@@ -270,6 +290,15 @@ test("dual-process minimum-fenced operator bridges CAS and denies a restored SQL
   // A previous, authentically signed SQLite snapshot is NOT an acceptable
   // recovery when a separate minimum service retained a newer sequence.
   fs.copyFileSync(originalPrefix, database);
+  const authenticOldPrefix = new Zk1SyncAtomicRetainedAnchorDevOff({
+    filename: database, bootstrapNew: false, signerPrivateKey: signer.privateKey,
+    ownerBindings: [owner], trustedMinimumHeads: genesis,
+    minimumFencePublicKey: minimumSigner.publicKey,
+  });
+  assert.equal(authenticOldPrefix.readSignedBindingHead({ scope: owner.scope,
+    nonce: nonce() }).statement.sequence, 0,
+  "the restored prefix is valid, signed, and bound to the v2 minimum authority");
+  authenticOldPrefix.close();
   const restored = runOperator(configFile);
   t.after(() => stopOperator(restored.child));
   await assert.rejects(restored.ready,

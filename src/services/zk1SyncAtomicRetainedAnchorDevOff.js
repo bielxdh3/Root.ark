@@ -14,6 +14,7 @@ const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
 
 const CHAIN_DOMAIN = "rootark-sync-atomic-retained-anchor-chain-dev-off-v1\0";
 const SEAL_DOMAIN = "rootark-sync-atomic-retained-anchor-seal-dev-off-v1\0";
+const BINDING_DOMAIN = "rootark-sync-atomic-retained-binding-dev-off-v2\0";
 const CHAIN_GENESIS = crypto.createHash("sha256")
   .update("rootark-sync-atomic-retained-anchor-genesis-dev-off-v1\0").digest("hex");
 const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
@@ -67,20 +68,24 @@ function chainHash(statement) {
   return crypto.createHash("sha256").update(CHAIN_DOMAIN
     + protocol.canonicalJson(statement)).digest("hex");
 }
-function assertStorage(db, bindings) {
+function assertStorage(db, bindings, minimumFingerprint = null) {
   // A trigger, view or an unexpected table is outside this fixed authority.
   const objects = db.prepare(`SELECT name,type FROM sqlite_schema
     WHERE name NOT LIKE 'sqlite_%' ORDER BY name`).all();
-  requireValid(objects.length === 4 && objects.every((object) => object.type === "table")
+  requireValid(objects.length === (minimumFingerprint ? 5 : 4)
+    && objects.every((object) => object.type === "table")
     && objects.map((object) => object.name).join(",") === [
       "atomic_anchor_binding", "atomic_anchor_head", "atomic_anchor_history",
-      "atomic_anchor_identity"].join(","));
+      "atomic_anchor_identity", ...(minimumFingerprint ? ["atomic_anchor_minimum_fence"] : [])
+    ].join(","));
   for (const [table, columns] of [
     ["atomic_anchor_identity", ["id", "signer_fingerprint"]],
     ["atomic_anchor_binding", ["scope", "account_id", "store_id"]],
     ["atomic_anchor_head", ["scope", "sequence", "head_hash", "chain_hash"]],
     ["atomic_anchor_history", ["scope", "sequence", "previous_hash",
       "previous_chain", "head_hash", "chain_hash", "seal"]],
+    ...(minimumFingerprint ? [["atomic_anchor_minimum_fence",
+      ["id", "minimum_fingerprint"]]] : []),
   ]) {
     const actual = db.pragma(`table_info("${table}")`);
     requireValid(actual.length === columns.length && actual.every((col, i) =>
@@ -101,6 +106,8 @@ function assertStorage(db, bindings) {
       previous_hash TEXT NOT NULL, previous_chain TEXT NOT NULL,
       head_hash TEXT NOT NULL, chain_hash TEXT NOT NULL, seal TEXT NOT NULL,
       PRIMARY KEY(scope,sequence), UNIQUE(scope,head_hash))`,
+    ...(minimumFingerprint ? [`CREATE TABLE atomic_anchor_minimum_fence (
+      id INTEGER PRIMARY KEY CHECK(id=1), minimum_fingerprint TEXT NOT NULL)`] : []),
   ];
   const normalize = (sql) => sql.replace(/\s+/g, " ")
     .replace(/\(\s+/g, "(").replace(/\s+\)/g, ")")
@@ -117,6 +124,11 @@ function assertStorage(db, bindings) {
     const trusted = bindings.get(row.scope);
     requireValid(trusted && trusted.accountId === row.account_id
       && trusted.storeId === row.store_id);
+  }
+  if (minimumFingerprint) {
+    const minima = db.prepare("SELECT * FROM atomic_anchor_minimum_fence").all();
+    requireValid(minima.length === 1 && minima[0].id === 1
+      && minima[0].minimum_fingerprint === minimumFingerprint);
   }
 }
 function current(db, trusted, signerPublicKey) {
@@ -161,10 +173,11 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
   #publicKey;
   #bindings;
   #minimum;
+  #minimumFenceFingerprint;
   #closed = false;
 
   constructor({ filename, bootstrapNew = false, signerPrivateKey,
-    ownerBindings, trustedMinimumHeads } = {}) {
+    ownerBindings, trustedMinimumHeads, minimumFencePublicKey = null } = {}) {
     requireValid(signerPrivateKey instanceof crypto.KeyObject
       && signerPrivateKey.type === "private"
       && signerPrivateKey.asymmetricKeyType === "ed25519"
@@ -174,6 +187,13 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
       && trustedMinimumHeads.length === ownerBindings.length);
     this.#key = signerPrivateKey;
     this.#publicKey = crypto.createPublicKey(signerPrivateKey);
+    requireValid(minimumFencePublicKey === null
+      || (minimumFencePublicKey instanceof crypto.KeyObject
+        && minimumFencePublicKey.type === "public"
+        && minimumFencePublicKey.asymmetricKeyType === "ed25519"));
+    this.#minimumFenceFingerprint = minimumFencePublicKey === null
+      ? null : fingerprint(minimumFencePublicKey);
+    requireValid(this.#minimumFenceFingerprint !== fingerprint(this.#publicKey));
     this.#bindings = new Map();
     this.#minimum = new Map();
     for (const item of ownerBindings) {
@@ -198,7 +218,7 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
         const observer = new Database(filenameAbs, { readonly: true, fileMustExist: true });
         try {
           observer.exec("BEGIN TRANSACTION");
-          assertStorage(observer, this.#bindings);
+          assertStorage(observer, this.#bindings, this.#minimumFenceFingerprint);
           const identity = observer.prepare("SELECT * FROM atomic_anchor_identity").all();
           requireValid(identity.length === 1 && identity[0].id === 1
             && identity[0].signer_fingerprint === signer);
@@ -238,6 +258,10 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
           head_hash TEXT NOT NULL, chain_hash TEXT NOT NULL,
           seal TEXT NOT NULL,
           PRIMARY KEY(scope,sequence), UNIQUE(scope,head_hash));`);
+      if (this.#minimumFenceFingerprint) {
+        this.#db.exec(`CREATE TABLE IF NOT EXISTS atomic_anchor_minimum_fence (
+          id INTEGER PRIMARY KEY CHECK(id=1), minimum_fingerprint TEXT NOT NULL);`);
+      }
       if (!existed) {
         this.#db.transaction(() => {
           this.#db.prepare(`INSERT INTO atomic_anchor_identity
@@ -247,6 +271,11 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
               (scope,account_id,store_id) VALUES(?,?,?)`).run(
               value.scope, value.accountId, value.storeId);
           }
+          if (this.#minimumFenceFingerprint) {
+            this.#db.prepare(`INSERT INTO atomic_anchor_minimum_fence
+              (id,minimum_fingerprint) VALUES(1,?)`).run(
+              this.#minimumFenceFingerprint);
+          }
         }).immediate();
       }
       this.#db.transaction(() => this.#assertTrusted(signer)).immediate();
@@ -254,7 +283,7 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
   }
 
   #assertTrusted(signer = fingerprint(crypto.createPublicKey(this.#key))) {
-    assertStorage(this.#db, this.#bindings);
+    assertStorage(this.#db, this.#bindings, this.#minimumFenceFingerprint);
     const identity = this.#db.prepare("SELECT * FROM atomic_anchor_identity").all();
     requireValid(identity.length === 1 && identity[0].id === 1
       && identity[0].signer_fingerprint === signer);
@@ -286,6 +315,31 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
           nonce: request.nonce, sequence: tip.sequence, headHash: tip.headHash };
         return Object.freeze({ statement: Object.freeze(statement),
           signature: crypto.sign(null, Buffer.from(ANCHOR_DOMAIN
+            + protocol.canonicalJson(statement)), this.#key).toString("base64url") });
+      }).immediate();
+    } catch { throw deny(); }
+  }
+
+  readSignedBindingHead(input) {
+    const request = snapshot(input);
+    exact(request, ["scope", "nonce"]);
+    requireValid(!this.#closed && this.#bindings.has(request.scope)
+      && typeof request.nonce === "string" && NONCE.test(request.nonce)
+      && Buffer.from(request.nonce, "base64url").length === 32
+      && Buffer.from(request.nonce, "base64url").toString("base64url") === request.nonce);
+    try {
+      return this.#db.transaction(() => {
+        this.#assertTrusted();
+        const owner = this.#bindings.get(request.scope);
+        const tip = current(this.#db, owner, this.#publicKey);
+        // Unlike the legacy head, this domain binds the immutable account
+        // and storage identities. A second anchor with the same scope but a
+        // different owner cannot be misinterpreted as the trusted minimum.
+        const statement = { version: 2, scope: request.scope,
+          accountId: owner.accountId, storeId: owner.storeId,
+          nonce: request.nonce, sequence: tip.sequence, headHash: tip.headHash };
+        return Object.freeze({ statement: Object.freeze(statement),
+          signature: crypto.sign(null, Buffer.from(BINDING_DOMAIN
             + protocol.canonicalJson(statement)), this.#key).toString("base64url") });
       }).immediate();
     } catch { throw deny(); }
@@ -336,4 +390,4 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
 }
 
 module.exports = { Zk1SyncAtomicRetainedAnchorDevOff, CHAIN_DOMAIN,
-  SEAL_DOMAIN };
+  SEAL_DOMAIN, BINDING_DOMAIN };

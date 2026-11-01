@@ -24,6 +24,10 @@ The precise Sync v2 adapter shape is:
   headHash})` — strictly compares a current per-scope head and advances **one**
   sequence inside a SQLite IMMEDIATE transaction; returns `false` on stale
   compare, and fails closed on corrupt data, invalid schema, or a wrong owner.
+* `readSignedBindingHead({scope,nonce})` — separately signs a domain-separated
+  v2 statement binding `scope`, immutable `accountId`, `storeId`, nonce,
+  sequence and head hash. This must be checked when comparing two authorities:
+  the legacy scope-only head does **not** prove the same owner/storage identity.
 
 Every returned signed head is checked against all locally persisted per-scope
 hash-linked history, **individual Ed25519-sealed append records**, and the
@@ -86,9 +90,15 @@ operator-owned trust files. The independent minimum signer must differ from
 the primary signing key. Its separately running authority has its own mTLS
 permissions and immutable scope/account/store bindings. There is no local
 fallback when the independent authority is unavailable.
+The primary's offline-bootstrap database is **v2-sealed** using the trusted
+minimum public key: it persists a separate exact-schema
+`atomic_anchor_minimum_fence` binding. Any v1 operator trying to open this
+database fails its four-table schema audit; v2 startup also rejects a changed
+minimum signer. Existing legacy v1 databases are not silently migrated.
 
 V2 startup requires a fresh independently signed minimum that exactly matches
-each local scope head. Every head read checks this again. On an advance, the
+each local scope head **and account/store identities**. Every head read checks
+the independently signed binding statement again. On an advance, the
 independent minimum commits and is signed **before** the primary SQLite CAS.
 A crash between these steps intentionally leaves the primary locked: it cannot
 serve a signed stale head, acknowledge an uncertain commit, or silently repair

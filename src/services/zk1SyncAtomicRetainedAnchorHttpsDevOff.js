@@ -8,15 +8,17 @@ const tls = require("node:tls");
 const crypto = require("node:crypto");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { ANCHOR_DOMAIN } = require("./zk1SyncAtomicCasFloorLedgerDevOff");
-const { Zk1SyncAtomicRetainedAnchorDevOff } =
+const { Zk1SyncAtomicRetainedAnchorDevOff, BINDING_DOMAIN } =
   require("./zk1SyncAtomicRetainedAnchorDevOff");
 
 const HEAD_ROUTE = "/v2/sync-atomic/retained/head";
 const ADVANCE_ROUTE = "/v2/sync-atomic/retained/advance";
+const BINDING_ROUTE = "/v2/sync-atomic/retained/binding";
 const FINGERPRINT = /^(?:[A-F0-9]{2}:){31}[A-F0-9]{2}$/;
 const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
 const HEX = /^[0-9a-f]{64}$/;
 const NONCE = /^[A-Za-z0-9_-]{43}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_BYTES = 1024;
 
 function deniedError() {
@@ -72,13 +74,18 @@ function grantsOf(principals) {
   }
   return result;
 }
-async function independentlySignedHead(minimumFence, scope) {
-  const nonce = crypto.randomBytes(32).toString("base64url");
-  const receipt = detached(await minimumFence.readSignedHead({ scope, nonce }));
+function verifiedBindingReceipt(value, input, publicKey) {
+  const receipt = detached(value);
   exact(receipt, ["statement", "signature"]);
-  exact(receipt.statement, ["version", "scope", "nonce", "sequence", "headHash"]);
-  requireValid(receipt.statement.version === 1 && receipt.statement.scope === scope
-    && receipt.statement.nonce === nonce
+  exact(receipt.statement, ["version", "scope", "accountId", "storeId",
+    "nonce", "sequence", "headHash"]);
+  requireValid(receipt.statement.version === 2
+    && receipt.statement.scope === input.scope
+    && receipt.statement.nonce === input.nonce
+    && typeof receipt.statement.accountId === "string"
+    && UUID.test(receipt.statement.accountId)
+    && typeof receipt.statement.storeId === "string"
+    && UUID.test(receipt.statement.storeId)
     && Number.isSafeInteger(receipt.statement.sequence)
     && receipt.statement.sequence >= 0
     && typeof receipt.statement.headHash === "string"
@@ -88,10 +95,15 @@ async function independentlySignedHead(minimumFence, scope) {
   const signature = Buffer.from(receipt.signature, "base64url");
   requireValid(signature.length === 64
     && signature.toString("base64url") === receipt.signature
-    && crypto.verify(null, Buffer.from(ANCHOR_DOMAIN
-      + protocol.canonicalJson(receipt.statement)),
-    minimumFence.publicKey, signature));
-  return { sequence: receipt.statement.sequence, headHash: receipt.statement.headHash };
+    && crypto.verify(null, Buffer.from(BINDING_DOMAIN
+      + protocol.canonicalJson(receipt.statement)), publicKey, signature));
+  return receipt;
+}
+async function independentlySignedBindingHead(minimumFence, scope) {
+  const nonce = crypto.randomBytes(32).toString("base64url");
+  const receipt = await minimumFence.readSignedBindingHead({ scope, nonce });
+  return verifiedBindingReceipt(receipt, { scope, nonce },
+    minimumFence.publicKey).statement;
 }
 function send(res, status, data) {
   if (res.destroyed || res.headersSent) return;
@@ -123,7 +135,7 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
   requireValid(key && cert && clientCa
     && anchor instanceof Zk1SyncAtomicRetainedAnchorDevOff);
   if (minimumFence !== null) {
-    requireValid(minimumFence && typeof minimumFence.readSignedHead === "function"
+    requireValid(minimumFence && typeof minimumFence.readSignedBindingHead === "function"
       && typeof minimumFence.compareAndAdvance === "function"
       && minimumFence.publicKey instanceof crypto.KeyObject
       && minimumFence.publicKey.type === "public"
@@ -132,10 +144,12 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
   const grants = grantsOf(principals);
   const active = new Set();
   async function requireTwinHead(scope) {
-    const remote = await independentlySignedHead(minimumFence, scope);
-    const local = anchor.readSignedHead({ scope,
+    const remote = await independentlySignedBindingHead(minimumFence, scope);
+    const local = anchor.readSignedBindingHead({ scope,
       nonce: crypto.randomBytes(32).toString("base64url") }).statement;
-    requireValid(local.sequence === remote.sequence
+    requireValid(local.accountId === remote.accountId
+      && local.storeId === remote.storeId
+      && local.sequence === remote.sequence
       && local.headHash === remote.headHash);
     return remote;
   }
@@ -147,7 +161,8 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
     if (!req.socket.authorized || !fingerprint || !grants.has(fingerprint)) {
       return send(res, 403, { error: "FORBIDDEN" });
     }
-    if (req.method !== "POST" || ![HEAD_ROUTE, ADVANCE_ROUTE].includes(req.url)) {
+    if (req.method !== "POST"
+      || ![HEAD_ROUTE, ADVANCE_ROUTE, BINDING_ROUTE].includes(req.url)) {
       return send(res, 404, { error: "NOT_FOUND" });
     }
     if (active.has(fingerprint) || active.size >= 8) {
@@ -162,6 +177,11 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
         readInput(input);
         if (minimumFence) await requireTwinHead(input.scope);
         return send(res, 200, { receipt: anchor.readSignedHead(input) });
+      }
+      if (req.url === BINDING_ROUTE) {
+        readInput(input);
+        if (minimumFence) await requireTwinHead(input.scope);
+        return send(res, 200, { receipt: anchor.readSignedBindingHead(input) });
       }
       advanceInput(input);
       if (!allowed.get(input.scope)) return send(res, 403, { error: "FORBIDDEN" });
@@ -286,6 +306,13 @@ function createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({ hostname = "localh
   return Object.freeze({
     async readSignedHead(value) {
       return readVerified(value);
+    },
+    async readSignedBindingHead(value) {
+      const input = detached(value);
+      readInput(input);
+      const result = await post(BINDING_ROUTE, input);
+      exact(result, ["receipt"]);
+      return verifiedBindingReceipt(result.receipt, input, anchorPublicKey);
     },
     async compareAndAdvance(value) {
       // The advance and its required signed readback share ONE deadline.

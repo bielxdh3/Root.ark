@@ -8,7 +8,10 @@ const crypto = require("node:crypto");
 const https = require("node:https");
 const fs = require("node:fs");
 const path = require("node:path");
+const protocol = require("../sync-client/rootark-sync-protocol");
 const { Zk1SyncAtomicRetainedAnchorDevOff } = require(
+  "../src/services/zk1SyncAtomicRetainedAnchorDevOff");
+const { BINDING_DOMAIN } = require(
   "../src/services/zk1SyncAtomicRetainedAnchorDevOff");
 const { GENESIS } = require("../src/services/zk1SyncAtomicCasFloorLedgerDevOff");
 const { createZk1SyncAtomicRetainedAnchorHttpsServerDevOff,
@@ -99,6 +102,11 @@ test("real Sync v2 retained-anchor mTLS signs a fresh head and confirms durable 
   assert.equal(genesis.statement.sequence, 0);
   assert.equal(genesis.statement.nonce, challenge);
   assert.equal(genesis.statement.headHash, GENESIS);
+  const bound = await reader.readSignedBindingHead({ scope: f.owner.scope,
+    nonce: nonce() });
+  assert.equal(bound.statement.accountId, f.owner.accountId);
+  assert.equal(bound.statement.storeId, f.owner.storeId);
+  assert.equal(bound.statement.headHash, GENESIS);
   assert.equal(Object.hasOwn(genesis.statement, "physicalDurable"), false);
   assert.equal(Object.hasOwn(genesis.statement, "clientAckAuthorized"), false);
   const next = head();
@@ -111,6 +119,41 @@ test("real Sync v2 retained-anchor mTLS signs a fresh head and confirms durable 
     expectedSequence: 0, expectedHeadHash: GENESIS,
     sequence: 1, headHash: head() }), false,
   "a stale compare cannot overwrite a real signed retained head");
+});
+
+test("a valid independently signed genesis for another account is never an accepted twin", async (t) => {
+  const f = await fixture(t);
+  const minimumSigner = crypto.generateKeyPairSync("ed25519");
+  const impostor = { ...f.owner, accountId: crypto.randomUUID() };
+  const minimumFence = {
+    publicKey: minimumSigner.publicKey,
+    async readSignedBindingHead({ scope, nonce: challenge }) {
+      const statement = { version: 2, scope, accountId: impostor.accountId,
+        storeId: impostor.storeId, nonce: challenge, sequence: 0, headHash: GENESIS };
+      return { statement, signature: crypto.sign(null, Buffer.from(BINDING_DOMAIN
+        + protocol.canonicalJson(statement)), minimumSigner.privateKey)
+        .toString("base64url") };
+    },
+    async compareAndAdvance() {
+      throw Error("wrong-owner minimum must never reach CAS");
+    },
+  };
+  const isolated = createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({
+    key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
+    clientCa: f.read("ca.pem"), anchor: f.anchor, minimumFence,
+    principals: { [f.fingerprint("reader")]: [{ scope: f.owner.scope,
+      canAdvance: false }] },
+  });
+  await new Promise((resolve, reject) => {
+    isolated.once("error", reject);
+    isolated.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => isolated.close(resolve)));
+  await assert.rejects(f.client("reader", { port: isolated.address().port })
+    .readSignedHead({ scope: f.owner.scope, nonce: nonce() }), denied,
+  "matching scope, sequence, genesis hash and valid remote signature do not replace owner identity");
+  assert.equal(f.anchor.readSignedBindingHead({ scope: f.owner.scope,
+    nonce: nonce() }).statement.sequence, 0);
 });
 
 test("Sync v2 mTLS denies reader writes, unlisted certificates, and unauthorized scopes", async (t) => {
