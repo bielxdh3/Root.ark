@@ -13,6 +13,9 @@
 // update despite having no direct UPDATE privilege of its own.
 // REFERENCES can also confer an indirect callback/coercion path through
 // foreign-key enforcement; it is not an appropriate least-privilege grant.
+// PG18 MAINTAIN is an independent table privilege, not only membership in
+// pg_maintain: it can refresh an owner-defined materialized view or change
+// relation storage without normal DML rights.
 // Refuse ALL application-schema DML except the issuer's explicit ticket INSERT.
 const PROTECTED_TABLE_COUNT = 7;
 
@@ -27,6 +30,7 @@ async function hasUnexpectedProtectedDml(client, { allowTicketInsert = false } =
         OR pg_catalog.has_table_privilege(current_user,c.oid,'TRUNCATE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'TRIGGER')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'REFERENCES')
+        OR pg_catalog.has_table_privilege(current_user,c.oid,'MAINTAIN')
         OR COALESCE(pg_catalog.has_column_privilege(
           current_user,c.oid,a.attnum,'UPDATE'),false)
         OR COALESCE(pg_catalog.has_column_privilege(

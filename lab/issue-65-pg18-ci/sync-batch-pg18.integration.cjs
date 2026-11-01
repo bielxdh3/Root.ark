@@ -2484,11 +2484,17 @@ test("PG18 rejects REFERENCES column grants that allow foreign-key authority out
   const committed = await commitTestBatch(f, pair);
   const other = await fixture();
   const before = await other.state();
-  for (const [role, pool] of [
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [other.scope])).rows[0].n);
+  const beforeTickets = await countTickets();
+  const fkSchema = "zk65_fk_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${fkSchema}`);
+  try { for (const [role, pool] of [
     ["zk1_sync_batch_attestor_reader", attestor],
     ["zk1_sync_batch_admission_issuer", issuer],
     ["zk1_sync_batch_verifier", verifier],
   ]) {
+    await admin.query(`GRANT USAGE, CREATE ON SCHEMA ${fkSchema} TO ${role}`);
     await admin.query(`GRANT REFERENCES(scope) ON zk1_sync_batch.scope_head TO ${role}`);
     try {
       const actual = await pool.query(`SELECT
@@ -2497,6 +2503,25 @@ test("PG18 rejects REFERENCES column grants that allow foreign-key authority out
         pg_catalog.has_table_privilege(current_user,
           'zk1_sync_batch.scope_head','UPDATE') AS can_update`);
       assert.deepEqual(actual.rows[0], { can_reference: true, can_update: false });
+      const fkClient = await pool.connect();
+      let begun = false;
+      try {
+        await fkClient.query("BEGIN");
+        begun = true;
+        await fkClient.query(`CREATE TABLE ${fkSchema}.foreign_reference (
+          scoped text REFERENCES zk1_sync_batch.scope_head(scope))`);
+        const proof = await fkClient.query(`SELECT count(*)::int AS foreign_keys
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class c ON c.oid=con.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname=$1 AND c.relname='foreign_reference'
+            AND con.contype='f'`, [fkSchema]);
+        assert.equal(proof.rows[0].foreign_keys, 1,
+          "the non-writer must really be able to install a foreign key to protected rows");
+      } finally {
+        if (begun) await fkClient.query("ROLLBACK");
+        fkClient.release();
+      }
       if (role === "zk1_sync_batch_attestor_reader") {
         await assert.rejects(readback.verifyLatestSignedPair({
           scope: f.scope, commitId: committed.commitId,
@@ -2516,10 +2541,14 @@ test("PG18 rejects REFERENCES column grants that allow foreign-key authority out
         }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
       }
       assert.deepEqual(await other.state(), before);
+      assert.equal(await countTickets(), beforeTickets +
+        (role === "zk1_sync_batch_verifier" ? 1 : 0),
+      "a REFERENCES misgrant must not mint unexpected admission tickets");
     } finally {
       await admin.query(`REVOKE REFERENCES(scope) ON zk1_sync_batch.scope_head FROM ${role}`);
+      await admin.query(`REVOKE USAGE, CREATE ON SCHEMA ${fkSchema} FROM ${role}`);
     }
-  }
+  } } finally { await admin.query(`DROP SCHEMA ${fkSchema} CASCADE`); }
   assert.equal((await readback.verifyLatestSignedPair({
     scope: f.scope, commitId: committed.commitId,
   })).localPgRowsConsistent, true);
@@ -2539,6 +2568,12 @@ test("PG18 audits DELETE privilege on a zero-column foreign relation", async () 
       ["zk1_sync_batch_verifier", verifier],
     ]) {
       await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      const baselineClient = await pool.connect();
+      try {
+        assert.equal(await hasUnexpectedProtectedDml(baselineClient,
+          { allowTicketInsert: role === "zk1_sync_batch_admission_issuer" }), false,
+        "a zero-column foreign table without any grants must be harmless");
+      } finally { baselineClient.release(); }
       await admin.query(`GRANT DELETE ON ${schema}.empty_relation TO ${role}`);
       try {
         assert.equal((await pool.query(`SELECT pg_catalog.has_table_privilege(
@@ -2567,12 +2602,73 @@ test("PG18 audits DELETE privilege on a zero-column foreign relation", async () 
         } finally { auditClient.release(); }
       } finally {
         await admin.query(`REVOKE DELETE ON ${schema}.empty_relation FROM ${role}`);
+        const recoveredClient = await pool.connect();
+        try {
+          assert.equal(await hasUnexpectedProtectedDml(recoveredClient,
+            { allowTicketInsert: role === "zk1_sync_batch_admission_issuer" }), false,
+          "a zero-column table audit must recover after DELETE is revoked");
+        } finally { recoveredClient.release(); }
         await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
       }
     }
   } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
   assert.equal((await readback.verifyLatestSignedPair({
     scope: f.scope, commitId: saved.commitId,
+  })).localPgRowsConsistent, true);
+});
+
+test("PG18 rejects direct per-table MAINTAIN grants without predefined role membership", async () => {
+  const saved = await fixture();
+  const committed = await commitTestBatch(saved, await saved.signedPair());
+  const waiting = await fixture();
+  const before = await waiting.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const beforeTickets = await countTickets();
+  for (const [role, pool] of [
+    ["zk1_sync_batch_attestor_reader", attestor],
+    ["zk1_sync_batch_admission_issuer", issuer],
+    ["zk1_sync_batch_verifier", verifier],
+  ]) {
+    await admin.query(`GRANT MAINTAIN ON zk1_sync_batch.scope_head TO ${role}`);
+    try {
+      const privileges = await pool.query(`SELECT
+        pg_catalog.has_table_privilege(current_user,
+          'zk1_sync_batch.scope_head','MAINTAIN') AS direct_maintain,
+        pg_catalog.pg_has_role(current_user,'pg_maintain','MEMBER') AS privileged_group`);
+      assert.deepEqual(privileges.rows[0], {
+        direct_maintain: true, privileged_group: false,
+      }, "the actual direct grant must bypass previous predefined-group checks");
+      if (role === "zk1_sync_batch_attestor_reader") {
+        await assert.rejects(readback.verifyLatestSignedPair({
+          scope: saved.scope, commitId: committed.commitId,
+        }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      } else if (role === "zk1_sync_batch_admission_issuer") {
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      } else {
+        const pair = await waiting.signedPair();
+        const ticket = await mintTestAdmission(waiting, pair);
+        await assert.rejects(store.commitSignedOverwritePair({
+          ...waiting, operations: pair, admissionTicket: ticket,
+        }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+      }
+      assert.deepEqual(await waiting.state(), before);
+      assert.equal(await countTickets(), beforeTickets +
+        (role === "zk1_sync_batch_verifier" ? 1 : 0),
+      "a direct MAINTAIN misgrant must never mint unauthorized tickets");
+    } finally {
+      await admin.query(`REVOKE MAINTAIN ON zk1_sync_batch.scope_head FROM ${role}`);
+    }
+  }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
   })).localPgRowsConsistent, true);
 });
 

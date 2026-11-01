@@ -55,6 +55,13 @@ callback fired by a later owner-rights admission update; `REFERENCES` also
 introduces a non-DML foreign-key enforcement authority that isolated roles
 must not receive. PG18 tests establish real grants and denied admissions, and
 install then roll back a harmless protected trigger to demonstrate reachability.
+The column-level `REFERENCES` regression additionally builds and rolls back a
+real foreign-key constraint to the protected scope head under each misgranted
+role, rather than treating a catalog ACL bit as proof by itself.
+PG18 per-table `MAINTAIN` grants are also forbidden, independently of whether
+the credential belongs to the broader `pg_maintain` predefined role; these
+grants can otherwise authorize physical maintenance and materialized-view
+refresh outside normal INSERT/UPDATE/DELETE permissions.
 The relation scan keeps base-table presence checking even for PostgreSQL
 zero-column tables: it uses a column `LEFT JOIN` and non-null-safe ACL checks,
 so a granted DELETE on a foreign relation with zero columns cannot disappear
