@@ -72,6 +72,27 @@ function grantsOf(principals) {
   }
   return result;
 }
+async function independentlySignedHead(minimumFence, scope) {
+  const nonce = crypto.randomBytes(32).toString("base64url");
+  const receipt = detached(await minimumFence.readSignedHead({ scope, nonce }));
+  exact(receipt, ["statement", "signature"]);
+  exact(receipt.statement, ["version", "scope", "nonce", "sequence", "headHash"]);
+  requireValid(receipt.statement.version === 1 && receipt.statement.scope === scope
+    && receipt.statement.nonce === nonce
+    && Number.isSafeInteger(receipt.statement.sequence)
+    && receipt.statement.sequence >= 0
+    && typeof receipt.statement.headHash === "string"
+    && HEX.test(receipt.statement.headHash)
+    && typeof receipt.signature === "string"
+    && /^[A-Za-z0-9_-]{86}$/.test(receipt.signature));
+  const signature = Buffer.from(receipt.signature, "base64url");
+  requireValid(signature.length === 64
+    && signature.toString("base64url") === receipt.signature
+    && crypto.verify(null, Buffer.from(ANCHOR_DOMAIN
+      + protocol.canonicalJson(receipt.statement)),
+    minimumFence.publicKey, signature));
+  return { sequence: receipt.statement.sequence, headHash: receipt.statement.headHash };
+}
 function send(res, status, data) {
   if (res.destroyed || res.headersSent) return;
   const bytes = Buffer.from(JSON.stringify(data));
@@ -98,11 +119,26 @@ async function readBody(req) {
 }
 
 function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientCa,
-  anchor, principals } = {}) {
+  anchor, principals, minimumFence = null } = {}) {
   requireValid(key && cert && clientCa
     && anchor instanceof Zk1SyncAtomicRetainedAnchorDevOff);
+  if (minimumFence !== null) {
+    requireValid(minimumFence && typeof minimumFence.readSignedHead === "function"
+      && typeof minimumFence.compareAndAdvance === "function"
+      && minimumFence.publicKey instanceof crypto.KeyObject
+      && minimumFence.publicKey.type === "public"
+      && minimumFence.publicKey.asymmetricKeyType === "ed25519");
+  }
   const grants = grantsOf(principals);
   const active = new Set();
+  async function requireTwinHead(scope) {
+    const remote = await independentlySignedHead(minimumFence, scope);
+    const local = anchor.readSignedHead({ scope,
+      nonce: crypto.randomBytes(32).toString("base64url") }).statement;
+    requireValid(local.sequence === remote.sequence
+      && local.headHash === remote.headHash);
+    return remote;
+  }
   const server = https.createServer({ key, cert, ca: clientCa,
     requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3",
     handshakeTimeout: 3000 }, async (req, res) => {
@@ -124,10 +160,25 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
       if (!allowed.has(input.scope)) return send(res, 403, { error: "FORBIDDEN" });
       if (req.url === HEAD_ROUTE) {
         readInput(input);
+        if (minimumFence) await requireTwinHead(input.scope);
         return send(res, 200, { receipt: anchor.readSignedHead(input) });
       }
       advanceInput(input);
       if (!allowed.get(input.scope)) return send(res, 403, { error: "FORBIDDEN" });
+      if (minimumFence) {
+        const before = await requireTwinHead(input.scope);
+        if (before.sequence !== input.expectedSequence
+          || before.headHash !== input.expectedHeadHash) {
+          return send(res, 200, { advanced: false });
+        }
+        // Record the independently signed minimum FIRST. A crash or lost ACK
+        // after its commit but before local commit MUST leave this operator
+        // unavailable on recovery, never silently accept a restored prefix.
+        requireValid(await minimumFence.compareAndAdvance(input) === true);
+        requireValid(anchor.compareAndAdvance(input) === true);
+        await requireTwinHead(input.scope);
+        return send(res, 200, { advanced: true });
+      }
       return send(res, 200, { advanced: anchor.compareAndAdvance(input) });
     } catch {
       return send(res, 503, { error: "UNAVAILABLE" });
@@ -171,9 +222,12 @@ function createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({ hostname = "localh
         + protocol.canonicalJson(value.statement)), anchorPublicKey, signature));
     return value;
   }
-  async function post(route, input) {
+  async function post(route, input, deadline = null) {
     const data = Buffer.from(protocol.canonicalJson(input));
     requireValid(data.length > 0 && data.length <= MAX_BYTES);
+    const budget = deadline === null ? timeoutMs
+      : Math.min(timeoutMs, deadline - Date.now());
+    requireValid(Number.isSafeInteger(budget) && budget > 0);
     try {
       return await new Promise((resolve, reject) => {
         const req = https.request({ hostname, port, servername, ca, cert, key,
@@ -181,7 +235,7 @@ function createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({ hostname = "localh
           rejectUnauthorized: true,
           // Socket inactivity alone is not a deadline: a peer can drip bytes
           // forever, or delay DNS/TLS setup, without tripping setTimeout().
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(budget),
           checkServerIdentity(name, certificate) {
             const hostnameError = tls.checkServerIdentity(name, certificate);
             if (hostnameError) return hostnameError;
@@ -216,31 +270,37 @@ function createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({ hostname = "localh
           });
           response.on("error", reject);
         });
-        req.setTimeout(timeoutMs, () => req.destroy(deniedError()));
+        req.setTimeout(budget, () => req.destroy(deniedError()));
         req.on("error", reject);
         req.end(data);
       });
     } catch { throw deny(); }
   }
+  async function readVerified(value, deadline = null) {
+    const input = detached(value);
+    readInput(input);
+    const result = await post(HEAD_ROUTE, input, deadline);
+    exact(result, ["receipt"]);
+    return signedReceipt(result.receipt, input);
+  }
   return Object.freeze({
     async readSignedHead(value) {
-      const input = detached(value);
-      readInput(input);
-      const result = await post(HEAD_ROUTE, input);
-      exact(result, ["receipt"]);
-      return signedReceipt(result.receipt, input);
+      return readVerified(value);
     },
     async compareAndAdvance(value) {
+      // The advance and its required signed readback share ONE deadline.
+      // Two individual socket timeouts must never silently double the lease.
+      const deadline = Date.now() + timeoutMs;
       const input = detached(value);
       advanceInput(input);
-      const result = await post(ADVANCE_ROUTE, input);
+      const result = await post(ADVANCE_ROUTE, input, deadline);
       exact(result, ["advanced"]);
       requireValid(typeof result.advanced === "boolean");
       if (!result.advanced) return false;
       // An unsigned HTTP 200 or {advanced:true} cannot acknowledge a floor.
       // Require a SECOND independent nonce-signed committed readback.
-      const receipt = await this.readSignedHead({ scope: input.scope,
-        nonce: crypto.randomBytes(32).toString("base64url") });
+      const receipt = await readVerified({ scope: input.scope,
+        nonce: crypto.randomBytes(32).toString("base64url") }, deadline);
       requireValid(receipt.statement.sequence === input.sequence
         && receipt.statement.headHash === input.headHash);
       return true;

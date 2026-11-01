@@ -49,6 +49,7 @@ successful SQLite CAS: the caller must deny the missing response, while a new
 nonce-signed read can discover the committed floor and a retry stays stale.
 All mTLS requests have an absolute wall-clock deadline, including DNS/TLS
 setup and slowly streamed responses, independently of socket inactivity.
+The advance and its required signed readback share one overall client deadline.
 Principal grants are static at server creation: revoking or rotating an
 operator certificate requires replacing the running service and its TLS
 sessions. This prototype has no online CRL/OCSP policy or live grant reload.
@@ -77,6 +78,29 @@ denial, absent-grant denial, simultaneous conflicting CAS from two real
 operator processes against one SQLite WAL, and failure after operator termination. Their
 physical-fence evidence is deliberately synthetic: separate *processes* are
 not independent *hosts*, custody or a physical durability proof.
+
+An opt-in **v2 operator configuration** adds the required `minimumFence` object
+with exact fields `hostname`, `port`, `servername`, `pinnedServerFingerprint`,
+`publicKeyFile`, `caFile`, `certFile`, and `keyFile`. All file names are private
+operator-owned trust files. The independent minimum signer must differ from
+the primary signing key. Its separately running authority has its own mTLS
+permissions and immutable scope/account/store bindings. There is no local
+fallback when the independent authority is unavailable.
+
+V2 startup requires a fresh independently signed minimum that exactly matches
+each local scope head. Every head read checks this again. On an advance, the
+independent minimum commits and is signed **before** the primary SQLite CAS.
+A crash between these steps intentionally leaves the primary locked: it cannot
+serve a signed stale head, acknowledge an uncertain commit, or silently repair
+the divergence. Hosted tests exercise two actual operator processes and deny
+a restored primary SQLite snapshot with an old valid Ed25519 history prefix.
+
+This protects against restoring **only the primary database**. Running both
+operators under the same CI OS identity is NOT independent custody, and a
+simultaneous rollback of both stores remains possible. Nor can the independent
+minimum prove that an authorized writer's proposed head was physically durable.
+An independently operated, non-rollbackable custodian and normative physical
+witness are still required before any protected ACK is permissible.
 The endpoint is not mounted in the normal Root.ark server and no production
 capability is enabled. Operator certificate scope grants are deployment trust
 inputs and the transport cannot prove physical bytes or owner custody.

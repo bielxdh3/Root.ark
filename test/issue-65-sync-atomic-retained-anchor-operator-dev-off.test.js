@@ -80,42 +80,76 @@ test("opt-in separate process denies missing activation even for a valid private
     "missing activation must deny by the explicit operator gate, not an unrelated crash");
 });
 
-test("separate operator mTLS bridges the real CAS ledger and refuses external drift and lost authority", { timeout: 240_000 }, async (t) => {
+test("dual-process minimum-fenced operator bridges CAS and denies a restored SQLite prefix", { timeout: 240_000 }, async (t) => {
   const directory = createPrivateAuthorityFixture("zk65-operator-bridge-");
-  let operator, secondOperator, ledger;
+  let operator, secondOperator, minimumOperator, ledger;
   t.after(async () => {
     ledger?.close();
     if (operator) await stopOperator(operator.child);
     if (secondOperator) await stopOperator(secondOperator.child);
+    if (minimumOperator) await stopOperator(minimumOperator.child);
     fs.rmSync(directory, { recursive: true, force: true,
       maxRetries: 10, retryDelay: 100 });
   });
   generateNativeFixtureCertificates(directory, { caSubject: "Rootark Operator Test CA",
-    servers: ["anchor-server"], clients: ["reader", "writer", "outsider"] });
+    servers: ["anchor-server", "minimum-server"], clients: ["reader", "writer", "outsider"] });
   const read = (name) => fs.readFileSync(path.join(directory, name));
   const fingerprint = (name) => new crypto.X509Certificate(
     read(`${name}.pem`)).fingerprint256.toUpperCase();
   const owner = { scope: "alice:protected", accountId: crypto.randomUUID(),
     storeId: crypto.randomUUID() };
   const signer = crypto.generateKeyPairSync("ed25519");
+  const minimumSigner = crypto.generateKeyPairSync("ed25519");
   const database = path.join(directory, "retained.sqlite");
+  const minimumDatabase = path.join(directory, "minimum.sqlite");
+  const genesis = [{ scope: owner.scope, sequence: 0, headHash: GENESIS }];
   new Zk1SyncAtomicRetainedAnchorDevOff({
     filename: database, bootstrapNew: true, signerPrivateKey: signer.privateKey,
-    ownerBindings: [owner], trustedMinimumHeads: [{ scope: owner.scope,
-      sequence: 0, headHash: GENESIS }],
+    ownerBindings: [owner], trustedMinimumHeads: genesis,
   }).close();
+  new Zk1SyncAtomicRetainedAnchorDevOff({
+    filename: minimumDatabase, bootstrapNew: true,
+    signerPrivateKey: minimumSigner.privateKey,
+    ownerBindings: [owner], trustedMinimumHeads: genesis,
+  }).close();
+  const originalPrefix = path.join(directory, "primary-genesis-snapshot.sqlite");
+  fs.copyFileSync(database, originalPrefix);
   fs.writeFileSync(path.join(directory, "signer.key"),
     signer.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
-  const configFile = path.join(directory, "operator.json");
-  fs.writeFileSync(configFile, JSON.stringify({
+  fs.writeFileSync(path.join(directory, "minimum-signer.key"),
+    minimumSigner.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
+  fs.writeFileSync(path.join(directory, "minimum-public.pem"),
+    minimumSigner.publicKey.export({ format: "pem", type: "spki" }), { mode: 0o600 });
+  const minimumConfigFile = path.join(directory, "minimum-operator.json");
+  fs.writeFileSync(minimumConfigFile, JSON.stringify({
     version: 1, host: "127.0.0.1", port: 0,
-    database: "retained.sqlite", serverKey: "anchor-server.key",
-    serverCert: "anchor-server.pem", clientCa: "ca.pem",
-    signerKey: "signer.key", ownerBindings: [owner],
-    trustedMinimumHeads: [{ scope: owner.scope, sequence: 0, headHash: GENESIS }],
+    database: "minimum.sqlite", serverKey: "minimum-server.key",
+    serverCert: "minimum-server.pem", clientCa: "ca.pem",
+    signerKey: "minimum-signer.key", ownerBindings: [owner],
+    trustedMinimumHeads: genesis,
     principals: {
       [fingerprint("reader")]: [{ scope: owner.scope, canAdvance: false }],
       [fingerprint("writer")]: [{ scope: owner.scope, canAdvance: true }],
+    },
+  }), { mode: 0o600 });
+  minimumOperator = runOperator(minimumConfigFile);
+  const minimumPort = await minimumOperator.ready;
+  const configFile = path.join(directory, "operator.json");
+  fs.writeFileSync(configFile, JSON.stringify({
+    version: 2, host: "127.0.0.1", port: 0,
+    database: "retained.sqlite", serverKey: "anchor-server.key",
+    serverCert: "anchor-server.pem", clientCa: "ca.pem",
+    signerKey: "signer.key", ownerBindings: [owner],
+    trustedMinimumHeads: genesis,
+    principals: {
+      [fingerprint("reader")]: [{ scope: owner.scope, canAdvance: false }],
+      [fingerprint("writer")]: [{ scope: owner.scope, canAdvance: true }],
+    },
+    minimumFence: {
+      hostname: "127.0.0.1", port: minimumPort, servername: "localhost",
+      pinnedServerFingerprint: fingerprint("minimum-server"),
+      publicKeyFile: "minimum-public.pem", caFile: "ca.pem",
+      certFile: "writer.pem", keyFile: "writer.key",
     },
   }), { mode: 0o600 });
   if (process.platform !== "win32") {
@@ -139,6 +173,12 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
   });
   const writer = client("writer");
   const reader = client("reader");
+  const minimumReader = createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({
+    hostname: "127.0.0.1", servername: "localhost", port: minimumPort,
+    ca: read("ca.pem"), cert: read("reader.pem"), key: read("reader.key"),
+    pinnedServerFingerprint: fingerprint("minimum-server"),
+    anchorPublicKey: minimumSigner.publicKey,
+  });
   assert.equal((await reader.readSignedHead({ scope: owner.scope,
     nonce: nonce() })).statement.sequence, 0);
   await assert.rejects(client("outsider").readSignedHead({ scope: owner.scope,
@@ -175,6 +215,9 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
     "a repeated operation cannot append another remote retained head");
   assert.equal((await reader.readSignedHead({ scope: owner.scope,
     nonce: nonce() })).statement.headHash, advanced.headHash);
+  assert.equal((await minimumReader.readSignedHead({ scope: owner.scope,
+    nonce: nonce() })).statement.headHash, advanced.headHash,
+  "the separately signed minimum must advance before a positive primary CAS");
 
   // Two genuinely separate processes contend for one physical SQLite CAS.
   // Exactly one signed advance can win, even with distinct proposed heads.
@@ -223,4 +266,15 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
   await assert.rejects(reader.readSignedHead({ scope: owner.scope,
     nonce: nonce() }), { code: "SYNC_ATOMIC_RETAINED_HTTPS_DEV_OFF_DENIED" },
   "there is no local bypass when the independently running authority stops");
+  await stopOperator(secondOperator.child);
+  // A previous, authentically signed SQLite snapshot is NOT an acceptable
+  // recovery when a separate minimum service retained a newer sequence.
+  fs.copyFileSync(originalPrefix, database);
+  const restored = runOperator(configFile);
+  t.after(() => stopOperator(restored.child));
+  await assert.rejects(restored.ready,
+    /operator exited 1: SYNC_RETAINED_OPERATOR_DEV_OFF_DENIED/,
+    "a stale primary SQLite prefix cannot restart with its old local genesis minimum");
+  assert.equal((await minimumReader.readSignedHead({ scope: owner.scope,
+    nonce: nonce() })).statement.sequence, 2);
 });

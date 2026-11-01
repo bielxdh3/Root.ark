@@ -68,6 +68,28 @@ async function fixture(t) {
     fingerprint, certificate, read };
 }
 
+function rawAuthenticatedPost(f, role, route, data, contentType = "application/json") {
+  const bytes = Buffer.from(data);
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: "127.0.0.1", port: f.server.address().port,
+      servername: "localhost", ca: f.read("ca.pem"),
+      cert: f.certificate(role), key: f.read(`${role}.key`),
+      agent: false, rejectUnauthorized: true, method: "POST", path: route,
+      headers: { "content-type": contentType,
+        "content-length": String(bytes.length) },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode,
+        body: Buffer.concat(chunks).toString("utf8") }));
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end(bytes);
+  });
+}
+
 test("real Sync v2 retained-anchor mTLS signs a fresh head and confirms durable CAS by second signed read", async (t) => {
   const f = await fixture(t);
   const reader = f.client("reader");
@@ -138,6 +160,34 @@ test("Sync v2 mTLS never accepts input injection or exposes a physical ACK endpo
   await assert.rejects(client.compareAndAdvance({ scope: f.owner.scope,
     expectedSequence: 0, expectedHeadHash: GENESIS, sequence: 1,
     headHash: head(), clientAckAuthorized: true }), denied);
+  assert.equal(f.anchor.readSignedHead({ scope: f.owner.scope,
+    nonce: nonce() }).statement.sequence, 0);
+});
+
+test("real mTLS admission rejects hostile wire payloads before any retained CAS mutation", async (t) => {
+  const f = await fixture(t);
+  const route = "/v2/sync-atomic/retained/advance";
+  const valid = { scope: f.owner.scope, expectedSequence: 0,
+    expectedHeadHash: GENESIS, sequence: 1, headHash: head() };
+  const candidates = [
+    { data: JSON.stringify(valid), type: "text/plain" },
+    { data: JSON.stringify({ ...valid, clientAckAuthorized: true }) },
+    { data: JSON.stringify({ ...valid, sequence: 2 }) },
+    { data: "{\"scope\":", type: "application/json" },
+  ];
+  for (const candidate of candidates) {
+    const response = await rawAuthenticatedPost(f, "writer", route,
+      candidate.data, candidate.type);
+    assert.equal(response.status, 503, "a trusted client must still fail strict admission");
+    assert.deepEqual(JSON.parse(response.body), { error: "UNAVAILABLE" });
+    assert.equal(f.anchor.readSignedHead({ scope: f.owner.scope,
+      nonce: nonce() }).statement.sequence, 0,
+    "invalid wire data must never mutate the signed retained floor");
+  }
+  const readonly = await rawAuthenticatedPost(f, "reader", route,
+    JSON.stringify(valid));
+  assert.equal(readonly.status, 403);
+  assert.deepEqual(JSON.parse(readonly.body), { error: "FORBIDDEN" });
   assert.equal(f.anchor.readSignedHead({ scope: f.owner.scope,
     nonce: nonce() }).statement.sequence, 0);
 });
