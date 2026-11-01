@@ -8,6 +8,8 @@ const protocol = require("../../sync-client/rootark-sync-protocol");
 const { WITNESS_DOMAIN } = require("./zk1SyncAtomicCasFloorLedgerDevOff");
 const { createZk1SyncPgBatchIndependentReadback } =
   require("./zk1SyncPgBatchIndependentReadback");
+const { verifySignedOwnerBindingsDevOff } =
+  require("./zk1SyncAtomicSignedOwnerBindingsDevOff");
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
@@ -112,6 +114,7 @@ function physicalOf(value, challenge, publicKey) {
 
 function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
   externalPhysicalFence, witnessPublicKey, ownerBindings,
+  signedOwnerBindingsAuthority = null,
   unsafeTestReadback = null, readbackTimeoutMs = 5000,
   operationTimeoutMs = 8000 } = {}) {
   // Test-only signed-fence adversarial harness. Runtime operation always uses
@@ -131,7 +134,17 @@ function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
     && operationTimeoutMs >= readbackTimeoutMs && operationTimeoutMs <= 15000);
   // Input scopes and UUIDs are never admission authority. The independent
   // attestor operator must pin its immutable identities outside writer input.
-  const owners = pinnedOwnerBindings(ownerBindings);
+  const signedRoster = signedOwnerBindingsAuthority === null ? null
+    : verifySignedOwnerBindingsDevOff(signedOwnerBindingsAuthority);
+  const owners = pinnedOwnerBindings(ownerBindings ?? signedRoster?.bindings);
+  if (signedRoster && ownerBindings !== undefined) {
+    const fromSignature = pinnedOwnerBindings(signedRoster.bindings);
+    need(owners.size === fromSignature.size);
+    for (const [scope, pinned] of owners) {
+      const signed = fromSignature.get(scope);
+      need(signed && ID_FIELDS.every((key) => pinned[key] === signed[key]));
+    }
+  }
   const readback = unsafeTestReadback || createZk1SyncPgBatchIndependentReadback({ attestorPool });
   // A timeout does NOT cancel pg.Pool.connect or an already-running SQL call.
   // Keep unresolved work in a bounded set until the actual provider settles.

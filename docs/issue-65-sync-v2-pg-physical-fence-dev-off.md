@@ -21,6 +21,30 @@ operation IDs, invalid owner-device authorization, broken DELETE+MOVE pairing,
 stale policy and conflicting scope heads. SQL row consistency alone remains
 `witnessVerified:false` and `clientAckAuthorized:false`.
 
+### Optional independently owner-signed roster bootstrap (still DEV-OFF)
+
+An isolated operator can now provide `signedOwnerBindingsAuthority` instead of
+an unsigned `ownerBindings` array. The new
+`zk1SyncAtomicSignedOwnerBindingsDevOff.js` verifier requires an Ed25519
+signature over `Root.ark/zk1/sync-atomic-owner-bindings/v1\0` plus the canonical
+version-1 manifest containing a positive safe-integer revision and a nonempty
+immutable roster of exactly `scope/accountId/storeId/username/compartmentId`.
+Its signer public key, exact **domain-separated signed-statement SHA-256**
+(SHA-256 of the UTF-8 domain prefix followed by canonical manifest JSON, not
+SHA-256 of the bare JSON) and minimum permitted revision
+must be pinned **outside the writer/store and independently of the manifest**.
+Any malformed entry, duplicate scope, altered owner/store, invalid signature,
+stale revision or wrong exact statement SHA-256 denies bootstrap. The verifier detaches
+and freezes the roster; later changes to caller-owned configuration cannot
+change the accepted scope mapping. If an operator supplies both signed and
+unsigned rosters, every field must agree; the unsigned array cannot silently
+override a valid signature. The existing unsigned-roster path remains available
+for strictly trusted DEV-OFF operator fixtures, **not** as an acceptable
+production bootstrap. This cryptographic manifest does not supply independent
+owner custody, revocation freshness, a nonrollbackable pin source, physical
+durability or a protected ACK. The focused Ubuntu/Windows hosted tests include
+the positive and adversarial owner-manifest contract.
+
 The PostgreSQL role checks additionally reject membership in the server-side
 file read/write, program execution, and universal maintenance predefined roles,
 as well as CREATEDB and REPLICATION credentials. Ordinary table permissions and
