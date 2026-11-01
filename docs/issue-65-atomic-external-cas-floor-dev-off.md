@@ -95,8 +95,10 @@ are obtained **before** entering that transaction, so a slow or unresponsive
 operator cannot pin the WAL/checkpoint. In one synchronous read-only snapshot,
 the full chain, persisted signer-identity constraints and required CAS schema
 must exactly match those signed heads before any
-writable SQLite connection is created. The post-open full-history audit also
-denies intervening changes before a usable signer can escape. The service
+writable SQLite connection is created. A separate post-open read transaction
+revalidates all identity and scope bindings, history and schema after the last
+external callback, denying intervening changes before a usable signer can
+escape. The service
 never adopts a SQLite file first materialized while the signed bootstrap
 genesis check is waiting; a new file must be created with exclusive creation,
 whereas a pre-existing file must retain its inspected device/inode identity.

@@ -448,23 +448,31 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
       }
       // A remote callback can mutate the local database after its initial
       // full-chain audit. Audit ALL identities, scopes, orphans and schema
-      // again synchronously
-      // AFTER the final await, before returning a usable signer.
-      assertStorageSchema(ledger.#db);
-      const identity = ledger.#db.prepare(
-        "SELECT * FROM atomic_cas_identity WHERE id=1").get();
-      requireValid(identity && identity.cas_fingerprint === fingerprint(
-        crypto.createPublicKey(options.casPrivateKey))
-        && identity.witness_fingerprint === fingerprint(options.witnessPublicKey)
-        && identity.anchor_fingerprint === fingerprint(options.anchorPublicKey));
-      const heads = ledger.#db.prepare("SELECT scope FROM atomic_cas_head").all();
-      requireValid(heads.length <= ledger.#bindings.size
-        && heads.every((head) => ledger.#bindings.has(head.scope)));
-      requireValid(!ledger.#db.prepare(`SELECT 1 FROM atomic_cas_history h
-        WHERE NOT EXISTS (SELECT 1 FROM atomic_cas_head a
-          WHERE a.scope=h.scope) LIMIT 1`).get());
-      for (const [scope, verified] of verifiedHeads) {
-        requireValid(same(ledger.#current(scope), verified));
+      // again in ONE synchronous SQLite snapshot AFTER the last await.
+      // Separate autocommit SELECTs would allow an independent writer to
+      // interleave inconsistent observations of the identity and history.
+      ledger.#db.exec("BEGIN TRANSACTION");
+      try {
+        assertStorageSchema(ledger.#db);
+        const identity = ledger.#db.prepare(
+          "SELECT * FROM atomic_cas_identity WHERE id=1").get();
+        requireValid(identity && identity.cas_fingerprint === fingerprint(
+          crypto.createPublicKey(options.casPrivateKey))
+          && identity.witness_fingerprint === fingerprint(options.witnessPublicKey)
+          && identity.anchor_fingerprint === fingerprint(options.anchorPublicKey));
+        const heads = ledger.#db.prepare("SELECT scope FROM atomic_cas_head").all();
+        requireValid(heads.length <= ledger.#bindings.size
+          && heads.every((head) => ledger.#bindings.has(head.scope)));
+        requireValid(!ledger.#db.prepare(`SELECT 1 FROM atomic_cas_history h
+          WHERE NOT EXISTS (SELECT 1 FROM atomic_cas_head a
+            WHERE a.scope=h.scope) LIMIT 1`).get());
+        for (const [scope, verified] of verifiedHeads) {
+          requireValid(same(ledger.#current(scope), verified));
+        }
+        ledger.#db.exec("COMMIT");
+      } catch {
+        try { ledger.#db.exec("ROLLBACK"); } catch { /* no active transaction */ }
+        throw deny();
       }
       return ledger;
     } catch (error) {
