@@ -69,6 +69,17 @@ runDisposablePgLab("gate", async (fixture) => {
       process.stderr.write("ZK65_SYNC_PG_BATCH_SAFE_DIAG class="
         + (errorClass?.[1] || "UNKNOWN") + " line=" + (fileLine?.[1] || "none") + "\n");
     }
+    // Developer-owned test locations are numeric only. Keep this bounded and
+    // strip ALL TAP titles, SQL arguments, pg URLs, credentials and stack text.
+    // The first line usually names the test declaration; later numeric lines
+    // identify the actual assertion which caused an otherwise opaque failure.
+    const trustedSourceLines = [...rawDiagnostic.matchAll(
+      /sync-batch-pg18\.integration\.cjs:(\d{1,7}):\d{1,5}/g)]
+      .slice(0, 16).map((match) => match[1]);
+    if (trustedSourceLines.length) {
+      process.stderr.write("ZK65_SYNC_PG_BATCH_SAFE_SOURCE_LINES "
+        + trustedSourceLines.join(",") + "\n");
+    }
     if (result.error?.code === "ETIMEDOUT") {
       process.stderr.write("ZK65_SYNC_PG_BATCH_CHILD_TIMEOUT\n");
     }
