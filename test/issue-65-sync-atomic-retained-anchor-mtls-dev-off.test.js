@@ -181,6 +181,48 @@ test("a valid independently signed genesis for another account is never an accep
     anchorPublicKey: primarySigner.publicKey })
     .readSignedHead({ scope: f.owner.scope, nonce: nonce() }), denied,
   "matching scope, sequence, genesis hash and valid remote signature do not replace owner identity");
+  let mode = "valid";
+  const proofFence = {
+    publicKey: minimumSigner.publicKey,
+    async readSignedBindingHead({ scope, nonce: challenge }) {
+      const statement = { version: 2, scope, accountId: f.owner.accountId,
+        storeId: f.owner.storeId, nonce: challenge, sequence: 0, headHash: GENESIS };
+      if (mode === "wrong-nonce") statement.nonce = nonce();
+      if (mode === "wrong-version") statement.version = 1;
+      if (mode === "wrong-head") statement.headHash = head();
+      const signature = mode === "invalid-signature"
+        ? crypto.sign(null, Buffer.from("unrelated\0" + protocol.canonicalJson(statement)),
+          minimumSigner.privateKey).toString("base64url")
+        : crypto.sign(null, Buffer.from(BINDING_DOMAIN
+          + protocol.canonicalJson(statement)), minimumSigner.privateKey)
+          .toString("base64url");
+      return { statement, signature };
+    },
+    async compareAndAdvance() {
+      throw Error("read-only proof challenge must never advance the minimum");
+    },
+  };
+  const proofServer = createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({
+    key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
+    clientCa: f.read("ca.pem"), anchor: strictAnchor, minimumFence: proofFence,
+    principals: { [f.fingerprint("reader")]: [{ scope: f.owner.scope,
+      canAdvance: false }] },
+  });
+  await new Promise((resolve, reject) => {
+    proofServer.once("error", reject);
+    proofServer.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => proofServer.close(resolve)));
+  const pinnedReader = f.client("reader", { port: proofServer.address().port,
+    anchorPublicKey: primarySigner.publicKey });
+  assert.equal((await pinnedReader.readSignedHead({ scope: f.owner.scope,
+    nonce: nonce() })).statement.headHash, GENESIS,
+  "a correct independently signed owner-bound proof is accepted by the same live server");
+  for (mode of ["wrong-nonce", "wrong-version", "wrong-head", "invalid-signature"]) {
+    await assert.rejects(pinnedReader.readSignedHead({ scope: f.owner.scope,
+      nonce: nonce() }), denied,
+    `${mode} must not bypass the independent signed-binding read barrier`);
+  }
   assert.equal(strictAnchor.readSignedBindingHead({ scope: f.owner.scope,
     nonce: nonce() }).statement.sequence, 0);
 });
