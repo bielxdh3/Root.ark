@@ -374,7 +374,8 @@ test("real Node CLI exchanges candidate and two signed witness proofs with separ
     const root = createPrivateAuthorityFixture("rootark-owner-revoke-");
     t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
     const file = (name) => path.join(root, name);
-    const write = (name, data) => publishFixtureJson(root, name, data);
+    const write = (name, data, beforePublish) =>
+      publishFixtureJson(root, name, data, beforePublish);
     const source = path.resolve(__dirname, "../");
     write("offline-state.json", {
       scope: Object.fromEntries(Object.entries(f.state.scope).map(([name, bytes]) =>
@@ -434,16 +435,25 @@ test("real Node CLI exchanges candidate and two signed witness proofs with separ
     const candidate = await until("revocation-candidate.json");
     assert.equal(candidate.committed, false);
     const committed = f.first(candidate);
-    write("revocation-committed-receipt.json", committed);
     if (mode === "valid") {
+      // The separate owner process waits only for the committed receipt and
+      // immediately reads BOTH signed CAS proofs. Publish the complete proof
+      // set first, then use the atomic receipt rename as the ready marker.
+      // Publishing the receipt first races the child on loaded CI runners.
       write("cas-head-proof.json", f.second(candidate, committed));
       write("cas-commit-proof.json", f.casReceipt(committed, candidate));
+      write("revocation-committed-receipt.json", committed, () => {
+        assert.equal(fs.existsSync(file("cas-head-proof.json")), true);
+        assert.equal(fs.existsSync(file("cas-commit-proof.json")), true);
+      });
       const delivery = await until("revocation-browser-delivery.json");
       assert.equal(delivery.schema, "rootark-zk1-v2-owner-revocation-delivery/v1");
       assert.equal(delivery.revokedDeviceId, "trusted-1");
       assert.equal((await exit).code, 0, err);
       assert.match(out, /"completed":true/);
     } else {
+      // Deliberately commit without either CAS proof. The child must deny.
+      write("revocation-committed-receipt.json", committed);
       assert.notEqual((await exit).code, 0);
       assert.equal(fs.existsSync(file("revocation-browser-delivery.json")), false);
       assert.match(err, /ZK_OWNER_V2_REVOKE_CLI_DENIED/);
