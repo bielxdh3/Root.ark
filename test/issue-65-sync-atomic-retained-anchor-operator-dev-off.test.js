@@ -36,7 +36,9 @@ function runOperator(configFile, flag = "true") {
   let errors = "";
   child.stderr.on("data", (chunk) => { errors = (errors + chunk.toString()).slice(-1024); });
   const ready = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(Error("operator readiness timeout")), 20_000);
+    // Windows CI may compile a fresh native owner/DACL verifier before any
+    // TLS listener is created; this is not the socket's response timeout.
+    const timer = setTimeout(() => reject(Error("operator readiness timeout")), 45_000);
     const stop = (error, port) => {
       clearTimeout(timer);
       child.removeListener("message", onMessage);
@@ -78,7 +80,7 @@ test("opt-in separate process denies missing activation even for a valid private
     "missing activation must deny by the explicit operator gate, not an unrelated crash");
 });
 
-test("separate operator mTLS bridges the real CAS ledger and refuses external drift and lost authority", { timeout: 120_000 }, async (t) => {
+test("separate operator mTLS bridges the real CAS ledger and refuses external drift and lost authority", { timeout: 240_000 }, async (t) => {
   const directory = createPrivateAuthorityFixture("zk65-operator-bridge-");
   let operator, secondOperator, ledger;
   t.after(async () => {
@@ -116,6 +118,17 @@ test("separate operator mTLS bridges the real CAS ledger and refuses external dr
       [fingerprint("writer")]: [{ scope: owner.scope, canAdvance: true }],
     },
   }), { mode: 0o600 });
+  if (process.platform !== "win32") {
+    // A world-readable config can expose private signer/TLS key names and
+    // operator grant topology even when its parent directory is private.
+    // Fail closed on its leaf permissions, not just its directory ancestry.
+    fs.chmodSync(configFile, 0o644);
+    const exposed = runOperator(configFile);
+    await assert.rejects(exposed.ready,
+      /operator exited 1: SYNC_RETAINED_OPERATOR_DEV_OFF_DENIED/);
+    await stopOperator(exposed.child);
+    fs.chmodSync(configFile, 0o600);
+  }
   operator = runOperator(configFile);
   const port = await operator.ready;
   const client = (role, portNumber = port) => createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({

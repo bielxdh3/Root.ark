@@ -58,7 +58,12 @@ basenames `database`, `serverKey`, `serverCert`, `clientCa`, `signerKey`,
 `ownerBindings`, `trustedMinimumHeads`, and certificate `principals` grants.
 It refuses to create an absent SQLite database or silently reset a minimum;
 only explicit separate offline bootstrap of the existing anchor is supported.
-The runner refuses symlinked and non-private authority files and directories;
+The runner reads configuration and signing/TLS trust material through pinned
+file descriptors with stable inode checks and owner-only leaf permissions;
+Windows additionally uses the existing native ACL verifier on each file,
+not just on their parent directories. Insecure POSIX leaf permissions have a
+negative startup test. The runner refuses symlinked and non-private authority
+files and directories;
 the operator should run under a separate operating-system identity. Only
 test mode permits ephemeral port `0`. The real hosted tests launch a child
 process over mTLS and demonstrate local CAS integration, remote divergence

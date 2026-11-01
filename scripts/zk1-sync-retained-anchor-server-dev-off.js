@@ -3,11 +3,12 @@
 // Explicit DEV-OFF process boundary for the Sync v2 retained high-water.
 // No physical witness, owner custody guarantee or protected ACK capability.
 const crypto = require("node:crypto");
-const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const { assertPrivateSqliteFile, assertPrivateSqliteAuthorityDirectory } =
   require("../src/services/zk1PrivateSqlitePath");
+const { readAuthorityPinnedFile } =
+  require("../src/services/zk1AuthorityPinnedFile");
 const { Zk1SyncAtomicRetainedAnchorDevOff } =
   require("../src/services/zk1SyncAtomicRetainedAnchorDevOff");
 const { createZk1SyncAtomicRetainedAnchorHttpsServerDevOff } =
@@ -25,8 +26,10 @@ function operatorConfiguration(file) {
   const absolute = path.resolve(file);
   const directory = path.dirname(absolute);
   assertPrivateSqliteAuthorityDirectory(absolute);
-  assertPrivateSqliteFile(absolute);
-  const config = JSON.parse(fs.readFileSync(absolute, "utf8"));
+  // A private parent directory does not necessarily protect a leaf file's
+  // Windows DACL (e.g. a granted direct READ ACE with traverse bypass).
+  // Read the same pinned inode, verifying native owner/leaf ACL and parents.
+  const config = JSON.parse(readAuthorityPinnedFile(absolute, 1024 * 1024).toString("utf8"));
   exact(config, ["version", "host", "port", "database", "serverKey",
     "serverCert", "clientCa", "signerKey", "ownerBindings",
     "trustedMinimumHeads", "principals"]);
@@ -38,12 +41,11 @@ function operatorConfiguration(file) {
   const ownedFile = (name) => {
     demand(typeof name === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(name)
       && name !== "." && name !== "..");
-    const pathname = path.join(directory, name);
-    assertPrivateSqliteFile(pathname);
-    return pathname;
+    return path.join(directory, name);
   };
   const dbFile = ownedFile(config.database);
-  const readPrivate = (name) => fs.readFileSync(ownedFile(name));
+  assertPrivateSqliteFile(dbFile);
+  const readPrivate = (name) => readAuthorityPinnedFile(ownedFile(name), 1024 * 1024);
   return {
     config, dbFile, key: readPrivate(config.serverKey),
     cert: readPrivate(config.serverCert),
