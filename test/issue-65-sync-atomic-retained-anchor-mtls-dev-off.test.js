@@ -142,6 +142,56 @@ test("Sync v2 mTLS never accepts input injection or exposes a physical ACK endpo
     nonce: nonce() }).statement.sequence, 0);
 });
 
+test("a lost mTLS compare response never creates a positive ACK even after a real committed CAS", async (t) => {
+  const f = await fixture(t);
+  let committed = false;
+  // This TEST-ONLY peer simulates a network cut immediately after the real
+  // retained SQLite COMMIT, before the mTLS caller receives any response.
+  const interrupted = https.createServer({
+    key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
+    ca: f.base.ca, requestCert: true, rejectUnauthorized: true,
+    minVersion: "TLSv1.3",
+  }, async (req) => {
+    try {
+      if (!req.socket.authorized || req.method !== "POST"
+        || req.url !== "/v2/sync-atomic/retained/advance"
+        || req.socket.getPeerCertificate()?.fingerprint256?.toUpperCase()
+          !== f.fingerprint("writer")) {
+        req.socket.destroy();
+        return;
+      }
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      committed = f.anchor.compareAndAdvance(
+        JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    } catch { /* An invalid challenge cannot produce an affirmative receipt. */ }
+    req.socket.destroy();
+  });
+  await new Promise((resolve, reject) => {
+    interrupted.once("error", reject);
+    interrupted.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(async () => {
+    interrupted.closeAllConnections();
+    await new Promise((resolve) => interrupted.close(resolve));
+  });
+  const next = head();
+  const comparison = { scope: f.owner.scope, expectedSequence: 0,
+    expectedHeadHash: GENESIS, sequence: 1, headHash: next };
+  await assert.rejects(f.client("writer", {
+    port: interrupted.address().port,
+  }).compareAndAdvance(comparison), denied,
+  "a committed server-side CAS without a response must remain indeterminate to the client");
+  assert.equal(committed, true, "the real SQLite commit happened before the socket cut");
+  const observed = await f.client("reader").readSignedHead({
+    scope: f.owner.scope, nonce: nonce(),
+  });
+  assert.equal(observed.statement.sequence, 1);
+  assert.equal(observed.statement.headHash, next);
+  assert.equal(await f.client("writer").compareAndAdvance(comparison), false,
+    "a stale retry cannot append or claim another committed operation");
+});
+
 test("Sync v2 mTLS bounds total elapsed time even when a pinned peer trickles HTTP bytes", async (t) => {
   const f = await fixture(t);
   const dripServer = https.createServer({

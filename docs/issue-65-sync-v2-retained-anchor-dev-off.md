@@ -44,6 +44,9 @@ compare **cannot** authorize a floor: the client insists on a separate fresh
 nonce-signed head after the compare. Real TLS/SQLite/Ed25519 tests cover denied
 roles, unauthorized/foreign principals, incorrect server pin and signing pin,
 missing client certificate, stale CAS and prohibited extra protocol fields.
+The hosted transport suite also cuts a real TLS socket immediately after a
+successful SQLite CAS: the caller must deny the missing response, while a new
+nonce-signed read can discover the committed floor and a retry stays stale.
 All mTLS requests have an absolute wall-clock deadline, including DNS/TLS
 setup and slowly streamed responses, independently of socket inactivity.
 Principal grants are static at server creation: revoking or rotating an
