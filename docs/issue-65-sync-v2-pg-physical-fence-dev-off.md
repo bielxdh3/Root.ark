@@ -9,7 +9,12 @@ physical lease, CAS signer, or locally fabricated success fallback.
 Its constructor requires a real `attestorPool` read-only PostgreSQL connection,
 an externally supplied `externalPhysicalFence.withCurrentRead(challenge, fn)`
 that holds a live lease during `fn`, and a separately pinned Ed25519 witness
-public key. The SQL verifier is the existing
+public key. It also requires an explicit non-empty immutable
+`ownerBindings` roster keyed by scope and containing the exact scope,
+accountId, storeId, username, and compartmentId. The adapter refuses a
+challenge that differs from these operator trust inputs even if a witness
+signs it. The operator must provision these bindings independently of writer
+input; an arbitrary writer-controlled roster is not an authority. The SQL verifier is the existing
 `zk1SyncPgBatchIndependentReadback.js`, which rejects destructive PostgreSQL
 privileges, hostile DML/DDL grants, altered ciphertext, replayed/unbound
 operation IDs, invalid owner-device authorization, broken DELETE+MOVE pairing,

@@ -70,6 +70,24 @@ function challengeOf(value) {
   Object.freeze(copy.envelopeDigests);
   return Object.freeze(copy);
 }
+function pinnedOwnerBindings(values) {
+  need(Array.isArray(values) && values.length > 0 && values.length <= 1024);
+  const bindings = new Map();
+  for (const item of values) {
+    const copy = detach(item);
+    exact(copy, ID_FIELDS);
+    need(typeof copy.scope === "string" && SCOPE.test(copy.scope)
+      && typeof copy.accountId === "string" && UUID.test(copy.accountId)
+      && typeof copy.storeId === "string" && UUID.test(copy.storeId)
+      && typeof copy.username === "string" && copy.username.length > 0
+      && copy.username.length <= 512
+      && typeof copy.compartmentId === "string"
+      && copy.compartmentId.length > 0 && copy.compartmentId.length <= 512
+      && !bindings.has(copy.scope));
+    bindings.set(copy.scope, Object.freeze(copy));
+  }
+  return bindings;
+}
 function physicalOf(value, challenge, publicKey) {
   const receipt = detach(value);
   exact(receipt, ["statement", "signature"]);
@@ -93,7 +111,7 @@ function physicalOf(value, challenge, publicKey) {
 }
 
 function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
-  externalPhysicalFence, witnessPublicKey,
+  externalPhysicalFence, witnessPublicKey, ownerBindings,
   unsafeTestReadback = null, readbackTimeoutMs = 5000,
   operationTimeoutMs = 8000 } = {}) {
   // Test-only signed-fence adversarial harness. Runtime operation always uses
@@ -111,6 +129,9 @@ function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
     && readbackTimeoutMs <= 7000
     && Number.isSafeInteger(operationTimeoutMs)
     && operationTimeoutMs >= readbackTimeoutMs && operationTimeoutMs <= 15000);
+  // Input scopes and UUIDs are never admission authority. The independent
+  // attestor operator must pin its immutable identities outside writer input.
+  const owners = pinnedOwnerBindings(ownerBindings);
   const readback = unsafeTestReadback || createZk1SyncPgBatchIndependentReadback({ attestorPool });
   // A timeout does NOT cancel pg.Pool.connect or an already-running SQL call.
   // Keep unresolved work in a bounded set until the actual provider settles.
@@ -121,6 +142,8 @@ function createZk1SyncAtomicPgPhysicalFenceDevOff({ attestorPool,
     async withCurrentRead(input, continuation) {
       const challenge = challengeOf(input);
       need(typeof continuation === "function");
+      const trusted = owners.get(challenge.scope);
+      need(trusted && ID_FIELDS.every((field) => trusted[field] === challenge[field]));
       let called = false, completed = false, callbackSucceeded = false;
       let closed = false, inner;
       try {

@@ -28,6 +28,9 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
     operationIds: ["delete:reserved", "move:reserved"],
     envelopeDigests: [randomHash(), randomHash()], expectedPrevious: null,
   };
+  const ownerBindings = [{ scope: challenge.scope, accountId: challenge.accountId,
+    storeId: challenge.storeId, username: challenge.username,
+    compartmentId: challenge.compartmentId }];
   const physical = {
     version: 2, scope: challenge.scope, accountId: challenge.accountId,
     storeId: challenge.storeId, username: challenge.username,
@@ -74,6 +77,7 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
     },
   };
   const options = { externalPhysicalFence, witnessPublicKey: signer.publicKey,
+    ownerBindings,
     unsafeTestReadback: mockReadback };
 
   process.env.NODE_ENV = "production";
@@ -86,8 +90,17 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
   assert.throws(() => createZk1SyncAtomicPgPhysicalFenceDevOff({
     ...options, witnessPublicKey: crypto.generateKeyPairSync("ed25519").privateKey,
   }), DENIED);
+  assert.throws(() => createZk1SyncAtomicPgPhysicalFenceDevOff({
+    ...options, ownerBindings: [] }), DENIED,
+  "operator identity bindings must be explicitly pinned");
 
   const adapter = createZk1SyncAtomicPgPhysicalFenceDevOff(options);
+  const forgedOwner = { ...challenge, storeId: crypto.randomUUID() };
+  await assert.rejects(adapter.withCurrentRead(forgedOwner, async () => {
+    continued++;
+  }), DENIED, "an input-controlled account/store ID cannot replace operator pins");
+  assert.equal(observed, 0,
+    "wrong owner binding must be rejected before any physical/SQL verification");
   assert.equal(await adapter.withCurrentRead(challenge, async (bundle, lease) => {
     continued++;
     assert.equal(lease.assertHeld(), true);
@@ -117,7 +130,7 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
   const pausedSql = new Promise((resolve) => { releaseSql = resolve; });
   let lateCallback;
   const lateAdapter = createZk1SyncAtomicPgPhysicalFenceDevOff({
-    witnessPublicKey: signer.publicKey,
+    witnessPublicKey: signer.publicKey, ownerBindings,
     unsafeTestReadback: {
       async verifyCurrentSignedPair() {
         await pausedSql;
@@ -155,7 +168,7 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
   let releasePending;
   const stalled = new Promise((resolve) => { releasePending = resolve; });
   const limited = createZk1SyncAtomicPgPhysicalFenceDevOff({
-    witnessPublicKey: signer.publicKey, readbackTimeoutMs: 100,
+    witnessPublicKey: signer.publicKey, ownerBindings, readbackTimeoutMs: 100,
     operationTimeoutMs: 600,
     unsafeTestReadback: {
       async verifyCurrentSignedPair() {
@@ -203,6 +216,7 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
   held = true;
   const swallowedSqlFailure = createZk1SyncAtomicPgPhysicalFenceDevOff({
     unsafeTestReadback: mockReadback, witnessPublicKey: signer.publicKey,
+    ownerBindings,
     externalPhysicalFence: {
       async withCurrentRead(_request, callback) {
         try { await callback(signedBundle(), { assertHeld: () => true }); }
@@ -219,6 +233,7 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
 
   const droppedCallback = createZk1SyncAtomicPgPhysicalFenceDevOff({
     unsafeTestReadback: mockReadback, witnessPublicKey: signer.publicKey,
+    ownerBindings,
     externalPhysicalFence: {
       async withCurrentRead(_request, callback) {
         void callback(signedBundle(), { assertHeld: () => true });
@@ -237,6 +252,7 @@ test("DEV-OFF PG physical fence requires a separately signed witness AND exact r
   mode = "valid";
   const swallowedFinalLease = createZk1SyncAtomicPgPhysicalFenceDevOff({
     unsafeTestReadback: mockReadback, witnessPublicKey: signer.publicKey,
+    ownerBindings,
     externalPhysicalFence: {
       async withCurrentRead(_request, callback) {
         let checks = 0;

@@ -1420,6 +1420,9 @@ test("PG18 actual read-only role bridges a synthetic held v2 physical lease with
     envelopeDigests: operations.map((op) =>
       hash(protocol.canonicalJson(op)).toString("hex")),
     expectedPrevious: null };
+  const ownerBindings = [{ scope: challenge.scope,
+    accountId: challenge.accountId, storeId: challenge.storeId,
+    username: challenge.username, compartmentId: challenge.compartmentId }];
   const externalPhysicalFence = { async withCurrentRead(request, continuation) {
     assert.deepEqual(request, challenge);
     let held = true;
@@ -1440,6 +1443,7 @@ test("PG18 actual read-only role bridges a synthetic held v2 physical lease with
   } };
   const adapterFor = (attestorPool) => createZk1SyncAtomicPgPhysicalFenceDevOff({
     attestorPool, externalPhysicalFence, witnessPublicKey: key.publicKey,
+    ownerBindings,
   });
   let signedContinuation = 0;
   const accepted = await adapterFor(attestor).withCurrentRead(challenge,
@@ -1479,6 +1483,11 @@ test("PG18 actual read-only role bridges a synthetic held v2 physical lease with
     const negative = createZk1SyncAtomicPgPhysicalFenceDevOff({
       attestorPool: attestor, externalPhysicalFence: signedForAltered,
       witnessPublicKey: key.publicKey,
+      // Deliberately trust the ALTERED identity for this test so denial
+      // actually comes from the independent SQL policy, not constructor pins.
+      ownerBindings: [{ ...ownerBindings[0],
+        ...(change.username ? { username: change.username } : {}),
+        ...(change.compartmentId ? { compartmentId: change.compartmentId } : {}) }],
     });
     await assert.rejects(negative.withCurrentRead(altered, async () => {
       signedContinuation++;
