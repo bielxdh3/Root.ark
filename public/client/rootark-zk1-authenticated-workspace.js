@@ -964,7 +964,8 @@
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
       "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
-      "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect"].includes(action)) return;
+      "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
+      "catalog-delta-restore"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1101,7 +1102,8 @@
       const trust = await grantAndOwner();
       assertLive();
       if (["catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
-        "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect"].includes(action)) {
+        "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
+        "catalog-delta-restore"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
           || field("catalog-delta-opt-in")?.checked !== true
           || trust.signedDeviceGrant.revoked_at_epoch !== null
@@ -1128,7 +1130,8 @@
         assertLive();
         if (action !== "catalog-delta-list")
           field("catalog-delta-private-list")?.replaceChildren();
-        if (action === "catalog-delta-trash" || action === "catalog-delta-trash-inspect") {
+        if (["catalog-delta-trash", "catalog-delta-trash-inspect",
+          "catalog-delta-restore"].includes(action)) {
           const objectId = field("catalog-write-id")?.value.trim();
           if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)) fail();
           const versions = held.baseline.entries.filter((row) => row.objectId === objectId);

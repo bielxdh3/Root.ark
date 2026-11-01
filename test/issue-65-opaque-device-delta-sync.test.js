@@ -27,6 +27,19 @@ test("independently authorized opaque delta client boots without generic sync-v2
   assert.doesNotMatch(source, /sync-client\/|rootark-sync-v2|rootark-sync-adapter/);
 });
 
+test("normal workspace routes historical restore through all three existing authorization gates", () => {
+  const source = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  const allowlist = source.match(/if \(!\[([\s\S]*?)\]\.includes\(action\)\) return;/)?.[1];
+  const deltaGate = source.match(/if \(\[([\s\S]*?)\]\.includes\(action\)\) \{\s*if \(available\.opaqueCatalogV1/)?.[1];
+  const historyGate = source.match(/if \(\["catalog-delta-trash", "catalog-delta-trash-inspect",([\s\S]*?)\]\.includes\(action\)\) \{/)?.[1];
+  for (const [gate, value] of Object.entries({ allowlist, deltaGate, historyGate })) {
+    assert.ok(value?.includes('"catalog-delta-restore"'),
+      `historical restore must not bypass or be excluded by ${gate}`);
+  }
+  assert.match(source, /if \(action === "catalog-delta-restore"\) \{[\s\S]*?held\.client\.restoreVersion\(/);
+});
+
 test("Node22/24 browser VM rejects replay/logout after opaque delta with no plaintext metadata", async () => {
   const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
     RootarkZk1BrowserOpaqueCatalogCommit: { createClient() {} },
@@ -166,6 +179,21 @@ test("real Edge CSP exposes normal authenticated manual delta import, but no unc
       }
       if(!dlg.querySelector('[data-zk1-field="status"]').textContent
         .includes("Operação recusada"))throw Error("UNCONSENTED_IMPORT_NOT_DENIED");
+      const restore=dlg.querySelector('[data-zk1-action="catalog-delta-restore"]');
+      if(!restore)throw Error("HISTORICAL_RESTORE_ACTION_MISSING");
+      for(let i=0;i<100&&restore.disabled;i++)await sleep(30);
+      if(restore.disabled)throw Error("HISTORICAL_RESTORE_STILL_BUSY");
+      const restoreStatus=dlg.querySelector('[data-zk1-field="status"]');
+      restoreStatus.textContent="RESTORE_NOT_DISPATCHED";
+      restore.click();
+      if(restoreStatus.textContent==="RESTORE_NOT_DISPATCHED")
+        throw Error("HISTORICAL_RESTORE_SILENT_NOOP");
+      for(let i=0;i<100;i++){
+        if(restoreStatus.textContent.includes("Operação recusada"))break;
+        await sleep(30);
+      }
+      if(!restoreStatus.textContent.includes("Operação recusada"))
+        throw Error("UNAUTHORIZED_RESTORE_NOT_DENIED");
       out.textContent="EDGE_DELTA_UI_PASS";
     }catch(error){out.textContent="EDGE_DELTA_UI_FAIL:"+error.message;}
   });`;
