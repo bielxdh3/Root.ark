@@ -65,3 +65,50 @@ these are
 separately
 implemented, independently audited, and adversarially validated, protected
 production ACK/rollout remains **NO-GO**.
+
+## Isolated durable Sync v2 CAS ledger prototype
+
+`src/services/zk1SyncAtomicCasFloorLedgerDevOff.js` adds an intentionally
+**unwired** v2 authority implementation. Unlike legacy ZK1 CAS, the signed
+floor has the exact `rootark-sync-atomic-batch-external-cas-floor-v2\0`
+domain and client-required fields. It uses a private SQLite location,
+verified WAL mode and synchronous=FULL (refusing SQLite fallback to rollback
+journaling), hash-linked append history, a positive monotonic
+sequence, a strictly advancing fencing epoch for each different physical
+head, separately pinned CAS/witness/anchor Ed25519 identities and mandatory
+fresh-signed verification. An ambiguous external advance latches denial;
+readback signs a fresh nonce only while a separate physical read fence and
+signed retained high-water check both succeed. Restart with an older local
+SQLite snapshot fails against the external floor.
+
+Its constructor **requires** a separately custody-protected
+`physicalFence.withCurrentRead` callback holding the real physical writer
+fence across verification, the SQLite transaction, the independent retained
+anchor advance/readback and signing. The provider must await the complete
+continuation and return its exact result without releasing the fence first;
+the continuation also requires an externally trustworthy synchronous
+`lease.assertHeld() === true` throughout the critical section (including
+after asynchronous retained-anchor calls). This detects the common mistaken
+`try { return continuation(...); } finally { unlock(); }` pattern; an adapter
+that lies about the lease remains outside what this prototype can prove.
+An early return or release error causes fail-closed quarantine. Each changed physical head
+also requires a distinct signed previous-to-current physical lineage receipt;
+the local CAS ledger cannot infer physical ancestry from a freshly signed
+current head. It additionally requires a separately monotonic retained
+anchor implementing `readSignedHead` and `compareAndAdvance`.
+Injecting callback objects does not prove their independence. In any real
+deployment, those services, their Ed25519 private keys, the owner provision
+certificate digest and the signed retained floor must be kept outside the
+writer/CAS trust domains. The tests use genuine SQLite/Ed25519 but **synthetic**
+implementations of the off-host authorities, not actual independently
+operated physical stores.
+
+The prototype is NOT routed over HTTP or wired to the SyncEngine. It does
+not assert a physical durable receipt from PostgreSQL, establish independent
+custody, prove multi-host fencing, or authorize client ACK. A stronger-than-
+device-epoch rule requires a strictly newer witness fencing epoch for **each
+different commit**. The physical operator needs a per-batch fencing allocator
+to satisfy this rule safely; merely re-signing an old physical head must
+never advance it. Actual off-host physical/WAL/fsync verification, anchor
+custody, crash recovery, failover, and end-to-end Sync v2 integration remain
+DEV work, not production release approval.
