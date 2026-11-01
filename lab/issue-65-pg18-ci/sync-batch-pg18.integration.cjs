@@ -2711,6 +2711,27 @@ test("PG18 rejects isolated login or sole-service-group ownership of protected s
       }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
     }],
   ];
+  async function restoreSchemaOwnerAndServiceGrants() {
+    // PostgreSQL ALTER SCHEMA OWNER rewrites owner-related ACL entries: an
+    // owner round-trip can consume a service group's pre-existing USAGE grant.
+    // Restoring only nspowner leaves reader/issuer/verifier unable to see the
+    // protected schema and creates cascading false failures in later tests.
+    await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${schemaOwner}`);
+    await admin.query(`GRANT USAGE ON SCHEMA zk1_sync_batch TO
+      zk1_sync_batch_runtime, zk1_sync_batch_verifier,
+      zk1_sync_batch_attestor_reader, zk1_sync_batch_admission_issuer`);
+    for (const [role, pool] of authorities) {
+      const acl = await pool.query(`SELECT
+        pg_catalog.has_schema_privilege(current_user,'zk1_sync_batch','USAGE') AS can_read,
+        pg_catalog.has_schema_privilege(current_user,'zk1_sync_batch','CREATE') AS can_create,
+        pg_catalog.has_schema_privilege($1::name,'zk1_sync_batch','USAGE') AS group_read,
+        pg_catalog.has_schema_privilege($1::name,'zk1_sync_batch','CREATE') AS group_create`,
+      [role]);
+      assert.deepEqual(acl.rows[0], { can_read: true, can_create: false,
+        group_read: true, group_create: false },
+      "owner round-trip must restore exact least-privilege schema access");
+    }
+  }
   async function rejected(role, pool, deniedAction) {
     const client = await pool.connect();
     try {
@@ -2756,7 +2777,7 @@ test("PG18 rejects isolated login or sole-service-group ownership of protected s
       assert.equal(ownerCheck.rows[0].owns, true);
       await rejected(role, pool, deny);
     } finally {
-      await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${schemaOwner}`);
+      await restoreSchemaOwnerAndServiceGrants();
     }
   }
   const readerLogin = (await attestor.query(`SELECT
@@ -2769,7 +2790,7 @@ test("PG18 rejects isolated login or sole-service-group ownership of protected s
       .rows[0].owns, true);
     await rejected(...authorities[0]);
   } finally {
-    await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${schemaOwner}`);
+    await restoreSchemaOwnerAndServiceGrants();
   }
   // Database ownership is a distinct destructive path: from a second DB
   // connection, the owner may DROP DATABASE regardless of DML privileges.
