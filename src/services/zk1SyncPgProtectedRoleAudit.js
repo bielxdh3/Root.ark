@@ -8,6 +8,11 @@
 // runs against the underlying table using its owner's privileges by default.
 // A role with only UPDATE(view) can thus modify protected physical rows even
 // when no direct base-table DML or SECURITY DEFINER EXECUTE was granted.
+// TRIGGER is also mutation authority: a non-writer able to install a trigger
+// on scope_head can redirect a later owner-run SECURITY DEFINER admission
+// update despite having no direct UPDATE privilege of its own.
+// REFERENCES can also confer an indirect callback/coercion path through
+// foreign-key enforcement; it is not an appropriate least-privilege grant.
 // Refuse ALL application-schema DML except the issuer's explicit ticket INSERT.
 const PROTECTED_TABLE_COUNT = 7;
 
@@ -20,16 +25,22 @@ async function hasUnexpectedProtectedDml(client, { allowTicketInsert = false } =
         pg_catalog.has_table_privilege(current_user,c.oid,'UPDATE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'DELETE')
         OR pg_catalog.has_table_privilege(current_user,c.oid,'TRUNCATE')
-        OR pg_catalog.has_column_privilege(current_user,c.oid,a.attnum,'UPDATE')
+        OR pg_catalog.has_table_privilege(current_user,c.oid,'TRIGGER')
+        OR pg_catalog.has_table_privilege(current_user,c.oid,'REFERENCES')
+        OR COALESCE(pg_catalog.has_column_privilege(
+          current_user,c.oid,a.attnum,'UPDATE'),false)
+        OR COALESCE(pg_catalog.has_column_privilege(
+          current_user,c.oid,a.attnum,'REFERENCES'),false)
         OR (NOT ($1::boolean AND n.nspname='zk1_sync_batch'
           AND c.relname='admission_ticket' AND c.relkind IN ('r','p')) AND (
           pg_catalog.has_table_privilege(current_user,c.oid,'INSERT')
-          OR pg_catalog.has_column_privilege(current_user,c.oid,a.attnum,'INSERT')
+          OR COALESCE(pg_catalog.has_column_privilege(
+            current_user,c.oid,a.attnum,'INSERT'),false)
         ))
       ),true) AS unsafe_dml
     FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-    JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid
+    LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid
       AND a.attnum > 0 AND NOT a.attisdropped
     WHERE n.nspname NOT IN ('pg_catalog','information_schema')
       AND n.nspname NOT LIKE 'pg_toast%'
