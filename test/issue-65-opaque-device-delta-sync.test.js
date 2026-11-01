@@ -13,6 +13,7 @@ const { sealZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-c
 const sourceFile = path.join(__dirname,
   "../public/client/rootark-zk1-opaque-device-delta-sync.js");
 const probeFile = path.join(__dirname, "support/issue-65-opaque-delta-browser-probe.js");
+const restoreProbeFile = path.join(__dirname, "support/issue-65-opaque-restore-probe.js");
 
 test("independently authorized opaque delta client boots without generic sync-v2", () => {
   const source = fs.readFileSync(path.join(__dirname,
@@ -51,6 +52,80 @@ test("Node22/24 browser VM rejects replay/logout after opaque delta with no plai
   vm.runInContext(fs.readFileSync(probeFile, "utf8"), context);
   assert.equal(await context.runOpaqueDeltaBrowserProbe(), "PASS");
 });
+
+for (const caseName of ["valid", "rekeyValid"]) {
+  test(`authorized ${caseName} historical restore re-encrypts through signed browser PUT/GET and rejects replay`,
+    { timeout: 30_000 }, async (t) => {
+      const scopeBytes = { account_id: crypto.randomBytes(16),
+        compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };
+      const scope = Object.fromEntries(Object.entries(scopeBytes)
+        .map(([name, value]) => [name, value.toString("base64url")]));
+      const objectId = crypto.randomBytes(16).toString("base64url");
+      const metadataKey = crypto.randomBytes(32);
+      const tombstoneKey = caseName === "rekeyValid" ? crypto.randomBytes(32) : metadataKey;
+      const name = "restored-private-name.txt";
+      const sourceMetadataCiphertext = await sealZk1CatalogMetadataV1({
+        scope: scopeBytes, objectId, revision: 1, epoch: 1, metadataKey, name,
+      });
+      const tombstoneMetadataCiphertext = await sealZk1CatalogMetadataV1({
+        scope: scopeBytes, objectId, revision: 2,
+        epoch: caseName === "rekeyValid" ? 2 : 1,
+        metadataKey: tombstoneKey, name: "\uE000rootark-zk1-logical-trash/v1",
+      });
+      const stored = new Map();
+      const server = http.createServer(async (req, res) => {
+        try {
+          const parts = [];
+          for await (const part of req) parts.push(part);
+          const input = JSON.parse(Buffer.concat(parts).toString("utf8"));
+          const key = `${input.objectId}:${input.revision}`;
+          let reply;
+          if (req.method !== "POST") throw Error("INVALID_METHOD");
+          if (req.url === "/fixture" || req.url === "/protected-put") {
+            if (stored.has(key)) throw Error("DUPLICATE_VERSION");
+            stored.set(key, input.ciphertextBase64);
+            reply = { accepted: true };
+          } else if (req.url === "/protected-get") {
+            if (!stored.has(key)) throw Error("MISSING_CIPHERTEXT");
+            reply = { ciphertextBase64: stored.get(key) };
+          } else throw Error("INVALID_ROUTE");
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(reply));
+        } catch (_) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end('{"error":"denied"}');
+        }
+      });
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      t.after(() => new Promise((resolve) => server.close(resolve)));
+      const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob, fetch };
+      context.globalThis = context;
+      vm.createContext(context);
+      for (const script of ["rootark-zk1-file-content",
+        "rootark-zk1-ciphertext-chunk-root", "rootark-zk1-browser-opaque-catalog-commit"]) {
+        vm.runInContext(fs.readFileSync(path.join(__dirname,
+          `../public/client/${script}.js`), "utf8"), context);
+      }
+      context.installOpaqueRestoreClient = async () => {
+        vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+      };
+      vm.runInContext(fs.readFileSync(restoreProbeFile, "utf8"), context);
+      const result = await context.runOpaqueRestoreProbe({ caseName, scope, objectId,
+        sourceMetadata: { ...scope, object_id: objectId,
+          version_id: crypto.randomBytes(16).toString("base64url"),
+          parent_version_id: null, epoch: 1, kind: "file" },
+        metadataKeyBase64: metadataKey.toString("base64url"),
+        tombstoneMetadataKeyBase64: tombstoneKey.toString("base64url"),
+        cekBase64: crypto.randomBytes(32).toString("base64url"),
+        sourceMetadataCiphertextBase64: sourceMetadataCiphertext.toString("base64url"),
+        tombstoneMetadataCiphertextBase64: tombstoneMetadataCiphertext.toString("base64url"),
+        origin: `http://127.0.0.1:${server.address().port}` });
+      assert.equal(result.result, "PASS");
+      assert.equal(result.puts, 1);
+      assert.equal(result.gets, caseName === "rekeyValid" ? 3 : 2);
+      assert.equal(stored.size, 3, "historical source, signed tombstone, and one new ciphertext version");
+    });
+}
 
 test("real Edge runs opaque delta browser contract under restrictive CSP", {
   timeout: 40_000,
