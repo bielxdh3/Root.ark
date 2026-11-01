@@ -187,6 +187,10 @@ function createZk1SyncPgBatchIndependentReadback({ attestorPool } = {}) {
         return Object.freeze({
           scope, commitId, sequence: Number(m.sequence),
           head: m.head.toString("hex"),
+          // Checked against the immutable signed DELETE+MOVE envelopes and
+          // current SQL policy in this same read-only snapshot. Account/store
+          // IDs are NOT present in this schema and are not invented here.
+          username: m.username, compartmentId: m.compartment_id,
           operationIds: operations.map((op) => op.operationId),
           envelopeDigests: originalRows.rows.map((row) => row.envelope_digest.toString("hex")),
           localPgRowsConsistent: true,

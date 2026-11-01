@@ -17,6 +17,10 @@ const { createZk1SyncPgIndependentAdmissionIssuer } =
   require("../../src/services/zk1SyncPgIndependentAdmissionIssuer");
 const { createZk1SyncPgBatchIndependentReadback } =
   require("../../src/services/zk1SyncPgBatchIndependentReadback");
+const { createZk1SyncAtomicPgPhysicalFenceDevOff } =
+  require("../../src/services/zk1SyncAtomicPgPhysicalFenceDevOff");
+const { WITNESS_DOMAIN } =
+  require("../../src/services/zk1SyncAtomicCasFloorLedgerDevOff");
 const { createZk1SyncAtomicSqlReadbackHttpsServer } =
   require("../../src/services/zk1SyncAtomicSqlReadbackHttpsServer");
 const { createPrivateAuthorityFixture } =
@@ -1400,6 +1404,92 @@ test("PG18 read-only current signed pair resolves a lost ACK by exact signed env
   await assert.rejects(readback.verifyCurrentSignedPair(request),
     { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
     "current revocation must defeat a previously committed SQL row readback");
+});
+
+test("PG18 actual read-only role bridges a synthetic held v2 physical lease without creating ACK authorization", async () => {
+  // Real PostgreSQL 18 SQL transaction and least-privilege reader, but a
+  // TEST-ONLY synthetic witness. This is not evidence of physical durability.
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const committed = await commitTestBatch(f, operations);
+  const key = crypto.generateKeyPairSync("ed25519");
+  const challenge = { scope: f.scope, accountId: crypto.randomUUID(),
+    storeId: crypto.randomUUID(), username: f.username, compartmentId: "private",
+    nonce: crypto.randomBytes(32).toString("base64url"),
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) =>
+      hash(protocol.canonicalJson(op)).toString("hex")),
+    expectedPrevious: null };
+  const externalPhysicalFence = { async withCurrentRead(request, continuation) {
+    assert.deepEqual(request, challenge);
+    let held = true;
+    const statement = { version: 2, scope: request.scope,
+      accountId: request.accountId, storeId: request.storeId,
+      username: request.username, compartmentId: request.compartmentId,
+      nonce: request.nonce, operationIds: request.operationIds,
+      envelopeDigests: request.envelopeDigests,
+      commitId: committed.commitId,
+      storeHeadSha256: committed.storeHeadSha256,
+      fencingEpoch: 1, physicalDurable: true };
+    const signature = crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+      + protocol.canonicalJson(statement)), key.privateKey).toString("base64url");
+    try {
+      return await continuation({ receipt: { statement, signature }, lineage: null },
+        { assertHeld: () => held });
+    } finally { held = false; }
+  } };
+  const adapterFor = (attestorPool) => createZk1SyncAtomicPgPhysicalFenceDevOff({
+    attestorPool, externalPhysicalFence, witnessPublicKey: key.publicKey,
+  });
+  let signedContinuation = 0;
+  const accepted = await adapterFor(attestor).withCurrentRead(challenge,
+    async (bundle, lease) => {
+      assert.equal(lease.assertHeld(), true);
+      assert.equal(bundle.receipt.statement.commitId, committed.commitId);
+      signedContinuation++;
+      return "DEV_OFF_SQL_AND_SYNTHETIC_WITNESS_ONLY";
+    });
+  assert.equal(accepted, "DEV_OFF_SQL_AND_SYNTHETIC_WITNESS_ONLY");
+  assert.equal(signedContinuation, 1);
+  for (const change of [{ username: "different-user" },
+    { compartmentId: "different-compartment" },
+    { envelopeDigests: ["0".repeat(64), challenge.envelopeDigests[1]] }]) {
+    // Separate test callbacks re-sign the submitted challenge; PostgreSQL
+    // itself must reject any mismatched policy identity or operation digest.
+    const altered = { ...challenge, ...change };
+    const signedForAltered = {
+      async withCurrentRead(request, continuation) {
+        let held = true;
+        const statement = { version: 2, scope: request.scope,
+          accountId: request.accountId, storeId: request.storeId,
+          username: request.username, compartmentId: request.compartmentId,
+          nonce: request.nonce, operationIds: request.operationIds,
+          envelopeDigests: request.envelopeDigests,
+          commitId: committed.commitId,
+          storeHeadSha256: committed.storeHeadSha256,
+          fencingEpoch: 1, physicalDurable: true };
+        const signature = crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+          + protocol.canonicalJson(statement)), key.privateKey).toString("base64url");
+        try {
+          return await continuation({ receipt: { statement, signature }, lineage: null },
+            { assertHeld: () => held });
+        } finally { held = false; }
+      },
+    };
+    const negative = createZk1SyncAtomicPgPhysicalFenceDevOff({
+      attestorPool: attestor, externalPhysicalFence: signedForAltered,
+      witnessPublicKey: key.publicKey,
+    });
+    await assert.rejects(negative.withCurrentRead(altered, async () => {
+      signedContinuation++;
+    }), { code: "SYNC_ATOMIC_PG_FENCE_DEV_OFF_DENIED" },
+    "a signed but SQL-inconsistent v2 witness cannot enter protected CAS");
+  }
+  await assert.rejects(adapterFor(runtime).withCurrentRead(challenge, async () => {
+    signedContinuation++;
+  }), { code: "SYNC_ATOMIC_PG_FENCE_DEV_OFF_DENIED" },
+  "a writer/runtime role cannot impersonate the read-only PostgreSQL witness reader");
+  assert.equal(signedContinuation, 1);
 });
 
 test("PG18 latest-pair resolver refuses rolled-back physical SQL head without treating rows as a witness", async () => {
