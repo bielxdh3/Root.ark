@@ -94,7 +94,10 @@ The primary's offline-bootstrap database is **v2-sealed** using the trusted
 minimum public key: it persists a separate exact-schema
 `atomic_anchor_minimum_fence` binding. Any v1 operator trying to open this
 database fails its four-table schema audit; v2 startup also rejects a changed
-minimum signer. Existing legacy v1 databases are not silently migrated.
+minimum signer. The HTTPS factory additionally refuses a configured minimum
+whose public signing key does not match the database's immutable pinned key;
+checking only whether an independent operator exists is never sufficient.
+Existing legacy v1 databases are not silently migrated.
 
 V2 startup requires a fresh independently signed minimum that exactly matches
 each local scope head **and account/store identities**. Every head read checks

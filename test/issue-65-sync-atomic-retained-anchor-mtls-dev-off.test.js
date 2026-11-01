@@ -158,6 +158,14 @@ test("a valid independently signed genesis for another account is never an accep
     principals: { [f.fingerprint("reader")]: [{ scope: f.owner.scope,
       canAdvance: false }] },
   }), denied, "a minimum-sealed v2 database cannot be served by legacy v1 transport");
+  assert.throws(() => createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({
+    key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
+    clientCa: f.read("ca.pem"), anchor: strictAnchor,
+    minimumFence: { ...minimumFence,
+      publicKey: crypto.generateKeyPairSync("ed25519").publicKey },
+    principals: { [f.fingerprint("reader")]: [{ scope: f.owner.scope,
+      canAdvance: false }] },
+  }), denied, "a v2 minimum service with a different otherwise valid signing key must be rejected before listening");
   const isolated = createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({
     key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
     clientCa: f.read("ca.pem"), anchor: strictAnchor, minimumFence,

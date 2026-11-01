@@ -177,6 +177,7 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
   #closed = false;
 
   get requiresMinimumFence() { return this.#minimumFenceFingerprint !== null; }
+  get minimumFenceFingerprint() { return this.#minimumFenceFingerprint; }
 
   constructor({ filename, bootstrapNew = false, signerPrivateKey,
     ownerBindings, trustedMinimumHeads, minimumFencePublicKey = null } = {}) {

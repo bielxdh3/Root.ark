@@ -142,7 +142,12 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
       && typeof minimumFence.compareAndAdvance === "function"
       && minimumFence.publicKey instanceof crypto.KeyObject
       && minimumFence.publicKey.type === "public"
-      && minimumFence.publicKey.asymmetricKeyType === "ed25519");
+      && minimumFence.publicKey.asymmetricKeyType === "ed25519"
+      // Mere existence of a second authority is insufficient: a privileged
+      // integration mistake must not silently substitute another (stale)
+      // signer B for the immutable minimum signer A sealed in SQLite.
+      && anchor.minimumFenceFingerprint === minimumFence.publicKey
+        .export({ type: "spki", format: "der" }).toString("hex"));
   }
   const grants = grantsOf(principals);
   const active = new Set();
