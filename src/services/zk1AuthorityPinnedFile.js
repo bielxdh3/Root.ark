@@ -101,8 +101,10 @@ function readPinned(value, maxBytes, verifyWindowsFile) {
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
       || before.size < 1n || before.size > BigInt(maxBytes)) denied();
     checkAuthorityPermissions(value, before, verifyWindowsFile);
+    // O_NOFOLLOW rejects symlinks, not FIFOs swapped into lstat-to-open.
+    // O_NONBLOCK ensures a substituted FIFO cannot indefinitely hang open().
     fd = fs.openSync(value, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
-      | (fs.constants.O_CLOEXEC || 0));
+      | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_CLOEXEC || 0));
     const opened = fs.fstatSync(fd, { bigint: true });
     if (!same(before, opened)) denied();
     content = Buffer.alloc(Number(opened.size));

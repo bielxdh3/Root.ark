@@ -167,6 +167,7 @@ function assertPrivateSqliteFile(filename) {
   // A prior pathname lstat is not a stable authorization for this open.
   const fd = fs.openSync(filename,
     fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+      | (fs.constants.O_NONBLOCK || 0)
       | (fs.constants.O_CLOEXEC || 0));
   try {
     const pinned = fs.fstatSync(fd, { bigint: true });
