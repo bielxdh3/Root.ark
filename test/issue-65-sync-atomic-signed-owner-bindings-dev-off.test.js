@@ -81,9 +81,15 @@ test("DEV-OFF operator-signed scope/owner/storage roster requires independent di
         { assertHeld: () => true });
     } },
   };
-  assert.throws(() => createZk1SyncAtomicPgPhysicalFenceDevOff({ ...options,
-    ownerBindings: [{ ...binding, accountId: crypto.randomUUID() }] }),
-  ADAPTER_DENIED, "a raw roster cannot silently override a signed/pinned owner identity");
+  for (const mismatch of [
+    { scope: "malicious:scope" }, { accountId: crypto.randomUUID() },
+    { storeId: crypto.randomUUID() }, { username: "malicious-owner" },
+    { compartmentId: "malicious-compartment" },
+  ]) {
+    assert.throws(() => createZk1SyncAtomicPgPhysicalFenceDevOff({ ...options,
+      ownerBindings: [{ ...binding, ...mismatch }] }), ADAPTER_DENIED,
+    "raw operator input must not override any signed/pinned owner identity field");
+  }
   assert.equal(observed, 0);
   const adapter = createZk1SyncAtomicPgPhysicalFenceDevOff(options);
   binding.storeId = crypto.randomUUID();
