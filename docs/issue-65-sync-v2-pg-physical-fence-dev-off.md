@@ -38,6 +38,22 @@ membership still permits a later `SET ROLE` to a more privileged owner; an
 admin session that temporarily `SET ROLE`s to appear read-only can likewise
 `RESET ROLE` to regain superuser authority. Both cases are denied in the
 disposable real-PostgreSQL grant/role-switch regression.
+The admission issuer now places its INSERT-only credential in a transaction
+with `statement_timeout` and `lock_timeout`, so a competing PostgreSQL
+`scope_head FOR UPDATE` lock cannot stall ticket creation indefinitely.
+Connection checkouts have independent finite deadlines; up to eight pending
+checkouts remain accounted for after a timeout until the underlying pool
+actually resolves, and late clients are released. These protections are
+availability/fail-closed controls, not authority for physical durability.
+The issuer additionally caps eight **whole admission operations** and denies
+each caller after a bounded wall deadline, even when PostgreSQL's driver hangs
+before `BEGIN` or after sending `COMMIT`. A timed-out operation retains its
+slot until the underlying query/rollback really settles; stale continuations
+cannot issue an ACK or run additional admission SQL and uncertain connections
+are destroyed rather than recycled. A `COMMIT` already sent to PostgreSQL can
+still durably create an expiring admission ticket after caller timeout: this
+ambiguous outcome is intentionally denied, never reported as success or
+upgraded to a protected physical acknowledgment.
 
 For each nonce-bound protected pair, the adapter independently checks:
 

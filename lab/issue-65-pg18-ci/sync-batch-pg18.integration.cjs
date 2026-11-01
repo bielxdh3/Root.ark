@@ -2217,3 +2217,237 @@ test("PG18 admission issuer rejects SECURITY DEFINER EXECUTE grants on both inde
   assert.equal(issued.clientAckAuthorized, false);
   assert.deepEqual(await f.state(), before);
 });
+
+test("PG18 ticket issuer lock timeout denies blocked admission without a ticket or protected mutation", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const before = await f.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [f.scope])).rows[0].n);
+  const originalCount = await countTickets();
+  const locked = await admin.connect();
+  const sqlErrors = [];
+  const observedIssuerPool = { async connect() {
+    const client = await issuer.connect();
+    return {
+      query: async (...args) => {
+        try { return await client.query(...args); }
+        catch (error) { sqlErrors.push(error?.code); throw error; }
+      },
+      release: () => client.release(),
+    };
+  } };
+  const timeoutIssuer = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: observedIssuerPool,
+  });
+  let begun = false;
+  try {
+    await locked.query("BEGIN");
+    begun = true;
+    await locked.query(`SELECT scope FROM zk1_sync_batch.scope_head
+      WHERE scope=$1 FOR UPDATE`, [f.scope]);
+    // The issuer's BEFORE INSERT trigger must wait for this actual SQL row
+    // lock; SET LOCAL lock_timeout terminates it instead of hanging forever.
+    await assert.rejects(timeoutIssuer.issueTicket({
+      scope: f.scope, username: f.username, operations,
+    }), { code: "SYNC_PG_ISSUER_DENIED" });
+    assert.ok(sqlErrors.includes("55P03"),
+      "PostgreSQL must actually throw lock_not_available from SET LOCAL lock_timeout");
+    assert.equal(await countTickets(), originalCount,
+      "rejected blocked issuer INSERT must not leave a live ticket");
+    assert.deepEqual(await f.state(), before);
+  } finally {
+    if (begun) await locked.query("ROLLBACK");
+    locked.release();
+  }
+  const valid = await timeoutIssuer.issueTicket({
+    scope: f.scope, username: f.username,
+    operations: await f.signedPair(),
+  });
+  assert.equal(typeof valid.admissionTicket, "string",
+    "the scoped issuer must recover after PostgreSQL unlocks");
+  assert.equal(await countTickets(), originalCount + 1);
+});
+
+test("PG18 issuer bounds abandoned pool acquisitions and releases late connections", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const unresolved = [];
+  let lateReleases = 0;
+  let readerPaused = true;
+  const pausedReader = { connect: () => readerPaused
+    ? new Promise((resolve) => unresolved.push(resolve)) : attestor.connect() };
+  const bounded = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: pausedReader, issuerPool: issuer, connectTimeoutMs: 2000,
+  });
+  const request = { scope: f.scope, username: f.username, operations: pair };
+  const eight = Array.from({ length: 8 }, () => assert.rejects(
+    bounded.issueTicket(request), { code: "SYNC_PG_ISSUER_DENIED" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(unresolved.length, 8,
+    "the first eight checkouts must actually be in flight");
+  await assert.rejects(bounded.issueTicket(request),
+    { code: "SYNC_PG_ISSUER_DENIED" },
+    "a ninth hanging checkout must be rejected by capacity, not queued");
+  assert.equal(unresolved.length, 8);
+  await Promise.all(eight);
+  unresolved.forEach((resolve) => resolve({ release() { lateReleases++; } }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lateReleases, 8,
+    "timed-out acquisitions must return any late connection to the pool");
+  assert.equal((await f.state()).markers.length, 0);
+  readerPaused = false;
+  const reopened = await bounded.issueTicket({
+    ...request, operations: await f.signedPair(),
+  });
+  assert.equal(typeof reopened.admissionTicket, "string",
+    "capacity must recover after actual pool checkout settlement");
+
+  const second = await fixture();
+  const issuerPending = [];
+  let issuerLateReleases = 0;
+  let issuerPaused = true;
+  const pausedIssuer = { connect: () => issuerPaused
+    ? new Promise((resolve) => issuerPending.push(resolve)) : issuer.connect() };
+  const boundedIssuer = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: pausedIssuer, connectTimeoutMs: 2000,
+  });
+  await assert.rejects(boundedIssuer.issueTicket({
+    scope: second.scope, username: second.username,
+    operations: await second.signedPair(),
+  }), { code: "SYNC_PG_ISSUER_DENIED" },
+  "the second pool acquisition after successful read-only attestation must time out");
+  assert.equal(issuerPending.length, 1,
+    "issuer credential checkout must actually have been reached");
+  issuerPending[0]({ release() { issuerLateReleases++; } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(issuerLateReleases, 1,
+    "an issuer connection arriving after timeout must also be returned");
+  issuerPaused = false;
+  const secondIssued = await boundedIssuer.issueTicket({
+    scope: second.scope, username: second.username,
+    operations: await second.signedPair(),
+  });
+  assert.equal(typeof secondIssued.admissionTicket, "string",
+    "issuer credential admission must recover after its late checkout settles");
+});
+
+test("PG18 issuer full-operation timeout retains eight hung BEGIN queries until they actually settle", async () => {
+  const f = await fixture();
+  const request = { scope: f.scope, username: f.username,
+    operations: await f.signedPair() };
+  const waitingBegins = [];
+  let released = 0;
+  let destroyed = 0;
+  let otherSql = 0;
+  const readerPool = { async connect() {
+    return {
+      query(sql) {
+        if (sql.startsWith("BEGIN")) {
+          return new Promise((resolve) => waitingBegins.push(resolve));
+        }
+        if (sql === "ROLLBACK") return Promise.resolve({});
+        otherSql++;
+        throw Error("a timed-out operation resumed prohibited SQL");
+      },
+      release(error) { released++; if (error) destroyed++; },
+    };
+  } };
+  const bounded = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool, issuerPool: issuer, connectTimeoutMs: 500,
+    operationTimeoutMs: 100,
+  });
+  const timedOut = Array.from({ length: 8 }, () => assert.rejects(
+    bounded.issueTicket(request), { code: "SYNC_PG_ISSUER_DENIED" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(waitingBegins.length, 8,
+    "all eight reader checkouts must finish and hang inside their BEGIN queries");
+  await Promise.all(timedOut);
+  await assert.rejects(bounded.issueTicket(request),
+    { code: "SYNC_PG_ISSUER_DENIED" });
+  assert.equal(waitingBegins.length, 8,
+    "a ninth checked-out query must not bypass the retained in-flight quota");
+  assert.equal(released, 0, "a still-running BEGIN must not be pooled early");
+  waitingBegins.forEach((resolve) => resolve({}));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 8);
+  assert.equal(destroyed, 8, "uncertain timed-out readers must be destroyed");
+  assert.equal(otherSql, 0, "late BEGIN completion cannot advance to policy SQL");
+  const retry = bounded.issueTicket(request);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(waitingBegins.length, 9,
+    "the full-operation cap must recover after actual driver settlement");
+  waitingBegins[8]({});
+  await assert.rejects(retry, { code: "SYNC_PG_ISSUER_DENIED" },
+    "the fake pool intentionally cannot provide further policy SQL");
+});
+
+test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket ACK", async () => {
+  const f = await fixture();
+  const request = { scope: f.scope, username: f.username,
+    operations: await f.signedPair() };
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [f.scope])).rows[0].n);
+  const before = await countTickets();
+  let commitReached;
+  const atCommit = new Promise((resolve) => { commitReached = resolve; });
+  let settleCommit;
+  let uncertainDestroyed = 0;
+  let signalRelease;
+  const released = new Promise((resolve) => { signalRelease = resolve; });
+  const deferredIssuer = { async connect() {
+    const client = await issuer.connect();
+    return {
+      query(sql, ...args) {
+        if (sql === "COMMIT") {
+          commitReached();
+          return new Promise((resolve, reject) => {
+            settleCommit = async () => {
+              try { resolve(await client.query("COMMIT")); }
+              catch (error) { reject(error); }
+            };
+          });
+        }
+        return client.query(sql, ...args);
+      },
+      release(error) {
+        if (error) uncertainDestroyed++;
+        try { client.release(error); } finally { signalRelease(); }
+      },
+    };
+  } };
+  const bounded = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: deferredIssuer,
+    connectTimeoutMs: 6000, operationTimeoutMs: 8000,
+  });
+  const denied = assert.rejects(bounded.issueTicket(request),
+    { code: "SYNC_PG_ISSUER_DENIED" });
+  let guard;
+  let priorCount;
+  try {
+    try {
+      await Promise.race([atCommit, new Promise((_, reject) => {
+        guard = setTimeout(() => reject(Error("issuer never reached COMMIT")), 12000);
+      })]);
+    } finally { clearTimeout(guard); }
+    await denied;
+    priorCount = await countTickets();
+  } finally {
+    // Never leave a real PostgreSQL client inside an intercepted COMMIT if
+    // a test assertion/guard fails: CI teardown must remain recoverable.
+    if (settleCommit) await settleCommit();
+    await denied;
+  }
+  assert.equal(priorCount, before,
+    "a paused COMMIT must not make an uncommitted ticket visible");
+  let releaseGuard;
+  try {
+    await Promise.race([released, new Promise((_, reject) => {
+      releaseGuard = setTimeout(() => reject(Error("issuer rollback/release never settled")), 6000);
+    })]);
+  } finally { clearTimeout(releaseGuard); }
+  assert.equal(uncertainDestroyed, 1,
+    "a commit resumed after caller deadline must destroy its uncertain pool client");
+  assert.equal(await countTickets(), before + 1,
+    "a late physical commit can persist, but must never generate a positive caller ACK");
+});

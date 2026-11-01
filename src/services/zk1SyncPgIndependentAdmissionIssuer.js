@@ -17,16 +17,54 @@ const validScope = /^[A-Za-z0-9._:-]{1,256}$/;
 const signedDigest = (value) =>
   crypto.createHash("sha256").update(protocol.canonicalJson(value), "utf8").digest();
 
-function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = {}) {
-  if (!readerPool?.connect || !issuerPool?.connect) throw fail();
-  return Object.freeze({
-    async issueTicket({ scope, username, operations } = {}) {
+function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool,
+  connectTimeoutMs = 6000, operationTimeoutMs = 25000 } = {}) {
+  if (!readerPool?.connect || !issuerPool?.connect
+    || !Number.isSafeInteger(connectTimeoutMs)
+    || connectTimeoutMs < 50 || connectTimeoutMs > 7000
+    || !Number.isSafeInteger(operationTimeoutMs)
+    || operationTimeoutMs < 50 || operationTimeoutMs > 30000) throw fail();
+  // A pool checkout may hang before PostgreSQL's statement_timeout begins.
+  // A wall-clock timeout does not cancel an in-flight checkout: count it until
+  // the real pool settles, then release any late client without using it.
+  const connecting = new Set();
+  // A connection may be checked out yet remain stalled in BEGIN/COMMIT or a
+  // network query before statement_timeout is installed. Count the COMPLETE
+  // operation until its driver Promise really settles, not just its timeout.
+  const pendingOperations = new Set();
+  async function acquire(pool) {
+    if (connecting.size >= 8) throw fail();
+    let abandoned = false;
+    const attempt = Promise.resolve().then(() => pool.connect());
+    connecting.add(attempt);
+    attempt.then((client) => {
+      connecting.delete(attempt);
+      if (abandoned) {
+        try { client?.release?.(); } catch { /* late checkout is unusable */ }
+      }
+    }, () => connecting.delete(attempt));
+    let timer;
+    try {
+      return await Promise.race([attempt, new Promise((_, reject) => {
+        timer = setTimeout(() => { abandoned = true; reject(fail()); }, connectTimeoutMs);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  async function executeTicket({ scope, username, operations } = {}, assertLive,
+    isCancelled) {
       if (typeof scope !== "string" || !validScope.test(scope)
         || typeof username !== "string" || !username || username.length > 512
         || !Array.isArray(operations) || operations.length !== 2) throw fail();
+      async function queryLive(client, ...args) {
+        assertLive();
+        const result = await client.query(...args);
+        assertLive();
+        return result;
+      }
       let reader;
       let issuer;
       let snapshot = false;
+      let issuing = false;
       try {
         const pair = operations.map((item) =>
           protocol.validateFreshSignedOperation(JSON.parse(protocol.canonicalJson(item))));
@@ -46,11 +84,13 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           || deleted.operationId === moved.operationId
           || !verifyWebdavOverwriteProvenance(deleted, moved)) throw fail();
 
-        reader = await readerPool.connect();
-        await reader.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        assertLive();
+        reader = await acquire(readerPool);
+        assertLive();
         snapshot = true;
-        await reader.query("SET LOCAL statement_timeout = '8000ms'");
-        const role = await reader.query(`SELECT
+        await queryLive(reader, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        await queryLive(reader, "SET LOCAL statement_timeout = '8000ms'");
+        const role = await queryLive(reader, `SELECT
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_attestor_reader','USAGE') AS reader,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','MEMBER') AS verifier,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_admission_issuer','MEMBER') AS issuer,
@@ -80,9 +120,14 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           || r.definer_execute
           || r.state_write || r.head_write || r.state_delete || r.state_truncate
           || r.head_delete || r.head_truncate) throw fail();
-        if (await hasUnexpectedRoleMembership(reader, "zk1_sync_batch_attestor_reader")
-          || await hasUnexpectedProtectedDml(reader)) throw fail();
-        const pinned = await reader.query(`SELECT p.username,p.compartment_id,p.key_epoch,
+        const readerEscalation = await hasUnexpectedRoleMembership(
+          reader, "zk1_sync_batch_attestor_reader");
+        assertLive();
+        if (readerEscalation) throw fail();
+        const readerDml = await hasUnexpectedProtectedDml(reader);
+        assertLive();
+        if (readerDml) throw fail();
+        const pinned = await queryLive(reader, `SELECT p.username,p.compartment_id,p.key_epoch,
           p.enabled,p.allow_delete,p.policy_epoch,g.device_id,g.public_key,g.revoked,
           h.sequence,h.head FROM zk1_sync_batch.scope_policy p
           JOIN zk1_sync_batch.scope_head h ON h.scope=p.scope
@@ -99,12 +144,14 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           || !Buffer.isBuffer(row.head) || row.head.length !== 32
           || !Number.isSafeInteger(Number(row.sequence) + 1)) throw fail();
         for (const op of pair) {
+          assertLive();
           await verifyAuthorizationProof(op.authorization, op, {
             username, trustedDevicePublicKeys: { [row.device_id]: row.public_key },
             revokedDeviceIds: [],
           });
+          assertLive();
         }
-        await reader.query("COMMIT");
+        await queryLive(reader, "COMMIT");
         snapshot = false;
         reader.release();
         reader = undefined;
@@ -112,8 +159,14 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
         // The independent issuer can only INSERT, not UPDATE/DELETE/read the
         // ticket or modify any protected state. The DB owner verifies the
         // policy_epoch/head/key/ticket AGAIN during admission consumption.
-        issuer = await issuerPool.connect();
-        const privileges = await issuer.query(`SELECT
+        assertLive();
+        issuer = await acquire(issuerPool);
+        assertLive();
+        issuing = true;
+        await queryLive(issuer, "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED");
+        await queryLive(issuer, "SET LOCAL statement_timeout = '8000ms'");
+        await queryLive(issuer, "SET LOCAL lock_timeout = '3000ms'");
+        const privileges = await queryLive(issuer, `SELECT
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_admission_issuer','USAGE') AS issuer,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','MEMBER') AS verifier,
           pg_catalog.pg_has_role(current_user,'zk1_sync_batch_attestor_reader','MEMBER') AS reader,
@@ -148,10 +201,17 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           || a.head_write || a.state_write || a.marker_write
           || a.ticket_delete || a.ticket_truncate || a.state_delete
           || a.state_truncate) throw fail();
-        if (await hasUnexpectedRoleMembership(issuer, "zk1_sync_batch_admission_issuer")
-          || await hasUnexpectedProtectedDml(issuer, { allowTicketInsert: true })) throw fail();
+        const issuerEscalation = await hasUnexpectedRoleMembership(
+          issuer, "zk1_sync_batch_admission_issuer");
+        assertLive();
+        if (issuerEscalation) throw fail();
+        const issuerDml = await hasUnexpectedProtectedDml(
+          issuer, { allowTicketInsert: true });
+        assertLive();
+        if (issuerDml) throw fail();
+        assertLive();
         const ticket = crypto.randomUUID();
-        await issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+        await queryLive(issuer, `INSERT INTO zk1_sync_batch.admission_ticket
           (ticket_id,scope,username,device_id,public_key,policy_epoch,
            sequence,previous_head,delete_digest,move_digest,expires_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
@@ -160,16 +220,47 @@ function createZk1SyncPgIndependentAdmissionIssuer({ readerPool, issuerPool } = 
           row.policy_epoch, Number(row.sequence) + 1, row.head,
           signedDigest(deleted), signedDigest(moved),
         ]);
+        await queryLive(issuer, "COMMIT");
+        issuing = false;
         // This is a short-lived DB admission handle, NOT a witness.
         return Object.freeze({ admissionTicket: ticket,
           witnessVerified: false, clientAckAuthorized: false });
       } catch { throw fail(); } finally {
+        let readerRollbackFailed = false;
+        let issuerRollbackFailed = false;
         if (snapshot && reader) {
-          try { await reader.query("ROLLBACK"); } catch { /* fail closed */ }
+          try { await reader.query("ROLLBACK"); }
+          catch { readerRollbackFailed = true; }
         }
-        reader?.release?.();
-        issuer?.release?.();
+        if (issuing && issuer) {
+          try { await issuer.query("ROLLBACK"); }
+          catch { issuerRollbackFailed = true; }
+        }
+        // A timed-out or unsuccessfully rolled-back connection has uncertain
+        // session state; ask node-postgres to DESTROY it instead of pooling it.
+        try { reader?.release?.(isCancelled() || readerRollbackFailed ? fail() : undefined); }
+        catch { /* original denial is authoritative */ }
+        try { issuer?.release?.(isCancelled() || issuerRollbackFailed ? fail() : undefined); }
+        catch { /* original denial is authoritative */ }
       }
+  }
+  return Object.freeze({
+    async issueTicket(input) {
+      if (pendingOperations.size >= 8) throw fail();
+      let cancelled = false;
+      const assertLive = () => { if (cancelled) throw fail(); };
+      const operation = Promise.resolve().then(() =>
+        executeTicket(input, assertLive, () => cancelled));
+      pendingOperations.add(operation);
+      const settle = () => { pendingOperations.delete(operation); };
+      operation.then(settle, settle);
+      let timer;
+      try {
+        return await Promise.race([operation, new Promise((_, reject) => {
+          timer = setTimeout(() => { cancelled = true; reject(fail()); },
+            operationTimeoutMs);
+        })]);
+      } catch { throw fail(); } finally { clearTimeout(timer); }
     },
   });
 }
