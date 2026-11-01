@@ -104,6 +104,11 @@ A crash between these steps intentionally leaves the primary locked: it cannot
 serve a signed stale head, acknowledge an uncertain commit, or silently repair
 the divergence. Hosted tests exercise two actual operator processes and deny
 a restored primary SQLite snapshot with an old valid Ed25519 history prefix.
+The test also advances the minimum while leaving the primary at its old tip,
+modeling a crash between the two commits; the operator then refuses startup.
+To simulate an actual old SQLite backup rather than WAL roll-forward, the
+disposable test first closes both primary processes and removes only that
+fixture database's newer WAL/SHM sidecars before restoring its old snapshot.
 
 This protects against restoring **only the primary database**. Running both
 operators under the same CI OS identity is NOT independent custody, and a
@@ -115,10 +120,12 @@ The endpoint is not mounted in the normal Root.ark server and no production
 capability is enabled. Operator certificate scope grants are deployment trust
 inputs and the transport cannot prove physical bytes or owner custody.
 
-**No deployment or ACK authorization is implied.** A local SQLite file remains
-rollbackable by a privileged administrator or a stale backup. WAL/FULL is not
-proof of separate physical durability, nor does this module implement an
-independently operated mTLS service, operator key custody, physical witness, fencing lease,
-or independently persisted update of the owner's trusted minimum after each
-advance. Until those are implemented and tested, this prototype MUST NOT be
-wired to protected SyncEngine ACK or represented as a production authority.
+**No deployment or ACK authorization is implied.** Both DEV-OFF operators use
+SQLite and can be simultaneously rolled back by an administrator with custody
+of both stores. The v2 remote-first minimum does persist a second signed head
+on every successful advance; it does **not** establish a non-rollbackable
+minimum in genuinely separate operator custody. WAL/FULL is not physical
+durability proof, and normative physical witness, independent signing-key
+custody, long-lived fencing leases, and authorized crash reconciliation remain
+unproven. This prototype MUST NOT be wired to protected SyncEngine ACK or
+represented as a production authority.

@@ -287,8 +287,40 @@ test("dual-process minimum-fenced operator bridges CAS and denies a restored SQL
     nonce: nonce() }), { code: "SYNC_ATOMIC_RETAINED_HTTPS_DEV_OFF_DENIED" },
   "there is no local bypass when the independently running authority stops");
   await stopOperator(secondOperator.child);
+  const locallyCommitted = new Zk1SyncAtomicRetainedAnchorDevOff({
+    filename: database, bootstrapNew: false, signerPrivateKey: signer.privateKey,
+    ownerBindings: [owner], trustedMinimumHeads: genesis,
+    minimumFencePublicKey: minimumSigner.publicKey,
+  });
+  assert.equal(locallyCommitted.readSignedBindingHead({ scope: owner.scope,
+    nonce: nonce() }).statement.sequence, 2,
+  "the primary is intact before simulating a remote-first interrupted advance");
+  locallyCommitted.close();
+  const minimumWriter = createZk1SyncAtomicRetainedAnchorHttpsClientDevOff({
+    hostname: "127.0.0.1", servername: "localhost", port: minimumPort,
+    ca: read("ca.pem"), cert: read("writer.pem"), key: read("writer.key"),
+    pinnedServerFingerprint: fingerprint("minimum-server"),
+    anchorPublicKey: minimumSigner.publicKey,
+  });
+  assert.equal(await minimumWriter.compareAndAdvance({ scope: owner.scope,
+    expectedSequence: 2, expectedHeadHash: divergent,
+    sequence: 3, headHash: hash() }), true,
+  "simulate a minimum CAS committed before the primary CAS, then crash");
+  const interrupted = runOperator(configFile);
+  t.after(() => stopOperator(interrupted.child));
+  await assert.rejects(interrupted.ready,
+    /operator exited 1: SYNC_RETAINED_OPERATOR_DEV_OFF_DENIED/,
+    "a missing primary commit after independent advance must block startup");
   // A previous, authentically signed SQLite snapshot is NOT an acceptable
   // recovery when a separate minimum service retained a newer sequence.
+  // A SQLite restore must replace its WAL/SHM as one backup generation:
+  // leaving a newer WAL next to the old primary file can replay sequence 2
+  // and produce a false negative on Windows. Both primary operators have
+  // exited; these are disposable test-only database sidecars.
+  for (const suffix of ["-wal", "-shm"]) {
+    fs.rmSync(`${database}${suffix}`, { force: true, maxRetries: 10,
+      retryDelay: 100 });
+  }
   fs.copyFileSync(originalPrefix, database);
   const authenticOldPrefix = new Zk1SyncAtomicRetainedAnchorDevOff({
     filename: database, bootstrapNew: false, signerPrivateKey: signer.privateKey,
@@ -305,5 +337,5 @@ test("dual-process minimum-fenced operator bridges CAS and denies a restored SQL
     /operator exited 1: SYNC_RETAINED_OPERATOR_DEV_OFF_DENIED/,
     "a stale primary SQLite prefix cannot restart with its old local genesis minimum");
   assert.equal((await minimumReader.readSignedHead({ scope: owner.scope,
-    nonce: nonce() })).statement.sequence, 2);
+    nonce: nonce() })).statement.sequence, 3);
 });

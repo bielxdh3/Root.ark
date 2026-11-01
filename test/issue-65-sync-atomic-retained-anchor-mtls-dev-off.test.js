@@ -124,6 +124,20 @@ test("real Sync v2 retained-anchor mTLS signs a fresh head and confirms durable 
 test("a valid independently signed genesis for another account is never an accepted twin", async (t) => {
   const f = await fixture(t);
   const minimumSigner = crypto.generateKeyPairSync("ed25519");
+  const primarySigner = crypto.generateKeyPairSync("ed25519");
+  const strictDir = createPrivateAuthorityFixture("zk65-binding-mismatch-");
+  const strictAnchor = new Zk1SyncAtomicRetainedAnchorDevOff({
+    filename: path.join(strictDir, "identity-fenced.sqlite"), bootstrapNew: true,
+    signerPrivateKey: primarySigner.privateKey, ownerBindings: [f.owner],
+    trustedMinimumHeads: [{ scope: f.owner.scope,
+      sequence: 0, headHash: GENESIS }],
+    minimumFencePublicKey: minimumSigner.publicKey,
+  });
+  t.after(() => {
+    strictAnchor.close();
+    fs.rmSync(strictDir, { recursive: true, force: true,
+      maxRetries: 10, retryDelay: 100 });
+  });
   const impostor = { ...f.owner, accountId: crypto.randomUUID() };
   const minimumFence = {
     publicKey: minimumSigner.publicKey,
@@ -138,9 +152,15 @@ test("a valid independently signed genesis for another account is never an accep
       throw Error("wrong-owner minimum must never reach CAS");
     },
   };
+  assert.throws(() => createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({
+    key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
+    clientCa: f.read("ca.pem"), anchor: strictAnchor,
+    principals: { [f.fingerprint("reader")]: [{ scope: f.owner.scope,
+      canAdvance: false }] },
+  }), denied, "a minimum-sealed v2 database cannot be served by legacy v1 transport");
   const isolated = createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({
     key: f.read("anchor-server.key"), cert: f.certificate("anchor-server"),
-    clientCa: f.read("ca.pem"), anchor: f.anchor, minimumFence,
+    clientCa: f.read("ca.pem"), anchor: strictAnchor, minimumFence,
     principals: { [f.fingerprint("reader")]: [{ scope: f.owner.scope,
       canAdvance: false }] },
   });
@@ -149,10 +169,11 @@ test("a valid independently signed genesis for another account is never an accep
     isolated.listen(0, "127.0.0.1", resolve);
   });
   t.after(() => new Promise((resolve) => isolated.close(resolve)));
-  await assert.rejects(f.client("reader", { port: isolated.address().port })
+  await assert.rejects(f.client("reader", { port: isolated.address().port,
+    anchorPublicKey: primarySigner.publicKey })
     .readSignedHead({ scope: f.owner.scope, nonce: nonce() }), denied,
   "matching scope, sequence, genesis hash and valid remote signature do not replace owner identity");
-  assert.equal(f.anchor.readSignedBindingHead({ scope: f.owner.scope,
+  assert.equal(strictAnchor.readSignedBindingHead({ scope: f.owner.scope,
     nonce: nonce() }).statement.sequence, 0);
 });
 

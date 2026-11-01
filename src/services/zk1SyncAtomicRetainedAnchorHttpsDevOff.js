@@ -134,6 +134,9 @@ function createZk1SyncAtomicRetainedAnchorHttpsServerDevOff({ key, cert, clientC
   anchor, principals, minimumFence = null } = {}) {
   requireValid(key && cert && clientCa
     && anchor instanceof Zk1SyncAtomicRetainedAnchorDevOff);
+  // A v2-pinned database cannot be exposed by a legacy transport that skips
+  // its independent minimum. Conversely, a v1 DB cannot impersonate v2.
+  requireValid(anchor.requiresMinimumFence === (minimumFence !== null));
   if (minimumFence !== null) {
     requireValid(minimumFence && typeof minimumFence.readSignedBindingHead === "function"
       && typeof minimumFence.compareAndAdvance === "function"

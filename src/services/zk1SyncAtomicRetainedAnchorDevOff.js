@@ -176,6 +176,8 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
   #minimumFenceFingerprint;
   #closed = false;
 
+  get requiresMinimumFence() { return this.#minimumFenceFingerprint !== null; }
+
   constructor({ filename, bootstrapNew = false, signerPrivateKey,
     ownerBindings, trustedMinimumHeads, minimumFencePublicKey = null } = {}) {
     requireValid(signerPrivateKey instanceof crypto.KeyObject
