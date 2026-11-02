@@ -68,6 +68,21 @@ test("canonical TAP recorder reveals bounded cold-ACL categories but no raw titl
   }
 });
 
+test("canonical Windows breadcrumb hashes last subtest/result without leaking untrusted labels", () => {
+  const output = [];
+  const tracker = createTapProgressRecorder((line) => output.push(line));
+  const secretTitle = "test C:\\private\\hidden password=DO_NOT_LOG";
+  const secretSubtest = "path=C:\\private\\another secret=DO_NOT_LOG";
+  tracker.accept(`# Subtest: ${secretSubtest}`);
+  tracker.accept(`ok 1 - ${secretTitle}`);
+  assert.equal(tracker.state.results, 1);
+  assert.equal(tracker.state.subtests, 1);
+  const summary = tracker.safeSummary();
+  assert.match(summary, new RegExp(`lastSubtestSha256=${hash(secretSubtest)}`));
+  assert.match(summary, new RegExp(`lastResultSha256=${hash(secretTitle)}`));
+  assert.doesNotMatch(summary + output.join("\n"), /DO_NOT_LOG|C:\\private|password=|secret=/);
+});
+
 test("cold diagnostic producer has only pinned stage choices and retains a genuine failure", async () => {
   const printed = [];
   const diag = createAclFailureDiagnostic({ diagnostic: (message) => printed.push(message) }, "WEB_DAV_COLD");

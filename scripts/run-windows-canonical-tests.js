@@ -9,7 +9,10 @@ const { getNpmInvocation } = require("./release-gate-environment");
 const { parseAclFailureDiagnostic } = require("./acl-test-failure-diagnostic");
 const { parseEdgeFailureDiagnostic } = require("./edge-test-failure-diagnostic");
 
-const HEARTBEAT_MS = 60_000;
+// Hosted Windows can terminate a process before Node exit/close callbacks run.
+// Small, synchronous and secret-safe progress breadcrumbs preserve the last
+// observed state even when the final TAP summary cannot be emitted.
+const HEARTBEAT_MS = 15_000;
 const IDLE_LIMIT_MS = 15 * 60_000;
 const TOTAL_LIMIT_MS = 55 * 60_000;
 const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
@@ -42,7 +45,8 @@ function canonicalWindowsTestEnvironment(environment = process.env,
 }
 
 function createTapProgressRecorder(write) {
-  const state = { results: 0, failures: 0, plan: false, tests: null, reportedFailures: null };
+  const state = { results: 0, failures: 0, plan: false, tests: null, reportedFailures: null,
+    lastResultHash: "none", lastSubtestHash: "none", subtests: 0 };
   const categories = { assertion: 0, sqlite_busy: 0, filesystem: 0,
     network_timeout: 0, dependency: 0, runtime: 0, unknown: 0 };
   const failurePaths = new Map();
@@ -79,20 +83,26 @@ function createTapProgressRecorder(write) {
       const topFailurePaths = [...failurePaths].sort((a, b) => b[1] - a[1]
         || a[0].localeCompare(b[0])).slice(0, 4)
         .map(([pathHash, count]) => `${pathHash}:${count}`).join(",") || "none";
-      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths}`;
+      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths} subtests=${state.subtests} lastSubtestSha256=${state.lastSubtestHash} lastResultSha256=${state.lastResultHash}`;
     },
     accept(line) {
+      const subtest = /^\s{0,8}# Subtest: (.{1,4096})$/.exec(line);
+      if (subtest) {
+        state.lastSubtestHash = hash(subtest[1]);
+        state.subtests += 1;
+      }
       const result = /^(ok|not ok) ([1-9]\d{0,8}) - (.{1,4096})$/.exec(line);
       if (result) {
         finish();
         state.results += 1;
+        state.lastResultHash = hash(result[3]);
         if (result[1] === "not ok") {
           state.failures += 1;
           const nameHash = hash(result[3]);
           write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
           pending = { index: result[2], nameHash, pathHash: "none",
             failureType: "unknown", code: "unknown" };
-        } else if (state.results % 100 === 0) {
+        } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
         }
       }
@@ -131,7 +141,11 @@ function run() {
   let spawnFailed = false;
   let stderrBytes = 0;
   let reportedSuite = false;
-  const tracker = createTapProgressRecorder((message) => console.log(message));
+  function writeProgressDiagnostic(message) {
+    try { fs.writeSync(1, `${message}\n`); }
+    catch { console.log(message); }
+  }
+  const tracker = createTapProgressRecorder(writeProgressDiagnostic);
   // PowerShell/CI can lose the last asynchronous console line when npm or its
   // parent exits during a buffered write. Emit failures synchronously instead.
   function writeFailureDiagnostic(message) {
@@ -168,6 +182,10 @@ function run() {
 
   consume(child.stdout, false);
   consume(child.stderr, true);
+  process.on("uncaughtExceptionMonitor", (error, origin) => {
+    const code = SAFE_CODES.has(error?.code) ? error.code : "unknown";
+    writeFailureDiagnostic(`FAIL Windows canonical runner uncaught error: code=${code} origin=${origin === "unhandledRejection" ? "rejection" : "exception"} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()}`);
+  });
   process.on("exit", (exitCode) => {
     if (!reportedSuite) {
       tracker.finish();
@@ -193,12 +211,18 @@ function run() {
   const heartbeat = setInterval(() => {
     const elapsed = Math.floor((Date.now() - started) / 1000);
     const idle = Math.floor((Date.now() - lastOutput) / 1000);
-    console.log(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()}`);
+    writeProgressDiagnostic(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()}`);
     if (idle * 1000 >= IDLE_LIMIT_MS) terminate("idle timeout (15 minutes without child output)");
     else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (55 minutes)");
   }, HEARTBEAT_MS);
 
-  child.on("error", () => { spawnFailed = true; });
+  child.on("error", (error) => {
+    spawnFailed = true;
+    writeFailureDiagnostic(`FAIL Windows canonical child spawn error: code=${SAFE_CODES.has(error?.code) ? error.code : "unknown"} ${tracker.safeSummary()}`);
+  });
+  child.on("exit", (code, signal) => {
+    if (code !== 0 || signal) writeFailureDiagnostic(`FAIL Windows canonical child exit: code=${Number.isSafeInteger(code) ? code : "unknown"} signal=${signal ? "present" : "none"} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()}`);
+  });
   child.on("close", (code, signal) => {
     clearInterval(heartbeat);
     tracker.finish();
