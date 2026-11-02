@@ -5,8 +5,8 @@
 // a durable external receipt or a fenced cross-provider transaction.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
+const { createZk1PrivateCloudStagingDirectory } = require("./zk1PrivateCloudStagingDirectory");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { computeZk1CiphertextRoot } = require("../crypto/rootark-zk-chunk-root-v1");
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
@@ -138,10 +138,7 @@ class Zk1CloudCiphertextCopyPublisher {
         || !key.endsWith(`/uploads/${address.folder}/${address.name}`)) fail();
       if (await boundedIdentity(() => this.#writer.resolveInventoryContext()) !== this.#context) fail();
       this.#assertWriterStillPinned(address, key);
-      directory = process.platform === "win32"
-        ? await require("./zk1PrivateCloudStagingDirectory")
-          .createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-copy-")
-        : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-copy-"));
+      directory = await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-copy-");
       const staged = path.join(directory, "sealed-opaque-copy.ct");
       const fd = fs.openSync(staged,
         fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
