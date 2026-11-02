@@ -344,7 +344,8 @@
             || !Number.isSafeInteger(inputVersion.epoch)
             || inputVersion.epoch !== trust.pinnedOwnerHead.epoch) deny();
           if (typeof inputVersion.name !== "string" || !inputVersion.name
-            || inputVersion.name.length > 220) deny();
+            || inputVersion.name.length > 220 || te.encode(inputVersion.name).length > 220
+            || /[\u0000-\u001f\u007f]/.test(inputVersion.name)) deny();
           if ((inputVersion.name === TRASH_NAME) !== (internalTrash === true)) deny();
           sealed = bytes(inputVersion.ciphertext, 16, MAX);
           if (typeof inputVersion.objectId !== "string"
