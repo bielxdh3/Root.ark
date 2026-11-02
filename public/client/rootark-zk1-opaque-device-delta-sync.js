@@ -347,6 +347,9 @@
             || inputVersion.name.length > 220 || te.encode(inputVersion.name).length > 220
             || /[\u0000-\u001f\u007f]/.test(inputVersion.name)) deny();
           if ((inputVersion.name === TRASH_NAME) !== (internalTrash === true)) deny();
+          // A new object has no predecessor to decrypt, but its catalog row
+          // still needs an encrypt-capable key. Reject before intent/PUT.
+          metadataKey(inputVersion.metadataKey);
           sealed = bytes(inputVersion.ciphertext, 16, MAX);
           if (typeof inputVersion.objectId !== "string"
             || !/^[A-Za-z0-9_-]{22}$/.test(inputVersion.objectId)) deny();
@@ -363,7 +366,6 @@
             // visible file. Only the privately authorized restore path may
             // issue that transition. A changed/unknown old metadata key also
             // fails closed instead of treating ciphertext as "not trash".
-            metadataKey(inputVersion.metadataKey);
             if (internalRestore) readablePredecessorMetadataKey(predecessorMetadataKey);
             const parent = fresh.rows.find((row) => row.object_id === inputVersion.objectId
               && row.revision === expectedRevision);

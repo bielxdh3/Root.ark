@@ -26,7 +26,15 @@ function fixture({ sealed, readbackFailure = false }) {
   const request = { scope, operation, digest, expectedRootHash,
     expectedChunkCount: chunks.length, chunks };
   const activity = [];
+  const admissionId = crypto.randomBytes(16);
   const sink = Object.create(Zk1SharedPgCiphertextSink.prototype);
+  sink.finishVerifiedSeal = async ({ scope: sealedScope, operationId, admissionId: sealedId }) => {
+    activity.push("finish");
+    assert.deepEqual(sealedScope, scope);
+    assert.deepEqual(operationId, operation.operation_id);
+    assert.deepEqual(sealedId, admissionId);
+    return { status: "FINISHED" };
+  };
   sink.putSealed = async (input) => {
     activity.push("write");
     assert.deepEqual(input.operationId, operation.operation_id);
@@ -40,6 +48,7 @@ function fixture({ sealed, readbackFailure = false }) {
     assert.deepEqual(input.operationId, operation.operation_id);
     return { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
       walFlushConfirmed: true, operationId: Buffer.from(operation.operation_id),
+      admissionId: Buffer.from(admissionId),
       root: Buffer.from(expectedRootHash),
       ciphertextSha256: Buffer.from(operation.ciphertext_sha256) };
   };
@@ -64,7 +73,7 @@ test("previously sealed strict operation skips writer and requires authenticated
   const f = fixture({ sealed: true });
   assert.deepEqual(await f.bridge.putAndAttest(f.request),
     { status: "pending", authorizesIo: false });
-  assert.deepEqual(f.activity, ["reserve", "readback", "readback"]);
+  assert.deepEqual(f.activity, ["reserve", "readback", "finish", "readback"]);
 });
 
 test("unsealed exact prewrite intent resumes same immutable operation", async () => {

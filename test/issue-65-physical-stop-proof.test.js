@@ -7,6 +7,8 @@ const z = require("../src/crypto/rootark-zk-1");
 const path = require("node:path");
 const { signZk1PhysicalStopProof, verifyZk1PhysicalStopProof } =
   require("../src/crypto/rootark-zk-physical-stop-proof-v1");
+const { createZk1PhysicalStopRecorder } =
+  require("../src/services/zk1SharedPgPhysicalStopRecorder");
 const { Zk1IsolatedProcessStopSupervisor } =
   require("../src/services/zk1IsolatedProcessStopSupervisor");
 
@@ -21,6 +23,52 @@ function sample() {
     outcome: "kernel-process-handles-closed" };
   return { proof, keys };
 }
+
+test("durable identical STOP replay survives 50-second window; new stale STOP cannot insert", async () => {
+  const { proof, keys } = sample();
+  const signedProof = await signZk1PhysicalStopProof({ proof, privateKey: keys.privateKey });
+  const digest = crypto.createHash("sha256").update(signedProof).digest();
+  const expected = { scope: { account_id: proof.account_id,
+    compartment_id: proof.compartment_id, keyring_id: proof.keyring_id },
+  admissionId: proof.admission_id, workerId: proof.worker_id,
+  generation: proof.generation, principal: proof.principal,
+  processEpoch: proof.process_epoch, processPid: proof.process_pid };
+  const role = {
+    session_identity: "trusted_stop_login", active_identity: "trusted_stop_login",
+    login_ok: true, superuser: false, createdb: false, createrole: false,
+    stop_role: true, gate_role: false, writer_role: false, gate_member: false,
+    writer_member: false, can_set_gate: false, can_set_writer: false,
+    schema_use: true, schema_create: false, can_record_stop: true,
+    can_update_phase: false, can_update_worker: false,
+    can_write_ciphertext: false, can_delete_stop: false,
+  };
+  let persisted = true;
+  let inserted = false;
+  const client = { release() {}, async query(sql) {
+    if (sql.includes("pg_catalog.pg_has_role")) return { rowCount: 1, rows: [role] };
+    if (sql.startsWith("SELECT keyring_id")) return { rowCount: 1, rows: [{
+      keyring_id: proof.keyring_id, phase: "PENDING",
+      require_stop_proof: true, generation: 4 }] };
+    if (sql.includes("FROM\n        zk1_gate.physical_stop_receipt")) {
+      return persisted
+        ? { rowCount: 1, rows: [{ signed_proof: signedProof, proof_digest: digest }] }
+        : { rowCount: 0, rows: [] };
+    }
+    if (sql.includes("INSERT INTO zk1_gate.physical_stop_receipt")) inserted = true;
+    return { rowCount: 0, rows: [] };
+  } };
+  const recorder = await createZk1PhysicalStopRecorder({
+    pool: { connect: async () => client }, trustedHostKeyId: proof.host_key_id,
+    trustedHostPublicKey: keys.publicKey, nowSeconds: () => 1060,
+  });
+  assert.deepEqual(await recorder.record({ signedProof, expected }), {
+    status: "STOP_ATTESTED", proofDigest: digest,
+  });
+  persisted = false;
+  await assert.rejects(recorder.record({ signedProof, expected }),
+    /ZK_STOP_LEDGER_UNAVAILABLE/);
+  assert.equal(inserted, false, "stale unrecorded proof must never reach INSERT");
+});
 
 test("Ed25519 STOP receipt binds host/process epoch, worker and exact zk-1 scope", async () => {
   const { proof, keys } = sample();

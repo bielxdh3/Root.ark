@@ -766,6 +766,7 @@ async function verifyRecoveryTransitionPublicV2(input) {
   verifiedPublicTransitions.set(proof, {
     previousManifest: previousManifest === null ? null : await z.encodeDeterministic(previousManifest),
     nextManifest: await z.encodeDeterministic(nextManifest),
+    core: await z.encodeDeterministic(core),
   });
   return proof;
 }
@@ -773,25 +774,32 @@ async function verifyRecoveryTransitionPublicV2(input) {
 async function verifyRecoveryTransitionMacV2(input) {
   const proof = input.publicTransitionProof;
   if (!proof || !proof.nextManifest || !await module.exports.isVerifiedRecoveryTransitionPublicProofV2(proof)) fail();
+  // The public proof (including core) is caller-visible and mutable. Consume
+  // only the private canonical snapshot that passed public verification, not
+  // fields that could change before the asynchronous MAC calculation.
+  const snapshot = verifiedPublicTransitions.get(proof);
+  const previousManifest = snapshot.previousManifest === null
+    ? null : await z.decodeDeterministic(snapshot.previousManifest);
+  const nextManifest = await z.decodeDeterministic(snapshot.nextManifest);
   checkBytes(input.manifestMacKey, 32);
-  if (proof.previousManifest
-    && asNumber(proof.nextManifest.current_epoch) > asNumber(proof.previousManifest.current_epoch)) {
-    await assertPriorEpochKeyCoverage(input.priorEpochKeys, proof.previousManifest.epochs.length);
+  if (previousManifest
+    && asNumber(nextManifest.current_epoch) > asNumber(previousManifest.current_epoch)) {
+    await assertPriorEpochKeyCoverage(input.priorEpochKeys, previousManifest.epochs.length);
     const priorKeys = input.priorEpochKeys instanceof Map
       ? [...input.priorEpochKeys.values()]
       : input.priorEpochKeys.map((entry) => entry.key);
     if (priorKeys.some((key) => sameBytes(key, input.manifestMacKey))) fail("HISTORY_INVALID");
   }
-  if (proof.nextManifest.operation.operation_type === "compromise-package") {
+  if (nextManifest.operation.operation_type === "compromise-package") {
     assertCompromisePackageTransition({
-      previousManifest: proof.previousManifest,
-      nextManifestCore: coreOf(proof.nextManifest),
+      previousManifest,
+      nextManifestCore: coreOf(nextManifest),
       priorEpochKeys: input.priorEpochKeys,
     });
   }
-  const expected = await manifestMac(proof.core, input.manifestMacKey);
+  const expected = await manifestMac(coreOf(nextManifest), input.manifestMacKey);
   try {
-    if (!sameBytes(expected, proof.nextManifest.mac)) fail("HISTORY_INVALID");
+    if (!sameBytes(expected, nextManifest.mac)) fail("HISTORY_INVALID");
     return true;
   } finally {
     z.clearSecret(expected);
@@ -931,8 +939,9 @@ module.exports = {
     try {
       const previous = proof.previousManifest === null ? null : await z.encodeDeterministic(proof.previousManifest);
       const next = await z.encodeDeterministic(proof.nextManifest);
+      const core = await z.encodeDeterministic(proof.core);
       return (snapshot.previousManifest === null ? previous === null : sameBytes(snapshot.previousManifest, previous))
-        && sameBytes(snapshot.nextManifest, next);
+        && sameBytes(snapshot.nextManifest, next) && sameBytes(snapshot.core, core);
     } catch (_) {
       return false;
     }
