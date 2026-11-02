@@ -148,29 +148,22 @@ async function createCoordinatedSnapshots(main, mainPath, stageDir) {
   let sidecar;
   let inTransaction = false;
   try {
-    if (!strictMarker(lock)) {
-      // Before strict enrollment the legacy online-backup contract permits
-      // active SQLite writers. A long BEGIN IMMEDIATE here regresses that
-      // contract and can make concurrent writers fail with SQLITE_BUSY.
-      // Keep the strict two-snapshot writer fence only for enrolled accounts.
-      const sourcePath = journalPath(authoritativePath);
-      if (fs.existsSync(sourcePath)) {
-        auditPhysicalBytes(sourcePath);
-        verifyAuditDatabase(sourcePath);
-        sidecar = new Database(sourcePath, { readonly: true, fileMustExist: true });
-      }
+    const sourcePath = journalPath(authoritativePath);
+    const hasSidecar = fs.existsSync(sourcePath);
+    if (!strictMarker(lock) && !hasSidecar) {
+      // The legacy online backup admits concurrent writers ONLY when there
+      // is no independent audit journal to coordinate with the main DB.
+      // A present journal (even before strict enrollment) can move entries
+      // into main and then prune them between two SQLite snapshot points.
       await main.backup(mainSnapshot);
-      if (sidecar) {
-        await sidecar.backup(auditSnapshot);
-        verifyAuditDatabase(auditSnapshot);
+      // An enrollment or sidecar appearing mid-snapshot must not leave a
+      // purportedly complete backup with its acknowledged journal omitted.
+      if (inspectPrimary(mainSnapshot) || strictMarker(lock)
+        || fs.existsSync(sourcePath)) {
+        throw Error("Strict audit source changed across backup snapshot");
       }
-      // A concurrent strict enrollment may not be silently represented by
-      // a backup that contains an unmarked primary database.
-      if (inspectPrimary(mainSnapshot) || strictMarker(lock)) {
-        throw Error("Strict audit marker changed across backup snapshot");
-      }
-      return { snapshotPath: mainSnapshot, auditSnapshotPath: sidecar ? auditSnapshot : null,
-        auditSha256: sidecar ? sha256(auditSnapshot) : null, strict: false };
+      return { snapshotPath: mainSnapshot, auditSnapshotPath: null,
+        auditSha256: null, strict: false };
     }
     lock.pragma("busy_timeout = 0");
     const deadline = performance.now() + 15_000;
@@ -184,8 +177,8 @@ async function createCoordinatedSnapshots(main, mainPath, stageDir) {
       }
     }
     const strict = strictMarker(lock);
-    const sourcePath = journalPath(authoritativePath);
     const sourceExists = fs.existsSync(sourcePath);
+    if (hasSidecar && !sourceExists) throw Error("Audit journal disappeared during backup");
     if (strict && !sourceExists) throw Error("Strict audit journal missing: refusing incomplete backup");
     if (sourceExists) {
       auditPhysicalBytes(sourcePath);

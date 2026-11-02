@@ -118,7 +118,7 @@ test("main writer fence prevents pending audit transfer during both online snaps
 });
 
 test("unmarked legacy online backup allows concurrent main SQLite writers", async (t) => {
-  const sample = fixture(t, { strict: false });
+  const sample = fixture(t, { strict: false, missing: true });
   let writerAccepted = false;
   const originalBackup = sample.source.backup.bind(sample.source);
   sample.source.backup = async (...args) => {
@@ -134,6 +134,45 @@ test("unmarked legacy online backup allows concurrent main SQLite writers", asyn
   assert.equal(snapshot.strict, false);
   assert.equal(writerAccepted, true, "nonstrict online backup must not reserve the main writer");
   assert.equal(strictAudit.inspectPrimary(snapshot.snapshotPath), false);
+});
+
+test("unmarked backup with a sidecar fences transfers between main and journal", async (t) => {
+  const sample = fixture(t, { strict: false });
+  let writerBlocked = false;
+  const originalBackup = sample.source.backup.bind(sample.source);
+  sample.source.backup = (...args) => {
+    const writer = new Database(sample.primaryPath, { timeout: 0 });
+    try {
+      assert.throws(() => writer.exec("BEGIN IMMEDIATE"), /busy|locked/i);
+      writerBlocked = true;
+    } finally { writer.close(); }
+    return originalBackup(...args);
+  };
+  const snapshot = await strictAudit.createCoordinatedSnapshots(sample.source, sample.primaryPath, sample.stageDir);
+  assert.equal(snapshot.strict, false);
+  assert.equal(writerBlocked, true);
+  assert.equal(strictAudit.inspectPrimary(snapshot.snapshotPath), false);
+  assert.deepEqual(strictAudit.verifyAuditDatabase(snapshot.auditSnapshotPath), { pending: 1, archived: 1 });
+});
+
+test("unmarked backup rejects a sidecar created while the primary snapshot runs", async (t) => {
+  const sample = fixture(t, { strict: false, missing: true });
+  const originalBackup = sample.source.backup.bind(sample.source);
+  sample.source.backup = async (...args) => {
+    await originalBackup(...args);
+    fs.mkdirSync(path.dirname(sample.journalPath), { recursive: true });
+    const appeared = new Database(sample.journalPath);
+    try {
+      appeared.exec("CREATE TABLE pending_audit (id TEXT PRIMARY KEY, event TEXT);"
+        + "CREATE TABLE archived_audit (id TEXT PRIMARY KEY, event TEXT);");
+      appeared.prepare("INSERT INTO pending_audit VALUES (?,?)")
+        .run("new-during-backup", JSON.stringify({
+          id: "new-during-backup", eventType: "auth.login.failed",
+        }));
+    } finally { appeared.close(); }
+  };
+  await assert.rejects(strictAudit.createCoordinatedSnapshots(
+    sample.source, sample.primaryPath, sample.stageDir), /source changed across backup snapshot/);
 });
 
 test("restore writer drain waits for an already-admitted sidecar transaction", async (t) => {
