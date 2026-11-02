@@ -33,6 +33,43 @@ class Zk1SharedPgCiphertextSink {
     return this.#write(input, Buffer.from(root));
   }
 
+  async finishVerifiedSeal({ scope, operationId, admissionId } = {}) {
+    // Called only after an independent physical readback has verified the
+    // immutable SEALED row and supplied its original admission ID. This path
+    // writes no ciphertext and never creates/replaces an admission.
+    if (!scope || typeof scope !== "object" || Array.isArray(scope)
+      || Reflect.ownKeys(scope).length !== 3
+      || ["account_id", "compartment_id", "keyring_id"].some((k) =>
+        !Object.hasOwn(scope, k) || !(Buffer.isBuffer(scope[k]) || scope[k] instanceof Uint8Array))
+      || scope.account_id.length !== 16 || scope.keyring_id.length !== 16
+      || scope.compartment_id.length < 1 || scope.compartment_id.length > 128
+      || !(Buffer.isBuffer(operationId) || operationId instanceof Uint8Array)
+      || operationId.length !== 16
+      || !(Buffer.isBuffer(admissionId) || admissionId instanceof Uint8Array)
+      || admissionId.length !== 16) fail();
+    const workerId = crypto.createHash("sha256")
+      .update("Root.ark/zk-1/physical-inventory-worker/v1\0")
+      .update(Buffer.from(operationId)).digest().subarray(0, 16);
+    const detachedScope = {
+      account_id: Buffer.from(scope.account_id),
+      compartment_id: Buffer.from(scope.compartment_id),
+      keyring_id: Buffer.from(scope.keyring_id),
+    };
+    const stop = () => ({ scope: {
+      account_id: Buffer.from(detachedScope.account_id),
+      compartment_id: Buffer.from(detachedScope.compartment_id),
+      keyring_id: Buffer.from(detachedScope.keyring_id),
+    }, admissionId: Buffer.from(admissionId), workerId: Buffer.from(workerId) });
+    try {
+      let result;
+      try { result = await this.gate.finishIoAdmission(stop()); }
+      catch (_) { result = await this.gate.finishIoAdmission(stop()); }
+      if (!result || result.status !== "FINISHED"
+        || Reflect.ownKeys(result).length !== 1) fail();
+      return result;
+    } catch (_) { fail(); }
+  }
+
   async #write({ scope, objectId, revision, digest, chunks,
     expectedChunkCount, operationId } = {}, root) {
     if (!scope || typeof scope !== "object" || Array.isArray(scope)

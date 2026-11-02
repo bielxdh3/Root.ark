@@ -6,6 +6,7 @@
 // Cryptographic verification proves the trusted host supervisor made this
 // statement. OS exit and provider-stop truth remain the SUPERVISOR's duty.
 const crypto = require("node:crypto");
+const z = require("../crypto/rootark-zk-1");
 const { verifyZk1PhysicalStopProof } =
   require("../crypto/rootark-zk-physical-stop-proof-v1");
 // An instanceof check proves only JS class shape. Only the factory below
@@ -103,9 +104,19 @@ class Zk1SharedPgPhysicalStopRecorder {
 
   async record({ signedProof, expected } = {}) {
     // Verify the Ed25519 proof BEFORE touching any live SQL authority.
-    const proof = await verifyZk1PhysicalStopProof({ signedProof,
+    // First authenticate the historical statement without applying the fresh
+    // admission window. Only an EXACT already-committed SQL receipt may replay
+    // after 50 seconds; a new INSERT must still pass the original time fence.
+    const wire = bytes(signedProof, 100, 4096);
+    let timestamp;
+    try {
+      const parsed = await z.decodeDeterministic(wire);
+      timestamp = parsed?.stopped_at;
+      if (!Number.isSafeInteger(timestamp) || timestamp < 1) stopError();
+    } catch (_) { stopError(); }
+    const proof = await verifyZk1PhysicalStopProof({ signedProof: wire,
       hostKeyId: this.hostKeyId, hostPublicKey: this.hostPublicKey,
-      expected, nowSeconds: this.nowSeconds() });
+      expected, nowSeconds: timestamp });
     const scope = scopeKey(proof.scope);
     let c;
     try {
@@ -132,6 +143,9 @@ class Zk1SharedPgPhysicalStopRecorder {
         await c.query("COMMIT");
         return { status: "STOP_ATTESTED", proofDigest: Buffer.from(proof.proofDigest) };
       }
+      const now = this.nowSeconds();
+      if (!Number.isSafeInteger(now) || now < 1
+        || Math.abs(now - proof.stoppedAt) > 50) stopError();
       if (!["OPEN", "QUIESCING"].includes(head.phase)
         || (head.phase === "OPEN" && BigInt(head.generation) !== BigInt(proof.generation))
         || (head.phase === "QUIESCING"

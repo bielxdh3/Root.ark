@@ -762,7 +762,14 @@ class Zk1PgPhysicalInventoryBridge {
       // A lost SEAL acknowledgment is distinguished from an incomplete write
       // by a transactional PostgreSQL read under the pinned intent. An offline
       // or forged attestor can never be mistaken for a missing seal.
-      await this.#verifiedPhysical(v);
+      const physical = await this.#verifiedPhysical(v);
+      // A crash after SEAL but before FINISH leaves the original admission
+      // ACTIVE. Close exactly the persisted, physically attested admission;
+      // replaying START is forbidden once its immutable seal exists.
+      if (!Buffer.isBuffer(physical.admissionId) || physical.admissionId.length !== 16
+        || typeof this.sink.finishVerifiedSeal !== "function") fail();
+      await this.sink.finishVerifiedSeal({ scope: v.scope,
+        operationId: v.operation.operation_id, admissionId: physical.admissionId });
       return this.publishExisting({
         scope: v.scope, operation: v.operation, digest: v.digest,
         expectedRootHash: v.expectedRootHash, expectedChunkCount: v.expectedChunkCount,

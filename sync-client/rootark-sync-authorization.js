@@ -48,9 +48,10 @@ function exact(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !PROOF_FIELDS.includes(key)) || PROOF_FIELDS.some((key) => !Object.hasOwn(value, key))) fail("Invalid authorization schema");
 }
 
-function proofCore(operation, options) {
+function proofCore(operation, options, { allowExpired = false } = {}) {
   const expiresAt = Number(options.expiresAt || Date.now() + 5 * 60 * 1000);
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) fail("Authorization expired");
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0
+    || (!allowExpired && expiresAt <= Date.now())) fail("Authorization expired");
   const replayId = options.replayId || crypto.randomBytes(16).toString("base64url");
   const idempotencyKey = options.idempotencyKey === undefined ? generateIdempotencyKey() : options.idempotencyKey;
   if (!isValidIdempotencyKey(idempotencyKey)) fail("Invalid device authorization");
@@ -95,14 +96,15 @@ async function createAuthorizationProof(operation, options = {}) {
   return core;
 }
 
-async function verifyAuthorizationProof(proof, operation, expected = {}) {
+async function verifyProof(proof, operation, expected = {}, allowExpired = false) {
   exact(proof);
   const normalized = { ...proof };
   if (!isValidIdempotencyKey(normalized.idempotencyKey)) fail("Invalid device authorization");
   if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
-  if (normalized.expiresAt < Date.now()) fail("Authorization expired", "authorization_expired");
+  if (!Number.isSafeInteger(normalized.expiresAt) || normalized.expiresAt <= 0
+    || (!allowExpired && normalized.expiresAt <= Date.now())) fail("Authorization expired", "authorization_expired");
   if (normalized.protocolVersion !== operation.protocolVersion || normalized.username !== expected.username || normalized.deviceId !== operation.deviceId) fail("Authorization scope mismatch", "authorization_scope");
-  const expectedCore = proofCore(operation, { username: normalized.username, publicKey: normalized.publicKey, expiresAt: normalized.expiresAt, replayId: normalized.replayId, idempotencyKey: normalized.idempotencyKey });
+  const expectedCore = proofCore(operation, { username: normalized.username, publicKey: normalized.publicKey, expiresAt: normalized.expiresAt, replayId: normalized.replayId, idempotencyKey: normalized.idempotencyKey }, { allowExpired });
   for (const field of ["operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
     if (JSON.stringify(normalized[field]) !== JSON.stringify(expectedCore[field])) fail("Authorization payload mismatch", "authorization_scope");
   }
@@ -111,4 +113,21 @@ async function verifyAuthorizationProof(proof, operation, expected = {}) {
   return true;
 }
 
-module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof };
+async function verifyAuthorizationProof(proof, operation, expected = {}) {
+  return verifyProof(proof, operation, expected);
+}
+
+async function verifyHistoricalAuthorizationProof(proof, operation, expected = {}) {
+  // A historical signature remains cryptographically verifiable after expiry.
+  // Trust comes from current local device policy and the independently signed
+  // witnessed admission, which MUST precede the original expiration.
+  if (!expected.trustedDevicePublicKeys
+    || expected.trustedDevicePublicKeys[operation?.deviceId] !== proof?.publicKey
+    || !Array.isArray(expected.revokedDeviceIds)
+    || expected.revokedDeviceIds.includes(operation.deviceId)) {
+    fail("Historical device no longer trusted", "authorization_scope");
+  }
+  return verifyProof(proof, operation, expected, true);
+}
+
+module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof, verifyHistoricalAuthorizationProof };
