@@ -80,4 +80,10 @@ test("offline CAS proof rejects a signing key disguised as the separately pinned
     signerPublicKey: signer.disguised,
     independentSignerSpkiSha256: signer.foreignPin }),
   /ZK_OWNER_OFFLINE_CAS_PROOF_DENIED/);
+  // This is a separate CAS clock boundary from offline device approval.
+  for (const invalidNow of [undefined, NaN, null, -1, 1.5, "1700000000",
+    Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => cas.verifySignedCasProof({ ...expected, nowSeconds: invalidNow }),
+      /ZK_OWNER_OFFLINE_CAS_PROOF_DENIED/, `invalid CAS clock ${String(invalidNow)}`);
+  }
 });
