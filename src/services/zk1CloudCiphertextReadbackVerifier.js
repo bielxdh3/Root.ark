@@ -6,7 +6,6 @@
 // assertion that the provider cannot roll its bytes back after this check.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { createZk1PrivateCloudStagingDirectory } = require("./zk1PrivateCloudStagingDirectory");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
@@ -141,9 +140,7 @@ class Zk1CloudCiphertextReadbackVerifier {
       // Every bounded Windows provider GET now requires a private root:
       // S3/Drive stage through a nested disposable directory, while WebDAV
       // performs an exclusive create at the selected target pathname.
-      dir = process.platform === "win32"
-        ? await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-readback-")
-        : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-readback-"));
+      dir = await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-readback-");
       const destination = path.join(dir, "ciphertext.ct");
       const downloaded = await this.#reader.download(folder, name, destination, "uploads",
         () => true, { maxBytes: total,

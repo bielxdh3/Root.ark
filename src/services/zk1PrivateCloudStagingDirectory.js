@@ -13,7 +13,12 @@ const { checkWindowsPrivateCloudDirectory } = require("./zk1WindowsPrivateCloudA
 async function createZk1PrivateCloudStagingDirectory(prefix) {
   if (!/^[a-z0-9-]{1,64}$/.test(prefix)) throw new Error("Invalid cloud staging prefix");
   if (process.platform !== "win32") {
-    return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    // TEMP/TMPDIR may resolve through an ordinary OS-managed symlink.
+    // Canonicalize only the trusted staging root, BEFORE creating our private
+    // 0700 directory. Never canonicalize a caller-controlled upload source:
+    // the bounded provider's per-ancestor no-symlink checks stay mandatory.
+    const realTempRoot = fs.realpathSync.native(os.tmpdir());
+    return fs.mkdtempSync(path.join(realTempRoot, prefix));
   }
   const root = path.join(process.env.LOCALAPPDATA || os.homedir(),
     `${prefix}${crypto.randomBytes(16).toString("hex")}`);
