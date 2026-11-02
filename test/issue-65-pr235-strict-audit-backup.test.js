@@ -10,6 +10,9 @@ const { spawnSync } = require("node:child_process");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const crypto = require("node:crypto");
 const strictAudit = require("../services/strictAuditSnapshot");
+// Child fixtures run from disposable directories, outside the checkout.
+const CHILD_NODE_PATH = [path.join(__dirname, "..", "node_modules"), process.env.NODE_PATH]
+  .filter(Boolean).join(path.delimiter);
 
 function fixture(t, { strict = true, missing = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-strict-audit-backup-fixture-"));
@@ -114,6 +117,25 @@ test("main writer fence prevents pending audit transfer during both online snaps
   assert.deepEqual(strictAudit.verifyAuditDatabase(snapshot.auditSnapshotPath), { pending: 1, archived: 1 });
 });
 
+test("unmarked legacy online backup allows concurrent main SQLite writers", async (t) => {
+  const sample = fixture(t, { strict: false });
+  let writerAccepted = false;
+  const originalBackup = sample.source.backup.bind(sample.source);
+  sample.source.backup = async (...args) => {
+    const writer = new Database(sample.primaryPath, { timeout: 0 });
+    try {
+      writer.exec("BEGIN IMMEDIATE");
+      writer.exec("ROLLBACK");
+      writerAccepted = true;
+    } finally { writer.close(); }
+    return originalBackup(...args);
+  };
+  const snapshot = await strictAudit.createCoordinatedSnapshots(sample.source, sample.primaryPath, sample.stageDir);
+  assert.equal(snapshot.strict, false);
+  assert.equal(writerAccepted, true, "nonstrict online backup must not reserve the main writer");
+  assert.equal(strictAudit.inspectPrimary(snapshot.snapshotPath), false);
+});
+
 test("restore writer drain waits for an already-admitted sidecar transaction", async (t) => {
   const sample = fixture(t);
   const writer = new Database(sample.journalPath, { timeout: 0 });
@@ -183,7 +205,7 @@ test("real backup ZIP and whole restore preserve both saved and newer strict aud
   })().catch(e=>{console.error(e);process.exitCode=1});`;
   const result = spawnSync(process.execPath, ["-e", script], {
     cwd: root,
-    env: { ...process.env, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
+    env: { ...process.env, NODE_PATH: CHILD_NODE_PATH, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
       DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
       BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20",
       ROOTARK_RESTORE_INSTANCE_COUNT: "1", ROOTARK_INSTANCE_ID: "sidecar-fixture" },
@@ -228,7 +250,7 @@ test("post-audit replacement failure restores live sidecar evidence and main DB 
       console.log("STRICT_AUDIT_ROLLBACK_OK");
     })().catch(e=>{console.error(e);process.exitCode=1});`;
   const result = spawnSync(process.execPath, ["-e", script], { cwd: root,
-    env: { ...process.env, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
+    env: { ...process.env, NODE_PATH: CHILD_NODE_PATH, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
       DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
       BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20",
       ROOTARK_RESTORE_INSTANCE_COUNT: "1", ROOTARK_INSTANCE_ID: "sidecar-rollback" },
@@ -297,7 +319,7 @@ for (const origin of ["pending", "main", "current", "stored-pending", "stored-ma
         console.log("STRICT_AUDIT_COLLISION_DENIED");
       })().catch(e=>{console.error(e);process.exitCode=1});`;
     const result = spawnSync(process.execPath, ["-e", script], { cwd: root,
-      env: { ...process.env, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
+      env: { ...process.env, NODE_PATH: CHILD_NODE_PATH, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
         DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
         BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20",
         ROOTARK_RESTORE_INSTANCE_COUNT: "1", ROOTARK_INSTANCE_ID: `collision-${origin}` },
@@ -359,7 +381,7 @@ test("live strict audit path fails closed for conflicting IDs without deleting a
       console.log("STRICT_LIVE_COLLISIONS_FAIL_CLOSED");
     }catch(e){console.error(e);process.exitCode=1};`;
   const result = spawnSync(process.execPath, ["-e", script], { cwd: root,
-    env: { ...process.env, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
+    env: { ...process.env, NODE_PATH: CHILD_NODE_PATH, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
       DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
       BACKUP_INCLUDE_TEMP: "false" }, encoding: "utf8", timeout: 45_000 });
   assert.equal(result.status, 0, `${result.error?.message || ""}\n${result.stderr || ""}\n${result.stdout || ""}`);
