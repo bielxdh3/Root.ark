@@ -67,6 +67,19 @@ test("rename and move reject sessions revoked while waiting for a file lifecycle
     { username: "editor", password: bcrypt.hashSync(password, 10), role: "user", permissions: { listFiles: true, upload: true, delete: true }, sessionVersion: 0 },
     { username: "owner", password: bcrypt.hashSync(adminPassword, 10), role: "admin", permissions: { upload: true }, sessionVersion: 0 },
   ]));
+  function updateFixtureUser(update) {
+    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+    update(users[0]);
+    // The disposable server reads this file concurrently for authentication.
+    // Truncating it in place can expose partial JSON and turn a 403 into a 500.
+    const stagingPath = `${usersPath}.${crypto.randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(stagingPath, JSON.stringify(users), { flag: "wx" });
+      fs.renameSync(stagingPath, usersPath);
+    } finally {
+      fs.rmSync(stagingPath, { force: true });
+    }
+  }
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
     { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
     { id: "folder-a", name: "Folder A", createdBy: "editor", allowedUsers: [] },
@@ -171,9 +184,7 @@ test("rename and move reject sessions revoked while waiting for a file lifecycle
     const stale = mutate(session, stalePath, staleBody).then((response) => { staleSettled = true; return response; });
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(staleSettled, false, `${name} waits behind the active lifecycle lock`);
-    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
-    users[0].sessionVersion += 1;
-    fs.writeFileSync(usersPath, JSON.stringify(users));
+    updateFixtureUser((user) => { user.sessionVersion += 1; });
     fs.writeFileSync(gateReleasePath, "release");
     const [firstResult, staleResult] = await Promise.all([first, stale]);
     assert.equal(firstResult.status, 200, firstResult.body);
@@ -201,11 +212,17 @@ test("rename and move reject sessions revoked while waiting for a file lifecycle
   await scanStarted;
   let staleWebDavSettled = false;
   const staleWebDavPut = webDavPut("webdav-stale.txt", "stale webdav put").then((response) => { staleWebDavSettled = true; return response; });
+  const incomingDir = path.join(tempDir, ".incoming");
+  const incomingDeadline = Date.now() + 5000;
+  const stagedWebDavCount = () => fs.existsSync(incomingDir)
+    ? fs.readdirSync(incomingDir).filter((name) => name.endsWith(".webdav")).length : 0;
+  while (stagedWebDavCount() < 2 && Date.now() < incomingDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(stagedWebDavCount(), 2, "both WebDAV requests are authenticated and staged before revocation");
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(staleWebDavSettled, false, "WebDAV PUT waits behind the active folder lifecycle lock");
-  const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
-  users[0].permissions.upload = false;
-  fs.writeFileSync(usersPath, JSON.stringify(users));
+  updateFixtureUser((user) => { user.permissions.upload = false; });
   releaseScan();
   const [firstPutResult, stalePutResult] = await Promise.all([firstWebDavPut, staleWebDavPut]);
   assert.equal(firstPutResult.status, 201, firstPutResult.body);
@@ -292,18 +309,14 @@ test("rename and move reject sessions revoked while waiting for a file lifecycle
     method: "PUT",
     bodyValue: { expiresAt: new Date(Date.now() + 60_000).toISOString() },
   }, () => {
-    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
-    users.find((user) => user.username === "editor").sessionVersion += 1;
-    fs.writeFileSync(usersPath, JSON.stringify(users));
+    updateFixtureUser((user) => { user.sessionVersion += 1; });
   }, 401, () => {
     const folders = JSON.parse(fs.readFileSync(path.join(dataDir, "folders.json"), "utf8"));
     assert.equal(folders.find((folder) => folder.id === "folder-c").expiresAt, undefined);
   });
 
   await runFolderMutationWhileLocked("folder-b", "/folders/folder-b", { method: "DELETE" }, () => {
-    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
-    users.find((user) => user.username === "editor").permissions.delete = false;
-    fs.writeFileSync(usersPath, JSON.stringify(users));
+    updateFixtureUser((user) => { user.permissions.delete = false; });
   }, 403, () => {
     const folders = JSON.parse(fs.readFileSync(path.join(dataDir, "folders.json"), "utf8"));
     assert.equal(folders.some((folder) => folder.id === "folder-b"), true);
