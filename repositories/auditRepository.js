@@ -7,6 +7,7 @@ const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindows
 const { assertNoLocalStrictSyncWriter, isStrictSyncAccountFenceConfigured } =
   require("../src/services/syncSqliteAccountWriteFence");
 const { assertPrivateSqliteDirectory } = require("../src/services/zk1PrivateSqlitePath");
+const { resolveRuntimePath } = require("../src/runtime-paths");
 const { jsonStringify, runWrite, safeJsonParse } = require("./repositoryUtils");
 const MAX_DEFERRED_AUDITS = 4096;
 // The archival record is deliberately retained, but its capacity is finite.
@@ -15,6 +16,27 @@ const MAX_DEFERRED_AUDITS = 4096;
 const MAX_ARCHIVED_AUDITS = 100000;
 const MAX_ARCHIVED_BYTES = 512 * 1024 * 1024;
 const preparedJournals = new Set();
+
+function assertNoStrictAuditRestore() {
+  // A durable whole-restore coordinator is written before the pre-restore
+  // backup. Refuse any NEW audit mutation until the restart/rollback barrier
+  // clears, including other Node processes sharing this runtime. Reads remain
+  // possible so the restore can preserve the full acknowledged evidence set.
+  const coordinator = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
+  let status;
+  try { status = fs.lstatSync(coordinator); }
+  catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw Object.assign(new Error("Strict audit restore barrier unavailable", { cause: error }), {
+      code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+    });
+  }
+  if (status) {
+    throw Object.assign(new Error("Strict audit writes blocked during whole restore"), {
+      code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+    });
+  }
+}
 
 function auditJournalPath() {
   return path.join(`${getDatabasePath()}.audit-private`, "pending.sqlite");
@@ -166,10 +188,12 @@ function ensurePendingAuditDatabase() {
 function archiveAuditLogs(logs) {
   if (!Array.isArray(logs) || !logs.length) return;
   try {
+    assertNoStrictAuditRestore();
     withPendingAuditDb((db) => {
       const insert = db.prepare("INSERT INTO archived_audit(id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
       const clear = db.prepare("DELETE FROM pending_audit WHERE id=?");
       db.transaction(() => {
+        assertNoStrictAuditRestore();
         const size = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(event)),0) AS bytes FROM archived_audit").get();
         let count = size.n;
         let bytes = size.bytes;
@@ -216,6 +240,7 @@ function pruneArchivedAuditRows(logs) {
     assertNoLocalStrictSyncWriter();
     const main = getDb();
     main.transaction(() => {
+      assertNoStrictAuditRestore();
       const remove = main.prepare("DELETE FROM audit_logs WHERE id=?");
       for (const id of ids) remove.run(id);
     })();
@@ -295,8 +320,10 @@ function deferAuditLog(log) {
   // Commit+fsync completes before auditLog reports success. No in-memory
   // queue, no timer-dependent guarantee and no swallowed errors.
   try {
+    assertNoStrictAuditRestore();
     withPendingAuditDb((db) => {
       db.transaction(() => {
+        assertNoStrictAuditRestore();
         const exists = db.prepare("SELECT 1 FROM pending_audit WHERE id=?").get(log.id);
         if (!exists && db.prepare("SELECT COUNT(*) AS n FROM pending_audit").get().n >= MAX_DEFERRED_AUDITS) {
           throw Object.assign(new Error("Durable pending audit capacity exhausted"), {
@@ -399,6 +426,7 @@ function loadAuditLogs() {
 }
 
 function saveAuditLogsImpl(entries = {}) {
+  assertNoStrictAuditRestore();
   assertNoLocalStrictSyncWriter();
   const db = getDb();
   const logs = Array.isArray(entries?.logs) ? entries.logs : [];
@@ -416,6 +444,7 @@ function saveAuditLogsImpl(entries = {}) {
     : [];
   const archived = protectedAudit ? archivedAuditIds(candidates) : new Set();
   runWrite(db, () => {
+    assertNoStrictAuditRestore();
     if (!protectedAudit) db.prepare("DELETE FROM audit_logs").run();
     // Physical retention: every archive ID is already durably held on the
     // separate FULL journal, so the primary table need not grow forever.
@@ -460,6 +489,7 @@ function saveAuditLogsImpl(entries = {}) {
       withPendingAuditDb((pending) => {
         const remove = pending.prepare("DELETE FROM pending_audit WHERE id=?");
         pending.transaction(() => {
+          assertNoStrictAuditRestore();
           for (const { id } of pending.prepare("SELECT id FROM pending_audit").all()) {
             if (committedIds.has(id)) remove.run(id);
           }
