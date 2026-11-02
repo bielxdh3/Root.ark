@@ -347,6 +347,7 @@ test("protected HTTP ingress rejects tampered signed bytes before durable store/
     assert.equal(await verifyHistoricalAuthorizationProof(
       persisted[0].authorization, persisted[0], {
         username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+        revokedDeviceIds: [],
       }), true);
     assert.throws(() => validateFreshSignedOperation(persisted[0]),
       { code: "authorization_expired" },
