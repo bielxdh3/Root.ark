@@ -125,7 +125,8 @@ class Zk1SharedPgPhysicalInventoryIntent {
       // path; a SEALED result is NEVER accepted without independent full
       // physical attestation/readback by the bridge.
       const sealed = await c.query(`SELECT 1 FROM zk1_gate.sealed_object
-        WHERE scope_key=$1 AND object_id=$2`, [v.scopeKey, v.objectId]);
+        WHERE scope_key=$1 AND object_id=$2 AND revision=$3`,
+        [v.scopeKey, v.objectId, v.revision]);
       if (sealed.rowCount > 1) fail();
       await c.query("COMMIT");
       open = false;
