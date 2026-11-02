@@ -111,6 +111,21 @@
       }
       return value;
     }
+    function operationClock(input) {
+      const initial = input.nowSeconds;
+      if (!Number.isSafeInteger(initial) || initial < 1) deny();
+      const descriptor = Object.getOwnPropertyDescriptor(input, "clockSeconds");
+      if (descriptor && (!Object.hasOwn(descriptor, "value")
+        || typeof descriptor.value !== "function")) deny();
+      const sample = descriptor?.value;
+      let last = initial;
+      return () => {
+        const now = sample ? sample() : initial;
+        if (!Number.isSafeInteger(now) || now < 1 || now < last) deny();
+        last = now;
+        return now;
+      };
+    }
     async function openMigrationJournal(indexedDBImpl =
       typeof indexedDB === "object" ? indexedDB : undefined) {
       if (!indexedDBImpl?.open) deny();
@@ -229,7 +244,7 @@
         return source;
       } finally { if (!accepted) source.data.fill(0); }
     }
-    async function verifyReadback(input, context, saved) {
+    async function verifyReadback(input, context, saved, clockSeconds) {
       const ciphertext = from64(saved.ciphertext, 16, 4 * 1024 * 1024);
       let source;
       try {
@@ -238,6 +253,7 @@
         if (b64(bytes(root, 32)) !== saved.root) deny();
         await reconcile.reconcileUncertainProtectedPut({
           origin: input.origin, fetchImpl: input.fetchImpl, signer: context.signer,
+          clockSeconds,
           objectId: context.meta.object_id, previousRevision: null,
           ciphertext, expectedRoot: root,
           expectedPlaintextSha256: from64(saved.plainDigest, 32),
@@ -255,7 +271,10 @@
       let source, ciphertext;
       try {
         exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
-          "fetchImpl", "journal", "nowSeconds", ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+          "fetchImpl", "journal", "nowSeconds",
+          ...(Object.hasOwn(input, "clockSeconds") ? ["clockSeconds"] : []),
+          ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const clockSeconds = operationClock(input);
         const context = await authority(input);
         const key = context.meta.object_id;
         let previous = await input.journal.read(key);
@@ -277,7 +296,7 @@
           await input.journal.cas(key, null, saved);
           previous = saved;
           const put = await http.signProtectedContentOperation({
-            ...context.signer, operation: "put", objectId: key,
+            ...context.signer, nowSeconds: clockSeconds(), operation: "put", objectId: key,
             expectedObjectRevision: null, ciphertext,
           });
           try {
@@ -288,7 +307,7 @@
         }
         record(previous);
         if (previous.binding !== context.binding) deny();
-        await verifyReadback(input, context, previous);
+        await verifyReadback(input, context, previous, clockSeconds);
         if (previous.phase === "uncertain") await input.journal.cas(key, previous,
           { ...previous, phase: "readback" });
         return Object.freeze({ objectId: key, root: previous.root,
@@ -323,14 +342,16 @@
       try {
         exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
           "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
+          ...(Object.hasOwn(input, "clockSeconds") ? ["clockSeconds"] : []),
           ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const clockSeconds = operationClock(input);
         const context = await authority(input);
         const key = context.meta.object_id;
         const previous = await input.journal.read(key);
         if (!previous || !["readback", "owner-proven"].includes(previous.phase)
           || previous.binding !== context.binding) deny();
         record(previous);
-        await verifyReadback(input, context, previous);
+        await verifyReadback(input, context, previous, clockSeconds);
         await verifyOwnerCheckpoint(input, context, previous);
         if (previous.phase === "readback") await input.journal.cas(key, previous,
           { ...previous, phase: "owner-proven" });
@@ -360,14 +381,16 @@
       try {
         exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
           "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
+          ...(Object.hasOwn(input, "clockSeconds") ? ["clockSeconds"] : []),
           ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const clockSeconds = operationClock(input);
         const context = await authority(input);
         if (!context.pinnedSource) deny();
         const saved = await input.journal.read(context.meta.object_id);
         if (!saved || !["readback", "owner-proven"].includes(saved.phase)
           || saved.binding !== context.binding) deny();
         record(saved);
-        await verifyReadback(input, context, saved);
+        await verifyReadback(input, context, saved, clockSeconds);
         await verifyOwnerCheckpoint(input, context, saved);
         // Only owner-approved provenance can become a signed transition.
         const nonce = new Uint8Array(16);
@@ -381,7 +404,7 @@
           ownerHead: { revision: context.signer.manifestRevision,
             digest: b64(context.signer.manifestDigest), epoch: context.meta.epoch },
           binding: context.binding, sourceDescriptorDigest: saved.sourceDescriptorDigest,
-          issuedAt: input.nowSeconds, nonce: b64(nonce),
+          issuedAt: clockSeconds(), nonce: b64(nonce),
         });
       } catch (_) { deny(); }
     }
@@ -390,7 +413,9 @@
         exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
           "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
           "signedTransitionReceipt",
+          ...(Object.hasOwn(input, "clockSeconds") ? ["clockSeconds"] : []),
           ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const clockSeconds = operationClock(input);
         const context = await authority(input);
         if (!context.pinnedSource) deny();
         const key = context.meta.object_id;
@@ -398,14 +423,14 @@
         if (!previous || !["readback", "owner-proven"].includes(previous.phase)
           || previous.binding !== context.binding) deny();
         record(previous);
-        await verifyReadback(input, context, previous);
+        await verifyReadback(input, context, previous, clockSeconds);
         await verifyOwnerCheckpoint(input, context, previous);
         const candidate = transition.cloneReceipt(input.signedTransitionReceipt);
         const approved = await transition.verifyTransitionReceipt({
           receipt: candidate,
           expected: proposal(context, previous, candidate),
           ownerPublicKey: context.trust.ownerPublicKey,
-          nowSeconds: input.nowSeconds,
+          nowSeconds: clockSeconds(),
         });
         if (previous.transition) {
           if (JSON.stringify(previous.transition) !== JSON.stringify(approved.receipt)) deny();

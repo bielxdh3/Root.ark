@@ -61,7 +61,10 @@
       let expectedRoot;
       let expectedPlain;
       try {
-        exact(input, INPUT);
+        const clockDescriptor = Object.getOwnPropertyDescriptor(input || {}, "clockSeconds");
+        exact(input, clockDescriptor ? [...INPUT, "clockSeconds"] : INPUT);
+        if (clockDescriptor && (!Object.hasOwn(clockDescriptor, "value")
+          || typeof clockDescriptor.value !== "function")) deny();
         exact(input.signer, SIGNER);
         exact(input.signer.scope, SCOPE);
         exact(input.metadata, META);
@@ -83,6 +86,9 @@
         const metadata = { ...input.metadata };
         const signer = { ...input.signer, scope: { ...input.signer.scope },
           manifestDigest: copy(input.signer.manifestDigest, 32) };
+        const initialSeconds = signer.nowSeconds;
+        if (!Number.isSafeInteger(initialSeconds) || initialSeconds < 0) deny();
+        const clockSeconds = clockDescriptor?.value;
         const origin = input.origin;
         const fetchImpl = input.fetchImpl;
         const cek = input.cek;
@@ -93,8 +99,12 @@
         if (!equal(expectedRoot, actualRoot)) deny();
         const ciphertextDigest = new Uint8Array(
           await webCrypto.subtle.digest("SHA-256", local));
+        // Signed GET follows multiple awaited root/digest computations. A
+        // timestamp captured before those awaits can already be expired.
+        const nowSeconds = clockSeconds ? clockSeconds() : initialSeconds;
+        if (!Number.isSafeInteger(nowSeconds) || nowSeconds < initialSeconds) deny();
         const signedRead = await httpClient.signProtectedContentOperation({
-          ...signer, operation: "get", objectId,
+          ...signer, nowSeconds, operation: "get", objectId,
           expectedObjectRevision: revision,
           expectedCiphertextDigest: ciphertextDigest, ciphertext: null,
         });

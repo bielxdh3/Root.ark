@@ -259,6 +259,14 @@
       if (selectionWindow && (now < selectionWindow.issuedAt
         || now > selectionWindow.expiresAt)) refuse();
     }
+    // The workflow can await plaintext reads, encryption and durable journal
+    // CAS after this batch samples time. Every nested signature/receipt needs
+    // another trusted sample, with the same owner-selection expiry bound.
+    function operationClock() {
+      const now = currentSeconds();
+      assertSelectionAt(now);
+      return now;
+    }
     const results = [];
     for (const [index, { entry, metadata }] of prepared.entries()) {
       const safeResult = { objectId: metadata.object_id,
@@ -272,7 +280,7 @@
           optIn: true, legacy: entry.legacy, sourcePin: entry.sourcePin,
           metadata, trust: input.trust, cek: entry.cek, origin: input.origin,
           fetchImpl: input.fetchImpl, journal: input.journal,
-          nowSeconds: signingSeconds,
+          nowSeconds: signingSeconds, clockSeconds: operationClock,
         });
         await verifyCatalog(entry, input.fetchImpl);
         let transitionResult = null;
@@ -285,7 +293,7 @@
             optIn: true, legacy: entry.legacy, sourcePin: entry.sourcePin,
             metadata, trust: input.trust, cek: entry.cek, origin: input.origin,
             fetchImpl: input.fetchImpl, journal: input.journal,
-            nowSeconds: approvalSeconds,
+            nowSeconds: approvalSeconds, clockSeconds: operationClock,
             signedRootCheckpoint: approved.signedRootCheckpoint,
             signedTransitionReceipt: approved.signedTransitionReceipt,
           });
