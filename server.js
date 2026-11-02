@@ -1342,6 +1342,13 @@ function loadAuditLogs(file = AUDIT_LOGS_FILE) {
       if (entries.logs.length || !shouldReadJsonFallback()) return entries;
     } catch (error) {
       console.error("Falha ao ler auditoria do SQLite:", error.message);
+      // An enrolled strict audit authority must never be represented as an
+      // empty, successful audit history after an integrity/sidecar failure.
+      if (dbConfig.isStrictSyncModeObserved() || error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
+        throw Object.assign(new Error("Strict audit history unavailable", { cause: error }), {
+          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+        });
+      }
       if (!shouldReadJsonFallback()) return getDefaultAuditLogs();
     }
   }
