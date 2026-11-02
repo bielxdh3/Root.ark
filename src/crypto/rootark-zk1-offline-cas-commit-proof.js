@@ -56,6 +56,7 @@ function verifySignedCasProof({
   witnessReceiptSha256, witnessSequence, minimumCasSequence,
   nowSeconds,
 }) {
+  if (!Number.isSafeInteger(nowSeconds) || nowSeconds < 0) denied();
   proof = exact(proof, [...FIELDS, "signature"]);
   let nativeSpki;
   try { nativeSpki = nativeEd25519Spki(signerPublicKey); }

@@ -1141,6 +1141,11 @@ REVOKE SELECT ON zk1_gate.head,zk1_gate.admission,
 REVOKE SELECT (chunk_index) ON zk1_gate.ciphertext_chunk
   FROM zk1_chunk_writer_runtime;
 REVOKE INSERT ON zk1_gate.ciphertext_chunk FROM zk1_chunk_writer_runtime;
+-- PostgreSQL tracks column-level privileges separately from table-level
+-- privileges. Revoke grants left by older writer deployments on every chunk
+-- column before exposing the restricted runtime after migration.
+REVOKE INSERT (scope_key,object_id,revision,chunk_index,ciphertext)
+  ON zk1_gate.ciphertext_chunk FROM zk1_chunk_writer_runtime;
 GRANT EXECUTE ON FUNCTION zk1_gate.verify_chunk_writer_binding(
   text,bytea,text,bigint,bytea,bytea,bigint,bigint,bytea,bytea,text)
   TO zk1_chunk_writer_runtime;
