@@ -122,7 +122,9 @@ test("PG18 strict physical revisions preserve v1 ciphertext and reject stale or 
       revision, epoch: 1, ciphertext_sha256: crypto.createHash("sha256").update(bytes).digest() };
     const request = { scope: s, operation: op, digest,
       expectedRootHash: computeZk1CiphertextRoot([bytes]), expectedChunkCount: 1 };
-    await intent.reserveExact(request);
+    const freshIntent = await intent.reserveExact(request);
+    assert.equal(freshIntent.sealed, false,
+      "another revision of this same logical object is not this revision's seal");
     const io = { scope: s, workerId: crypto.randomBytes(16), principal: "versioned-physical-fixture",
       action: "put", objectId: physicalObjectId, revision, digest };
     const admission = await gate.beginIoAdmission(io);
@@ -132,6 +134,11 @@ test("PG18 strict physical revisions preserve v1 ciphertext and reject stale or 
     assert.deepEqual(await gate.putCiphertextChunk(authorized, 0, bytes), { stored: true });
     assert.deepEqual(await store.seal({ ...authorized, expectedChunkCount: 1,
       expectedRootHash: request.expectedRootHash }), { status: "SEALED", chunkCount: 1 });
+    await assert.rejects(runtime.query(`INSERT INTO zk1_gate.ciphertext_chunk
+      (scope_key,object_id,revision,chunk_index,ciphertext) VALUES($1,$2,$3,0,$4)`,
+    [scopeKey, physicalObjectId, revision, bytes]),
+    /sealed ciphertext object is immutable/i,
+    "the sealed revision must reject even valid-index direct SQL inserts");
     await assert.rejects(gate.putCiphertextChunk(authorized, 1, bytes),
       /ZK_GATE_DENIED|ZK_GATE_UNAVAILABLE/);
     assert.deepEqual(await store.seal({ ...authorized, expectedChunkCount: 1,
@@ -149,10 +156,16 @@ test("PG18 strict physical revisions preserve v1 ciphertext and reject stale or 
     "same operation prewrite replay is read-only and preserves the original revision");
   await assert.rejects(runtime.query(`INSERT INTO zk1_gate.ciphertext_chunk
     (scope_key,object_id,revision,chunk_index,ciphertext) VALUES($1,$2,1,1,$3)`,
-  [scopeKey, objectId, first]), /revision differs|immutable|denied/i,
+  [scopeKey, objectId, first]), /strict chunk requires exact prewrite physical operation intent/i,
   "restricted SQL cannot append to the prior sealed revision");
   const second = crypto.randomBytes(60);
   const secondSeal = await write(2, firstDigest, second, 1);
+  for (const completed of [firstSeal, secondSeal]) {
+    const replay = await intent.reserveExact(completed.request);
+    assert.equal(replay.replay, true);
+    assert.equal(replay.sealed, true,
+      "each immutable object revision must resolve only its own physical seal");
+  }
   const secondObjectId = crypto.randomBytes(16).toString("base64url");
   const siblingSeal = await write(1, firstDigest, crypto.randomBytes(25), 2, secondObjectId);
   await assert.rejects(gate.beginIoAdmission({ scope: s, workerId: crypto.randomBytes(16),
