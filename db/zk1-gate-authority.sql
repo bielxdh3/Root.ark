@@ -273,6 +273,8 @@ CREATE OR REPLACE FUNCTION zk1_gate.validate_admission_transition()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE
   strict_mode boolean;
+  head_phase text;
+  needs_physical_intent boolean;
 BEGIN
   IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'admission transition requires READ COMMITTED isolation'
@@ -325,7 +327,8 @@ BEGIN
     IF FOUND THEN RETURN NEW; END IF;
   END IF;
   IF OLD.state IN ('ACTIVE','STOP_REQUESTED') AND NEW.state='FINISHED' THEN
-    SELECT require_stop_proof INTO strict_mode
+    SELECT require_stop_proof,phase,require_physical_inventory_intent
+      INTO strict_mode,head_phase,needs_physical_intent
       FROM zk1_gate.head WHERE scope_key=NEW.scope_key;
     IF NOT FOUND THEN
       RAISE EXCEPTION 'missing gate scope for completion'
@@ -336,6 +339,33 @@ BEGIN
       WHERE ack.admission_id=NEW.id AND ack.scope_key=NEW.scope_key
         AND ack.worker_id=NEW.worker_id AND ack.generation=NEW.generation) THEN
       RAISE EXCEPTION 'independent physical STOP receipt required'
+        USING ERRCODE='23514';
+    END IF;
+    -- The HTTPS physical-inventory path has no independently supervised STOP
+    -- process: finishing an unsealed PUT while OPEN would permanently strand
+    -- the immutable operation/admission binding after any gateway restart.
+    -- Keep its admission ACTIVE for exact-byte resume. QUIESCING still allows
+    -- irrevocable drain, while independently STOP-proven scopes retain their
+    -- stricter process-exit contract.
+    IF needs_physical_intent AND NOT strict_mode
+      AND OLD.action='put' AND head_phase='OPEN'
+      AND NOT EXISTS (
+        SELECT 1 FROM zk1_gate.sealed_object AS s
+        WHERE s.scope_key=OLD.scope_key AND s.object_id=OLD.object_id
+          AND s.admission_id=OLD.id
+          AND s.generation=OLD.generation
+          AND EXISTS (
+            SELECT 1 FROM zk1_gate.physical_inventory_admission AS b
+            JOIN zk1_gate.physical_inventory_intent AS i
+              ON i.operation_id=b.operation_id
+              AND i.scope_key=b.scope_key AND i.object_id=b.object_id
+              AND i.revision=s.revision AND i.generation=s.generation
+            WHERE b.admission_id=OLD.id
+              AND b.scope_key=OLD.scope_key AND b.object_id=OLD.object_id
+              AND b.generation=OLD.generation
+          )
+      ) THEN
+      RAISE EXCEPTION 'unsealed physical operation cannot finish while OPEN'
         USING ERRCODE='23514';
     END IF;
     RETURN NEW;
