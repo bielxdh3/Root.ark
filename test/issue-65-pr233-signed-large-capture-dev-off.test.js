@@ -260,7 +260,11 @@ test("authentic encrypted stage becomes unavailable if on-disk ciphertext is cor
     const ret = fsync.call(fs, fd);
     if (!corrupted && fdPath.has(fd)) {
       corrupted = true;
-      fs.writeSync(fd, Buffer.from([0x7e]), 0, 1, 0);
+      // A fixed replacement byte is occasionally identical to randomized
+      // ciphertext; always flip the byte actually persisted by the capture.
+      const originalByte = fs.readFileSync(fdPath.get(fd))[0];
+      assert.notEqual(originalByte, undefined);
+      fs.writeSync(fd, Buffer.from([originalByte ^ 0xff]), 0, 1, 0);
       fsync.call(fs, fd);
     }
     return ret;
