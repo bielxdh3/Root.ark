@@ -162,9 +162,9 @@ test("both individually signed operations must remain in the exact same key epoc
   const before = await f.onDisk();
   const trustedDevicePublicKeys = { "device-a": f.publicKey };
   assert.equal(await verifyAuthorizationProof(deleted.authorization, deleted,
-    { username: "alice", trustedDevicePublicKeys }), true);
+    { username: "alice", trustedDevicePublicKeys, revokedDeviceIds: [] }), true);
   assert.equal(await verifyAuthorizationProof(moved.authorization, moved,
-    { username: "alice", trustedDevicePublicKeys }), true);
+    { username: "alice", trustedDevicePublicKeys, revokedDeviceIds: [] }), true);
   assert.equal((await f.batch(deleted, moved)).status, 400);
   assert.equal(await f.onDisk(), before);
   await assert.rejects(f.routes.store.putSignedBatch("alice", [deleted, moved]),
@@ -268,9 +268,9 @@ test("independently valid signed DELETE A + MOVE B to unrelated C must not mutat
   const unrelated = await f.make("move", "b", 2, "target-c", { targetPath: "c.txt" });
   const trustedDevicePublicKeys = { "device-a": f.publicKey };
   assert.equal(await verifyAuthorizationProof(deleted.authorization, deleted,
-    { username: "alice", trustedDevicePublicKeys }), true);
+    { username: "alice", trustedDevicePublicKeys, revokedDeviceIds: [] }), true);
   assert.equal(await verifyAuthorizationProof(unrelated.authorization, unrelated,
-    { username: "alice", trustedDevicePublicKeys }), true);
+    { username: "alice", trustedDevicePublicKeys, revokedDeviceIds: [] }), true);
   assert.equal(deleted.metadata.path, "a.txt");
   assert.equal(unrelated.metadata.path, "c.txt");
   const before = await f.onDisk();
