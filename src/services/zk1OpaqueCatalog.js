@@ -137,6 +137,15 @@ function validateHeader(header, scope) {
     || header.page_digests.length !== Math.ceil(header.total_count / PAGE_SIZE)
     || header.page_digests.some((x) => !same(buf(x, 32), Buffer.from(x)))) fail();
 }
+function historicalSigner(manifest, header) {
+  // A device may attest a durable head only in its enrolled, pre-revocation
+  // epoch. Current request authorization is checked separately by the store.
+  return manifest.devices.find((device) =>
+    device.device_id === header.signer_device_id
+    && Number(device.enrolled_epoch) <= header.epoch
+    && (device.revoked_at_epoch === null
+      || header.epoch < Number(device.revoked_at_epoch)));
+}
 async function verifyCas(raw, scope, nonce, authority, now) {
   if ((!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array)) || raw.byteLength > 8192) {
     fail("ZK_CATALOG_UNAVAILABLE");
@@ -333,11 +342,7 @@ class Zk1OpaqueCatalog {
       // A revoked signer remains valid ONLY for a head committed in an older
       // epoch. Its historical signature is verified against the owner-rooted
       // roster, but that key is never accepted to authorize fresh catalog I/O.
-      const signer = activeManifest.devices.find((device) =>
-        device.device_id === header.signer_device_id
-        && Number(device.enrolled_epoch) <= header.epoch
-        && (device.revoked_at_epoch === null
-          || header.epoch < Number(device.revoked_at_epoch)));
+      const signer = historicalSigner(activeManifest, header);
       if (!signer || !crypto.verify(null, Buffer.concat([HEAD_DOMAIN, saved.header]),
         crypto.createPublicKey({ key: Buffer.concat([
           ED_SPKI, buf(signer.authorization_public_key, 32)]), format: "der", type: "spki" }),
@@ -428,13 +433,10 @@ class Zk1OpaqueCatalog {
         && !same(buf(remote.header.manifest_digest, 32), auth.request.manifest_digest))) {
       fail("ZK_CATALOG_UNAVAILABLE");
     }
-    // The signed device must still have an OWNER CURRENT V2 grant. Historical
-    // revocation, stale epoch, or signer substitution never gains authority by
-    // being present in the external operator's database.
-    const signer = auth.verifiedHeadManifest.devices.find((device) =>
-      device.device_id === remote.header.signer_device_id
-      && device.revoked_at_epoch === null
-      && Number(device.enrolled_epoch) <= remote.header.epoch);
+    // A recovered snapshot is historical: its signed epoch must precede any
+    // revocation, as in verifyStoredChain(). Fresh catalog operations still
+    // require a currently authorized device via runCatalogWithAdmission().
+    const signer = historicalSigner(auth.verifiedHeadManifest, remote.header);
     if (!signer) fail("ZK_CATALOG_DENIED");
     const signerKey = crypto.createPublicKey({ key: Buffer.concat([
       ED_SPKI, buf(signer.authorization_public_key, 32)]), format: "der", type: "spki" });
@@ -575,9 +577,7 @@ class Zk1OpaqueCatalog {
         if (totalVersions < header.total_count) fail("ZK_CATALOG_UNAVAILABLE");
         if (header.sequence !== current.sequence || header.manifest_revision > auth.request.manifest_revision
           || page >= Math.max(1, header.page_digests.length)) fail("ZK_CATALOG_CONFLICT");
-        const signer = auth.verifiedHeadManifest.devices.find((device) =>
-          device.device_id === header.signer_device_id
-          && device.revoked_at_epoch === null && Number(device.enrolled_epoch) <= auth.request.epoch);
+        const signer = historicalSigner(auth.verifiedHeadManifest, header);
         if (!signer) fail("ZK_CATALOG_DENIED");
         const publicKey = crypto.createPublicKey({ key: Buffer.concat([
           ED_SPKI, buf(signer.authorization_public_key, 32)]), format: "der", type: "spki" });
