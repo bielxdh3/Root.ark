@@ -10,6 +10,8 @@ const vm = require("node:vm");
 const { spawnSync } = require("node:child_process");
 
 const project = path.resolve(__dirname, "..");
+const CHILD_NODE_PATH = [path.join(project, "node_modules"), process.env.NODE_PATH]
+  .filter(Boolean).join(path.delimiter);
 const implementation = process.env.ROOTARK_LIVE_AUDIT_IMPL || project;
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
@@ -54,7 +56,7 @@ test("strict audit rejects duplicate pending and archived IDs without acknowledg
   `;
   const result = spawnSync(process.execPath, ["-e", script], {
     cwd: root, encoding: "utf8", timeout: 55_000, windowsHide: true,
-    env: { ...process.env, ZK65_TEST_PROJECT: implementation,
+    env: { ...process.env, NODE_PATH: CHILD_NODE_PATH, ZK65_TEST_PROJECT: implementation,
       DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
       DB_ENABLED: "true", DB_WRITE_LEGACY_JSON: "false" },
   });

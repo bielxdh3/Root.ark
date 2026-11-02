@@ -17,6 +17,8 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const strictAudit = require("../services/strictAuditSnapshot");
+const CHILD_NODE_PATH = [path.join(__dirname, "..", "node_modules"), process.env.NODE_PATH]
+  .filter(Boolean).join(path.delimiter);
 
 const writerScript = String.raw`
 "use strict";
@@ -122,6 +124,7 @@ for (const kind of ["sidecar", "main"]) test(
   const child = spawn(process.execPath,
     ["-e", writerScript, heldPath, fixture.coordinator, kind],
     { cwd: fixture.root, stdio: ["ignore", "ignore", "ignore", "ipc"],
+      env: { ...process.env, NODE_PATH: CHILD_NODE_PATH },
       windowsHide: true });
   const expect = childMessages(child);
   t.after(async () => {

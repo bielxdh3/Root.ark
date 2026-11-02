@@ -11,6 +11,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const PROJECT = path.resolve(__dirname, "..");
+const CHILD_NODE_PATH = [path.join(PROJECT, "node_modules"), process.env.NODE_PATH]
+  .filter(Boolean).join(path.delimiter);
 const { ensureWindowsChunkUploadRoot } = require(path.join(
   process.env.ROOTARK_LIVE_AUDIT_IMPL || PROJECT, "services", "chunkUploadWindowsAcl"));
 const CASE = String.raw`
@@ -110,7 +112,7 @@ test("normal strict audit rejects divergent main/pending/archive IDs and accepts
       t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 4 }));
       const result = spawnSync(process.execPath, ["-e", CASE], {
         cwd: root, encoding: "utf8", timeout: 55_000, windowsHide: true,
-        env: { ...process.env,
+        env: { ...process.env, NODE_PATH: CHILD_NODE_PATH,
           ROOTARK_LIVE_AUDIT_TEST_PROJECT: process.env.ROOTARK_LIVE_AUDIT_IMPL || PROJECT,
           DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
           DB_ENABLED: "true", DB_WRITE_LEGACY_JSON: "false",
