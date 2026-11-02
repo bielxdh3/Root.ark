@@ -73,8 +73,9 @@ function readAuthorityPinnedFile(value) {
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
       || before.size < 1n || before.size > BigInt(LIMIT)) denied();
     checkAuthorityPermissions(value, before);
+    // A FIFO swapped after lstat() must not hang the authority reader.
     fd = fs.openSync(value, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
-      | (fs.constants.O_CLOEXEC || 0));
+      | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_CLOEXEC || 0));
     const opened = fs.fstatSync(fd, { bigint: true });
     if (!same(before, opened)) denied();
     content = Buffer.alloc(Number(opened.size));
