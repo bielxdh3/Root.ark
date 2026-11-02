@@ -337,6 +337,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     { pinnedCurrentHead: { ...credentials.pinnedCurrentHead, revision: former.revision } },
     { signedDeviceGrant: { ...issued.signedDeviceGrant, revoked_at_epoch: committed.epoch } },
     { nowSeconds: now + 310 },
+    ...[undefined, null, NaN, Infinity, -Infinity, -1, 1.5,
+      "100", Number.MAX_SAFE_INTEGER + 1].map((nowSeconds) => ({ nowSeconds })),
   ];
   for (const [index, changes] of attacks.entries()) {
     await assert.rejects(approval.verifyImportedApproval({

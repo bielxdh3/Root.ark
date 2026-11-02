@@ -794,10 +794,16 @@ class SyncObjectStore {
     return ownRecord(ownRecord(this.readSnapshot().users, username), "resumeIntent") || null;
   }
 
-  async stageResume(username, intent) {
+  async stageResume(username, intent, expectedPending = null) {
     return this.transact((next) => {
       const user = this.user(next, username);
-      if (ownRecord(user, "resumeIntent")) {
+      const current = ownRecord(user, "resumeIntent") || null;
+      // A stale intent can only be replaced by an authenticated request that
+      // observed its exact durable contents. Never overwrite a concurrent
+      // resume, replacement, or new intent based on a stale snapshot.
+      if (expectedPending
+        ? !current || JSON.stringify(current) !== JSON.stringify(expectedPending)
+        : current) {
         throw Object.assign(new Error("A sync resume intent is already pending"), { code: "SYNC_RESUME_PENDING" });
       }
       const pause = ownRecord(user.pausedDevices, pausedKey(intent.deviceId));
@@ -1268,6 +1274,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       if (user.totpEnabled) {
         // Fail closed: 2FA is required but the key or the persistence helper is not available.
         if (typeof getTotpKey !== "function" || typeof commitSyncResumeProof !== "function") return errorResponse(res, 503, "Sync re-authentication unavailable");
+        if (typeof body.code !== "string" || body.code.length > 256) return fail("second_factor_failed");
         let key;
         try { key = getTotpKey(); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
         if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
@@ -1283,19 +1290,27 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           pending = store.pendingResume(username);
           pauseFence = store.pauseFence(username, deviceId);
         } catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
-        if (pending && (pending.deviceId !== deviceId || pending.pauseFence !== pauseFence
-          || pending.version !== 2
-          || pending.passwordHash !== checkedHash || pending.sessionVersion !== checkedSessionVersion
-          || typeof body.code !== "string" || body.code.length > 256
-          || !equalMac(pending.codeMac, resumeCodeMac(key, username, deviceId, pauseFence, body.code, pending)))) {
-          return fail("pending_resume_mismatch");
-        }
+        const pendingMatches = Boolean(pending
+          && pending.deviceId === deviceId && pending.pauseFence === pauseFence
+          && pending.version === 2
+          && pending.passwordHash === checkedHash && pending.sessionVersion === checkedSessionVersion
+          && pending.secretDigest === crypto.createHash("sha256").update(JSON.stringify(user.totpSecret)).digest("hex")
+          && pending.authorizationDigest === authorizationDigest(user)
+          && equalMac(pending.codeMac, resumeCodeMac(key, username, deviceId, pauseFence, body.code, pending)));
         let proof = null;
-        if (!pending) {
+        if (!pendingMatches) {
           try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
           lease?.assertActive();
           if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
           if (!proof) return fail("second_factor_failed");
+          // Even if a prior account CAS failed, the same pending factor is not
+          // fresh re-authentication for cancellation/replacement.
+          if (pending && pending.proof?.type === proof.type
+            && (proof.type === "recovery" ? pending.proof.hash === proof.hash
+              : proof.type === "totp" && (!Number.isSafeInteger(pending.proof.step)
+                || proof.step <= pending.proof.step))) {
+            return fail("pending_factor_reuse");
+          }
         }
         // Re-load after async recovery-code verification and revalidate the account before committing replay state.
         const freshUsers = loadUsers();
@@ -1304,9 +1319,9 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           return errorResponse(res, 401, "Re-authentication failed");
         }
         const secretDigest = crypto.createHash("sha256").update(JSON.stringify(freshUser.totpSecret)).digest("hex");
-        if (pending && (secretDigest !== pending.secretDigest
+        if (pendingMatches && (secretDigest !== pending.secretDigest
           || authorizationDigest(freshUser) !== pending.authorizationDigest)) return fail("second_factor_or_authority_rotated");
-        if (pending) {
+        if (pendingMatches) {
           stagedResume = pending;
         } else {
           if (!commitSecondFactorProof(freshUser, proof)) return fail("second_factor_failed");
@@ -1318,9 +1333,11 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
             expectedReplayDigest: secondFactorReplayDigest(freshUser),
           };
           stagedResume.codeMac = resumeCodeMac(key, username, deviceId, pauseFence, body.code, stagedResume);
-          // Prepare an immutable durable intent *before* spending the factor.
+          // Prepare or atomically replace the durable intent *before* spending
+          // the fresh factor. The previous intent must still match our read,
+          // and an external ZK10 account lease must remain active.
           lease?.assertActive();
-          try { await store.stageResume(username, stagedResume); } catch (error) {
+          try { await store.stageResume(username, stagedResume, pending); } catch (error) {
             // A concurrent valid factor cannot overtake an already staged
             // single-use proof, even if both verified before the first commit.
             if (error?.code === "SYNC_RESUME_PENDING") return fail("concurrent_resume_pending");

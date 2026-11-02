@@ -152,9 +152,11 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   };
   const ownerHash = digest(rawPub(ownerKeys.publicKey));
   let active = true, csrf = "known-csrf-token", loseAck = false,
-    losePutAck = false, csrfRequests = 0, commits = 0, putRequests = 0;
+    losePutAck = false, csrfRequests = 0, commits = 0, putRequests = 0,
+    journalWrites = 0;
   const journalStore = {
     async write(key, value) {
+      journalWrites++;
       const pathname = path.join(dir, "intent-" + key + ".json");
       const fd = fs.openSync(pathname, "wx", 0o600);
       try {
@@ -344,12 +346,25 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   const secondCipher = nodeCrypto.randomBytes(90);
   const producer = await syncClient(0);
   const producerBefore = await producer.readCurrent();
+  for (const invalidName of ["é".repeat(111), "a".repeat(221), "bad\u0000name"]) {
+    const beforeWrites = journalWrites, beforePuts = putRequests, beforeCommits = commits;
+    await assert.rejects(producer.commitVersion({ previous: producerBefore,
+      objectId, expectedRevision: 1, revision: 2, epoch: 1,
+      ciphertext: secondCipher, name: invalidName, metadataKey: cryptoMeta }),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "invalid UTF-8 metadata must be rejected before signed intent and PUT");
+    assert.equal(journalWrites, beforeWrites, "no durable intent for invalid filename");
+    assert.equal(putRequests, beforePuts, "no ciphertext PUT for invalid filename");
+    assert.equal(commits, beforeCommits, "no catalog CAS for invalid filename");
+  }
+  const boundaryName = "é".repeat(110);
+  assert.equal(Buffer.byteLength(boundaryName, "utf8"), 220);
   const beforeDeltaPut = putRequests, beforeDeltaCommit = commits;
   losePutAck = true;
   loseAck = true;
   const secondCommit = await producer.commitVersion({ previous: producerBefore,
     objectId, expectedRevision: 1, revision: 2, epoch: 1,
-    ciphertext: secondCipher, name: "sensitive/private/revision-2.txt",
+    ciphertext: secondCipher, name: boundaryName,
     metadataKey: cryptoMeta });
   assert.equal(putRequests, beforeDeltaPut + 1,
     "one signed PUT despite lost HTTP ACK");
@@ -357,8 +372,13 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     "one signed catalog CAS despite lost HTTP ACK");
   assert.equal(secondCommit.journalClearedAfterSignedProof, true);
   assert.equal(secondCommit.plaintextMetadataExposed, false);
-  assert.equal((await second.readAll()).head.sequence, 2,
+  const secondSignedPage = await second.readAll();
+  assert.equal(secondSignedPage.head.sequence, 2,
     "a freshly signed successor CAS advances a live reader's monotonic floor");
+  assert.equal(await catalogBrowser.openMetadata({
+    scope: await grant(manifest.devices[0]), objectId, revision: 2, epoch: 1,
+    metadataKey: cryptoMeta, ciphertext: secondSignedPage.rows[1].metadata_ciphertext,
+  }), boundaryName, "220-byte UTF-8 boundary must commit and decrypt correctly");
   assert.equal(secondCommit.sequence, 2);
   await assert.rejects(tamperedReceiver.pullDelta(tamperedBefore),
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "forged encrypted bytes cannot become verified delta");

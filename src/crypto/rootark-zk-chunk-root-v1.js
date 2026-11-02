@@ -24,7 +24,9 @@ function builder(count) {
   return Object.freeze({
     append(bytes) {
       if (next >= count) invalid();
-      for (const item of part(next++, bytes)) hash.update(item);
+      const items = part(next, bytes);
+      for (const item of items) hash.update(item);
+      next++;
     },
     finish() {
       if (next !== count) invalid();

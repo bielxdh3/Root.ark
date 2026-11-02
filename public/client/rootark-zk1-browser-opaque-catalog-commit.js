@@ -216,20 +216,31 @@
     for (const key of SCOPE) if (!equal(bytes(raw[key],
       key === "compartment_id" ? 1 : 16, key === "compartment_id" ? 128 : 16), scope[key])) deny();
   }
+  function snapshotGrant(grant) {
+    const fields = [...GRANT_FIELDS, "signature"];
+    exact(grant, fields);
+    // Every wire field is scalar. Copy before any asynchronous boundary so
+    // the imported key, owner-signed payload and signature stay identical.
+    return Object.freeze(Object.fromEntries(fields.map((field) => {
+      const value = grant[field];
+      if (value !== null && typeof value !== "string" && typeof value !== "number") deny();
+      return [field, value];
+    })));
+  }
   async function verifyGrant(grant, ownerKey, scope, pin) {
-    exact(grant, [...GRANT_FIELDS, "signature"]);
-    if (grant.schema !== "rootark-zk1-browser-owner-device-grant/v1"
-      || grant.manifest_revision !== pin.revision || grant.manifest_digest !== b64(pin.digest)
-      || grant.current_epoch !== pin.epoch || grant.revoked_at_epoch !== null
-      || uint(grant.enrolled_epoch, 1) > pin.epoch) deny();
-    matchingScope(scopeOf(grant), scope);
-    from64(grant.authorization_key_id, 16);
-    const key = await crypto.subtle.importKey("raw", from64(grant.authorization_public_key, 32),
+    const fixed = snapshotGrant(grant);
+    if (fixed.schema !== "rootark-zk1-browser-owner-device-grant/v1"
+      || fixed.manifest_revision !== pin.revision || fixed.manifest_digest !== b64(pin.digest)
+      || fixed.current_epoch !== pin.epoch || fixed.revoked_at_epoch !== null
+      || uint(fixed.enrolled_epoch, 1) > pin.epoch) deny();
+    matchingScope(scopeOf(fixed), scope);
+    from64(fixed.authorization_key_id, 16);
+    const key = await crypto.subtle.importKey("raw", from64(fixed.authorization_public_key, 32),
       "Ed25519", false, ["verify"]);
-    if (typeof grant.device_id !== "string" || !grant.device_id
-      || grant.device_id.length > 64 || /[\u0000-\u001f\u007f]/.test(grant.device_id)) deny();
-    const signed = Object.fromEntries(GRANT_FIELDS.map((name) => [name, grant[name]]));
-    if (!await crypto.subtle.verify("Ed25519", ownerKey, from64(grant.signature, 64),
+    if (typeof fixed.device_id !== "string" || !fixed.device_id
+      || fixed.device_id.length > 64 || /[\u0000-\u001f\u007f]/.test(fixed.device_id)) deny();
+    const signed = Object.fromEntries(GRANT_FIELDS.map((name) => [name, fixed[name]]));
+    if (!await crypto.subtle.verify("Ed25519", ownerKey, from64(fixed.signature, 64),
       concat(GRANT, te.encode(JSON.stringify(signed))))) deny();
     return key;
   }
@@ -341,9 +352,15 @@
         || !Array.isArray(input.historicalOwnerEpochHistory.grants)
         || input.historicalOwnerEpochHistory.grants.length > 128) deny();
     }
-    if (input.signerGrants.length > 64 || input.signerGrants.some((entry, index) =>
+    const signedDeviceGrant = snapshotGrant(input.signedDeviceGrant);
+    const signerGrants = Object.freeze(input.signerGrants.map(snapshotGrant));
+    const historicalOwnerEpochHistory = historicalEpochs ? Object.freeze({
+      heads: input.historicalOwnerEpochHistory.heads,
+      grants: Object.freeze(input.historicalOwnerEpochHistory.grants.map(snapshotGrant)),
+    }) : undefined;
+    if (signerGrants.length > 64 || signerGrants.some((entry, index) =>
       !entry || typeof entry.device_id !== "string" || !entry.device_id
-      || input.signerGrants.slice(0, index).some((prior) => prior.device_id === entry.device_id))) deny();
+      || signerGrants.slice(0, index).some((prior) => prior.device_id === entry.device_id))) deny();
     originURL(input.origin, "read");
     edKey(input.ownerPublicKey, "public"); edKey(input.devicePublicKey, "public");
     edKey(input.devicePrivateKey, "private");
@@ -356,7 +373,8 @@
     bytes(input.ownerWitnessKeyId, 16); bytes(input.pinnedOwnerKeyHash, 32);
     const journal = customJournal ? input.journalStore : indexedDbJournalStore();
     if (["write", "read", "remove"].some((name) => typeof journal?.[name] !== "function")) deny();
-    return Object.freeze({ ...input, journalStore: journal });
+    return Object.freeze({ ...input, signedDeviceGrant, signerGrants,
+      ...(historicalEpochs ? { historicalOwnerEpochHistory } : {}), journalStore: journal });
   }
   function createClient(input) {
     const trust = configure(input);
