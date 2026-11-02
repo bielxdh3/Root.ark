@@ -41,7 +41,8 @@ test("fresh and stored parsers bind proof identity and digests to actual envelop
   assert.throws(() => protocol.validateFreshSignedOperation(plain), /authorization/i,
     "trusted strict ingress must not accept an unsigned legacy operation");
   assert.equal(await verifyAuthorizationProof(proof, signed, {
-    username: "alice", trustedDevicePublicKeys: { "device-a": publicKey } }), true);
+    username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [] }), true);
 
   for (const [label, value] of [
     ["ciphertext", { ...signed, ciphertext: Buffer.from("tampered ciphertext").toString("base64url") }],
