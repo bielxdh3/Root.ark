@@ -33,7 +33,8 @@ class Zk1SharedPgCiphertextSink {
     return this.#write(input, Buffer.from(root));
   }
 
-  async #write({ scope, objectId, revision, digest, chunks, expectedChunkCount } = {}, root) {
+  async #write({ scope, objectId, revision, digest, chunks,
+    expectedChunkCount, operationId } = {}, root) {
     if (!scope || typeof scope !== "object" || Array.isArray(scope)
       || Reflect.ownKeys(scope).length !== 3
       || ["account_id", "compartment_id", "keyring_id"]
@@ -51,6 +52,16 @@ class Zk1SharedPgCiphertextSink {
       || !Number.isSafeInteger(revision) || revision < 1
       || !(Buffer.isBuffer(digest) || digest instanceof Uint8Array)
       || digest.length !== 32) fail();
+    // The trusted inventory bridge supplies the owner-validated immutable
+    // operation ID. Its stable worker identity lets the SAME trusted mTLS
+    // principal replay the ORIGINAL admission, which PostgreSQL pins to that
+    // operation before the first byte. This is not authorization for a new
+    // supervised process or a competing principal. Legacy/non-inventory writes
+    // retain ephemeral workers.
+    if (operationId !== undefined && (!root
+      || (!Buffer.isBuffer(operationId) && !(operationId instanceof Uint8Array))
+      || operationId.length !== 16)) fail();
+    const pinnedOperation = operationId === undefined ? null : Buffer.from(operationId);
     // Typed-array fields are mutable across awaits: detach authoritative
     // owner-verified bytes before calling any asynchronous gateway adapter.
     const detachedScope = {
@@ -58,7 +69,11 @@ class Zk1SharedPgCiphertextSink {
       compartment_id: Buffer.from(scope.compartment_id),
       keyring_id: Buffer.from(scope.keyring_id),
     };
-    const workerId = crypto.randomBytes(16);
+    const workerId = pinnedOperation
+      ? crypto.createHash("sha256")
+        .update("Root.ark/zk-1/physical-inventory-worker/v1\0")
+        .update(pinnedOperation).digest().subarray(0, 16)
+      : crypto.randomBytes(16);
     const approvedDigest = Buffer.from(digest);
     const detached = () => ({ scope: {
       account_id: Buffer.from(detachedScope.account_id),
@@ -67,6 +82,7 @@ class Zk1SharedPgCiphertextSink {
     }, objectId, revision, digest: Buffer.from(approvedDigest),
     action: "put", workerId: Buffer.from(workerId) });
     let receipt;
+    let sealedSuccessfully = false;
     try {
       // Lost START responses must use exactly the same worker and request.
       try { receipt = await this.gate.beginIoAdmission(detached()); }
@@ -111,20 +127,31 @@ class Zk1SharedPgCiphertextSink {
         catch (_) { sealed = await this.gate.sealCiphertextObject(authorized(), count, Buffer.from(root)); }
         if (!sealed || sealed.status !== "SEALED" || sealed.chunkCount !== count
           || Reflect.ownKeys(sealed).length !== 2) fail();
+        sealedSuccessfully = true;
         return { status: "SEALED", chunkCount: count };
       }
       return { chunkCount: count };
     } finally {
-      try {
-        let receipt;
-        try { receipt = await this.gate.finishIoAdmission(stop()); }
-        catch (_) { receipt = await this.gate.finishIoAdmission(stop()); }
-        if (!receipt || receipt.status !== "FINISHED"
-          || Reflect.ownKeys(receipt).length !== 1) fail();
-      } catch (_) {
-        // Never call an uncertain FINISH a success: the durable gate remains
-        // closed until the trusted worker is independently reconciled.
-        fail();
+      // An unsealed strict operation may have committed START or any subset of
+      // chunks before an outage. FINISH is irreversible: it would strand the
+      // immutable physical admission and make valid owner-operation retries
+      // impossible. Leave it ACTIVE so the same worker can resume against the
+      // head/generation CAS. Quiescence fences the stale generation; reclaiming
+      // an abandoned process still requires an independent, STOP-fenced path.
+      // A scope already quiescing has revoked this worker: terminate its
+      // original admission so pending STOP can drain, never attempt to resume.
+      if (!pinnedOperation || sealedSuccessfully || !receipt.proceed) {
+        try {
+          let receipt;
+          try { receipt = await this.gate.finishIoAdmission(stop()); }
+          catch (_) { receipt = await this.gate.finishIoAdmission(stop()); }
+          if (!receipt || receipt.status !== "FINISHED"
+            || Reflect.ownKeys(receipt).length !== 1) fail();
+        } catch (_) {
+          // Never call an uncertain FINISH a success: the durable gate remains
+          // closed until the trusted worker is independently reconciled.
+          fail();
+        }
       }
     }
   }
