@@ -65,17 +65,20 @@ class Zk1SharedPgSealedObjectStore {
       const head = await db.query("SELECT * FROM zk1_gate.head WHERE scope_key=$1 FOR UPDATE", [v.key]);
       const h = head.rows[0];
       if (!h || !h.keyring_id.equals(v.keyring) || h.phase !== "OPEN"
-        || Number(h.generation) !== v.generation || Number(h.revision) !== v.revision
+        || Number(h.generation) !== v.generation
+        || (!h.require_physical_inventory_intent && Number(h.revision) !== v.revision)
         || !h.digest.equals(v.digest)) fail();
       const admission = await db.query("SELECT * FROM zk1_gate.admission WHERE id=$1", [v.admissionId]);
       const a = admission.rows[0];
       if (!a || a.scope_key !== v.key || !a.id.equals(v.admissionId)
         || !a.worker_id.equals(v.worker) || a.principal !== v.principal
         || a.action !== "put" || a.object_id !== v.objectId
-        || a.state !== "ACTIVE" || Number(a.revision) !== v.revision
+        || a.state !== "ACTIVE" || Number(a.revision) !== Number(h.revision)
+        || Number(a.object_revision ?? a.revision) !== v.revision
         || Number(a.generation) !== v.generation || !a.digest.equals(v.digest)) fail();
       const existing = await db.query(`SELECT * FROM zk1_gate.sealed_object
-        WHERE scope_key=$1 AND object_id=$2`, [v.key, v.objectId]);
+        WHERE scope_key=$1 AND object_id=$2 AND revision=$3`,
+      [v.key, v.objectId, v.revision]);
       if (existing.rowCount) {
         const row = existing.rows[0];
         if (row.revision == v.revision && row.generation == v.generation
@@ -89,13 +92,14 @@ class Zk1SharedPgSealedObjectStore {
       // Check for extra chunks and read at most 4 MiB per iteration. 4096
       // chunks can total 16 GiB; no array materialization or SQL string_agg.
       const extra = await db.query(`SELECT 1 FROM zk1_gate.ciphertext_chunk
-        WHERE scope_key=$1 AND object_id=$2 AND chunk_index >= $3 LIMIT 1`,
-      [v.key, v.objectId, v.count]);
+        WHERE scope_key=$1 AND object_id=$2 AND revision=$3 AND chunk_index >= $4 LIMIT 1`,
+      [v.key, v.objectId, v.revision, v.count]);
       if (extra.rowCount) fail("ZK_GATE_SEAL_INCOMPLETE");
       const hash = createZk1CiphertextRootBuilder(v.count);
       for (let index = 0; index < v.count; ++index) {
         const row = await db.query(`SELECT ciphertext FROM zk1_gate.ciphertext_chunk
-          WHERE scope_key=$1 AND object_id=$2 AND chunk_index=$3`, [v.key, v.objectId, index]);
+          WHERE scope_key=$1 AND object_id=$2 AND revision=$3 AND chunk_index=$4`,
+        [v.key, v.objectId, v.revision, index]);
         if (row.rowCount !== 1) fail("ZK_GATE_SEAL_INCOMPLETE");
         hash.append(row.rows[0].ciphertext);
       }
