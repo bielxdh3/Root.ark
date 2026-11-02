@@ -229,6 +229,7 @@ class Zk1CasTerminalAnchor {
       assertPrivateFile(namedBefore);
       const fd = fs.openSync(this.filename,
         fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_NONBLOCK || 0)
         | (fs.constants.O_CLOEXEC || 0));
       try {
         const before = fs.fstatSync(fd, { bigint: true });
@@ -412,7 +413,8 @@ class Zk1CasTerminalAnchor {
         || namedBefore.size > 4096n) fail();
       assertPrivateFile(namedBefore);
       fd = fs.openSync(pathname, fs.constants.O_RDONLY
-        | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+        | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0)
+        | (fs.constants.O_CLOEXEC || 0));
       const opened = fs.fstatSync(fd, { bigint: true });
       if (!opened.isFile() || opened.nlink !== 1n
         || opened.dev !== namedBefore.dev || opened.ino !== namedBefore.ino
@@ -569,6 +571,7 @@ class Zk1CasTerminalAnchor {
           || before.size !== pinned.size) fail();
         fd = fs.openSync(this.filename,
           fs.constants.O_WRONLY | fs.constants.O_APPEND
+          | (fs.constants.O_NONBLOCK || 0)
           | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
         const opened = fs.fstatSync(fd, { bigint: true });
         const named = fs.lstatSync(this.filename, { bigint: true });
