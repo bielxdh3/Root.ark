@@ -100,11 +100,12 @@ class Zk1SharedPgPhysicalInventoryIntent {
       if (rows.rowCount !== 1 || !h || h.phase !== "OPEN"
         || h.require_physical_inventory_intent !== true
         || !same(h.keyring_id, v.scope.keyring_id)
-        || Number(h.revision) !== v.revision || !same(h.digest, v.digest)
+        || !same(h.digest, v.digest)
         || !Number.isSafeInteger(Number(h.generation))) fail();
       const generation = Number(h.generation);
       const previous = await c.query(`SELECT * FROM zk1_gate.physical_inventory_intent
-        WHERE scope_key=$1 AND object_id=$2`, [v.scopeKey, v.objectId]);
+        WHERE scope_key=$1 AND object_id=$2 AND revision=$3`,
+      [v.scopeKey, v.objectId, v.revision]);
       if (previous.rowCount > 1
         || (previous.rowCount === 1 && !isSame(previous.rows[0], v, generation))) fail();
       if (!previous.rowCount) {

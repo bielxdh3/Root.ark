@@ -19,12 +19,14 @@ runDisposablePgLab("gate", async (fixture) => {
   fixture.sql(sql);
   if (!/f\s*\|\s*f/.test(probe())) throw Error("ZK65_LEGACY_ACL_NOT_REVOKED");
   const runtimeUrl = fixture.provision("zkgatefixture_", "zk1_gate_runtime");
+  const attestorUrl = fixture.provision("zkattestfixture_", "zk1_physical_attestor_runtime");
   const result = fixture.runTestsNoSkip([
     "test/issue-65-gate-runtime-role.test.js",
     "test/issue-65-pg-sealed-sink.test.js",
     "test/issue-65-shared-pg-sealed-object.test.js",
   ], { ROOTARK_ZK1_TEST_PG_URL: fixture.adminUrl,
-    ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUrl }, 150000);
+    ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUrl,
+    ROOTARK_ZK1_ATTESTOR_PG_URL: attestorUrl }, 150000);
   process.stdout.write("ZK65_SHARED_GATE_PG18_PASS files=" + result.files
     + " tests=" + result.tests + " skipped=0\n");
 }).catch((error) => {

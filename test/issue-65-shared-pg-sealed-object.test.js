@@ -6,10 +6,15 @@ const crypto = require("node:crypto");
 const { Pool } = require("pg");
 const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAuthority");
 const { Zk1SharedPgSealedObjectStore } = require("../src/services/zk1SharedPgSealedObjectStore");
+const { Zk1SharedPgPhysicalInventoryIntent } =
+  require("../src/services/zk1SharedPgPhysicalInventoryIntent");
+const { Zk1SharedPgPhysicalCiphertextVerifier } =
+  require("../src/services/zk1SharedPgPhysicalCiphertextVerifier");
 const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 
 const url = process.env.ROOTARK_ZK1_TEST_PG_URL;
 const restrictedUrl = process.env.ROOTARK_ZK1_RUNTIME_PG_URL;
+const attestorUrl = process.env.ROOTARK_ZK1_ATTESTOR_PG_URL;
 const pgTest = { skip: !url && "requires disposable ROOTARK_ZK1_TEST_PG_URL" };
 test("ciphertext root v1 independently matches domain-separated index and byte lengths", () => {
   const chunks = [Buffer.from("encrypted-A"), Buffer.from("encrypted-BC")];
@@ -90,6 +95,112 @@ test("incomplete ciphertext is not publishable; final seal binds ordered bytes a
   const remaining = await f.pool.query(`SELECT COUNT(*)::int AS n FROM zk1_gate.ciphertext_chunk
     WHERE scope_key=$1 AND object_id=$2`, [key(f.scope), f.io.objectId]);
   assert.equal(remaining.rows[0].n, 3);
+});
+
+test("PG18 strict physical revisions preserve v1 ciphertext and reject stale or same-revision replacement", {
+  skip: !url || !restrictedUrl || !attestorUrl
+    ? "requires disposable PG18 plus isolated gate and attestor runtimes" : false,
+}, async (t) => {
+  const admin = new Pool({ connectionString: url, max: 3, connectionTimeoutMillis: 3000 });
+  const runtime = new Pool({ connectionString: restrictedUrl, max: 2, connectionTimeoutMillis: 3000 });
+  const attestor = new Pool({ connectionString: attestorUrl, max: 2, connectionTimeoutMillis: 3000 });
+  t.after(async () => { await admin.end(); await runtime.end(); await attestor.end(); });
+  const s = scope();
+  const scopeKey = key(s);
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const gate = new Zk1SharedPgGateAuthority({ pool: runtime });
+  const store = new Zk1SharedPgSealedObjectStore({ pool: runtime });
+  const intent = new Zk1SharedPgPhysicalInventoryIntent({ pool: runtime });
+  const verifier = new Zk1SharedPgPhysicalCiphertextVerifier({ pool: attestor });
+  const firstDigest = crypto.randomBytes(32);
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_physical_inventory_intent)
+    VALUES($1,$2,1,$3,true)`, [scopeKey, s.keyring_id, firstDigest]);
+  const write = async (revision, digest, bytes, sequence, physicalObjectId = objectId) => {
+    const op = { operation_id: crypto.randomBytes(16), expected_sequence: sequence,
+      expected_root: crypto.randomBytes(32), object_id: Buffer.from(physicalObjectId, "base64url"),
+      revision, epoch: 1, ciphertext_sha256: crypto.createHash("sha256").update(bytes).digest() };
+    const request = { scope: s, operation: op, digest,
+      expectedRootHash: computeZk1CiphertextRoot([bytes]), expectedChunkCount: 1 };
+    await intent.reserveExact(request);
+    const io = { scope: s, workerId: crypto.randomBytes(16), principal: "versioned-physical-fixture",
+      action: "put", objectId: physicalObjectId, revision, digest };
+    const admission = await gate.beginIoAdmission(io);
+    assert.equal(admission.proceed, true);
+    const authorized = { ...io, admissionId: admission.admissionId,
+      generation: admission.generation };
+    assert.deepEqual(await gate.putCiphertextChunk(authorized, 0, bytes), { stored: true });
+    assert.deepEqual(await store.seal({ ...authorized, expectedChunkCount: 1,
+      expectedRootHash: request.expectedRootHash }), { status: "SEALED", chunkCount: 1 });
+    await assert.rejects(gate.putCiphertextChunk(authorized, 1, bytes),
+      /ZK_GATE_DENIED|ZK_GATE_UNAVAILABLE/);
+    assert.deepEqual(await store.seal({ ...authorized, expectedChunkCount: 1,
+      expectedRootHash: request.expectedRootHash }), { status: "SEALED", chunkCount: 1 });
+    await assert.rejects(intent.reserveExact({ ...request,
+      operation: { ...op, operation_id: crypto.randomBytes(16) } }),
+    /ZK_PHYSICAL_INTENT_UNAVAILABLE/, "same version cannot be relabeled to another operation");
+    await gate.finishIoAdmission({ scope: s, admissionId: admission.admissionId,
+      workerId: io.workerId, principal: io.principal });
+    return { request, authorized, physicalObjectId };
+  };
+  const first = crypto.randomBytes(48);
+  const firstSeal = await write(1, firstDigest, first, 0);
+  assert.equal((await intent.reserveExact(firstSeal.request)).replay, true,
+    "same operation prewrite replay is read-only and preserves the original revision");
+  await assert.rejects(runtime.query(`INSERT INTO zk1_gate.ciphertext_chunk
+    (scope_key,object_id,revision,chunk_index,ciphertext) VALUES($1,$2,1,1,$3)`,
+  [scopeKey, objectId, first]), /revision differs|immutable|denied/i,
+  "restricted SQL cannot append to the prior sealed revision");
+  const second = crypto.randomBytes(60);
+  const secondSeal = await write(2, firstDigest, second, 1);
+  const secondObjectId = crypto.randomBytes(16).toString("base64url");
+  const siblingSeal = await write(1, firstDigest, crypto.randomBytes(25), 2, secondObjectId);
+  await assert.rejects(gate.beginIoAdmission({ scope: s, workerId: crypto.randomBytes(16),
+    principal: "versioned-physical-fixture", action: "put", objectId,
+    revision: 1, digest: firstDigest }), /ZK_GATE_UNAVAILABLE|ZK_GATE_DENIED/,
+  "a new stale v1 admission cannot consume or replace its immutable physical binding");
+  await assert.rejects(runtime.query(`INSERT INTO zk1_gate.admission
+    (id,scope_key,worker_id,principal,action,object_id,revision,object_revision,digest,generation,state)
+    VALUES($1,$2,$3,'gate-forgery','put',$4,2,2,$5,1,'ACTIVE')`,
+  [crypto.randomBytes(16), scopeKey, crypto.randomBytes(16), objectId, firstDigest]),
+  /current OPEN gate|revision|denied/i,
+  "attacker cannot substitute object revision for current gate authority revision");
+  const persisted = await admin.query(`SELECT c.revision,c.ciphertext,s.root_hash,i.operation_id,
+      b.admission_id FROM zk1_gate.ciphertext_chunk c
+    JOIN zk1_gate.sealed_object s ON s.scope_key=c.scope_key
+      AND s.object_id=c.object_id AND s.revision=c.revision
+    JOIN zk1_gate.physical_inventory_intent i ON i.scope_key=c.scope_key
+      AND i.object_id=c.object_id AND i.revision=c.revision
+    JOIN zk1_gate.physical_inventory_admission b ON b.scope_key=c.scope_key
+      AND b.object_id=c.object_id AND b.revision=c.revision
+    WHERE c.scope_key=$1 AND c.object_id=$2 AND c.chunk_index=0 ORDER BY c.revision`,
+  [scopeKey, objectId]);
+  assert.deepEqual(persisted.rows.map((row) => Number(row.revision)), [1, 2]);
+  assert.deepEqual(persisted.rows.map((row) => row.ciphertext), [first, second]);
+  assert.deepEqual(persisted.rows[0].root_hash, firstSeal.request.expectedRootHash);
+  assert.deepEqual(persisted.rows[1].root_hash, secondSeal.request.expectedRootHash);
+  assert.deepEqual(persisted.rows[0].operation_id, firstSeal.request.operation.operation_id);
+  assert.deepEqual(persisted.rows[1].operation_id, secondSeal.request.operation.operation_id);
+  assert.notDeepEqual(persisted.rows[0].admission_id, persisted.rows[1].admission_id);
+  const gateRevision = await admin.query(`SELECT revision,object_revision FROM zk1_gate.admission
+    WHERE id=$1`, [secondSeal.authorized.admissionId]);
+  assert.equal(Number(gateRevision.rows[0].revision), 1, "scope-wide gate authority stays pinned");
+  assert.equal(Number(gateRevision.rows[0].object_revision), 2, "signed object revision stays separate");
+  const reread = async ({ request, physicalObjectId }) => verifier.verifyExact({
+    scope: s, objectId: physicalObjectId, revision: request.operation.revision,
+    digest: firstDigest, expectedRootHash: request.expectedRootHash,
+    expectedChunkCount: request.expectedChunkCount,
+    expectedSha256: request.operation.ciphertext_sha256,
+    operationId: request.operation.operation_id,
+    expectedInventorySequence: request.operation.expected_sequence,
+    expectedInventoryRoot: request.operation.expected_root, epoch: request.operation.epoch,
+  });
+  for (const item of [firstSeal, secondSeal, siblingSeal]) {
+    const result = await reread(item);
+    assert.equal(result.status, "PHYSICALLY_REREAD_PG_COMMITTED");
+    assert.deepEqual(result.operationId, item.request.operation.operation_id);
+    assert.equal(result.revision, item.request.operation.revision);
+  }
 });
 
 test("quiescence and wrong scope prohibit sealing, and crashes leave chunks unsealed", pgTest, async (t) => {
