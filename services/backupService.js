@@ -13,11 +13,12 @@ const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContains
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
+const strictAudit = require("./strictAuditSnapshot");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
 const MAX_ORPHAN_SQLITE_BACKUP_STAGES = 128;
-const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal", "rootark.sqlite-shm"]);
+const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal", "rootark.sqlite-shm", strictAudit.SNAPSHOT_NAME]);
 const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
 const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
 const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
@@ -431,6 +432,12 @@ async function collectBackupFiles(options = {}) {
     const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
     if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
     files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
+    if (options.auditSnapshotPath) {
+      const auditStat = fs.lstatSync(options.auditSnapshotPath, { bigint: true });
+      if (!auditStat.isFile() || auditStat.isSymbolicLink() || auditStat.nlink !== 1n) throw Error("Strict audit snapshot is unsafe");
+      files.push({ absolutePath: options.auditSnapshotPath, entryPath: strictAudit.ARCHIVE_ENTRY,
+        size: Number(auditStat.size), archiveRoot: dataRootInfo, sourceStat: auditStat });
+    } else if (options.strictAudit) throw Error("Strict audit snapshot is missing");
   } else if (options.sqliteSnapshotPath) {
     throw new Error("SQLite database snapshot cannot be included in a JSON backup");
   }
@@ -515,12 +522,8 @@ async function createSqliteSnapshot(persistenceMode = isDbEnabled() ? "sqlite" :
   const snapshotPath = path.join(stageDir, "rootark.sqlite");
   fs.mkdirSync(stageDir, { recursive: true });
   try {
-    await getDb().backup(snapshotPath);
-    const snapshot = new Database(snapshotPath, { readonly: true, fileMustExist: true });
-    try {
-      if (snapshot.pragma("integrity_check", { simple: true }) !== "ok") throw new Error("SQLite snapshot integrity check failed");
-    } finally { snapshot.close(); }
-    return { stageDir, snapshotPath };
+    const result = await strictAudit.createCoordinatedSnapshots(getDb(), getDatabasePath(), stageDir);
+    return { stageDir, ...result };
   } catch (error) {
     try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch {}
     throw error;
@@ -1471,7 +1474,9 @@ async function createBackup(options = {}) {
     }
     const persistenceMode = isDbEnabled() ? "sqlite" : "json";
     sqliteSnapshot = await createSqliteSnapshot(persistenceMode);
-    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
+    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath,
+      auditSnapshotPath: sqliteSnapshot?.auditSnapshotPath, strictAudit: sqliteSnapshot?.strict,
+      persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);
     const manifest = {
@@ -1479,6 +1484,8 @@ async function createBackup(options = {}) {
       created_at: createdAt,
       type: backupType,
       persistence_mode: persistenceMode,
+      ...(persistenceMode === "sqlite" ? { strict_audit_sidecar: sqliteSnapshot?.strict === true,
+        ...(sqliteSnapshot?.auditSnapshotPath ? { strict_audit_sha256: sqliteSnapshot.auditSha256 } : {}) } : {}),
       created_by: options.createdBy || null,
       total_size: totalSize,
       included_files: files.map((file) => ({ path: file.entryPath, size: file.size })),

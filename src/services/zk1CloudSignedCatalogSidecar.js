@@ -6,7 +6,6 @@
 // Ed25519 committed proof, signed snapshot, owner root and monotonic floor.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { createZk1PrivateCloudStagingDirectory } = require("./zk1PrivateCloudStagingDirectory");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
@@ -154,9 +153,7 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
     // Windows. The ordinary shared OS temp root is not a trusted authority;
     // fail closed rather than weakening the storage adapter's source checks.
     // POSIX retains the original disposable staging directory behavior.
-    dir = process.platform === "win32"
-      ? await createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-write-")
-      : fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
+    dir = await createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-write-");
     const staged = path.join(dir, "signed-catalog.ct");
     fs.writeFileSync(staged, payload, { flag: "wx", mode: 0o600 });
     const acknowledgements = [];
@@ -226,9 +223,8 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   for (const [index, target] of pinned.entries()) {
     try {
       if (await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context) deny();
-      if (!stageDir) stageDir = process.platform === "win32"
-        ? await limit.run(() => createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-read-"))
-        : fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
+      if (!stageDir) stageDir = await limit.run(() =>
+        createZk1PrivateCloudStagingDirectory("zk1-signed-catalog-read-"));
       const destination = path.join(stageDir, `catalog-${index}.ct`);
       const received = await limit.run((signal) => target.adapter.download(address.folder, address.name,
         destination, "uploads", () => !signal.aborted,

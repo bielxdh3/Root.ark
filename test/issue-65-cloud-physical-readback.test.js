@@ -238,9 +238,7 @@ test("cloud ciphertext readback never allocates beyond pinned size if the downlo
 test("bounded S3 readback never substitutes a file raced into the destination after GET", async () => {
   // On Windows, a bounded GET deliberately refuses a shared OS temp root.
   // Race the destination in a valid, ACL-protected private staging root.
-  const disposable = process.platform === "win32"
-    ? await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-race-")
-    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-race-"));
+  const disposable = await createZk1PrivateCloudStagingDirectory("rootark-zk1-cloud-race-");
   const destination = path.join(disposable, "ciphertext.ct");
   const remoteBytes = Buffer.from("provider-ciphertext");
   const replacement = Buffer.from("untrusted-local-copy");
