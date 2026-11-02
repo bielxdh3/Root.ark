@@ -628,7 +628,12 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
           fs.writeFileSync(${JSON.stringify(failurePath)}, "injected");
           throw Object.assign(new Error("injected one-time unlink failure"), { code: "EIO" });
         }
-        return unlinkSync.call(this, target, ...args);
+        const result = unlinkSync.call(this, target, ...args);
+        if (String(target).includes(${JSON.stringify(uploadId)}) && String(target).endsWith("0.part")) {
+          // Make the unlink-to-quota-release window observable across processes.
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+        }
+        return result;
       };
       global.setInterval = (callback, delay, ...args) => {
         if (String(callback).includes("cleanupExpiredChunkSessions")) {
@@ -653,8 +658,9 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
     entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId
   ).length >= 2);
   fs.writeFileSync(retrySweepPath, "run", { flag: "wx", mode: 0o600 });
-  const retryDeadline = Date.now() + 3000;
-  while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  // The successful expiry audit follows part unlink and quota release in the server.
+  // Observe completion before reading quota state across processes.
+  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
   assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
   // The part disappears before quota release; the success audit is written after release.
