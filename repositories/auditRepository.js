@@ -189,22 +189,43 @@ function archiveAuditLogs(logs) {
   if (!Array.isArray(logs) || !logs.length) return;
   try {
     assertNoStrictAuditRestore();
+    // Reject a conflicting main-table ID BEFORE making the candidate archive
+    // event durable in the independent sidecar. The post-archive prune repeats
+    // this check against any concurrent main-table changes.
+    if (isStrictSyncModeObserved()) {
+      const primary = getDb();
+      const existing = primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
+      for (const log of logs) {
+        const main = existing.get(log?.id);
+        if (main && !sameAuditEvidence(rowToLog(main), log, true)) {
+          throw Error("Strict audit collision has divergent evidence");
+        }
+      }
+    }
     withPendingAuditDb((db) => {
       const insert = db.prepare("INSERT INTO archived_audit(id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
       const clear = db.prepare("DELETE FROM pending_audit WHERE id=?");
       db.transaction(() => {
         assertNoStrictAuditRestore();
-        const size = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(event)),0) AS bytes FROM archived_audit").get();
+        const size = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(event AS BLOB))),0) AS bytes FROM archived_audit").get();
         let count = size.n;
         let bytes = size.bytes;
-        const exists = db.prepare("SELECT 1 FROM archived_audit WHERE id=?");
+        const exists = db.prepare("SELECT event FROM archived_audit WHERE id=?");
+        const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?");
         for (const log of logs) {
           if (typeof log?.id !== "string" || !log.id || log.id.length > 128) {
             throw new TypeError("Invalid archived audit ID");
           }
           const serialized = JSON.stringify(log);
           if (Buffer.byteLength(serialized) > 64 * 1024) throw new Error("Archived audit too large");
-          if (!exists.get(log.id)) {
+          const archivedEvent = exists.get(log.id);
+          const pendingEvent = pending.get(log.id);
+          if ((archivedEvent && !sameAuditEvidence(JSON.parse(archivedEvent.event), log))
+            || (pendingEvent && !sameAuditEvidence(JSON.parse(pendingEvent.event), log))) {
+            throw Error("Strict audit collision has divergent evidence");
+          }
+          if (!archivedEvent) {
             if (++count > MAX_ARCHIVED_AUDITS || (bytes += Buffer.byteLength(serialized)) > MAX_ARCHIVED_BYTES) {
               throw Object.assign(new Error("Durable audit archive capacity reached: operator action required"), {
                 code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
@@ -241,6 +262,14 @@ function pruneArchivedAuditRows(logs) {
     const main = getDb();
     main.transaction(() => {
       assertNoStrictAuditRestore();
+      const findMain = main.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
+      for (const log of logs) {
+        const existing = findMain.get(log.id);
+        if (existing && !sameAuditEvidence(rowToLog(existing), log, true)) {
+          throw Error("Strict audit collision has divergent evidence");
+        }
+      }
       const remove = main.prepare("DELETE FROM audit_logs WHERE id=?");
       for (const id of ids) remove.run(id);
     })();
@@ -403,6 +432,51 @@ function logToRow(log) {
   };
 }
 
+// Match the canonical representation of an event stored in the legacy
+// structured main table; raw sidecar JSON retains its complete evidence.
+function normalizeMainAuditLog(log) {
+  const value = logToRow(log);
+  return rowToLog({
+    id: value.id,
+    event_type: value.eventType,
+    severity: value.severity,
+    actor_username: value.actorUsername,
+    actor_ip: value.actorIp,
+    target_type: value.targetType,
+    target_id: value.targetId,
+    action: value.action,
+    result: value.result,
+    timestamp: value.timestamp,
+    details_json: value.detailsJson,
+  });
+}
+
+function stableAuditValue(value) {
+  if (Array.isArray(value)) return value.map(stableAuditValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableAuditValue(value[key])]));
+  }
+  return value;
+}
+
+function sameAuditEvidence(left, right, structuredMain = false) {
+  const a = structuredMain ? normalizeMainAuditLog(left) : left;
+  const b = structuredMain ? normalizeMainAuditLog(right) : right;
+  return JSON.stringify(stableAuditValue(a)) === JSON.stringify(stableAuditValue(b));
+}
+
+function loadAllAuditEvidenceForRestore() {
+  // Unlike loadAuditLogs(), do NOT suppress pending/main rows that share an
+  // archived ID. A divergent hidden row must abort restore, not be discarded.
+  const primary = getDb().prepare(`
+    SELECT id, event_type, severity, actor_username, actor_ip, target_type,
+      target_id, action, result, timestamp, details_json FROM audit_logs
+  `).all().map((row) => ({ source: "main", log: rowToLog(row) }));
+  const pending = pendingAudits().map((log) => ({ source: "pending", log }));
+  const archived = loadArchivedAuditLogs().logs.map((log) => ({ source: "archived", log }));
+  return [...primary, ...pending, ...archived];
+}
+
 function loadAuditLogs() {
   try {
     const rows = getDb().prepare(`
@@ -411,11 +485,25 @@ function loadAuditLogs() {
     ORDER BY timestamp ASC
   `).all();
     const logs = rows.map(rowToLog);
-    const seen = new Set(logs.map(({ id }) => id));
+    const seen = new Map(logs.map((log) => [log.id, { log, main: true }]));
     for (const log of pendingAudits()) {
-      if (!seen.has(log.id)) { seen.add(log.id); logs.push(log); }
+      const older = seen.get(log.id);
+      if (older && !sameAuditEvidence(older.log, log, older.main)) {
+        throw Error("Strict audit collision has divergent evidence");
+      }
+      if (!older) { seen.set(log.id, { log, main: false }); logs.push(log); }
     }
     const archived = archivedAuditIds(logs.map(({ id }) => id));
+    if (archived.size) withPendingAuditDb((sidecar) => {
+      const find = sidecar.prepare("SELECT event FROM archived_audit WHERE id=?");
+      for (const id of archived) {
+        const row = find.get(id);
+        const prior = seen.get(id);
+        if (row && prior && !sameAuditEvidence(prior.log, JSON.parse(row.event), prior.main)) {
+          throw Error("Strict audit collision has divergent evidence");
+        }
+      }
+    });
     const activeLogs = logs.filter(({ id }) => !archived.has(id));
     activeLogs.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
     return { logs: activeLogs };
@@ -449,6 +537,19 @@ function saveAuditLogsImpl(entries = {}) {
     // Physical retention: every archive ID is already durably held on the
     // separate FULL journal, so the primary table need not grow forever.
     if (archived.size) {
+      const archivedEvents = new Map(withPendingAuditDb((sidecar) => {
+        const get = sidecar.prepare("SELECT event FROM archived_audit WHERE id=?");
+        return [...archived].map((id) => [id, get.get(id)?.event]);
+      }));
+      const find = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
+      for (const id of archived) {
+        const active = find.get(id);
+        if (active && (!archivedEvents.get(id)
+          || !sameAuditEvidence(rowToLog(active), JSON.parse(archivedEvents.get(id)), true))) {
+          throw Error("Strict audit collision has divergent evidence");
+        }
+      }
       const remove = db.prepare("DELETE FROM audit_logs WHERE id=?");
       for (const id of archived) remove.run(id);
     }
@@ -466,6 +567,11 @@ function saveAuditLogsImpl(entries = {}) {
     for (const log of logs) {
       if (archived.has(log.id)) continue;
       const row = logToRow(log);
+      const existing = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`).get(row.id);
+      if (existing && !sameAuditEvidence(rowToLog(existing), log, true)) {
+        throw Error("Strict audit collision has divergent evidence");
+      }
       insert.run(
         row.id,
         row.eventType,
@@ -490,8 +596,20 @@ function saveAuditLogsImpl(entries = {}) {
         const remove = pending.prepare("DELETE FROM pending_audit WHERE id=?");
         pending.transaction(() => {
           assertNoStrictAuditRestore();
+          const getMain = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+            target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
+          const getArchived = pending.prepare("SELECT event FROM archived_audit WHERE id=?");
+          const getPending = pending.prepare("SELECT event FROM pending_audit WHERE id=?");
           for (const { id } of pending.prepare("SELECT id FROM pending_audit").all()) {
-            if (committedIds.has(id)) remove.run(id);
+            if (!committedIds.has(id)) continue;
+            const pendingLog = JSON.parse(getPending.get(id).event);
+            const mainRow = getMain.get(id);
+            const archivedRow = getArchived.get(id);
+            if ((mainRow && !sameAuditEvidence(rowToLog(mainRow), pendingLog, true))
+              || (archivedRow && !sameAuditEvidence(JSON.parse(archivedRow.event), pendingLog))) {
+              throw Error("Strict audit collision has divergent evidence");
+            }
+            if (mainRow || archivedRow) remove.run(id);
           }
         })();
       });
@@ -520,4 +638,5 @@ function saveAuditLogs(entries = {}) {
 }
 
 module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter,
-  preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs };
+  preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs,
+  normalizeMainAuditLog, loadAllAuditEvidenceForRestore, rowToLog };

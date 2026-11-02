@@ -2271,23 +2271,70 @@ function validateStrictAuditRestoreArchive(extractedRoot, manifest) {
       || strictAudit.sha256(source) !== manifest.strict_audit_sha256) throw Error("Strict audit archive digest mismatch");
     strictAudit.verifyAuditDatabase(source);
   }
-  return { source: included ? source : null, strict: archiveStrict, liveStrict };
+  return { source: included ? source : null, primary, strict: archiveStrict, liveStrict };
+}
+
+function stableAuditValue(value) {
+  if (Array.isArray(value)) return value.map(stableAuditValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableAuditValue(value[key])]));
+  }
+  return value;
+}
+
+function sameAuditEvidence(left, right, mainStructured = false) {
+  const a = mainStructured ? auditRepository.normalizeMainAuditLog(left) : left;
+  const b = mainStructured ? auditRepository.normalizeMainAuditLog(right) : right;
+  return JSON.stringify(stableAuditValue(a)) === JSON.stringify(stableAuditValue(b));
 }
 
 function collectCurrentStrictAuditEvidence(liveStrict) {
   if (!liveStrict) return [];
   // Include pending, active and historically archived audit records, which
   // must survive an operator's rollback to an older protected backup.
-  const current = auditRepository.loadAuditLogs().logs;
-  const archived = auditRepository.loadArchivedAuditLogs().logs;
   const records = new Map();
-  for (const entry of [...archived, ...current]) {
+  for (const { log: entry, source } of auditRepository.loadAllAuditEvidenceForRestore()) {
     if (typeof entry?.id !== "string" || !entry.id || entry.id.length > 128
       || typeof entry.eventType !== "string") throw Error("Current strict audit evidence is invalid");
-    if (!records.has(entry.id)) records.set(entry.id, entry);
+    const previous = records.get(entry.id);
+    if (previous && !sameAuditEvidence(previous.log, entry, previous.source === "main" || source === "main")) {
+      throw Error("Current strict audit collision has divergent evidence");
+    }
+    if (!previous || (previous.source === "main" && source !== "main")) records.set(entry.id, { log: entry, source });
   }
   if (records.size > strictAudit.MAX_AUDIT_RECORDS) throw Error("Current strict audit evidence exceeds retention capacity");
   return [...records.values()];
+}
+
+function assertRestoredAuditCollisionFree(archive, currentEvidence) {
+  if (!archive.source) return;
+  const sidecar = new Database(archive.source, { readonly: true, fileMustExist: true });
+  const primary = new Database(archive.primary, { readonly: true, fileMustExist: true });
+  try {
+    const seen = new Map();
+    const add = (log, source) => {
+      if (typeof log?.id !== "string" || !log.id || log.id.length > 128 || typeof log.eventType !== "string") {
+        throw Error("Strict audit restore evidence is invalid");
+      }
+      const old = seen.get(log.id);
+      if (old && !sameAuditEvidence(log, old.log, source === "main" || old.source === "main")) {
+        throw Error("Strict audit collision has divergent evidence");
+      }
+      if (!old || (old.source === "main" && source !== "main")) seen.set(log.id, { log, source });
+    };
+    // Compare ALL intersections in the selected archive, including IDs not
+    // present in the current runtime. Archived-ID pruning must not conceal a
+    // different pending or main event restored under the same identifier.
+    for (const row of sidecar.prepare("SELECT id,event FROM pending_audit").iterate()) add(JSON.parse(row.event), "pending");
+    for (const row of sidecar.prepare("SELECT id,event FROM archived_audit").iterate()) add(JSON.parse(row.event), "archived");
+    for (const row of primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+      target_type, target_id, action, result, timestamp, details_json FROM audit_logs`).iterate()) {
+      add(auditRepository.rowToLog(row), "main");
+    }
+    for (const { log, source } of currentEvidence) {
+      add(log, source);
+    }
+  } finally { primary.close(); sidecar.close(); }
 }
 
 function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
@@ -2310,22 +2357,34 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
   try {
     restorePreimage.copyVerifiedFile(archive.source, staged, strictAudit.sha256(archive.source));
     const db = new Database(staged, { fileMustExist: true });
+    const primary = new Database(archive.primary, { readonly: true, fileMustExist: true });
     try {
       // A restore must never erase acknowledged records logged after the
       // selected backup. Carry forward them into the private archive.
-      const archived = db.prepare("SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(event)),0) AS bytes FROM archived_audit").get();
+      const archived = db.prepare("SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(CAST(event AS BLOB))),0) AS bytes FROM archived_audit").get();
       let count = archived.count;
       let bytes = archived.bytes;
       const exists = db.prepare("SELECT event FROM archived_audit WHERE id=?");
+      const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?");
+      const main = primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
       const put = db.prepare("INSERT INTO archived_audit (id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
       db.transaction(() => {
-        for (const entry of currentEvidence) {
+        for (const { log: entry, source } of currentEvidence) {
           const serialized = JSON.stringify(entry);
           const saved = exists.get(entry.id);
-          if (saved) {
-            if (JSON.stringify(JSON.parse(saved.event)) !== serialized) {
+          const pendingRow = pending.get(entry.id);
+          const mainRow = main.get(entry.id);
+          for (const match of [
+            saved && { log: JSON.parse(saved.event), source: "archived" },
+            pendingRow && { log: JSON.parse(pendingRow.event), source: "pending" },
+            mainRow && { log: auditRepository.rowToLog(mainRow), source: "main" },
+          ]) {
+            if (match && !sameAuditEvidence(match.log, entry, match.source === "main" || source === "main")) {
               throw Error("Strict audit collision has divergent evidence");
             }
+          }
+          if (saved) {
             continue;
           }
           if (Buffer.byteLength(serialized) > 64 * 1024
@@ -2336,7 +2395,7 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
           put.run(entry.id, serialized);
         }
       })();
-    } finally { db.close(); }
+    } finally { primary.close(); db.close(); }
     strictAudit.verifyAuditDatabase(staged, { requireWal: true });
     fsyncFile(staged);
     // Whole-restore pre-images were durably committed before this point. Any
@@ -2829,6 +2888,7 @@ async function restoreBackup(id, options = {}) {
     // gate, before reading current evidence or copying live SQLite pre-images.
     if (persistenceMode === "sqlite") await strictAudit.drainAuditWriters(getDatabasePath());
     const currentAuditEvidence = collectCurrentStrictAuditEvidence(strictAuditArchive.liveStrict);
+    assertRestoredAuditCollisionFree(strictAuditArchive, currentAuditEvidence);
     const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);

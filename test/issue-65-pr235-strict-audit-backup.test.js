@@ -64,6 +64,39 @@ test("strict backup refuses a corrupt pending audit row with mismatched signed I
     /Strict audit row mismatches its ID/);
 });
 
+test("strict audit capacity preserves independent legal archived+pending byte limits", () => {
+  const MiB = 1024 * 1024;
+  assert.doesNotThrow(() => strictAudit.assertAuditByteBudgets({
+    archivedBytes: 510 * MiB, pendingBytes: 3 * MiB, fileBytes: 600 * MiB,
+  }), "a legal 513 MiB combined payload must not fail the 512 MiB archive-only limit");
+  assert.throws(() => strictAudit.assertAuditByteBudgets({
+    archivedBytes: strictAudit.MAX_ARCHIVED_BYTES + 1, pendingBytes: 1, fileBytes: 600 * MiB,
+  }), /capacity/);
+  assert.throws(() => strictAudit.assertAuditByteBudgets({
+    archivedBytes: 1, pendingBytes: strictAudit.MAX_PENDING_BYTES + 1, fileBytes: 600 * MiB,
+  }), /capacity/);
+  assert.throws(() => strictAudit.assertAuditByteBudgets({
+    archivedBytes: 1, pendingBytes: 1, fileBytes: strictAudit.MAX_SIDECAR_FILE_BYTES + 1,
+  }), /capacity/);
+  assert.throws(() => strictAudit.assertAuditByteBudgets({
+    archivedBytes: 1, pendingBytes: 1, fileBytes: 900 * MiB, walBytes: 1200 * MiB,
+    shmBytes: 64 * 1024,
+  }), /capacity/, "WAL/SHM physical expansion must count toward the bounded file budget");
+});
+
+test("SQLite audit byte accounting counts UTF-8 bytes, not characters", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE archived_audit (event TEXT NOT NULL)");
+    const text = JSON.stringify({ eventType: "auth.login.failed", details: { note: "🧪".repeat(8) } });
+    db.prepare("INSERT INTO archived_audit(event) VALUES(?)").run(text);
+    const { bytes, chars } = db.prepare(`SELECT SUM(LENGTH(CAST(event AS BLOB))) AS bytes,
+      SUM(LENGTH(event)) AS chars FROM archived_audit`).get();
+    assert.equal(bytes, Buffer.byteLength(text));
+    assert.ok(bytes > chars);
+  } finally { db.close(); }
+});
+
 test("main writer fence prevents pending audit transfer during both online snapshots", async (t) => {
   const sample = fixture(t);
   let held = false;
@@ -202,4 +235,133 @@ test("post-audit replacement failure restores live sidecar evidence and main DB 
     encoding: "utf8", timeout: 50_000 });
   assert.equal(result.status, 0, `${result.error?.message || ""}\n${result.stderr || ""}\n${result.stdout || ""}`);
   assert.match(result.stdout, /STRICT_AUDIT_ROLLBACK_OK/);
+});
+
+for (const origin of ["pending", "main", "current", "stored-pending", "stored-main"]) for (const replay of origin.startsWith("stored-") ? [false] : [false, true]) {
+  test(`restore ${replay ? "accepts exact replay" : "rejects divergent same-ID live evidence"} vs archived ${origin} audit`, { timeout: 70_000 }, (t) => {
+    const root = process.platform === "win32"
+      ? path.join(process.env.LOCALAPPDATA, `rootark-audit-collision-${crypto.randomBytes(10).toString("hex")}`)
+      : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-audit-collision-"));
+    if (process.platform === "win32") ensureWindowsChunkUploadRoot(root);
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const project = path.resolve(__dirname, "..");
+    const script = `
+      const assert=require("node:assert/strict"),Database=require("better-sqlite3");
+      const { runMigrations }=require(${JSON.stringify(path.join(project, "db", "migrations"))});
+      const { getDb }=require(${JSON.stringify(path.join(project, "db"))});
+      const { createSyncSqliteAccountWriteFence }=require(${JSON.stringify(path.join(project, "src", "services", "syncSqliteAccountWriteFence"))});
+      const backup=require(${JSON.stringify(path.join(project, "services", "backupService"))});
+      const restore=require(${JSON.stringify(path.join(project, "services", "restoreService"))});
+      const audit=require(${JSON.stringify(path.join(project, "repositories", "auditRepository"))});
+      const strict=require(${JSON.stringify(path.join(project, "services", "strictAuditSnapshot"))});
+      const mode=${JSON.stringify(origin)};
+      const replay=${JSON.stringify(replay)};
+      const event=(kind)=>({id:"reused",timestamp:"2026-11-02T00:00:00Z",eventType:kind,
+        severity:"warning",actor:{username:"fixture"},action:"login",result:"failure",details:{}});
+      (async()=>{
+        runMigrations({backup:false});createSyncSqliteAccountWriteFence();
+        if(mode==="stored-pending"||mode==="stored-main")audit.archiveAuditLogs([event("auth.new")]);
+        if(mode==="pending"||mode==="current"||mode==="stored-pending")audit.deferAuditLog(event("auth.old"));
+        else getDb().prepare("INSERT INTO audit_logs " +
+          "(id,event_type,severity,actor_username,actor_ip,target_type,target_id,action,result,timestamp,details_json) " +
+          "VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("reused","auth.old","warning","fixture",null,null,null,"login","failure",
+            "2026-11-02T00:00:00Z",JSON.stringify({details:{},actorRole:null,userAgent:null,targetMetadata:null}));
+        if(mode==="current")audit.archiveAuditLogs([event("auth.old")]);
+        const selected=await backup.createBackup({createdBy:"fixture"});
+        if(mode==="current")audit.deferAuditLog(event("auth.old"));
+        if(mode.startsWith("stored-")){
+          if(mode==="stored-main")getDb().prepare("DELETE FROM audit_logs WHERE id='reused'").run();
+          const db=new Database(strict.journalPath(process.env.DATABASE_URL));
+          db.prepare("DELETE FROM pending_audit WHERE id='reused'").run();
+          db.prepare("DELETE FROM archived_audit WHERE id='reused'").run();
+          db.close();
+        }else if(mode==="pending"||mode==="current"){
+          const db=new Database(strict.journalPath(process.env.DATABASE_URL));
+          db.prepare("UPDATE pending_audit SET event=? WHERE id='reused'").run(JSON.stringify(event(replay ? "auth.old" : "auth.new")));
+          db.close();
+        }else getDb().prepare("UPDATE audit_logs SET event_type=? WHERE id='reused'").run(replay ? "auth.old" : "auth.new");
+        if(replay) await restore.restoreBackup(selected.id,{confirmation:"RESTORE"});
+        else await assert.rejects(restore.restoreBackup(selected.id,{confirmation:"RESTORE"}),/collision|divergent/i);
+        if(!replay) assert.equal(restore.assertNoPendingWholeRestore().recovered,false);
+        if(mode==="current"&&!replay){
+          assert.throws(()=>audit.loadAuditLogs(),e=>e?.code==="SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+            "divergent live records must remain visible as fail-closed, never silently pruned");
+          const pending=new Database(strict.journalPath(process.env.DATABASE_URL),{readonly:true});
+          try{assert.equal(JSON.parse(pending.prepare("SELECT event FROM pending_audit WHERE id='reused'").get().event).eventType,"auth.new");}
+          finally{pending.close()}
+        } else {
+          const after=[...audit.loadAuditLogs().logs,...audit.loadArchivedAuditLogs().logs].find(x=>x.id==="reused");
+          if(mode.startsWith("stored-")&&!replay)assert.equal(after,undefined,"live state has no conflicting ID");
+          else assert.equal(after.eventType,replay ? "auth.old" : "auth.new", "restore must preserve exact replay or current evidence");
+        }
+        console.log("STRICT_AUDIT_COLLISION_DENIED");
+      })().catch(e=>{console.error(e);process.exitCode=1});`;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: root,
+      env: { ...process.env, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
+        DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
+        BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20",
+        ROOTARK_RESTORE_INSTANCE_COUNT: "1", ROOTARK_INSTANCE_ID: `collision-${origin}` },
+      encoding: "utf8", timeout: 50_000 });
+    assert.equal(result.status, 0, `${result.error?.message || ""}\n${result.stderr || ""}\n${result.stdout || ""}`);
+    assert.match(result.stdout, /STRICT_AUDIT_COLLISION_DENIED/);
+  });
+}
+
+test("live strict audit path fails closed for conflicting IDs without deleting acknowledged events", { timeout: 60_000 }, (t) => {
+  const root = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA, `rootark-audit-live-conflict-${crypto.randomBytes(10).toString("hex")}`)
+    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-audit-live-conflict-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.resolve(__dirname, "..");
+  const script = `
+    const assert=require("node:assert/strict"),Database=require("better-sqlite3");
+    const { runMigrations }=require(${JSON.stringify(path.join(project, "db", "migrations"))});
+    const { getDb }=require(${JSON.stringify(path.join(project, "db"))});
+    const { createSyncSqliteAccountWriteFence }=require(${JSON.stringify(path.join(project, "src", "services", "syncSqliteAccountWriteFence"))});
+    const audit=require(${JSON.stringify(path.join(project, "repositories", "auditRepository"))});
+    const strict=require(${JSON.stringify(path.join(project, "services", "strictAuditSnapshot"))});
+    const log=(id,type)=>({id,timestamp:"2026-11-02T00:00:00Z",eventType:type,
+      severity:"warning",actor:{username:"fixture"},action:"login",result:"failure",details:{}});
+    const insertMain=(id,type)=>getDb().prepare("INSERT INTO audit_logs " +
+      "(id,event_type,severity,actor_username,actor_ip,target_type,target_id,action,result,timestamp,details_json) " +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id,type,"warning","fixture",null,null,null,"login","failure",
+       "2026-11-02T00:00:00Z",JSON.stringify({details:{},actorRole:null,userAgent:null,targetMetadata:null}));
+    const denied=(error)=>/collision|divergent/i.test(String(error?.message))
+      || error?.code==="SYNC_ATOMIC_ACCOUNT_UNAVAILABLE";
+    try{
+      runMigrations({backup:false});createSyncSqliteAccountWriteFence();
+      insertMain("main","auth.old");audit.deferAuditLog(log("main","auth.new"));
+      assert.throws(()=>audit.loadAuditLogs(),denied);
+      assert.throws(()=>audit.saveAuditLogs({logs:[log("main","auth.old")]}),denied);
+      insertMain("main-archive","auth.old");
+      assert.throws(()=>audit.archiveAuditLogs([log("main-archive","auth.new")]),denied);
+      audit.deferAuditLog(log("pending","auth.new"));
+      assert.throws(()=>audit.archiveAuditLogs([log("pending","auth.old")]),denied);
+      audit.archiveAuditLogs([log("pending","auth.new")]);
+      audit.archiveAuditLogs([log("archived","auth.old")]);
+      audit.deferAuditLog(log("archived","auth.new"));
+      assert.throws(()=>audit.archiveAuditLogs([log("archived","auth.new")]),denied);
+      insertMain("replay","auth.old");audit.deferAuditLog(log("replay","auth.old"));
+      assert.doesNotThrow(()=>audit.saveAuditLogs({logs:[log("replay","auth.old")]}));
+      const sidecar=new Database(strict.journalPath(process.env.DATABASE_URL),{readonly:true});
+      try{
+        const get=sidecar.prepare("SELECT event FROM pending_audit WHERE id=?");
+        assert.equal(JSON.parse(get.get("main").event).eventType,"auth.new");
+        assert.equal(JSON.parse(get.get("archived").event).eventType,"auth.new");
+        assert.equal(get.get("pending"),undefined);
+        assert.equal(get.get("replay"),undefined);
+        assert.equal(JSON.parse(sidecar.prepare("SELECT event FROM archived_audit WHERE id='pending'").get().event).eventType,"auth.new");
+        assert.equal(sidecar.prepare("SELECT event FROM archived_audit WHERE id='main-archive'").get(),undefined,
+          "failed preflight must not publish a conflicting archive entry");
+      } finally {sidecar.close()}
+      assert.equal(getDb().prepare("SELECT event_type FROM audit_logs WHERE id='main'").get().event_type,"auth.old");
+      console.log("STRICT_LIVE_COLLISIONS_FAIL_CLOSED");
+    }catch(e){console.error(e);process.exitCode=1};`;
+  const result = spawnSync(process.execPath, ["-e", script], { cwd: root,
+    env: { ...process.env, DATABASE_URL: path.join(root, "data", "rootark.sqlite"),
+      DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
+      BACKUP_INCLUDE_TEMP: "false" }, encoding: "utf8", timeout: 45_000 });
+  assert.equal(result.status, 0, `${result.error?.message || ""}\n${result.stderr || ""}\n${result.stdout || ""}`);
+  assert.match(result.stdout, /STRICT_LIVE_COLLISIONS_FAIL_CLOSED/);
 });

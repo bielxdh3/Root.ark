@@ -11,6 +11,42 @@ const SNAPSHOT_NAME = "audit-pending.sqlite";
 const MAX_AUDIT_RECORDS = 100_000;
 const MAX_ARCHIVED_BYTES = 512 * 1024 * 1024;
 const MAX_PENDING_RECORDS = 4_096;
+const MAX_PENDING_ENTRY_BYTES = 64 * 1024;
+const MAX_PENDING_BYTES = MAX_PENDING_RECORDS * MAX_PENDING_ENTRY_BYTES;
+// SQLite stores both tables and their indexes in the same file. Include a
+// bounded allowance for page fragmentation and indexes, not merely row bytes.
+const MAX_SIDECAR_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+
+function assertAuditByteBudgets({ archivedBytes, pendingBytes, fileBytes, walBytes = 0, shmBytes = 0 }) {
+  if (!Number.isSafeInteger(archivedBytes) || archivedBytes < 0 || archivedBytes > MAX_ARCHIVED_BYTES
+    || !Number.isSafeInteger(pendingBytes) || pendingBytes < 0 || pendingBytes > MAX_PENDING_BYTES
+    || !Number.isSafeInteger(fileBytes) || fileBytes <= 0
+    || !Number.isSafeInteger(walBytes) || walBytes < 0
+    || !Number.isSafeInteger(shmBytes) || shmBytes < 0
+    || fileBytes + walBytes + shmBytes > MAX_SIDECAR_FILE_BYTES) {
+    throw Error("Strict audit byte capacity exceeded");
+  }
+}
+
+function auditPhysicalBytes(filename) {
+  const main = assertRegular(filename, MAX_SIDECAR_FILE_BYTES);
+  let walBytes = 0;
+  let shmBytes = 0;
+  for (const [suffix, key] of [["-wal", "wal"], ["-shm", "shm"]]) {
+    let stat;
+    try { stat = fs.lstatSync(`${filename}${suffix}`); }
+    catch (error) { if (error.code === "ENOENT") continue; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw Error("Unsafe strict audit SQLite WAL/SHM file");
+    }
+    if (key === "wal") walBytes = stat.size;
+    else shmBytes = stat.size;
+  }
+  if (main.size + walBytes + shmBytes > MAX_SIDECAR_FILE_BYTES) {
+    throw Error("Strict audit physical SQLite capacity exceeded");
+  }
+  return { fileBytes: main.size, walBytes, shmBytes };
+}
 
 function journalPath(dbPath) {
   return path.join(`${path.resolve(dbPath)}.audit-private`, "pending.sqlite");
@@ -69,7 +105,7 @@ function verifyAuditSchema(db, name) {
 }
 
 function verifyAuditDatabase(filename, { requireWal = false } = {}) {
-  assertRegular(filename, MAX_ARCHIVED_BYTES + 32 * 1024 * 1024);
+  const physical = auditPhysicalBytes(filename);
   const db = new Database(filename, { readonly: true, fileMustExist: true });
   try {
     if (db.pragma("integrity_check", { simple: true }) !== "ok") throw Error("Strict audit SQLite integrity failure");
@@ -80,13 +116,23 @@ function verifyAuditDatabase(filename, { requireWal = false } = {}) {
     const pending = db.prepare("SELECT id,event FROM pending_audit").all();
     const archived = db.prepare("SELECT id,event FROM archived_audit").all();
     if (pending.length > MAX_PENDING_RECORDS || archived.length > MAX_AUDIT_RECORDS) throw Error("Strict audit capacity invalid");
-    let bytes = 0;
-    for (const row of [...pending, ...archived]) {
+    let pendingBytes = 0;
+    let archivedBytes = 0;
+    for (const row of pending) {
       if (typeof row.id !== "string" || !row.id || row.id.length > 128 || typeof row.event !== "string") throw Error("Invalid audit row");
       const entry = JSON.parse(row.event);
       if (!entry || entry.id !== row.id || typeof entry.eventType !== "string") throw Error("Strict audit row mismatches its ID");
-      if ((bytes += Buffer.byteLength(row.event)) > MAX_ARCHIVED_BYTES) throw Error("Strict audit byte capacity exceeded");
+      const entryBytes = Buffer.byteLength(row.event);
+      if (entryBytes > MAX_PENDING_ENTRY_BYTES) throw Error("Strict pending audit entry too large");
+      pendingBytes += entryBytes;
     }
+    for (const row of archived) {
+      if (typeof row.id !== "string" || !row.id || row.id.length > 128 || typeof row.event !== "string") throw Error("Invalid audit row");
+      const entry = JSON.parse(row.event);
+      if (!entry || entry.id !== row.id || typeof entry.eventType !== "string") throw Error("Strict audit row mismatches its ID");
+      archivedBytes += Buffer.byteLength(row.event);
+    }
+    assertAuditByteBudgets({ archivedBytes, pendingBytes, ...physical });
     return { pending: pending.length, archived: archived.length };
   } finally { db.close(); }
 }
@@ -118,7 +164,7 @@ async function createCoordinatedSnapshots(main, mainPath, stageDir) {
     const sourceExists = fs.existsSync(sourcePath);
     if (strict && !sourceExists) throw Error("Strict audit journal missing: refusing incomplete backup");
     if (sourceExists) {
-      assertRegular(sourcePath, MAX_ARCHIVED_BYTES + 32 * 1024 * 1024);
+      auditPhysicalBytes(sourcePath);
       verifyAuditDatabase(sourcePath, { requireWal: strict });
       sidecar = new Database(sourcePath, { readonly: true, fileMustExist: true });
     }
@@ -178,4 +224,4 @@ async function drainAuditWriters(mainPath) {
 
 module.exports = { ARCHIVE_ENTRY, SNAPSHOT_NAME, journalPath, sha256,
   inspectPrimary, verifyAuditDatabase, createCoordinatedSnapshots, drainAuditWriters, MAX_AUDIT_RECORDS,
-  MAX_ARCHIVED_BYTES };
+  MAX_ARCHIVED_BYTES, MAX_PENDING_BYTES, MAX_SIDECAR_FILE_BYTES, assertAuditByteBudgets, auditPhysicalBytes };
