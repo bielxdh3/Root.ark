@@ -127,11 +127,12 @@ function aadFor(operation) {
   });
 }
 
-function normalizeAuthorization(value) {
+function normalizeAuthorization(value, { allowExpired = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("Invalid device authorization");
   assertExactKeys(value, AUTHORIZATION_FIELDS, "authorization");
   if (AUTHORIZATION_FIELDS.some((field) => !Object.hasOwn(value, field)) || value.schemaVersion !== 1 || value.type !== "rootark-sync-device-authorization-v1" || value.suite !== "rootark-zk-1" || value.protocolVersion !== PROTOCOL_VERSION) fail("Invalid device authorization");
-  if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now()) fail("Expired device authorization", "authorization_expired");
+  if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0
+    || (!allowExpired && value.expiresAt <= Date.now())) fail("Expired device authorization", "authorization_expired");
   for (const field of ["aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest", "replayId", "publicKey", "signature"]) {
     if (typeof value[field] !== "string" || !/^[A-Za-z0-9_-]+$/.test(value[field]) || value[field].length % 4 === 1) fail("Invalid device authorization");
   }
@@ -241,14 +242,20 @@ function createOperation(input = {}) {
   return result;
 }
 
-function validateOperation(input) {
+function validateOperation(input, { allowExpiredAuthorization = false } = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("Invalid operation");
   if (input.protocolVersion !== PROTOCOL_VERSION) fail("Unsupported sync protocol version", "invalid_protocol_version");
   assertExactKeys(input, OPERATION_FIELDS, "operation");
   for (const field of OPERATION_FIELDS) {
     if (!OPTIONAL_OPERATION_FIELDS.has(field) && !Object.hasOwn(input, field)) fail(`Missing operation field: ${field}`);
   }
-  const operation = createOperation({ ...input, plaintext: Buffer.alloc(0), fileKey: Buffer.alloc(32) });
+  // Stored historical ciphertext can legitimately outlive its signed device
+  // authorization. Do not reauthorize it here: signature and the historical
+  // admission time are independently verified before any historical READ.
+  const { authorization, ...fields } = input;
+  const operation = createOperation({ ...fields, plaintext: Buffer.alloc(0), fileKey: Buffer.alloc(32) });
+  if (authorization !== undefined) operation.authorization = normalizeAuthorization(authorization,
+    { allowExpired: allowExpiredAuthorization });
   if (input.tombstone !== operation.tombstone) fail("Invalid tombstone flag");
   if (!operation.metadata.path) fail("Operation metadata.path is required");
   if (operation.operation === "move" && !operation.metadata.sourcePath) fail("Move metadata.sourcePath is required");
@@ -262,6 +269,10 @@ function validateOperation(input) {
   const expectedAad = Buffer.from(aadFor(operation), "utf8");
   if (aad.length !== expectedAad.length || !crypto.timingSafeEqual(aad, expectedAad)) fail("AAD binding mismatch", "aad_mismatch");
   return { ...operation, ciphertext: input.ciphertext, nonce: input.nonce, tag: input.tag, aad: input.aad };
+}
+
+function validateStoredOperation(input) {
+  return validateOperation(input, { allowExpiredAuthorization: true });
 }
 
 function nextRevision(current, deviceId) {
@@ -285,5 +296,6 @@ module.exports = {
   normalizeAuthorization,
   safeRelativePath,
   validateOperation,
+  validateStoredOperation,
   OPTIONAL_OPERATION_FIELDS,
 };
