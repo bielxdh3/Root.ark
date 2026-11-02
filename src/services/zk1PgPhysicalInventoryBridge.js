@@ -754,11 +754,24 @@ class Zk1PgPhysicalInventoryBridge {
       expectedRootHash: v.expectedRootHash, expectedChunkCount: v.expectedChunkCount,
     });
     if (durableIntent.status !== "IMMUTABLE_PREWRITE_INTENT"
-      || !same(durableIntent.operationId, v.operation.operation_id)) fail();
+      || !same(durableIntent.operationId, v.operation.operation_id)
+      || typeof durableIntent.replay !== "boolean"
+      || typeof durableIntent.sealed !== "boolean"
+      || (durableIntent.sealed && !durableIntent.replay)) fail();
+    if (durableIntent.sealed) {
+      // A lost SEAL acknowledgment is distinguished from an incomplete write
+      // by a transactional PostgreSQL read under the pinned intent. An offline
+      // or forged attestor can never be mistaken for a missing seal.
+      await this.#verifiedPhysical(v);
+      return this.publishExisting({
+        scope: v.scope, operation: v.operation, digest: v.digest,
+        expectedRootHash: v.expectedRootHash, expectedChunkCount: v.expectedChunkCount,
+      });
+    }
     const stored = await this.sink.putSealed({
       scope: v.scope, objectId: v.objectId, revision: v.operation.revision,
       digest: v.digest, chunks, expectedChunkCount: v.expectedChunkCount,
-      expectedRootHash: v.expectedRootHash,
+      expectedRootHash: v.expectedRootHash, operationId: v.operation.operation_id,
     });
     if (stored.status !== "SEALED" || stored.chunkCount !== v.expectedChunkCount) fail();
     return this.publishExisting({

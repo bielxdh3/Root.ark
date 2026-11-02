@@ -118,11 +118,20 @@ class Zk1SharedPgPhysicalInventoryIntent {
           v.ciphertextSha256, v.root, v.count]);
         if (result.rowCount !== 1) fail();
       }
+      // A persisted intent can outlive a lost seal acknowledgment or a
+      // process restart. Under the same head lock, check whether an immutable
+      // seal already exists. This boolean only selects the reconciliation
+      // path; a SEALED result is NEVER accepted without independent full
+      // physical attestation/readback by the bridge.
+      const sealed = await c.query(`SELECT 1 FROM zk1_gate.sealed_object
+        WHERE scope_key=$1 AND object_id=$2`, [v.scopeKey, v.objectId]);
+      if (sealed.rowCount > 1) fail();
       await c.query("COMMIT");
       open = false;
       return Object.freeze({ status: "IMMUTABLE_PREWRITE_INTENT",
         operationId: Buffer.from(v.operationId), generation,
-        replay: previous.rowCount === 1, authorizesIo: false });
+        replay: previous.rowCount === 1, sealed: sealed.rowCount === 1,
+        authorizesIo: false });
     } catch (_) {
       if (open && c) { try { await c.query("ROLLBACK"); } catch (_) {} }
       fail();
