@@ -129,7 +129,7 @@
         // Node V2 ceremony. The browser pins its domain-separated digest, and
         // the server separately verifies the full owner-rooted V2 signature
         // chain before any protected GET. Do not call this a public V2 proof.
-        const manifestBytes = decode(input.signedV2Manifest, 128, 262144);
+        const manifestBytes = decode(input.signedV2Manifest, 128, 8 * 1024 * 1024);
         const manifestDigest = await sha(concat(
           encoder.encode("Root.ark/zk-1/recovery-manifest-digest/v1\0"), manifestBytes));
         if (!equal(manifestDigest, raw(input.pinnedCurrentHead.digest, 32))) deny();

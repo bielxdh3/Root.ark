@@ -130,7 +130,9 @@
         const grantBytes = grantWire(input.signedDeviceGrant);
         const approval = input.approval;
         exact(approval, [...BODY, "signature"]);
-        if (approval.schema !== SCHEMA || input.ownerPublicKey?.type !== "public"
+        if (approval.schema !== SCHEMA
+          || !Number.isSafeInteger(input.nowSeconds) || input.nowSeconds < 0
+          || input.ownerPublicKey?.type !== "public"
           || input.ownerPublicKey?.algorithm?.name !== "Ed25519"
           || input.nowSeconds < approval.issued_at - 30
           || input.nowSeconds > approval.expires_at
