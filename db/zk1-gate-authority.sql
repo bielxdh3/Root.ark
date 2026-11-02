@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS zk1_gate.admission (
   principal text NOT NULL CHECK (length(principal) BETWEEN 1 AND 128),
   action text NOT NULL CHECK (action IN ('get','put')),
   object_id text NOT NULL CHECK (length(object_id) BETWEEN 1 AND 128),
+  -- Gate revision remains scope-wide; opt-in strict operations separately pin
+  -- their immutable logical object revision (which need not equal gate revision).
   revision bigint NOT NULL CHECK (revision>0),
+  object_revision bigint CHECK(object_revision IS NULL OR object_revision>0),
   digest bytea NOT NULL CHECK (octet_length(digest)=32),
   generation bigint NOT NULL CHECK (generation>0),
   -- Strict physical-stop scopes pin the exact supervised OS process BEFORE
@@ -63,6 +66,8 @@ ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
   process_epoch bytea CHECK(process_epoch IS NULL OR octet_length(process_epoch)=16);
 ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
   process_pid bigint CHECK(process_pid IS NULL OR process_pid>0);
+ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
+  object_revision bigint CHECK(object_revision IS NULL OR object_revision>0);
 CREATE INDEX IF NOT EXISTS admission_unfinished
   ON zk1_gate.admission(scope_key,state);
 -- A separately provisioned physical writer LOGIN may be bound by the trusted
@@ -140,13 +145,15 @@ RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog 
       AND b.worker_id=p_worker_id AND b.process_epoch=p_process_epoch
       AND b.process_pid=p_process_pid
       AND h.phase='OPEN' AND h.require_stop_proof=TRUE
-      AND h.generation=p_generation AND h.revision=p_revision
+      AND h.generation=p_generation AND h.revision=a.revision
       AND h.digest=p_digest AND h.keyring_id=p_keyring_id
       AND a.scope_key=b.scope_key AND a.worker_id=b.worker_id
       AND a.object_id=b.object_id AND a.generation=b.generation
       AND a.process_epoch=b.process_epoch AND a.process_pid=b.process_pid
       AND a.principal=p_principal AND a.action='put' AND a.state='ACTIVE'
-      AND a.revision=p_revision AND a.digest=p_digest
+      AND (a.object_revision=p_revision OR
+        (a.object_revision IS NULL AND a.revision=p_revision))
+      AND a.digest=p_digest
   )
 $$;
 REVOKE ALL ON FUNCTION zk1_gate.verify_chunk_writer_binding(
@@ -194,8 +201,10 @@ BEGIN
     RAISE EXCEPTION 'physical writer admission is not ACTIVE'
       USING ERRCODE='23514';
   END IF;
-  INSERT INTO zk1_gate.ciphertext_chunk(scope_key,object_id,chunk_index,ciphertext)
-    VALUES(bound.scope_key,bound.object_id,p_chunk_index,p_ciphertext);
+  INSERT INTO zk1_gate.ciphertext_chunk(scope_key,object_id,revision,chunk_index,ciphertext)
+    SELECT bound.scope_key,bound.object_id,
+      COALESCE(a.object_revision,a.revision),p_chunk_index,p_ciphertext
+    FROM zk1_gate.admission AS a WHERE a.id=bound.admission_id;
   RETURN TRUE;
 END $$;
 REVOKE ALL ON FUNCTION zk1_gate.write_bound_chunk(integer,bytea) FROM PUBLIC;
@@ -264,6 +273,8 @@ CREATE OR REPLACE FUNCTION zk1_gate.validate_admission_transition()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE
   strict_mode boolean;
+  head_phase text;
+  needs_physical_intent boolean;
 BEGIN
   IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'admission transition requires READ COMMITTED isolation'
@@ -277,6 +288,12 @@ BEGIN
         AND digest=NEW.digest FOR UPDATE;
     IF NOT FOUND OR NEW.state <> 'ACTIVE' THEN
       RAISE EXCEPTION 'admission requires a current OPEN gate head'
+        USING ERRCODE='23514';
+    END IF;
+    IF EXISTS (SELECT 1 FROM zk1_gate.head h WHERE h.scope_key=NEW.scope_key
+        AND h.require_physical_inventory_intent) IS DISTINCT FROM
+      (NEW.object_revision IS NOT NULL) THEN
+      RAISE EXCEPTION 'object revision must follow strict physical policy'
         USING ERRCODE='23514';
     END IF;
     IF (strict_mode AND (NEW.host_key_id IS NULL
@@ -295,6 +312,7 @@ BEGIN
     OR NEW.action IS DISTINCT FROM OLD.action
     OR NEW.object_id IS DISTINCT FROM OLD.object_id
     OR NEW.revision IS DISTINCT FROM OLD.revision
+    OR NEW.object_revision IS DISTINCT FROM OLD.object_revision
     OR NEW.digest IS DISTINCT FROM OLD.digest
     OR NEW.generation IS DISTINCT FROM OLD.generation
     OR NEW.host_key_id IS DISTINCT FROM OLD.host_key_id
@@ -309,7 +327,8 @@ BEGIN
     IF FOUND THEN RETURN NEW; END IF;
   END IF;
   IF OLD.state IN ('ACTIVE','STOP_REQUESTED') AND NEW.state='FINISHED' THEN
-    SELECT require_stop_proof INTO strict_mode
+    SELECT require_stop_proof,phase,require_physical_inventory_intent
+      INTO strict_mode,head_phase,needs_physical_intent
       FROM zk1_gate.head WHERE scope_key=NEW.scope_key;
     IF NOT FOUND THEN
       RAISE EXCEPTION 'missing gate scope for completion'
@@ -320,6 +339,33 @@ BEGIN
       WHERE ack.admission_id=NEW.id AND ack.scope_key=NEW.scope_key
         AND ack.worker_id=NEW.worker_id AND ack.generation=NEW.generation) THEN
       RAISE EXCEPTION 'independent physical STOP receipt required'
+        USING ERRCODE='23514';
+    END IF;
+    -- The HTTPS physical-inventory path has no independently supervised STOP
+    -- process: finishing an unsealed PUT while OPEN would permanently strand
+    -- the immutable operation/admission binding after any gateway restart.
+    -- Keep its admission ACTIVE for exact-byte resume. QUIESCING still allows
+    -- irrevocable drain, while independently STOP-proven scopes retain their
+    -- stricter process-exit contract.
+    IF needs_physical_intent AND NOT strict_mode
+      AND OLD.action='put' AND head_phase='OPEN'
+      AND NOT EXISTS (
+        SELECT 1 FROM zk1_gate.sealed_object AS s
+        WHERE s.scope_key=OLD.scope_key AND s.object_id=OLD.object_id
+          AND s.admission_id=OLD.id
+          AND s.generation=OLD.generation
+          AND EXISTS (
+            SELECT 1 FROM zk1_gate.physical_inventory_admission AS b
+            JOIN zk1_gate.physical_inventory_intent AS i
+              ON i.operation_id=b.operation_id
+              AND i.scope_key=b.scope_key AND i.object_id=b.object_id
+              AND i.revision=s.revision AND i.generation=s.generation
+            WHERE b.admission_id=OLD.id
+              AND b.scope_key=OLD.scope_key AND b.object_id=OLD.object_id
+              AND b.generation=OLD.generation
+          )
+      ) THEN
+      RAISE EXCEPTION 'unsealed physical operation cannot finish while OPEN'
         USING ERRCODE='23514';
     END IF;
     RETURN NEW;
@@ -408,9 +454,10 @@ END $$;
 CREATE TABLE IF NOT EXISTS zk1_gate.ciphertext_chunk (
   scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
   object_id text NOT NULL,
+  revision bigint NOT NULL DEFAULT 1 CHECK(revision>0),
   chunk_index integer NOT NULL CHECK(chunk_index>=0),
   ciphertext bytea NOT NULL CHECK (octet_length(ciphertext) BETWEEN 1 AND 4194304),
-  PRIMARY KEY(scope_key,object_id,chunk_index)
+  PRIMARY KEY(scope_key,object_id,revision,chunk_index)
 );
 -- Physical chunk writes are STAGING until a trusted worker, while OPEN,
 -- seals the entire ordered ciphertext sequence against an independently
@@ -427,7 +474,7 @@ CREATE TABLE IF NOT EXISTS zk1_gate.sealed_object (
   -- Populated and checked by SQL trigger on opted-in physical-intent scopes.
   -- NULL on legacy scopes, which are not claimed as operation-bound.
   operation_id bytea CHECK(operation_id IS NULL OR octet_length(operation_id)=16),
-  PRIMARY KEY(scope_key,object_id)
+  PRIMARY KEY(scope_key,object_id,revision)
 );
 ALTER TABLE zk1_gate.sealed_object ADD COLUMN IF NOT EXISTS
   operation_id bytea CHECK(operation_id IS NULL OR octet_length(operation_id)=16);
@@ -448,7 +495,7 @@ CREATE TABLE IF NOT EXISTS zk1_gate.physical_inventory_intent (
   ciphertext_sha256 bytea NOT NULL CHECK(octet_length(ciphertext_sha256)=32),
   expected_root_hash bytea NOT NULL CHECK(octet_length(expected_root_hash)=32),
   expected_chunks integer NOT NULL CHECK(expected_chunks BETWEEN 1 AND 16),
-  PRIMARY KEY(scope_key,object_id)
+  PRIMARY KEY(scope_key,object_id,revision)
 );
 -- Separate second-phase binding: the owner-operation intent MUST exist before
 -- the first strict PUT admission. The PostgreSQL admission trigger pins its
@@ -458,11 +505,208 @@ CREATE TABLE IF NOT EXISTS zk1_gate.physical_inventory_intent (
 CREATE TABLE IF NOT EXISTS zk1_gate.physical_inventory_admission (
   scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
   object_id text NOT NULL,
+  revision bigint NOT NULL CHECK(revision>0),
   operation_id bytea NOT NULL UNIQUE CHECK(octet_length(operation_id)=16),
   admission_id bytea NOT NULL UNIQUE REFERENCES zk1_gate.admission(id),
   generation bigint NOT NULL CHECK(generation>0),
-  PRIMARY KEY(scope_key,object_id)
+  PRIMARY KEY(scope_key,object_id,revision)
 );
+-- Existing deployments used one physical row per logical object. Retain its
+-- original revision and immutable bytes while expanding each physical primary
+-- key. Missing or ambiguous historical revision provenance fails migration.
+-- No rewrite of external object IDs, inventory IDs, or signed operation IDs.
+ALTER TABLE zk1_gate.ciphertext_chunk ADD COLUMN IF NOT EXISTS revision bigint;
+ALTER TABLE zk1_gate.physical_inventory_admission ADD COLUMN IF NOT EXISTS revision bigint;
+-- Legacy immutable mutation triggers guard application writes, including
+-- administrator UPDATE. Temporarily disable only these named triggers inside
+-- this operator-owned migration transaction to annotate pre-existing rows.
+-- The transaction's DDL locks block concurrent application writers throughout.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+    WHERE t.tgrelid='zk1_gate.admission'::pg_catalog.regclass
+      AND t.tgname='zk1_gate_validate_admission_transition' AND NOT t.tgisinternal) THEN
+    ALTER TABLE zk1_gate.admission DISABLE TRIGGER zk1_gate_validate_admission_transition;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+    WHERE t.tgrelid='zk1_gate.physical_inventory_admission'::pg_catalog.regclass
+      AND t.tgname='zk1_gate_physical_inventory_admission_immutable' AND NOT t.tgisinternal) THEN
+    ALTER TABLE zk1_gate.physical_inventory_admission
+      DISABLE TRIGGER zk1_gate_physical_inventory_admission_immutable;
+  END IF;
+END $$;
+-- Validate ALL independent legacy revision witnesses before backfilling any
+-- physical identity. A matching seal alone cannot override a contradictory
+-- prewrite intent, immutable admission, or a competing old PUT admission.
+-- Never choose an arbitrary admission with LIMIT 1.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.ciphertext_chunk AS c
+    CROSS JOIN LATERAL (
+      SELECT count(DISTINCT candidate.revision) AS versions FROM (
+        SELECT s.revision FROM zk1_gate.sealed_object AS s
+          WHERE s.scope_key=c.scope_key AND s.object_id=c.object_id
+        UNION ALL
+        SELECT i.revision FROM zk1_gate.physical_inventory_intent AS i
+          WHERE i.scope_key=c.scope_key AND i.object_id=c.object_id
+        UNION ALL
+        SELECT COALESCE(a.object_revision,a.revision) FROM zk1_gate.admission AS a
+          WHERE a.scope_key=c.scope_key AND a.object_id=c.object_id
+            AND a.action='put'
+      ) AS candidate
+    ) AS witness
+    WHERE c.revision IS NULL AND witness.versions<>1
+  ) THEN
+    RAISE EXCEPTION 'legacy chunk has missing or conflicting revision provenance'
+      USING ERRCODE='23514';
+  END IF;
+  -- The immutable operation maps to ONE exact admission and the same
+  -- inventory intent; mixing operation IDs, generations or revisions is fatal.
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.physical_inventory_admission AS b
+    LEFT JOIN zk1_gate.physical_inventory_intent AS i
+      ON i.scope_key=b.scope_key AND i.object_id=b.object_id
+        AND i.operation_id=b.operation_id
+    LEFT JOIN zk1_gate.admission AS a ON a.id=b.admission_id
+    WHERE i.operation_id IS NULL OR a.id IS NULL
+      OR COALESCE(b.revision,i.revision)<>i.revision
+      OR b.generation<>i.generation OR a.generation<>b.generation
+      OR a.scope_key<>b.scope_key OR a.object_id<>b.object_id
+      OR a.action<>'put' OR COALESCE(a.object_revision,a.revision)<>i.revision
+      OR a.digest<>i.digest
+  ) THEN
+    RAISE EXCEPTION 'legacy physical admission conflicts with immutable intent'
+      USING ERRCODE='23514';
+  END IF;
+  -- Every historical strict PUT must already have the corresponding unique
+  -- SQL-pinned admission and immutable owner prewrite intent. No guess from
+  -- the mutable scope head is permitted, including for unfinished workers.
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.admission AS a
+    JOIN zk1_gate.head AS h ON h.scope_key=a.scope_key
+      AND h.require_physical_inventory_intent
+    LEFT JOIN zk1_gate.physical_inventory_admission AS b
+      ON b.admission_id=a.id AND b.scope_key=a.scope_key AND b.object_id=a.object_id
+    LEFT JOIN zk1_gate.physical_inventory_intent AS i
+      ON i.operation_id=b.operation_id AND i.scope_key=b.scope_key
+        AND i.object_id=b.object_id
+    WHERE a.action='put'
+      AND (b.admission_id IS NULL OR i.operation_id IS NULL
+        OR COALESCE(a.object_revision,a.revision)<>i.revision OR a.digest<>i.digest
+        OR a.generation<>i.generation OR b.generation<>i.generation)
+  ) THEN
+    RAISE EXCEPTION 'legacy strict PUT admission lacks exact immutable intent'
+      USING ERRCODE='23514';
+  END IF;
+  -- Strict finalized bytes must match the independently stored operation,
+  -- reservation and the admitted worker; a seal cannot relabel an old PUT.
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.sealed_object AS s
+    JOIN zk1_gate.head AS h ON h.scope_key=s.scope_key
+      AND h.require_physical_inventory_intent
+    LEFT JOIN zk1_gate.physical_inventory_intent AS i
+      ON i.scope_key=s.scope_key AND i.object_id=s.object_id AND i.revision=s.revision
+    LEFT JOIN zk1_gate.physical_inventory_admission AS b
+      ON b.scope_key=s.scope_key AND b.object_id=s.object_id
+        AND (b.revision=s.revision OR b.revision IS NULL)
+    WHERE i.operation_id IS NULL OR b.admission_id IS NULL
+      OR s.operation_id IS DISTINCT FROM i.operation_id
+      OR b.operation_id<>i.operation_id OR b.admission_id<>s.admission_id
+      OR s.generation<>i.generation OR s.generation<>b.generation
+      OR s.digest<>i.digest
+  ) THEN
+    RAISE EXCEPTION 'legacy sealed object contradicts physical operation intent'
+      USING ERRCODE='23514';
+  END IF;
+END $$;
+-- Legacy strict GET admissions have no PUT operation intent: keep their NULL
+-- object_revision rather than inventing a binding. Reader admission checks
+-- still require the old gate revision and an exact sealed ciphertext version.
+UPDATE zk1_gate.admission AS a SET object_revision=i.revision
+  FROM zk1_gate.physical_inventory_admission AS b
+  JOIN zk1_gate.physical_inventory_intent AS i
+    ON i.operation_id=b.operation_id AND i.scope_key=b.scope_key
+      AND i.object_id=b.object_id
+  JOIN zk1_gate.head AS h ON h.scope_key=b.scope_key
+    AND h.require_physical_inventory_intent
+  WHERE a.object_revision IS NULL AND a.action='put' AND a.id=b.admission_id;
+UPDATE zk1_gate.ciphertext_chunk AS c SET revision=(
+  SELECT DISTINCT candidate.revision FROM (
+    SELECT s.revision FROM zk1_gate.sealed_object AS s
+      WHERE s.scope_key=c.scope_key AND s.object_id=c.object_id
+    UNION
+    SELECT i.revision FROM zk1_gate.physical_inventory_intent AS i
+      WHERE i.scope_key=c.scope_key AND i.object_id=c.object_id
+    UNION
+    SELECT COALESCE(a.object_revision,a.revision) FROM zk1_gate.admission AS a
+      WHERE a.scope_key=c.scope_key AND a.object_id=c.object_id AND a.action='put'
+  ) AS candidate)
+WHERE c.revision IS NULL;
+UPDATE zk1_gate.physical_inventory_admission AS b SET revision=i.revision
+  FROM zk1_gate.physical_inventory_intent AS i
+  WHERE b.revision IS NULL AND b.operation_id=i.operation_id
+    AND b.scope_key=i.scope_key AND b.object_id=i.object_id;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+    WHERE t.tgrelid='zk1_gate.admission'::pg_catalog.regclass
+      AND t.tgname='zk1_gate_validate_admission_transition' AND NOT t.tgisinternal) THEN
+    ALTER TABLE zk1_gate.admission ENABLE TRIGGER zk1_gate_validate_admission_transition;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+    WHERE t.tgrelid='zk1_gate.physical_inventory_admission'::pg_catalog.regclass
+      AND t.tgname='zk1_gate_physical_inventory_admission_immutable' AND NOT t.tgisinternal) THEN
+    ALTER TABLE zk1_gate.physical_inventory_admission
+      ENABLE TRIGGER zk1_gate_physical_inventory_admission_immutable;
+  END IF;
+END $$;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM zk1_gate.ciphertext_chunk WHERE revision IS NULL)
+    OR EXISTS (SELECT 1 FROM zk1_gate.physical_inventory_admission WHERE revision IS NULL) THEN
+    RAISE EXCEPTION 'legacy physical revision cannot be proven' USING ERRCODE='23514';
+  END IF;
+END $$;
+ALTER TABLE zk1_gate.ciphertext_chunk ALTER COLUMN revision SET NOT NULL;
+ALTER TABLE zk1_gate.ciphertext_chunk ALTER COLUMN revision SET DEFAULT 1;
+ALTER TABLE zk1_gate.physical_inventory_admission ALTER COLUMN revision SET NOT NULL;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid='zk1_gate.ciphertext_chunk'::pg_catalog.regclass
+      AND conname='ciphertext_chunk_revision_check') THEN
+    ALTER TABLE zk1_gate.ciphertext_chunk ADD CONSTRAINT
+      ciphertext_chunk_revision_check CHECK(revision>0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid='zk1_gate.physical_inventory_admission'::pg_catalog.regclass
+      AND conname='physical_inventory_admission_revision_check') THEN
+    ALTER TABLE zk1_gate.physical_inventory_admission ADD CONSTRAINT
+      physical_inventory_admission_revision_check CHECK(revision>0);
+  END IF;
+END $$;
+DO $$
+DECLARE
+  name text;
+BEGIN
+  FOR name IN SELECT c.relname FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname IN
+      ('ciphertext_chunk','physical_inventory_intent','physical_inventory_admission','sealed_object')
+  LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
+      JOIN pg_catalog.pg_class t ON t.oid=k.conrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+      WHERE n.nspname='zk1_gate' AND t.relname=name AND k.contype='p'
+        AND pg_catalog.pg_get_constraintdef(k.oid) LIKE '%revision%') THEN
+      EXECUTE pg_catalog.format('ALTER TABLE zk1_gate.%I DROP CONSTRAINT %I',name,name || '_pkey');
+      EXECUTE pg_catalog.format('ALTER TABLE zk1_gate.%I ADD PRIMARY KEY (%s)',name,
+        CASE WHEN name='ciphertext_chunk' THEN 'scope_key,object_id,revision,chunk_index'
+          ELSE 'scope_key,object_id,revision' END);
+    END IF;
+  END LOOP;
+END $$;
 CREATE OR REPLACE FUNCTION zk1_gate.pin_physical_inventory_admission()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
 DECLARE
@@ -480,15 +724,16 @@ BEGIN
   IF h.require_physical_inventory_intent AND NEW.action='put' THEN
     SELECT operation_id,revision,digest,generation INTO i
       FROM zk1_gate.physical_inventory_intent
-      WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id;
-    IF NOT FOUND OR i.revision<>NEW.revision OR i.digest<>NEW.digest
+      WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+        AND revision=NEW.object_revision;
+    IF NOT FOUND OR i.revision<>NEW.object_revision OR i.digest<>NEW.digest
       OR i.generation<>NEW.generation THEN
       RAISE EXCEPTION 'strict PUT admission requires exact prewrite intent'
         USING ERRCODE='23514';
     END IF;
     INSERT INTO zk1_gate.physical_inventory_admission
-      (scope_key,object_id,operation_id,admission_id,generation)
-      VALUES(NEW.scope_key,NEW.object_id,i.operation_id,NEW.id,NEW.generation);
+      (scope_key,object_id,revision,operation_id,admission_id,generation)
+      VALUES(NEW.scope_key,NEW.object_id,NEW.object_revision,i.operation_id,NEW.id,NEW.generation);
   END IF;
   RETURN NEW;
 END $$;
@@ -531,17 +776,19 @@ BEGIN
   IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'physical inventory intent requires READ COMMITTED' USING ERRCODE='23514';
   END IF;
-  SELECT generation,revision,digest,keyring_id INTO h FROM zk1_gate.head
+  SELECT generation,digest,keyring_id INTO h FROM zk1_gate.head
     WHERE scope_key=NEW.scope_key AND phase='OPEN' FOR UPDATE;
-  IF NOT FOUND OR h.generation<>NEW.generation OR h.revision<>NEW.revision
+  IF NOT FOUND OR h.generation<>NEW.generation
     OR h.digest<>NEW.digest OR h.keyring_id<>NEW.keyring_id THEN
     RAISE EXCEPTION 'physical inventory intent requires current OPEN generation'
       USING ERRCODE='23514';
   END IF;
   IF EXISTS(SELECT 1 FROM zk1_gate.ciphertext_chunk
-    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id)
+    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+      AND revision=NEW.revision)
     OR EXISTS(SELECT 1 FROM zk1_gate.sealed_object
-    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id) THEN
+    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+      AND revision=NEW.revision) THEN
     RAISE EXCEPTION 'physical intent cannot relabel previously written bytes'
       USING ERRCODE='23514';
   END IF;
@@ -637,11 +884,17 @@ BEGIN
     RAISE EXCEPTION 'ciphertext chunk index exceeds the committed format limit'
       USING ERRCODE='23514';
   END IF;
+  IF NOT current_head.require_physical_inventory_intent
+    AND NEW.revision<>current_head.revision THEN
+    RAISE EXCEPTION 'ciphertext chunk revision differs from current gate head'
+      USING ERRCODE='23514';
+  END IF;
   IF current_head.require_physical_inventory_intent AND NOT EXISTS (
     SELECT 1 FROM zk1_gate.physical_inventory_intent AS i
     WHERE i.scope_key=NEW.scope_key AND i.object_id=NEW.object_id
+      AND i.revision=NEW.revision
       AND i.generation=current_head.generation
-      AND i.revision=current_head.revision AND i.digest=current_head.digest
+      AND i.digest=current_head.digest
       AND NEW.chunk_index<i.expected_chunks
   ) THEN
     RAISE EXCEPTION 'strict chunk requires exact prewrite physical operation intent'
@@ -651,22 +904,28 @@ BEGIN
     SELECT 1 FROM zk1_gate.physical_inventory_admission AS b
       JOIN zk1_gate.admission AS a ON a.id=b.admission_id
     WHERE b.scope_key=NEW.scope_key AND b.object_id=NEW.object_id
+      AND b.revision=NEW.revision
       AND b.generation=current_head.generation
       AND a.state='ACTIVE' AND a.action='put'
       AND a.scope_key=NEW.scope_key AND a.object_id=NEW.object_id
-      AND a.generation=b.generation
+      AND a.generation=b.generation AND a.object_revision=NEW.revision
+      AND a.revision=current_head.revision
+      AND a.digest=current_head.digest
   ) THEN
     RAISE EXCEPTION 'strict chunk requires bound physical PUT admission'
       USING ERRCODE='23514';
   END IF;
   IF EXISTS (SELECT 1 FROM zk1_gate.sealed_object
-             WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id) THEN
+             WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+               AND revision=NEW.revision) THEN
     RAISE EXCEPTION 'sealed ciphertext object is immutable'
       USING ERRCODE='23514';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM zk1_gate.admission
                  WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
                    AND action='put' AND state='ACTIVE'
+                   AND (object_revision=NEW.revision OR
+                     (object_revision IS NULL AND revision=NEW.revision))
                    AND revision=current_head.revision
                    AND digest=current_head.digest
                    AND generation=current_head.generation) THEN
@@ -696,7 +955,8 @@ BEGIN
         AND a.worker_id=b.worker_id AND a.generation=b.generation
         AND a.process_epoch=b.process_epoch AND a.process_pid=b.process_pid
         AND a.action='put' AND a.state='ACTIVE'
-        AND a.revision=current_head.revision AND a.digest=current_head.digest;
+        AND a.object_revision=NEW.revision AND a.revision=current_head.revision
+        AND a.digest=current_head.digest;
     IF NOT FOUND THEN
       RAISE EXCEPTION 'physical child writer lacks bound active admission'
         USING ERRCODE='23514';
@@ -736,9 +996,10 @@ BEGIN
     RAISE EXCEPTION 'sealed object requires READ COMMITTED isolation'
       USING ERRCODE='23514';
   END IF;
-  SELECT require_physical_inventory_intent INTO h FROM zk1_gate.head
+  SELECT require_physical_inventory_intent,revision INTO h FROM zk1_gate.head
     WHERE scope_key=NEW.scope_key AND phase='OPEN'
-      AND revision=NEW.revision AND digest=NEW.digest
+      AND (revision=NEW.revision OR require_physical_inventory_intent)
+      AND digest=NEW.digest
       AND generation=NEW.generation FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'sealed object requires the current OPEN gate head'
@@ -747,7 +1008,8 @@ BEGIN
   IF h.require_physical_inventory_intent THEN
     SELECT operation_id,revision,digest,generation,expected_chunks,
       expected_root_hash INTO i FROM zk1_gate.physical_inventory_intent
-      WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id;
+      WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+        AND revision=NEW.revision;
     IF NOT FOUND OR i.revision<>NEW.revision OR i.digest<>NEW.digest
       OR i.generation<>NEW.generation OR i.expected_chunks<>NEW.expected_chunks
       OR i.expected_root_hash<>NEW.root_hash
@@ -758,7 +1020,8 @@ BEGIN
     NEW.operation_id := i.operation_id;
     SELECT operation_id,admission_id,generation INTO b
       FROM zk1_gate.physical_inventory_admission
-      WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id;
+      WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+        AND revision=NEW.revision;
     IF NOT FOUND OR b.operation_id<>i.operation_id
       OR b.admission_id<>NEW.admission_id OR b.generation<>NEW.generation THEN
       RAISE EXCEPTION 'strict seal requires the operation-bound physical admission'
@@ -771,7 +1034,9 @@ BEGIN
   PERFORM 1 FROM zk1_gate.admission
     WHERE id=NEW.admission_id AND scope_key=NEW.scope_key
       AND action='put' AND object_id=NEW.object_id
-      AND revision=NEW.revision AND digest=NEW.digest
+      AND revision=h.revision AND (object_revision=NEW.revision OR
+        (object_revision IS NULL AND revision=NEW.revision))
+      AND digest=NEW.digest
       AND generation=NEW.generation AND state='ACTIVE';
   IF NOT FOUND THEN
     RAISE EXCEPTION 'sealed object requires an active matching admission'
@@ -784,6 +1049,7 @@ BEGIN
   -- exactly matches rootark-zk-chunk-root-v1.js.
   FOR item IN SELECT chunk_index, ciphertext FROM zk1_gate.ciphertext_chunk
     WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+      AND revision=NEW.revision
     ORDER BY chunk_index LOOP
     IF next_index >= NEW.expected_chunks OR item.chunk_index <> next_index THEN
       RAISE EXCEPTION 'sealed object has missing or excess ciphertext chunks'
@@ -841,10 +1107,10 @@ GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
 GRANT UPDATE (phase, generation, operation_id, reservation_id)
   ON zk1_gate.head TO zk1_gate_runtime;
 GRANT INSERT (id, scope_key, worker_id, principal, action, object_id,
-  revision, digest, generation, state, host_key_id, process_epoch, process_pid)
+  revision, object_revision, digest, generation, state, host_key_id, process_epoch, process_pid)
   ON zk1_gate.admission TO zk1_gate_runtime;
 GRANT UPDATE (state) ON zk1_gate.admission TO zk1_gate_runtime;
-GRANT INSERT (scope_key, object_id, chunk_index, ciphertext)
+GRANT INSERT (scope_key, object_id, revision, chunk_index, ciphertext)
   ON zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
 GRANT INSERT (writer_login,admission_id,scope_key,object_id,worker_id,
   generation,process_epoch,process_pid)
@@ -886,6 +1152,10 @@ GRANT USAGE ON SCHEMA zk1_gate TO zk1_physical_attestor_runtime;
 GRANT SELECT ON zk1_gate.head,zk1_gate.sealed_object,
   zk1_gate.ciphertext_chunk,zk1_gate.physical_inventory_intent,
   zk1_gate.physical_inventory_admission TO zk1_physical_attestor_runtime;
+-- The physical attestor cross-checks immutable gate/object revision, digest
+-- and generation without exposing worker principals or process credentials.
+GRANT SELECT (id,revision,object_revision,digest,generation)
+  ON zk1_gate.admission TO zk1_physical_attestor_runtime;
 GRANT EXECUTE ON FUNCTION zk1_gate.physical_inventory_wal_flush_barrier()
   TO zk1_physical_attestor_runtime;
 REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER

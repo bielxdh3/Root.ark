@@ -129,6 +129,86 @@ test("mutating external admission adapter cannot retarget subsequent physical ch
     "worker identity must remain pinned even if START adapter mutates its input");
 });
 
+test("strict physical operation survives lost START response, chunk outage and a new sink instance", async () => {
+  const chunks = [crypto.randomBytes(73), crypto.randomBytes(39)];
+  const input = { ...request(chunks), operationId: crypto.randomBytes(16) };
+  const pinnedAdmission = crypto.randomBytes(16);
+  let pinnedWorker;
+  let state = "NONE";
+  let startAckLost = true;
+  let outage = true;
+  const events = [];
+  const client = {
+    async beginIoAdmission(op) {
+      events.push("start");
+      if (state === "NONE") {
+        pinnedWorker = Buffer.from(op.workerId);
+        state = "ACTIVE";
+      } else if (state !== "ACTIVE" || !pinnedWorker.equals(op.workerId)) {
+        throw Error("immutable admission mismatch");
+      }
+      if (startAckLost) {
+        startAckLost = false;
+        throw Error("START committed but response lost");
+      }
+      return { admissionId: Buffer.from(pinnedAdmission), generation: 2, proceed: true };
+    },
+    async putCiphertextChunk(op, index) {
+      events.push("chunk:" + index);
+      if (outage) throw Error("PG transient network outage");
+      assert.equal(state, "ACTIVE");
+      assert.deepEqual(op.admissionId, pinnedAdmission);
+      assert.deepEqual(op.workerId, pinnedWorker);
+      return { stored: true };
+    },
+    async sealCiphertextObject(op, count, root) {
+      events.push("seal");
+      assert.equal(state, "ACTIVE");
+      assert.deepEqual(op.workerId, pinnedWorker);
+      assert.deepEqual(root, input.expectedRootHash);
+      return { status: "SEALED", chunkCount: count };
+    },
+    async finishIoAdmission(op) {
+      events.push("finish");
+      assert.deepEqual(op.workerId, pinnedWorker);
+      state = "FINISHED";
+      return { status: "FINISHED" };
+    },
+  };
+  await assert.rejects(new Zk1SharedPgCiphertextSink({ gateClient: client })
+    .putSealed(input), /ZK_GATE_SINK_UNAVAILABLE/);
+  assert.equal(state, "ACTIVE", "uncertain unsealed write retains original admission");
+  assert.equal(events.includes("finish"), false, "failed strict IO must not burn its durable identity");
+  outage = false;
+  await assert.rejects(new Zk1SharedPgCiphertextSink({ gateClient: client })
+    .putSealed({ ...input, operationId: crypto.randomBytes(16) }),
+  /ZK_GATE_SINK_UNAVAILABLE/, "unrelated operation cannot adopt the original admission");
+  assert.equal(state, "ACTIVE");
+  assert.deepEqual(await new Zk1SharedPgCiphertextSink({ gateClient: client })
+    .putSealed(input), { status: "SEALED", chunkCount: 2 });
+  assert.equal(state, "FINISHED");
+  assert.deepEqual(events.slice(-4), ["chunk:0", "chunk:1", "seal", "finish"]);
+});
+
+test("revoked strict admission finishes original worker so quiescence can drain", async () => {
+  const chunks = [crypto.randomBytes(20)];
+  const input = { ...request(chunks), operationId: crypto.randomBytes(16) };
+  const finished = [];
+  const gateClient = {
+    beginIoAdmission: async (io) => ({ admissionId: crypto.randomBytes(16),
+      generation: 4, proceed: false }),
+    putCiphertextChunk: async () => { assert.fail("must not write after quiesce"); },
+    sealCiphertextObject: async () => { assert.fail("must not seal after quiesce"); },
+    finishIoAdmission: async (io) => {
+      finished.push(Buffer.from(io.workerId));
+      return { status: "FINISHED" };
+    },
+  };
+  await assert.rejects(new Zk1SharedPgCiphertextSink({ gateClient })
+    .putSealed(input), /ZK_GATE_SINK_UNAVAILABLE/);
+  assert.equal(finished.length, 1);
+});
+
 test("sealed sink commits all physical chunks and seal under real PG generation", {
   skip: !process.env.ROOTARK_ZK1_TEST_PG_URL || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
     ? "requires disposable PostgreSQL admin and restricted runtime" : false,
@@ -168,4 +248,102 @@ test("sealed sink commits all physical chunks and seal under real PG generation"
     "the sink must not leave a live worker after a successful seal");
   assert.equal((await gate.markPending({ scope: s, operationId: operation.operationId,
     reservationId: operation.reservationId })).status, "PENDING");
+});
+
+test("PG18 strict prewrite admission survives partial outage and rejects worker substitution", {
+  skip: !process.env.ROOTARK_ZK1_TEST_PG_URL || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
+    ? "requires disposable PG18 administrator and restricted runtime" : false,
+}, async (t) => {
+  const admin = new Pool({ connectionString: process.env.ROOTARK_ZK1_TEST_PG_URL,
+    max: 2, connectionTimeoutMillis: 3000 });
+  const restricted = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL,
+    max: 3, connectionTimeoutMillis: 3000 });
+  t.after(async () => Promise.all([admin.end(), restricted.end()]));
+  const chunks = [crypto.randomBytes(45), crypto.randomBytes(98)];
+  const input = { ...request(chunks), operationId: crypto.randomBytes(16) };
+  const scopeKey = `${input.scope.account_id.toString("hex")}:${input.scope.compartment_id.length.toString(16)}:${input.scope.compartment_id.toString("hex")}`;
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_physical_inventory_intent)
+    VALUES($1,$2,1,$3,true)`, [scopeKey, input.scope.keyring_id, input.digest]);
+  await admin.query(`INSERT INTO zk1_gate.physical_inventory_intent
+    (scope_key,object_id,operation_id,expected_inventory_sequence,expected_inventory_root,
+      keyring_id,revision,epoch,digest,generation,ciphertext_sha256,
+      expected_root_hash,expected_chunks)
+    VALUES($1,$2,$3,0,$4,$5,1,0,$6,1,$7,$8,$9)`,
+  [scopeKey, input.objectId, input.operationId, crypto.randomBytes(32),
+    input.scope.keyring_id, input.digest,
+    crypto.createHash("sha256").update(Buffer.concat(chunks)).digest(),
+    input.expectedRootHash, chunks.length]);
+  const gate = new Zk1SharedPgGateAuthority({ pool: restricted });
+  const seal = new Zk1SharedPgSealedObjectStore({ pool: restricted });
+  const principal = "trusted-isolated-gateway";
+  let failChunkOne = true;
+  let failStartAck = true;
+  let finishCount = 0;
+  const client = {
+    async beginIoAdmission(op) {
+      const accepted = await gate.beginIoAdmission({ ...op, principal });
+      if (failStartAck) {
+        failStartAck = false;
+        throw Error("lost START ACK after SQL COMMIT");
+      }
+      return accepted;
+    },
+    async putCiphertextChunk(op, index, bytes) {
+      if (failChunkOne && index === 1) throw Error("transient PG outage");
+      return gate.putCiphertextChunk({ ...op, principal }, index, bytes);
+    },
+    sealCiphertextObject: (op, count, root) => seal.seal({ ...op,
+      principal, expectedChunkCount: count, expectedRootHash: root }),
+    async finishIoAdmission(op) {
+      finishCount += 1;
+      return gate.finishIoAdmission({ ...op, principal });
+    },
+  };
+  await assert.rejects(new Zk1SharedPgCiphertextSink({ gateClient: client })
+    .putSealed(input), /ZK_GATE_SINK_UNAVAILABLE/);
+  assert.equal(finishCount, 0, "failed strict upload must preserve ACTIVE admission");
+  const original = await admin.query(`SELECT b.operation_id,b.admission_id,a.worker_id,a.state,
+    a.principal,a.process_epoch,a.process_pid
+    FROM zk1_gate.physical_inventory_admission b
+    JOIN zk1_gate.admission a ON a.id=b.admission_id
+    WHERE b.scope_key=$1 AND b.object_id=$2`, [scopeKey, input.objectId]);
+  assert.equal(original.rowCount, 1);
+  assert.deepEqual(original.rows[0].operation_id, input.operationId);
+  assert.equal(original.rows[0].state, "ACTIVE");
+  assert.equal(original.rows[0].principal, principal);
+  assert.equal(original.rows[0].process_epoch, null,
+    "HTTP gate replay never impersonates a supervised process epoch");
+  assert.equal(original.rows[0].process_pid, null);
+  const savedChunk = await admin.query(`SELECT ciphertext FROM zk1_gate.ciphertext_chunk
+    WHERE scope_key=$1 AND object_id=$2 AND chunk_index=0`, [scopeKey, input.objectId]);
+  assert.equal(savedChunk.rowCount, 1);
+  assert.deepEqual(savedChunk.rows[0].ciphertext, chunks[0]);
+  await assert.rejects(gate.beginIoAdmission({ scope: input.scope,
+    workerId: crypto.randomBytes(16), principal, action: "put",
+    objectId: input.objectId, revision: input.revision, digest: input.digest }),
+  /ZK_GATE_UNAVAILABLE|ZK_GATE_DENIED/, "new worker cannot bind the immutable operation");
+  await assert.rejects(gate.beginIoAdmission({ scope: input.scope,
+    workerId: original.rows[0].worker_id, principal: "different-gateway", action: "put",
+    objectId: input.objectId, revision: input.revision, digest: input.digest }),
+  /ZK_GATE_UNAVAILABLE|ZK_GATE_DENIED/, "same worker bytes do not bypass pinned principal");
+  failChunkOne = false;
+  assert.deepEqual(await new Zk1SharedPgCiphertextSink({ gateClient: client })
+    .putSealed(input), { status: "SEALED", chunkCount: chunks.length });
+  assert.equal(finishCount, 1);
+  const final = await admin.query(`SELECT a.id,a.worker_id,a.state,s.admission_id,
+    s.operation_id,s.root_hash FROM zk1_gate.admission a
+    JOIN zk1_gate.sealed_object s ON s.admission_id=a.id
+    WHERE a.scope_key=$1 AND a.object_id=$2`, [scopeKey, input.objectId]);
+  assert.equal(final.rowCount, 1);
+  assert.deepEqual(final.rows[0].id, original.rows[0].admission_id);
+  assert.deepEqual(final.rows[0].worker_id, original.rows[0].worker_id);
+  assert.equal(final.rows[0].state, "FINISHED");
+  assert.deepEqual(final.rows[0].operation_id, input.operationId);
+  assert.deepEqual(final.rows[0].root_hash, input.expectedRootHash);
+  await assert.rejects(admin.query(`UPDATE zk1_gate.physical_inventory_admission
+    SET admission_id=$3 WHERE scope_key=$1 AND object_id=$2`,
+  [scopeKey, input.objectId, crypto.randomBytes(16)]), /immutable/i);
+  await assert.rejects(admin.query(`DELETE FROM zk1_gate.physical_inventory_admission
+    WHERE scope_key=$1 AND object_id=$2`, [scopeKey, input.objectId]), /immutable/i);
 });

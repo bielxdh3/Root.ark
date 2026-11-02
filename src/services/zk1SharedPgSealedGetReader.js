@@ -67,7 +67,8 @@ class Zk1SharedPgSealedGetReader {
       return await this.gate.transaction(async (db) => {
         const h = await this.gate.lockedHead(db, { key: s.key, keyringId: s.keyring });
         if (h.require_stop_proof !== true || h.phase !== "OPEN"
-          || Number(h.generation) !== generation || Number(h.revision) !== revision
+          || Number(h.generation) !== generation
+          || (!h.require_physical_inventory_intent && Number(h.revision) !== revision)
           || !h.digest.equals(digest)) deny();
         const a = await db.query("SELECT * FROM zk1_gate.admission WHERE id=$1", [admission]);
         const workerRow = a.rows[0];
@@ -76,12 +77,15 @@ class Zk1SharedPgSealedGetReader {
           || workerRow.principal !== principal || workerRow.action !== "get"
           || workerRow.object_id !== objectId || workerRow.state !== "ACTIVE"
           || Number(workerRow.generation) !== generation
-          || Number(workerRow.revision) !== revision || !workerRow.digest.equals(digest)
+          || Number(workerRow.revision) !== Number(h.revision)
+          || Number(workerRow.object_revision ?? workerRow.revision) !== revision
+          || !workerRow.digest.equals(digest)
           || !workerRow.host_key_id?.equals(hostKey)
           || !workerRow.process_epoch?.equals(epoch)
           || Number(workerRow.process_pid) !== process.processPid) deny();
         const sealed = await db.query(`SELECT revision,digest,generation,expected_chunks,root_hash
-          FROM zk1_gate.sealed_object WHERE scope_key=$1 AND object_id=$2`, [s.key, objectId]);
+          FROM zk1_gate.sealed_object WHERE scope_key=$1 AND object_id=$2 AND revision=$3`,
+        [s.key, objectId, revision]);
         const object = sealed.rows[0];
         const expectedChunks = Number(object?.expected_chunks);
         if (sealed.rowCount !== 1 || !object || Number(object.revision) !== revision
@@ -89,7 +93,8 @@ class Zk1SharedPgSealedGetReader {
           || !object.root_hash.equals(root) || !Number.isSafeInteger(expectedChunks)
           || expectedChunks < 1 || expectedChunks > 4096 || chunkIndex >= expectedChunks) deny();
         const chunk = await db.query(`SELECT ciphertext FROM zk1_gate.ciphertext_chunk
-          WHERE scope_key=$1 AND object_id=$2 AND chunk_index=$3`, [s.key, objectId, chunkIndex]);
+          WHERE scope_key=$1 AND object_id=$2 AND revision=$3 AND chunk_index=$4`,
+        [s.key, objectId, revision, chunkIndex]);
         if (chunk.rowCount !== 1 || !Buffer.isBuffer(chunk.rows[0]?.ciphertext)
           || chunk.rows[0].ciphertext.length < 1 || chunk.rows[0].ciphertext.length > 4 * 1024 * 1024) deny();
         return Buffer.from(chunk.rows[0].ciphertext);

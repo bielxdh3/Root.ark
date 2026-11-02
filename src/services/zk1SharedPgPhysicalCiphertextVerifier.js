@@ -251,14 +251,18 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         i.generation AS intent_generation,i.ciphertext_sha256 AS intent_sha256,
         i.expected_root_hash AS intent_root,i.expected_chunks AS intent_count,
         b.operation_id AS admission_operation_id,
-        b.admission_id AS bound_admission_id,b.generation AS bound_generation
+        b.admission_id AS bound_admission_id,b.generation AS bound_generation,
+        a.revision AS admitted_gate_revision,a.object_revision AS admitted_object_revision,
+        a.digest AS admitted_gate_digest,a.generation AS admitted_generation
         FROM zk1_gate.sealed_object s
         JOIN zk1_gate.head h ON h.scope_key=s.scope_key
         JOIN zk1_gate.physical_inventory_intent i
-          ON i.scope_key=s.scope_key AND i.object_id=s.object_id
+          ON i.scope_key=s.scope_key AND i.object_id=s.object_id AND i.revision=s.revision
         JOIN zk1_gate.physical_inventory_admission b
-          ON b.scope_key=s.scope_key AND b.object_id=s.object_id
-        WHERE s.scope_key=$1 AND s.object_id=$2`, [v.scopeKey, v.objectId]);
+          ON b.scope_key=s.scope_key AND b.object_id=s.object_id AND b.revision=s.revision
+        JOIN zk1_gate.admission a ON a.id=b.admission_id
+        WHERE s.scope_key=$1 AND s.object_id=$2 AND s.revision=$3`,
+      [v.scopeKey, v.objectId, v.revision]);
       if (state.rowCount !== 1) fail();
       const s = state.rows[0];
       if (s.intent_required !== true
@@ -266,6 +270,10 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         || !same(s.admission_operation_id, v.operationId)
         || !same(s.bound_admission_id, s.admission_id)
         || Number(s.bound_generation) !== Number(s.generation)
+        || Number(s.admitted_generation) !== Number(s.generation)
+        || Number(s.admitted_gate_revision) !== Number(s.live_revision)
+        || Number(s.admitted_object_revision) !== v.revision
+        || !same(s.admitted_gate_digest, v.digest)
         || Number(s.revision) !== v.revision || !same(s.digest, v.digest)
         || !same(s.root_hash, v.expectedRootHash)
         || s.expected_chunks !== v.expectedChunkCount
@@ -281,11 +289,12 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         || s.intent_count !== v.expectedChunkCount
         || !same(s.keyring_id, v.scope.keyring_id)
         || s.phase !== "OPEN" || Number(s.live_generation) !== Number(s.generation)
-        || Number(s.live_revision) !== v.revision || !same(s.live_digest, v.digest)
+        || !same(s.live_digest, v.digest)
         || !Buffer.isBuffer(s.admission_id) || s.admission_id.length !== 16) fail();
       const chunks = await client.query(`SELECT chunk_index,ciphertext
-        FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1 AND object_id=$2
-        ORDER BY chunk_index LIMIT $3`, [v.scopeKey, v.objectId, v.expectedChunkCount + 1]);
+        FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1 AND object_id=$2 AND revision=$3
+        ORDER BY chunk_index LIMIT $4`,
+      [v.scopeKey, v.objectId, v.revision, v.expectedChunkCount + 1]);
       if (chunks.rowCount !== v.expectedChunkCount) fail();
       const root = createZk1CiphertextRootBuilder(v.expectedChunkCount);
       const hash = crypto.createHash("sha256");

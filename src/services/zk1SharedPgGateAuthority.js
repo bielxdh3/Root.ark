@@ -107,7 +107,8 @@ function worker(input) {
 function matchAdmission(record, input, requireProcess = false) {
   return record && record.worker_id.equals(input.workerId)
     && record.principal === input.principal && record.action === input.action
-    && record.object_id === input.objectId && Number(record.revision) === input.revision
+    && record.object_id === input.objectId
+    && Number(record.object_revision ?? record.revision) === input.revision
     && record.digest.equals(input.digest) && record.scope_key === input.key
     && (!requireProcess || (
       input.hostKeyId && input.processEpoch && input.processPid
@@ -254,27 +255,32 @@ class Zk1SharedPgGateAuthority {
       if (existing) {
         if (!matchAdmission(existing, io, Boolean(head.require_stop_proof))
           || existing.state === "FINISHED") deny();
-        const sameGeneration = Number(head.generation) === Number(existing.generation);
+        const sameGeneration = Number(head.generation) === Number(existing.generation)
+          && Number(head.revision) === Number(existing.revision);
         // Replaying a previously admitted GET is itself a fresh egress
         // decision. A replaced head must never resurrect an old worker merely
         // because the generation was accidentally left unchanged. Preserve
         // non-proceed replay of stale generations for lost-ACK reconciliation.
         if (head.phase === "OPEN" && sameGeneration
-          && (Number(head.revision) !== io.revision || !head.digest.equals(io.digest))) deny();
+          && ((!head.require_physical_inventory_intent
+            && Number(head.revision) !== io.revision) || !head.digest.equals(io.digest))) deny();
         return { admissionId: Buffer.from(existing.id),
           generation: Number(existing.generation),
           proceed: head.phase === "OPEN" && existing.state === "ACTIVE"
             && sameGeneration };
       }
-      if (head.phase !== "OPEN" || Number(head.revision) !== io.revision
+      if (head.phase !== "OPEN" || (!head.require_physical_inventory_intent
+        && Number(head.revision) !== io.revision)
         || !head.digest.equals(io.digest)) deny();
       const admissionId = crypto.randomBytes(16);
       await c.query(`INSERT INTO zk1_gate.admission
-        (id,scope_key,worker_id,principal,action,object_id,revision,digest,
+        (id,scope_key,worker_id,principal,action,object_id,revision,object_revision,digest,
           generation,host_key_id,process_epoch,process_pid,state)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'ACTIVE')`,
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'ACTIVE')`,
       [admissionId, io.key, io.workerId, io.principal, io.action,
-        io.objectId, io.revision, io.digest, head.generation,
+        io.objectId, head.revision,
+        head.require_physical_inventory_intent ? io.revision : null,
+        io.digest, head.generation,
         io.hostKeyId || null, io.processEpoch || null, io.processPid || null]);
       return { admissionId, generation: Number(head.generation), proceed: true };
     });
@@ -296,11 +302,13 @@ class Zk1SharedPgGateAuthority {
     return this.transaction(async (c) => {
       const head = await this.lockedHead(c, io);
       if (head.phase !== "OPEN" || Number(head.generation) !== generation
-        || Number(head.revision) !== io.revision || !head.digest.equals(io.digest)) deny();
+        || (!head.require_physical_inventory_intent
+          && Number(head.revision) !== io.revision) || !head.digest.equals(io.digest)) deny();
       const found = await c.query("SELECT * FROM zk1_gate.admission WHERE id=$1", [admissionId]);
       const entry = found.rows[0];
       if (!matchAdmission(entry, io) || !entry.id.equals(admissionId)
-        || entry.state !== "ACTIVE" || Number(entry.generation) !== generation) deny();
+        || entry.state !== "ACTIVE" || Number(entry.generation) !== generation
+        || Number(entry.revision) !== Number(head.revision)) deny();
       return effect(c, io);
     });
   }
@@ -313,13 +321,13 @@ class Zk1SharedPgGateAuthority {
       || input?.action !== "put") deny();
     return this.#authorizeStep(input, async (c, io) => {
       const inserted = await c.query(`INSERT INTO zk1_gate.ciphertext_chunk
-        (scope_key,object_id,chunk_index,ciphertext) VALUES($1,$2,$3,$4)
+        (scope_key,object_id,revision,chunk_index,ciphertext) VALUES($1,$2,$3,$4,$5)
         ON CONFLICT DO NOTHING RETURNING chunk_index`,
-      [io.key, io.objectId, chunkIndex, blob]);
+      [io.key, io.objectId, io.revision, chunkIndex, blob]);
       if (inserted.rowCount === 1) return { stored: true };
       const old = await c.query(`SELECT ciphertext FROM zk1_gate.ciphertext_chunk
-        WHERE scope_key=$1 AND object_id=$2 AND chunk_index=$3`,
-      [io.key, io.objectId, chunkIndex]);
+        WHERE scope_key=$1 AND object_id=$2 AND revision=$3 AND chunk_index=$4`,
+      [io.key, io.objectId, io.revision, chunkIndex]);
       if (old.rowCount !== 1 || !old.rows[0].ciphertext.equals(blob)) deny("ZK_GATE_CHUNK_CONFLICT");
       return { stored: false };
     });
