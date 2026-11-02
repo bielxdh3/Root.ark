@@ -209,3 +209,37 @@ test("invalid or regressive trusted inner clock refuses a new signed request", a
   assert.equal((await rollback.input.journal.read(rollback.input.metadata.object_id)).phase,
     "uncertain", "ambiguous PUT stays journaled and never retries");
 });
+
+test("individual migrate and migration-finalize UI options refresh nested signing timestamps", async () => {
+  const source = fs.readFileSync(path.resolve(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  assert.match(source, /action === "migrate" \|\| action === "migration-finalize"/);
+  const start = source.indexOf("const migrationOptions = {");
+  const end = source.indexOf("const journal = await window.RootarkZk1LegacyMigrationWorkflow.openMigrationJournal();", start);
+  assert.ok(start !== -1 && end > start, "both individual UI actions must share migrationOptions");
+
+  const f = await fixture();
+  const ctx = vm.createContext({
+    Math,
+    Date: class extends Date { static now() { return f.seconds * 1000; } },
+    field: (name) => ({ value: name === "legacy-name" ? "legacy.txt" : "" }),
+    objectInput: { value: f.input.metadata.object_id },
+    versionInput: { value: f.input.metadata.version_id },
+    scope: f.input.trust.signedDeviceGrant,
+    trust: f.input.trust, devicePublicKey: null, devicePrivateKey: null,
+    cek: f.input.cek, location: { origin: "http://localhost" },
+    guardedFetch: f.input.fetchImpl,
+  });
+  vm.runInContext(source.slice(start, end) + "\nglobalThis.migrationOptionsUnderTest = migrationOptions;", ctx);
+  const options = ctx.migrationOptionsUnderTest;
+  assert.equal(options.nowSeconds, 1400);
+  assert.equal(typeof options.clockSeconds, "function",
+    "the real UI must supply a live clock to both individual actions");
+  f.input.clockSeconds = options.clockSeconds;
+  const result = await f.ctx.RootarkZk1LegacyMigrationWorkflow.beginLegacyMigration(f.input);
+  assert.equal(result.verifiedLocalReadback, true);
+  assert.deepEqual(f.signed, [
+    { op: "put", seconds: 1450 },
+    { op: "get", seconds: 1500 },
+  ], "the UI callback must refresh signatures after both >45s asynchronous delays");
+});

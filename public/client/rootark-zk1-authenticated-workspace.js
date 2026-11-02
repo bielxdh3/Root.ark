@@ -2501,6 +2501,9 @@
             trust: { ...trust, devicePublicKey, devicePrivateKey },
             cek, origin: location.origin + "/", fetchImpl: guardedFetch,
             nowSeconds: Math.floor(Date.now() / 1000),
+            // Each protected PUT/GET signs after async legacy reads and
+            // reconciliation; the initial timestamp may already be expired.
+            clockSeconds: () => Math.floor(Date.now() / 1000),
           };
           const journal = await window.RootarkZk1LegacyMigrationWorkflow.openMigrationJournal();
           try {
