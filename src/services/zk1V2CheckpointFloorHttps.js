@@ -9,6 +9,10 @@ const { verifySignedHead, fullRetainedMinimum } =
 
 const CERT = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
 const B64 = /^[A-Za-z0-9_-]+$/;
+// Eight signed ancestry entries exceed 4 KiB; 6 KiB bounds their CBOR proof
+// while the independently enforced 8 KiB limit bounds the JSON wire response.
+const MAX_SIGNED_HEAD_BYTES = 6 * 1024;
+const MAX_RESPONSE_BYTES = 8 * 1024;
 function deny() { throw new Error("ZK_V2_REMOTE_FLOOR_UNAVAILABLE"); }
 function exact(v, fields) {
   if (!v || typeof v !== "object" || Array.isArray(v)
@@ -154,7 +158,7 @@ class Zk1V2CheckpointFloorHttpsClient {
         let count = 0;
         response.on("data", (chunk) => {
           count += chunk.length;
-          if (count > 8192) { request.destroy(); done(new Error("too large")); }
+          if (count > MAX_RESPONSE_BYTES) { request.destroy(); done(new Error("too large")); }
           else chunks.push(chunk);
         });
         response.on("end", () => {
@@ -175,7 +179,7 @@ class Zk1V2CheckpointFloorHttpsClient {
         minimum: { sequence: this.#minimum.sequence,
           chainHash: to64(this.#minimum.chainHash) } });
       exact(answer, ["proof"]);
-      const head = await verifySignedHead(raw(answer.proof, 4096), {
+      const head = await verifySignedHead(raw(answer.proof, MAX_SIGNED_HEAD_BYTES), {
         scope: this.#scope, pinnedFloorPublicKey: this.#floorPin,
         pinnedOwnerPublicKey: this.#ownerPin, nonce, minimum: this.#minimum });
       this.#minimum = { sequence: head.sequence, chainHash: Buffer.from(head.chainHash),
