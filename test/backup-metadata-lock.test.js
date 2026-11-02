@@ -479,7 +479,7 @@ test("cross-process JSON history writes cannot overwrite a restore-sync mutation
   assert.equal(history.some((entry) => entry.id === "ordinary-save"), true, "a retry after lock release must preserve both writes");
 });
 
-test("an expired live JSON lease blocks takeover and cannot mutate history", { timeout: 15_000 }, async () => {
+test("an expired live JSON lease blocks takeover and cannot mutate history", { timeout: 30_000 }, async () => {
   reset();
   const backup = seedMutation();
   const originalTtl = process.env.ROOTARK_JSON_LOCK_TTL_MS;
@@ -490,6 +490,9 @@ test("an expired live JSON lease blocks takeover and cannot mutate history", { t
   writeLock(record);
   const resultFile = path.join(runtime, "expired-lease-contender-result");
   const contender = startChild(`
+    // Reproduce a heavily loaded Windows runner: the contender has not yet
+    // entered the lock attempt when the parent's former 5s marker expires.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5500);
     try {
       repository.acquireJsonMutationLock("replacement-owner");
       fs.writeFileSync(${JSON.stringify(resultFile)}, "stole-lock");
@@ -502,9 +505,14 @@ test("an expired live JSON lease blocks takeover and cannot mutate history", { t
   let contenderBlocked = false;
   let staleWriteError = null;
   try {
-    const deadline = Date.now() + 5000;
-    while (!fs.existsSync(resultFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
-    if (fs.existsSync(resultFile)) contenderBlocked = fs.readFileSync(resultFile, "utf8") === "blocked";
+    // Child startup and filesystem scheduling can exceed a wall-clock marker
+    // deadline under the concurrent Windows canonical suite. Wait for the
+    // actual contender to exit while the original owner remains alive, then
+    // verify both its exit code and recorded refusal before releasing the lease.
+    const outcome = await contender.result;
+    assert.equal(outcome.code, 0, `${outcome.stderr} ${outcome.stdout}`);
+    assert.equal(fs.existsSync(resultFile), true, "contender must record its decision");
+    contenderBlocked = fs.readFileSync(resultFile, "utf8") === "blocked";
     try {
       backupRepository.saveBackup({ ...backup, metadata: { staleWrite: true } }, { mutationLease: staleLease });
     } catch (error) {
