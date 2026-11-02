@@ -357,6 +357,51 @@ test("clientMacVerificationStillRequiresPriorEpochKeysAfterPublicVerification", 
   }), true);
 });
 
+test("public proof cannot authenticate a MAC against a substituted mutable core", async () => {
+  const state = await fixtures.createInitialState();
+  const previous = state.headManifest;
+  const priorHistory = state.verifiedHistory;
+  const original = await fixtures.appendDeviceRevocation(state, "trusted-1");
+  const forged = await z.decodeDeterministic(await z.encodeDeterministic(original));
+  const actor = state.actors.get(previous.devices[0].authorization_key_id.toString("hex"));
+  // Change the signed transition core but keep the original MAC. The actor's
+  // signature and request digest remain valid, so public-only verification
+  // must succeed while private MAC verification must reject.
+  forged.operation.issued_at += 1;
+  const coreOf = (manifest) => {
+    const { mac: _mac, actor_signature: _signature, ...core } = manifest;
+    return core;
+  };
+  forged.operation.request_digest = await m.expectedRecoveryRequestDigestV2(previous, coreOf(forged));
+  const { actor_signature: _discard, ...signed } = forged;
+  forged.actor_signature = crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/recovery-manifest/v1\0", "ascii"),
+    await z.encodeDeterministic(signed),
+  ]), actor);
+
+  const proof = await m.verifyRecoveryTransitionPublicV2({
+    previousManifest: previous,
+    nextManifest: forged,
+    expectedScope: state.scope,
+    retainedIdentifiers: { complete: true, values: new Set(priorHistory.usedIdentifiers) },
+  });
+  assert.equal(await m.isVerifiedRecoveryTransitionPublicProofV2(proof), true);
+  const verification = () => m.verifyRecoveryTransitionMacV2({
+    publicTransitionProof: proof,
+    manifestMacKey: state.epochKeys.at(-1).key,
+    priorEpochKeys: priorHistory.epochKeys,
+  });
+  await assert.rejects(verification(),
+    (error) => error instanceof z.RootarkZkError && error.code === "HISTORY_INVALID");
+  // Object.freeze(proof) does not freeze its nested core. An attacker can
+  // substitute the earlier MAC-matching operation without changing the signed
+  // manifest or the verified-public-proof snapshot.
+  proof.core.operation = original.operation;
+  assert.equal(await m.isVerifiedRecoveryTransitionPublicProofV2(proof), false);
+  await assert.rejects(verification(),
+    (error) => error instanceof z.RootarkZkError && error.code === "HISTORY_INVALID");
+});
+
 test("rejectsAnEpochRotationThatReusesAnyPriorEpochKey", async () => {
   const state = await fixtures.createInitialState();
   const prepared = await fixtures.prepareDeviceRevocation(state, "trusted-1");
