@@ -81,14 +81,43 @@ test("device authorization is exact, signed, expiry-bound, and revocable", async
   const body = Buffer.from(JSON.stringify(operation));
   const first = await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": body.length }, body });
   assert.equal(first.status, 201);
+  const forgedKeys = crypto.generateKeyPairSync("ed25519");
+  const forgedPublicKey = forgedKeys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const forged = protocol.createOperation({ operation: "create", objectId: "auth-forged",
+    fileId: "auth-forged", versionId: "forged-version", operationId: "forged-operation",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "forged.txt" }, plaintext: Buffer.from("forged"), fileKey: key });
+  forged.authorization = await createAuthorizationProof(forged, {
+    username: "alice", privateKey: forgedKeys.privateKey,
+    publicKey: forgedPublicKey, expiresAt: Date.now() + 60_000 });
+  const forgedBody = Buffer.from(JSON.stringify(forged));
+  assert.equal((await request(server.address().port, "/sync/v1/objects", {
+    method: "POST", headers: { "content-type": "application/json",
+      "content-length": forgedBody.length }, body: forgedBody })).status, 403,
+  "an independently unregistered key must not impersonate a registered device");
+  const unsignedBody = Buffer.from(JSON.stringify({
+    ...operation, authorization: undefined }));
+  assert.equal((await request(server.address().port, "/sync/v1/objects", {
+    method: "POST", headers: { "content-type": "application/json",
+      "content-length": unsignedBody.length }, body: unsignedBody })).status, 403,
+  "protected ingress never permits a client to omit signed authorization");
   assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": body.length }, body })).status, 409);
   const expired = { ...operation, operationId: "expired-operation", authorization: { ...operation.authorization, expiresAt: Date.now() - 1 } };
   const expiredBody = Buffer.from(JSON.stringify(expired));
   assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": expiredBody.length }, body: expiredBody })).status, 403);
   await fsp.writeFile(registryPath, JSON.stringify({ devices: { "device-a": { username: "alice", publicKey, active: false } } }));
   const revoked = { ...operation, operationId: "revoked-operation" };
+  revoked.authorization = await createAuthorizationProof(revoked, {
+    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 60_000 });
   const revokedBody = Buffer.from(JSON.stringify(revoked));
   assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": revokedBody.length }, body: revokedBody })).status, 403);
+  await fsp.writeFile(registryPath, JSON.stringify({ devices: {
+    "device-a": { username: "alice", publicKey, active: true, revoked: true },
+  } }));
+  assert.equal((await request(server.address().port, "/sync/v1/objects", {
+    method: "POST", headers: { "content-type": "application/json",
+      "content-length": revokedBody.length }, body: revokedBody })).status, 403);
 });
 
 test("two authorized devices separate local send authorization from remote apply verification", async (t) => {
@@ -104,7 +133,9 @@ test("two authorized devices separate local send authorization from remote apply
     async push(operation) { records.set(operation.objectId, operation); return { status: 201, operationId: operation.operationId }; },
     async list() { return [...records.values()]; },
   };
-  const authorizeIncoming = async (operation) => verifyAuthorizationProof(operation.authorization, operation, { username: "alice" });
+  const trustedPolicy = { username: "alice", trustedDevicePublicKeys: {
+    "device-a": publicDer(deviceA), "device-b": publicDer(deviceB) }, revokedDeviceIds: [] };
+  const authorizeIncoming = async (operation) => verifyAuthorizationProof(operation.authorization, operation, trustedPolicy);
   const engineA = await new SyncEngine({
     rootDir: path.join(dir, "a"), adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key, authorize: async () => true,

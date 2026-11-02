@@ -2,7 +2,7 @@
 
 const fs = require("node:fs/promises");
 const path = require("node:path");
-const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
+const { PROTOCOL_VERSION, compareRevisions, validateOperation, validateFreshSignedOperation } = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
@@ -330,7 +330,14 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     try { registry = JSON.parse(await fs.readFile(deviceRegistryPath, "utf8")); } catch { return false; }
     const record = registry?.devices?.[operation.deviceId];
     if (!record || record.username !== username || record.revoked || record.active === false || record.publicKey !== proof.publicKey) return false;
-    return verifyAuthorizationProof(proof, operation, { username });
+    // This registry is the independently provisioned source of device keys
+    // and current revocations; never self-enroll the key from the envelope.
+    const revokedDeviceIds = Object.entries(registry.devices)
+      .filter(([, device]) => device?.revoked || device?.active === false)
+      .map(([deviceId]) => deviceId);
+    return verifyAuthorizationProof(proof, operation, { username,
+      trustedDevicePublicKeys: { [operation.deviceId]: record.publicKey },
+      revokedDeviceIds });
   } : null);
   const retentionMs = positiveEnvInteger(process.env.SYNC_RECOVERY_RETENTION_MS, DEFAULT_RECOVERY_RETENTION_MS);
   const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard(), retentionMs });
@@ -347,7 +354,10 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (Object.hasOwn(payload, "plaintext") || Object.hasOwn(payload, "fileKey")) return errorResponse(res, 400, "Plaintext and keys are not accepted");
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
-    try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
+    try {
+      operation = (requireDeviceAuthorization || verifyRegisteredDevice
+        ? validateFreshSignedOperation : validateOperation)(payload);
+    } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
     if (requireDeviceAuthorization || verifyRegisteredDevice) {
       if (typeof verifyRegisteredDevice !== "function" || !operation.authorization) return errorResponse(res, 403, "Sync device authorization required");
       try {

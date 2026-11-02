@@ -10,7 +10,7 @@ const { createAuthorizationProof, generateIdempotencyKey, verifyAuthorizationPro
 const KEY_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const keys = crypto.generateKeyPairSync("ed25519");
 const publicKey = keys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
-const trustedAlice = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey } };
+const trustedAlice = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
 
 function operationFor(operationId = "idem-operation") {
   return protocol.createOperation({
