@@ -535,36 +535,113 @@ BEGIN
       DISABLE TRIGGER zk1_gate_physical_inventory_admission_immutable;
   END IF;
 END $$;
--- Before this migration, strict scopes used the gate revision as the object
--- revision. Preserve that pinned admission identity on existing records.
-UPDATE zk1_gate.admission AS a SET object_revision=a.revision
-  FROM zk1_gate.head AS h
-  WHERE a.object_revision IS NULL AND h.scope_key=a.scope_key
-    AND h.require_physical_inventory_intent;
+-- Validate ALL independent legacy revision witnesses before backfilling any
+-- physical identity. A matching seal alone cannot override a contradictory
+-- prewrite intent, immutable admission, or a competing old PUT admission.
+-- Never choose an arbitrary admission with LIMIT 1.
 DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM zk1_gate.ciphertext_chunk AS c
-    WHERE c.revision IS NULL
-      AND NOT EXISTS (SELECT 1 FROM zk1_gate.sealed_object AS s
-        WHERE s.scope_key=c.scope_key AND s.object_id=c.object_id)
-      AND NOT EXISTS (SELECT 1 FROM zk1_gate.physical_inventory_intent AS i
-        WHERE i.scope_key=c.scope_key AND i.object_id=c.object_id)
-      AND (SELECT count(DISTINCT a.revision) FROM zk1_gate.admission AS a
-        WHERE a.scope_key=c.scope_key AND a.object_id=c.object_id
-          AND a.action='put') > 1
+    CROSS JOIN LATERAL (
+      SELECT count(DISTINCT candidate.revision) AS versions FROM (
+        SELECT s.revision FROM zk1_gate.sealed_object AS s
+          WHERE s.scope_key=c.scope_key AND s.object_id=c.object_id
+        UNION ALL
+        SELECT i.revision FROM zk1_gate.physical_inventory_intent AS i
+          WHERE i.scope_key=c.scope_key AND i.object_id=c.object_id
+        UNION ALL
+        SELECT COALESCE(a.object_revision,a.revision) FROM zk1_gate.admission AS a
+          WHERE a.scope_key=c.scope_key AND a.object_id=c.object_id
+            AND a.action='put'
+      ) AS candidate
+    ) AS witness
+    WHERE c.revision IS NULL AND witness.versions<>1
   ) THEN
-    RAISE EXCEPTION 'cannot determine immutable legacy chunk revision' USING ERRCODE='23514';
+    RAISE EXCEPTION 'legacy chunk has missing or conflicting revision provenance'
+      USING ERRCODE='23514';
+  END IF;
+  -- The immutable operation maps to ONE exact admission and the same
+  -- inventory intent; mixing operation IDs, generations or revisions is fatal.
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.physical_inventory_admission AS b
+    LEFT JOIN zk1_gate.physical_inventory_intent AS i
+      ON i.scope_key=b.scope_key AND i.object_id=b.object_id
+        AND i.operation_id=b.operation_id
+    LEFT JOIN zk1_gate.admission AS a ON a.id=b.admission_id
+    WHERE i.operation_id IS NULL OR a.id IS NULL
+      OR COALESCE(b.revision,i.revision)<>i.revision
+      OR b.generation<>i.generation OR a.generation<>b.generation
+      OR a.scope_key<>b.scope_key OR a.object_id<>b.object_id
+      OR a.action<>'put' OR COALESCE(a.object_revision,a.revision)<>i.revision
+      OR a.digest<>i.digest
+  ) THEN
+    RAISE EXCEPTION 'legacy physical admission conflicts with immutable intent'
+      USING ERRCODE='23514';
+  END IF;
+  -- Every historical strict PUT must already have the corresponding unique
+  -- SQL-pinned admission and immutable owner prewrite intent. No guess from
+  -- the mutable scope head is permitted, including for unfinished workers.
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.admission AS a
+    JOIN zk1_gate.head AS h ON h.scope_key=a.scope_key
+      AND h.require_physical_inventory_intent
+    LEFT JOIN zk1_gate.physical_inventory_admission AS b
+      ON b.admission_id=a.id AND b.scope_key=a.scope_key AND b.object_id=a.object_id
+    LEFT JOIN zk1_gate.physical_inventory_intent AS i
+      ON i.operation_id=b.operation_id AND i.scope_key=b.scope_key
+        AND i.object_id=b.object_id
+    WHERE a.action='put'
+      AND (b.admission_id IS NULL OR i.operation_id IS NULL
+        OR COALESCE(a.object_revision,a.revision)<>i.revision OR a.digest<>i.digest
+        OR a.generation<>i.generation OR b.generation<>i.generation)
+  ) THEN
+    RAISE EXCEPTION 'legacy strict PUT admission lacks exact immutable intent'
+      USING ERRCODE='23514';
+  END IF;
+  -- Strict finalized bytes must match the independently stored operation,
+  -- reservation and the admitted worker; a seal cannot relabel an old PUT.
+  IF EXISTS (
+    SELECT 1 FROM zk1_gate.sealed_object AS s
+    JOIN zk1_gate.head AS h ON h.scope_key=s.scope_key
+      AND h.require_physical_inventory_intent
+    LEFT JOIN zk1_gate.physical_inventory_intent AS i
+      ON i.scope_key=s.scope_key AND i.object_id=s.object_id AND i.revision=s.revision
+    LEFT JOIN zk1_gate.physical_inventory_admission AS b
+      ON b.scope_key=s.scope_key AND b.object_id=s.object_id
+        AND (b.revision=s.revision OR b.revision IS NULL)
+    WHERE i.operation_id IS NULL OR b.admission_id IS NULL
+      OR s.operation_id IS DISTINCT FROM i.operation_id
+      OR b.operation_id<>i.operation_id OR b.admission_id<>s.admission_id
+      OR s.generation<>i.generation OR s.generation<>b.generation
+      OR s.digest<>i.digest
+  ) THEN
+    RAISE EXCEPTION 'legacy sealed object contradicts physical operation intent'
+      USING ERRCODE='23514';
   END IF;
 END $$;
-UPDATE zk1_gate.ciphertext_chunk AS c SET revision=COALESCE(
-  (SELECT s.revision FROM zk1_gate.sealed_object AS s
-    WHERE s.scope_key=c.scope_key AND s.object_id=c.object_id LIMIT 1),
-  (SELECT i.revision FROM zk1_gate.physical_inventory_intent AS i
-    WHERE i.scope_key=c.scope_key AND i.object_id=c.object_id LIMIT 1),
-  (SELECT a.revision FROM zk1_gate.admission AS a
-    WHERE a.scope_key=c.scope_key AND a.object_id=c.object_id AND a.action='put'
-    LIMIT 1))
+-- Legacy strict GET admissions have no PUT operation intent: keep their NULL
+-- object_revision rather than inventing a binding. Reader admission checks
+-- still require the old gate revision and an exact sealed ciphertext version.
+UPDATE zk1_gate.admission AS a SET object_revision=i.revision
+  FROM zk1_gate.physical_inventory_admission AS b
+  JOIN zk1_gate.physical_inventory_intent AS i
+    ON i.operation_id=b.operation_id AND i.scope_key=b.scope_key
+      AND i.object_id=b.object_id
+  JOIN zk1_gate.head AS h ON h.scope_key=b.scope_key
+    AND h.require_physical_inventory_intent
+  WHERE a.object_revision IS NULL AND a.action='put' AND a.id=b.admission_id;
+UPDATE zk1_gate.ciphertext_chunk AS c SET revision=(
+  SELECT DISTINCT candidate.revision FROM (
+    SELECT s.revision FROM zk1_gate.sealed_object AS s
+      WHERE s.scope_key=c.scope_key AND s.object_id=c.object_id
+    UNION
+    SELECT i.revision FROM zk1_gate.physical_inventory_intent AS i
+      WHERE i.scope_key=c.scope_key AND i.object_id=c.object_id
+    UNION
+    SELECT COALESCE(a.object_revision,a.revision) FROM zk1_gate.admission AS a
+      WHERE a.scope_key=c.scope_key AND a.object_id=c.object_id AND a.action='put'
+  ) AS candidate)
 WHERE c.revision IS NULL;
 UPDATE zk1_gate.physical_inventory_admission AS b SET revision=i.revision
   FROM zk1_gate.physical_inventory_intent AS i
