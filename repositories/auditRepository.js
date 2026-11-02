@@ -353,7 +353,10 @@ function deferAuditLog(log) {
     withPendingAuditDb((db) => {
       db.transaction(() => {
         assertNoStrictAuditRestore();
-        const exists = db.prepare("SELECT 1 FROM pending_audit WHERE id=?").get(log.id);
+        const exists = db.prepare("SELECT event FROM pending_audit WHERE id=?").get(log.id);
+        if (exists && !sameAuditEvidence(JSON.parse(exists.event), log)) {
+          throw Error("Strict audit collision has divergent evidence");
+        }
         if (!exists && db.prepare("SELECT COUNT(*) AS n FROM pending_audit").get().n >= MAX_DEFERRED_AUDITS) {
           throw Object.assign(new Error("Durable pending audit capacity exhausted"), {
             code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
@@ -536,11 +539,13 @@ function saveAuditLogsImpl(entries = {}) {
     if (!protectedAudit) db.prepare("DELETE FROM audit_logs").run();
     // Physical retention: every archive ID is already durably held on the
     // separate FULL journal, so the primary table need not grow forever.
-    if (archived.size) {
-      const archivedEvents = new Map(withPendingAuditDb((sidecar) => {
+    const archivedEvents = archived.size
+      ? new Map(withPendingAuditDb((sidecar) => {
         const get = sidecar.prepare("SELECT event FROM archived_audit WHERE id=?");
         return [...archived].map((id) => [id, get.get(id)?.event]);
-      }));
+      }))
+      : new Map();
+    if (archived.size) {
       const find = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
         target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
       for (const id of archived) {
@@ -565,7 +570,13 @@ function saveAuditLogsImpl(entries = {}) {
     `);
 
     for (const log of logs) {
-      if (archived.has(log.id)) continue;
+      if (archived.has(log.id)) {
+        const archivedEvent = archivedEvents.get(log.id);
+        if (!archivedEvent || !sameAuditEvidence(JSON.parse(archivedEvent), log)) {
+          throw Error("Strict audit collision has divergent evidence");
+        }
+        continue;
+      }
       const row = logToRow(log);
       const existing = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
         target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`).get(row.id);
