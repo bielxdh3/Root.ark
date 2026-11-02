@@ -27,6 +27,7 @@
     const SCOPE = ["account_id", "compartment_id", "keyring_id"];
     const ID = /^[A-Za-z0-9_-]{22}$/;
     const MAX = 4 * 1024 * 1024;
+    const te = new TextEncoder();
     function deny() { throw new Error("ZK_CLIENT_RENAME_MOVE_DENIED"); }
     function exact(value, keys) {
       if (!value || typeof value !== "object" || Array.isArray(value)
@@ -120,7 +121,8 @@
           || !Number.isSafeInteger(source.epoch) || source.epoch < 1
           || source.epoch > head.epoch
           || typeof input.destinationName !== "string"
-          || input.destinationName.length < 1 || input.destinationName.length > 255
+          || input.destinationName.length < 1 || input.destinationName.length > 220
+          || te.encode(input.destinationName).length > 220
           || /[\\/\u0000-\u001f\u007f]/.test(input.destinationName)
           || (input.destinationParentFolderId !== null
             && typeof input.destinationParentFolderId !== "string")
