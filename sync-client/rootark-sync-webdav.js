@@ -1161,6 +1161,10 @@ class LocalSyncWebDavBridge {
         // binding without accepting an expired grant as permission to write.
         await verifyHistoricalAuthorizationProof(signed.authorization, signed, {
           username: pinned.username, trustedDevicePublicKeys: keys,
+          // This authenticates the exact already-committed signed outbox,
+          // not a new write. Its historical device can since be revoked;
+          // current authorization is separately required for fresh ingress.
+          revokedDeviceIds: [],
         });
       }
     } catch {

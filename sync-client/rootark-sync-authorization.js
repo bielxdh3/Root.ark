@@ -137,11 +137,9 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
   if (typeof pinned !== "string" || pinned !== normalized.publicKey) {
     fail("Device signing key is not trusted", "authorization_device_untrusted");
   }
-  if (expected.revokedDeviceIds !== undefined) {
-    if (!Array.isArray(expected.revokedDeviceIds)
-      || expected.revokedDeviceIds.includes(normalized.deviceId)) {
-      fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
-    }
+  if (!Array.isArray(expected.revokedDeviceIds)
+    || expected.revokedDeviceIds.includes(normalized.deviceId)) {
+    fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
   }
   assertAuthorizationEnvelopeBinding(normalized, operation);
   const key = crypto.createPublicKey({ key: Buffer.from(normalized.publicKey, "base64url"), format: "der", type: "spki" });

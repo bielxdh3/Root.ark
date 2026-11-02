@@ -544,6 +544,8 @@ class SyncObjectStore {
         try {
           if (await verifyAuthorizationProof(input.authorization, input, {
             username, trustedDevicePublicKeys: { [input.deviceId]: record.publicKey },
+            // The fresh device was checked against this same locked atomic registry.
+            revokedDeviceIds: [],
           }) !== true) throw atomicDeviceAuthError();
         } catch { throw atomicDeviceAuthError(); }
         // The device proof may expire while the Ed25519 verifier awaits. Its
@@ -655,6 +657,7 @@ class SyncObjectStore {
         try {
           if (await verifyAuthorizationProof(input.authorization, input, {
             username, trustedDevicePublicKeys: { [input.deviceId]: device.publicKey },
+            revokedDeviceIds: [],
           }) !== true) throw atomicDeviceAuthError();
         } catch { throw atomicDeviceAuthError(); }
         if (!Number.isSafeInteger(input.authorization.expiresAt)
@@ -907,6 +910,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (!record || record.username !== username || record.revoked || record.active === false || record.publicKey !== proof.publicKey) return false;
     return verifyAuthorizationProof(proof, operation, {
       username, trustedDevicePublicKeys: { [operation.deviceId]: record.publicKey },
+      revokedDeviceIds: [],
     });
   } : null));
   const retentionMs = positiveEnvInteger(process.env.SYNC_RECOVERY_RETENTION_MS, DEFAULT_RECOVERY_RETENTION_MS);

@@ -142,7 +142,8 @@ test("two authorized devices separate local send authorization from remote apply
     async list() { return [...records.values()]; },
   };
   const authorizeIncoming = async (operation) => verifyAuthorizationProof(operation.authorization, operation,
-    { username: "alice", trustedDevicePublicKeys: { "device-a": publicDer(deviceA) } });
+    { username: "alice", trustedDevicePublicKeys: { "device-a": publicDer(deviceA) },
+      revokedDeviceIds: [] });
   const engineA = await new SyncEngine({
     rootDir: path.join(dir, "a"), adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key, authorize: async () => true,
