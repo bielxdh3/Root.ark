@@ -1,6 +1,7 @@
 "use strict";
 
 const { runDisposablePgLab } = require("./disposable-postgres");
+const { runPhysicalMigrationNegativeFixtures } = require("./physical-migration-negative");
 
 runDisposablePgLab("gate", async (fixture) => {
   const sql = fixture.readLabSql("db/zk1-gate-authority.sql");
@@ -27,8 +28,10 @@ runDisposablePgLab("gate", async (fixture) => {
   ], { ROOTARK_ZK1_TEST_PG_URL: fixture.adminUrl,
     ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUrl,
     ROOTARK_ZK1_ATTESTOR_PG_URL: attestorUrl }, 150000);
+  const rejectedMigrations = runPhysicalMigrationNegativeFixtures(fixture, sql);
   process.stdout.write("ZK65_SHARED_GATE_PG18_PASS files=" + result.files
-    + " tests=" + result.tests + " skipped=0\n");
+    + " tests=" + result.tests + " migration_denials=" + rejectedMigrations
+    + " skipped=0\n");
 }).catch((error) => {
   process.stderr.write("ZK65_SHARED_GATE_FAILED: " + error.message + "\n");
   process.exitCode = 1;
