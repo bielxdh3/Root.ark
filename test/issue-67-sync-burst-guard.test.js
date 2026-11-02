@@ -869,3 +869,116 @@ test("issue 67 resume 2FA: concurrent requests cannot reuse the same recovery co
   const { route } = await raceTwoDeviceResumes(t, (account) => account.recoveryCodes[0]);
   assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
 });
+
+test("issue 65 resume: a failed account CAS and password rotation allow replacement using a fresh factor", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-replace-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath, accountUsers: account.users,
+    burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }) });
+  await pauseDeviceA(opened.port, crypto.randomBytes(32), 500, 501);
+  const originalStage = opened.route.store.stageResume.bind(opened.route.store);
+  const changedPassword = "new-password-after-rotation";
+  let rotated = false;
+  opened.route.store.stageResume = async (...args) => {
+    await originalStage(...args);
+    if (!rotated) {
+      rotated = true;
+      const current = opened.route.accountState.users[0];
+      current.password = bcrypt.hashSync(changedPassword, 4);
+      current.sessionVersion += 1;
+    }
+  };
+  assert.equal((await resumeRequest(opened.port, { password: PASSWORD, code: account.recoveryCodes[0] })).status, 401);
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 2);
+  assert.equal(opened.route.store.isDevicePaused("alice", "device-a"), true);
+  const obsolete = opened.route.store.pendingResume("alice");
+  assert.ok(obsolete);
+  const bobIntent = { version: 2, deviceId: "device-b", pauseFence: null, codeMac: "a".repeat(64) };
+  await opened.route.store.stageResume("bob", bobIntent);
+  const restarted = await startServer(t, { storagePath, accountUsers: opened.route.accountState.users });
+  const tryResume = (password, code) => resumeRequest(restarted.port, { password, code });
+  assert.equal((await tryResume(PASSWORD, account.recoveryCodes[1])).status, 401);
+  assert.equal((await tryResume(changedPassword, "invalid-code")).status, 401);
+  assert.equal((await tryResume(changedPassword, account.recoveryCodes[0])).status, 401);
+  assert.deepEqual(restarted.route.store.pendingResume("alice"), obsolete);
+  assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), true);
+  assert.equal((await tryResume(changedPassword, account.recoveryCodes[1])).status, 200);
+  assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), false);
+  assert.equal(restarted.route.store.pendingResume("alice"), null);
+  assert.deepEqual(restarted.route.store.pendingResume("bob"), bobIntent);
+  assert.deepEqual(restarted.route.accountState.users[0].totpRecoveryHashes,
+    [account.users[0].totpRecoveryHashes[0]]);
+  assert.equal((await tryResume(changedPassword, account.recoveryCodes[1])).status, 401);
+});
+
+test("issue 65 resume: consumed factor cannot finish a stale intent after rotation", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-consumed-rotation-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath, accountUsers: account.users,
+    burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }) });
+  await pauseDeviceA(opened.port, crypto.randomBytes(32), 510, 511);
+  const originalTransact = opened.route.store.transact.bind(opened.route.store);
+  let writes = 0;
+  opened.route.store.transact = async (mutator) => {
+    if (++writes === 3) throw Object.assign(new Error("final persistence rejected"), { code: "EACCES" });
+    return originalTransact(mutator);
+  };
+  assert.equal((await resumeRequest(opened.port, { password: PASSWORD, code: account.recoveryCodes[0] })).status, 503);
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 1);
+  assert.ok(opened.route.store.pendingResume("alice"));
+  const newPassword = "new-password-after-consumption";
+  const current = opened.route.accountState.users[0];
+  current.password = bcrypt.hashSync(newPassword, 4);
+  current.sessionVersion += 1;
+  const restarted = await startServer(t, { storagePath, accountUsers: opened.route.accountState.users });
+  assert.equal((await resumeRequest(restarted.port, { password: newPassword, code: account.recoveryCodes[0] })).status, 401);
+  assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), true);
+  assert.equal((await resumeRequest(restarted.port, { password: newPassword, code: account.recoveryCodes[1] })).status, 200);
+  assert.equal(restarted.route.accountState.users[0].totpRecoveryHashes.length, 0);
+  assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), false);
+});
+
+test("issue 65 resume: staged TOTP step is not fresh after session rotation", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-totp-rotation-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath: path.join(dir, "objects.json"), accountUsers: account.users });
+  const originalStage = opened.route.store.stageResume.bind(opened.route.store);
+  opened.route.store.stageResume = async (...args) => {
+    await originalStage(...args);
+    opened.route.accountState.users[0].sessionVersion += 1;
+  };
+  const totp = codeAt(account.secret);
+  assert.equal((await resumeRequest(opened.port, { password: PASSWORD, code: totp })).status, 401);
+  opened.route.store.stageResume = originalStage;
+  const pending = opened.route.store.pendingResume("alice");
+  assert.equal(pending.proof.type, "totp");
+  assert.equal((await resumeRequest(opened.port, { password: PASSWORD, code: totp })).status, 401);
+  assert.deepEqual(opened.route.store.pendingResume("alice"), pending);
+  assert.equal((await resumeRequest(opened.port, { password: PASSWORD, code: account.recoveryCodes[0] })).status, 200);
+  assert.equal(opened.route.store.pendingResume("alice"), null);
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
+test("issue 65 resume: stale CAS cannot overwrite a newer durable intent or another user", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-cas-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const old = { version: 2, deviceId: "device-a", pauseFence: null, codeMac: "a".repeat(64) };
+  const newer = { ...old, codeMac: "b".repeat(64) };
+  const stale = { ...old, codeMac: "c".repeat(64) };
+  await store.stageResume("alice", old);
+  await store.stageResume("bob", old);
+  await store.stageResume("alice", newer, old);
+  await assert.rejects(store.stageResume("alice", stale, old), { code: "SYNC_RESUME_PENDING" });
+  await assert.rejects(store.finishStagedResume("alice", old), /intent mismatch/);
+  assert.deepEqual(store.pendingResume("alice"), newer);
+  assert.deepEqual(store.pendingResume("bob"), old);
+  const restarted = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  assert.deepEqual(restarted.pendingResume("alice"), newer);
+  assert.deepEqual(restarted.pendingResume("bob"), old);
+});
