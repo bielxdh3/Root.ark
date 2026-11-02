@@ -14,7 +14,8 @@ const SNAPSHOT_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-snapshot-fetch
 const RAW_KEY = (key) => key.export({ type: "spki", format: "der" }).subarray(-32);
 const encode = async (value) => Buffer.from(await z.encodeDeterministic(value));
 
-async function fixture() {
+async function fixture({ revokeHistoricalSigner = false, recoveredHeadEpoch = 1,
+  forgeRecoveredSignature = false } = {}) {
   const db = new Database(":memory:");
   db.exec(`CREATE TABLE zk_content_version (
     scope TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -31,8 +32,13 @@ async function fixture() {
   const key = [scope.account_id, scope.compartment_id, scope.keyring_id]
     .map((part) => part.toString("hex")).join(":");
   const signer = crypto.generateKeyPairSync("ed25519");
+  const activeSigner = revokeHistoricalSigner
+    ? crypto.generateKeyPairSync("ed25519") : signer;
+  const forgedSigner = crypto.generateKeyPairSync("ed25519");
   const authoritySigner = crypto.generateKeyPairSync("ed25519");
   const manifestDigest = crypto.randomBytes(32);
+  const currentManifestDigest = revokeHistoricalSigner
+    ? crypto.randomBytes(32) : manifestDigest;
   const now = 1000;
   const ids = [crypto.randomBytes(16).toString("base64url"),
     crypto.randomBytes(16).toString("base64url")].sort();
@@ -54,12 +60,13 @@ async function fixture() {
     const header = {
       type: "rootark-zk1-opaque-catalog/v1", ...scope,
       sequence, previous_digest, manifest_revision: 1, manifest_digest: manifestDigest,
-      epoch: 1, signer_device_id: "owner-device",
+      epoch: recoveredHeadEpoch, signer_device_id: "owner-device",
       total_count: entries.length, page_digests: await Promise.all(pages.map(catalogPageDigest)),
       issued_at: now,
     };
     const bytes = await encode(header);
-    const signature = crypto.sign(null, await catalogHeaderMessage(header), signer.privateKey);
+    const signature = crypto.sign(null, await catalogHeaderMessage(header),
+      forgeRecoveredSignature ? forgedSigner.privateKey : signer.privateKey);
     return { header, bytes, signature, digest: catalogHeadDigest(bytes, signature),
       bodies: await Promise.all(pages.map(encode)), pages };
   }
@@ -105,15 +112,20 @@ async function fixture() {
   const store = {
     signedHistoryRequired: true, admissionRequired: true, db, trustedScope: scope,
     nowSeconds: () => now,
-    minimumHead: { revision: 1, digest: manifestDigest },
+    minimumHead: { revision: revokeHistoricalSigner ? 2 : 1,
+      digest: currentManifestDigest },
     clockRow: db.prepare("SELECT last_at FROM zk_content_clock WHERE scope=?"),
     getHead: db.prepare("SELECT revision,digest FROM zk_content_head WHERE scope=?"),
     nonceCount: db.prepare("SELECT COUNT(*) n FROM zk_content_nonce WHERE scope=?"),
   };
   const manifest = {
-    revision: 1, current_epoch: 1,
+    revision: revokeHistoricalSigner ? 2 : 1,
+    current_epoch: revokeHistoricalSigner ? 2 : 1,
     devices: [{ device_id: "owner-device", enrolled_epoch: 1,
-      revoked_at_epoch: null, authorization_public_key: RAW_KEY(signer.publicKey) }],
+      revoked_at_epoch: revokeHistoricalSigner ? 2 : null,
+      authorization_public_key: RAW_KEY(signer.publicKey) },
+    ...(revokeHistoricalSigner ? [{ device_id: "active-device", enrolled_epoch: 2,
+      revoked_at_epoch: null, authorization_public_key: RAW_KEY(activeSigner.publicKey) }] : [])],
   };
   let auth;
   store.runCatalogWithAdmission = async (_input, _operation, run) => run(auth);
@@ -121,11 +133,14 @@ async function fixture() {
   const authorize = (operation, sequence, digest) => {
     const nonce = crypto.randomBytes(32);
     auth = {
-      key, head: { current_revision: 1, current_manifest_digest: manifestDigest },
-      verifiedHeadManifest: manifest, deviceAuthorizationPublicKey: RAW_KEY(signer.publicKey),
+      key, head: { current_revision: manifest.revision,
+        current_manifest_digest: currentManifestDigest },
+      verifiedHeadManifest: manifest,
+      deviceAuthorizationPublicKey: RAW_KEY(activeSigner.publicKey),
       request: {
-        nonce, manifest_revision: 1, manifest_digest: manifestDigest,
-        epoch: 1, issued_at: now, expires_at: now + 30, device_id: "owner-device",
+        nonce, manifest_revision: manifest.revision, manifest_digest: currentManifestDigest,
+        epoch: manifest.current_epoch, issued_at: now, expires_at: now + 30,
+        device_id: revokeHistoricalSigner ? "active-device" : "owner-device",
         object_id: catalogOperationObjectId(scope, operation),
         expected_object_revision: operation === "catalog-commit" ? sequence - 1 : sequence,
         ciphertext_digest: digest,
@@ -134,9 +149,45 @@ async function fixture() {
     return auth;
   };
   return { db, key, scope, catalog, versions, addPhysical, signHead,
-    authorize, first, signer, authority, setAuthoritative: (v) => { authoritative = v; },
+    authorize, first, signer, activeSigner, authority,
+    setAuthoritative: (v) => { authoritative = v; },
     onReadHead: (fn) => { onReadHead = fn; } };
 }
+
+test("lost-ACK catalog recovery accepts a formerly valid signer after owner revocation", async () => {
+  // The external CAS committed epoch 1, then the owner rotated to epoch 2
+  // and revoked that signer before the client recovered its missing local row.
+  const f = await fixture({ revokeHistoricalSigner: true });
+  try {
+    const auth = f.authorize("catalog-read", 1, f.first.digest);
+    assert.equal(auth.request.device_id, "active-device");
+    assert.equal(auth.verifiedHeadManifest.devices[0].revoked_at_epoch, 2);
+    assert.notDeepEqual(auth.deviceAuthorizationPublicKey, RAW_KEY(f.signer.publicKey));
+    const recovered = await f.catalog.read({ scope: f.scope,
+      authorization: null, signature: null, pageIndex: 0 });
+    assert.equal(recovered.sequence, 1);
+    assert.equal(recovered.entries.length, 1);
+    assert.equal(f.catalog.head.get(f.key).sequence, 1);
+  } finally { f.db.close(); }
+});
+
+test("lost-ACK catalog recovery refuses forged and after-revocation signatures", async (t) => {
+  for (const [name, options] of [
+    ["forged historical head", { revokeHistoricalSigner: true, forgeRecoveredSignature: true }],
+    ["head signed at revoked epoch", { revokeHistoricalSigner: true, recoveredHeadEpoch: 2 }],
+  ]) await t.test(name, async () => {
+    const f = await fixture(options);
+    try {
+      const auth = f.authorize("catalog-read", 1, f.first.digest);
+      assert.equal(auth.request.device_id, "active-device");
+      await assert.rejects(f.catalog.read({ scope: f.scope, authorization: null,
+        signature: null, pageIndex: 0 }), /ZK_CATALOG_DENIED/);
+      assert.equal(f.catalog.head.get(f.key), undefined);
+      assert.equal(f.db.prepare("SELECT COUNT(*) n FROM zk_content_catalog_snapshot WHERE scope=?")
+        .get(f.key).n, 0);
+    } finally { f.db.close(); }
+  });
+});
 
 test("committed CAS head recovers after ACK loss even after a later immutable PUT; read and next commit work", async () => {
   const f = await fixture();
