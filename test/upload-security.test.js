@@ -1630,9 +1630,14 @@ test("overlapping expiry sweep ticks do not start competing session-lock work", 
   assert.equal(fs.readFileSync(lockAttemptsPath, "utf8").trim().split(/\r?\n/).length, 1);
 });
 
-test("chunk-session expiry sweep yields to requests and eventually reaches later sessions", { timeout: 45_000 }, async (t) => {
+test("chunk-session expiry sweep yields to requests and eventually reaches later sessions", { timeout: 60_000 }, async (t) => {
   const sweepCount = 128;
   const sweepDelayMs = 50;
+  // The test deliberately queues sequential filesystem delays. Startup and
+  // filesystem scheduling are not guaranteed to finish within a fixed 10s on
+  // Windows under parallel tests. Bound progress by the injected workload,
+  // but never relax the normal-request responsiveness assertion below.
+  const sweepProgressBudgetMs = 10_000 + 2 * sweepCount * sweepDelayMs;
   const lastUploadId = `sweep-yield-${sweepCount - 1}`;
   const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-chunk-sweep-markers-"));
   const delayEnabledPath = path.join(markerDir, "delay-enabled");
@@ -1679,7 +1684,7 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
     `,
   });
 
-  assert.equal(await waitForFile(sweepStartedPath), true, "the periodic sweep completed eight delayed session reads");
+  assert.equal(await waitForFile(sweepStartedPath, sweepProgressBudgetMs), true, "the periodic sweep completed eight delayed session reads");
   const lastMetadataPath = path.join(harness.chunkRoot, FOLDER_ID, lastUploadId, "metadata.json");
   const lastMetadata = JSON.parse(fs.readFileSync(lastMetadataPath, "utf8"));
   lastMetadata.lastActivityAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString();
@@ -1690,10 +1695,10 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
   const response = await request(harness.port, "/login.html");
   const requestDuration = Date.now() - requestStartedAt;
   assert.equal(response.status, 200);
-  const remainingSweepDelayMs = (sweepCount - 8) * sweepDelayMs;
-  assert.ok(requestDuration < remainingSweepDelayMs / 2, `normal request took ${requestDuration}ms with at least ${remainingSweepDelayMs}ms of sequential metadata delays still queued`);
+  const requestLatencyBudgetMs = (sweepCount - 8) * 50 / 2;
+  assert.ok(requestDuration < requestLatencyBudgetMs, `normal request took ${requestDuration}ms while sequential metadata delays were still queued`);
 
-  const cleanupDeadline = Date.now() + 10_000;
+  const cleanupDeadline = Date.now() + sweepProgressBudgetMs;
   while (fs.existsSync(finalPartPath) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fs.existsSync(finalPartPath), false, "the sweep eventually processes the last expired session");
 });
