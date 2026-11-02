@@ -663,8 +663,6 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
   assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
-  // The part disappears before quota release; the success audit is written after release.
-  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     assert.equal(quotaDatabase.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE session_key = ?").get(`${FOLDER_ID}/${uploadId}`).count, 0, "all expiry charges release after tombstone cleanup confirms the parts are gone");
