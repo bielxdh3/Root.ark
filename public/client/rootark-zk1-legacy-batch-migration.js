@@ -143,6 +143,7 @@
   async function runLegacyMigrationBatch(input) {
     exact(input, ["optIn", "entries", "migrationSecret", "trust", "origin",
       "fetchImpl", "journal", "nowSeconds",
+      ...(Object.hasOwn(input || {}, "clockSeconds") ? ["clockSeconds"] : []),
       ...(Object.hasOwn(input || {}, "transitionApprovals") ? ["transitionApprovals"] : []),
       ...(Object.hasOwn(input || {}, "selectionApproval") ? ["selectionApproval"] : [])]);
     if (input.optIn !== true || !Array.isArray(input.entries)
@@ -151,6 +152,29 @@
       || input.migrationSecret.byteLength !== 32
       || typeof input.fetchImpl !== "function" || typeof input.origin !== "string"
       || !input.trust?.signedDeviceGrant || !input.trust?.pinnedCurrentHead) refuse();
+    // Keep existing nowSeconds callers working, but advance their trusted
+    // starting timestamp by elapsed wall time; an optional trusted clock is
+    // useful for deterministic tests and embedding environments. Never reuse
+    // a batch-start timestamp for later signed PUTs or owner receipts.
+    const initialSeconds = input.nowSeconds;
+    const suppliedClock = Object.hasOwn(input, "clockSeconds") ? input.clockSeconds : null;
+    if (!Number.isSafeInteger(initialSeconds) || initialSeconds < 1
+      || (suppliedClock !== null && typeof suppliedClock !== "function")) refuse();
+    const startedMs = Date.now();
+    if (!Number.isSafeInteger(startedMs) || startedMs < 0) refuse();
+    let lastSeconds = initialSeconds;
+    function currentSeconds() {
+      let value;
+      if (suppliedClock !== null) value = suppliedClock();
+      else {
+        const elapsed = Date.now() - startedMs;
+        if (!Number.isSafeInteger(elapsed) || elapsed < 0) refuse();
+        value = initialSeconds + Math.floor(elapsed / 1000);
+      }
+      if (!Number.isSafeInteger(value) || value < 1 || value < lastSeconds) refuse();
+      lastSeconds = value;
+      return value;
+    }
     const approvals = Object.hasOwn(input, "transitionApprovals")
       ? input.transitionApprovals : null;
     if (approvals !== null && (!Array.isArray(approvals)
@@ -186,15 +210,25 @@
       return { legacy: { ...selected.legacy },
         sourcePin: { ...selected.sourcePin }, cek: selected.cek };
     });
+    let selectionWindow = null;
     if (Object.hasOwn(input, "selectionApproval")) {
       const approval = input.selectionApproval;
       exact(approval, ["signedSelection", "independentlyPinnedSelectionSha256"]);
       try {
+        // Snapshot the signed lifetime before any asynchronous verification.
+        // Do not read mutable caller-controlled expiry fields after awaiting.
+        const signed = approval.signedSelection;
+        const issuedAt = signed?.issuedAt;
+        const expiresAt = signed?.expiresAt;
+        if (!Number.isSafeInteger(issuedAt) || issuedAt < 1
+          || !Number.isSafeInteger(expiresAt) || expiresAt < issuedAt) refuse();
         await selection.verifyOwnerSelection({ optIn: true,
-          signedSelection: approval.signedSelection,
+          signedSelection: signed,
           independentlyPinnedSelectionSha256: approval.independentlyPinnedSelectionSha256,
           entries: chosen.map(({ legacy, sourcePin }) => ({ legacy, sourcePin })),
-          trust: input.trust, migrationSecret: secret, nowSeconds: input.nowSeconds });
+          trust: input.trust, migrationSecret: secret, nowSeconds: currentSeconds() });
+        if (signed.issuedAt !== issuedAt || signed.expiresAt !== expiresAt) refuse();
+        selectionWindow = { issuedAt, expiresAt };
       } catch (_) { secret.fill(0); refuse(); }
       const current = input.trust;
       if (SCOPE.some((field) => current.signedDeviceGrant[field] !== scope[field])
@@ -221,6 +255,10 @@
     } finally { secret.fill(0); }
     // Sequential, bounded: an ambiguous item never authorizes re-sending PUT,
     // and a partial batch never marks subsequent items as complete.
+    function assertSelectionAt(now) {
+      if (selectionWindow && (now < selectionWindow.issuedAt
+        || now > selectionWindow.expiresAt)) refuse();
+    }
     const results = [];
     for (const [index, { entry, metadata }] of prepared.entries()) {
       const safeResult = { objectId: metadata.object_id,
@@ -228,22 +266,26 @@
         canDeleteLegacy: false, authorizesCutover: false };
       try {
         await verifyCatalog(entry, input.fetchImpl);
+        const signingSeconds = currentSeconds();
+        assertSelectionAt(signingSeconds);
         const result = await migration.beginLegacyMigration({
           optIn: true, legacy: entry.legacy, sourcePin: entry.sourcePin,
           metadata, trust: input.trust, cek: entry.cek, origin: input.origin,
           fetchImpl: input.fetchImpl, journal: input.journal,
-          nowSeconds: input.nowSeconds,
+          nowSeconds: signingSeconds,
         });
         await verifyCatalog(entry, input.fetchImpl);
         let transitionResult = null;
         if (approvals && approvals[index] !== null) {
           const approved = approvals[index];
           exact(approved, ["signedRootCheckpoint", "signedTransitionReceipt"]);
+          const approvalSeconds = currentSeconds();
+          assertSelectionAt(approvalSeconds);
           transitionResult = await migration.stageLegacyMigrationTransition({
             optIn: true, legacy: entry.legacy, sourcePin: entry.sourcePin,
             metadata, trust: input.trust, cek: entry.cek, origin: input.origin,
             fetchImpl: input.fetchImpl, journal: input.journal,
-            nowSeconds: input.nowSeconds,
+            nowSeconds: approvalSeconds,
             signedRootCheckpoint: approved.signedRootCheckpoint,
             signedTransitionReceipt: approved.signedTransitionReceipt,
           });
