@@ -11,39 +11,55 @@ const rename = require("../public/client/rootark-zk1-client-rename-move");
 const id = Buffer.alloc(16, 3).toString("base64url");
 const scope = { account_id: id, compartment_id: id, keyring_id: id };
 
-function uploadFixture() {
+function uploadFixture({ allowFreshRead = false, allowPut = false } = {}) {
   const effects = { signedReads: 0, intentWrites: 0, puts: 0 };
   const writer = {
     async readAll() {
       effects.signedReads++;
-      if (effects.signedReads > 1) throw Error("stop after filename preflight");
+      if (effects.signedReads > 1 && !allowFreshRead) throw Error("stop after filename preflight");
       return { head: { sequence: 0, digest: new Uint8Array(32) }, rows: [] };
     },
-    async prepareIntent() { effects.intentWrites++; throw Error("unexpected intent"); },
+    async prepareIntent() {
+      effects.intentWrites++;
+      if (!allowPut) throw Error("unexpected intent");
+      return "test-intent";
+    },
   };
   const context = vm.createContext({
     crypto, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, WeakMap,
     btoa, atob, objectId: id,
     RootarkZk1BrowserOpaqueCatalogCommit: { createClient: () => writer },
     RootarkZk1ProtectedHttpClient: {
-      signProtectedContentOperation: async () => { effects.puts++; throw Error("unexpected PUT"); },
+      signProtectedContentOperation: async () => {
+        if (!allowPut) { effects.puts++; throw Error("unexpected PUT"); }
+        return { signed: true };
+      },
+      postProtectedCiphertextPut: async () => {
+        effects.puts++;
+        throw Error("simulated lost PUT acknowledgement");
+      },
+      postProtectedCiphertextBackupRead: async () => {
+        throw Error("simulated uncertain GET after immutable PUT");
+      },
     },
     RootarkZk1CiphertextRoot: { computeCiphertextRoot: async () => new Uint8Array(32) },
     RootarkZk1FileContent: {},
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-opaque-device-delta-sync.js"), "utf8"), context);
-  const commit = vm.runInContext(`async (name) => {
+  const commit = vm.runInContext(`async (name, key = { type: "secret", extractable: false,
+    algorithm: { name: "AES-GCM", length: 256 }, usages: ["encrypt", "decrypt"] }) => {
     const client = RootarkZk1OpaqueDeviceDeltaSync.createClient({
       authority: { signedDeviceGrant: {}, pinnedOwnerHead: {
         epoch: 1, digest: new Uint8Array(32) }, signerGrants: [],
-        csrfToken: () => "csrf", isSessionCurrent: () => true },
+        csrfToken: () => "csrf", isSessionCurrent: () => true,
+        nowSeconds: () => 100, origin: "https://example.invalid" },
       assertLive: () => true,
     });
     const previous = await client.readCurrent();
     return client.commitVersion({ previous, objectId, expectedRevision: null,
       revision: 1, epoch: 1, ciphertext: new Uint8Array(32), name,
-      metadataKey: null });
+      metadataKey: key });
   }`, context);
   return { commit, effects };
 }
@@ -65,6 +81,14 @@ test("composed upload admits exactly 220 UTF-8 bytes to signed authority preflig
     assert.deepEqual(effects, { signedReads: 2, intentWrites: 0, puts: 0 },
       "valid name must pass metadata prevalidation and reach fresh signed read");
   }
+});
+
+test("new revision rejects a real decrypt-only AES-GCM metadata key before durable intent or ciphertext PUT", async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  const { commit, effects } = uploadFixture({ allowFreshRead: true, allowPut: true });
+  await assert.rejects(commit("valid.txt", key), /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  assert.deepEqual(effects, { signedReads: 1, intentWrites: 0, puts: 0 },
+    "invalid metadata key must fail before external immutable content effects");
 });
 
 function renameFixture(destinationName, composed) {

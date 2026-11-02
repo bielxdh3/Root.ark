@@ -1513,27 +1513,47 @@ function parseWebDavSegments(req) {
 
 function archiveAuditLogs(logs) {
   if (!logs.length) return;
+  if (shouldUseDatabase()) {
+    // The FULL-synchronous private audit sidecar is the durable archive in
+    // SQLite mode. Never also append its contents to the legacy JSON archive.
+    auditRepository.archiveAuditLogs(logs);
+    return;
+  }
   const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE);
   archive.logs.push(...logs);
   saveAuditLogs(archive, AUDIT_ARCHIVE_FILE);
 }
 
 function appendAuditLog(log) {
+  // The strict Sync account fence reserves the main SQLite writer across
+  // physical durability. Persist this event to the independent FULL sidecar
+  // first so a failed login during that window cannot lose its audit trail.
+  const sqliteAudit = shouldUseDatabase();
+  if (sqliteAudit && auditRepository.deferIfStrictSyncWriter(log)) {
+    broadcastDataChanged("audit");
+    return;
+  }
   const entries = loadAuditLogs();
   const cutoff = Date.now() - AUDIT_RETENTION_MS;
+  const expired = [];
   const retained = entries.logs.filter((entry) => {
     const time = new Date(entry.timestamp).getTime();
-    return Number.isFinite(time) && time >= cutoff;
+    if (Number.isFinite(time) && time >= cutoff) return true;
+    // JSON mode historically drops expired records. SQLite must archive them
+    // durably before retention; monotonic UPSERT otherwise keeps them forever.
+    if (sqliteAudit) expired.push(entry);
+    return false;
   });
 
   retained.push(log);
   if (retained.length > MAX_AUDIT_LOGS) {
-    archiveAuditLogs(retained.slice(0, retained.length - MAX_AUDIT_LOGS));
+    expired.push(...retained.slice(0, retained.length - MAX_AUDIT_LOGS));
     entries.logs = retained.slice(-MAX_AUDIT_LOGS);
   } else {
     entries.logs = retained;
   }
 
+  archiveAuditLogs(expired);
   saveAuditLogs(entries);
 }
 
