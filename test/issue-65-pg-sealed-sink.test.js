@@ -59,6 +59,32 @@ test("trusted sealed sink verifies expected root and seal before declaring a com
   assert.deepEqual(f.activity[3][3], f.activity[5][1]);
 });
 
+test("verified sealed retry only finishes the exact original worker admission", async () => {
+  const requestOperationId = crypto.randomBytes(16);
+  const admissionId = crypto.randomBytes(16);
+  const s = request([crypto.randomBytes(19)]).scope;
+  const calls = [];
+  const client = {
+    beginIoAdmission: async () => { assert.fail("recovery cannot start a new admission"); },
+    putCiphertextChunk: async () => { assert.fail("recovery cannot write ciphertext"); },
+    finishIoAdmission: async (request) => {
+      calls.push(request);
+      return { status: "FINISHED" };
+    },
+  };
+  const sink = new Zk1SharedPgCiphertextSink({ gateClient: client });
+  assert.deepEqual(await sink.finishVerifiedSeal({ scope: s,
+    operationId: requestOperationId, admissionId }), { status: "FINISHED" });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].admissionId, admissionId);
+  assert.deepEqual(calls[0].workerId, crypto.createHash("sha256")
+    .update("Root.ark/zk-1/physical-inventory-worker/v1\0")
+    .update(requestOperationId).digest().subarray(0, 16));
+  await assert.rejects(sink.finishVerifiedSeal({ scope: s,
+    operationId: crypto.randomBytes(15), admissionId }), /ZK_GATE_SINK_UNAVAILABLE/);
+  assert.equal(calls.length, 1);
+});
+
 test("sealed sink rejects invalid root, bad receipt and revoked next chunk without reporting success", async () => {
   const chunks = [crypto.randomBytes(30), crypto.randomBytes(40)];
   const f = fixture();
