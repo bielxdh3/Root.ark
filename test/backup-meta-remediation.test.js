@@ -3,9 +3,10 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const originalCwd = process.cwd();
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-meta-"));
+const runtime = createPrivateAuthorityFixture("rootark-backup-meta-");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupService = require("../services/backupService");
