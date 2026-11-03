@@ -44,7 +44,17 @@ function findDefinitelyDeadPid() {
 }
 
 function reset() {
-  for (const name of ["data", "uploads", "temp"]) fs.rmSync(path.join(runtime, name), { recursive: true, force: true });
+  const dataDir = path.join(runtime, "data");
+  if (fs.existsSync(dataDir)) {
+    for (const name of fs.readdirSync(dataDir)) {
+      // JSON audit locks verify this private directory once per process on Windows.
+      // Keep its verified directory across fixtures while resetting all backup data.
+      if (name !== ".rootark-json-audit-private") {
+        fs.rmSync(path.join(dataDir, name), { recursive: true, force: true });
+      }
+    }
+  }
+  for (const name of ["uploads", "temp"]) fs.rmSync(path.join(runtime, name), { recursive: true, force: true });
   fs.mkdirSync(path.join(runtime, "data", "backups"), { recursive: true });
   fs.mkdirSync(path.join(runtime, "uploads"), { recursive: true });
   for (const name of ["BACKUP_ENABLED", "BACKUP_AUTO_ENABLED", "BACKUP_RETENTION_COUNT", "BACKUP_RETENTION_DAYS", "BACKUP_LOCK_STALE_MS"]) delete process.env[name];
