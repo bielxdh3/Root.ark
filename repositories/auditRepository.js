@@ -729,13 +729,22 @@ function sameAuditEvidence(left, right, structuredMain = false) {
   return JSON.stringify(stableAuditValue(a)) === JSON.stringify(stableAuditValue(b));
 }
 
+function hasMainAuditTableForRestore(db) {
+  const auditTable = db.prepare("SELECT type FROM sqlite_master WHERE name='audit_logs'").get();
+  const strictMarker = db.prepare("SELECT type FROM sqlite_master WHERE name='rootark_strict_sync_audit_mode'").get();
+  if (auditTable && auditTable.type !== "table") throw Error("Unexpected SQLite audit authority type during restore");
+  if (!auditTable && strictMarker) throw Error("Strict SQLite restore is missing its audit authority");
+  return Boolean(auditTable);
+}
+
 function loadAllAuditEvidenceForRestore() {
   // Unlike loadAuditLogs(), do NOT suppress pending/main rows that share an
   // archived ID. A divergent hidden row must abort restore, not be discarded.
-  const primary = getDb().prepare(`
+  const db = getDb();
+  const primary = hasMainAuditTableForRestore(db) ? db.prepare(`
     SELECT id, event_type, severity, actor_username, actor_ip, target_type,
       target_id, action, result, timestamp, details_json FROM audit_logs
-  `).all().map((row) => ({ source: "main", log: rowToLog(row) }));
+  `).all().map((row) => ({ source: "main", log: rowToLog(row) })) : [];
   const pending = pendingAudits().map((log) => ({ source: "pending", log }));
   const archived = loadArchivedAuditLogs().logs.map((log) => ({ source: "archived", log }));
   return [...primary, ...pending, ...archived];
@@ -911,6 +920,6 @@ function saveAuditLogs(entries = {}) {
 
 module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter,
   preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs,
-  normalizeMainAuditLog, loadAllAuditEvidenceForRestore, persistTerminalRestoreAudit,
+  normalizeMainAuditLog, hasMainAuditTableForRestore, loadAllAuditEvidenceForRestore, persistTerminalRestoreAudit,
   appendJsonArchiveLogs, writeJsonArchiveBackupSnapshot: jsonArchiveStore.writeJsonArchiveBackupSnapshot,
   rowToLog, withJsonAuditLock, readJsonAuditHistory, persistJsonAuditFile };
