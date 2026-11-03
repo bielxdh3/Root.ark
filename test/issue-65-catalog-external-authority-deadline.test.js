@@ -87,6 +87,18 @@ test("catalog external authority mTLS client has an absolute deadline for both r
     endpoint: `https://127.0.0.1:${server.address().port}`,
     ca, key: read("operator.key"), cert: read("operator.pem"), serverSpkiSha256,
   });
+  await t.test("rejects malformed or mismatched mTLS credentials before sending", () => {
+    const options = {
+      endpoint: `https://127.0.0.1:${server.address().port}`,
+      ca, key: read("operator.key"), cert: read("operator.pem"), serverSpkiSha256,
+    };
+    assert.throws(() => createCatalogAuthorityHttpsClient({
+      ...options, key: Buffer.from("not-a-private-key"),
+    }), DENIED);
+    assert.throws(() => createCatalogAuthorityHttpsClient({
+      ...options, cert: serverCert,
+    }), DENIED);
+  });
   const request = {
     scope: { account_id: Buffer.alloc(16, 1), compartment_id: Buffer.from("fixture"),
       keyring_id: Buffer.alloc(16, 2) },
