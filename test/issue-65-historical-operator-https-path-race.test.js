@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const https = require("node:https");
+const os = require("node:os");
 const path = require("node:path");
 const v8 = require("node:v8");
 const { spawnSync } = require("node:child_process");
@@ -14,6 +15,32 @@ const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+
+test("POSIX operator --serve refuses an unwritten config FIFO without hanging", {
+  skip: process.platform === "win32",
+}, (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-operator-fifo-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fifo = path.join(dir, "operator-config.fifo");
+  const created = spawnSync("mkfifo", ["-m", "600", fifo], {
+    encoding: "utf8", timeout: 5000,
+  });
+  assert.equal(created.status, 0, created.stderr || "mkfifo failed");
+
+  // A read-only open of a FIFO blocks until a writer appears, before fstat
+  // can reject the nonregular file. Run the real operator CLI in a bounded
+  // child so a regression cannot hang the test runner itself.
+  const operatorScript = path.resolve(__dirname,
+    "../scripts/zk1-historical-recovery-operator.js");
+  const child = spawnSync(process.execPath, [operatorScript, "--serve", fifo], {
+    encoding: "utf8", timeout: 15000,
+  });
+  assert.equal(child.error, undefined,
+    `operator blocked on FIFO: ${child.error?.code}`);
+  assert.equal(child.status, 1);
+  assert.equal(child.stdout, "");
+  assert.match(child.stderr, /^HISTORICAL_RECOVERY_OPERATOR_DENIED\r?\n$/);
+});
 
 test("a renamed untrusted Windows config cannot reach a real pinned TLS 1.3 mTLS endpoint after the private-file guard", {
   skip: process.platform !== "win32",

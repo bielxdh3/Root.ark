@@ -54,6 +54,7 @@ function readProtectedFile(filename) {
   // Keep the opened object pinned across pathname and native Windows ACL
   // checks. A second read by pathname would reopen an unverified replacement.
   const fd = fs.openSync(filename, fs.constants.O_RDONLY
+    | (fs.constants.O_NONBLOCK || 0)
     | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
