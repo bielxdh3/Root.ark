@@ -32,6 +32,10 @@ function fixture({ strictWriter = false, database = true, max = 2, now = Date.no
       if (archiveFailure) throw Error("archive unavailable");
       archived.push(...logs);
     },
+    appendJsonArchiveLogs(logs) {
+      if (archiveFailure) throw Error("archive unavailable");
+      legacyArchiveWrites.push(...logs);
+    },
   };
   const context = vm.createContext({
     crypto: { randomUUID: () => "new-audit-id" },
@@ -95,7 +99,7 @@ test("archive failure stops active-table retention before acknowledging a new au
   assert.equal(state.writes.length, 0);
 });
 
-test("legacy JSON mode retains its original count archive path", () => {
+test("legacy JSON mode archives count-evicted events through the locked archive writer", () => {
   const now = Date.parse("2026-11-02T00:00:00Z");
   const state = fixture({ now, database: false, max: 1, seed: [
     { id: "one", timestamp: new Date(now - 300).toISOString() },
@@ -103,4 +107,14 @@ test("legacy JSON mode retains its original count archive path", () => {
   state.audit("auth.login.failed", {}, null, "login", "failure");
   assert.equal(state.archived.length, 0);
   assert.deepEqual(state.legacyArchiveWrites.map((entry) => entry.id), ["one"]);
+});
+
+test("JSON archive failure cannot acknowledge active log pruning", () => {
+  const now = Date.parse("2026-11-02T00:00:00Z");
+  const state = fixture({ now, database: false, archiveFailure: true, max: 1,
+    seed: [{ id: "one", timestamp: new Date(now - 300).toISOString() }] });
+  assert.throws(() => state.audit("auth.login.failed", {}, null, "login", "failure"),
+    /archive unavailable/);
+  assert.deepEqual(state.events.map((entry) => entry.id), ["one"]);
+  assert.equal(state.writes.length, 0);
 });
