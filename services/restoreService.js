@@ -2401,9 +2401,11 @@ function assertRestoredAuditCollisionFree(archive, currentEvidence) {
       for (const row of sidecar.prepare("SELECT id,event FROM pending_audit").iterate()) add(JSON.parse(row.event), "pending");
       for (const row of sidecar.prepare("SELECT id,event FROM archived_audit").iterate()) add(JSON.parse(row.event), "archived");
     }
-    for (const row of primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
-      target_type, target_id, action, result, timestamp, details_json FROM audit_logs`).iterate()) {
-      add(auditRepository.rowToLog(row), "main");
+    if (auditRepository.hasMainAuditTableForRestore(primary)) {
+      for (const row of primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs`).iterate()) {
+        add(auditRepository.rowToLog(row), "main");
+      }
     }
     for (const { log, source } of currentEvidence) {
       add(log, source);
@@ -2452,15 +2454,17 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
       let bytes = archived.bytes;
       const exists = db.prepare("SELECT event FROM archived_audit WHERE id=?");
       const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?");
-      const main = primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
-        target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
+      const main = auditRepository.hasMainAuditTableForRestore(primary)
+        ? primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+          target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`)
+        : null;
       const put = db.prepare("INSERT INTO archived_audit (id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
       db.transaction(() => {
         for (const { log: entry, source } of currentEvidence) {
           const serialized = JSON.stringify(entry);
           const saved = exists.get(entry.id);
           const pendingRow = pending.get(entry.id);
-          const mainRow = main.get(entry.id);
+          const mainRow = main?.get(entry.id);
           for (const match of [
             saved && { log: JSON.parse(saved.event), source: "archived" },
             pendingRow && { log: JSON.parse(pendingRow.event), source: "pending" },
