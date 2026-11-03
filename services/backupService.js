@@ -13,6 +13,7 @@ const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContains
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const strictAudit = require("./strictAuditSnapshot");
+const jsonAuditArchiveStore = require("../repositories/jsonAuditArchiveStore");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
@@ -122,6 +123,7 @@ function isSensitivePath(relativePath) {
   if (lowerPath === `data/${BACKUP_METADATA_LOCK_NAME}` || lowerPath.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)) return true;
   if (lowerPath.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)) return true;
   if (lowerPath.startsWith(`data/${JSON_AUDIT_COORDINATION_DB_PREFIX}`)) return true;
+  if (lowerPath.startsWith("data/.rootark-json-audit-enrollment.json")) return true;
   if (lowerPath.startsWith("data/.rootark-cloud-")) return true;
   if (lowerPath.startsWith("temp/.chunks/") || lowerPath.startsWith("temp/.incoming/")) return true;
   if (lowerPath.startsWith("data/.rootark-active-requests/")) return true;
@@ -402,6 +404,33 @@ async function collectBackupFiles(options = {}) {
       name === "README.md"
     ) && !quarantineExclusions.isPayloadPath(absolutePath, stat)) {
       files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
+    }
+  }
+  if (options.jsonArchiveSnapshotPath) {
+    // The runtime keeps an immutable legacy JSON archive plus a FULL/WAL
+    // append delta. Backups still carry the single canonical JSON member
+    // expected by older backups and the restore allowlist.
+    const entryPath = "data/audit-logs-archive.json";
+    const sourceStat = fs.lstatSync(options.jsonArchiveSnapshotPath, { bigint: true });
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.nlink !== 1n) {
+      throw new Error("JSON audit archive backup snapshot is unsafe");
+    }
+    const previous = files.findIndex((file) => file.entryPath === entryPath);
+    if (previous >= 0) files.splice(previous, 1);
+    files.push({ absolutePath: options.jsonArchiveSnapshotPath, entryPath,
+      size: Number(sourceStat.size), archiveRoot: archiveRootInfo(path.dirname(options.jsonArchiveSnapshotPath)), sourceStat });
+  }
+  if (options.jsonMainSnapshotCaptured) {
+    const entryPath = "data/audit-logs.json";
+    const previous = files.findIndex((file) => file.entryPath === entryPath);
+    if (previous >= 0) files.splice(previous, 1);
+    if (options.jsonMainSnapshotPath) {
+      const sourceStat = fs.lstatSync(options.jsonMainSnapshotPath, { bigint: true });
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.nlink !== 1n) {
+        throw new Error("JSON main audit backup snapshot is unsafe");
+      }
+      files.push({ absolutePath: options.jsonMainSnapshotPath, entryPath,
+        size: Number(sourceStat.size), archiveRoot: archiveRootInfo(path.dirname(options.jsonMainSnapshotPath)), sourceStat });
     }
   }
 
@@ -1452,8 +1481,16 @@ async function createBackup(options = {}) {
     }
     const persistenceMode = isDbEnabled() ? "sqlite" : "json";
     sqliteSnapshot = await createSqliteSnapshot(persistenceMode);
+    const jsonAuditSnapshots = persistenceMode === "json"
+      ? await jsonAuditArchiveStore.writeJsonArchiveBackupSnapshot(
+        path.join(stageDir, "audit-archive-snapshot.json"),
+        path.join(stageDir, "audit-main-snapshot.json"))
+      : null;
     const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath,
       auditSnapshotPath: sqliteSnapshot?.auditSnapshotPath, strictAudit: sqliteSnapshot?.strict,
+      jsonArchiveSnapshotPath: jsonAuditSnapshots?.archiveSnapshotPath,
+      jsonMainSnapshotPath: jsonAuditSnapshots?.mainSnapshotPath,
+      jsonMainSnapshotCaptured: persistenceMode === "json",
       persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);

@@ -14,6 +14,7 @@ const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const strictAudit = require("./strictAuditSnapshot");
 const auditRepository = require("../repositories/auditRepository");
+const jsonAuditArchiveStore = require("../repositories/jsonAuditArchiveStore");
 const { JSON_AUDIT_COORDINATION_FILE } = require("../repositories/jsonAuditLock");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
@@ -2948,6 +2949,10 @@ async function restoreBackup(id, options = {}) {
     // Validate the restored primary's strict marker against the only allowed
     // audit sidecar member before preparing any destructive pre-image changes.
     const strictAuditArchive = validateStrictAuditRestoreArchive(restoreDir, manifest);
+    // The private JSON archive delta is an acknowledged audit authority that
+    // survives whole restore. Reject a divergent selected backup before any
+    // local replacement, so restart cannot expose mismatched evidence.
+    if (persistenceMode === "json") jsonAuditArchiveStore.assertJsonRestoreCompatible(restoreDir);
     // Drain every audit writer that started before the durable coordinator
     // gate, before reading current evidence or copying live SQLite pre-images.
     if (persistenceMode === "sqlite") await strictAudit.drainAuditWriters(getDatabasePath());
