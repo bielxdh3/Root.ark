@@ -1,14 +1,14 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 
 function runFixture(body, envOverrides = {}, timeoutMs = 30_000) {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-manifest-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-manifest-runtime-");
   const quarantineDir = path.join(runtime, "quarantine");
   const script = `
     const assert = require("node:assert/strict");

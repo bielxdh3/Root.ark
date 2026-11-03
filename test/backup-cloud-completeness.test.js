@@ -9,7 +9,7 @@ const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 
 const originalCwd = process.cwd();
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-"));
+const runtime = createPrivateAuthorityFixture("rootark-cloud-backup-");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupService = require("../services/backupService");
@@ -96,7 +96,7 @@ test("a changed provider suppression policy cannot be recorded as a successful b
 });
 
 test("divergent cloud collisions fail closed and leave no archive", () => {
-  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-fail-"));
+  const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-fail-");
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   const script = [
     `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false";`,
@@ -114,7 +114,7 @@ test("divergent cloud collisions fail closed and leave no archive", () => {
 test("cloud inventory and download failures cannot create a successful backup", async (t) => {
   for (const mode of ["list", "download"]) {
     await t.test(`${mode} failure`, () => {
-      const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-error-"));
+      const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-error-");
       const servicePath = path.join(__dirname, "..", "services", "backupService");
       const script = [
         `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false";`,
@@ -134,7 +134,7 @@ test("pending cloud objects are included only when configured", async (t) => {
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   for (const includePending of [false, true]) {
     await t.test(includePending ? "includes pending area" : "excludes pending area", () => {
-      const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-pending-"));
+      const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-pending-");
       const script = [
         `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false"; process.env.BACKUP_INCLUDE_PENDING = ${JSON.stringify(String(includePending))};`,
         `const service = require(${JSON.stringify(servicePath)});`,
@@ -154,7 +154,7 @@ test("unsafe cloud object names fail closed without retaining an archive", async
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   for (const name of ["../escape.txt", "/absolute.txt", "nested/file.txt", "nested\\file.txt", ".env"]) {
     await t.test(name, () => {
-      const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-unsafe-"));
+      const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-unsafe-");
       const script = [
         `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false";`,
         'const fs = require("fs"); const path = require("path");',
@@ -170,7 +170,7 @@ test("unsafe cloud object names fail closed without retaining an archive", async
 });
 
 test("a cloud-only object survives SQLite backup and restore", () => {
-  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-sqlite-runtime-"));
+  const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-sqlite-runtime-");
   const databaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-sqlite-db-"));
   const databasePath = path.join(databaseDir, "configured.sqlite");
   const servicePath = path.join(__dirname, "..", "services", "backupService");
@@ -225,7 +225,7 @@ test("cloud backup object matrix", async (t) => {
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   const unzipperPath = path.join(__dirname, "..", "node_modules", "unzipper");
   const run = ({ objects = [], local = null, enabled = true, failList = false, failDownload = false }) => {
-    const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-matrix-"));
+    const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-matrix-");
     const payload = JSON.stringify({ objects, local, enabled, failList, failDownload });
     const script = [
       `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false"; const input = ${payload};`,
@@ -253,7 +253,7 @@ test("cloud backup object matrix", async (t) => {
 });
 
 test("restore-suppressed provider objects are not downloaded or archived", () => {
-  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-suppressed-"));
+  const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-suppressed-");
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   const unzipperPath = path.join(__dirname, "..", "node_modules", "unzipper");
   const script = [
