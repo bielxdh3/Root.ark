@@ -5839,7 +5839,11 @@ function initData() {
     if (!fs.existsSync(FILE_VERSIONS_FILE)) saveFileVersions({});
     if (!fs.existsSync(ENCRYPTED_FILES_FILE)) saveEncryptedFiles({});
     if (!fs.existsSync(ANALYTICS_FILE)) saveAnalytics(getDefaultAnalytics());
-    if (!fs.existsSync(AUDIT_LOGS_FILE)) {
+    // A pending whole-restore coordinator owns the JSON audit history until
+    // startup rehydration and its terminal outcome have completed. Ordinary
+    // initialization must not acquire the writer lock across that barrier;
+    // the trusted terminal audit creates the missing file when required.
+    if (!fs.existsSync(AUDIT_LOGS_FILE) && !restoreService.isWholeRestoreBlocked()) {
       if (shouldUseDatabase()) saveAuditLogs(getDefaultAuditLogs());
       else auditRepository.withJsonAuditLock(() => {
         if (!fs.existsSync(AUDIT_LOGS_FILE)) saveAuditLogs(getDefaultAuditLogs());

@@ -10,7 +10,7 @@ const vm = require("node:vm");
 // functions in a deterministic harness, without starting the full server or
 // writing to a real account database.
 const source = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
-const start = source.indexOf("function archiveAuditLogs(logs) {");
+const start = source.indexOf("function archiveAuditLogs(");
 const end = source.indexOf("function addActionHistory(", start);
 assert.ok(start >= 0 && end > start, "production audit functions must be present");
 
@@ -22,6 +22,7 @@ function fixture({ strictWriter = false, database = true, max = 2, now = Date.no
   const legacyArchiveWrites = [];
   const writes = [];
   const repo = {
+    withJsonAuditLock(callback) { return callback(); },
     deferIfStrictSyncWriter(log) {
       if (!strictWriter) return false;
       deferred.push(log);
@@ -39,12 +40,14 @@ function fixture({ strictWriter = false, database = true, max = 2, now = Date.no
     AUDIT_EVENTS: {},
     AUDIT_RETENTION_MS: 1000,
     MAX_AUDIT_LOGS: max,
+    AUDIT_LOGS_FILE: "audit.json",
     AUDIT_ARCHIVE_FILE: "archived.json",
     shouldUseDatabase: () => database,
     auditRepository: repo,
     broadcastDataChanged(source) { assert.equal(source, "audit"); },
     loadAuditLogs(file) {
-      return file ? { logs: legacyArchiveWrites.slice() } : { logs: events.slice() };
+      return file === "archived.json" ? { logs: legacyArchiveWrites.slice() }
+        : { logs: events.slice() };
     },
     saveAuditLogs(value, file) {
       if (file) { legacyArchiveWrites.push(...value.logs); return; }
