@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { fork } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -176,6 +177,82 @@ async function signedPendingCommitForTest(f, operation) {
     await z.encodeDeterministic(unsigned),
   ]), f.keys.privateKey);
   return { entry, requestCbor, requestDigest, root, signature };
+}
+
+// Seed the actual signed maximum in one SQLite transaction. Repeated appends
+// would reverify the entire growing log 4096 times and obscure the boundary test.
+async function seedSignedFullInventory(f, ledger) {
+  const objectId = Buffer.alloc(16, 91);
+  const entries = [];
+  const rows = [];
+  let root = (await ledger.readLocalHead()).root;
+  for (let sequence = 1; sequence <= inventory.MAX_ENTRIES; sequence += 1) {
+    const operationId = Buffer.alloc(16);
+    operationId.writeUInt32BE(sequence, 12);
+    const entry = makeTuple(objectId, sequence, 1,
+      crypto.createHash("sha256").update(String(sequence)).digest());
+    const operation = {
+      operation_id: operationId, expected_sequence: sequence - 1, expected_root: root, ...entry,
+    };
+    const requestCbor = await z.encodeDeterministic(operationMapForTest(operation));
+    const requestDigest = crypto.createHash("sha256").update(requestCbor).digest();
+    entries.push(entry);
+    const nextRoot = await inventory.computeRoot(f.scope, sequence, root, entries);
+    const unsigned = {
+      type: ENTRY_TYPE, version: 1, signer_key_id: f.signerKeyId, scope: f.scope,
+      sequence, previous_root: root, root: nextRoot,
+      operation_id: operationId, expected_sequence: sequence - 1, expected_root: root,
+      request_digest: requestDigest, entry,
+    };
+    const signature = crypto.sign(null, Buffer.concat([
+      ENTRY_DOMAIN, await z.encodeDeterministic(unsigned),
+    ]), f.keys.privateKey);
+    rows.push({ operation, requestCbor, requestDigest, nextRoot, signature });
+    root = nextRoot;
+  }
+  const insertOperation = ledger.db.prepare(`INSERT INTO content_operation
+    (operation_id,request_cbor,expected_sequence,expected_root,status,sequence,root)
+    VALUES(?,?,?,?,'committed',?,?)`);
+  const insertEntry = ledger.db.prepare(`INSERT INTO content_entry
+    (sequence,operation_id,object_id,revision,epoch,ciphertext_sha256,expected_sequence,
+     expected_root,previous_root,root,request_digest,signature)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  ledger.db.transaction(() => {
+    for (let index = 0; index < rows.length; index += 1) {
+      const { operation, requestCbor, requestDigest, nextRoot, signature } = rows[index];
+      const sequence = index + 1;
+      insertOperation.run(operation.operation_id, requestCbor, operation.expected_sequence,
+        operation.expected_root, sequence, nextRoot);
+      insertEntry.run(sequence, operation.operation_id, operation.object_id, operation.revision,
+        operation.epoch, operation.ciphertext_sha256, operation.expected_sequence,
+        operation.expected_root, operation.expected_root, nextRoot, requestDigest, signature);
+    }
+    ledger.db.prepare("UPDATE content_head SET sequence=?,root=? WHERE id=1")
+      .run(inventory.MAX_ENTRIES, root);
+  }).immediate();
+  return { root, lastOperation: rows[rows.length - 1].operation };
+}
+
+function appendFromSeparateProcess(f, operation) {
+  return new Promise((resolve, reject) => {
+    const child = fork(path.join(__dirname, "support/issue-65-inventory-capacity-worker.js"), [], {
+      execArgv: [], serialization: "advanced", stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    let result;
+    const timer = setTimeout(() => child.kill(), 30000);
+    child.on("message", (message) => { result = message; });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0 || !result) return reject(new Error(`capacity worker exited ${code}`));
+      resolve(result);
+    });
+    child.send({
+      filename: f.filename, scope: f.scope, signerKeyId: f.signerKeyId,
+      privateKeyPem: f.keys.privateKey.export({ type: "pkcs8", format: "pem" }),
+      operation,
+    });
+  });
 }
 
 function trackMaterializingReads(ledger, predicate) {
@@ -726,6 +803,75 @@ test("concurrent exact retries share one verified signed commit before and after
   assert.equal(restartedState.entries.length, 1);
   assert.deepEqual(restartedState.root, results[0].root);
   assert.deepEqual(restartedState.operations.get(operation.operation_id.toString("hex")).digest, requestDigest);
+});
+
+test("signed 4096-entry inventory rejects overflow without pending intents across handles and restart", async (t) => {
+  const f = await testFixture(t);
+  let ledger = await f.openNew();
+  const { root, lastOperation } = await seedSignedFullInventory(f, ledger);
+  const fullSnapshot = await ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  assert.equal(fullSnapshot.status, "snapshot");
+  assert.equal(fullSnapshot.sequence, inventory.MAX_ENTRIES);
+  assert.deepEqual(fullSnapshot.root, root);
+  const priorProofPage = await ledger.getCommittedProofPage({
+    afterSequence: inventory.MAX_ENTRIES - 1, limit: 1,
+  });
+  assert.equal(priorProofPage.status, "chain_page");
+  assert.equal(priorProofPage.proofs.length, 1);
+
+  const overflow = {
+    operation_id: crypto.randomBytes(16), expected_sequence: inventory.MAX_ENTRIES,
+    expected_root: root, ...makeTuple(lastOperation.object_id, inventory.MAX_ENTRIES + 1, 1),
+  };
+  await assert.rejects(ledger.prepareAppend(overflow), /INVENTORY_LIMIT/);
+  assert.deepEqual(await ledger.getOperationStatus(overflow.operation_id), { status: "unknown" });
+  assert.equal((await ledger.getSnapshot({ nonce: crypto.randomBytes(32) })).status, "snapshot");
+
+  const second = await f.open();
+  const third = await f.open();
+  const anotherOverflow = { ...overflow, operation_id: crypto.randomBytes(16) };
+  const attempts = await Promise.allSettled([
+    ledger.append(overflow), second.prepareAppend(overflow), third.append(anotherOverflow),
+  ]);
+  assert.ok(attempts.every((result) => result.status === "rejected"
+    && /INVENTORY_LIMIT/.test(String(result.reason))),
+  "all independent SQLite connections reject capacity before durable intents");
+  assert.deepEqual(await ledger.getOperationStatus(overflow.operation_id), { status: "unknown" });
+  assert.deepEqual(await ledger.getOperationStatus(anotherOverflow.operation_id), { status: "unknown" });
+  const childResults = await Promise.all([
+    appendFromSeparateProcess(f, overflow), appendFromSeparateProcess(f, anotherOverflow),
+    ledger.append(overflow).then(() => ({ status: "accepted" }), (error) => ({
+      status: "rejected", code: error.code,
+    })),
+  ]);
+  assert.deepEqual(childResults, Array.from({ length: 3 }, () => ({
+    status: "rejected", code: "INVENTORY_LIMIT",
+  })));
+  assert.deepEqual(await second.append(lastOperation), {
+    status: "committed", replay: true, sequence: inventory.MAX_ENTRIES, root,
+  });
+  await assert.rejects(second.append({ ...lastOperation, ciphertext_sha256: crypto.randomBytes(32) }),
+    /INVENTORY_OPERATION_CONFLICT/);
+
+  f.close(ledger);
+  f.close(second);
+  f.close(third);
+  ledger = await f.open();
+  const state = await ledger.loadState();
+  assert.equal(state.sequence, inventory.MAX_ENTRIES);
+  assert.equal(state.pending.length, 0);
+  assert.equal(state.operations.size, inventory.MAX_ENTRIES);
+  assert.deepEqual(state.root, root);
+  assert.deepEqual(await ledger.getOperationStatus(overflow.operation_id), { status: "unknown" });
+  const snapshotAfterRestart = await ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  assert.equal(snapshotAfterRestart.status, "snapshot");
+  assert.deepEqual(snapshotAfterRestart.root, root);
+  assert.deepEqual((await ledger.getCommittedProofPage({
+    afterSequence: inventory.MAX_ENTRIES - 1, limit: 1,
+  })).proofs, priorProofPage.proofs);
+  assert.deepEqual(await ledger.append(lastOperation), {
+    status: "committed", replay: true, sequence: inventory.MAX_ENTRIES, root,
+  });
 });
 
 test("stale-head and invalid-chronology operations get durable signed final identities", async (t) => {
