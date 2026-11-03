@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 
@@ -1444,8 +1445,8 @@ test("quarantine restore recovery preserves missing metadata state across startu
 });
 
 test("quarantine journal directory fsync failure preserves the published journal stage for startup recovery", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-journal-fsync-runtime-"));
-  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-journal-fsync-payloads-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-journal-fsync-runtime-");
+  const quarantineDir = createPrivateAuthorityFixture("rootark-quarantine-journal-fsync-payloads-");
   const archiverModulePath = require.resolve("archiver");
   const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
   try {
@@ -1497,7 +1498,17 @@ test("quarantine journal directory fsync failure preserves the published journal
         backupService.acquireLock = function (...args) {
           const release = nativeAcquireLock.apply(this, args);
           if (args[0] === "restore") {
-            Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+            // Exercise the POSIX directory-fsync branch without changing the
+            // platform seen by Windows private audit locks and their native ACL
+            // verifier. A global Linux impersonation breaks this trust boundary.
+            const hostPlatform = process.platform;
+            Object.defineProperty(process, "platform", {
+              configurable: true,
+              get() {
+                return (new Error().stack || "").includes("at fsyncDirectory (")
+                  ? "linux" : hostPlatform;
+              },
+            });
             fs.openSync = function (target, ...openArgs) {
               if (typeof target === "string" && fs.existsSync(target) && fs.statSync(target).isDirectory()) {
                 const descriptor = nativeOpen.call(this, metadataPath, "r");
