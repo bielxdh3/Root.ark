@@ -2413,6 +2413,17 @@ function assertRestoredAuditCollisionFree(archive, currentEvidence) {
   } finally { primary.close(); sidecar?.close(); }
 }
 
+function assertPrivateAuditStage(staged, descriptor) {
+  const pinned = fs.fstatSync(descriptor, { bigint: true });
+  const linked = fs.lstatSync(staged, { bigint: true });
+  if (!pinned.isFile() || pinned.nlink !== 1n
+    || !linked.isFile() || linked.isSymbolicLink() || linked.nlink !== 1n
+    || pinned.dev !== linked.dev || pinned.ino !== linked.ino
+    || (process.platform !== "win32" && (pinned.mode & 0o077n) !== 0n)) {
+    throw Error("Private strict audit staging file changed or is aliased");
+  }
+}
+
 function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
   if (!archive.source && !currentEvidence.length) return false;
   const destination = strictAudit.journalPath(getDatabasePath());
@@ -2429,18 +2440,28 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
     }
   }
   const staged = `${destination}.restore-stage-${transactionId}`;
-  if (fs.existsSync(staged)) throw Error("Staged strict audit journal already exists");
+  let stageDescriptor;
+  let createdStage = false;
   try {
     if (archive.source) {
       restorePreimage.copyVerifiedFile(archive.source, staged, strictAudit.sha256(archive.source));
+      createdStage = true;
+      stageDescriptor = fs.openSync(staged, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
     } else {
       // Older backups may predate creation of the unmarked journal. Build a
       // private empty destination and carry all live evidence into it.
-      fs.closeSync(fs.openSync(staged, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600));
+      stageDescriptor = fs.openSync(staged,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0), 0o600);
+      createdStage = true;
     }
+    assertPrivateAuditStage(staged, stageDescriptor);
     const db = new Database(staged, { fileMustExist: true });
-    const primary = new Database(archive.primary, { readonly: true, fileMustExist: true });
+    let primary;
     try {
+      // SQLite reopens by pathname. Before its first SQL statement, verify
+      // that the path still names the exact exclusive-created private inode.
+      assertPrivateAuditStage(staged, stageDescriptor);
+      primary = new Database(archive.primary, { readonly: true, fileMustExist: true });
       if (!archive.source) {
         db.pragma("journal_mode = WAL");
         db.pragma("synchronous = FULL");
@@ -2488,9 +2509,14 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
           put.run(entry.id, serialized);
         }
       })();
-    } finally { primary.close(); db.close(); }
+    } finally {
+      try { primary?.close(); }
+      finally { db.close(); }
+    }
+    assertPrivateAuditStage(staged, stageDescriptor);
     strictAudit.verifyAuditDatabase(staged, { requireWal: true });
-    fsyncFile(staged);
+    assertPrivateAuditStage(staged, stageDescriptor);
+    fs.fsyncSync(stageDescriptor);
     // Whole-restore pre-images were durably committed before this point. Any
     // crash in the WAL removal/replacement window invokes coordinator rollback
     // restoring ALL three former sidecar files along with the primary DB.
@@ -2499,12 +2525,17 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
       if (fs.existsSync(live)) fs.rmSync(live, { force: false });
     }
     if (fs.existsSync(destination)) fs.rmSync(destination, { force: false });
+    assertPrivateAuditStage(staged, stageDescriptor);
+    // Release the pinned handle before Windows renames the staged database.
+    fs.closeSync(stageDescriptor);
+    stageDescriptor = undefined;
     renameSyncWithWindowsEpermRetry(staged, destination);
     fsyncDirectory(directory);
     strictAudit.verifyAuditDatabase(destination, { requireWal: true });
     return true;
   } finally {
-    if (fs.existsSync(staged)) fs.rmSync(staged, { force: true });
+    if (stageDescriptor !== undefined) fs.closeSync(stageDescriptor);
+    if (createdStage) fs.rmSync(staged, { force: true });
   }
 }
 

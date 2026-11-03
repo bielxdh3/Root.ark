@@ -18,10 +18,47 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const project = process.env.PR235_TEST_PROJECT;
 const scenario = process.env.PR235_TEST_SCENARIO;
+const attack = ["late-hardlink-swap", "late-symlink-swap",
+  "pending-hardlink-swap", "pending-symlink-swap"].includes(scenario);
+const outside = path.join(process.cwd(), "data", "outside-audit.sqlite");
+let swappedStage = false;
+let sqliteCallsOnSwappedStage = 0;
+let attackedStage = null;
+// Interpose at the exact SQLite reopen, after staging has created an empty
+// inode, so the test exercises the real restore path and real SQLite writes.
+const sqliteModule = require.cache[require.resolve("better-sqlite3")];
+if (attack) {
+  function DatabaseWithStageSwap(filename, options) {
+    if (!swappedStage && typeof filename === "string"
+      && filename.includes(".audit-private") && filename.includes(".restore-stage-")) {
+      swappedStage = true;
+      attackedStage = filename;
+      fs.unlinkSync(filename);
+      if (scenario.endsWith("hardlink-swap")) fs.linkSync(outside, filename);
+      else fs.symlinkSync(outside, filename, "file");
+    }
+    const db = new Database(filename, options);
+    if (!swappedStage || typeof filename !== "string" || !filename.includes(".restore-stage-")) return db;
+    return new Proxy(db, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (typeof value !== "function") return value;
+        return (...args) => {
+          if (["pragma", "exec", "prepare", "transaction"].includes(property)) sqliteCallsOnSwappedStage += 1;
+          return value.apply(target, args);
+        };
+      },
+    });
+  }
+  Object.setPrototypeOf(DatabaseWithStageSwap, Database);
+  DatabaseWithStageSwap.prototype = Database.prototype;
+  sqliteModule.exports = DatabaseWithStageSwap;
+}
 const { runMigrations } = require(path.join(project, "db", "migrations"));
 const { isStrictSyncModeObserved, getDb } = require(path.join(project, "db"));
 const backup = require(path.join(project, "services", "backupService"));
 const restore = require(path.join(project, "services", "restoreService"));
+if (attack) sqliteModule.exports = Database;
 const audit = require(path.join(project, "repositories", "auditRepository"));
 const strictAudit = require(path.join(project, "services", "strictAuditSnapshot"));
 const { Open } = require("unzipper");
@@ -36,6 +73,15 @@ const makeEvent = (id, eventType = "auth.login.failed") => ({
   const sidecar = strictAudit.journalPath(process.env.DATABASE_URL);
   const state = path.join(process.cwd(), "data", "fixture-state.json");
   fs.writeFileSync(state, JSON.stringify({ value: "selected" }));
+  if (attack) {
+    const foreign = new Database(outside);
+    try {
+      foreign.pragma("journal_mode = WAL");
+      foreign.pragma("synchronous = FULL");
+      foreign.exec("CREATE TABLE pending_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL);"
+        + "CREATE TABLE archived_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+    } finally { foreign.close(); }
+  }
   if (scenario === "late-divergent") {
     audit.saveAuditLogs({ logs: [makeEvent("A-before-backup")] });
   } else if (!scenario.startsWith("late")) {
@@ -67,7 +113,7 @@ const makeEvent = (id, eventType = "auth.login.failed") => ({
       assert.ok(getDb().prepare("SELECT id FROM audit_logs WHERE id=?").get("B-after-backup"));
     }
   }
-  const negative = ["divergent", "late-divergent", "oversized"].includes(scenario);
+  const negative = attack || ["divergent", "late-divergent", "oversized"].includes(scenario);
   const expectedId = scenario.includes("divergent") ? "A-before-backup" : "B-after-backup";
   assert.ok(audit.loadAuditLogs().logs.some(({ id }) => id === expectedId));
   let destructive = 0;
@@ -85,8 +131,25 @@ const makeEvent = (id, eventType = "auth.login.failed") => ({
       assert.match(error.message, /INJECTED_POST_SQLITE_REPLACEMENT/);
     } else {
       if (!negative) throw error;
-      assert.match(error.message, /collision|divergent|capacity/i);
+      assert.match(error.message, attack ? /stage|unsafe|audit|alias|identity/i : /collision|divergent|capacity/i);
     }
+  }
+  if (attack) {
+    assert.equal(swappedStage, true, "attacker swapped the real SQLite reopen path");
+    assert.equal(result, undefined, "restore must fail without publishing a substituted stage");
+    assert.equal(sqliteCallsOnSwappedStage, 0,
+      "foreign SQLite must be rejected before any SQL command is issued");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      assert.equal(fs.existsSync(attackedStage + suffix), false,
+        "rejected stage must not leave an abandoned SQLite artifact: " + suffix);
+    }
+    const foreign = new Database(outside, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(foreign.prepare("SELECT event FROM archived_audit WHERE id=?")
+        .get("B-after-backup"), undefined, "outside DB must not receive even one acknowledged audit row");
+    } finally { foreign.close(); }
+    console.log("NONSTRICT_SQLITE_RESTORE_AUDIT_OK", scenario);
+    return;
   }
   if (scenario === "rollback") {
     assert.equal(result, undefined);
@@ -132,7 +195,8 @@ const makeEvent = (id, eventType = "auth.login.failed") => ({
 `;
 
 for (const scenario of ["pending", "main", "late-sidecar", "late-main", "divergent",
-  "late-divergent", "oversized", "rollback"]) {
+  "late-divergent", "oversized", "rollback", "late-hardlink-swap", "late-symlink-swap",
+  "pending-hardlink-swap", "pending-symlink-swap"]) {
   test(`real SQLite whole restore retains non-strict audit evidence: ${scenario}`,
     { timeout: 90_000 }, (t) => {
       const runtime = process.platform === "win32"
