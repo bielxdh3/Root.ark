@@ -178,11 +178,16 @@
         const length = { 24: 1, 25: 2, 26: 4, 27: 8 }[info];
         if (!length) deny(); let n = 0;
         for (const b of take(length)) n = n * 256 + b;
-        return uint(n, 0, maximum);
+        // `maximum` bounds encoded bytes and aggregate container allocation,
+        // not the numeric value of a CBOR unsigned integer (e.g. Unix seconds).
+        return uint(n, 0, major === 0 ? Number.MAX_SAFE_INTEGER : maximum);
       })();
       // Snapshot envelopes can be larger than a catalog header, but a tiny
       // CBOR array/map declaration must not allocate millions of JS entries.
-      if ((major === 4 || major === 5) && count > 16384) deny();
+      // Every element consumes at least one input byte; every map entry needs
+      // at least a key and a value. Reject impossible counts before allocation.
+      if ((major === 4 || major === 5) && (count > 16384
+        || count > Math.floor((input.length - at) / (major === 5 ? 2 : 1)))) deny();
       if (major === 0) return count;
       if (major === 2) return take(count);
       if (major === 3) return td.decode(take(count));
