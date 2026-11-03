@@ -2424,6 +2424,27 @@ function assertPrivateAuditStage(staged, descriptor) {
   }
 }
 
+function assertPinnedAuditStageDigest(staged, descriptor, expectedSha256) {
+  assertPrivateAuditStage(staged, descriptor);
+  const before = fs.fstatSync(descriptor, { bigint: true });
+  const digest = crypto.createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let offset = 0;
+  let count;
+  while ((count = fs.readSync(descriptor, buffer, 0, buffer.length, offset)) > 0) {
+    digest.update(buffer.subarray(0, count));
+    offset += count;
+  }
+  const after = fs.fstatSync(descriptor, { bigint: true });
+  assertPrivateAuditStage(staged, descriptor);
+  if (BigInt(offset) !== before.size || after.size !== before.size
+    || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs
+    || after.dev !== before.dev || after.ino !== before.ino || after.nlink !== before.nlink
+    || digest.digest("hex") !== expectedSha256) {
+    throw Error("Private strict audit stage digest or identity changed after copy");
+  }
+}
+
 function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
   if (!archive.source && !currentEvidence.length) return false;
   const destination = strictAudit.journalPath(getDatabasePath());
@@ -2444,9 +2465,14 @@ function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
   let createdStage = false;
   try {
     if (archive.source) {
-      restorePreimage.copyVerifiedFile(archive.source, staged, strictAudit.sha256(archive.source));
+      const expectedSha256 = strictAudit.sha256(archive.source);
+      restorePreimage.copyVerifiedFile(archive.source, staged, expectedSha256);
       createdStage = true;
       stageDescriptor = fs.openSync(staged, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
+      // copyVerifiedFile closes its O_EXCL destination descriptor. Reopening
+      // the path must re-attest the actual bytes on the new pinned descriptor:
+      // another regular nlink=1 file could have replaced the verified copy.
+      assertPinnedAuditStageDigest(staged, stageDescriptor, expectedSha256);
     } else {
       // Older backups may predate creation of the unmarked journal. Build a
       // private empty destination and carry all live evidence into it.

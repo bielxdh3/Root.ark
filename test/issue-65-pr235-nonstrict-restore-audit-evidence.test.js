@@ -18,8 +18,9 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const project = process.env.PR235_TEST_PROJECT;
 const scenario = process.env.PR235_TEST_SCENARIO;
+const prePinSwap = scenario === "pending-prepin-replace";
 const attack = ["late-hardlink-swap", "late-symlink-swap",
-  "pending-hardlink-swap", "pending-symlink-swap"].includes(scenario);
+  "pending-hardlink-swap", "pending-symlink-swap"].includes(scenario) || prePinSwap;
 const outside = path.join(process.cwd(), "data", "outside-audit.sqlite");
 let swappedStage = false;
 let sqliteCallsOnSwappedStage = 0;
@@ -58,6 +59,24 @@ const { runMigrations } = require(path.join(project, "db", "migrations"));
 const { isStrictSyncModeObserved, getDb } = require(path.join(project, "db"));
 const backup = require(path.join(project, "services", "backupService"));
 const restore = require(path.join(project, "services", "restoreService"));
+if (prePinSwap) {
+  const restorePreimage = require(path.join(project, "services", "restorePreimage"));
+  const originalCopy = restorePreimage.copyVerifiedFile;
+  restorePreimage.copyVerifiedFile = function (source, destination, expectedHash) {
+    const result = originalCopy(source, destination, expectedHash);
+    if (!swappedStage && destination.includes(".audit-private")
+      && destination.includes(".restore-stage-")) {
+      swappedStage = true;
+      attackedStage = destination;
+      // Replace the verified copy with a distinct, valid private SQLite file
+      // before restoreStrictAuditSidecar can pin its fresh descriptor.
+      fs.unlinkSync(destination);
+      fs.copyFileSync(outside, destination, fs.constants.COPYFILE_EXCL);
+      if (process.platform !== "win32") fs.chmodSync(destination, 0o600);
+    }
+    return result;
+  };
+}
 if (attack) sqliteModule.exports = Database;
 const audit = require(path.join(project, "repositories", "auditRepository"));
 const strictAudit = require(path.join(project, "services", "strictAuditSnapshot"));
@@ -196,7 +215,7 @@ const makeEvent = (id, eventType = "auth.login.failed") => ({
 
 for (const scenario of ["pending", "main", "late-sidecar", "late-main", "divergent",
   "late-divergent", "oversized", "rollback", "late-hardlink-swap", "late-symlink-swap",
-  "pending-hardlink-swap", "pending-symlink-swap"]) {
+  "pending-hardlink-swap", "pending-symlink-swap", "pending-prepin-replace"]) {
   test(`real SQLite whole restore retains non-strict audit evidence: ${scenario}`,
     { timeout: 90_000 }, (t) => {
       const runtime = process.platform === "win32"
