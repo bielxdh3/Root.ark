@@ -2426,7 +2426,33 @@ function reconcileMigratedJsonAuditForRestore(archive, currentEvidence) {
     const liveHas = auditRepository.hasMigratedJsonArchive(live);
     restored = new Database(archive.primary, { fileMustExist: true });
     const restoredHas = auditRepository.hasMigratedJsonArchive(restored);
-    if (!liveHas && !restoredHas) return;
+    const auditMarker = (db) => db.prepare("SELECT type FROM sqlite_master WHERE name='legacy_json_sqlite_audit_import'").get();
+    if (Boolean(auditMarker(live)) !== liveHas) {
+      throw Error("Live migrated JSON audit archive authority/marker mismatch");
+    }
+    if (!liveHas && !restoredHas && !auditMarker(restored)) return;
+    // A pre-archive-migration SQLite backup has only the old v1 JSON import
+    // marker. Adding a migrated archive table to it without the separate
+    // enrollment marker would make every subsequent migrate() fail closed.
+    // Refuse that backup before any local state is replaced. The caller can
+    // select a post-migration backup with a complete authority+marker pair.
+    const markerType = auditMarker(restored);
+    if (!restoredHas || markerType?.type !== "table") {
+      throw Error("Selected SQLite backup predates migrated JSON audit archive authority; refusing restore");
+    }
+    const auditMarkers = restored.prepare("SELECT id,version,source_sha256 FROM legacy_json_sqlite_audit_import").all();
+    if (auditMarkers.length !== 1 || auditMarkers[0].id !== 1 || auditMarkers[0].version !== 1
+      || !/^[a-f0-9]{64}$/.test(auditMarkers[0].source_sha256)) {
+      throw Error("Invalid selected SQLite migrated JSON audit enrollment marker");
+    }
+    if (liveHas) {
+      const liveMarkers = live.prepare("SELECT id,version,source_sha256 FROM legacy_json_sqlite_audit_import").all();
+      if (auditMarker(live)?.type !== "table" || liveMarkers.length !== 1
+        || liveMarkers[0].id !== 1 || liveMarkers[0].version !== 1
+        || !/^[a-f0-9]{64}$/.test(liveMarkers[0].source_sha256)) {
+        throw Error("Invalid live migrated JSON audit enrollment marker");
+      }
+    }
     journal = archive.source ? new Database(archive.source, { readonly: true, fileMustExist: true }) : null;
 
     const currentlyActive = new Map(currentEvidence.map(({ log, source }) => [log.id, { log, source }]));

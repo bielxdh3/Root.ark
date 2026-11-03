@@ -185,3 +185,28 @@ test("SQLite restore rejects a divergent archived identity without replacing liv
   `, true);
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
+
+test("SQLite restore refuses old v1 backup without archive marker and later migration rerun remains idempotent", { timeout: 95_000 }, (t) => {
+  const { root, run } = isolatedRuntime(t);
+  const event = { id: "old-backup-event", eventType: "audit.old", timestamp: "2026-11-03T10:00:00Z" };
+  fs.writeFileSync(path.join(root, "data", "audit-logs.json"), JSON.stringify({ logs: [] }));
+  const put = run(`require('./repositories/jsonAuditArchiveStore').appendJsonArchiveLogs([${JSON.stringify(event)}])`, false);
+  assert.equal(put.status, 0, put.stderr || put.stdout);
+  const migrate = run(`require('./db/migrate-json-to-sqlite').migrate()`, true);
+  assert.equal(migrate.status, 0, migrate.stderr || migrate.stdout);
+  const oldRestore = run(`
+    (async()=>{
+      const assert=require('node:assert/strict');
+      const db=require('./db').getDb();
+      db.exec('DROP TABLE legacy_json_sqlite_audit_import; DROP TABLE legacy_json_audit_archive');
+      const archived=await require('./services/backupService').createBackup();
+      require('./db/migrate-json-to-sqlite').migrate();
+      await assert.rejects(require('./services/restoreService').restoreBackup(archived.id,{confirmation:'RESTORE',username:'test'}),/predates migrated JSON audit archive authority/i);
+      const live=db.prepare('SELECT event FROM legacy_json_audit_archive WHERE id=?').get(${JSON.stringify(event.id)});
+      assert.deepEqual(JSON.parse(live.event),${JSON.stringify(event)});
+      require('./db/migrate-json-to-sqlite').migrate();
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM legacy_json_audit_archive').get().n,1);
+    })().catch(error=>{console.error(error);process.exitCode=1});
+  `, true);
+  assert.equal(oldRestore.status, 0, oldRestore.stderr || oldRestore.stdout);
+});
