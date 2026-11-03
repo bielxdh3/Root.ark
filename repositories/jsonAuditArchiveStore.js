@@ -28,20 +28,39 @@ function syncDirectory(directory) {
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
+function pinnedFileIdentity(filename, fd, description) {
+  const opened = fs.fstatSync(fd);
+  const named = fs.lstatSync(filename);
+  if (!opened.isFile() || opened.nlink !== 1 || !named.isFile()
+    || named.isSymbolicLink() || named.nlink !== 1
+    || opened.dev !== named.dev || opened.ino !== named.ino
+    || opened.size !== named.size || opened.mtimeMs !== named.mtimeMs
+    || opened.ctimeMs !== named.ctimeMs
+    || (process.platform !== "win32" && ((opened.mode & 0o077) !== 0
+      || (named.mode & 0o077) !== 0
+      || (typeof process.getuid === "function" && (opened.uid !== process.getuid()
+        || named.uid !== process.getuid()))))) {
+    throw new Error(`Unsafe ${description} inode or pathname changed`);
+  }
+  return opened;
+}
+
 function readEnrollment() {
-  let info;
-  try { info = fs.lstatSync(ENROLLMENT); }
+  let fd;
+  try { fd = fs.openSync(ENROLLMENT, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)); }
   catch (error) { if (error.code === "ENOENT") return null; throw error; }
-  const fd = fs.openSync(ENROLLMENT, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
-    const opened = fs.fstatSync(fd);
-    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 4096
-      || opened.size !== info.size || opened.ino !== info.ino || opened.dev !== info.dev
-      || (process.platform !== "win32" && ((info.mode & 0o077) !== 0
-        || (typeof process.getuid === "function" && info.uid !== process.getuid())))) {
+    const before = pinnedFileIdentity(ENROLLMENT, fd, "JSON audit archive enrollment marker");
+    if (before.size < 1 || before.size > 4096) {
       throw new Error("Unsafe JSON audit archive enrollment marker");
     }
     const value = JSON.parse(fs.readFileSync(fd, "utf8"));
+    const after = pinnedFileIdentity(ENROLLMENT, fd, "JSON audit archive enrollment marker");
+    if (after.dev !== before.dev || after.ino !== before.ino
+      || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+      || after.ctimeMs !== before.ctimeMs) {
+      throw new Error("Unsafe JSON audit archive enrollment marker changed during read");
+    }
     if (value?.version !== 1 || !/^[a-f0-9-]{36}$/i.test(value.storeId || "")) {
       throw new Error("Invalid JSON audit archive enrollment marker");
     }
@@ -136,9 +155,11 @@ function openStore(create = true) {
     const temporary = `${STORE}.${crypto.randomUUID()}.tmp`;
     let initialized = false;
     let db;
+    let createdFd;
     try {
-      const fd = fs.openSync(temporary, "wx", 0o600);
-      fs.closeSync(fd);
+      createdFd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT
+        | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+      const original = pinnedFileIdentity(temporary, createdFd, "private JSON audit archive staging");
       db = new Database(temporary, { fileMustExist: true });
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = FULL");
@@ -148,15 +169,27 @@ function openStore(create = true) {
       db.prepare("INSERT INTO metadata(name,value) VALUES ('store-id',?)").run(crypto.randomUUID());
       db.close();
       db = null;
-      // Windows FlushFileBuffers requires a descriptor opened for write.
-      const opened = fs.openSync(temporary, "r+");
-      try { fs.fsyncSync(opened); } finally { fs.closeSync(opened); }
+      // The exclusive-create descriptor remains held through native SQLite
+      // initialization; do not re-open a replaceable pathname for the flush.
+      fs.fsyncSync(createdFd);
+      const staged = pinnedFileIdentity(temporary, createdFd, "private JSON audit archive staging");
+      if (staged.dev !== original.dev || staged.ino !== original.ino || staged.size < 1) {
+        throw new Error("Private JSON audit archive staging identity changed");
+      }
+      if (process.platform === "win32") {
+        // Revalidate the owner-controlled directory ACL after native SQLite
+        // initialization and before publishing an authority-bearing file.
+        verifyWindowsChunkUploadTree(path.dirname(STORE));
+      }
+      pinnedFileIdentity(temporary, createdFd, "private JSON audit archive staging");
       if (fs.existsSync(STORE)) throw new Error("JSON audit archive enrollment raced another writer");
       renameSyncWithWindowsEpermRetry(temporary, STORE);
+      pinnedFileIdentity(STORE, createdFd, "private JSON audit archive published");
       initialized = true;
       syncDirectory(path.dirname(STORE));
     } finally {
       db?.close();
+      if (createdFd !== undefined) fs.closeSync(createdFd);
       if (!initialized) fs.rmSync(temporary, { force: true });
     }
   }
