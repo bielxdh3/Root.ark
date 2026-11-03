@@ -10,12 +10,13 @@ const { spawnSync } = require("node:child_process");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const project = path.resolve(__dirname, "..");
-for (const { injectFailure, strictMode } of [
+for (const { injectFailure, strictMode, beforeMutation = false } of [
   { injectFailure: false, strictMode: true },
   { injectFailure: true, strictMode: true },
   { injectFailure: false, strictMode: false },
+  { injectFailure: true, strictMode: false, beforeMutation: true },
 ]) test(
-  `HTTP/SQLite ${strictMode ? "strict" : "unenrolled"} restore ${injectFailure ? "failed after mutation and rolled back" : "committed"} retains a durable outcome`,
+  `HTTP/SQLite ${strictMode ? "strict" : "unenrolled"} restore ${!injectFailure ? "committed" : beforeMutation ? "cancelled before mutation" : "failed after mutation and rolled back"} retains a durable outcome`,
   { timeout: 90_000 }, (t) => {
   const root = process.platform === "win32"
     ? path.join(process.env.LOCALAPPDATA || os.homedir(), `rootark-restore-outcome-${crypto.randomBytes(10).toString("hex")}`)
@@ -34,6 +35,7 @@ for (const { injectFailure, strictMode } of [
     const register=require(${JSON.stringify(path.join(project,"src","routes","backups"))});
     const injectFailure=${JSON.stringify(injectFailure)};
     const strictMode=${JSON.stringify(strictMode)};
+    const beforeMutation=${JSON.stringify(beforeMutation)};
     const actor={username:'fixture-manager',role:'admin',ip:'127.0.0.1',userAgent:null};
     let n=0;
     function auditLog(eventType,who,target,action,result,details){
@@ -56,18 +58,19 @@ for (const { injectFailure, strictMode } of [
         requireBackupAccess(req,res,next){next();},getAuditActor(){return actor;},backupService:backup,
         revalidateBackupAccess(){return null;},waitForRequestQuiescence:async()=>true,
         restoreService:{...restore,restoreBackup(id,opts){return restore.restoreBackup(id,{
-          ...opts,...(injectFailure?{failureInjector(phase){if(phase==='restore.sqlite.committed')throw Error('INJECTED_AFTER_SQLITE');}}:{})});}}});
+          ...opts,...(injectFailure?{failureInjector(phase){if(phase===(beforeMutation?'restore.coordinator.persisted':'restore.sqlite.committed'))throw Error('INJECTED_RESTORE');}}:{})});}}});
       const server=app.listen(0,'127.0.0.1');
       await new Promise(resolve=>server.once('listening',resolve));
       let response;
       try{response=await request(server,saved.id);}finally{await new Promise(resolve=>server.close(resolve));}
-      assert.equal(response.status,injectFailure?503:200,response.body);
+      assert.equal(response.status,injectFailure?(beforeMutation?400:503):200,response.body);
       if(strictMode)assert.throws(()=>audit.deferAuditLog({id:'unauthorized-during-restore',eventType:'auth.login.failed'}),
         /Strict audit writes blocked during whole restore/);
-      if(injectFailure){
+      if(injectFailure&&!beforeMutation){
         assert.equal(restore.getWholeRestorePhase(),'prepared');
         assert.equal(restore.assertNoPendingWholeRestore().recovered,true);
-      }else assert.equal(restore.getWholeRestorePhase(),'restart_required');
+      }else if(!injectFailure) assert.equal(restore.getWholeRestorePhase(),'restart_required');
+      else assert.equal(restore.getWholeRestorePhase(),null);
       const logs=[...audit.loadAuditLogs().logs,...audit.loadArchivedAuditLogs().logs];
       const matches=logs.filter(log=>log.eventType==='backup.restore.'+(injectFailure?'failed':'completed'));
       assert.equal(matches.length,1,'exactly one restore outcome must survive');

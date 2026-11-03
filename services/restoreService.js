@@ -3060,8 +3060,12 @@ async function restoreBackup(id, options = {}) {
         }
         const cancelledCoordinator = updateWholeRestoreCoordinator(activeCoordinator, { phase: "cancelled" });
         completeWholeRestoreCoordinator(cancelledCoordinator);
+        // completeWholeRestoreCoordinator has just persisted the exact
+        // coordinator-derived outcome into FULL/WAL for EVERY SQLite restore,
+        // including before strict Sync enrollment. Do not emit a second
+        // randomly identified failure audit from the HTTP catch path.
         error.restoreOutcomeRecorded = Boolean(isDbEnabled()
-          && fs.existsSync(getDatabasePath()) && strictAudit.inspectPrimary(getDatabasePath()));
+          && activeCoordinator.restoreAudit && fs.existsSync(getDatabasePath()));
       }
       catch (cleanupError) {
         error.coordinatorCleanupError = cleanupError;
