@@ -1528,9 +1528,7 @@ function archiveAuditLogs(logs, strictJson = false) {
     auditRepository.archiveAuditLogs(logs);
     return;
   }
-  const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE, strictJson);
-  archive.logs.push(...logs);
-  saveAuditLogs(archive, AUDIT_ARCHIVE_FILE);
+  auditRepository.appendJsonArchiveLogs(logs);
 }
 
 function appendAuditLog(log) {

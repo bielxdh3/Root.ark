@@ -547,6 +547,123 @@ function persistJsonAuditFile(entries, filename) {
   }
 }
 
+// Caller holds the JSON audit lock across archive and main-history updates.
+// Append while preserving the complete, potentially multi-gigabyte archive:
+// validate every JSON token and every candidate ID from a pinned descriptor,
+// then copy the original bytes around the array's closing bracket into a
+// fsynced replacement. A crash or failed rename leaves the old archive intact.
+function appendJsonArchiveLogs(logs) {
+  if (!Array.isArray(logs)) throw new TypeError("Invalid JSON audit archive entries");
+  if (!logs.length) return;
+  assertNoStrictAuditRestore();
+
+  const additions = new Map();
+  for (const log of logs) {
+    if (!log || typeof log !== "object" || Array.isArray(log)
+      || typeof log.id !== "string" || !log.id || Buffer.byteLength(log.id) > 512) {
+      throw new Error("Invalid JSON audit archive identity");
+    }
+    const encoded = JSON.stringify(log);
+    if (!encoded || Buffer.byteLength(encoded) > 64 * 1024) {
+      throw new Error("JSON audit archive event exceeds safe append budget");
+    }
+    const duplicate = additions.get(log.id);
+    if (duplicate && !sameAuditEvidence(duplicate, log)) {
+      throw new Error("JSON restore audit identity collision");
+    }
+    additions.set(log.id, log);
+  }
+
+  const filename = resolveRuntimePath("data", "audit-logs-archive.json");
+  const temporary = `${filename}.${crypto.randomUUID()}.tmp`;
+  let published = false;
+  let existed = true;
+  let sourceIdentity;
+  function writeAll(fd, data) {
+    let written = 0;
+    while (written < data.length) {
+      const count = fs.writeSync(fd, data, written, data.length - written);
+      if (count < 1) throw new Error("JSON audit archive temporary write failed");
+      written += count;
+    }
+  }
+  function copyRange(sourceFd, targetFd, from, to) {
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    while (from < to) {
+      const bytes = fs.readSync(sourceFd, buffer, 0, Math.min(buffer.length, to - from), from);
+      if (bytes < 1) throw new Error("JSON audit archive changed while copying");
+      writeAll(targetFd, buffer.subarray(0, bytes));
+      from += bytes;
+    }
+  }
+  function writeAdditions(fd, pending, hasExisting) {
+    let needsComma = hasExisting;
+    for (const log of pending) {
+      if (needsComma) writeAll(fd, Buffer.from(","));
+      writeAll(fd, Buffer.from(JSON.stringify(log)));
+      needsComma = true;
+    }
+  }
+  function syncParent() {
+    if (process.platform === "win32") return;
+    const directory = fs.openSync(path.dirname(filename), "r");
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  }
+
+  try {
+    try {
+      withPinnedRestoreAuditFile(filename, Infinity, (sourceFd) => {
+        sourceIdentity = fs.fstatSync(sourceFd);
+        const scan = findArchivedRestoreAuditMatches(sourceFd, new Set(additions.keys()));
+        for (const previous of scan.matches) {
+          const newLog = additions.get(previous.id);
+          if (!sameAuditEvidence(previous, newLog)) {
+            throw new Error("JSON restore audit identity collision");
+          }
+          additions.delete(previous.id);
+        }
+        if (!additions.size) return { value: null, bytesRead: scan.bytesRead };
+        if (!Number.isSafeInteger(scan.arrayCloseOffset) || scan.arrayCloseOffset < 0) {
+          throw new Error("Invalid JSON restore audit history");
+        }
+        const targetFd = fs.openSync(temporary, "wx", 0o600);
+        try {
+          copyRange(sourceFd, targetFd, 0, scan.arrayCloseOffset);
+          writeAdditions(targetFd, additions.values(), scan.arrayHasEntries);
+          copyRange(sourceFd, targetFd, scan.arrayCloseOffset, scan.bytesRead);
+          fs.fsyncSync(targetFd);
+        } finally { fs.closeSync(targetFd); }
+        return { value: true, bytesRead: scan.bytesRead };
+      });
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      existed = false;
+      const targetFd = fs.openSync(temporary, "wx", 0o600);
+      try {
+        writeAll(targetFd, Buffer.from('{"logs":['));
+        writeAdditions(targetFd, additions.values(), false);
+        writeAll(targetFd, Buffer.from("]}\n"));
+        fs.fsyncSync(targetFd);
+      } finally { fs.closeSync(targetFd); }
+    }
+    if (!fs.existsSync(temporary)) return; // all events already archived
+    // No existing audit authority may be replaced by an invented empty one.
+    const current = fs.lstatSync(filename, { throwIfNoEntry: false });
+    if (!existed && current) throw new Error("JSON audit archive appeared during append");
+    if (existed && (!current || !current.isFile() || current.isSymbolicLink()
+      || current.nlink !== 1 || current.dev !== sourceIdentity.dev
+      || current.ino !== sourceIdentity.ino || current.size !== sourceIdentity.size
+      || current.mtimeMs !== sourceIdentity.mtimeMs)) {
+      throw new Error("JSON audit archive changed before atomic append");
+    }
+    renameSyncWithWindowsEpermRetry(temporary, filename);
+    published = true;
+    syncParent();
+  } finally {
+    if (!published) fs.rmSync(temporary, { force: true });
+  }
+}
+
 function persistTerminalRestoreAudit(coordinator) {
   const filename = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
   const original = readPinnedRestoreAuditFile(filename);
@@ -893,5 +1010,5 @@ function saveAuditLogs(entries = {}) {
 
 module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter,
   preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs,
-  normalizeMainAuditLog, loadAllAuditEvidenceForRestore, persistTerminalRestoreAudit, rowToLog,
-  withJsonAuditLock, readJsonAuditHistory, persistJsonAuditFile };
+  normalizeMainAuditLog, loadAllAuditEvidenceForRestore, persistTerminalRestoreAudit,
+  appendJsonArchiveLogs, rowToLog, withJsonAuditLock, readJsonAuditHistory, persistJsonAuditFile };
