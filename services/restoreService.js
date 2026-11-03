@@ -150,12 +150,30 @@ function restoreAuditContext(options) {
 }
 
 function persistWholeRestoreTerminalAudit(coordinator) {
-  if (!isDbEnabled() || !coordinator?.restoreAudit) return false;
-  const mainPath = getDatabasePath();
-  // The post-restore main SQLite write barrier also applies before strict
-  // enrollment. A fresh private FULL sidecar is valid in that case, and the
-  // ordinary loader already merges its pending records on the next restart.
-  if (!fs.existsSync(mainPath)) return false;
+  if (!coordinator?.restoreAudit) return false;
+  if (isDbEnabled()) {
+    // The post-restore SQLite barrier also applies before strict enrollment.
+    // A private FULL sidecar may be populated without loosening main writes.
+    const mainPath = getDatabasePath();
+    if (!fs.existsSync(mainPath)) return false;
+    // Legacy SQLite fixtures may predate audit_logs; they must still recover.
+    // Never fabricate a table inside the restore barrier. Strict enrollment
+    // with a missing table instead fails closed.
+    const probe = new Database(mainPath, { readonly: true, fileMustExist: true });
+    try {
+      const auditTable = probe.prepare("SELECT type FROM sqlite_master WHERE name='audit_logs'").get();
+      const strictMarker = probe.prepare("SELECT type FROM sqlite_master WHERE name='rootark_strict_sync_audit_mode'").get();
+      if (auditTable?.type !== undefined && auditTable.type !== "table") {
+        throw Error("Unexpected SQLite audit authority type during restore");
+      }
+      if (!auditTable) {
+        if (strictMarker) throw Error("Strict SQLite restore is missing its audit authority");
+        return false;
+      }
+    } finally { probe.close(); }
+  }
+  // JSON mode persists the same deterministic outcome atomically in the
+  // restored JSON audit history, before coordinator removal.
   auditRepository.persistTerminalRestoreAudit(coordinator);
   return true;
 }
@@ -3101,12 +3119,11 @@ async function restoreBackup(id, options = {}) {
         }
         const cancelledCoordinator = updateWholeRestoreCoordinator(activeCoordinator, { phase: "cancelled" });
         completeWholeRestoreCoordinator(cancelledCoordinator);
-        // completeWholeRestoreCoordinator has just persisted the exact
-        // coordinator-derived outcome into FULL/WAL for EVERY SQLite restore,
-        // including before strict Sync enrollment. Do not emit a second
-        // randomly identified failure audit from the HTTP catch path.
-        error.restoreOutcomeRecorded = Boolean(isDbEnabled()
-          && activeCoordinator.restoreAudit && fs.existsSync(getDatabasePath()));
+        // The coordinator's terminal outcome has been handled durably in
+        // JSON or the SQLite FULL/WAL sidecar. A legacy SQLite without an
+        // audit table is explicitly not writable under the restore barrier.
+        // Do not append a second independent random-ID HTTP failure event.
+        error.restoreOutcomeRecorded = Boolean(cancelledCoordinator.restoreAudit);
       }
       catch (cleanupError) {
         error.coordinatorCleanupError = cleanupError;

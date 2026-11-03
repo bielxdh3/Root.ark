@@ -1,13 +1,15 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
-const { getDb, getDatabasePath, isStrictSyncModeObserved } = require("../db");
+const { getDb, getDatabasePath, isDbEnabled, isStrictSyncModeObserved } = require("../db");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
 const { assertNoLocalStrictSyncWriter, isStrictSyncAccountFenceConfigured } =
   require("../src/services/syncSqliteAccountWriteFence");
 const { assertPrivateSqliteDirectory } = require("../src/services/zk1PrivateSqlitePath");
 const { resolveRuntimePath } = require("../src/runtime-paths");
+const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const { jsonStringify, runWrite, safeJsonParse } = require("./repositoryUtils");
 const MAX_DEFERRED_AUDITS = 4096;
 // The archival record is deliberately retained, but its capacity is finite.
@@ -376,18 +378,99 @@ function deferAuditLog(log) {
   }
 }
 
+// JSON deployments have no SQLite sidecar. After rollback, preserve the
+// restored JSON audit authority and append the coordinator's deterministic
+// terminal outcome atomically while ordinary restore writes remain fenced.
+function persistJsonTerminalRestoreAudit(log, coordinatorPath, coordinatorBytes) {
+  const mainPath = resolveRuntimePath("data", "audit-logs.json");
+  const archivePath = resolveRuntimePath("data", "audit-logs-archive.json");
+  const read = (filename) => {
+    const info = fs.lstatSync(filename, { throwIfNoEntry: false });
+    if (!info) return { logs: [] };
+    // Re-open through a verified descriptor, never through a pathname that
+    // can be replaced after the initial lstat check.
+    const parsed = JSON.parse(readPinnedRestoreAuditFile(filename, MAX_ARCHIVED_BYTES).toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.logs)) {
+      throw new Error("Invalid JSON restore audit history");
+    }
+    return parsed;
+  };
+  const main = read(mainPath);
+  const archive = read(archivePath);
+  const previous = [...main.logs, ...archive.logs].filter((entry) => entry?.id === log.id);
+  if (previous.length > 1 || (previous.length === 1 && !sameAuditEvidence(previous[0], log))) {
+    throw new Error("JSON restore audit identity collision");
+  }
+  const latest = readPinnedRestoreAuditFile(coordinatorPath);
+  if (!latest.equals(coordinatorBytes)) {
+    throw new Error("JSON restore audit coordinator changed during persistence");
+  }
+  const syncParent = () => {
+    if (process.platform === "win32") return;
+    const directory = fs.openSync(path.dirname(mainPath), "r");
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  };
+  if (previous.length === 1) {
+    // If the previous attempt committed the rename but its directory fsync
+    // failed, retry durability before allowing coordinator removal.
+    syncParent();
+    return log.id;
+  }
+  const temporary = `${mainPath}.${crypto.randomUUID()}.tmp`;
+  let published = false;
+  try {
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify({ ...main, logs: [...main.logs, log] }, null, 2)}\n`);
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    // Do not remove or truncate the original audit history on rename failure.
+    renameSyncWithWindowsEpermRetry(temporary, mainPath);
+    published = true;
+    syncParent();
+  } finally {
+    if (!published) fs.rmSync(temporary, { force: true });
+  }
+  return log.id;
+}
+
 // The whole-restore coordinator is the only authority that may produce its
 // terminal audit event while ordinary audit writers are fenced. A successful
-// restore has already replaced the main database; rollback has already
-// restored its pre-images. Persist this deterministic event ONLY in the
-// independent FULL/WAL journal, before the coordinator can be removed.
-function persistTerminalRestoreAudit(coordinator) {
-  const filename = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
-  const info = fs.lstatSync(filename);
-  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 256 * 1024) {
+// restore has committed its data; rollback has restored its pre-images.
+// Persist the deterministic event in FULL/WAL SQLite or restored JSON audit
+// history before the coordinator is removed.
+function readPinnedRestoreAuditFile(filename, maxBytes = 256 * 1024) {
+  // Never check a pathname and then read that pathname through a fresh
+  // resolution. Hold a verified regular-file descriptor across the read:
+  // on POSIX O_NOFOLLOW prevents symlink substitution, and inode comparison
+  // also detects a replaced name on platforms without O_NOFOLLOW.
+  const before = fs.lstatSync(filename);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+    || before.size < 1 || before.size > maxBytes) {
     throw new Error("Unsafe strict restore audit coordinator");
   }
-  const current = JSON.parse(fs.readFileSync(filename, "utf8"));
+  const fd = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size !== before.size
+      || opened.dev !== before.dev || opened.ino !== before.ino
+      || opened.size > maxBytes) {
+      throw new Error("Strict restore audit coordinator changed during open");
+    }
+    const bytes = fs.readFileSync(fd);
+    const after = fs.fstatSync(fd);
+    if (bytes.length !== opened.size || after.size !== opened.size
+      || after.mtimeMs !== opened.mtimeMs) {
+      throw new Error("Strict restore audit coordinator changed during read");
+    }
+    return bytes;
+  } finally { fs.closeSync(fd); }
+}
+
+function persistTerminalRestoreAudit(coordinator) {
+  const filename = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
+  const original = readPinnedRestoreAuditFile(filename);
+  const current = JSON.parse(original.toString("utf8"));
   const phase = current.phase;
   if (!coordinator || current.transactionId !== coordinator.transactionId
     || current.phase !== coordinator.phase || current.backupId !== coordinator.backupId
@@ -423,6 +506,9 @@ function persistTerminalRestoreAudit(coordinator) {
   if (!Number.isFinite(Date.parse(log.timestamp || ""))) throw new Error("Invalid strict restore audit timestamp");
   const serialized = JSON.stringify(log);
   if (Buffer.byteLength(serialized) > 64 * 1024) throw new Error("Strict restore audit entry too large");
+  if (!isDbEnabled()) {
+    return persistJsonTerminalRestoreAudit(log, filename, original);
+  }
   // Verify the authoritative main table before accepting an ID into the
   // sidecar. Never loosen the main SQLite write reservation for this event.
   const main = getDb().prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
@@ -431,8 +517,10 @@ function persistTerminalRestoreAudit(coordinator) {
     throw new Error("Strict restore audit identity collision");
   }
   return withPendingAuditDb((db) => db.transaction(() => {
-    const latest = JSON.parse(fs.readFileSync(filename, "utf8"));
-    if (latest.transactionId !== current.transactionId || latest.phase !== phase) {
+    // The same exact coordinator bytes must still be present at commit time:
+    // neither a forged actor nor a different restore transaction can race in.
+    const latest = readPinnedRestoreAuditFile(filename);
+    if (!latest.equals(original)) {
       throw new Error("Strict restore audit coordinator changed during persistence");
     }
     const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?").get(log.id);
