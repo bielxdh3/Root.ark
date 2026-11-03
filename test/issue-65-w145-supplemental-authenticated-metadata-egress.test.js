@@ -8,10 +8,10 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
-const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const SECRET = "W145_SUPPLEMENTAL_REAL_DECRYPTED_OWNER_BYTES";
@@ -41,7 +41,7 @@ const freePort = () => new Promise((resolve, reject) => {
 });
 
 async function fixture(t, strict) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-w145-auth-metadata-"));
+  const dir = createPrivateAuthorityFixture("zk65-w145-auth-metadata-");
   const data = path.join(dir, "data");
   fs.mkdirSync(data);
   fs.mkdirSync(path.join(dir, "uploads"));
