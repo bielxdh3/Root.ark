@@ -282,6 +282,14 @@ function createCatalogAuthorityHttpsClient({ endpoint, ca, key: clientKey, cert,
     || url.pathname !== "/" || url.search || url.hash
     || !ca || !clientKey || !cert) deny();
   const pinned = bytes(serverSpkiSha256, 32);
+  // Prepare and validate operator-supplied mTLS material once. Requests use
+  // the opaque TLS context, never raw certificate/private-key bytes.
+  let secureContext;
+  try {
+    secureContext = tls.createSecureContext({
+      ca, key: clientKey, cert, minVersion: "TLSv1.3",
+    });
+  } catch (_) { deny(); }
   async function send(route, payload) {
     return new Promise((resolve, reject) => {
       const encoded = Buffer.from(JSON.stringify(payload));
@@ -302,7 +310,7 @@ function createCatalogAuthorityHttpsClient({ endpoint, ca, key: clientKey, cert,
         resolve(proof);
       };
       const req = https.request({ hostname: url.hostname, port: url.port || 443,
-        path: route, method: "POST", ca, key: clientKey, cert, agent: false,
+        path: route, method: "POST", secureContext, agent: false,
         minVersion: "TLSv1.3", rejectUnauthorized: true,
         checkServerIdentity(name, peer) {
           const err = tls.checkServerIdentity(name, peer);
