@@ -178,11 +178,16 @@
         const length = { 24: 1, 25: 2, 26: 4, 27: 8 }[info];
         if (!length) deny(); let n = 0;
         for (const b of take(length)) n = n * 256 + b;
-        return uint(n, 0, maximum);
+        // `maximum` bounds encoded bytes and aggregate container allocation,
+        // not the numeric value of a CBOR unsigned integer (e.g. Unix seconds).
+        return uint(n, 0, major === 0 ? Number.MAX_SAFE_INTEGER : maximum);
       })();
       // Snapshot envelopes can be larger than a catalog header, but a tiny
       // CBOR array/map declaration must not allocate millions of JS entries.
-      if ((major === 4 || major === 5) && count > 16384) deny();
+      // Every element consumes at least one input byte; every map entry needs
+      // at least a key and a value. Reject impossible counts before allocation.
+      if ((major === 4 || major === 5) && (count > 16384
+        || count > Math.floor((input.length - at) / (major === 5 ? 2 : 1)))) deny();
       if (major === 0) return count;
       if (major === 2) return take(count);
       if (major === 3) return td.decode(take(count));
@@ -482,7 +487,7 @@
       const historic = heads.get(revision);
       if (!historic || historic.epoch !== epoch
         || !equal(historic.digest, bytes(digest, 32))
-        || epoch >= pin.epoch) deny();
+        || revision >= pin.revision || epoch > pin.epoch) deny();
       const matching = trust.historicalOwnerEpochHistory.grants.filter((grant) =>
         grant?.device_id === deviceId && grant.manifest_revision === revision
         && grant.current_epoch === epoch);
@@ -816,15 +821,19 @@
         exact(header, HEADER); matchingScope(header, scope);
         if (header.type !== "rootark-zk1-opaque-catalog/v1"
           || header.sequence !== current.sequence
-          || !equal(bytes(header.manifest_digest, 32), pin.digest)
-          || header.manifest_revision !== pin.revision || header.epoch !== pin.epoch
           || uint(header.total_count, 0, MAX_ROWS) !== response.totalCount
           || uint(response.sequence) !== current.sequence
           || uint(response.pageIndex) !== page
           || !Array.isArray(header.page_digests)
           || header.page_digests.length !== Math.ceil(header.total_count / PAGE_SIZE)
           || response.pageCount !== header.page_digests.length) deny();
-        const signerKey = await verifyAuthorizedSigner(header.signer_device_id, header.epoch);
+        // This immutable head may predate an owner-approved revocation or
+        // epoch rotation. Authenticate its signer at the historical owner-
+        // signed revision; ownerCurrent() and signedAuth() still independently
+        // require the surviving reader's CURRENT device grant for every read.
+        const signerKey = await verifyHistoricalSigner(header.signer_device_id,
+          uint(header.epoch, 1), uint(header.manifest_revision, 1),
+          bytes(header.manifest_digest, 32));
         const sig = from64(response.headerSignatureBase64, 64);
         if (!await crypto.subtle.verify("Ed25519", signerKey, sig,
           concat(HEAD, headerBytes))) deny();

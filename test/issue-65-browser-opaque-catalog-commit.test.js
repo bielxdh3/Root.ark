@@ -674,6 +674,9 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     ciphertext: revision3 }], plannedIntent), /ZK_BROWSER_CATALOG_UNVERIFIED/,
   "an additional PUT after the pre-write journal cannot be silently omitted");
   assert.equal(sequence, 5, "CAS must not advance when server inventory contains an unlisted write");
+  const beforeRevocationRows = (await (await client(1)).readAll()).rows.length;
+  const priorA = await grant(manifest.devices[0]);
+  const priorB = await grant(manifest.devices[1]);
   await fixture.appendDeviceRevocation(state, "trusted-0");
   manifest = state.headManifest;
   ownerHistory = await history.verifyRecoveryHistoryPublicV2({
@@ -688,4 +691,74 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   /ZK_OPAQUE_DELTA_SYNC_DENIED/, "revoked owner grant cannot inspect historical tombstone");
   await assert.rejects(producer.pullDelta(producerBefore),
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "revoked source device cannot accept a later delta");
+
+  // The CAS still points at the catalog signed by device A in epoch 1. A is
+  // revoked at epoch 2; the surviving B must authenticate that immutable head
+  // with historical owner authority while signing fresh reads in epoch 2.
+  const ownerEpochHeads = [];
+  let previousEpochDigest = null;
+  const pastManifests = [state.baseManifest,
+    ...(await Promise.all(state.transitions.map((raw) => z.decodeDeterministic(raw))))];
+  for (const historic of pastManifests) {
+    const data = { schema: "rootark-zk1-browser-owner-epoch-head/v1",
+      ...Object.fromEntries(Object.entries(scope).map(([key, value]) => [key, b64(value)])),
+      revision: historic.revision,
+      manifestDigest: b64(await v2.recoveryManifestDigestV2(historic)),
+      epoch: historic.current_epoch, previousDigest: previousEpochDigest };
+    const canonical = Buffer.from(JSON.stringify(data));
+    const signature = nodeCrypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/browser-owner-epoch-head/v1\0"), canonical]), ownerKeys.privateKey);
+    ownerEpochHeads.push({ ...data, signature: b64(signature) });
+    previousEpochDigest = b64(digest(Buffer.concat([
+      Buffer.from("Root.ark/zk-1/browser-owner-epoch-head-hash/v1\0"), canonical, signature])));
+  }
+  const historicalOwnerEpochHistory = { heads: ownerEpochHeads, grants: [priorA, priorB] };
+  const survivor = await client(1, { historicalOwnerEpochHistory });
+  const afterRevocation = await survivor.readAll();
+  assert.equal(afterRevocation.head.sequence, sequence);
+  assert.equal(afterRevocation.rows.length, beforeRevocationRows,
+    "survivor must retain the former A-authenticated catalog without rewriting it");
+  const originalA = await survivor.readSignedHistoricalHead(afterRevocation, 1, {
+    objectId, revision: 1, epoch: 1,
+    ciphertextDigest: digest(firstCipher),
+    metadataCiphertext: afterRevocation.rows.find((row) =>
+      row.object_id === objectId && row.revision === 1).metadata_ciphertext,
+  });
+  assert.equal(originalA.exactHistoricalAuthorityVerified, true,
+    "revoked A's old signature remains valid historical evidence, never fresh IO authority");
+  const newObjectId = b64(nodeCrypto.randomBytes(16));
+  const newlyEncrypted = nodeCrypto.randomBytes(65);
+  const nextIntent = await survivor.prepareIntent([{
+    objectId: newObjectId, revision: 1, epoch: 2, ciphertext: newlyEncrypted,
+  }], afterRevocation.head);
+  assert.equal(typeof nextIntent, "string",
+    "a freshly authorized survivor must be able to prepare an additive write");
+  assert.ok(await journalStore.read(nextIntent));
+  const originalSequence = sequence;
+
+  const revokedReader = await client(0, { historicalOwnerEpochHistory });
+  await assert.rejects(revokedReader.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "revoked A must never obtain fresh epoch-2 catalog authorization");
+  const missingHistory = await client(1);
+  await assert.rejects(missingHistory.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "an old head without independent owner-rooted historical proof fails closed");
+  const poisonedGrant = await client(1, { historicalOwnerEpochHistory: {
+    heads: ownerEpochHeads, grants: [priorA,
+      { ...priorB, signature: b64(nodeCrypto.randomBytes(64)) }],
+  } });
+  await assert.rejects(poisonedGrant.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "owner-signed history cannot be forged by replacing its signer grant");
+  const poisonedHead = await client(1, { historicalOwnerEpochHistory: {
+    heads: ownerEpochHeads.map((item, index) => index === 1
+      ? { ...item, manifestDigest: b64(nodeCrypto.randomBytes(32)) } : item), grants: [priorA, priorB],
+  } });
+  await assert.rejects(poisonedHead.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "the owner-pinned manifest chain must reject a changed historical digest");
+  const rollbackFloor = await client(1, { historicalOwnerEpochHistory,
+    minimumCatalogHead: { sequence: sequence + 1, digest: nodeCrypto.randomBytes(32) },
+  });
+  await assert.rejects(rollbackFloor.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "historical signer provenance must never weaken the independent CAS rollback floor");
+  assert.equal(sequence, originalSequence,
+    "invalid historic authority must not change the independent CAS head");
 });
