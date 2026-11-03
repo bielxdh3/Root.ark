@@ -895,6 +895,9 @@ class Zk1DurableContentInventoryLedger {
             VALUES(?,?,?)`).run(key, requestBytes, proof);
           return { status: "not_committed_final", replay: false, reason, proof: Buffer.from(proof) };
         }
+        // The capacity check must share the immediate write transaction with
+        // the pending insert, or another process can fill the signed head first.
+        if (head.sequence >= inventory.MAX_ENTRIES) fail("INVENTORY_LIMIT");
         this.db.prepare(`INSERT INTO content_operation
           (operation_id,request_cbor,expected_sequence,expected_root,status,sequence,root)
           VALUES(?,?,?,?,'pending',NULL,NULL)`).run(
