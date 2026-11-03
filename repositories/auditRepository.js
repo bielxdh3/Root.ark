@@ -385,11 +385,16 @@ function persistJsonTerminalRestoreAudit(log, coordinatorPath, coordinatorBytes)
   const mainPath = resolveRuntimePath("data", "audit-logs.json");
   const archivePath = resolveRuntimePath("data", "audit-logs-archive.json");
   const read = (filename) => {
-    const info = fs.lstatSync(filename, { throwIfNoEntry: false });
-    if (!info) return { logs: [] };
     // Re-open through a verified descriptor, never through a pathname that
-    // can be replaced after the initial lstat check.
-    const parsed = JSON.parse(readPinnedRestoreAuditFile(filename, MAX_ARCHIVED_BYTES).toString("utf8"));
+    // can be replaced after the initial check. An absent historical JSON
+    // audit archive is valid; an unsafe existing inode must fail closed.
+    let bytes;
+    try { bytes = readPinnedRestoreAuditFile(filename, MAX_ARCHIVED_BYTES); }
+    catch (error) {
+      if (error?.code === "ENOENT") return { logs: [] };
+      throw error;
+    }
+    const parsed = JSON.parse(bytes.toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.logs)) {
       throw new Error("Invalid JSON restore audit history");
     }
@@ -440,21 +445,24 @@ function persistJsonTerminalRestoreAudit(log, coordinatorPath, coordinatorBytes)
 // Persist the deterministic event in FULL/WAL SQLite or restored JSON audit
 // history before the coordinator is removed.
 function readPinnedRestoreAuditFile(filename, maxBytes = 256 * 1024) {
-  // Never check a pathname and then read that pathname through a fresh
-  // resolution. Hold a verified regular-file descriptor across the read:
-  // on POSIX O_NOFOLLOW prevents symlink substitution, and inode comparison
-  // also detects a replaced name on platforms without O_NOFOLLOW.
-  const before = fs.lstatSync(filename);
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
-    || before.size < 1 || before.size > maxBytes) {
-    throw new Error("Unsafe strict restore audit coordinator");
-  }
+  // Open FIRST; all security checks apply to the open descriptor instead of
+  // checking a pathname and then opening it in a separate resolution. POSIX
+  // O_NOFOLLOW refuses symlinks; Windows verifies the descriptor's file ID
+  // against the still-present, non-symlinked directory entry.
   const fd = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
     const opened = fs.fstatSync(fd);
-    if (!opened.isFile() || opened.nlink !== 1 || opened.size !== before.size
-      || opened.dev !== before.dev || opened.ino !== before.ino
-      || opened.size > maxBytes) {
+    let entry;
+    try { entry = fs.lstatSync(filename); }
+    catch (error) {
+      // A file removed AFTER successful open is not an absent legacy audit
+      // file: it is a failed inode-consistency check, not an empty history.
+      throw new Error("Strict restore audit file disappeared after open", { cause: error });
+    }
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size < 1
+      || opened.size > maxBytes || !entry.isFile() || entry.isSymbolicLink()
+      || entry.nlink !== 1 || entry.size !== opened.size
+      || entry.dev !== opened.dev || entry.ino !== opened.ino) {
       throw new Error("Strict restore audit coordinator changed during open");
     }
     const bytes = fs.readFileSync(fd);
