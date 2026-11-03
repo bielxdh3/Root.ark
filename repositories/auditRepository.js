@@ -381,13 +381,38 @@ function deferAuditLog(log) {
 // restore has already replaced the main database; rollback has already
 // restored its pre-images. Persist this deterministic event ONLY in the
 // independent FULL/WAL journal, before the coordinator can be removed.
-function persistTerminalRestoreAudit(coordinator) {
-  const filename = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
-  const info = fs.lstatSync(filename);
-  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 256 * 1024) {
+function readPinnedRestoreAuditCoordinator(filename) {
+  // Never check a pathname and then read that pathname through a fresh
+  // resolution. Hold a verified regular-file descriptor across the read:
+  // on POSIX O_NOFOLLOW prevents symlink substitution, and inode comparison
+  // also detects a replaced name on platforms without O_NOFOLLOW.
+  const before = fs.lstatSync(filename);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+    || before.size < 1 || before.size > 256 * 1024) {
     throw new Error("Unsafe strict restore audit coordinator");
   }
-  const current = JSON.parse(fs.readFileSync(filename, "utf8"));
+  const fd = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size !== before.size
+      || opened.dev !== before.dev || opened.ino !== before.ino
+      || opened.size > 256 * 1024) {
+      throw new Error("Strict restore audit coordinator changed during open");
+    }
+    const bytes = fs.readFileSync(fd);
+    const after = fs.fstatSync(fd);
+    if (bytes.length !== opened.size || after.size !== opened.size
+      || after.mtimeMs !== opened.mtimeMs) {
+      throw new Error("Strict restore audit coordinator changed during read");
+    }
+    return bytes;
+  } finally { fs.closeSync(fd); }
+}
+
+function persistTerminalRestoreAudit(coordinator) {
+  const filename = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
+  const original = readPinnedRestoreAuditCoordinator(filename);
+  const current = JSON.parse(original.toString("utf8"));
   const phase = current.phase;
   if (!coordinator || current.transactionId !== coordinator.transactionId
     || current.phase !== coordinator.phase || current.backupId !== coordinator.backupId
@@ -431,8 +456,10 @@ function persistTerminalRestoreAudit(coordinator) {
     throw new Error("Strict restore audit identity collision");
   }
   return withPendingAuditDb((db) => db.transaction(() => {
-    const latest = JSON.parse(fs.readFileSync(filename, "utf8"));
-    if (latest.transactionId !== current.transactionId || latest.phase !== phase) {
+    // The same exact coordinator bytes must still be present at commit time:
+    // neither a forged actor nor a different restore transaction can race in.
+    const latest = readPinnedRestoreAuditCoordinator(filename);
+    if (!latest.equals(original)) {
       throw new Error("Strict restore audit coordinator changed during persistence");
     }
     const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?").get(log.id);
