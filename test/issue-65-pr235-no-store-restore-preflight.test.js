@@ -63,13 +63,19 @@ for (const mode of cases) test(`never-enrolled JSON archive preflight before rea
           assert.equal(fs.readFileSync(runtime,'utf8'),'live-state');
           assert.ok(JSON.parse(fs.readFileSync(main,'utf8')).logs.some(e=>e.id==='live-main'));
           assert.ok(JSON.parse(fs.readFileSync(archive,'utf8')).logs.some(e=>e.id==='live-archive'));
+          assert.equal(fs.existsSync(store.STORE),false,'rejected preflight must not enroll a persistent archive');
+          assert.equal(fs.existsSync(enrollment),false,'rejected preflight must not publish an enrollment marker');
         }else{
           assert.equal(outcome.restartRecommended,true);
           assert.equal(fs.readFileSync(runtime,'utf8'),'selected-state');
           assert.ok(JSON.parse(fs.readFileSync(main,'utf8')).logs.some(e=>e.id===shared.id));
+          // After preflight succeeds, the restore deliberately enrolls the
+          // durable archive to carry live-only records across replacement.
+          assert.equal(fs.existsSync(store.STORE),true,'successful restore preserves live audit in durable archive');
+          assert.equal(fs.existsSync(enrollment),true,'durable carry-forward is enrolled');
+          for(const id of ['live-main','live-archive'])
+            assert.equal(store.findDeltaAuditMatches(id).length,1,'lost live audit evidence: '+id);
         }
-        assert.equal(fs.existsSync(store.STORE),false,'read-only preflight never enrolls a persistent archive');
-        assert.equal(fs.existsSync(enrollment),false,'preflight never publishes an enrollment marker');
         console.log('NO_STORE_PREFLIGHT_VERIFIED');
       }
       run().catch(e=>{console.error(e.stack||e);process.exitCode=1;});`;
