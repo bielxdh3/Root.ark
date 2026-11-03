@@ -26,6 +26,28 @@ const domain = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
 const ownerDomain = Buffer.from("Root.ark/zk-1/client-backup-import-authorization/v1\0");
 const id = () => crypto.randomBytes(16).toString("base64url");
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
+const HTTP_AUTH_FIELDS = ["account_id", "compartment_id", "keyring_id",
+  "device_id", "operation", "object_id", "expected_object_revision",
+  "manifest_revision", "manifest_digest", "epoch", "nonce", "issued_at",
+  "expires_at", "ciphertext_digest"];
+
+function assertNoOwnerSecretOnProtectedWire(wire, operation, { cek, plaintext, sealed }) {
+  const body = JSON.parse(wire);
+  assert.equal(cek.type, "secret");
+  assert.equal(cek.extractable, false, "the file CEK must be non-extractable");
+  assert.deepEqual(Object.keys(body).sort(),
+    (operation === "put" ? ["authorization", "signatureBase64", "ciphertextBase64"]
+      : ["authorization", "signatureBase64"]).sort(),
+    "HTTP envelope cannot contain CEK or plaintext fields");
+  assert.deepEqual(Object.keys(body.authorization).sort(), [...HTTP_AUTH_FIELDS].sort(),
+    "signed authorization cannot contain CEK or plaintext fields");
+  assert.equal(body.authorization.operation, operation);
+  if (operation === "put") assert.equal(body.ciphertextBase64, b64(sealed));
+  for (const secret of ["[object CryptoKey]", Buffer.from(plaintext).toString("utf8"),
+    b64(plaintext), "hidden-from-server.txt"]) {
+    assert.equal(wire.includes(secret), false, "secret material must never appear in HTTP JSON");
+  }
+}
 
 async function scenario(t) {
   const dir = createPrivateAuthorityFixture("rootark-zk1-owner-import-");
@@ -40,6 +62,7 @@ async function scenario(t) {
   let countPut = 0;
   let networkReads = 0;
   let wire = "";
+  const wires = [];
   const manifestDigest = () => v2.recoveryManifestDigestV2(head);
   const witnessProvider = {
     async freshHead({ nonce }) {
@@ -90,6 +113,7 @@ async function scenario(t) {
     if (url.endsWith("/content/put")) countPut++;
     if (url.endsWith("/content/read")) networkReads++;
     wire = String(options.body);
+    wires.push({ operation: url.endsWith("/content/put") ? "put" : "get", body: wire });
     return fetch(url, { ...options,
       headers: { ...options.headers, "x-owner-test": "yes" } });
   };
@@ -161,6 +185,7 @@ async function scenario(t) {
     ownerHistoryCheckpoint, ownerRootCheckpoint, ownerPublicKey, ownerSignerKey,
     ownerKeyId, ownerDeviceId,
     get countPut() { return countPut; }, get networkReads() { return networkReads; },
+    get wires() { return wires; },
     get wire() { return wire; }, setGate: (value) => { gateOpen = value; },
     revoke: async () => { await fixtures.appendDeviceRevocation(state, device.device_id);
       head = state.headManifest; },
@@ -178,7 +203,26 @@ async function scenario(t) {
 
 test("real protected HTTP import verifies owner signature and pinned root before restoring sealed bytes", async (t) => {
   const f = await scenario(t);
-  const result = await importer.importOwnerSignedBackupCiphertext(f.input);
+  // A signed public nonce can contain these Base64URL characters by chance.
+  // Keep the remaining 232 nonce bits random and sign each operation normally.
+  const originalRandomValues = crypto.webcrypto.getRandomValues;
+  const originalOverride = Object.getOwnPropertyDescriptor(crypto.webcrypto, "getRandomValues");
+  Object.defineProperty(crypto.webcrypto, "getRandomValues", {
+    configurable: true, value(array) {
+      const bytes = originalRandomValues.call(crypto.webcrypto, array);
+      if (bytes instanceof Uint8Array && bytes.byteLength === 32) {
+        bytes.set(Buffer.from("cekA", "base64url"), 0);
+      }
+      return bytes;
+    },
+  });
+  let result;
+  try {
+    result = await importer.importOwnerSignedBackupCiphertext(f.input);
+  } finally {
+    if (originalOverride) Object.defineProperty(crypto.webcrypto, "getRandomValues", originalOverride);
+    else delete crypto.webcrypto.getRandomValues;
+  }
   assert.equal(result.ownerSignatureVerified, true);
   assert.equal(result.signedHistoricalRootVerified, true);
   assert.equal(result.externalPinSourceVerifiedByModule, false);
@@ -191,7 +235,22 @@ test("real protected HTTP import verifies owner signature and pinned root before
   assert.equal(f.networkReads, 1);
   assert.equal(f.wire.includes("hidden-from-server.txt"), false);
   assert.equal(f.wire.includes("owner ZK restore test"), false);
-  assert.equal(f.wire.includes("cek"), false);
+  assert.deepEqual(f.wires.map(({ operation }) => operation), ["put", "get"]);
+  for (const { operation, body } of f.wires) {
+    assert.equal(JSON.parse(body).authorization.nonce.startsWith("cek"), true,
+      "the valid signed nonce deliberately contains the ambiguous text");
+    assertNoOwnerSecretOnProtectedWire(body, operation, f);
+  }
+  const readBody = JSON.parse(f.wires[1].body);
+  assert.throws(() => assertNoOwnerSecretOnProtectedWire(JSON.stringify({
+    ...readBody, cek: "injected-file-secret",
+  }), "get", f), /HTTP envelope cannot contain CEK/);
+  assert.throws(() => assertNoOwnerSecretOnProtectedWire(JSON.stringify({
+    ...readBody, authorization: { ...readBody.authorization, cek: "injected-file-secret" },
+  }), "get", f), /signed authorization cannot contain CEK/);
+  assert.throws(() => assertNoOwnerSecretOnProtectedWire(JSON.stringify({
+    ...readBody, signatureBase64: b64(f.plaintext),
+  }), "get", f), /secret material must never appear/);
   const ciphertext = f.store.db.prepare("SELECT ciphertext FROM zk_content_object WHERE id=?")
     .get(f.metadata.object_id).ciphertext;
   assert.deepEqual(Buffer.from(ciphertext), Buffer.from(f.sealed));
