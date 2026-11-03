@@ -3193,7 +3193,7 @@ test("startup fails closed on an ambiguous preparing coordinator instead of clea
 
 test("successful SQLite restore reinserts selected and pre-restore records into the restored index", { timeout: 30_000 }, () => {
   const runtime = createPrivateAuthorityFixture("rootark-restore-history-runtime-");
-  const databaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-history-db-"));
+  const databaseDir = createPrivateAuthorityFixture("rootark-restore-history-db-");
   const databasePath = path.join(databaseDir, "configured.sqlite");
   const script = `
     const assert = require("node:assert/strict");
