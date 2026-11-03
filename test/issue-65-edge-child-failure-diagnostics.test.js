@@ -29,6 +29,29 @@ test("failed Edge child yields bounded hashed top ordinal, pinned filename and t
   assert.doesNotMatch(safe, /JWT|very-private|Users|private\.key|Root\.ark|real V2|C:/i);
 });
 
+test("failed real Edge offline UI emits only its allowlisted phase, never browser errors or secrets", () => {
+  const { summarizeFailedEdgeChild } = require("../scripts/edge-child-failure-diagnostics");
+  const title = EXPECTED_EDGE_CASES[0];
+  const file = EDGE_FILES[0];
+  const output = ["TAP version 13", `# Subtest: ${title}`,
+    `not ok 7 - ${title}`, "  ---",
+    String.raw`  location: 'C:\runner\Root.ark\test\issue-65-browser-offline-persisted-restore.test.js:218:1'`,
+    "  failureType: 'testCodeFailure'", "  code: 'ERR_TEST_FAILURE'",
+    `  error: '${hostile}'`, "  ...",
+    "# EDGE_OFFLINE_STAGE_V1 cdp-port",
+    `# EDGE_OFFLINE_STAGE_V1 ${hostile}`,
+    "# fail 1"].join("\n");
+  const base = `EDGE_CHILD_DIAG_V1 exit=1 spawn=none failCount=1 top=7:${sha(title)}:${sha(file)}:runtime nested=none`;
+  assert.equal(summarizeFailedEdgeChild({ status: 1, stdout: output, stderr: hostile }, EDGE_FILES),
+    `${base} offlineStage=cdp-port`);
+  assert.equal(summarizeFailedEdgeChild({ status: 1,
+    stdout: output.replace("not ok 7 -", "ok 7 -") }, EDGE_FILES),
+  "EDGE_CHILD_DIAG_V1 exit=1 spawn=none failCount=1 top=none nested=none",
+  "phase diagnostics cannot attach to a passing Edge E2E test");
+  const maliciousOnly = output.replace("# EDGE_OFFLINE_STAGE_V1 cdp-port\n", "");
+  assert.equal(summarizeFailedEdgeChild({ status: 1, stdout: maliciousOnly }, EDGE_FILES), base);
+});
+
 test("failing real Edge v2 archive reports only an allowlisted numeric test call-site", () => {
   const { summarizeFailedEdgeChild } = require("../scripts/edge-child-failure-diagnostics");
   const title = EXPECTED_EDGE_CASES[4];

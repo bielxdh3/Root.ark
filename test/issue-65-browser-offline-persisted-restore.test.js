@@ -218,12 +218,19 @@ test("experimental page explicitly loads the browser chunk API and keeps protect
 test("real Edge opt-in UI refuses missing external pins and recovers signed local chunks without HTTP GET", {
   timeout: 85_000,
 }, async (t) => {
+  let failureStage = "fixture";
   const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
   if (process.platform !== "win32" || !fs.existsSync(EDGE)) {
     t.skip("Edge Windows unavailable");
     return;
   }
+  // The parent mandatory gate suppresses raw browser/CDP errors because they
+  // may contain owner-held secrets. Emit only one fixed phase if this E2E fails.
+  t.after(() => {
+    if (failureStage !== "complete") t.diagnostic(`EDGE_OFFLINE_STAGE_V1 ${failureStage}`);
+  });
   const f = await fixture(t);
+  failureStage = "lab-setup";
   const htmlFile = path.join(__dirname, "../dev-ui/zk1-protected-file-lab.html");
   const html = fs.readFileSync(htmlFile, "utf8");
   const allowed = new Set([...html.matchAll(/<script defer src="\/client\/([\w-]+)\.js"/g)]
@@ -324,11 +331,14 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       response.end(fs.readFileSync(file));
     } else { response.writeHead(404); response.end(); }
   });
+  failureStage = "server-listen";
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-edge-offline-chunks-"));
   const profile = path.join(directory, "edge-profile");
   let edge, socket;
+  let finishedBrowserChecks = false;
   try {
+    failureStage = "edge-launch";
     edge = spawn(EDGE, ["--headless=new", "--disable-gpu", "--no-first-run",
       "--disable-extensions", "--remote-debugging-port=0",
       "--user-data-dir=" + profile, "about:blank"], { stdio: "ignore", windowsHide: true });
@@ -341,15 +351,18 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       }
       throw Error("EDGE_LOCAL_TIMEOUT");
     };
+    failureStage = "cdp-port";
     const port = await waitFor(() => {
       const file = path.join(profile, "DevToolsActivePort");
       if (!fs.existsSync(file)) return null;
       const n = Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
       return Number.isSafeInteger(n) && n > 0 ? n : null;
     });
+    failureStage = "cdp-target";
     const tabs = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
     const tab = tabs.find((item) => item.type === "page");
     assert.ok(tab?.webSocketDebuggerUrl);
+    failureStage = "cdp-websocket";
     socket = new WebSocket(tab.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
       socket.addEventListener("open", resolve, { once: true });
@@ -370,9 +383,11 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       pending.set(id, { resolve, reject });
       socket.send(JSON.stringify({ id, method, params }));
     });
+    failureStage = "cdp-navigate";
     await send("Page.enable");
     await send("Runtime.enable");
     await send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/zk1-protected-file-lab.html` });
+    failureStage = "ui-outcome";
     const result = await waitFor(async () => {
       const info = await send("Runtime.evaluate", {
         expression: "document.getElementById('edge-local-result')?.textContent || null",
@@ -382,7 +397,9 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       return typeof value === "string" && /^EDGE_LOCAL_(PASS|FAIL)/.test(value) ? value : null;
     }, 26000);
     assert.equal(result, "EDGE_LOCAL_PASS");
+    finishedBrowserChecks = true;
   } finally {
+    if (finishedBrowserChecks) failureStage = "cleanup";
     socket?.close();
     if (edge?.pid) {
       try { execFileSync("taskkill", ["/PID", String(edge.pid), "/T", "/F"],
@@ -402,4 +419,5 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
     }
     if (!removed) process.stderr.write("EDGE_LOCAL_PROFILE_CLEANUP_PENDING\n");
   }
+  failureStage = "complete";
 });

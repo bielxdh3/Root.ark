@@ -9,6 +9,8 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { parseIndependentCatalogConnectOrigins } = require("../src/zk1-catalog-connect-csp");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
@@ -31,7 +33,9 @@ async function listen(server) {
 }
 
 async function fixture(t, catalogOrigins, script = "") {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-csp-"));
+  // The real JSON audit lock refuses shared Windows TEMP ACLs. The disposable
+  // child runtime must meet the same native owner-only ACL invariant.
+  const dir = createPrivateAuthorityFixture("zk65-csp-");
   const publicDir = path.join(dir, "public");
   fs.mkdirSync(publicDir);
   fs.mkdirSync(path.join(dir, "data"));

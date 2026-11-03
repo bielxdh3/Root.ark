@@ -26,6 +26,11 @@ const EDGE_ARCHIVE_FILE = "test/issue-65-versioned-keyring-ciphertext-archive.te
 const EDGE_ARCHIVE_TITLE = "REAL Edge: authenticated signed CBOR v2 archive export/import and failure fencing";
 const EDGE_ARCHIVE_TITLE_HASH = hash(EDGE_ARCHIVE_TITLE);
 const EDGE_ARCHIVE_FILE_HASH = hash(EDGE_ARCHIVE_FILE);
+const EDGE_OFFLINE_TITLE_HASH = hash("real Edge opt-in UI refuses missing external pins and recovers signed local chunks without HTTP GET");
+const EDGE_OFFLINE_FILE_HASH = hash("test/issue-65-browser-offline-persisted-restore.test.js");
+// Test-owned phase labels only. Never propagate Edge's raw DOM result, CDP
+// errors, paths, ciphertext, key material or untrusted diagnostic strings.
+const EDGE_OFFLINE_STAGE = /^# EDGE_OFFLINE_STAGE_V1 (fixture|lab-setup|server-listen|edge-launch|cdp-port|cdp-target|cdp-websocket|cdp-navigate|ui-outcome|cleanup)$/;
 // Print only a numeric call-site from this allowlisted test, never any stack,
 // error text or runtime value. A forged TAP can mislead diagnostics but never
 // makes the actual release gate green.
@@ -63,6 +68,8 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
   let failCount = "unknown";
   let archiveCallSite = null;
   let archiveFailed = false;
+  let offlineStage = null;
+  let offlineFailed = false;
   function isArchiveHelperLine(number) {
     return (number >= 616 && number <= 623)
       || (number >= 643 && number <= 660)
@@ -79,6 +86,8 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
   }
   function flush() {
     if (!current) return;
+    if (current.nameHash === EDGE_OFFLINE_TITLE_HASH
+      && current.fileHash === EDGE_OFFLINE_FILE_HASH) offlineFailed = true;
     if (current.nameHash === EDGE_ARCHIVE_TITLE_HASH
       && current.fileHash === EDGE_ARCHIVE_FILE_HASH) {
       archiveFailed = true;
@@ -106,6 +115,8 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
     const line = size <= 8192
       ? stdout.slice(start, end).replace(/\r$/, "") : "";
     start = next === -1 ? stdout.length : next + 1;
+    const offline = EDGE_OFFLINE_STAGE.exec(line);
+    if (offline && offlineStage === null) offlineStage = offline[1];
     const subtest = TOP_SUBTEST.exec(line);
     if (subtest) {
       flushNested();
@@ -186,7 +197,9 @@ function summarizeFailedEdgeChild(child, edgeFiles) {
     ? nestedFailures.join(",") + (nestedOverflow ? "+" : "") : "none";
   const archiveHint = archiveFailed
     ? ` archiveCallSite=${archiveCallSite === null ? "none" : archiveCallSite}` : "";
-  return `EDGE_CHILD_DIAG_V1 exit=${exit} spawn=${spawn} failCount=${failCount} top=${top} nested=${nested}${archiveHint}`;
+  const offlineHint = offlineFailed && offlineStage !== null
+    ? ` offlineStage=${offlineStage}` : "";
+  return `EDGE_CHILD_DIAG_V1 exit=${exit} spawn=${spawn} failCount=${failCount} top=${top} nested=${nested}${archiveHint}${offlineHint}`;
 }
 
 module.exports = { summarizeFailedEdgeChild };
