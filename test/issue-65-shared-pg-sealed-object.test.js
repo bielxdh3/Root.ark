@@ -97,6 +97,77 @@ test("incomplete ciphertext is not publishable; final seal binds ordered bytes a
   assert.equal(remaining.rows[0].n, 3);
 });
 
+test("PG18 supervised child can write a bound legacy revision without physical inventory intent", {
+  skip: !url ? "requires disposable PG18" : false,
+}, async (t) => {
+  const admin = new Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 3000 });
+  t.after(async () => admin.end());
+  const s = scope();
+  const scopeKey = key(s);
+  const digest = crypto.randomBytes(32);
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const workerId = crypto.randomBytes(16);
+  const admissionId = crypto.randomBytes(16);
+  const processEpoch = crypto.randomBytes(16);
+  const writerLogin = "zkchildfixture_" + crypto.randomBytes(6).toString("hex");
+  const unboundLogin = "zkunboundfixture_" + crypto.randomBytes(6).toString("hex");
+  const loginPool = async (name) => {
+    const password = crypto.randomBytes(24).toString("hex");
+    await admin.query(`CREATE ROLE ${name} LOGIN PASSWORD '${password}'`);
+    await admin.query(`GRANT zk1_chunk_writer_runtime TO ${name}`);
+    const connection = new URL(url);
+    connection.username = name;
+    connection.password = password;
+    const pool = new Pool({ connectionString: connection.href,
+      max: 1, connectionTimeoutMillis: 3000 });
+    t.after(async () => pool.end());
+    return pool;
+  };
+  const writer = await loginPool(writerLogin);
+  const unbound = await loginPool(unboundLogin);
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_stop_proof,require_physical_inventory_intent)
+    VALUES($1,$2,1,$3,true,false)`, [scopeKey, s.keyring_id, digest]);
+  await admin.query(`INSERT INTO zk1_gate.admission
+    (id,scope_key,worker_id,principal,action,object_id,revision,digest,generation,
+     state,host_key_id,process_epoch,process_pid)
+    VALUES($1,$2,$3,'supervised-child-fixture','put',$4,1,$5,1,
+      'ACTIVE',$6,$7,1729)`, [admissionId, scopeKey, workerId, objectId, digest,
+    crypto.randomBytes(16), processEpoch]);
+  const admission = await admin.query(`SELECT object_revision FROM zk1_gate.admission WHERE id=$1`,
+    [admissionId]);
+  assert.equal(admission.rows[0].object_revision, null,
+    "validated admission MUST omit object_revision for non-inventory scopes");
+  await admin.query(`INSERT INTO zk1_gate.writer_binding
+    (writer_login,admission_id,scope_key,object_id,worker_id,generation,process_epoch,process_pid)
+    VALUES($1,$2,$3,$4,$5,1,$6,1729)`,
+  [writerLogin, admissionId, scopeKey, objectId, workerId, processEpoch]);
+
+  const bytes = crypto.randomBytes(56);
+  await assert.rejects(unbound.query(`SELECT zk1_gate.write_bound_chunk(0,$1)`, [bytes]),
+    /physical writer has no trusted admission binding/i,
+  "writer-role membership alone cannot authorize physical writes");
+  await assert.rejects(writer.query(`INSERT INTO zk1_gate.ciphertext_chunk
+    (scope_key,object_id,revision,chunk_index,ciphertext) VALUES($1,$2,1,0,$3)`,
+  [scopeKey, objectId, bytes]), /permission denied/i,
+  "the child must use the operator-bound function rather than direct SQL");
+  assert.equal((await writer.query("SELECT zk1_gate.write_bound_chunk(0,$1) AS stored",
+    [bytes])).rows[0].stored, true,
+  "the bound supervised writer must be accepted when object_revision is NULL");
+  const rows = await admin.query(`SELECT revision,ciphertext FROM zk1_gate.ciphertext_chunk
+    WHERE scope_key=$1 AND object_id=$2`, [scopeKey, objectId]);
+  assert.equal(rows.rowCount, 1);
+  assert.equal(Number(rows.rows[0].revision), 1);
+  assert.deepEqual(rows.rows[0].ciphertext, bytes);
+
+  await admin.query("DELETE FROM zk1_gate.writer_binding WHERE writer_login=$1", [writerLogin]);
+  await assert.rejects(writer.query("SELECT zk1_gate.write_bound_chunk(1,$1)", [bytes]),
+    /physical writer has no trusted admission binding/i,
+  "revoking the trusted binding must immediately stop subsequent writes");
+  assert.equal((await admin.query(`SELECT count(*)::int AS n FROM zk1_gate.ciphertext_chunk
+    WHERE scope_key=$1 AND object_id=$2`, [scopeKey, objectId])).rows[0].n, 1);
+});
+
 test("PG18 strict physical revisions preserve v1 ciphertext and reject stale or same-revision replacement", {
   skip: !url || !restrictedUrl || !attestorUrl
     ? "requires disposable PG18 plus isolated gate and attestor runtimes" : false,

@@ -2,7 +2,7 @@
 
 const Database = require("better-sqlite3");
 const { performance } = require("node:perf_hooks");
-const { getDatabasePath, getDb, isDbEnabled, isLegacyJsonWriteEnabled,
+const { getDatabasePath, getDb, hasAuditSidecar, isDbEnabled, isLegacyJsonWriteEnabled,
   isStrictSyncModeObserved, normalizeStrictSyncSqliteError } = require("../../db");
 
 const localAccountWriters = new Map();
@@ -16,18 +16,22 @@ function assertNoLocalStrictSyncWriter(dbPath = getDatabasePath()) {
   // connection with a 5s busy_timeout. Never enter that blocking wait on the
   // same Node event loop while a protected Sync owns the SQLite writer lock.
   // The admin write is rejected for a retry; it does not commit stale state.
-  if (localAccountWriters.get(dbPath)?.held) throw unavailable();
-  // A peer process can hold the writer lock even when our process-local FIFO
-  // is empty. Observe durable strict mode, then use only bounded synchronous
-  // SQLite waits, never the legacy 5-second busy_timeout.
+  if (localAccountWriters.get(dbPath)?.held) throw writerBusy();
+  // A peer process (including a coordinated backup) can hold the writer lock
+  // even when our process-local FIFO is empty. An unmarked DB with a sidecar
+  // also needs the probe: retention creates the journal before enrollment.
   if (!isDbEnabled() || isLegacyJsonWriteEnabled()) return;
   const db = getDb();
-  if (!isStrictSyncModeObserved() || db.inTransaction) return;
+  const journalPresent = hasAuditSidecar(dbPath);
+  if ((!isStrictSyncModeObserved() && !journalPresent) || db.inTransaction) return;
   try {
     db.exec("BEGIN IMMEDIATE");
     db.exec("ROLLBACK");
   } catch (error) {
     if (db.inTransaction) db.exec("ROLLBACK");
+    if (journalPresent && ["SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT", "SQLITE_LOCKED"].includes(error?.code)) {
+      throw writerBusy(error);
+    }
     throw normalizeStrictSyncSqliteError(error);
   }
 }
@@ -87,6 +91,10 @@ function unavailable() {
   return Object.assign(new Error("Durable SQLite sync account authority unavailable"), {
     code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
   });
+}
+
+function writerBusy(cause) {
+  return Object.assign(unavailable(), { auditWriterBusy: true, cause });
 }
 
 function createSyncSqliteAccountWriteFence() {

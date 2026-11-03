@@ -282,11 +282,35 @@ function createCatalogAuthorityHttpsClient({ endpoint, ca, key: clientKey, cert,
     || url.pathname !== "/" || url.search || url.hash
     || !ca || !clientKey || !cert) deny();
   const pinned = bytes(serverSpkiSha256, 32);
+  // Prepare and validate operator-supplied mTLS material once. Requests use
+  // the opaque TLS context, never raw certificate/private-key bytes.
+  let secureContext;
+  try {
+    secureContext = tls.createSecureContext({
+      ca, key: clientKey, cert, minVersion: "TLSv1.3",
+    });
+  } catch (_) { deny(); }
   async function send(route, payload) {
     return new Promise((resolve, reject) => {
       const encoded = Buffer.from(JSON.stringify(payload));
+      let settled = false;
+      let deadline;
+      let responseStarted = false;
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        req.destroy();
+        reject(Error("CATALOG_EXTERNAL_DENIED"));
+      };
+      const accept = (proof) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        resolve(proof);
+      };
       const req = https.request({ hostname: url.hostname, port: url.port || 443,
-        path: route, method: "POST", ca, key: clientKey, cert, agent: false,
+        path: route, method: "POST", secureContext, agent: false,
         minVersion: "TLSv1.3", rejectUnauthorized: true,
         checkServerIdentity(name, peer) {
           const err = tls.checkServerIdentity(name, peer);
@@ -299,21 +323,24 @@ function createCatalogAuthorityHttpsClient({ endpoint, ca, key: clientKey, cert,
         },
         headers: { "content-type": "application/json", "content-length": encoded.length },
       }, (res) => {
+        responseStarted = true;
         let size = 0; const chunks = [];
         res.on("data", (chunk) => {
           size += chunk.length;
-          if (size > 8192) res.destroy();
+          if (size > 8192) fail();
           else chunks.push(chunk);
         });
         res.on("end", () => {
           try {
-            if (res.statusCode !== 200) deny();
+            if (!res.complete || res.statusCode !== 200) deny();
             const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             exact(result, ["signedProof"]);
-            resolve(b64(result.signedProof, 1, 4096));
-          } catch (_) { reject(Error("CATALOG_EXTERNAL_DENIED")); }
+            accept(b64(result.signedProof, 1, 4096));
+          } catch (_) { fail(); }
         });
-        res.on("error", () => reject(Error("CATALOG_EXTERNAL_DENIED")));
+        res.on("error", fail);
+        res.on("aborted", fail);
+        res.on("close", () => { if (!res.complete) fail(); });
       });
       // Explicit peer-pin assertion on EVERY secure connection. Relying on
       // checkServerIdentity alone can be skipped by TLS session resumption.
@@ -323,14 +350,19 @@ function createCatalogAuthorityHttpsClient({ endpoint, ca, key: clientKey, cert,
             const peer = socket.getPeerCertificate(true);
             if (!socket.authorized || !peer?.raw
               || !eq(fp(new crypto.X509Certificate(peer.raw).publicKey), pinned)) {
-              req.destroy(Error("CATALOG_EXTERNAL_DENIED"));
+              fail();
             }
-          } catch (_) { req.destroy(Error("CATALOG_EXTERNAL_DENIED")); }
+          } catch (_) { fail(); }
         });
       });
-      req.setTimeout(4000, () => req.destroy());
-      req.on("error", () => reject(Error("CATALOG_EXTERNAL_DENIED")));
-      req.end(encoded);
+      // Socket timeouts measure inactivity only: a trusted mTLS peer can drip
+      // one byte every 500ms indefinitely. Bound the entire exchange instead.
+      deadline = setTimeout(fail, 4000);
+      req.setTimeout(4000, fail);
+      req.on("error", fail);
+      req.on("abort", fail);
+      req.on("close", () => { if (!responseStarted) fail(); });
+      try { req.end(encoded); } catch (_) { fail(); }
     });
   }
   return Object.freeze({

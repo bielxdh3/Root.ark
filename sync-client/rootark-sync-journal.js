@@ -9,6 +9,10 @@ const { canonicalJson } = require("./rootark-sync-protocol");
 const JOURNAL_VERSION = 1;
 const MAX_PENDING = 10000;
 const MAX_OBSERVATIONS = 10000;
+// Signed receipts cover both durable pending work and the retained seen window.
+// Each partition has its own limit; combining them must not stall a full seen
+// history when a new signed operation enters an otherwise empty outbox.
+const MAX_SIGNED_RECEIPTS = MAX_PENDING + MAX_OBSERVATIONS;
 const VALID_OPERATION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const VALID_DIGEST = /^[0-9a-f]{64}$/;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
@@ -96,7 +100,7 @@ function recordSignedOutboxReceipt(next, operation) {
   if (previous && previous !== digest) {
     throw new Error("Conflicting durable signed outbox receipt");
   }
-  if (!previous && Object.keys(next.committedSigned).length >= MAX_OBSERVATIONS) {
+  if (!previous && Object.keys(next.committedSigned).length >= MAX_SIGNED_RECEIPTS) {
     throw new Error("Durable signed outbox receipt capacity exceeded");
   }
   // This is evidence of an *already persisted* envelope, not an independent
@@ -251,13 +255,15 @@ class SyncJournal {
       if (invalidAtomicSignedGroups(this.state.atomicSignedGroups, this.state.pending, this.state.seen)) {
         throw new Error("Invalid atomic signed WebDAV journal group");
       }
+      const pendingById = new Map(this.state.pending.map((entry) =>
+        [entry.operationId, entry]));
       if (!this.state.committedSigned || typeof this.state.committedSigned !== "object"
         || Array.isArray(this.state.committedSigned)
-        || Object.entries(this.state.committedSigned).length > MAX_OBSERVATIONS
+        || Object.entries(this.state.committedSigned).length > MAX_SIGNED_RECEIPTS
         || Object.entries(this.state.committedSigned).some(([id, digest]) =>
           !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest)
-          || (!this.state.seen.includes(id) && !this.state.pending.some((entry) =>
-            entry.operationId === id && signedEnvelopeDigest(entry) === digest)))) {
+          || (!seenIdSet.has(id)
+            && signedEnvelopeDigest(pendingById.get(id)) !== digest))) {
         throw new Error("Invalid durable signed outbox receipt journal");
       }
       if (!this.state.admitted || typeof this.state.admitted !== "object"
@@ -334,7 +340,8 @@ class SyncJournal {
         throw new Error("Invalid atomic signed WebDAV journal group");
       }
       const pendingById = new Map(next.pending.map((entry) => [entry.operationId, entry]));
-      if (Object.entries(next.committedSigned).some(([id, digest]) =>
+      if (Object.entries(next.committedSigned).length > MAX_SIGNED_RECEIPTS
+        || Object.entries(next.committedSigned).some(([id, digest]) =>
         !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest)
         || (!seen.has(id) && signedEnvelopeDigest(pendingById.get(id)) !== digest))) {
         throw new Error("Invalid durable signed outbox receipt journal");
