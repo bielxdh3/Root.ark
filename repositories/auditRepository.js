@@ -10,6 +10,7 @@ const { assertNoLocalStrictSyncWriter, isStrictSyncAccountFenceConfigured } =
 const { assertPrivateSqliteDirectory } = require("../src/services/zk1PrivateSqlitePath");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
+const { findArchivedRestoreAuditMatches } = require("./jsonAuditArchiveScanner");
 const { jsonStringify, runWrite, safeJsonParse } = require("./repositoryUtils");
 const MAX_DEFERRED_AUDITS = 4096;
 // The archival record is deliberately retained, but its capacity is finite.
@@ -401,8 +402,20 @@ function persistJsonTerminalRestoreAudit(log, coordinatorPath, coordinatorBytes)
     return parsed;
   };
   const main = read(mainPath);
-  const archive = read(archivePath);
-  const previous = [...main.logs, ...archive.logs].filter((entry) => entry?.id === log.id);
+  // The legacy JSON archive has no size cap and may legitimately exceed the
+  // SQLite sidecar's 512 MiB budget. Scan its full validated JSON structure
+  // using a pinned descriptor without reading or copying the whole file.
+  let archiveMatches;
+  try {
+    archiveMatches = withPinnedRestoreAuditFile(archivePath, Infinity, (fd) => {
+      const { matches, bytesRead } = findArchivedRestoreAuditMatches(fd, log.id);
+      return { value: matches, bytesRead };
+    });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    archiveMatches = [];
+  }
+  const previous = [...main.logs.filter((entry) => entry?.id === log.id), ...archiveMatches];
   if (previous.length > 1 || (previous.length === 1 && !sameAuditEvidence(previous[0], log))) {
     throw new Error("JSON restore audit identity collision");
   }
@@ -444,7 +457,7 @@ function persistJsonTerminalRestoreAudit(log, coordinatorPath, coordinatorBytes)
 // restore has committed its data; rollback has restored its pre-images.
 // Persist the deterministic event in FULL/WAL SQLite or restored JSON audit
 // history before the coordinator is removed.
-function readPinnedRestoreAuditFile(filename, maxBytes = 256 * 1024) {
+function withPinnedRestoreAuditFile(filename, maxBytes, read) {
   // Open FIRST; all security checks apply to the open descriptor instead of
   // checking a pathname and then opening it in a separate resolution. POSIX
   // O_NOFOLLOW refuses symlinks; Windows verifies the descriptor's file ID
@@ -465,14 +478,26 @@ function readPinnedRestoreAuditFile(filename, maxBytes = 256 * 1024) {
       || entry.dev !== opened.dev || entry.ino !== opened.ino) {
       throw new Error("Strict restore audit coordinator changed during open");
     }
-    const bytes = fs.readFileSync(fd);
+    const { value, bytesRead } = read(fd);
     const after = fs.fstatSync(fd);
-    if (bytes.length !== opened.size || after.size !== opened.size
-      || after.mtimeMs !== opened.mtimeMs) {
+    let latest;
+    try { latest = fs.lstatSync(filename); }
+    catch (error) { throw new Error("Strict restore audit file disappeared during read", { cause: error }); }
+    if (bytesRead !== opened.size || after.size !== opened.size
+      || after.mtimeMs !== opened.mtimeMs || !latest.isFile() || latest.isSymbolicLink()
+      || latest.nlink !== 1 || latest.size !== opened.size
+      || latest.dev !== opened.dev || latest.ino !== opened.ino) {
       throw new Error("Strict restore audit coordinator changed during read");
     }
-    return bytes;
+    return value;
   } finally { fs.closeSync(fd); }
+}
+
+function readPinnedRestoreAuditFile(filename, maxBytes = 256 * 1024) {
+  return withPinnedRestoreAuditFile(filename, maxBytes, (fd) => {
+    const bytes = fs.readFileSync(fd);
+    return { value: bytes, bytesRead: bytes.length };
+  });
 }
 
 function persistTerminalRestoreAudit(coordinator) {
