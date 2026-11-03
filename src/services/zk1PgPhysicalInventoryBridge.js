@@ -251,24 +251,41 @@ class Zk1PgPhysicalInventoryBridge {
           || !same(this.#trustedInventoryFloor.minimumHead.root, minimumHead.root)
           || !same(this.#trustedInventoryFloor.minimumSnapshot, minimumSnapshot))) fail();
       const nonce = crypto.randomBytes(32);
-      const current = await this.ledger.getSnapshot({ nonce });
-      if (current.status !== "snapshot"
+      const operationState = await this.ledger.getOperationStatus(v.operation.operation_id);
+      // With the exact operation durably pending, public snapshots/pages must
+      // stay blocked. The trusted local signer instead attests ONLY to the
+      // previously committed prefix beneath this same immutable pending ID.
+      // Never accept a different operation's pending head as floor evidence.
+      const pending = operationState.status === "pending";
+      const current = pending
+        ? await this.ledger.getPrewriteFloorEvidence({
+          operationId: v.operation.operation_id, nonce,
+          afterSequence: minimumHead.sequence,
+        }) : await this.ledger.getSnapshot({ nonce });
+      if (current.status !== (pending ? "prewrite_floor_evidence" : "snapshot")
         || !Number.isSafeInteger(current.sequence)
         || current.sequence < minimumHead.sequence
         || current.sequence - minimumHead.sequence > 64) fail();
       let cursor = minimumHead.sequence;
       const proofs = [];
-      while (cursor < current.sequence) {
-        const page = await this.ledger.getCommittedProofPage({
-          afterSequence: cursor, limit: Math.min(16, current.sequence - cursor),
-        });
-        if (page.status !== "chain_page" || page.afterSequence !== cursor
-          || !Array.isArray(page.proofs)
-          || page.proofs.length !== page.nextSequence - cursor
-          || page.nextSequence <= cursor || page.nextSequence > current.sequence
-          || page.headSequence !== current.sequence) fail();
-        proofs.push(...page.proofs);
-        cursor = page.nextSequence;
+      if (pending) {
+        if (!Array.isArray(current.committedProofChain)
+          || current.committedProofChain.length !== current.sequence - cursor
+          || current.committedProofChain.some((proof) => !Buffer.isBuffer(proof))) fail();
+        proofs.push(...current.committedProofChain);
+      } else {
+        while (cursor < current.sequence) {
+          const page = await this.ledger.getCommittedProofPage({
+            afterSequence: cursor, limit: Math.min(16, current.sequence - cursor),
+          });
+          if (page.status !== "chain_page" || page.afterSequence !== cursor
+            || !Array.isArray(page.proofs)
+            || page.proofs.length !== page.nextSequence - cursor
+            || page.nextSequence <= cursor || page.nextSequence > current.sequence
+            || page.headSequence !== current.sequence) fail();
+          proofs.push(...page.proofs);
+          cursor = page.nextSequence;
+        }
       }
       const verified = await inventory.verifySnapshot({
         serialized: current.bytes, pinnedPublicKey: this.pinnedPublicKey,
@@ -749,6 +766,25 @@ class Zk1PgPhysicalInventoryBridge {
         expectedRootHash: v.expectedRootHash, expectedChunkCount: v.expectedChunkCount,
       });
     }
+    // Reserve the *logical* inventory position before the immutable physical
+    // slot. Otherwise two different writes observing the same head can both
+    // seal ciphertext, but the losing ledger append gets a terminal denial.
+    // Its physical object/revision would then be permanently occupied and a
+    // fresh, rebased operation could not store the version. prepareAppend's
+    // SQLite transaction allows only one pending operation at this head;
+    // exact lost-ACK retries reuse that same durable pending operation.
+    const prepared = await this.ledger.prepareAppend(v.operation);
+    if (prepared.status === "not_committed_final") {
+      return { status: "not_committed_final", reason: prepared.reason,
+        proof: Buffer.from(prepared.proof), authorizesIo: false };
+    }
+    if (prepared.status === "committed") {
+      return this.reconcile({
+        scope: v.scope, operation: v.operation, digest: v.digest,
+        expectedRootHash: v.expectedRootHash, expectedChunkCount: v.expectedChunkCount,
+      });
+    }
+    if (prepared.status !== "pending" || typeof prepared.replay !== "boolean") fail();
     const durableIntent = await this.intentAuthority.reserveExact({
       scope: v.scope, operation: v.operation, digest: v.digest,
       expectedRootHash: v.expectedRootHash, expectedChunkCount: v.expectedChunkCount,
