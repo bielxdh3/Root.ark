@@ -955,27 +955,50 @@ function saveAuditLogsImpl(entries = {}) {
   if (fs.existsSync(auditJournalPath())) {
     const committedIds = new Set(logs.map(({ id }) => id));
     try {
-      withPendingAuditDb((pending) => {
-        const remove = pending.prepare("DELETE FROM pending_audit WHERE id=?");
-        pending.transaction(() => {
-          assertNoStrictAuditRestore();
-          const getMain = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
-            target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
-          const getArchived = pending.prepare("SELECT event FROM archived_audit WHERE id=?");
-          const getPending = pending.prepare("SELECT event FROM pending_audit WHERE id=?");
-          for (const { id } of pending.prepare("SELECT id FROM pending_audit").all()) {
-            if (!committedIds.has(id)) continue;
-            const pendingLog = JSON.parse(getPending.get(id).event);
-            const mainRow = getMain.get(id);
-            const archivedRow = getArchived.get(id);
-            if ((mainRow && !sameAuditEvidence(rowToLog(mainRow), pendingLog, true))
-              || (archivedRow && !sameAuditEvidence(JSON.parse(archivedRow.event), pendingLog))) {
-              throw Error("Strict audit collision has divergent evidence");
+      // Reserve the primary writer BEFORE the sidecar writer. This is the
+      // order used by the whole-restore drain and prevents a restore from
+      // replacing the migrated archive after we prove a pending duplicate but
+      // before its FULL-durable sidecar removal. The primary archive is never
+      // modified by this cleanup; a crash before sidecar COMMIT simply retries.
+      db.transaction(() => {
+        assertNoStrictAuditRestore();
+        const migrated = hasMigratedJsonArchive(db)
+          ? db.prepare(`SELECT event FROM ${MIGRATED_JSON_ARCHIVE} WHERE id=?`)
+          : null;
+        withPendingAuditDb((pending) => {
+          const remove = pending.prepare("DELETE FROM pending_audit WHERE id=?");
+          pending.transaction(() => {
+            assertNoStrictAuditRestore();
+            const getMain = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+              target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
+            const getArchived = pending.prepare("SELECT event FROM archived_audit WHERE id=?");
+            // Scan only the bounded pending queue (<=4096), looking up each
+            // migrated ID by primary-key index. A multi-GiB legacy archive is
+            // never scanned on the request path.
+            for (const { id, event } of pending.prepare("SELECT id,event FROM pending_audit").all()) {
+              const migratedRow = migrated?.get(id);
+              if (!migratedRow && !committedIds.has(id)) continue;
+              const pendingLog = JSON.parse(event);
+              const mainRow = getMain.get(id);
+              const archivedRow = getArchived.get(id);
+              if (migratedRow) {
+                const legacy = JSON.parse(migratedRow.event);
+                if (legacy?.id !== id || pendingLog?.id !== id
+                  || typeof legacy.eventType !== "string"
+                  || !sameAuditEvidence(legacy, pendingLog)) {
+                  throw Error("Migrated JSON audit identity collision during pending cleanup");
+                }
+              }
+              if ((mainRow && !sameAuditEvidence(rowToLog(mainRow), pendingLog, true))
+                || (archivedRow && !sameAuditEvidence(JSON.parse(archivedRow.event), pendingLog))) {
+                throw Error("Strict audit collision has divergent evidence");
+              }
+              if (mainRow || archivedRow || migratedRow) remove.run(id);
             }
-            if (mainRow || archivedRow) remove.run(id);
-          }
-        })();
-      });
+            assertNoStrictAuditRestore();
+          })();
+        });
+      }).immediate();
     } catch (error) {
       const sqliteBusy = (value) => ["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(value);
       if (sqliteBusy(error?.code)
