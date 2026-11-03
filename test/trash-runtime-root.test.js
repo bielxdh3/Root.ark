@@ -7,6 +7,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -38,7 +39,7 @@ function request(port, requestPath, { method = "GET", headers = {}, body } = {})
   });
 }
 
-async function waitForServer(port) {
+async function waitForServer(port, child, getStartupErrors) {
   const deadline = Date.now() + TIMEOUT_MS;
   let lastError;
   while (Date.now() < deadline) {
@@ -46,10 +47,13 @@ async function waitForServer(port) {
       return await request(port, "/login.html");
     } catch (error) {
       lastError = error;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(`Child server exited before readiness (code ${child.exitCode}, signal ${child.signalCode}): ${getStartupErrors() || lastError.message}`);
+      }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
-  throw lastError;
+  throw new Error(`Child server did not become ready: ${getStartupErrors() || lastError?.message}`);
 }
 
 async function login(port, username, password) {
@@ -84,7 +88,7 @@ function isContained(parent, candidate) {
 
 test("file trash stays inside the child server runtime root", { timeout: 30_000 }, async (t) => {
   const password = crypto.randomBytes(24).toString("base64url");
-  const sandbox = fs.mkdtempSync(path.join(ROOT, ".tmp-trash-runtime-root-"));
+  const sandbox = createPrivateAuthorityFixture("rootark-trash-runtime-root-");
   const source = path.join(sandbox, "uploads", FOLDER_ID, "keep.txt");
   const bytes = Buffer.from("runtime-root isolation\n");
   const checkoutJson = path.join(ROOT, "data", "trash-items.json");
@@ -114,9 +118,11 @@ test("file trash stays inside the child server runtime root", { timeout: 30_000 
       TRASH_AUTO_CLEANUP_ENABLED: "false",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
     windowsHide: true,
   });
+  let startupErrors = "";
+  child.stderr.on("data", (bytes) => { startupErrors = (startupErrors + bytes.toString("utf8")).slice(-4096); });
   t.after(async () => {
     if (child.exitCode === null) {
       await new Promise((resolve) => {
@@ -128,7 +134,7 @@ test("file trash stays inside the child server runtime root", { timeout: 30_000 
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  assert.equal((await waitForServer(port)).status, 200);
+  assert.equal((await waitForServer(port, child, () => startupErrors)).status, 200);
   const session = await login(port, "deleter", password);
   const legacyDelete = await request(port, `/delete/keep.txt?folderId=${FOLDER_ID}`, { headers: { cookie: session.cookie } });
   assert.equal(legacyDelete.status, 405, "legacy GET cannot move a file to trash");
