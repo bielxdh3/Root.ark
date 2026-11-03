@@ -47,10 +47,15 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
   function hex(value) {
     return digit(value) || (value >= 65 && value <= 70) || (value >= 97 && value <= 102);
   }
-  function string(maxRetainedBytes = 0) {
-    const retained = maxRetainedBytes ? [] : null;
+  function string(maxDecodedBytes = 0) {
+    // A JSON Unicode escape occupies at most six source bytes for one UTF-8
+    // code point's logical bytes. Keep a bounded encoded buffer derived from
+    // the decoded-byte budget; comparing source bytes directly misses IDs
+    // such as 180 escaped \u0041 sequences whose decoded value is 180 "A"s.
+    const encodedBudget = maxDecodedBytes * 6 + 2; // Includes JSON quotes.
+    const retained = maxDecodedBytes ? [] : null;
     function accept(value) {
-      if (retained && retained.length <= maxRetainedBytes) retained.push(value);
+      if (retained && retained.length <= encodedBudget) retained.push(value);
     }
     expect(34);
     accept(34);
@@ -70,9 +75,10 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
         if (!hex(char)) invalid();
       }
     }
-    if (!retained || retained.length > maxRetainedBytes) return undefined;
+    if (!retained || retained.length > encodedBudget) return undefined;
     // JSON.parse also interprets escaped property names (e.g. "\u0069d").
-    return JSON.parse(Buffer.from(retained).toString("utf8"));
+    const decoded = JSON.parse(Buffer.from(retained).toString("utf8"));
+    return Buffer.byteLength(decoded, "utf8") <= maxDecodedBytes ? decoded : undefined;
   }
   function literal(expected) {
     for (const char of expected) expect(char.charCodeAt(0));
@@ -100,7 +106,7 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
     if (depth > 256) invalid();
     whitespace();
     switch (peek()) {
-      case 34: return string(wantId ? 1024 : 0);
+      case 34: return string(wantId ? 512 : 0);
       case 123: return object(depth + 1);
       case 91: return array(depth + 1);
       case 116: literal("true"); return;

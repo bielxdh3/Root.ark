@@ -11,7 +11,8 @@ const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindows
 
 const project = path.resolve(__dirname, "..");
 const modes = ["large", "missing", "empty", "escaped-collision", "identical-replay",
-  "divergent", "truncated", "malformed", "rename-failure", "sync-failure", "duplicate-input"];
+  "long-escaped-collision", "long-escaped-replay", "boundary-escaped-collision", "divergent", "truncated", "malformed",
+  "rename-failure", "sync-failure", "duplicate-input"];
 
 for (const mode of modes) test(`JSON archive atomic streaming append: ${mode}`, { timeout: 30_000 }, (t) => {
   const root = process.platform === "win32"
@@ -25,14 +26,22 @@ for (const mode of modes) test(`JSON archive atomic streaming append: ${mode}`, 
     const data=path.join(process.cwd(),'data');fs.mkdirSync(data,{recursive:true});
     const archive=path.join(data,'audit-logs-archive.json');
     const mode=${JSON.stringify(mode)};
-    const newLog={id:'candidate-1',eventType:'new.audit',timestamp:'2026-11-03T13:00:00Z',details:{nested:'test'}};
+    const newLog={id:mode==='boundary-escaped-collision'?'A'.repeat(512):
+      mode.startsWith('long-escaped-')?'A'.repeat(180):'candidate-1',
+      eventType:'new.audit',timestamp:'2026-11-03T13:00:00Z',details:{nested:'test'}};
     const extraLog={id:'candidate-2',eventType:'extra.audit'};
     const oldLogs=[{id:'earlier-1',details:{blob:'Q'.repeat(90*1024)}}, {id:'earlier-2',eventType:'old.audit'}];
     if(mode==='empty')oldLogs.length=0;
-    if(mode==='escaped-collision'||mode==='divergent')oldLogs.push({...newLog,eventType:'wrong.evidence'});
-    if(mode==='identical-replay')oldLogs.push(newLog);
+    if(['escaped-collision','long-escaped-collision','boundary-escaped-collision','divergent'].includes(mode))
+      oldLogs.push({...newLog,eventType:'wrong.evidence'});
+    if(mode==='identical-replay'||mode==='long-escaped-replay')oldLogs.push(newLog);
     let content=JSON.stringify({logs:oldLogs,metadata:{retention:'forever'}},null,2)+'\\n';
     if(mode==='escaped-collision')content=content.replace('"id": "candidate-1"','"\\\\u0069d": "candidate-1"');
+    if(mode.startsWith('long-escaped-')||mode==='boundary-escaped-collision'){
+      const encodedId=(String.fromCharCode(92)+'u0041').repeat(newLog.id.length);
+      content=content.replace('"id": "'+newLog.id+'"','"id": "'+encodedId+'"');
+      assert.ok(encodedId.length>1024,'encoded ID crosses old raw retention cap');
+    }
     if(mode==='truncated')content=content.slice(0,-2);
     if(mode==='malformed')content=content.slice(0,-2)+',}';
     if(mode!=='missing')fs.writeFileSync(archive,content);
@@ -54,7 +63,7 @@ for (const mode of modes) test(`JSON archive atomic streaming append: ${mode}`, 
       return originalFsync.call(this,fd,...args);
     };
     try {
-      if(['escaped-collision','divergent','truncated','malformed','rename-failure','sync-failure','duplicate-input'].includes(mode)) {
+      if(['escaped-collision','long-escaped-collision','boundary-escaped-collision','divergent','truncated','malformed','rename-failure','sync-failure','duplicate-input'].includes(mode)) {
         assert.throws(()=>audit.appendJsonArchiveLogs(mode==='duplicate-input'
           ?[newLog,{...newLog,eventType:'different'}]:[newLog,extraLog]),
           /collision|Invalid JSON restore audit history|SIMULATED_(RENAME|SYNC)_FAILURE/i);
@@ -63,11 +72,11 @@ for (const mode of modes) test(`JSON archive atomic streaming append: ${mode}`, 
         assert.ok(result!==false);
       }
     } finally {fs.readFileSync=originalRead;fs.renameSync=originalRename;fs.fsyncSync=originalFsync;}
-    if(['escaped-collision','divergent','truncated','malformed','rename-failure','sync-failure','duplicate-input'].includes(mode)) {
+    if(['escaped-collision','long-escaped-collision','boundary-escaped-collision','divergent','truncated','malformed','rename-failure','sync-failure','duplicate-input'].includes(mode)) {
       assert.deepEqual(fs.readFileSync(archive),before,'original authority unchanged');
     } else {
       const saved=JSON.parse(fs.readFileSync(archive,'utf8'));
-      assert.equal(saved.logs.filter(x=>x.id==='candidate-1').length,1);
+      assert.equal(saved.logs.filter(x=>x.id===newLog.id).length,1);
       assert.equal(saved.logs.filter(x=>x.id==='candidate-2').length,1);
       assert.equal(saved.logs.filter(x=>x.id==='earlier-1').length,mode==='missing'||mode==='empty'?0:1);
       if(mode!=='missing')assert.equal(saved.metadata.retention,'forever');
