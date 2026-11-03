@@ -2451,6 +2451,114 @@ function assertRestoredAuditCollisionFree(archive, currentEvidence) {
   } finally { primary.close(); sidecar?.close(); }
 }
 
+// The legacy JSON archive imported into SQLite is deliberately independent of
+// the capped strict audit sidecar. Merge its evidence into the extracted
+// primary before replacing the live SQLite file, so restoring an older backup
+// cannot erase previously acknowledged archived events. Stream rows under a
+// single SQLite transaction; the complete archive may exceed 512 MiB.
+function reconcileMigratedJsonAuditForRestore(archive, currentEvidence) {
+  const live = new Database(getDatabasePath(), { readonly: true, fileMustExist: true });
+  let restored;
+  let journal;
+  try {
+    const liveHas = auditRepository.hasMigratedJsonArchive(live);
+    restored = new Database(archive.primary, { fileMustExist: true });
+    const restoredHas = auditRepository.hasMigratedJsonArchive(restored);
+    const auditMarker = (db) => db.prepare("SELECT type FROM sqlite_master WHERE name='legacy_json_sqlite_audit_import'").get();
+    if (Boolean(auditMarker(live)) !== liveHas) {
+      throw Error("Live migrated JSON audit archive authority/marker mismatch");
+    }
+    if (!liveHas && !restoredHas && !auditMarker(restored)) return;
+    // A pre-archive-migration SQLite backup has only the old v1 JSON import
+    // marker. Adding a migrated archive table to it without the separate
+    // enrollment marker would make every subsequent migrate() fail closed.
+    // Refuse that backup before any local state is replaced. The caller can
+    // select a post-migration backup with a complete authority+marker pair.
+    const markerType = auditMarker(restored);
+    if (!restoredHas || markerType?.type !== "table") {
+      throw Error("Selected SQLite backup predates migrated JSON audit archive authority; refusing restore");
+    }
+    const auditMarkers = restored.prepare("SELECT id,version,source_sha256 FROM legacy_json_sqlite_audit_import").all();
+    if (auditMarkers.length !== 1 || auditMarkers[0].id !== 1 || auditMarkers[0].version !== 1
+      || !/^[a-f0-9]{64}$/.test(auditMarkers[0].source_sha256)) {
+      throw Error("Invalid selected SQLite migrated JSON audit enrollment marker");
+    }
+    if (liveHas) {
+      const liveMarkers = live.prepare("SELECT id,version,source_sha256 FROM legacy_json_sqlite_audit_import").all();
+      if (auditMarker(live)?.type !== "table" || liveMarkers.length !== 1
+        || liveMarkers[0].id !== 1 || liveMarkers[0].version !== 1
+        || !/^[a-f0-9]{64}$/.test(liveMarkers[0].source_sha256)) {
+        throw Error("Invalid live migrated JSON audit enrollment marker");
+      }
+    }
+    journal = archive.source ? new Database(archive.source, { readonly: true, fileMustExist: true }) : null;
+
+    const currentlyActive = new Map(currentEvidence.map(({ log, source }) => [log.id, { log, source }]));
+    const selectedMain = auditRepository.hasMainAuditTableForRestore(restored)
+      ? restored.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+          target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`)
+      : null;
+    const selectedPending = journal?.prepare("SELECT event FROM pending_audit WHERE id=?");
+    const selectedArchived = journal?.prepare("SELECT event FROM archived_audit WHERE id=?");
+    const liveLegacy = liveHas
+      ? live.prepare("SELECT event FROM legacy_json_audit_archive WHERE id=?") : null;
+
+    const verifyEvent = (log, id) => {
+      if (!log || typeof id !== "string" || !id || Buffer.byteLength(id) > 512
+        || log.id !== id || typeof log.eventType !== "string"
+        || Buffer.byteLength(JSON.stringify(log)) > 64 * 1024) {
+        throw Error("Invalid migrated JSON audit restore evidence");
+      }
+      return log;
+    };
+    const ensureSame = (left, right, main = false) => {
+      if (!sameAuditEvidence(left, right, main)) {
+        throw Error("Migrated JSON audit restore identity collision");
+      }
+    };
+    const checkOtherEvidence = (event) => {
+      const active = currentlyActive.get(event.id);
+      if (active) ensureSame(active.log, event, active.source === "main");
+      const main = selectedMain?.get(event.id);
+      if (main) ensureSame(auditRepository.rowToLog(main), event, true);
+      for (const find of [selectedPending, selectedArchived]) {
+        const other = find?.get(event.id);
+        if (other) ensureSame(JSON.parse(other.event), event);
+      }
+    };
+
+    restored.transaction(() => {
+      if (!restoredHas) {
+        restored.exec("CREATE TABLE legacy_json_audit_archive (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+      }
+      const getSelected = restored.prepare("SELECT event FROM legacy_json_audit_archive WHERE id=?");
+      const addSelected = restored.prepare("INSERT INTO legacy_json_audit_archive(id,event) VALUES (?,?)");
+      // Check *all* archived IDs from the selected backup, even where the
+      // current live archive has no match. They may collide with live or
+      // selected primary/sidecar evidence.
+      for (const { id, event } of restored.prepare("SELECT id,event FROM legacy_json_audit_archive").iterate()) {
+        const record = verifyEvent(JSON.parse(event), id);
+        checkOtherEvidence(record);
+        const older = liveLegacy?.get(id);
+        if (older) ensureSame(verifyEvent(JSON.parse(older.event), id), record);
+      }
+      if (liveHas) {
+        for (const { id, event } of live.prepare("SELECT id,event FROM legacy_json_audit_archive").iterate()) {
+          const record = verifyEvent(JSON.parse(event), id);
+          checkOtherEvidence(record);
+          const selected = getSelected.get(id);
+          if (selected) ensureSame(verifyEvent(JSON.parse(selected.event), id), record);
+          else addSelected.run(id, event);
+        }
+      }
+    }).immediate();
+  } finally {
+    journal?.close();
+    restored?.close();
+    live.close();
+  }
+}
+
 function assertPrivateAuditStage(staged, descriptor) {
   const pinned = fs.fstatSync(descriptor, { bigint: true });
   const linked = fs.lstatSync(staged, { bigint: true });
@@ -3085,6 +3193,7 @@ async function restoreBackup(id, options = {}) {
     if (persistenceMode === "sqlite") await strictAudit.drainAuditWriters(getDatabasePath());
     const currentAuditEvidence = persistenceMode === "sqlite" ? collectCurrentSqliteAuditEvidence() : [];
     if (persistenceMode === "sqlite") assertRestoredAuditCollisionFree(strictAuditArchive, currentAuditEvidence);
+    if (persistenceMode === "sqlite") reconcileMigratedJsonAuditForRestore(strictAuditArchive, currentAuditEvidence);
     const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);

@@ -737,6 +737,44 @@ async function writeJsonArchiveBackupSnapshot(destination, mainDestination = nul
   }
 }
 
+// Called with the JSON audit writer lease held by the one-time migration.
+// Iterate every archived event, including the immutable legacy JSON and the
+// private committed delta. Never materialize the entire archive: a deployment
+// may have archived multiple GiB before choosing SQLite persistence.
+function forEachArchivedAuditForMigration(consume) {
+  if (typeof consume !== "function") throw new TypeError("Migration audit consumer required");
+  const db = openStore(false); // Enrollment is authoritative even if STORE vanished.
+  try {
+    if (db) ensureLegacyIndex(db);
+    if (legacyIdentity() !== "missing") {
+      const allIds = new Set();
+      allIds.has = () => true;
+      withPinnedLegacy((fd) => {
+        const result = findArchivedRestoreAuditMatches(fd, allIds, {
+          // The receiving SQLite table enforces uniqueness without a Set of
+          // all historical IDs in JavaScript heap space.
+          onId() {},
+          onMatch(log) {
+            assertLog(log);
+            consume(log);
+          },
+        });
+        return { value: null, bytesRead: result.bytesRead };
+      });
+    }
+    if (db) {
+      for (const { id, event } of db.prepare("SELECT id,event FROM delta ORDER BY rowid").iterate()) {
+        const log = JSON.parse(event);
+        if (log?.id !== id) {
+          throw new Error("Private JSON audit migration evidence identity mismatch");
+        }
+        assertLog(log);
+        consume(log);
+      }
+    }
+  } finally { db?.close(); }
+}
+
 module.exports = { STORE, LEGACY, appendJsonArchiveLogs, findDeltaAuditMatches,
   assertJsonRestoreCompatible, carryForwardLiveJsonAuditForRestore,
-  writeJsonArchiveBackupSnapshot };
+  writeJsonArchiveBackupSnapshot, forEachArchivedAuditForMigration };

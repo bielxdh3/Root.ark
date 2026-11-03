@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const ROOT = path.join(__dirname, "..");
 
@@ -28,7 +29,10 @@ test("SQLite JSON read fallback is disabled unless explicitly enabled", () => {
 });
 
 test("JSON migration preserves trash and backup history in SQLite across restart", { timeout: 20_000 }, () => {
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-json-sqlite-migration-"));
+  const fixtureRoot = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA || os.homedir(), `rootark-json-sqlite-migration-${require('node:crypto').randomUUID()}`)
+    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-json-sqlite-migration-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(fixtureRoot);
   try {
     for (const directory of ["db", "repositories"]) {
       fs.cpSync(path.join(ROOT, directory), path.join(fixtureRoot, directory), { recursive: true });
@@ -79,7 +83,7 @@ test("JSON migration preserves trash and backup history in SQLite across restart
       ...process.env,
       DB_ENABLED: "true",
       DATABASE_URL: path.join(fixtureRoot, "data", "rootark.sqlite"),
-      NODE_PATH: path.join(ROOT, "node_modules"),
+      NODE_PATH: [path.join(ROOT, "node_modules"), process.env.NODE_PATH].filter(Boolean).join(path.delimiter),
     };
     const migrate = spawnSync(process.execPath, ["-e", [
       'const trashRepository = require("./repositories/trashRepository");',

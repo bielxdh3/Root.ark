@@ -4,11 +4,15 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const ROOT = path.resolve(__dirname, "..");
 
 function withMigrationFixture(run) {
-  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-json-migration-rerun-"));
+  const fixture = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA || os.homedir(), `rootark-json-migration-rerun-${require('node:crypto').randomUUID()}`)
+    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-json-migration-rerun-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(fixture);
   try {
     for (const directory of ["db", "repositories"]) {
       fs.cpSync(path.join(ROOT, directory), path.join(fixture, directory), { recursive: true });

@@ -21,6 +21,43 @@ const MAX_DEFERRED_AUDITS = 4096;
 const MAX_ARCHIVED_AUDITS = 100000;
 const MAX_ARCHIVED_BYTES = 512 * 1024 * 1024;
 const preparedJournals = new Set();
+const MIGRATED_JSON_ARCHIVE = "legacy_json_audit_archive";
+
+function hasMigratedJsonArchive(db) {
+  const table = db.prepare("SELECT type FROM sqlite_master WHERE name=?").get(MIGRATED_JSON_ARCHIVE);
+  if (!table) return false;
+  if (table.type !== "table") throw Error("Invalid migrated JSON audit authority type");
+  const columns = db.pragma(`table_info(${MIGRATED_JSON_ARCHIVE})`);
+  if (columns.length !== 2 || columns[0].name !== "id" || columns[0].type.toUpperCase() !== "TEXT"
+    || columns[0].pk !== 1 || columns[0].notnull !== 1
+    || columns[1].name !== "event" || columns[1].type.toUpperCase() !== "TEXT"
+    || columns[1].notnull !== 1) {
+    throw Error("Invalid migrated JSON audit authority schema");
+  }
+  return true;
+}
+
+function migratedJsonArchiveEvent(db, id) {
+  if (!hasMigratedJsonArchive(db)) return null;
+  const row = db.prepare(`SELECT event FROM ${MIGRATED_JSON_ARCHIVE} WHERE id=?`).get(id);
+  if (!row) return null;
+  const event = JSON.parse(row.event);
+  if (!event || event.id !== id || typeof event.eventType !== "string") {
+    throw Error("Invalid migrated JSON audit evidence");
+  }
+  return event;
+}
+
+function forEachMigratedJsonArchivedAudit(callback, db = getDb()) {
+  if (!hasMigratedJsonArchive(db)) return;
+  for (const { id, event } of db.prepare(`SELECT id,event FROM ${MIGRATED_JSON_ARCHIVE} ORDER BY rowid`).iterate()) {
+    const log = JSON.parse(event);
+    if (!log || log.id !== id || typeof log.eventType !== "string") {
+      throw Error("Invalid migrated JSON audit evidence");
+    }
+    callback(log);
+  }
+}
 
 function assertNoStrictAuditRestore() {
   // A durable whole-restore coordinator is written before the pre-restore
@@ -194,6 +231,17 @@ function archiveAuditLogs(logs) {
   if (!Array.isArray(logs) || !logs.length) return;
   try {
     assertNoStrictAuditRestore();
+    const mainDb = getDb();
+    const toArchive = [];
+    for (const log of logs) {
+      const migrated = migratedJsonArchiveEvent(mainDb, log?.id);
+      if (migrated) {
+        if (!sameAuditEvidence(migrated, log)) {
+          throw Error("Migrated JSON audit identity collision");
+        }
+      } else toArchive.push(log);
+    }
+    if (!toArchive.length) return;
     // Reject a conflicting main-table ID BEFORE making the candidate archive
     // event durable in the independent sidecar. The post-archive prune repeats
     // this check against any concurrent main-table changes.
@@ -201,7 +249,11 @@ function archiveAuditLogs(logs) {
       const primary = getDb();
       const existing = primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
         target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
-      for (const log of logs) {
+      for (const log of toArchive) {
+        const prior = migratedJsonArchiveEvent(primary, log?.id);
+        if (prior && !sameAuditEvidence(prior, log)) {
+          throw Error("Migrated JSON audit identity collision");
+        }
         const main = existing.get(log?.id);
         if (main && !sameAuditEvidence(rowToLog(main), log, true)) {
           throw Error("Strict audit collision has divergent evidence");
@@ -218,7 +270,7 @@ function archiveAuditLogs(logs) {
         let bytes = size.bytes;
         const exists = db.prepare("SELECT event FROM archived_audit WHERE id=?");
         const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?");
-        for (const log of logs) {
+        for (const log of toArchive) {
           if (typeof log?.id !== "string" || !log.id || log.id.length > 128) {
             throw new TypeError("Invalid archived audit ID");
           }
@@ -242,7 +294,7 @@ function archiveAuditLogs(logs) {
         }
       })();
     });
-    pruneArchivedAuditRows(logs);
+    pruneArchivedAuditRows(toArchive);
   } catch (error) {
     if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
       throw Object.assign(new Error("Durable audit archive busy", { cause: error }), {
@@ -350,6 +402,11 @@ function deferAuditLog(log) {
     throw Object.assign(new Error("Pending audit entry too large"), {
       code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
     });
+  }
+  const legacy = migratedJsonArchiveEvent(getDb(), log.id);
+  if (legacy) {
+    if (!sameAuditEvidence(legacy, log)) throw Error("Migrated JSON audit identity collision");
+    return;
   }
   // Commit+fsync completes before auditLog reports success. No in-memory
   // queue, no timer-dependent guarantee and no swallowed errors.
@@ -767,6 +824,19 @@ function loadAuditLogs() {
       if (!older) { seen.set(log.id, { log, main: false }); logs.push(log); }
     }
     const archived = archivedAuditIds(logs.map(({ id }) => id));
+    const legacyArchive = getDb();
+    if (hasMigratedJsonArchive(legacyArchive)) {
+      const find = legacyArchive.prepare(`SELECT event FROM ${MIGRATED_JSON_ARCHIVE} WHERE id=?`);
+      for (const { log, main } of seen.values()) {
+        const legacy = find.get(log.id);
+        if (!legacy) continue;
+        const entry = JSON.parse(legacy.event);
+        if (entry?.id !== log.id || !sameAuditEvidence(log, entry, main)) {
+          throw Error("Migrated JSON audit identity collision");
+        }
+        archived.add(log.id);
+      }
+    }
     if (archived.size) withPendingAuditDb((sidecar) => {
       const find = sidecar.prepare("SELECT event FROM archived_audit WHERE id=?");
       for (const id of archived) {
@@ -839,7 +909,19 @@ function saveAuditLogsImpl(entries = {}) {
       ON CONFLICT(id) DO NOTHING
     `);
 
+    const migrated = hasMigratedJsonArchive(db)
+      ? db.prepare(`SELECT event FROM ${MIGRATED_JSON_ARCHIVE} WHERE id=?`)
+      : null;
+
     for (const log of logs) {
+      const legacy = migrated?.get(log.id);
+      if (legacy) {
+        const previous = JSON.parse(legacy.event);
+        if (previous?.id !== log.id || !sameAuditEvidence(previous, log)) {
+          throw Error("Migrated JSON audit identity collision");
+        }
+        continue;
+      }
       if (archived.has(log.id)) {
         const archivedEvent = archivedEvents.get(log.id);
         if (!archivedEvent || !sameAuditEvidence(JSON.parse(archivedEvent), log)) {
@@ -922,4 +1004,5 @@ module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyn
   preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs,
   normalizeMainAuditLog, hasMainAuditTableForRestore, loadAllAuditEvidenceForRestore, persistTerminalRestoreAudit,
   appendJsonArchiveLogs, writeJsonArchiveBackupSnapshot: jsonArchiveStore.writeJsonArchiveBackupSnapshot,
-  rowToLog, withJsonAuditLock, readJsonAuditHistory, persistJsonAuditFile };
+  rowToLog, withJsonAuditLock, readJsonAuditHistory, persistJsonAuditFile,
+  hasMigratedJsonArchive, forEachMigratedJsonArchivedAudit, migratedJsonArchiveEvent };

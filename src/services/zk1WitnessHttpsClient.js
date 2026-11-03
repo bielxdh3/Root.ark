@@ -6,6 +6,7 @@
 const https = require("node:https");
 const tls = require("node:tls");
 const net = require("node:net");
+const { performance } = require("node:perf_hooks");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -85,11 +86,27 @@ function createZk1WitnessHttpsClient({
     if (payload.length > 4096) fail();
     return new Promise((resolve, reject) => {
       let completed = false;
+      let deadlineTimer;
+      const expiresAt = performance.now() + timeoutMs;
       const unavailable = () => {
         if (completed) return;
         completed = true;
+        clearTimeout(deadlineTimer);
+        // A partial response may keep sending bytes forever. Tear down the
+        // underlying socket on every failure, including an expired deadline.
+        if (request && !request.destroyed) request.destroy();
         reject(new Error("WITNESS_TRANSPORT_UNAVAILABLE"));
       };
+      const succeed = (result) => {
+        if (completed) return;
+        // Do not accept a late response if the event loop delayed the timer.
+        if (performance.now() >= expiresAt) { unavailable(); return; }
+        completed = true;
+        clearTimeout(deadlineTimer);
+        resolve(result);
+      };
+      // A single wall-clock budget covers connection, TLS, headers and body.
+      // Socket inactivity timeouts alone can be defeated by a byte trickle.
       const request = https.request({
         hostname: url.hostname, port: url.port, path, method: "POST",
         // Enforce this instance's certificate pin on EVERY TLS handshake.
@@ -108,21 +125,20 @@ function createZk1WitnessHttpsClient({
           }
           return undefined;
         },
-        timeout: timeoutMs,
         headers: { "content-type": "application/json",
           "content-length": String(payload.length), accept: "application/json" },
       }, (response) => {
         if (![200, 201].includes(response.statusCode)
           || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(response.headers["content-type"] || "")) {
-          response.resume();
           unavailable();
           return;
         }
         let length = 0;
         const chunks = [];
         response.on("data", (part) => {
+          if (completed) return;
           length += part.length;
-          if (length > 12000) { request.destroy(); unavailable(); }
+          if (length > 12000) unavailable();
           else chunks.push(part);
         });
         response.on("end", () => {
@@ -144,15 +160,13 @@ function createZk1WitnessHttpsClient({
                 || !["QUIESCING", "DRAINED"].includes(parsed.status)
                 || !Number.isSafeInteger(parsed.activeCount) || parsed.activeCount < 0
                 || (parsed.status === "DRAINED") !== (parsed.activeCount === 0)) fail();
-              completed = true;
-              resolve({ status: parsed.status, activeCount: parsed.activeCount });
+              succeed({ status: parsed.status, activeCount: parsed.activeCount });
               return;
             }
             if (quiesceCancel) {
               if (parsed.authority !== "WITNESS_IO_GATE_LOCAL_V1"
                 || parsed.status !== "ABORTED_EXPIRED") fail();
-              completed = true;
-              resolve({ status: parsed.status });
+              succeed({ status: parsed.status });
               return;
             }
             if (ioStart || ioFinish) {
@@ -169,22 +183,25 @@ function createZk1WitnessHttpsClient({
                 if (parsed.status !== "completed") fail();
                 result = { status: parsed.status };
               }
-              completed = true;
-              resolve(result);
+              succeed(result);
               return;
             }
             if (parsed.authority !== "WITNESS_ENGINE_ONLY") fail();
             if (path === "/v1/resolve" && !["committed", "cancelled"].includes(parsed.status)) fail();
             const receipt = canonicalReceipt(parsed.receiptBase64);
-            completed = true;
-            resolve(path === "/v1/resolve" ? { status: parsed.status, receipt } : receipt);
+            succeed(path === "/v1/resolve" ? { status: parsed.status, receipt } : receipt);
           } catch (_) { unavailable(); }
         });
         response.on("error", unavailable);
+        response.on("close", () => {
+          if (!response.complete) unavailable();
+        });
       });
-      request.on("timeout", () => request.destroy());
+      deadlineTimer = setTimeout(unavailable,
+        Math.max(0, Math.ceil(expiresAt - performance.now())));
       request.on("error", unavailable);
-      request.end(payload);
+      try { request.end(payload); }
+      catch (_) { unavailable(); }
     });
   }
   return Object.freeze({
