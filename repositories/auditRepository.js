@@ -972,13 +972,15 @@ function saveAuditLogsImpl(entries = {}) {
             const getMain = db.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
               target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`);
             const getArchived = pending.prepare("SELECT event FROM archived_audit WHERE id=?");
-            // Scan only the bounded pending queue (<=4096), looking up each
-            // migrated ID by primary-key index. A multi-GiB legacy archive is
-            // never scanned on the request path.
-            for (const { id, event } of pending.prepare("SELECT id,event FROM pending_audit").all()) {
+            const getPending = pending.prepare("SELECT event FROM pending_audit WHERE id=?");
+            // Snapshot only IDs (<=4096), never up to 256 MiB of event bodies.
+            // Fetch a payload lazily by indexed ID only if the candidate was
+            // committed or has matching migrated-archive authority. Do not
+            // iterate a live SELECT while deleting from that same table.
+            for (const { id } of pending.prepare("SELECT id FROM pending_audit").all()) {
               const migratedRow = migrated?.get(id);
               if (!migratedRow && !committedIds.has(id)) continue;
-              const pendingLog = JSON.parse(event);
+              const pendingLog = JSON.parse(getPending.get(id).event);
               const mainRow = getMain.get(id);
               const archivedRow = getArchived.get(id);
               if (migratedRow) {

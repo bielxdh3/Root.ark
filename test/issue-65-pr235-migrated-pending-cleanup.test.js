@@ -11,7 +11,19 @@ const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindows
 
 const root = path.resolve(__dirname, "..");
 
-for (const scenario of ["single-v1", "capacity-4096", "divergent-v1"]) {
+test("pending cleanup snapshots IDs only and fetches eligible event payloads by indexed ID", () => {
+  const source = fs.readFileSync(path.join(root, "repositories", "auditRepository.js"), "utf8");
+  const start = source.indexOf("// A crash after main commit but before sidecar removal");
+  const end = source.indexOf("function saveAuditLogs(entries", start);
+  assert.ok(start !== -1 && end > start, "cleanup source boundaries must be present");
+  const cleanup = source.slice(start, end);
+  assert.match(cleanup, /SELECT id FROM pending_audit/);
+  assert.match(cleanup, /SELECT event FROM pending_audit WHERE id=\?/);
+  assert.doesNotMatch(cleanup, /SELECT id\s*,\s*event FROM pending_audit/i,
+    "never materialize up to 256 MiB of pending event bodies per normal save");
+});
+
+for (const scenario of ["single-v1", "capacity-4096", "divergent-v1", "large-orphans-4096"]) {
   test(`migrated JSON archive frees only matching pending audit evidence: ${scenario}`, { timeout: 90_000 }, (t) => {
     const fixture = process.platform === "win32"
       ? path.join(process.env.LOCALAPPDATA || os.homedir(), `rootark-migrated-pending-${crypto.randomUUID()}`)
@@ -32,8 +44,9 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1"]) {
       const repo = require('./repositories/auditRepository');
       const archive = require('./repositories/jsonAuditArchiveStore');
       const scenario = ${JSON.stringify(scenario)};
-      const count = scenario === 'capacity-4096' ? 4096 : 1;
-      const events = Array.from({length: count}, (_,n)=>({
+      const largeOrphans = scenario === 'large-orphans-4096';
+      const count = scenario === 'capacity-4096' || largeOrphans ? 4096 : 1;
+      const events = Array.from({length: largeOrphans ? 0 : count}, (_,n)=>({
         id: 'signed-🔐-' + n, eventType: 'auth.login.failed', timestamp:'2026-11-03T10:00:00Z',
         details:{witness:'private-json-archive'}
       }));
@@ -43,13 +56,21 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1"]) {
       // exists, while the independent private-archive import did not yet exist.
       primary.exec('DROP TABLE legacy_json_sqlite_audit_import; DROP TABLE legacy_json_audit_archive');
       repo.ensurePendingAuditDatabase();
-      archive.appendJsonArchiveLogs(events);
+      if (!largeOrphans) archive.appendJsonArchiveLogs(events);
       const journal = new Database(getDatabasePath() + '.audit-private/pending.sqlite');
       try {
         journal.pragma('journal_mode = WAL');
         journal.pragma('synchronous = FULL');
         const insert = journal.prepare('INSERT INTO pending_audit(id,event) VALUES (?,?)');
-        journal.transaction(()=>{for (const e of events) insert.run(e.id, JSON.stringify(e))})();
+        journal.transaction(()=>{
+          if (largeOrphans) {
+            const payload = 'x'.repeat(63*1024);
+            for (let i = 0; i < count; i++) insert.run('large-orphan-'+i,
+              JSON.stringify({id:'large-orphan-'+i,eventType:'auth.login.failed',details:{payload}}));
+          } else {
+            for (const e of events) insert.run(e.id, JSON.stringify(e));
+          }
+        })();
       } finally {journal.close()}
       migrate();
       primary.exec("CREATE TABLE rootark_strict_sync_audit_mode " +
@@ -62,6 +83,18 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1"]) {
         finally {side.close()}
       };
       assert.equal(pendingCount(),count);
+      if (largeOrphans) {
+        // This fixture uses ~252 MiB of sidecar event bytes. A normal empty
+        // save must NOT copy the whole journal into V8 just to find matches.
+        const before = process.memoryUsage().rss;
+        repo.saveAuditLogs({logs:[]});
+        const delta = process.memoryUsage().rss - before;
+        assert.ok(delta < 100*1024*1024,
+          'empty save materialized large pending evidence in RSS: '+(delta/1048576).toFixed(1)+' MiB');
+        assert.equal(pendingCount(),count,'unmatched pending events must not be erased');
+        console.log('LARGE_PENDING_ID_ONLY');
+        return;
+      }
       assert.deepEqual(repo.loadAuditLogs().logs,[]);
       if (scenario === 'divergent-v1') {
         const side = new Database(sidecarPath);
@@ -91,6 +124,6 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1"]) {
         DB_ENABLED: "true", DATABASE_URL: path.join(fixture, "data", "rootark.sqlite") },
     });
     assert.equal(result.status, 0, `${result.error?.message || ""}\n${result.stderr}\n${result.stdout}`);
-    assert.match(result.stdout, /MIGRATED_PENDING_DRAINED|PENDING_REPLAY_REJECTED/);
+    assert.match(result.stdout, /MIGRATED_PENDING_DRAINED|PENDING_REPLAY_REJECTED|LARGE_PENDING_ID_ONLY/);
   });
 }
