@@ -66,7 +66,7 @@ test("strict audit rejects duplicate pending and archived IDs without acknowledg
 
 test("strict audit repository failures cannot be disguised as a successful empty server history", () => {
   const source = fs.readFileSync(path.join(implementation, "server.js"), "utf8");
-  const start = source.indexOf("function loadAuditLogs(file = AUDIT_LOGS_FILE) {");
+  const start = source.indexOf("function loadAuditLogs(");
   const end = source.indexOf("function saveAuditLogs(", start);
   assert.ok(start >= 0 && end > start);
   const unavailable = Object.assign(new Error("Strict audit collision"), {code:"SYNC_ATOMIC_ACCOUNT_UNAVAILABLE"});

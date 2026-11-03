@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { spawn } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const project = path.resolve(__dirname, "..");
@@ -107,4 +107,32 @@ test("JSON audit lock rejects ordinary writes under coordinator and releases aft
     repo.withJsonAuditLock(()=>{}, { allowCoordinator: true });`, root);
   assert.deepEqual(await probe.result, { code: 0, signal: null, output: "" });
   assert.equal(fs.readFileSync(path.join(root, "after-crash"), "utf8"), "ok");
+});
+
+test("Windows JSON audit lock rejects an ancestor writable by unrelated users", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async (t) => {
+  const root = fixtureRoot("rootark-json-audit-unsafe-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const unsafe = path.join(root, "untrusted-parent");
+  fs.mkdirSync(unsafe);
+  const canary = path.join(unsafe, "canary.txt");
+  fs.writeFileSync(canary, "preserve disposable data");
+  execFileSync("C:\\Windows\\System32\\icacls.exe", [
+    unsafe, "/grant", "*S-1-5-32-545:(OI)(CI)M",
+  ], { stdio: "ignore", windowsHide: true, timeout: 12000 });
+  const runtime = path.join(unsafe, "runtime");
+  fs.mkdirSync(runtime);
+  const child = subprocess(`
+    const fs=require('node:fs'),path=require('node:path');
+    const { withJsonAuditLock, JSON_AUDIT_COORDINATION_FILE }=
+      require(${JSON.stringify(path.join(project, "repositories", "jsonAuditLock.js"))});
+    try { withJsonAuditLock(()=>{throw Error('UNTRUSTED_CALLBACK_RAN')});
+      throw Error('UNTRUSTED_LOCK_ALLOWED'); }
+    catch(error) {
+      if(!/Untrusted principal can replace chunk staging path|Windows chunk staging ACL validation failed/.test(error.message)) throw error;
+    }
+    if(fs.existsSync(JSON_AUDIT_COORDINATION_FILE)) throw Error('UNTRUSTED_LOCK_CREATED');`, runtime);
+  assert.deepEqual(await child.result, { code: 0, signal: null, output: "" });
+  assert.equal(fs.readFileSync(canary, "utf8"), "preserve disposable data");
 });

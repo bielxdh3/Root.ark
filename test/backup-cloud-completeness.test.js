@@ -5,6 +5,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const unzipper = require("unzipper");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const originalCwd = process.cwd();
 const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-"));
@@ -190,7 +192,9 @@ test("a cloud-only object survives SQLite backup and restore", () => {
 });
 
 test("an incomplete backup does not claim a same-path provider object was archived", () => {
-  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-incomplete-cloud-restore-"));
+  // JSON restore coordination uses a private ACL-protected SQLite lock.
+  // Shared Windows TEMP can grant unrelated principals Modify on an ancestor.
+  const isolated = createPrivateAuthorityFixture("rootark-incomplete-cloud-restore-");
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   const restorePath = path.join(__dirname, "..", "services", "restoreService");
   const orphanPolicyPath = path.join(isolated, "data", ".rootark-restore-provider-orphans.json");

@@ -6,9 +6,13 @@ const fs = require("node:fs");
 // Size of the complete archive is unrestricted; working space is bounded by
 // the read block, the longest examined key/ID, and one candidate audit event.
 function findArchivedRestoreAuditMatches(fd, wantedId) {
+  const wantedIds = wantedId instanceof Set ? wantedId : new Set([wantedId]);
   const block = Buffer.allocUnsafe(64 * 1024);
   const eventBytes = Buffer.allocUnsafe(64 * 1024);
   const matches = [];
+  const matchedIds = new Set();
+  let arrayCloseOffset = -1;
+  let arrayHasEntries = false;
   let offset = 0;
   let available = 0;
   let bytesRead = 0;
@@ -43,10 +47,15 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
   function hex(value) {
     return digit(value) || (value >= 65 && value <= 70) || (value >= 97 && value <= 102);
   }
-  function string(maxRetainedBytes = 0) {
-    const retained = maxRetainedBytes ? [] : null;
+  function string(maxDecodedBytes = 0) {
+    // A JSON Unicode escape occupies at most six source bytes for one UTF-8
+    // code point's logical bytes. Keep a bounded encoded buffer derived from
+    // the decoded-byte budget; comparing source bytes directly misses IDs
+    // such as 180 escaped \u0041 sequences whose decoded value is 180 "A"s.
+    const encodedBudget = maxDecodedBytes * 6 + 2; // Includes JSON quotes.
+    const retained = maxDecodedBytes ? [] : null;
     function accept(value) {
-      if (retained && retained.length <= maxRetainedBytes) retained.push(value);
+      if (retained && retained.length <= encodedBudget) retained.push(value);
     }
     expect(34);
     accept(34);
@@ -66,9 +75,10 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
         if (!hex(char)) invalid();
       }
     }
-    if (!retained || retained.length > maxRetainedBytes) return undefined;
+    if (!retained || retained.length > encodedBudget) return undefined;
     // JSON.parse also interprets escaped property names (e.g. "\u0069d").
-    return JSON.parse(Buffer.from(retained).toString("utf8"));
+    const decoded = JSON.parse(Buffer.from(retained).toString("utf8"));
+    return Buffer.byteLength(decoded, "utf8") <= maxDecodedBytes ? decoded : undefined;
   }
   function literal(expected) {
     for (const char of expected) expect(char.charCodeAt(0));
@@ -96,7 +106,7 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
     if (depth > 256) invalid();
     whitespace();
     switch (peek()) {
-      case 34: return string(wantId ? 1024 : 0);
+      case 34: return string(wantId ? 512 : 0);
       case 123: return object(depth + 1);
       case 91: return array(depth + 1);
       case 116: literal("true"); return;
@@ -153,7 +163,12 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
     if (depth > 256) invalid();
     expect(91);
     whitespace();
-    if (peek() === 93) { take(); return; }
+    if (peek() === 93) {
+      arrayCloseOffset = bytesRead - (available - offset);
+      take();
+      return;
+    }
+    arrayHasEntries = true;
     while (true) {
       if (peek() === 123) {
         recording = true;
@@ -161,13 +176,15 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
         oversized = false;
         const { id } = object(depth + 1, "log");
         recording = false;
-        if (id === wantedId) {
+        if (wantedIds.has(id)) {
           if (oversized) throw new Error("Matching JSON restore audit event exceeds safe parse budget");
+          if (matchedIds.has(id)) throw new Error("JSON restore audit identity collision");
+          matchedIds.add(id);
           matches.push(JSON.parse(eventBytes.subarray(0, recorded).toString("utf8")));
-          if (matches.length > 1) throw new Error("JSON restore audit identity collision");
         }
       } else invalid();
       whitespace();
+      if (peek() === 93) arrayCloseOffset = bytesRead - (available - offset);
       const separator = take();
       if (separator === 93) return;
       if (separator !== 44) invalid();
@@ -180,7 +197,7 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
   const { sawLogs } = object(0, "root");
   whitespace();
   if (!sawLogs || peek() !== -1) invalid();
-  return { matches, bytesRead };
+  return { matches, bytesRead, arrayCloseOffset, arrayHasEntries };
 }
 
 module.exports = { findArchivedRestoreAuditMatches };

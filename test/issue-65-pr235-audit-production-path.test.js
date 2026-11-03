@@ -10,7 +10,7 @@ const vm = require("node:vm");
 // functions in a deterministic harness, without starting the full server or
 // writing to a real account database.
 const source = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
-const start = source.indexOf("function archiveAuditLogs(logs) {");
+const start = source.indexOf("function archiveAuditLogs(");
 const end = source.indexOf("function addActionHistory(", start);
 assert.ok(start >= 0 && end > start, "production audit functions must be present");
 
@@ -22,6 +22,7 @@ function fixture({ strictWriter = false, database = true, max = 2, now = Date.no
   const legacyArchiveWrites = [];
   const writes = [];
   const repo = {
+    withJsonAuditLock(callback) { return callback(); },
     deferIfStrictSyncWriter(log) {
       if (!strictWriter) return false;
       deferred.push(log);
@@ -31,6 +32,10 @@ function fixture({ strictWriter = false, database = true, max = 2, now = Date.no
       if (archiveFailure) throw Error("archive unavailable");
       archived.push(...logs);
     },
+    appendJsonArchiveLogs(logs) {
+      if (archiveFailure) throw Error("archive unavailable");
+      legacyArchiveWrites.push(...logs);
+    },
   };
   const context = vm.createContext({
     crypto: { randomUUID: () => "new-audit-id" },
@@ -39,12 +44,14 @@ function fixture({ strictWriter = false, database = true, max = 2, now = Date.no
     AUDIT_EVENTS: {},
     AUDIT_RETENTION_MS: 1000,
     MAX_AUDIT_LOGS: max,
+    AUDIT_LOGS_FILE: "audit.json",
     AUDIT_ARCHIVE_FILE: "archived.json",
     shouldUseDatabase: () => database,
     auditRepository: repo,
     broadcastDataChanged(source) { assert.equal(source, "audit"); },
     loadAuditLogs(file) {
-      return file ? { logs: legacyArchiveWrites.slice() } : { logs: events.slice() };
+      return file === "archived.json" ? { logs: legacyArchiveWrites.slice() }
+        : { logs: events.slice() };
     },
     saveAuditLogs(value, file) {
       if (file) { legacyArchiveWrites.push(...value.logs); return; }
@@ -92,7 +99,7 @@ test("archive failure stops active-table retention before acknowledging a new au
   assert.equal(state.writes.length, 0);
 });
 
-test("legacy JSON mode retains its original count archive path", () => {
+test("legacy JSON mode archives count-evicted events through the locked archive writer", () => {
   const now = Date.parse("2026-11-02T00:00:00Z");
   const state = fixture({ now, database: false, max: 1, seed: [
     { id: "one", timestamp: new Date(now - 300).toISOString() },
@@ -100,4 +107,14 @@ test("legacy JSON mode retains its original count archive path", () => {
   state.audit("auth.login.failed", {}, null, "login", "failure");
   assert.equal(state.archived.length, 0);
   assert.deepEqual(state.legacyArchiveWrites.map((entry) => entry.id), ["one"]);
+});
+
+test("JSON archive failure cannot acknowledge active log pruning", () => {
+  const now = Date.parse("2026-11-02T00:00:00Z");
+  const state = fixture({ now, database: false, archiveFailure: true, max: 1,
+    seed: [{ id: "one", timestamp: new Date(now - 300).toISOString() }] });
+  assert.throws(() => state.audit("auth.login.failed", {}, null, "login", "failure"),
+    /archive unavailable/);
+  assert.deepEqual(state.events.map((entry) => entry.id), ["one"]);
+  assert.equal(state.writes.length, 0);
 });
