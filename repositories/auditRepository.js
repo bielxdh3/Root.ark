@@ -376,6 +376,81 @@ function deferAuditLog(log) {
   }
 }
 
+// The whole-restore coordinator is the only authority that may produce its
+// terminal audit event while ordinary audit writers are fenced. A successful
+// restore has already replaced the main database; rollback has already
+// restored its pre-images. Persist this deterministic event ONLY in the
+// independent FULL/WAL journal, before the coordinator can be removed.
+function persistTerminalRestoreAudit(coordinator) {
+  const filename = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
+  const info = fs.lstatSync(filename);
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 256 * 1024) {
+    throw new Error("Unsafe strict restore audit coordinator");
+  }
+  const current = JSON.parse(fs.readFileSync(filename, "utf8"));
+  const phase = current.phase;
+  if (!coordinator || current.transactionId !== coordinator.transactionId
+    || current.phase !== coordinator.phase || current.backupId !== coordinator.backupId
+    || !["restart_required", "rollback_complete", "cancelled"].includes(phase)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(current.transactionId || "")
+    || typeof current.backupId !== "string" || !current.backupId || current.backupId.length > 128
+    || !current.restoreAudit || typeof current.restoreAudit !== "object"
+    || typeof current.restoreAudit.requestedAt !== "string"
+    || !Number.isFinite(Date.parse(current.restoreAudit.requestedAt))) {
+    throw new Error("Invalid strict restore audit coordinator state");
+  }
+  const actor = current.restoreAudit.actor;
+  if (!actor || typeof actor.username !== "string" || !actor.username || actor.username.length > 128
+    || !["string", "object"].includes(typeof actor.role)
+    || typeof actor.ip !== "object" && typeof actor.ip !== "string"
+    || typeof actor.userAgent !== "object" && typeof actor.userAgent !== "string") {
+    throw new Error("Invalid strict restore audit actor");
+  }
+  const completed = phase === "restart_required";
+  const log = {
+    id: `restore-outcome-${current.transactionId}`,
+    timestamp: completed ? current.completedAt : current.restoreAudit.requestedAt,
+    eventType: completed ? "backup.restore.completed" : "backup.restore.failed",
+    severity: completed ? "critical" : "error",
+    actor,
+    target: { type: "backup", id: current.backupId },
+    action: "restore",
+    result: completed ? "success" : "failure",
+    details: completed
+      ? { preRestoreBackupId: current.preRestoreBackupId, restartRecommended: true }
+      : { error: "restore_not_committed", phase },
+  };
+  if (!Number.isFinite(Date.parse(log.timestamp || ""))) throw new Error("Invalid strict restore audit timestamp");
+  const serialized = JSON.stringify(log);
+  if (Buffer.byteLength(serialized) > 64 * 1024) throw new Error("Strict restore audit entry too large");
+  // Verify the authoritative main table before accepting an ID into the
+  // sidecar. Never loosen the main SQLite write reservation for this event.
+  const main = getDb().prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+    target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`).get(log.id);
+  if (main && !sameAuditEvidence(rowToLog(main), log, true)) {
+    throw new Error("Strict restore audit identity collision");
+  }
+  return withPendingAuditDb((db) => db.transaction(() => {
+    const latest = JSON.parse(fs.readFileSync(filename, "utf8"));
+    if (latest.transactionId !== current.transactionId || latest.phase !== phase) {
+      throw new Error("Strict restore audit coordinator changed during persistence");
+    }
+    const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?").get(log.id);
+    const archived = db.prepare("SELECT event FROM archived_audit WHERE id=?").get(log.id);
+    for (const prior of [pending, archived]) {
+      if (prior && !sameAuditEvidence(JSON.parse(prior.event), log)) {
+        throw new Error("Strict restore audit identity collision");
+      }
+    }
+    if (pending || archived || main) return log.id;
+    if (db.prepare("SELECT COUNT(*) AS count FROM pending_audit").get().count >= MAX_DEFERRED_AUDITS) {
+      throw new Error("Strict restore outcome journal capacity exhausted");
+    }
+    db.prepare("INSERT INTO pending_audit (id,event) VALUES (?,?)").run(log.id, serialized);
+    return log.id;
+  })());
+}
+
 function deferIfStrictSyncWriter(log) {
   try {
     assertNoLocalStrictSyncWriter();
@@ -650,4 +725,4 @@ function saveAuditLogs(entries = {}) {
 
 module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter,
   preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs,
-  normalizeMainAuditLog, loadAllAuditEvidenceForRestore, rowToLog };
+  normalizeMainAuditLog, loadAllAuditEvidenceForRestore, persistTerminalRestoreAudit, rowToLog };

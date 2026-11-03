@@ -92,6 +92,7 @@ function registerBackupRoutes(app, context) {
       const result = await restoreService.restoreBackup(req.params.id, {
         confirmation: req.body?.confirmation,
         username: req.user.username,
+        auditActor: getAuditActor(req),
         waitForRequestQuiescence: () => waitForRequestQuiescence(req.rootarkRestoreRequestLease),
         revalidateAuthorization: async () => {
           const authorizationFailure = await revalidateBackupAccess(req);
@@ -103,10 +104,15 @@ function registerBackupRoutes(app, context) {
           }
         },
       });
-      auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
-        preRestoreBackupId: result.preRestore.id,
-        restartRecommended: result.restartRecommended,
-      });
+      // In strict SQLite the service has durably recorded the terminal event
+      // in the private sidecar under its coordinator before returning. The
+      // regular audit writer must stay blocked until all instances restart.
+      if (!result.restoreOutcomeRecorded) {
+        auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
+          preRestoreBackupId: result.preRestore.id,
+          restartRecommended: result.restartRecommended,
+        });
+      }
       res.json({
         message: "Backup restaurado",
         backup: result.backup,
@@ -115,11 +121,16 @@ function registerBackupRoutes(app, context) {
       });
     } catch (error) {
       const restorePhase = restoreService.getWholeRestorePhase?.() || null;
-      auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
-        error: restorePhase ? "restore_recovery_pending" : error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
-        phase: restorePhase,
-        cleanupPending: Boolean(error.authorizationCleanupPending),
-      });
+      // A pending whole-restore marker also fences all ordinary audit writes.
+      // Failed outcomes survive in that coordinator and are committed only
+      // AFTER rollback restores the original sidecar. Never emit a false
+      // failed event for a restore already committed as restart_required.
+      if (!restorePhase && !error.restoreOutcomeRecorded) {
+        auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
+          error: error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
+          cleanupPending: Boolean(error.authorizationCleanupPending),
+        });
+      }
       if (restorePhase === "restart_required") {
         res.status(503).json({
           error: "Backup restaurado, mas a limpeza temporária falhou. Reinicie todas as instâncias; o serviço tentará remover a área temporária antes de aceitar novas solicitações.",

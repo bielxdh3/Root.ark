@@ -133,6 +133,32 @@ function restoreInstanceId(requiredInstances, explicitInstanceId) {
   return instanceId;
 }
 
+function restoreAuditContext(options) {
+  const input = options.auditActor || {};
+  const clean = (value, max) => typeof value === "string"
+    ? value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, max) : null;
+  return {
+    requestedAt: new Date().toISOString(),
+    actor: {
+      username: clean(options.username, 120) || clean(input.username, 120) || "system",
+      role: clean(input.role, 80),
+      ip: clean(input.ip, 120),
+      userAgent: clean(input.userAgent, 300),
+    },
+  };
+}
+
+function persistWholeRestoreTerminalAudit(coordinator) {
+  if (!isDbEnabled() || !coordinator?.restoreAudit) return false;
+  const mainPath = getDatabasePath();
+  // The post-restore main SQLite write barrier also applies before strict
+  // enrollment. A fresh private FULL sidecar is valid in that case, and the
+  // ordinary loader already merges its pending records on the next restart.
+  if (!fs.existsSync(mainPath)) return false;
+  auditRepository.persistTerminalRestoreAudit(coordinator);
+  return true;
+}
+
 function requiresProviderOrphanPolicyAtStartup(startupState) {
   if (!startupState?.restartRequired) return false;
   const coordinator = startupState.coordinator || {};
@@ -149,7 +175,7 @@ function assertWholeRestorePersistenceMode(coordinator) {
   }
 }
 
-function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], providerPolicyRequired = false, phase = "preparing" }) {
+function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], providerPolicyRequired = false, phase = "preparing", restoreAudit = null }) {
   return writeWholeRestoreCoordinator({
     version: WHOLE_RESTORE_COORDINATOR_VERSION,
     transactionId: crypto.randomUUID(),
@@ -159,6 +185,7 @@ function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, pr
     preRestoreBackupId: preRestoreBackupId == null ? null : String(preRestoreBackupId),
     providerReconciliation,
     providerPolicyRequired: Boolean(providerPolicyRequired),
+    ...(restoreAudit ? { restoreAudit } : {}),
     startedAt: new Date().toISOString(),
   });
 }
@@ -559,7 +586,8 @@ function assertNoPendingWholeRestore(options = {}) {
       const current = readWholeRestoreCoordinator();
       if (!current || current.transactionId !== coordinator.transactionId || current.phase !== "preparing") throw new Error("Whole-restore preparation changed during startup");
       cleanupWholeRestorePreimages(current.transactionId);
-      completeWholeRestoreCoordinator(current);
+      const cancelled = updateWholeRestoreCoordinator(current, { phase: "cancelled" });
+      completeWholeRestoreCoordinator(cancelled);
       return { recovered: true, reason: "incomplete_preimage_preparation" };
     } finally { release(); }
   }
@@ -588,6 +616,11 @@ function completeWholeRestoreCoordinator(expectedCoordinator = null) {
   if (!/^[a-f0-9-]{36}$/i.test(String(current.transactionId || ""))) {
     throw new Error("Whole-restore coordinator is ambiguous; startup blocked for manual recovery");
   }
+  // The coordinator remains durable until the final audit is in the FULL
+  // sidecar. On rollback this runs after the original SQLite pre-images are
+  // restored; on restart_required it confirms the committed outcome. A crash
+  // during cleanup retries the same deterministic event without duplication.
+  persistWholeRestoreTerminalAudit(current);
   cleanupRestoreExtraction(current.backupId);
   const ackDirectory = path.join(WHOLE_RESTORE_ACK_ROOT, current.transactionId);
   fs.rmSync(ackDirectory, { recursive: true, force: true });
@@ -2850,7 +2883,8 @@ async function restoreBackup(id, options = {}) {
     const { backup, archivePath } = backupService.getBackupOrThrow(id);
     const staging = restoreExtractionPaths(backup.id, { createRoot: true });
     restoreDir = staging.restoreDir;
-    coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances });
+    coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances,
+      restoreAudit: restoreAuditContext(options) });
     await options.waitForRequestQuiescence?.();
     await options.revalidateAuthorization?.();
     let providerInventory = null;
@@ -3006,12 +3040,14 @@ async function restoreBackup(id, options = {}) {
       selectedBackup: restoredBackup,
       preRestoreBackup: preRestore,
     });
+    const restoreOutcomeRecorded = persistWholeRestoreTerminalAudit(coordinator);
     injectFailure("restore.commit-marker.persisted");
     return {
       backup: restoredBackup,
       manifest,
       preRestore,
       restartRecommended: true,
+      restoreOutcomeRecorded,
       cloudSync,
     };
   } catch (error) {
@@ -3024,6 +3060,8 @@ async function restoreBackup(id, options = {}) {
         }
         const cancelledCoordinator = updateWholeRestoreCoordinator(activeCoordinator, { phase: "cancelled" });
         completeWholeRestoreCoordinator(cancelledCoordinator);
+        error.restoreOutcomeRecorded = Boolean(isDbEnabled()
+          && fs.existsSync(getDatabasePath()) && strictAudit.inspectPrimary(getDatabasePath()));
       }
       catch (cleanupError) {
         error.coordinatorCleanupError = cleanupError;

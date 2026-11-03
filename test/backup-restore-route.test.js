@@ -115,10 +115,8 @@ test("committed restore cleanup failure returns restart-required service unavail
   assert.equal(response.body.restartRequired, true);
   assert.equal(response.body.cleanupPending, true);
   assert.match(response.body.error, /limpeza temporária falhou/);
-  assert.equal(auditEvents.at(-1)[0], "backup.restore.failed");
-  assert.equal(auditEvents.at(-1)[4], "failure");
-  assert.equal(auditEvents.at(-1)[5].error, "restore_recovery_pending");
-  assert.equal(JSON.stringify(auditEvents.at(-1)[5]).includes("injected staging cleanup failure"), false);
+  assert.deepEqual(auditEvents.map(([type]) => type), ["backup.restore.started"],
+    "a committed restore must never emit a forged failure audit while its coordinator remains active");
 });
 
 test("backup restore revalidates current authorization after request quiescence", async (t) => {
