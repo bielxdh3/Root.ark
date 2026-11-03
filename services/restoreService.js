@@ -155,6 +155,22 @@ function persistWholeRestoreTerminalAudit(coordinator) {
   // enrollment. A fresh private FULL sidecar is valid in that case, and the
   // ordinary loader already merges its pending records on the next restart.
   if (!fs.existsSync(mainPath)) return false;
+  // Legacy/disposable SQLite databases can predate the audit_logs table.
+  // They must still be recoverable after a whole-restore interruption; do
+  // not create a brand-new table inside the protected restore barrier. An
+  // enrolled strict authority missing its table is instead a hard failure.
+  const probe = new Database(mainPath, { readonly: true, fileMustExist: true });
+  try {
+    const auditTable = probe.prepare("SELECT type FROM sqlite_master WHERE name='audit_logs'").get();
+    const strictMarker = probe.prepare("SELECT type FROM sqlite_master WHERE name='rootark_strict_sync_audit_mode'").get();
+    if (auditTable?.type !== undefined && auditTable.type !== "table") {
+      throw Error("Unexpected SQLite audit authority type during restore");
+    }
+    if (!auditTable) {
+      if (strictMarker) throw Error("Strict SQLite restore is missing its audit authority");
+      return false;
+    }
+  } finally { probe.close(); }
   auditRepository.persistTerminalRestoreAudit(coordinator);
   return true;
 }

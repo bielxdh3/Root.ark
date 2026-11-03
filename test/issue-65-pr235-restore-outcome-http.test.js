@@ -25,7 +25,9 @@ for (const { injectFailure, strictMode, beforeMutation = false } of [
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   const script = `
     const assert=require('node:assert/strict'),fs=require('node:fs'),http=require('node:http');
-    const express=require('express');
+    // The disposable cwd has no node_modules. Resolve the real checkout's
+    // dependency before spawning, rather than relying on NODE_PATH in CI.
+    const express=require(${JSON.stringify(require.resolve("express"))});
     const {runMigrations}=require(${JSON.stringify(path.join(project,"db","migrations"))});
     const {createSyncSqliteAccountWriteFence}=require(${JSON.stringify(path.join(project,"src","services","syncSqliteAccountWriteFence"))});
     const backup=require(${JSON.stringify(path.join(project,"services","backupService"))});
