@@ -154,6 +154,14 @@ class Zk1V2CheckpointFloorHttpsClient {
           response.resume();
           return done(new Error("denied"));
         }
+        // A peer can send 200 + partial JSON and close before `end`. The
+        // request itself may already be destroyed, so only observing its
+        // `error` cannot settle the caller. Reject every incomplete response.
+        response.once("error", done);
+        response.once("aborted", () => done(new Error("truncated response")));
+        response.once("close", () => {
+          if (!response.complete) done(new Error("incomplete response"));
+        });
         const chunks = [];
         let count = 0;
         response.on("data", (chunk) => {
@@ -166,8 +174,11 @@ class Zk1V2CheckpointFloorHttpsClient {
           catch (error) { done(error); }
         });
       });
-      const deadline = setTimeout(() => request.destroy(
-        new Error("ZK_V2_REMOTE_FLOOR_UNAVAILABLE")), this.#tls.timeoutMs);
+      const deadline = setTimeout(() => {
+        // A destroyed request need not emit another error: reject explicitly.
+        done(new Error("ZK_V2_REMOTE_FLOOR_UNAVAILABLE"));
+        request.destroy();
+      }, this.#tls.timeoutMs);
       request.on("error", done);
       request.end(payload);
     });
