@@ -2356,7 +2356,8 @@
           if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)) fail();
           secret = await fileBytes("secret", 32, 32);
           const resumed = await window.RootarkZk1RecoverableWorkspace.resumePendingProtectedFile({
-            ...common, recoverySecret: secret, objectId,
+            ...common, clockSeconds: () => Math.floor(Date.now() / 1000),
+            recoverySecret: secret, objectId,
             journal: window.RootarkZk1RecoverablePendingJournal.openStore(indexedDB),
           });
           assertLive();
@@ -2454,7 +2455,8 @@
           if (action === "upload-recoverable") {
             secret = await fileBytes("secret", 32, 32);
             const result = await window.RootarkZk1RecoverableWorkspace.createRecoverableProtectedFile({
-              ...common, recoverySecret: secret, metadata,
+              ...common, clockSeconds: () => Math.floor(Date.now() / 1000),
+              recoverySecret: secret, metadata,
               name: selected.name, mediaType: selected.type || "", data,
               journal: window.RootarkZk1RecoverablePendingJournal.openStore(indexedDB),
             });

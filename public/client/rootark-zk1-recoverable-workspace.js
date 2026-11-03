@@ -33,6 +33,29 @@
       "ownerRootCheckpoint", "previousOwnerHistoryProof"];
     const b64re = /^[A-Za-z0-9_-]+$/;
     function deny() { throw new Error("ZK_RECOVERABLE_WORKSPACE_DENIED"); }
+    // A browser operation can span IndexedDB durability, tab suspension or a
+    // cold resume. A caller's initial time is only the lower bound, not the
+    // timestamp to reuse on every later signed HTTP request.
+    function operationClock(input) {
+      const supplied = Object.hasOwn(input, "clockSeconds") ? input.clockSeconds : null;
+      if (supplied !== null && typeof supplied !== "function") deny();
+      const originMs = Date.now();
+      if (!Number.isSafeInteger(originMs) || originMs < 0) deny();
+      let lastMs = originMs;
+      let lastSeconds = input.nowSeconds;
+      return () => {
+        const nowMs = Date.now();
+        if (!Number.isSafeInteger(nowMs) || nowMs < lastMs) deny();
+        lastMs = nowMs;
+        const current = supplied === null
+          ? input.nowSeconds + Math.floor((nowMs - originMs) / 1000)
+          : supplied();
+        if (!Number.isSafeInteger(current) || current < lastSeconds
+          || current < input.nowSeconds || current < 1) deny();
+        lastSeconds = current;
+        return current;
+      };
+    }
     function exact(value, fields) {
       if (!value || typeof value !== "object" || Array.isArray(value)
         || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -86,13 +109,24 @@
       // offline-provisioned monotonic floor before sending protected requests.
       if (typeof window === "object") await floor.assertCurrent(anchor(input));
     }
-    function signer(input) {
+    function signer(input, nowSeconds) {
       const grant = input.signedDeviceGrant;
       return { signerKey: input.devicePrivateKey,
         scope: Object.fromEntries(scopeKeys.map((key) => [key, grant[key]])),
         deviceId: grant.device_id, manifestRevision: input.pinnedCurrentHead.revision,
         manifestDigest: input.pinnedCurrentHead.digest,
-        epoch: input.pinnedCurrentHead.epoch, nowSeconds: input.nowSeconds };
+        epoch: input.pinnedCurrentHead.epoch, nowSeconds };
+    }
+    async function freshlySigned(input, clock, fields) {
+      // A browser may sleep even inside async WebCrypto; expiry must be
+      // rechecked after signing. Limit retries if it remains suspended.
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const issuedAt = clock();
+        const signed = await http.signProtectedContentOperation({
+          ...signer(input, issuedAt), ...fields });
+        if (clock() - issuedAt < 25) return signed;
+      }
+      deny();
     }
     async function verifiedJournal(input, bundle, secret, signed) {
       const candidate = input.journal;
@@ -112,14 +146,14 @@
       if (check?.encryptedJournalReadbackVerified !== true
         || JSON.stringify(check.bundle) !== JSON.stringify(bundle)) deny();
     }
-    async function signedReadback(input, bundle, secret, digest, root) {
-      const signedGet = await http.signProtectedContentOperation({
-        ...signer(input), operation: "get", objectId: bundle.metadata.object_id,
+    async function signedReadback(input, clock, bundle, secret, digest, root) {
+      await floor.verifyExternalAnchor(anchor(input));
+      if (typeof window === "object") await floor.assertCurrent(anchor(input));
+      const signedGet = await freshlySigned(input, clock, {
+        operation: "get", objectId: bundle.metadata.object_id,
         expectedObjectRevision: bundle.objectRevision,
         expectedCiphertextDigest: digest, ciphertext: null,
       });
-      await floor.verifyExternalAnchor(anchor(input));
-      if (typeof window === "object") await floor.assertCurrent(anchor(input));
       const read = await http.postProtectedCiphertextBackupRead({
         origin: input.origin, request: signedGet, fetchImpl: input.fetchImpl,
         expectedObjectRevision: bundle.objectRevision,
@@ -135,8 +169,11 @@
     async function createRecoverableProtectedFile(input) {
       let secret, ciphertext;
       try {
-        exact(input, Object.hasOwn(input || {}, "previousOwnerHistoryProof")
-          ? [...upload, "previousOwnerHistoryProof"] : upload);
+        exact(input, [...upload,
+          ...(Object.hasOwn(input, "clockSeconds") ? ["clockSeconds"] : []),
+          ...(Object.hasOwn(input, "previousOwnerHistoryProof")
+            ? ["previousOwnerHistoryProof"] : [])]);
+        const clock = operationClock(input);
         secret = raw(input.recoverySecret, 32);
         await validate(input, input.metadata);
         if (input.metadata.epoch !== input.pinnedCurrentHead.epoch
@@ -155,14 +192,49 @@
         const root = decode(bundle.ciphertextRoot, 32);
         // Generate one signed operation nonce before recording the intent; the
         // exact signed nonce/signature are authenticated by the pre-PUT journal.
-        const signed = await http.signProtectedContentOperation({
-          ...signer(input), operation: "put", objectId: input.metadata.object_id,
+        const putFields = { operation: "put", objectId: input.metadata.object_id,
           expectedObjectRevision: null, ciphertext,
-        });
+        };
+        let signed = await freshlySigned(input, clock, putFields);
         // No PUT is permitted until encrypted local intent is committed with
         // strict IndexedDB durability and independently read back/decrypted.
         // Browser storage eviction / OS crash protection remains unproven.
         await verifiedJournal(input, bundle, secret, signed);
+        // Journal encryption/strict IDB may exceed the 45-second signature
+        // validity. Rebind the exact new nonce/signature with a strict CAS and
+        // authenticated readback before the first, and only, PUT attempt.
+        let ready = false;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const now = clock();
+          if (Number.isSafeInteger(signed.authorization?.issued_at)
+            && signed.authorization.issued_at <= now
+            && now - signed.authorization.issued_at < 25) {
+            ready = true;
+            break;
+          }
+          const next = await freshlySigned(input, clock, putFields);
+          if (typeof input.journal.rebindBeforePut !== "function") deny();
+          const saved = await input.journal.rebindBeforePut({
+            recoverySecret: secret, bundle,
+            previousOperationId: signed.authorization.nonce,
+            previousOperationSignature: signed.signatureBase64,
+            operationId: next.authorization.nonce,
+            operationSignature: next.signatureBase64,
+          });
+          if (saved.strictTransactionCompleted !== true
+            || saved.encryptedJournalReadbackVerified !== true
+            || saved.objectId !== bundle.metadata.object_id) deny();
+          signed = next;
+        }
+        if (!ready || typeof input.journal.beginPut !== "function") deny();
+        const sending = await input.journal.beginPut({ recoverySecret: secret,
+          bundle,
+          operationId: signed.authorization.nonce,
+          operationSignature: signed.signatureBase64 });
+        if (sending.strictTransactionCompleted !== true
+          || sending.encryptedJournalReadbackVerified !== true
+          || sending.objectId !== bundle.metadata.object_id
+          || clock() - signed.authorization.issued_at >= 25) deny();
         // A disconnected HTTP ACK says nothing about whether the server
         // committed the immutable version. Never repeat PUT: reconcile by the
         // same exact revision/digest/root signed historical GET below, and
@@ -173,7 +245,7 @@
             origin: input.origin, request: signed, fetchImpl: input.fetchImpl,
           });
         } catch (_) { lostPutAck = true; }
-        await signedReadback(input, bundle, secret, digest, root);
+        await signedReadback(input, clock, bundle, secret, digest, root);
         return Object.freeze({ bundle, objectId: input.metadata.object_id,
           ciphertextRoot: bundle.ciphertextRoot,
           clientReadbackVerified: true, lostPutAckReconciled: lostPutAck,
@@ -190,9 +262,12 @@
     async function resumePendingProtectedFile(input) {
       let secret, ciphertext;
       try {
-        exact(input, Object.hasOwn(input || {}, "previousOwnerHistoryProof")
-          ? [...resume, "previousOwnerHistoryProof"] : resume);
+        exact(input, [...resume,
+          ...(Object.hasOwn(input, "clockSeconds") ? ["clockSeconds"] : []),
+          ...(Object.hasOwn(input, "previousOwnerHistoryProof")
+            ? ["previousOwnerHistoryProof"] : [])]);
         secret = raw(input.recoverySecret, 32);
+        const clock = operationClock(input);
         if (typeof input.journal?.load !== "function"
           || typeof input.objectId !== "string") deny();
         const saved = await input.journal.load({ recoverySecret: secret,
@@ -221,7 +296,7 @@
         if (digest.some((value, i) => value !== decode(bundle.ciphertextSha256, 32)[i])) deny();
         // Deliberately GET-ONLY; the pending intent may have been committed,
         // refused or interrupted before it ever reached the server.
-        await signedReadback(input, bundle, secret, digest, root);
+        await signedReadback(input, clock, bundle, secret, digest, root);
         return Object.freeze({ bundle, objectId: input.objectId,
           ciphertextRoot: bundle.ciphertextRoot,
           clientReadbackVerified: true, resumedSignedGetOnly: true,

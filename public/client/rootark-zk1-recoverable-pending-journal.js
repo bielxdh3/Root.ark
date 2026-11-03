@@ -13,7 +13,8 @@
   // Keep after uncertain GET and browser restart; never retry an ambiguous PUT.
   const DB = "rootark-zk1-recoverable-pending-v1";
   const STORE = "sealed-intents";
-  const FORMAT = "rootark-zk1-recoverable-pending/v1";
+  const LEGACY_FORMAT = "rootark-zk1-recoverable-pending/v1";
+  const FORMAT = "rootark-zk1-recoverable-pending/v2";
   const DOMAIN = "Root.ark/zk-1/recoverable-pending-journal/v1\0";
   const encode = new TextEncoder();
   const decode = new TextDecoder("utf-8", { fatal: true });
@@ -60,7 +61,8 @@
       ownerSpkiSha256: row.ownerSpkiSha256,
       manifestRevision: row.manifestRevision, manifestDigest: row.manifestDigest,
       epoch: row.epoch, ownerHistorySequence: row.ownerHistorySequence,
-      ciphertextSha256: row.ciphertextSha256, ciphertextRoot: row.ciphertextRoot }));
+      ciphertextSha256: row.ciphertextSha256, ciphertextRoot: row.ciphertextRoot,
+      ...(row.schema === FORMAT ? { phase: row.phase } : {}) }));
   }
   async function key(secret, salt, aad) {
     const imported = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]);
@@ -80,11 +82,15 @@
     return bundle.metadata;
   }
   function record(value) {
+    const isCurrent = value?.schema === FORMAT;
     exact(value, ["schema", "operationId", "operationSignature",
       "objectId", "versionId", "ownerSpkiSha256",
       "manifestRevision", "manifestDigest", "epoch", "ownerHistorySequence",
-      "ciphertextSha256", "ciphertextRoot", "salt", "iv", "sealed"]);
-    if (value.schema !== FORMAT || !ID.test(value.objectId) || !ID.test(value.versionId)
+      "ciphertextSha256", "ciphertextRoot", "salt", "iv", "sealed",
+      ...(isCurrent ? ["phase"] : [])]);
+    if (![FORMAT, LEGACY_FORMAT].includes(value.schema)
+      || (isCurrent && !["prepared", "sending"].includes(value.phase))
+      || !ID.test(value.objectId) || !ID.test(value.versionId)
       || !Number.isSafeInteger(value.manifestRevision) || value.manifestRevision < 1
       || !Number.isSafeInteger(value.epoch) || value.epoch < 1
       || (value.ownerHistorySequence !== null && (!Number.isSafeInteger(value.ownerHistorySequence)
@@ -99,7 +105,10 @@
   }
   function openStore(indexedDBImpl = typeof indexedDB === "object" ? indexedDB : undefined) {
     if (typeof indexedDBImpl?.open !== "function") deny();
-    async function transact(mode, task) {
+    // Only this live store may renew an intent it prepared, and only before
+    // beginning the first PUT. Reloading a journal never grants that ability.
+    const prePut = new Map();
+    async function transact(mode, task, afterRead = null) {
       let db;
       try {
         db = await new Promise((resolve, reject) => {
@@ -118,8 +127,16 @@
               : db.transaction(STORE, mode, { durability: "strict" });
             // Unsupported/relaxed strict transaction MUST NOT allow PUT.
             if (mode === "readwrite" && tx.durability !== "strict") { tx.abort(); deny(); }
-            const request = task(tx.objectStore(STORE));
-            request.onsuccess = () => { result = request.result; };
+            const objectStore = tx.objectStore(STORE);
+            const request = task(objectStore);
+            request.onsuccess = () => {
+              if (!afterRead) { result = request.result; return; }
+              try {
+                const update = afterRead(objectStore, request.result);
+                update.onsuccess = () => { result = update.result; };
+                update.onerror = () => tx.abort();
+              } catch (_) { tx.abort(); }
+            };
             tx.oncomplete = () => resolve(result);
             tx.onerror = tx.onabort = () => reject(Error("transaction"));
           } catch (error) { reject(error); }
@@ -136,7 +153,8 @@
           const meta = metadata(bundle);
           const pinned = head(pinnedCurrentHead);
           if (pinned.epoch !== meta.epoch) deny();
-          const row = { schema: FORMAT, operationId, operationSignature,
+          const row = { schema: FORMAT, phase: "prepared",
+            operationId, operationSignature,
             objectId: meta.object_id,
             versionId: meta.version_id, ownerSpkiSha256: b64(bytes(ownerSpkiSha256, 32)),
             manifestRevision: pinned.revision, manifestDigest: pinned.digest,
@@ -156,9 +174,103 @@
           await transact("readwrite", (os) => os.add(row, row.objectId));
           const recovered = await store.load({ recoverySecret: secret, objectId: row.objectId });
           if (JSON.stringify(recovered.bundle) !== JSON.stringify(bundle)) deny();
+          prePut.set(row.objectId, { operationId, operationSignature,
+            state: "prepared" });
           return Object.freeze({ objectId: row.objectId, strictTransactionCompleted: true,
             encryptedJournalReadbackVerified: true, independentPhysicalDurabilityProven: false });
         } catch (_) { deny(); }
+        finally { secret?.fill(0); plaintext?.fill(0); sealed?.fill(0); }
+      },
+      async rebindBeforePut({ recoverySecret, bundle, previousOperationId,
+        previousOperationSignature, operationId, operationSignature }) {
+        let secret, plaintext, sealed;
+        try {
+          secret = bytes(recoverySecret, 32);
+          const objectId = metadata(bundle).object_id;
+          const pending = prePut.get(objectId);
+          if (!pending || pending.state !== "prepared"
+            || pending.operationId !== previousOperationId
+            || pending.operationSignature !== previousOperationSignature) deny();
+          pending.state = "rebinding";
+          from64(operationId, 32); from64(operationSignature, 64);
+          if (operationId === previousOperationId) deny();
+          const loaded = await store.load({ recoverySecret: secret, objectId });
+          if (JSON.stringify(loaded.bundle) !== JSON.stringify(bundle)) deny();
+          const previous = record(await transact("readonly", (os) => os.get(objectId)));
+          if (previous.schema !== FORMAT || previous.phase !== "prepared"
+            || previous.operationId !== previousOperationId
+            || previous.operationSignature !== previousOperationSignature) deny();
+          const next = { ...previous, operationId, operationSignature,
+            salt: b64(crypto.getRandomValues(new Uint8Array(32))),
+            iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
+          plaintext = encode.encode(JSON.stringify(bundle));
+          const aad = context(next);
+          const sealingKey = await key(secret, from64(next.salt, 32), aad);
+          sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM",
+            iv: from64(next.iv, 12), additionalData: aad, tagLength: 128 }, sealingKey, plaintext));
+          next.sealed = b64(sealed);
+          record(next);
+          // One strict transaction: compare the exact old signed intent,
+          // then replace only this same object. Never overwrite a concurrent intent.
+          await transact("readwrite", (os) => os.get(objectId), (os, current) => {
+            if (JSON.stringify(record(current)) !== JSON.stringify(previous)) deny();
+            return os.put(next, objectId);
+          });
+          const readback = await store.load({ recoverySecret: secret, objectId });
+          const bound = record(await transact("readonly", (os) => os.get(objectId)));
+          if (JSON.stringify(readback.bundle) !== JSON.stringify(bundle)
+            || bound.operationId !== operationId
+            || bound.operationSignature !== operationSignature
+            || JSON.stringify(bound) !== JSON.stringify(next)) deny();
+          prePut.set(objectId, { operationId, operationSignature,
+            state: "prepared" });
+          return Object.freeze({ strictTransactionCompleted: true,
+            encryptedJournalReadbackVerified: true, objectId });
+        } catch (_) { prePut.delete(bundle?.metadata?.object_id); deny(); }
+        finally { secret?.fill(0); plaintext?.fill(0); sealed?.fill(0); }
+      },
+      async beginPut({ recoverySecret, bundle, operationId, operationSignature }) {
+        let secret, plaintext, sealed;
+        const objectId = bundle?.metadata?.object_id;
+        const pending = prePut.get(objectId);
+        if (!pending || pending.state !== "prepared"
+          || pending.operationId !== operationId
+          || pending.operationSignature !== operationSignature) deny();
+        // Claim the live session synchronously: an in-flight rebind cannot
+        // race ahead of the final network request while we durably mark sent.
+        pending.state = "sending";
+        try {
+          secret = bytes(recoverySecret, 32);
+          if (metadata(bundle).object_id !== objectId) deny();
+          const loaded = await store.load({ recoverySecret: secret, objectId });
+          if (JSON.stringify(loaded.bundle) !== JSON.stringify(bundle)) deny();
+          const previous = record(await transact("readonly", (os) => os.get(objectId)));
+          if (previous.schema !== FORMAT || previous.phase !== "prepared"
+            || previous.operationId !== operationId
+            || previous.operationSignature !== operationSignature) deny();
+          const next = { ...previous, phase: "sending",
+            salt: b64(crypto.getRandomValues(new Uint8Array(32))),
+            iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
+          plaintext = encode.encode(JSON.stringify(bundle));
+          const aad = context(next);
+          const sealingKey = await key(secret, from64(next.salt, 32), aad);
+          sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM",
+            iv: from64(next.iv, 12), additionalData: aad, tagLength: 128 }, sealingKey, plaintext));
+          next.sealed = b64(sealed);
+          record(next);
+          await transact("readwrite", (os) => os.get(objectId), (os, current) => {
+            if (JSON.stringify(record(current)) !== JSON.stringify(previous)) deny();
+            return os.put(next, objectId);
+          });
+          const readback = await store.load({ recoverySecret: secret, objectId });
+          const bound = record(await transact("readonly", (os) => os.get(objectId)));
+          if (JSON.stringify(readback.bundle) !== JSON.stringify(bundle)
+            || bound.phase !== "sending"
+            || JSON.stringify(bound) !== JSON.stringify(next)) deny();
+          prePut.delete(objectId);
+          return Object.freeze({ strictTransactionCompleted: true,
+            encryptedJournalReadbackVerified: true, objectId });
+        } catch (_) { prePut.delete(objectId); deny(); }
         finally { secret?.fill(0); plaintext?.fill(0); sealed?.fill(0); }
       },
       async load({ recoverySecret, objectId }) {
@@ -188,6 +300,7 @@
             revision: row.manifestRevision, digest: row.manifestDigest,
             epoch: row.epoch, ownerHistorySequence: row.ownerHistorySequence,
             ownerSpkiSha256: row.ownerSpkiSha256 }),
+            putAttempted: row.schema === FORMAT && row.phase === "sending",
             encryptedJournalReadbackVerified: true, authorizesProductionIo: false });
         } catch (_) { deny(); }
         finally { secret?.fill(0); plaintext?.fill(0); opened?.data?.fill(0); }

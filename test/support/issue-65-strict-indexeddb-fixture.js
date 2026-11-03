@@ -6,10 +6,14 @@ function strictIndexedDB({ refuseStrict = false, failCommit = false,
   cloneOnRead = (value) => value } = {}) {
   const values = new Map();
   const names = { contains: (name) => name === "sealed-intents" || initialized };
-  let initialized = false, writes = 0;
+  let initialized = false, writes = 0, gets = 0;
+  let rejectStrict = refuseStrict;
+  let onGet = null;
   const schedule = (fn) => setImmediate(fn);
   const result = {
     values, get writes() { return writes; },
+    setRefuseStrict(value) { rejectStrict = value; },
+    setOnGet(callback) { onGet = callback; },
     open() {
       const request = {};
       schedule(() => {
@@ -20,7 +24,7 @@ function strictIndexedDB({ refuseStrict = false, failCommit = false,
             let dead = false;
             const strict = opts?.durability === "strict";
             const tx = {
-              durability: mode === "readwrite" && strict && !refuseStrict ? "strict" : "default",
+              durability: mode === "readwrite" && strict && !rejectStrict ? "strict" : "default",
               abort() { dead = true; schedule(() => tx.onabort?.()); },
               objectStore() {
                 const enqueue = (action) => {
@@ -41,9 +45,17 @@ function strictIndexedDB({ refuseStrict = false, failCommit = false,
                   return req;
                 };
                 return {
-                  get(key) { return enqueue(() => cloneOnRead(values.get(key))); },
+                  get(key) { return enqueue(() => {
+                    gets++;
+                    onGet?.(key, gets, values);
+                    return cloneOnRead(values.get(key));
+                  }); },
                   add(value, key) { return enqueue(() => {
                     if (values.has(key)) throw Error("unique conflict");
+                    values.set(key, structuredClone(value)); writes++; return key;
+                  }); },
+                  put(value, key) { return enqueue(() => {
+                    if (!values.has(key)) throw Error("missing predecessor");
                     values.set(key, structuredClone(value)); writes++; return key;
                   }); },
                   getAllKeys() { return enqueue(() => [...values.keys()]); },
