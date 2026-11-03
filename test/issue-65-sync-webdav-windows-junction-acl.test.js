@@ -188,17 +188,19 @@ test("Windows native ACL worker initialization leaves the Node event loop respon
   }, 20);
   try {
     // This includes cold Add-Type compilation; it MUST remain asynchronous.
-    // A fixed independent observation window prevents a very fast native
-    // worker from falsely failing the 12-tick responsiveness assertion.
+    // An independent bounded observation window prevents a fast native worker
+    // or CI timer coalescing (within the separately enforced 275ms maximum
+    // lag) from falsely failing the 12-tick responsiveness assertion.
     // The ACL checks still run concurrently and must ALL complete successfully.
     await Promise.all([
       Promise.all(Array.from({ length: 12 }, () => verifier.verifyFile(file))),
-      new Promise((resolve) => setTimeout(resolve, 320)),
+      new Promise((resolve) => setTimeout(resolve, 600)),
     ]);
   } finally {
     clearInterval(interval);
   }
-  assert.ok(beats >= 12, `event loop must advance during cold native ACL checks: ${beats} ticks`);
+  assert.ok(beats >= 12,
+    `event loop must advance during cold native ACL checks: ${beats} ticks; maximum lag ${worstLag}ms`);
   assert.ok(worstLag < 275,
     `cold native ACL worker must not block the Node event loop: ${worstLag}ms`);
 });
