@@ -28,6 +28,21 @@ test("scheduler validates time and preserves explicit UTC scheduling", async (t)
     scheduleAutomaticBackups({ env: {}, cron: { schedule: (_expr, fn) => { callback = fn; return { stop() {} }; } }, createBackup: async () => { throw new Error("failed"); }, auditLog: (...args) => events.push(args) });
     await callback(); assert.equal(events[0][0], "backup.failed");
   });
+  await t.test("restore-paused automatic backup does not emit a false backup.failed event", async () => {
+    let callback; const events = [];
+    const task = scheduleAutomaticBackups({
+      env: {},
+      cron: { schedule: (_expr, fn) => { callback = fn; return { stop() {} }; } },
+      createBackup: async () => {
+        throw Object.assign(new Error("restore in progress"), { code: "BACKUP_PAUSED_DURING_RESTORE" });
+      },
+      auditLog: (...args) => events.push(args),
+    });
+    await callback();
+    assert.deepEqual(events, []);
+    assert.equal(task.latestStatus().state, "paused");
+    assert.equal(task.latestStatus().error, "restore_pending");
+  });
   await t.test("invalid configuration is reported without registration", () => {
     let invalid; let registered = false;
     const task = scheduleAutomaticBackups({ env: { BACKUP_TIME: "99:00" }, cron: { schedule: () => { registered = true; } }, createBackup: async () => {}, onInvalid: (message) => { invalid = message; } });
