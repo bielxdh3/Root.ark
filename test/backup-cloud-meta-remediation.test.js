@@ -1,13 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { createCloudStorage } = require("../services/cloudStorage");
 const { normalizeProviderError } = require("../src/services/deploymentResilience");
 
 const originalCwd = process.cwd();
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-meta-"));
+const runtime = createPrivateAuthorityFixture("rootark-cloud-meta-");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupService = require("../services/backupService");
@@ -19,7 +19,25 @@ let sequence = 0;
 const clock = { value: Date.parse("2026-08-01T00:00:00.000Z"), now() { return this.value; } };
 
 function reset() {
-  for (const name of ["data", "uploads", "temp"]) fs.rmSync(path.join(runtime, name), { recursive: true, force: true });
+  // Backup/restore cases start with fresh user data, but the JSON audit
+  // coordination SQLite and its enrolled archive are durable process state.
+  // Removing them between subtests invalidates the already-verified private
+  // directory and causes later backups to fail before reaching cloud logic.
+  const durableAuditEntries = new Set([
+    ".rootark-json-audit-private",
+    ".rootark-json-audit-enrollment.json",
+    "audit-logs-archive.json",
+    "audit-logs.json",
+  ]);
+  const dataDir = path.join(runtime, "data");
+  if (fs.existsSync(dataDir)) {
+    for (const entry of fs.readdirSync(dataDir)) {
+      if (!durableAuditEntries.has(entry)) {
+        fs.rmSync(path.join(dataDir, entry), { recursive: true, force: true });
+      }
+    }
+  }
+  for (const name of ["uploads", "temp"]) fs.rmSync(path.join(runtime, name), { recursive: true, force: true });
   fs.mkdirSync(path.join(runtime, "data", "backups"), { recursive: true });
   fs.mkdirSync(path.join(runtime, "uploads"), { recursive: true });
   delete process.env.BACKUP_INCLUDE_PENDING;
