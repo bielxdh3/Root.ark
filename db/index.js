@@ -48,7 +48,8 @@ function refreshStrictSyncMode(database) {
     }
     throw normalizeStrictSyncSqliteError(error);
   } finally {
-    database.pragma(`busy_timeout = ${marked || strictSyncModeObserved ? STRICT_SYNC_BUSY_TIMEOUT_MS : 5000}`);
+    database.pragma(`busy_timeout = ${marked || strictSyncModeObserved || hasAuditSidecar(getDatabasePath())
+      ? STRICT_SYNC_BUSY_TIMEOUT_MS : 5000}`);
   }
   return marked;
 }
@@ -65,6 +66,18 @@ function isJsonReadFallbackEnabled() {
 
 function isLegacyJsonWriteEnabled() {
   return String(process.env.DB_WRITE_LEGACY_JSON || "false").toLowerCase() === "true";
+}
+
+function hasAuditSidecar(databasePath = getDatabasePath()) {
+  // Retention can create the durable audit journal before strict enrollment.
+  // A coordinated backup then reserves the main writer even without a marker.
+  try {
+    fs.lstatSync(path.join(`${databasePath}.audit-private`, "pending.sqlite"));
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function getDatabasePath() {
@@ -158,6 +171,7 @@ module.exports = {
   closeDb,
   getOpenDatabasePath,
   getDatabasePath,
+  hasAuditSidecar,
   getDb,
   isDbEnabled,
   isJsonReadFallbackEnabled,

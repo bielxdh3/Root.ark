@@ -1567,7 +1567,22 @@ function appendAuditLogUnlocked(log, sqliteAudit) {
   }
 
   archiveAuditLogs(expired, !sqliteAudit);
-  saveAuditLogs(entries);
+  try {
+    saveAuditLogs(entries);
+  } catch (error) {
+    // The backup can acquire BEGIN IMMEDIATE after our initial writer probe.
+    // Keep the failed login durable in the FULL sidecar if this last main
+    // write lost the race; never mask schema, integrity or journal failures.
+    const busyCodes = ["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"];
+    const writerContention = busyCodes.includes(error?.code) || error?.auditWriterBusy === true
+      || (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE"
+        && (error?.cause?.auditWriterBusy === true || busyCodes.includes(error?.cause?.code)));
+    if (!sqliteAudit || !writerContention) {
+      throw error;
+    }
+    auditRepository.deferAuditLog(log);
+    broadcastDataChanged("audit");
+  }
 }
 
 function auditLog(eventType, actor, target, action, result, details = {}) {
