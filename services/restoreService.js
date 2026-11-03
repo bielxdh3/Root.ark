@@ -14,6 +14,7 @@ const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const strictAudit = require("./strictAuditSnapshot");
 const auditRepository = require("../repositories/auditRepository");
+const { JSON_AUDIT_COORDINATION_FILE } = require("../repositories/jsonAuditLock");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
 const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
@@ -25,6 +26,7 @@ const WHOLE_RESTORE_ACK_ROOT = resolveRuntimePath("data", ".rootark-restore-rest
 const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
 const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
 const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
+const JSON_AUDIT_COORDINATION_DB_PREFIX = path.basename(path.dirname(JSON_AUDIT_COORDINATION_FILE)).toLowerCase();
 const RESTORABLE_ROOTS = new Set(["data", "uploads"]);
 const RESTORABLE_JSON_STATE_FILES = new Set([
   "users.json", "users.local.json", "user-generations.local.json", "pending-uploads.json",
@@ -44,6 +46,15 @@ function setCloudStorage(storage) {
 }
 
 function writeWholeRestoreCoordinator(coordinator) {
+  if (!isDbEnabled()) {
+    return auditRepository.withJsonAuditLock(
+      () => writeWholeRestoreCoordinatorUnlocked(coordinator), { allowCoordinator: true }
+    );
+  }
+  return writeWholeRestoreCoordinatorUnlocked(coordinator);
+}
+
+function writeWholeRestoreCoordinatorUnlocked(coordinator) {
   const directory = path.dirname(WHOLE_RESTORE_COORDINATOR_PATH);
   fs.mkdirSync(directory, { recursive: true });
   let previousBytes = null;
@@ -276,7 +287,7 @@ function restorableDataNames(extractedRoot) {
   if (!fs.existsSync(extractedData)) return [...names].sort();
   for (const name of fs.readdirSync(extractedData)) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName.startsWith(JSON_AUDIT_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     if (path.basename(name) !== name || name === "." || name === "..") throw new Error("Restore archive contains an unsafe data filename");
     const source = path.join(extractedData, name);
     const stat = fs.lstatSync(source);
@@ -1444,6 +1455,7 @@ function assertSafeZipPath(entryPath) {
     || normalizedFolded === `data/${BACKUP_METADATA_LOCK_NAME}`
     || normalizedFolded.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)
     || normalizedFolded.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)
+    || normalizedFolded.startsWith(`data/${JSON_AUDIT_COORDINATION_DB_PREFIX}`)
     || normalizedFolded === `data/${path.basename(restoreProviderOrphans.POLICY_PATH)}`
     || normalizedFolded === `data/${path.basename(restoreProviderOrphans.STATE_PATH)}`
     || normalizedFolded.startsWith("data/.rootark-active-requests/")
@@ -1829,7 +1841,7 @@ function restoreDataFiles(extractedRoot, obsoleteJsonPreimages, onFile = null) {
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.existsSync(extractedData) ? fs.readdirSync(extractedData) : []) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName.startsWith(JSON_AUDIT_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {

@@ -1335,7 +1335,8 @@ function sanitizeAuditValue(value, maxLength = 500) {
   return String(value).slice(0, maxLength);
 }
 
-function loadAuditLogs(file = AUDIT_LOGS_FILE) {
+function loadAuditLogs(file = AUDIT_LOGS_FILE, strictJson = false) {
+  if (strictJson) return auditRepository.readJsonAuditHistory(path.resolve(file));
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) {
     try {
       const entries = auditRepository.loadAuditLogs();
@@ -1366,7 +1367,8 @@ function saveAuditLogs(entries, file = AUDIT_LOGS_FILE) {
   const normalized = { logs: Array.isArray(entries?.logs) ? entries.logs : [] };
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) auditRepository.saveAuditLogs(normalized);
   if (file !== AUDIT_LOGS_FILE || shouldWriteLegacyJson()) {
-    fs.writeFileSync(file, JSON.stringify(normalized, null, 2));
+    if (shouldUseDatabase()) fs.writeFileSync(file, JSON.stringify(normalized, null, 2));
+    else auditRepository.persistJsonAuditFile(normalized, path.resolve(file));
   }
   if (file === AUDIT_LOGS_FILE) broadcastDataChanged("audit");
 }
@@ -1548,7 +1550,7 @@ function parseWebDavSegments(req) {
   });
 }
 
-function archiveAuditLogs(logs) {
+function archiveAuditLogs(logs, strictJson = false) {
   if (!logs.length) return;
   if (shouldUseDatabase()) {
     // The FULL-synchronous private audit sidecar is the durable archive in
@@ -1556,21 +1558,27 @@ function archiveAuditLogs(logs) {
     auditRepository.archiveAuditLogs(logs);
     return;
   }
-  const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE);
+  const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE, strictJson);
   archive.logs.push(...logs);
   saveAuditLogs(archive, AUDIT_ARCHIVE_FILE);
 }
 
 function appendAuditLog(log) {
+  if (!shouldUseDatabase()) {
+    return auditRepository.withJsonAuditLock(() => appendAuditLogUnlocked(log, false));
+  }
+  return appendAuditLogUnlocked(log, true);
+}
+
+function appendAuditLogUnlocked(log, sqliteAudit) {
   // The strict Sync account fence reserves the main SQLite writer across
   // physical durability. Persist this event to the independent FULL sidecar
   // first so a failed login during that window cannot lose its audit trail.
-  const sqliteAudit = shouldUseDatabase();
   if (sqliteAudit && auditRepository.deferIfStrictSyncWriter(log)) {
     broadcastDataChanged("audit");
     return;
   }
-  const entries = loadAuditLogs();
+  const entries = loadAuditLogs(AUDIT_LOGS_FILE, !sqliteAudit);
   const cutoff = Date.now() - AUDIT_RETENTION_MS;
   const expired = [];
   const retained = entries.logs.filter((entry) => {
@@ -1590,7 +1598,7 @@ function appendAuditLog(log) {
     entries.logs = retained;
   }
 
-  archiveAuditLogs(expired);
+  archiveAuditLogs(expired, !sqliteAudit);
   saveAuditLogs(entries);
 }
 
@@ -5890,7 +5898,12 @@ function initData() {
     if (!fs.existsSync(FILE_VERSIONS_FILE)) saveFileVersions({});
     if (!fs.existsSync(ENCRYPTED_FILES_FILE)) saveEncryptedFiles({});
     if (!fs.existsSync(ANALYTICS_FILE)) saveAnalytics(getDefaultAnalytics());
-    if (!fs.existsSync(AUDIT_LOGS_FILE)) saveAuditLogs(getDefaultAuditLogs());
+    if (!fs.existsSync(AUDIT_LOGS_FILE)) {
+      if (shouldUseDatabase()) saveAuditLogs(getDefaultAuditLogs());
+      else auditRepository.withJsonAuditLock(() => {
+        if (!fs.existsSync(AUDIT_LOGS_FILE)) saveAuditLogs(getDefaultAuditLogs());
+      });
+    }
     if (!fs.existsSync(QUARANTINE_FILE) && !restoreService.hasPendingQuarantineRestore()) saveQuarantine(getDefaultQuarantine());
   }
 
@@ -12778,7 +12791,11 @@ if (!startupRestoreCoordinator) {
 scheduleAutomaticBackups({
   cron,
   createBackup: (...args) => {
-    if (restoreService.isWholeRestoreBlocked()) return Promise.reject(new Error("Backup pausado durante recuperacao de restore"));
+    if (restoreService.isWholeRestoreBlocked()) {
+      return Promise.reject(Object.assign(new Error("Backup pausado durante recuperacao de restore"), {
+        code: "BACKUP_PAUSED_DURING_RESTORE",
+      }));
+    }
     return backupService.createBackup(...args);
   },
   auditLog,

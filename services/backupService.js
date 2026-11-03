@@ -22,6 +22,7 @@ const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal
 const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
 const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
 const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
+const JSON_AUDIT_COORDINATION_DB_PREFIX = path.basename(path.dirname(require("../repositories/jsonAuditLock").JSON_AUDIT_COORDINATION_FILE)).toLowerCase();
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
 const LOCK_TAKEOVER_DIR = `${LOCK_FILE}.takeover`;
 const LOCK_TAKEOVER_META = path.join(LOCK_TAKEOVER_DIR, "authority.json");
@@ -121,6 +122,7 @@ function isSensitivePath(relativePath) {
   if (lowerPath.startsWith("data/backups/") || lowerPath === "data/backups") return true;
   if (lowerPath === `data/${BACKUP_METADATA_LOCK_NAME}` || lowerPath.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)) return true;
   if (lowerPath.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)) return true;
+  if (lowerPath.startsWith(`data/${JSON_AUDIT_COORDINATION_DB_PREFIX}`)) return true;
   if (lowerPath.startsWith("data/.rootark-cloud-")) return true;
   if (lowerPath.startsWith("temp/.chunks/") || lowerPath.startsWith("temp/.incoming/")) return true;
   if (lowerPath.startsWith("data/.rootark-active-requests/")) return true;

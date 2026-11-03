@@ -44,6 +44,11 @@ function scheduleAutomaticBackups({ env = process.env, cron, createBackup, audit
       latest.backupId = backup.id;
       auditLog("backup.created", { username: "system" }, { type: "backup", id: backup.id }, "created", "success", { filename: backup.filename, automatic: true });
     } catch (error) {
+      if (error?.code === "BACKUP_PAUSED_DURING_RESTORE") {
+        latest.state = "paused";
+        latest.error = "restore_pending";
+        return;
+      }
       latest.state = "failure";
       latest.error = "backup_failed";
       auditLog("backup.failed", { username: "system" }, { type: "backup", id: error.backup?.id || null }, "created", "failure", { error: error.message, automatic: true });
