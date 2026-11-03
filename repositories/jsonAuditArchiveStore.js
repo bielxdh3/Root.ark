@@ -449,6 +449,107 @@ function assertJsonRestoreCompatible(extractedRoot) {
   }
 }
 
+// The selected backup may be much older than the live audit retention window.
+// Its main/archive JSON files must be restored as supplied, but the live
+// evidence being replaced must first survive in the durable private archive.
+// Called only after the whole-restore coordinator has been published under
+// the same cross-process lease as normal JSON audit writes. The entire import
+// is one FULL/WAL transaction: a crash before COMMIT carries nothing and a
+// crash after COMMIT can replay every record exactly once.
+function carryForwardLiveJsonAuditForRestore(transactionId, extractedRoot, { beforeCommit } = {}) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || ""))) {
+    throw new Error("Invalid JSON restore audit carry-forward transaction");
+  }
+  return withJsonAuditLock(() => {
+    const coordinatorPath = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
+    const readCoordinator = () => withPinnedJson(coordinatorPath, (fd) => {
+      const length = fs.fstatSync(fd).size;
+      if (length > 256 * 1024) throw new Error("JSON restore audit coordinator exceeds safe budget");
+      const bytes = fs.readFileSync(fd);
+      return { value: bytes, bytesRead: bytes.length };
+    });
+    const coordinatorBytes = readCoordinator();
+    const coordinator = JSON.parse(coordinatorBytes.toString("utf8"));
+    if (coordinator.transactionId !== transactionId || !["preparing", "prepared"].includes(coordinator.phase)
+      || coordinator.persistenceMode !== "json") {
+      throw new Error("JSON audit carry-forward requires the current durable restore barrier");
+    }
+
+    const db = openStore(true);
+    try {
+      ensureLegacyIndex(db);
+      const selectDelta = db.prepare("SELECT event FROM delta WHERE id=?");
+      const appendDelta = db.prepare("INSERT INTO delta(id,event) VALUES (?,?)");
+      // The durable delta's UNIQUE ID is also our bounded collision index:
+      // a main/archive replay checks the same transaction-visible row.
+      // No separate TEMP table of private event bodies is ever created.
+      const sourceMain = resolveRuntimePath("data", "audit-logs.json");
+      let carried = 0;
+      const ingest = (entry) => {
+        const event = assertLog(entry); // invalid/oversized records fail closed
+        const prior = selectDelta.get(entry.id);
+        if (prior) {
+          if (!sameEvidence(JSON.parse(prior.event), entry)) {
+            throw new Error("Current JSON audit history collides with durable evidence");
+          }
+        } else {
+          appendDelta.run(entry.id, event);
+          carried += 1;
+        }
+      };
+      db.transaction(() => {
+        try {
+          withPinnedJson(sourceMain, (fd) => {
+            const length = fs.fstatSync(fd).size;
+            if (length > 512 * 1024 * 1024) throw new Error("Current active JSON audit history exceeds safe restore budget");
+            const bytes = fs.readFileSync(fd);
+            const parsed = JSON.parse(bytes.toString("utf8"));
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.logs)) {
+              throw new Error("Invalid current active JSON audit history");
+            }
+            for (const entry of parsed.logs) ingest(entry);
+            return { value: null, bytesRead: bytes.length };
+          });
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        try {
+          const everyId = new Set();
+          everyId.has = () => true;
+          withPinnedLegacy((fd) => {
+            const result = findArchivedRestoreAuditMatches(fd, everyId, {
+              onId(id) {
+                if (typeof id !== "string" || !id || Buffer.byteLength(id) > MAX_ID_BYTES) {
+                  throw new Error("Invalid current JSON archive audit identity");
+                }
+              },
+              onMatch: ingest,
+            });
+            return { value: null, bytesRead: result.bytesRead };
+          });
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        if (beforeCommit) {
+          const result = beforeCommit({ carried });
+          if (result && typeof result.then === "function") {
+            throw new TypeError("JSON audit carry-forward precommit hook must be synchronous");
+          }
+        }
+        if (!readCoordinator().equals(coordinatorBytes)) {
+          throw new Error("JSON restore audit coordinator changed during carry-forward");
+        }
+      })();
+      syncDirectory(path.dirname(STORE));
+      // Recheck selected archive against the complete durable live evidence.
+      // A chosen older backup is permitted, but a same-ID divergent history
+      // is never allowed to be replayed in place of acknowledged records.
+      assertJsonRestoreCompatible(extractedRoot);
+      return { carried };
+    } finally { db.close(); }
+  }, { allowCoordinator: true });
+}
+
 function writeAll(fd, buffer) {
   let offset = 0;
   while (offset < buffer.length) {
@@ -604,4 +705,5 @@ async function writeJsonArchiveBackupSnapshot(destination, mainDestination = nul
 }
 
 module.exports = { STORE, LEGACY, appendJsonArchiveLogs, findDeltaAuditMatches,
-  assertJsonRestoreCompatible, writeJsonArchiveBackupSnapshot };
+  assertJsonRestoreCompatible, carryForwardLiveJsonAuditForRestore,
+  writeJsonArchiveBackupSnapshot };

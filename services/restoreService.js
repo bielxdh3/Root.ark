@@ -3002,6 +3002,16 @@ async function restoreBackup(id, options = {}) {
       throw new Error("Restore persistence mode changed before local commit");
     }
     verifyObsoleteJsonState(restoreDir, obsoleteJsonPreimages);
+    if (persistenceMode === "json") {
+      // The selected backup may predate live security events. Permanently
+      // preserve all current active and legacy archived audit evidence in the
+      // enrolled FULL/WAL delta before replacing either JSON file. This runs
+      // after pre-images and authorization, under the durable coordinator.
+      jsonAuditArchiveStore.carryForwardLiveJsonAuditForRestore(coordinator.transactionId, restoreDir, {
+        beforeCommit: () => injectFailure("restore.audit.carry-forward.before-commit"),
+      });
+      injectFailure("restore.audit.carry-forward.persisted");
+    }
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {
