@@ -352,14 +352,17 @@ function findDeltaAuditMatches(id) {
 
 function assertJsonRestoreCompatible(extractedRoot) {
   const db = openStore(false);
-  if (!db) return;
+  let archiveIndex;
+  let archiveIndexPath;
   try {
-    const find = db.prepare("SELECT event FROM delta WHERE id=?");
+    // A never-enrolled JSON runtime has no delta database. That must not
+    // bypass validation of the selected backup's main/archive pair.
+    const find = db?.prepare("SELECT event FROM delta WHERE id=?");
     const testCollision = (entry) => {
       if (typeof entry?.id !== "string" || !entry.id || Buffer.byteLength(entry.id) > MAX_ID_BYTES) {
         throw new Error("Invalid restored JSON audit identity");
       }
-      const delta = find.get(entry.id);
+      const delta = find?.get(entry.id);
       if (delta && !sameEvidence(JSON.parse(delta.event), entry)) {
         throw new Error("JSON restore audit identity collision");
       }
@@ -374,7 +377,9 @@ function assertJsonRestoreCompatible(extractedRoot) {
         const fileSize = fs.fstatSync(fd).size;
         if (fileSize > 512 * 1024 * 1024) throw new Error("Restored active JSON audit history too large");
         const bytes = fs.readFileSync(fd);
-        const entries = JSON.parse(bytes.toString("utf8"));
+        let entries;
+        try { entries = JSON.parse(bytes.toString("utf8")); }
+        catch { throw new Error("Invalid restored active JSON audit history"); }
         if (!entries || !Array.isArray(entries.logs)) throw new Error("Invalid restored active JSON audit history");
         for (const entry of entries.logs) {
           testCollision(entry);
@@ -389,17 +394,38 @@ function assertJsonRestoreCompatible(extractedRoot) {
     }
     const candidateArchive = path.join(extractedRoot, "data", "audit-logs-archive.json");
     if (fs.existsSync(candidateArchive)) {
-      db.exec("CREATE TEMP TABLE restored_archive_ids (id TEXT PRIMARY KEY NOT NULL)");
-      const insert = db.prepare("INSERT INTO restored_archive_ids(id) VALUES (?)");
+      // Use a disposable, on-disk SQLite index rather than a memory Set or a
+      // TEMP table whose backing storage depends on SQLite's temp_store mode.
+      // It is confined to the private extraction root and removed on success
+      // and on every handled failure; it is never an enrolled audit authority.
+      archiveIndexPath = path.join(extractedRoot, `.rootark-audit-preflight-${crypto.randomUUID()}.sqlite`);
+      const created = fs.openSync(archiveIndexPath, "wx", 0o600);
+      fs.closeSync(created);
+      archiveIndex = new Database(archiveIndexPath, { fileMustExist: true });
+      // The disposable index is never reused after a crash, so journaling and
+      // fsync would only add O(events) synchronous disk churn during a scan.
+      archiveIndex.pragma("journal_mode = OFF");
+      archiveIndex.pragma("synchronous = OFF");
+      archiveIndex.pragma("cache_size = -2048");
+      archiveIndex.exec("CREATE TABLE restored_archive_ids (id TEXT PRIMARY KEY NOT NULL)");
+      const insert = archiveIndex.prepare("INSERT INTO restored_archive_ids(id) VALUES (?)");
       const wantedIds = new Set();
-      wantedIds.has = (id) => typeof id === "string" && (mainEvents.has(id) || Boolean(find.get(id)));
-      withPinnedJson(candidateArchive, (fd) => {
+      wantedIds.has = (id) => typeof id === "string" && (mainEvents.has(id) || Boolean(find?.get(id)));
+      // Batch inserts into the disposable on-disk B-tree. The capped pager
+      // cache bounds RAM while one transaction avoids 1 fsync per legacy ID.
+      archiveIndex.transaction(() => withPinnedJson(candidateArchive, (fd) => {
         const result = findArchivedRestoreAuditMatches(fd, wantedIds, {
           onId(id) {
             if (typeof id !== "string" || !id || Buffer.byteLength(id) > MAX_ID_BYTES) {
               throw new Error("Invalid restored JSON archive audit identity");
             }
-            insert.run(id); // any duplicate in the incoming archive is invalid
+            try { insert.run(id); }
+            catch (error) {
+              if (error.code?.startsWith("SQLITE_CONSTRAINT")) {
+                throw new Error("JSON restore audit identity collision", { cause: error });
+              }
+              throw error;
+            }
           },
           onMatch(event) {
             testCollision(event);
@@ -410,9 +436,17 @@ function assertJsonRestoreCompatible(extractedRoot) {
           },
         });
         return { value: null, bytesRead: result.bytesRead };
-      });
+      }))();
     }
-  } finally { db.close(); }
+  } finally {
+    archiveIndex?.close();
+    if (archiveIndexPath) {
+      for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+        fs.rmSync(`${archiveIndexPath}${suffix}`, { force: true });
+      }
+    }
+    db?.close();
+  }
 }
 
 function writeAll(fd, buffer) {
