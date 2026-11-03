@@ -1072,6 +1072,49 @@ class Zk1DurableContentInventoryLedger {
     return { sequence: state.sequence, root: Buffer.from(state.root) };
   }
 
+  // Trusted operator ONLY: verify the committed prefix beneath this exact
+  // durable prewrite reservation. Public snapshots and chain pages deliberately
+  // remain unavailable while ANY operation is pending; this evidence cannot
+  // authorize a remote reader or assert that the pending version was committed.
+  async getPrewriteFloorEvidence(input) {
+    await this.assertOpen();
+    const raw = exact(input, ["operationId", "nonce", "afterSequence"],
+      "INVENTORY_PREWRITE_FLOOR_INPUT");
+    const operationId = bytes(raw.operationId, 16);
+    const nonce = inventory.normalizeNonce(raw.nonce);
+    if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
+      || raw.afterSequence > inventory.MAX_ENTRIES) fail("INVENTORY_PREWRITE_FLOOR_INPUT");
+    const state = await this.loadState();
+    const pending = state.pending[0];
+    if (state.pending.length !== 1 || !pending
+      || !same(pending.operation.operation_id, operationId)
+      || pending.operation.expected_sequence !== state.sequence
+      || !same(pending.operation.expected_root, state.root)
+      || raw.afterSequence > state.sequence
+      || state.sequence - raw.afterSequence > 64) fail("INVENTORY_PREWRITE_FLOOR_UNAVAILABLE");
+    const committedProofChain = [];
+    for (let sequence = raw.afterSequence + 1; sequence <= state.sequence; sequence += 1) {
+      const committed = [...state.operations.values()].find((operation) =>
+        operation.status === "committed" && operation.sequence === sequence);
+      if (!committed?.signedEntry) fail("INVENTORY_LEDGER_CORRUPT");
+      const proof = Buffer.from(await z.encodeDeterministic(committed.signedEntry));
+      if (proof.length < 1 || proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) fail("INVENTORY_LIMIT");
+      committedProofChain.push(proof);
+    }
+    const signedSnapshot = await inventory.createSignedSnapshot({
+      signerKeyId: this.signerKeyId, privateKey: this.privateKey,
+      scope: this.scope, sequence: state.sequence,
+      previousRoot: state.previousRoot, entries: state.entries, nonce,
+    });
+    const after = await this.loadState();
+    if (after.sequence !== state.sequence || !same(after.root, state.root)
+      || after.pending.length !== 1
+      || !same(after.pending[0].operation.operation_id, operationId)
+      || !same(after.pending[0].encoded, pending.encoded)) fail("INVENTORY_STATE_CHANGED");
+    return { status: "prewrite_floor_evidence", sequence: state.sequence,
+      root: Buffer.from(state.root), bytes: signedSnapshot, committedProofChain };
+  }
+
   async getSnapshot(input) {
     await this.assertOpen();
     const raw = exact(input, ["nonce"], "INVENTORY_SNAPSHOT_INPUT");
