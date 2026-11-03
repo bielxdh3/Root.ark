@@ -955,7 +955,8 @@ BEGIN
         AND a.worker_id=b.worker_id AND a.generation=b.generation
         AND a.process_epoch=b.process_epoch AND a.process_pid=b.process_pid
         AND a.action='put' AND a.state='ACTIVE'
-        AND a.object_revision=NEW.revision AND a.revision=current_head.revision
+        AND COALESCE(a.object_revision,a.revision)=NEW.revision
+        AND a.revision=current_head.revision
         AND a.digest=current_head.digest;
     IF NOT FOUND THEN
       RAISE EXCEPTION 'physical child writer lacks bound active admission'
