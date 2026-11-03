@@ -14,6 +14,7 @@ const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const strictAudit = require("./strictAuditSnapshot");
 const auditRepository = require("../repositories/auditRepository");
+const jsonAuditArchiveStore = require("../repositories/jsonAuditArchiveStore");
 const { JSON_AUDIT_COORDINATION_FILE } = require("../repositories/jsonAuditLock");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
 const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
@@ -2989,6 +2990,10 @@ async function restoreBackup(id, options = {}) {
     // Validate the restored primary's strict marker against the only allowed
     // audit sidecar member before preparing any destructive pre-image changes.
     const strictAuditArchive = validateStrictAuditRestoreArchive(restoreDir, manifest);
+    // The private JSON archive delta is an acknowledged audit authority that
+    // survives whole restore. Reject a divergent selected backup before any
+    // local replacement, so restart cannot expose mismatched evidence.
+    if (persistenceMode === "json") jsonAuditArchiveStore.assertJsonRestoreCompatible(restoreDir);
     // Drain every audit writer that started before the durable coordinator
     // gate, before reading current evidence or copying live SQLite pre-images.
     if (persistenceMode === "sqlite") await strictAudit.drainAuditWriters(getDatabasePath());
@@ -3038,6 +3043,16 @@ async function restoreBackup(id, options = {}) {
       throw new Error("Restore persistence mode changed before local commit");
     }
     verifyObsoleteJsonState(restoreDir, obsoleteJsonPreimages);
+    if (persistenceMode === "json") {
+      // The selected backup may predate live security events. Permanently
+      // preserve all current active and legacy archived audit evidence in the
+      // enrolled FULL/WAL delta before replacing either JSON file. This runs
+      // after pre-images and authorization, under the durable coordinator.
+      jsonAuditArchiveStore.carryForwardLiveJsonAuditForRestore(coordinator.transactionId, restoreDir, {
+        beforeCommit: () => injectFailure("restore.audit.carry-forward.before-commit"),
+      });
+      injectFailure("restore.audit.carry-forward.persisted");
+    }
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {

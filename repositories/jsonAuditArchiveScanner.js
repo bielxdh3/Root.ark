@@ -5,7 +5,7 @@ const fs = require("node:fs");
 // Read the JSON-mode archive from an already security-checked, pinned fd.
 // Size of the complete archive is unrestricted; working space is bounded by
 // the read block, the longest examined key/ID, and one candidate audit event.
-function findArchivedRestoreAuditMatches(fd, wantedId) {
+function findArchivedRestoreAuditMatches(fd, wantedId, { onId, onMatch } = {}) {
   const wantedIds = wantedId instanceof Set ? wantedId : new Set([wantedId]);
   const block = Buffer.allocUnsafe(64 * 1024);
   const eventBytes = Buffer.allocUnsafe(64 * 1024);
@@ -176,11 +176,16 @@ function findArchivedRestoreAuditMatches(fd, wantedId) {
         oversized = false;
         const { id } = object(depth + 1, "log");
         recording = false;
+        if (onId) onId(id);
         if (wantedIds.has(id)) {
           if (oversized) throw new Error("Matching JSON restore audit event exceeds safe parse budget");
-          if (matchedIds.has(id)) throw new Error("JSON restore audit identity collision");
-          matchedIds.add(id);
-          matches.push(JSON.parse(eventBytes.subarray(0, recorded).toString("utf8")));
+          // A streaming index consumer enforces uniqueness in its own durable
+          // UNIQUE constraint, without retaining every historic ID in RAM.
+          if (!onId && matchedIds.has(id)) throw new Error("JSON restore audit identity collision");
+          if (!onId) matchedIds.add(id);
+          const event = JSON.parse(eventBytes.subarray(0, recorded).toString("utf8"));
+          if (onMatch) onMatch(event);
+          else matches.push(event);
         }
       } else invalid();
       whitespace();

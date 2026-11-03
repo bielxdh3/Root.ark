@@ -25,6 +25,7 @@ for (const mode of modes) test(`JSON archive atomic streaming append: ${mode}`, 
     const audit=require(${JSON.stringify(path.join(project, "repositories", "auditRepository"))});
     const data=path.join(process.cwd(),'data');fs.mkdirSync(data,{recursive:true});
     const archive=path.join(data,'audit-logs-archive.json');
+    const snapshot=path.join(data,'audit-archive-snapshot.json');
     const mode=${JSON.stringify(mode)};
     const newLog={id:mode==='boundary-escaped-collision'?'A'.repeat(512):
       mode.startsWith('long-escaped-')?'A'.repeat(180):'candidate-1',
@@ -55,39 +56,48 @@ for (const mode of modes) test(`JSON archive atomic streaming append: ${mode}`, 
       return originalRead.call(this,target,...args);
     };
     if(mode==='rename-failure')fs.renameSync=function(src,dst,...args){
-      if(path.resolve(dst)===archive)throw Object.assign(Error('SIMULATED_RENAME_FAILURE'),{code:'EIO'});
+      if(path.resolve(dst)===snapshot)throw Object.assign(Error('SIMULATED_RENAME_FAILURE'),{code:'EIO'});
       return originalRename.call(this,src,dst,...args);
     };
-    if(mode==='sync-failure')fs.fsyncSync=function(fd,...args){
-      if(fs.fstatSync(fd).isFile())throw Object.assign(Error('SIMULATED_SYNC_FAILURE'),{code:'EIO'});
-      return originalFsync.call(this,fd,...args);
-    };
-    try {
-      if(['escaped-collision','long-escaped-collision','boundary-escaped-collision','divergent','truncated','malformed','rename-failure','sync-failure','duplicate-input'].includes(mode)) {
-        assert.throws(()=>audit.appendJsonArchiveLogs(mode==='duplicate-input'
+    async function verify(){
+      const rejected=['escaped-collision','long-escaped-collision','boundary-escaped-collision',
+        'divergent','truncated','malformed','duplicate-input'].includes(mode);
+      try {
+        if(rejected)assert.throws(()=>audit.appendJsonArchiveLogs(mode==='duplicate-input'
           ?[newLog,{...newLog,eventType:'different'}]:[newLog,extraLog]),
-          /collision|Invalid JSON restore audit history|SIMULATED_(RENAME|SYNC)_FAILURE/i);
-      } else {
-        const result=audit.appendJsonArchiveLogs([newLog,extraLog]);
-        assert.ok(result!==false);
-      }
-    } finally {fs.readFileSync=originalRead;fs.renameSync=originalRename;fs.fsyncSync=originalFsync;}
-    if(['escaped-collision','long-escaped-collision','boundary-escaped-collision','divergent','truncated','malformed','rename-failure','sync-failure','duplicate-input'].includes(mode)) {
-      assert.deepEqual(fs.readFileSync(archive),before,'original authority unchanged');
-    } else {
-      const saved=JSON.parse(fs.readFileSync(archive,'utf8'));
-      assert.equal(saved.logs.filter(x=>x.id===newLog.id).length,1);
-      assert.equal(saved.logs.filter(x=>x.id==='candidate-2').length,1);
-      assert.equal(saved.logs.filter(x=>x.id==='earlier-1').length,mode==='missing'||mode==='empty'?0:1);
-      if(mode!=='missing')assert.equal(saved.metadata.retention,'forever');
-      if(mode==='large')assert.equal(saved.logs[0].details.blob.length,90*1024);
-      const committed=fs.readFileSync(archive);
-      assert.doesNotThrow(()=>audit.appendJsonArchiveLogs([newLog,extraLog]),'idempotent append');
-      assert.deepEqual(fs.readFileSync(archive),committed,'replay leaves bytes unchanged');
+          /collision|Invalid JSON restore audit history/i);
+        else {
+          audit.appendJsonArchiveLogs([newLog,extraLog]);
+          assert.equal(audit.appendJsonArchiveLogs([newLog,extraLog]),undefined,'idempotent append');
+        }
+        assert.deepEqual(fs.existsSync(archive)?originalRead(archive):null,before,
+          'ordinary writes must not recopy or truncate the immutable legacy archive');
+        if(!rejected){
+          if(mode==='sync-failure')fs.fsyncSync=function(fd,...args){
+            if(fs.fstatSync(fd).isFile())throw Object.assign(Error('SIMULATED_SYNC_FAILURE'),{code:'EIO'});
+            return originalFsync.call(this,fd,...args);
+          };
+          if(['rename-failure','sync-failure'].includes(mode)){
+            await assert.rejects(audit.writeJsonArchiveBackupSnapshot(snapshot),
+              /SIMULATED_(RENAME|SYNC)_FAILURE/i);
+            assert.equal(fs.existsSync(snapshot),false,'no torn snapshot published on fault');
+            fs.renameSync=originalRename;fs.fsyncSync=originalFsync;
+          }
+          await audit.writeJsonArchiveBackupSnapshot(snapshot);
+          const saved=JSON.parse(originalRead(snapshot,'utf8'));
+          assert.equal(saved.logs.filter(x=>x.id===newLog.id).length,1);
+          assert.equal(saved.logs.filter(x=>x.id==='candidate-2').length,1);
+          assert.equal(saved.logs.filter(x=>x.id==='earlier-1').length,mode==='missing'||mode==='empty'?0:1);
+          if(mode!=='missing')assert.equal(saved.metadata.retention,'forever');
+          if(mode==='large')assert.equal(saved.logs[0].details.blob.length,90*1024);
+          assert.deepEqual(fs.existsSync(archive)?originalRead(archive):null,before);
+        }
+        assert.equal(fs.readdirSync(data).filter(name=>name.includes('.tmp')).length,0,
+          'temporary files cleaned');
+        console.log('ATOMIC_JSON_ARCHIVE_VERIFIED');
+      }finally{fs.readFileSync=originalRead;fs.renameSync=originalRename;fs.fsyncSync=originalFsync;}
     }
-    const leftovers=fs.readdirSync(data).filter(name=>name.includes('.tmp'));
-    assert.equal(leftovers.length,0,'temporary files cleaned');
-    console.log('ATOMIC_JSON_ARCHIVE_VERIFIED');`;
+    verify().catch(error=>{console.error(error);process.exitCode=1;});`;
   const run = spawnSync(process.execPath, ["-e", script], {
     cwd: root, encoding: "utf8", timeout: 25_000, windowsHide: true,
     env: { ...process.env, DB_ENABLED: "false", NODE_PATH: [path.join(project, "node_modules"), process.env.NODE_PATH].filter(Boolean).join(path.delimiter) },
