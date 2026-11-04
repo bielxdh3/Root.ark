@@ -27,7 +27,16 @@ function failedTestDiagnostics(output, tapStdout) {
 }
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
-  const result = spawnSync(executable, args, { cwd: root, encoding: "utf8", windowsHide: true, shell, maxBuffer: 16 * 1024 * 1024 });
+  const options = { cwd: root, encoding: "utf8", windowsHide: true,
+    shell, maxBuffer: 16 * 1024 * 1024 };
+  if (name === "final-head canonical npm test"
+    && typeof process === "object" && process.platform === "win32") {
+    // Mirror the independently passing full Windows canonical runner: hosted
+    // TEMP may be a junction rejected by strict private-fixture path guards.
+    const { canonicalWindowsTestEnvironment } = require("./run-windows-canonical-tests");
+    options.env = canonicalWindowsTestEnvironment();
+  }
+  const result = spawnSync(executable, args, options);
   const output = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error?.message || ""}`.trim();
   if (result.status === 0) {
     record(name, "PASS", "exit 0");
