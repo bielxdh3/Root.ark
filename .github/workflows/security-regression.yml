@@ -59,7 +59,10 @@ jobs:
   windows-release-gate:
     name: Windows Node 22 - mandatory release gates
     runs-on: windows-2022
-    timeout-minutes: 60
+    # The full unfiltered canonical suite now runs with bounded file
+    # concurrency inside the release gate; allow the preceding security gates
+    # and that suite to complete without dropping mandatory coverage.
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository

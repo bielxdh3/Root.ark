@@ -129,9 +129,10 @@ for (const [name, files] of [
   ["Phase 14 backup/restore evidence", ["test/backup-restore-security.test.js"]],
 ]) command(name, process.execPath, ["--test", ...files], { blockedOnMissing: true });
 
-// npm forwards args after `--` to the unchanged `node --test` script. Stable TAP
-// reporting makes failing test names and counts parseable across Windows/CI.
-const npmTest = getNpmInvocation(["test", "--", "--test-reporter=tap"]);
+// npm forwards args after `--` to the unchanged `node --test` script. Match
+// the separately validated Windows canonical runner's bounded file concurrency
+// without filtering, skipping or weakening any of the mandatory test cases.
+const npmTest = getNpmInvocation(["test", "--", "--test-reporter=tap", "--test-concurrency=2"]);
 if (results.some((result) => result.status === "FAIL")) {
   record("final-head canonical npm test", "SKIPPED", "earlier mandatory gate failed; run after correction");
 } else {
