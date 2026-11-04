@@ -3,9 +3,11 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const originalCwd = process.cwd();
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-route-"));
+const runtime = createPrivateAuthorityFixture("rootark-trash-route-");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 
@@ -297,5 +299,5 @@ test("POST /trash/:id/restore rejects a session revoked while waiting for the li
 });
 test.after(() => {
   process.chdir(originalCwd);
-  fs.rmSync(runtime, { recursive: true, force: true });
+  fs.rmSync(runtime, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });

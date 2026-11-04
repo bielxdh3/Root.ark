@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { execFileSync } = require("node:child_process");
 const Database = require("better-sqlite3");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const trashRepository = require("../repositories/trashRepository");
@@ -116,30 +117,75 @@ function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
 
 function ensurePrivateRemoteClaimDirectory() {
   if (process.platform === "win32") {
-    // A junction at data/ is an ancestor of the final lock directory.
-    // Checking only the leaf would follow the ancestor and create the claim
-    // database/lock outside the runtime. Create each level without following
-    // pre-existing reparse points, and verify ancestor identity afterward.
+    // A junction at data/ can redirect SQLite's main DB and WAL/SHM as well
+    // as lock files. A pathname lstat alone is insufficient on Windows:
+    // another SID with DELETE_CHILD/Modify may replace the ancestor after
+    // inspection. Pin this authority to native owner-only ACL checks, and
+    // create missing levels with a protected DACL at CreateDirectoryW time.
+    const { ensureWindowsChunkUploadRoot } = require("./chunkUploadWindowsAcl");
+    const { assertPrivateSqliteAuthorityDirectory } =
+      require("../src/services/zk1PrivateSqlitePath");
     const dataDir = path.dirname(REMOTE_LOCK_DIR);
     const runtimeRoot = path.dirname(dataDir);
     const runtime = fs.lstatSync(runtimeRoot, { bigint: true });
     if (!runtime.isDirectory() || runtime.isSymbolicLink()) {
       throw new Error("Remote deletion claim directory is unsafe");
     }
-    try { fs.mkdirSync(dataDir, { mode: 0o700 }); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
+    for (const directory of [dataDir, REMOTE_LOCK_DIR]) {
+      try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+          throw new Error("Remote deletion claim directory is unsafe");
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        // Native creation checks the full parent ACL before writing and
+        // never adopts an untrusted replacement as a private authority.
+        ensureWindowsChunkUploadRoot(directory);
+      }
+    }
     const data = fs.lstatSync(dataDir, { bigint: true });
     if (!data.isDirectory() || data.isSymbolicLink()) {
       throw new Error("Remote deletion claim directory is unsafe");
     }
-    try { fs.mkdirSync(REMOTE_LOCK_DIR, { mode: 0o700 }); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
     const directory = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
     const finalData = fs.lstatSync(dataDir, { bigint: true });
     if (!directory.isDirectory() || directory.isSymbolicLink()
         || !finalData.isDirectory() || finalData.isSymbolicLink()
         || finalData.dev !== data.dev || finalData.ino !== data.ino) {
       throw new Error("Remote deletion claim directory is unsafe");
+    }
+    // A fresh native ACL/ancestry verification is required on EVERY claim,
+    // including with an existing coordinator DB, and before SQLite opens its
+    // path-based database/WAL/SHM handles or any O_EXCL claim lock.
+    try {
+      assertPrivateSqliteAuthorityDirectory(REMOTE_LOCK_COORDINATION_FILE);
+    } catch (strictError) {
+      // Older versions used fs.mkdirSync(mode:0700), which leaves an NTFS
+      // directory with an inherited (unprotected) DACL. Migrate ONLY when
+      // native full-tree checks confirm owner/SYSTEM/Admin-only ACEs, real
+      // paths and trusted ancestors. Never seal an untrusted Users:Modify
+      // DACL or change permissions before these checks.
+      const { verifyWindowsLocalWebDavTree, getWindowsChunkAclDescriptor } =
+        require("./chunkUploadWindowsAcl");
+      try {
+        verifyWindowsLocalWebDavTree(REMOTE_LOCK_DIR);
+        // Do not mutate a path whose ACL is already protected: its failed
+        // strict admission has a different cause and must remain fail-closed.
+        if (/D:P/.test(getWindowsChunkAclDescriptor(REMOTE_LOCK_DIR))) {
+          throw strictError;
+        }
+        execFileSync("C:\\Windows\\System32\\icacls.exe",
+          [REMOTE_LOCK_DIR, "/inheritance:d"], {
+            stdio: "ignore", windowsHide: true, timeout: 12000,
+          });
+        // Fail closed if conversion, DACL, ancestor or a descendant changed.
+        assertPrivateSqliteAuthorityDirectory(REMOTE_LOCK_COORDINATION_FILE);
+      } catch (error) {
+        throw new Error("Remote deletion claim directory needs a protected owner-only Windows ACL", {
+          cause: error,
+        });
+      }
     }
     return;
   }

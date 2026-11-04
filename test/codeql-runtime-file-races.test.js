@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { execFile, spawn } = require("node:child_process");
+const { execFile, execFileSync, spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -11,6 +11,8 @@ const path = require("node:path");
 const test = require("node:test");
 const { promisify } = require("node:util");
 const { previewText } = require("../services/documentPreviewService");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const execFileAsync = promisify(execFile);
 
@@ -294,4 +296,100 @@ test("remote deletion refuses a junction in the data ancestor before any externa
   });
   assert.deepEqual(await fsp.readdir(outside), [],
     "a reparse-point ancestor must not redirect the claim DB or lock outside runtime data");
+});
+
+test("Windows remote claims deny Users:Modify on the data parent before creating locks or SQLite", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async () => {
+  const selected = createPrivateAuthorityFixture("rootark-trash-acl-parent-");
+  const data = path.join(selected, "data");
+  const icacls = "C:\\Windows\\System32\\icacls.exe";
+  const users = "*S-1-5-32-545";
+  let granted = false;
+  try {
+    require("../services/chunkUploadWindowsAcl").ensureWindowsChunkUploadRoot(data);
+    execFileSync(icacls, [data, "/grant", `${users}:(OI)(CI)M`],
+      { windowsHide: true, stdio: "ignore", timeout: 12000 });
+    granted = true;
+    const servicePath = path.resolve(__dirname, "../services/trashService.js");
+    const script = `const svc = require(${JSON.stringify(servicePath)});\n` +
+      "try { svc.claimRemoteDeletion({ item: { id: 'acl-fixture', metadata: { remoteDeletion: { state: 'pending', operationId: 'acl-fixture' } } } }); process.exit(9); } catch (error) { if (!/ACL|Untrusted|unsafe/i.test(error.message)) throw error; process.exit(0); }";
+    await execFileAsync(process.execPath, ["-e", script], {
+      cwd: selected, timeout: 12000, env: { ...process.env, DB_ENABLED: "false" },
+    });
+    assert.deepEqual(fs.readdirSync(data), [],
+      "untrusted DELETE_CHILD ACL must be denied before lockdir or SQLite/WAL/SHM creation");
+  } finally {
+    if (granted) {
+      execFileSync(icacls, [data, "/remove:g", users],
+        { windowsHide: true, stdio: "ignore", timeout: 12000 });
+    }
+    fs.rmSync(selected, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("Windows remote claims safely migrate an old owned inherited-DACL lock directory", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async () => {
+  const selected = createPrivateAuthorityFixture("rootark-trash-inherited-lock-");
+  try {
+    const data = path.join(selected, "data");
+    const locks = path.join(data, "trash-remote-locks");
+    const acl = require("../services/chunkUploadWindowsAcl");
+    acl.ensureWindowsChunkUploadRoot(data);
+    // Old code used fs.mkdirSync(mode:0700), which does NOT protect Windows
+    // DACL inheritance. The inherited ACEs are still trusted owner-only.
+    fs.mkdirSync(locks);
+    const original = acl.getWindowsChunkAclDescriptor(locks);
+    assert.doesNotMatch(original, /D:P/, "fixture must start with an unprotected inherited NTFS DACL");
+    const preserved = path.join(locks, "old-owned-claim.lock");
+    fs.writeFileSync(preserved, "existing-owner-claim");
+    const servicePath = path.resolve(__dirname, "../services/trashService.js");
+    const script = `const svc = require(${JSON.stringify(servicePath)});\n` +
+      "const claim = svc.claimRemoteDeletion({ item: { id: 'legacy-acl-fixture', metadata: { remoteDeletion: { state: 'pending', operationId: 'legacy-acl-fixture' } } } }); if (!claim) process.exit(9);";
+    await execFileAsync(process.execPath, ["-e", script], {
+      cwd: selected, timeout: 15000, env: { ...process.env, DB_ENABLED: "false" },
+    });
+    assert.match(acl.getWindowsChunkAclDescriptor(locks), /D:P/,
+      "trusted inherited ACEs must become an owner-private protected DACL");
+    assert.equal(fs.readFileSync(preserved, "utf8"), "existing-owner-claim");
+    assert.ok(fs.existsSync(path.join(locks, ".coordination.sqlite")));
+  } finally {
+    fs.rmSync(selected, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("Windows remote claim migration never seals an inherited Users:Modify lock directory", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async () => {
+  const selected = createPrivateAuthorityFixture("rootark-trash-hostile-acl-");
+  const icacls = "C:\\Windows\\System32\\icacls.exe";
+  const users = "*S-1-5-32-545";
+  const data = path.join(selected, "data");
+  const locks = path.join(data, "trash-remote-locks");
+  let granted = false;
+  try {
+    const acl = require("../services/chunkUploadWindowsAcl");
+    acl.ensureWindowsChunkUploadRoot(data);
+    fs.mkdirSync(locks);
+    execFileSync(icacls, [locks, "/grant", `${users}:(OI)(CI)M`],
+      { windowsHide: true, stdio: "ignore", timeout: 12000 });
+    granted = true;
+    const servicePath = path.resolve(__dirname, "../services/trashService.js");
+    const script = `const svc = require(${JSON.stringify(servicePath)});\n` +
+      "try { svc.claimRemoteDeletion({ item: { id: 'hostile-acl-fixture', metadata: { remoteDeletion: { state: 'pending', operationId: 'hostile-acl-fixture' } } } }); process.exit(9); } catch (error) { if (!/ACL|Untrusted|unsafe/i.test(error.message)) throw error; process.exit(0); }";
+    await execFileAsync(process.execPath, ["-e", script], {
+      cwd: selected, timeout: 15000, env: { ...process.env, DB_ENABLED: "false" },
+    });
+    assert.doesNotMatch(acl.getWindowsChunkAclDescriptor(locks), /D:P/,
+      "unsafe legacy ACL must remain unsealed, with no opportunistic chmod");
+    assert.deepEqual(fs.readdirSync(locks), [],
+      "no lock, database or WAL/SHM may be created under an unsafe inherited ACL");
+  } finally {
+    if (granted) {
+      execFileSync(icacls, [locks, "/remove:g", users],
+        { windowsHide: true, stdio: "ignore", timeout: 12000 });
+    }
+    fs.rmSync(selected, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 });

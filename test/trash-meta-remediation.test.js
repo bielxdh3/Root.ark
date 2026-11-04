@@ -3,8 +3,10 @@ const os = require("os");
 const path = require("path");
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-meta-"));
+const runtime = createPrivateAuthorityFixture("rootark-trash-meta-");
 process.chdir(runtime);
 const trashRepository = require("../repositories/trashRepository");
 const trashService = require("../services/trashService");

@@ -370,6 +370,10 @@ while ($true) {
     try {
       const child = spawn(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive",
         "-OutputFormat", "Text", "-EncodedCommand", encoded], {
+        // The resident verifier uses absolute paths only. Inheriting a
+        // disposable runtime CWD keeps that directory open on Windows and
+        // prevents its cleanup until this warm worker exits.
+        cwd: "C:\\Windows\\System32",
         windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
       });
       worker = child;
