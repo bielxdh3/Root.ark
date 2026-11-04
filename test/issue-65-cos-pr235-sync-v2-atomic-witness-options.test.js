@@ -55,17 +55,21 @@ function resignOwnerCertificate(base, statement) {
 }
 
 test("atomic witness accepts an independently pinned Ed25519 public KeyObject without reimport", () => {
-  const pair = crypto.generateKeyPairSync("ed25519");
-  const witness = { pinnedPublicKey: pair.publicKey,
-    scope: "alice:store", readback: async () => null };
+  // PR236 additionally requires owner-signed provision and a separate CAS
+  // floor. Preserve that full authority chain while testing KeyObject input.
+  const witness = trustedFixture();
+  const publicKey = crypto.createPublicKey({ key: witness.pinnedPublicKey,
+    format: "der", type: "spki" });
+  witness.pinnedPublicKey = publicKey;
   const configured = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: witness }, true);
   const makeEngine = (atomicBatchWitnessPublicKey) => new SyncEngine({
+    ...configured,
     adapter: { push: async () => null, list: async () => [] },
     atomicBatchWitnessPublicKey,
   });
   assert.equal(makeEngine(configured.atomicBatchWitnessPublicKey).atomicBatchWitnessPublicKey,
-    pair.publicKey);
-  assert.equal(makeEngine(pair.publicKey.export({ type: "spki", format: "der" }))
+    publicKey);
+  assert.equal(makeEngine(publicKey.export({ type: "spki", format: "der" }))
     .atomicBatchWitnessPublicKey.asymmetricKeyType, "ed25519");
   assert.throws(() => makeEngine(crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048 }).publicKey), /must be an Ed25519 public key/);
