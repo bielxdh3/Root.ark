@@ -1,5 +1,8 @@
 "use strict";
 
+// Node --test discovers every JS file under test/, including support workers.
+// Only the explicit child invocation may initialize or mutate a SQLite runtime.
+function runFixture() {
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -63,3 +66,8 @@ function reclaim(item) {
   assert.equal(repo.getTrashItem(item.id).metadata.remoteDeletion.state, "cancelled");
 }
 process.stdout.write("SQLITE_REMOTE_CLAIM_FENCE_OK\n");
+}
+
+const selected = process.env.ROOTARK_TEST_TRASH_CLAIM_SQLITE_CHILD;
+if (selected === "1") runFixture();
+else if (selected !== undefined) throw Error("INVALID_SQLITE_TRASH_TEST_INVOCATION");

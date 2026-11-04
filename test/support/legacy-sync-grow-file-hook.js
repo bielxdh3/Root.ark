@@ -2,6 +2,9 @@
 
 // Adversarial fixture: grow the pinned inode after the first stat but before
 // the caller reads it, and record any unbounded FileHandle.readFile call.
+// The preloader also lives under test/support: default test discovery must
+// neither mutate the host fs module nor require a private fixture environment.
+function installGrowthFixture() {
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
@@ -32,3 +35,11 @@ fsp.open = async function (...args) {
   };
   return handle;
 };
+}
+
+const selected = process.env.ROOTARK_TEST_SYNC_GROW_FIXTURE;
+if (selected === "1") installGrowthFixture();
+else if (selected !== undefined || process.env.ROOTARK_TEST_SYNC_GROW_PATH
+  || process.env.ROOTARK_TEST_SYNC_UNBOUNDED_READ_MARKER) {
+  throw Error("INVALID_SYNC_GROW_TEST_INVOCATION");
+}

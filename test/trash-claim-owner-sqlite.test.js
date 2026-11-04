@@ -15,6 +15,7 @@ test("real SQLite claim fencing preserves the new owner on stale success and fai
     const result = spawnSync(process.execPath, [worker], {
       cwd: dir, encoding: "utf8", timeout: 20_000, windowsHide: true,
       env: { ...process.env, DB_ENABLED: "true",
+        ROOTARK_TEST_TRASH_CLAIM_SQLITE_CHILD: "1",
         DATABASE_URL: path.join(dir, "data", "rootark.sqlite") },
     });
     assert.equal(result.status, 0, result.stderr || result.error?.message);
@@ -22,4 +23,15 @@ test("real SQLite claim fencing preserves the new owner on stale success and fai
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("SQLite child invoked explicitly without DB authority fails closed", () => {
+  const worker = path.join(__dirname, "support", "trash-claim-owner-sqlite-worker.js");
+  const result = spawnSync(process.execPath, [worker], {
+    encoding: "utf8", timeout: 5_000, windowsHide: true,
+    env: { ...process.env, DB_ENABLED: "false",
+      ROOTARK_TEST_TRASH_CLAIM_SQLITE_CHILD: "1" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /SQLITE_TRASH_TEST_REQUIRED/);
 });

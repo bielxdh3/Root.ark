@@ -245,7 +245,8 @@ test("legacy sync never re-stats an enlarged file into an unbounded read allocat
     ["-r", preload, path.resolve(__dirname, "../sync-client/rootark-sync.js"),
       "start", "--legacy-development-opt-in", "--once", "--config", config], {
       timeout: 15_000,
-      env: { ...process.env, ROOTARK_TEST_SYNC_GROW_PATH: target,
+      env: { ...process.env, ROOTARK_TEST_SYNC_GROW_FIXTURE: "1",
+        ROOTARK_TEST_SYNC_GROW_PATH: target,
         ROOTARK_TEST_SYNC_UNBOUNDED_READ_MARKER: marker },
     });
   assert.ok((await fsp.stat(target)).size > 8 * 1024 * 1024, "fixture must grow a pinned inode");
