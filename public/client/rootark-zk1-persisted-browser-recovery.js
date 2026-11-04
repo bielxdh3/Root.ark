@@ -59,6 +59,23 @@
     function assertLive(callback) {
       if (typeof callback !== "function" || callback() !== undefined) deny();
     }
+    function readbackClock(initialSeconds) {
+      // Advance the independently supplied operation time only by elapsed
+      // platform time. A caller-controlled callback or remote response can
+      // never mint newer GET authorization or extend an owner grant.
+      if (typeof Date === "undefined" || typeof Date.now !== "function") deny();
+      const originMs = Date.now();
+      if (!Number.isSafeInteger(originMs) || originMs < 0) deny();
+      let lastMs = originMs;
+      return () => {
+        const currentMs = Date.now();
+        if (!Number.isSafeInteger(currentMs) || currentMs < lastMs) deny();
+        lastMs = currentMs;
+        const seconds = initialSeconds + Math.floor((currentMs - originMs) / 1000);
+        if (!Number.isSafeInteger(seconds) || seconds < initialSeconds) deny();
+        return seconds;
+      };
+    }
     async function recoverFromPinnedPersistedHttpGet(input) {
       let ciphertext, secret, recovered;
       try {
@@ -75,6 +92,7 @@
           || meta.epoch !== input.pinnedCurrentHead?.epoch
           || SCOPE.some((name) => meta[name] !== grant?.[name])
           || input.bundle.objectRevision !== input.signedInventory?.objectRevision) deny();
+        const currentReadbackSeconds = readbackClock(input.nowSeconds);
         secret = bytes(input.recoverySecret, 32);
         const portableRoot = bytes(input.independentlyPinnedCiphertextRoot, 32);
         const nativeRoot = bytes(input.independentlyPinnedSourceChunkRoot, 32);
@@ -116,17 +134,24 @@
         const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", ciphertext));
         assertLive(input.assertLive);
         const verifyCurrentHttpRead = async () => {
+          // Recheck the independent floor *before* sampling time and signing
+          // each GET, including the final read after slow persisted chunks.
+          await floor.verifyExternalAnchor(anchor);
+          if (typeof window === "object") await floor.assertCurrent(anchor);
+          assertLive(input.assertLive);
           const get = await http.signProtectedContentOperation({
             signerKey: input.devicePrivateKey,
             scope: Object.fromEntries(SCOPE.map((name) => [name, meta[name]])),
             deviceId: grant.device_id, manifestRevision: input.pinnedCurrentHead.revision,
             manifestDigest: input.pinnedCurrentHead.digest,
-            epoch: input.pinnedCurrentHead.epoch, nowSeconds: input.nowSeconds,
+            epoch: input.pinnedCurrentHead.epoch, nowSeconds: currentReadbackSeconds(),
             operation: "get", objectId: meta.object_id,
             expectedObjectRevision: input.bundle.objectRevision,
             expectedCiphertextDigest: digest, ciphertext: null,
           });
           assertLive(input.assertLive);
+          // Signing is asynchronous WebCrypto: a floor change while the
+          // signature is generated must still be detected before the GET.
           await floor.verifyExternalAnchor(anchor);
           if (typeof window === "object") await floor.assertCurrent(anchor);
           assertLive(input.assertLive);

@@ -119,7 +119,7 @@ test("browser UMD executes without Node require and refuses a cross-origin signe
   })()`, context);
 });
 
-test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obey server admission and verified ciphertext root", async (t) => {
+async function runProtectedHttpFixture(t, { lateClockOnly = false } = {}) {
   const dir = createPrivateAuthorityFixture("rootark-browser-protected-http-");
   const state = await fixtures.createInitialState(2);
   const scope = state.scope;
@@ -127,6 +127,7 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   const witnessKeys = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);
   let gateOpen = true;
+  let storeNowSeconds = 1400;
   let signedHead = state.headManifest;
   let admissions = 0;
   let emittedBody = "";
@@ -137,7 +138,7 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
         type: "rootark-recovery-witness-head/v1", witness_key_id: witnessKeyId,
         ...scope, current_revision: signedHead.revision,
         current_manifest_digest: await manifestDigest(),
-        witness_sequence: signedHead.revision, nonce, observed_at: 1400,
+        witness_sequence: signedHead.revision, nonce, observed_at: storeNowSeconds,
         status: gateOpen ? "committed" : "pending",
         pending_reservation_id: gateOpen ? null : crypto.randomBytes(16),
       };
@@ -164,7 +165,7 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
       witnessSequence: 1, digest: await v2.recoveryManifestDigestV2(state.baseManifest) },
     manifestProvider: () => z.encodeDeterministic(signedHead),
     witnessProvider, bootstrapNew: true, admissionRequired: true,
-    nowSeconds: () => 1400,
+    nowSeconds: () => storeNowSeconds,
   };
   let store = new Zk1ProtectedObjectStore(storeFilename, storeConfig);
   const liveStore = {
@@ -503,6 +504,39 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   assert.equal(bridgedResult.independentRemoteDurabilityProven, false);
   assert.equal(bridgedResult.authorizesProductionRestore, false);
   bridgedResult.data.fill(0);
+  // The final GET is a fresh authorization decision: local SQLite chunk
+  // reads may finish after the first signed GET's 45-second expiration.
+  // Keep the real protected HTTP server and owner/floor signatures active.
+  if (lateClockOnly) {
+    const originalDateNow = Date.now;
+    const startedMs = originalDateNow();
+    try {
+    const recover = process.env.ROOTARK_PERSISTED_BROWSER_RECOVERY_IMPL
+      ? require(process.env.ROOTARK_PERSISTED_BROWSER_RECOVERY_IMPL)
+      : persistedBrowser;
+    Date.now = () => startedMs + (storeNowSeconds - 1400) * 1000;
+    let advanced = false;
+    const lateReadback = await recover.recoverFromPinnedPersistedHttpGet({
+      ...trustedBridgeInput,
+      readChunk: async (request) => {
+        const chunk = await readPersistedChunk(request);
+        if (!advanced) {
+          advanced = true;
+          storeNowSeconds = 1450;
+        }
+        return chunk;
+      },
+    });
+    assert.equal(advanced, true);
+    assert.deepEqual(Buffer.from(lateReadback.data), persistedPlaintext,
+      "a fresh real Ed25519 GET after slow local chunks must authorize recovery");
+    lateReadback.data.fill(0);
+    } finally {
+      Date.now = originalDateNow;
+      storeNowSeconds = 1400;
+    }
+    return;
+  }
   let forgedOutbound = 0;
   await assert.rejects(persistedBrowser.recoverFromPinnedPersistedHttpGet({
     ...trustedBridgeInput, independentlyPinnedSourceChunkRoot:
@@ -1122,4 +1156,9 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     expectedRoot, cek, metadata,
   }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "pending witness never releases ciphertext");
   assert.ok(admissions >= 3);
-});
+}
+
+test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obey server admission and verified ciphertext root",
+  async (t) => runProtectedHttpFixture(t));
+test("persisted encrypted recovery re-signs final GET after 50 seconds of local chunk reads",
+  async (t) => runProtectedHttpFixture(t, { lateClockOnly: true }));
