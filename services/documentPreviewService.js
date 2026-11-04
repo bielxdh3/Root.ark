@@ -229,22 +229,27 @@ function readPreviewBytes(filePath) {
 }
 
 async function parseDocumentInChildProcess(filePathOrBytes, extension, options = {}) {
-  const bytes = Buffer.isBuffer(filePathOrBytes) ? filePathOrBytes : readPreviewBytes(filePathOrBytes);
-  if (bytes.length > MAX_INPUT_BYTES) throw new Error("PREVIEW_TOO_LARGE");
-  if (extension === ".docx") await preflightDocx(bytes);
+  // Reserve the bounded parser admission slot BEFORE retaining snapshot bytes
+  // or starting ZIP preflight. Queued/overflow requests must not hold 5 MiB
+  // buffers while waiting for the parser or an attacker-stalled archive.
   const release = await acquireParserSlot();
-  try { return await parseDocumentInChildProcessUnbounded(bytes, extension, options); }
+  try {
+    const bytes = Buffer.isBuffer(filePathOrBytes) ? filePathOrBytes : readPreviewBytes(filePathOrBytes);
+    if (bytes.length > MAX_INPUT_BYTES) throw new Error("PREVIEW_TOO_LARGE");
+    if (extension === ".docx") await preflightDocx(bytes);
+    return await parseDocumentInChildProcessUnbounded(bytes, extension, options);
+  }
   finally { release(); }
 }
 
 async function previewText(filePath, fileName, options = {}) {
   const extension = path.extname(fileName || filePath).toLowerCase();
   if (!TEXT_EXTENSIONS.has(extension) && extension !== ".doc" && extension !== ".docx") throw new Error("PREVIEW_UNSUPPORTED");
-  const bytes = readPreviewBytes(filePath);
   if (TEXT_EXTENSIONS.has(extension)) {
+    const bytes = readPreviewBytes(filePath);
     return { content: bounded(bytes.toString("utf8")), format: "text", language: extension.slice(1) || "text" };
   }
-  const content = await parseDocumentInChildProcess(bytes, extension, options);
+  const content = await parseDocumentInChildProcess(filePath, extension, options);
   return { content, format: "document", language: extension.slice(1) };
 }
 

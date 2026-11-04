@@ -4,7 +4,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { preflightDocx, parseDocumentInChildProcess, MAX_CONCURRENT_PARSERS } = require("../services/documentPreviewService");
+const unzipper = require("unzipper");
+const { preflightDocx, previewText, parseDocumentInChildProcess, MAX_CONCURRENT_PARSERS, MAX_PARSER_QUEUE } = require("../services/documentPreviewService");
 
 function fakeSpawn({ output = JSON.stringify({ ok: true, content: "ok" }), stderr = [], delay = 0, never = false, closeOnKill = 0 } = {}) {
   const child = new EventEmitter();
@@ -95,6 +96,66 @@ test("parser concurrency has a bounded queue and releases timed-out work", async
   assert.equal(results.filter((result) => result.status === "rejected" && result.reason.code === "PREVIEW_BUSY").length, 1);
   assert.equal(results.filter((result) => result.status === "rejected" && result.reason.code === "PREVIEW_PROCESS_UNREAPED").length, MAX_CONCURRENT_PARSERS + 16);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("DOCX preview rejects overflow before taking file snapshots or preflighting ZIP", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preview-docx-queue-"));
+  const count = MAX_CONCURRENT_PARSERS + MAX_PARSER_QUEUE + 1;
+  const document = path.join(dir, "valid.docx");
+  makeZip(document, [{ name: "word/document.xml", data: "<w:document/>" }]);
+  const files = Array.from({ length: count }, (_, index) => {
+    const filename = path.join(dir, `document-${index}.docx`);
+    fs.copyFileSync(document, filename);
+    return filename;
+  });
+  const originalOpen = fs.openSync;
+  const originalPreflight = unzipper.Open.buffer;
+  const opened = new Set();
+  let preflights = 0;
+  let resumePreflights;
+  const held = new Promise((resolve) => { resumePreflights = resolve; });
+  const outcomes = [];
+  let completed;
+  try {
+    fs.openSync = function observedOpen(filename, ...args) {
+      if (files.includes(filename)) opened.add(filename);
+      return originalOpen.call(this, filename, ...args);
+    };
+    unzipper.Open.buffer = async function delayedPreflight(...args) {
+      preflights++;
+      await held;
+      return originalPreflight.apply(this, args);
+    };
+    for (const filename of files) {
+      outcomes.push(previewText(filename, path.basename(filename), {
+        spawnImpl: () => fakeSpawn(),
+      }).then((value) => ({ status: "fulfilled", value }),
+        (reason) => ({ status: "rejected", reason })));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const beforeRelease = { reads: opened.size, preflights };
+    const overflow = await Promise.race([
+      outcomes.at(-1),
+      new Promise((resolve) => setTimeout(() => resolve(null), 40)),
+    ]);
+    assert.equal(overflow?.status, "rejected", "the overflow request must be rejected promptly");
+    assert.equal(overflow.reason.code, "PREVIEW_BUSY");
+    assert.ok(beforeRelease.reads <= MAX_CONCURRENT_PARSERS,
+      `overflow must not read a file before acquiring a slot: read ${beforeRelease.reads}`);
+    assert.ok(beforeRelease.preflights <= MAX_CONCURRENT_PARSERS,
+      `preflights must stay inside slots: entered ${beforeRelease.preflights}`);
+  } finally {
+    resumePreflights();
+    completed = await Promise.all(outcomes);
+    fs.openSync = originalOpen;
+    unzipper.Open.buffer = originalPreflight;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(completed.filter((outcome) => outcome.status === "fulfilled").length,
+    MAX_CONCURRENT_PARSERS + MAX_PARSER_QUEUE,
+    "all admitted previews must still complete after the held preflight resumes");
+  assert.equal(completed.filter((outcome) => outcome.status === "rejected"
+    && outcome.reason.code === "PREVIEW_BUSY").length, 1);
 });
 
 test("parser termination waits for confirmed close and keeps the slot occupied", async () => {
