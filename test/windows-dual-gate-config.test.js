@@ -32,8 +32,11 @@ function assertDualGate(yaml) {
   for (const job of [release, canonical]) {
     assert.match(job, /node-version:\s*22/);
     assert.match(job, /run:\s*npm ci/);
-    assert.match(job, /timeout-minutes:\s*60/);
   }
+  assert.match(release, /timeout-minutes:\s*90/,
+    "the full mandatory release gate requires a bounded 90-minute budget");
+  assert.match(canonical, /timeout-minutes:\s*60/,
+    "the separate complete canonical suite retains its original 60-minute bound");
   assert.match(release, /node scripts\/validate-edge-e2e\.js --probe/);
   assert.match(release, /node scripts\/validate-edge-e2e\.js --run/);
   assert.match(release, /run:\s*npm run validate:release-gate/);
