@@ -10,6 +10,7 @@ const https = require("node:https");
 const http = require("node:http");
 const path = require("node:path");
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const registerAuthRoutes = require("../src/routes/auth");
@@ -534,7 +535,9 @@ test("ZK10 DEV-OFF real Express login/JWT → signed never_enrolled mTLS → dur
     });
     // Exercise the exact WebDAV boundary helper through real JWT auth and
     // the genuine signed mTLS adapter; main server still has no owner bootstrap.
-    app.get("/dav/legacy-object", authenticate, (req, res) =>
+    const legacyReadLimit = rateLimit({ windowMs: 60_000, limit: 128,
+      standardHeaders: false, legacyHeaders: false });
+    app.get("/dav/legacy-object", legacyReadLimit, authenticate, (req, res) =>
       runZk10LegacyWebDavOperation({ req, res, strict: true,
         legacyCutoverFence: fence, operation: "webdav:get" },
       () => res.status(200).send("legacy-read-only-object")));

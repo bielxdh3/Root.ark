@@ -5,6 +5,7 @@
 // The attacker changes ONLY the physical same-inode file and local mutation
 // journal. The independent outbox, signing key and file key remain untouched.
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -229,7 +230,7 @@ test("RED: same-inode MOVE content and local-only hash witness poisoned; signed 
     await handle.sync();
   } finally { await handle.close(); }
   sameInode(exactInode(proof.target), proof.sourceIdentity);
-  assert.deepEqual(fs.readFileSync(proof.target), poison);
+  assert.deepEqual(readPinnedFixtureFileSync(proof.target), poison);
 
   // Independent stolen local-only journal control, committed through the
   // normal fsync-backed SyncJournal transaction machinery. Neither receipt
@@ -272,7 +273,7 @@ test("RED: same-inode MOVE content and local-only hash witness poisoned; signed 
   assert.equal((await fsp.readFile(f.localPath)).equals(localBeforeRestart), true);
   assert.equal((await fsp.readFile(f.outboxPath)).equals(proof.outboxBytes), true);
   sameInode(exactInode(proof.target), proof.sourceIdentity);
-  assert.deepEqual(fs.readFileSync(proof.target), poison);
+  assert.deepEqual(readPinnedFixtureFileSync(proof.target), poison);
 });
 
 test("positive revoked replay: valid signed MOVE preserves original inode, exactly once, without reauthorization", {

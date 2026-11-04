@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -71,7 +74,12 @@ async function login(port, username, password) {
 function state(target) {
   try {
     const stat = fs.statSync(target);
-    return { exists: true, size: stat.size, hash: stat.isFile() ? crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex") : null };
+    if (stat.isFile()) {
+      const content = readPinnedFixtureFileSync(target);
+      return { exists: true, size: content.length,
+        hash: crypto.createHash("sha256").update(content).digest("hex") };
+    }
+    return { exists: true, size: stat.size, hash: null };
   } catch (error) {
     if (error.code === "ENOENT") return { exists: false };
     throw error;
@@ -100,7 +108,7 @@ function headers(port, session) {
 
 test("file trash lifecycle keeps authorization and paths inside a disposable runtime root", { timeout: 30_000 }, async (t) => {
   const password = crypto.randomBytes(24).toString("base64url");
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-security-"));
+  const sandbox = createPrivateAuthorityFixture("rootark-trash-security-");
   const checkoutJson = path.join(ROOT, "data", "trash-items.json");
   const checkoutBefore = state(checkoutJson);
   const sandboxJson = path.join(sandbox, "data", "trash-items.json");

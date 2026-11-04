@@ -8,8 +8,11 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
+const CLEANUP_INJECTOR = path.join(__dirname, "support", "realtime-webdav-cleanup-injector.js");
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -46,7 +49,7 @@ function serverEnv(port) {
 }
 
 function createFixture({ phase = "cloud_complete", state = "completed", absent = [], terminal = false } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-completed-"));
+  const dir = createPrivateAuthorityFixture("rootark-webdav-completed-");
   fs.mkdirSync(path.join(dir, "data"));
   fs.mkdirSync(path.join(dir, "uploads"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: { upload: true }, sessionVersion: 0 }]));
@@ -161,8 +164,9 @@ test("completed WebDAV journals finalize idempotently across restart boundaries"
 test("completed cleanup retries EPERM/EBUSY without rollback", { timeout: 30_000 }, async () => {
   for (const code of ["EPERM", "EBUSY"]) {
     const fixture = createFixture();
-    const script = `const fs=require("fs"); const path=require("path"); const target=path.resolve(${JSON.stringify(fixture.destinationBackupPath)}); const original=fs.rmSync; let failed=false; fs.rmSync=(value, options)=>{ if(path.resolve(value)===target&&!failed){failed=true; throw Object.assign(new Error("busy"),{code:${JSON.stringify(code)}});} return original(value, options); }; require(${JSON.stringify(path.join(ROOT, "server.js"))});`;
-    const failed = spawnSync(process.execPath, ["-e", script], { cwd: fixture.dir, env: serverEnv(0), encoding: "utf8", timeout: 10_000, windowsHide: true });
+    const failed = spawnSync(process.execPath, ["-r", CLEANUP_INJECTOR, path.join(ROOT, "server.js")], {
+      cwd: fixture.dir, env: { ...serverEnv(0), ROOTARK_TEST_CLEANUP_BACKUP: fixture.destinationBackupPath,
+        ROOTARK_TEST_CLEANUP_FAULT: code + "_ONCE" }, encoding: "utf8", timeout: 10_000, windowsHide: true });
     assert.notEqual(failed.status, 0, `${code} cleanup unexpectedly completed`);
     assert.equal(fs.readFileSync(fixture.destinationPath, "utf8"), "destination");
     const second = await startServer(fixture.dir);
@@ -174,8 +178,9 @@ test("completed cleanup retries EPERM/EBUSY without rollback", { timeout: 30_000
 
 test("persistent cleanup failure remains visible and retryable", { timeout: 30_000 }, async () => {
   const fixture = createFixture();
-  const script = `const fs=require("fs"); const path=require("path"); const target=path.resolve(${JSON.stringify(fixture.destinationBackupPath)}); const original=fs.rmSync; fs.rmSync=(value, options)=>{ if(path.resolve(value)===target) throw Object.assign(new Error("permission denied"),{code:"EPERM"}); return original(value, options); }; require(${JSON.stringify(path.join(ROOT, "server.js"))});`;
-  const failed = spawnSync(process.execPath, ["-e", script], { cwd: fixture.dir, env: serverEnv(0), encoding: "utf8", timeout: 10_000, windowsHide: true });
+  const failed = spawnSync(process.execPath, ["-r", CLEANUP_INJECTOR, path.join(ROOT, "server.js")], {
+    cwd: fixture.dir, env: { ...serverEnv(0), ROOTARK_TEST_CLEANUP_BACKUP: fixture.destinationBackupPath,
+      ROOTARK_TEST_CLEANUP_FAULT: "EPERM_ALWAYS" }, encoding: "utf8", timeout: 10_000, windowsHide: true });
   assert.notEqual(failed.status, 0);
   assert.equal(fs.existsSync(fixture.journalPath), true);
   assert.equal(fs.readFileSync(fixture.destinationPath, "utf8"), "destination");

@@ -858,7 +858,8 @@ test("cache eviction keeps the staged copy and the marker when the local path is
   const originalLstat = fsp.lstat;
   fsp.lstat = async function injectedLstat(target, options) {
     if (String(target).includes(`${path.sep}.rootark-trash${path.sep}`) && await originalLstat(localPath).then(() => false, () => true)) {
-      await fsp.writeFile(localPath, "user recreated file");
+      // A replaced pathname must never be overwritten by this race injector.
+      await fsp.writeFile(localPath, "user recreated file", { flag: "wx", mode: 0o600 });
       throw Object.assign(new Error("injected identity check failure"), { code: "EIO" });
     }
     return originalLstat.call(fsp, target, options);

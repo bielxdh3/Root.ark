@@ -8,6 +8,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFile } = require("./support/pinned-fixture-file");
 
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
@@ -1350,7 +1351,7 @@ async function persistPhysicallyMovedWebDavJournal(root, transactionJournal, ope
     if (error.code === "ENOENT") return false;
     throw error;
   }), false);
-  assert.equal(await fsp.readFile(destination, "utf8"), payload);
+  assert.equal(await readPinnedFixtureFile(destination, "utf8"), payload);
   await transactionJournal.update(operationId, { phase: "source-moved" });
   const diskRecord = (await new SyncJournal(transactionJournal.filePath).open()).pending()[0];
   assert.equal(diskRecord.phase, "source-moved");

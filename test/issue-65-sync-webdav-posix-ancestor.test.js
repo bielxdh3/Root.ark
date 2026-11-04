@@ -9,6 +9,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
 
 const LINUX = process.platform === "linux";
@@ -97,7 +98,7 @@ test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and jo
   assert.equal((await request(port, "/nested/unsafe.txt", "HEAD")).status, 200);
   assert.equal((await request(port, "/nested/", "PROPFIND", null, { depth: "1" })).status, 207);
   assert.equal((await request(port, "/nested/unsafe.txt", "PUT", "RECOVERED")).status, 204);
-  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  assert.equal(readPinnedFixtureFileSync(leaf, "utf8"), "RECOVERED");
   // Recovery needs exclusive lifetime ownership. A second concurrent bridge
   // would be refused by the real root lock before POSIX leaf validation.
   await bridge.stop();
@@ -108,7 +109,7 @@ test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and jo
   await assert.rejects(recovering.start(), /Untrusted POSIX bridge file mode/,
     "exclusive startup must refuse untrusted recovery leaf before modifying it");
   assert.equal(recovering.server.listening, false);
-  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  assert.equal(readPinnedFixtureFileSync(leaf, "utf8"), "RECOVERED");
   fs.chmodSync(leaf, 0o644);
   const stat = fs.lstatSync(leaf, { bigint: true });
   const previousIdentity = { dev: String(stat.dev), ino: String(stat.ino), type: "file" };

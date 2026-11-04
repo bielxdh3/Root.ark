@@ -8,6 +8,7 @@ const vm = require("node:vm");
 const os = require("node:os");
 const { spawn, execFileSync } = require("node:child_process");
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
 const z = require("../src/crypto/rootark-zk-1");
 const inventory = require("../src/crypto/rootark-zk-content-inventory-v1");
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
@@ -567,7 +568,9 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     /^rootark-[a-z0-9-]+$/.test(name) && scriptNames.includes(name)),
   "real Edge archive fixture must explicitly allow each workspace script");
   assert.equal(scriptNames.includes("arbitrary-untrusted-script"), false);
-  for (const name of scriptNames) app.get("/client/" + name + ".js", (_req, res) =>
+  const browserFixtureLimit = rateLimit({ windowMs: 60_000, limit: 128,
+    standardHeaders: false, legacyHeaders: false });
+  for (const name of scriptNames) app.get("/client/" + name + ".js", browserFixtureLimit, (_req, res) =>
     res.type("application/javascript").sendFile(path.join(__dirname, "../public/client",
       name + ".js"), { dotfiles: "allow" }));
   app.get("/edge-bootstrap.js", (_req, res) => res.type("application/javascript")
@@ -985,7 +988,11 @@ test("real authenticated HTTP owner backup survives lost PUT ACK and restores hi
     gets++;
     const data = store.get(req.params.digest);
     if (!data) return res.sendStatus(404);
-    return res.type("application/octet-stream").send(data);
+    // This fixture serves opaque, attacker-controlled ciphertext bytes.
+    // Prevent MIME sniffing even if the payload resembles active HTML.
+    res.set("Content-Type", "application/octet-stream");
+    res.set("X-Content-Type-Options", "nosniff");
+    return res.end(data);
   });
   const server = await new Promise((resolve) => {
     const s = app.listen(0, "127.0.0.1", () => resolve(s));

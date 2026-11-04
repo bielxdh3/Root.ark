@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
 const unzipper = require("unzipper");
 const { validateBackupArchive } = require("../services/restoreService");
 
@@ -69,7 +70,7 @@ function manifest(backupId = "fixture-backup") {
 function state(target) {
   try {
     const stat = fs.lstatSync(target);
-    if (stat.isFile()) return `file:${crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex")}`;
+    if (stat.isFile()) return `file:${crypto.createHash("sha256").update(readPinnedFixtureFileSync(target)).digest("hex")}`;
     return stat.isDirectory() ? `directory:${fs.readdirSync(target).sort().join(",")}` : "other";
   } catch (error) {
     if (error.code === "ENOENT") return "absent";

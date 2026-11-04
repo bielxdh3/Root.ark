@@ -155,14 +155,12 @@ test("unsafe cloud object names fail closed without retaining an archive", async
   for (const name of ["../escape.txt", "/absolute.txt", "nested/file.txt", "nested\\file.txt", ".env"]) {
     await t.test(name, () => {
       const isolated = createPrivateAuthorityFixture("rootark-cloud-backup-unsafe-");
-      const script = [
-        `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false";`,
-        'const fs = require("fs"); const path = require("path");',
-        `const service = require(${JSON.stringify(servicePath)});`,
-        `service.setCloudStorage({ enabled: () => true, inventory: async () => [{ provider: "s3", providerIdentity: "bad", area: "uploads", folderId: "root", name: ${JSON.stringify(name)} }], download: async () => true });`,
-        'service.createBackup().then(() => process.exitCode = 2).catch(() => { const backups = path.join(process.cwd(), "data", "backups"); const files = fs.existsSync(backups) ? fs.readdirSync(backups).filter((file) => file.endsWith(".zip")) : []; process.exitCode = files.length ? 3 : 0; });',
-      ].join(" ");
-      const result = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+      const result = spawnSync(process.execPath,
+        [path.join(__dirname, "support", "backup-cloud-unsafe-name-worker.js")], {
+          cwd: isolated, encoding: "utf8",
+          env: { ...process.env, DB_ENABLED: "false", ROOTARK_TEST_BACKUP_SERVICE: servicePath,
+            ROOTARK_TEST_CLOUD_NAME: name }, windowsHide: true,
+        });
       fs.rmSync(isolated, { recursive: true, force: true });
       assert.equal(result.status, 0, `${name}: ${result.stderr}`);
     });
