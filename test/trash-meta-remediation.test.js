@@ -134,6 +134,29 @@ test("trash remote deletion meta-remediation matrix", async (t) => {
     assert.ok(first);
     assert.equal(second, null);
   });
+  await t.test("stale lock reclamation cannot erase a competing fresh claim", () => {
+    const value = queue();
+    const expired = trashService.claimRemoteDeletion({ item: value, clock, leaseMs: 1000 });
+    assert.ok(expired);
+    const stale = new Date(clock.now() - 120_000);
+    fs.utimesSync(expired.path, stale, stale);
+    const originalRemove = fs.rmSync;
+    let competingClaim = null;
+    let nested = false;
+    fs.rmSync = function (...args) {
+      if (args[0] === expired.path && !nested) {
+        nested = true;
+        try { competingClaim = trashService.claimRemoteDeletion({ item: value, clock, leaseMs: 1000 }); }
+        catch (error) { competingClaim = error; }
+      }
+      return originalRemove.apply(this, args);
+    };
+    let outerClaim;
+    try { outerClaim = trashService.claimRemoteDeletion({ item: value, clock, leaseMs: 1000 }); }
+    finally { fs.rmSync = originalRemove; }
+    assert.equal(Boolean(outerClaim && competingClaim && !(competingClaim instanceof Error)), false,
+      "two workers must never own one remote deletion after stale lock recovery");
+  });
   await t.test("duplicate request is idempotent", () => {
     const value = queue();
     const again = trashService.queueRemoteDeletion({ item: value, deletedBy: "other", loaders: {}, provider: "s3", clock });

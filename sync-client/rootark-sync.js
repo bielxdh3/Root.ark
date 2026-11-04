@@ -194,29 +194,48 @@ async function approveRemoteFile(config, configPath, fileName, passwordProvider)
   return payload;
 }
 
-async function hashFile(filePath) {
-  const hash = crypto.createHash("sha256");
-  const stream = fs.createReadStream(filePath);
-  await new Promise((resolve, reject) => {
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", resolve);
-  });
-  return hash.digest("hex");
+async function isSafeLocalFile(rootDir, filePath) {
+  const root = path.resolve(rootDir);
+  const candidate = safeResolveInside(root, filePath);
+  if (!candidate || candidate === root) return false;
+  const canonicalRoot = await fsp.realpath(root);
+  const canonicalTarget = await fsp.realpath(candidate);
+  if (!safeResolveInside(canonicalRoot, canonicalTarget)) return false;
+  for (let current = candidate; current !== root; current = path.dirname(current)) {
+    if ((await fsp.lstat(current)).isSymbolicLink()) return false;
+  }
+  return true;
 }
 
-async function getStableFileInfo(filePath, waitMs) {
-  const first = await fsp.stat(filePath);
+async function getStableFileInfo(filePath, waitMs, rootDir) {
+  if (!(await isSafeLocalFile(rootDir, filePath))) return null;
+  const first = await fsp.lstat(filePath);
   if (!first.isFile()) return null;
   await new Promise((resolve) => setTimeout(resolve, waitMs));
-  const second = await fsp.stat(filePath);
+  if (!(await isSafeLocalFile(rootDir, filePath))) return null;
+  const second = await fsp.lstat(filePath);
   if (!second.isFile()) return null;
   if (first.size !== second.size || first.mtimeMs !== second.mtimeMs) return null;
-  return {
-    size: second.size,
-    mtimeMs: second.mtimeMs,
-    hash: await hashFile(filePath),
+  // Keep the legacy oversized-file failure/retry reporting without reading it.
+  if (second.size > MAX_FILE_BYTES) return {
+    size: second.size, mtimeMs: second.mtimeMs, hash: null, bytes: null,
   };
+  const handle = await fsp.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size > MAX_FILE_BYTES || opened.dev !== second.dev || opened.ino !== second.ino) return null;
+    const bytes = await handle.readFile();
+    const finalStat = await handle.stat();
+    if (!finalStat.isFile() || bytes.length !== finalStat.size ||
+        opened.size !== finalStat.size || opened.mtimeMs !== finalStat.mtimeMs ||
+        !(await isSafeLocalFile(rootDir, filePath))) return null;
+    const finalPath = await fsp.lstat(filePath);
+    if (!finalPath.isFile() || finalPath.dev !== finalStat.dev || finalPath.ino !== finalStat.ino) return null;
+    return { size: finalStat.size, mtimeMs: finalStat.mtimeMs,
+      hash: crypto.createHash("sha256").update(bytes).digest("hex"), bytes };
+  } finally {
+    await handle.close();
+  }
 }
 
 async function scanFiles(rootDir) {
@@ -227,9 +246,9 @@ async function scanFiles(rootDir) {
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
       const safePath = safeResolveInside(rootDir, fullPath);
-      if (!safePath) continue;
+      if (!safePath || entry.isSymbolicLink()) continue;
       const relativePath = path.relative(rootDir, safePath);
-      const stats = await fsp.stat(safePath).catch(() => null);
+      const stats = await fsp.lstat(safePath).catch(() => null);
       if (!stats || shouldIgnore(relativePath, stats)) continue;
 
       if (stats.isDirectory()) {
@@ -244,9 +263,8 @@ async function scanFiles(rootDir) {
   return result;
 }
 
-async function uploadFile(config, configPath, filePath, relativePath, stateEntry, passwordProvider) {
-  const stats = await fsp.stat(filePath);
-  if (stats.size > MAX_FILE_BYTES) {
+async function uploadFile(config, configPath, bytes, relativePath, stateEntry, passwordProvider) {
+  if (!Buffer.isBuffer(bytes) || bytes.length > MAX_FILE_BYTES) {
     throw new Error(`Arquivo maior que ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB ainda nao e suportado pelo cliente MVP`);
   }
 
@@ -254,8 +272,7 @@ async function uploadFile(config, configPath, filePath, relativePath, stateEntry
   const remoteFiles = await listRemoteFiles(config, configPath, passwordProvider).catch(() => []);
   const remoteExists = remoteFiles.some((file) => file.name === fileName);
   const formData = new FormData();
-  const buffer = await fsp.readFile(filePath);
-  formData.append("file", new Blob([buffer]), fileName);
+  formData.append("file", new Blob([bytes]), fileName);
   formData.append("encryptionLevel", "none");
   if (remoteExists || stateEntry?.remoteFileName === fileName) {
     formData.append("versionComment", `Root.ark Sync update ${nowIso()}`);
@@ -341,7 +358,7 @@ class SyncClient {
     if (!safePath) throw new Error("Caminho fora da pasta sincronizada bloqueado");
     if (!(await fileExists(safePath))) return;
 
-    const info = await getStableFileInfo(safePath, this.config.stabilityMs);
+    const info = await getStableFileInfo(safePath, this.config.stabilityMs, this.config.localFolder);
     if (!info) {
       this.schedule(relativePath, "not-stable");
       return;
@@ -361,7 +378,7 @@ class SyncClient {
     for (let attempt = 1; attempt <= this.config.retryLimit; attempt += 1) {
       try {
         log(`Enviando ${relativePath} (${reason}, tentativa ${attempt})`);
-        const uploaded = await uploadFile(this.config, this.configPath, safePath, relativePath, previous, this.passwordProvider);
+        const uploaded = await uploadFile(this.config, this.configPath, info.bytes, relativePath, previous, this.passwordProvider);
         this.state.files[relativePath] = {
           relativePath,
           remoteFileName: uploaded.remoteFileName,

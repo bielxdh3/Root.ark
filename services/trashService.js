@@ -1,12 +1,14 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const Database = require("better-sqlite3");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const trashRepository = require("../repositories/trashRepository");
 const { assertZk10LegacyBackupNotStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 const TRASH_STORAGE_DIR = resolveRuntimePath("data", "trash");
 const REMOTE_LOCK_DIR = resolveRuntimePath("data", "trash-remote-locks");
+const REMOTE_LOCK_COORDINATION_FILE = path.join(REMOTE_LOCK_DIR, ".coordination.sqlite");
 const DEFAULT_MAX_REMOTE_ATTEMPTS = 25;
 const MAX_REMOTE_BACKOFF_MS = 60 * 60 * 1000;
 
@@ -68,7 +70,41 @@ function lockFile(operationId) {
   return path.join(REMOTE_LOCK_DIR, `${safeName(operationId)}.lock`);
 }
 
-function releaseRemoteClaim(claim) {
+function withRemoteClaimCoordination(operation) {
+  // A filesystem lease alone cannot safely reclaim an expired path: two
+  // processes can both stat the old lock and erase a newer owner's claim.
+  // SQLite's BEGIN IMMEDIATE serializes claim, stale recovery and release.
+  fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+  const directory = fs.lstatSync(REMOTE_LOCK_DIR);
+  if (!directory.isDirectory() || directory.isSymbolicLink() ||
+      (process.platform !== "win32" && (directory.mode & 0o022) !== 0)) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  try {
+    const file = fs.lstatSync(REMOTE_LOCK_COORDINATION_FILE);
+    if (!file.isFile() || file.isSymbolicLink()) throw new Error("Remote deletion claim coordinator is unsafe");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const db = new Database(REMOTE_LOCK_COORDINATION_FILE);
+  try {
+    db.pragma("busy_timeout = 2000");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  } finally {
+    try { if (db.inTransaction) db.exec("ROLLBACK"); } catch {}
+    db.close();
+  }
+}
+
+function releaseRemoteClaimUnlocked(claim) {
   if (!claim?.path) return;
   try {
     const current = fs.readFileSync(claim.path, "utf8");
@@ -76,6 +112,12 @@ function releaseRemoteClaim(claim) {
   } catch {
     // A missing lock is already released; never mask the operation result.
   }
+}
+
+function releaseRemoteClaim(claim) {
+  if (!claim?.path) return;
+  try { withRemoteClaimCoordination(() => releaseRemoteClaimUnlocked(claim)); }
+  catch { /* Preserve the operation result; an unreleased lock is fail-closed. */ }
 }
 
 function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = crypto.randomUUID() }) {
@@ -88,27 +130,9 @@ function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = cryp
   const operationId = previous.operationId || crypto.randomUUID();
   const token = `${workerId}:${crypto.randomUUID()}`;
   const target = lockFile(operationId);
-  fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true });
-  try {
-    const fd = fs.openSync(target, "wx");
-    fs.writeFileSync(fd, token, "utf8");
-    fs.closeSync(fd);
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    try {
-      const lockState = fs.statSync(target);
-      if (lockState.mtimeMs + leaseMs <= now) fs.rmSync(target, { force: true });
-    } catch {
-      return null;
-    }
-    try {
-      const fd = fs.openSync(target, "wx");
-      fs.writeFileSync(fd, token, "utf8");
-      fs.closeSync(fd);
-    } catch {
-      return null;
-    }
-  }
+  // Keep repository operations outside the coordination transaction to avoid
+  // locking the claim SQLite file and the application DB in opposite orders.
+  if (!withRemoteClaimCoordination(() => reserveRemoteClaimPath(target, token, now, leaseMs))) return null;
   const at = new Date(now).toISOString();
   const claimed = transition(previous, previous.state, at, {
     operationId,
@@ -129,6 +153,31 @@ function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = cryp
     releaseRemoteClaim({ path: target, token });
     throw error;
   }
+}
+
+function reserveRemoteClaimPath(target, token, now, leaseMs) {
+  try {
+    const fd = fs.openSync(target, "wx");
+    fs.writeFileSync(fd, token, "utf8");
+    fs.closeSync(fd);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    try {
+      const lockState = fs.lstatSync(target);
+      if (!lockState.isFile() || lockState.isSymbolicLink()) return null;
+      if (lockState.mtimeMs + leaseMs <= now) fs.rmSync(target, { force: true });
+    } catch {
+      return false;
+    }
+    try {
+      const fd = fs.openSync(target, "wx");
+      fs.writeFileSync(fd, token, "utf8");
+      fs.closeSync(fd);
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 function ensureTrashStorage() {
