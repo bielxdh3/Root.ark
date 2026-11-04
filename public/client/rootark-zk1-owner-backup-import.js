@@ -90,6 +90,22 @@
       if (!Number.isSafeInteger(value) || value < 1) deny();
       return value;
     }
+    function readbackClock(initialSeconds) {
+      // Only the platform clock advances the already validated signer time;
+      // untrusted caller-supplied clock callbacks cannot mint GET timestamps.
+      if (typeof Date === "undefined" || typeof Date.now !== "function") deny();
+      const originMs = Date.now();
+      if (!Number.isSafeInteger(originMs) || originMs < 0) deny();
+      let lastMs = originMs;
+      return () => {
+        const currentMs = Date.now();
+        if (!Number.isSafeInteger(currentMs) || currentMs < lastMs) deny();
+        lastMs = currentMs;
+        const seconds = initialSeconds + Math.floor((currentMs - originMs) / 1000);
+        if (!Number.isSafeInteger(seconds) || seconds < initialSeconds) deny();
+        return seconds;
+      };
+    }
     function id(value) {
       from64(value, 16);
       if (value.length !== 22) deny();
@@ -212,6 +228,7 @@
           ciphertextEpoch: owner.epoch, ciphertextRoot: root })) deny();
         const signer = { ...input.signer,
           scope: { ...input.signer.scope }, manifestDigest: copy32(input.signer.manifestDigest) };
+        const currentReadbackSeconds = readbackClock(signer.nowSeconds);
         const origin = input.origin;
         const fetchImpl = input.fetchImpl;
         // Snapshot ciphertext and all approval scalars before first await.
@@ -236,7 +253,8 @@
           if (written.id !== owner.object_id || written.revision !== 1) deny();
         }
         const get = await http.signProtectedContentOperation({
-          ...signer, operation: "get", objectId: owner.object_id,
+          ...signer, nowSeconds: currentReadbackSeconds(),
+          operation: "get", objectId: owner.object_id,
           expectedObjectRevision: 1, expectedCiphertextDigest: digest,
           ciphertext: null,
         });

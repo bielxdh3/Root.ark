@@ -58,6 +58,7 @@ async function scenario(t) {
   const witnessKeys = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);
   let gateOpen = true;
+  let serverNowSeconds = 1400;
   let head = state.headManifest;
   let countPut = 0;
   let networkReads = 0;
@@ -70,7 +71,7 @@ async function scenario(t) {
         witness_key_id: witnessKeyId, ...scope, nonce,
         current_revision: head.revision,
         current_manifest_digest: await manifestDigest(),
-        witness_sequence: head.revision, observed_at: 1400,
+        witness_sequence: head.revision, observed_at: serverNowSeconds,
         status: gateOpen ? "committed" : "pending",
         pending_reservation_id: gateOpen ? null : crypto.randomBytes(16) };
       return z.encodeDeterministic({ ...msg, signature: crypto.sign(null,
@@ -90,7 +91,7 @@ async function scenario(t) {
     witnessProvider, witnessPinned: {
       keyId: witnessKeyId, publicKey: witnessKeys.publicKey },
     manifestProvider: () => z.encodeDeterministic(head),
-    nowSeconds: () => 1400,
+    nowSeconds: () => serverNowSeconds,
   });
   const app = express();
   const authenticate = (req, res, next) => {
@@ -187,6 +188,7 @@ async function scenario(t) {
     get countPut() { return countPut; }, get networkReads() { return networkReads; },
     get wires() { return wires; },
     get wire() { return wire; }, setGate: (value) => { gateOpen = value; },
+    setServerTime: (value) => { serverNowSeconds = value; },
     revoke: async () => { await fixtures.appendDeviceRevocation(state, device.device_id);
       head = state.headManifest; },
     secondSigner: async () => {
@@ -200,6 +202,81 @@ async function scenario(t) {
       manifestDigest: await manifestDigest(), epoch: head.current_epoch }),
   };
 }
+
+test("delayed protected PUT acknowledgement requires a freshly timed signed GET", async (t) => {
+  const f = await scenario(t);
+  const originalNow = Date.now;
+  let fixtureNowMs = originalNow();
+  Date.now = () => fixtureNowMs;
+  try {
+    const delayedAck = async (url, options) => {
+      const response = await f.fetchImpl(url, options);
+      if (url.endsWith("/content/put")) {
+        fixtureNowMs += 50_000;
+        f.setServerTime(1450);
+      }
+      return response;
+    };
+    const result = await importer.importOwnerSignedBackupCiphertext({
+      ...f.input, fetchImpl: delayedAck,
+    });
+    assert.equal(result.ciphertextReadbackVerified, true);
+    assert.deepEqual(f.wires.map((item) => item.operation), ["put", "get"]);
+    assert.equal(JSON.parse(f.wires[0].body).authorization.issued_at, 1400);
+    assert.equal(JSON.parse(f.wires[1].body).authorization.issued_at, 1450);
+    assert.equal(f.countPut, 1);
+    assert.equal(f.networkReads, 1);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("owner approval expiry and forged caller clock reject before protected I/O", async (t) => {
+  const f = await scenario(t);
+  const expired = f.signOwner({ ...f.approvalUnsigned, expires_at: 1399 });
+  const expiredTrust = await f.prepareTrust({ approval: expired });
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+    ...f.input, approval: expired, ownerTrust: expiredTrust,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+    ...f.input, clockSeconds: () => 1450,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/,
+  "an untrusted callback may not replace the platform's elapsed clock");
+  assert.equal(f.countPut, 0);
+  assert.equal(f.networkReads, 0);
+});
+
+test("missing, invalid and regressive platform clock fail closed without retrying PUT", async (t) => {
+  const f = await scenario(t);
+  const originalNow = Date.now;
+  try {
+    for (const broken of [undefined, () => Number.NaN, () => -1,
+      () => Number.MAX_SAFE_INTEGER + 1]) {
+      Date.now = broken;
+      await assert.rejects(importer.importOwnerSignedBackupCiphertext(f.input),
+        /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+      assert.equal(f.countPut, 0);
+      assert.equal(f.networkReads, 0);
+    }
+    let currentMs = originalNow();
+    Date.now = () => currentMs;
+    const rollbackAck = async (url, options) => {
+      const response = await f.fetchImpl(url, options);
+      if (url.endsWith("/content/put")) currentMs -= 1000;
+      return response;
+    };
+    await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+      ...f.input, fetchImpl: rollbackAck,
+    }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+    assert.equal(f.countPut, 1, "a clock failure after durable PUT cannot repeat the write");
+    assert.equal(f.networkReads, 0, "rollback must deny before signing GET");
+    assert.deepEqual(Buffer.from(f.store.db.prepare(
+      "SELECT ciphertext FROM zk_content_object WHERE id=?").get(f.metadata.object_id).ciphertext),
+    Buffer.from(f.sealed), "a failed readback preserves the opaque committed object");
+  } finally {
+    Date.now = originalNow;
+  }
+});
 
 test("real protected HTTP import verifies owner signature and pinned root before restoring sealed bytes", async (t) => {
   const f = await scenario(t);
