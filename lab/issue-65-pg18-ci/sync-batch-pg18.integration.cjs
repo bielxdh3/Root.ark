@@ -1,0 +1,3090 @@
+"use strict";
+
+// Real PostgreSQL 18 ONLY. Invoked by the disposable lab runner, not npm test.
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const https = require("node:https");
+const { execFileSync } = require("node:child_process");
+const { Pool } = require("pg");
+const protocol = require("../../sync-client/rootark-sync-protocol");
+const { createAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
+const { createZk1SyncPgAtomicBatchStore } =
+  require("../../src/services/zk1SyncPgAtomicBatchStore");
+const { createZk1SyncPgIndependentAdmissionIssuer } =
+  require("../../src/services/zk1SyncPgIndependentAdmissionIssuer");
+const { createZk1SyncPgBatchIndependentReadback } =
+  require("../../src/services/zk1SyncPgBatchIndependentReadback");
+const { createZk1SyncAtomicPgPhysicalFenceDevOff } =
+  require("../../src/services/zk1SyncAtomicPgPhysicalFenceDevOff");
+const { DOMAIN: OWNER_BINDINGS_DOMAIN } =
+  require("../../src/services/zk1SyncAtomicSignedOwnerBindingsDevOff");
+const { Zk1SyncAtomicCasFloorLedgerDevOff, WITNESS_DOMAIN, GENESIS } =
+  require("../../src/services/zk1SyncAtomicCasFloorLedgerDevOff");
+const { Zk1SyncAtomicRetainedAnchorDevOff } =
+  require("../../src/services/zk1SyncAtomicRetainedAnchorDevOff");
+const { createZk1SyncAtomicSqlReadbackHttpsServer } =
+  require("../../src/services/zk1SyncAtomicSqlReadbackHttpsServer");
+const { createPrivateAuthorityFixture } =
+  require("../../test/support/issue-65-private-authority-fixture");
+const { hasUnexpectedProtectedDml, hasUnexpectedRoleMembership } =
+  require("../../src/services/zk1SyncPgProtectedRoleAudit");
+
+if (!process.env.ROOTARK_ZK1_TEST_PG_URL || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
+  || !process.env.ROOTARK_ZK1_VERIFIER_PG_URL
+  || !process.env.ROOTARK_ZK1_ATTESTOR_PG_URL
+  || !process.env.ROOTARK_ZK1_ADMISSION_ISSUER_PG_URL) {
+  throw Error("ZK65_SYNC_BATCH_DISPOSABLE_PG18_REQUIRED");
+}
+const admin = new Pool({ connectionString: process.env.ROOTARK_ZK1_TEST_PG_URL, max: 4 });
+const runtime = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL, max: 4 });
+const verifier = new Pool({ connectionString: process.env.ROOTARK_ZK1_VERIFIER_PG_URL, max: 4 });
+const attestor = new Pool({ connectionString: process.env.ROOTARK_ZK1_ATTESTOR_PG_URL, max: 2 });
+const issuer = new Pool({ connectionString: process.env.ROOTARK_ZK1_ADMISSION_ISSUER_PG_URL, max: 2 });
+const store = createZk1SyncPgAtomicBatchStore({ verifierPool: verifier });
+const admissionIssuer = createZk1SyncPgIndependentAdmissionIssuer({
+  readerPool: attestor, issuerPool: issuer,
+});
+const readback = createZk1SyncPgBatchIndependentReadback({ attestorPool: attestor });
+test.after(async () => {
+  await Promise.all([runtime.end(), verifier.end(), attestor.end(), issuer.end(), admin.end()]);
+});
+const hash = (input) => crypto.createHash("sha256").update(input).digest();
+
+function signedOwnerRosterFixture(bindings) {
+  // Fixture only: independently pinned statement hash, owner public key and
+  // revision MUST originate from different custody in any actual operator.
+  const key = crypto.generateKeyPairSync("ed25519");
+  const manifest = { version: 1, revision: 9, bindings };
+  const statement = Buffer.from(OWNER_BINDINGS_DOMAIN
+    + protocol.canonicalJson(manifest), "utf8");
+  return { manifest, signature: crypto.sign(null, statement,
+    key.privateKey).toString("base64url"),
+  trustedOwnerPublicKey: key.publicKey,
+  independentlyPinnedSha256: hash(statement).toString("hex"),
+  trustedMinimumRevision: 9 };
+}
+
+// TEST FIXTURE ONLY: exercise the real separate issuer implementation with
+// disposable credentials. All four pools coexist ONLY inside this one PG18
+// lab runner; never deploy this combined process or give HTTP issuer secrets.
+async function mintTestAdmission(f, operations) {
+  const result = await admissionIssuer.issueTicket({
+    scope: f.scope, username: f.username, operations,
+  });
+  assert.equal(result.clientAckAuthorized, false);
+  assert.equal(result.witnessVerified, false);
+  return result.admissionTicket;
+}
+
+async function commitTestBatch(f, operations, batchStore = store) {
+  return batchStore.commitSignedOverwritePair({
+    ...f, operations, admissionTicket: await mintTestAdmission(f, operations),
+  });
+}
+
+async function fixture() {
+  const scope = "w222-" + crypto.randomUUID();
+  const signKey = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signKey.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
+  const fileKey = crypto.randomBytes(32);
+  const deviceId = "device-a";
+  const username = "fixture";
+  await admin.query(`INSERT INTO zk1_sync_batch.scope_policy
+    (scope,username,compartment_id,key_epoch,enabled,allow_delete)
+    VALUES ($1,$2,'private','epoch-1',true,true)`, [scope, username]);
+  await admin.query("INSERT INTO zk1_sync_batch.scope_head(scope) VALUES ($1)", [scope]);
+  await admin.query(`INSERT INTO zk1_sync_batch.device_grant
+    (scope,device_id,public_key,revoked) VALUES ($1,$2,$3,false)`,
+  [scope, deviceId, publicKey]);
+  const create = (kind, objectId, path, rev = 1, sourcePath,
+    baseCounter = rev - 1, signedOperationId = crypto.randomUUID()) =>
+    protocol.createOperation({
+      operation: kind, objectId, fileId: "file-" + objectId,
+      versionId: crypto.randomUUID(), operationId: signedOperationId,
+      deviceId, keyEpoch: "epoch-1", compartmentId: "private",
+      revision: { counter: rev, deviceId },
+      baseRevision: rev > 1 ? { counter: baseCounter, deviceId } : null,
+      metadata: { path, ...(sourcePath ? { sourcePath } : {}) },
+      plaintext: Buffer.from("disposable " + objectId), fileKey,
+    });
+  for (const [objectId, path] of [["dest", "dest.ct"], ["src", "src.ct"]]) {
+    const initial = create("create", objectId, path);
+    const canonical = protocol.canonicalJson(initial);
+    await admin.query(`INSERT INTO zk1_sync_batch.object_state
+      (scope,object_id,file_id,version_id,device_id,revision_counter,
+       revision_device,compartment_id,key_epoch,logical_path,tombstone,
+       canonical_envelope,envelope_digest,ciphertext)
+      VALUES ($1,$2,$3,$4,$5,1,$5,'private','epoch-1',$6,false,$7,$8,$9)`,
+    [scope, objectId, initial.fileId, initial.versionId, deviceId, path,
+      canonical, hash(canonical), Buffer.from(initial.ciphertext,"base64url")]);
+  }
+  async function signedPair({ moveBaseCounter = 1,
+    eventId = crypto.randomUUID(), deleteEventId = eventId, moveEventId = eventId } = {}) {
+    const webdavId = (verb, event) => "webdav-" + event + "-" +
+      hash(verb + ":dest.ct").toString("hex").slice(0, 24);
+    const ops = [
+      create("delete", "dest", "dest.ct", 2, undefined, 1,
+        webdavId("delete", deleteEventId)),
+      create("move", "src", "dest.ct", 2, "src.ct", moveBaseCounter,
+        webdavId("move", moveEventId)),
+    ];
+    for (const op of ops) {
+      op.authorization = await createAuthorizationProof(op, {
+        username, publicKey, privateKey: signKey.privateKey,
+        expiresAt: Date.now() + 120000,
+      });
+    }
+    return ops;
+  }
+  const state = async () => {
+    const [head, markers, seen, rows] = await Promise.all([
+      admin.query("SELECT sequence,head FROM zk1_sync_batch.scope_head WHERE scope=$1", [scope]),
+      admin.query("SELECT * FROM zk1_sync_batch.batch_commit WHERE scope=$1", [scope]),
+      admin.query("SELECT * FROM zk1_sync_batch.seen_envelope WHERE scope=$1 ORDER BY ordinal", [scope]),
+      admin.query("SELECT * FROM zk1_sync_batch.object_state WHERE scope=$1 ORDER BY object_id", [scope]),
+    ]);
+    return { head: head.rows[0], markers: markers.rows, seen: seen.rows, rows: rows.rows };
+  };
+  return { scope, username, signedPair, state, publicKey };
+}
+
+test("PG18 scope accepts 256 ASCII characters and rejects 257 without invalid SQL regex", async () => {
+  const maxScope = "s".repeat(256);
+  await admin.query(`INSERT INTO zk1_sync_batch.scope_policy
+    (scope,username,compartment_id,key_epoch,enabled,allow_delete)
+    VALUES ($1,'fixture','private','epoch-1',true,true)`, [maxScope]);
+  await assert.rejects(admin.query(`INSERT INTO zk1_sync_batch.scope_policy
+    (scope,username,compartment_id,key_epoch,enabled,allow_delete)
+    VALUES ($1,'fixture','private','epoch-1',true,true)`, ["s".repeat(257)]),
+  { code: "23514" });
+  const actual = await admin.query(`SELECT scope FROM zk1_sync_batch.scope_policy WHERE scope=$1`,
+    [maxScope]);
+  assert.equal(actual.rowCount, 1);
+});
+
+test("PG18 independent roles satisfy complete live table-and-column DML auditor", async () => {
+  for (const [role, pool, opts] of [
+    ["READER", attestor, {}],
+    ["VERIFIER", verifier, {}],
+    ["ISSUER", issuer, { allowTicketInsert: true }],
+  ]) {
+    const client = await pool.connect();
+    try {
+      let unsafe;
+      try { unsafe = await hasUnexpectedProtectedDml(client, opts); }
+      catch (error) {
+        throw Object.assign(new Error("live protected role audit query rejected"),
+          { code: "PG_MATRIX_" + role + "_" + String(error?.code || "UNKNOWN") });
+      }
+      if (unsafe) {
+        throw Object.assign(new Error("live protected role audit detected DML"),
+          { code: "PG_MATRIX_" + role + "_FORBIDDEN" });
+      }
+    } finally { client.release(); }
+  }
+});
+
+test("PG18 atomic batch persists 2 original signed envelopes, ciphertext, state and one chained marker", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const result = await commitTestBatch(f, operations);
+  assert.equal(result.sequence, 1);
+  assert.equal(result.clientAckAuthorized, false);
+  assert.equal(result.witnessVerified, false);
+  const s = await f.state();
+  assert.equal(Number(s.head.sequence), 1);
+  assert.equal(s.markers.length, 1);
+  assert.equal(s.seen.length, 2);
+  assert.deepEqual(s.head.head, s.markers[0].head);
+  assert.equal(s.markers[0].commit_id, result.commitId);
+  assert.equal(s.markers[0].head.toString("hex"), result.storeHeadSha256);
+  for (let i = 0; i < 2; i++) {
+    const exact = protocol.canonicalJson(operations[i]);
+    assert.equal(s.seen[i].canonical_envelope, exact);
+    assert.deepEqual(s.seen[i].envelope_digest, hash(exact));
+    assert.deepEqual(s.seen[i].ciphertext, Buffer.from(operations[i].ciphertext, "base64url"));
+    assert.equal(s.seen[i].commit_id, result.commitId);
+  }
+  assert.equal(s.rows.find((r) => r.object_id === "dest").tombstone, true);
+  assert.equal(s.rows.find((r) => r.object_id === "src").logical_path, "dest.ct");
+  assert.equal(s.rows.every((r) => r.last_commit_id === result.commitId), true);
+  await assert.rejects(admin.query(`UPDATE zk1_sync_batch.batch_commit
+    SET policy_epoch=999 WHERE scope=$1`, [f.scope]));
+  await assert.rejects(admin.query(`UPDATE zk1_sync_batch.seen_envelope
+    SET ciphertext=decode('00','hex') WHERE scope=$1`, [f.scope]));
+});
+
+test("PG18 expired pending ticket can be reissued for the SAME signed pair without replay or stale ACK", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const expiredTicket = await mintTestAdmission(f, pair);
+  // Disposable DB operator advances only this ticket's expiry. The original
+  // Ed25519 envelopes remain fresh; no client-side clock mocking or waiting.
+  const expired = await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+    SET issued_at=clock_timestamp() - interval '90 seconds',
+        expires_at=clock_timestamp() - interval '60 seconds'
+    WHERE ticket_id=$1 AND consumed=false
+    RETURNING expires_at < clock_timestamp() AS expired`, [expiredTicket]);
+  assert.equal(expired.rowCount, 1);
+  assert.equal(expired.rows[0].expired, true);
+  const replacement = await mintTestAdmission(f, pair);
+  assert.notEqual(replacement, expiredTicket);
+  const pre = await f.state();
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: expiredTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  assert.deepEqual(await f.state(), pre, "expired handle cannot change any committed state");
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: replacement,
+  });
+  assert.equal(committed.sequence, 1);
+  assert.equal(committed.witnessVerified, false);
+  assert.equal(committed.clientAckAuthorized, false);
+  const consumed = await admin.query(`SELECT ticket_id,consumed,superseded
+    FROM zk1_sync_batch.admission_ticket WHERE ticket_id IN ($1,$2)`,
+  [expiredTicket, replacement]);
+  assert.equal(consumed.rowCount, 2);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === expiredTicket).consumed, false);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === expiredTicket).superseded, true);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === replacement).consumed, true);
+  assert.equal(consumed.rows.find((r) => r.ticket_id === replacement).superseded, false);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: replacement,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const after = await f.state();
+  assert.equal(after.markers.length, 1);
+  assert.equal(after.seen.length, 2);
+  assert.equal(Number(after.head.sequence), 1);
+});
+
+test("PG18 INSERT-only issuer cannot bypass ticket uniqueness or create future-lived handles", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const original = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket])).rows[0];
+  const submit = ({ consumed = false, superseded = false,
+    issuedAt = original.issued_at, expiresAt = original.expires_at } = {}) =>
+    issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+      (ticket_id,scope,username,device_id,public_key,policy_epoch,
+       sequence,previous_head,delete_digest,move_digest,expires_at,
+       consumed,superseded,issued_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [
+      crypto.randomUUID(), original.scope, original.username,
+      original.device_id, original.public_key, original.policy_epoch,
+      original.sequence, original.previous_head, original.delete_digest,
+      original.move_digest, expiresAt, consumed, superseded, issuedAt,
+    ]);
+  await assert.rejects(submit({ superseded: true }), { code: "23514" });
+  await assert.rejects(submit({ consumed: true }), { code: "23514" });
+  const farFuture = new Date(Date.now() + 86400000);
+  await assert.rejects(submit({ issuedAt: farFuture,
+    expiresAt: new Date(farFuture.valueOf() + 30000) }), { code: "23514" });
+  const staleIssue = new Date(Date.now() - 90000);
+  await assert.rejects(submit({ issuedAt: staleIssue,
+    expiresAt: new Date(staleIssue.valueOf() + 120000) }), { code: "23514" });
+  await assert.rejects(submit({ issuedAt: new Date(),
+    expiresAt: new Date(Date.now() + 3000) }), { code: "23514" });
+  await assert.rejects(submit({ expiresAt: new Date(Date.now() + 60000) }),
+    { code: "23514" });
+  await assert.rejects(submit(), { code: "23505" },
+    "active signed pair must remain unique even if issuer has INSERT");
+  const count = await admin.query(`SELECT count(*)::integer AS tickets FROM
+    zk1_sync_batch.admission_ticket WHERE scope=$1`, [f.scope]);
+  assert.equal(count.rows[0].tickets, 1);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  assert.equal((await f.state()).markers.length, 1);
+});
+
+test("PG18 issuer credential cannot mint stale head or epoch tickets independently of the scope lock", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const good = await mintTestAdmission(f, pair);
+  const row = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [good])).rows[0];
+  const insert = (epoch, head, sequence) => issuer.query(`INSERT INTO
+    zk1_sync_batch.admission_ticket (ticket_id,scope,username,device_id,
+      public_key,policy_epoch,sequence,previous_head,delete_digest,
+      move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), row.scope, row.username, row.device_id,
+    row.public_key, epoch, sequence, head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  const before = await f.state();
+  await assert.rejects(insert(Number(row.policy_epoch) + 1, row.previous_head,
+    row.sequence), { code: "23514" });
+  await assert.rejects(insert(row.policy_epoch, crypto.randomBytes(32),
+    row.sequence), { code: "23514" });
+  await assert.rejects(insert(row.policy_epoch, row.previous_head,
+    Number(row.sequence) + 1), { code: "23514" });
+  assert.deepEqual(await f.state(), before);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: good,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+});
+
+test("PG18 ticket issue time and 30-second TTL are stamped by database AFTER authority fencing", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const original = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket])).rows[0];
+  const chosen = crypto.randomUUID();
+  const attackerIssuedAt = new Date(Date.now() - 2000);
+  const attackerExpiresAt = new Date(attackerIssuedAt.getTime() + 30000);
+  const response = await issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,sequence,
+     previous_head,delete_digest,move_digest,issued_at,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [
+    chosen, original.scope, original.username, original.device_id, original.public_key,
+    original.policy_epoch, original.sequence, original.previous_head,
+    crypto.randomBytes(32), crypto.randomBytes(32), attackerIssuedAt, attackerExpiresAt,
+  ]);
+  assert.equal(response.rowCount, 1);
+  const verified = await admin.query(`SELECT
+    issued_at,
+    extract(epoch FROM (expires_at-issued_at)) AS ttl_s
+    FROM zk1_sync_batch.admission_ticket WHERE ticket_id=$1`, [chosen]);
+  assert.equal(verified.rowCount, 1);
+  assert.ok(new Date(verified.rows[0].issued_at).getTime() - attackerIssuedAt.getTime() >= 1500,
+    "the DB must override caller's exact backdated issue time, not merely recompute TTL");
+  assert.equal(Number(verified.rows[0].ttl_s), 30);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+});
+
+test("PG18 owner-only bounded seven-day ticket pruning preserves recent authorization and replay history", async () => {
+  const old = await fixture();
+  const pairOld = await old.signedPair();
+  const oldTicket = await mintTestAdmission(old, pairOld);
+  const recent = await fixture();
+  const pairRecent = await recent.signedPair();
+  const recentTicket = await mintTestAdmission(recent, pairRecent);
+  await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+    SET issued_at=clock_timestamp() - interval '8 days',
+        expires_at=clock_timestamp() - interval '8 days' + interval '30 seconds'
+    WHERE ticket_id=$1`, [oldTicket]);
+  for (const rolePool of [runtime, verifier, issuer, attestor]) {
+    await assert.rejects(rolePool.query(`SELECT
+      zk1_sync_batch.prune_expired_admission_tickets()`), { code: "42501" },
+    "untrusted roles must never prune admission evidence");
+  }
+  const beforeOld = await old.state();
+  const beforeRecent = await recent.state();
+  const pruned = await admin.query(`SELECT
+    zk1_sync_batch.prune_expired_admission_tickets() AS removed`);
+  assert.ok(pruned.rows[0].removed >= 1 && pruned.rows[0].removed <= 256);
+  const found = await admin.query(`SELECT ticket_id FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id IN ($1,$2)`, [oldTicket, recentTicket]);
+  assert.equal(found.rows.some((r) => r.ticket_id === oldTicket), false);
+  assert.equal(found.rows.some((r) => r.ticket_id === recentTicket), true);
+  assert.deepEqual(await old.state(), beforeOld);
+  assert.deepEqual(await recent.state(), beforeRecent);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...old, operations: pairOld, admissionTicket: oldTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const replacement = await mintTestAdmission(old, pairOld);
+  const recovered = await store.commitSignedOverwritePair({
+    ...old, operations: pairOld, admissionTicket: replacement,
+  });
+  assert.equal(recovered.sequence, 1);
+  assert.equal(recovered.clientAckAuthorized, false);
+  const committed = await store.commitSignedOverwritePair({
+    ...recent, operations: pairRecent, admissionTicket: recentTicket,
+  });
+  assert.equal(committed.sequence, 1);
+  assert.equal((await old.state()).seen.length, 2);
+  assert.equal((await recent.state()).seen.length, 2);
+});
+
+test("PG18 pruning an old consumed ticket does not erase replay evidence or allow a second signed commit", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const first = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(first.clientAckAuthorized, false);
+  const settled = await f.state();
+  await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+    SET issued_at=clock_timestamp() - interval '8 days',
+        expires_at=clock_timestamp() - interval '8 days' + interval '30 seconds'
+    WHERE ticket_id=$1 AND consumed=true`, [ticket]);
+  const removed = await admin.query(`SELECT
+    zk1_sync_batch.prune_expired_admission_tickets() AS count`);
+  assert.ok(removed.rows[0].count >= 1);
+  const absent = await admin.query(`SELECT 1 FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [ticket]);
+  assert.equal(absent.rowCount, 0);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const retry = await mintTestAdmission(f, pair);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: retry,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  assert.deepEqual(await f.state(), settled,
+    "retention must never mutate committed ciphertext, CAS head or replay ledger");
+});
+
+test("PG18 stolen issuer INSERT privilege is capped at 128 live distinct pair handles per scope head", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const validTicket = await mintTestAdmission(f, pair);
+  const ticket = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [validTicket])).rows[0];
+  const inject = () => issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,
+     sequence,previous_head,delete_digest,move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), ticket.scope, ticket.username, ticket.device_id,
+    ticket.public_key, ticket.policy_epoch, ticket.sequence,
+    ticket.previous_head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  for (let i = 1; i < 128; i++) await inject();
+  const live = await admin.query(`SELECT count(*)::integer AS count
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1 AND consumed=false
+      AND superseded=false AND expires_at > clock_timestamp()`, [f.scope]);
+  assert.equal(live.rows[0].count, 128);
+  await assert.rejects(inject(), { code: "23514" });
+  const before = await f.state();
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: validTicket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  assert.equal(before.seen.length, 0);
+  assert.equal((await f.state()).seen.length, 2);
+});
+
+test("PG18 one-minute issued-ticket quota survives expiry and cannot be bypassed by fake issuer digests", async () => {
+  const f = await fixture();
+  const original = await f.signedPair();
+  const live = await mintTestAdmission(f, original);
+  const template = (await admin.query(`SELECT * FROM zk1_sync_batch.admission_ticket
+    WHERE ticket_id=$1`, [live])).rows[0];
+  const insert = () => issuer.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,sequence,
+     previous_head,delete_digest,move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+      clock_timestamp()+interval '30 seconds')`, [
+    crypto.randomUUID(), template.scope, template.username, template.device_id,
+    template.public_key, template.policy_epoch, template.sequence,
+    template.previous_head, crypto.randomBytes(32), crypto.randomBytes(32),
+  ]);
+  for (let batch = 0; batch < 2; batch++) {
+    for (let i = batch ? 0 : 1; i < 128; i++) await insert();
+    await admin.query(`UPDATE zk1_sync_batch.admission_ticket
+      SET issued_at=clock_timestamp()-interval '30 seconds',
+          expires_at=clock_timestamp()-interval '1 second'
+      WHERE scope=$1 AND expires_at > clock_timestamp()`, [f.scope]);
+  }
+  const count = await admin.query(`SELECT count(*)::integer AS total
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1
+      AND issued_at >= clock_timestamp()-interval '1 minute'`, [f.scope]);
+  assert.equal(count.rows[0].total, 256);
+  await assert.rejects(insert(), { code: "23514" },
+    "expired but recent ticket handles must still count toward issuer budget");
+  const current = await f.state();
+  assert.equal(current.markers.length, 0);
+  assert.equal(current.seen.length, 0);
+});
+
+test("PG18 concurrent duplicate ticket requests cannot flood live same-pair handles", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const operator = await admin.connect();
+  let held = false;
+  let pending;
+  let issuances;
+  try {
+    await operator.query("BEGIN");
+    held = true;
+    await operator.query(`SELECT sequence FROM zk1_sync_batch.scope_head
+      WHERE scope=$1 FOR UPDATE`, [f.scope]);
+    pending = Promise.allSettled([
+      mintTestAdmission(f, pair), mintTestAdmission(f, pair),
+    ]);
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const waiting = await admin.query(`SELECT 1 FROM pg_catalog.pg_stat_activity
+        WHERE usename LIKE 'zkbatchissuer%'
+          AND wait_event_type='Lock'
+          AND query LIKE '%INSERT INTO zk1_sync_batch.admission_ticket%'
+        LIMIT 1`);
+      if (waiting.rowCount === 1) { observedLockWait = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(observedLockWait, true,
+      "duplicate issuance must genuinely wait behind scope_head row lock");
+    await operator.query("COMMIT");
+    held = false;
+    issuances = await pending;
+  } finally {
+    if (held) {
+      try { await operator.query("ROLLBACK"); } catch { /* test cleanup */ }
+    }
+    operator.release();
+    if (pending) await pending;
+  }
+  assert.equal(issuances.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(issuances.filter((r) => r.status === "rejected").length, 1);
+  assert.equal(issuances.find((r) => r.status === "rejected").reason.code,
+    "SYNC_PG_ISSUER_DENIED");
+  const ticket = issuances.find((r) => r.status === "fulfilled").value;
+  const issued = await admin.query(`SELECT COUNT(*)::integer AS live
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1 AND superseded=false`, [f.scope]);
+  assert.equal(issued.rows[0].live, 1);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const state = await f.state();
+  assert.equal(Number(state.head.sequence), 1);
+  assert.equal(state.markers.length, 1);
+  assert.equal(state.seen.length, 2);
+});
+
+test("PG18 full protected-role audit denies unlisted destructive table and column misgrants", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const before = await f.state();
+  await admin.query(`GRANT DELETE ON zk1_sync_batch.seen_envelope
+    TO zk1_sync_batch_verifier`);
+  try {
+    const effective = await verifier.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.seen_envelope','DELETE') AS granted`);
+    assert.equal(effective.rows[0].granted, true);
+    await assert.rejects(store.commitSignedOverwritePair({
+      ...f, operations: pair, admissionTicket: ticket,
+    }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    assert.deepEqual(await f.state(), before);
+  } finally {
+    await admin.query(`REVOKE DELETE ON zk1_sync_batch.seen_envelope
+      FROM zk1_sync_batch_verifier`);
+  }
+  await admin.query(`GRANT UPDATE(public_key) ON zk1_sync_batch.device_grant
+    TO zk1_sync_batch_admission_issuer`);
+  try {
+    const effective = await issuer.query(`SELECT
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.device_grant','public_key','UPDATE') AS granted`);
+    assert.equal(effective.rows[0].granted, true);
+    await assert.rejects(admissionIssuer.issueTicket({
+      ...f, operations: pair,
+    }), { code: "SYNC_PG_ISSUER_DENIED" });
+  } finally {
+    await admin.query(`REVOKE UPDATE(public_key) ON zk1_sync_batch.device_grant
+      FROM zk1_sync_batch_admission_issuer`);
+  }
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  await admin.query(`GRANT DELETE ON zk1_sync_batch.scope_policy
+    TO zk1_sync_batch_attestor_reader`);
+  try {
+    const effective = await attestor.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_policy','DELETE') AS granted`);
+    assert.equal(effective.rows[0].granted, true);
+    await assert.rejects(readback.verifyLatestSignedPair({
+      scope: f.scope, commitId: committed.commitId,
+    }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+  } finally {
+    await admin.query(`REVOKE DELETE ON zk1_sync_batch.scope_policy
+      FROM zk1_sync_batch_attestor_reader`);
+  }
+  const after = await f.state();
+  assert.equal(after.markers.length, 1);
+  assert.equal(after.seen.length, 2);
+});
+
+test("PG18 invalid second revision rolls back both writes and leaves no marker", async () => {
+  const f = await fixture();
+  // Sign an internally valid envelope whose signed base revision is stale.
+  // The first object passes; the second fails inside the PG row-lock boundary.
+  const pair = await f.signedPair({ moveBaseCounter: 0 });
+  await assert.rejects(commitTestBatch(f, pair));
+  const s = await f.state();
+  assert.equal(Number(s.head.sequence), 0);
+  assert.equal(s.markers.length, 0);
+  assert.equal(s.seen.length, 0);
+  assert.equal(s.rows.every((r) => r.revision_counter === "1"), true);
+});
+
+test("two valid Ed25519 WebDAV envelopes with same path but DIFFERENT journal events fail closed", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair({ moveEventId: crypto.randomUUID() });
+  assert.equal(operations[0].metadata.path, operations[1].metadata.path);
+  for (const op of operations) {
+    await require("../../sync-client/rootark-sync-authorization")
+      .verifyAuthorizationProof(op.authorization, op, {
+        username: f.username,
+        trustedDevicePublicKeys: { [op.deviceId]: f.publicKey },
+        revokedDeviceIds: [],
+      });
+  }
+  await assert.rejects(admissionIssuer.issueTicket({
+    scope: f.scope, username: f.username, operations,
+  }), { code: "SYNC_PG_ISSUER_DENIED" });
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations, admissionTicket: crypto.randomUUID(),
+  }), { code: "SYNC_PG_BATCH_INVALID" });
+
+  // Operator-only adversarial fixture: INSERT a ticket matching BOTH exact
+  // signed envelopes despite their different authentic WebDAV event IDs,
+  // proving the OWNER SQL guard independently rejects even with a ticket.
+  const [pinned, head] = await Promise.all([
+    admin.query(`SELECT p.policy_epoch,g.public_key
+      FROM zk1_sync_batch.scope_policy p JOIN zk1_sync_batch.device_grant g
+      ON g.scope=p.scope WHERE p.scope=$1 AND g.device_id=$2`,
+    [f.scope, operations[0].deviceId]),
+    admin.query("SELECT sequence,head FROM zk1_sync_batch.scope_head WHERE scope=$1",
+      [f.scope]),
+  ]);
+  const id = crypto.randomUUID();
+  await admin.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope,username,device_id,public_key,policy_epoch,
+      sequence,previous_head,delete_digest,move_digest,expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+interval '30 seconds')`,
+  [id, f.scope, f.username, operations[0].deviceId,
+    pinned.rows[0].public_key, pinned.rows[0].policy_epoch,
+    Number(head.rows[0].sequence) + 1, head.rows[0].head,
+    hash(protocol.canonicalJson(operations[0])),
+    hash(protocol.canonicalJson(operations[1]))]);
+  await assert.rejects(verifier.query(`SELECT
+    zk1_sync_batch.commit_admitted_pair($1,$2,$3,$4,$5)`, [
+    f.scope, f.username, id, protocol.canonicalJson(operations[0]),
+    protocol.canonicalJson(operations[1]),
+  ]), { code: "23514" }, "owner SQL must independently reject cross-event splice");
+  const remaining = await f.state();
+  assert.equal(Number(remaining.head.sequence), 0);
+  assert.equal(remaining.markers.length, 0);
+  assert.equal(remaining.seen.length, 0);
+});
+
+test("PG18 stale signature mutation and revoked device fail closed before any write", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const corrupt = structuredClone(pair);
+  corrupt[1].ciphertext = (corrupt[1].ciphertext.startsWith("A") ? "B" : "A")
+    + corrupt[1].ciphertext.slice(1);
+  await assert.rejects(commitTestBatch(f, corrupt));
+  const ticket = await mintTestAdmission(f, pair);
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  }),
+    { code: "SYNC_PG_BATCH_UNAUTHORIZED" });
+  const s = await f.state();
+  assert.equal(Number(s.head.sequence), 0);
+  assert.equal(s.seen.length, 0);
+});
+
+test("PG18 concurrent competing batches serialize and cannot commit two updates", async () => {
+  const f = await fixture();
+  const first = await f.signedPair();
+  const second = await f.signedPair();
+  const tickets = await Promise.all([first, second].map((operations) =>
+    mintTestAdmission(f, operations)));
+  const results = await Promise.allSettled([first, second].map((operations, i) =>
+    store.commitSignedOverwritePair({ ...f, operations, admissionTicket: tickets[i] })));
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(results.filter((r) => r.status === "rejected").length, 1);
+  const s = await f.state();
+  assert.equal(Number(s.head.sequence), 1);
+  assert.equal(s.markers.length, 1);
+  assert.equal(s.seen.length, 2);
+  await assert.rejects(store.commitSignedOverwritePair({ ...f,
+    operations: results[0].status === "fulfilled" ? first : second,
+    admissionTicket: results[0].status === "fulfilled" ? tickets[0] : tickets[1],
+  }), /./);
+  assert.equal((await f.state()).markers.length, 1);
+});
+
+test("PG18 concurrently committed revocation fences an issuer-admitted batch at the SQL scope lock", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const admissionTicket = await mintTestAdmission(f, pair);
+  const before = await f.state();
+  const operator = await admin.connect();
+  let held = false;
+  let pending;
+  try {
+    await operator.query("BEGIN");
+    held = true;
+    await operator.query(`SELECT sequence FROM zk1_sync_batch.scope_head
+      WHERE scope=$1 FOR UPDATE`, [f.scope]);
+    // This is an actual lock conflict: do not accept a timing-only, never-
+    // overlapping test as evidence of concurrent revocation correctness.
+    pending = store.commitSignedOverwritePair({
+      ...f, operations: pair, admissionTicket,
+    }).then((value) => ({ accepted: true, value }),
+      (error) => ({ accepted: false, error }));
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const waiting = await admin.query(`SELECT 1 FROM pg_catalog.pg_stat_activity
+        WHERE usename LIKE 'zkbatchverify\\_%' ESCAPE '\\'
+          AND wait_event_type='Lock'
+          AND query LIKE '%zk1_sync_batch.commit_admitted_pair%'
+        LIMIT 1`);
+      if (waiting.rowCount === 1) {
+        observedLockWait = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(observedLockWait, true,
+      "the verifier must actually wait for the same scope_head lock");
+    await operator.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+      WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+    await operator.query("COMMIT");
+    held = false;
+    const outcome = await pending;
+    assert.equal(outcome.accepted, false,
+      "a revoked grant must never admit an already verified signed pair");
+    assert.equal(outcome.error?.code, "SYNC_PG_BATCH_UNAVAILABLE");
+    const after = await f.state();
+    assert.deepEqual(after, before,
+      "revocation must not partially write objects, envelopes, marker or head");
+    const revoked = await admin.query(`SELECT g.revoked,p.policy_epoch FROM
+      zk1_sync_batch.device_grant g JOIN zk1_sync_batch.scope_policy p
+        ON p.scope=g.scope WHERE g.scope=$1 AND g.device_id='device-a'`, [f.scope]);
+    assert.equal(revoked.rows[0].revoked, true);
+    assert.ok(Number(revoked.rows[0].policy_epoch) > 1);
+  } finally {
+    if (held) {
+      try { await operator.query("ROLLBACK"); } catch { /* failed test cleanup */ }
+    }
+    operator.release();
+    if (pending) await pending;
+  }
+});
+
+test("PG18 injected second object SQL trigger failure rolls back both physical writes", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const admissionTicket = await mintTestAdmission(f, pair);
+  // Inject a real error INSIDE PostgreSQL after the second object UPDATE.
+  // The temporary custom GUC is scoped to this one verifier transaction.
+  await admin.query(`CREATE FUNCTION zk1_sync_batch.test_only_abort_second_write()
+    RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+    BEGIN
+      IF NEW.object_id='src' AND
+        NEW.scope=current_setting('zk1_sync_batch_test.abort_scope',true) THEN
+        RAISE EXCEPTION 'TEST_SECOND_PHYSICAL_WRITE_ABORT' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$`);
+  await admin.query(`CREATE TRIGGER test_only_abort_second_write
+    AFTER UPDATE ON zk1_sync_batch.object_state FOR EACH ROW
+    EXECUTE FUNCTION zk1_sync_batch.test_only_abort_second_write()`);
+  const sabotaged = createZk1SyncPgAtomicBatchStore({
+    verifierPool: { async connect() {
+      const actual = await verifier.connect();
+      return {
+        async query(text, args) {
+          if (typeof text === "string" && text.includes("SELECT\n          zk1_sync_batch.commit_admitted_pair")) {
+            await actual.query("SELECT set_config('zk1_sync_batch_test.abort_scope',$1,true)",
+              [f.scope]);
+          }
+          return actual.query(text, args);
+        },
+        release: () => actual.release(),
+      };
+    } },
+  });
+  try {
+    await assert.rejects(sabotaged.commitSignedOverwritePair({
+      ...f, operations: pair, admissionTicket,
+    }));
+  } finally {
+    await admin.query("DROP TRIGGER IF EXISTS test_only_abort_second_write ON zk1_sync_batch.object_state");
+    await admin.query("DROP FUNCTION IF EXISTS zk1_sync_batch.test_only_abort_second_write()");
+  }
+  const s = await f.state();
+  assert.equal(Number(s.head.sequence), 0);
+  assert.equal(s.markers.length, 0);
+  assert.equal(s.seen.length, 0);
+  assert.equal(s.rows.every((r) => r.revision_counter === "1"), true);
+});
+
+test("PG18 changing a device grant or scope policy always advances the policy epoch", async () => {
+  const f = await fixture();
+  const epoch = async () => Number((await admin.query(
+    "SELECT policy_epoch FROM zk1_sync_batch.scope_policy WHERE scope=$1",
+    [f.scope])).rows[0].policy_epoch);
+  const before = await epoch();
+  assert.ok(before >= 2, "initial device grant must advance epoch");
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  assert.equal(await epoch(), before + 1);
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=false
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  assert.equal(await epoch(), before + 2);
+  await admin.query(`UPDATE zk1_sync_batch.scope_policy
+    SET allow_delete=false,policy_epoch=1 WHERE scope=$1`, [f.scope]);
+  assert.equal(await epoch(), before + 3, "operator cannot override next epoch");
+  await admin.query(`UPDATE zk1_sync_batch.scope_policy
+    SET allow_delete=true WHERE scope=$1`, [f.scope]);
+  assert.equal(await epoch(), before + 4);
+});
+
+test("PG18 device_grant scope OLD->NEW UPDATE is denied BEFORE old authority can be bypassed", async () => {
+  const old = await fixture();
+  const newScope = "w222-new-" + crypto.randomUUID();
+  // A real, initialized NEW scope with NO matching grant avoids incidental
+  // primary-key/unique errors: the rejection must be the owner SQL invariant,
+  // not a constraint on the attempted relocation destination.
+  await admin.query(`INSERT INTO zk1_sync_batch.scope_policy
+    (scope,username,compartment_id,key_epoch,enabled,allow_delete)
+    VALUES ($1,$2,'private','epoch-1',true,true)`, [newScope, old.username]);
+  await admin.query("INSERT INTO zk1_sync_batch.scope_head(scope) VALUES ($1)", [newScope]);
+  const signed = await old.signedPair();
+  const existingAdmission = await mintTestAdmission(old, signed);
+  const snapshot = async () => {
+    const [heads, policies, grants, markers] = await Promise.all([
+      admin.query(`SELECT scope,sequence,head FROM zk1_sync_batch.scope_head
+        WHERE scope IN ($1,$2) ORDER BY scope`, [old.scope, newScope]),
+      admin.query(`SELECT scope,policy_epoch,enabled,allow_delete
+        FROM zk1_sync_batch.scope_policy WHERE scope IN ($1,$2) ORDER BY scope`,
+      [old.scope, newScope]),
+      admin.query(`SELECT scope,device_id,public_key,revoked
+        FROM zk1_sync_batch.device_grant WHERE scope IN ($1,$2)
+        ORDER BY scope,device_id`, [old.scope, newScope]),
+      admin.query(`SELECT scope,sequence,commit_id FROM zk1_sync_batch.batch_commit
+        WHERE scope IN ($1,$2) ORDER BY scope,sequence`, [old.scope, newScope]),
+    ]);
+    return { heads: heads.rows, policies: policies.rows,
+      grants: grants.rows, markers: markers.rows };
+  };
+  const trigger = await admin.query(`SELECT t.tgenabled,
+    p.prosecdef AS security_definer, pg_catalog.pg_get_userbyid(p.proowner) AS owner,
+    (t.tgtype & 1)<>0 AS row_level, (t.tgtype & 2)<>0 AS before_row,
+    (t.tgtype & 16)<>0 AS on_update
+    FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p ON p.oid=t.tgfoid
+    WHERE t.tgrelid='zk1_sync_batch.device_grant'::regclass
+      AND t.tgname='deny_device_grant_scope_reassignment' AND NOT t.tgisinternal`);
+  assert.equal(trigger.rowCount, 1, "dedicated owner trigger must exist");
+  assert.equal(trigger.rows[0].tgenabled, "O", "scope immutability cannot be disabled");
+  assert.equal(trigger.rows[0].security_definer, true);
+  assert.equal(trigger.rows[0].row_level, true);
+  assert.equal(trigger.rows[0].before_row, true);
+  assert.equal(trigger.rows[0].on_update, true);
+  assert.equal(trigger.rows[0].owner, (await admin.query("SELECT current_user AS owner")).rows[0].owner);
+  const before = await snapshot();
+  assert.equal(before.grants.length, 1, "only OLD scope has the signing key");
+  assert.equal(before.grants[0].scope, old.scope);
+
+  for (const update of [
+    `UPDATE zk1_sync_batch.device_grant SET scope=$2
+      WHERE scope=$1 AND device_id='device-a' RETURNING scope,device_id`,
+    `UPDATE zk1_sync_batch.device_grant SET scope=$2,
+      device_id='moved-a',revoked=true
+      WHERE scope=$1 AND device_id='device-a' RETURNING scope,device_id`,
+  ]) {
+    const conn = await admin.connect();
+    try {
+      await conn.query("BEGIN");
+      await assert.rejects(conn.query(update, [old.scope, newScope]),
+        { code: "23514" },
+        "BEFORE ROW trigger must reject OLD->NEW before either scope can change");
+    } finally {
+      try { await conn.query("ROLLBACK"); } catch { /* aborted transaction */ }
+      conn.release();
+    }
+    assert.deepEqual(await snapshot(), before,
+      "failed grant reassignment must roll back OLD and NEW grants, epochs, heads and markers");
+  }
+
+  // A legitimate same-scope revocation still locks/fences the OLD scope, not
+  // the target scope. A previously issued admission cannot survive it.
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [old.scope]);
+  const afterRevocation = await snapshot();
+  assert.equal(Number(afterRevocation.policies.find((x) => x.scope === old.scope).policy_epoch),
+    Number(before.policies.find((x) => x.scope === old.scope).policy_epoch) + 1);
+  assert.equal(Number(afterRevocation.policies.find((x) => x.scope === newScope).policy_epoch),
+    Number(before.policies.find((x) => x.scope === newScope).policy_epoch));
+  assert.deepEqual(afterRevocation.heads, before.heads,
+    "ordinary revocation must not rewrite either physical scope head");
+  assert.equal(afterRevocation.grants.length, 1);
+  assert.equal(afterRevocation.grants[0].scope, old.scope);
+  assert.equal(afterRevocation.grants[0].revoked, true);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...old, operations: signed, admissionTicket: existingAdmission,
+  }), { code: "SYNC_PG_BATCH_UNAUTHORIZED" },
+  "revoked OLD grant must fence the already-issued admission");
+  assert.deepEqual((await snapshot()).markers, before.markers);
+});
+
+test("PG18 refuses direct SQL mutation of a committed state under the same marker", async () => {
+  const f = await fixture();
+  await commitTestBatch(f, await f.signedPair());
+  await assert.rejects(runtime.query(`UPDATE zk1_sync_batch.object_state
+    SET ciphertext=decode('00','hex') WHERE scope=$1 AND object_id='src'`,
+  [f.scope]), /./);
+  assert.equal((await f.state()).markers.length, 1);
+});
+
+test("PG18 denies incomplete direct-SQL marker without the exact seen originals", async () => {
+  const f = await fixture();
+  const ops = await f.signedPair();
+  const digests = ops.map((o) => hash(protocol.canonicalJson(o)));
+  const id = crypto.randomUUID();
+  const conn = await admin.connect();
+  try {
+    await conn.query("BEGIN");
+    const current = await conn.query("SELECT sequence,head FROM zk1_sync_batch.scope_head WHERE scope=$1 FOR UPDATE", [f.scope]);
+    const epoch = await conn.query("SELECT policy_epoch FROM zk1_sync_batch.scope_policy WHERE scope=$1", [f.scope]);
+    const previous = current.rows[0].head;
+    const fakeState = hash("unverified-physical-state");
+    const marker = await conn.query(`INSERT INTO zk1_sync_batch.batch_commit
+      (scope,sequence,commit_id,policy_epoch,previous_head,head,
+      delete_id,move_id,delete_digest,move_digest,state_digest)
+      VALUES ($1,1,$2,$3,$4,
+      zk1_sync_batch.commit_head($1,1,$2,$3,$4,$5,$6,$7,$8,$9),
+      $5,$6,$7,$8,$9) RETURNING head`,
+    [f.scope, id, Number(epoch.rows[0].policy_epoch), previous,
+      ops[0].operationId, ops[1].operationId, digests[0], digests[1], fakeState]);
+    await conn.query("UPDATE zk1_sync_batch.scope_head SET sequence=1,head=$2 WHERE scope=$1",
+      [f.scope, marker.rows[0].head]);
+    await assert.rejects(conn.query("COMMIT"), /./,
+      "marker without either physical envelope must fail at deferred SQL constraint");
+  } finally {
+    try { await conn.query("ROLLBACK"); } catch { /* aborted transaction */ }
+    conn.release();
+  }
+  assert.equal((await f.state()).markers.length, 0);
+});
+
+test("PG18 deferred marker denies different but self-consistent physical MOVE bytes", async () => {
+  const f = await fixture();
+  const original = await f.signedPair();
+  const alternative = await f.signedPair();
+  const stored = [original[0], alternative[1]];
+  const originalDigests = original.map((o) => hash(protocol.canonicalJson(o)));
+  const commitId = crypto.randomUUID();
+  const conn = await admin.connect();
+  try {
+    await conn.query("BEGIN");
+    const head = (await conn.query(`SELECT sequence,head FROM zk1_sync_batch.scope_head
+      WHERE scope=$1 FOR UPDATE`, [f.scope])).rows[0];
+    const epoch = (await conn.query(`SELECT policy_epoch FROM zk1_sync_batch.scope_policy
+      WHERE scope=$1`, [f.scope])).rows[0].policy_epoch;
+    for (const op of stored) {
+      const canonical = protocol.canonicalJson(op);
+      await conn.query(`UPDATE zk1_sync_batch.object_state SET
+        version_id=$3,revision_counter=$4,revision_device=$5,logical_path=$6,
+        tombstone=$7,canonical_envelope=$8,envelope_digest=$9,
+        ciphertext=$10,last_commit_id=$11 WHERE scope=$1 AND object_id=$2`, [
+        f.scope, op.objectId, op.versionId, op.revision.counter,
+        op.revision.deviceId, op.metadata.path, op.tombstone, canonical,
+        hash(canonical), Buffer.from(op.ciphertext, "base64url"), commitId,
+      ]);
+    }
+    const stateDigest = (await conn.query(`SELECT zk1_sync_batch.state_digest($1,'dest','src') AS digest`,
+      [f.scope])).rows[0].digest;
+    const marker = await conn.query(`INSERT INTO zk1_sync_batch.batch_commit
+      (scope,sequence,commit_id,policy_epoch,previous_head,head,
+      delete_id,move_id,delete_digest,move_digest,state_digest)
+      VALUES ($1,1,$2,$3,$4,
+        zk1_sync_batch.commit_head($1,1,$2,$3,$4,$5,$6,$7,$8,$9),
+        $5,$6,$7,$8,$9) RETURNING head`, [
+      f.scope, commitId, Number(epoch), head.head,
+      original[0].operationId, original[1].operationId,
+      originalDigests[0], originalDigests[1], stateDigest,
+    ]);
+    for (let i = 0; i < original.length; i++) {
+      const op = original[i];
+      const canonical = protocol.canonicalJson(op);
+      await conn.query(`INSERT INTO zk1_sync_batch.seen_envelope
+        (scope,operation_id,replay_id,idempotency_key,commit_id,
+        ordinal,kind,canonical_envelope,envelope_digest,ciphertext)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [
+        f.scope, op.operationId, op.authorization.replayId,
+        op.authorization.idempotencyKey, commitId, i, op.operation,
+        canonical, originalDigests[i], Buffer.from(op.ciphertext,"base64url"),
+      ]);
+    }
+    await conn.query(`UPDATE zk1_sync_batch.scope_head SET sequence=1,head=$2
+      WHERE scope=$1`, [f.scope, marker.rows[0].head]);
+    await assert.rejects(conn.query("COMMIT"), /./,
+      "two independently matching digests must not bypass original-envelope equality");
+  } finally {
+    try { await conn.query("ROLLBACK"); } catch { /* aborted transaction */ }
+    conn.release();
+  }
+  const after = await f.state();
+  assert.equal(after.markers.length, 0);
+  assert.equal(Number(after.head.sequence), 0);
+  assert.equal(after.seen.length, 0);
+  assert.equal(after.rows.every((r) => r.revision_counter === "1"), true);
+});
+
+test("runtime, verifier, issuer and reader DENY raw protected DML, including column ACLs", async () => {
+  for (const rolePool of [runtime, verifier, issuer, attestor]) {
+    const access = await rolePool.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.scope_head','UPDATE') AS head_write,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','UPDATE') AS state_write,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.batch_commit','INSERT') AS marker_write,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.seen_envelope','INSERT') AS seen_write,
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.scope_head','head','UPDATE') AS head_col_write,
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.object_state','ciphertext','UPDATE') AS cipher_col_write,
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.batch_commit','commit_id','INSERT') AS marker_col_write,
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.seen_envelope','canonical_envelope','INSERT') AS seen_col_write`);
+    assert.ok(Object.values(access.rows[0]).every((allowed) => allowed === false),
+      "all untrusted and readback DB roles must lack table AND column DML");
+    await assert.rejects(rolePool.query(`UPDATE zk1_sync_batch.scope_head
+      SET sequence=sequence WHERE scope='blocked'`), /permission denied/i);
+    await assert.rejects(rolePool.query(`UPDATE zk1_sync_batch.object_state
+      SET ciphertext=ciphertext WHERE scope='blocked'`), /permission denied/i);
+    await assert.rejects(rolePool.query(`INSERT INTO zk1_sync_batch.batch_commit (scope,sequence)
+      VALUES ('blocked',1)`), /permission denied/i);
+    await assert.rejects(rolePool.query(`INSERT INTO zk1_sync_batch.seen_envelope
+      (scope,operation_id) VALUES ('blocked','denied')`), /permission denied/i);
+  }
+});
+
+test("PG18 verifier, runtime, issuer and attestor real DELETE/TRUNCATE return 42501 without changing physical state", async () => {
+  const f = await fixture();
+  const before = await f.state();
+  for (const rolePool of [runtime, verifier, issuer, attestor]) {
+    const grants = await rolePool.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','DELETE') AS may_delete,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','TRUNCATE') AS may_truncate`);
+    assert.deepEqual(grants.rows[0], { may_delete: false, may_truncate: false });
+    await assert.rejects(rolePool.query(`DELETE FROM zk1_sync_batch.object_state
+      WHERE scope=$1 AND object_id='dest'`, [f.scope]), { code: "42501" },
+    "DELETE with a real existing target row must fail at the ACL boundary");
+    await assert.rejects(rolePool.query("TRUNCATE TABLE zk1_sync_batch.object_state"),
+      { code: "42501" }, "TRUNCATE must fail even without a WHERE clause");
+    assert.deepEqual(await f.state(), before,
+      "failed DELETE/TRUNCATE cannot alter objects, head, history or replay state");
+  }
+});
+
+test("PG18 accidental direct DELETE/TRUNCATE grants make verifier, readback and admission issuer fail closed", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const ticket = await mintTestAdmission(f, pair);
+  const before = await f.state();
+  await admin.query(`GRANT DELETE,TRUNCATE ON zk1_sync_batch.object_state
+    TO zk1_sync_batch_verifier`);
+  try {
+    const effective = await verifier.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','DELETE') AS can_delete,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','TRUNCATE') AS can_truncate`);
+    assert.deepEqual(effective.rows[0], { can_delete: true, can_truncate: true },
+      "the test must genuinely elevate the verifier's destructive privileges");
+    await assert.rejects(store.commitSignedOverwritePair({
+      ...f, operations: pair, admissionTicket: ticket,
+    }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    assert.deepEqual(await f.state(), before);
+  } finally {
+    await admin.query(`REVOKE DELETE,TRUNCATE ON zk1_sync_batch.object_state
+      FROM zk1_sync_batch_verifier`);
+  }
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: pair, admissionTicket: ticket,
+  });
+  await admin.query(`GRANT DELETE,TRUNCATE ON zk1_sync_batch.object_state
+    TO zk1_sync_batch_attestor_reader`);
+  try {
+    const effective = await attestor.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','DELETE') AS can_delete,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.object_state','TRUNCATE') AS can_truncate`);
+    assert.deepEqual(effective.rows[0], { can_delete: true, can_truncate: true });
+    await assert.rejects(readback.verifyLatestSignedPair({
+      scope: f.scope, commitId: committed.commitId,
+    }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+    await assert.rejects(admissionIssuer.issueTicket({
+      ...f, operations: pair,
+    }), { code: "SYNC_PG_ISSUER_DENIED" });
+  } finally {
+    await admin.query(`REVOKE DELETE,TRUNCATE ON zk1_sync_batch.object_state
+      FROM zk1_sync_batch_attestor_reader`);
+  }
+  const next = await fixture();
+  const nextPair = await next.signedPair();
+  await admin.query(`GRANT DELETE,TRUNCATE ON zk1_sync_batch.admission_ticket
+    TO zk1_sync_batch_admission_issuer`);
+  try {
+    const effective = await issuer.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','DELETE') AS can_delete,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','TRUNCATE') AS can_truncate`);
+    assert.deepEqual(effective.rows[0], { can_delete: true, can_truncate: true });
+    await assert.rejects(admissionIssuer.issueTicket({
+      ...next, operations: nextPair,
+    }), { code: "SYNC_PG_ISSUER_DENIED" });
+    assert.equal((await next.state()).markers.length, 0);
+  } finally {
+    await admin.query(`REVOKE DELETE,TRUNCATE ON zk1_sync_batch.admission_ticket
+      FROM zk1_sync_batch_admission_issuer`);
+  }
+});
+
+test("PG18 host-file, program and maintenance role grants fail closed across all protected credentials", async () => {
+  // PostgreSQL's predefined roles can bypass ordinary table ACLs: a
+  // server-side COPY TO file / PROGRAM is NOT made safe by a READ ONLY SQL
+  // transaction. Never execute those dangerous capabilities in this lab;
+  // establish the real effective GRANT, then require each authority to deny.
+  const saved = await fixture();
+  const savedPair = await saved.signedPair();
+  const committed = await commitTestBatch(saved, savedPair);
+  const waiting = await fixture();
+  const waitingPair = await waiting.signedPair();
+  const ticket = await mintTestAdmission(waiting, waitingPair);
+  const before = await waiting.state();
+  const ticketCount = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const ticketsBefore = await ticketCount();
+  const protectedRoles = [
+    ["zk1_sync_batch_attestor_reader", attestor, async () => {
+      await assert.rejects(readback.verifyLatestSignedPair({
+        scope: saved.scope, commitId: committed.commitId,
+      }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_admission_issuer", issuer, async () => {
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_verifier", verifier, async () => {
+      await assert.rejects(store.commitSignedOverwritePair({
+        ...waiting, operations: waitingPair, admissionTicket: ticket,
+      }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    }],
+  ];
+  for (const dangerousRole of ["pg_read_server_files", "pg_write_server_files",
+    "pg_execute_server_program", "pg_maintain"]) {
+    for (const [dbRole, pool, deniedAction] of protectedRoles) {
+      // Names in this loop are fixed literals above, never caller input.
+      await admin.query(`GRANT ${dangerousRole} TO ${dbRole}`);
+      try {
+        const granted = await pool.query(`SELECT
+          pg_catalog.pg_has_role(current_user,$1::name,'MEMBER') AS member`,
+        [dangerousRole]);
+        assert.equal(granted.rows[0]?.member, true,
+          `${dbRole} must actually hold the hostile ${dangerousRole} membership`);
+        await deniedAction();
+        assert.equal(await ticketCount(), ticketsBefore,
+          "a rejected authority cannot mint or consume an admission ticket");
+        assert.deepEqual(await waiting.state(), before,
+          "no privileged role misgrant may change protected SQL objects");
+      } finally {
+        await admin.query(`REVOKE ${dangerousRole} FROM ${dbRole}`);
+      }
+    }
+  }
+  const valid = await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  });
+  assert.equal(valid.localPgRowsConsistent, true,
+    "real readback must recover when all privileged grants are revoked");
+  assert.equal(valid.clientAckAuthorized, false);
+  assert.deepEqual(await waiting.state(), before);
+  const resumed = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof resumed.admissionTicket, "string",
+    "a fresh valid pair must still mint a ticket after the hostile GRANT is revoked");
+  assert.equal(await ticketCount(), ticketsBefore + 1);
+});
+
+test("PG18 NOINHERIT SET ROLE escalation and delegated superuser sessions fail protected role preflight", async () => {
+  const saved = await fixture();
+  const pair = await saved.signedPair();
+  const committed = await commitTestBatch(saved, pair);
+  const waiting = await fixture();
+  const waitingPair = await waiting.signedPair();
+  const admissionTicket = await mintTestAdmission(waiting, waitingPair);
+  const before = await waiting.state();
+  const ticketCount = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const ticketsBefore = await ticketCount();
+  const elevated = "zk65_escape_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE ROLE ${elevated} NOLOGIN`);
+  try {
+    await admin.query(`GRANT DELETE ON zk1_sync_batch.object_state TO ${elevated}`);
+    for (const [role, pool, rejected] of [
+      ["zk1_sync_batch_attestor_reader", attestor, async () => {
+        await assert.rejects(readback.verifyLatestSignedPair({
+          scope: saved.scope, commitId: committed.commitId,
+        }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      }],
+      ["zk1_sync_batch_admission_issuer", issuer, async () => {
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      }],
+      ["zk1_sync_batch_verifier", verifier, async () => {
+        await assert.rejects(store.commitSignedOverwritePair({
+          ...waiting, operations: waitingPair, admissionTicket,
+        }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+      }],
+    ]) {
+      await admin.query(`GRANT ${elevated} TO ${role} WITH INHERIT FALSE`);
+      try {
+        const membership = await pool.query(`SELECT
+          pg_catalog.pg_has_role(current_user,$1::name,'MEMBER') AS member,
+          pg_catalog.pg_has_role(current_user,$1::name,'SET') AS can_set,
+          pg_catalog.has_table_privilege(current_user,
+            'zk1_sync_batch.object_state','DELETE') AS inherited_delete`, [elevated]);
+        assert.deepEqual(membership.rows[0], {
+          member: true, can_set: true, inherited_delete: false,
+        }, "dangerous membership must be real but invisible to inherited table ACL audit");
+        await rejected();
+        assert.equal(await ticketCount(), ticketsBefore);
+        assert.deepEqual(await waiting.state(), before);
+      } finally { await admin.query(`REVOKE ${elevated} FROM ${role}`); }
+    }
+  } finally {
+    await admin.query(`REVOKE DELETE ON zk1_sync_batch.object_state FROM ${elevated}`);
+    await admin.query(`DROP ROLE ${elevated}`);
+  }
+  const privileged = await admin.connect();
+  let roleSwitched = false;
+  try {
+    await privileged.query("SET ROLE zk1_sync_batch_attestor_reader");
+    roleSwitched = true;
+    assert.equal((await privileged.query(`SELECT session_user <> current_user AS delegated`))
+      .rows[0].delegated, true);
+    assert.equal(await hasUnexpectedRoleMembership(
+      privileged, "zk1_sync_batch_attestor_reader"), true,
+    "a privileged login cannot fake a clean reader by SET ROLE then RESET ROLE");
+  } finally {
+    if (roleSwitched) await privileged.query("RESET ROLE");
+    privileged.release();
+  }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+  assert.deepEqual(await waiting.state(), before);
+  const resumed = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof resumed.admissionTicket, "string");
+  assert.equal(await ticketCount(), ticketsBefore + 1);
+});
+
+test("admission tickets are issuer-only; verifier cannot fabricate or edit them", async () => {
+  const grants = await Promise.all([runtime, verifier, attestor, issuer].map((pool) =>
+    pool.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','INSERT') AS mint,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','UPDATE') AS edit,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','DELETE') AS erase,
+      pg_catalog.has_table_privilege(current_user,'zk1_sync_batch.admission_ticket','SELECT') AS read,
+      pg_catalog.has_column_privilege(current_user,'zk1_sync_batch.admission_ticket','consumed','UPDATE') AS consume`)));
+  assert.equal(grants[0].rows[0].mint, false);
+  assert.equal(grants[1].rows[0].mint, false);
+  assert.equal(grants[2].rows[0].mint, false);
+  assert.deepEqual(grants[3].rows[0], {
+    mint: true, edit: false, erase: false, read: false, consume: false,
+  });
+  await assert.rejects(verifier.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope) VALUES ($1,'unauthorized')`, [crypto.randomUUID()]),
+  /permission denied/i);
+  const verifierConn = await verifier.connect();
+  try {
+    await assert.rejects(verifierConn.query("SET ROLE zk1_sync_batch_admission_issuer"),
+      /permission denied/i);
+  } finally {
+    verifierConn.release();
+  }
+  await assert.rejects(issuer.query("SELECT 1 FROM zk1_sync_batch.scope_head"),
+    /permission denied/i);
+  await assert.rejects(issuer.query(`SELECT zk1_sync_batch.commit_admitted_pair(
+    'blocked','blocked',$1,'{}','{}')`, [crypto.randomUUID()]),
+  /permission denied/i);
+});
+
+test("future SECURITY DEFINER functions inherit global owner default with NO PUBLIC EXECUTE", async () => {
+  // PostgreSQL's default PUBLIC EXECUTE is GLOBAL, not schema-scoped. Verify
+  // owner metadata and effective ACL on a real newly created definer function.
+  const ownerDefault = await admin.query(`SELECT
+    d.defaclnamespace AS namespace, d.defaclacl::text AS acl,
+    pg_catalog.pg_get_userbyid(d.defaclrole) AS owner,
+    EXISTS (SELECT 1 FROM pg_catalog.aclexplode(d.defaclacl) grant_entry
+      WHERE grant_entry.grantee=0 AND grant_entry.privilege_type='EXECUTE') AS public_execute
+    FROM pg_catalog.pg_default_acl d
+    WHERE d.defaclnamespace=0 AND d.defaclobjtype='f'
+      AND d.defaclrole=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user)`);
+  assert.equal(ownerDefault.rowCount, 1,
+    "dedicated owner must have an explicit GLOBAL revoked default ACL");
+  assert.equal(ownerDefault.rows[0].public_execute, false,
+    "global function defaults must not grant EXECUTE to PUBLIC");
+  const name = "test_future_definer_" + crypto.randomBytes(6).toString("hex");
+  try {
+    await admin.query(`CREATE FUNCTION zk1_sync_batch.${name}()
+      RETURNS boolean LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog
+      AS $$ SELECT true $$`);
+    const meta = await admin.query(`SELECT p.prosecdef AS security_definer,
+      p.proacl::text AS acl, pg_catalog.pg_get_userbyid(p.proowner) AS owner
+      FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n
+        ON n.oid=p.pronamespace
+      WHERE n.nspname='zk1_sync_batch' AND p.proname=$1`, [name]);
+    assert.equal(meta.rowCount, 1);
+    assert.equal(meta.rows[0].security_definer, true);
+    assert.equal(meta.rows[0].owner, ownerDefault.rows[0].owner);
+    for (const rolePool of [runtime, verifier, issuer, attestor]) {
+      const granted = await rolePool.query(`SELECT
+        pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+      [`zk1_sync_batch.${name}()`]);
+      assert.equal(granted.rows[0].allowed, false,
+        "future SECURITY DEFINER EXECUTE must not leak through PUBLIC");
+      await assert.rejects(rolePool.query(`SELECT zk1_sync_batch.${name}()`),
+        { code: "42501" });
+    }
+  } finally {
+    await admin.query(`DROP FUNCTION IF EXISTS zk1_sync_batch.${name}()`);
+  }
+});
+
+test("untrusted verifier cannot mutate any physical state or invent admission via its function", async () => {
+  const f = await fixture();
+  const original = await f.signedPair();
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: original, admissionTicket: crypto.randomUUID(),
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  const validTicket = await mintTestAdmission(f, original);
+  const alternate = await f.signedPair();
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: alternate, admissionTicket: validTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" },
+  "ticket for one signed pair must not authorize a different valid signed pair");
+  const current = await f.state();
+  assert.equal(current.markers.length, 0);
+  assert.equal(current.seen.length, 0);
+  const committed = await store.commitSignedOverwritePair({
+    ...f, operations: original, admissionTicket: validTicket,
+  });
+  assert.equal(committed.clientAckAuthorized, false);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...f, operations: original, admissionTicket: validTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" },
+  "single-use admission ticket must not be replayable");
+  assert.equal((await f.state()).markers.length, 1);
+});
+
+test("operator epoch/head changes fence a valid independently minted admission ticket", async () => {
+  const epochFixture = await fixture();
+  const signed = await epochFixture.signedPair();
+  const staleTicket = await mintTestAdmission(epochFixture, signed);
+  await admin.query(`UPDATE zk1_sync_batch.scope_policy SET allow_delete=true
+    WHERE scope=$1`, [epochFixture.scope]);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...epochFixture, operations: signed, admissionTicket: staleTicket,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  assert.equal((await epochFixture.state()).markers.length, 0);
+
+  const headFixture = await fixture();
+  const signedHead = await headFixture.signedPair();
+  const ticketForOldHead = await mintTestAdmission(headFixture, signedHead);
+  await admin.query(`UPDATE zk1_sync_batch.scope_head
+    SET head=decode(repeat('ab',32),'hex') WHERE scope=$1`, [headFixture.scope]);
+  await assert.rejects(store.commitSignedOverwritePair({
+    ...headFixture, operations: signedHead, admissionTicket: ticketForOldHead,
+  }), { code: "SYNC_PG_BATCH_UNAVAILABLE" });
+  assert.equal((await headFixture.state()).markers.length, 0);
+});
+
+test("unprivileged runtime cannot call admission entrypoint or mint fake admission", async () => {
+  const f = await fixture();
+  await assert.rejects(runtime.query(`SELECT zk1_sync_batch.commit_admitted_pair(
+    $1,$2,$3,'{}','{}')`, [f.scope, f.username, crypto.randomUUID()]),
+  /permission denied/i);
+  await assert.rejects(runtime.query(`INSERT INTO zk1_sync_batch.admission_ticket
+    (ticket_id,scope) VALUES ($1,$2)`, [crypto.randomUUID(), f.scope]),
+  /permission denied/i);
+  const state = await f.state();
+  assert.equal(state.markers.length, 0);
+  assert.equal(Number(state.head.sequence), 0);
+});
+
+test("issuer rejects signature forgery, revoked grants, and substituted DB identities", async () => {
+  const f = await fixture();
+  const original = await f.signedPair();
+  const forged = structuredClone(original);
+  forged[1].ciphertext = (forged[1].ciphertext.startsWith("A") ? "B" : "A")
+    + forged[1].ciphertext.slice(1);
+  await assert.rejects(admissionIssuer.issueTicket({
+    ...f, operations: forged,
+  }), { code: "SYNC_PG_ISSUER_DENIED" });
+  await assert.rejects(createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: verifier, issuerPool: issuer,
+  }).issueTicket({ ...f, operations: original }),
+  { code: "SYNC_PG_ISSUER_DENIED" });
+  await assert.rejects(createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: verifier,
+  }).issueTicket({ ...f, operations: original }),
+  { code: "SYNC_PG_ISSUER_DENIED" });
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  await assert.rejects(admissionIssuer.issueTicket({
+    ...f, operations: original,
+  }), { code: "SYNC_PG_ISSUER_DENIED" });
+  assert.equal((await f.state()).markers.length, 0);
+});
+
+test("runtime cannot SET ROLE verifier, inherit verifier membership or impersonate admission pool", async () => {
+  const membership = await runtime.query(`SELECT
+    pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','MEMBER') AS verifier_member,
+    pg_catalog.pg_has_role(current_user,'zk1_sync_batch_verifier','USAGE') AS verifier_usage,
+    pg_catalog.pg_has_role(current_user,'zk1_sync_batch_attestor_reader','MEMBER') AS reader_member,
+    pg_catalog.pg_has_role(current_user,'zk1_sync_batch_admission_issuer','MEMBER') AS issuer_member`);
+  assert.deepEqual(membership.rows[0],
+    { verifier_member: false, verifier_usage: false, reader_member: false, issuer_member: false });
+  const conn = await runtime.connect();
+  try {
+    await assert.rejects(conn.query("SET ROLE zk1_sync_batch_verifier"), /permission denied/i);
+  } finally {
+    try { await conn.query("RESET ROLE"); } catch { /* role never switched */ }
+    conn.release();
+  }
+  const f = await fixture();
+  await assert.rejects(createZk1SyncPgAtomicBatchStore({ verifierPool: runtime })
+    .commitSignedOverwritePair({
+      ...f, operations: await f.signedPair(), admissionTicket: crypto.randomUUID(),
+    }),
+  { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+  assert.equal((await f.state()).markers.length, 0);
+});
+
+test("attestor reader can inspect committed marker, state and signed originals without writer rights", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  await commitTestBatch(f, operations);
+  const visible = await attestor.query(`SELECT m.commit_id, m.sequence,
+    m.head, s.ordinal,s.canonical_envelope,s.envelope_digest,s.ciphertext,
+    o.canonical_envelope AS state_envelope,o.envelope_digest AS state_digest,
+    o.ciphertext AS state_ciphertext
+    FROM zk1_sync_batch.batch_commit m
+    JOIN zk1_sync_batch.seen_envelope s ON s.scope=m.scope AND s.commit_id=m.commit_id
+    JOIN zk1_sync_batch.object_state o ON o.scope=s.scope
+      AND o.object_id=(s.canonical_envelope::jsonb->>'objectId')
+    WHERE m.scope=$1 ORDER BY s.ordinal`, [f.scope]);
+  assert.equal(visible.rowCount, 2);
+  for (const [index, row] of visible.rows.entries()) {
+    assert.equal(row.canonical_envelope, protocol.canonicalJson(operations[index]));
+    assert.equal(row.canonical_envelope, row.state_envelope);
+    assert.deepEqual(row.envelope_digest, row.state_digest);
+    assert.deepEqual(row.ciphertext, row.state_ciphertext);
+  }
+  const proof = await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: visible.rows[0].commit_id,
+  });
+  assert.equal(proof.localPgRowsConsistent, true);
+  assert.equal(proof.witnessVerified, false);
+  assert.equal(proof.clientAckAuthorized, false);
+  assert.deepEqual(proof.operationIds, operations.map((op) => op.operationId));
+});
+
+test("PG18 read-only current signed pair resolves a lost ACK by exact signed envelopes without trusting commitId", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const committed = await commitTestBatch(f, operations);
+  const request = {
+    scope: f.scope,
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
+  };
+  const uniqueCurrent = await attestor.query(`SELECT m.commit_id FROM zk1_sync_batch.batch_commit m
+    JOIN zk1_sync_batch.scope_head h ON h.scope=m.scope
+      AND h.sequence=m.sequence AND h.head=m.head
+    WHERE m.scope=$1 AND m.delete_id=$2 AND m.move_id=$3
+      AND m.delete_digest=pg_catalog.decode($4,'hex')
+      AND m.move_digest=pg_catalog.decode($5,'hex')`, [
+    f.scope, ...request.operationIds, ...request.envelopeDigests,
+  ]);
+  assert.equal(uniqueCurrent.rowCount, 1,
+    "real PG18 exact-pair current-head lookup must select precisely one commit");
+  assert.equal(uniqueCurrent.rows[0].commit_id, committed.commitId);
+  const original = structuredClone(request);
+  let queryCount = 0;
+  const instrumentedAttestor = createZk1SyncPgBatchIndependentReadback({
+    attestorPool: { connect: async () => {
+      const connection = await attestor.connect();
+      return { query: async (...args) => {
+        queryCount += 1;
+        return connection.query(...args);
+      }, release: () => connection.release() };
+    } },
+  });
+  let evidence;
+  try { evidence = await instrumentedAttestor.verifyCurrentSignedPair(request); }
+  catch {
+    // Only generic numeric query-stage diagnostics are exposed by the lab
+    // runner; never print SQL parameters, scope names or DB credentials.
+    const code = `ZK65_SQL_CURRENT_STAGE_${queryCount}`;
+    throw Object.assign(new Error(code), { code });
+  }
+  assert.equal(evidence.localPgRowsConsistent, true);
+  assert.equal(evidence.witnessVerified, false);
+  assert.equal(evidence.clientAckAuthorized, false);
+  assert.equal(evidence.commitId, committed.commitId);
+  assert.equal(evidence.head, committed.storeHeadSha256);
+  assert.deepEqual(evidence.operationIds, request.operationIds);
+  assert.deepEqual(evidence.envelopeDigests, request.envelopeDigests);
+  await assert.rejects(createZk1SyncPgBatchIndependentReadback({ attestorPool: runtime })
+    .verifyCurrentSignedPair(request),
+  { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+  "runtime role cannot impersonate the independent read-only attestor");
+  const other = await fixture();
+  for (const forged of [
+    { ...request, scope: other.scope },
+    { ...request, operationIds: [...request.operationIds].reverse() },
+    { ...request, operationIds: [request.operationIds[0], request.operationIds[0]] },
+    { ...request, operationIds: [crypto.randomUUID(), request.operationIds[1]] },
+    { ...request, envelopeDigests: [...request.envelopeDigests].reverse() },
+    { ...request, envelopeDigests: ["0".repeat(64), request.envelopeDigests[1]] },
+    { ...request, envelopeDigests: [request.envelopeDigests[0].toUpperCase(), request.envelopeDigests[1]] },
+    { ...request, envelopeDigests: [request.envelopeDigests[0], "g".repeat(64)] },
+    { ...request, operationIds: [request.operationIds[0]] },
+    { ...request, operationIds: ["x".repeat(161), request.operationIds[1]] },
+    { ...request, commitId: committed.commitId },
+    { ...request, clientAckAuthorized: true },
+  ]) {
+    await assert.rejects(readback.verifyCurrentSignedPair(forged),
+      { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+      "caller-supplied pair, scope or trust flags cannot select a signed readback");
+  }
+  assert.deepEqual(request, original, "verified readback must never mutate challenge bytes");
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  await assert.rejects(readback.verifyCurrentSignedPair(request),
+    { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+    "current revocation must defeat a previously committed SQL row readback");
+});
+
+test("PG18 actual read-only role bridges a synthetic held v2 physical lease without creating ACK authorization", async () => {
+  // Real PostgreSQL 18 SQL transaction and least-privilege reader, but a
+  // TEST-ONLY synthetic witness. This is not evidence of physical durability.
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const committed = await commitTestBatch(f, operations);
+  const key = crypto.generateKeyPairSync("ed25519");
+  const challenge = { scope: f.scope, accountId: crypto.randomUUID(),
+    storeId: crypto.randomUUID(), username: f.username, compartmentId: "private",
+    nonce: crypto.randomBytes(32).toString("base64url"),
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) =>
+      hash(protocol.canonicalJson(op)).toString("hex")),
+    expectedPrevious: null };
+  const ownerBindings = [{ scope: challenge.scope,
+    accountId: challenge.accountId, storeId: challenge.storeId,
+    username: challenge.username, compartmentId: challenge.compartmentId }];
+  const signedOwnerBindingsAuthority = signedOwnerRosterFixture(ownerBindings);
+  const externalPhysicalFence = { async withCurrentRead(request, continuation) {
+    assert.deepEqual(request, challenge);
+    let held = true;
+    const statement = { version: 2, scope: request.scope,
+      accountId: request.accountId, storeId: request.storeId,
+      username: request.username, compartmentId: request.compartmentId,
+      nonce: request.nonce, operationIds: request.operationIds,
+      envelopeDigests: request.envelopeDigests,
+      commitId: committed.commitId,
+      storeHeadSha256: committed.storeHeadSha256,
+      fencingEpoch: 1, physicalDurable: true };
+    const signature = crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+      + protocol.canonicalJson(statement)), key.privateKey).toString("base64url");
+    try {
+      return await continuation({ receipt: { statement, signature }, lineage: null },
+        { assertHeld: () => held });
+    } finally { held = false; }
+  } };
+  const adapterFor = (attestorPool) => createZk1SyncAtomicPgPhysicalFenceDevOff({
+    attestorPool, externalPhysicalFence, witnessPublicKey: key.publicKey,
+    signedOwnerBindingsAuthority,
+  });
+  let signedContinuation = 0;
+  const accepted = await adapterFor(attestor).withCurrentRead(challenge,
+    async (bundle, lease) => {
+      assert.equal(lease.assertHeld(), true);
+      assert.equal(bundle.receipt.statement.commitId, committed.commitId);
+      signedContinuation++;
+      return "DEV_OFF_SQL_AND_SYNTHETIC_WITNESS_ONLY";
+    });
+  assert.equal(accepted, "DEV_OFF_SQL_AND_SYNTHETIC_WITNESS_ONLY");
+  assert.equal(signedContinuation, 1);
+  for (const change of [{ username: "different-user" },
+    { compartmentId: "different-compartment" },
+    { envelopeDigests: ["0".repeat(64), challenge.envelopeDigests[1]] }]) {
+    // Separate test callbacks re-sign the submitted challenge; PostgreSQL
+    // itself must reject any mismatched policy identity or operation digest.
+    const altered = { ...challenge, ...change };
+    const signedForAltered = {
+      async withCurrentRead(request, continuation) {
+        let held = true;
+        const statement = { version: 2, scope: request.scope,
+          accountId: request.accountId, storeId: request.storeId,
+          username: request.username, compartmentId: request.compartmentId,
+          nonce: request.nonce, operationIds: request.operationIds,
+          envelopeDigests: request.envelopeDigests,
+          commitId: committed.commitId,
+          storeHeadSha256: committed.storeHeadSha256,
+          fencingEpoch: 1, physicalDurable: true };
+        const signature = crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+          + protocol.canonicalJson(statement)), key.privateKey).toString("base64url");
+        try {
+          return await continuation({ receipt: { statement, signature }, lineage: null },
+            { assertHeld: () => held });
+        } finally { held = false; }
+      },
+    };
+    const negative = createZk1SyncAtomicPgPhysicalFenceDevOff({
+      attestorPool: attestor, externalPhysicalFence: signedForAltered,
+      witnessPublicKey: key.publicKey,
+      // Deliberately trust the ALTERED identity for this test so denial
+      // actually comes from the independent SQL policy, not constructor pins.
+      ownerBindings: [{ ...ownerBindings[0],
+        ...(change.username ? { username: change.username } : {}),
+        ...(change.compartmentId ? { compartmentId: change.compartmentId } : {}) }],
+    });
+    await assert.rejects(negative.withCurrentRead(altered, async () => {
+      signedContinuation++;
+    }), { code: "SYNC_ATOMIC_PG_FENCE_DEV_OFF_DENIED" },
+    "a signed but SQL-inconsistent v2 witness cannot enter protected CAS");
+  }
+  await assert.rejects(adapterFor(runtime).withCurrentRead(challenge, async () => {
+    signedContinuation++;
+  }), { code: "SYNC_ATOMIC_PG_FENCE_DEV_OFF_DENIED" },
+  "a writer/runtime role cannot impersonate the read-only PostgreSQL witness reader");
+  assert.equal(signedContinuation, 1);
+});
+
+test("PG18 real signed DELETE+MOVE flows through DEV-OFF physical fence into local CAS and signed retained anchor", async (t) => {
+  // The SQL storage/role and two SQLite ledgers are real. The physical witness
+  // is explicitly SYNTHETIC and the retained anchor shares this CI process.
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const committed = await commitTestBatch(f, operations);
+  const owner = { scope: f.scope, accountId: crypto.randomUUID(),
+    storeId: crypto.randomUUID(), username: f.username, compartmentId: "private" };
+  const witnessKey = crypto.generateKeyPairSync("ed25519");
+  const casKey = crypto.generateKeyPairSync("ed25519");
+  const anchorKey = crypto.generateKeyPairSync("ed25519");
+  const directory = createPrivateAuthorityFixture("zk65-pg-real-cas-");
+  let ledger, retained;
+  t.after(() => {
+    ledger?.close();
+    retained?.close();
+    fs.rmSync(directory, { recursive: true, force: true,
+      maxRetries: 10, retryDelay: 100 });
+  });
+  retained = new Zk1SyncAtomicRetainedAnchorDevOff({
+    filename: path.join(directory, "retained.sqlite"), bootstrapNew: true,
+    signerPrivateKey: anchorKey.privateKey,
+    ownerBindings: [{ scope: owner.scope, accountId: owner.accountId,
+      storeId: owner.storeId }],
+    trustedMinimumHeads: [{ scope: owner.scope, sequence: 0, headHash: GENESIS }],
+  });
+  const physical = createZk1SyncAtomicPgPhysicalFenceDevOff({
+    attestorPool: attestor, witnessPublicKey: witnessKey.publicKey,
+    ownerBindings: [owner],
+    signedOwnerBindingsAuthority: signedOwnerRosterFixture([owner]),
+    externalPhysicalFence: {
+      async withCurrentRead(challenge, continuation) {
+        let held = true;
+        const statement = { version: 2, ...owner, nonce: challenge.nonce,
+          operationIds: challenge.operationIds,
+          envelopeDigests: challenge.envelopeDigests,
+          commitId: committed.commitId,
+          storeHeadSha256: committed.storeHeadSha256,
+          fencingEpoch: 7, physicalDurable: true };
+        const signature = crypto.sign(null, Buffer.from(WITNESS_DOMAIN
+          + protocol.canonicalJson(statement)), witnessKey.privateKey)
+          .toString("base64url");
+        try {
+          return await continuation({ receipt: { statement, signature }, lineage: null },
+            { assertHeld: () => held });
+        } finally { held = false; }
+      },
+    },
+  });
+  ledger = await Zk1SyncAtomicCasFloorLedgerDevOff.open({
+    filename: path.join(directory, "local-cas.sqlite"), bootstrapNew: true,
+    casPrivateKey: casKey.privateKey,
+    witnessPublicKey: witnessKey.publicKey,
+    anchorPublicKey: anchorKey.publicKey, ownerBindings: [owner],
+    physicalFence: physical, retainedAnchor: retained,
+  });
+  const input = { scope: owner.scope, accountId: owner.accountId,
+    storeId: owner.storeId,
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) =>
+      hash(protocol.canonicalJson(op)).toString("hex")) };
+  const advanced = await ledger.recordPhysicalPair(input);
+  assert.equal(advanced.sequence, 1);
+  assert.equal(typeof advanced.headHash, "string");
+  const remote = retained.readSignedHead({ scope: owner.scope,
+    nonce: crypto.randomBytes(32).toString("base64url") });
+  assert.equal(remote.statement.sequence, 1);
+  assert.equal(remote.statement.headHash, advanced.headHash);
+  assert.deepEqual(await ledger.recordPhysicalPair(input), advanced,
+    "replaying the same physical pair must not advance a second retained head");
+  assert.equal(retained.readSignedHead({ scope: owner.scope,
+    nonce: crypto.randomBytes(32).toString("base64url") }).statement.sequence, 1);
+  await admin.query(`UPDATE zk1_sync_batch.scope_policy SET allow_delete=false
+    WHERE scope=$1`, [owner.scope]);
+  await assert.rejects(ledger.recordPhysicalPair(input),
+    { code: "SYNC_ATOMIC_CAS_DEV_OFF_UNVERIFIED" },
+    "revoking the real PG18 scope after commit defeats even an old locally signed CAS pair");
+  assert.equal(retained.readSignedHead({ scope: owner.scope,
+    nonce: crypto.randomBytes(32).toString("base64url") }).statement.sequence, 1,
+  "failed independent PG revalidation cannot append another retained head");
+  // This test validates the path but grants NO production ACK/custody claim.
+});
+
+test("PG18 latest-pair resolver refuses rolled-back physical SQL head without treating rows as a witness", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const request = {
+    scope: f.scope,
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
+  };
+  const committed = await commitTestBatch(f, operations);
+  assert.equal((await readback.verifyCurrentSignedPair(request)).commitId, committed.commitId);
+  await admin.query(`UPDATE zk1_sync_batch.scope_head
+    SET sequence=0,head=decode(repeat('00',32),'hex') WHERE scope=$1`, [f.scope]);
+  await assert.rejects(readback.verifyCurrentSignedPair(request),
+    { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+    "SQL head mismatch must deny rather than re-sign a stale committed marker");
+});
+
+test("PG18 current pair accepts legitimate dotted and colon WebDAV signed event IDs", async () => {
+  for (const eventId of ["evt.one", "evt:two", "evt.three:four"]) {
+    const f = await fixture();
+    const operations = await f.signedPair({ eventId });
+    assert.ok(operations.every((op) => op.operationId.includes(eventId)));
+    const committed = await commitTestBatch(f, operations);
+    const proof = await readback.verifyCurrentSignedPair({
+      scope: f.scope,
+      operationIds: operations.map((op) => op.operationId),
+      envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")),
+    });
+    assert.equal(proof.commitId, committed.commitId);
+    assert.equal(proof.localPgRowsConsistent, true);
+    assert.equal(proof.clientAckAuthorized, false);
+  }
+});
+
+test("PG18 exact signed batch is observable over isolated real TLS1.3 mTLS without authorizing ACK", {
+  timeout: 120000,
+}, async (t) => {
+  const f = await fixture();
+  const operations = await f.signedPair({ eventId: "tls.real:batch" });
+  const committed = await commitTestBatch(f, operations);
+  const directory = createPrivateAuthorityFixture("zk65-sql-mtls-");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const openssl = (...args) => execFileSync("openssl", args, {
+    cwd: directory, windowsHide: true, stdio: "ignore", timeout: 30000,
+  });
+  openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", "ca.key", "-out", "ca.pem", "-subj", "/CN=zk65 SQL fixture CA", "-days", "1");
+  function makeCert(name, usage, server = false) {
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`,
+      "-out", `${name}.csr`, "-subj", `/CN=${server ? "localhost" : name}`);
+    fs.writeFileSync(path.join(directory, `${name}.ext`),
+      `extendedKeyUsage=${usage}\nkeyUsage=digitalSignature,keyEncipherment\n`
+      + (server ? "subjectAltName=DNS:localhost,IP:127.0.0.1\n" : ""),
+    { mode: 0o600, flag: "wx" });
+    openssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem",
+      "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem`,
+      "-days", "1", "-extfile", `${name}.ext`);
+  }
+  makeCert("server", "serverAuth", true);
+  makeCert("reader", "clientAuth");
+  makeCert("unlisted", "clientAuth");
+  const read = (name) => fs.readFileSync(path.join(directory, name));
+  const client = { key: read("reader.key"), cert: read("reader.pem") };
+  const otherClient = { key: read("unlisted.key"), cert: read("unlisted.pem") };
+  const fingerprint = new crypto.X509Certificate(client.cert).fingerprint256;
+  const accountId = crypto.randomUUID();
+  const storeId = crypto.randomUUID();
+  const server = createZk1SyncAtomicSqlReadbackHttpsServer({
+    key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
+    attestorPool: attestor,
+    principals: { [fingerprint]: [{ scope: f.scope, accountId, storeId }] },
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const challenge = { scope: f.scope, accountId, storeId,
+    nonce: crypto.randomBytes(32).toString("base64url"),
+    operationIds: operations.map((op) => op.operationId),
+    envelopeDigests: operations.map((op) => hash(protocol.canonicalJson(op)).toString("hex")) };
+  function send(body, credential = client, route = "/v2/sync-atomic/sql-observe",
+    tlsOverride = {}, targetServer = server) {
+    return new Promise((resolve, reject) => {
+      const data = Buffer.from(JSON.stringify(body));
+      const request = https.request({ host: "127.0.0.1", port: targetServer.address().port,
+        path: route, method: "POST", ca: read("ca.pem"), ...credential,
+        agent: false, rejectUnauthorized: true, minVersion: "TLSv1.3", timeout: 5000,
+        headers: { "content-type": "application/json", "content-length": String(data.length) },
+        ...tlsOverride },
+      (response) => {
+        const parts = [];
+        response.on("data", (part) => parts.push(part));
+        response.on("end", () => {
+          try { resolve({ status: response.statusCode,
+            body: JSON.parse(Buffer.concat(parts).toString("utf8")),
+            headers: response.headers }); }
+          catch (e) { reject(e); }
+        });
+      });
+      request.on("error", reject);
+      request.on("timeout", () => request.destroy(new Error("SQL_MTLS_TIMEOUT")));
+      request.end(data);
+    });
+  }
+  const observed = await send(challenge);
+  assert.equal(observed.status, 200);
+  assert.equal(observed.headers["cache-control"], "no-store");
+  assert.equal(observed.body.kind, "SYNC_ATOMIC_SQL_ROWS_ONLY_DEV_OFF");
+  assert.equal(observed.body.commitId, committed.commitId);
+  assert.equal(observed.body.storeHeadSha256, committed.storeHeadSha256);
+  assert.equal(observed.body.nonce, challenge.nonce);
+  assert.equal(observed.body.localPgRowsConsistent, true);
+  assert.equal(observed.body.physicalDurable, false);
+  assert.equal(observed.body.witnessVerified, false);
+  assert.equal(observed.body.clientAckAuthorized, false);
+  assert.equal(Object.hasOwn(observed.body, "statement"), false);
+  assert.equal(Object.hasOwn(observed.body, "signature"), false);
+  assert.equal(Object.hasOwn(observed.body, "atomicAdmission"), false);
+  await assert.rejects(send(challenge, {}),
+    "client TLS certificates must be mandatory at the handshake boundary");
+  await assert.rejects(send(challenge, client, "/v2/sync-atomic/sql-observe",
+    { minVersion: "TLSv1.2", maxVersion: "TLSv1.2" }),
+  "TLS 1.2 cannot negotiate the mTLS observer service");
+  for (const [bad, credential, expected] of [
+    [challenge, otherClient, 403],
+    [{ ...challenge, accountId: crypto.randomUUID() }, client, 403],
+    [{ ...challenge, storeId: crypto.randomUUID() }, client, 403],
+    [{ ...challenge, nonce: "invalid" }, client, 400],
+    [{ ...challenge, envelopeDigests: ["0".repeat(64), challenge.envelopeDigests[1]] }, client, 503],
+    [{ ...challenge, clientAckAuthorized: true }, client, 400],
+    [{ ...challenge, padding: "x".repeat(4097) }, client, 400],
+  ]) {
+    const denied = await send(bad, credential);
+    assert.equal(denied.status, expected);
+    assert.equal(denied.headers["cache-control"], "no-store");
+    assert.equal(Object.hasOwn(denied.body, "commitId"), false);
+  }
+  assert.equal((await send(challenge, client, "/v2/sync-atomic/witness/readback")).status, 404,
+    "SQL-only endpoint must not impersonate a physical witness route");
+  const repeat = await send(challenge);
+  assert.equal(repeat.status, 200, "replayed read-only SQL observation is not a consumed admission");
+  assert.equal(repeat.body.clientAckAuthorized, false);
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  const revoked = await send(challenge);
+  assert.equal(revoked.status, 503);
+  assert.equal(Object.hasOwn(revoked.body, "commitId"), false,
+    "revoked device cannot be read back over mTLS as an authorized physical ACK");
+
+  // A blocked PG connection must not pin an HTTP response forever or create
+  // unbounded work via retries. Expiration does NOT cancel or release a
+  // database operation until it genuinely settles. Multiple independently
+  // pinned client certificates prove one credential cannot starve the others.
+  const stalledClients = [client];
+  for (let i = 1; i < 8; i++) {
+    makeCert(`stalled-reader-${i}`, "clientAuth");
+    stalledClients.push({
+      key: read(`stalled-reader-${i}.key`),
+      cert: read(`stalled-reader-${i}.pem`),
+    });
+  }
+  const stalledPrincipals = Object.fromEntries(stalledClients.map((identity) =>
+    [new crypto.X509Certificate(identity.cert).fingerprint256,
+      [{ scope: f.scope, accountId, storeId }]]));
+  let stalledConnectAttempts = 0;
+  const stalled = createZk1SyncAtomicSqlReadbackHttpsServer({
+    key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
+    attestorPool: { connect: () => {
+      stalledConnectAttempts += 1;
+      return new Promise(() => {});
+    } },
+    principals: stalledPrincipals,
+    observationTimeoutMs: 80,
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    stalled.once("error", onError);
+    stalled.listen(0, "127.0.0.1", () => {
+      stalled.off("error", onError);
+      resolve();
+    });
+  });
+  t.after(() => new Promise((resolve) => stalled.close(resolve)));
+  for (let i = 0; i < stalledClients.length; i++) {
+    const unavailable = await send(challenge, stalledClients[i],
+      "/v2/sync-atomic/sql-observe", {}, stalled);
+    assert.equal(unavailable.status, 503);
+    assert.equal(unavailable.body.error, "SYNC_ATOMIC_SQL_OBSERVE_UNAVAILABLE");
+    assert.equal(Object.hasOwn(unavailable.body, "commitId"), false);
+    if (i === 0) {
+      const samePeer = await send(challenge, stalledClients[0],
+        "/v2/sync-atomic/sql-observe", {}, stalled);
+      assert.equal(samePeer.status, 503);
+      assert.equal(samePeer.body.error, "SYNC_ATOMIC_SQL_OBSERVE_BUSY",
+        "same certificate cannot fill all pending PG slots after HTTP timeout");
+      assert.equal(stalledConnectAttempts, 1);
+    }
+  }
+  const deniedAfterCap = await send(challenge, client,
+    "/v2/sync-atomic/sql-observe", {}, stalled);
+  assert.equal(deniedAfterCap.status, 503);
+  assert.equal(deniedAfterCap.body.error, "SYNC_ATOMIC_SQL_OBSERVE_BUSY",
+    "timed-out SQL requests must keep consuming the bounded pending quota");
+  assert.equal(stalledConnectAttempts, 8,
+    "retries cannot allocate more PostgreSQL connections after the pending cap");
+  assert.equal(Object.hasOwn(deniedAfterCap.body, "clientAckAuthorized"), false);
+});
+
+test("independent readback rejects revocation and runtime impersonation", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const result = await commitTestBatch(f, operations);
+  await assert.rejects(createZk1SyncPgBatchIndependentReadback({ attestorPool: runtime })
+    .verifyLatestSignedPair({ scope: f.scope, commitId: result.commitId }),
+  { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+  await admin.query(`UPDATE zk1_sync_batch.device_grant SET revoked=true
+    WHERE scope=$1 AND device_id='device-a'`, [f.scope]);
+  await assert.rejects(readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: result.commitId,
+  }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+});
+
+test("PG18 direct SQL rejects missing JSON-bound fields, including NULL ciphertext", async () => {
+  const f = await fixture();
+  const original = (await f.state()).rows.find((row) => row.object_id === "dest");
+  const variants = [
+    (op) => { delete op.objectId; },
+    (op) => { delete op.fileId; },
+    (op) => { delete op.versionId; },
+    (op) => { delete op.deviceId; },
+    (op) => { delete op.revision.deviceId; },
+    (op) => { delete op.revision.counter; },
+    (op) => { delete op.compartmentId; },
+    (op) => { delete op.keyEpoch; },
+    (op) => { delete op.metadata.path; },
+    (op) => { delete op.tombstone; },
+    (op) => { delete op.ciphertext; },
+    (op) => { op.metadata = null; },
+    (op) => { op.revision = null; },
+  ];
+  for (const mutate of variants) {
+    const operation = JSON.parse(original.canonical_envelope);
+    mutate(operation);
+    const canonical = protocol.canonicalJson(operation);
+    const ciphertext = Buffer.from(operation.ciphertext || "", "base64url");
+    await assert.rejects(admin.query(`UPDATE zk1_sync_batch.object_state
+      SET canonical_envelope=$2,envelope_digest=$3,ciphertext=$4
+      WHERE scope=$1 AND object_id='dest'`, [
+      f.scope, canonical, hash(canonical), ciphertext,
+    ]), { code: "23514" }, "missing JSON field must violate CHECK, not pass UNKNOWN");
+  }
+  assert.equal((await f.state()).rows.find((row) => row.object_id === "dest")
+    .canonical_envelope, original.canonical_envelope);
+});
+
+test("PG18 direct SQL rejects missing original signed-envelope proof fields", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const result = await commitTestBatch(f, pair);
+  const variants = [
+    (op) => { delete op.operationId; },
+    (op) => { delete op.operation; },
+    (op) => { delete op.authorization; },
+    (op) => { delete op.authorization.replayId; },
+    (op) => { delete op.authorization.idempotencyKey; },
+    (op) => { delete op.authorization.signature; },
+    (op) => { delete op.authorization.publicKey; },
+    (op) => { delete op.ciphertext; },
+  ];
+  for (const mutate of variants) {
+    const op = structuredClone(pair[0]);
+    const operationId = crypto.randomUUID();
+    const replayId = crypto.randomUUID();
+    const idempotencyKey = crypto.randomBytes(18).toString("base64url");
+    op.operationId = operationId;
+    op.authorization.replayId = replayId;
+    op.authorization.idempotencyKey = idempotencyKey;
+    mutate(op);
+    const canonical = protocol.canonicalJson(op);
+    await assert.rejects(admin.query(`INSERT INTO zk1_sync_batch.seen_envelope
+      (scope,operation_id,replay_id,idempotency_key,commit_id,ordinal,kind,
+       canonical_envelope,envelope_digest,ciphertext)
+      VALUES ($1,$2,$3,$4,$5,0,'delete',$6,$7,$8)`, [
+      f.scope, operationId, replayId, idempotencyKey, result.commitId,
+      canonical, hash(canonical), Buffer.from(op.ciphertext || "", "base64url"),
+    ]), { code: "23514" }, "missing signed proof field must fail SQL CHECK");
+  }
+  assert.equal((await f.state()).seen.length, 2);
+});
+
+test("independent readback rejects an actual PostgreSQL old-head rollback", async () => {
+  const f = await fixture();
+  const result = await commitTestBatch(f, await f.signedPair());
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: result.commitId,
+  })).localPgRowsConsistent, true);
+  // Operator-only adversarial rollback in a disposable test scope. Restoring
+  // the genesis head while leaving the committed rows must fail closed.
+  await admin.query(`UPDATE zk1_sync_batch.scope_head
+    SET sequence=0,head=decode(repeat('00',32),'hex') WHERE scope=$1`, [f.scope]);
+  assert.equal(Number((await f.state()).head.sequence), 0);
+  await assert.rejects(readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: result.commitId,
+  }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+});
+
+test("independent readback rejects physically forged ciphertext with a self-consistent replacement envelope", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const result = await commitTestBatch(f, operations);
+  const alternative = (await f.signedPair())[1];
+  assert.notEqual(protocol.canonicalJson(alternative),
+    protocol.canonicalJson(operations[1]));
+  const canonical = protocol.canonicalJson(alternative);
+  // Operator-only corruption fixture: disable the protective object UPDATE
+  // trigger for a single transaction, replace all JSON-derived columns and
+  // actual ciphertext consistently, then re-enable the trigger BEFORE COMMIT.
+  // The ordinary SQL CHECKs should allow the internally coherent replacement;
+  // independent readback must still reject it against ORIGINAL seen/marker.
+  const conn = await admin.connect();
+  let begun = false;
+  try {
+    await conn.query("BEGIN");
+    begun = true;
+    await conn.query(`ALTER TABLE zk1_sync_batch.object_state
+      DISABLE TRIGGER object_revision_requires_new_commit`);
+    const changed = await conn.query(`UPDATE zk1_sync_batch.object_state
+      SET version_id=$3,canonical_envelope=$4,envelope_digest=$5,ciphertext=$6
+      WHERE scope=$1 AND object_id=$2`, [
+      f.scope, alternative.objectId, alternative.versionId, canonical,
+      hash(canonical), Buffer.from(alternative.ciphertext, "base64url"),
+    ]);
+    assert.equal(changed.rowCount, 1);
+    await conn.query(`ALTER TABLE zk1_sync_batch.object_state
+      ENABLE TRIGGER object_revision_requires_new_commit`);
+    await conn.query("COMMIT");
+    begun = false;
+  } finally {
+    if (begun) {
+      try { await conn.query("ROLLBACK"); } catch { /* test-only rollback */ }
+    }
+    conn.release();
+  }
+  const forged = (await f.state()).rows.find((row) => row.object_id === alternative.objectId);
+  assert.equal(forged.canonical_envelope, canonical);
+  assert.deepEqual(forged.ciphertext, Buffer.from(alternative.ciphertext, "base64url"));
+  await assert.rejects(readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: result.commitId,
+  }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+});
+
+test("P1 adversarial RED requirement: verifier direct SQL state/head/marker/seen mutation is denied", async () => {
+  // Retain the ORIGINAL verifier-bypass regression as executable, real SQL
+  // attacks. Introspection alone is insufficient. Every attempt must be
+  // rejected with PostgreSQL SQLSTATE 42501, not by unrelated data CHECKs.
+  const f = await fixture();
+  const signed = await f.signedPair();
+  const before = await f.state();
+  const marker = crypto.randomUUID();
+  const attackQueries = [
+    [`UPDATE zk1_sync_batch.scope_head SET head=decode(repeat('ac',32),'hex')
+      WHERE scope=$1`, [f.scope]],
+    [`UPDATE zk1_sync_batch.object_state SET ciphertext=decode('deadbeef','hex')
+      WHERE scope=$1 AND object_id='src'`, [f.scope]],
+    [`INSERT INTO zk1_sync_batch.batch_commit
+      (scope,sequence,commit_id,policy_epoch,previous_head,head,
+       delete_id,move_id,delete_digest,move_digest,state_digest)
+      VALUES ($1,1,$2,1,decode(repeat('00',32),'hex'),
+        decode(repeat('ab',32),'hex'),$3,$4,$5,$6,$7)`, [
+      f.scope, marker, signed[0].operationId, signed[1].operationId,
+      hash(protocol.canonicalJson(signed[0])),
+      hash(protocol.canonicalJson(signed[1])), hash("attacker-state"),
+    ]],
+    [`INSERT INTO zk1_sync_batch.seen_envelope
+      (scope,operation_id,replay_id,idempotency_key,commit_id,ordinal,kind,
+       canonical_envelope,envelope_digest,ciphertext)
+      VALUES ($1,$2,$3,$4,$5,0,'delete',$6,$7,$8)`, [
+      f.scope, signed[0].operationId, signed[0].authorization.replayId,
+      signed[0].authorization.idempotencyKey, marker,
+      protocol.canonicalJson(signed[0]), hash(protocol.canonicalJson(signed[0])),
+      Buffer.from(signed[0].ciphertext, "base64url"),
+    ]],
+  ];
+  for (const [sql, parameters] of attackQueries) {
+    await assert.rejects(verifier.query(sql, parameters), { code: "42501" },
+      "verifier must never reach protected DML even with valid-looking values");
+  }
+  const after = await f.state();
+  assert.deepEqual(after, before,
+    "direct SQL attack cannot change physical state or authoritative marker");
+});
+
+test("PG18 attestor rejects accidental SECURITY DEFINER EXECUTE grants even with no table DML", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const result = await commitTestBatch(f, operations);
+  const signature = "zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)";
+  const baseline = await attestor.query(`SELECT
+    pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+  [signature]);
+  assert.equal(baseline.rows[0].allowed, false);
+  let granted = false;
+  try {
+    await admin.query(`GRANT EXECUTE ON FUNCTION
+      zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+      TO zk1_sync_batch_attestor_reader`);
+    granted = true;
+    const observed = await attestor.query(`SELECT
+      pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+    [signature]);
+    assert.equal(observed.rows[0].allowed, true,
+      "test must establish that a SECURITY DEFINER write capability became effective");
+    await assert.rejects(readback.verifyLatestSignedPair({
+      scope: f.scope, commitId: result.commitId,
+    }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+    "read-only attestor must fail closed on accidental owner-function authority");
+  } finally {
+    if (granted) {
+      await admin.query(`REVOKE EXECUTE ON FUNCTION
+        zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+        FROM zk1_sync_batch_attestor_reader`);
+    }
+  }
+  const restored = await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: result.commitId,
+  });
+  assert.equal(restored.localPgRowsConsistent, true);
+  assert.equal(restored.clientAckAuthorized, false);
+});
+
+test("PG18 admission issuer rejects SECURITY DEFINER EXECUTE grants on both independent DB credentials", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const before = await f.state();
+  const signature = "zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)";
+  for (const [role, pool] of [
+    ["zk1_sync_batch_attestor_reader", attestor],
+    ["zk1_sync_batch_admission_issuer", issuer],
+  ]) {
+    const baseline = await pool.query(`SELECT
+      pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+    [signature]);
+    assert.equal(baseline.rows[0].allowed, false);
+    await admin.query(`GRANT EXECUTE ON FUNCTION
+      zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+      TO ${role}`);
+    try {
+      const effective = await pool.query(`SELECT
+        pg_catalog.has_function_privilege(current_user,$1::regprocedure,'EXECUTE') AS allowed`,
+      [signature]);
+      assert.equal(effective.rows[0].allowed, true,
+        `${role} must actually acquire the writer's SECURITY DEFINER capability`);
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: f.scope, username: f.username, operations,
+      }), { code: "SYNC_PG_ISSUER_DENIED" },
+      "issuer must fail closed when either DB credential can execute owner writes");
+      assert.deepEqual(await f.state(), before);
+    } finally {
+      await admin.query(`REVOKE EXECUTE ON FUNCTION
+        zk1_sync_batch.commit_admitted_pair(text,text,uuid,text,text)
+        FROM ${role}`);
+    }
+  }
+  const issued = await admissionIssuer.issueTicket({
+    scope: f.scope, username: f.username, operations,
+  });
+  assert.equal(typeof issued.admissionTicket, "string",
+    "ticket issuance must recover after all hostile function grants are removed");
+  assert.equal(issued.clientAckAuthorized, false);
+  assert.deepEqual(await f.state(), before);
+});
+
+test("PG18 rejects owner SECURITY DEFINER functions granted from a foreign application schema", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const committed = await commitTestBatch(f, pair);
+  const pending = await fixture();
+  const pendingPair = await pending.signedPair();
+  const original = await pending.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [pending.scope])).rows[0].n);
+  const originalTickets = await countTickets();
+  const schema = "zk65_foreign_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    await admin.query(`CREATE FUNCTION ${schema}.owner_probe() RETURNS integer
+      LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'`);
+    await admin.query(`REVOKE ALL ON FUNCTION ${schema}.owner_probe() FROM PUBLIC`);
+    for (const [role, pool] of [
+      ["zk1_sync_batch_attestor_reader", attestor],
+      ["zk1_sync_batch_admission_issuer", issuer],
+    ]) {
+      await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      await admin.query(`GRANT EXECUTE ON FUNCTION ${schema}.owner_probe() TO ${role}`);
+      try {
+        const access = await pool.query(`SELECT
+          pg_catalog.has_function_privilege(current_user,
+            $1::regprocedure,'EXECUTE') AS executable`, [`${schema}.owner_probe()`]);
+        assert.equal(access.rows[0].executable, true,
+          "the test must prove that this foreign-schema owner function is callable");
+        assert.equal((await pool.query(`SELECT ${schema}.owner_probe() AS exercised`))
+          .rows[0].exercised, 1);
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: pending.scope, username: pending.username,
+          operations: await pending.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" },
+        "both independently isolated issuer credentials must reject foreign owner functions");
+        if (role === "zk1_sync_batch_attestor_reader") {
+          await assert.rejects(readback.verifyLatestSignedPair({
+            scope: f.scope, commitId: committed.commitId,
+          }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" },
+          "independent physical SQL reader must also deny a foreign owner function");
+        }
+        assert.deepEqual(await pending.state(), original,
+          "a foreign-schema misgrant must never mutate a protected object");
+        assert.equal(await countTickets(), originalTickets,
+          "a foreign-schema misgrant must never mint an admission ticket");
+      } finally {
+        await admin.query(`REVOKE EXECUTE ON FUNCTION ${schema}.owner_probe()
+          FROM ${role}`);
+        await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
+      }
+    }
+  } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+  const restored = await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: committed.commitId,
+  });
+  assert.equal(restored.localPgRowsConsistent, true,
+    "a normal independent SQL read must recover when foreign grants are removed");
+  assert.equal(restored.clientAckAuthorized, false);
+  const ticket = await admissionIssuer.issueTicket({
+    scope: pending.scope, username: pending.username,
+    operations: await pending.signedPair(),
+  });
+  assert.equal(typeof ticket.admissionTicket, "string");
+  assert.equal(ticket.clientAckAuthorized, false);
+  assert.equal(await countTickets(), originalTickets + 1,
+    "only a clean recovered credential may mint a new ticket");
+});
+
+test("PG18 denies writable owner-rights views in foreign schemas despite no base-table DML grant", async () => {
+  const saved = await fixture();
+  const savedPair = await saved.signedPair();
+  const committed = await commitTestBatch(saved, savedPair);
+  const pending = await fixture();
+  const before = await pending.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [pending.scope])).rows[0].n);
+  const originalTickets = await countTickets();
+  const schema = "zk65_definer_view_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    // Ordinary PostgreSQL views run as the VIEW OWNER by default. A user
+    // granted only UPDATE(view) can reach the protected head even without
+    // UPDATE(scope_head) or executable SECURITY DEFINER functions.
+    await admin.query(`CREATE VIEW ${schema}.indirect_head AS
+      SELECT scope,head FROM zk1_sync_batch.scope_head`);
+    for (const [role, pool] of [
+      ["zk1_sync_batch_attestor_reader", attestor],
+      ["zk1_sync_batch_admission_issuer", issuer],
+      ["zk1_sync_batch_verifier", verifier],
+    ]) {
+      await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      await admin.query(`GRANT SELECT(scope,head), UPDATE(head)
+        ON ${schema}.indirect_head TO ${role}`);
+      try {
+        const privileges = await pool.query(`SELECT
+          pg_catalog.has_table_privilege(current_user,
+            'zk1_sync_batch.scope_head','UPDATE') AS direct_write,
+          pg_catalog.has_column_privilege(current_user,
+            $1::regclass,'head','UPDATE') AS indirect_write`, [`${schema}.indirect_head`]);
+        assert.equal(privileges.rows[0].direct_write, false,
+          "this regression requires an apparently read-only direct protected role");
+        assert.equal(privileges.rows[0].indirect_write, true,
+          "the hostile view UPDATE capability must actually be granted");
+        const tx = await pool.connect();
+        let begun = false;
+        try {
+          await tx.query("BEGIN");
+          begun = true;
+          const attack = await tx.query(`UPDATE ${schema}.indirect_head
+            SET head=decode(repeat('ab',32),'hex') WHERE scope=$1`, [pending.scope]);
+          assert.equal(attack.rowCount, 1,
+            "owner-rights view must really be able to mutate the protected head");
+          const changed = await tx.query(`SELECT encode(head,'hex') AS altered_head
+            FROM ${schema}.indirect_head WHERE scope=$1`, [pending.scope]);
+          assert.equal(changed.rows[0]?.altered_head, "ab".repeat(32),
+            "the view owner must actually change bytes in the protected row");
+        } finally {
+          if (begun) await tx.query("ROLLBACK");
+          tx.release();
+        }
+        assert.deepEqual(await pending.state(), before,
+          "the disposable exploit must roll back before testing the fail-closed gate");
+        if (role === "zk1_sync_batch_attestor_reader") {
+          await assert.rejects(readback.verifyLatestSignedPair({
+            scope: saved.scope, commitId: committed.commitId,
+          }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+          await assert.rejects(admissionIssuer.issueTicket({
+            scope: pending.scope, username: pending.username,
+            operations: await pending.signedPair(),
+          }), { code: "SYNC_PG_ISSUER_DENIED" });
+        } else if (role === "zk1_sync_batch_admission_issuer") {
+          await assert.rejects(admissionIssuer.issueTicket({
+            scope: pending.scope, username: pending.username,
+            operations: await pending.signedPair(),
+          }), { code: "SYNC_PG_ISSUER_DENIED" });
+        } else {
+          const verifierPair = await pending.signedPair();
+          const ticket = await mintTestAdmission(pending, verifierPair);
+          await assert.rejects(store.commitSignedOverwritePair({
+            ...pending, operations: verifierPair, admissionTicket: ticket,
+          }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+        }
+        assert.deepEqual(await pending.state(), before);
+        assert.equal(await countTickets(), originalTickets +
+          (role === "zk1_sync_batch_verifier" ? 1 : 0),
+        "an indirect view grant must not let a failed credential mint extra tickets");
+      } finally {
+        await admin.query(`REVOKE SELECT(scope,head), UPDATE(head)
+          ON ${schema}.indirect_head FROM ${role}`);
+        await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
+      }
+    }
+  } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+  const admissionTicket = await admissionIssuer.issueTicket({
+    scope: pending.scope, username: pending.username,
+    operations: await pending.signedPair(),
+  });
+  assert.equal(typeof admissionTicket.admissionTicket, "string");
+  assert.equal(admissionTicket.clientAckAuthorized, false);
+});
+
+test("PG18 denies real TRIGGER grants that let isolated roles install owner-run hooks", async () => {
+  const saved = await fixture();
+  const committed = await commitTestBatch(saved, await saved.signedPair());
+  const waiting = await fixture();
+  const before = await waiting.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const beforeTickets = await countTickets();
+  const schema = "zk65_trigger_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    // A harmless SECURITY INVOKER trigger function is intentionally available
+    // to the hostile role. The dangerous privilege is TRIGGER on scope_head:
+    // its callback would run on future protected writer transactions.
+    await admin.query(`CREATE FUNCTION ${schema}.on_head_update() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`);
+    await admin.query(`REVOKE ALL ON FUNCTION ${schema}.on_head_update() FROM PUBLIC`);
+    for (const [role, pool] of [
+      ["zk1_sync_batch_attestor_reader", attestor],
+      ["zk1_sync_batch_admission_issuer", issuer],
+      ["zk1_sync_batch_verifier", verifier],
+    ]) {
+      await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      await admin.query(`GRANT EXECUTE ON FUNCTION ${schema}.on_head_update() TO ${role}`);
+      await admin.query(`GRANT TRIGGER ON zk1_sync_batch.scope_head TO ${role}`);
+      try {
+        const granted = await pool.query(`SELECT
+          pg_catalog.has_table_privilege(current_user,
+            'zk1_sync_batch.scope_head','TRIGGER') AS can_trigger,
+          pg_catalog.has_table_privilege(current_user,
+            'zk1_sync_batch.scope_head','UPDATE') AS can_update`);
+        assert.deepEqual(granted.rows[0], { can_trigger: true, can_update: false },
+          "the actual trigger grant must be effective without direct protected UPDATE");
+        const client = await pool.connect();
+        let begun = false;
+        try {
+          await client.query("BEGIN");
+          begun = true;
+          await client.query(`CREATE TRIGGER zk65_unsafe_hook BEFORE UPDATE
+            ON zk1_sync_batch.scope_head FOR EACH ROW
+            EXECUTE FUNCTION ${schema}.on_head_update()`);
+          const installed = await client.query(`SELECT count(*)::int AS hooks
+            FROM pg_catalog.pg_trigger t
+            JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname='zk1_sync_batch' AND c.relname='scope_head'
+              AND t.tgname='zk65_unsafe_hook'`);
+          assert.equal(installed.rows[0].hooks, 1,
+            "the misgranted role can actually install a protected owner-run hook");
+        } finally {
+          if (begun) await client.query("ROLLBACK");
+          client.release();
+        }
+        assert.deepEqual(await waiting.state(), before);
+        if (role === "zk1_sync_batch_attestor_reader") {
+          await assert.rejects(readback.verifyLatestSignedPair({
+            scope: saved.scope, commitId: committed.commitId,
+          }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+          await assert.rejects(admissionIssuer.issueTicket({
+            scope: waiting.scope, username: waiting.username,
+            operations: await waiting.signedPair(),
+          }), { code: "SYNC_PG_ISSUER_DENIED" });
+        } else if (role === "zk1_sync_batch_admission_issuer") {
+          await assert.rejects(admissionIssuer.issueTicket({
+            scope: waiting.scope, username: waiting.username,
+            operations: await waiting.signedPair(),
+          }), { code: "SYNC_PG_ISSUER_DENIED" });
+        } else {
+          const pair = await waiting.signedPair();
+          const admissionTicket = await mintTestAdmission(waiting, pair);
+          await assert.rejects(store.commitSignedOverwritePair({
+            ...waiting, operations: pair, admissionTicket,
+          }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+        }
+        assert.equal(await countTickets(), beforeTickets +
+          (role === "zk1_sync_batch_verifier" ? 1 : 0),
+        "TRIGGER misgrant may not mint extra admission tickets");
+        assert.deepEqual(await waiting.state(), before);
+      } finally {
+        await admin.query(`REVOKE TRIGGER ON zk1_sync_batch.scope_head FROM ${role}`);
+        await admin.query(`REVOKE EXECUTE ON FUNCTION ${schema}.on_head_update() FROM ${role}`);
+        await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
+      }
+    }
+  } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+  const restored = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof restored.admissionTicket, "string");
+  assert.equal(restored.clientAckAuthorized, false);
+});
+
+test("PG18 rejects REFERENCES column grants that allow foreign-key authority outside table DML", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const committed = await commitTestBatch(f, pair);
+  const other = await fixture();
+  const before = await other.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [other.scope])).rows[0].n);
+  const beforeTickets = await countTickets();
+  const fkSchema = "zk65_fk_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${fkSchema}`);
+  try { for (const [role, pool] of [
+    ["zk1_sync_batch_attestor_reader", attestor],
+    ["zk1_sync_batch_admission_issuer", issuer],
+    ["zk1_sync_batch_verifier", verifier],
+  ]) {
+    await admin.query(`GRANT USAGE, CREATE ON SCHEMA ${fkSchema} TO ${role}`);
+    await admin.query(`GRANT REFERENCES(scope) ON zk1_sync_batch.scope_head TO ${role}`);
+    try {
+      const actual = await pool.query(`SELECT
+        pg_catalog.has_column_privilege(current_user,
+          'zk1_sync_batch.scope_head','scope','REFERENCES') AS can_reference,
+        pg_catalog.has_table_privilege(current_user,
+          'zk1_sync_batch.scope_head','UPDATE') AS can_update`);
+      assert.deepEqual(actual.rows[0], { can_reference: true, can_update: false });
+      const fkClient = await pool.connect();
+      let begun = false;
+      try {
+        await fkClient.query("BEGIN");
+        begun = true;
+        await fkClient.query(`CREATE TABLE ${fkSchema}.foreign_reference (
+          scoped text REFERENCES zk1_sync_batch.scope_head(scope))`);
+        const proof = await fkClient.query(`SELECT count(*)::int AS foreign_keys
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class c ON c.oid=con.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname=$1 AND c.relname='foreign_reference'
+            AND con.contype='f'`, [fkSchema]);
+        assert.equal(proof.rows[0].foreign_keys, 1,
+          "the non-writer must really be able to install a foreign key to protected rows");
+      } finally {
+        if (begun) await fkClient.query("ROLLBACK");
+        fkClient.release();
+      }
+      if (role === "zk1_sync_batch_attestor_reader") {
+        await assert.rejects(readback.verifyLatestSignedPair({
+          scope: f.scope, commitId: committed.commitId,
+        }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: other.scope, username: other.username, operations: await other.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      } else if (role === "zk1_sync_batch_admission_issuer") {
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: other.scope, username: other.username, operations: await other.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      } else {
+        const verifierPair = await other.signedPair();
+        const ticket = await mintTestAdmission(other, verifierPair);
+        await assert.rejects(store.commitSignedOverwritePair({
+          ...other, operations: verifierPair, admissionTicket: ticket,
+        }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+      }
+      assert.deepEqual(await other.state(), before);
+      assert.equal(await countTickets(), beforeTickets +
+        (role === "zk1_sync_batch_verifier" ? 1 : 0),
+      "a REFERENCES misgrant must not mint unexpected admission tickets");
+    } finally {
+      await admin.query(`REVOKE REFERENCES(scope) ON zk1_sync_batch.scope_head FROM ${role}`);
+      await admin.query(`REVOKE USAGE, CREATE ON SCHEMA ${fkSchema} FROM ${role}`);
+    }
+  } } finally { await admin.query(`DROP SCHEMA ${fkSchema} CASCADE`); }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+});
+
+test("PG18 audits DELETE privilege on a zero-column foreign relation", async () => {
+  const f = await fixture();
+  const saved = await commitTestBatch(f, await f.signedPair());
+  const schema = "zk65_zero_columns_" + crypto.randomUUID().replace(/-/g, "");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    await admin.query(`CREATE TABLE ${schema}.empty_relation ()`);
+    await admin.query(`INSERT INTO ${schema}.empty_relation DEFAULT VALUES`);
+    for (const [role, pool] of [
+      ["zk1_sync_batch_attestor_reader", attestor],
+      ["zk1_sync_batch_admission_issuer", issuer],
+      ["zk1_sync_batch_verifier", verifier],
+    ]) {
+      await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+      const baselineClient = await pool.connect();
+      try {
+        assert.equal(await hasUnexpectedProtectedDml(baselineClient,
+          { allowTicketInsert: role === "zk1_sync_batch_admission_issuer" }), false,
+        "a zero-column foreign table without any grants must be harmless");
+      } finally { baselineClient.release(); }
+      await admin.query(`GRANT DELETE ON ${schema}.empty_relation TO ${role}`);
+      try {
+        assert.equal((await pool.query(`SELECT pg_catalog.has_table_privilege(
+          current_user,$1::regclass,'DELETE') AS can_delete`,
+        [`${schema}.empty_relation`])).rows[0].can_delete, true);
+        const client = await pool.connect();
+        let begun = false;
+        try {
+          await client.query("BEGIN");
+          begun = true;
+          const deleted = await client.query(`DELETE FROM ${schema}.empty_relation`);
+          assert.equal(deleted.rowCount, 1,
+            "the zero-column table permission must actually delete a protected-by-owner row");
+        } finally {
+          if (begun) await client.query("ROLLBACK");
+          client.release();
+        }
+        assert.equal((await admin.query(`SELECT count(*)::int AS n
+          FROM ${schema}.empty_relation`)).rows[0].n, 1,
+        "the adversarial DELETE must be fully rolled back");
+        const auditClient = await pool.connect();
+        try {
+          assert.equal(await hasUnexpectedProtectedDml(auditClient,
+            { allowTicketInsert: role === "zk1_sync_batch_admission_issuer" }), true,
+          "a zero-column table must never disappear from table-level DML auditing");
+        } finally { auditClient.release(); }
+      } finally {
+        await admin.query(`REVOKE DELETE ON ${schema}.empty_relation FROM ${role}`);
+        const recoveredClient = await pool.connect();
+        try {
+          assert.equal(await hasUnexpectedProtectedDml(recoveredClient,
+            { allowTicketInsert: role === "zk1_sync_batch_admission_issuer" }), false,
+          "a zero-column table audit must recover after DELETE is revoked");
+        } finally { recoveredClient.release(); }
+        await admin.query(`REVOKE USAGE ON SCHEMA ${schema} FROM ${role}`);
+      }
+    }
+  } finally { await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: f.scope, commitId: saved.commitId,
+  })).localPgRowsConsistent, true);
+});
+
+test("PG18 rejects direct per-table MAINTAIN grants without predefined role membership", async () => {
+  const saved = await fixture();
+  const committed = await commitTestBatch(saved, await saved.signedPair());
+  const waiting = await fixture();
+  const before = await waiting.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [waiting.scope])).rows[0].n);
+  const beforeTickets = await countTickets();
+  for (const [role, pool] of [
+    ["zk1_sync_batch_attestor_reader", attestor],
+    ["zk1_sync_batch_admission_issuer", issuer],
+    ["zk1_sync_batch_verifier", verifier],
+  ]) {
+    await admin.query(`GRANT MAINTAIN ON zk1_sync_batch.scope_head TO ${role}`);
+    try {
+      const privileges = await pool.query(`SELECT
+        pg_catalog.has_table_privilege(current_user,
+          'zk1_sync_batch.scope_head','MAINTAIN') AS direct_maintain,
+        pg_catalog.pg_has_role(current_user,'pg_maintain','MEMBER') AS privileged_group`);
+      assert.deepEqual(privileges.rows[0], {
+        direct_maintain: true, privileged_group: false,
+      }, "the actual direct grant must bypass previous predefined-group checks");
+      if (role === "zk1_sync_batch_attestor_reader") {
+        await assert.rejects(readback.verifyLatestSignedPair({
+          scope: saved.scope, commitId: committed.commitId,
+        }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      } else if (role === "zk1_sync_batch_admission_issuer") {
+        await assert.rejects(admissionIssuer.issueTicket({
+          scope: waiting.scope, username: waiting.username,
+          operations: await waiting.signedPair(),
+        }), { code: "SYNC_PG_ISSUER_DENIED" });
+      } else {
+        const pair = await waiting.signedPair();
+        const ticket = await mintTestAdmission(waiting, pair);
+        await assert.rejects(store.commitSignedOverwritePair({
+          ...waiting, operations: pair, admissionTicket: ticket,
+        }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+      }
+      assert.deepEqual(await waiting.state(), before);
+      assert.equal(await countTickets(), beforeTickets +
+        (role === "zk1_sync_batch_verifier" ? 1 : 0),
+      "a direct MAINTAIN misgrant must never mint unauthorized tickets");
+    } finally {
+      await admin.query(`REVOKE MAINTAIN ON zk1_sync_batch.scope_head FROM ${role}`);
+    }
+  }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: saved.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true);
+});
+
+test("PG18 rejects isolated login or sole-service-group ownership of protected schema and database", async () => {
+  const committedFixture = await fixture();
+  const committed = await commitTestBatch(committedFixture,
+    await committedFixture.signedPair());
+  const waiting = await fixture();
+  const before = await waiting.state();
+  const schemaOwner = (await admin.query(`SELECT
+    pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(nspowner)) AS owner_ident
+    FROM pg_catalog.pg_namespace WHERE nspname='zk1_sync_batch'`)).rows[0].owner_ident;
+  const databaseIdentity = (await admin.query(`SELECT
+    pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(datdba)) AS owner_ident,
+    pg_catalog.quote_ident(datname) AS database_ident
+    FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()`)).rows[0];
+  const authorities = [
+    ["zk1_sync_batch_attestor_reader", attestor, async () => {
+      await assert.rejects(readback.verifyLatestSignedPair({
+        scope: committedFixture.scope, commitId: committed.commitId,
+      }), { code: "ZK1_SYNC_PG_READBACK_UNVERIFIED" });
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_admission_issuer", issuer, async () => {
+      await assert.rejects(admissionIssuer.issueTicket({
+        scope: waiting.scope, username: waiting.username,
+        operations: await waiting.signedPair(),
+      }), { code: "SYNC_PG_ISSUER_DENIED" });
+    }],
+    ["zk1_sync_batch_verifier", verifier, async () => {
+      // Tickets expire after 30s; re-mint a fresh, correctly bound admission
+      // for this negative so a stale ticket never causes a false-green deny.
+      const operations = await waiting.signedPair();
+      const ticket = await mintTestAdmission(waiting, operations);
+      await assert.rejects(store.commitSignedOverwritePair({
+        ...waiting, operations, admissionTicket: ticket,
+      }), { code: "SYNC_PG_BATCH_UNTRUSTED_DATABASE_ROLE" });
+    }],
+  ];
+  async function restoreSchemaOwnerAndServiceGrants() {
+    // PostgreSQL ALTER SCHEMA OWNER rewrites owner-related ACL entries: an
+    // owner round-trip can consume a service group's pre-existing USAGE grant.
+    // Restoring only nspowner leaves reader/issuer/verifier unable to see the
+    // protected schema and creates cascading false failures in later tests.
+    await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${schemaOwner}`);
+    await admin.query(`GRANT USAGE ON SCHEMA zk1_sync_batch TO
+      zk1_sync_batch_runtime, zk1_sync_batch_verifier,
+      zk1_sync_batch_attestor_reader, zk1_sync_batch_admission_issuer`);
+    for (const [role, pool] of authorities) {
+      const acl = await pool.query(`SELECT
+        pg_catalog.has_schema_privilege(current_user,'zk1_sync_batch','USAGE') AS can_read,
+        pg_catalog.has_schema_privilege(current_user,'zk1_sync_batch','CREATE') AS can_create,
+        pg_catalog.has_schema_privilege($1::name,'zk1_sync_batch','USAGE') AS group_read,
+        pg_catalog.has_schema_privilege($1::name,'zk1_sync_batch','CREATE') AS group_create`,
+      [role]);
+      assert.deepEqual(acl.rows[0], { can_read: true, can_create: false,
+        group_read: true, group_create: false },
+      "owner round-trip must restore exact least-privilege schema access");
+    }
+  }
+  async function rejected(role, pool, deniedAction) {
+    const client = await pool.connect();
+    try {
+      assert.equal(await hasUnexpectedRoleMembership(client, role), true,
+        "a credential with protected schema/database authority must fail preflight");
+    } finally { client.release(); }
+    await deniedAction();
+    assert.deepEqual(await waiting.state(), before,
+      "a denied owner must not mutate existing protected rows");
+  }
+  // DML grants and table owners stay unchanged throughout. CREATE on schema
+  // or database alone must not be silently accepted, even via the only group
+  // the login may legitimately belong to.
+  for (const [role, pool, deny] of authorities) {
+    await admin.query(`GRANT CREATE ON SCHEMA zk1_sync_batch TO ${role}`);
+    try {
+      assert.equal((await pool.query(`SELECT pg_catalog.has_schema_privilege(
+        $1::name,'zk1_sync_batch','CREATE') AS group_create`, [role]))
+        .rows[0].group_create, true);
+      await rejected(role, pool, deny);
+    } finally {
+      await admin.query(`REVOKE CREATE ON SCHEMA zk1_sync_batch FROM ${role}`);
+    }
+    await admin.query(`GRANT CREATE ON DATABASE ${databaseIdentity.database_ident} TO ${role}`);
+    try {
+      assert.equal((await pool.query(`SELECT pg_catalog.has_database_privilege(
+        $1::name,pg_catalog.current_database(),'CREATE') AS group_create`, [role]))
+        .rows[0].group_create, true);
+      await rejected(role, pool, deny);
+    } finally {
+      await admin.query(`REVOKE CREATE ON DATABASE ${databaseIdentity.database_ident} FROM ${role}`);
+    }
+  }
+  // A schema owner can DROP SCHEMA ... CASCADE even when no table DELETE or
+  // TRUNCATE is granted. Prove actual ownership but never execute destructive
+  // DROP; restore the disposable schema to its independent operator owner.
+  for (const [role, pool, deny] of authorities) {
+    await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${role}`);
+    try {
+      const ownerCheck = await pool.query(`SELECT pg_catalog.pg_has_role(
+        $1::name,nspowner,'MEMBER') AS owns
+        FROM pg_catalog.pg_namespace WHERE nspname='zk1_sync_batch'`, [role]);
+      assert.equal(ownerCheck.rows[0].owns, true);
+      await rejected(role, pool, deny);
+    } finally {
+      await restoreSchemaOwnerAndServiceGrants();
+    }
+  }
+  const readerLogin = (await attestor.query(`SELECT
+    pg_catalog.quote_ident(current_user) AS login_ident`)).rows[0].login_ident;
+  await admin.query(`ALTER SCHEMA zk1_sync_batch OWNER TO ${readerLogin}`);
+  try {
+    assert.equal((await attestor.query(`SELECT pg_catalog.pg_has_role(
+      current_user,nspowner,'MEMBER') AS owns
+      FROM pg_catalog.pg_namespace WHERE nspname='zk1_sync_batch'`))
+      .rows[0].owns, true);
+    await rejected(...authorities[0]);
+  } finally {
+    await restoreSchemaOwnerAndServiceGrants();
+  }
+  // Database ownership is a distinct destructive path: from a second DB
+  // connection, the owner may DROP DATABASE regardless of DML privileges.
+  for (const [ownerIdent, authority] of [
+    ["zk1_sync_batch_attestor_reader", authorities[0]],
+    ["zk1_sync_batch_admission_issuer", authorities[1]],
+    ["zk1_sync_batch_verifier", authorities[2]],
+    [readerLogin, authorities[0]],
+  ]) {
+    await admin.query(`ALTER DATABASE ${databaseIdentity.database_ident}
+      OWNER TO ${ownerIdent}`);
+    try {
+      assert.equal((await authority[1].query(`SELECT pg_catalog.pg_has_role(
+        current_user,d.datdba,'MEMBER') AS owns
+        FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database()`))
+        .rows[0].owns, true);
+      await rejected(...authority);
+    } finally {
+      await admin.query(`ALTER DATABASE ${databaseIdentity.database_ident}
+        OWNER TO ${databaseIdentity.owner_ident}`);
+    }
+  }
+  assert.equal((await readback.verifyLatestSignedPair({
+    scope: committedFixture.scope, commitId: committed.commitId,
+  })).localPgRowsConsistent, true,
+  "the legitimate reader must recover after operator ownership is restored");
+  const restored = await admissionIssuer.issueTicket({
+    scope: waiting.scope, username: waiting.username,
+    operations: await waiting.signedPair(),
+  });
+  assert.equal(typeof restored.admissionTicket, "string");
+  assert.equal(restored.clientAckAuthorized, false);
+});
+
+test("PG18 ticket issuer lock timeout denies blocked admission without a ticket or protected mutation", async () => {
+  const f = await fixture();
+  const operations = await f.signedPair();
+  const before = await f.state();
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [f.scope])).rows[0].n);
+  const originalCount = await countTickets();
+  const locked = await admin.connect();
+  const sqlErrors = [];
+  const observedIssuerPool = { async connect() {
+    const client = await issuer.connect();
+    return {
+      query: async (...args) => {
+        try { return await client.query(...args); }
+        catch (error) { sqlErrors.push(error?.code); throw error; }
+      },
+      release: () => client.release(),
+    };
+  } };
+  const timeoutIssuer = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: observedIssuerPool,
+  });
+  let begun = false;
+  try {
+    await locked.query("BEGIN");
+    begun = true;
+    await locked.query(`SELECT scope FROM zk1_sync_batch.scope_head
+      WHERE scope=$1 FOR UPDATE`, [f.scope]);
+    // The issuer's BEFORE INSERT trigger must wait for this actual SQL row
+    // lock; SET LOCAL lock_timeout terminates it instead of hanging forever.
+    await assert.rejects(timeoutIssuer.issueTicket({
+      scope: f.scope, username: f.username, operations,
+    }), { code: "SYNC_PG_ISSUER_DENIED" });
+    assert.ok(sqlErrors.includes("55P03"),
+      "PostgreSQL must actually throw lock_not_available from SET LOCAL lock_timeout");
+    assert.equal(await countTickets(), originalCount,
+      "rejected blocked issuer INSERT must not leave a live ticket");
+    assert.deepEqual(await f.state(), before);
+  } finally {
+    if (begun) await locked.query("ROLLBACK");
+    locked.release();
+  }
+  const valid = await timeoutIssuer.issueTicket({
+    scope: f.scope, username: f.username,
+    operations: await f.signedPair(),
+  });
+  assert.equal(typeof valid.admissionTicket, "string",
+    "the scoped issuer must recover after PostgreSQL unlocks");
+  assert.equal(await countTickets(), originalCount + 1);
+});
+
+test("PG18 issuer bounds abandoned pool acquisitions and releases late connections", async () => {
+  const f = await fixture();
+  const pair = await f.signedPair();
+  const unresolved = [];
+  let lateReleases = 0;
+  let readerPaused = true;
+  const pausedReader = { connect: () => readerPaused
+    ? new Promise((resolve) => unresolved.push(resolve)) : attestor.connect() };
+  const bounded = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: pausedReader, issuerPool: issuer, connectTimeoutMs: 2000,
+  });
+  const request = { scope: f.scope, username: f.username, operations: pair };
+  const eight = Array.from({ length: 8 }, () => assert.rejects(
+    bounded.issueTicket(request), { code: "SYNC_PG_ISSUER_DENIED" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(unresolved.length, 8,
+    "the first eight checkouts must actually be in flight");
+  await assert.rejects(bounded.issueTicket(request),
+    { code: "SYNC_PG_ISSUER_DENIED" },
+    "a ninth hanging checkout must be rejected by capacity, not queued");
+  assert.equal(unresolved.length, 8);
+  await Promise.all(eight);
+  unresolved.forEach((resolve) => resolve({ release() { lateReleases++; } }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lateReleases, 8,
+    "timed-out acquisitions must return any late connection to the pool");
+  assert.equal((await f.state()).markers.length, 0);
+  readerPaused = false;
+  const reopened = await bounded.issueTicket({
+    ...request, operations: await f.signedPair(),
+  });
+  assert.equal(typeof reopened.admissionTicket, "string",
+    "capacity must recover after actual pool checkout settlement");
+
+  const second = await fixture();
+  const issuerPending = [];
+  let issuerLateReleases = 0;
+  let issuerPaused = true;
+  const pausedIssuer = { connect: () => issuerPaused
+    ? new Promise((resolve) => issuerPending.push(resolve)) : issuer.connect() };
+  const boundedIssuer = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: pausedIssuer, connectTimeoutMs: 2000,
+  });
+  await assert.rejects(boundedIssuer.issueTicket({
+    scope: second.scope, username: second.username,
+    operations: await second.signedPair(),
+  }), { code: "SYNC_PG_ISSUER_DENIED" },
+  "the second pool acquisition after successful read-only attestation must time out");
+  assert.equal(issuerPending.length, 1,
+    "issuer credential checkout must actually have been reached");
+  issuerPending[0]({ release() { issuerLateReleases++; } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(issuerLateReleases, 1,
+    "an issuer connection arriving after timeout must also be returned");
+  issuerPaused = false;
+  const secondIssued = await boundedIssuer.issueTicket({
+    scope: second.scope, username: second.username,
+    operations: await second.signedPair(),
+  });
+  assert.equal(typeof secondIssued.admissionTicket, "string",
+    "issuer credential admission must recover after its late checkout settles");
+});
+
+test("PG18 issuer full-operation timeout retains eight hung BEGIN queries until they actually settle", async () => {
+  const f = await fixture();
+  const request = { scope: f.scope, username: f.username,
+    operations: await f.signedPair() };
+  const waitingBegins = [];
+  let released = 0;
+  let destroyed = 0;
+  let otherSql = 0;
+  const readerPool = { async connect() {
+    return {
+      query(sql) {
+        if (sql.startsWith("BEGIN")) {
+          return new Promise((resolve) => waitingBegins.push(resolve));
+        }
+        if (sql === "ROLLBACK") return Promise.resolve({});
+        otherSql++;
+        throw Error("a timed-out operation resumed prohibited SQL");
+      },
+      release(error) { released++; if (error) destroyed++; },
+    };
+  } };
+  const bounded = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool, issuerPool: issuer, connectTimeoutMs: 500,
+    operationTimeoutMs: 100,
+  });
+  const timedOut = Array.from({ length: 8 }, () => assert.rejects(
+    bounded.issueTicket(request), { code: "SYNC_PG_ISSUER_DENIED" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(waitingBegins.length, 8,
+    "all eight reader checkouts must finish and hang inside their BEGIN queries");
+  await Promise.all(timedOut);
+  await assert.rejects(bounded.issueTicket(request),
+    { code: "SYNC_PG_ISSUER_DENIED" });
+  assert.equal(waitingBegins.length, 8,
+    "a ninth checked-out query must not bypass the retained in-flight quota");
+  assert.equal(released, 0, "a still-running BEGIN must not be pooled early");
+  waitingBegins.forEach((resolve) => resolve({}));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 8);
+  assert.equal(destroyed, 8, "uncertain timed-out readers must be destroyed");
+  assert.equal(otherSql, 0, "late BEGIN completion cannot advance to policy SQL");
+  const retry = bounded.issueTicket(request);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(waitingBegins.length, 9,
+    "the full-operation cap must recover after actual driver settlement");
+  waitingBegins[8]({});
+  await assert.rejects(retry, { code: "SYNC_PG_ISSUER_DENIED" },
+    "the fake pool intentionally cannot provide further policy SQL");
+});
+
+test("PG18 late issuer COMMIT never upgrades a timed-out operation to a ticket ACK", async () => {
+  const f = await fixture();
+  const request = { scope: f.scope, username: f.username,
+    operations: await f.signedPair() };
+  const countTickets = async () => Number((await admin.query(`SELECT count(*)::int AS n
+    FROM zk1_sync_batch.admission_ticket WHERE scope=$1`, [f.scope])).rows[0].n);
+  const before = await countTickets();
+  let commitReached;
+  const atCommit = new Promise((resolve) => { commitReached = resolve; });
+  let settleCommit;
+  let realCommit;
+  let uncertainDestroyed = 0;
+  let signalRelease;
+  const released = new Promise((resolve) => { signalRelease = resolve; });
+  const deferredIssuer = { async connect() {
+    const client = await issuer.connect();
+    return {
+      query(sql, ...args) {
+        if (sql === "COMMIT") {
+          commitReached();
+          // Send the COMMIT to real PostgreSQL IMMEDIATELY, but withhold only
+          // its driver-visible reply. This exercises durable-but-unacknowledged
+          // admission, not an INSERT which commits only after cancellation.
+          realCommit = Promise.resolve().then(() => client.query("COMMIT"));
+          realCommit.catch(() => {});
+          return new Promise((resolve, reject) => {
+            settleCommit = async () => {
+              try { resolve(await realCommit); }
+              catch (error) { reject(error); }
+            };
+          });
+        }
+        return client.query(sql, ...args);
+      },
+      release(error) {
+        if (error) uncertainDestroyed++;
+        try { client.release(error); } finally { signalRelease(); }
+      },
+    };
+  } };
+  const bounded = createZk1SyncPgIndependentAdmissionIssuer({
+    readerPool: attestor, issuerPool: deferredIssuer,
+    connectTimeoutMs: 6000, operationTimeoutMs: 8000,
+  });
+  let callerSettled = false;
+  const caller = bounded.issueTicket(request);
+  caller.then(() => { callerSettled = true; }, () => { callerSettled = true; });
+  const denied = assert.rejects(caller,
+    { code: "SYNC_PG_ISSUER_DENIED" });
+  let guard;
+  let priorCount;
+  try {
+    try {
+      await Promise.race([atCommit, new Promise((_, reject) => {
+        guard = setTimeout(() => reject(Error("issuer never reached COMMIT")), 12000);
+      })]);
+    } finally { clearTimeout(guard); }
+    await realCommit;
+    assert.equal(callerSettled, false,
+      "real PostgreSQL COMMIT must finish while the caller is still awaiting its hidden reply");
+    priorCount = await countTickets();
+    await denied;
+  } finally {
+    // Never leave a real PostgreSQL client inside an intercepted COMMIT if
+    // a test assertion/guard fails: CI teardown must remain recoverable.
+    if (settleCommit) await settleCommit();
+    await denied;
+  }
+  assert.equal(priorCount, before + 1,
+    "real PostgreSQL must have durably COMMITted before its reply is delivered");
+  let releaseGuard;
+  try {
+    await Promise.race([released, new Promise((_, reject) => {
+      releaseGuard = setTimeout(() => reject(Error("issuer rollback/release never settled")), 6000);
+    })]);
+  } finally { clearTimeout(releaseGuard); }
+  assert.equal(uncertainDestroyed, 1,
+    "a commit resumed after caller deadline must destroy its uncertain pool client");
+  assert.equal(await countTickets(), before + 1,
+    "a lost reply after physical COMMIT must never generate a positive caller ACK");
+});

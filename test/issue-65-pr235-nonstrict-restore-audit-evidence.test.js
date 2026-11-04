@@ -1,0 +1,242 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
+
+const project = path.resolve(__dirname, "..");
+const CASE = String.raw`
+"use strict";
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const Database = require("better-sqlite3");
+const project = process.env.PR235_TEST_PROJECT;
+const scenario = process.env.PR235_TEST_SCENARIO;
+const prePinSwap = scenario === "pending-prepin-replace";
+const attack = ["late-hardlink-swap", "late-symlink-swap",
+  "pending-hardlink-swap", "pending-symlink-swap"].includes(scenario) || prePinSwap;
+const outside = path.join(process.cwd(), "data", "outside-audit.sqlite");
+let swappedStage = false;
+let sqliteCallsOnSwappedStage = 0;
+let attackedStage = null;
+// Interpose at the exact SQLite reopen, after staging has created an empty
+// inode, so the test exercises the real restore path and real SQLite writes.
+const sqliteModule = require.cache[require.resolve("better-sqlite3")];
+if (attack) {
+  function DatabaseWithStageSwap(filename, options) {
+    if (!swappedStage && typeof filename === "string"
+      && filename.includes(".audit-private") && filename.includes(".restore-stage-")) {
+      swappedStage = true;
+      attackedStage = filename;
+      fs.unlinkSync(filename);
+      if (scenario.endsWith("hardlink-swap")) fs.linkSync(outside, filename);
+      else fs.symlinkSync(outside, filename, "file");
+    }
+    const db = new Database(filename, options);
+    if (!swappedStage || typeof filename !== "string" || !filename.includes(".restore-stage-")) return db;
+    return new Proxy(db, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (typeof value !== "function") return value;
+        return (...args) => {
+          if (["pragma", "exec", "prepare", "transaction"].includes(property)) sqliteCallsOnSwappedStage += 1;
+          return value.apply(target, args);
+        };
+      },
+    });
+  }
+  Object.setPrototypeOf(DatabaseWithStageSwap, Database);
+  DatabaseWithStageSwap.prototype = Database.prototype;
+  sqliteModule.exports = DatabaseWithStageSwap;
+}
+const { runMigrations } = require(path.join(project, "db", "migrations"));
+const { isStrictSyncModeObserved, getDb } = require(path.join(project, "db"));
+const backup = require(path.join(project, "services", "backupService"));
+const restore = require(path.join(project, "services", "restoreService"));
+if (prePinSwap) {
+  const restorePreimage = require(path.join(project, "services", "restorePreimage"));
+  const originalCopy = restorePreimage.copyVerifiedFile;
+  restorePreimage.copyVerifiedFile = function (source, destination, expectedHash) {
+    const result = originalCopy(source, destination, expectedHash);
+    if (!swappedStage && destination.includes(".audit-private")
+      && destination.includes(".restore-stage-")) {
+      swappedStage = true;
+      attackedStage = destination;
+      // Replace the verified copy with a distinct, valid private SQLite file
+      // before restoreStrictAuditSidecar can pin its fresh descriptor.
+      fs.unlinkSync(destination);
+      fs.copyFileSync(outside, destination, fs.constants.COPYFILE_EXCL);
+      if (process.platform !== "win32") fs.chmodSync(destination, 0o600);
+    }
+    return result;
+  };
+}
+if (attack) sqliteModule.exports = Database;
+const audit = require(path.join(project, "repositories", "auditRepository"));
+const strictAudit = require(path.join(project, "services", "strictAuditSnapshot"));
+const { Open } = require("unzipper");
+const makeEvent = (id, eventType = "auth.login.failed") => ({
+  id, timestamp: "2026-11-02T00:00:00.000Z", eventType,
+  severity: "warning", actor: { username: "fixture" },
+  action: "login", result: "failure", details: {},
+});
+(async () => {
+  runMigrations({ backup: false });
+  assert.equal(isStrictSyncModeObserved(), false);
+  const sidecar = strictAudit.journalPath(process.env.DATABASE_URL);
+  const state = path.join(process.cwd(), "data", "fixture-state.json");
+  fs.writeFileSync(state, JSON.stringify({ value: "selected" }));
+  if (attack) {
+    const foreign = new Database(outside);
+    try {
+      foreign.pragma("journal_mode = WAL");
+      foreign.pragma("synchronous = FULL");
+      foreign.exec("CREATE TABLE pending_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL);"
+        + "CREATE TABLE archived_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+    } finally { foreign.close(); }
+  }
+  if (scenario === "late-divergent") {
+    audit.saveAuditLogs({ logs: [makeEvent("A-before-backup")] });
+  } else if (!scenario.startsWith("late")) {
+    audit.deferAuditLog(makeEvent("A-before-backup"));
+  }
+  const saved = await backup.createBackup({ createdBy: "fixture" });
+  const zip = await Open.file(backup.getArchivePath(saved.filename));
+  const included = zip.files.some((entry) => entry.path === strictAudit.ARCHIVE_ENTRY);
+  assert.equal(included, !scenario.startsWith("late"), "real backup sidecar membership");
+  fs.writeFileSync(state, JSON.stringify({ value: "live" }));
+  if (scenario === "divergent") {
+    const journal = new Database(sidecar);
+    try {
+      journal.prepare("UPDATE pending_audit SET event=? WHERE id=?")
+        .run(JSON.stringify(makeEvent("A-before-backup", "auth.login.success")), "A-before-backup");
+    } finally { journal.close(); }
+  } else if (scenario === "late-divergent") {
+    audit.saveAuditLogs({ logs: [makeEvent("A-before-backup", "auth.login.success")] });
+  } else if (scenario === "oversized") {
+    audit.saveAuditLogs({ logs: [{ ...makeEvent("B-after-backup"),
+      details: { payload: "Z".repeat(70 * 1024) } }] });
+  } else if (scenario === "late-main") {
+    audit.saveAuditLogs({ logs: [makeEvent("B-after-backup")] });
+    assert.ok(getDb().prepare("SELECT id FROM audit_logs WHERE id=?").get("B-after-backup"));
+  } else {
+    audit.deferAuditLog(makeEvent("B-after-backup"));
+    if (scenario === "main") {
+      audit.saveAuditLogs(audit.loadAuditLogs());
+      assert.ok(getDb().prepare("SELECT id FROM audit_logs WHERE id=?").get("B-after-backup"));
+    }
+  }
+  const negative = attack || ["divergent", "late-divergent", "oversized"].includes(scenario);
+  const expectedId = scenario.includes("divergent") ? "A-before-backup" : "B-after-backup";
+  assert.ok(audit.loadAuditLogs().logs.some(({ id }) => id === expectedId));
+  let destructive = 0;
+  let result;
+  try {
+    result = await restore.restoreBackup(saved.id, { confirmation: "RESTORE",
+      failureInjector(stage) {
+        if (stage.startsWith("restore.data.")) destructive += 1;
+        if (scenario === "rollback" && stage === "restore.sqlite.committed") {
+          throw Error("INJECTED_POST_SQLITE_REPLACEMENT");
+        }
+      } });
+  } catch (error) {
+    if (scenario === "rollback") {
+      assert.match(error.message, /INJECTED_POST_SQLITE_REPLACEMENT/);
+    } else {
+      if (!negative) throw error;
+      assert.match(error.message, attack ? /stage|unsafe|audit|alias|identity/i : /collision|divergent|capacity/i);
+    }
+  }
+  if (attack) {
+    assert.equal(swappedStage, true, "attacker swapped the real SQLite reopen path");
+    assert.equal(result, undefined, "restore must fail without publishing a substituted stage");
+    assert.equal(sqliteCallsOnSwappedStage, 0,
+      "foreign SQLite must be rejected before any SQL command is issued");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      assert.equal(fs.existsSync(attackedStage + suffix), false,
+        "rejected stage must not leave an abandoned SQLite artifact: " + suffix);
+    }
+    const foreign = new Database(outside, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(foreign.prepare("SELECT event FROM archived_audit WHERE id=?")
+        .get("B-after-backup"), undefined, "outside DB must not receive even one acknowledged audit row");
+    } finally { foreign.close(); }
+    console.log("NONSTRICT_SQLITE_RESTORE_AUDIT_OK", scenario);
+    return;
+  }
+  if (scenario === "rollback") {
+    assert.equal(result, undefined);
+    assert.ok(destructive > 0, "rollback case must pass the local mutation boundary");
+    assert.equal(restore.getWholeRestorePhase(), "prepared");
+    assert.equal(restore.assertNoPendingWholeRestore().recovered, true);
+    assert.equal(JSON.parse(fs.readFileSync(state, "utf8")).value, "live");
+    const evidence = audit.loadAllAuditEvidenceForRestore().map(({ log }) => log);
+    for (const id of ["A-before-backup", "B-after-backup"]) {
+      assert.equal(evidence.filter((entry) => entry.id === id).length, 1,
+        "whole-restore rollback must recover current audit event " + id);
+    }
+    assert.equal(evidence.filter((entry) => entry.eventType === "backup.restore.failed").length, 1);
+    assert.equal(evidence.filter((entry) => entry.eventType === "backup.restore.completed").length, 0);
+  } else if (negative) {
+    assert.equal(result, undefined);
+    assert.equal(destructive, 0, "unsafe current evidence rejected before replacement");
+    assert.equal(JSON.parse(fs.readFileSync(state, "utf8")).value, "live");
+    if (scenario.includes("divergent")) {
+      assert.equal(audit.loadAuditLogs().logs.find((entry) => entry.id === "A-before-backup").eventType,
+        "auth.login.success");
+    }
+  } else {
+    assert.equal(result.restartRecommended, true);
+    assert.equal(JSON.parse(fs.readFileSync(state, "utf8")).value, "selected");
+    // Carried history is archived on purpose, so active-only loadAuditLogs()
+    // must not be used to check durability of the complete audit evidence.
+    const evidence = audit.loadAllAuditEvidenceForRestore().map(({ log }) => log);
+    assert.equal(evidence.filter(({ id }) => id === "B-after-backup").length, 1,
+      "acknowledged event B must survive whole SQLite restore in one durable record");
+    if (!scenario.startsWith("late")) {
+      assert.equal(evidence.filter(({ id }) => id === "A-before-backup").length, 1,
+        "restored selected evidence must not be duplicated in history");
+      assert.equal(audit.loadAuditLogs().logs.filter(({ id }) => id === "A-before-backup").length, 1,
+        "selected active audit evidence remains visible");
+    }
+    assert.equal(evidence.filter(({ eventType }) => eventType === "backup.restore.completed").length, 1,
+      "exactly one successful restore outcome");
+    assert.ok(fs.existsSync(sidecar), "private sidecar stores retained evidence");
+  }
+  console.log("NONSTRICT_SQLITE_RESTORE_AUDIT_OK", scenario);
+})().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
+`;
+
+for (const scenario of ["pending", "main", "late-sidecar", "late-main", "divergent",
+  "late-divergent", "oversized", "rollback", "late-hardlink-swap", "late-symlink-swap",
+  "pending-hardlink-swap", "pending-symlink-swap", "pending-prepin-replace"]) {
+  test(`real SQLite whole restore retains non-strict audit evidence: ${scenario}`,
+    { timeout: 90_000 }, (t) => {
+      const runtime = process.platform === "win32"
+        ? path.join(process.env.LOCALAPPDATA || os.homedir(),
+          `rootark-nonstrict-restore-${crypto.randomBytes(10).toString("hex")}`)
+        : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-nonstrict-restore-"));
+      if (process.platform === "win32") ensureWindowsChunkUploadRoot(runtime);
+      t.after(() => fs.rmSync(runtime, { recursive: true, force: true, maxRetries: 5 }));
+      const result = spawnSync(process.execPath, ["-e", CASE], {
+        cwd: runtime, encoding: "utf8", windowsHide: true, timeout: 80_000,
+        env: { ...process.env, DATABASE_URL: path.join(runtime, "data", "rootark.sqlite"),
+          DB_ENABLED: "true", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false",
+          BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20",
+          ROOTARK_RESTORE_INSTANCE_COUNT: "1", ROOTARK_INSTANCE_ID: "nonstrict-restore-fixture",
+          PR235_TEST_SCENARIO: scenario, PR235_TEST_PROJECT: project,
+          UPLOAD_QUARANTINE_DIR: path.join(runtime, "quarantine"),
+          NODE_PATH: [path.join(project, "node_modules"), process.env.NODE_PATH].filter(Boolean).join(path.delimiter),
+        },
+      });
+      assert.equal(result.status, 0,
+        `${scenario}: ${result.error?.message || ""}\n${result.stderr || ""}\n${result.stdout || ""}`);
+      assert.match(result.stdout, /NONSTRICT_SQLITE_RESTORE_AUDIT_OK/);
+    });
+}

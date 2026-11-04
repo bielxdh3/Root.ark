@@ -4,13 +4,27 @@ const crypto = require("node:crypto");
 
 // Short-lived cache of VERIFIED WebDAV Basic credentials so parallel client requests do not each
 // need a bcrypt compare (and do not each consume a login-protection reservation).
-// Keys are HMAC(process-random secret, username NUL password); passwords are never stored. Failures are never cached.
+// Keys are HMAC(process-random secret, length-framed username and password); plaintext passwords are never stored.
+// Unambiguous framing prevents embedded NUL bytes in a credential from aliasing another identity's key.
+// Failures are never cached.
 function createWebDavCredentialCache({ ttlMs = 60 * 1000, maxEntries = 1000, now = Date.now } = {}) {
   const secret = crypto.randomBytes(32);
   const entries = new Map();
   const inflight = new Map();
 
-  const keyFor = (username, password) => crypto.createHmac("sha256", secret).update(`${username}\0${password}`).digest("hex");
+  const keyFor = (username, password) => {
+    const userBytes = Buffer.from(String(username), "utf8");
+    const passwordBytes = Buffer.from(String(password), "utf8");
+    const length = (bytes) => {
+      const framed = Buffer.allocUnsafe(4);
+      framed.writeUInt32BE(bytes.length);
+      return framed;
+    };
+    return crypto.createHmac("sha256", secret)
+      .update(length(userBytes)).update(userBytes)
+      .update(length(passwordBytes)).update(passwordBytes)
+      .digest("hex");
+  };
   const stillValid = (entry, user) => Boolean(entry && entry.expiresAt > now() && user && !user.disabled
     && String(user.password || "") === entry.passwordHash && (user.sessionVersion || 0) === entry.sessionVersion);
 

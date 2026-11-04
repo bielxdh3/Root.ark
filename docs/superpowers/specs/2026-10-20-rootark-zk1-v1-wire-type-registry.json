@@ -1,0 +1,26 @@
+{
+  "registry": "rootark-zk-1/v1-recovery-authority-wire-types",
+  "scope": "normative-type-clarification-only",
+  "objects": {
+    "fresh_witness_head": {
+      "type": "rootark-recovery-witness-head/v1",
+      "domain": "Root.ark/zk-1/recovery-witness-head/v1"
+    },
+    "cas_terminal_status": {
+      "type": "rootark-recovery-cas-status/v1",
+      "domain": "Root.ark/zk-1/recovery-cas-status/v1"
+    },
+    "witness_reservation": {
+      "type": "rootark-recovery-witness-reservation/v1",
+      "domain": "Root.ark/zk-1/recovery-witness-reservation/v1"
+    },
+    "witness_commit": {
+      "type": "rootark-recovery-witness-commit/v1",
+      "domain": "Root.ark/zk-1/recovery-witness-commit/v1"
+    },
+    "witness_cancel": {
+      "type": "rootark-recovery-witness-cancel/v1",
+      "domain": "Root.ark/zk-1/recovery-witness-cancel/v1"
+    }
+  }
+}

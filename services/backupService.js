@@ -12,14 +12,18 @@ const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilien
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
+const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
+const strictAudit = require("./strictAuditSnapshot");
+const jsonAuditArchiveStore = require("../repositories/jsonAuditArchiveStore");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
 const MAX_ORPHAN_SQLITE_BACKUP_STAGES = 128;
-const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal", "rootark.sqlite-shm"]);
+const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal", "rootark.sqlite-shm", strictAudit.SNAPSHOT_NAME]);
 const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
 const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
 const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
+const JSON_AUDIT_COORDINATION_DB_PREFIX = path.basename(path.dirname(require("../repositories/jsonAuditLock").JSON_AUDIT_COORDINATION_FILE)).toLowerCase();
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
 const LOCK_TAKEOVER_DIR = `${LOCK_FILE}.takeover`;
 const LOCK_TAKEOVER_META = path.join(LOCK_TAKEOVER_DIR, "authority.json");
@@ -119,6 +123,8 @@ function isSensitivePath(relativePath) {
   if (lowerPath.startsWith("data/backups/") || lowerPath === "data/backups") return true;
   if (lowerPath === `data/${BACKUP_METADATA_LOCK_NAME}` || lowerPath.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)) return true;
   if (lowerPath.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)) return true;
+  if (lowerPath.startsWith(`data/${JSON_AUDIT_COORDINATION_DB_PREFIX}`)) return true;
+  if (lowerPath.startsWith("data/.rootark-json-audit-enrollment.json")) return true;
   if (lowerPath.startsWith("data/.rootark-cloud-")) return true;
   if (lowerPath.startsWith("temp/.chunks/") || lowerPath.startsWith("temp/.incoming/")) return true;
   if (lowerPath.startsWith("data/.rootark-active-requests/")) return true;
@@ -366,6 +372,7 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 }
 
 async function collectBackupFiles(options = {}) {
+  assertZk10LegacyBackupNotStrict();
   if (options.persistenceMode && options.persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
     throw new Error("Persistence mode changed while collecting backup files");
   }
@@ -401,6 +408,33 @@ async function collectBackupFiles(options = {}) {
       files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
     }
   }
+  if (options.jsonArchiveSnapshotPath) {
+    // The runtime keeps an immutable legacy JSON archive plus a FULL/WAL
+    // append delta. Backups still carry the single canonical JSON member
+    // expected by older backups and the restore allowlist.
+    const entryPath = "data/audit-logs-archive.json";
+    const sourceStat = fs.lstatSync(options.jsonArchiveSnapshotPath, { bigint: true });
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.nlink !== 1n) {
+      throw new Error("JSON audit archive backup snapshot is unsafe");
+    }
+    const previous = files.findIndex((file) => file.entryPath === entryPath);
+    if (previous >= 0) files.splice(previous, 1);
+    files.push({ absolutePath: options.jsonArchiveSnapshotPath, entryPath,
+      size: Number(sourceStat.size), archiveRoot: archiveRootInfo(path.dirname(options.jsonArchiveSnapshotPath)), sourceStat });
+  }
+  if (options.jsonMainSnapshotCaptured) {
+    const entryPath = "data/audit-logs.json";
+    const previous = files.findIndex((file) => file.entryPath === entryPath);
+    if (previous >= 0) files.splice(previous, 1);
+    if (options.jsonMainSnapshotPath) {
+      const sourceStat = fs.lstatSync(options.jsonMainSnapshotPath, { bigint: true });
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.nlink !== 1n) {
+        throw new Error("JSON main audit backup snapshot is unsafe");
+      }
+      files.push({ absolutePath: options.jsonMainSnapshotPath, entryPath,
+        size: Number(sourceStat.size), archiveRoot: archiveRootInfo(path.dirname(options.jsonMainSnapshotPath)), sourceStat });
+    }
+  }
 
   if (quarantineMetadata) {
     const safeItems = quarantineMetadata.items.filter((item) => {
@@ -429,6 +463,12 @@ async function collectBackupFiles(options = {}) {
     const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
     if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
     files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
+    if (options.auditSnapshotPath) {
+      const auditStat = fs.lstatSync(options.auditSnapshotPath, { bigint: true });
+      if (!auditStat.isFile() || auditStat.isSymbolicLink() || auditStat.nlink !== 1n) throw Error("Strict audit snapshot is unsafe");
+      files.push({ absolutePath: options.auditSnapshotPath, entryPath: strictAudit.ARCHIVE_ENTRY,
+        size: Number(auditStat.size), archiveRoot: dataRootInfo, sourceStat: auditStat });
+    } else if (options.strictAudit) throw Error("Strict audit snapshot is missing");
   } else if (options.sqliteSnapshotPath) {
     throw new Error("SQLite database snapshot cannot be included in a JSON backup");
   }
@@ -513,12 +553,8 @@ async function createSqliteSnapshot(persistenceMode = isDbEnabled() ? "sqlite" :
   const snapshotPath = path.join(stageDir, "rootark.sqlite");
   fs.mkdirSync(stageDir, { recursive: true });
   try {
-    await getDb().backup(snapshotPath);
-    const snapshot = new Database(snapshotPath, { readonly: true, fileMustExist: true });
-    try {
-      if (snapshot.pragma("integrity_check", { simple: true }) !== "ok") throw new Error("SQLite snapshot integrity check failed");
-    } finally { snapshot.close(); }
-    return { stageDir, snapshotPath };
+    const result = await strictAudit.createCoordinatedSnapshots(getDb(), getDatabasePath(), stageDir);
+    return { stageDir, ...result };
   } catch (error) {
     try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch {}
     throw error;
@@ -970,6 +1006,7 @@ function createLockRelease(operation, token) {
 }
 
 async function createZipArchive(archivePath, manifest, files) {
+  assertZk10LegacyBackupNotStrict();
   const closeTimeoutMs = Math.max(50, Math.min(5000, envNumber("BACKUP_OUTPUT_CLOSE_TIMEOUT_MS", 1000)));
   const cleanupRetries = 2;
   const cleanupDelayMs = 25;
@@ -1278,6 +1315,8 @@ function recoverLegacyRetentionTombstones() {
 }
 
 function recoverRetentionTombstones() {
+  // Exported for direct callers: may delete archived private bytes or history.
+  assertZk10LegacyBackupNotStrict();
   recoverRetentionTransactions();
   recoverLegacyRetentionTombstones();
 }
@@ -1341,11 +1380,16 @@ function cleanupOrphanSqliteBackupStages() {
 }
 
 async function recoverRetentionAtStartup() {
+  // Legacy retained ciphertext/SQLite stages are not globally owner-authorized
+  // for deletion. Preserve them under strict cutover, without blocking boot.
+  if (isZk10LegacyBackupStrict()) return;
   const release = acquireLock("backup-history-recovery");
   let inventoryLease = null;
   try {
     if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
     inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    // The strict state may have changed while inventory operations awaited.
+    if (isZk10LegacyBackupStrict()) return;
     recoverRetentionTombstones();
     cleanupOrphanCloudBackupStages();
     cleanupOrphanSqliteBackupStages();
@@ -1356,11 +1400,15 @@ async function recoverRetentionAtStartup() {
 }
 
 async function cleanupRetention(options = {}) {
+  // This exported service entrypoint may run outside the guarded scheduler.
+  // Retention removes historical ZIP bytes and their durable references.
+  assertZk10LegacyBackupNotStrict();
   const release = options.lockHeld ? null : acquireLock("backup");
   let inventoryLease = null;
   try {
   if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+  assertZk10LegacyBackupNotStrict();
   const count = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_COUNT", 10)));
   const days = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_DAYS", 30)));
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
@@ -1373,17 +1421,24 @@ async function cleanupRetention(options = {}) {
 
   const toDelete = backups.filter((item, index) => (count > 0 && index >= count) || (cutoff && new Date(item.createdAt).getTime() < cutoff));
   for (const backup of toDelete) {
+    assertZk10LegacyBackupNotStrict();
     const archivePath = getArchivePath(backup.filename);
     if (!archivePath || !fs.existsSync(archivePath)) continue;
     const transactionId = crypto.randomUUID();
     const tombstone = retentionTombstone(archivePath);
-    const transaction = { version: 1, transactionId, phase: "prepared", backupId: String(backup.id), filename: path.basename(archivePath), archivePath, tombstonePath: tombstone, checksum: await calculateFileHash(archivePath), createdAt: new Date().toISOString() };
+    const checksum = await calculateFileHash(archivePath);
+    // Do not write even a prepared durable deletion journal after a late
+    // STRICT flip during the asynchronous archive hash.
+    assertZk10LegacyBackupNotStrict();
+    const transaction = { version: 1, transactionId, phase: "prepared", backupId: String(backup.id), filename: path.basename(archivePath), archivePath, tombstonePath: tombstone, checksum, createdAt: new Date().toISOString() };
     const record = { transaction, transactionPath: persistRetentionTransaction(transaction), directory: path.dirname(retentionTransactionPath(transactionId)) };
     try {
+      assertZk10LegacyBackupNotStrict();
       renameDurably(archivePath, tombstone);
       transaction.phase = "archive_moved";
       persistRetentionTransaction(transaction);
       inventoryLease.renew();
+      assertZk10LegacyBackupNotStrict();
       backupRepository.deleteBackup(backup.id, { mutationLease: inventoryLease });
       transaction.phase = "history_removed";
       persistRetentionTransaction(transaction);
@@ -1405,6 +1460,9 @@ async function cleanupRetention(options = {}) {
 }
 
 async function createBackup(options = {}) {
+  // A global archive mixes all accounts and cannot prove per-object ownership.
+  // Abort before snapshots, directory creation, locks or cloud download.
+  assertZk10LegacyBackupNotStrict();
   if (!envBool("BACKUP_ENABLED", true)) {
     throw new Error("Backups desativados por BACKUP_ENABLED=false");
   }
@@ -1447,7 +1505,17 @@ async function createBackup(options = {}) {
     }
     const persistenceMode = isDbEnabled() ? "sqlite" : "json";
     sqliteSnapshot = await createSqliteSnapshot(persistenceMode);
-    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
+    const jsonAuditSnapshots = persistenceMode === "json"
+      ? await jsonAuditArchiveStore.writeJsonArchiveBackupSnapshot(
+        path.join(stageDir, "audit-archive-snapshot.json"),
+        path.join(stageDir, "audit-main-snapshot.json"))
+      : null;
+    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath,
+      auditSnapshotPath: sqliteSnapshot?.auditSnapshotPath, strictAudit: sqliteSnapshot?.strict,
+      jsonArchiveSnapshotPath: jsonAuditSnapshots?.archiveSnapshotPath,
+      jsonMainSnapshotPath: jsonAuditSnapshots?.mainSnapshotPath,
+      jsonMainSnapshotCaptured: persistenceMode === "json",
+      persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);
     const manifest = {
@@ -1455,6 +1523,8 @@ async function createBackup(options = {}) {
       created_at: createdAt,
       type: backupType,
       persistence_mode: persistenceMode,
+      ...(persistenceMode === "sqlite" ? { strict_audit_sidecar: sqliteSnapshot?.strict === true,
+        ...(sqliteSnapshot?.auditSnapshotPath ? { strict_audit_sha256: sqliteSnapshot.auditSha256 } : {}) } : {}),
       created_by: options.createdBy || null,
       total_size: totalSize,
       included_files: files.map((file) => ({ path: file.entryPath, size: file.size })),
@@ -1595,6 +1665,8 @@ function listBackups() {
 }
 
 function getBackupOrThrow(id) {
+  // Includes direct service callers, not only HTTP GET/HEAD downloads.
+  assertZk10LegacyBackupNotStrict();
   if (!/^[a-f0-9-]{36}$/i.test(String(id || ""))) throw new Error("Backup invalido");
   const backup = backupRepository.getBackup(id);
   if (!backup) throw new Error("Backup nao encontrado");
@@ -1619,8 +1691,11 @@ function compensateFailedBackupDeletion(backup, mutationLease, originalError) {
 }
 
 async function deleteBackupTransaction(backup, archivePath, mutationLease) {
+  assertZk10LegacyBackupNotStrict();
   const transactionId = crypto.randomUUID();
   const tombstone = retentionTombstone(archivePath);
+  const checksum = await calculateFileHash(archivePath);
+  assertZk10LegacyBackupNotStrict();
   const transaction = {
     version: 1,
     transactionId,
@@ -1629,7 +1704,7 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
     filename: path.basename(archivePath),
     archivePath,
     tombstonePath: tombstone,
-    checksum: await calculateFileHash(archivePath),
+    checksum,
     createdAt: new Date().toISOString(),
   };
   const record = {
@@ -1639,6 +1714,7 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
   };
   let removedBackup = null;
   try {
+    assertZk10LegacyBackupNotStrict();
     renameDurably(archivePath, tombstone);
     transaction.phase = "archive_moved";
     persistRetentionTransaction(transaction);
@@ -1667,6 +1743,7 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
 }
 
 async function deleteBackup(id, options = {}) {
+  assertZk10LegacyBackupNotStrict();
   const release = options.lockHeld ? null : acquireLock("delete");
   let inventoryLease = null;
   try {

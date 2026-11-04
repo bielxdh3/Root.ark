@@ -130,6 +130,12 @@ test("active request lease wait allows delayed teardown and reports remaining le
 
 function startS3Fixture() {
   const getObjects = [];
+  // Diagnostics are opt-in and local to this disposable S3 fixture. A label
+  // identifies the arrival window, NOT the originating HTTP request: an older
+  // asynchronous SDK GET can arrive during a later forbidden request.
+  const getTraceEvents = [];
+  let getTraceStage = null;
+  let getTraceOverflow = 0;
   const putObjects = [];
   const deleteObjects = [];
   const failedDeleteKeys = new Set();
@@ -155,6 +161,12 @@ function startS3Fixture() {
     }
     if (req.method === "GET" && OBJECTS.has(key)) {
       getObjects.push(key);
+      if (getTraceStage !== null) {
+        if (getTraceEvents.length < 16) {
+          getTraceEvents.push({ stage: getTraceStage,
+            key: key === "rootark/uploads/root/private.txt.v1" ? "private-version" : "other-fixture-get" });
+        } else getTraceOverflow += 1;
+      }
       const send = () => { res.writeHead(200, { "content-length": OBJECTS.get(key).length }); res.end(OBJECTS.get(key)); };
       const gate = getGates.get(key)?.shift();
       if (gate) { gate.markStarted(); return gate.released.then(send); }
@@ -192,6 +204,14 @@ function startS3Fixture() {
       server,
       port: server.address().port,
       getObjects,
+      beginGetTrace(stage) {
+        getTraceEvents.length = 0;
+        getTraceOverflow = 0;
+        getTraceStage = stage;
+      },
+      markGetTraceStage(stage) { getTraceStage = stage; },
+      getTrace() { return { events: getTraceEvents.slice(), overflow: getTraceOverflow }; },
+      endGetTrace() { getTraceStage = null; },
       putObjects,
       deleteObjects,
       failDelete(key) { failedDeleteKeys.add(key); },
@@ -217,8 +237,34 @@ function startS3Fixture() {
   });
 }
 
+test("S3 fixture diagnostics distinguish bounded provider GET arrival windows", async (t) => {
+  const cloud = await startS3Fixture();
+  t.after(async () => new Promise((resolve) => cloud.server.close(resolve)));
+  const key = "rootark/uploads/root/private.txt.v1";
+  cloud.beginGetTrace("before-denied-request");
+  assert.equal((await request(cloud.port, `/fixture-bucket/${key}`)).status, 200);
+  cloud.markGetTraceStage("during-denied-request");
+  assert.equal((await request(cloud.port, `/fixture-bucket/${key}`)).status, 200);
+  assert.deepEqual(cloud.getObjects, [key, key], "existing provider GET evidence is not modified");
+  assert.deepEqual(cloud.getTrace(), {
+    events: [
+      { stage: "before-denied-request", key: "private-version" },
+      { stage: "during-denied-request", key: "private-version" },
+    ],
+    overflow: 0,
+  });
+  for (let index = 0; index < 17; index++) {
+    assert.equal((await request(cloud.port, `/fixture-bucket/${key}`)).status, 200);
+  }
+  assert.equal(cloud.getTrace().events.length, 16, "diagnostic records remain bounded");
+  assert.equal(cloud.getTrace().overflow, 3, "overflow is accounted for without losing GET evidence");
+  assert.equal(cloud.getObjects.length, 19, "security assertion's original GET log stays intact");
+});
+
 async function waitForServer(port, child) {
-  const deadline = Date.now() + 15_000;
+  // Canonical Windows runs contend with many process-isolated suites;
+  // tolerate slower disposable startup without relaxing HTTP assertions.
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("disposable server exited");
     try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
@@ -312,7 +358,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/restore-race.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: true } } },
     "root/issued-token-race.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: false } } },
   }));
-  fs.writeFileSync(path.join(dataDir, "file-versions.json"), JSON.stringify({
+  const versionFixtureHistory = {
     "root/history-only.txt": { currentVersion: 1, versions: [
       { version: 1, storedAs: "history-only.txt", size: 0 },
     ] },
@@ -367,7 +413,14 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
       { version: 1, storedAs: "issued-token-race.txt.v1", size: OBJECTS.get("rootark/uploads/root/issued-token-race.txt.v1").length },
       { version: 2, storedAs: "issued-token-race.txt", size: 0 },
     ] },
-  }));
+  };
+  // This matrix exercises authorization and provider hydration. Its allowed
+  // historical versions need the immutable upload time required by the live
+  // download route; a cache file's fresh mtime is never acceptable evidence.
+  for (const history of Object.values(versionFixtureHistory)) {
+    for (const version of history.versions) version.uploadedAt = "2026-10-05T00:00:00.000Z";
+  }
+  fs.writeFileSync(path.join(dataDir, "file-versions.json"), JSON.stringify(versionFixtureHistory));
   fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({
     "root/encrypted.txt": { encryptionLevel: "server-key", originalFilename: "encrypted.txt" },
     "root/revoke-encrypted.txt": { encryptionLevel: "server-key", originalFilename: "revoke-encrypted.txt" },
@@ -769,6 +822,19 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const authorizedSiblingVersion = await request(port, "/download/version-primary.txt/v/2", { headers: { cookie } });
   assert.equal(authorizedSiblingVersion.status, 200, "an authorized sibling version remains available when only v1 is suppressed");
   assert.equal(authorizedSiblingVersion.body, "authorized stored version fixture");
+  {
+    const historyBefore = fs.readFileSync(versionHistoryPath, "utf8");
+    const missingTimestamp = JSON.parse(historyBefore);
+    delete missingTimestamp["root/version-primary.txt"].versions[1].uploadedAt;
+    fs.writeFileSync(versionHistoryPath, JSON.stringify(missingTimestamp));
+    const remoteReadsBefore = cloud.getObjects.length;
+    const denied = await request(port, "/download/version-primary.txt/v/2", { headers: { cookie } });
+    assert.equal(denied.status, 409,
+      "missing historical timestamp must fail closed even for an authorized sibling version");
+    assert.equal(cloud.getObjects.length, remoteReadsBefore,
+      "invalid historical metadata must fail before remote hydration");
+    fs.writeFileSync(versionHistoryPath, historyBefore);
+  }
   cloud.getObjects.length = 0;
 
   const orphanPolicyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
@@ -909,19 +975,24 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const ordinaryOpenToken = await mutate("/file-open-token", "POST", { name: "budget.v2" });
   assert.equal(ordinaryOpenToken.status, 200, ordinaryOpenToken.body);
   cloud.getObjects.length = 0;
+  cloud.beginGetTrace("public-history-404");
   const storedPublicVersion = await request(port, "/files/public.txt.v1", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(storedPublicVersion.status, 404, "version metadata hides historical bytes even with an alias ACL");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/public.txt.v1"), false);
   cloud.getObjects.length = 0;
 
+  cloud.markGetTraceStage("private-current-403");
   const privateFile = await request(port, "/files/private.txt", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(privateFile.status, 403, privateFile.body);
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt"), false, "denied direct GET never downloads the object");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "private.txt")), false, "denied direct GET never materializes the object");
 
+  cloud.markGetTraceStage("private-version-403");
   const privateVersion = await request(port, "/files/private.txt.v1", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(privateVersion.status, 403, privateVersion.body);
-  assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt.v1"), false, "cross-origin requests are rejected before stored-version lookup or provider hydration");
+  assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt.v1"), false,
+    `cross-origin requests are rejected before stored-version lookup or provider hydration; bounded S3 GET arrival windows (not causal attribution): ${JSON.stringify(cloud.getTrace())}`);
+  cloud.endGetTrace();
 
   const orphanVersion = await request(port, "/files/orphan-private.txt.v1", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(orphanVersion.status, 404, orphanVersion.body);

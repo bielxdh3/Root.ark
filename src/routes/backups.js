@@ -1,3 +1,5 @@
+const { isZk10LegacyBackupStrict } = require("../services/zk10LegacyBackupDeny");
+
 function registerBackupRoutes(app, context) {
   const {
     auditLog,
@@ -10,15 +12,28 @@ function registerBackupRoutes(app, context) {
     waitForRequestQuiescence,
   } = context;
 
-  app.get("/backups", authenticate, requireBackupAccess, (req, res) => {
+  // These are whole-instance archives: an authenticated manager is not an
+  // externally attested owner of every account, object, or historic ZIP.
+  // Deny even metadata and mutations on this route module while experimental
+  // STRICT is requested without an external account-wide authority.
+  const denyStrictZk10Backup = (_req, res, next) => {
+    if (!isZk10LegacyBackupStrict()) return next();
+    return res.status(503).set("Cache-Control", "no-store").json({
+      error: "ZK10 external account-wide backup authority unavailable",
+      code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+    });
+  };
+  const access = [authenticate, requireBackupAccess, denyStrictZk10Backup];
+
+  app.get("/backups", ...access, (req, res) => {
     res.json({ backups: backupService.listBackups() });
   });
 
-  app.get("/backups/latest-status", authenticate, requireBackupAccess, (req, res) => {
+  app.get("/backups/latest-status", ...access, (req, res) => {
     res.json({ latest: backupService.latestStatus() });
   });
 
-  app.post("/backups", authenticate, requireBackupAccess, async (req, res) => {
+  app.post("/backups", ...access, async (req, res) => {
     try {
       const backup = await backupService.createBackup({
         type: "manual",
@@ -63,7 +78,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.get("/backups/:id/download", authenticate, requireBackupAccess, (req, res) => {
+  app.get("/backups/:id/download", ...access, (req, res) => {
     try {
       const { backup, archivePath } = backupService.getBackupOrThrow(req.params.id);
       if (req.method !== "HEAD") {
@@ -77,7 +92,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.get("/backups/:id/manifest", authenticate, requireBackupAccess, async (req, res) => {
+  app.get("/backups/:id/manifest", ...access, async (req, res) => {
     try {
       const manifest = await restoreService.getBackupManifest(req.params.id);
       res.json(manifest);
@@ -86,12 +101,13 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.post("/backups/:id/restore", authenticate, requireBackupAccess, async (req, res) => {
+  app.post("/backups/:id/restore", ...access, async (req, res) => {
     auditLog("backup.restore.started", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "partial", {});
     try {
       const result = await restoreService.restoreBackup(req.params.id, {
         confirmation: req.body?.confirmation,
         username: req.user.username,
+        auditActor: getAuditActor(req),
         waitForRequestQuiescence: () => waitForRequestQuiescence(req.rootarkRestoreRequestLease),
         revalidateAuthorization: async () => {
           const authorizationFailure = await revalidateBackupAccess(req);
@@ -103,10 +119,15 @@ function registerBackupRoutes(app, context) {
           }
         },
       });
-      auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
-        preRestoreBackupId: result.preRestore.id,
-        restartRecommended: result.restartRecommended,
-      });
+      // In strict SQLite the service has durably recorded the terminal event
+      // in the private sidecar under its coordinator before returning. The
+      // regular audit writer must stay blocked until all instances restart.
+      if (!result.restoreOutcomeRecorded) {
+        auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
+          preRestoreBackupId: result.preRestore.id,
+          restartRecommended: result.restartRecommended,
+        });
+      }
       res.json({
         message: "Backup restaurado",
         backup: result.backup,
@@ -115,11 +136,16 @@ function registerBackupRoutes(app, context) {
       });
     } catch (error) {
       const restorePhase = restoreService.getWholeRestorePhase?.() || null;
-      auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
-        error: restorePhase ? "restore_recovery_pending" : error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
-        phase: restorePhase,
-        cleanupPending: Boolean(error.authorizationCleanupPending),
-      });
+      // A pending whole-restore marker also fences all ordinary audit writes.
+      // Failed outcomes survive in that coordinator and are committed only
+      // AFTER rollback restores the original sidecar. Never emit a false
+      // failed event for a restore already committed as restart_required.
+      if (!restorePhase && !error.restoreOutcomeRecorded) {
+        auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
+          error: error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
+          cleanupPending: Boolean(error.authorizationCleanupPending),
+        });
+      }
       if (restorePhase === "restart_required") {
         res.status(503).json({
           error: "Backup restaurado, mas a limpeza temporária falhou. Reinicie todas as instâncias; o serviço tentará remover a área temporária antes de aceitar novas solicitações.",
@@ -142,7 +168,7 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.delete("/backups/:id", authenticate, requireBackupAccess, async (req, res) => {
+  app.delete("/backups/:id", ...access, async (req, res) => {
     try {
       const backup = await backupService.deleteBackup(req.params.id);
       auditLog("backup.deleted", getAuditActor(req), { type: "backup", id: backup.id }, "deleted", "success", {

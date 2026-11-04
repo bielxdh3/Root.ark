@@ -261,6 +261,30 @@ const MIGRATIONS = [
       db.exec("ALTER TABLE public_links ADD COLUMN permissions_json TEXT;");
     },
   },
+  {
+    version: 8,
+    name: "sync_resume_factor_spend_grants",
+    up(db) {
+      db.exec(`
+        CREATE TABLE sync_resume_factor_spend_grant (
+          username TEXT NOT NULL,
+          replay_digest TEXT NOT NULL CHECK(length(replay_digest)=64),
+          code_mac TEXT NOT NULL CHECK(length(code_mac)=64),
+          device_id TEXT NOT NULL,
+          pause_fence TEXT,
+          committed_at TEXT NOT NULL,
+          PRIMARY KEY(username, replay_digest)
+        );
+      `);
+    },
+  },
+  {
+    version: 9,
+    name: "users_optimistic_storage_revision",
+    up(db) {
+      db.exec("ALTER TABLE users ADD COLUMN storage_revision INTEGER NOT NULL DEFAULT 0 CHECK(storage_revision >= 0);");
+    },
+  },
 ];
 
 function ensureMigrationTable(db) {

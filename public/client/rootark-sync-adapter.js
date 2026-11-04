@@ -104,11 +104,12 @@
     return canonicalize(result);
   }
 
-  function authorization(value) {
+  function authorization(value, requireFresh = true) {
     exact(value, AUTHORIZATION_FIELDS, "authorization");
     if (value.schemaVersion !== 1 || value.type !== "rootark-sync-device-authorization-v1" || value.suite !== "rootark-zk-1") fail("Invalid device authorization");
     for (const field of ["aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest", "replayId", "idempotencyKey", "publicKey", "signature"]) decoded(value[field], "authorization");
-    if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now()) fail("Expired device authorization");
+    if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0
+      || (requireFresh && value.expiresAt <= Date.now())) fail("Expired device authorization");
     return canonicalize(value);
   }
 
@@ -116,11 +117,11 @@
     return canonicalJson({ protocolVersion: PROTOCOL_VERSION, objectId: operation.objectId, fileId: operation.fileId, versionId: operation.versionId, operation: operation.operation, revision: operation.revision, baseRevision: operation.baseRevision, keyEpoch: operation.keyEpoch, compartmentId: operation.compartmentId, deviceId: operation.deviceId, metadata: operation.metadata, tombstone: operation.tombstone });
   }
 
-  function assertOpaqueEnvelope(input) {
+  function assertOpaqueEnvelope(input, requireFreshAuthorization = true) {
     exact(input, OPERATION_FIELDS, "operation");
     if (input.protocolVersion !== PROTOCOL_VERSION || !["create", "update", "move", "delete"].includes(input.operation)) fail("Unsupported sync operation");
     const operation = { ...input, objectId: id(input.objectId), fileId: id(input.fileId), versionId: id(input.versionId), operationId: id(input.operationId), keyEpoch: id(input.keyEpoch), compartmentId: id(input.compartmentId), deviceId: id(input.deviceId), revision: revision(input.revision), baseRevision: revision(input.baseRevision, true), metadata: metadata(input.metadata, input.operation), tombstone: input.operation === "delete" };
-    if (input.authorization !== undefined) operation.authorization = authorization(input.authorization);
+    if (input.authorization !== undefined) operation.authorization = authorization(input.authorization, requireFreshAuthorization);
     if (input.tombstone !== operation.tombstone) fail("Invalid tombstone flag");
     const aad = decoded(input.aad, "aad");
     decoded(input.ciphertext, "ciphertext");
@@ -132,7 +133,12 @@
 
   function createOpaqueSyncAdapter({ fetchImpl = fetch, baseUrl = "" } = {}) {
     const request = async (url, options = {}) => {
-      const response = await fetchImpl(`${baseUrl}${url}`, { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+      // A 307/308 replays the complete signed encrypted operation to the
+      // redirect target. Never let an untrusted sync endpoint or proxy choose
+      // a different recipient for ciphertext, AAD filenames or bearer tokens.
+      const response = await fetchImpl(`${baseUrl}${url}`, { ...options,
+        redirect: "error",
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
       const payload = await response.json().catch(() => ({}));
       if (response.status === 409) throw new SyncConflictError(payload);
       if (!response.ok) throw Object.assign(new Error(payload.error || "Falha de sincronizacao"), { status: response.status, payload });
@@ -141,13 +147,42 @@
     return {
       list: async (objectId = "") => {
         const payload = await request(`/sync/v1/objects${objectId ? `/${encodeURIComponent(objectId)}` : ""}`);
-        if (Array.isArray(payload.objects)) return { ...payload, protocolVersion: PROTOCOL_VERSION, objects: payload.objects.map(assertOpaqueEnvelope) };
-        return assertOpaqueEnvelope(payload);
+        // LIST is an untrusted historical read, not ingress authorization.
+        // Preserve expired signed bytes for the engine's independent
+        // signature/pin/revocation checks; POST and the public normalize API
+        // continue to require a fresh authorization.
+        if (Array.isArray(payload.objects)) return { ...payload, protocolVersion: PROTOCOL_VERSION, objects: payload.objects.map((record) => assertOpaqueEnvelope(record, false)) };
+        return assertOpaqueEnvelope(payload, false);
       },
       push: (envelope) => {
         const normalized = assertOpaqueEnvelope(envelope);
         const deleteRequest = normalized.operation === "delete";
         return request(`/sync/v1/objects${deleteRequest ? `/${encodeURIComponent(normalized.objectId)}` : ""}`, { method: deleteRequest ? "DELETE" : "POST", body: JSON.stringify(normalized) });
+      },
+      // The protected overwrite handshake must be ONE remote transaction.
+      // Two consecutive push() calls would delete the displaced destination
+      // before a separately rejected MOVE; callers must use this endpoint
+      // only when their store/authority actually supports atomic batch CAS.
+      pushBatch: (envelopes) => {
+        if (!Array.isArray(envelopes) || envelopes.length !== 2) {
+          fail("Protected compound sync requires exactly two signed operations");
+        }
+        const [deleted, moved] = envelopes.map((entry) => assertOpaqueEnvelope(entry));
+        if (deleted.operation !== "delete" || moved.operation !== "move"
+          || !deleted.authorization || !moved.authorization
+          || deleted.metadata.path !== moved.metadata.path
+          || deleted.compartmentId !== moved.compartmentId
+          || deleted.keyEpoch !== moved.keyEpoch
+          || deleted.objectId === moved.objectId || deleted.fileId === moved.fileId
+          || deleted.operationId === moved.operationId
+          || deleted.deviceId !== moved.deviceId
+          || deleted.authorization.replayId === moved.authorization.replayId
+          || deleted.authorization.idempotencyKey === moved.authorization.idempotencyKey) {
+          fail("Invalid authenticated DELETE-before-MOVE transaction");
+        }
+        return request("/sync/v1/objects/batch", {
+          method: "POST", body: JSON.stringify({ operations: [deleted, moved] }),
+        });
       },
       validate: assertOpaqueEnvelope,
       normalize: assertOpaqueEnvelope,

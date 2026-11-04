@@ -10,6 +10,7 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");
 const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
@@ -30,6 +31,7 @@ const WebSocket = require("ws");
 const cron = require("node-cron");
 const { Transform } = require("node:stream");
 const { scheduleAutomaticBackups } = require("./services/backupScheduler");
+const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("./src/services/zk10LegacyBackupDeny");
 const { getServerMasterKey: readServerMasterKey } = require("./services/serverMasterKey");
 const {
   assertSafeChunkUploadAncestors,
@@ -69,14 +71,17 @@ const registerAuditRoutes = require("./src/routes/audit");
 const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
+const { registerZk1ProtectedContentFromConfig } = require("./src/services/zk1ProtectedContentBootstrap");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
+const { parseIndependentCatalogConnectOrigins } = require("./src/zk1-catalog-connect-csp");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
+const { runZk10LegacyWebDavOperation } = require("./src/services/zk10LegacyWebDavRouteGuard");
 const { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
@@ -106,6 +111,9 @@ const REALTIME_IDLE_TIMEOUT_MS = parseBoundedNumber("REALTIME_IDLE_TIMEOUT_MS", 
 const REALTIME_UPGRADE_MAX_PER_WINDOW = parseBoundedNumber("REALTIME_UPGRADE_MAX_PER_WINDOW", 120, 1, 100_000);
 const REALTIME_UPGRADE_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_UPGRADE_RATE_WINDOW_MS", 60_000, 1000, 10 * 60 * 1000);
 const REALTIME_MAX_CONNECTIONS_PER_PEER = parseBoundedNumber("REALTIME_MAX_CONNECTIONS_PER_PEER", 100, 1, 10_000);
+const requestedZk10RealtimeStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10RealtimeEgress = requestedZk10RealtimeStrict !== ""
+  && requestedZk10RealtimeStrict !== "0" && requestedZk10RealtimeStrict !== "off";
 const ROUTE_RATE_LIMIT_MAX = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_MAX", 60, 1_000_000);
 const ROUTE_RATE_LIMIT_WINDOW_MS = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 2_147_483_647);
 const realtimeUpgradeGuard = createRealtimeUpgradeGuard({
@@ -353,13 +361,20 @@ function isCloudStorageEnabled() { return cloudStorage.enabled(); }
 function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
 async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") {
+  assertZk10LegacyBackupNotStrict();
   const result = await guardedCloudStorage.upload(localPath, folderId, fileName, area);
   if (result) await restoreProviderOrphans.clear(folderId, fileName, area, cloudStorage);
   return result;
 }
 async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return guardedCloudStorage.download(folderId, fileName, localPath, area, canPublish); }
-async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return guardedCloudStorage.remove(folderId, fileName, area); }
-async function deleteCloudPrefix(prefix) { return guardedCloudStorage.removePrefix(prefix); }
+async function deleteFileFromCloud(folderId, fileName, area = "uploads") {
+  assertZk10LegacyBackupNotStrict();
+  return guardedCloudStorage.remove(folderId, fileName, area);
+}
+async function deleteCloudPrefix(prefix) {
+  assertZk10LegacyBackupNotStrict();
+  return guardedCloudStorage.removePrefix(prefix);
+}
 async function listCloudFiles(folderId, area = "uploads") { return guardedCloudStorage.list(folderId, area); }
 
 async function syncFolderCacheFromCloud(folderId, area = "uploads") {
@@ -392,6 +407,9 @@ let cloudUploadMutationDrainRunning = false;
 let cloudUploadMutationDrainRequested = false;
 
 function requestCloudUploadMutationDrain(label) {
+  // Replayed provider writes have no attached authenticated immutable owner.
+  // Preserve queue records until an actual independently authorized handler exists.
+  if (isZk10LegacyBackupStrict()) return;
   if (!isCloudStorageEnabled()) return;
   cloudUploadMutationDrainRequested = true;
   if (cloudUploadMutationDrainScheduled || cloudUploadMutationDrainRunning) return;
@@ -559,13 +577,25 @@ function sendRealtime(socket, event, payload = {}) {
 }
 
 function broadcastRealtime(event, payload = {}) {
+  // A globally delivered event reveals mutation presence, category and timing
+  // even when object metadata is stripped. ZK10 strict mode has no verified
+  // external owner/account identity or lease to authorize any recipient, so
+  // suppress all application broadcasts until one is provisioned. Session
+  // greetings and direct ping/pong remain available via sendRealtime().
+  if (strictZk10RealtimeEgress) return;
   for (const socket of wss.clients) {
     sendRealtime(socket, event, payload);
   }
 }
 
-function broadcastDataChanged(source, payload = {}) {
-  broadcastRealtime("data:changed", { source, ...payload });
+function broadcastDataChanged(source, _payload = {}) {
+  // A /ws connection authenticates a *session*, not access to every folder,
+  // filename, pending upload or protected account. The realtime fanout is
+  // global; forward only the fixed invalidation category already consumed by
+  // the workspace and management clients. Never relay per-object metadata
+  // from WebDAV, trash, or future mutation call sites across ACL boundaries.
+  // Individual data is fetched later through ordinary authenticated routes.
+  broadcastRealtime("data:changed", { source });
 }
 
 function loadUsers({ failOnDatabaseError = false, allowJsonFallback = true } = {}) {
@@ -631,14 +661,14 @@ function getCreatedUserSessionVersion(username) {
   return Object.hasOwn(generations, username) ? generations[username] + 1 : 0;
 }
 
-function saveUsers(users) {
+function saveUsers(users, options = {}) {
   const passwordHashesToValidate = trustedUserPasswordHashes === null
     ? users
     : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
   if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
     throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
   }
-  if (shouldUseDatabase()) usersRepository.saveUsers(users);
+  if (shouldUseDatabase()) usersRepository.saveUsers(users, options);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
     const temporaryFile = `${USERS_FILE}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
@@ -651,6 +681,13 @@ function saveUsers(users) {
     }
   }
   trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
+}
+
+function commitSyncResumeProof(claim) {
+  if (!shouldUseDatabase() || shouldWriteLegacyJson()) {
+    throw new Error("Sync 2FA resume requires one authoritative SQLite account store");
+  }
+  return usersRepository.commitSyncResumeProof(claim);
 }
 
 function getBasePermissions() {
@@ -821,6 +858,11 @@ function loadFolders() {
       if (folders.length > 1 || !jsonHasFolders) return folders;
     } catch (error) {
       console.error("Falha ao ler pastas do SQLite:", error.message);
+      if (dbConfig.isStrictSyncModeObserved() || error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
+        throw Object.assign(new Error("Strict SQLite folders unavailable", { cause: error }), {
+          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+        });
+      }
       if (!shouldReadJsonFallback()) return getDefaultFolders();
     }
   }
@@ -1298,13 +1340,21 @@ function sanitizeAuditValue(value, maxLength = 500) {
   return String(value).slice(0, maxLength);
 }
 
-function loadAuditLogs(file = AUDIT_LOGS_FILE) {
+function loadAuditLogs(file = AUDIT_LOGS_FILE, strictJson = false) {
+  if (strictJson) return auditRepository.readJsonAuditHistory(path.resolve(file));
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) {
     try {
       const entries = auditRepository.loadAuditLogs();
       if (entries.logs.length || !shouldReadJsonFallback()) return entries;
     } catch (error) {
       console.error("Falha ao ler auditoria do SQLite:", error.message);
+      // An enrolled strict audit authority must never be represented as an
+      // empty, successful audit history after an integrity/sidecar failure.
+      if (dbConfig.isStrictSyncModeObserved() || error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
+        throw Object.assign(new Error("Strict audit history unavailable", { cause: error }), {
+          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+        });
+      }
       if (!shouldReadJsonFallback()) return getDefaultAuditLogs();
     }
   }
@@ -1322,7 +1372,8 @@ function saveAuditLogs(entries, file = AUDIT_LOGS_FILE) {
   const normalized = { logs: Array.isArray(entries?.logs) ? entries.logs : [] };
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) auditRepository.saveAuditLogs(normalized);
   if (file !== AUDIT_LOGS_FILE || shouldWriteLegacyJson()) {
-    fs.writeFileSync(file, JSON.stringify(normalized, null, 2));
+    if (shouldUseDatabase()) fs.writeFileSync(file, JSON.stringify(normalized, null, 2));
+    else auditRepository.persistJsonAuditFile(normalized, path.resolve(file));
   }
   if (file === AUDIT_LOGS_FILE) broadcastDataChanged("audit");
 }
@@ -1504,30 +1555,69 @@ function parseWebDavSegments(req) {
   });
 }
 
-function archiveAuditLogs(logs) {
+function archiveAuditLogs(logs, strictJson = false) {
   if (!logs.length) return;
-  const archive = loadAuditLogs(AUDIT_ARCHIVE_FILE);
-  archive.logs.push(...logs);
-  saveAuditLogs(archive, AUDIT_ARCHIVE_FILE);
+  if (shouldUseDatabase()) {
+    // The FULL-synchronous private audit sidecar is the durable archive in
+    // SQLite mode. Never also append its contents to the legacy JSON archive.
+    auditRepository.archiveAuditLogs(logs);
+    return;
+  }
+  auditRepository.appendJsonArchiveLogs(logs);
 }
 
 function appendAuditLog(log) {
-  const entries = loadAuditLogs();
+  if (!shouldUseDatabase()) {
+    return auditRepository.withJsonAuditLock(() => appendAuditLogUnlocked(log, false));
+  }
+  return appendAuditLogUnlocked(log, true);
+}
+
+function appendAuditLogUnlocked(log, sqliteAudit) {
+  // The strict Sync account fence reserves the main SQLite writer across
+  // physical durability. Persist this event to the independent FULL sidecar
+  // first so a failed login during that window cannot lose its audit trail.
+  if (sqliteAudit && auditRepository.deferIfStrictSyncWriter(log)) {
+    broadcastDataChanged("audit");
+    return;
+  }
+  const entries = loadAuditLogs(AUDIT_LOGS_FILE, !sqliteAudit);
   const cutoff = Date.now() - AUDIT_RETENTION_MS;
+  const expired = [];
   const retained = entries.logs.filter((entry) => {
     const time = new Date(entry.timestamp).getTime();
-    return Number.isFinite(time) && time >= cutoff;
+    if (Number.isFinite(time) && time >= cutoff) return true;
+    // JSON mode historically drops expired records. SQLite must archive them
+    // durably before retention; monotonic UPSERT otherwise keeps them forever.
+    if (sqliteAudit) expired.push(entry);
+    return false;
   });
 
   retained.push(log);
   if (retained.length > MAX_AUDIT_LOGS) {
-    archiveAuditLogs(retained.slice(0, retained.length - MAX_AUDIT_LOGS));
+    expired.push(...retained.slice(0, retained.length - MAX_AUDIT_LOGS));
     entries.logs = retained.slice(-MAX_AUDIT_LOGS);
   } else {
     entries.logs = retained;
   }
 
-  saveAuditLogs(entries);
+  archiveAuditLogs(expired, !sqliteAudit);
+  try {
+    saveAuditLogs(entries);
+  } catch (error) {
+    // The backup can acquire BEGIN IMMEDIATE after our initial writer probe.
+    // Keep the failed login durable in the FULL sidecar if this last main
+    // write lost the race; never mask schema, integrity or journal failures.
+    const busyCodes = ["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"];
+    const writerContention = busyCodes.includes(error?.code) || error?.auditWriterBusy === true
+      || (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE"
+        && (error?.cause?.auditWriterBusy === true || busyCodes.includes(error?.cause?.code)));
+    if (!sqliteAudit || !writerContention) {
+      throw error;
+    }
+    auditRepository.deferAuditLog(log);
+    broadcastDataChanged("audit");
+  }
 }
 
 function auditLog(eventType, actor, target, action, result, details = {}) {
@@ -2963,7 +3053,10 @@ function normalizeVersionHistory(entry) {
           version: Number(version.version),
           storedAs: path.basename(version.storedAs || ""),
           uploadedBy: version.uploadedBy || "sistema",
-          uploadedAt: version.uploadedAt || new Date().toISOString(),
+          // A missing historical date cannot be fabricated during a read:
+          // the signed migration pin needs a stable, independently checkable value.
+          uploadedAt: typeof version.uploadedAt === "string" && Number.isFinite(Date.parse(version.uploadedAt))
+            ? version.uploadedAt : null,
           size: Number(version.size) || 0,
           comment: version.comment || "",
         }))
@@ -3872,6 +3965,18 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
   const range = parseRangeHeader(req.headers.range, size);
   const cacheControl = options.cacheControl || "private, max-age=3600";
   const highWaterMark = Number(options.highWaterMark) || 1024 * 1024;
+  // Versioned legacy migration signs/pins the historical upload date, not
+  // the filesystem mtime of a freshly rehydrated ciphertext cache copy.
+  // Never silently omit or emit a noncanonical HTTP date when opted in.
+  let lastModified = null;
+  if (options.includeLastModified === true) {
+    lastModified = options.lastModified;
+    if (typeof lastModified !== "string" || !Number.isFinite(Date.parse(lastModified))
+      || new Date(lastModified).toUTCString() !== lastModified) {
+      try { fs.closeSync(fd); } catch {}
+      return res.status(409).send("Metadados historicos da versao indisponiveis");
+    }
+  }
 
   if (range?.invalid) {
     try { fs.closeSync(fd); } catch {}
@@ -3905,6 +4010,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
+  if (lastModified !== null) commonHeaders["Last-Modified"] = lastModified;
   if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
@@ -4034,7 +4140,7 @@ function normalizeFilePermissionEntry(entry) {
   };
 }
 
-function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, ...user }) {
+function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, storageRevision, ...user }) {
   return user;
 }
 
@@ -4288,6 +4394,10 @@ function getTrashRetentionDays() {
 }
 
 async function cleanupExpiredTrashItems() {
+  // Direct retention cleanup is also called independently of the guarded
+  // processPendingCloudTrashItems() retry loop. Do not queue a destructive
+  // expired-item operation, much less call its provider, under strict cutover.
+  if (isZk10LegacyBackupStrict()) return;
   if (!isTrashEnabled()) return;
   if (!shouldAutoCleanupTrash()) return;
 
@@ -5674,6 +5784,7 @@ function isWebDavInternalStoredFile(folderId, fileName) {
 }
 
 async function deleteCloudTrashItem(item) {
+  assertZk10LegacyBackupNotStrict();
   if (!isCloudStorageEnabled()) return false;
   if (item.itemType === "folder") {
     await deleteCloudPrefix(getCloudKey(item.originalFolderId, "", "uploads"));
@@ -5703,6 +5814,9 @@ function isTrashReplacementActive(item) {
 }
 
 function processCloudTrashDeletion(item) {
+  // Callers include HTTP DELETE /trash/:id, bulk deletion, startup retries,
+  // and automatic expiry cleanup. Guard independently of those entry points.
+  assertZk10LegacyBackupNotStrict();
   return trashService.processRemoteDeletion({
     item,
     provider: deleteCloudTrashItem,
@@ -5713,6 +5827,8 @@ function processCloudTrashDeletion(item) {
 }
 
 async function processPendingCloudTrashItems() {
+  // Do not replay unowned remote-delete jobs under experimental strict cutover.
+  if (isZk10LegacyBackupStrict()) return;
   return restoreRequestGate.run(async () => {
     if (!isCloudStorageEnabled()) return;
     try {
@@ -5753,6 +5869,7 @@ function deleteCloudTrashItemLater(item) {
 }
 
 async function processPendingCloudRestoreSync() {
+  if (isZk10LegacyBackupStrict()) return;
   return restoreRequestGate.run(async () => {
     if (!isCloudStorageEnabled()) return;
     for (const backup of backupService.listBackups()) {
@@ -5799,7 +5916,16 @@ function initData() {
     if (!fs.existsSync(FILE_VERSIONS_FILE)) saveFileVersions({});
     if (!fs.existsSync(ENCRYPTED_FILES_FILE)) saveEncryptedFiles({});
     if (!fs.existsSync(ANALYTICS_FILE)) saveAnalytics(getDefaultAnalytics());
-    if (!fs.existsSync(AUDIT_LOGS_FILE)) saveAuditLogs(getDefaultAuditLogs());
+    // A pending whole-restore coordinator owns the JSON audit history until
+    // startup rehydration and its terminal outcome have completed. Ordinary
+    // initialization must not acquire the writer lock across that barrier;
+    // the trusted terminal audit creates the missing file when required.
+    if (!fs.existsSync(AUDIT_LOGS_FILE) && !restoreService.isWholeRestoreBlocked()) {
+      if (shouldUseDatabase()) saveAuditLogs(getDefaultAuditLogs());
+      else auditRepository.withJsonAuditLock(() => {
+        if (!fs.existsSync(AUDIT_LOGS_FILE)) saveAuditLogs(getDefaultAuditLogs());
+      });
+    }
     if (!fs.existsSync(QUARANTINE_FILE) && !restoreService.hasPendingQuarantineRestore()) saveQuarantine(getDefaultQuarantine());
   }
 
@@ -5935,8 +6061,16 @@ const APP_CONTENT_SECURITY_POLICY = [
   "form-action 'self'",
   "frame-ancestors 'self'",
 ].join("; ");
+const independentCatalogConnectOrigins = parseIndependentCatalogConnectOrigins(
+  process.env.ROOTARK_ZK1_INDEPENDENT_CATALOG_CONNECT_ORIGINS);
+const WORKSPACE_CONTENT_SECURITY_POLICY = independentCatalogConnectOrigins.length
+  ? APP_CONTENT_SECURITY_POLICY.replace("connect-src 'self' ws: wss:",
+    "connect-src 'self' ws: wss: " + independentCatalogConnectOrigins.join(" "))
+  : APP_CONTENT_SECURITY_POLICY;
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY);
+  const isWorkspace = req.path === "/" || req.path === "/index.html";
+  res.setHeader("Content-Security-Policy",
+    isWorkspace ? WORKSPACE_CONTENT_SECURITY_POLICY : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
@@ -5952,11 +6086,20 @@ app.use((req, res, next) => {
   }
   next();
 });
+if ((NODE_ENV === "development" || NODE_ENV === "test")
+  && process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  app.get("/zk1-protected-file-lab.html", apiRequestRateLimit, (_req, res) =>
+    res.sendFile(path.join(__dirname, "dev-ui", "zk1-protected-file-lab.html"),
+      { dotfiles: "allow" }));
+}
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
+  if (shouldDeferZk1JsonParsing(req, {
+    contentConfig: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+  })) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
   return express.json()(req, res, next);
 });
@@ -5964,6 +6107,55 @@ const loadCurrentUser = (username) => loadUsers().find((user) => user.username =
 const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseError: true }).find((user) => user.username === username);
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
+
+// DEV-OFF deny-only guard for authenticated legacy HTTP reads. JWT proves a
+// session, NOT an independently signed immutable owner/account cutover state.
+// There is no off-host monotonic floor or external authority in this process.
+// Install before the route handlers so HEAD, If-None-Match, Range and file
+// streams cannot produce legacy metadata, 304s or bytes under strict cutover.
+const requestedZk10LegacyHttpStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10LegacyHttpEgress = requestedZk10LegacyHttpStrict !== ""
+  && requestedZk10LegacyHttpStrict !== "0" && requestedZk10LegacyHttpStrict !== "off";
+const legacyAuthenticatedHttpReadPaths = [
+  /^\/files\/(?:search|[^/]+)\/?$/i,
+  /^\/list\/?$/i,
+  /^\/versions\/[^/]+\/?$/i,
+  /^\/download\/[^/]+\/v\/[^/]+\/?$/i,
+  /^\/history\/?$/i,
+  /^\/preview\/(?:file|text)\/[^/]+\/[^/]+\/?$/i,
+  // Other genuine authenticated metadata responders, including routes
+  // registered by separate route modules below. Keep this data-plane list
+  // bounded: do not block auth, health, or unrelated POST mutations.
+  /^\/folders\/?$/i,
+  /^\/folders\/[^/]+\/access\/?$/i,
+  /^\/file-access\/?$/i,
+  /^\/encrypted\/[^/]+\/metadata\/?$/i,
+  /^\/pending\/?$/i,
+  /^\/quarantine\/?$/i,
+  /^\/trash(?:\/summary)?\/?$/i,
+  /^\/backups(?:\/latest-status|\/[^/]+\/(?:manifest|download))?\/?$/i,
+  /^\/analytics\/(?:summary|uploads-by-month|uploads-by-user|active-users|file-types|downloads-by-file|recent)\/?$/i,
+  /^\/audit\/(?:logs|summary)\/?$/i,
+  /^\/groups(?:\/[^/]+\/key-manifest)?\/?$/i,
+];
+// These are POST *read responses*, not mutations: one returns decrypted
+// plaintext, the other exports private audit records as JSON/CSV.
+const legacyAuthenticatedHttpPostReadPaths = [
+  /^\/encrypted-download\/[^/]+\/?$/i,
+  /^\/audit\/export\/?$/i,
+];
+app.use((req, res, next) => {
+  if (!strictZk10LegacyHttpEgress) return next();
+  const readGet = (req.method === "GET" || req.method === "HEAD")
+    && legacyAuthenticatedHttpReadPaths.some((pattern) => pattern.test(req.path));
+  const readPost = req.method === "POST"
+    && legacyAuthenticatedHttpPostReadPaths.some((pattern) => pattern.test(req.path));
+  if (!readGet && !readPost) return next();
+  return authenticate(req, res, () => res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external authenticated owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  }));
+});
 
 function refreshAuthenticatedUserState(req) {
   if (isAuthTokenExpired(req)) return { status: 401, error: "Sessao invalida ou expirada" };
@@ -6067,6 +6259,45 @@ wss.on("connection", (socket, req) => {
 
 const requirePermission = createRequirePermission();
 
+// Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
+// This is an experimental single-scope integration, not a replacement for
+// legacy file, sync, cloud, backup or WebDAV routes and not complete ZK.
+if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  if (!["development", "test"].includes(NODE_ENV)) {
+    throw new Error("ROOTARK_ZK1_CONTENT_CONFIG requires development or test mode");
+  }
+  // Optional operator-owned JavaScript provisioning (trusted startup code)
+  // constructs real provider readers and OFF-SERVER pinned public trust roots.
+  // This opt-in module is executed only in development/test, never from a
+  // request body or legacy file and never with production restore privileges.
+  let multiproviderRestore = null;
+  if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+    const filename = process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE;
+    if (!path.isAbsolute(filename)) throw new Error("ZK restore provisioning requires absolute module path");
+    const stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("ZK restore provisioning must be an ordinary operator-owned file");
+    }
+    const provision = require(filename);
+    if (typeof provision !== "function") {
+      throw new Error("ZK restore provisioning must export a function");
+    }
+    multiproviderRestore = provision();
+  }
+  const zk1ContentStore = registerZk1ProtectedContentFromConfig({
+    app, authenticate, requirePermission,
+    configPath: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+    multiproviderRestore,
+  });
+  server.once("close", () => zk1ContentStore.close());
+} else if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+  throw new Error("ZK multiprovider restore requires protected content bootstrap");
+}
+
+if (process.env.SYNC_ATOMIC_DEVICE_REGISTRY !== undefined
+  && !["true", "false"].includes(process.env.SYNC_ATOMIC_DEVICE_REGISTRY)) {
+  throw new Error("SYNC_ATOMIC_DEVICE_REGISTRY must be explicitly true or false");
+}
 registerSyncRoutes({
   app,
   authenticate,
@@ -6074,10 +6305,13 @@ registerSyncRoutes({
   storagePath: process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json",
   requireDeviceAuthorization: true,
   deviceRegistryPath: process.env.SYNC_DEVICE_REGISTRY || "",
+  atomicDeviceRegistry: process.env.SYNC_ATOMIC_DEVICE_REGISTRY === "true",
   auditLog,
   bcrypt,
   loadUsers,
   saveUsers,
+  commitSyncResumeProof: shouldUseDatabase() && !shouldWriteLegacyJson()
+    ? commitSyncResumeProof : null,
   getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 
@@ -6227,7 +6461,7 @@ app.post("/users", authenticate, requirePermission("manageUsers"), async (req, r
     sessionVersion: getCreatedUserSessionVersion(username),
   });
 
-  saveUsers(users);
+  saveUsers(users, { allowRecreateUsernames: [username] });
   auditLog("user.created", getAuditActor(req), { type: "user", id: username }, "created", "success", {
     role: role || "user",
     permissions: finalPermissions,
@@ -6315,7 +6549,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   }
 
   if (shouldWriteLegacyJson()) rememberUserGenerations(users);
-  saveUsers(filtered);
+  saveUsers(filtered, { expectedDeletedUsers: users.filter((u) => u.username === req.params.username) });
   removeUserFromFilePermissions(req.params.username);
   removeUserFromFolderPermissions(req.params.username);
   auditLog("user.deleted", getAuditActor(req), { type: "user", id: req.params.username }, "deleted", "success", {
@@ -7230,6 +7464,23 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
   }
 
   sendOptimizedFile(req, res, filePath, name, "attachment");
+});
+
+// The experimental ZK10 Sync strict switch cannot authorize anonymous file
+// egress: neither a JWT/local file owner nor a public token proves the
+// independent immutable-account/object mapping. Until a current external
+// issuer and owner inventory are wired through these routes, strict means
+// denial of *both* legacy token issuance and anonymous redemption. Default
+// OFF retains the #63/#64 legacy behavior; this is not production cutover.
+const requestedZk10AnonymousFence = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10AnonymousFence = requestedZk10AnonymousFence !== ""
+  && requestedZk10AnonymousFence !== "0" && requestedZk10AnonymousFence !== "off";
+app.use(["/file-open-token", "/version-open-token", "/open-file", "/share"], (req, res, next) => {
+  if (!strictZk10AnonymousFence) return next();
+  return res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external anonymous owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
 });
 
 app.post("/file-open-token", fileOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
@@ -10957,58 +11208,76 @@ function sendWebDavOptions(req, res) {
 }
 
 function registerWebDavRoutes() {
-  recoverWebDavMoveJournals();
-  resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message));
-  if (!webDavReconciliationTimer) {
-    webDavReconciliationTimer = setInterval(() => resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)), WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
-    server.once("close", () => clearInterval(webDavReconciliationTimer));
+  const requestedZk10Cutover = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+  const strictZk10WebDav = requestedZk10Cutover !== "" && requestedZk10Cutover !== "0"
+    && requestedZk10Cutover !== "off";
+  // No production account-UUID + independently retained signed authority is
+  // bootstrapped into server.js. A strict opt-in must block legacy WebDAV
+  // until a real server-owned authority is attached; never trust Basic/JWT.
+  const webDavLegacyFence = null;
+  // Reconciliation can write/delete cloud objects without a request or a
+  // verified owner lease. A strict cutover therefore suspends this entire
+  // legacy background path pending an independently guarded job protocol.
+  if (!strictZk10WebDav) {
+    recoverWebDavMoveJournals();
+    resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message));
+    if (!webDavReconciliationTimer) {
+      webDavReconciliationTimer = setInterval(() => resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)), WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
+      server.once("close", () => clearInterval(webDavReconciliationTimer));
+    }
   }
-  app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) => {
-    const transactionId = canonicalWebDavMoveTransactionId(req.params.transactionId);
-    if (!transactionId) return res.status(404).send("Not found");
-    const journalPath = webDavMoveJournalPath(transactionId);
-    if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
-    let journal;
-    try { journal = readWebDavMoveJournal(journalPath); } catch { return res.status(409).send("Status unavailable"); }
-    if (!isSafeWebDavMoveJournal(journal)) return res.status(409).send("Status unavailable");
-    const cloud = journal.cloud || {};
-    return res.json({ transactionId: journal.transactionId, phase: journal.phase, state: cloud.state || journal.phase, provider: cloud.provider || null, attempts: cloud.attempts || 0, maxAttempts: cloud.maxAttempts || WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS, lastAttemptAt: cloud.lastAttemptAt || null, nextAttemptAt: cloud.nextAttemptAt || null, failureCategory: cloud.failureCategory || null, completedAt: cloud.completedAt || null, terminalAt: cloud.terminalAt || null, transitions: Array.isArray(cloud.transitions) ? cloud.transitions : [] });
-  });
+  app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) =>
+    runZk10LegacyWebDavOperation({ req, res, strict: strictZk10WebDav,
+      legacyCutoverFence: webDavLegacyFence, operation: "webdav:status" }, () => {
+      const transactionId = canonicalWebDavMoveTransactionId(req.params.transactionId);
+      if (!transactionId) return res.status(404).send("Not found");
+      const journalPath = webDavMoveJournalPath(transactionId);
+      if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
+      let journal;
+      try { journal = readWebDavMoveJournal(journalPath); } catch { return res.status(409).send("Status unavailable"); }
+      if (!isSafeWebDavMoveJournal(journal)) return res.status(409).send("Status unavailable");
+      const cloud = journal.cloud || {};
+      return res.json({ transactionId: journal.transactionId, phase: journal.phase, state: cloud.state || journal.phase, provider: cloud.provider || null, attempts: cloud.attempts || 0, maxAttempts: cloud.maxAttempts || WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS, lastAttemptAt: cloud.lastAttemptAt || null, nextAttemptAt: cloud.nextAttemptAt || null, failureCategory: cloud.failureCategory || null, completedAt: cloud.completedAt || null, terminalAt: cloud.terminalAt || null, transitions: Array.isArray(cloud.transitions) ? cloud.transitions : [] });
+    }));
   const handler = async (req, res) => {
     try {
       if (req.method === "OPTIONS") return sendWebDavOptions(req, res);
       if (req.headers.origin && req.headers.origin !== getExpectedOrigin(req)) return res.status(403).send("Origin denied");
       if (!await authenticateWebDavRequest(req, res)) return;
 
-      const segments = parseWebDavSegments(req);
-      if (!segments) return res.status(404).send("Not found");
+      return await runZk10LegacyWebDavOperation({ req, res,
+        strict: strictZk10WebDav, legacyCutoverFence: webDavLegacyFence,
+        operation: `webdav:${req.method.toLowerCase()}` }, async () => {
+          const segments = parseWebDavSegments(req);
+          if (!segments) return res.status(404).send("Not found");
 
-      if (req.method === "PROPFIND") return webDavPropfindRateLimit(req, res, (error) => {
-        const sendFailure = (failure) => {
-          auditLog("webdav.error", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
-            error: failure.message,
-            path: getSafeWebDavAuditPath(req),
+          if (req.method === "PROPFIND") return webDavPropfindRateLimit(req, res, (error) => {
+            const sendFailure = (failure) => {
+              auditLog("webdav.error", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
+                error: failure.message,
+                path: getSafeWebDavAuditPath(req),
+              });
+              return res.status(failure.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
+            };
+            if (error) return sendFailure(error);
+            return sendWebDavPropfind(req, res, segments).catch(sendFailure);
           });
-          return res.status(failure.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
-        };
-        if (error) return sendFailure(error);
-        return sendWebDavPropfind(req, res, segments).catch(sendFailure);
+          if (req.method === "GET") return sendWebDavFile(req, res, segments, false);
+          if (req.method === "HEAD") return sendWebDavFile(req, res, segments, true);
+          if (req.method === "PUT") return handleWebDavPut(req, res, segments);
+          if (req.method === "MKCOL") return handleWebDavMkcol(req, res, segments);
+
+          if (req.method === "DELETE") {
+            auditLog("webdav.delete", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, "delete", "failure", {
+              reason: WEBDAV_ALLOW_DELETE ? "not_implemented" : "disabled",
+            });
+            return res.status(405).send("DELETE is disabled for WebDAV MVP");
+          }
+
+          if (req.method === "MOVE") return handleWebDavMove(req, res, segments);
+          if (req.method === "LOCK" || req.method === "UNLOCK") return res.status(501).send("WebDAV locking is not supported in this MVP");
+          return res.status(405).send("Method not allowed");
       });
-      if (req.method === "GET") return sendWebDavFile(req, res, segments, false);
-      if (req.method === "HEAD") return sendWebDavFile(req, res, segments, true);
-      if (req.method === "PUT") return handleWebDavPut(req, res, segments);
-      if (req.method === "MKCOL") return handleWebDavMkcol(req, res, segments);
-
-      if (req.method === "DELETE") {
-        auditLog("webdav.delete", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, "delete", "failure", {
-          reason: WEBDAV_ALLOW_DELETE ? "not_implemented" : "disabled",
-        });
-        return res.status(405).send("DELETE is disabled for WebDAV MVP");
-      }
-
-      if (req.method === "MOVE") return handleWebDavMove(req, res, segments);
-      if (req.method === "LOCK" || req.method === "UNLOCK") return res.status(501).send("WebDAV locking is not supported in this MVP");
-      return res.status(405).send("Method not allowed");
     } catch (error) {
       auditLog("webdav.error", getAuditActor(req, "anonymous"), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
         error: error.message,
@@ -11212,7 +11481,18 @@ app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermissio
 });
 
 
+function denyStrictLegacyVersionMutation(res) {
+  // JWT permissions do not establish an owner-signed account-wide cutover.
+  // Recheck after every asynchronous boundary and before local/cloud writes.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
+  if (denyStrictLegacyVersionMutation(res)) return;
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -11224,7 +11504,8 @@ app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requ
   if (!isExistingFile(filePath)) {
     if (!isCloudStorageEnabled()) return res.status(404).json({ error: "Arquivo nao encontrado" });
     if (!consumeCloudMetadataRateLimit(req, res)) return;
-    await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+    await ensureCloudFileCached(folder.id, name, filePath, "uploads",
+      () => !isFileInTrash(folder.id, name) && !isZk10LegacyBackupStrict());
   }
   if (!refreshAuthenticatedUser(req, res)) return;
   const currentFolder = getFolderById(folder.id);
@@ -11233,6 +11514,7 @@ app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requ
   if (!isFolderAvailable(currentFolder.id) || isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
   if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (denyStrictLegacyVersionMutation(res)) return;
   const currentFolderWithPaths = { ...currentFolder, ...ensureFolderDirectories(currentFolder.id) };
   const { history } = ensureVersionHistory(currentFolderWithPaths, name, normalizeFilePermissionEntry(getFilePermissionEntry(currentFolder.id, name)).owner, "Versao inicial");
   return res.json({ folderId: folder.id, fileName: name, currentVersion: history.currentVersion });
@@ -11262,6 +11544,19 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
+  // Deny a suppressed archive alias before reporting missing metadata, so
+  // protected source existence cannot leak through a differing 409 response.
+  if (target?.version?.storedAs
+    && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) {
+    return res.status(403).json({ error: "Acesso negado a esta versao" });
+  }
+  // Cache rehydration can replace the local file timestamp. Only the pinned
+  // historical upload date may become the Last-Modified response header.
+  const storedUploadedAt = target?.version?.uploadedAt;
+  if (target && (typeof storedUploadedAt !== "string"
+    || !Number.isFinite(Date.parse(storedUploadedAt)))) {
+    return res.status(409).json({ error: "Metadados historicos da versao indisponiveis" });
+  }
   if (target?.version?.storedAs) {
     if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
@@ -11281,7 +11576,9 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
-  sendOptimizedFile(req, res, target.filePath, name, "attachment");
+  sendOptimizedFile(req, res, target.filePath, name, "attachment", {
+    includeLastModified: true, lastModified: new Date(storedUploadedAt).toUTCString(),
+  });
 });
 
 app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
@@ -11345,6 +11642,7 @@ app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, require
 });
 
 app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
+  if (denyStrictLegacyVersionMutation(res)) return;
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -11359,6 +11657,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
   if (!hasFileEditAccess(req, folder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
 
   return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (denyStrictLegacyVersionMutation(res)) return;
     if (!refreshAuthenticatedUser(req, res)) return;
     let currentFolder = getReadableFolderOrRespond(req, res, folder.id);
     if (!currentFolder) return;
@@ -11377,9 +11676,11 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 
     const currentPath = path.join(currentFolder.uploadDir, name);
     const targetPath = path.join(currentFolder.uploadDir, target.storedAs);
-    await ensureCloudFileCached(currentFolder.id, name, currentPath, "uploads", () => !isFileInTrash(currentFolder.id, name));
+    await ensureCloudFileCached(currentFolder.id, name, currentPath, "uploads",
+      () => !isFileInTrash(currentFolder.id, name) && !isZk10LegacyBackupStrict());
     if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
-    await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads", () => !isFileInTrash(currentFolder.id, name), name);
+    await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads",
+      () => !isFileInTrash(currentFolder.id, name) && !isZk10LegacyBackupStrict(), name);
     if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     if (!refreshAuthenticatedUser(req, res)) return;
     currentFolder = getReadableFolderOrRespond(req, res, currentFolder.id);
@@ -11389,6 +11690,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
     if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
+    if (denyStrictLegacyVersionMutation(res)) return;
 
     let restoreStagePath = null;
     let archivedPath = null;
@@ -11402,6 +11704,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
       const archivedName = getStoredVersionName(name, oldCurrentVersion);
       archivedPath = path.join(currentFolder.uploadDir, archivedName);
       if (fs.existsSync(archivedPath)) return res.status(409).json({ error: "Arquivo de versao atual ja existe" });
+      if (denyStrictLegacyVersionMutation(res)) return;
       const projectedNewVersion = oldCurrentVersion + 1;
       if (isCloudStorageEnabled()) {
         cloudMutationPreparation = prepareCloudUploadMutations(currentFolder.id, getRestoredVersionCloudMutationNames(
@@ -11469,6 +11772,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 });
 
 app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), async (req, res) => {
+  if (denyStrictLegacyVersionMutation(res)) return;
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -11480,6 +11784,7 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
   }
 
   return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (denyStrictLegacyVersionMutation(res)) return;
     if (!refreshAuthenticatedUser(req, res)) return;
     if (!req.user?.permissions?.delete) return res.status(403).json({ error: "Permissao negada: delete" });
     const currentFolder = getReadableFolderOrRespond(req, res, folder.id);
@@ -11495,6 +11800,7 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
     if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
     if (versionNumber === history.currentVersion) return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
 
+    if (denyStrictLegacyVersionMutation(res)) return;
     const cloudDeletePreparation = prepareCloudUploadAbsenceMutations(currentFolder.id, name, [target.storedAs]);
     try {
       fs.rmSync(path.join(currentFolder.uploadDir, target.storedAs), { force: true });
@@ -11997,7 +12303,18 @@ app.get("/preview/text/:scope/:name", authenticate, async (req, res) => {
 });
 
 app.get("/approve/:name", approveRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+function denyStrictLegacyApproval(res) {
+  // A JWT approver cannot revive legacy plaintext while owner/object cutover
+  // lacks independently authenticated, account-wide admission.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("approve"), async (req, res) => {
+  if (denyStrictLegacyApproval(res)) return;
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
@@ -12041,6 +12358,9 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
 
       const uploadedBy = refreshedPendingEntry.uploadedBy || null;
       const pendingTempPath = path.join(folder.tempDir, name);
+      // Recheck immediately before committing the physical promotion, after
+      // any asynchronous staging or authorization refresh has completed.
+      if (denyStrictLegacyApproval(res)) return;
       const cloudMutations = isCloudStorageEnabled()
         ? prepareCloudUploadMutations(folder.id, getApprovedFileCloudMutationNames(folder, name, pendingTempPath))
         : { queued: false, rollback() {} };
@@ -12270,7 +12590,18 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   }, res);
 });
 
+function denyStrictLegacyRename(res) {
+  // Legacy ACLs cannot establish an independently attested owner/object
+  // cutover. Do not even issue a transient filesystem rename under STRICT.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
+  if (denyStrictLegacyRename(res)) return;
   const rawOldName = typeof req.body.oldName === "string" ? req.body.oldName.trim() : "";
   const rawNewName = typeof req.body.newName === "string" ? req.body.newName.trim() : "";
   const oldName = path.basename(rawOldName);
@@ -12321,6 +12652,9 @@ app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
       .filter(Boolean);
     if (fs.existsSync(newPath)) return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
 
+    // The asynchronous file cache/ACL refresh above may outlive the original
+    // request admission. Recheck immediately before dispatching native I/O.
+    if (denyStrictLegacyRename(res)) return;
     try {
       await fs.promises.rename(oldPath, newPath);
     } catch {
@@ -12356,7 +12690,18 @@ app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
   }, res);
 });
 
+function denyStrictLegacyMove(res) {
+  // A legacy folder ACL cannot authorize a physical cross-folder move after
+  // STRICT owner/object cutover. Do not rename first and roll it back later.
+  if (!isZk10LegacyBackupStrict()) return false;
+  res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 external owner/object authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  });
+  return true;
+}
 app.put("/move", moveRateLimit, authenticate, async (req, res) => {
+  if (denyStrictLegacyMove(res)) return;
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const fromFolder = getAccessibleFolderRecordOrRespond(req, res, req.body.fromFolderId);
@@ -12404,6 +12749,9 @@ app.put("/move", moveRateLimit, authenticate, async (req, res) => {
     const oldStoredNames = getVersionHistory(sourceFolder.id, name).versions
       .map((version) => path.basename(version.storedAs || ""))
       .filter(Boolean);
+    // A mode change can happen during the awaited cache/authorization work.
+    // Recheck at the physical sink before issuing even a transient rename.
+    if (denyStrictLegacyMove(res)) return;
     try {
       await fs.promises.rename(sourcePath, destinationPath);
     } catch {
@@ -12465,7 +12813,11 @@ if (!startupRestoreCoordinator) {
 scheduleAutomaticBackups({
   cron,
   createBackup: (...args) => {
-    if (restoreService.isWholeRestoreBlocked()) return Promise.reject(new Error("Backup pausado durante recuperacao de restore"));
+    if (restoreService.isWholeRestoreBlocked()) {
+      return Promise.reject(Object.assign(new Error("Backup pausado durante recuperacao de restore"), {
+        code: "BACKUP_PAUSED_DURING_RESTORE",
+      }));
+    }
     return backupService.createBackup(...args);
   },
   auditLog,
@@ -12474,6 +12826,7 @@ scheduleAutomaticBackups({
 void processPendingCloudTrashItems();
 const cloudTempReconciliationIntervalMs = parseBoundedNumber("CLOUD_TEMP_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
 const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
+  if (isZk10LegacyBackupStrict()) return;
   if (!isCloudStorageEnabled()) return;
   let pendingUploads = {};
   try { pendingUploads = loadPendingUploads(); }
@@ -12491,7 +12844,10 @@ const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
 }).catch((error) => {
   console.error("[cloud-temp] startup reconciliation failed:", sanitizeLogValue(error.message));
 });
-const retryCloudTempMutations = () => restoreRequestGate.run(() => cloudTempMutationQueue.processAll()).catch((error) => {
+const retryCloudTempMutations = () => restoreRequestGate.run(() => {
+  if (isZk10LegacyBackupStrict()) return;
+  return cloudTempMutationQueue.processAll();
+}).catch((error) => {
   console.error("[cloud-temp] retry reconciliation failed:", sanitizeLogValue(error.message));
 });
 setTimeout(() => { void recoverCloudTempMutations(); }, 0);

@@ -106,6 +106,88 @@ test("download cleans up a partial cache file after a provider stream failure", 
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("bounded ZK cloud GET refuses a junction/symlink cache parent without publishing outside the selected workspace", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-parent-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-external-"));
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  });
+  const link = path.join(root, "cache");
+  try {
+    fs.symlinkSync(external, link, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+      return t.skip("directory symlink/junction unavailable");
+    }
+    throw error;
+  }
+  let providerGets = 0;
+  const bytes = Buffer.from("ciphertext");
+  const cloud = createCloudStorage({
+    provider: "s3", s3: { bucket: "disposable" },
+    createS3Client: async () => ({ async send() {
+      providerGets++;
+      return { $metadata: { httpStatusCode: 200 },
+        ContentLength: bytes.length, Body: Readable.from([bytes]) };
+    } }),
+  });
+  const destination = path.join(link, "outside.ct");
+  await assert.rejects(cloud.download("opaque", "version.ct", destination, "uploads",
+    () => true, { maxBytes: bytes.length }), { code: "provider_error" });
+  assert.equal(fs.existsSync(path.join(external, "outside.ct")), false,
+    "untrusted cache parent redirected a successful signed ciphertext GET outside workspace");
+  assert.equal(providerGets, 0, "unsafe cache path must fail before cloud access");
+});
+
+test("bounded GET rejects parent replacement before NO_REPLACE and never cleans a foreign staging directory", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-race-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-race-foreign-"));
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  });
+  const parent = path.join(root, "cache");
+  const relocated = path.join(root, "old-cache");
+  fs.mkdirSync(parent);
+  const payload = Buffer.from("ciphertext");
+  const cloud = createCloudStorage({
+    provider: "s3", s3: { bucket: "disposable" },
+    createS3Client: async () => ({ async send() {
+      return { $metadata: { httpStatusCode: 200 }, ContentLength: payload.length,
+        Body: Readable.from([payload]) };
+    } }),
+  });
+  let sentinel;
+  let swapped = false;
+  const target = path.join(parent, "archive.ct");
+  await assert.rejects(cloud.download("opaque", "version.ct", target, "uploads", () => {
+    const staged = fs.readdirSync(parent).find((name) => name.startsWith(".rootark-cloud-cache-"));
+    assert.ok(staged);
+    fs.renameSync(parent, relocated);
+    const foreignStaging = path.join(external, staged);
+    fs.mkdirSync(foreignStaging);
+    sentinel = path.join(foreignStaging, "DO-NOT-REMOVE.txt");
+    fs.writeFileSync(sentinel, "foreign survivor");
+    try {
+      fs.symlinkSync(external, parent, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+        fs.renameSync(relocated, parent);
+        return false;
+      }
+      throw error;
+    }
+    swapped = true;
+    return true;
+  }, { maxBytes: payload.length }), { code: "provider_error" });
+  if (swapped) {
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "foreign survivor",
+      "cleanup followed an attacker-swapped parent junction and removed an unrelated file");
+    assert.equal(fs.existsSync(path.join(external, "archive.ct")), false);
+  }
+});
+
 test("Google Drive escapes lookup values and uses a deterministic duplicate", async () => {
   const queries = [];
   const key = "rootark/uploads/folder'one/safe.txt";
@@ -120,13 +202,71 @@ test("Google Drive escapes lookup values and uses a deterministic duplicate", as
   assert.match(queries[0], /folder\\'one/);
 });
 
-test("provider selection and configuration failures have stable categories", async () => {
+test("Google Drive keeps backslash and apostrophe inside exact list and inventory query literals", async () => {
+  // Decode Drive's single-quoted q literals: both backslash and apostrophe are
+  // escaped with a backslash. An unescaped backslash can consume the escape on
+  // an apostrophe and turn following user text into a query clause.
+  const literals = (query) => {
+    const result = [];
+    let current = null;
+    for (let i = 0; i < query.length; i += 1) {
+      const char = query[i];
+      if (current === null) {
+        if (char === "'") current = "";
+      } else if (char === "\\") {
+        assert.ok(i + 1 < query.length, "Drive query cannot end inside an escape");
+        current += query[++i];
+      } else if (char === "'") {
+        result.push(current);
+        current = null;
+      } else {
+        current += char;
+      }
+    }
+    assert.equal(current, null, "Drive query must not have an unterminated string");
+    return result;
+  };
+  const folderId = "folder\\' or name='foreign";
+  const area = "uploads\\' or trashed=true or name='foreign";
+  const parent = "parent\\' or name='foreign";
+  const filename = "safe.txt";
+  const calls = [];
+  const storage = createCloudStorage({
+    provider: "gdrive", gdrive: { folderId: parent },
+    createGoogleDriveClient: async () => ({ files: {
+      list: async ({ q }) => {
+        calls.push(q);
+        return { data: { files: calls.length === 1 ? [{
+          id: "owned", parents: [parent], appProperties: {
+            rootArkKey: storage.key(folderId, filename, area),
+            rootArkFolderId: folderId, rootArkArea: area,
+          },
+        }] : [] } };
+      },
+    } }),
+  });
+  assert.deepEqual((await storage.list(folderId, area)).map((file) => file.id), ["owned"]);
+  assert.deepEqual(await storage.inventory(), []);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(literals(calls[0]), ["rootArkFolderId", folderId, "rootArkArea", area]);
+  assert.deepEqual(literals(calls[1]), [parent, "rootArkKey"]);
+});
+
+test("provider selection and configuration failures have stable categories", async (t) => {
   const unsupported = createCloudStorage({ provider: "ftp" });
   await assert.rejects(unsupported.list("root"), { code: "unsupported_provider" });
   const s3 = createCloudStorage({ provider: "s3", createS3Client: async () => ({}) });
   await assert.rejects(s3.list("root"), { code: "configuration" });
   const drive = createCloudStorage({ provider: "gdrive", createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [] } }) } }) });
-  await assert.rejects(drive.upload(__filename, "root", "file.txt"), { code: "configuration" });
+  // The caller's repository tree may be mounted through an untrusted /mnt
+  // ancestor on Linux. Exercise provider configuration after selecting an
+  // independently private source, not by bypassing the source-path fence.
+  const privateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-config-"));
+  t.after(() => fs.rmSync(privateRoot, { recursive: true, force: true }));
+  if (process.platform !== "win32") fs.chmodSync(privateRoot, 0o700);
+  const privateSource = path.join(privateRoot, "source.txt");
+  fs.writeFileSync(privateSource, "provider-config-only", { flag: "wx", mode: 0o600 });
+  await assert.rejects(drive.upload(privateSource, "root", "file.txt"), { code: "configuration" });
 });
 
 test("key containment normalizes separators and rejects empty or absolute segments", () => {
@@ -567,10 +707,23 @@ test("filename separators are rejected for object operations", async () => {
   await assert.rejects(storage.remove("folder", "nested\\item.bin"), { code: "invalid_path" });
 });
 
-test("upload of a missing local file is a no-op", async () => {
+test("upload of a missing local file under a trusted private parent is a no-op", async (t) => {
   let created = 0;
   const storage = createCloudStorage({ provider: "s3", s3: { bucket: "bucket" }, createS3Client: async () => { created += 1; return { send: async () => ({}) }; } });
-  assert.equal(await storage.upload(path.join(os.tmpdir(), "rootark-missing-file"), "root", "item.bin"), null);
+  const privateParent = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-missing-private-"));
+  t.after(() => fs.rmSync(privateParent, { recursive: true, force: true }));
+  if (process.platform !== "win32") fs.chmodSync(privateParent, 0o700);
+  assert.equal(await storage.upload(path.join(privateParent, "absent.bin"), "root", "item.bin"), null);
+  assert.equal(created, 0);
+});
+
+test("missing upload path cannot bypass untrusted POSIX source-parent validation", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX sticky public TEMP trust boundary");
+  let created = 0;
+  const storage = createCloudStorage({ provider: "s3", s3: { bucket: "bucket" }, createS3Client: async () => { created += 1; return { send: async () => ({}) }; } });
+  await assert.rejects(
+    storage.upload(path.join(os.tmpdir(), "rootark-missing-file"), "root", "item.bin"),
+    { code: "invalid_path" });
   assert.equal(created, 0);
 });
 

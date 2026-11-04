@@ -5,6 +5,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 require("./isolated-runtime")(test, "rootark-backup-restore-runtime-");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const ALL_MIGRATION_VERSIONS = require("../db/migrations").MIGRATIONS.map((migration) => migration.version);
@@ -28,7 +29,7 @@ function operatorRecoverExitedRestoreLock(runtime, childPid) {
 }
 
 test("pre-image copy preserves a pre-existing destination when exclusive staging fails", () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-copy-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-preimage-copy-runtime-");
   const source = path.join(runtime, "source.bin");
   const destination = path.join(runtime, "destination.bin");
   fs.writeFileSync(source, "source bytes");
@@ -192,7 +193,7 @@ test("legacy quarantine recovery rejects a symlinked staged prior payload", { sk
 });
 
 test("pre-image copy rejects a source replaced after open but before path validation", () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-open-race-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-preimage-open-race-runtime-");
   const source = path.join(runtime, "source.bin");
   const replacement = path.join(runtime, "replacement.bin");
   const displaced = path.join(runtime, "displaced.bin");
@@ -230,7 +231,7 @@ test("pre-image copy rejects a source replaced after open but before path valida
 });
 
 test("tree hashing rejects a source replaced after open before staging it", () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-tree-open-race-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-preimage-tree-open-race-runtime-");
   const treeRoot = path.join(runtime, "tree");
   const source = path.join(treeRoot, "entry.txt");
   const replacement = path.join(runtime, "replacement.txt");
@@ -268,7 +269,7 @@ test("pre-image copy and tree hashing reject FIFO sources without blocking", (t)
     t.skip("FIFO or O_NONBLOCK is unavailable");
     return;
   }
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-fifo-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-preimage-fifo-runtime-");
   const copyFifo = path.join(runtime, "copy.fifo");
   const copyDestination = path.join(runtime, "copy-staged.bin");
   const treeRoot = path.join(runtime, "tree");
@@ -319,7 +320,7 @@ test("pre-image copy and tree hashing reject FIFO sources without blocking", (t)
 });
 
 function runFixture(body, envOverrides = {}, timeoutMs = 30_000) {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-boundary-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-quarantine-"));
   const script = `
     const assert = require("node:assert/strict");
@@ -3191,8 +3192,8 @@ test("startup fails closed on an ambiguous preparing coordinator instead of clea
 });
 
 test("successful SQLite restore reinserts selected and pre-restore records into the restored index", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-history-runtime-"));
-  const databaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-history-db-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-history-runtime-");
+  const databaseDir = createPrivateAuthorityFixture("rootark-restore-history-db-");
   const databasePath = path.join(databaseDir, "configured.sqlite");
   const script = `
     const assert = require("node:assert/strict");
@@ -3438,7 +3439,7 @@ test("restore authorization cleanup preserves a valid snapshot when coordinator 
 });
 
 test("process restart resumes canceled restore cleanup after pre-image removal", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-cancelled-crash-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-cancelled-crash-");
   const quarantineDir = path.join(runtime, "quarantine");
   const env = {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
@@ -3553,7 +3554,7 @@ test("restore failure after quarantine commit rolls quarantine, JSON, and upload
 
 test("abrupt whole-restore interruptions automatically roll back before startup migrations", { timeout: 90_000 }, () => {
   for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.data.obsolete-removed", "restore.uploads.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
-    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-coordinator-runtime-"));
+    const runtime = createPrivateAuthorityFixture("rootark-restore-coordinator-runtime-");
     const quarantineDir = path.join(runtime, "quarantine");
     const env = {
       ...process.env,
@@ -3734,7 +3735,7 @@ test("abrupt exit after the restart-required marker preserves committed state an
 });
 
 test("abrupt exit during partial whole-restore pre-image creation cleans preparing state", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-partial-preimage-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-partial-preimage-");
   const quarantineDir = path.join(runtime, "quarantine");
   const env = {
     ...process.env,
@@ -3849,7 +3850,7 @@ test("restart rolls back crashes inside quarantine journal and commit boundaries
 
 test("restart resumes quarantine compensation after restoring an overwritten old payload", { timeout: 60_000 }, () => {
   for (const legacyJournal of [false, true]) {
-    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-rollback-retry-"));
+    const runtime = createPrivateAuthorityFixture("rootark-quarantine-rollback-retry-");
     const quarantineDir = path.join(runtime, "quarantine");
     const env = {
       ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
@@ -3987,7 +3988,7 @@ test("startup rolls back an interrupted JSON and uploads restore from verified l
 
 test("startup rejects mismatched whole-restore coordinator and pre-image schema pairs before restoring data", { timeout: 30_000 }, () => {
   for (const [coordinatorVersion, manifestVersion] of [[3, 2], [4, 1]]) {
-    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-schema-mismatch-"));
+    const runtime = createPrivateAuthorityFixture("rootark-restore-schema-mismatch-");
     const quarantineDir = path.join(runtime, "quarantine");
     const env = {
       ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
@@ -4198,7 +4199,7 @@ test("rollback cleanup retries after partial pre-image removal without revalidat
 });
 
 test("restart resumes rollback interrupted after one local domain", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-rollback-restart-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-rollback-restart-");
   const env = {
     ...process.env,
     NODE_ENV: "test",
@@ -4276,7 +4277,7 @@ test("restore failure before an upload copy rolls earlier JSON and upload change
 });
 
 test("restore failure after SQLite commit rolls database, JSON, and uploads back", () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-sqlite-boundary-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-sqlite-boundary-runtime-");
   const databaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-sqlite-boundary-db-"));
   const databasePath = path.join(databaseDir, "configured.sqlite");
   const script = `
@@ -4338,7 +4339,7 @@ test("restore failure after SQLite commit rolls database, JSON, and uploads back
 });
 
 test("restart recovers whole-restore pre-images after an interrupted SQLite journal update", { timeout: 60_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-journal-restart-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-journal-restart-");
   const databasePath = path.join(runtime, "data", "rootark.sqlite");
   const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
   const env = {
@@ -4412,7 +4413,7 @@ test("restart recovers whole-restore pre-images after an interrupted SQLite jour
 });
 
 test("post-migration startup failure keeps the whole-restore barrier until a later listener acknowledgement", { timeout: 60_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-post-migration-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-post-migration-");
   const databasePath = path.join(runtime, "data", "rootark.sqlite");
   const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
   const env = {
@@ -4600,7 +4601,7 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
 
 test("process exit after a partial restore data or upload copy recovers the prior bytes", { timeout: 60_000 }, () => {
   for (const domain of ["data", "uploads"]) {
-    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), `rootark-restore-${domain}-copy-crash-`));
+    const runtime = createPrivateAuthorityFixture(`rootark-restore-${domain}-copy-crash-`);
     const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-copy-crash-quarantine-"));
     const target = path.join(runtime, domain, "crash-copy.json");
     const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
@@ -4686,7 +4687,7 @@ test("process exit after a partial restore data or upload copy recovers the prio
 });
 
 test("process exit after the first restored pre-image tree entry keeps the barrier for restart recovery", { timeout: 60_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-tree-rollback-crash-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-tree-rollback-crash-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-tree-crash-quarantine-"));
   const uploadsDir = path.join(runtime, "uploads");
   const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
@@ -4784,7 +4785,7 @@ test("process exit after the first restored pre-image tree entry keeps the barri
 });
 
 test("successful migrations before listener acknowledgement preserve the restore barrier and provider queue across restart", { timeout: 60_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-migration-before-ack-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-migration-before-ack-");
   const databasePath = path.join(runtime, "data", "rootark.sqlite");
   const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
   const backupIdPath = path.join(runtime, "data", "restore-backup-id.txt");
@@ -4906,7 +4907,7 @@ test("successful migrations before listener acknowledgement preserve the restore
 });
 
 test("application startup recovers an interrupted SQLite restore before migrations read the database", { timeout: 60_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-startup-recovery-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-startup-recovery-");
   const databasePath = path.join(runtime, "data", "rootark.sqlite");
   const env = {
     ...process.env,
@@ -5020,7 +5021,7 @@ test("Windows restore startup fails closed and preserves journals behind an unve
 });
 
 test("startup checks whole-restore coordinator before WebDAV journal recovery", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-webdav-order-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-webdav-order-");
   const transactionId = "00000000-0000-4000-8000-000000000000";
   const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
   const webDavJournalPath = path.join(runtime, "temp", ".incoming", `rootark-webdav-move-${transactionId}.json`);
@@ -5060,7 +5061,7 @@ test("startup checks whole-restore coordinator before WebDAV journal recovery", 
 });
 
 test("declared multi-instance startup fails closed without acknowledging or touching a pending restore", { timeout: 60_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-multi-instance-startup-"));
+  const runtime = createPrivateAuthorityFixture("rootark-restore-multi-instance-startup-");
   const quarantineDir = path.join(runtime, "quarantine");
   const env = {
     ...process.env,

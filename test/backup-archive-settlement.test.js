@@ -1,12 +1,13 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { ZipArchive } = require("archiver");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const originalCwd = process.cwd();
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-archive-settlement-"));
+const runtime = createPrivateAuthorityFixture("rootark-archive-settlement-");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupService = require("../services/backupService");
@@ -16,6 +17,10 @@ const restoreProviderOrphans = require("../services/restoreProviderOrphans");
 function reset() {
   fs.rmSync(path.join(runtime, "data"), { recursive: true, force: true });
   fs.rmSync(path.join(runtime, "uploads"), { recursive: true, force: true });
+  fs.mkdirSync(path.join(runtime, "data"), { recursive: true });
+  if (process.platform === "win32") {
+    ensureWindowsChunkUploadRoot(path.join(runtime, "data", ".rootark-json-audit-private"));
+  }
   fs.mkdirSync(path.join(runtime, "uploads"), { recursive: true });
   fs.mkdirSync(backupService.BACKUPS_DIR, { recursive: true });
 }
@@ -171,6 +176,7 @@ test("post-rename history durability failure preserves the archive if failed-his
   const historyPath = path.join(runtime, "data", "backup-history.json");
   const historyDirectory = path.dirname(historyPath);
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalSaveBackup = backupRepository.saveBackup;
   const originalOpenSync = fs.openSync;
   const originalFsyncSync = fs.fsyncSync;
   const originalCloseSync = fs.closeSync;
@@ -178,7 +184,14 @@ test("post-rename history durability failure preserves the archive if failed-his
   let nextFakeDescriptor = 0x7fff0000;
   let historyTemporaryOpens = 0;
 
-  Object.defineProperty(process, "platform", { ...originalPlatform, value: "linux" });
+  // Exercise the POSIX directory-fsync branch only while persisting history.
+  // Spoofing the platform for the entire backup would bypass the real Windows
+  // ACL path and send the JSON audit coordinator through POSIX mode checks.
+  backupRepository.saveBackup = function saveWithDirectoryFsync(...args) {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "linux" });
+    try { return originalSaveBackup.apply(this, args); }
+    finally { Object.defineProperty(process, "platform", originalPlatform); }
+  };
   fs.openSync = function openWithInjectedRecoveryFailure(target, flags, ...rest) {
     const targetPath = String(target);
     if (targetPath.startsWith(`${historyPath}.`) && targetPath.endsWith(".tmp")) {
@@ -214,6 +227,7 @@ test("post-rename history durability failure preserves the archive if failed-his
   } catch (error) {
     failure = error;
   } finally {
+    backupRepository.saveBackup = originalSaveBackup;
     fs.openSync = originalOpenSync;
     fs.fsyncSync = originalFsyncSync;
     fs.closeSync = originalCloseSync;

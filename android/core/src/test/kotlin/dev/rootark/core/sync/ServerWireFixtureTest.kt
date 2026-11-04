@@ -52,12 +52,20 @@ class ServerWireFixtureTest {
     }
 
     @Test
-    fun tombstoneHasEmptyCiphertextNotNull() {
+    fun tombstoneHasEmptyCiphertextAndPreservesSignedAuthorization() {
         val delete = body("sync.delete.200").toRecord()
         assertEquals(SyncOperationType.DELETE, delete.operation)
         assertEquals(true, delete.tombstone)
         assertEquals("", delete.ciphertext)
-        assertNull(delete.authorization)
+        // A successful signed DELETE remains authenticated even though it
+        // carries no ciphertext. Nulling the proof would silently discard
+        // the owner's device signature from the server's tombstone.
+        val proof = assertNotNull(delete.authorization, "signed DELETE must retain device proof")
+        assertEquals("rootark-sync-device-authorization-v1", proof.type)
+        assertEquals(delete.operationId, proof.operationId)
+        assertEquals(delete.deviceId, proof.deviceId)
+        assertEquals("delete", proof.operation)
+        assertTrue(proof.signature.isNotEmpty())
     }
 
     @Test
@@ -96,7 +104,7 @@ class ServerWireFixtureTest {
     fun errorBodiesCarryOnlyTheErrorText() {
         assertEquals(404, status("sync.get.404"))
         assertEquals("Sync object not found", body("sync.get.404").getString("error"))
-        assertEquals(400, status("sync.post.400.invalid"))
+        assertEquals(403, status("sync.post.403.invalid"))
     }
 
     @Test

@@ -12,7 +12,12 @@ const backupService = require("./backupService");
 const restorePreimage = require("./restorePreimage");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
+const strictAudit = require("./strictAuditSnapshot");
+const auditRepository = require("../repositories/auditRepository");
+const jsonAuditArchiveStore = require("../repositories/jsonAuditArchiveStore");
+const { JSON_AUDIT_COORDINATION_FILE } = require("../repositories/jsonAuditLock");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
+const { assertZk10LegacyBackupNotStrict, isZk10LegacyBackupStrict } = require("../src/services/zk10LegacyBackupDeny");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const RESTORE_TMP_DIR = path.join(backupService.BACKUPS_DIR, ".restore-tmp");
@@ -22,6 +27,7 @@ const WHOLE_RESTORE_ACK_ROOT = resolveRuntimePath("data", ".rootark-restore-rest
 const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
 const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
 const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
+const JSON_AUDIT_COORDINATION_DB_PREFIX = path.basename(path.dirname(JSON_AUDIT_COORDINATION_FILE)).toLowerCase();
 const RESTORABLE_ROOTS = new Set(["data", "uploads"]);
 const RESTORABLE_JSON_STATE_FILES = new Set([
   "users.json", "users.local.json", "user-generations.local.json", "pending-uploads.json",
@@ -41,6 +47,15 @@ function setCloudStorage(storage) {
 }
 
 function writeWholeRestoreCoordinator(coordinator) {
+  if (!isDbEnabled()) {
+    return auditRepository.withJsonAuditLock(
+      () => writeWholeRestoreCoordinatorUnlocked(coordinator), { allowCoordinator: true }
+    );
+  }
+  return writeWholeRestoreCoordinatorUnlocked(coordinator);
+}
+
+function writeWholeRestoreCoordinatorUnlocked(coordinator) {
   const directory = path.dirname(WHOLE_RESTORE_COORDINATOR_PATH);
   fs.mkdirSync(directory, { recursive: true });
   let previousBytes = null;
@@ -131,6 +146,50 @@ function restoreInstanceId(requiredInstances, explicitInstanceId) {
   return instanceId;
 }
 
+function restoreAuditContext(options) {
+  const input = options.auditActor || {};
+  const clean = (value, max) => typeof value === "string"
+    ? value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, max) : null;
+  return {
+    requestedAt: new Date().toISOString(),
+    actor: {
+      username: clean(options.username, 120) || clean(input.username, 120) || "system",
+      role: clean(input.role, 80),
+      ip: clean(input.ip, 120),
+      userAgent: clean(input.userAgent, 300),
+    },
+  };
+}
+
+function persistWholeRestoreTerminalAudit(coordinator) {
+  if (!coordinator?.restoreAudit) return false;
+  if (isDbEnabled()) {
+    // The post-restore SQLite barrier also applies before strict enrollment.
+    // A private FULL sidecar may be populated without loosening main writes.
+    const mainPath = getDatabasePath();
+    if (!fs.existsSync(mainPath)) return false;
+    // Legacy SQLite fixtures may predate audit_logs; they must still recover.
+    // Never fabricate a table inside the restore barrier. Strict enrollment
+    // with a missing table instead fails closed.
+    const probe = new Database(mainPath, { readonly: true, fileMustExist: true });
+    try {
+      const auditTable = probe.prepare("SELECT type FROM sqlite_master WHERE name='audit_logs'").get();
+      const strictMarker = probe.prepare("SELECT type FROM sqlite_master WHERE name='rootark_strict_sync_audit_mode'").get();
+      if (auditTable?.type !== undefined && auditTable.type !== "table") {
+        throw Error("Unexpected SQLite audit authority type during restore");
+      }
+      if (!auditTable) {
+        if (strictMarker) throw Error("Strict SQLite restore is missing its audit authority");
+        return false;
+      }
+    } finally { probe.close(); }
+  }
+  // JSON mode persists the same deterministic outcome atomically in the
+  // restored JSON audit history, before coordinator removal.
+  auditRepository.persistTerminalRestoreAudit(coordinator);
+  return true;
+}
+
 function requiresProviderOrphanPolicyAtStartup(startupState) {
   if (!startupState?.restartRequired) return false;
   const coordinator = startupState.coordinator || {};
@@ -147,7 +206,7 @@ function assertWholeRestorePersistenceMode(coordinator) {
   }
 }
 
-function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], providerPolicyRequired = false, phase = "preparing" }) {
+function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], providerPolicyRequired = false, phase = "preparing", restoreAudit = null }) {
   return writeWholeRestoreCoordinator({
     version: WHOLE_RESTORE_COORDINATOR_VERSION,
     transactionId: crypto.randomUUID(),
@@ -157,6 +216,7 @@ function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, pr
     preRestoreBackupId: preRestoreBackupId == null ? null : String(preRestoreBackupId),
     providerReconciliation,
     providerPolicyRequired: Boolean(providerPolicyRequired),
+    ...(restoreAudit ? { restoreAudit } : {}),
     startedAt: new Date().toISOString(),
   });
 }
@@ -228,7 +288,7 @@ function restorableDataNames(extractedRoot) {
   if (!fs.existsSync(extractedData)) return [...names].sort();
   for (const name of fs.readdirSync(extractedData)) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName.startsWith(JSON_AUDIT_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     if (path.basename(name) !== name || name === "." || name === "..") throw new Error("Restore archive contains an unsafe data filename");
     const source = path.join(extractedData, name);
     const stat = fs.lstatSync(source);
@@ -288,7 +348,7 @@ function wholePreimagePlan(extractedRoot, quarantinePlan) {
   if (quarantinePlan) domains.push("quarantine-files", "quarantine-tree");
   domains.push("data-files");
   if (pathExists(path.join(extractedRoot, "uploads"))) domains.push("uploads-tree");
-  if (isDbEnabled()) domains.push("database-files");
+  if (isDbEnabled()) domains.push("audit-sidecar-files", "database-files");
   return { domains, dataFiles: [...new Set([...restorableDataNames(extractedRoot), ...obsoleteJsonStateNames(extractedRoot), path.basename(restoreProviderOrphans.POLICY_PATH), path.basename(restoreProviderOrphans.STATE_PATH)])].sort() };
 }
 
@@ -365,6 +425,16 @@ function createWholeRestorePreimages(coordinator, extractedRoot, quarantinePlan,
     onDomainComplete("uploads-tree");
   }
 
+  if (plan.domains.includes("audit-sidecar-files")) {
+    const destination = strictAudit.journalPath(getDatabasePath());
+    domains.push({
+      name: "audit-sidecar-files",
+      kind: "files",
+      root: path.dirname(destination),
+      files: restorePreimage.snapshotFileSet(SQLITE_SUFFIXES.map((suffix) => `${destination}${suffix}`), stagePath("audit-sidecar-files")),
+    });
+    onDomainComplete("audit-sidecar-files");
+  }
   if (plan.domains.includes("database-files")) {
     closeDb();
     const databasePath = path.resolve(getDatabasePath());
@@ -410,6 +480,7 @@ function validateWholeRestorePreimages(coordinator, manifest) {
   const quarantineRoot = path.resolve(validateQuarantineDestination(getUploadQuarantineDir()));
   const uploadsRoot = path.resolve(resolveRuntimePath("uploads"));
   const databasePath = path.resolve(getDatabasePath());
+  const auditPath = strictAudit.journalPath(databasePath);
   for (const domain of manifest.domains) {
     const snapshotRoot = path.join(preimageRoot, domain.name);
     if (domain.name === "data-files" || domain.name === "quarantine-files") {
@@ -432,6 +503,21 @@ function validateWholeRestorePreimages(coordinator, manifest) {
         const entry = domain.files[index];
         if (typeof entry.existed !== "boolean" || entry.destination !== `${databasePath}${SQLITE_SUFFIXES[index]}`) throw new Error("Whole-restore database pre-image target is invalid");
         if (entry.existed && (entry.stagedName !== String(index) || !/^[a-f0-9]{64}$/.test(entry.sha256 || "") || restorePreimage.hashFile(path.join(snapshotRoot, entry.stagedName)) !== entry.sha256)) throw new Error("Whole-restore database pre-image failed integrity verification");
+      }
+    } else if (domain.name === "audit-sidecar-files") {
+      if (!isDbEnabled() || domain.kind !== "files" || path.resolve(domain.root) !== path.dirname(auditPath)
+        || !Array.isArray(domain.files) || domain.files.length !== SQLITE_SUFFIXES.length) {
+        throw Error("Whole-restore strict audit pre-image is invalid");
+      }
+      for (let index = 0; index < SQLITE_SUFFIXES.length; index += 1) {
+        const entry = domain.files[index];
+        if (typeof entry.existed !== "boolean" || entry.destination !== `${auditPath}${SQLITE_SUFFIXES[index]}`) {
+          throw Error("Whole-restore strict audit pre-image target is invalid");
+        }
+        if (entry.existed && (entry.stagedName !== String(index) || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")
+          || restorePreimage.hashFile(path.join(snapshotRoot, entry.stagedName)) !== entry.sha256)) {
+          throw Error("Whole-restore strict audit pre-image failed integrity verification");
+        }
       }
     } else if (domain.name === "uploads-tree" || domain.name === "quarantine-tree") {
       const target = domain.name === "uploads-tree" ? uploadsRoot : quarantineRoot;
@@ -531,7 +617,8 @@ function assertNoPendingWholeRestore(options = {}) {
       const current = readWholeRestoreCoordinator();
       if (!current || current.transactionId !== coordinator.transactionId || current.phase !== "preparing") throw new Error("Whole-restore preparation changed during startup");
       cleanupWholeRestorePreimages(current.transactionId);
-      completeWholeRestoreCoordinator(current);
+      const cancelled = updateWholeRestoreCoordinator(current, { phase: "cancelled" });
+      completeWholeRestoreCoordinator(cancelled);
       return { recovered: true, reason: "incomplete_preimage_preparation" };
     } finally { release(); }
   }
@@ -560,6 +647,11 @@ function completeWholeRestoreCoordinator(expectedCoordinator = null) {
   if (!/^[a-f0-9-]{36}$/i.test(String(current.transactionId || ""))) {
     throw new Error("Whole-restore coordinator is ambiguous; startup blocked for manual recovery");
   }
+  // The coordinator remains durable until the final audit is in the FULL
+  // sidecar. On rollback this runs after the original SQLite pre-images are
+  // restored; on restart_required it confirms the committed outcome. A crash
+  // during cleanup retries the same deterministic event without duplication.
+  persistWholeRestoreTerminalAudit(current);
   cleanupRestoreExtraction(current.backupId);
   const ackDirectory = path.join(WHOLE_RESTORE_ACK_ROOT, current.transactionId);
   fs.rmSync(ackDirectory, { recursive: true, force: true });
@@ -800,6 +892,20 @@ async function refreshPendingRestoreDownloadFences() {
 }
 
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
+  // This startup path bypasses the public processRestoreSync wrapper. Under
+  // strict mode, avoid ALL provider I/O. An idle, already-known inventory
+  // should still let the app boot (legacy endpoints remain deny-only), but
+  // unknown inventory or a pending restore queue must remain blocked.
+  if (isZk10LegacyBackupStrict()) {
+    const status = restoreProviderOrphans.getInventoryStatus();
+    const pendingQueue = backupRepository.listBackups().some((backup) => {
+      const sync = backup.metadata?.restoreSync;
+      return sync && !["completed", "cancelled"].includes(sync.state)
+        && (sync.entries || []).some((entry) => !["completed", "cancelled"].includes(entry.state));
+    });
+    if (status.state === "unknown" || pendingQueue) assertZk10LegacyBackupNotStrict();
+    return { state: status.state, changed: false };
+  }
   if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   const previousStatus = restoreProviderOrphans.getInventoryStatus();
   let status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
@@ -998,6 +1104,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     if (!hasEligibleEntry && !allCompleted) break;
     const revision = Number(sync?.revision) || 0;
     const priorAttempts = new Map(entries.map((entry) => [entry.entryId, Number(entry.attempts) || 0]));
+    assertZk10LegacyBackupNotStrict();
     selectedBackup = await processRestoreSyncInternal(
       { backupId: selectedBackupId, clock, uploader: contextBoundCloudStorage },
       STARTUP_INVENTORY_RECONCILIATION,
@@ -1013,7 +1120,9 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     throw new Error(`Selected archive uploads are not fully reconciled (${sync?.state || "missing"}); cloud access remains blocked`);
   }
   const selectedUploads = new Set(sync.entries.map((entry) => restoreProviderOrphans.identityKey(entry.area, entry.folderId, entry.name)));
+  assertZk10LegacyBackupNotStrict();
   const inventory = await contextBoundCloudStorage.inventory();
+  assertZk10LegacyBackupNotStrict();
   if (!Array.isArray(inventory)) throw new Error("Cloud provider inventory is invalid; cloud access remains blocked");
   const normalizedInventory = restoreProviderOrphans.normalizeObjects(inventory
     .filter((entry) => ["uploads", "temp"].includes(entry.area))
@@ -1150,6 +1259,10 @@ function cancelRestoreSync(backupId, reason = "cancelled", { clock } = {}) {
 const STARTUP_INVENTORY_RECONCILIATION = Symbol("startup-inventory-reconciliation");
 
 async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}, authority) {
+  // Mandatory physical source-of-work boundary, including the privileged
+  // STARTUP_INVENTORY_RECONCILIATION caller which intentionally does not use
+  // the public processRestoreSync() method.
+  assertZk10LegacyBackupNotStrict();
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
@@ -1168,6 +1281,7 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
     }
     operationProvider = bindProviderContext(provider, expectedProviderContext);
   }
+  assertZk10LegacyBackupNotStrict();
   if (restoreProviderOrphans.isInventoryUnknown(provider) && authority !== STARTUP_INVENTORY_RECONCILIATION) restoreProviderOrphans.assertProviderAvailable(provider);
   if (latest.metadata.restoreSync.entries?.length
     && latest.metadata.restoreSync.entries.every((entry) => entry.state === "completed")
@@ -1192,12 +1306,14 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
   const now = typeof clock === "function" ? clock() : clock?.now ? clock.now() : Date.now();
   const providerIdentity = String(provider.provider || provider.name || "cloud").toLowerCase();
   for (const candidate of latest.metadata.restoreSync.entries || []) {
+    assertZk10LegacyBackupNotStrict();
     if (candidate.state === "completed") continue;
     if (candidate.nextAttemptAt && new Date(candidate.nextAttemptAt).getTime() > now) continue;
     const lease = claimSyncEntry(backupId, candidate.entryId, { now, leaseMs, workerId, providerIdentity });
     if (!lease) continue;
     try {
       const reconcileObject = async () => {
+        assertZk10LegacyBackupNotStrict();
         const localPath = resolveRuntimePath(lease.entry.path);
         const sourceStat = fs.lstatSync(localPath, { throwIfNoEntry: false });
         if (!sourceStat?.isFile() || sourceStat.isSymbolicLink()) {
@@ -1235,8 +1351,12 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
               if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) return false;
             }
           }
+          // Never rely on a pre-await check: a background reconciliation can
+          // change strict state while hashing or reserving a Drive file ID.
+          assertZk10LegacyBackupNotStrict();
           const uploaded = await operationProvider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
             providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
+          assertZk10LegacyBackupNotStrict();
           if (!uploaded) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
           if (lease.entry.sourceHash && await backupService.calculateFileHash(localPath) !== lease.entry.sourceHash) {
             throw Object.assign(new Error("restore source changed during upload"), { code: "source_unavailable" });
@@ -1273,7 +1393,10 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
       if (error.code?.startsWith("backup_")) throw error;
       const current = backupRepository.getBackup(backupId);
       const entry = current?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId && value.leaseToken === lease.token);
-      if (!entry) continue;
+      if (!entry) {
+        if (error.code === "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE") throw error;
+        continue;
+      }
       const attempts = Math.max(1, Number(entry.attempts) || 1);
       const failureCategory = ["source_unavailable", "configuration"].includes(error.code) ? error.code : "provider_error";
       const at = syncNow(clock);
@@ -1291,6 +1414,9 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
       } catch (mutationError) {
         if (!["backup_revision_conflict", "backup_state_conflict", "backup_lease_conflict", "backup_mutation_conflict"].includes(mutationError.code)) throw mutationError;
       }
+      // A strict fence is not a transient provider outage. After releasing
+      // the durable lease into retry_wait, propagate denial to startup.
+      if (error.code === "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE") throw error;
     }
     latest = backupRepository.getBackup(backupId) || latest;
   }
@@ -1298,6 +1424,9 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
 }
 
 async function processRestoreSync(options = {}) {
+  // Restarted cloud-reconciliation workers must not replay unverified backup
+  // corpus into provider storage while strict cutover is requested.
+  assertZk10LegacyBackupNotStrict();
   return processRestoreSyncInternal(options);
 }
 
@@ -1327,6 +1456,7 @@ function assertSafeZipPath(entryPath) {
     || normalizedFolded === `data/${BACKUP_METADATA_LOCK_NAME}`
     || normalizedFolded.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)
     || normalizedFolded.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)
+    || normalizedFolded.startsWith(`data/${JSON_AUDIT_COORDINATION_DB_PREFIX}`)
     || normalizedFolded === `data/${path.basename(restoreProviderOrphans.POLICY_PATH)}`
     || normalizedFolded === `data/${path.basename(restoreProviderOrphans.STATE_PATH)}`
     || normalizedFolded.startsWith("data/.rootark-active-requests/")
@@ -1453,6 +1583,7 @@ async function validateBackupArchive(backup, archivePath) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) throw new Error("Manifest invalido");
   const destinations = new Set();
   let hasSqlitePrimary = false;
+  let hasStrictAuditSidecar = false;
   for (const entry of zip.files) {
     if (isZipSymlink(entry)) throw new Error(`Symlink bloqueado no backup: ${entry.path}`);
     const safePath = assertSafeZipPath(entry.path);
@@ -1461,11 +1592,17 @@ async function validateBackupArchive(backup, archivePath) {
     destinations.add(destinationKey);
     const foldedPath = safePath.toLowerCase();
     if (foldedPath.startsWith("data/rootark.sqlite")) {
-      if (safePath !== "data/rootark.sqlite") {
+      if (safePath === strictAudit.ARCHIVE_ENTRY) {
+        if (entry.type === "Directory") throw Error("Strict audit snapshot must be a regular file");
+        hasStrictAuditSidecar = true;
+      } else if (safePath === "data/rootark.sqlite.audit-private/" && entry.type === "Directory") {
+        // The only permitted directory under the protected SQLite namespace.
+      } else if (safePath !== "data/rootark.sqlite") {
         throw new Error(`Non-canonical SQLite database or sidecar entry: ${entry.path}`);
+      } else {
+        if (entry.type === "Directory") throw new Error("SQLite database payload must be a regular file");
+        hasSqlitePrimary = true;
       }
-      if (entry.type === "Directory") throw new Error("SQLite database payload must be a regular file");
-      hasSqlitePrimary = true;
     }
   }
   const manifestBackupId = String(manifest.backup_id || "");
@@ -1475,6 +1612,13 @@ async function validateBackupArchive(backup, archivePath) {
     throw new Error("Manifest do backup nao corresponde ao backup selecionado");
   }
   const persistenceMode = validatePersistenceMode(manifest, hasSqlitePrimary);
+  if (hasStrictAuditSidecar) {
+    if (persistenceMode !== "sqlite" || !/^[a-f0-9]{64}$/.test(manifest.strict_audit_sha256 || "")) {
+      throw Error("Strict audit backup manifest is incomplete");
+    }
+  } else if (manifest.strict_audit_sidecar === true || Object.hasOwn(manifest, "strict_audit_sha256")) {
+    throw Error("Strict audit backup is missing its mandatory sidecar");
+  }
   const archivePayloads = await validateIncludedFiles(zip, manifest);
   await attestCiphertextOnlyArchive(zip);
   return { zip, manifest, persistenceMode, archivePayloads };
@@ -1698,7 +1842,7 @@ function restoreDataFiles(extractedRoot, obsoleteJsonPreimages, onFile = null) {
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.existsSync(extractedData) ? fs.readdirSync(extractedData) : []) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName.startsWith(JSON_AUDIT_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {
@@ -2211,6 +2355,362 @@ function validateDatabase(pathname) {
   }
 }
 
+function validateStrictAuditRestoreArchive(extractedRoot, manifest) {
+  if (!isDbEnabled()) return { source: null, strict: false, liveStrict: false };
+  const primary = path.join(extractedRoot, "data", "rootark.sqlite");
+  const archiveStrict = strictAudit.inspectPrimary(primary);
+  const currentPrimary = getDatabasePath();
+  const liveStrict = fs.existsSync(currentPrimary) && strictAudit.inspectPrimary(currentPrimary);
+  if (liveStrict && !archiveStrict) {
+    throw Error("Restore would roll back the enrolled strict audit authority");
+  }
+  const source = path.join(extractedRoot, ...strictAudit.ARCHIVE_ENTRY.split("/"));
+  const included = fs.existsSync(source);
+  if (archiveStrict && !included) throw Error("Strict audit archive requires its durable journal");
+  if (manifest.strict_audit_sidecar === true && !archiveStrict) throw Error("Strict audit archive marker mismatch");
+  if (included) {
+    if (!/^[a-f0-9]{64}$/.test(manifest.strict_audit_sha256 || "")
+      || strictAudit.sha256(source) !== manifest.strict_audit_sha256) throw Error("Strict audit archive digest mismatch");
+    strictAudit.verifyAuditDatabase(source);
+  }
+  return { source: included ? source : null, primary, strict: archiveStrict, liveStrict };
+}
+
+function stableAuditValue(value) {
+  if (Array.isArray(value)) return value.map(stableAuditValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableAuditValue(value[key])]));
+  }
+  return value;
+}
+
+function sameAuditEvidence(left, right, mainStructured = false) {
+  const a = mainStructured ? auditRepository.normalizeMainAuditLog(left) : left;
+  const b = mainStructured ? auditRepository.normalizeMainAuditLog(right) : right;
+  return JSON.stringify(stableAuditValue(a)) === JSON.stringify(stableAuditValue(b));
+}
+
+function collectCurrentSqliteAuditEvidence() {
+  // Both enrolled and older unmarked SQLite journals hold acknowledged
+  // evidence. Include pending, active and historical records before restore.
+  const records = new Map();
+  let bytes = 0;
+  for (const { log: entry, source } of auditRepository.loadAllAuditEvidenceForRestore()) {
+    if (typeof entry?.id !== "string" || !entry.id || entry.id.length > 128
+      || typeof entry.eventType !== "string") throw Error("Current strict audit evidence is invalid");
+    const serializedBytes = Buffer.byteLength(JSON.stringify(entry));
+    if (serializedBytes > 64 * 1024) throw Error("Current SQLite audit evidence exceeds entry capacity");
+    const previous = records.get(entry.id);
+    if (previous && !sameAuditEvidence(previous.log, entry, previous.source === "main" || source === "main")) {
+      throw Error("Current strict audit collision has divergent evidence");
+    }
+    if (!previous || (previous.source === "main" && source !== "main")) {
+      if (previous) bytes -= Buffer.byteLength(JSON.stringify(previous.log));
+      bytes += serializedBytes;
+      if (bytes > strictAudit.MAX_ARCHIVED_BYTES) throw Error("Current SQLite audit evidence exceeds byte capacity");
+      records.set(entry.id, { log: entry, source });
+    }
+  }
+  if (records.size > strictAudit.MAX_AUDIT_RECORDS) throw Error("Current strict audit evidence exceeds retention capacity");
+  return [...records.values()];
+}
+
+function assertRestoredAuditCollisionFree(archive, currentEvidence) {
+  const sidecar = archive.source
+    ? new Database(archive.source, { readonly: true, fileMustExist: true })
+    : null;
+  const primary = new Database(archive.primary, { readonly: true, fileMustExist: true });
+  try {
+    const seen = new Map();
+    const add = (log, source) => {
+      if (typeof log?.id !== "string" || !log.id || log.id.length > 128 || typeof log.eventType !== "string") {
+        throw Error("Strict audit restore evidence is invalid");
+      }
+      const old = seen.get(log.id);
+      if (old && !sameAuditEvidence(log, old.log, source === "main" || old.source === "main")) {
+        throw Error("Strict audit collision has divergent evidence");
+      }
+      if (!old || (old.source === "main" && source !== "main")) seen.set(log.id, { log, source });
+    };
+    // Compare ALL intersections in the selected archive, including IDs not
+    // present in the current runtime. Archived-ID pruning must not conceal a
+    // different pending or main event restored under the same identifier.
+    if (sidecar) {
+      for (const row of sidecar.prepare("SELECT id,event FROM pending_audit").iterate()) add(JSON.parse(row.event), "pending");
+      for (const row of sidecar.prepare("SELECT id,event FROM archived_audit").iterate()) add(JSON.parse(row.event), "archived");
+    }
+    if (auditRepository.hasMainAuditTableForRestore(primary)) {
+      for (const row of primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+        target_type, target_id, action, result, timestamp, details_json FROM audit_logs`).iterate()) {
+        add(auditRepository.rowToLog(row), "main");
+      }
+    }
+    for (const { log, source } of currentEvidence) {
+      add(log, source);
+    }
+  } finally { primary.close(); sidecar?.close(); }
+}
+
+// The legacy JSON archive imported into SQLite is deliberately independent of
+// the capped strict audit sidecar. Merge its evidence into the extracted
+// primary before replacing the live SQLite file, so restoring an older backup
+// cannot erase previously acknowledged archived events. Stream rows under a
+// single SQLite transaction; the complete archive may exceed 512 MiB.
+function reconcileMigratedJsonAuditForRestore(archive, currentEvidence) {
+  const live = new Database(getDatabasePath(), { readonly: true, fileMustExist: true });
+  let restored;
+  let journal;
+  try {
+    const liveHas = auditRepository.hasMigratedJsonArchive(live);
+    restored = new Database(archive.primary, { fileMustExist: true });
+    const restoredHas = auditRepository.hasMigratedJsonArchive(restored);
+    const auditMarker = (db) => db.prepare("SELECT type FROM sqlite_master WHERE name='legacy_json_sqlite_audit_import'").get();
+    if (Boolean(auditMarker(live)) !== liveHas) {
+      throw Error("Live migrated JSON audit archive authority/marker mismatch");
+    }
+    if (!liveHas && !restoredHas && !auditMarker(restored)) return;
+    // A pre-archive-migration SQLite backup has only the old v1 JSON import
+    // marker. Adding a migrated archive table to it without the separate
+    // enrollment marker would make every subsequent migrate() fail closed.
+    // Refuse that backup before any local state is replaced. The caller can
+    // select a post-migration backup with a complete authority+marker pair.
+    const markerType = auditMarker(restored);
+    if (!restoredHas || markerType?.type !== "table") {
+      throw Error("Selected SQLite backup predates migrated JSON audit archive authority; refusing restore");
+    }
+    const auditMarkers = restored.prepare("SELECT id,version,source_sha256 FROM legacy_json_sqlite_audit_import").all();
+    if (auditMarkers.length !== 1 || auditMarkers[0].id !== 1 || auditMarkers[0].version !== 1
+      || !/^[a-f0-9]{64}$/.test(auditMarkers[0].source_sha256)) {
+      throw Error("Invalid selected SQLite migrated JSON audit enrollment marker");
+    }
+    if (liveHas) {
+      const liveMarkers = live.prepare("SELECT id,version,source_sha256 FROM legacy_json_sqlite_audit_import").all();
+      if (auditMarker(live)?.type !== "table" || liveMarkers.length !== 1
+        || liveMarkers[0].id !== 1 || liveMarkers[0].version !== 1
+        || !/^[a-f0-9]{64}$/.test(liveMarkers[0].source_sha256)) {
+        throw Error("Invalid live migrated JSON audit enrollment marker");
+      }
+    }
+    journal = archive.source ? new Database(archive.source, { readonly: true, fileMustExist: true }) : null;
+
+    const currentlyActive = new Map(currentEvidence.map(({ log, source }) => [log.id, { log, source }]));
+    const selectedMain = auditRepository.hasMainAuditTableForRestore(restored)
+      ? restored.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+          target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`)
+      : null;
+    const selectedPending = journal?.prepare("SELECT event FROM pending_audit WHERE id=?");
+    const selectedArchived = journal?.prepare("SELECT event FROM archived_audit WHERE id=?");
+    const liveLegacy = liveHas
+      ? live.prepare("SELECT event FROM legacy_json_audit_archive WHERE id=?") : null;
+
+    const verifyEvent = (log, id) => {
+      if (!log || typeof id !== "string" || !id || Buffer.byteLength(id) > 512
+        || log.id !== id || typeof log.eventType !== "string"
+        || Buffer.byteLength(JSON.stringify(log)) > 64 * 1024) {
+        throw Error("Invalid migrated JSON audit restore evidence");
+      }
+      return log;
+    };
+    const ensureSame = (left, right, main = false) => {
+      if (!sameAuditEvidence(left, right, main)) {
+        throw Error("Migrated JSON audit restore identity collision");
+      }
+    };
+    const checkOtherEvidence = (event) => {
+      const active = currentlyActive.get(event.id);
+      if (active) ensureSame(active.log, event, active.source === "main");
+      const main = selectedMain?.get(event.id);
+      if (main) ensureSame(auditRepository.rowToLog(main), event, true);
+      for (const find of [selectedPending, selectedArchived]) {
+        const other = find?.get(event.id);
+        if (other) ensureSame(JSON.parse(other.event), event);
+      }
+    };
+
+    restored.transaction(() => {
+      if (!restoredHas) {
+        restored.exec("CREATE TABLE legacy_json_audit_archive (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+      }
+      const getSelected = restored.prepare("SELECT event FROM legacy_json_audit_archive WHERE id=?");
+      const addSelected = restored.prepare("INSERT INTO legacy_json_audit_archive(id,event) VALUES (?,?)");
+      // Check *all* archived IDs from the selected backup, even where the
+      // current live archive has no match. They may collide with live or
+      // selected primary/sidecar evidence.
+      for (const { id, event } of restored.prepare("SELECT id,event FROM legacy_json_audit_archive").iterate()) {
+        const record = verifyEvent(JSON.parse(event), id);
+        checkOtherEvidence(record);
+        const older = liveLegacy?.get(id);
+        if (older) ensureSame(verifyEvent(JSON.parse(older.event), id), record);
+      }
+      if (liveHas) {
+        for (const { id, event } of live.prepare("SELECT id,event FROM legacy_json_audit_archive").iterate()) {
+          const record = verifyEvent(JSON.parse(event), id);
+          checkOtherEvidence(record);
+          const selected = getSelected.get(id);
+          if (selected) ensureSame(verifyEvent(JSON.parse(selected.event), id), record);
+          else addSelected.run(id, event);
+        }
+      }
+    }).immediate();
+  } finally {
+    journal?.close();
+    restored?.close();
+    live.close();
+  }
+}
+
+function assertPrivateAuditStage(staged, descriptor) {
+  const pinned = fs.fstatSync(descriptor, { bigint: true });
+  const linked = fs.lstatSync(staged, { bigint: true });
+  if (!pinned.isFile() || pinned.nlink !== 1n
+    || !linked.isFile() || linked.isSymbolicLink() || linked.nlink !== 1n
+    || pinned.dev !== linked.dev || pinned.ino !== linked.ino
+    || (process.platform !== "win32" && (pinned.mode & 0o077n) !== 0n)) {
+    throw Error("Private strict audit staging file changed or is aliased");
+  }
+}
+
+function assertPinnedAuditStageDigest(staged, descriptor, expectedSha256) {
+  assertPrivateAuditStage(staged, descriptor);
+  const before = fs.fstatSync(descriptor, { bigint: true });
+  const digest = crypto.createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let offset = 0;
+  let count;
+  while ((count = fs.readSync(descriptor, buffer, 0, buffer.length, offset)) > 0) {
+    digest.update(buffer.subarray(0, count));
+    offset += count;
+  }
+  const after = fs.fstatSync(descriptor, { bigint: true });
+  assertPrivateAuditStage(staged, descriptor);
+  if (BigInt(offset) !== before.size || after.size !== before.size
+    || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs
+    || after.dev !== before.dev || after.ino !== before.ino || after.nlink !== before.nlink
+    || digest.digest("hex") !== expectedSha256) {
+    throw Error("Private strict audit stage digest or identity changed after copy");
+  }
+}
+
+function restoreStrictAuditSidecar(archive, currentEvidence, transactionId) {
+  if (!archive.source && !currentEvidence.length) return false;
+  const destination = strictAudit.journalPath(getDatabasePath());
+  const directory = path.dirname(destination);
+  if (process.platform === "win32") {
+    const { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree } = require("./chunkUploadWindowsAcl");
+    ensureWindowsChunkUploadRoot(directory);
+    verifyWindowsChunkUploadTree(directory);
+  } else {
+    restorePreimage.ensureSafeDirectory(directory, { create: true });
+    const info = fs.lstatSync(directory);
+    if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0) {
+      throw Error("Private strict audit directory is unsafe");
+    }
+  }
+  const staged = `${destination}.restore-stage-${transactionId}`;
+  let stageDescriptor;
+  let createdStage = false;
+  try {
+    if (archive.source) {
+      const expectedSha256 = strictAudit.sha256(archive.source);
+      restorePreimage.copyVerifiedFile(archive.source, staged, expectedSha256);
+      createdStage = true;
+      stageDescriptor = fs.openSync(staged, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
+      // copyVerifiedFile closes its O_EXCL destination descriptor. Reopening
+      // the path must re-attest the actual bytes on the new pinned descriptor:
+      // another regular nlink=1 file could have replaced the verified copy.
+      assertPinnedAuditStageDigest(staged, stageDescriptor, expectedSha256);
+    } else {
+      // Older backups may predate creation of the unmarked journal. Build a
+      // private empty destination and carry all live evidence into it.
+      stageDescriptor = fs.openSync(staged,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0), 0o600);
+      createdStage = true;
+    }
+    assertPrivateAuditStage(staged, stageDescriptor);
+    const db = new Database(staged, { fileMustExist: true });
+    let primary;
+    try {
+      // SQLite reopens by pathname. Before its first SQL statement, verify
+      // that the path still names the exact exclusive-created private inode.
+      assertPrivateAuditStage(staged, stageDescriptor);
+      primary = new Database(archive.primary, { readonly: true, fileMustExist: true });
+      if (!archive.source) {
+        db.pragma("journal_mode = WAL");
+        db.pragma("synchronous = FULL");
+        db.exec("CREATE TABLE pending_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL);"
+          + "CREATE TABLE archived_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+      }
+      // A restore must never erase acknowledged records logged after the
+      // selected backup. Carry forward them into the private archive.
+      const archived = db.prepare("SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(CAST(event AS BLOB))),0) AS bytes FROM archived_audit").get();
+      let count = archived.count;
+      let bytes = archived.bytes;
+      const exists = db.prepare("SELECT event FROM archived_audit WHERE id=?");
+      const pending = db.prepare("SELECT event FROM pending_audit WHERE id=?");
+      const main = auditRepository.hasMainAuditTableForRestore(primary)
+        ? primary.prepare(`SELECT id, event_type, severity, actor_username, actor_ip,
+          target_type, target_id, action, result, timestamp, details_json FROM audit_logs WHERE id=?`)
+        : null;
+      const put = db.prepare("INSERT INTO archived_audit (id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
+      db.transaction(() => {
+        for (const { log: entry, source } of currentEvidence) {
+          const serialized = JSON.stringify(entry);
+          const saved = exists.get(entry.id);
+          const pendingRow = pending.get(entry.id);
+          const mainRow = main?.get(entry.id);
+          for (const match of [
+            saved && { log: JSON.parse(saved.event), source: "archived" },
+            pendingRow && { log: JSON.parse(pendingRow.event), source: "pending" },
+            mainRow && { log: auditRepository.rowToLog(mainRow), source: "main" },
+          ]) {
+            if (match && !sameAuditEvidence(match.log, entry, match.source === "main" || source === "main")) {
+              throw Error("Strict audit collision has divergent evidence");
+            }
+          }
+          // Identical evidence already in the selected backup survives as-is.
+          // Copying its pending/main form into archived_audit would both
+          // suppress a still-active event and risk a raw/normalized mismatch.
+          if (saved || pendingRow || mainRow) {
+            continue;
+          }
+          if (Buffer.byteLength(serialized) > 64 * 1024
+            || ++count > strictAudit.MAX_AUDIT_RECORDS
+            || (bytes += Buffer.byteLength(serialized)) > strictAudit.MAX_ARCHIVED_BYTES) {
+            throw Error("Restored audit archive capacity cannot preserve current evidence");
+          }
+          put.run(entry.id, serialized);
+        }
+      })();
+    } finally {
+      try { primary?.close(); }
+      finally { db.close(); }
+    }
+    assertPrivateAuditStage(staged, stageDescriptor);
+    strictAudit.verifyAuditDatabase(staged, { requireWal: true });
+    assertPrivateAuditStage(staged, stageDescriptor);
+    fs.fsyncSync(stageDescriptor);
+    // Whole-restore pre-images were durably committed before this point. Any
+    // crash in the WAL removal/replacement window invokes coordinator rollback
+    // restoring ALL three former sidecar files along with the primary DB.
+    for (const suffix of SQLITE_SUFFIXES.slice(1)) {
+      const live = `${destination}${suffix}`;
+      if (fs.existsSync(live)) fs.rmSync(live, { force: false });
+    }
+    if (fs.existsSync(destination)) fs.rmSync(destination, { force: false });
+    assertPrivateAuditStage(staged, stageDescriptor);
+    // Release the pinned handle before Windows renames the staged database.
+    fs.closeSync(stageDescriptor);
+    stageDescriptor = undefined;
+    renameSyncWithWindowsEpermRetry(staged, destination);
+    fsyncDirectory(directory);
+    strictAudit.verifyAuditDatabase(destination, { requireWal: true });
+    return true;
+  } finally {
+    if (stageDescriptor !== undefined) fs.closeSync(stageDescriptor);
+    if (createdStage) fs.rmSync(staged, { force: true });
+  }
+}
+
 const SQLITE_SUFFIXES = ["", "-wal", "-shm"];
 const LEGACY_RESTORE_JOURNAL_VERSION = 1;
 const RESTORE_JOURNAL_VERSION = 2;
@@ -2618,6 +3118,9 @@ function restoreDatabaseFiles(extractedRoot, options = {}) {
 }
 
 async function restoreBackup(id, options = {}) {
+  // Whole-account restore and its pre-restore ZIP cannot be attributed to a
+  // single owner. Deny before entering a persistent whole-restore state.
+  require("../src/services/zk10LegacyBackupDeny").assertZk10LegacyBackupNotStrict();
   if (String(options.confirmation || "") !== "RESTORE") {
     throw new Error("Confirmacao invalida. Digite RESTORE para restaurar.");
   }
@@ -2646,7 +3149,8 @@ async function restoreBackup(id, options = {}) {
     const { backup, archivePath } = backupService.getBackupOrThrow(id);
     const staging = restoreExtractionPaths(backup.id, { createRoot: true });
     restoreDir = staging.restoreDir;
-    coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances });
+    coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances,
+      restoreAudit: restoreAuditContext(options) });
     await options.waitForRequestQuiescence?.();
     await options.revalidateAuthorization?.();
     let providerInventory = null;
@@ -2677,6 +3181,19 @@ async function restoreBackup(id, options = {}) {
       preRestoreBackup: preRestore,
     });
     await extractArchive(zip, restoreDir);
+    // Validate the restored primary's strict marker against the only allowed
+    // audit sidecar member before preparing any destructive pre-image changes.
+    const strictAuditArchive = validateStrictAuditRestoreArchive(restoreDir, manifest);
+    // The private JSON archive delta is an acknowledged audit authority that
+    // survives whole restore. Reject a divergent selected backup before any
+    // local replacement, so restart cannot expose mismatched evidence.
+    if (persistenceMode === "json") jsonAuditArchiveStore.assertJsonRestoreCompatible(restoreDir);
+    // Drain every audit writer that started before the durable coordinator
+    // gate, before reading current evidence or copying live SQLite pre-images.
+    if (persistenceMode === "sqlite") await strictAudit.drainAuditWriters(getDatabasePath());
+    const currentAuditEvidence = persistenceMode === "sqlite" ? collectCurrentSqliteAuditEvidence() : [];
+    if (persistenceMode === "sqlite") assertRestoredAuditCollisionFree(strictAuditArchive, currentAuditEvidence);
+    if (persistenceMode === "sqlite") reconcileMigratedJsonAuditForRestore(strictAuditArchive, currentAuditEvidence);
     const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);
@@ -2721,6 +3238,16 @@ async function restoreBackup(id, options = {}) {
       throw new Error("Restore persistence mode changed before local commit");
     }
     verifyObsoleteJsonState(restoreDir, obsoleteJsonPreimages);
+    if (persistenceMode === "json") {
+      // The selected backup may predate live security events. Permanently
+      // preserve all current active and legacy archived audit evidence in the
+      // enrolled FULL/WAL delta before replacing either JSON file. This runs
+      // after pre-images and authorization, under the durable coordinator.
+      jsonAuditArchiveStore.carryForwardLiveJsonAuditForRestore(coordinator.transactionId, restoreDir, {
+        beforeCommit: () => injectFailure("restore.audit.carry-forward.before-commit"),
+      });
+      injectFailure("restore.audit.carry-forward.persisted");
+    }
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {
@@ -2742,6 +3269,17 @@ async function restoreBackup(id, options = {}) {
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "uploads" });
     if (persistenceMode === "sqlite") {
       if (!isDbEnabled()) throw new Error("SQLite database restoration is unavailable in the active runtime");
+      // Protected audit journal and main SQLite form one restore transaction:
+      // both have pre-images under the durable whole-restore coordinator.
+      // Re-open and recheck every stage before the primary database is moved.
+      if (strictAuditArchive.source || currentAuditEvidence.length) {
+        injectFailure("restore.audit.before-replacement");
+        restoreStrictAuditSidecar(strictAuditArchive, currentAuditEvidence, coordinator.transactionId);
+        coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "audit-sidecar" });
+        injectFailure("restore.audit.committed");
+      } else if (strictAuditArchive.strict) {
+        throw Error("Strict audit sidecar was lost before restore commit");
+      }
       injectFailure("restore.sqlite.before-replacement");
       const restoredDatabase = restoreDatabaseFiles(restoreDir, {
         lockHeld: true,
@@ -2783,12 +3321,14 @@ async function restoreBackup(id, options = {}) {
       selectedBackup: restoredBackup,
       preRestoreBackup: preRestore,
     });
+    const restoreOutcomeRecorded = persistWholeRestoreTerminalAudit(coordinator);
     injectFailure("restore.commit-marker.persisted");
     return {
       backup: restoredBackup,
       manifest,
       preRestore,
       restartRecommended: true,
+      restoreOutcomeRecorded,
       cloudSync,
     };
   } catch (error) {
@@ -2801,6 +3341,11 @@ async function restoreBackup(id, options = {}) {
         }
         const cancelledCoordinator = updateWholeRestoreCoordinator(activeCoordinator, { phase: "cancelled" });
         completeWholeRestoreCoordinator(cancelledCoordinator);
+        // The coordinator's terminal outcome has been handled durably in
+        // JSON or the SQLite FULL/WAL sidecar. A legacy SQLite without an
+        // audit table is explicitly not writable under the restore barrier.
+        // Do not append a second independent random-ID HTTP failure event.
+        error.restoreOutcomeRecorded = Boolean(cancelledCoordinator.restoreAudit);
       }
       catch (cleanupError) {
         error.coordinatorCleanupError = cleanupError;

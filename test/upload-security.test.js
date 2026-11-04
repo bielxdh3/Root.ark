@@ -52,7 +52,7 @@ test("dead-owner quota test preload is inert outside the test environment", () =
   assert.equal(result.status, 0, result.stderr || "production preload changed the quota factory");
 });
 
-test("release gate reports a sanitized failing test and skips redundant full tests after a required failure", () => {
+test("release gate reports categorical failed-child telemetry and skips redundant full tests", () => {
   const vm = require("node:vm");
   const { createRequire } = require("node:module");
   const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
@@ -79,14 +79,16 @@ test("release gate reports a sanitized failing test and skips redundant full tes
   }, { filename: gatePath });
   const output = printed.join("\n");
   assert.match(output, /FAIL: Upload security boundary — exit 1/);
-  assert.match(output, /a second startup rejects ambiguous quota owner/, "the exact failing test is visible in CI");
-  assert.doesNotMatch(output, /synthetic-sensitive-fixture|test-secret-value|c2Vuc2l0aXZl|synthetic-refresh-key|synthetic-access-key/, "raw test output cannot leak any fixture secrets");
-  assert.match(output, /\[REDACTED\]/, "sensitive diagnostic text is redacted rather than silently dropped");
+  assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=none reporter=none/,
+    "only allowlisted child status metadata is visible in CI");
+  assert.match(output, /raw output withheld/);
+  assert.doesNotMatch(output, /a second startup rejects ambiguous quota owner|synthetic-sensitive-fixture|test-secret-value|c2Vuc2l0aXZl|synthetic-refresh-key|synthetic-access-key|bearer/i,
+    "neither arbitrary failing test names nor fixture secrets may be logged");
   assert.equal(calls.some(({ args }) => /(?:^|\s)(?:npm(?:\.cmd)?\s+test|test(?:\s|$))/.test(args.join(" "))), false, "no expensive canonical npm test after an earlier hard failure on Windows or POSIX");
   assert.equal(simulatedProcess.exitCode, 1, "the gate still fails closed");
 });
 
-test("release gate emits a bounded redacted TAP failure from canonical npm test on Windows", () => {
+test("release gate emits bounded categorical TAP failure metadata from canonical npm test on Windows", () => {
   const vm = require("node:vm");
   const { createRequire } = require("node:module");
   const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
@@ -115,11 +117,44 @@ test("release gate emits a bounded redacted TAP failure from canonical npm test 
   const output = printed.join("\n");
   assert.ok(commands.some((line) => /(?:^|\s)(?:npm(?:\.cmd)?\s+)?test -- --test-reporter=tap(?:\s|$)/.test(line)), "canonical npm still runs every test with a deterministic TAP reporter");
   assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
-  assert.match(output, /not ok 327 - a concurrent upload boundary failed/);
-  assert.match(output, /# fail 1/);
+  assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=327:327 reporter=tap/);
+  assert.match(output, /raw output withheld/);
+  assert.doesNotMatch(output, /not ok 327|a concurrent upload boundary failed|# fail 1/,
+    "arbitrary TAP names and raw counters are never copied into CI logs");
   assert.doesNotMatch(output, new RegExp(secret), "TAP and stderr secrets are not printed");
   assert.ok(output.length < 5000, "CI failure log stays bounded");
   assert.equal(simulatedProcess.exitCode, 1);
+});
+
+test("release gate preserves early TAP failure ordinals, not names, after long diagnostics", () => {
+  const vm = require("node:vm");
+  const { createRequire } = require("node:module");
+  const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
+  const gateRequire = createRequire(gatePath);
+  const printed = [];
+  const secret = "synthetic-early-failure-secret";
+  const simulatedProcess = { execPath: process.execPath, exitCode: 0 };
+  const names = Array.from({ length: 7 }, (_, i) =>
+    `not ok ${i + 1} - WebDAV failure ${i + 1} token=${secret}`);
+  const trailing = Array.from({ length: 40 }, (_, i) => `  error: synthetic error detail ${i}`);
+  vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
+    __dirname: path.dirname(gatePath),
+    process: simulatedProcess,
+    console: { log: (line) => printed.push(String(line)) },
+    require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) =>
+      isCanonicalNpmTestInvocation(executable, args)
+        ? { status: 1, stdout: `TAP version 13\n${names.join("\n")}\n${trailing.join("\n")}\n# fail 7\n`, stderr: "" }
+        : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+  }, { filename: gatePath });
+  const output = printed.join("\n");
+  assert.match(output, /FAIL: final-head canonical npm test — exit 1/);
+  assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=1:7 reporter=tap/,
+    "bounded first/last TAP ordinals remain visible without test names");
+  assert.match(output, /raw output withheld/);
+  assert.doesNotMatch(output, /not ok|WebDAV failure|# fail 7|synthetic error detail/);
+  assert.doesNotMatch(output, new RegExp(secret));
+  assert.ok(output.length < 12000, "categorical metadata remains bounded");
+  assert.equal(simulatedProcess.exitCode, 1, "the canonical release gate must still fail closed");
 });
 
 test("release gate prints metadata-only failure diagnostics for unknown npm output", () => {
@@ -582,6 +617,7 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   const retrySweepPath = path.join(markerDir, "retry");
   t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
   const harness = await createHarness(t, {
+    waitForReady: false,
     envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "60000" },
     chunkSessions: [{
       uploadId,
@@ -601,7 +637,12 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
           fs.writeFileSync(${JSON.stringify(failurePath)}, "injected");
           throw Object.assign(new Error("injected one-time unlink failure"), { code: "EIO" });
         }
-        return unlinkSync.call(this, target, ...args);
+        const result = unlinkSync.call(this, target, ...args);
+        if (String(target).includes(${JSON.stringify(uploadId)}) && String(target).endsWith("0.part")) {
+          // Make the unlink-to-quota-release window observable across processes.
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+        }
+        return result;
       };
       global.setInterval = (callback, delay, ...args) => {
         if (String(callback).includes("cleanupExpiredChunkSessions")) {
@@ -617,7 +658,7 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
   const metadataPath = path.join(sessionDir, "metadata.json");
   const partPath = path.join(sessionDir, "0.part");
-  assert.equal(await waitForFile(failurePath), true, "startup sweep injected one unlink failure");
+  assert.equal(await waitForFile(failurePath, 30_000), true, "startup sweep injected one unlink failure");
   const firstMarker = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
   assert.deepEqual(Object.keys(firstMarker), ["__expiredAt"]);
   assert.equal(fs.existsSync(partPath), true, "part remains after the failed first sweep");
@@ -626,8 +667,9 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
     entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId
   ).length >= 2);
   fs.writeFileSync(retrySweepPath, "run", { flag: "wx", mode: 0o600 });
-  const retryDeadline = Date.now() + 3000;
-  while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  // The successful expiry audit follows part unlink and quota release in the server.
+  // Observe completion before reading quota state across processes.
+  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
   assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
   const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
@@ -636,7 +678,6 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   } finally {
     quotaDatabase.close();
   }
-  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.deepEqual(expiryEvents.map((entry) => ({ result: entry.result, details: entry.details })), [
     { result: "failure", details: { source: "sweeper" } },
     { result: "success", details: { source: "sweeper" } },
@@ -1589,9 +1630,14 @@ test("overlapping expiry sweep ticks do not start competing session-lock work", 
   assert.equal(fs.readFileSync(lockAttemptsPath, "utf8").trim().split(/\r?\n/).length, 1);
 });
 
-test("chunk-session expiry sweep yields to requests and eventually reaches later sessions", { timeout: 45_000 }, async (t) => {
+test("chunk-session expiry sweep yields to requests and eventually reaches later sessions", { timeout: 60_000 }, async (t) => {
   const sweepCount = 128;
   const sweepDelayMs = 50;
+  // The test deliberately queues sequential filesystem delays. Startup and
+  // filesystem scheduling are not guaranteed to finish within a fixed 10s on
+  // Windows under parallel tests. Bound progress by the injected workload,
+  // but never relax the normal-request responsiveness assertion below.
+  const sweepProgressBudgetMs = 10_000 + 2 * sweepCount * sweepDelayMs;
   const lastUploadId = `sweep-yield-${sweepCount - 1}`;
   const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-chunk-sweep-markers-"));
   const delayEnabledPath = path.join(markerDir, "delay-enabled");
@@ -1638,7 +1684,7 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
     `,
   });
 
-  assert.equal(await waitForFile(sweepStartedPath), true, "the periodic sweep completed eight delayed session reads");
+  assert.equal(await waitForFile(sweepStartedPath, sweepProgressBudgetMs), true, "the periodic sweep completed eight delayed session reads");
   const lastMetadataPath = path.join(harness.chunkRoot, FOLDER_ID, lastUploadId, "metadata.json");
   const lastMetadata = JSON.parse(fs.readFileSync(lastMetadataPath, "utf8"));
   lastMetadata.lastActivityAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString();
@@ -1649,10 +1695,10 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
   const response = await request(harness.port, "/login.html");
   const requestDuration = Date.now() - requestStartedAt;
   assert.equal(response.status, 200);
-  const remainingSweepDelayMs = (sweepCount - 8) * sweepDelayMs;
-  assert.ok(requestDuration < remainingSweepDelayMs / 2, `normal request took ${requestDuration}ms with at least ${remainingSweepDelayMs}ms of sequential metadata delays still queued`);
+  const requestLatencyBudgetMs = (sweepCount - 8) * 50 / 2;
+  assert.ok(requestDuration < requestLatencyBudgetMs, `normal request took ${requestDuration}ms while sequential metadata delays were still queued`);
 
-  const cleanupDeadline = Date.now() + 10_000;
+  const cleanupDeadline = Date.now() + sweepProgressBudgetMs;
   while (fs.existsSync(finalPartPath) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fs.existsSync(finalPartPath), false, "the sweep eventually processes the last expired session");
 });
@@ -2500,8 +2546,17 @@ test("chunk assembly fails closed when a session ledger path is duplicated", { t
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
-test("a valid upload can send all 2,000 allowed chunks within the configured window", { timeout: 180_000 }, async (t) => {
-  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1" } });
+// The hosted Windows runner can need more than 180 seconds for the same 2,000
+// individually authenticated requests. Keep every assertion and per-request
+// deadline; restore the bounded CI-only budget from the historical #228 test.
+const chunkBoundarySuiteTimeoutMs = process.platform === "win32" && process.env.CI === "true"
+  ? 480_000 : 180_000;
+test("a valid upload can send all 2,000 allowed chunks within the configured window",
+  { timeout: chunkBoundarySuiteTimeoutMs }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1" },
+    readyTimeout: process.platform === "win32" ? 45_000 : TIMEOUT_MS,
+  });
   const session = await login(harness.port, "uploader", harness.password);
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   t.after(() => agent.destroy());

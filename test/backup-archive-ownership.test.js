@@ -1,11 +1,12 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const originalCwd = process.cwd();
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-archive-ownership-"));
+const runtime = createPrivateAuthorityFixture("rootark-archive-ownership-");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupService = require("../services/backupService");
@@ -13,6 +14,12 @@ const backupService = require("../services/backupService");
 function reset() {
   fs.rmSync(path.join(runtime, "data"), { recursive: true, force: true });
   fs.rmSync(path.join(runtime, "uploads"), { recursive: true, force: true });
+  // The JSON audit lock caches ACL verification per process. Recreate its
+  // private directory after each reset so the cached coordinator can open.
+  fs.mkdirSync(path.join(runtime, "data"), { recursive: true });
+  if (process.platform === "win32") {
+    ensureWindowsChunkUploadRoot(path.join(runtime, "data", ".rootark-json-audit-private"));
+  }
   fs.mkdirSync(path.join(runtime, "uploads"), { recursive: true });
 }
 

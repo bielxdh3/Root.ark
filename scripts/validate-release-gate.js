@@ -6,6 +6,8 @@ const path = require("node:path");
 const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
 const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
+const { extractHostedAclFailureDiagnostics } = require("./release-gate-acl-diagnostics");
+const { summarizeUnrecognizedChild, summarizeFailedChildTests } = require("./release-gate-child-diagnostics");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -15,21 +17,26 @@ function record(name, status, details) {
   console.log(`${status}: ${name}${details ? ` — ${details}` : ""}`);
 }
 
-function failedTestDiagnostics(output) {
-  return String(output || "").split(/\r?\n/)
-    .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
-    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line))
-    .slice(-20)
-    .map((line) => line
-      .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
-      .replace(/\b(?:password|passphrase|client_secret|refresh_token|access_token|id_token|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
-      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
-      .slice(0, 240))
-    .join("\n").slice(0, 3000);
+function failedTestDiagnostics(output, tapStdout) {
+  // Every freeform TAP name, exception, path or error message is untrusted.
+  // A few secret regex replacements are not an exhaustive output allowlist;
+  // retain ONLY the already identity-pinned categorical ACL diagnostics.
+  // Other failures remain visible as finite numeric counters/ordinals below.
+  void output;
+  return [...new Set(extractHostedAclFailureDiagnostics(tapStdout))].join("\n").slice(0, 12000);
 }
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
-  const result = spawnSync(executable, args, { cwd: root, encoding: "utf8", windowsHide: true, shell, maxBuffer: 16 * 1024 * 1024 });
+  const options = { cwd: root, encoding: "utf8", windowsHide: true,
+    shell, maxBuffer: 16 * 1024 * 1024 };
+  if (name === "final-head canonical npm test"
+    && typeof process === "object" && process.platform === "win32") {
+    // Mirror the independently passing full Windows canonical runner: hosted
+    // TEMP may be a junction rejected by strict private-fixture path guards.
+    const { canonicalWindowsTestEnvironment } = require("./run-windows-canonical-tests");
+    options.env = canonicalWindowsTestEnvironment();
+  }
+  const result = spawnSync(executable, args, options);
   const output = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error?.message || ""}`.trim();
   if (result.status === 0) {
     record(name, "PASS", "exit 0");
@@ -40,13 +47,12 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
     return false;
   }
   record(name, "FAIL", `exit ${result.status ?? "unknown"}`);
-  const diagnostics = failedTestDiagnostics(output);
-  if (diagnostics) console.log(`FAIL diagnostics (${name}):\n${diagnostics}`);
-  else {
-    const code = String(result.error?.code || "none");
-    const safeCode = /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "unknown";
-    console.log(`FAIL diagnostics (${name}): unrecognized child output; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")} spawnError=${safeCode}; raw output withheld`);
-  }
+  const diagnostics = failedTestDiagnostics(output, result.stdout || "");
+  // Emit the categorical child envelope even for TAP/ACL failures; a child
+  // without trusted ACL telemetry never gets to print its arbitrary test name.
+  const identities = name === "final-head canonical npm test"
+    ? summarizeFailedChildTests(result) : "";
+  console.log(`FAIL diagnostics (${name}):\n${diagnostics ? `${diagnostics}\n` : ""}${identities ? `${identities}\n` : ""}${summarizeUnrecognizedChild(result)}; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")}; raw output withheld`);
   return false;
 }
 
@@ -132,9 +138,10 @@ for (const [name, files] of [
   ["Phase 14 backup/restore evidence", ["test/backup-restore-security.test.js"]],
 ]) command(name, process.execPath, ["--test", ...files], { blockedOnMissing: true });
 
-// npm forwards args after `--` to the unchanged `node --test` script. Stable TAP
-// reporting makes failing test names and counts parseable across Windows/CI.
-const npmTest = getNpmInvocation(["test", "--", "--test-reporter=tap"]);
+// npm forwards args after `--` to the unchanged `node --test` script. Match
+// the separately validated Windows canonical runner's bounded file concurrency
+// without filtering, skipping or weakening any of the mandatory test cases.
+const npmTest = getNpmInvocation(["test", "--", "--test-reporter=tap", "--test-concurrency=2"]);
 if (results.some((result) => result.status === "FAIL")) {
   record("final-head canonical npm test", "SKIPPED", "earlier mandatory gate failed; run after correction");
 } else {

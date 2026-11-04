@@ -978,7 +978,17 @@ test("service worker caches only the public shell and bypasses protected paths",
   for (const asset of versionedAssets) {
     let response;
     handlers.fetch({ request: { method: "GET", url: "https://rootark.test" + asset }, respondWith: (promise) => { response = promise; } });
-    assert.equal((await response).asset, new URL(asset, "https://rootark.test").pathname, `${asset} is served from the upgraded cache while offline`);
+    const canonicalUrl = new URL(asset, "https://rootark.test");
+    const publicShellCache = caches.get("rootark-public-shell-v26");
+    if (!publicShellCache.has(canonicalUrl.origin + canonicalUrl.pathname)) {
+      // A script or stylesheet referenced by a page is not automatically
+      // public-shell material. In particular, the opt-in authenticated ZK
+      // workspace and its CSS must not expand this offline cache allowlist.
+      assert.equal(response, undefined, `${asset} is not a precached public shell asset`);
+      continue;
+    }
+    assert.ok(response, `${asset} is intercepted only when explicitly precached`);
+    assert.equal((await response).asset, canonicalUrl.pathname, `${asset} is served from the upgraded cache while offline`);
   }
   let fetchWait;
   handlers.fetch({ request: { method: "GET", url: "https://rootark.test/files/private.txt" }, respondWith: (promise) => { fetchWait = promise; } });

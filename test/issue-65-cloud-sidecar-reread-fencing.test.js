@@ -1,0 +1,445 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { createCloudStorage } = require("../services/cloudStorage");
+const {
+  publishSignedCatalogSidecars, recoverSignedCatalogSidecar,
+  verifyPublishedSignedCatalogSidecars,
+} = require("../src/services/zk1CloudSignedCatalogSidecar");
+const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
+  spkiFingerprint } = require("../src/services/zk1ExternallyPinnedProviderDomains");
+
+const b64 = (value) => Buffer.from(value).toString("base64url");
+const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const PROVIDERS = ["s3", "gdrive", "webdav"];
+
+function durableFixture(directory) {
+  const scope = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(6), keyring_id: crypto.randomBytes(16) };
+  const operationId = crypto.randomBytes(16);
+  const signedCatalog = { signedCommittedProof: crypto.randomBytes(50),
+    signedSnapshot: crypto.randomBytes(64), snapshotNonce: crypto.randomBytes(32),
+    committedProofChain: [], ownerCheckpoint: null,
+    ownerHistoryCheckpoint: null, previousOwnerHistoryProof: null,
+    expectedCiphertextRoot: crypto.randomBytes(32), chunkLengths: [15] };
+  const admins = PROVIDERS.map((provider) => ({ provider,
+    keys: crypto.generateKeyPairSync("ed25519"), trustDomainId: sha(provider + ":" + b64(operationId)) }));
+  const pinset = new Zk1ExternallyPinnedProviderDomains({
+    externallyPinnedDomains: admins.map((admin) => ({
+      provider: admin.provider, trustDomainId: admin.trustDomainId,
+      administratorPublicKey: admin.keys.publicKey,
+      independentAdministratorSpkiSha256: spkiFingerprint(admin.keys.publicKey),
+    })),
+  });
+  const identities = {};
+  const targets = admins.map((admin) => {
+    const provider = admin.provider;
+    const context = sha(provider + ":reader");
+    const namespace = sha(provider + ":namespace");
+    const pinnedDriveFileId = provider === "gdrive" ? "sidecar-drive-fixed-id" : null;
+    identities[provider] = context;
+    const object = (folder, name, area) => path.join(directory, provider, area, folder, name);
+    const reader = {
+      enabled: () => true, status: () => ({ provider }),
+      zk1StorageNamespace: () => namespace,
+      resolveInventoryContext: async () => identities[provider],
+      key: (folder, name, area) => `${provider}/${area}/${folder}/${name}`,
+      async upload(source, folder, name, area, options) {
+        assert.equal(options.zk1BoundedBytes, fs.statSync(source).size);
+        if (provider === "gdrive") assert.equal(options.providerFileId, pinnedDriveFileId);
+        const target = object(folder, name, area);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(source, target);
+        return { provider, key: this.key(folder, name, area),
+          ...(provider === "gdrive" ? { id: pinnedDriveFileId } : {}) };
+      },
+      async download(folder, name, destination, area, allowWrite, options) {
+        if (provider === "gdrive") assert.equal(options.providerFileId, pinnedDriveFileId);
+        const source = object(folder, name, area);
+        if (!fs.existsSync(source) || !allowWrite()) return false;
+        const bytes = fs.readFileSync(source);
+        if (bytes.length > options.maxBytes) return false;
+        fs.writeFileSync(destination, bytes, { flag: "wx", mode: 0o600 });
+        return true;
+      },
+    };
+    const now = Math.floor(Date.now() / 1000);
+    const domainAttestation = signProviderDomainAttestation({
+      administratorPrivateKey: admin.keys.privateKey,
+      statement: { schema: "rootark-zk1-provider-domain-attestation/v1",
+        provider, trust_domain_id: admin.trustDomainId,
+        namespace_sha256: namespace, principal_context_sha256: context,
+        drive_file_id: pinnedDriveFileId,
+        ...Object.fromEntries(Object.entries(scope).map(([key, value]) => [key, b64(value)])),
+        issued_at: now - 5, expires_at: now + 600 },
+    });
+    return { provider, cloudWriter: reader, cloudReader: reader,
+      expectedContext: context, pinnedDriveFileId, domainAttestation,
+      path: object, adminSpki: b64(admin.keys.publicKey.export({ type: "spki", format: "der" })),
+      trustDomainId: admin.trustDomainId, namespace };
+  });
+  const writers = targets.map(({ provider, cloudWriter, expectedContext, pinnedDriveFileId,
+    domainAttestation }) => ({ provider, cloudWriter, expectedContext,
+    pinnedDriveFileId, domainAttestation }));
+  const readers = targets.map(({ provider, cloudReader, expectedContext, pinnedDriveFileId,
+    domainAttestation }) => ({ provider, cloudReader, expectedContext,
+    pinnedDriveFileId, domainAttestation }));
+  const publication = { scope, operationId, signedCatalog, writers,
+    providerDomainPinset: pinset };
+  // The Windows WebDAV path now performs native ACL verification in a bounded
+  // child process. Parallel CI test files can consume several seconds across
+  // three sequential providers; only this disposable fixture gets extra time.
+  const verification = { scope, operationId, signedCatalog, readers,
+    providerDomainPinset: pinset, minimumMatchingProviders: 2,
+    deadlineMs: process.platform === "win32" ? 8000 : 3000,
+    observationOnly: true };
+  return { directory, scope, operationId, signedCatalog, pinset,
+    targets, readers, identities, publication, verification };
+}
+
+test("signed sidecar recovery cannot block opening a FIFO after a checked regular file", {
+  skip: process.platform !== "linux",
+}, (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-fifo-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const child = String.raw`
+    const crypto = require('node:crypto');
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const cp = require('node:child_process');
+    const { publishSignedCatalogSidecars, recoverSignedCatalogSidecar } =
+      require('./src/services/zk1CloudSignedCatalogSidecar');
+    const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
+      spkiFingerprint } = require('./src/services/zk1ExternallyPinnedProviderDomains');
+    const PROVIDERS = ['s3','gdrive','webdav'];
+    const b64 = (value) => Buffer.from(value).toString('base64url');
+    const sha = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    const durableFixture = ` + durableFixture.toString() + String.raw`;
+    (async () => {
+      const f = durableFixture(process.argv[1]);
+      await publishSignedCatalogSidecars(f.publication);
+      const original = fs.lstatSync;
+      let swapped = false;
+      fs.lstatSync = function(file, ...args) {
+        const stat = original.call(this,file,...args);
+        if (!swapped && typeof file === 'string'
+          && /^catalog-\d+\.ct$/.test(path.basename(file))) {
+          swapped = true;
+          fs.unlinkSync(file);
+          cp.execFileSync('mkfifo',[file]);
+        }
+        return stat;
+      };
+      try { await recoverSignedCatalogSidecar(f.verification); }
+      catch (_) {}
+      process.exit(swapped ? 0 : 4);
+    })().catch(() => process.exit(5));
+  `;
+  const outcome = spawnSync(process.execPath, ["-e", child, dir], {
+    cwd: path.resolve(__dirname, ".."), timeout: 10000, encoding: "utf8", windowsHide: true,
+  });
+  assert.equal(outcome.status, 0,
+    `recovered sidecar must not hang on a FIFO (signal=${outcome.signal}, error=${outcome.error?.code}, stderr=${outcome.stderr})`);
+});
+
+test("signed catalog quorum uses distinct exclusive leaves under one private recovery root", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-staging-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const destinations = [];
+  const readers = fixture.verification.readers.map((target) => ({ ...target,
+    cloudReader: { ...target.cloudReader,
+      async download(...args) {
+        destinations.push(args[2]);
+        return target.cloudReader.download(...args);
+      },
+    },
+  }));
+  const result = await verifyPublishedSignedCatalogSidecars({
+    ...fixture.verification, readers,
+  });
+  assert.equal(result.matchingCount, 2);
+  assert.equal(destinations.length, 2);
+  assert.notEqual(destinations[0], destinations[1],
+    "separate providers must never share a local output file");
+  assert.equal(path.dirname(destinations[0]), path.dirname(destinations[1]),
+    "one native ACL-verified root must serve the same bounded recovery attempt");
+  assert.equal(fs.existsSync(path.dirname(destinations[0])), false,
+    "all temporary provider leaves must be removed after the operation");
+});
+
+test("signed sidecar publishes exact pinned bytes through physical S3 and Drive bounded upload", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-physical-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  const uploads = { s3: [], gdrive: [] };
+  const s3 = createCloudStorage({ provider: "s3", s3: { bucket: "disposable-sidecar" },
+    createS3Client: async () => ({ send: async (command) => {
+      uploads.s3.push(Buffer.from(command.input.Body));
+      return {};
+    } }),
+  });
+  const drive = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "disposable-root" },
+    createGoogleDriveClient: async () => ({ files: {
+      get: async () => { throw Object.assign(new Error("not found"), { status: 404 }); },
+      create: async ({ media }) => {
+        const chunks = [];
+        for await (const chunk of media.body) chunks.push(Buffer.from(chunk));
+        uploads.gdrive.push(Buffer.concat(chunks));
+        return { data: { id: "sidecar-drive-fixed-id" } };
+      },
+    } }),
+  });
+  const writers = fixture.publication.writers.filter((item) => item.provider !== "webdav");
+  for (const writer of writers) {
+    const originalKey = writer.cloudWriter.key;
+    const client = writer.provider === "s3" ? s3 : drive;
+    writer.cloudWriter.upload = async (source, folder, name, area, options) => {
+      assert.equal(options.zk1BoundedBytes, fs.statSync(source).size);
+      const result = await client.upload(source, folder, name, area, options);
+      assert.match(options.zk1ExpectedSha256, /^[a-f0-9]{64}$/,
+        "the signed wire digest must be carried to the physical provider adapter");
+      // Check the bytes the SDK actually received. Rereading the staging
+      // pathname after an async upload could observe a different inode.
+      const transmitted = writer.provider === "s3" ? uploads.s3 : uploads.gdrive;
+      assert.equal(transmitted.length, 1);
+      assert.equal(options.zk1ExpectedSha256, sha(transmitted[0]));
+      return { ...result, key: originalKey(folder, name, area) };
+    };
+  }
+  const ack = await publishSignedCatalogSidecars({ ...fixture.publication, writers });
+  assert.equal(ack.acknowledgements.length, 2);
+  assert.equal(uploads.s3.length, 1);
+  assert.equal(uploads.gdrive.length, 1);
+  assert.ok(uploads.s3[0].equals(uploads.gdrive[0]), "both SDKs receive the same signed wire");
+});
+
+for (const attack of ["same-length stage tamper", "replaced staging parent junction"]) {
+  test(`sidecar bounded physical S3 denies ${attack} with zero provider writes`, async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-negative-"));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+    const fixture = durableFixture(directory);
+    const writes = [];
+    const cloud = createCloudStorage({ provider: "s3", s3: { bucket: "disposable-sidecar" },
+      createS3Client: async () => ({ send: async (command) => {
+        writes.push(Buffer.from(command.input.Body));
+        return {};
+      } }),
+    });
+    const writer = fixture.publication.writers[0].cloudWriter;
+    writer.upload = async (source, folder, name, area, options) => {
+      if (attack === "same-length stage tamper") {
+        const previous = fs.readFileSync(source);
+        fs.writeFileSync(source, Buffer.alloc(previous.length, 0x5a));
+        return cloud.upload(source, folder, name, area, options);
+      }
+      const original = path.dirname(source);
+      const relocated = `${original}-held`;
+      const foreign = path.join(directory, "foreign");
+      fs.mkdirSync(foreign);
+      fs.writeFileSync(path.join(foreign, "keep.txt"), "unchanged");
+      fs.renameSync(original, relocated);
+      fs.symlinkSync(foreign, original, process.platform === "win32" ? "junction" : "dir");
+      try { return await cloud.upload(source, folder, name, area, options); }
+      finally {
+        fs.rmdirSync(original);
+        fs.renameSync(relocated, original);
+        assert.equal(fs.readFileSync(path.join(foreign, "keep.txt"), "utf8"), "unchanged");
+        assert.equal(fs.existsSync(path.join(foreign, path.basename(source))), false);
+      }
+    };
+    await assert.rejects(publishSignedCatalogSidecars({ ...fixture.publication,
+      writers: fixture.publication.writers.slice(0, 2) }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/);
+    assert.deepEqual(writes, [], "untrusted stage bytes must never reach a remote provider");
+  });
+}
+
+test("readback is bound to the exact sidecar across process restart, provider corruption, and lost ACK", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-reread-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  const ack = await publishSignedCatalogSidecars(fixture.publication);
+  assert.equal(ack.status, "SIGNED_CATALOG_PUT_ACK_NONAUTHORITATIVE");
+  assert.equal(ack.remoteDurabilityProven, false);
+  const verified = await verifyPublishedSignedCatalogSidecars(fixture.verification);
+  assert.equal(verified.status, "SIGNED_CATALOG_EXACT_REMOTE_REREAD_OBSERVATION");
+  assert.equal(verified.readbackMatched, true);
+  assert.equal(verified.remoteDurabilityProven, false);
+  assert.equal(verified.authorizesIo, false);
+  assert.equal(verified.observationalOnly, true);
+  assert.equal(verified.coherentProviderIdentityQuorumProven, false);
+  assert.equal(verified.crossProviderAtomicFenceProven, false);
+  assert.equal(verified.matchingCount, 2);
+
+  const childInput = {
+    directory,
+    scope: Object.fromEntries(Object.entries(fixture.scope).map(([key, value]) => [key, b64(value)])),
+    operationId: b64(fixture.operationId),
+    signedCatalog: Object.fromEntries(Object.entries(fixture.signedCatalog).map(([key, value]) =>
+      [key, Buffer.isBuffer(value) ? { binary: b64(value) } : value])),
+    providers: fixture.targets.map(({ provider, pinnedDriveFileId, expectedContext,
+      domainAttestation, adminSpki, trustDomainId, namespace }) => ({ provider,
+      pinnedDriveFileId, expectedContext, domainAttestation, adminSpki, trustDomainId, namespace })),
+  };
+  const child = spawnSync(process.execPath,
+    [path.resolve(__dirname, "../scripts/fixtures/issue-65-sidecar-restart-child.js")],
+    { input: JSON.stringify(childInput), encoding: "utf8", timeout: 10000 });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(JSON.parse(child.stdout).matchingCount, 2);
+
+  // Two providers can agree on a syntactically valid but different (older or
+  // replaced) catalog. Their quorum cannot satisfy our retained digest.
+  const competingCatalog = { ...fixture.signedCatalog,
+    signedSnapshot: crypto.randomBytes(64) };
+  await publishSignedCatalogSidecars({ ...fixture.publication,
+    signedCatalog: competingCatalog, writers: fixture.publication.writers.slice(0, 2) });
+  await assert.rejects(verifyPublishedSignedCatalogSidecars(fixture.verification),
+    /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+    "two matching but wrong signed-wire payloads are not a valid exact readback");
+  await publishSignedCatalogSidecars(fixture.publication);
+
+  const second = fixture.targets[1].path;
+  const catalogDir = path.join(directory, "gdrive", "uploads");
+  const file = fs.readdirSync(catalogDir).flatMap((folder) =>
+    fs.readdirSync(path.join(catalogDir, folder)).map((name) => second(folder, name, "uploads")))[0];
+  const saved = fs.readFileSync(file);
+  fs.writeFileSync(file, Buffer.from(saved).fill(0x13));
+  const survivingQuorum = await verifyPublishedSignedCatalogSidecars(fixture.verification);
+  assert.deepEqual(survivingQuorum.providers, ["s3", "webdav"],
+    "a corrupt Drive copy cannot count, but independent S3+WebDAV should recover");
+  await assert.rejects(verifyPublishedSignedCatalogSidecars({ ...fixture.verification,
+    minimumMatchingProviders: 3 }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+  "two healthy providers cannot conceal a corrupted required third copy");
+  fs.writeFileSync(file, saved);
+  fs.rmSync(file);
+  await assert.rejects(verifyPublishedSignedCatalogSidecars({ ...fixture.verification,
+    minimumMatchingProviders: 3 }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+  "missing remote ciphertext cannot satisfy the configured three-provider quorum");
+});
+
+test("sidecar PUT does not acknowledge an earlier S3 principal revoked during later Drive upload", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-stale-put-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  const drive = fixture.publication.writers[1].cloudWriter;
+  const upload = drive.upload;
+  let uploaded = false;
+  drive.upload = async function (...args) {
+    const result = await upload.apply(this, args);
+    uploaded = true;
+    fixture.identities.s3 = sha("revoked-s3-during-drive-put");
+    return result;
+  };
+  await assert.rejects(publishSignedCatalogSidecars({ ...fixture.publication,
+    writers: fixture.publication.writers.slice(0, 2) }),
+  /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+  "previous S3 upload cannot be acknowledged after its pinned principal changes");
+  assert.equal(uploaded, true, "exercise actual later Drive PUT before detecting stale S3");
+});
+
+test("recovery refuses a provider whose pinned principal changes while another provider downloads", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-principal-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const second = fixture.readers[1];
+  const read = second.cloudReader.download;
+  second.cloudReader.download = async function (...args) {
+    const result = await read.apply(this, args);
+    fixture.identities.s3 = sha("rotated-principal-after-s3-get");
+    return result;
+  };
+  await assert.rejects(recoverSignedCatalogSidecar({ scope: fixture.scope,
+    operationId: fixture.operationId, readers: fixture.readers,
+    providerDomainPinset: fixture.pinset, deadlineMs: 3000,
+    observationOnly: true }),
+  /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+  "first provider must remain in its pinned principal through quorum completion");
+});
+
+test("late principal change during final probe is observational only; strict quorum fails closed", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-final-probe-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const drive = fixture.readers[1].cloudReader;
+  const original = drive.resolveInventoryContext;
+  let driveChecks = 0;
+  drive.resolveInventoryContext = async () => {
+    driveChecks++;
+    if (driveChecks === 3) fixture.identities.s3 = sha("rotated-during-final-drive-check");
+    return original();
+  };
+  await assert.rejects(verifyPublishedSignedCatalogSidecars({ ...fixture.verification,
+    observationOnly: false }),
+    /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+    "no cross-provider atomic identity lease exists: a strict current-authority claim must fail");
+  assert.equal(driveChecks, 3, "exercise the actual final Drive identity probe");
+  assert.notEqual(fixture.identities.s3, fixture.readers[0].expectedContext);
+  fixture.identities.s3 = fixture.readers[0].expectedContext;
+  driveChecks = 0;
+  const observed = await verifyPublishedSignedCatalogSidecars(fixture.verification);
+  assert.equal(driveChecks, 3);
+  assert.equal(observed.observationalOnly, true);
+  assert.equal(observed.coherentProviderIdentityQuorumProven, false);
+  assert.equal(observed.crossProviderAtomicFenceProven, false);
+  assert.equal(observed.authorizesIo, false);
+});
+
+test("signed sidecar read cannot allocate bytes appended after descriptor fstat", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-size-race-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  await publishSignedCatalogSidecars(fixture.publication);
+  const s3 = fixture.readers[0].cloudReader;
+  const download = s3.download;
+  let destination;
+  s3.download = async function (...args) {
+    const result = await download.apply(this, args);
+    destination = args[2];
+    return result;
+  };
+  const realOpen = fs.openSync;
+  const realFstat = fs.fstatSync;
+  const realReadFile = fs.readFileSync;
+  let selectedFd;
+  let attacked = false;
+  const fdReadLengths = [];
+  fs.openSync = function (name, ...args) {
+    const fd = realOpen.call(fs, name, ...args);
+    if (name === destination && selectedFd === undefined) selectedFd = fd;
+    return fd;
+  };
+  fs.fstatSync = function (fd, ...args) {
+    const stat = realFstat.call(fs, fd, ...args);
+    if (fd === selectedFd && !attacked) {
+      attacked = true;
+      fs.appendFileSync(destination, Buffer.alloc(5 * 1024 * 1024, 0x58));
+    }
+    return stat;
+  };
+  fs.readFileSync = function (source, ...args) {
+    const bytes = realReadFile.call(fs, source, ...args);
+    if (typeof source === "number") fdReadLengths.push(bytes.length);
+    return bytes;
+  };
+  try {
+    await assert.rejects(verifyPublishedSignedCatalogSidecars({ ...fixture.verification,
+      readers: fixture.readers.slice(0, 2) }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/);
+  } finally {
+    fs.openSync = realOpen;
+    fs.fstatSync = realFstat;
+    fs.readFileSync = realReadFile;
+  }
+  assert.equal(attacked, true, "the file must grow after descriptor identity preflight");
+  assert.deepEqual(fdReadLengths, [],
+    "a bounded sidecar read must never use readFileSync(fd) on attacker-growable inode");
+});

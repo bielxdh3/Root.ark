@@ -16,6 +16,11 @@ const { SyncJournal } = require("../sync-client/rootark-sync-journal");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
+const { runMigrations } = require("../db/migrations");
+const { closeDb } = require("../db");
+const usersRepository = require("../repositories/usersRepository");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 function request(port, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
@@ -66,15 +71,36 @@ test("HTTP 409 adapter contract recovers local content and applies remote-wins",
 });
 
 test("device authorization is exact, signed, expiry-bound, and revocable", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-authz-"));
+  // A signed device needs private, co-located SQLite authority, not mutable
+  // JSON device state. Preserve the real expiry and durable revocation checks.
+  const dir = createPrivateAuthorityFixture("rootark-phase16-authz-");
   const keys = crypto.generateKeyPairSync("ed25519");
   const publicKey = keys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
-  const registryPath = path.join(dir, "devices.json");
-  await fsp.writeFile(registryPath, JSON.stringify({ devices: { "device-a": { username: "alice", publicKey, active: true } } }));
-  const { app, route } = appFor(path.join(dir, "objects.json"), { requireDeviceAuthorization: true, deviceRegistryPath: registryPath });
+  const oldEnv = { DB_ENABLED: process.env.DB_ENABLED,
+    DATABASE_URL: process.env.DATABASE_URL, DB_WRITE_LEGACY_JSON: process.env.DB_WRITE_LEGACY_JSON };
+  process.env.DB_ENABLED = "true";
+  process.env.DB_WRITE_LEGACY_JSON = "false";
+  process.env.DATABASE_URL = path.join(dir, "accounts.sqlite");
+  t.after(async () => {
+    closeDb();
+    for (const [key, value] of Object.entries(oldEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fsp.rm(dir, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
+  usersRepository.saveUsers([{ username: "alice", password: "synthetic-fixture-hash", role: "user",
+    sessionVersion: 0, permissions: { upload: true, delete: true } }]);
+  const { app, route } = appFor(path.join(dir, "objects.json"), {
+    atomicDeviceRegistry: true, requireDeviceAuthorization: true,
+    authenticate: (req, _res, next) => { req.user = { username: "alice", role: "user",
+      sessionVersion: 0, permissions: { upload: true, delete: true } }; next(); },
+  });
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
-  t.after(async () => { await new Promise((resolve) => server.close(resolve)); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
   await route.ready;
+  await route.store.enrollDevice({ username: "alice", deviceId: "device-a", publicKey, expectedEpoch: 0 });
   const key = crypto.randomBytes(32);
   const operation = protocol.createOperation({ operation: "create", objectId: "auth-object", fileId: "auth-file", versionId: "auth-version", operationId: "auth-operation", deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "auth.txt" }, plaintext: Buffer.from("ciphertext-only"), fileKey: key });
   operation.authorization = await createAuthorizationProof(operation, { username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 60_000 });
@@ -82,11 +108,22 @@ test("device authorization is exact, signed, expiry-bound, and revocable", async
   const first = await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": body.length }, body });
   assert.equal(first.status, 201);
   assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": body.length }, body })).status, 409);
-  const expired = { ...operation, operationId: "expired-operation", authorization: { ...operation.authorization, expiresAt: Date.now() - 1 } };
+  const expired = { ...operation, operationId: "expired-operation" };
+  expired.authorization = await createAuthorizationProof(expired, {
+    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 60_000,
+  });
   const expiredBody = Buffer.from(JSON.stringify(expired));
-  assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": expiredBody.length }, body: expiredBody })).status, 403);
-  await fsp.writeFile(registryPath, JSON.stringify({ devices: { "device-a": { username: "alice", publicKey, active: false } } }));
+  const realNow = Date.now;
+  try {
+    Date.now = () => expired.authorization.expiresAt + 1;
+    assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": expiredBody.length }, body: expiredBody })).status, 403);
+  } finally { Date.now = realNow; }
+  assert.deepEqual(await route.store.revokeDevice({ username: "alice", deviceId: "device-a",
+    expectedEpoch: 1 }), { epoch: 2 });
   const revoked = { ...operation, operationId: "revoked-operation" };
+  revoked.authorization = await createAuthorizationProof(revoked, {
+    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 60_000,
+  });
   const revokedBody = Buffer.from(JSON.stringify(revoked));
   assert.equal((await request(server.address().port, "/sync/v1/objects", { method: "POST", headers: { "content-type": "application/json", "content-length": revokedBody.length }, body: revokedBody })).status, 403);
 });
@@ -104,7 +141,9 @@ test("two authorized devices separate local send authorization from remote apply
     async push(operation) { records.set(operation.objectId, operation); return { status: 201, operationId: operation.operationId }; },
     async list() { return [...records.values()]; },
   };
-  const authorizeIncoming = async (operation) => verifyAuthorizationProof(operation.authorization, operation, { username: "alice" });
+  const authorizeIncoming = async (operation) => verifyAuthorizationProof(operation.authorization, operation,
+    { username: "alice", trustedDevicePublicKeys: { "device-a": publicDer(deviceA) },
+      revokedDeviceIds: [] });
   const engineA = await new SyncEngine({
     rootDir: path.join(dir, "a"), adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key, authorize: async () => true,
@@ -271,7 +310,7 @@ test("sync snapshot retries a transient Windows rename EPERM", { skip: process.p
 });
 
 test("WebDAV mutation journal translates into v2 move and reaches a second client", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-sync-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-sync-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true }); await fsp.mkdir(rootB, { recursive: true });
@@ -413,7 +452,7 @@ test("WebDAV mutation journal translates into v2 move and reaches a second clien
 });
 
 test("WebDAV file overwrite keeps the moved source identity and tombstones the old destination", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-file-overwrite-identity-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-file-overwrite-identity-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -467,7 +506,7 @@ test("WebDAV file overwrite keeps the moved source identity and tombstones the o
 });
 
 test("WebDAV recreation after delete uses a fresh identity on the same path", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recreate-identity-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recreate-identity-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -518,7 +557,7 @@ test("WebDAV recreation after delete uses a fresh identity on the same path", as
 });
 
 test("WebDAV directory MOVE overwrite and DELETE reconcile complete subtrees", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-subtree-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-subtree-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -595,7 +634,7 @@ test("WebDAV directory MOVE overwrite and DELETE reconcile complete subtrees", a
 });
 
 test("WebDAV move preserves an explicit source directory when the destination has no snapshot record", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-new-directory-destination-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-new-directory-destination-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -638,7 +677,7 @@ test("WebDAV move preserves an explicit source directory when the destination ha
 });
 
 test("WebDAV MOVE preserves explicit directory identities when Windows source casing differs", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-source-case-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-source-case-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(rootA, { recursive: true });
@@ -697,7 +736,7 @@ test("WebDAV MOVE preserves explicit directory identities when Windows source ca
 });
 
 test("WebDAV MOVE rejects a Windows case-only rename before changing the source", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-case-only-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-case-only-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "source.txt"), "case-only source");
@@ -714,7 +753,9 @@ test("WebDAV MOVE rejects a Windows case-only rename before changing the source"
   assert.equal(moved.status, 400);
   assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "case-only source");
   assert.deepEqual(await fsp.readdir(path.join(root, ".rootark-trash")), []);
-  assert.deepEqual((await fsp.readdir(root)).filter((name) => name !== ".rootark-trash"), ["source.txt"]);
+  assert.deepEqual((await fsp.readdir(root)).filter((name) =>
+    ![".rootark-trash", ".rootark-webdav-owner.lock"].includes(name)),
+  ["source.txt"], "an internal exclusive-owner lock is not another user document");
   assert.deepEqual(await transactionJournal.recover(), []);
   assert.deepEqual(await protocolJournal.recover(), []);
 });
@@ -772,7 +813,7 @@ test("remote case-only MOVE in a parent directory casing applies on Windows", { 
 });
 
 test("WebDAV MOVE resolves Windows parent casing for new and overwritten destinations", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-destination-parent-case-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-destination-parent-case-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(path.join(rootA, "CaseParent"), { recursive: true });
@@ -874,7 +915,7 @@ test("remote Windows paths preserve actual parent casing through reconciliation"
 });
 
 test("WebDAV PUT and DELETE canonicalize Windows parent casing before enqueue", { skip: process.platform !== "win32" }, async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-put-delete-parent-case-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-put-delete-parent-case-");
   const rootA = path.join(dir, "a");
   const rootB = path.join(dir, "b");
   await fsp.mkdir(path.join(rootA, "CaseParent"), { recursive: true });
@@ -1033,7 +1074,7 @@ test("offline peers delete moved directory trees by identity from latest-only to
 });
 
 test("WebDAV directory MOVE rejects nested file/collection collisions without changing either tree", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-nested-types-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-nested-types-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
@@ -1078,7 +1119,7 @@ test("WebDAV directory MOVE rejects nested file/collection collisions without ch
 });
 
 test("WebDAV keeps a queued move committed when transaction completion marking fails", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-outbox-mark-failure-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-outbox-mark-failure-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "source.txt"), "durable move payload");
@@ -1127,7 +1168,7 @@ test("WebDAV keeps a queued move committed when transaction completion marking f
 
 test("WebDAV recovery clears staged transactions after a failed update rolls back PUT and MOVE", { timeout: 30_000 }, async (t) => {
   for (const method of ["PUT", "MOVE"]) {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-phase16-webdav-${method.toLowerCase()}-rollback-`));
+    const dir = createPrivateAuthorityFixture(`rootark-phase16-webdav-${method.toLowerCase()}-rollback-`);
     const root = path.join(dir, "root");
     await fsp.mkdir(root, { recursive: true });
     await fsp.writeFile(path.join(root, "destination.txt"), "original destination");
@@ -1155,7 +1196,8 @@ test("WebDAV recovery clears staged transactions after a failed update rolls bac
       ...(method === "PUT" ? { body: Buffer.from("replacement") } : {}),
     });
     assert.equal(response.status, 500);
-    assert.equal(journal.pending()[0].phase, "staged");
+    assert.deepEqual(journal.pending(), [],
+      "a fully restored PUT/MOVE must not retain a speculative staged journal entry");
     assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "original destination");
     if (method === "MOVE") assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "original source");
 
@@ -1168,7 +1210,7 @@ test("WebDAV recovery clears staged transactions after a failed update rolls bac
 });
 
 test("WebDAV retains recovery state when protocol journal directory sync fails after rename", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-journal-sync-failure-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-journal-sync-failure-");
   const root = path.join(dir, "root");
   const protocolDirectory = path.join(dir, "protocol");
   const protocolPath = path.join(protocolDirectory, "journal.json");
@@ -1191,8 +1233,14 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
     rootDir: root, token: "webdav-journal-sync-token", journal: transactionJournal, protocolJournal,
     toProtocolOperation: async () => operation,
   });
+  let recoveredBridge = null;
   await bridge.start();
-  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => {
+    try {
+      if (recoveredBridge) await recoveredBridge.stop();
+      await bridge.stop();
+    } finally { await fsp.rm(dir, { recursive: true, force: true }); }
+  });
 
   const originalOpen = fsp.open;
   let injectDirectorySyncFailure = true;
@@ -1224,23 +1272,45 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
   }
 
   assert.equal(observedRenamedOperation, true);
-  assert.equal(response.status, 201);
+  assert.equal(response.status, 503,
+    "a failed outbox directory fsync cannot be acknowledged as a durable HTTP success");
+  assert.match(response.body.toString("utf8"), /protocol durability unverified/i);
   assert.equal(await fsp.stat(path.join(root, "source.txt")).then(() => true, () => false), false);
   assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "committed despite fsync error");
   assert.deepEqual(protocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);
   assert.equal(transactionJournal.pending()[0].phase, "source-moved");
+  assert.equal(bridge.protocolDurabilityUncertain, true);
+  const refusedFollowup = await request(bridge.address().port, "/must-not-admit-after-uncertain-outbox.txt", {
+    method: "PUT",
+    headers: { authorization: "Bearer webdav-journal-sync-token" },
+    body: Buffer.from("must never be admitted after uncertain outbox"),
+  });
+  assert.equal(refusedFollowup.status, 503,
+    "uncertain outbox custody must fence ALL later authenticated mutations");
+  await assert.rejects(fsp.lstat(path.join(root, "must-not-admit-after-uncertain-outbox.txt")),
+    { code: "ENOENT" });
+  let enteredPhysicalMutation = false;
+  await assert.rejects(
+    bridge.withLocalMutationLock(async () => {
+      enteredPhysicalMutation = true;
+    }),
+    { statusCode: 503 },
+    "already admitted/waiting requests must recheck the outbox fence under the physical lock",
+  );
+  assert.equal(enteredPhysicalMutation, false);
 
   await bridge.stop();
+  await assert.rejects(bridge.start(), /outbox durability uncertain/i,
+    "the same bridge cannot erase a physically uncertain custody fence by restarting");
   await fsp.rm(protocolPath, { force: true });
   const reopenedProtocolJournal = await new SyncJournal(protocolPath).open();
   assert.deepEqual(reopenedProtocolJournal.pending(), []);
   const recoveredTransactionJournal = await new SyncJournal(transactionPath).open();
-  const recoveredBridge = new LocalSyncWebDavBridge({
+  recoveredBridge = new LocalSyncWebDavBridge({
     rootDir: root, token: "webdav-journal-sync-token", journal: recoveredTransactionJournal,
     protocolJournal: reopenedProtocolJournal, toProtocolOperation: async () => operation,
   });
   await recoveredBridge.start();
-  t.after(async () => { await recoveredBridge.stop(); });
   assert.deepEqual(await recoveredTransactionJournal.recover(), []);
   assert.deepEqual(reopenedProtocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);
   const recovered = reopenedProtocolJournal.pending()[0];
@@ -1248,18 +1318,55 @@ test("WebDAV retains recovery state when protocol journal directory sync fails a
   assert.equal((protocol.decodeMovePayload(recoveredPayload, key) || recoveredPayload).toString("utf8"), "committed despite fsync error");
 });
 
+async function persistPhysicallyMovedWebDavJournal(root, transactionJournal, operationId, payload) {
+  // A phase string is not proof of a completed MOVE. Construct the durable
+  // prepared record from the original source inode, actually rename that same
+  // inode, then persist source-moved. No destination file is fabricated.
+  const source = path.join(root, "source.txt");
+  const destination = path.join(root, "destination.txt");
+  await fsp.writeFile(source, payload, { flag: "wx", mode: 0o600 });
+  const sourceStat = await fsp.lstat(source, { bigint: true });
+  assert.equal(sourceStat.isFile(), true);
+  assert.equal(sourceStat.isSymbolicLink(), false);
+  assert.equal(sourceStat.nlink, 1n);
+  assert.ok(sourceStat.ino > 0n, "a zero/unknown source inode is not MOVE recovery evidence");
+  const sourceIdentity = { dev: String(sourceStat.dev), ino: String(sourceStat.ino), type: "file" };
+  const event = {
+    operationId, kind: "move", journalType: "webdav-mutation",
+    source: "/source.txt", destination: "/destination.txt", trash: null,
+    sourceIdentity, previousDestinationIdentity: null, phase: "prepared",
+  };
+  await transactionJournal.enqueue(event);
+  assert.equal((await new SyncJournal(transactionJournal.filePath).open()).pending()[0].phase,
+    "prepared", "prepared entry must be physically durable before MOVE");
+  await fsp.rename(source, destination);
+  const installed = await fsp.lstat(destination, { bigint: true });
+  assert.equal(installed.isFile(), true);
+  assert.equal(installed.isSymbolicLink(), false);
+  assert.equal(installed.nlink, 1n);
+  assert.deepEqual({ dev: String(installed.dev), ino: String(installed.ino), type: "file" },
+    sourceIdentity, "the published destination must be the originally witnessed source inode");
+  assert.equal(await fsp.stat(source).then(() => true, (error) => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }), false);
+  assert.equal(await fsp.readFile(destination, "utf8"), payload);
+  await transactionJournal.update(operationId, { phase: "source-moved" });
+  const diskRecord = (await new SyncJournal(transactionJournal.filePath).open()).pending()[0];
+  assert.equal(diskRecord.phase, "source-moved");
+  assert.deepEqual(diskRecord.sourceIdentity, sourceIdentity);
+  return diskRecord;
+}
+
 test("WebDAV recovery translates a source-moved transaction after a crash before enqueue", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-before-enqueue-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-before-enqueue-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
-  await fsp.writeFile(path.join(root, "destination.txt"), "crash-recovered payload");
   const key = crypto.randomBytes(32);
   const protocolJournal = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
   const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
-  await transactionJournal.enqueue({
-    operationId: "crash-recovery-move", kind: "move", journalType: "webdav-mutation",
-    source: "/source.txt", destination: "/destination.txt", trash: null, phase: "source-moved",
-  });
+  await persistPhysicallyMovedWebDavJournal(root, transactionJournal,
+    "crash-recovery-move", "crash-recovered payload");
   const adapter = { async push() { return { status: 201 }; }, async list() { return []; } };
   const engine = await new SyncEngine({ rootDir: root, journal: protocolJournal, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
   engine.snapshot.files["source.txt"] = { objectId: "crash-object", fileId: "crash-file", revision: { counter: 1, deviceId: "device-a" }, hash: crypto.createHash("sha256").update("crash-recovered payload").digest("hex"), deleted: false, directory: false };
@@ -1279,35 +1386,86 @@ test("WebDAV recovery translates a source-moved transaction after a crash before
 });
 
 test("WebDAV recovery recreates an outbox entry when protocol-queued survived without it", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-missing-outbox-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-missing-outbox-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
-  await fsp.writeFile(path.join(root, "destination.txt"), "recovered after directory sync loss");
   const key = crypto.randomBytes(32);
-  const protocolJournal = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
+  const protocolPath = path.join(dir, "protocol-journal.json");
+  const protocolJournal = await new SyncJournal(protocolPath).open();
   const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
-  await transactionJournal.enqueue({
-    operationId: "missing-outbox-move", kind: "move", journalType: "webdav-mutation",
-    source: "/source.txt", destination: "/destination.txt", trash: null, phase: "protocol-queued",
-  });
+  const recoveredMove = await persistPhysicallyMovedWebDavJournal(root, transactionJournal,
+    "missing-outbox-move", "recovered after directory sync loss");
   const adapter = { async push() { return { status: 201 }; }, async list() { return []; } };
   const engine = await new SyncEngine({ rootDir: root, journal: protocolJournal, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
   engine.snapshot.files["source.txt"] = { objectId: "missing-outbox-object", fileId: "missing-outbox-file", revision: { counter: 1, deviceId: "device-a" }, hash: crypto.createHash("sha256").update("recovered after directory sync loss").digest("hex"), deleted: false, directory: false };
-  const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "webdav-missing-outbox-token", journal: transactionJournal, protocolJournal, toProtocolOperation: (event) => engine.translateWebDavMutation(event) });
+  const originallyQueued = await engine.translateWebDavMutation(recoveredMove);
+  assert.equal(originallyQueued.length, 1);
+  assert.equal(originallyQueued[0].operation, "move");
+  await protocolJournal.enqueueMany(originallyQueued);
+  assert.equal((await new SyncJournal(protocolPath).open()).pending().length, 1,
+    "protocol outbox must actually receive an operation before protocol-queued");
+  await transactionJournal.update(recoveredMove.operationId, { phase: "protocol-queued" });
+  assert.equal((await new SyncJournal(transactionJournal.filePath).open()).pending()[0].phase,
+    "protocol-queued", "advanced phase must be durable before simulating outbox loss");
+  // Model losing an outbox directory entry after its journal phase survived.
+  // This is deliberate fault injection, NOT a claim of an actual power cut.
+  await fsp.unlink(protocolPath);
+  const lostOutbox = await new SyncJournal(protocolPath).open();
+  assert.deepEqual(lostOutbox.pending(), []);
+  const resumedEngine = await new SyncEngine({ rootDir: root, journal: lostOutbox, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  resumedEngine.snapshot.files["source.txt"] = { ...engine.snapshot.files["source.txt"] };
+  const reopenedTransactionJournal = await new SyncJournal(transactionJournal.filePath).open();
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "webdav-missing-outbox-token", journal: reopenedTransactionJournal, protocolJournal: lostOutbox, toProtocolOperation: (event) => resumedEngine.translateWebDavMutation(event) });
   await bridge.start();
   t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
-  const pending = protocolJournal.pending();
+  const pending = lostOutbox.pending();
   assert.equal(pending.length, 1);
   assert.equal(pending[0].operation, "move");
   assert.equal(pending[0].metadata.sourcePath, "source.txt");
   assert.equal(pending[0].metadata.path, "destination.txt");
   const decoded = protocol.decodeMovePayload(protocol.decryptPayload(pending[0], key), key);
   assert.equal(decoded.toString("utf8"), "recovered after directory sync loss");
-  assert.deepEqual(await transactionJournal.recover(), []);
+  assert.equal(pending[0].operationId, originallyQueued[0].operationId,
+    "recovery must restore the same stable MOVE operation ID after outbox loss");
+  assert.deepEqual((await new SyncJournal(protocolPath).open()).pending().map((item) => item.operationId),
+    [originallyQueued[0].operationId], "the restored outbox must be persisted on disk");
+  assert.deepEqual(await reopenedTransactionJournal.recover(), []);
+  assert.deepEqual((await new SyncJournal(transactionJournal.filePath).open()).pending(), [],
+    "recovery must durably acknowledge the physical MOVE after rebuilding the outbox");
+});
+
+test("WebDAV MOVE recovery refuses physically moved bytes without a source inode witness", async (t) => {
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-missing-witness-");
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const root = path.join(dir, "root");
+  await fsp.mkdir(root, { recursive: true });
+  const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
+  const outbox = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
+  const physical = await persistPhysicallyMovedWebDavJournal(root, transactionJournal,
+    "no-witness-move", "physical bytes require origin proof");
+  assert.ok(physical.sourceIdentity?.ino, "fixture must begin with a real source inode witness");
+  // Corrupt only the durable recovery record, not the physical destination.
+  // Omitting sourceIdentity must deny replay even when the renamed bytes exist.
+  await transactionJournal.update(physical.operationId, { sourceIdentity: null });
+  const reopened = await new SyncJournal(transactionJournal.filePath).open();
+  assert.equal(reopened.pending()[0].phase, "source-moved");
+  assert.equal(reopened.pending()[0].sourceIdentity, null);
+  let translations = 0;
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "missing-inode-witness-token",
+    journal: reopened, protocolJournal: outbox,
+    toProtocolOperation: async () => { translations += 1; return { operationId: "unjustified-move", operation: "move" }; },
+  });
+  await assert.rejects(() => bridge.recoverPending(), { code: "WEBDAV_RECOVERY_INDETERMINATE" });
+  assert.equal(translations, 0, "unproven physical MOVE cannot reach protocol translation");
+  assert.deepEqual((await new SyncJournal(outbox.filePath).open()).pending(), []);
+  assert.deepEqual((await new SyncJournal(transactionJournal.filePath).open()).pending(), reopened.pending(),
+    "the rejected operation must remain durably pending for manual recovery");
+  assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"),
+    "physical bytes require origin proof");
 });
 
 test("WebDAV recovery deduplicates a batch after the protocol-queued phase write fails", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-queued-phase-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-webdav-recover-queued-phase-");
   const root = path.join(dir, "root");
   await fsp.mkdir(root, { recursive: true });
   await fsp.writeFile(path.join(root, "source.txt"), "queued phase payload");
@@ -1346,7 +1504,7 @@ test("WebDAV recovery deduplicates a batch after the protocol-queued phase write
 });
 
 test("sync reconciliation protects URL-encoded pending WebDAV paths", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-encoded-webdav-reconcile-"));
+  const dir = createPrivateAuthorityFixture("rootark-phase16-encoded-webdav-reconcile-");
   const key = crypto.randomBytes(32);
   const filename = "résumé report.txt";
   await fsp.writeFile(path.join(dir, filename), "renamed bytes");

@@ -1,3 +1,5 @@
+const { isZk10LegacyBackupStrict } = require("../services/zk10LegacyBackupDeny");
+
 function registerTrashRoutes(app, context) {
   const {
     addActionHistory,
@@ -131,6 +133,8 @@ function registerTrashRoutes(app, context) {
 
   app.delete("/trash/:id", authenticate, requireTrashManageAccess, async (req, res) => {
     if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
+    if (isZk10LegacyBackupStrict()) return res.status(503).set("Cache-Control", "no-store")
+      .json({ code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE", error: "ZK10 external account-wide trash authority unavailable" });
     const id = String(req.params.id || "");
     if (!/^[a-f0-9-]{36}$/i.test(id)) return res.status(400).json({ error: "Item de lixeira invalido" });
     const item = trashRepository.getTrashItem(id);
@@ -210,6 +214,8 @@ function registerTrashRoutes(app, context) {
 
   app.delete("/trash", authenticate, requireTrashManageAccess, async (req, res) => {
     if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
+    if (isZk10LegacyBackupStrict()) return res.status(503).set("Cache-Control", "no-store")
+      .json({ code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE", error: "ZK10 external account-wide trash authority unavailable" });
     if (req.body?.confirmation !== "DELETE") {
       return res.status(400).json({ error: "Confirmacao invalida. Digite DELETE." });
     }

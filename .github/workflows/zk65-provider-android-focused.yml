@@ -1,0 +1,108 @@
+name: ZK65 Provider and Android Focused Regression
+
+# An additional genuine hosted test boundary; never replaces or relaxes the
+# canonical release-gate, full Ubuntu/Windows tests or PostgreSQL 18 checks.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/zk65-provider-android-focused.yml'
+      - 'src/services/zk1MultiproviderCiphertextRestore.js'
+      - 'src/services/zk1WebdavCiphertextAdapter.js'
+      - 'sync-client/rootark-sync-protocol.js'
+      - 'sync-client/rootark-sync-paths.js'
+      - 'sync-client/rootark-sync-authorization.js'
+      - 'sync-client/rootark-sync-engine.js'
+      - 'sync-client/rootark-sync-v2.js'
+      - 'src/routes/sync.js'
+      - 'src/routes/auth.js'
+      - 'scripts/issue-64-android-fixtures.js'
+      - 'test/issue-65-full-multiprovider-http-restore.test.js'
+      - 'test/issue-64-android-contract.test.js'
+      - 'test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js'
+      - 'test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js'
+      - 'src/services/zk1SyncAtomicCasFloorLedgerDevOff.js'
+      - 'test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js'
+      - 'src/services/zk1SyncAtomicRetainedAnchorDevOff.js'
+      - 'test/issue-65-sync-atomic-retained-anchor-dev-off.test.js'
+      - 'src/services/zk1SyncAtomicRetainedAnchorHttpsDevOff.js'
+      - 'test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js'
+      - 'scripts/zk1-sync-retained-anchor-server-dev-off.js'
+      - 'test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js'
+      - 'src/services/zk1SyncAtomicPgPhysicalFenceDevOff.js'
+      - 'test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js'
+      - 'src/services/zk1SyncAtomicSignedOwnerBindingsDevOff.js'
+      - 'test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js'
+      - 'src/services/zk1AuthorityPinnedFile.js'
+      - 'src/services/zk1PrivateSqlitePath.js'
+      - 'src/services/zk1CasTerminalAnchor.js'
+      - 'test/issue-65-private-fifo-open-nonblock.test.js'
+      - 'android/core/**'
+      - 'android/build.gradle.kts'
+      - 'android/settings.gradle.kts'
+      - 'android/gradle.properties'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zk65-provider-android-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  focused-real-transport-contracts:
+    name: WebDAV TLS, Android wire and atomic CAS floor denials (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The rolling windows-latest image may select VS 18 / Python 3.15,
+        # unsupported by the locked better-sqlite3/node-gyp toolchain. Pin a
+        # real Windows runner with VS 2022 instead of skipping native builds.
+        os: [ubuntu-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Real signed remote-provider TLS, Android routes and atomic CAS floor negatives
+        run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js test/issue-65-private-fifo-open-nonblock.test.js
+      - name: Verify tests did not change repository files
+        run: git diff --exit-code
+      - name: Verify tests did not create untracked files
+        shell: bash
+        run: test -z "$(git status --porcelain)"
+
+  kotlin-server-wire-contracts:
+    name: Kotlin JVM real fixture deserialization and portable paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # The scaffold has no checked-in wrapper. Use a pinned Gradle binary,
+      # rather than trusting an unversioned runner installation.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Compile Kotlin and deserialize captured server responses in JVM
+        working-directory: android
+        run: gradle --no-daemon :core:test
+      - name: Verify Kotlin tests did not change tracked files
+        run: git diff --exit-code
+      - name: Diagnose Gradle-generated untracked paths without reading contents
+        shell: bash
+        run: git ls-files --others --exclude-standard | head -n 30
+      - name: Verify Kotlin tests did not create untracked files
+        run: test -z "$(git status --porcelain)"
