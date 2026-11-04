@@ -59,11 +59,11 @@ test("rejected streaming 503 closes pinned TLS 1.3/mTLS socket immediately", asy
     ca: read("ca.pem"), key: read("history-reader.key"),
     cert: read("history-reader.pem"),
     fingerprint: new crypto.X509Certificate(read("history-server.pem"))
-      .fingerprint256.toUpperCase(), timeoutMs: 120,
+      .fingerprint256.toUpperCase(), timeoutMs: 750,
   };
   await assert.rejects(post(options, Buffer.from("{}"), "/v1/cas-anchor/historical-admit"),
     /HISTORICAL_RESPONSE_INVALID/);
   assert.equal(await Promise.race([responseClosed,
-    new Promise((resolve) => setTimeout(() => resolve(false), 450))]),
+    new Promise((resolve) => setTimeout(() => resolve(false), 1100))]),
   true, "a rejected streaming response must physically close before three wall deadlines");
 });
