@@ -14,6 +14,7 @@ const DEFAULT_SCAN_INTERVAL_MS = 5000;
 const DEFAULT_STABILITY_MS = 1200;
 const DEFAULT_RETRIES = 3;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_CONCURRENT_SYNCS = 4;
 
 const IGNORE_DIRECTORY_NAMES = new Set(["node_modules", ".git"]);
 const IGNORE_FILE_NAMES = new Set([STATE_FILE_NAME, ".rootark-sync.json", ".env"]);
@@ -224,7 +225,20 @@ async function getStableFileInfo(filePath, waitMs, rootDir) {
   try {
     const opened = await handle.stat();
     if (!opened.isFile() || opened.size > MAX_FILE_BYTES || opened.dev !== second.dev || opened.ino !== second.ino) return null;
-    const bytes = await handle.readFile();
+    // FileHandle.readFile internally sizes its allocation from a fresh stat.
+    // A writer could grow the same opened inode after our size check, so use
+    // bounded reads from that descriptor and reject any growth past the cap.
+    const chunks = [];
+    let size = 0;
+    while (size <= MAX_FILE_BYTES) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_FILE_BYTES + 1 - size));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      size += bytesRead;
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    if (size > MAX_FILE_BYTES) return null;
+    const bytes = Buffer.concat(chunks, size);
     const finalStat = await handle.stat();
     if (!finalStat.isFile() || bytes.length !== finalStat.size ||
         opened.size !== finalStat.size || opened.mtimeMs !== finalStat.mtimeMs ||
@@ -308,6 +322,9 @@ class SyncClient {
     this.running = false;
     this.scanTimer = null;
     this.idleResolvers = [];
+    this.activeSyncTasks = 0;
+    this.activeSyncSlots = 0;
+    this.syncSlotWaiters = [];
   }
 
   async init() {
@@ -328,11 +345,16 @@ class SyncClient {
     if (!fullPath) return;
     clearTimeout(this.pending.get(relativePath));
     this.pending.set(relativePath, setTimeout(async () => {
+      this.activeSyncTasks++;
       this.pending.delete(relativePath);
-      await this.syncOne(fullPath, relativePath, reason).catch((error) => {
-        log(`ERRO ${relativePath}: ${error.message}`);
-      });
-      this.resolveIdleIfNeeded();
+      try {
+        await this.syncOne(fullPath, relativePath, reason).catch((error) => {
+          log(`ERRO ${relativePath}: ${error.message}`);
+        });
+      } finally {
+        this.activeSyncTasks--;
+        this.resolveIdleIfNeeded();
+      }
     }, this.config.debounceMs));
   }
 
@@ -353,7 +375,28 @@ class SyncClient {
     this.resolveIdleIfNeeded();
   }
 
+  async acquireSyncSlot() {
+    // Only a bounded number of per-file snapshots may remain resident while
+    // uploads wait for the remote server or retry/backoff to complete.
+    if (this.activeSyncSlots < MAX_CONCURRENT_SYNCS) this.activeSyncSlots++;
+    else await new Promise((resolve) => this.syncSlotWaiters.push(resolve));
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.syncSlotWaiters.shift();
+      if (next) next();
+      else this.activeSyncSlots--;
+    };
+  }
+
   async syncOne(filePath, relativePath, reason) {
+    const release = await this.acquireSyncSlot();
+    try { return await this.syncOneWithSlot(filePath, relativePath, reason); }
+    finally { release(); }
+  }
+
+  async syncOneWithSlot(filePath, relativePath, reason) {
     const safePath = safeResolveInside(this.config.localFolder, filePath);
     if (!safePath) throw new Error("Caminho fora da pasta sincronizada bloqueado");
     if (!(await fileExists(safePath))) return;
@@ -428,13 +471,13 @@ class SyncClient {
   }
 
   resolveIdleIfNeeded() {
-    if (this.pending.size > 0) return;
+    if (this.pending.size > 0 || this.activeSyncTasks > 0) return;
     const resolvers = this.idleResolvers.splice(0);
     resolvers.forEach((resolve) => resolve());
   }
 
   waitForIdle(timeoutMs = 30000) {
-    if (this.pending.size === 0) return Promise.resolve();
+    if (this.pending.size === 0 && this.activeSyncTasks === 0) return Promise.resolve();
     return new Promise((resolve) => {
       const timer = setTimeout(resolve, timeoutMs);
       this.idleResolvers.push(() => {

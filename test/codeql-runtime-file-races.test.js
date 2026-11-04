@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { execFile } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -141,6 +141,116 @@ test("legacy sync uploads its verified snapshot if the file is replaced during r
   assert.equal(swapped, true, "fixture should race the remote-list response");
   assert.match(uploaded, /inside-snapshot-sentinel/);
   assert.doesNotMatch(uploaded, /outside-swap-sentinel/);
+});
+
+test("legacy sync bounds pinned snapshots while many remote listings stall", { timeout: 30_000 }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-memory-bound-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const selected = path.join(dir, "selected");
+  await fsp.mkdir(selected);
+  const fileCount = 28;
+  for (let index = 0; index < fileCount; index++) {
+    await fsp.writeFile(path.join(selected, `file-${index}.txt`), Buffer.alloc(128 * 1024, index + 1));
+  }
+  let pendingLists = [];
+  let listings = 0;
+  let releaseListings = false;
+  const uploaded = [];
+  const listOk = (res) => res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
+  const server = http.createServer((req, res) => {
+    if (req.url.startsWith("/list?")) {
+      listings++;
+      if (releaseListings) listOk(res);
+      else pendingLists.push(res);
+      return;
+    }
+    if (req.url.startsWith("/upload?")) {
+      const chunks = [];
+      req.on("data", (part) => chunks.push(part));
+      req.on("end", () => {
+        uploaded.push(Buffer.concat(chunks));
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ fileName: "uploaded.txt" }));
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    releaseListings = true;
+    for (const res of pendingLists) if (!res.writableEnded) listOk(res);
+    pendingLists = [];
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const config = path.join(dir, "config.json");
+  await fsp.writeFile(config, JSON.stringify({
+    serverUrl: `http://127.0.0.1:${server.address().port}`,
+    username: "test", token: "fixture-token", localFolder: selected,
+    targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
+  }));
+  const child = spawn(process.execPath, [
+    path.resolve(__dirname, "../sync-client/rootark-sync.js"), "start",
+    "--legacy-development-opt-in", "--once", "--config", config,
+  ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  let stderr = "";
+  child.stderr.on("data", (part) => { stderr += part; });
+  child.stdout.resume();
+  const completion = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code));
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const stalledListCount = listings;
+  releaseListings = true;
+  for (const res of pendingLists) if (!res.writableEnded) listOk(res);
+  pendingLists = [];
+  assert.ok(stalledListCount > 0, "uploads must reach the stalled network boundary");
+  assert.ok(stalledListCount <= 4,
+    `at most four resident file snapshots may wait for the network; saw ${stalledListCount}`);
+  assert.equal(await completion, 0, stderr);
+  assert.equal(uploaded.length, fileCount, "once mode must drain every queued file");
+});
+
+test("legacy sync never re-stats an enlarged file into an unbounded read allocation", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-growth-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const selected = path.join(dir, "selected");
+  await fsp.mkdir(selected);
+  const target = path.join(selected, "mutable.txt");
+  const marker = path.join(dir, "unbounded-read.marker");
+  await fsp.writeFile(target, "small");
+  let uploads = 0;
+  const server = http.createServer((req, res) => {
+    if (req.url.startsWith("/list?")) {
+      return res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
+    }
+    if (req.url.startsWith("/upload?")) {
+      uploads++;
+      req.resume();
+      return res.writeHead(200, { "Content-Type": "application/json" }).end("{}");
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const config = path.join(dir, "config.json");
+  await fsp.writeFile(config, JSON.stringify({
+    serverUrl: `http://127.0.0.1:${server.address().port}`,
+    username: "test", token: "fixture-token", localFolder: selected,
+    targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
+  }));
+  const preload = path.resolve(__dirname, "support/legacy-sync-grow-file-hook.js");
+  await execFileAsync(process.execPath,
+    ["-r", preload, path.resolve(__dirname, "../sync-client/rootark-sync.js"),
+      "start", "--legacy-development-opt-in", "--once", "--config", config], {
+      timeout: 15_000,
+      env: { ...process.env, ROOTARK_TEST_SYNC_GROW_PATH: target,
+        ROOTARK_TEST_SYNC_UNBOUNDED_READ_MARKER: marker },
+    });
+  assert.ok((await fsp.stat(target)).size > 8 * 1024 * 1024, "fixture must grow a pinned inode");
+  assert.equal(fs.existsSync(marker), false, "a post-stat FileHandle.readFile must never allocate from a grown size");
+  assert.equal(uploads, 0, "a grown file must never be sent");
 });
 
 test("remote deletion refuses a symlinked claim coordination directory", async (t) => {

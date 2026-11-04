@@ -70,16 +70,59 @@ function lockFile(operationId) {
   return path.join(REMOTE_LOCK_DIR, `${safeName(operationId)}.lock`);
 }
 
+function ensurePrivateRemoteClaimDirectory() {
+  // Older deployments created this directory with the process umask, often
+  // 0775. A plain mkdir(mode:0700) cannot repair an existing directory.
+  fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+  const directory = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  if (process.platform === "win32") return;
+
+  // Only migrate an owned directory under an owner-controlled parent. A
+  // group/other-writable parent can replace the directory even if it is 0700.
+  const parent = fs.lstatSync(path.dirname(REMOTE_LOCK_DIR), { bigint: true });
+  const owner = BigInt(process.getuid());
+  if (!parent.isDirectory() || parent.isSymbolicLink() ||
+      parent.uid !== owner || (parent.mode & 0o022n) !== 0n ||
+      directory.uid !== owner) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  if ((directory.mode & 0o077n) === 0n) return;
+  if (!fs.constants.O_NOFOLLOW || !fs.constants.O_DIRECTORY) {
+    throw new Error("Remote deletion claim directory cannot be pinned");
+  }
+
+  const fd = fs.openSync(REMOTE_LOCK_DIR,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+    if (!opened.isDirectory() || opened.isSymbolicLink() ||
+        named.isSymbolicLink() || opened.uid !== owner ||
+        opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error("Remote deletion claim directory changed during migration");
+    }
+    fs.fchmodSync(fd, 0o700);
+    const after = fs.fstatSync(fd, { bigint: true });
+    const afterName = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+    if (!after.isDirectory() || after.dev !== opened.dev ||
+        after.ino !== opened.ino || after.dev !== afterName.dev ||
+        after.ino !== afterName.ino || afterName.isSymbolicLink() ||
+        (after.mode & 0o077n) !== 0n) {
+      throw new Error("Remote deletion claim directory migration failed");
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function withRemoteClaimCoordination(operation) {
   // A filesystem lease alone cannot safely reclaim an expired path: two
   // processes can both stat the old lock and erase a newer owner's claim.
   // SQLite's BEGIN IMMEDIATE serializes claim, stale recovery and release.
-  fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true, mode: 0o700 });
-  const directory = fs.lstatSync(REMOTE_LOCK_DIR);
-  if (!directory.isDirectory() || directory.isSymbolicLink() ||
-      (process.platform !== "win32" && (directory.mode & 0o022) !== 0)) {
-    throw new Error("Remote deletion claim directory is unsafe");
-  }
+  ensurePrivateRemoteClaimDirectory();
   try {
     const file = fs.lstatSync(REMOTE_LOCK_COORDINATION_FILE);
     if (!file.isFile() || file.isSymbolicLink()) throw new Error("Remote deletion claim coordinator is unsafe");
