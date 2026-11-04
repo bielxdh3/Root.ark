@@ -70,23 +70,19 @@ function lockFile(operationId) {
   return path.join(REMOTE_LOCK_DIR, `${safeName(operationId)}.lock`);
 }
 
-function ensurePrivateRemoteClaimDirectory() {
-  // Older deployments created this directory with the process umask, often
-  // 0775. A plain mkdir(mode:0700) cannot repair an existing directory.
-  fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true, mode: 0o700 });
-  const directory = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
-  if (!directory.isDirectory() || directory.isSymbolicLink()) {
-    throw new Error("Remote deletion claim directory is unsafe");
-  }
-  if (process.platform === "win32") return;
-
-  // Only migrate an owned directory under an owner-controlled parent. A
-  // group/other-writable parent can replace the directory even if it is 0700.
-  const parent = fs.lstatSync(path.dirname(REMOTE_LOCK_DIR), { bigint: true });
+function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
+  // Never try to repair a child underneath a replaceable parent. Historical
+  // installs often have both data/ and its lock directory at umask-0002 0775.
+  const parent = fs.lstatSync(parentPath, { bigint: true });
   const owner = BigInt(process.getuid());
   if (!parent.isDirectory() || parent.isSymbolicLink() ||
-      parent.uid !== owner || (parent.mode & 0o022n) !== 0n ||
-      directory.uid !== owner) {
+      parent.uid !== owner || (parent.mode & 0o022n) !== 0n) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  try { fs.mkdirSync(directoryPath, { mode: 0o700 }); }
+  catch (error) { if (error.code !== "EEXIST") throw error; }
+  const directory = fs.lstatSync(directoryPath, { bigint: true });
+  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== owner) {
     throw new Error("Remote deletion claim directory is unsafe");
   }
   if ((directory.mode & 0o077n) === 0n) return;
@@ -94,11 +90,11 @@ function ensurePrivateRemoteClaimDirectory() {
     throw new Error("Remote deletion claim directory cannot be pinned");
   }
 
-  const fd = fs.openSync(REMOTE_LOCK_DIR,
+  const fd = fs.openSync(directoryPath,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
-    const named = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+    const named = fs.lstatSync(directoryPath, { bigint: true });
     if (!opened.isDirectory() || opened.isSymbolicLink() ||
         named.isSymbolicLink() || opened.uid !== owner ||
         opened.dev !== named.dev || opened.ino !== named.ino) {
@@ -106,7 +102,7 @@ function ensurePrivateRemoteClaimDirectory() {
     }
     fs.fchmodSync(fd, 0o700);
     const after = fs.fstatSync(fd, { bigint: true });
-    const afterName = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+    const afterName = fs.lstatSync(directoryPath, { bigint: true });
     if (!after.isDirectory() || after.dev !== opened.dev ||
         after.ino !== opened.ino || after.dev !== afterName.dev ||
         after.ino !== afterName.ino || afterName.isSymbolicLink() ||
@@ -116,6 +112,21 @@ function ensurePrivateRemoteClaimDirectory() {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function ensurePrivateRemoteClaimDirectory() {
+  if (process.platform === "win32") {
+    fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+    const directory = fs.lstatSync(REMOTE_LOCK_DIR);
+    if (!directory.isDirectory() || directory.isSymbolicLink()) {
+      throw new Error("Remote deletion claim directory is unsafe");
+    }
+    return;
+  }
+  const dataDir = path.dirname(REMOTE_LOCK_DIR);
+  const runtimeRoot = path.dirname(dataDir);
+  ensurePrivateOwnedPosixDirectory(dataDir, runtimeRoot);
+  ensurePrivateOwnedPosixDirectory(REMOTE_LOCK_DIR, dataDir);
 }
 
 function withRemoteClaimCoordination(operation) {
@@ -173,25 +184,43 @@ function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = cryp
   const operationId = previous.operationId || crypto.randomUUID();
   const token = `${workerId}:${crypto.randomUUID()}`;
   const target = lockFile(operationId);
-  // Keep repository operations outside the coordination transaction to avoid
-  // locking the claim SQLite file and the application DB in opposite orders.
-  if (!withRemoteClaimCoordination(() => reserveRemoteClaimPath(target, token, now, leaseMs))) return null;
   const at = new Date(now).toISOString();
-  const claimed = transition(previous, previous.state, at, {
-    operationId,
-    leaseToken: token,
-    leaseUntil: new Date(now + leaseMs).toISOString(),
-    workerId,
-  });
+  const saveClaim = () => {
+    const fresh = trashRepository.getTrashItem(item.id);
+    const update = (entry) => {
+      const state = remoteState(entry);
+      return { ...entry, metadata: { ...entry.metadata, remoteDeletion: transition(state,
+        state.state, at, { operationId, leaseToken: token,
+          leaseUntil: new Date(now + leaseMs).toISOString(), workerId }) } };
+    };
+    const saved = fresh
+      ? trashRepository.saveRemoteDeletionIfExpectedLease(item.id,
+        previous.leaseToken ?? null, operationId, update)
+      : trashRepository.saveTrashItem(update(current));
+    return saved?.metadata?.remoteDeletion?.leaseToken === token ? { item: saved, token, path: target } : null;
+  };
+  if (!trashRepository.usesSqliteTrashStore()) {
+    // Legacy JSON read/compare/write is protected by the SAME coordination
+    // mutex as lease-file reclaim. This path never acquires the application DB.
+    return withRemoteClaimCoordination(() => {
+      if (!reserveRemoteClaimPath(target, token, now, leaseMs)) return null;
+      try {
+        const claimed = saveClaim();
+        if (!claimed) releaseRemoteClaimUnlocked({ path: target, token });
+        return claimed;
+      } catch (error) {
+        releaseRemoteClaimUnlocked({ path: target, token });
+        throw error;
+      }
+    });
+  }
+  // SQLite's claim-row CAS is atomic, but it is never nested under the
+  // independent claim-coordination DB transaction (no lock inversion).
+  if (!withRemoteClaimCoordination(() => reserveRemoteClaimPath(target, token, now, leaseMs))) return null;
   try {
-    const fresh = trashRepository.getTrashItem(item.id) || current;
-    const freshState = remoteState(fresh);
-    if (!freshState || !["pending", "retry_wait"].includes(freshState.state)) {
-      releaseRemoteClaim({ path: target, token });
-      return null;
-    }
-    const saved = trashRepository.saveTrashItem({ ...fresh, metadata: { ...fresh.metadata, remoteDeletion: claimed } });
-    return { item: saved, token, path: target };
+    const claimed = saveClaim();
+    if (!claimed) releaseRemoteClaim({ path: target, token });
+    return claimed;
   } catch (error) {
     releaseRemoteClaim({ path: target, token });
     throw error;
@@ -555,7 +584,31 @@ function queueRemoteDeletion({ item, deletedBy, loaders, provider = "unknown", c
   });
 }
 
+function saveClaimedRemoteTransition(item, token, update) {
+  const operationId = remoteState(item)?.operationId;
+  if (!operationId) return trashRepository.getTrashItem(item.id) || item;
+  const save = () => trashRepository.saveRemoteDeletionIfLeaseOwner(
+    item.id, token, operationId, update) || item;
+  // JSON's synchronous read/compare/write must share the lease coordination
+  // mutex with JSON claim/reclaim. SQLite mode instead uses an atomic guarded
+  // UPDATE in the main database, with no coordinator lock held.
+  return trashRepository.usesSqliteTrashStore() ? save() : withRemoteClaimCoordination(save);
+}
+
 function completeRemoteDeletion(item, { clock, claimToken } = {}) {
+  if (claimToken) {
+    return saveClaimedRemoteTransition(item, claimToken, (fresh) => {
+      const previous = remoteState(fresh);
+      const completedAt = nowIso(clock);
+      return {
+        ...fresh, status: "permanently_deleted",
+        metadata: { ...fresh.metadata, remoteDeletion: transition(previous, "completed", completedAt, {
+          completedAt, lastAttemptAt: previous.lastAttemptAt || completedAt,
+          nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null,
+        }) },
+      };
+    });
+  }
   const previous = remoteState(item);
   if (item.status !== "remote_delete_pending" || !previous || ["completed", "cancelled", "terminal_failure"].includes(previous.state)) return item;
   if (claimToken && previous.leaseToken !== claimToken) return item;
@@ -574,6 +627,23 @@ function completeRemoteDeletion(item, { clock, claimToken } = {}) {
 }
 
 function failRemoteDeletion(item, error, { clock, claimToken } = {}) {
+  if (claimToken) {
+    return saveClaimedRemoteTransition(item, claimToken, (fresh) => {
+      const previous = remoteState(fresh);
+      const attempts = Math.min(Number(previous.maxAttempts) || DEFAULT_MAX_REMOTE_ATTEMPTS,
+        (Number(previous.attempts) || 0) + 1);
+      const failedAt = nowIso(clock);
+      const terminal = attempts >= (Number(previous.maxAttempts) || DEFAULT_MAX_REMOTE_ATTEMPTS);
+      const nextAttemptAt = terminal ? null : new Date(getClock(clock)() + backoffMs(attempts)).toISOString();
+      return {
+        ...fresh, metadata: { ...fresh.metadata, remoteDeletion: transition(previous,
+          terminal ? "terminal_failure" : "retry_wait", failedAt, {
+            attempts, lastAttemptAt: failedAt, nextAttemptAt,
+            failureCategory: failureCategory(error), leaseToken: null, leaseUntil: null,
+          }) },
+      };
+    });
+  }
   const previous = remoteState(item);
   if (item.status !== "remote_delete_pending" || !previous || ["completed", "cancelled", "terminal_failure"].includes(previous.state)) return item;
   if (claimToken && previous.leaseToken !== claimToken) return item;
@@ -596,6 +666,27 @@ function failRemoteDeletion(item, error, { clock, claimToken } = {}) {
 function cancelRemoteDeletion(item, reason = "cancelled", { clock, status } = {}) {
   const previous = remoteState(item);
   if (!previous || ["completed", "cancelled"].includes(previous.state)) return item;
+  if (item.status === "remote_delete_pending" && previous.operationId
+      && ["pending", "retry_wait"].includes(previous.state)) {
+    const save = () => {
+      const persisted = trashRepository.saveRemoteDeletionIfExpectedLease(
+        item.id, previous.leaseToken ?? null, previous.operationId, (fresh) => {
+          const currentState = remoteState(fresh);
+          const at = nowIso(clock);
+          return {
+            ...fresh, status: status || fresh.status,
+            metadata: { ...fresh.metadata, remoteDeletion: transition(currentState,
+              "cancelled", at, {
+                cancellationReason: String(reason).slice(0, 120),
+                nextAttemptAt: null, leaseToken: null, leaseUntil: null,
+              }) },
+          };
+        });
+      if (persisted) Object.assign(item, persisted);
+      return persisted || item;
+    };
+    return trashRepository.usesSqliteTrashStore() ? save() : withRemoteClaimCoordination(save);
+  }
   const at = nowIso(clock);
   if (status) item.status = status;
   item.metadata = { ...item.metadata, remoteDeletion: transition(previous, "cancelled", at, {

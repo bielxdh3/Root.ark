@@ -92,15 +92,19 @@ test("restart recovers a cancelled remote deletion left pending by an older part
 
 test("failed cancellation persistence leaves a retryable record that recovers on the next worker run", async () => {
   const item = pendingFile("66666666-6666-4666-8666-666666666666", "cancel-save-failure.txt");
-  const saveTrashItem = trashRepository.saveTrashItem;
-  trashRepository.saveTrashItem = () => { throw new Error("simulated trash repository write failure"); };
+  const saveLease = trashRepository.saveRemoteDeletionIfExpectedLease;
+  trashRepository.saveRemoteDeletionIfExpectedLease = () => {
+    throw new Error("simulated trash repository write failure");
+  };
 
-  await assert.rejects(
-    processItem(item, async () => assert.fail("replacement must not be deleted"), () => true),
-    /simulated trash repository write failure/
-  );
-
-  trashRepository.saveTrashItem = saveTrashItem;
+  try {
+    await assert.rejects(
+      processItem(item, async () => assert.fail("replacement must not be deleted"), () => true),
+      /simulated trash repository write failure/
+    );
+  } finally {
+    trashRepository.saveRemoteDeletionIfExpectedLease = saveLease;
+  }
   const afterFailure = trashRepository.getTrashItem(item.id);
   assert.equal(afterFailure.status, "remote_delete_pending");
   assert.notEqual(afterFailure.metadata.remoteDeletion.state, "cancelled");

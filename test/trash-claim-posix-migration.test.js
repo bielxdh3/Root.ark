@@ -23,7 +23,8 @@ function loadTrashServiceWithoutDatabase() {
     const [name, parent] = args;
     if (parent?.filename === service && name === "better-sqlite3") return TestDatabase;
     if (parent?.filename === service && name === "../repositories/trashRepository") {
-      return { getTrashItem: () => null, saveTrashItem: (item) => item };
+      return { getTrashItem: () => null, saveTrashItem: (item) => item,
+        usesSqliteTrashStore: () => false };
     }
     return original.apply(this, args);
   };
@@ -38,7 +39,7 @@ function loadTrashServiceWithoutDatabase() {
   }
 }
 
-test("existing owned 0775 remote lock directory is privately migrated before claiming", (t) => {
+test("existing owned 0775 data parent and remote lock directory are privately migrated", (t) => {
   if (process.platform === "win32") return t.skip("requires native POSIX permissions");
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-posix-upgrade-"));
   t.after(() => fs.rmSync(runtime, { recursive: true, force: true }));
@@ -46,9 +47,11 @@ test("existing owned 0775 remote lock directory is privately migrated before cla
   try {
     const data = path.join(runtime, "data");
     const directory = path.join(data, "trash-remote-locks");
-    fs.mkdirSync(data, { mode: 0o700 });
+    fs.mkdirSync(data, { mode: 0o775 });
+    fs.chmodSync(data, 0o775);
     fs.mkdirSync(directory, { mode: 0o775 });
     fs.chmodSync(directory, 0o775);
+    assert.equal(fs.statSync(data).mode & 0o777, 0o775);
     assert.equal(fs.statSync(directory).mode & 0o777, 0o775);
     process.chdir(runtime);
     const svc = loadTrashServiceWithoutDatabase();
@@ -58,6 +61,7 @@ test("existing owned 0775 remote lock directory is privately migrated before cla
       } },
     } });
     assert.ok(claim, "old 0775 directory under trusted private parent must be migrated");
+    assert.equal(fs.lstatSync(data).mode & 0o777, 0o700);
     assert.equal(fs.lstatSync(directory).mode & 0o777, 0o700);
     assert.equal(fs.lstatSync(directory).isSymbolicLink(), false);
   } finally {
@@ -65,7 +69,7 @@ test("existing owned 0775 remote lock directory is privately migrated before cla
   }
 });
 
-test("remote lock directory migration refuses a group-writable parent", (t) => {
+test("remote lock directory migration refuses a group-writable runtime ancestor", (t) => {
   if (process.platform === "win32") return t.skip("requires native POSIX permissions");
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-posix-parent-"));
   t.after(() => fs.rmSync(runtime, { recursive: true, force: true }));
@@ -77,6 +81,7 @@ test("remote lock directory migration refuses a group-writable parent", (t) => {
     fs.chmodSync(data, 0o775);
     fs.mkdirSync(directory, { mode: 0o775 });
     fs.chmodSync(directory, 0o775);
+    fs.chmodSync(runtime, 0o775);
     process.chdir(runtime);
     const svc = loadTrashServiceWithoutDatabase();
     assert.throws(() => svc.claimRemoteDeletion({ item: {
@@ -85,6 +90,7 @@ test("remote lock directory migration refuses a group-writable parent", (t) => {
       } },
     } }), /unsafe/i);
     assert.equal(fs.lstatSync(directory).mode & 0o777, 0o775);
+    assert.equal(fs.lstatSync(data).mode & 0o777, 0o775);
   } finally {
     process.chdir(originalCwd);
   }
