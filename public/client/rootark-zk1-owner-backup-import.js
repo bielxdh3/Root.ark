@@ -91,8 +91,10 @@
       return value;
     }
     function readbackClock(initialSeconds) {
-      // Only the platform clock advances the already validated signer time;
-      // untrusted caller-supplied clock callbacks cannot mint GET timestamps.
+      // The caller's signer time can be cached before entering this function.
+      // Never let that stale anchor extend an owner approval past the actual
+      // local platform wall clock; still preserve elapsed monotonic progress
+      // and reject a platform clock rollback across awaited work.
       if (typeof Date === "undefined" || typeof Date.now !== "function") deny();
       const originMs = Date.now();
       if (!Number.isSafeInteger(originMs) || originMs < 0) deny();
@@ -101,7 +103,9 @@
         const currentMs = Date.now();
         if (!Number.isSafeInteger(currentMs) || currentMs < lastMs) deny();
         lastMs = currentMs;
-        const seconds = initialSeconds + Math.floor((currentMs - originMs) / 1000);
+        const elapsedSeconds = initialSeconds + Math.floor((currentMs - originMs) / 1000);
+        const platformSeconds = Math.floor(currentMs / 1000);
+        const seconds = Math.max(elapsedSeconds, platformSeconds);
         if (!Number.isSafeInteger(seconds) || seconds < initialSeconds) deny();
         return seconds;
       };

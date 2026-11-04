@@ -9,6 +9,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { createRequire } = require("node:module");
 const express = require("express");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -16,7 +17,26 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const file = require("../public/client/rootark-zk1-file-content");
 const roots = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const http = require("../public/client/rootark-zk1-protected-http-client");
-const importer = require("../public/client/rootark-zk1-owner-backup-import");
+// Test the real, unmodified browser module against a deterministic 1400s
+// platform clock. The protected server fixture uses the same synthetic epoch.
+// A production wall-clock check must not be bypassed by stale signer input.
+const importerFile = path.join(__dirname, "../public/client/rootark-zk1-owner-backup-import.js");
+const importerSource = fs.readFileSync(importerFile, "utf8");
+function ownerImporterWithDate(platformDate) {
+  const loader = vm.compileFunction(importerSource, ["module", "require", "Date"],
+    { filename: importerFile });
+  const loaded = { exports: {} };
+  loader(loaded, createRequire(importerFile), platformDate);
+  return loaded.exports;
+}
+const nativeDateNow = Date.now;
+let fixtureDateBaselineMs = nativeDateNow();
+const importer = ownerImporterWithDate({ now: () => {
+  // The fixture's server clock is frozen at 1400 unless a particular test
+  // explicitly substitutes/advances Date.now. Keep both clocks aligned.
+  return Date.now === nativeDateNow ? 1_400_000
+    : 1_400_000 + Date.now() - fixtureDateBaselineMs;
+} });
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const signedRoot = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
@@ -178,6 +198,7 @@ async function scenario(t) {
     previousHistoryProof: null, ownerRootCheckpoint, approval, ...overrides,
   });
   const ownerTrust = await prepareTrust();
+  fixtureDateBaselineMs = Date.now();
   const input = { approval, ownerTrust, ciphertextBase64: b64(sealed),
     signer, origin, fetchImpl };
   return { input, signOwner, approvalUnsigned, scopeWire, metadata, cek,
@@ -252,7 +273,7 @@ async function ownerExpiryDuringAsyncImport(t, delayedStage) {
   // 45-second signed request. A slow cryptographic await must not turn the
   // expired owner approval into a write authorization.
   const approval = f.signOwner({ ...f.approvalUnsigned, expires_at: 1410 });
-  const startedMs = Date.now();
+  const startedMs = 1_400_000;
   let elapsedMs = 0;
   let advanced = false;
   const advance = () => {
@@ -318,6 +339,27 @@ test("owner approval expiring during awaited ciphertext hashing denies before PU
   ownerExpiryDuringAsyncImport(t, "digest"));
 test("owner approval expiring during awaited Ed25519 signing denies before PUT", async (t) =>
   ownerExpiryDuringAsyncImport(t, "sign"));
+
+test("owner approval expired before entry cannot reuse stale signer clock to PUT", async (t) => {
+  const f = await scenario(t);
+  const approval = f.signOwner({ ...f.approvalUnsigned, expires_at: 1410 });
+  f.setServerTime(1420);
+  const currentImporter = ownerImporterWithDate({ now: () => 1_420_000 });
+  const ownerTrust = await currentImporter.prepareOwnerBackupImportTrust({
+    ownerIdentity: f.ownerIdentity,
+    independentOwnerSpkiSha256: f.independentOwnerSpkiSha256,
+    ownerHistoryCheckpoint: f.ownerHistoryCheckpoint,
+    previousHistoryProof: null,
+    ownerRootCheckpoint: f.ownerRootCheckpoint,
+    approval,
+  });
+  await assert.rejects(currentImporter.importOwnerSignedBackupCiphertext({
+    ...f.input, approval, ownerTrust,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/,
+  "a previously cached device signer time cannot extend an expired owner approval");
+  assert.equal(f.countPut, 0, "expired owner approval cannot send an HTTP PUT");
+  assert.equal(f.networkReads, 0);
+});
 
 test("missing, invalid and regressive platform clock fail closed without retrying PUT", async (t) => {
   const f = await scenario(t);
