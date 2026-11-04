@@ -218,7 +218,12 @@ async function postHistoricalAdmission(options, payload, pathname) {
         || (res.headers["content-length"] !== undefined
           && (!/^\d+$/.test(res.headers["content-length"])
             || Number(res.headers["content-length"]) > RESPONSE_LIMIT))) {
-        res.resume(); done(new Error("HISTORICAL_RESPONSE_INVALID")); return;
+        // A rejected peer may stream indefinitely. Draining after done()
+        // clears the wall deadline would leave a live pinned TLS socket.
+        // Tear down both sides before releasing the in-flight nonce slot.
+        res.destroy();
+        request.destroy();
+        done(new Error("HISTORICAL_RESPONSE_INVALID")); return;
       }
       const parts = [];
       let count = 0;
