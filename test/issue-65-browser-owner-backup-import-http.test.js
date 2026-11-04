@@ -246,6 +246,79 @@ test("owner approval expiry and forged caller clock reject before protected I/O"
   assert.equal(f.networkReads, 0);
 });
 
+async function ownerExpiryDuringAsyncImport(t, delayedStage) {
+  const f = await scenario(t);
+  // The owner approval expires *before* the independent device's valid
+  // 45-second signed request. A slow cryptographic await must not turn the
+  // expired owner approval into a write authorization.
+  const approval = f.signOwner({ ...f.approvalUnsigned, expires_at: 1410 });
+  const startedMs = Date.now();
+  let elapsedMs = 0;
+  let advanced = false;
+  const advance = () => {
+    if (advanced) return;
+    advanced = true;
+    elapsedMs = 20_000;
+    f.setServerTime(1420);
+  };
+  // Use a real protected HTTP server and real Ed25519 signatures, but inject
+  // the elapsed-clock and delay at exactly one async boundary. The browser
+  // UMD factory accepts only the explicit trusted dependencies, and creates
+  // an independent internal owner-trust WeakMap for this test.
+  class ElapsedDate extends Date {
+    static now() { return startedMs + elapsedMs; }
+  }
+  const delayedRoots = Object.freeze({ ...roots,
+    computeCiphertextRoot: async (...args) => {
+      const digest = await roots.computeCiphertextRoot(...args);
+      if (delayedStage === "digest") advance();
+      return digest;
+    },
+  });
+  const delayedHttp = Object.freeze({ ...http,
+    signProtectedContentOperation: async (args) => {
+      const signed = await http.signProtectedContentOperation(args);
+      if (delayedStage === "sign" && args.operation === "put") advance();
+      return signed;
+    },
+  });
+  // Compile the unmodified, fixed-path CommonJS module into the host realm:
+  // owner-checkpoint helpers intentionally reject cross-realm object
+  // prototypes, and this test must not weaken or bypass those checks.
+  const moduleFile = path.join(__dirname,
+    "../public/client/rootark-zk1-owner-backup-import.js");
+  const loader = vm.compileFunction(fs.readFileSync(moduleFile, "utf8"),
+    ["module", "require", "Date"], { filename: moduleFile });
+  const testModule = { exports: {} };
+  loader(testModule, (name) => {
+    if (name === "node:crypto") return crypto;
+    if (name === "./rootark-zk1-ciphertext-chunk-root") return delayedRoots;
+    if (name === "./rootark-zk1-protected-http-client") return delayedHttp;
+    if (name === "./rootark-zk1-owner-ciphertext-root-checkpoint") return signedRoot;
+    throw Error("UNEXPECTED_TEST_MODULE_IMPORT");
+  }, ElapsedDate);
+  const imported = testModule.exports;
+  const ownerTrust = await imported.prepareOwnerBackupImportTrust({
+    ownerIdentity: f.ownerIdentity,
+    independentOwnerSpkiSha256: f.independentOwnerSpkiSha256,
+    ownerHistoryCheckpoint: f.ownerHistoryCheckpoint,
+    previousHistoryProof: null,
+    ownerRootCheckpoint: f.ownerRootCheckpoint,
+    approval,
+  });
+  await assert.rejects(imported.importOwnerSignedBackupCiphertext({
+    ...f.input, approval, ownerTrust,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  assert.equal(advanced, true, "the specified real async boundary must be crossed");
+  assert.equal(f.countPut, 0, "expired owner consent must not send PUT");
+  assert.equal(f.networkReads, 0, "rejected owner import cannot read remote ciphertext");
+}
+
+test("owner approval expiring during awaited ciphertext hashing denies before PUT", async (t) =>
+  ownerExpiryDuringAsyncImport(t, "digest"));
+test("owner approval expiring during awaited Ed25519 signing denies before PUT", async (t) =>
+  ownerExpiryDuringAsyncImport(t, "sign"));
+
 test("missing, invalid and regressive platform clock fail closed without retrying PUT", async (t) => {
   const f = await scenario(t);
   const originalNow = Date.now;

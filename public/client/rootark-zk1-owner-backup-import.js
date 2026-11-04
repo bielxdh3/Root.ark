@@ -245,10 +245,19 @@
           // Create ONLY. An existing object (including a previous lost ACK)
           // must fail the server's CAS check. The caller may then explicitly
           // reconcile with a separate GET-only operation.
+          // Owner approval has an INDEPENDENT deadline from the device's
+          // 45-second signed request. Signature verification, hashing and
+          // owner-root checks are async; approval may expire before a PUT.
+          const putNowSeconds = currentReadbackSeconds();
+          if (owner.expires_at < putNowSeconds) deny();
           const put = await http.signProtectedContentOperation({
-            ...signer, operation: "put", objectId: owner.object_id,
+            ...signer, nowSeconds: putNowSeconds,
+            operation: "put", objectId: owner.object_id,
             expectedObjectRevision: null, ciphertext: sealed,
           });
+          // WebCrypto signing is another await. Reject revocation/expiry at
+          // this final local boundary BEFORE any write request is submitted.
+          if (owner.expires_at < currentReadbackSeconds()) deny();
           const written = await http.postProtectedCiphertextPut({ origin, request: put, fetchImpl });
           if (written.id !== owner.object_id || written.revision !== 1) deny();
         }
