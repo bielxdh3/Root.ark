@@ -68,11 +68,46 @@ The repository currently contains working foundations for:
 - [x] unauthenticated health/readiness endpoints with fail-closed deployment checks;
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
+- [x] an **opt-in, default-off** Zero-Knowledge v1 (ZK-1) protected-content implementation, with client-held keys and independent trust/fencing requirements.
+
+### Zero-Knowledge v1 — integrated on 2026-11-04 (Issue #65)
+
+The six reviewed PRs [#231](https://github.com/bielxdh3/Root.ark/pull/231),
+[#232](https://github.com/bielxdh3/Root.ark/pull/232),
+[#233](https://github.com/bielxdh3/Root.ark/pull/233),
+[#234](https://github.com/bielxdh3/Root.ark/pull/234),
+[#235](https://github.com/bielxdh3/Root.ark/pull/235), and
+[#236](https://github.com/bielxdh3/Root.ark/pull/236) were merged into
+`Root/main` at `3f4636331436e3fbc0d6a4076a03662584bea7bc` (the tree matches
+the final #236 head `66d25f1b4f0abd317f262a98210ad88402bc5476`).
+
+The integrated **protected** paths provide client-side AEAD and signed device/
+owner authority, encrypted object and catalog metadata, versioned ciphertext
+transport (including bounded S3/Drive/WebDAV adapters), independently pinned
+CAS/witness and PostgreSQL 18 physical-fencing checks, guarded browser sync,
+and owner-authorized backup/recovery and non-destructive legacy migration.
+Seven concrete P2 regressions in this stack were corrected and independently
+reviewed, including an online recovery GET signing-clock expiry. On their
+exact final PR heads, GitHub reported **38 SUCCESS** checks and **six expected
+SKIPPED** dependency checks, including Windows and Ubuntu Node 22, the complete
+Windows canonical and mandatory release suites, six real Microsoft Edge E2E
+cases, CodeQL, PostgreSQL 18, Kotlin, and WebDAV TLS/Android validations.
+
+**This is integration and test evidence, not authorization to enable protected
+mode globally or deploy it to production.** ZK-1 remains opt-in and default-off.
+The ordinary file, WebDAV, preview, search, sharing, backup and legacy sync
+paths can still handle server-readable information; they do **not** inherit a
+Zero-Knowledge guarantee. Ciphertext sizes, timing, device/operation identity
+and opaque routing identifiers can remain visible. Independent off-host key
+custody, external provider durability, production failover, universal Android
+interoperability and a destructive legacy cutover are not established by CI or
+disposable fixtures. See the [migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md)
+and [residual metadata/trust register](docs/issue-65-zk1-runtime-leakage-register.md).
 
 **Recent merged progress (2026-10-18–19; not a release-readiness claim):**
 
 - File-name FTS5 search for non-protected data, Android client scaffolding, selective-sync exclusion/rollback, ransomware-burst detection with device pause, and per-operation sharing permissions were merged in PRs [#211](https://github.com/bielxdh3/Root.ark/pull/211), [#212](https://github.com/bielxdh3/Root.ark/pull/212), [#214](https://github.com/bielxdh3/Root.ark/pull/214), [#215](https://github.com/bielxdh3/Root.ark/pull/215), and [#216](https://github.com/bielxdh3/Root.ark/pull/216).
-- The zero-knowledge work includes a **keyring library** for device enrollment/revocation and epoch rotation ([#213](https://github.com/bielxdh3/Root.ark/pull/213)) plus a v2 wire-format test fixture ([#221](https://github.com/bielxdh3/Root.ark/pull/221)). These are not an integrated, production-ready zero-knowledge storage flow.
+- At that historical date, the Zero-Knowledge work consisted of a **keyring library** for device enrollment/revocation and epoch rotation ([#213](https://github.com/bielxdh3/Root.ark/pull/213)) plus a v2 wire-format test fixture ([#221](https://github.com/bielxdh3/Root.ark/pull/221)); the later integrated, still opt-in ZK-1 v1 stack is documented above.
 - Async cryptographic request handling was hardened ([#220](https://github.com/bielxdh3/Root.ark/pull/220)). The Mammoth transitive-dependency advisory has containment tests and documented review controls ([#223](https://github.com/bielxdh3/Root.ark/pull/223)), **not** a patched dependency or a resolved security finding.
 
 ### Historical application validation snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`)
@@ -148,7 +183,7 @@ Phase 16 evidence is recorded in [the Phase 16 security review](docs/security/ph
 The historical 2026-10-06 GitHub snapshot at `1955eab3d05f72632396eff62ef96d39eedd634b` is retained in [the issue ledger](docs/issue-ledger.md); it is not the current default-branch SHA.
 
 > [!IMPORTANT]
-> Client-side zero-knowledge encryption remains a long-term direction. Experimental keyring components and wire-format fixtures exist, but integrated end-to-end zero-knowledge storage, recovery, migration and production validation are **not** complete.
+> The opt-in ZK-1 v1 implementation is now integrated, but **production deployment, cross-provider durability, independent operator custody, global legacy cutover and whole-application Zero-Knowledge guarantees remain unproven**. Older dated validation snapshots below apply only to their recorded SHAs.
 
 ## Requirements
 
@@ -221,6 +256,7 @@ and `REALTIME_MAX_CONNECTIONS_PER_PEER`).
 | Real-time boundary | Live communication where enabled | WebSocket |
 | Integrations | S3-compatible storage and Google APIs | AWS SDK + Google APIs |
 | Synchronization | Local initialization and continuous sync | Root.ark sync client |
+| Protected ZK-1 (opt-in/default-off) | Client-side encryption, signed protected requests, opaque catalog, CAS/witness and guarded recovery | ZK-1 browser client, protected HTTP routes, independently pinned verification boundaries |
 
 ## Main workflows
 
@@ -300,7 +336,7 @@ Root.ark should currently be treated as a private administrative service, not a 
 - quarantine and suspicious-file handling reduce risk but do not replace malware scanning or sandboxing;
 - external storage adapters expand the trust boundary and require separate credential review;
 - historical security notes are engineering records, not proof that every deployment is safe;
-- current server-side storage is not the future zero-knowledge design.
+- ordinary and legacy server-readable storage is **not** equivalent to the opt-in ZK-1 protected protocol; enablement requires separate authorization, independent trust anchors and deployment review.
 
 See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 
@@ -315,11 +351,14 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [Support](SUPPORT.md)
 - [Governance](GOVERNANCE.md)
 - [Security policy](SECURITY.md)
+- [Zero-Knowledge migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md)
+- [ZK-1 metadata leakage and security boundary register](docs/issue-65-zk1-runtime-leakage-register.md)
 
 ## Roadmap
 
-- [ ] Define and implement the approved client-side zero-knowledge architecture
-- [ ] Separate cryptographic, storage, and sharing trust boundaries
+- [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
+- [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
+- [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
 - [ ] Harden deployment defaults and document a reviewed production profile
 - [ ] Expand restore testing and disaster-recovery evidence
 - [ ] Strengthen suspicious-file isolation and scanning integrations

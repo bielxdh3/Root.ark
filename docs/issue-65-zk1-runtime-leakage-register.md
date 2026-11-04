@@ -1,7 +1,7 @@
-# Issue #65: zk-1 metadata and trust-boundary register (split review)
+# Issue #65: zk-1 metadata and trust-boundary register
 
-Scope: the published, **opt-in development** zk-1 implementation in stacked PRs
-#231–#236, assessed against `1466c126a64f7e651dac6c1421f802725c453dcf`.
+Scope: the **opt-in, default-off** ZK-1 implementation delivered in PRs
+#231–#236 and merged into `Root/main` at `3f4636331436e3fbc0d6a4076a03662584bea7bc`.
 This describes observable data and limits of individual implemented paths; it
 does **not** authorize deployment, production recovery, cutover, deletion of
 legacy data, or a zero-knowledge label for the whole application.
@@ -50,7 +50,9 @@ production key custody or physical failover.
   `test/issue-65-w99-opaque-cas-signer-rotation-mtls.test.js`: mutable claims,
   signer rotation, independent floor, restart and rollback rejection.
 
-These are focused review regressions, not evidence that all 18 issue #65
-traceability items, complete cross-device recovery, real Android interoperability,
-physical off-host isolation, or independent vendor durability have passed.
-See `docs/issue-65-v1-pr-split-traceability-20261026.md` for mandatory gates.
+These are focused review regressions, not proof of universal cross-device
+recovery, real Android interoperability, physical off-host isolation, or
+independent vendor durability. The final PR-head CI certifies the reviewed
+implementation but does not authorize global opt-in activation or production
+deployment. See `docs/architecture/zero-knowledge-migration-contract.md` and
+the ZK-1 integration and deployment limits in `README.md`.
