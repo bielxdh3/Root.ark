@@ -9,6 +9,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { createRequire } = require("node:module");
 const express = require("express");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -119,7 +120,8 @@ test("browser UMD executes without Node require and refuses a cross-origin signe
   })()`, context);
 });
 
-async function runProtectedHttpFixture(t, { lateClockOnly = false } = {}) {
+async function runProtectedHttpFixture(t, { lateClockOnly = false,
+  lateOnlineClockOnly = false } = {}) {
   const dir = createPrivateAuthorityFixture("rootark-browser-protected-http-");
   const state = await fixtures.createInitialState(2);
   const scope = state.scope;
@@ -496,6 +498,102 @@ async function runProtectedHttpFixture(t, { lateClockOnly = false } = {}) {
     ownerRootCheckpoint: pinnedNativeCheckpoint, recoverySecret: heldSecret,
     readChunk: readPersistedChunk, assertLive: () => undefined,
   };
+  if (lateOnlineClockOnly) {
+    // The original owner history, grant, portable root and actual protected
+    // Express/SQLite GET remain real. Only advance the fixture's platform and
+    // server clocks during the real WebCrypto ciphertext digest. This is the
+    // online path used by both the portable UI and restoreOnNewDevice.
+    const signedPortableRoot = await ownerRoot.signOwnerCiphertextRootCheckpoint({
+      ...ownerRootInput, objectId: persistedMeta.object_id,
+      ciphertextRoot: Buffer.from(persistedBundle.ciphertextRoot, "base64url"),
+    });
+    const fieldNames = ["ownerPublicKey", "pinnedOwnerKeyHash",
+      "independentOwnerSpkiSha256", "pinnedCurrentHead", "signedDeviceGrant",
+      "devicePublicKey", "devicePrivateKey", "ownerHistoryCheckpoint",
+      "recoverySecret", "bundle", "expectedMetadata",
+      "independentlyPinnedCiphertextRoot", "origin", "fetchImpl", "nowSeconds"];
+    let observedAuthorization;
+    const recoveryInput = Object.fromEntries(fieldNames.map((name) =>
+      [name, trustedBridgeInput[name]]));
+    recoveryInput.ownerSignerKeyId = base64(ownerPin.signerKeyId);
+    recoveryInput.ownerDeviceId = device.device_id;
+    recoveryInput.ownerRootCheckpoint = signedPortableRoot;
+    recoveryInput.previousOwnerHistoryProof = null;
+    recoveryInput.fetchImpl = (url, options) => {
+      if (url.endsWith("/zk-1/v1/content/read")) {
+        observedAuthorization = JSON.parse(options.body).authorization;
+      }
+      return sessionFetch(url, options);
+    };
+    let advancedDuringDigest = false;
+    const observedCrypto = { subtle: {
+      digest: async (...args) => {
+        const digest = await crypto.webcrypto.subtle.digest(...args);
+        if (!advancedDuringDigest && args[0] === "SHA-256"
+          && args[1]?.byteLength === persistedBytes.length) {
+          advancedDuringDigest = true;
+          storeNowSeconds = 1450;
+        }
+        return digest;
+      },
+    } };
+    const recoveryFile = path.join(__dirname,
+      "../public/client/rootark-zk1-browser-recovery-http.js");
+    const recoverySource = fs.readFileSync(recoveryFile, "utf8");
+    const recoveryLoader = vm.compileFunction(recoverySource,
+      ["module", "require", "Date"], { filename: recoveryFile });
+    const productionRequire = createRequire(recoveryFile);
+    const loadRecoveryWithClock = (platformDate) => {
+      const loaded = { exports: {} };
+      recoveryLoader(loaded, (specifier) => specifier === "node:crypto"
+        ? { webcrypto: observedCrypto } : productionRequire(specifier), platformDate);
+      return loaded.exports;
+    };
+    const onlineRecovery = loadRecoveryWithClock({
+      now: () => storeNowSeconds * 1000,
+    });
+    let opened, rejection;
+    try {
+      opened = await onlineRecovery.recoverFromOwnerSignedProtectedGet(recoveryInput);
+    } catch (error) { rejection = error; }
+    try {
+      assert.equal(advancedDuringDigest, true, "real ciphertext digest must trigger 50s delay");
+      assert.equal(observedAuthorization?.issued_at, 1450,
+        "the real protected GET must sign at 1450, not reuse 1400/expiry 1445");
+      assert.equal(rejection, undefined,
+        "the protected server must admit the newly signed owner-root GET");
+      assert.deepEqual(Buffer.from(opened.data), persistedPlaintext);
+      assert.equal(opened.ownerSignedHistoricalRootVerified, true);
+      assert.equal(opened.authorizesProductionRestore, false);
+      // The supplied signing time can already be stale at invocation, even
+      // without any new await. Never let it suppress the current platform time.
+      observedAuthorization = undefined;
+      const staleStart = await onlineRecovery.recoverFromOwnerSignedProtectedGet(recoveryInput);
+      try {
+        assert.equal(observedAuthorization?.issued_at, 1450);
+        assert.deepEqual(Buffer.from(staleStart.data), persistedPlaintext);
+      } finally { staleStart.data.fill(0); }
+      // Clock rollback or an unsafe timestamp MUST stop before network; the
+      // protected server is not a substitute for a local fail-closed clock.
+      for (const platformDate of [
+        { now: (() => { let calls = 0;
+          return () => ++calls === 1 ? 1_450_000 : 1_449_000; })() },
+        { now: () => Number.MAX_SAFE_INTEGER + 1 },
+      ]) {
+        let outbound = 0;
+        await assert.rejects(loadRecoveryWithClock(platformDate)
+          .recoverFromOwnerSignedProtectedGet({
+            ...recoveryInput,
+            fetchImpl: () => { outbound++; throw Error("FORBIDDEN_GET"); },
+          }), /ZK_BROWSER_RECOVERY_HTTP_DENIED/);
+        assert.equal(outbound, 0, "invalid platform clock must fail before protected GET");
+      }
+    } finally {
+      opened?.data?.fill(0);
+      heldSecret.fill(0);
+    }
+    return;
+  }
   const bridgedResult = await persistedBrowser.recoverFromPinnedPersistedHttpGet(trustedBridgeInput);
   assert.deepEqual(Buffer.from(bridgedResult.data), persistedPlaintext);
   assert.equal(bridgedResult.protectedHttpReadbackVerified, true);
@@ -1162,3 +1260,5 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   async (t) => runProtectedHttpFixture(t));
 test("persisted encrypted recovery re-signs final GET after 50 seconds of local chunk reads",
   async (t) => runProtectedHttpFixture(t, { lateClockOnly: true }));
+test("owner-signed online recovery refreshes GET clock after 50 seconds of real hashing",
+  async (t) => runProtectedHttpFixture(t, { lateOnlineClockOnly: true }));

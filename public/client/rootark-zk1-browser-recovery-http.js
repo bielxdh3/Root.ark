@@ -62,6 +62,25 @@
       for (let i = 0; i < a.length; i++) different |= a[i] ^ b[i];
       return different === 0;
     }
+    function signingClock(initialSeconds) {
+      // Owner/grant and trust-floor checks may await for longer than the
+      // protected GET's 45-second TTL. Only trusted platform time may refresh
+      // this operation; never consult a caller callback or the HTTP response.
+      if (typeof Date === "undefined" || typeof Date.now !== "function") deny();
+      const originMs = Date.now();
+      if (!Number.isSafeInteger(originMs) || originMs < 0) deny();
+      let lastMs = originMs;
+      return () => {
+        const nowMs = Date.now();
+        if (!Number.isSafeInteger(nowMs) || nowMs < lastMs) deny();
+        lastMs = nowMs;
+        const elapsedSeconds = initialSeconds + Math.floor((nowMs - originMs) / 1000);
+        const platformSeconds = Math.floor(nowMs / 1000);
+        const seconds = Math.max(elapsedSeconds, platformSeconds);
+        if (!Number.isSafeInteger(seconds) || seconds < initialSeconds) deny();
+        return seconds;
+      };
+    }
     async function recoverFromProtectedGet(input) {
       let received, expectedCiphertext, digest, output;
       try {
@@ -90,6 +109,7 @@
           || typeof input.origin !== "string"
           || typeof input.fetchImpl !== "function"
           || !Number.isSafeInteger(input.nowSeconds) || input.nowSeconds < 0) deny();
+        const currentSigningSeconds = signingClock(input.nowSeconds);
         const ownerAnchor = {
           ownerPublicKey: input.ownerPublicKey,
           independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
@@ -124,7 +144,9 @@
           manifestRevision: input.pinnedCurrentHead.revision,
           manifestDigest: input.pinnedCurrentHead.digest,
           epoch: input.pinnedCurrentHead.epoch,
-          nowSeconds: input.nowSeconds,
+          // All owner/trust-floor and ciphertext digest awaits have completed.
+          // A newly signed GET must not replay the recovery-start timestamp.
+          nowSeconds: currentSigningSeconds(),
         };
         const signed = await http.signProtectedContentOperation({
           ...signer, operation: "get", objectId: meta.object_id,
