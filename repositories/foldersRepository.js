@@ -3,8 +3,7 @@ const { ensureRootFolder, jsonStringify, nowIso, runWrite, safeJsonParse } = req
 
 function loadFolders() {
   const db = getDb();
-  ensureRootFolder(db);
-  return db.prepare(`
+  const folders = db.prepare(`
     SELECT id, name, created_by, created_at, updated_at, allowed_users_json, is_root, expires_at
     FROM folders
     WHERE deleted_at IS NULL
@@ -19,6 +18,14 @@ function loadFolders() {
     isRoot: Boolean(row.is_root),
     expiresAt: row.expires_at || null,
   }));
+  // A read can run during a protected Sync's BEGIN IMMEDIATE reservation.
+  // Never UPSERT the root here: that can fail with SQLITE_BUSY and hide every
+  // other folder behind the server's legacy fallback. Writes still ensure it.
+  if (folders.some((folder) => folder.id === "root")) return folders;
+  const now = nowIso();
+  return [{ id: "root", name: "Arquivos atuais", createdBy: "sistema",
+    createdAt: now, updatedAt: now, allowedUsers: [], isRoot: true,
+    expiresAt: null }, ...folders];
 }
 
 function saveFolders(folders = []) {

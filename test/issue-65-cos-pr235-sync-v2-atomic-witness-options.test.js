@@ -54,6 +54,23 @@ function resignOwnerCertificate(base, statement) {
     ownerProvisionDigest: sha256(OWNER_PROVISION_DOMAIN + protocol.canonicalJson(ownerProvisioning)) };
 }
 
+test("atomic witness accepts an independently pinned Ed25519 public KeyObject without reimport", () => {
+  const pair = crypto.generateKeyPairSync("ed25519");
+  const witness = { pinnedPublicKey: pair.publicKey,
+    scope: "alice:store", readback: async () => null };
+  const configured = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: witness }, true);
+  const makeEngine = (atomicBatchWitnessPublicKey) => new SyncEngine({
+    adapter: { push: async () => null, list: async () => [] },
+    atomicBatchWitnessPublicKey,
+  });
+  assert.equal(makeEngine(configured.atomicBatchWitnessPublicKey).atomicBatchWitnessPublicKey,
+    pair.publicKey);
+  assert.equal(makeEngine(pair.publicKey.export({ type: "spki", format: "der" }))
+    .atomicBatchWitnessPublicKey.asymmetricKeyType, "ed25519");
+  assert.throws(() => makeEngine(crypto.generateKeyPairSync("rsa", {
+    modulusLength: 2048 }).publicKey), /must be an Ed25519 public key/);
+});
+
 test("standalone Sync v2 keeps remote atomic witness disabled without external injection", () => {
   assert.deepEqual(trustedAtomicBatchWitnessOptions({}, false), {});
   assert.deepEqual(trustedAtomicBatchWitnessOptions({}, true), {});

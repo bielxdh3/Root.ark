@@ -60,6 +60,10 @@ function pinnedAtomicWitnessKey(value) {
       fail("Atomic batch witness key is not canonical", "authorization_required");
     }
     key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+  } else if (value instanceof crypto.KeyObject && value.type === "public") {
+    // createPublicKey(publicKeyObject) throws ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE:
+    // an independently supplied public pin is already a parsed KeyObject.
+    key = value;
   } else {
     key = crypto.createPublicKey(value);
   }
