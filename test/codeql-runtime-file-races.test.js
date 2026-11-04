@@ -272,3 +272,26 @@ test("remote deletion refuses a symlinked claim coordination directory", async (
   await execFileAsync(process.execPath, ["-e", script], { cwd: dir, timeout: 5000 });
   assert.deepEqual(await fsp.readdir(outside), [], "no database or lock should be written through the link");
 });
+
+test("remote deletion refuses a junction in the data ancestor before any external write", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-trash-data-ancestor-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const outside = path.join(dir, "outside");
+  const selected = path.join(dir, "selected");
+  await fsp.mkdir(outside);
+  await fsp.mkdir(selected);
+  try {
+    fs.symlinkSync(outside, path.join(selected, "data"), process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) return t.skip("OS does not allow disposable directory links");
+    throw error;
+  }
+  const servicePath = path.resolve(__dirname, "../services/trashService.js");
+  const script = `const svc = require(${JSON.stringify(servicePath)});\n` +
+    "try { svc.claimRemoteDeletion({ item: { id: 'ancestor-fixture', metadata: { remoteDeletion: { state: 'pending', operationId: 'ancestor-fixture' } } } }); process.exit(9); } catch { process.exit(0); }";
+  await execFileAsync(process.execPath, ["-e", script], {
+    cwd: selected, timeout: 5000, env: { ...process.env, DB_ENABLED: "false" },
+  });
+  assert.deepEqual(await fsp.readdir(outside), [],
+    "a reparse-point ancestor must not redirect the claim DB or lock outside runtime data");
+});

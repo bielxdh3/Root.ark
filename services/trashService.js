@@ -116,9 +116,29 @@ function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
 
 function ensurePrivateRemoteClaimDirectory() {
   if (process.platform === "win32") {
-    fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true, mode: 0o700 });
-    const directory = fs.lstatSync(REMOTE_LOCK_DIR);
-    if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    // A junction at data/ is an ancestor of the final lock directory.
+    // Checking only the leaf would follow the ancestor and create the claim
+    // database/lock outside the runtime. Create each level without following
+    // pre-existing reparse points, and verify ancestor identity afterward.
+    const dataDir = path.dirname(REMOTE_LOCK_DIR);
+    const runtimeRoot = path.dirname(dataDir);
+    const runtime = fs.lstatSync(runtimeRoot, { bigint: true });
+    if (!runtime.isDirectory() || runtime.isSymbolicLink()) {
+      throw new Error("Remote deletion claim directory is unsafe");
+    }
+    try { fs.mkdirSync(dataDir, { mode: 0o700 }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; }
+    const data = fs.lstatSync(dataDir, { bigint: true });
+    if (!data.isDirectory() || data.isSymbolicLink()) {
+      throw new Error("Remote deletion claim directory is unsafe");
+    }
+    try { fs.mkdirSync(REMOTE_LOCK_DIR, { mode: 0o700 }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; }
+    const directory = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+    const finalData = fs.lstatSync(dataDir, { bigint: true });
+    if (!directory.isDirectory() || directory.isSymbolicLink()
+        || !finalData.isDirectory() || finalData.isSymbolicLink()
+        || finalData.dev !== data.dev || finalData.ino !== data.ino) {
       throw new Error("Remote deletion claim directory is unsafe");
     }
     return;

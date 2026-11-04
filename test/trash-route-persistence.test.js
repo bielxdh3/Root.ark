@@ -129,13 +129,23 @@ test("DELETE /trash/:id reports the reloaded retry state after provider failure"
 test("DELETE /trash/:id never reports completion when completion persistence fails", async () => {
   const id = "22222222-2222-4222-8222-222222222222";
   item(id);
-  const originalSave = trashRepository.saveTrashItem;
-  trashRepository.saveTrashItem = (value) => {
-    if (value.metadata?.remoteDeletion?.state === "completed") throw new Error("completion persistence");
-    return originalSave(value);
+  // Claimed completions now use a fenced CAS rather than saveTrashItem.
+  // Fail only the completion write; the recovery failure transition must
+  // still persist retry_wait through that same guarded API.
+  const originalSave = trashRepository.saveRemoteDeletionIfLeaseOwner;
+  let rejectedCompletion = 0;
+  trashRepository.saveRemoteDeletionIfLeaseOwner = (itemId, token, operationId, update) => {
+    const next = update(trashRepository.getTrashItem(itemId));
+    if (next.metadata?.remoteDeletion?.state === "completed") {
+      rejectedCompletion += 1;
+      throw new Error("completion persistence");
+    }
+    return originalSave(itemId, token, operationId, update);
   };
   const res = response();
-  try { await routes[`DELETE /trash/:id`](request(id), res); } finally { trashRepository.saveTrashItem = originalSave; }
+  try { await routes[`DELETE /trash/:id`](request(id), res); }
+  finally { trashRepository.saveRemoteDeletionIfLeaseOwner = originalSave; }
+  assert.equal(rejectedCompletion, 1, "real fenced completion persistence must be attempted and denied");
   assert.equal(res.result.status, undefined);
   assert.equal(res.result.body.remoteDeletion, "retry_wait");
   assert.notEqual(res.result.body.remoteDeletion, "completed");
