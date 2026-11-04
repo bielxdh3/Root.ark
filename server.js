@@ -828,6 +828,11 @@ function loadFolders() {
       if (folders.length > 1 || !jsonHasFolders) return folders;
     } catch (error) {
       console.error("Falha ao ler pastas do SQLite:", error.message);
+      if (dbConfig.isStrictSyncModeObserved() || error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
+        throw Object.assign(new Error("Strict SQLite folders unavailable", { cause: error }), {
+          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+        });
+      }
       if (!shouldReadJsonFallback()) return getDefaultFolders();
     }
   }
