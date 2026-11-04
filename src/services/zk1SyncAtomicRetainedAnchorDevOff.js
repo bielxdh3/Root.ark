@@ -239,11 +239,23 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
         ensurePrivateSqliteDirectory(filenameAbs);
         const fd = fs.openSync(filenameAbs, fs.constants.O_CREAT | fs.constants.O_EXCL
           | fs.constants.O_RDWR, 0o600);
-        fs.closeSync(fd);
+        try {
+          // A closed bootstrap descriptor cannot authorize a later SQLite
+          // pathname open: another same-UID actor may substitute its own DB.
+          const created = fs.fstatSync(fd, { bigint: true });
+          requireValid(created.isFile() && created.nlink === 1n
+            && (process.platform === "win32"
+              || (created.uid === BigInt(process.getuid())
+                && (created.mode & 0o077n) === 0n)));
+          observed = Object.freeze({ dev: created.dev, ino: created.ino });
+        } finally { fs.closeSync(fd); }
       }
       assertPrivateSqliteAuthorityDirectory(filenameAbs);
-      assertPrivateSqliteFile(filenameAbs);
+      const beforeOpen = assertPrivateSqliteFile(filenameAbs);
+      requireValid(beforeOpen.dev === observed.dev && beforeOpen.ino === observed.ino);
       this.#db = new Database(filenameAbs, { fileMustExist: true });
+      const opened = assertPrivateSqliteFile(filenameAbs);
+      requireValid(opened.dev === observed.dev && opened.ino === observed.ino);
       requireValid(this.#db.pragma("journal_mode = WAL", { simple: true }) === "wal");
       this.#db.pragma("synchronous = FULL");
       requireValid(this.#db.pragma("synchronous", { simple: true }) === 2);
