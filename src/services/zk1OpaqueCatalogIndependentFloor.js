@@ -9,6 +9,7 @@ const https = require("node:https");
 const tls = require("node:tls");
 const net = require("node:net");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const Database = require("better-sqlite3");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
 const { assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteFile } =
@@ -470,6 +471,23 @@ function createZk1OpaqueCatalogIndependentFloorHttpsClient({ endpoint, ca,
     const payload = Buffer.from(JSON.stringify(body));
     if (payload.length > 3 * 1024 * 1024) fail();
     const raw = await new Promise((resolve, reject) => {
+      const expiresAt = performance.now() + timeoutMs;
+      let settled = false;
+      let response;
+      let deadline;
+      const finish = (error, value) => {
+        if (settled) return;
+        if (!error && performance.now() >= expiresAt) error = new Error("FLOOR_TIMEOUT");
+        settled = true;
+        clearTimeout(deadline);
+        if (error) {
+          // A peer can stream forever while keeping the socket active. Close
+          // both sides of a partial response before rejecting the operation.
+          response?.destroy();
+          req.destroy();
+          reject(error);
+        } else resolve(value);
+      };
       const req = https.request({ hostname: url.hostname, port: url.port,
         path: route, method: "POST", agent: false, ca, key: clientKey,
         cert: clientCert, rejectUnauthorized: true, minVersion: "TLSv1.3",
@@ -479,26 +497,35 @@ function createZk1OpaqueCatalogIndependentFloorHttpsClient({ endpoint, ca,
           return invalid || (cert.fingerprint256?.toUpperCase() === pin ? undefined
             : new Error("FLOOR_PEER_PIN_MISMATCH"));
         }, headers: { "content-type": "application/json", "content-length": payload.length },
-      }, (response) => {
+      }, (incoming) => {
+        response = incoming;
+        response.once("error", (error) => finish(error));
+        response.once("aborted", () => finish(new Error("FLOOR_BODY_ABORTED")));
+        response.once("close", () => {
+          if (!response.complete) finish(new Error("FLOOR_BODY_INCOMPLETE"));
+        });
         if (response.statusCode !== 200 || response.headers["content-type"] !== "application/json") {
-          response.resume(); reject(new Error("FLOOR_HTTP_REJECTED")); return;
+          finish(new Error("FLOOR_HTTP_REJECTED"));
+          return;
         }
         const chunks = []; let count = 0;
         response.on("data", (chunk) => {
+          if (settled) return;
           count += chunk.length;
-          if (count > 8192) { req.destroy(); reject(new Error("FLOOR_BODY_TOO_LONG")); }
+          if (count > 8192) finish(new Error("FLOOR_BODY_TOO_LONG"));
           else chunks.push(chunk);
         });
-        response.on("error", reject);
         response.on("end", () => {
+          if (settled) return;
           try { const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-            exact(data, ["proofBase64"]); resolve(decode(data.proofBase64, 1, 4096)); }
-          catch (error) { reject(error); }
+            exact(data, ["proofBase64"]); finish(null, decode(data.proofBase64, 1, 4096)); }
+          catch (error) { finish(error); }
         });
       });
-      req.setTimeout(timeoutMs, () => req.destroy(new Error("FLOOR_TIMEOUT")));
-      req.on("error", reject);
-      req.end(payload);
+      // A single deadline covers TCP, mTLS, headers and every body chunk.
+      deadline = setTimeout(() => finish(new Error("FLOOR_TIMEOUT")), timeoutMs);
+      req.once("error", (error) => finish(error));
+      try { req.end(payload); } catch (error) { finish(error); }
     }).catch(() => fail());
     return verify(raw, nonce, scope, fp, floorPublicKey).catch(() => fail());
   }
