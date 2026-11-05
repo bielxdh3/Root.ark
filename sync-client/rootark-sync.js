@@ -6,6 +6,8 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const readline = require("readline");
+const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
+const { writePrivateSyncConfig } = require("./rootark-sync-private-config");
 
 const DEFAULT_CONFIG_PATH = path.resolve(process.cwd(), ".rootark-sync.json");
 const STATE_FILE_NAME = ".rootark-sync-state.json";
@@ -68,7 +70,7 @@ async function fileExists(filePath) {
 }
 
 function normalizeServerUrl(serverUrl) {
-  return String(serverUrl || "").trim().replace(/\/+$/, "");
+  return normalizeTrustedSyncServerUrl(serverUrl);
 }
 
 function safeResolveInside(rootDir, targetPath) {
@@ -124,12 +126,13 @@ async function loadConfig(configPath) {
 async function saveConfig(configPath, config) {
   const safeConfig = { ...config };
   delete safeConfig.password;
-  await writeJsonAtomic(configPath, safeConfig);
+  await writePrivateSyncConfig(configPath, `${JSON.stringify(safeConfig, null, 2)}\n`);
 }
 
 async function login(serverUrl, username, password) {
   const response = await fetch(`${serverUrl}/auth/login`, {
     method: "POST",
+    redirect: "error",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   });
@@ -155,6 +158,7 @@ async function authFetch(config, configPath, urlPath, options = {}) {
   const token = await ensureToken(config, configPath, options.passwordProvider);
   const response = await fetch(`${config.serverUrl}${urlPath}`, {
     ...options,
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {}),
@@ -166,6 +170,7 @@ async function authFetch(config, configPath, urlPath, options = {}) {
     const freshToken = await ensureToken(config, configPath, options.passwordProvider);
     return fetch(`${config.serverUrl}${urlPath}`, {
       ...options,
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${freshToken}`,
         ...(options.headers || {}),
