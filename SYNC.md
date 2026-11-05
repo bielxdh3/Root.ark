@@ -70,6 +70,15 @@ O estado privado registra caminho relativo, tamanho, `mtime`, hash SHA-256,
 status do ultimo upload e nome remoto. Leituras sao limitadas a 16 MiB;
 estados maiores ou invalidos sao recusados para evitar aceitar corrupcao como
 confirmacao de upload. Nao armazena senha nem bearer token.
+Como o uploader legado envia apenas o nome-base ao servidor, o estado privado
+tambem registra a autoridade duravel desse nome (raiz local + caminho relativo)
+sob o mesmo lock da identidade remota. Configuracoes com a mesma conta/pasta
+remota podem sincronizar nomes-base diferentes, mas a segunda raiz nao pode
+assumir `same.txt` que ja foi reservado pela primeira: a tentativa falha com
+`SYNC_REMOTE_BASENAME_AUTHORITY_CONFLICT` **antes do POST**. Marcadores antigos
+sem origem verificavel continuam intactos, mas sao bloqueados com
+`SYNC_REMOTE_BASENAME_AUTHORITY_UNVERIFIED` ate reconciliacao explicita;
+jamais sao apropriados silenciosamente pela primeira configuracao a executar.
 O estado e seu lock ficam numa unica pasta privada por usuario do sistema,
 independentemente do caminho `--config`. Duas configuracoes privadas que
 apontem para a mesma pasta local e destino remoto compartilham a identidade,

@@ -417,7 +417,7 @@ class SyncClient {
     this.once = Boolean(options.once);
     this.passwordProvider = options.passwordProvider || null;
     this.statePath = assertStateSeparateFromConfig(this.configPath, this.config);
-    this.state = { files: Object.create(null) };
+    this.state = { files: Object.create(null), remoteBasenameOwners: Object.create(null) };
     this.stateSaveQueue = Promise.resolve();
     this.uncertainRemoteOutcome = false;
     this.stateLock = null;
@@ -488,6 +488,38 @@ class SyncClient {
     next.finally(() => { this.stateWritePending--; }).catch(() => {});
     this.stateSaveQueue = next.catch(() => {});
     return next;
+  }
+
+  async ensureRemoteBasenameAuthority(relativePath) {
+    // Sync's legacy HTTP API discards directory context: every `same.txt`
+    // uploaded to a remote folder refers to exactly the same object, even
+    // when the two configs use different localFolder roots. The shared
+    // state/lock must enforce one durable source identity for that basename.
+    const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+    const selected = path.resolve(this.config.localFolder);
+    const localFolder = process.platform === "win32" ? selected.toLowerCase() : selected;
+    const sourceKey = process.platform === "win32"
+      ? syncPathKey(relativePath).toLowerCase() : syncPathKey(relativePath);
+    const owners = this.state.remoteBasenameOwners;
+    const existing = owners[basename];
+    if (existing) {
+      if (existing.localFolder !== localFolder || existing.relativePath !== sourceKey) {
+        throw new Error(`SYNC_REMOTE_BASENAME_AUTHORITY_CONFLICT: ${basename} belongs to a different source folder/path; refusing remote overwrite`);
+      }
+      return;
+    }
+    // Cache entries from the pre-authority release might correspond to any
+    // source root. Never silently assign the first caller ownership based
+    // on an old `uploaded` hash that lacked source-root provenance.
+    const oldEntry = Object.keys(this.state.files).find((name) =>
+      path.basename(name).normalize("NFC").toLowerCase() === basename);
+    if (oldEntry !== undefined) {
+      throw new Error(`SYNC_REMOTE_BASENAME_AUTHORITY_UNVERIFIED: ${basename} has a historical acknowledgement without a trusted source; explicit reconciliation required`);
+    }
+    owners[basename] = { localFolder, relativePath: sourceKey };
+    // Publish the claim under the already-acquired remote-identity lock,
+    // BEFORE any mutating HTTP request or even an uploaded-cache skip.
+    await this.saveState();
   }
 
   schedule(relativePath, reason = "change") {
@@ -695,6 +727,8 @@ class SyncClient {
       this.schedule(relativePath, "not-stable");
       return;
     }
+
+    await this.ensureRemoteBasenameAuthority(relativePath);
 
     const previous = this.state.files[relativePath];
     if (

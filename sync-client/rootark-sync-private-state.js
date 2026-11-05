@@ -70,13 +70,38 @@ function validatedState(value) {
     // their prototype instead of recording its upload status as an own key.
     safeFiles[name] = entry;
   }
-  return { files: safeFiles };
+  // The legacy uploader uses basename(relativePath) for the remote object.
+  // A cache shared by multiple source folders therefore needs a durable,
+  // private provenance claim for each remote basename. A pre-existing v1
+  // cache has no trusted source-root provenance: retain those old entries,
+  // but never invent authority for them while reading.
+  const rawOwners = value.remoteBasenameOwners;
+  if (rawOwners !== undefined && (!rawOwners || typeof rawOwners !== "object"
+    || Array.isArray(rawOwners))) throw new Error("SYNC_STATE_INVALID_BASENAME_OWNERS");
+  const remoteBasenameOwners = Object.create(null);
+  for (const [basename, owner] of Object.entries(rawOwners || {})) {
+    if (!basename || basename.length > 4096 || basename !== basename.normalize("NFC").toLowerCase()
+      || basename.includes("/") || basename.includes("\\")
+      || !owner || typeof owner !== "object" || Array.isArray(owner)
+      || typeof owner.localFolder !== "string" || !path.isAbsolute(owner.localFolder)
+      || owner.localFolder.length > 4096
+      || typeof owner.relativePath !== "string" || !owner.relativePath
+      || owner.relativePath.length > 4096 || path.isAbsolute(owner.relativePath)) {
+      throw new Error("SYNC_STATE_INVALID_BASENAME_OWNER");
+    }
+    remoteBasenameOwners[basename] = {
+      localFolder: owner.localFolder, relativePath: owner.relativePath,
+    };
+  }
+  return { files: safeFiles, remoteBasenameOwners };
 }
 
 async function readPrivateSyncState(statePath, config) {
   const existing = await readPrivateSyncConfig(statePath, null,
     { maxBytes: MAX_STATE_BYTES });
-  if (existing === null) return { files: Object.create(null) };
+  if (existing === null) return {
+    files: Object.create(null), remoteBasenameOwners: Object.create(null),
+  };
   if (existing.version !== STATE_VERSION || existing.binding !== privateSyncStateBinding(config)) {
     throw new Error("SYNC_STATE_BINDING_MISMATCH");
   }
@@ -84,9 +109,10 @@ async function readPrivateSyncState(statePath, config) {
 }
 
 async function writePrivateSyncState(statePath, state, config) {
+  const validated = validatedState(state);
   const content = `${JSON.stringify({
     version: STATE_VERSION, binding: privateSyncStateBinding(config),
-    files: validatedState(state).files,
+    files: validated.files, remoteBasenameOwners: validated.remoteBasenameOwners,
   }, null, 2)}\n`;
   if (Buffer.byteLength(content, "utf8") > MAX_STATE_BYTES) {
     throw new Error("SYNC_STATE_TOO_LARGE");
