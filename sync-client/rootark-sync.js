@@ -440,6 +440,7 @@ class SyncClient {
     this.deferredWatcherPaths = new Map();
     this.needsFullRescan = false;
     this.remoteBasenameOwners = new Map();
+    this.activeRemoteBasenames = new Map();
     this.remoteBasenameCollision = null;
   }
 
@@ -496,7 +497,8 @@ class SyncClient {
     const fullPath = safeResolveInside(this.config.localFolder, path.join(this.config.localFolder, relativePath));
     if (!fullPath) return;
     const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
-    const earlier = this.remoteBasenameOwners.get(basename);
+    const earlier = this.activeRemoteBasenames.get(basename)
+      ?? this.remoteBasenameOwners.get(basename);
     if (earlier !== undefined && earlier !== relativePath) {
       this.remoteBasenameCollision = new Error(
         `SYNC_REMOTE_BASENAME_COLLISION: ${earlier} conflicts with ${relativePath}`);
@@ -556,6 +558,10 @@ class SyncClient {
         return;
       }
       this.activePaths.add(key);
+      // An active remote write owns its flattened basename until its ACK
+      // and private-state fsync settle. A later scan must not forget that
+      // owner merely because the old local pathname was renamed/deleted.
+      this.activeRemoteBasenames.set(basename, relativePath);
       this.activeKinds.set(key, kind);
       this.activeSyncTasks++;
       try {
@@ -564,6 +570,9 @@ class SyncClient {
           log(`ERRO ${relativePath}: ${error.message}`);
         });
       } finally {
+        if (this.activeRemoteBasenames.get(basename) === relativePath) {
+          this.activeRemoteBasenames.delete(basename);
+        }
         this.activePaths.delete(key);
         this.activeKinds.delete(key);
         this.activeSyncTasks--;
@@ -611,9 +620,21 @@ class SyncClient {
       this.schedule(relativePath, "deferred-watcher");
     }
     const files = await scanFiles(this.config.localFolder);
-    this.remoteBasenameOwners = new Map(files.map((file) => [
+    const scannedOwners = new Map(files.map((file) => [
       path.basename(file.relativePath).normalize("NFC").toLowerCase(), file.relativePath,
     ]));
+    for (const [basename, activePath] of this.activeRemoteBasenames) {
+      const newPath = scannedOwners.get(basename);
+      if (newPath !== undefined && newPath !== activePath) {
+        const error = new Error(
+          `SYNC_REMOTE_BASENAME_COLLISION: ${activePath} conflicts with ${newPath}`);
+        this.remoteBasenameCollision = error;
+        this.stop();
+        throw error;
+      }
+      scannedOwners.set(basename, activePath);
+    }
+    this.remoteBasenameOwners = scannedOwners;
     if (files.length === 0) return;
     // Round-robin admission prevents low-sorted unchanged files from always
     // taking the entire bounded budget while newer/renamed paths starve.
@@ -693,6 +714,7 @@ class SyncClient {
         const uploaded = await uploadFile(this.config, this.configPath, info.bytes,
           relativePath, previous, this.passwordProvider,
           () => {
+            if (this.remoteBasenameCollision) throw this.remoteBasenameCollision;
             if (this.uncertainRemoteOutcome) {
               throw new Error("SYNC_REMOTE_OUTCOME_UNCERTAIN");
             }
