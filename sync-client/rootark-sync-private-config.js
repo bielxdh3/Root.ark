@@ -27,17 +27,59 @@ function equalIdentity(first, second) {
   return first && second && first.dev === second.dev && first.ino === second.ino;
 }
 
-async function writePrivateSyncConfig(filename, contents) {
+function preparePrivateSyncConfigPath(filename, { createParent = false } = {}) {
   const configPath = path.resolve(filename);
-  // An existing private parent needs only the authority check; avoid scanning
-  // unrelated sibling files. Missing parents are created one level at a time
-  // with protected permissions before writing any credential bytes.
-  try { fs.lstatSync(path.dirname(configPath)); }
-  catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    ensurePrivateSqliteDirectory(configPath);
+  // Do not enter a caller-selected, writable directory or junction before
+  // asking for credentials. New private children use the existing native
+  // protected-ACL-at-creation path; no chmod-after-creation security gap.
+  if (createParent) {
+    try { fs.lstatSync(path.dirname(configPath)); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      ensurePrivateSqliteDirectory(configPath);
+    }
   }
   assertPrivateSqliteAuthorityDirectory(configPath);
+  return configPath;
+}
+
+async function readPrivateSyncConfig(filename, fallback, { createParent = false } = {}) {
+  if (!createParent) {
+    try { fs.lstatSync(path.dirname(path.resolve(filename))); }
+    catch (error) {
+      if (error.code === "ENOENT") return fallback;
+      throw error;
+    }
+  }
+  const configPath = preparePrivateSyncConfigPath(filename, { createParent });
+  const before = inspectExistingConfig(configPath);
+  if (!before) return fallback;
+  // Read from an opened, unlinked-to-foreign-inodes descriptor. Never trust a
+  // preliminary lstat or follow a mutable symlink to obtain bearer tokens or
+  // a server URL which could otherwise redirect an operator's login.
+  const fd = fs.openSync(configPath, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  let bytes;
+  try {
+    const pinned = fs.fstatSync(fd, { bigint: true });
+    if (!pinned.isFile() || pinned.nlink !== 1n || pinned.dev !== before.dev
+      || pinned.ino !== before.ino || pinned.size > 1024n * 1024n) {
+      throw new Error("SYNC_CONFIG_UNSAFE_FILE");
+    }
+    bytes = fs.readFileSync(fd, { encoding: "utf8" });
+    const afterFd = fs.fstatSync(fd, { bigint: true });
+    const afterName = inspectExistingConfig(configPath);
+    if (afterFd.dev !== pinned.dev || afterFd.ino !== pinned.ino
+      || afterFd.size !== pinned.size || !equalIdentity(before, afterName)) {
+      throw new Error("SYNC_CONFIG_CHANGED_DURING_READ");
+    }
+  } finally { fs.closeSync(fd); }
+  try { return JSON.parse(bytes); }
+  catch { throw new Error("SYNC_CONFIG_INVALID_JSON"); }
+}
+
+async function writePrivateSyncConfig(filename, contents) {
+  const configPath = preparePrivateSyncConfigPath(filename, { createParent: true });
   const existing = inspectExistingConfig(configPath);
   const staged = `${configPath}.tmp-${crypto.randomUUID()}`;
   let handle;
@@ -93,4 +135,5 @@ async function writePrivateSyncConfig(filename, contents) {
   if (!published) throw new Error("SYNC_CONFIG_NOT_PUBLISHED");
 }
 
-module.exports = { writePrivateSyncConfig };
+module.exports = { writePrivateSyncConfig, readPrivateSyncConfig,
+  preparePrivateSyncConfigPath };

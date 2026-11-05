@@ -1,36 +1,42 @@
-# Root.ark Sync MVP
+# Root.ark Sync: protocolo v2 e uploader legado
 
-Cliente desktop/CLI minimo para enviar arquivos novos ou alterados de uma pasta local para o Root.ark.
+O protocolo v2 e o uploader legado de desenvolvimento sao clientes diferentes.
+O `sync:init` legado **nao** provisiona as chaves ou a politica de confianca exigidas pelo v2.
 
 ## Comandos
 
 ```powershell
 npm run sync:init
-npm run sync:start
+npm run sync:start:legacy-dev -- --once
 ```
 
-`sync:init` pede URL do servidor, usuario, senha, pasta local e `folderId` de destino. A senha e usada apenas para login e nao e salva. O arquivo `.rootark-sync.json` guarda URL, usuario, token, pasta local e destino.
+Estes dois comandos se referem **somente ao uploader legado (dev opt-in)**.
+`sync:init` pede URL do servidor, usuario, senha, pasta local e `folderId` de destino. A senha e usada apenas para login e nao e salva; o token Bearer e armazenado num arquivo privado, nunca numa pasta compartilhada por padrao.
 
-`sync:start` monitora a pasta local, ignora arquivos sensiveis/temporarios e envia arquivos novos ou alterados para `/upload`.
+O caminho padrao do legado e `%APPDATA%\Rootark\sync\config.json` no Windows e `${XDG_CONFIG_HOME:-~/.config}/Rootark/sync/config.json` em POSIX. `--config <caminho>` aceita apenas um diretorio com permissoes privadas e arquivo regular do usuario; links simbolicos, hardlinks e configuracoes legiveis por outros usuarios sao recusados. Um `.rootark-sync.json` legado antigo no diretorio atual so pode ser reutilizado pelo `sync:start:legacy-dev` se for seguro e nao contiver uma politica do v2. `sync:init` sem `--config` nao sobrescreve esse arquivo antigo.
+
+`sync:start:legacy-dev` monitora a pasta local, ignora arquivos sensiveis/temporarios e envia arquivos novos ou alterados para `/upload`. URLs remotas exigem HTTPS; HTTP so e permitido para destinos locais aprovados. Redirects autenticados sao bloqueados.
+
+Para o **Sync v2**, use `npm run sync:start -- --config <config-v2-privado> --once` depois do provisionamento independente da identidade e politica dos dispositivos e das chaves mantidas apenas em memoria. O v2 recusa uma configuracao sem `trustedDevicePublicKeys` e `revokedDeviceIds`; nao reutilize a configuracao do uploader legado. O arquivo v2 deve estar em pasta privada e protegido contra substituicao local.
 
 ## Opcoes
 
 ```powershell
-npm run sync:init -- --server http://localhost:3000 --username bielx --folder C:\RootArkSync --folder-id root
-npm run sync:start -- --once
-npm run sync:start -- --auto-approve true
+npm run sync:init -- --server http://localhost:3000 --username usuario --folder E:\RootArkSync --folder-id root
+npm run sync:start:legacy-dev -- --once
+npm run sync:start:legacy-dev -- --auto-approve true
 ```
 
 Use `ROOTARK_SYNC_PASSWORD` para renovar token expirado sem salvar senha:
 
 ```powershell
 $env:ROOTARK_SYNC_PASSWORD="sua-senha"
-npm run sync:start
+npm run sync:start:legacy-dev
 ```
 
 ## Estado local
 
-O estado fica na pasta sincronizada:
+No uploader legado, o estado fica na pasta sincronizada:
 
 ```text
 .rootark-sync-state.json

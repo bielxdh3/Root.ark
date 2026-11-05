@@ -4,16 +4,21 @@ const assert = require("node:assert/strict");
 const { execFile } = require("node:child_process");
 const fsp = require("node:fs/promises");
 const http = require("node:http");
-const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
+const { writePrivateSyncConfig } =
+  require("../sync-client/rootark-sync-private-config");
 
 const execFileAsync = promisify(execFile);
 const syncClient = path.resolve(__dirname, "../sync-client/rootark-sync.js");
 
 test("legacy sync auto-approval sends POST to the approval endpoint", async (t) => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-auto-approve-"));
+  // The sync config contains a bearer token; tests must not place it in a
+  // shared temp directory with an inherited Windows Modify ACL.
+  const dir = createPrivateAuthorityFixture("rootark-sync-auto-approve-");
   const localFolder = path.join(dir, "files");
   await fsp.mkdir(localFolder);
   await fsp.writeFile(path.join(localFolder, "new.txt"), "content");
@@ -45,7 +50,7 @@ test("legacy sync auto-approval sends POST to the approval endpoint", async (t) 
 
   const address = server.address();
   const configPath = path.join(dir, "config.json");
-  await fsp.writeFile(configPath, JSON.stringify({
+  await writePrivateSyncConfig(configPath, JSON.stringify({
     serverUrl: `http://127.0.0.1:${address.port}`,
     username: "sync-test",
     token: "test-token",
