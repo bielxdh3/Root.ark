@@ -62,6 +62,11 @@ test("legacy sync auto-approval sends POST to the approval endpoint", async (t) 
     retryLimit: 1,
   }));
 
-  await execFileAsync(process.execPath, [syncClient, "start", "--legacy-development-opt-in", "--once", "--config", configPath], { timeout: 10000 });
+  // Windows' native protected-DACL checks now also cover the shared private
+  // state directory and its durable publication. They can exceed the older
+  // 10s wall-clock budget without a network or authorization regression.
+  await execFileAsync(process.execPath,
+    [syncClient, "start", "--legacy-development-opt-in", "--once", "--config", configPath],
+    { timeout: process.platform === "win32" ? 90000 : 10000 });
   assert.deepEqual(approvalMethods, ["POST"]);
 });
