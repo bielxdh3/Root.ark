@@ -89,6 +89,11 @@ async function fixture(t, prefix) {
   if (process.platform !== "win32") await fsp.chmod(selected, 0o777);
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       return res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     }
@@ -96,9 +101,11 @@ async function fixture(t, prefix) {
       const chunks = [];
       req.on("data", (data) => chunks.push(data));
       req.on("end", () => {
-        uploads.push(Buffer.concat(chunks).toString("utf8"));
+        const body = Buffer.concat(chunks).toString("utf8");
+        uploads.push(body);
+        const submittedName = /filename="([^"]+)"/.exec(body)?.[1];
         res.writeHead(200, { "Content-Type": "application/json" })
-          .end(JSON.stringify({ fileName: "uploaded.txt" }));
+          .end(JSON.stringify({ fileName: submittedName }));
       });
       return;
     }

@@ -86,6 +86,18 @@ origens sao comparadas com maiusculas e minusculas preservadas, inclusive no
 Windows (o NTFS permite diretorios sensiveis a caixa). Estados anteriores que
 registraram a raiz toda em minusculas podem causar bloqueio conservador de
 proveniencia e devem ser reconciliados manualmente, sem troca automatica de dono.
+O cliente exige, antes de cada POST, que o servidor autenticado confirme
+`GET /legacy-sync/capabilities` com `strictFilename: true`. Servidores antigos
+ou incapazes de confirmar a garantia sao recusados **antes de enviar bytes**.
+O POST inclui `rootarkSyncStrictFilename=true`: sob o lock da pasta remota,
+o servidor recusa com HTTP 409 qualquer nome alterado por truncamento, troca
+de caracteres ou sufixo automatico por conflito pendente, preservando uploads
+normais sem essa opcao. O cliente tambem recusa antes do POST nomes-base com
+mais de 30 unidades UTF-16, dois-pontos, barra invertida ou caracteres de
+controle, mesmo que a maquina local permita esses nomes. Assim, dois caminhos
+locais nao podem adquirir direitos sobre um nome remoto diferente daquele
+reservado; falhas apos tentativa de POST permanecem conservadoras e podem
+exigir verificacao manual de quiescencia e do lock.
 O estado e seu lock ficam numa unica pasta privada por usuario do sistema,
 independentemente do caminho `--config`. Duas configuracoes privadas que
 apontem para a mesma pasta local e destino remoto compartilham a identidade,

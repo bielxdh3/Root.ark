@@ -54,6 +54,11 @@ test("different local roots with same remote basename cannot overwrite one anoth
   const uploads = [];
   let remote = "";
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
       return;
@@ -138,6 +143,11 @@ test("different local roots can upload non-overlapping basenames to one remote a
   await fs.writeFile(path.join(folderB, "b-only.txt"), "CONTENT_B");
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
       return;

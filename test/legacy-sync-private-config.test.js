@@ -82,6 +82,11 @@ test("legacy init keeps bearer config private and preserves a preseeded predicta
   const configPath = path.join(dir, "config.json");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" })
       .end(JSON.stringify({ token: "fixture-token", permissions: {} }));
@@ -113,6 +118,11 @@ test("legacy init does not follow a preseeded predictable temp symlink", async (
   const configPath = path.join(dir, "config.json");
   await fsp.writeFile(outside, "PRESERVE_OUTSIDE");
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"fixture-token"}');
   });
@@ -133,6 +143,11 @@ test("legacy login never forwards a password across an HTTP redirect", async (t)
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   let redirectedRequests = 0;
   const attacker = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     redirectedRequests++;
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"untrusted"}');
@@ -140,6 +155,11 @@ test("legacy login never forwards a password across an HTTP redirect", async (t)
   await new Promise((resolve) => attacker.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => attacker.close(resolve)));
   const origin = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(307, { location: `http://127.0.0.1:${attacker.address().port}/receiver` }).end();
   });
@@ -156,6 +176,11 @@ test("legacy init refuses a symlinked config or an aliased parent", async (t) =>
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   let loginRequests = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     loginRequests++;
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"fixture-token"}');
@@ -191,6 +216,11 @@ test("legacy default config is stored in private user config home, not an arbitr
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const profileConfigHome = path.join(dir, "user-config-home");
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"fixture-token"}');
   });
@@ -217,6 +247,11 @@ test("legacy init cannot overwrite an existing private Sync v2 CWD config", asyn
     revokedDeviceIds: [], token: "v2-token", keyEpoch: "epoch-v2" });
   await writePrivateSyncConfig(configPath, v2Contents);
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"new-token"}');
   });
@@ -250,6 +285,11 @@ test("legacy start rejects planted CWD config while legacy init ignores it", asy
   }
   let requests = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     requests++;
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"untrusted"}');
@@ -353,6 +393,11 @@ test("legacy init preserves pre-existing hard-linked credentials", async (t) => 
   await fsp.writeFile(original, "PRESERVE_LINKED_FILE", { mode: 0o600 });
   await fsp.link(original, alias);
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"fixture-token"}');
   });
@@ -373,6 +418,11 @@ test("legacy init rejects a group-writable config parent", async (t) => {
   await fsp.mkdir(parent, { mode: 0o777 });
   await fsp.chmod(parent, 0o777);
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" }).end('{"token":"fixture-token"}');
   });

@@ -61,6 +61,11 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
       let uploadRequests = 0;
       let remoteCommits = 0;
       const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
         requests++;
         if (req.url.startsWith("/list?")) {
           res.writeHead(200, { "content-type": "application/json" }).end("[]");
@@ -174,6 +179,11 @@ test("failed HTTP upload retains lock if the server could COMMIT after client ex
     let requests = 0;
     let lateCommit;
     const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
       requests++;
       if (req.url.startsWith("/list?")) {
         res.writeHead(200, { "content-type": "application/json" }).end("[]");

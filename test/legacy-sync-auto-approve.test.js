@@ -25,6 +25,11 @@ test("legacy sync auto-approval sends POST to the approval endpoint", async (t) 
 
   const approvalMethods = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
       return;

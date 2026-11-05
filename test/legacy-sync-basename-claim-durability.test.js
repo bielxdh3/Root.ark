@@ -42,6 +42,11 @@ test("a transient failed basename claim save must be retried before remote POST"
   let postCount = 0;
   let statePath;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     } else if (req.url.startsWith("/upload?")) {
