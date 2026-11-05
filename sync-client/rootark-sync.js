@@ -13,6 +13,8 @@ const { writePrivateSyncConfig, readPrivateSyncConfig } =
 const { privateSyncStatePath, assertStateSeparateFromConfig,
   readPrivateSyncState, writePrivateSyncState,
   inspectHistoricalSyncState } = require("./rootark-sync-private-state");
+const { acquirePrivateSyncStateLock } =
+  require("./rootark-sync-private-lock");
 
 // Bearer credentials must not default to a potentially group-writable CWD.
 // A fresh private child of the user config home gets a protected ACL/mode
@@ -385,6 +387,7 @@ class SyncClient {
     this.statePath = assertStateSeparateFromConfig(this.configPath, this.config);
     this.state = { files: Object.create(null) };
     this.stateSaveQueue = Promise.resolve();
+    this.stateLock = null;
     this.pending = new Map();
     this.running = false;
     this.scanTimer = null;
@@ -395,18 +398,30 @@ class SyncClient {
   }
 
   async init() {
-    const safeFolder = path.resolve(this.config.localFolder);
-    await fsp.mkdir(safeFolder, { recursive: true });
-    this.config.localFolder = safeFolder;
-    this.state = await readPrivateSyncState(this.statePath, this.config);
-    // No migration of unauthenticated `uploaded` flags: it could skip real
-    // uploads. Retain historical state in place, inspect without writing,
-    // and rebuild a private cache from real uploads on this invocation.
-    const legacy = await inspectHistoricalSyncState(safeFolder);
-    if (legacy.present) {
-      log(`Estado legado preservado sem importacao: ${path.join(safeFolder, STATE_FILE_NAME)} (${legacy.status}). A primeira varredura refaz uploads sem confiar em marcadores antigos.`);
+    // Per-process saveState serialization is insufficient when two CLIs share
+    // the same protected state identity: each otherwise reads a stale cache
+    // and may overwrite the other's successful acknowledgement. The lock must
+    // be held BEFORE readPrivateSyncState until process exit, including
+    // unbounded in-flight HTTP uploads or async state writes.
+    this.stateLock = acquirePrivateSyncStateLock(this.statePath);
+    try {
+      const safeFolder = path.resolve(this.config.localFolder);
+      await fsp.mkdir(safeFolder, { recursive: true });
+      this.config.localFolder = safeFolder;
+      this.state = await readPrivateSyncState(this.statePath, this.config);
+      // No migration of unauthenticated `uploaded` flags: it could skip real
+      // uploads. Retain historical state in place, inspect without writing,
+      // and rebuild a private cache from real uploads on this invocation.
+      const legacy = await inspectHistoricalSyncState(safeFolder);
+      if (legacy.present) {
+        log(`Estado legado preservado sem importacao: ${path.join(safeFolder, STATE_FILE_NAME)} (${legacy.status}). A primeira varredura refaz uploads sem confiar em marcadores antigos.`);
+      }
+      await ensureToken(this.config, this.configPath, this.passwordProvider);
+    } catch (error) {
+      this.stateLock.release();
+      this.stateLock = null;
+      throw error;
     }
-    await ensureToken(this.config, this.configPath, this.passwordProvider);
   }
 
   saveState() {

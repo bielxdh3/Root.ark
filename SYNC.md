@@ -59,6 +59,16 @@ O estado privado registra caminho relativo, tamanho, `mtime`, hash SHA-256,
 status do ultimo upload e nome remoto. Leituras sao limitadas a 16 MiB;
 estados maiores ou invalidos sao recusados para evitar aceitar corrupcao como
 confirmacao de upload. Nao armazena senha nem bearer token.
+Um arquivo `.lock` ao lado desse estado impede **duas instancias** de usar
+simultaneamente a mesma identidade: a segunda falha imediatamente com
+`SYNC_STATE_LOCK_HELD` antes de ler o cache ou iniciar uploads. O lock e
+criado exclusivamente com permissoes privadas e liberado em encerramentos
+normais do processo. Apos encerramento forcado (como SIGKILL/queda de energia),
+um lock antigo pode permanecer; **nao e removido automaticamente**, porque
+checar apenas PID pode sofrer reutilizacao e apagar um lock valido. Para
+recuperar, verifique que nenhuma instancia de sync dessa identidade esteja
+ativa e somente entao remova manualmente o arquivo `.lock` indicado no erro.
+Nunca remova o arquivo de estado ou a configuracao bearer para resolver lock.
 Toda nova varredura verifica um snapshot local estavel e seu SHA-256 antes de
 reutilizar `uploaded`: arquivos de mesmo tamanho com `mtime` restaurado nao
 podem ser ignorados por uma pasta compartilhada. Esse cuidado aumenta o custo
