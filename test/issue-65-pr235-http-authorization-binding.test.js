@@ -109,8 +109,8 @@ test("protected HTTP ingress rejects tampered signed bytes before durable store/
   // Fail closed BEFORE that first native open, so even a pre-seeded hardlink,
   // symlink, junction or unexpectedly writable ancestor cannot be touched.
   assertPrivateSqliteAuthorityDirectory(databasePath);
-  assert.equal(fsSync.existsSync(databasePath), false,
-    "new isolated fixture must never adopt an existing SQLite file");
+  // The O_EXCL create below is the atomic no-adoption check. A separate
+  // existsSync inspection would be racy and cannot authorize the file open.
   let reserved;
   let pinned;
   try {

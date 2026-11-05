@@ -174,6 +174,32 @@ test("Sync v2 durable CAS requires independent signed retained genesis before bo
     "no current signed floor can exist before the first independently fenced batch");
 });
 
+test("Sync v2 exported constructor cannot bypass signed external preflight", async (t) => {
+  const f = fixture(t);
+  let opened = null;
+  let failure = null;
+  try {
+    // Static open() is the only entry point allowed to mint the module-private
+    // preflight token after the fresh signed retained-head and read-only audit.
+    opened = new Zk1SyncAtomicCasFloorLedgerDevOff(f.options);
+  } catch (error) { failure = error; }
+  finally { opened?.close(); }
+  assert.equal(failure?.code, deny.code);
+  assert.equal(fs.readdirSync(path.dirname(f.filename)).includes(path.basename(f.filename)), false,
+    "unverified direct construction must not create a local CAS authority");
+
+  const verified = await f.open();
+  f.close(verified);
+  f.effects.badAnchor = true;
+  opened = null;
+  failure = null;
+  try { opened = new Zk1SyncAtomicCasFloorLedgerDevOff(f.options); }
+  catch (error) { failure = error; }
+  finally { opened?.close(); }
+  assert.equal(failure?.code, deny.code,
+    "direct construction must not bypass externally signed restart validation");
+});
+
 test("Sync v2 bootstrap never adopts a SQLite file created during the signed genesis challenge", async (t) => {
   const f = fixture(t);
   const readHead = f.retainedAnchor.readSignedHead;

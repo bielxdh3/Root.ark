@@ -284,10 +284,15 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
     this.#physicalFence = physicalFence;
     this.#retainedAnchor = retainedAnchor;
     const absolute = path.resolve(filename);
-    const existed = fs.existsSync(absolute);
+    // This module's writable constructor is intentionally gated by open():
+    // only the module-private preflight token proves that the fresh signed
+    // external head and read-only storage audit preceded writable opening.
+    // Do not check pathname existence again: its status can change between
+    // that check and O_EXCL. The initial preflight disposition is authoritative
+    // and an unexpected new file must fail atomically at O_EXCL.
+    requireValid(preflight?.kind === "existing" || preflight?.kind === "absent");
+    const existed = preflight.kind === "existing";
     requireValid(existed || bootstrapNew === true);
-    requireValid(!preflight || (preflight.kind === "absent"
-      ? !existed : preflight.kind === "existing" && existed));
     let pinned;
     try {
       if (existed) {
