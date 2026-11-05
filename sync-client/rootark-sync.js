@@ -418,6 +418,10 @@ class SyncClient {
     this.passwordProvider = options.passwordProvider || null;
     this.statePath = assertStateSeparateFromConfig(this.configPath, this.config);
     this.state = { files: Object.create(null), remoteBasenameOwners: Object.create(null) };
+    // Only owner claims read from the guarded private state, or successfully
+    // fsynced during this process, may authorize remote HTTP mutations.
+    // An owner object left in memory after a failed write is NOT durable.
+    this.durableRemoteBasenameOwners = new Set();
     this.stateSaveQueue = Promise.resolve();
     this.uncertainRemoteOutcome = false;
     this.stateLock = null;
@@ -464,6 +468,8 @@ class SyncClient {
       await fsp.mkdir(safeFolder, { recursive: true });
       this.config.localFolder = safeFolder;
       this.state = await readPrivateSyncState(this.statePath, this.config);
+      this.durableRemoteBasenameOwners = new Set(
+        Object.keys(this.state.remoteBasenameOwners));
       // No migration of unauthenticated `uploaded` flags: it could skip real
       // uploads. Retain historical state in place, inspect without writing,
       // and rebuild a private cache from real uploads on this invocation.
@@ -497,14 +503,26 @@ class SyncClient {
     // state/lock must enforce one durable source identity for that basename.
     const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
     const selected = path.resolve(this.config.localFolder);
-    const localFolder = process.platform === "win32" ? selected.toLowerCase() : selected;
-    const sourceKey = process.platform === "win32"
-      ? syncPathKey(relativePath).toLowerCase() : syncPathKey(relativePath);
+    // Preserve case-exact source identity even on Windows: NTFS permits
+    // per-directory case-sensitive paths (notably WSL-managed trees). Lower-
+    // casing would falsely equate two physically distinct sources. Remote
+    // basename remains casefolded conservatively because the HTTP API drops
+    // directory context and may resolve remote names case-insensitively.
+    const localFolder = selected;
+    const sourceKey = syncPathKey(relativePath);
     const owners = this.state.remoteBasenameOwners;
     const existing = owners[basename];
     if (existing) {
       if (existing.localFolder !== localFolder || existing.relativePath !== sourceKey) {
         throw new Error(`SYNC_REMOTE_BASENAME_AUTHORITY_CONFLICT: ${basename} belongs to a different source folder/path; refusing remote overwrite`);
+      }
+      if (!this.durableRemoteBasenameOwners.has(basename)) {
+        // A prior private write may have failed AFTER inserting this owner
+        // into the process's mutable map. Never return based only on memory:
+        // a subsequent HTTP request could mutate the remote with no durable
+        // source provenance for another config/restart to enforce.
+        await this.saveState();
+        this.durableRemoteBasenameOwners.add(basename);
       }
       return;
     }
@@ -520,6 +538,7 @@ class SyncClient {
     // Publish the claim under the already-acquired remote-identity lock,
     // BEFORE any mutating HTTP request or even an uploaded-cache skip.
     await this.saveState();
+    this.durableRemoteBasenameOwners.add(basename);
   }
 
   schedule(relativePath, reason = "change") {

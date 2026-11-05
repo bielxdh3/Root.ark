@@ -79,6 +79,13 @@ assumir `same.txt` que ja foi reservado pela primeira: a tentativa falha com
 sem origem verificavel continuam intactos, mas sao bloqueados com
 `SYNC_REMOTE_BASENAME_AUTHORITY_UNVERIFIED` ate reconciliacao explicita;
 jamais sao apropriados silenciosamente pela primeira configuracao a executar.
+Somente reservas lidas do estado privado validado ou gravadas com sucesso
+podem autorizar uploads: uma falha transitoria no `fsync` exige repetir a
+gravacao antes de um novo POST, mesmo que a reserva continue na memoria. As
+origens sao comparadas com maiusculas e minusculas preservadas, inclusive no
+Windows (o NTFS permite diretorios sensiveis a caixa). Estados anteriores que
+registraram a raiz toda em minusculas podem causar bloqueio conservador de
+proveniencia e devem ser reconciliados manualmente, sem troca automatica de dono.
 O estado e seu lock ficam numa unica pasta privada por usuario do sistema,
 independentemente do caminho `--config`. Duas configuracoes privadas que
 apontem para a mesma pasta local e destino remoto compartilham a identidade,

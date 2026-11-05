@@ -102,7 +102,9 @@ test("different local roots with same remote basename cannot overwrite one anoth
 
   const privateState = JSON.parse(await fs.readFile(stateA, "utf8"));
   assert.deepEqual(privateState.remoteBasenameOwners["same.txt"], {
-    localFolder: process.platform === "win32" ? path.resolve(folderA).toLowerCase() : path.resolve(folderA),
+    // Case-exact provenance is required even on Windows, since NTFS can
+    // enable case-sensitive behavior for selected directories.
+    localFolder: path.resolve(folderA),
     relativePath: "same.txt",
   });
 
