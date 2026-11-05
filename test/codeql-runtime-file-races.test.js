@@ -153,7 +153,12 @@ test("legacy sync uploads its verified snapshot if the file is replaced during r
   assert.doesNotMatch(uploaded, /outside-swap-sentinel/);
 });
 
-test("legacy sync bounds pinned snapshots while many remote listings stall", { timeout: 30_000 }, async (t) => {
+test("legacy sync bounds pinned snapshots while many remote listings stall", {
+  // The native Windows authority ACL check runs for each of the 28 durable
+  // private-state publications. Preserve the strict four-snapshot boundary,
+  // but give hosted Windows enough wall-clock to finish the verified writes.
+  timeout: process.platform === "win32" ? 180_000 : 30_000,
+}, async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-memory-bound-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   const configRoot = createPrivateAuthorityFixture("rootark-sync-config-memory-");
@@ -215,7 +220,7 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", { t
   // On Windows, the native owner/DACL verification precedes the first /list
   // and may take longer than 1s. Wait for the actual stalled-network boundary
   // instead of assuming a fixed process startup time. Keep the bound finite.
-  const deadline = Date.now() + 12_000;
+  const deadline = Date.now() + (process.platform === "win32" ? 45_000 : 12_000);
   while (listings === 0 && child.exitCode === null && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }

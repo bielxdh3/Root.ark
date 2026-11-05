@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const { readPrivateSyncConfig, writePrivateSyncConfig } =
   require("./rootark-sync-private-config");
@@ -12,22 +13,26 @@ const LEGACY_STATE_NAME = ".rootark-sync-state.json";
 const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const MAX_HISTORICAL_INSPECTION_BYTES = 1024 * 1024;
 const STATE_VERSION = 1;
+// Different protected --config files can describe the very same remote
+// authority. Keeping state/lock beside each config would create independent
+// caches and locks, allowing concurrent stale remote writes. Use one
+// owner-private home shared by every config for this operating-system user.
+// `os.homedir()` may honor HOME/USERPROFILE overrides and split a lock across
+// invocations. The platform account database home is invariant under those
+// caller-controlled environment overrides for this OS principal.
+const STATE_HOME = path.join(os.userInfo().homedir, ".rootark", "sync", "private-state");
 
 function privateSyncStateBinding(config) {
-  // An operator may share localFolder with untrusted users; only the
-  // independently verified config directory owns this persistent state.
-  // Bind uploaded acknowledgements to the exact remote destination and
-  // operator identity. Changing a server/folder/user must NEVER treat a prior
-  // upload to an unrelated target as acknowledgement for this target.
-  const selected = path.resolve(config.localFolder);
-  const normalized = process.platform === "win32" ? selected.toLowerCase() : selected;
+  // The legacy API uploads basename(relativePath) into the account's remote
+  // folder; neither localFolder, deviceId nor keyEpoch is sent as a remote
+  // mutation discriminator. Binding the lock/cache to those local-only
+  // fields would let two distinct --config invocations race the SAME remote
+  // file and publish contradictory acknowledged hashes. Share one private
+  // state per actual server+account+target folder authority instead.
   const identity = JSON.stringify({
-    localFolder: normalized,
     serverUrl: normalizeTrustedSyncServerUrl(config.serverUrl),
     targetFolderId: String(config.targetFolderId || "root"),
     username: String(config.username || ""),
-    deviceId: String(config.deviceId || ""),
-    keyEpoch: String(config.keyEpoch || ""),
   });
   const digest = crypto.createHash("sha256").update(identity).digest("hex");
   return digest;
@@ -35,8 +40,7 @@ function privateSyncStateBinding(config) {
 
 function privateSyncStatePath(configPath, config) {
   const digest = privateSyncStateBinding(config);
-  return path.join(path.dirname(path.resolve(configPath)),
-    `.rootark-sync-state-${digest}.json`);
+  return path.join(STATE_HOME, `.rootark-sync-state-${digest}.json`);
 }
 
 function assertStateSeparateFromConfig(configPath, config) {

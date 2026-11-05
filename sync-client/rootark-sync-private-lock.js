@@ -21,8 +21,13 @@ function lockHeld(filename) {
 // atomic cross-process acquisition on one private filesystem; refusing an
 // existing lock is safer than racing two writers or reclaiming an apparently
 // stale PID (which could have been reused). Recovery is explicitly manual.
-function acquirePrivateSyncStateLock(statePath) {
-  const lockPath = `${preparePrivateSyncConfigPath(statePath)}.lock`;
+function acquirePrivateSyncStateLock(statePath, { canReleaseOnExit = () => true } = {}) {
+  if (typeof canReleaseOnExit !== "function") {
+    throw new Error("SYNC_STATE_LOCK_INVALID_RELEASE_GUARD");
+  }
+  // The stable per-user state home may not exist for the first run. Create
+  // it using the same private-at-creation POSIX/Windows ACL authority guard.
+  const lockPath = `${preparePrivateSyncConfigPath(statePath, { createParent: true })}.lock`;
   assertPrivateSqliteAuthorityDirectory(lockPath);
   let fd;
   try {
@@ -84,9 +89,18 @@ function acquirePrivateSyncStateLock(statePath) {
     }
     fs.closeSync(fd);
     fd = null;
-    // Synchronous exit handler releases even if the app uses process.exit()
-    // after SIGINT, without accidentally letting a concurrent SyncClient in.
-    releaseOnExit = () => release();
+    // An interrupted upload can still be committed by the remote server
+    // after our process is killed. Never give another process the lock while
+    // such a remote effect is uncertain, even on SIGINT/process.exit().
+    releaseOnExit = () => {
+      let safe = false;
+      try { safe = canReleaseOnExit() === true; } catch { /* fail closed */ }
+      if (!safe) {
+        console.error(`SYNC_STATE_LOCK_RETAINED_UNCERTAIN_UPLOAD: ${lockPath}`);
+        return;
+      }
+      release();
+    };
     process.once("exit", releaseOnExit);
     return { lockPath, release };
   } catch (error) {

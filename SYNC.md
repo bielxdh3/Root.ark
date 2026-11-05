@@ -36,11 +36,17 @@ npm run sync:start:legacy-dev
 
 ## Estado local
 
-No uploader legado, o estado fica **em arquivo privado ao lado da configuracao bearer**,
-e nunca dentro da pasta sincronizada (que pode ser compartilhada). O nome
-`.rootark-sync-state-<sha256>.json` vincula o cache a pasta local, URL do servidor,
-usuario, `folderId`, dispositivo e epoca da chave. Alterar o destino exige nova
-verificacao e nao reutiliza marcadores `uploaded` de outra conta/pasta.
+No uploader legado, o estado fica **em uma pasta privada do usuario do sistema**
+(`~/.rootark/sync/private-state`), independentemente do caminho da configuracao
+bearer, e nunca dentro da pasta sincronizada (que pode ser compartilhada). O nome
+`.rootark-sync-state-<sha256>.json` vincula o cache a URL do servidor,
+usuario e `folderId` remoto. Duas configuracoes que enviam para esse mesmo
+destino compartilham a trava e o cache, mesmo que mudem pasta local,
+`deviceId` ou `keyEpoch`, pois esses campos nao distinguem gravacoes no
+endpoint de upload legado. Alterar servidor, usuario ou pasta remota exige
+nova verificacao; o cache nunca autoriza uploads a outro destino.
+A pasta interna `.rootark/` e ignorada por padrao nas varreduras, inclusive
+quando a pasta local escolhida abrange o diretorio pessoal do usuario.
 
 O arquivo historico abaixo, se existir **na pasta sincronizada**, e preservado
 exatamente como encontrado, mas **nao e importado** nem atualizado:
@@ -59,6 +65,10 @@ O estado privado registra caminho relativo, tamanho, `mtime`, hash SHA-256,
 status do ultimo upload e nome remoto. Leituras sao limitadas a 16 MiB;
 estados maiores ou invalidos sao recusados para evitar aceitar corrupcao como
 confirmacao de upload. Nao armazena senha nem bearer token.
+O estado e seu lock ficam numa unica pasta privada por usuario do sistema,
+independentemente do caminho `--config`. Duas configuracoes privadas que
+apontem para a mesma pasta local e destino remoto compartilham a identidade,
+o cache e a exclusividade; nao podem forjar confirmacoes separadas.
 Um arquivo `.lock` ao lado desse estado impede **duas instancias** de usar
 simultaneamente a mesma identidade: a segunda falha imediatamente com
 `SYNC_STATE_LOCK_HELD` antes de ler o cache ou iniciar uploads. O lock e
@@ -68,6 +78,16 @@ um lock antigo pode permanecer; **nao e removido automaticamente**, porque
 checar apenas PID pode sofrer reutilizacao e apagar um lock valido. Para
 recuperar, verifique que nenhuma instancia de sync dessa identidade esteja
 ativa e somente entao remova manualmente o arquivo `.lock` indicado no erro.
+Se Ctrl+C ou outra terminacao interromper um upload em andamento, o lock e
+deliberadamente preservado: o servidor ainda pode concluir a gravacao mesmo
+apos a desconexao do cliente. Antes da recuperacao manual, verifique tambem
+que nao ha gravacoes remotas antigas pendentes.
+Uma falha de rede depois que um POST de upload pode ter sido enviado tambem
+preserva o lock, mesmo que o processo termine normalmente: a falta de resposta
+nao comprova que o servidor rejeitou a gravacao. Confirmar a ausencia de
+operacoes remotas pendentes e obrigatorio antes de remover o lock manualmente.
+O cliente em execucao tambem interrompe novos uploads quando esse resultado
+fica incerto; a trava nao protege apenas o encerramento do processo.
 Nunca remova o arquivo de estado ou a configuracao bearer para resolver lock.
 Toda nova varredura verifica um snapshot local estavel e seu SHA-256 antes de
 reutilizar `uploaded`: arquivos de mesmo tamanho com `mtime` restaurado nao
