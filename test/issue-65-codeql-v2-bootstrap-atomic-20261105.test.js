@@ -7,6 +7,8 @@ const path = require("node:path");
 const test = require("node:test");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
+const { readPinnedFixtureFileSync } =
+  require("./support/pinned-fixture-file");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
 const { OpaqueCheckpointV2Authority, createOpaqueCheckpointV2HttpsClient } =
@@ -102,7 +104,10 @@ test("V2 O_EXCL bootstraps refuse occupied target without overwriting it", (t) =
     const after = fs.statSync(filename, { bigint: true });
     assert.equal(after.dev, before.dev);
     assert.equal(after.ino, before.ino);
-    assert.deepEqual(fs.readFileSync(filename), sentinel);
+    // Reopen only through an O_NOFOLLOW descriptor, verifying inode, length
+    // and mtime before/after read. Two pathname stats alone cannot authorize
+    // reading a replaceable fixture after an adversarial collision.
+    assert.deepEqual(readPinnedFixtureFileSync(filename), sentinel);
     for (const suffix of ["-wal", "-shm", "-journal"]) {
       assert.equal(fs.existsSync(filename + suffix), false,
         `${scenario.name}: no SQLite sidecar may be created for a foreign path`);
