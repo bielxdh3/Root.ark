@@ -42,6 +42,11 @@ test("SIGINT during a remotely pending upload must retain the state lock", {
   let remote = null;
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -135,6 +140,11 @@ test("failed fetch after upload body cannot unlock a remotely uncertain write", 
   let pendingOldCommit = null;
   let remote = null;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -247,6 +257,11 @@ test("two private config roots targeting one authority share the lock and upload
   const firstUploadReceived = new Promise((resolve) => { firstUploadResolve = resolve; });
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -350,6 +365,11 @@ test("two processes can report stale uploaded hash while remote contents differ"
   let remoteContents = null;
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -452,6 +472,11 @@ test("a stale exclusive lock fails closed, preserves bytes, and permits explicit
   await fs.writeFile(path.join(selected, "a.txt"), "PRESERVE_UPLOAD");
   let uploadCount = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;

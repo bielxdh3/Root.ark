@@ -25,6 +25,11 @@ test("two relative paths with identical remote basename must fail closed before 
   }
   let uploads = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     } else if (req.url.startsWith("/upload?")) {
@@ -76,6 +81,11 @@ test("renaming the source during an unacknowledged POST cannot release remote ba
   let notifyOld;
   const oldReceived = new Promise((resolve) => { notifyOld = resolve; });
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     } else if (req.url.startsWith("/upload?")) {
@@ -151,6 +161,11 @@ test("basename conflict appearing during stability preflight prevents the first 
   await fs.writeFile(path.join(shared, "first", "same.txt"), "OLD_SOURCE");
   let uploads = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     } else if (req.url.startsWith("/upload?")) {

@@ -70,6 +70,37 @@ O estado privado registra caminho relativo, tamanho, `mtime`, hash SHA-256,
 status do ultimo upload e nome remoto. Leituras sao limitadas a 16 MiB;
 estados maiores ou invalidos sao recusados para evitar aceitar corrupcao como
 confirmacao de upload. Nao armazena senha nem bearer token.
+Como o uploader legado envia apenas o nome-base ao servidor, o estado privado
+tambem registra a autoridade duravel desse nome (raiz local + caminho relativo)
+sob o mesmo lock da identidade remota. Configuracoes com a mesma conta/pasta
+remota podem sincronizar nomes-base diferentes, mas a segunda raiz nao pode
+assumir `same.txt` que ja foi reservado pela primeira: a tentativa falha com
+`SYNC_REMOTE_BASENAME_AUTHORITY_CONFLICT` **antes do POST**. Marcadores antigos
+sem origem verificavel continuam intactos, mas sao bloqueados com
+`SYNC_REMOTE_BASENAME_AUTHORITY_UNVERIFIED` ate reconciliacao explicita;
+jamais sao apropriados silenciosamente pela primeira configuracao a executar.
+Somente reservas lidas do estado privado validado ou gravadas com sucesso
+podem autorizar uploads: uma falha transitoria no `fsync` exige repetir a
+gravacao antes de um novo POST, mesmo que a reserva continue na memoria. As
+origens sao comparadas com maiusculas e minusculas preservadas, inclusive no
+Windows (o NTFS permite diretorios sensiveis a caixa). Estados anteriores que
+registraram a raiz toda em minusculas podem causar bloqueio conservador de
+proveniencia e devem ser reconciliados manualmente, sem troca automatica de dono.
+O cliente exige, antes de cada POST, que o servidor autenticado confirme
+`GET /legacy-sync/capabilities` com `strictFilename: true`. Servidores antigos
+ou incapazes de confirmar a garantia sao recusados **antes de enviar bytes**.
+O envio usa o metodo distinto `PUT /upload` com o campo multipart
+`rootarkSyncStrictFilename=true`: um servidor antigo nao tem essa rota e
+recusa sem mutar arquivos, mesmo se o GET de capacidade atingiu outro no de
+um balanceador. Sob o lock da pasta remota,
+o servidor recusa com HTTP 409 qualquer nome alterado por truncamento, troca
+de caracteres ou sufixo automatico por conflito pendente, preservando uploads
+normais sem essa opcao. O cliente tambem recusa antes do POST nomes-base com
+mais de 30 unidades UTF-16, dois-pontos, barra invertida ou caracteres de
+controle, mesmo que a maquina local permita esses nomes. Assim, dois caminhos
+locais nao podem adquirir direitos sobre um nome remoto diferente daquele
+reservado; falhas apos tentativa de POST permanecem conservadoras e podem
+exigir verificacao manual de quiescencia e do lock.
 O estado e seu lock ficam numa unica pasta privada por usuario do sistema,
 independentemente do caminho `--config`. Duas configuracoes privadas que
 apontem para a mesma pasta local e destino remoto compartilham a identidade,

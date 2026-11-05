@@ -42,6 +42,11 @@ test("periodic scan cannot overlap two uploads for the same local path", {
   let releaseFirst;
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -130,6 +135,11 @@ test("ambiguous failed POST blocks further uploads in the still-running process"
   let commitOld;
   let remote = null;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -217,6 +227,11 @@ test("once mode finishes more files than the bounded admission queue", {
   await fs.writeFile(path.join(selected, "b.txt"), "CASE_LOWER");
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;
@@ -289,6 +304,11 @@ test("a busy watcher cannot starve round-robin audit of a late file", {
   let active = 0;
   let peak = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "content-type": "application/json" }).end("[]");
       return;

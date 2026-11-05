@@ -81,13 +81,20 @@ test("legacy sync ignores directory junctions and symlinks leading outside selec
 
   const uploads = [];
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) return res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     if (req.url.startsWith("/upload?")) {
       const chunks = [];
       req.on("data", (part) => chunks.push(part));
       req.on("end", () => {
-        uploads.push(Buffer.concat(chunks).toString("utf8"));
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ fileName: "uploaded.txt" }));
+        const body = Buffer.concat(chunks).toString("utf8");
+        uploads.push(body);
+        const fileName = /filename="([^"]+)"/.exec(body)?.[1];
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ fileName }));
       });
       return;
     }
@@ -120,6 +127,11 @@ test("legacy sync uploads its verified snapshot if the file is replaced during r
   let uploaded = "";
   let swapped = false;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       if (!swapped) {
         swapped = true;
@@ -175,6 +187,11 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", {
   const uploaded = [];
   const listOk = (res) => res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       listings++;
       if (releaseListings) listOk(res);
@@ -185,8 +202,10 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", {
       const chunks = [];
       req.on("data", (part) => chunks.push(part));
       req.on("end", () => {
-        uploaded.push(Buffer.concat(chunks));
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ fileName: "uploaded.txt" }));
+        const body = Buffer.concat(chunks);
+        uploaded.push(body);
+        const fileName = /filename="([^"]+)"/.exec(body.toString("utf8"))?.[1];
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ fileName }));
       });
       return;
     }
@@ -247,6 +266,11 @@ test("legacy sync never re-stats an enlarged file into an unbounded read allocat
   await fsp.writeFile(target, "small");
   let uploads = 0;
   const server = http.createServer((req, res) => {
+    // Disposable server fixture advertises the strict-name protocol contract.
+    if (req.url === "/legacy-sync/capabilities") {
+      return res.writeHead(200, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ strictFilename: true }));
+    }
     if (req.url.startsWith("/list?")) {
       return res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     }

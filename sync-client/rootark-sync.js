@@ -31,6 +31,11 @@ const DEFAULT_SCAN_INTERVAL_MS = 5000;
 const DEFAULT_STABILITY_MS = 1200;
 const DEFAULT_RETRIES = 3;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
+// server.js shortenFileName silently truncates input names to 30 UTF-16 code
+// units and, on Windows, rewrites ':' to '_'. The server may run on a
+// different platform than this client; refuse nonportable names rather than
+// reserving one basename locally and overwriting a second name remotely.
+const MAX_REMOTE_BASENAME_LENGTH = 30;
 const MAX_CONCURRENT_SYNCS = 4;
 // Snapshot hashing must never create an unbounded queue when a directory has
 // thousands of unchanged files and the scan interval is shorter than work.
@@ -101,6 +106,17 @@ function syncPathKey(relativePath) {
   // Folding case would collapse distinct A.txt/a.txt into one pending timer,
   // silently dropping one upload. Preserve the exact directory entry name.
   return path.normalize(relativePath);
+}
+
+function canonicalLegacyRemoteBasename(relativePath) {
+  const basename = path.basename(relativePath);
+  if (!basename || basename.length > MAX_REMOTE_BASENAME_LENGTH
+    || /[:\\\x00-\x1f]/.test(basename)) {
+    throw new Error(`SYNC_REMOTE_BASENAME_NONCANONICAL: ${basename} would be renamed or rejected by the remote server; use a portable name of at most ${MAX_REMOTE_BASENAME_LENGTH} code units`);
+  }
+  // The canonical remote key is deliberately conservative: files with names
+  // differing only by case/NFC must not be treated as different authorities.
+  return basename.normalize("NFC").toLowerCase();
 }
 
 function safeResolveInside(rootDir, targetPath) {
@@ -251,6 +267,19 @@ async function listRemoteFiles(config, configPath, passwordProvider) {
   return Array.isArray(payload) ? payload : Array.isArray(payload.items) ? payload.items : Array.isArray(payload.value) ? payload.value : [];
 }
 
+async function requireStrictFilenameCapability(config, configPath, passwordProvider) {
+  // Sending the opt-in flag to an older server is insufficient: it could
+  // ignore the field, silently suffix an occupied pending name, and overwrite
+  // a different source on approval. Verify support *before* sending bytes.
+  const response = await authFetch(config, configPath, "/legacy-sync/capabilities", {
+    passwordProvider,
+  });
+  const advertised = await response.json().catch(() => null);
+  if (!response.ok || advertised?.strictFilename !== true) {
+    throw new Error("SYNC_REMOTE_STRICT_FILENAME_UNSUPPORTED: server must enforce the exact requested remote filename before any upload");
+  }
+}
+
 async function approveRemoteFile(config, configPath, fileName, passwordProvider) {
   const response = await authFetch(config, configPath, `/approve/${encodeURIComponent(fileName)}?folderId=${encodeURIComponent(config.targetFolderId)}`, {
     method: "POST",
@@ -358,7 +387,7 @@ async function scanFiles(rootDir) {
         // competing versions of one remote object, while both local cache
         // entries falsely claim successful independent upload. Fail closed
         // before the scan schedules ANY write instead of silently flattening.
-        const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+        const basename = canonicalLegacyRemoteBasename(relativePath);
         const earlier = remoteBasenames.get(basename);
         if (earlier !== undefined && earlier !== relativePath) {
           throw new Error(`SYNC_REMOTE_BASENAME_COLLISION: ${earlier} conflicts with ${relativePath}`);
@@ -380,11 +409,14 @@ async function uploadFile(config, configPath, bytes, relativePath, stateEntry,
   }
 
   const fileName = path.basename(relativePath);
+  canonicalLegacyRemoteBasename(relativePath);
+  await requireStrictFilenameCapability(config, configPath, passwordProvider);
   const remoteFiles = await listRemoteFiles(config, configPath, passwordProvider).catch(() => []);
   const remoteExists = remoteFiles.some((file) => file.name === fileName);
   const formData = new FormData();
   formData.append("file", new Blob([bytes]), fileName);
   formData.append("encryptionLevel", "none");
+  formData.append("rootarkSyncStrictFilename", "true");
   if (remoteExists || stateEntry?.remoteFileName === fileName) {
     formData.append("versionComment", `Root.ark Sync update ${nowIso()}`);
   }
@@ -393,12 +425,18 @@ async function uploadFile(config, configPath, bytes, relativePath, stateEntry,
   // loss cannot prove that the remote server will not commit it later.
   onRemoteWriteBegin();
   const response = await authFetch(config, configPath, `/upload?folderId=${encodeURIComponent(config.targetFolderId)}`, {
-    method: "POST",
+    // An older server can ignore an unfamiliar multipart flag. PUT is a
+    // distinct route supported only by the strict protocol; if a load balancer
+    // sends this request to an old node it returns 404 without mutating data.
+    method: "PUT",
     body: formData,
     passwordProvider,
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.error || `Upload falhou: ${fileName}`);
+  if (payload.fileName !== fileName || payload.renamed === true) {
+    throw new Error("SYNC_REMOTE_STRICT_FILENAME_VIOLATION: server response did not acknowledge the exact requested name");
+  }
 
   if (config.autoApprove) {
     await approveRemoteFile(config, configPath, payload.fileName || fileName, passwordProvider);
@@ -417,7 +455,11 @@ class SyncClient {
     this.once = Boolean(options.once);
     this.passwordProvider = options.passwordProvider || null;
     this.statePath = assertStateSeparateFromConfig(this.configPath, this.config);
-    this.state = { files: Object.create(null) };
+    this.state = { files: Object.create(null), remoteBasenameOwners: Object.create(null) };
+    // Only owner claims read from the guarded private state, or successfully
+    // fsynced during this process, may authorize remote HTTP mutations.
+    // An owner object left in memory after a failed write is NOT durable.
+    this.durableRemoteBasenameOwners = new Set();
     this.stateSaveQueue = Promise.resolve();
     this.uncertainRemoteOutcome = false;
     this.stateLock = null;
@@ -464,6 +506,8 @@ class SyncClient {
       await fsp.mkdir(safeFolder, { recursive: true });
       this.config.localFolder = safeFolder;
       this.state = await readPrivateSyncState(this.statePath, this.config);
+      this.durableRemoteBasenameOwners = new Set(
+        Object.keys(this.state.remoteBasenameOwners));
       // No migration of unauthenticated `uploaded` flags: it could skip real
       // uploads. Retain historical state in place, inspect without writing,
       // and rebuild a private cache from real uploads on this invocation.
@@ -490,13 +534,58 @@ class SyncClient {
     return next;
   }
 
+  async ensureRemoteBasenameAuthority(relativePath) {
+    // Sync's legacy HTTP API discards directory context: every `same.txt`
+    // uploaded to a remote folder refers to exactly the same object, even
+    // when the two configs use different localFolder roots. The shared
+    // state/lock must enforce one durable source identity for that basename.
+    const basename = canonicalLegacyRemoteBasename(relativePath);
+    const selected = path.resolve(this.config.localFolder);
+    // Preserve case-exact source identity even on Windows: NTFS permits
+    // per-directory case-sensitive paths (notably WSL-managed trees). Lower-
+    // casing would falsely equate two physically distinct sources. Remote
+    // basename remains casefolded conservatively because the HTTP API drops
+    // directory context and may resolve remote names case-insensitively.
+    const localFolder = selected;
+    const sourceKey = syncPathKey(relativePath);
+    const owners = this.state.remoteBasenameOwners;
+    const existing = owners[basename];
+    if (existing) {
+      if (existing.localFolder !== localFolder || existing.relativePath !== sourceKey) {
+        throw new Error(`SYNC_REMOTE_BASENAME_AUTHORITY_CONFLICT: ${basename} belongs to a different source folder/path; refusing remote overwrite`);
+      }
+      if (!this.durableRemoteBasenameOwners.has(basename)) {
+        // A prior private write may have failed AFTER inserting this owner
+        // into the process's mutable map. Never return based only on memory:
+        // a subsequent HTTP request could mutate the remote with no durable
+        // source provenance for another config/restart to enforce.
+        await this.saveState();
+        this.durableRemoteBasenameOwners.add(basename);
+      }
+      return;
+    }
+    // Cache entries from the pre-authority release might correspond to any
+    // source root. Never silently assign the first caller ownership based
+    // on an old `uploaded` hash that lacked source-root provenance.
+    const oldEntry = Object.keys(this.state.files).find((name) =>
+      path.basename(name).normalize("NFC").toLowerCase() === basename);
+    if (oldEntry !== undefined) {
+      throw new Error(`SYNC_REMOTE_BASENAME_AUTHORITY_UNVERIFIED: ${basename} has a historical acknowledgement without a trusted source; explicit reconciliation required`);
+    }
+    owners[basename] = { localFolder, relativePath: sourceKey };
+    // Publish the claim under the already-acquired remote-identity lock,
+    // BEFORE any mutating HTTP request or even an uploaded-cache skip.
+    await this.saveState();
+    this.durableRemoteBasenameOwners.add(basename);
+  }
+
   schedule(relativePath, reason = "change") {
     // An aborted HTTP write can still COMMIT remotely after the socket dies.
     // The same running process must not send a newer write while uncertain.
     if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
     const fullPath = safeResolveInside(this.config.localFolder, path.join(this.config.localFolder, relativePath));
     if (!fullPath) return;
-    const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+    const basename = canonicalLegacyRemoteBasename(relativePath);
     const earlier = this.activeRemoteBasenames.get(basename)
       ?? this.remoteBasenameOwners.get(basename);
     if (earlier !== undefined && earlier !== relativePath) {
@@ -621,7 +710,7 @@ class SyncClient {
     }
     const files = await scanFiles(this.config.localFolder);
     const scannedOwners = new Map(files.map((file) => [
-      path.basename(file.relativePath).normalize("NFC").toLowerCase(), file.relativePath,
+      canonicalLegacyRemoteBasename(file.relativePath), file.relativePath,
     ]));
     for (const [basename, activePath] of this.activeRemoteBasenames) {
       const newPath = scannedOwners.get(basename);
@@ -695,6 +784,8 @@ class SyncClient {
       this.schedule(relativePath, "not-stable");
       return;
     }
+
+    await this.ensureRemoteBasenameAuthority(relativePath);
 
     const previous = this.state.files[relativePath];
     if (
