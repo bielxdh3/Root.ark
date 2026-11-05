@@ -16,9 +16,10 @@ const WITNESS_DOMAIN = "rootark-sync-atomic-batch-witness-v2\0";
 const CAS_DOMAIN = "rootark-sync-atomic-batch-external-cas-floor-v2\0";
 const ANCHOR_DOMAIN = "rootark-sync-atomic-batch-retained-highwater-v1\0";
 const LINEAGE_DOMAIN = "rootark-sync-atomic-batch-physical-lineage-v1\0";
-// Internal constructor preflight token: open() must never adopt a database
-// materialized during an awaited external genesis challenge.
-const OPEN_PREFLIGHT = Symbol("sync-v2-cas-open-preflight");
+// Bind the signed preflight to the EXACT module-created options object. A
+// Symbol property is forgeable through caller-controlled Proxy#get traps and
+// must never authorize a writable SQLite constructor.
+const OPEN_PREFLIGHT = new WeakMap();
 const GENESIS = crypto.createHash("sha256")
   .update("rootark-sync-atomic-batch-cas-genesis-v1\0").digest("hex");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -258,9 +259,14 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
   #uncertain = false;
   #poisoned = false;
 
-  constructor({ filename, bootstrapNew = false, casPrivateKey, witnessPublicKey,
-    anchorPublicKey, ownerBindings, physicalFence, retainedAnchor,
-    [OPEN_PREFLIGHT]: preflight = null } = {}) {
+  constructor(options = {}) {
+    const preflight = OPEN_PREFLIGHT.get(options);
+    OPEN_PREFLIGHT.delete(options);
+    // Reject unverified construction before invoking ANY user-supplied
+    // property getter or opening/creating a local SQLite authority.
+    requireValid(preflight?.kind === "existing" || preflight?.kind === "absent");
+    const { filename, bootstrapNew = false, casPrivateKey, witnessPublicKey,
+      anchorPublicKey, ownerBindings, physicalFence, retainedAnchor } = options;
     const casKey = assertKey(casPrivateKey, "private");
     const witnessKey = assertKey(witnessPublicKey, "public");
     const anchorKey = assertKey(anchorPublicKey, "public");
@@ -290,7 +296,6 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
     // Do not check pathname existence again: its status can change between
     // that check and O_EXCL. The initial preflight disposition is authoritative
     // and an unexpected new file must fail atomically at O_EXCL.
-    requireValid(preflight?.kind === "existing" || preflight?.kind === "absent");
     const existed = preflight.kind === "existing";
     requireValid(existed || bootstrapNew === true);
     let pinned;
@@ -452,11 +457,11 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
         requireValid(before.dev === afterAnchor.dev && before.ino === afterAnchor.ino);
       }
     } catch { throw deny(); }
-    const ledger = new Zk1SyncAtomicCasFloorLedgerDevOff({ ...options,
-      [OPEN_PREFLIGHT]: before
-        ? { kind: "existing", dev: before.dev, ino: before.ino }
-        : { kind: "absent" },
-    });
+    const verifiedOptions = { ...options };
+    OPEN_PREFLIGHT.set(verifiedOptions, before
+      ? { kind: "existing", dev: before.dev, ino: before.ino }
+      : { kind: "absent" });
+    const ledger = new Zk1SyncAtomicCasFloorLedgerDevOff(verifiedOptions);
     try {
       const verifiedHeads = new Map();
       for (const binding of ledger.#bindings.values()) {
