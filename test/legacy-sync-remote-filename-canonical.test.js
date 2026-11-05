@@ -21,7 +21,7 @@ function serverFilename(name) {
   return name.length <= 30 ? name : `${base.slice(0, Math.max(1, 30 - extension.length))}${extension}`;
 }
 
-async function runFixture(t, names, { strictCapability = true } = {}) {
+async function runFixture(t, names, { strictCapability = true, strictPutSupported = true } = {}) {
   const privateDir = createPrivateAuthorityFixture("rootark-canonical-name-private-");
   const source = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-canonical-name-source-"));
   t.after(async () => {
@@ -42,6 +42,9 @@ async function runFixture(t, names, { strictCapability = true } = {}) {
     if (req.url.startsWith("/list?")) {
       res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
     } else if (req.url.startsWith("/upload?")) {
+      if (req.method === "PUT" && !strictPutSupported) {
+        return res.writeHead(404, { "Content-Type": "application/json" }).end("{}");
+      }
       const chunks = [];
       req.on("data", (part) => chunks.push(part));
       req.on("end", () => {
@@ -119,4 +122,14 @@ test("an older server without strict-name capability is refused before any POST"
   assert.notEqual(result.code, 0);
   assert.match(result.output, /SYNC_REMOTE_STRICT_FILENAME_UNSUPPORTED/);
   assert.deepEqual(result.uploads, [], "unsupported server must not receive mutating bytes");
+});
+
+test("a mixed-version server cannot mutate through a legacy POST-only upload node", {
+  timeout: 180000,
+}, async (t) => {
+  // Simulate an upgraded capability GET routed to a new node but a write
+  // routed to an older node that accepts only POST /upload.
+  const result = await runFixture(t, ["safe.txt"], { strictPutSupported: false });
+  assert.notEqual(result.code, 0);
+  assert.deepEqual(result.uploads, [], "old POST-only node cannot accept strict PUT writes");
 });

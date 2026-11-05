@@ -89,7 +89,10 @@ proveniencia e devem ser reconciliados manualmente, sem troca automatica de dono
 O cliente exige, antes de cada POST, que o servidor autenticado confirme
 `GET /legacy-sync/capabilities` com `strictFilename: true`. Servidores antigos
 ou incapazes de confirmar a garantia sao recusados **antes de enviar bytes**.
-O POST inclui `rootarkSyncStrictFilename=true`: sob o lock da pasta remota,
+O envio usa o metodo distinto `PUT /upload` com o campo multipart
+`rootarkSyncStrictFilename=true`: um servidor antigo nao tem essa rota e
+recusa sem mutar arquivos, mesmo se o GET de capacidade atingiu outro no de
+um balanceador. Sob o lock da pasta remota,
 o servidor recusa com HTTP 409 qualquer nome alterado por truncamento, troca
 de caracteres ou sufixo automatico por conflito pendente, preservando uploads
 normais sem essa opcao. O cliente tambem recusa antes do POST nomes-base com

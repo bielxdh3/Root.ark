@@ -444,9 +444,9 @@ async function upload(port, session, filename, bytes) {
   return uploadPayload(port, session, payload);
 }
 
-async function uploadPayload(port, session, payload) {
+async function uploadPayload(port, session, payload, method = "POST") {
   return request(port, `/upload?folderId=${FOLDER_ID}`, {
-    method: "POST",
+    method,
     headers: {
       cookie: session.cookie,
       origin: `http://127.0.0.1:${port}`,
@@ -2092,17 +2092,24 @@ test("strict legacy sync rejects pending suffix aliases before remote overwrite 
   assert.deepEqual(fs.readFileSync(pendingPath), firstPendingBytes);
   const originalPending = pending(harness.dir);
 
-  const flaggedUpload = (flag) => uploadPayload(harness.port, session, multipartParts([
+  const flaggedUpload = (flag, method = "POST") => uploadPayload(harness.port, session, multipartParts([
     { filename: "a.txt", bytes: Buffer.from("UNAUTHORIZED_ALIAS_BYTES") },
     // The sync client's FormData puts the file before extra form fields.
     { field: "rootarkSyncStrictFilename", bytes: flag },
-  ]));
-  const strict = await flaggedUpload("true");
+  ]), method);
+  const strict = await flaggedUpload("true", "PUT");
   assert.equal(strict.status, 409, strict.body);
   assert.equal(JSON.parse(strict.body).code, "SYNC_STRICT_FILENAME_CONFLICT");
 
+  // The separate PUT route prevents capability GET on an upgraded node
+  // followed by POST on a legacy node ignoring a new multipart flag.
+  const missingFlag = await uploadPayload(harness.port, session,
+    multipart("a.txt", Buffer.from("MISSING_FLAG_BYTES")), "PUT");
+  assert.equal(missingFlag.status, 400, missingFlag.body);
+  assert.equal(JSON.parse(missingFlag.body).code, "SYNC_STRICT_FILENAME_INVALID_FLAG");
+
   for (const malformed of ["false", "TRUE", "1", ""]) {
-    const rejected = await flaggedUpload(malformed);
+    const rejected = await flaggedUpload(malformed, "PUT");
     assert.equal(rejected.status, 400, rejected.body);
     assert.equal(JSON.parse(rejected.body).code, "SYNC_STRICT_FILENAME_INVALID_FLAG");
   }
@@ -2110,7 +2117,7 @@ test("strict legacy sync rejects pending suffix aliases before remote overwrite 
     { field: "rootarkSyncStrictFilename", bytes: "true" },
     { field: "rootarkSyncStrictFilename", bytes: "true" },
     { filename: "a.txt", bytes: Buffer.from("DUPLICATE_FLAG_BYTES") },
-  ]));
+  ]), "PUT");
   assert.equal(duplicateFlag.status, 400, duplicateFlag.body);
   assert.equal(JSON.parse(duplicateFlag.body).code, "SYNC_STRICT_FILENAME_INVALID_FLAG");
 
@@ -2118,7 +2125,7 @@ test("strict legacy sync rejects pending suffix aliases before remote overwrite 
   const shortened = await uploadPayload(harness.port, session, multipartParts([
     { filename: longName, bytes: Buffer.from("TRUNCATION_ALIAS_BYTES") },
     { field: "rootarkSyncStrictFilename", bytes: "true" },
-  ]));
+  ]), "PUT");
   assert.equal(shortened.status, 409, shortened.body);
   assert.equal(JSON.parse(shortened.body).code, "SYNC_STRICT_FILENAME_CONFLICT");
   assert.deepEqual(pending(harness.dir), originalPending);
@@ -2127,6 +2134,13 @@ test("strict legacy sync rejects pending suffix aliases before remote overwrite 
   assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "a-1.txt")), false);
   assert.deepEqual(filesUnder(path.join(harness.dir, "temp", ".incoming")), []);
   assert.deepEqual(quarantine(harness.dir).items, []);
+
+  const safePut = await uploadPayload(harness.port, session, multipartParts([
+    { filename: "z-strict.txt", bytes: Buffer.from("SAFE_STRICT_UPLOAD") },
+    { field: "rootarkSyncStrictFilename", bytes: "true" },
+  ]), "PUT");
+  assert.equal(safePut.status, 200, safePut.body);
+  assert.equal(JSON.parse(safePut.body).fileName, "z-strict.txt");
 
   const ordinary = await upload(harness.port, session, "a.txt", Buffer.from("BROWSER_SUFFIX_UPLOAD"));
   assert.equal(ordinary.status, 200, ordinary.body);

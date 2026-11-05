@@ -425,7 +425,10 @@ async function uploadFile(config, configPath, bytes, relativePath, stateEntry,
   // loss cannot prove that the remote server will not commit it later.
   onRemoteWriteBegin();
   const response = await authFetch(config, configPath, `/upload?folderId=${encodeURIComponent(config.targetFolderId)}`, {
-    method: "POST",
+    // An older server can ignore an unfamiliar multipart flag. PUT is a
+    // distinct route supported only by the strict protocol; if a load balancer
+    // sends this request to an old node it returns 404 without mutating data.
+    method: "PUT",
     body: formData,
     passwordProvider,
   });

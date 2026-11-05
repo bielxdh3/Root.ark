@@ -9787,7 +9787,7 @@ app.get("/legacy-sync/capabilities", authenticate, (_req, res) => {
   res.json({ strictFilename: true });
 });
 
-app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, async (req, res) => {
+const finalizeSimpleUpload = async (req, res) => {
   const originalName = path.basename(req.file?.originalname || "");
   const requestedFileName = path.basename(req.uploadFinalFileName || "");
   const incomingPath = getTrustedUploadStagingPath(req.file);
@@ -9802,7 +9802,7 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   // to the ordinary upload's automatic renaming behavior.
   const strictFieldProvided = Object.hasOwn(req.body || {}, "rootarkSyncStrictFilename");
   const strictFilename = strictFieldProvided && req.body.rootarkSyncStrictFilename === "true";
-  if (strictFieldProvided && !strictFilename) {
+  if ((req.method === "PUT" && !strictFilename) || (strictFieldProvided && !strictFilename)) {
     fs.rmSync(incomingPath, { force: true });
     return res.status(400).json({
       code: "SYNC_STRICT_FILENAME_INVALID_FLAG",
@@ -9916,7 +9916,14 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   }
   processCloudTempMutationAfterLifecycle(folderId, fileName);
   res.json(payload);
-});
+};
+
+// Browser uploads retain POST and their historical suffix behavior. Legacy
+// sync uses a separately registered HTTP method, so older servers behind a
+// mixed-version load balancer cannot ignore its strict-name flag and mutate a
+// different remote basename after capability negotiation on a newer node.
+app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, finalizeSimpleUpload);
+app.put("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, finalizeSimpleUpload);
 
 app.put("/file-temporary", fileTemporaryRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
