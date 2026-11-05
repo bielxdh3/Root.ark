@@ -241,7 +241,8 @@ function matchesScope(value, scope) {
     field === "compartment_id" ? 128 : 16), scope[field])) fail();
 }
 function fileSecurity(filename, bootstrapNew) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) fail();
+  if (typeof filename !== "string" || !path.isAbsolute(filename)
+    || typeof bootstrapNew !== "boolean") fail();
   const parent = fs.lstatSync(path.dirname(filename));
   if (!parent.isDirectory() || parent.isSymbolicLink()
     || (process.platform !== "win32"

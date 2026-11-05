@@ -145,7 +145,8 @@ async function createSignedOpaqueCheckpointOwnerApprovalV2(statement, ownerPriva
   return { approvalBytes, approvalSignature };
 }
 function fileCheck(filename, bootstrapNew) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) fail();
+  if (typeof filename !== "string" || !path.isAbsolute(filename)
+    || typeof bootstrapNew !== "boolean") fail();
   assertPrivateSqliteAuthorityDirectory(filename);
   const folder = fs.lstatSync(path.dirname(filename));
   if (!folder.isDirectory() || folder.isSymbolicLink()

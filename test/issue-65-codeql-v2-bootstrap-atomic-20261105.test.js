@@ -39,25 +39,25 @@ function scenarios() {
     minimumHead: {}, freshWitnessHead: async () => { throw Error("unused"); } };
   const baseDigest = crypto.randomBytes(32), baseCheckpoint = crypto.randomBytes(32);
   return [
-    { name: "checkpoint V2 local client", construct: (filename) =>
+    { name: "checkpoint V2 local client", construct: (filename, bootstrapNew = true) =>
       new Zk1OpaqueCheckpointV2Client({
-        journalPath: filename, bootstrapNew: true, trustedScope: scope,
+        journalPath: filename, bootstrapNew, trustedScope: scope,
         expectedV1Digest: baseDigest, expectedV1Checkpoint: baseCheckpoint,
         casClient, floorClient, v1CasClient: oldCasClient,
         v1FloorClient: oldFloorClient, checkpointPublicKey: checkpoint.publicKey,
         ownerPublicKey: owner.publicKey, catalogPublicKey: catalog.publicKey,
         ownerTrust: trust }) },
-    { name: "checkpoint V2 remote CAS authority", construct: (filename) =>
+    { name: "checkpoint V2 remote CAS authority", construct: (filename, bootstrapNew = true) =>
       new OpaqueCheckpointV2Authority(filename, {
-        role: "CAS", bootstrapNew: true, scope,
+        role: "CAS", bootstrapNew, scope,
         signingPrivateKey: cas.privateKey, casSignerPublicKey: cas.publicKey,
         floorSignerPublicKey: floor.publicKey,
         checkpointPublicKey: checkpoint.publicKey, ownerPublicKey: owner.publicKey,
         ownerTrust: { ...trust, genesisDigest: crypto.randomBytes(32) },
         baseDigest, baseCheckpoint }) },
-    { name: "checkpoint V2 local stage", construct: (filename) =>
+    { name: "checkpoint V2 local stage", construct: (filename, bootstrapNew = true) =>
       new Zk1OpaqueCatalogCheckpointV2Stage(filename, {
-        bootstrapNew: true, trustedScope: scope,
+        bootstrapNew, trustedScope: scope,
         ownerPublicKey: owner.publicKey, checkpointPublicKey: checkpoint.publicKey,
         casClient: oldCasClient, floorClient: oldFloorClient,
         resolveCatalogSigner: async () => catalog.publicKey }) },
@@ -106,6 +106,24 @@ test("V2 O_EXCL bootstraps refuse occupied target without overwriting it", (t) =
     for (const suffix of ["-wal", "-shm", "-journal"]) {
       assert.equal(fs.existsSync(filename + suffix), false,
         `${scenario.name}: no SQLite sidecar may be created for a foreign path`);
+    }
+  }
+});
+
+test("V2 bootstrap rejects non-boolean options before creating any SQLite file", (t) => {
+  const root = createPrivateAuthorityFixture("zk65-codeql-v2-bool-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  for (const [index, scenario] of scenarios().entries()) {
+    for (const [kind, value] of [["string", "false"], ["object", new Boolean(false)]]) {
+      const filename = path.join(root, `invalid-${index}-${kind}.sqlite`);
+      assert.throws(() => scenario.construct(filename, value),
+        `${scenario.name}: ${kind} cannot authorize a new SQLite database`);
+      assert.equal(fs.existsSync(filename), false,
+        `${scenario.name}: no SQLite file may be created for non-boolean bootstrapNew`);
+      for (const suffix of ["-wal", "-shm", "-journal"]) {
+        assert.equal(fs.existsSync(filename + suffix), false,
+          `${scenario.name}: no SQLite sidecars on invalid bootstrapNew`);
+      }
     }
   }
 });
