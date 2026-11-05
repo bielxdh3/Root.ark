@@ -10,6 +10,11 @@ const os = require("node:os");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { writePrivateSyncConfig, readPrivateSyncConfig } =
   require("./rootark-sync-private-config");
+const { privateSyncStatePath, assertStateSeparateFromConfig,
+  readPrivateSyncState, writePrivateSyncState,
+  inspectHistoricalSyncState } = require("./rootark-sync-private-state");
+const { acquirePrivateSyncStateLock } =
+  require("./rootark-sync-private-lock");
 
 // Bearer credentials must not default to a potentially group-writable CWD.
 // A fresh private child of the user config home gets a protected ACL/mode
@@ -27,8 +32,16 @@ const DEFAULT_STABILITY_MS = 1200;
 const DEFAULT_RETRIES = 3;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_CONCURRENT_SYNCS = 4;
+// Snapshot hashing must never create an unbounded queue when a directory has
+// thousands of unchanged files and the scan interval is shorter than work.
+const MAX_QUEUED_SYNCS = 64;
+const MAX_AUDIT_SYNCS = 48;
+const MAX_WATCHER_SYNCS = 16;
+const MAX_DEFERRED_WATCHER_PATHS = 256;
 
-const IGNORE_DIRECTORY_NAMES = new Set(["node_modules", ".git"]);
+// Never upload the owner's private synchronization authority if the selected
+// source tree is their home directory (or contains this private child).
+const IGNORE_DIRECTORY_NAMES = new Set(["node_modules", ".git", ".rootark"]);
 const IGNORE_FILE_NAMES = new Set([STATE_FILE_NAME, ".rootark-sync.json", ".env"]);
 const IGNORE_EXTENSIONS = new Set([".key", ".pem", ".tmp", ".part", ".crdownload", ".log"]);
 
@@ -83,6 +96,13 @@ function normalizeServerUrl(serverUrl) {
   return normalizeTrustedSyncServerUrl(serverUrl);
 }
 
+function syncPathKey(relativePath) {
+  // Windows 10 supports case-sensitive NTFS directories (e.g. WSL-managed).
+  // Folding case would collapse distinct A.txt/a.txt into one pending timer,
+  // silently dropping one upload. Preserve the exact directory entry name.
+  return path.normalize(relativePath);
+}
+
 function safeResolveInside(rootDir, targetPath) {
   const root = path.resolve(rootDir);
   const resolved = path.resolve(targetPath);
@@ -102,21 +122,6 @@ function shouldIgnore(relativePath, stats) {
   if (IGNORE_EXTENSIONS.has(path.extname(baseName).toLowerCase())) return true;
   if (stats?.isDirectory?.()) return false;
   return false;
-}
-
-async function readJson(filePath, fallback) {
-  try {
-    return JSON.parse(await fsp.readFile(filePath, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJsonAtomic(filePath, data) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  await fsp.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-  await fsp.rename(tempPath, filePath);
 }
 
 async function loadConfig(configPath) {
@@ -181,6 +186,7 @@ async function selectSyncConfigPath(requested, { reusePrivateLegacy = false } = 
 async function saveConfig(configPath, config) {
   const safeConfig = { ...config };
   delete safeConfig.password;
+  assertStateSeparateFromConfig(configPath, safeConfig);
   await writePrivateSyncConfig(configPath, `${JSON.stringify(safeConfig, null, 2)}\n`);
 }
 
@@ -331,6 +337,7 @@ async function getStableFileInfo(filePath, waitMs, rootDir) {
 
 async function scanFiles(rootDir) {
   const result = [];
+  const remoteBasenames = new Map();
 
   async function walk(currentDir) {
     const entries = await fsp.readdir(currentDir, { withFileTypes: true });
@@ -345,6 +352,18 @@ async function scanFiles(rootDir) {
       if (stats.isDirectory()) {
         await walk(safePath);
       } else if (stats.isFile()) {
+        // The legacy upload endpoint places path.basename(relativePath) in a
+        // single remote folder, NOT in the corresponding local subfolder.
+        // Two distinct relative paths with the same basename would become
+        // competing versions of one remote object, while both local cache
+        // entries falsely claim successful independent upload. Fail closed
+        // before the scan schedules ANY write instead of silently flattening.
+        const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+        const earlier = remoteBasenames.get(basename);
+        if (earlier !== undefined && earlier !== relativePath) {
+          throw new Error(`SYNC_REMOTE_BASENAME_COLLISION: ${earlier} conflicts with ${relativePath}`);
+        }
+        remoteBasenames.set(basename, relativePath);
         result.push({ fullPath: safePath, relativePath, stats });
       }
     }
@@ -354,7 +373,8 @@ async function scanFiles(rootDir) {
   return result;
 }
 
-async function uploadFile(config, configPath, bytes, relativePath, stateEntry, passwordProvider) {
+async function uploadFile(config, configPath, bytes, relativePath, stateEntry,
+  passwordProvider, onRemoteWriteBegin = () => {}) {
   if (!Buffer.isBuffer(bytes) || bytes.length > MAX_FILE_BYTES) {
     throw new Error(`Arquivo maior que ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB ainda nao e suportado pelo cliente MVP`);
   }
@@ -369,6 +389,9 @@ async function uploadFile(config, configPath, bytes, relativePath, stateEntry, p
     formData.append("versionComment", `Root.ark Sync update ${nowIso()}`);
   }
 
+  // Once an upload might have crossed the HTTP boundary, an error/connection
+  // loss cannot prove that the remote server will not commit it later.
+  onRemoteWriteBegin();
   const response = await authFetch(config, configPath, `/upload?folderId=${encodeURIComponent(config.targetFolderId)}`, {
     method: "POST",
     body: formData,
@@ -393,62 +416,247 @@ class SyncClient {
     this.config = config;
     this.once = Boolean(options.once);
     this.passwordProvider = options.passwordProvider || null;
-    this.statePath = path.join(this.config.localFolder, STATE_FILE_NAME);
-    this.state = { files: {} };
+    this.statePath = assertStateSeparateFromConfig(this.configPath, this.config);
+    this.state = { files: Object.create(null) };
+    this.stateSaveQueue = Promise.resolve();
+    this.uncertainRemoteOutcome = false;
+    this.stateLock = null;
     this.pending = new Map();
+    this.pendingKinds = new Map();
+    this.activeKinds = new Map();
+    this.activePaths = new Set();
+    this.rescanAfterActive = new Set();
     this.running = false;
     this.scanTimer = null;
     this.idleResolvers = [];
     this.activeSyncTasks = 0;
     this.activeSyncSlots = 0;
+    this.stateWritePending = 0;
     this.syncSlotWaiters = [];
+    this.scanCursor = 0;
+    this.syncFailures = 0;
+    this.scanInProgress = false;
+    this.scanPending = false;
+    this.deferredWatcherPaths = new Map();
+    this.needsFullRescan = false;
+    this.remoteBasenameOwners = new Map();
+    this.activeRemoteBasenames = new Map();
+    this.remoteBasenameCollision = null;
   }
 
   async init() {
-    const safeFolder = path.resolve(this.config.localFolder);
-    await fsp.mkdir(safeFolder, { recursive: true });
-    this.config.localFolder = safeFolder;
-    this.state = await readJson(this.statePath, { files: {} });
-    if (!this.state.files || typeof this.state.files !== "object") this.state = { files: {} };
-    await ensureToken(this.config, this.configPath, this.passwordProvider);
+    // Per-process saveState serialization is insufficient when two CLIs share
+    // the same protected state identity: each otherwise reads a stale cache
+    // and may overwrite the other's successful acknowledgement. The lock must
+    // be held BEFORE readPrivateSyncState until process exit, including
+    // unbounded in-flight HTTP uploads or async state writes.
+    this.stateLock = acquirePrivateSyncStateLock(this.statePath, {
+      // Only a fully quiescent client can relinquish the state identity.
+      // activeSyncTasks spans HTTP upload, acknowledgement and state fsync.
+      // On forced exit with unfinished work, leave a stale lock for manual
+      // verified recovery instead of risking a delayed remote commit.
+      canReleaseOnExit: () => this.activeSyncTasks === 0
+        && this.activeSyncSlots === 0 && this.stateWritePending === 0
+        && !this.uncertainRemoteOutcome,
+    });
+    try {
+      const safeFolder = path.resolve(this.config.localFolder);
+      await fsp.mkdir(safeFolder, { recursive: true });
+      this.config.localFolder = safeFolder;
+      this.state = await readPrivateSyncState(this.statePath, this.config);
+      // No migration of unauthenticated `uploaded` flags: it could skip real
+      // uploads. Retain historical state in place, inspect without writing,
+      // and rebuild a private cache from real uploads on this invocation.
+      const legacy = await inspectHistoricalSyncState(safeFolder);
+      if (legacy.present) {
+        log(`Estado legado preservado sem importacao: ${path.join(safeFolder, STATE_FILE_NAME)} (${legacy.status}). A primeira varredura refaz uploads sem confiar em marcadores antigos.`);
+      }
+      await ensureToken(this.config, this.configPath, this.passwordProvider);
+    } catch (error) {
+      this.stateLock.release();
+      this.stateLock = null;
+      throw error;
+    }
   }
 
-  async saveState() {
-    await writeJsonAtomic(this.statePath, this.state);
+  saveState() {
+    // Four concurrent per-file syncs must never reuse the same temporary
+    // filename or race to publish stale snapshots of this shared state.
+    this.stateWritePending++;
+    const next = this.stateSaveQueue.then(() =>
+      writePrivateSyncState(this.statePath, this.state, this.config));
+    next.finally(() => { this.stateWritePending--; }).catch(() => {});
+    this.stateSaveQueue = next.catch(() => {});
+    return next;
   }
 
   schedule(relativePath, reason = "change") {
+    // An aborted HTTP write can still COMMIT remotely after the socket dies.
+    // The same running process must not send a newer write while uncertain.
+    if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
     const fullPath = safeResolveInside(this.config.localFolder, path.join(this.config.localFolder, relativePath));
     if (!fullPath) return;
-    clearTimeout(this.pending.get(relativePath));
-    this.pending.set(relativePath, setTimeout(async () => {
+    const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+    const earlier = this.activeRemoteBasenames.get(basename)
+      ?? this.remoteBasenameOwners.get(basename);
+    if (earlier !== undefined && earlier !== relativePath) {
+      this.remoteBasenameCollision = new Error(
+        `SYNC_REMOTE_BASENAME_COLLISION: ${earlier} conflicts with ${relativePath}`);
+      log(`ERRO: ${this.remoteBasenameCollision.message}`);
+      this.stop();
+      return;
+    }
+    this.remoteBasenameOwners.set(basename, relativePath);
+    const key = syncPathKey(relativePath);
+    const kind = ["scan", "interval", "initial"].includes(reason)
+      ? "audit" : "watcher";
+    const deferWatcher = () => {
+      if (kind !== "watcher" || this.once) return;
+      if (this.deferredWatcherPaths.has(key)) return;
+      if (this.deferredWatcherPaths.size < MAX_DEFERRED_WATCHER_PATHS) {
+        this.deferredWatcherPaths.set(key, relativePath);
+      } else {
+        // A later round-robin full digest sweep still covers the overflow,
+        // even if watcher events are deliberately coalesced under pressure.
+        this.needsFullRescan = true;
+      }
+    };
+    // The interval scanner and native watcher must not start an overlapping
+    // upload of the same remote file while the prior HTTP operation awaits
+    // its acknowledgement. A watcher/not-stable retry is remembered once.
+    if (this.activePaths.has(key)) {
+      if (reason !== "scan" && reason !== "interval") {
+        this.rescanAfterActive.add(key);
+      }
+      return;
+    }
+    // Never reset an already-armed debounce on every watcher event: a hot
+    // writer could otherwise indefinitely postpone the same file.
+    if (this.pending.has(key)) return;
+    if (this.pending.size + this.activeSyncTasks >= MAX_QUEUED_SYNCS) {
+      // The next periodic scan will revisit this path; do not enqueue an
+      // unbounded timer or task while the four execution slots are busy.
+      deferWatcher();
+      return;
+    }
+    if (!this.once) {
+      const occupied = [...this.pendingKinds.values(), ...this.activeKinds.values()]
+        .filter((item) => item === kind).length;
+      // Reserve capacity for both continuous digest auditing and urgent
+      // watcher changes, so a flood cannot monopolize the entire queue.
+      if (occupied >= (kind === "audit" ? MAX_AUDIT_SYNCS : MAX_WATCHER_SYNCS)) {
+        deferWatcher();
+        return;
+      }
+    }
+    this.pendingKinds.set(key, kind);
+    this.pending.set(key, setTimeout(async () => {
+      this.pending.delete(key);
+      this.pendingKinds.delete(key);
+      if (this.activePaths.has(key)) {
+        this.rescanAfterActive.add(key);
+        return;
+      }
+      this.activePaths.add(key);
+      // An active remote write owns its flattened basename until its ACK
+      // and private-state fsync settle. A later scan must not forget that
+      // owner merely because the old local pathname was renamed/deleted.
+      this.activeRemoteBasenames.set(basename, relativePath);
+      this.activeKinds.set(key, kind);
       this.activeSyncTasks++;
-      this.pending.delete(relativePath);
       try {
         await this.syncOne(fullPath, relativePath, reason).catch((error) => {
+          this.syncFailures++;
           log(`ERRO ${relativePath}: ${error.message}`);
         });
       } finally {
+        if (this.activeRemoteBasenames.get(basename) === relativePath) {
+          this.activeRemoteBasenames.delete(basename);
+        }
+        this.activePaths.delete(key);
+        this.activeKinds.delete(key);
         this.activeSyncTasks--;
+        if (this.rescanAfterActive.delete(key) && this.running) {
+          this.schedule(relativePath, "after-active");
+        }
         this.resolveIdleIfNeeded();
       }
     }, this.config.debounceMs));
   }
 
   async scanAndSchedule(reason = "scan") {
+    if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
+    if (this.scanInProgress) {
+      this.scanPending = true;
+      return;
+    }
+    this.scanInProgress = true;
+    try {
+      do {
+        this.scanPending = false;
+        try {
+          await this.scanAndScheduleOnePass(reason);
+        } catch (error) {
+          if (String(error?.message).includes("SYNC_REMOTE_BASENAME_COLLISION")) {
+            this.remoteBasenameCollision = error;
+            this.stop();
+          }
+          throw error;
+        }
+      } while (this.scanPending && this.running && !this.uncertainRemoteOutcome);
+    } finally {
+      this.scanInProgress = false;
+    }
+  }
+
+  async scanAndScheduleOnePass(reason) {
+    if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
+    // Deferred watcher paths get their own capped budget. Audit work keeps
+    // reserved capacity, so even sustained watcher floods cannot suppress
+    // every digest-sweep lane.
+    for (const [key, relativePath] of [...this.deferredWatcherPaths]) {
+      if (this.pending.size + this.activeSyncTasks >= MAX_QUEUED_SYNCS) break;
+      this.deferredWatcherPaths.delete(key);
+      this.schedule(relativePath, "deferred-watcher");
+    }
     const files = await scanFiles(this.config.localFolder);
-    for (const file of files) {
-      const stateEntry = this.state.files[file.relativePath];
-      if (
-        stateEntry &&
-        stateEntry.size === file.stats.size &&
-        stateEntry.mtimeMs === file.stats.mtimeMs &&
-        stateEntry.lastStatus === "uploaded"
-      ) {
-        continue;
+    const scannedOwners = new Map(files.map((file) => [
+      path.basename(file.relativePath).normalize("NFC").toLowerCase(), file.relativePath,
+    ]));
+    for (const [basename, activePath] of this.activeRemoteBasenames) {
+      const newPath = scannedOwners.get(basename);
+      if (newPath !== undefined && newPath !== activePath) {
+        const error = new Error(
+          `SYNC_REMOTE_BASENAME_COLLISION: ${activePath} conflicts with ${newPath}`);
+        this.remoteBasenameCollision = error;
+        this.stop();
+        throw error;
       }
+      scannedOwners.set(basename, activePath);
+    }
+    this.remoteBasenameOwners = scannedOwners;
+    if (files.length === 0) return;
+    // Round-robin admission prevents low-sorted unchanged files from always
+    // taking the entire bounded budget while newer/renamed paths starve.
+    files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    const start = this.scanCursor % files.length;
+    let checked = 0;
+    for (; checked < files.length; checked++) {
+      if (this.pending.size + this.activeSyncTasks >= MAX_QUEUED_SYNCS
+        || (!this.once && [...this.pendingKinds.values(), ...this.activeKinds.values()]
+          .filter((kind) => kind === "audit").length >= MAX_AUDIT_SYNCS)) break;
+      const file = files[(start + checked) % files.length];
+      // A different local principal may change bytes within a shared source
+      // folder and restore size/mtime. Metadata alone cannot authorize an
+      // `uploaded` cache hit; syncOne verifies a pinned snapshot SHA-256
+      // before deciding to omit the upload. Do not reset an in-flight debounce
+      // on every interval scan (especially when interval < debounce).
+      const key = syncPathKey(file.relativePath);
+      if (this.pending.has(key) || this.activePaths.has(key)) continue;
       this.schedule(file.relativePath, reason);
     }
+    this.scanCursor = (start + checked) % files.length;
+    if (checked === files.length) this.needsFullRescan = false;
     this.resolveIdleIfNeeded();
   }
 
@@ -474,6 +682,10 @@ class SyncClient {
   }
 
   async syncOneWithSlot(filePath, relativePath, reason) {
+    if (this.remoteBasenameCollision) throw this.remoteBasenameCollision;
+    if (this.uncertainRemoteOutcome) {
+      throw new Error("SYNC_REMOTE_OUTCOME_UNCERTAIN: reconcile remote writes before resuming");
+    }
     const safePath = safeResolveInside(this.config.localFolder, filePath);
     if (!safePath) throw new Error("Caminho fora da pasta sincronizada bloqueado");
     if (!(await fileExists(safePath))) return;
@@ -496,9 +708,18 @@ class SyncClient {
 
     let lastError = null;
     for (let attempt = 1; attempt <= this.config.retryLimit; attempt += 1) {
+      let remoteMutationMayHaveStarted = false;
       try {
         log(`Enviando ${relativePath} (${reason}, tentativa ${attempt})`);
-        const uploaded = await uploadFile(this.config, this.configPath, info.bytes, relativePath, previous, this.passwordProvider);
+        const uploaded = await uploadFile(this.config, this.configPath, info.bytes,
+          relativePath, previous, this.passwordProvider,
+          () => {
+            if (this.remoteBasenameCollision) throw this.remoteBasenameCollision;
+            if (this.uncertainRemoteOutcome) {
+              throw new Error("SYNC_REMOTE_OUTCOME_UNCERTAIN");
+            }
+            remoteMutationMayHaveStarted = true;
+          });
         this.state.files[relativePath] = {
           relativePath,
           remoteFileName: uploaded.remoteFileName,
@@ -512,6 +733,11 @@ class SyncClient {
         log(`OK ${relativePath} -> ${uploaded.remoteFileName}${this.config.autoApprove ? " (aprovado)" : " (pendente)"}`);
         return;
       } catch (error) {
+        // A failed/aborted mutating request may still be durable remotely;
+        // even after this local task ends, do not allow a new uploader to
+        // establish a supposedly authoritative private acknowledgement until
+        // an operator has confirmed remote quiescence and removed the lock.
+        if (remoteMutationMayHaveStarted) this.uncertainRemoteOutcome = true;
         lastError = error;
         await new Promise((resolve) => setTimeout(resolve, 700 * attempt));
       }
@@ -555,8 +781,8 @@ class SyncClient {
 
   waitForIdle(timeoutMs = 30000) {
     if (this.pending.size === 0 && this.activeSyncTasks === 0) return Promise.resolve();
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("SYNC_WAIT_FOR_IDLE_TIMEOUT")), timeoutMs);
       this.idleResolvers.push(() => {
         clearTimeout(timer);
         resolve();
@@ -568,12 +794,29 @@ class SyncClient {
     await this.init();
     this.running = true;
     log(`Sync iniciado: ${this.config.localFolder} -> ${this.config.serverUrl} / folderId=${this.config.targetFolderId}`);
-    await this.scanAndSchedule("initial");
     if (this.once) {
-      await this.waitForIdle(Math.max(30000, this.config.debounceMs + this.config.stabilityMs + 10000));
+      // A single scan cannot enqueue arbitrarily many files safely. Work in
+      // bounded chunks and await each chunk to finish, without reporting
+      // "complete" after a fixed timeout while uploads are still queued.
+      const initial = await scanFiles(this.config.localFolder);
+      for (let index = 0; index < initial.length; index += MAX_QUEUED_SYNCS) {
+        for (const file of initial.slice(index, index + MAX_QUEUED_SYNCS)) {
+          this.schedule(file.relativePath, "initial");
+        }
+        await this.waitForIdle(Math.max(300000,
+          (this.config.debounceMs + this.config.stabilityMs) * MAX_QUEUED_SYNCS));
+        if (this.uncertainRemoteOutcome) {
+          throw new Error("SYNC_REMOTE_OUTCOME_UNCERTAIN");
+        }
+      }
+      if (this.syncFailures !== 0) {
+        throw new Error(`SYNC_ONCE_INCOMPLETE: ${this.syncFailures} file sync failure(s)`);
+      }
       log("Sync --once concluido");
       return;
     }
+
+    await this.scanAndSchedule("initial");
 
     this.startWatcher();
     this.scanTimer = setInterval(() => {
@@ -586,6 +829,9 @@ class SyncClient {
     if (this.scanTimer) clearInterval(this.scanTimer);
     for (const timer of this.pending.values()) clearTimeout(timer);
     this.pending.clear();
+    this.pendingKinds.clear();
+    this.rescanAfterActive.clear();
+    this.deferredWatcherPaths.clear();
   }
 }
 
@@ -608,6 +854,8 @@ async function initCommand(args) {
     if (!username || !password) throw new Error("Usuario e senha sao obrigatorios para gerar token");
     await fsp.mkdir(localFolder, { recursive: true });
     const loginPayload = await login(serverUrl, username, password);
+    const deviceId = existing.deviceId || `legacy-dev-${crypto.randomUUID()}`;
+    const keyEpoch = existing.keyEpoch || "epoch-1";
     await saveConfig(configPath, {
       serverUrl,
       username,
@@ -615,8 +863,8 @@ async function initCommand(args) {
       permissions: loginPayload.permissions || {},
       localFolder,
       targetFolderId,
-      deviceId: existing.deviceId || `legacy-dev-${crypto.randomUUID()}`,
-      keyEpoch: existing.keyEpoch || "epoch-1",
+      deviceId,
+      keyEpoch,
       autoApprove,
       debounceMs: Number(args.debounce) || existing.debounceMs || DEFAULT_DEBOUNCE_MS,
       scanIntervalMs: Number(args.interval) || existing.scanIntervalMs || DEFAULT_SCAN_INTERVAL_MS,
@@ -626,7 +874,7 @@ async function initCommand(args) {
       updatedAt: nowIso(),
     });
     log(`Config salva em ${configPath}`);
-    log(`Estado sera salvo em ${path.join(localFolder, STATE_FILE_NAME)}`);
+    log(`Estado privado comum por identidade sera salvo em ${privateSyncStatePath(configPath, { serverUrl, username, localFolder, targetFolderId, deviceId, keyEpoch })}`);
   } finally {
     rl.close();
   }
@@ -655,6 +903,11 @@ async function startCommand(args) {
     client.stop();
     log("Sync parado");
     process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    client.stop();
+    log("Sync encerrado por SIGTERM");
+    process.exit(143);
   });
   await client.start();
 }
@@ -688,6 +941,9 @@ Configuracao legacy padrao: ${DEFAULT_CONFIG_PATH}
 Uma .rootark-sync.json antiga no CWD so e reutilizada se ja for privada.
 Se for insegura, mova-a com cuidado para uma pasta privada ou reinicialize
 o cliente com credenciais rotacionadas. Nao copie tokens para diretorios publicos.
+Estado local: ~/.rootark/sync/private-state/.rootark-sync-state-<sha256>.json (ate 16 MiB).
+O antigo .rootark-sync-state.json na pasta sincronizada e mantido sem importacao;
+a primeira execucao refaz uploads e pode criar novas versoes no servidor.
 `);
 }
 

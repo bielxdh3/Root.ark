@@ -153,7 +153,12 @@ test("legacy sync uploads its verified snapshot if the file is replaced during r
   assert.doesNotMatch(uploaded, /outside-swap-sentinel/);
 });
 
-test("legacy sync bounds pinned snapshots while many remote listings stall", { timeout: 30_000 }, async (t) => {
+test("legacy sync bounds pinned snapshots while many remote listings stall", {
+  // The native Windows authority ACL check runs for each of the 28 durable
+  // private-state publications. Preserve the strict four-snapshot boundary,
+  // but give hosted Windows enough wall-clock to finish the verified writes.
+  timeout: process.platform === "win32" ? 180_000 : 30_000,
+}, async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-memory-bound-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   const configRoot = createPrivateAuthorityFixture("rootark-sync-config-memory-");
@@ -215,7 +220,7 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", { t
   // On Windows, the native owner/DACL verification precedes the first /list
   // and may take longer than 1s. Wait for the actual stalled-network boundary
   // instead of assuming a fixed process startup time. Keep the bound finite.
-  const deadline = Date.now() + 12_000;
+  const deadline = Date.now() + (process.platform === "win32" ? 45_000 : 12_000);
   while (listings === 0 && child.exitCode === null && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -261,14 +266,14 @@ test("legacy sync never re-stats an enlarged file into an unbounded read allocat
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
   }));
   const preload = path.resolve(__dirname, "support/legacy-sync-grow-file-hook.js");
-  await execFileAsync(process.execPath,
+  await assert.rejects(execFileAsync(process.execPath,
     ["-r", preload, path.resolve(__dirname, "../sync-client/rootark-sync.js"),
       "start", "--legacy-development-opt-in", "--once", "--config", config], {
       timeout: 15_000,
       env: { ...process.env, ROOTARK_TEST_SYNC_GROW_FIXTURE: "1",
         ROOTARK_TEST_SYNC_GROW_PATH: target,
         ROOTARK_TEST_SYNC_UNBOUNDED_READ_MARKER: marker },
-    });
+    }), /SYNC_ONCE_INCOMPLETE/);
   assert.ok((await fsp.stat(target)).size > 8 * 1024 * 1024, "fixture must grow a pinned inode");
   assert.equal(fs.existsSync(marker), false, "a post-stat FileHandle.readFile must never allocate from a grown size");
   assert.equal(uploads, 0, "a grown file must never be sent");
