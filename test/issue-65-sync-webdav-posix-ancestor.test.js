@@ -122,7 +122,7 @@ test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and jo
   await recoveringSafe.start();
   assert.deepEqual(marked, ["trusted-leaf-recovery"],
     "genuine previous inode proves prepared overwrite never applied");
-  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  assert.equal(readPinnedFixtureFileSync(leaf, "utf8"), "RECOVERED");
   await recoveringSafe.stop();
   // Previously, an impossible prepared PUT with existed:false and an
   // already-occupied destination was falsely acknowledged as safe recovery.
@@ -131,7 +131,7 @@ test("POSIX existing writable file fails closed for GET HEAD PUT PROPFIND and jo
       kind: "put", path: "/nested/unsafe.txt", phase: "prepared", existed: false }]; } } }));
   await assert.rejects(ambiguous.start(),
     { code: "WEBDAV_RECOVERY_INDETERMINATE" });
-  assert.equal(fs.readFileSync(leaf, "utf8"), "RECOVERED");
+  assert.equal(readPinnedFixtureFileSync(leaf, "utf8"), "RECOVERED");
 });
 
 test("POSIX different local UID can change 0666 file, but HTTP must deny it until made private", {

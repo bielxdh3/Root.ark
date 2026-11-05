@@ -241,21 +241,26 @@ function matchesScope(value, scope) {
     field === "compartment_id" ? 128 : 16), scope[field])) fail();
 }
 function fileSecurity(filename, bootstrapNew) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) fail();
+  if (typeof filename !== "string" || !path.isAbsolute(filename)
+    || typeof bootstrapNew !== "boolean") fail();
   const parent = fs.lstatSync(path.dirname(filename));
   if (!parent.isDirectory() || parent.isSymbolicLink()
     || (process.platform !== "win32"
       && (parent.uid !== process.getuid() || parent.mode & 0o077))) fail();
-  const exists = fs.existsSync(filename);
-  if (exists === bootstrapNew) fail();
-  if (exists) {
-    const st = fs.lstatSync(filename);
+  if (!bootstrapNew) {
+    let st;
+    try { st = fs.lstatSync(filename); } catch (_) { fail(); }
     if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1
       || (process.platform !== "win32"
         && (st.uid !== process.getuid() || st.mode & 0o077))) fail();
   } else {
-    const fd = fs.openSync(filename, fs.constants.O_EXCL | fs.constants.O_CREAT
-      | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    // O_EXCL makes the absent-name decision atomically; do not admit based
+    // on a separate pathname existence probe.
+    let fd;
+    try {
+      fd = fs.openSync(filename, fs.constants.O_EXCL | fs.constants.O_CREAT
+        | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    } catch (_) { fail(); }
     try {
       // Pin the inode created by O_EXCL before closing its descriptor. A
       // single-link foreign SQLite can be renamed onto this pathname after

@@ -13,6 +13,8 @@ const { promisify } = require("node:util");
 const { previewText } = require("../services/documentPreviewService");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
+const { writePrivateSyncConfig } =
+  require("../sync-client/rootark-sync-private-config");
 
 const execFileAsync = promisify(execFile);
 
@@ -61,6 +63,10 @@ test("document preview rejects symlink input before launching a parser", async (
 test("legacy sync ignores directory junctions and symlinks leading outside selected folder", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-link-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  // Keep the bearer config independent of the adversarial selected tree:
+  // Windows authority preflight must not traverse its intentional junction.
+  const configRoot = createPrivateAuthorityFixture("rootark-sync-config-link-");
+  t.after(() => fsp.rm(configRoot, { recursive: true, force: true }));
   const selected = path.join(dir, "selected");
   const outside = path.join(dir, "outside");
   await fsp.mkdir(selected);
@@ -89,8 +95,8 @@ test("legacy sync ignores directory junctions and symlinks leading outside selec
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
-  const config = path.join(dir, "config.json");
-  await fsp.writeFile(config, JSON.stringify({
+  const config = path.join(configRoot, "config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
     username: "test", token: "fixture-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
@@ -103,6 +109,8 @@ test("legacy sync ignores directory junctions and symlinks leading outside selec
 test("legacy sync uploads its verified snapshot if the file is replaced during remote listing", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-swap-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const configRoot = createPrivateAuthorityFixture("rootark-sync-config-swap-");
+  t.after(() => fsp.rm(configRoot, { recursive: true, force: true }));
   const selected = path.join(dir, "selected");
   await fsp.mkdir(selected);
   const source = path.join(selected, "inside.txt");
@@ -133,8 +141,8 @@ test("legacy sync uploads its verified snapshot if the file is replaced during r
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
-  const config = path.join(dir, "config.json");
-  await fsp.writeFile(config, JSON.stringify({
+  const config = path.join(configRoot, "config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
     username: "test", token: "fixture-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
@@ -148,6 +156,8 @@ test("legacy sync uploads its verified snapshot if the file is replaced during r
 test("legacy sync bounds pinned snapshots while many remote listings stall", { timeout: 30_000 }, async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-memory-bound-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const configRoot = createPrivateAuthorityFixture("rootark-sync-config-memory-");
+  t.after(() => fsp.rm(configRoot, { recursive: true, force: true }));
   const selected = path.join(dir, "selected");
   await fsp.mkdir(selected);
   const fileCount = 28;
@@ -184,8 +194,8 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", { t
     pendingLists = [];
     await new Promise((resolve) => server.close(resolve));
   });
-  const config = path.join(dir, "config.json");
-  await fsp.writeFile(config, JSON.stringify({
+  const config = path.join(configRoot, "config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
     username: "test", token: "fixture-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
@@ -202,7 +212,13 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", { t
     child.once("close", (code) => resolve(code));
   });
   t.after(() => { if (child.exitCode === null) child.kill(); });
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  // On Windows, the native owner/DACL verification precedes the first /list
+  // and may take longer than 1s. Wait for the actual stalled-network boundary
+  // instead of assuming a fixed process startup time. Keep the bound finite.
+  const deadline = Date.now() + 12_000;
+  while (listings === 0 && child.exitCode === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   const stalledListCount = listings;
   releaseListings = true;
   for (const res of pendingLists) if (!res.writableEnded) listOk(res);
@@ -217,6 +233,8 @@ test("legacy sync bounds pinned snapshots while many remote listings stall", { t
 test("legacy sync never re-stats an enlarged file into an unbounded read allocation", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-sync-growth-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const configRoot = createPrivateAuthorityFixture("rootark-sync-config-growth-");
+  t.after(() => fsp.rm(configRoot, { recursive: true, force: true }));
   const selected = path.join(dir, "selected");
   await fsp.mkdir(selected);
   const target = path.join(selected, "mutable.txt");
@@ -236,8 +254,8 @@ test("legacy sync never re-stats an enlarged file into an unbounded read allocat
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
-  const config = path.join(dir, "config.json");
-  await fsp.writeFile(config, JSON.stringify({
+  const config = path.join(configRoot, "config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
     username: "test", token: "fixture-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,

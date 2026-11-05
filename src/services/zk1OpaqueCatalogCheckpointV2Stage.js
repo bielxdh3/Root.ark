@@ -145,22 +145,27 @@ async function createSignedOpaqueCheckpointOwnerApprovalV2(statement, ownerPriva
   return { approvalBytes, approvalSignature };
 }
 function fileCheck(filename, bootstrapNew) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) fail();
+  if (typeof filename !== "string" || !path.isAbsolute(filename)
+    || typeof bootstrapNew !== "boolean") fail();
   assertPrivateSqliteAuthorityDirectory(filename);
   const folder = fs.lstatSync(path.dirname(filename));
   if (!folder.isDirectory() || folder.isSymbolicLink()
     || (process.platform !== "win32"
     && (folder.uid !== process.getuid() || (folder.mode & 0o077)))) fail();
-  const exists = fs.existsSync(filename);
-  if (bootstrapNew !== !exists) fail();
-  if (exists) {
-    const stat = fs.lstatSync(filename);
+  if (!bootstrapNew) {
+    let stat;
+    try { stat = fs.lstatSync(filename); } catch (_) { fail(); }
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
       || (process.platform !== "win32"
       && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) fail();
   } else {
-    const handle = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
-      | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    // No pathname existsSync preflight: exclusive creation is the authority
+    // for a new journal, followed immediately by a pinned descriptor stat.
+    let handle;
+    try {
+      handle = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
+        | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    } catch (_) { fail(); }
     try {
       // Pin the file created by O_EXCL while its handle is still open. A
       // pathname lookup after close could instead pin a single-link SQLite

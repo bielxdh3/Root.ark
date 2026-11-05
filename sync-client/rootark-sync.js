@@ -6,8 +6,20 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const readline = require("readline");
+const os = require("node:os");
+const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
+const { writePrivateSyncConfig, readPrivateSyncConfig } =
+  require("./rootark-sync-private-config");
 
-const DEFAULT_CONFIG_PATH = path.resolve(process.cwd(), ".rootark-sync.json");
+// Bearer credentials must not default to a potentially group-writable CWD.
+// A fresh private child of the user config home gets a protected ACL/mode
+// before the first credential is written. A custom --config path still works
+// only when its containing directory meets that same security boundary.
+const USER_CONFIG_HOME = process.platform === "win32"
+  ? (process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"))
+  : (process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"));
+const DEFAULT_CONFIG_PATH = path.resolve(USER_CONFIG_HOME, "Rootark", "sync", "config.json");
+const LEGACY_CWD_CONFIG_PATH = path.resolve(process.cwd(), ".rootark-sync.json");
 const STATE_FILE_NAME = ".rootark-sync-state.json";
 const DEFAULT_DEBOUNCE_MS = 2500;
 const DEFAULT_SCAN_INTERVAL_MS = 5000;
@@ -68,7 +80,7 @@ async function fileExists(filePath) {
 }
 
 function normalizeServerUrl(serverUrl) {
-  return String(serverUrl || "").trim().replace(/\/+$/, "");
+  return normalizeTrustedSyncServerUrl(serverUrl);
 }
 
 function safeResolveInside(rootDir, targetPath) {
@@ -108,8 +120,9 @@ async function writeJsonAtomic(filePath, data) {
 }
 
 async function loadConfig(configPath) {
-  const config = await readJson(configPath, null);
+  const config = await readPrivateSyncConfig(configPath, null);
   if (!config) throw new Error(`Config nao encontrada: ${configPath}. Rode npm run sync:init primeiro.`);
+  assertLegacySyncConfig(config);
   config.serverUrl = normalizeServerUrl(config.serverUrl);
   config.localFolder = path.resolve(config.localFolder || "");
   config.targetFolderId = config.targetFolderId || "root";
@@ -121,15 +134,60 @@ async function loadConfig(configPath) {
   return config;
 }
 
+function assertLegacySyncConfig(config) {
+  // Both CLIs have historically used .rootark-sync.json, but protocol v2
+  // stores an independently provisioned device trust policy there. The
+  // legacy login flow must never overwrite or interpret that policy as its
+  // own config, even when an operator explicitly supplies --config.
+  if (config && typeof config === "object" && !Array.isArray(config)
+    && (Object.hasOwn(config, "trustedDevicePublicKeys")
+      || Object.hasOwn(config, "revokedDeviceIds"))) {
+    throw new Error("SYNC_LEGACY_CONFIG_IS_V2: use a separate private --config for the legacy development uploader");
+  }
+}
+
+async function configNamePresent(configPath) {
+  // fs.access/stat follows symlinks and treats permission failures as
+  // absence. A dangling link or unreadable config is PRESENT but unsafe;
+  // never fall through to another config or accept an untrusted new default.
+  try { await fsp.lstat(configPath); return true; }
+  catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function selectSyncConfigPath(requested, { reusePrivateLegacy = false } = {}) {
+  if (requested) return path.resolve(requested);
+  // Keep previously initialized legacy clients functional only when the old
+  // pathname meets the NEW private-config read boundary; this fallback is
+  // strictly for legacy START. Legacy INIT must not overwrite a v2 config
+  // whose separate trusted device policy shares the historical CWD filename.
+  if (await configNamePresent(DEFAULT_CONFIG_PATH)) return DEFAULT_CONFIG_PATH;
+  if (reusePrivateLegacy && LEGACY_CWD_CONFIG_PATH !== DEFAULT_CONFIG_PATH
+    && await configNamePresent(LEGACY_CWD_CONFIG_PATH)) {
+    try {
+      const oldConfig = await readPrivateSyncConfig(LEGACY_CWD_CONFIG_PATH, null);
+      assertLegacySyncConfig(oldConfig);
+    } catch (error) {
+      if (error?.message?.startsWith("SYNC_LEGACY_CONFIG_IS_V2")) throw error;
+      throw new Error("SYNC_LEGACY_CONFIG_UNSAFE: existing .rootark-sync.json must be moved securely or reinitialized with rotated credentials in a private config directory");
+    }
+    return LEGACY_CWD_CONFIG_PATH;
+  }
+  return DEFAULT_CONFIG_PATH;
+}
+
 async function saveConfig(configPath, config) {
   const safeConfig = { ...config };
   delete safeConfig.password;
-  await writeJsonAtomic(configPath, safeConfig);
+  await writePrivateSyncConfig(configPath, `${JSON.stringify(safeConfig, null, 2)}\n`);
 }
 
 async function login(serverUrl, username, password) {
   const response = await fetch(`${serverUrl}/auth/login`, {
     method: "POST",
+    redirect: "error",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   });
@@ -155,6 +213,7 @@ async function authFetch(config, configPath, urlPath, options = {}) {
   const token = await ensureToken(config, configPath, options.passwordProvider);
   const response = await fetch(`${config.serverUrl}${urlPath}`, {
     ...options,
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {}),
@@ -166,6 +225,7 @@ async function authFetch(config, configPath, urlPath, options = {}) {
     const freshToken = await ensureToken(config, configPath, options.passwordProvider);
     return fetch(`${config.serverUrl}${urlPath}`, {
       ...options,
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${freshToken}`,
         ...(options.headers || {}),
@@ -530,8 +590,12 @@ class SyncClient {
 }
 
 async function initCommand(args) {
-  const configPath = path.resolve(args.config || DEFAULT_CONFIG_PATH);
-  const existing = await readJson(configPath, {});
+  const configPath = await selectSyncConfigPath(args.config);
+  // Validate directory, ACL and opened config inode BEFORE prompting or
+  // sending a password. Previously an attacker-owned symlink/JSON could set
+  // the login URL while the write-time security check ran only afterwards.
+  const existing = await readPrivateSyncConfig(configPath, {}, { createParent: true });
+  assertLegacySyncConfig(existing);
   const { rl, question } = createPrompt();
   try {
     const serverUrl = normalizeServerUrl(args.server || await question("Root.ark URL", existing.serverUrl || "http://localhost:3000"));
@@ -570,7 +634,7 @@ async function initCommand(args) {
 
 async function startCommand(args) {
   if (args["legacy-development-opt-in"] !== true) throw new Error("Legacy uploader is development-only; use npm run sync:start for protocol v2");
-  const configPath = path.resolve(args.config || DEFAULT_CONFIG_PATH);
+  const configPath = await selectSyncConfigPath(args.config, { reusePrivateLegacy: true });
   const config = await loadConfig(configPath);
   if (args["auto-approve"] !== undefined) config.autoApprove = args["auto-approve"] === true || args["auto-approve"] === "true";
   const passwordProvider = async () => {
@@ -601,14 +665,15 @@ async function main() {
   if (command === "init") return initCommand(args);
   if (command === "start") return startCommand(args);
 
-  console.log(`Root.ark Sync MVP
+  console.log(`Root.ark Sync MVP (legacy development uploader)
 
 Comandos:
-  npm run sync:init
-  npm run sync:start
+  npm run sync:init                         # legacy init, no v2 device provisioning
+  npm run sync:start:legacy-dev             # legacy uploader, dev opt-in only
+  npm run sync:start                        # separate protocol v2 client
 
 Opcoes uteis:
-  --config .rootark-sync.json
+  --config <private-config-path>            # owner-only directory and file required
   --server http://localhost:3000
   --username admin
   --folder C:\\RootArkSync
@@ -618,6 +683,11 @@ Opcoes uteis:
 
 Variavel opcional para reautenticacao sem salvar senha:
   ROOTARK_SYNC_PASSWORD=senha
+
+Configuracao legacy padrao: ${DEFAULT_CONFIG_PATH}
+Uma .rootark-sync.json antiga no CWD so e reutilizada se ja for privada.
+Se for insegura, mova-a com cuidado para uma pasta privada ou reinicialize
+o cliente com credenciais rotacionadas. Nao copie tokens para diretorios publicos.
 `);
 }
 

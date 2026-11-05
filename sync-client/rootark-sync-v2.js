@@ -1,10 +1,10 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const fsp = require("node:fs/promises");
 const path = require("node:path");
 const protocol = require("./rootark-sync-protocol");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
+const { readPrivateV2Config } = require("./rootark-sync-v2-private-config");
 const { SyncEngine } = require("./rootark-sync-engine");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
@@ -61,7 +61,9 @@ function args(argv) {
 }
 
 async function readConfig(filePath) {
-  const config = JSON.parse(await fsp.readFile(filePath, "utf8"));
+  // Enforce the same private-directory/owner/ACL boundary as other local
+  // authority material before parsing a URL, token or device trust policy.
+  const config = readPrivateV2Config(filePath);
   if (!config.serverUrl || !config.localFolder || !config.token || !config.username || !config.deviceId || !config.keyEpoch) throw new Error("Sync v2 requires serverUrl, username, localFolder, token, deviceId, and keyEpoch");
   const policy = normalizeTrustedDevicePolicy(config);
   const master = process.env.ROOTARK_SYNC_FILE_KEY;

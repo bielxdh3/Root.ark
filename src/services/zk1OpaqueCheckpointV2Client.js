@@ -166,22 +166,27 @@ function scopeOf(v) {
   }));
 }
 function privateFile(filename, bootstrapNew) {
-  if (typeof filename !== "string" || !path.isAbsolute(filename)) deny();
+  if (typeof filename !== "string" || !path.isAbsolute(filename)
+    || typeof bootstrapNew !== "boolean") deny();
   assertPrivateSqliteAuthorityDirectory(filename);
   const parent = fs.lstatSync(path.dirname(filename));
   if (!parent.isDirectory() || parent.isSymbolicLink()
     || (process.platform !== "win32"
       && (parent.uid !== process.getuid() || parent.mode & 0o077))) deny();
-  const exists = fs.existsSync(filename);
-  if (exists === bootstrapNew) deny();
-  if (exists) {
-    const st = fs.lstatSync(filename);
+  if (!bootstrapNew) {
+    let st;
+    try { st = fs.lstatSync(filename); } catch (_) { deny(); }
     if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1
       || (process.platform !== "win32"
         && (st.uid !== process.getuid() || st.mode & 0o077))) deny();
   } else {
-    const fd = fs.openSync(filename, fs.constants.O_EXCL | fs.constants.O_CREAT
-      | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    // The exclusive create is the absence decision. A separate existsSync
+    // observation is stale by the time the kernel creates the file.
+    let fd;
+    try {
+      fd = fs.openSync(filename, fs.constants.O_EXCL | fs.constants.O_CREAT
+        | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    } catch (_) { deny(); }
     try {
       // Pin the inode returned by exclusive creation, not the pathname after
       // close. A swapped private, single-link SQLite must never receive our

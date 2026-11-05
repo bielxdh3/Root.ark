@@ -301,8 +301,9 @@ Backups are not useful until restore behavior is tested. Read [BACKUP.md](BACKUP
 | `npm run db:migrate` | Apply database migrations |
 | `npm run db:migrate-json` | Migrate supported JSON data to SQLite |
 | `npm run db:backup` | Run the database backup tool |
-| `npm run sync:init` | Initialize the local sync client |
-| `npm run sync:start` | Start the local sync client |
+| `npm run sync:init` | Initialize the development-only legacy uploader; bearer configuration is stored under the private user config directory by default |
+| `npm run sync:start:legacy-dev` | Run that legacy uploader with explicit development opt-in; an existing CWD config is reused only when its permissions are private |
+| `npm run sync:start` | Run Sync v2 with separately provisioned device credentials and trusted policy; legacy `sync:init` does **not** provision v2 |
 
 ## Validation
 

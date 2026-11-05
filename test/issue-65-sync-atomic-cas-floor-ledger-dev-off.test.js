@@ -174,6 +174,53 @@ test("Sync v2 durable CAS requires independent signed retained genesis before bo
     "no current signed floor can exist before the first independently fenced batch");
 });
 
+test("Sync v2 exported constructor cannot bypass signed external preflight", async (t) => {
+  const f = fixture(t);
+  let opened = null;
+  let failure = null;
+  try {
+    // Static open() is the only entry point allowed to mint the module-private
+    // preflight token after the fresh signed retained-head and read-only audit.
+    opened = new Zk1SyncAtomicCasFloorLedgerDevOff(f.options);
+  } catch (error) { failure = error; }
+  finally { opened?.close(); }
+  assert.equal(failure?.code, deny.code);
+  assert.equal(fs.readdirSync(path.dirname(f.filename)).includes(path.basename(f.filename)), false,
+    "unverified direct construction must not create a local CAS authority");
+
+  const verified = await f.open();
+  f.close(verified);
+  f.effects.badAnchor = true;
+  opened = null;
+  failure = null;
+  try { opened = new Zk1SyncAtomicCasFloorLedgerDevOff(f.options); }
+  catch (error) { failure = error; }
+  finally { opened?.close(); }
+  assert.equal(failure?.code, deny.code,
+    "direct construction must not bypass externally signed restart validation");
+});
+
+test("Sync v2 constructor cannot forge internal preflight through a Proxy symbol getter", (t) => {
+  const f = fixture(t);
+  const forged = new Proxy(f.options, {
+    get(target, key, receiver) {
+      // A private Symbol property name is not a secret against a Proxy:
+      // the trap sees the unknown symbol as soon as destructuring reads it.
+      if (typeof key === "symbol") return { kind: "absent" };
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  let opened = null;
+  let failure = null;
+  try { opened = new Zk1SyncAtomicCasFloorLedgerDevOff(forged); }
+  catch (error) { failure = error; }
+  finally { opened?.close(); }
+  assert.equal(failure?.code, deny.code,
+    "a caller must not synthesize the module-private signed preflight");
+  assert.equal(fs.readdirSync(path.dirname(f.filename)).includes(path.basename(f.filename)), false,
+    "forged preflight must fail without writing a SQLite authority");
+});
+
 test("Sync v2 bootstrap never adopts a SQLite file created during the signed genesis challenge", async (t) => {
   const f = fixture(t);
   const readHead = f.retainedAnchor.readSignedHead;
