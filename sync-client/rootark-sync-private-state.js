@@ -1,7 +1,6 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { readPrivateSyncConfig, writePrivateSyncConfig } =
@@ -95,10 +94,10 @@ async function writePrivateSyncState(statePath, state, config) {
 // the selected source folder. Importing `lastStatus:uploaded` would let a
 // forged historical cache silently suppress an actual upload. Never import
 // it as authority. Preserve the original bytes on disk for manual recovery.
-// This read-only inspection is bounded and refuses symlinks and hardlinks.
+// This metadata-only inspection never opens the historical path, preventing
+// any race between a pathname check and an open. No untrusted bytes are read.
 async function inspectHistoricalSyncState(localFolder) {
   const filename = path.join(path.resolve(localFolder), LEGACY_STATE_NAME);
-  let handle;
   try {
     const named = await fsp.lstat(filename);
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1) {
@@ -107,21 +106,13 @@ async function inspectHistoricalSyncState(localFolder) {
     if (named.size > MAX_HISTORICAL_INSPECTION_BYTES) {
       return { present: true, status: "oversized" };
     }
-    handle = await fsp.open(filename, fs.constants.O_RDONLY
-      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
-    const opened = await handle.stat();
-    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== named.dev
-      || opened.ino !== named.ino || opened.size !== named.size) {
-      return { present: true, status: "changed" };
-    }
-    // Do not allocate/read the entire historical object into trusted state;
-    // inspect metadata only and leave the bytes completely untouched.
+    // Classification is advisory only. Never import `uploaded` markers or
+    // acquire an FD: another principal may change this shared-folder entry
+    // at any moment without affecting trusted state.
     return { present: true, status: "preserved" };
   } catch (error) {
     if (error.code === "ENOENT") return { present: false };
     return { present: true, status: "unreadable" };
-  } finally {
-    await handle?.close();
   }
 }
 

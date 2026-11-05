@@ -13,11 +13,27 @@ const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 const { writePrivateSyncConfig } =
   require("../sync-client/rootark-sync-private-config");
-const { privateSyncStatePath } =
+const { privateSyncStatePath, inspectHistoricalSyncState } =
   require("../sync-client/rootark-sync-private-state");
 
 const CLI = path.resolve(__dirname, "../sync-client/rootark-sync.js");
 const STATE_NAME = ".rootark-sync-state.json";
+
+test("historical shared-folder state inspection never opens untrusted bytes", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-state-metadata-only-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const oldPath = path.join(dir, STATE_NAME);
+  const sentinel = "PRESERVE_HISTORICAL_BYTES";
+  await fsp.writeFile(oldPath, sentinel);
+  const opened = t.mock.method(fsp, "open", async () => {
+    throw new Error("HISTORICAL_STATE_MUST_NOT_OPEN");
+  });
+  assert.deepEqual(await inspectHistoricalSyncState(dir),
+    { present: true, status: "preserved" });
+  assert.equal(opened.mock.callCount(), 0);
+  opened.mock.restore();
+  assert.equal(await fsp.readFile(oldPath, "utf8"), sentinel);
+});
 
 function expectedPrivateState(configPath, selected, overrides = {}) {
   return privateSyncStatePath(configPath, {
