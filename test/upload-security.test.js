@@ -1703,10 +1703,13 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
   assert.equal(fs.existsSync(finalPartPath), false, "the sweep eventually processes the last expired session");
 });
 
-test("the expiry sweep does not keep a live session metadata handle open across chunk writes", { timeout: 30_000 }, async (t) => {
+test("the expiry sweep does not keep a live session metadata handle open across chunk writes", { timeout: process.platform === "win32" ? 60_000 : 30_000 }, async (t) => {
   const uploadId = "live-sweep-metadata-handle";
   let metadataHandleMarker;
   const harness = await createHarness(t, {
+    // Cold-start Windows ACL preflight may exceed the generic 10s readiness
+    // window under parallel hosted suites; upload assertions stay unchanged.
+    readyTimeout: process.platform === "win32" ? 30_000 : TIMEOUT_MS,
     envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
     preloadSource: ({ dir }) => {
       const metadataPath = path.join(dir, "temp", ".chunks", FOLDER_ID, uploadId, "metadata.json");
