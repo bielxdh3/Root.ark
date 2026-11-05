@@ -2065,6 +2065,78 @@ test("authorized harmless multipart upload enters the selected folder pending ar
   assert.deepEqual(fs.existsSync(harness.quarantineDir) ? fs.readdirSync(harness.quarantineDir) : [], []);
 });
 
+test("strict legacy sync rejects pending suffix aliases before remote overwrite while browser upload still renames", { timeout: 60_000 }, async (t) => {
+  const harness = await createHarness(t, { uploaderPermissions: { approve: true } });
+  const unauthenticated = await request(harness.port, "/legacy-sync/capabilities");
+  assert.equal(unauthenticated.status, 401, unauthenticated.body);
+  const session = await login(harness.port, "uploader", harness.password);
+  const capabilities = await request(harness.port, "/legacy-sync/capabilities", {
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(capabilities.status, 200, capabilities.body);
+  assert.deepEqual(JSON.parse(capabilities.body), { strictFilename: true });
+
+  const approvedBytes = Buffer.from("APPROVED_OTHER_SOURCE");
+  const approved = await upload(harness.port, session, "a-1.txt", approvedBytes);
+  assert.equal(approved.status, 200, approved.body);
+  assert.equal(JSON.parse(approved.body).fileName, "a-1.txt");
+  const promotion = await postJson(harness.port, session, `/approve/a-1.txt?folderId=${FOLDER_ID}`, {});
+  assert.ok([200, 202].includes(promotion.status), promotion.body);
+  const approvedPath = path.join(harness.dir, "uploads", FOLDER_ID, "a-1.txt");
+  assert.deepEqual(fs.readFileSync(approvedPath), approvedBytes);
+
+  const firstPendingBytes = Buffer.from("PENDING_A_ORIGINAL_SOURCE");
+  const pendingA = await upload(harness.port, session, "a.txt", firstPendingBytes);
+  assert.equal(pendingA.status, 200, pendingA.body);
+  const pendingPath = path.join(harness.dir, "temp", FOLDER_ID, "a.txt");
+  assert.deepEqual(fs.readFileSync(pendingPath), firstPendingBytes);
+  const originalPending = pending(harness.dir);
+
+  const flaggedUpload = (flag) => uploadPayload(harness.port, session, multipartParts([
+    { filename: "a.txt", bytes: Buffer.from("UNAUTHORIZED_ALIAS_BYTES") },
+    // The sync client's FormData puts the file before extra form fields.
+    { field: "rootarkSyncStrictFilename", bytes: flag },
+  ]));
+  const strict = await flaggedUpload("true");
+  assert.equal(strict.status, 409, strict.body);
+  assert.equal(JSON.parse(strict.body).code, "SYNC_STRICT_FILENAME_CONFLICT");
+
+  for (const malformed of ["false", "TRUE", "1", ""]) {
+    const rejected = await flaggedUpload(malformed);
+    assert.equal(rejected.status, 400, rejected.body);
+    assert.equal(JSON.parse(rejected.body).code, "SYNC_STRICT_FILENAME_INVALID_FLAG");
+  }
+  const duplicateFlag = await uploadPayload(harness.port, session, multipartParts([
+    { field: "rootarkSyncStrictFilename", bytes: "true" },
+    { field: "rootarkSyncStrictFilename", bytes: "true" },
+    { filename: "a.txt", bytes: Buffer.from("DUPLICATE_FLAG_BYTES") },
+  ]));
+  assert.equal(duplicateFlag.status, 400, duplicateFlag.body);
+  assert.equal(JSON.parse(duplicateFlag.body).code, "SYNC_STRICT_FILENAME_INVALID_FLAG");
+
+  const longName = `${"x".repeat(28)}.txt`;
+  const shortened = await uploadPayload(harness.port, session, multipartParts([
+    { filename: longName, bytes: Buffer.from("TRUNCATION_ALIAS_BYTES") },
+    { field: "rootarkSyncStrictFilename", bytes: "true" },
+  ]));
+  assert.equal(shortened.status, 409, shortened.body);
+  assert.equal(JSON.parse(shortened.body).code, "SYNC_STRICT_FILENAME_CONFLICT");
+  assert.deepEqual(pending(harness.dir), originalPending);
+  assert.deepEqual(fs.readFileSync(pendingPath), firstPendingBytes);
+  assert.deepEqual(fs.readFileSync(approvedPath), approvedBytes);
+  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "a-1.txt")), false);
+  assert.deepEqual(filesUnder(path.join(harness.dir, "temp", ".incoming")), []);
+  assert.deepEqual(quarantine(harness.dir).items, []);
+
+  const ordinary = await upload(harness.port, session, "a.txt", Buffer.from("BROWSER_SUFFIX_UPLOAD"));
+  assert.equal(ordinary.status, 200, ordinary.body);
+  const renamed = JSON.parse(ordinary.body);
+  assert.equal(renamed.fileName, "a-1.txt");
+  assert.equal(renamed.renamed, true);
+  assert.deepEqual(fs.readFileSync(approvedPath), approvedBytes,
+    "ordinary pending upload must not promote over the approved file before approval");
+});
+
 test("unavailable ClamAV fails closed before simple, chunked, or WebDAV uploads can reach approval", { timeout: 45_000 }, async (t) => {
   const unavailablePort = await getUnusedPort();
   const harness = await createHarness(t, {

@@ -9781,6 +9781,12 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
   }
 }));
 
+// An authenticated legacy client must negotiate support before sending any
+// stateful sync request. Old servers without this endpoint fail the preflight.
+app.get("/legacy-sync/capabilities", authenticate, (_req, res) => {
+  res.json({ strictFilename: true });
+});
+
 app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, async (req, res) => {
   const originalName = path.basename(req.file?.originalname || "");
   const requestedFileName = path.basename(req.uploadFinalFileName || "");
@@ -9789,6 +9795,19 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   if (!req.file || !requestedFileName || !incomingPath) {
     if (incomingPath) fs.rmSync(incomingPath, { force: true });
     return res.status(400).json({ error: "Arquivo obrigatorio" });
+  }
+
+  // Multipart fields can be sent before or after the file. Inspect the fully
+  // parsed body, and reject malformed opt-ins instead of silently falling back
+  // to the ordinary upload's automatic renaming behavior.
+  const strictFieldProvided = Object.hasOwn(req.body || {}, "rootarkSyncStrictFilename");
+  const strictFilename = strictFieldProvided && req.body.rootarkSyncStrictFilename === "true";
+  if (strictFieldProvided && !strictFilename) {
+    fs.rmSync(incomingPath, { force: true });
+    return res.status(400).json({
+      code: "SYNC_STRICT_FILENAME_INVALID_FLAG",
+      error: "Valor invalido para rootarkSyncStrictFilename",
+    });
   }
 
   let uploadWasCompressed = false;
@@ -9811,6 +9830,20 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
       if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
       req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
       fileName = getAvailableUploadFileName(originalName, folderId, true);
+      // This is the authoritative, serialized filename decision. A sync client
+      // owns only its requested basename; a suffix (-1), shortening or ADS
+      // rewrite can instead target another source's already-approved file.
+      // Refuse before scan, encryption, temp publication or pending metadata.
+      // Normal browser uploads continue using their existing rename behavior.
+      if (strictFilename && fileName !== originalName) {
+        payload = {
+          rejected: true,
+          status: 409,
+          code: "SYNC_STRICT_FILENAME_CONFLICT",
+          error: "Nome remoto indisponivel para sincronizacao estrita",
+        };
+        return;
+      }
       const scan = await scanUploadBeforePending(req, {
         filePath: incomingPath,
         fileName,
@@ -9876,7 +9909,10 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
 
   if (payload?.rejected) {
     fs.rmSync(incomingPath, { force: true });
-    return res.status(payload.status).json({ error: payload.error });
+    return res.status(payload.status).json({
+      error: payload.error,
+      ...(payload.code ? { code: payload.code } : {}),
+    });
   }
   processCloudTempMutationAfterLifecycle(folderId, fileName);
   res.json(payload);
