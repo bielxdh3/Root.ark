@@ -10,6 +10,9 @@ const os = require("node:os");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { writePrivateSyncConfig, readPrivateSyncConfig } =
   require("./rootark-sync-private-config");
+const { privateSyncStatePath, assertStateSeparateFromConfig,
+  readPrivateSyncState, writePrivateSyncState,
+  inspectHistoricalSyncState } = require("./rootark-sync-private-state");
 
 // Bearer credentials must not default to a potentially group-writable CWD.
 // A fresh private child of the user config home gets a protected ACL/mode
@@ -104,21 +107,6 @@ function shouldIgnore(relativePath, stats) {
   return false;
 }
 
-async function readJson(filePath, fallback) {
-  try {
-    return JSON.parse(await fsp.readFile(filePath, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJsonAtomic(filePath, data) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  await fsp.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-  await fsp.rename(tempPath, filePath);
-}
-
 async function loadConfig(configPath) {
   const config = await readPrivateSyncConfig(configPath, null);
   if (!config) throw new Error(`Config nao encontrada: ${configPath}. Rode npm run sync:init primeiro.`);
@@ -181,6 +169,7 @@ async function selectSyncConfigPath(requested, { reusePrivateLegacy = false } = 
 async function saveConfig(configPath, config) {
   const safeConfig = { ...config };
   delete safeConfig.password;
+  assertStateSeparateFromConfig(configPath, safeConfig);
   await writePrivateSyncConfig(configPath, `${JSON.stringify(safeConfig, null, 2)}\n`);
 }
 
@@ -393,8 +382,9 @@ class SyncClient {
     this.config = config;
     this.once = Boolean(options.once);
     this.passwordProvider = options.passwordProvider || null;
-    this.statePath = path.join(this.config.localFolder, STATE_FILE_NAME);
-    this.state = { files: {} };
+    this.statePath = assertStateSeparateFromConfig(this.configPath, this.config);
+    this.state = { files: Object.create(null) };
+    this.stateSaveQueue = Promise.resolve();
     this.pending = new Map();
     this.running = false;
     this.scanTimer = null;
@@ -408,13 +398,24 @@ class SyncClient {
     const safeFolder = path.resolve(this.config.localFolder);
     await fsp.mkdir(safeFolder, { recursive: true });
     this.config.localFolder = safeFolder;
-    this.state = await readJson(this.statePath, { files: {} });
-    if (!this.state.files || typeof this.state.files !== "object") this.state = { files: {} };
+    this.state = await readPrivateSyncState(this.statePath, this.config);
+    // No migration of unauthenticated `uploaded` flags: it could skip real
+    // uploads. Retain historical state in place, inspect without writing,
+    // and rebuild a private cache from real uploads on this invocation.
+    const legacy = await inspectHistoricalSyncState(safeFolder);
+    if (legacy.present) {
+      log(`Estado legado preservado sem importacao: ${path.join(safeFolder, STATE_FILE_NAME)} (${legacy.status}). A primeira varredura refaz uploads sem confiar em marcadores antigos.`);
+    }
     await ensureToken(this.config, this.configPath, this.passwordProvider);
   }
 
-  async saveState() {
-    await writeJsonAtomic(this.statePath, this.state);
+  saveState() {
+    // Four concurrent per-file syncs must never reuse the same temporary
+    // filename or race to publish stale snapshots of this shared state.
+    const next = this.stateSaveQueue.then(() =>
+      writePrivateSyncState(this.statePath, this.state, this.config));
+    this.stateSaveQueue = next.catch(() => {});
+    return next;
   }
 
   schedule(relativePath, reason = "change") {
@@ -438,15 +439,12 @@ class SyncClient {
   async scanAndSchedule(reason = "scan") {
     const files = await scanFiles(this.config.localFolder);
     for (const file of files) {
-      const stateEntry = this.state.files[file.relativePath];
-      if (
-        stateEntry &&
-        stateEntry.size === file.stats.size &&
-        stateEntry.mtimeMs === file.stats.mtimeMs &&
-        stateEntry.lastStatus === "uploaded"
-      ) {
-        continue;
-      }
+      // A different local principal may change bytes within a shared source
+      // folder and restore size/mtime. Metadata alone cannot authorize an
+      // `uploaded` cache hit; syncOne verifies a pinned snapshot SHA-256
+      // before deciding to omit the upload. Do not reset an in-flight debounce
+      // on every interval scan (especially when interval < debounce).
+      if (this.pending.has(file.relativePath)) continue;
       this.schedule(file.relativePath, reason);
     }
     this.resolveIdleIfNeeded();
@@ -608,6 +606,8 @@ async function initCommand(args) {
     if (!username || !password) throw new Error("Usuario e senha sao obrigatorios para gerar token");
     await fsp.mkdir(localFolder, { recursive: true });
     const loginPayload = await login(serverUrl, username, password);
+    const deviceId = existing.deviceId || `legacy-dev-${crypto.randomUUID()}`;
+    const keyEpoch = existing.keyEpoch || "epoch-1";
     await saveConfig(configPath, {
       serverUrl,
       username,
@@ -615,8 +615,8 @@ async function initCommand(args) {
       permissions: loginPayload.permissions || {},
       localFolder,
       targetFolderId,
-      deviceId: existing.deviceId || `legacy-dev-${crypto.randomUUID()}`,
-      keyEpoch: existing.keyEpoch || "epoch-1",
+      deviceId,
+      keyEpoch,
       autoApprove,
       debounceMs: Number(args.debounce) || existing.debounceMs || DEFAULT_DEBOUNCE_MS,
       scanIntervalMs: Number(args.interval) || existing.scanIntervalMs || DEFAULT_SCAN_INTERVAL_MS,
@@ -626,7 +626,7 @@ async function initCommand(args) {
       updatedAt: nowIso(),
     });
     log(`Config salva em ${configPath}`);
-    log(`Estado sera salvo em ${path.join(localFolder, STATE_FILE_NAME)}`);
+    log(`Estado privado sera salvo em ${privateSyncStatePath(configPath, { serverUrl, username, localFolder, targetFolderId, deviceId, keyEpoch })}`);
   } finally {
     rl.close();
   }
@@ -688,6 +688,9 @@ Configuracao legacy padrao: ${DEFAULT_CONFIG_PATH}
 Uma .rootark-sync.json antiga no CWD so e reutilizada se ja for privada.
 Se for insegura, mova-a com cuidado para uma pasta privada ou reinicialize
 o cliente com credenciais rotacionadas. Nao copie tokens para diretorios publicos.
+Estado local: .rootark-sync-state-<sha256>.json ao lado da config privada (ate 16 MiB).
+O antigo .rootark-sync-state.json na pasta sincronizada e mantido sem importacao;
+a primeira execucao refaz uploads e pode criar novas versoes no servidor.
 `);
 }
 

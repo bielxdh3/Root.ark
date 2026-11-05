@@ -36,13 +36,33 @@ npm run sync:start:legacy-dev
 
 ## Estado local
 
-No uploader legado, o estado fica na pasta sincronizada:
+No uploader legado, o estado fica **em arquivo privado ao lado da configuracao bearer**,
+e nunca dentro da pasta sincronizada (que pode ser compartilhada). O nome
+`.rootark-sync-state-<sha256>.json` vincula o cache a pasta local, URL do servidor,
+usuario, `folderId`, dispositivo e epoca da chave. Alterar o destino exige nova
+verificacao e nao reutiliza marcadores `uploaded` de outra conta/pasta.
+
+O arquivo historico abaixo, se existir **na pasta sincronizada**, e preservado
+exatamente como encontrado, mas **nao e importado** nem atualizado:
 
 ```text
 .rootark-sync-state.json
 ```
 
-Ele registra caminho relativo, tamanho, `mtime`, hash SHA-256, status do ultimo upload e nome remoto.
+Era um cache sem autenticacao; importar `uploaded` permitiria a outro usuario
+que escreva na pasta impedir uploads reais. Na primeira execucao com o novo
+estado privado, arquivos sao reenviados para o servidor para reconstruir o
+cache. Isso pode criar novas versoes de arquivos ja enviados; o estado antigo
+fica disponivel para recuperacao manual, sem sobrescrita ou exclusao automatica.
+
+O estado privado registra caminho relativo, tamanho, `mtime`, hash SHA-256,
+status do ultimo upload e nome remoto. Leituras sao limitadas a 16 MiB;
+estados maiores ou invalidos sao recusados para evitar aceitar corrupcao como
+confirmacao de upload. Nao armazena senha nem bearer token.
+Toda nova varredura verifica um snapshot local estavel e seu SHA-256 antes de
+reutilizar `uploaded`: arquivos de mesmo tamanho com `mtime` restaurado nao
+podem ser ignorados por uma pasta compartilhada. Esse cuidado aumenta o custo
+de leitura durante as varreduras periodicas.
 
 ## Ignorados por padrao
 

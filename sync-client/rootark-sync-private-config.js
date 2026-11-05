@@ -43,7 +43,11 @@ function preparePrivateSyncConfigPath(filename, { createParent = false } = {}) {
   return configPath;
 }
 
-async function readPrivateSyncConfig(filename, fallback, { createParent = false } = {}) {
+async function readPrivateSyncConfig(filename, fallback,
+  { createParent = false, maxBytes = 1024 * 1024 } = {}) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024) {
+    throw new Error("SYNC_CONFIG_INVALID_READ_LIMIT");
+  }
   if (!createParent) {
     try { fs.lstatSync(path.dirname(path.resolve(filename))); }
     catch (error) {
@@ -63,14 +67,25 @@ async function readPrivateSyncConfig(filename, fallback, { createParent = false 
   try {
     const pinned = fs.fstatSync(fd, { bigint: true });
     if (!pinned.isFile() || pinned.nlink !== 1n || pinned.dev !== before.dev
-      || pinned.ino !== before.ino || pinned.size > 1024n * 1024n) {
+      || pinned.ino !== before.ino || pinned.size > BigInt(maxBytes)) {
       throw new Error("SYNC_CONFIG_UNSAFE_FILE");
     }
-    bytes = fs.readFileSync(fd, { encoding: "utf8" });
+    // Never re-size a read based on an inode which could grow after the
+    // initially verified stat, even if a privileged actor races this read.
+    const buffer = Buffer.alloc(Number(pinned.size));
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = fs.readSync(fd, buffer, offset,
+        Math.min(64 * 1024, buffer.length - offset), offset);
+      if (count <= 0) throw new Error("SYNC_CONFIG_CHANGED_DURING_READ");
+      offset += count;
+    }
+    bytes = buffer.toString("utf8");
     const afterFd = fs.fstatSync(fd, { bigint: true });
     const afterName = inspectExistingConfig(configPath);
     if (afterFd.dev !== pinned.dev || afterFd.ino !== pinned.ino
-      || afterFd.size !== pinned.size || !equalIdentity(before, afterName)) {
+      || afterFd.size !== pinned.size || afterFd.mtimeNs !== pinned.mtimeNs
+      || afterFd.ctimeNs !== pinned.ctimeNs || !equalIdentity(before, afterName)) {
       throw new Error("SYNC_CONFIG_CHANGED_DURING_READ");
     }
   } finally { fs.closeSync(fd); }
