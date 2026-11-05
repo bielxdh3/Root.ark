@@ -219,8 +219,17 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
       // Only the atomic O_EXCL result can establish whether WE created it.
       if (bootstrapNew === true && [...this.#minimum.values()].every((head) =>
         head.sequence === 0 && head.headHash === GENESIS)) {
-        ensurePrivateSqliteDirectory(filenameAbs);
-        assertPrivateSqliteAuthorityDirectory(filenameAbs);
+        // Existing directory authority is already checked recursively by the
+        // native Windows verifier. Do not repeat a second, bulk bootstrap
+        // scan of the entire tree just because the DB might be absent.
+        // Only ENOENT may authorize creation of missing private ancestors.
+        try {
+          assertPrivateSqliteAuthorityDirectory(filenameAbs);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+          ensurePrivateSqliteDirectory(filenameAbs);
+          assertPrivateSqliteAuthorityDirectory(filenameAbs);
+        }
         let fd;
         try {
           fd = fs.openSync(filenameAbs, fs.constants.O_CREAT | fs.constants.O_EXCL
