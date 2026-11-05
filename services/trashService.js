@@ -1,12 +1,15 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { execFileSync } = require("node:child_process");
+const Database = require("better-sqlite3");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const trashRepository = require("../repositories/trashRepository");
 const { assertZk10LegacyBackupNotStrict } = require("../src/services/zk10LegacyBackupDeny");
 
 const TRASH_STORAGE_DIR = resolveRuntimePath("data", "trash");
 const REMOTE_LOCK_DIR = resolveRuntimePath("data", "trash-remote-locks");
+const REMOTE_LOCK_COORDINATION_FILE = path.join(REMOTE_LOCK_DIR, ".coordination.sqlite");
 const DEFAULT_MAX_REMOTE_ATTEMPTS = 25;
 const MAX_REMOTE_BACKOFF_MS = 60 * 60 * 1000;
 
@@ -68,7 +71,169 @@ function lockFile(operationId) {
   return path.join(REMOTE_LOCK_DIR, `${safeName(operationId)}.lock`);
 }
 
-function releaseRemoteClaim(claim) {
+function isAlreadyPrivateOwnedPosixDirectory(directoryPath, owner) {
+  const directory = fs.lstatSync(directoryPath, { bigint: true });
+  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== owner) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  // Existing owner-only write/search (0300) directories are legitimate and
+  // require no migration; opening those with O_RDONLY would fail EACCES.
+  return (directory.mode & 0o077n) === 0n;
+}
+
+function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
+  // Never try to repair a child underneath a replaceable parent. Historical
+  // installs often have both data/ and its lock directory at umask-0002 0775.
+  const parent = fs.lstatSync(parentPath, { bigint: true });
+  const owner = BigInt(process.getuid());
+  if (!parent.isDirectory() || parent.isSymbolicLink() ||
+      parent.uid !== owner || (parent.mode & 0o022n) !== 0n) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  try { fs.mkdirSync(directoryPath, { mode: 0o700 }); }
+  catch (error) { if (error.code !== "EEXIST") throw error; }
+  if (isAlreadyPrivateOwnedPosixDirectory(directoryPath, owner)) return;
+  if (!fs.constants.O_NOFOLLOW || !fs.constants.O_DIRECTORY) {
+    throw new Error("Remote deletion claim directory cannot be pinned");
+  }
+
+  // Pin the directory before inspecting the pathname. O_NOFOLLOW rejects a
+  // substituted symlink at the kernel boundary rather than trusting lstat.
+  const fd = fs.openSync(directoryPath,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(directoryPath, { bigint: true });
+    if (!opened.isDirectory() || opened.isSymbolicLink() ||
+        named.isSymbolicLink() || opened.uid !== owner ||
+        opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error("Remote deletion claim directory changed during migration");
+    }
+    if ((opened.mode & 0o077n) === 0n) return;
+    fs.fchmodSync(fd, 0o700);
+    const after = fs.fstatSync(fd, { bigint: true });
+    const afterName = fs.lstatSync(directoryPath, { bigint: true });
+    if (!after.isDirectory() || after.dev !== opened.dev ||
+        after.ino !== opened.ino || after.dev !== afterName.dev ||
+        after.ino !== afterName.ino || afterName.isSymbolicLink() ||
+        (after.mode & 0o077n) !== 0n) {
+      throw new Error("Remote deletion claim directory migration failed");
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function ensurePrivateRemoteClaimDirectory() {
+  if (process.platform === "win32") {
+    // A junction at data/ can redirect SQLite's main DB and WAL/SHM as well
+    // as lock files. A pathname lstat alone is insufficient on Windows:
+    // another SID with DELETE_CHILD/Modify may replace the ancestor after
+    // inspection. Pin this authority to native owner-only ACL checks, and
+    // create missing levels with a protected DACL at CreateDirectoryW time.
+    const { ensureWindowsChunkUploadRoot } = require("./chunkUploadWindowsAcl");
+    const { assertPrivateSqliteAuthorityDirectory } =
+      require("../src/services/zk1PrivateSqlitePath");
+    const dataDir = path.dirname(REMOTE_LOCK_DIR);
+    const runtimeRoot = path.dirname(dataDir);
+    const runtime = fs.lstatSync(runtimeRoot, { bigint: true });
+    if (!runtime.isDirectory() || runtime.isSymbolicLink()) {
+      throw new Error("Remote deletion claim directory is unsafe");
+    }
+    for (const directory of [dataDir, REMOTE_LOCK_DIR]) {
+      try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+          throw new Error("Remote deletion claim directory is unsafe");
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        // Native creation checks the full parent ACL before writing and
+        // never adopts an untrusted replacement as a private authority.
+        ensureWindowsChunkUploadRoot(directory);
+      }
+    }
+    const data = fs.lstatSync(dataDir, { bigint: true });
+    if (!data.isDirectory() || data.isSymbolicLink()) {
+      throw new Error("Remote deletion claim directory is unsafe");
+    }
+    const directory = fs.lstatSync(REMOTE_LOCK_DIR, { bigint: true });
+    const finalData = fs.lstatSync(dataDir, { bigint: true });
+    if (!directory.isDirectory() || directory.isSymbolicLink()
+        || !finalData.isDirectory() || finalData.isSymbolicLink()
+        || finalData.dev !== data.dev || finalData.ino !== data.ino) {
+      throw new Error("Remote deletion claim directory is unsafe");
+    }
+    // A fresh native ACL/ancestry verification is required on EVERY claim,
+    // including with an existing coordinator DB, and before SQLite opens its
+    // path-based database/WAL/SHM handles or any O_EXCL claim lock.
+    try {
+      assertPrivateSqliteAuthorityDirectory(REMOTE_LOCK_COORDINATION_FILE);
+    } catch (strictError) {
+      // Older versions used fs.mkdirSync(mode:0700), which leaves an NTFS
+      // directory with an inherited (unprotected) DACL. Migrate ONLY when
+      // native full-tree checks confirm owner/SYSTEM/Admin-only ACEs, real
+      // paths and trusted ancestors. Never seal an untrusted Users:Modify
+      // DACL or change permissions before these checks.
+      const { verifyWindowsLocalWebDavTree, getWindowsChunkAclDescriptor } =
+        require("./chunkUploadWindowsAcl");
+      try {
+        verifyWindowsLocalWebDavTree(REMOTE_LOCK_DIR);
+        // Do not mutate a path whose ACL is already protected: its failed
+        // strict admission has a different cause and must remain fail-closed.
+        if (/D:P/.test(getWindowsChunkAclDescriptor(REMOTE_LOCK_DIR))) {
+          throw strictError;
+        }
+        execFileSync("C:\\Windows\\System32\\icacls.exe",
+          [REMOTE_LOCK_DIR, "/inheritance:d"], {
+            stdio: "ignore", windowsHide: true, timeout: 12000,
+          });
+        // Fail closed if conversion, DACL, ancestor or a descendant changed.
+        assertPrivateSqliteAuthorityDirectory(REMOTE_LOCK_COORDINATION_FILE);
+      } catch (error) {
+        throw new Error("Remote deletion claim directory needs a protected owner-only Windows ACL", {
+          cause: error,
+        });
+      }
+    }
+    return;
+  }
+  const dataDir = path.dirname(REMOTE_LOCK_DIR);
+  const runtimeRoot = path.dirname(dataDir);
+  ensurePrivateOwnedPosixDirectory(dataDir, runtimeRoot);
+  ensurePrivateOwnedPosixDirectory(REMOTE_LOCK_DIR, dataDir);
+}
+
+function withRemoteClaimCoordination(operation) {
+  // A filesystem lease alone cannot safely reclaim an expired path: two
+  // processes can both stat the old lock and erase a newer owner's claim.
+  // SQLite's BEGIN IMMEDIATE serializes claim, stale recovery and release.
+  ensurePrivateRemoteClaimDirectory();
+  try {
+    const file = fs.lstatSync(REMOTE_LOCK_COORDINATION_FILE);
+    if (!file.isFile() || file.isSymbolicLink()) throw new Error("Remote deletion claim coordinator is unsafe");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const db = new Database(REMOTE_LOCK_COORDINATION_FILE);
+  try {
+    db.pragma("busy_timeout = 2000");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  } finally {
+    try { if (db.inTransaction) db.exec("ROLLBACK"); } catch {}
+    db.close();
+  }
+}
+
+function releaseRemoteClaimUnlocked(claim) {
   if (!claim?.path) return;
   try {
     const current = fs.readFileSync(claim.path, "utf8");
@@ -76,6 +241,12 @@ function releaseRemoteClaim(claim) {
   } catch {
     // A missing lock is already released; never mask the operation result.
   }
+}
+
+function releaseRemoteClaim(claim) {
+  if (!claim?.path) return;
+  try { withRemoteClaimCoordination(() => releaseRemoteClaimUnlocked(claim)); }
+  catch { /* Preserve the operation result; an unreleased lock is fail-closed. */ }
 }
 
 function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = crypto.randomUUID() }) {
@@ -88,47 +259,80 @@ function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = cryp
   const operationId = previous.operationId || crypto.randomUUID();
   const token = `${workerId}:${crypto.randomUUID()}`;
   const target = lockFile(operationId);
-  fs.mkdirSync(REMOTE_LOCK_DIR, { recursive: true });
-  try {
-    const fd = fs.openSync(target, "wx");
-    fs.writeFileSync(fd, token, "utf8");
-    fs.closeSync(fd);
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    try {
-      const lockState = fs.statSync(target);
-      if (lockState.mtimeMs + leaseMs <= now) fs.rmSync(target, { force: true });
-    } catch {
-      return null;
-    }
-    try {
-      const fd = fs.openSync(target, "wx");
-      fs.writeFileSync(fd, token, "utf8");
-      fs.closeSync(fd);
-    } catch {
-      return null;
-    }
-  }
   const at = new Date(now).toISOString();
-  const claimed = transition(previous, previous.state, at, {
-    operationId,
-    leaseToken: token,
-    leaseUntil: new Date(now + leaseMs).toISOString(),
-    workerId,
-  });
+  const saveClaim = () => {
+    const fresh = trashRepository.getTrashItem(item.id);
+    const update = (entry) => {
+      const state = remoteState(entry);
+      return { ...entry, metadata: { ...entry.metadata, remoteDeletion: transition(state,
+        state.state, at, { operationId, leaseToken: token,
+          leaseUntil: new Date(now + leaseMs).toISOString(), workerId }) } };
+    };
+    const saved = fresh
+      ? trashRepository.saveRemoteDeletionIfExpectedLease(item.id,
+        previous.leaseToken ?? null, operationId, update)
+      : trashRepository.saveTrashItem(update(current));
+    return saved?.metadata?.remoteDeletion?.leaseToken === token ? { item: saved, token, path: target } : null;
+  };
+  if (!trashRepository.usesSqliteTrashStore()) {
+    // Legacy JSON read/compare/write is protected by the SAME coordination
+    // mutex as lease-file reclaim. This path never acquires the application DB.
+    return withRemoteClaimCoordination(() => {
+      if (!reserveRemoteClaimPath(target, token, now, leaseMs)) return null;
+      try {
+        const claimed = saveClaim();
+        if (!claimed) releaseRemoteClaimUnlocked({ path: target, token });
+        return claimed;
+      } catch (error) {
+        releaseRemoteClaimUnlocked({ path: target, token });
+        throw error;
+      }
+    });
+  }
+  // SQLite's claim-row CAS is atomic, but it is never nested under the
+  // independent claim-coordination DB transaction (no lock inversion).
+  if (!withRemoteClaimCoordination(() => reserveRemoteClaimPath(target, token, now, leaseMs))) return null;
   try {
-    const fresh = trashRepository.getTrashItem(item.id) || current;
-    const freshState = remoteState(fresh);
-    if (!freshState || !["pending", "retry_wait"].includes(freshState.state)) {
-      releaseRemoteClaim({ path: target, token });
-      return null;
-    }
-    const saved = trashRepository.saveTrashItem({ ...fresh, metadata: { ...fresh.metadata, remoteDeletion: claimed } });
-    return { item: saved, token, path: target };
+    const claimed = saveClaim();
+    if (!claimed) releaseRemoteClaim({ path: target, token });
+    return claimed;
   } catch (error) {
     releaseRemoteClaim({ path: target, token });
     throw error;
   }
+}
+
+function createRemoteClaimExclusive(target, token) {
+  // An exclusive create remains atomic even after a competing stale-lock
+  // reclamation. Never reuse a pathname check as authority to overwrite it.
+  const fd = fs.openSync(target, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, token, "utf8");
+  } finally {
+    // A failed token write must not strand a live writable descriptor.
+    fs.closeSync(fd);
+  }
+}
+
+function reserveRemoteClaimPath(target, token, now, leaseMs) {
+  try {
+    createRemoteClaimExclusive(target, token);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    try {
+      const lockState = fs.lstatSync(target);
+      if (!lockState.isFile() || lockState.isSymbolicLink()) return null;
+      if (lockState.mtimeMs + leaseMs <= now) fs.rmSync(target, { force: true });
+    } catch {
+      return false;
+    }
+    try {
+      createRemoteClaimExclusive(target, token);
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 function ensureTrashStorage() {
@@ -463,7 +667,31 @@ function queueRemoteDeletion({ item, deletedBy, loaders, provider = "unknown", c
   });
 }
 
+function saveClaimedRemoteTransition(item, token, update) {
+  const operationId = remoteState(item)?.operationId;
+  if (!operationId) return trashRepository.getTrashItem(item.id) || item;
+  const save = () => trashRepository.saveRemoteDeletionIfLeaseOwner(
+    item.id, token, operationId, update) || item;
+  // JSON's synchronous read/compare/write must share the lease coordination
+  // mutex with JSON claim/reclaim. SQLite mode instead uses an atomic guarded
+  // UPDATE in the main database, with no coordinator lock held.
+  return trashRepository.usesSqliteTrashStore() ? save() : withRemoteClaimCoordination(save);
+}
+
 function completeRemoteDeletion(item, { clock, claimToken } = {}) {
+  if (claimToken) {
+    return saveClaimedRemoteTransition(item, claimToken, (fresh) => {
+      const previous = remoteState(fresh);
+      const completedAt = nowIso(clock);
+      return {
+        ...fresh, status: "permanently_deleted",
+        metadata: { ...fresh.metadata, remoteDeletion: transition(previous, "completed", completedAt, {
+          completedAt, lastAttemptAt: previous.lastAttemptAt || completedAt,
+          nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null,
+        }) },
+      };
+    });
+  }
   const previous = remoteState(item);
   if (item.status !== "remote_delete_pending" || !previous || ["completed", "cancelled", "terminal_failure"].includes(previous.state)) return item;
   if (claimToken && previous.leaseToken !== claimToken) return item;
@@ -482,6 +710,23 @@ function completeRemoteDeletion(item, { clock, claimToken } = {}) {
 }
 
 function failRemoteDeletion(item, error, { clock, claimToken } = {}) {
+  if (claimToken) {
+    return saveClaimedRemoteTransition(item, claimToken, (fresh) => {
+      const previous = remoteState(fresh);
+      const attempts = Math.min(Number(previous.maxAttempts) || DEFAULT_MAX_REMOTE_ATTEMPTS,
+        (Number(previous.attempts) || 0) + 1);
+      const failedAt = nowIso(clock);
+      const terminal = attempts >= (Number(previous.maxAttempts) || DEFAULT_MAX_REMOTE_ATTEMPTS);
+      const nextAttemptAt = terminal ? null : new Date(getClock(clock)() + backoffMs(attempts)).toISOString();
+      return {
+        ...fresh, metadata: { ...fresh.metadata, remoteDeletion: transition(previous,
+          terminal ? "terminal_failure" : "retry_wait", failedAt, {
+            attempts, lastAttemptAt: failedAt, nextAttemptAt,
+            failureCategory: failureCategory(error), leaseToken: null, leaseUntil: null,
+          }) },
+      };
+    });
+  }
   const previous = remoteState(item);
   if (item.status !== "remote_delete_pending" || !previous || ["completed", "cancelled", "terminal_failure"].includes(previous.state)) return item;
   if (claimToken && previous.leaseToken !== claimToken) return item;
@@ -504,6 +749,27 @@ function failRemoteDeletion(item, error, { clock, claimToken } = {}) {
 function cancelRemoteDeletion(item, reason = "cancelled", { clock, status } = {}) {
   const previous = remoteState(item);
   if (!previous || ["completed", "cancelled"].includes(previous.state)) return item;
+  if (item.status === "remote_delete_pending" && previous.operationId
+      && ["pending", "retry_wait"].includes(previous.state)) {
+    const save = () => {
+      const persisted = trashRepository.saveRemoteDeletionIfExpectedLease(
+        item.id, previous.leaseToken ?? null, previous.operationId, (fresh) => {
+          const currentState = remoteState(fresh);
+          const at = nowIso(clock);
+          return {
+            ...fresh, status: status || fresh.status,
+            metadata: { ...fresh.metadata, remoteDeletion: transition(currentState,
+              "cancelled", at, {
+                cancellationReason: String(reason).slice(0, 120),
+                nextAttemptAt: null, leaseToken: null, leaseUntil: null,
+              }) },
+          };
+        });
+      if (persisted) Object.assign(item, persisted);
+      return persisted || item;
+    };
+    return trashRepository.usesSqliteTrashStore() ? save() : withRemoteClaimCoordination(save);
+  }
   const at = nowIso(clock);
   if (status) item.status = status;
   item.metadata = { ...item.metadata, remoteDeletion: transition(previous, "cancelled", at, {

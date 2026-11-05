@@ -35,7 +35,8 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1", "large-orp
     }
     fs.mkdirSync(path.join(fixture, "data"), { recursive: true });
     fs.writeFileSync(path.join(fixture, "data", "audit-logs.json"), JSON.stringify({ logs: [] }));
-    const script = `
+    // Static child program: scenario is an environment value, never JavaScript source.
+    const script = `(function() {
       const assert = require('node:assert/strict');
       const fs = require('node:fs');
       const Database = require('better-sqlite3');
@@ -43,7 +44,7 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1", "large-orp
       const { migrate } = require('./db/migrate-json-to-sqlite');
       const repo = require('./repositories/auditRepository');
       const archive = require('./repositories/jsonAuditArchiveStore');
-      const scenario = ${JSON.stringify(scenario)};
+      const scenario = process.env.ROOTARK_TEST_SCENARIO;
       const largeOrphans = scenario === 'large-orphans-4096';
       const count = scenario === 'capacity-4096' || largeOrphans ? 4096 : 1;
       const events = Array.from({length: largeOrphans ? 0 : count}, (_,n)=>({
@@ -117,11 +118,12 @@ for (const scenario of ["single-v1", "capacity-4096", "divergent-v1", "large-orp
       repo.saveAuditLogs({logs:[]});
       assert.equal(pendingCount(),1,'uncommitted pending audit without a matching authority must survive cleanup');
       console.log('MIGRATED_PENDING_DRAINED');
-    `;
-    const result = spawnSync(process.execPath, ["-e", `(()=>{${script}})()`], {
+    })();`;
+    const result = spawnSync(process.execPath, ["-e", script], {
       cwd: fixture, encoding: "utf8", windowsHide: true, timeout: 80_000,
       env: { ...process.env, NODE_PATH: [path.join(root, "node_modules"), process.env.NODE_PATH].filter(Boolean).join(path.delimiter),
-        DB_ENABLED: "true", DATABASE_URL: path.join(fixture, "data", "rootark.sqlite") },
+        DB_ENABLED: "true", ROOTARK_TEST_SCENARIO: scenario,
+        DATABASE_URL: path.join(fixture, "data", "rootark.sqlite") },
     });
     assert.equal(result.status, 0, `${result.error?.message || ""}\n${result.stderr}\n${result.stdout}`);
     assert.match(result.stdout, /MIGRATED_PENDING_DRAINED|PENDING_REPLAY_REJECTED|LARGE_PENDING_ID_ONLY/);

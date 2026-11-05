@@ -14,6 +14,7 @@ const {
 } = require("../src/services/zk1LocalFixtureMigrationJournal");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 const { canonicalTestTempEnvironment } = require("./support/issue-65-canonical-temp-fixture");
+const { writeExistingFixtureFileSync } = require("./support/pinned-fixture-file");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
@@ -240,18 +241,18 @@ test("no missing or unknown class may be called reference-complete despite valid
 test("adulterated destination, source or journal blocks replay and rollback without destroying evidence", (t) => {
   const f = fixture(t);
   runLocalFixtureCiphertextMigration(f.plan);
-  fs.writeFileSync(f.target, "malicious ciphertext substitution");
+  writeExistingFixtureFileSync(f.target, "malicious ciphertext substitution");
   assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.equal(fs.existsSync(f.target), true);
-  fs.writeFileSync(f.target, bytes);
-  fs.writeFileSync(f.source, "source changed since plan");
+  writeExistingFixtureFileSync(f.target, bytes);
+  writeExistingFixtureFileSync(f.source, "source changed since plan");
   assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.equal(fs.existsSync(f.target), true);
-  fs.writeFileSync(f.source, bytes);
+  writeExistingFixtureFileSync(f.source, bytes);
   const journal = JSON.parse(fs.readFileSync(f.journal, "utf8"));
   journal.phase = "rolled-back";
-  fs.writeFileSync(f.journal, JSON.stringify(journal));
+  writeExistingFixtureFileSync(f.journal, JSON.stringify(journal));
   assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.equal(fs.existsSync(f.target), true);
 });

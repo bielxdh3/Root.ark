@@ -190,9 +190,8 @@ async function withDavServer(fn) {
   writeUsers();
   try { fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction"); } catch {}
   const port = await freePort();
-  const env = { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", LOGIN_DELAY_BASE: "0", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
-  const hook = path.join(dir, "hook.js");
-  fs.writeFileSync(hook, `const fs=require("fs");const b=require(${JSON.stringify(path.join(ROOT, "node_modules", "bcryptjs"))});const c=b.compare;b.compare=async function(...a){const r=await c.apply(this,a);const t=${JSON.stringify(path.join(dir, "mutate.json"))};if(fs.existsSync(t)){fs.writeFileSync(${JSON.stringify(path.join(dir, "data", "users.local.json"))},fs.readFileSync(t));fs.unlinkSync(t);}return r;};`);
+  const env = { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", LOGIN_DELAY_BASE: "0", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", ROOTARK_TEST_DAV_FIXTURE: dir, JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  const hook = path.join(__dirname, "support", "issue-203-async-auth-hook.js");
   const child = spawn(process.execPath, ["-r", hook, path.join(ROOT, "server.js")], { cwd: dir, env, stdio: "ignore", windowsHide: true });
   try {
     for (let i = 0; i < 150; i += 1) {

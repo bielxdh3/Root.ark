@@ -12,6 +12,7 @@ const path = require("node:path");
 const { execFileSync, spawnSync } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
+const tls = require("node:tls");
 const express = require("express");
 const { shouldDeferZk1JsonParsing } = require("../src/middlewares/zk1DeferredJsonParsing");
 const jwt = require("jsonwebtoken");
@@ -111,9 +112,19 @@ async function on(port, server) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   return `http://127.0.0.1:${server.address().port}`;
 }
+function fixtureHttpsUrl(uri) {
+  const parsed = new URL(uri);
+  if (parsed.protocol !== "https:" || parsed.hostname !== "127.0.0.1"
+    || !/^[0-9]+$/.test(parsed.port) || !(Number(parsed.port) > 0)
+    || parsed.username || parsed.password || parsed.hash) throw Error("UNSAFE_FIXTURE_HTTPS_URL");
+  return parsed;
+}
 async function secureGet(uri, ca) {
   return new Promise((resolve, reject) => {
-    const req = https.get(uri, { ca, rejectUnauthorized: true, timeout: 5000 }, (res) => {
+    const parsed = fixtureHttpsUrl(uri);
+    const req = https.get({ hostname: "127.0.0.1", port: parsed.port,
+      path: parsed.pathname + parsed.search, ca, rejectUnauthorized: true,
+      timeout: 5000 }, (res) => {
       const parts = [];
       res.on("data", (chunk) => parts.push(chunk));
       res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
@@ -123,9 +134,12 @@ async function secureGet(uri, ca) {
 }
 async function secureTransfer(uri, ca, method, data = null) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(uri);
-    const req = https.request({ hostname: parsed.hostname,
-      port: parsed.port, path: parsed.pathname, ca, rejectUnauthorized: true,
+    const parsed = fixtureHttpsUrl(uri);
+    // The generated CA stays within local TLS verification; it is not sent
+    // as HTTP body or headers. Preserve the certificate verification policy.
+    const secureContext = tls.createSecureContext({ ca });
+    const req = https.request({ hostname: "127.0.0.1",
+      port: parsed.port, path: parsed.pathname + parsed.search, secureContext, rejectUnauthorized: true,
       method, timeout: 5000 }, (res) => {
       const parts = [];
       res.on("data", (chunk) => parts.push(chunk));
@@ -136,6 +150,13 @@ async function secureTransfer(uri, ca, method, data = null) {
     req.end(data);
   });
 }
+
+test("fixture HTTPS transfer refuses a file-sourced non-loopback destination", async () => {
+  await assert.rejects(secureTransfer("https://example.com/private", null, "GET"),
+    /UNSAFE_FIXTURE_HTTPS_URL/);
+  await assert.rejects(secureGet("https://example.com/private", null),
+    /UNSAFE_FIXTURE_HTTPS_URL/);
+});
 
 test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 SDK, Drive HTTPS and WebDAV mTLS quorum, rejecting rollback and revoked owner", {
   timeout: 35000,

@@ -12,6 +12,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFile } = require("./support/pinned-fixture-file");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } =
   require("../sync-client/rootark-sync-authorization");
@@ -71,7 +72,7 @@ async function fixture(t) {
   const installed = await fsp.lstat(target, { bigint: true });
   assert.equal(installed.dev, physicalStaged.dev);
   assert.equal(installed.ino, physicalStaged.ino);
-  assert.deepEqual(await fsp.readFile(target), BYTES);
+  assert.deepEqual(await readPinnedFixtureFile(target), BYTES);
   const installedIdentity = physicalIdentity(installed);
   await mutation.update(operationId, { phase: "source-moved", installedIdentity });
   const onDiskEvent = (await disk(mutationPath)).pending()[0];

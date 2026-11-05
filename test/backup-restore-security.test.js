@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 const unzipper = require("unzipper");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -68,7 +71,11 @@ function write(root, relativePath, bytes) {
 function checkoutState(target) {
   try {
     const stat = fs.lstatSync(target);
-    if (stat.isFile()) return { type: "file", size: stat.size, sha256: crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex") };
+    if (stat.isFile()) {
+      const content = readPinnedFixtureFileSync(target);
+      return { type: "file", size: content.length,
+        sha256: crypto.createHash("sha256").update(content).digest("hex") };
+    }
     if (stat.isDirectory()) return { type: "directory" };
     return { type: "other" };
   } catch (error) {
@@ -83,7 +90,7 @@ function headers(port, session) {
 
 test("backup and restore stay in the child runtime root", { timeout: 45_000 }, async (t) => {
   const password = crypto.randomBytes(24).toString("base64url");
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-runtime-"));
+  const sandbox = createPrivateAuthorityFixture("rootark-backup-runtime-");
   const checkoutBefore = {
     backups: checkoutState(path.join(ROOT, "data", "backups")),
     history: checkoutState(path.join(ROOT, "data", "backup-history.json")),

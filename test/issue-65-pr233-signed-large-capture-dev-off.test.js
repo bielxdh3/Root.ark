@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
 
 const { verifyDevOffSignedLargeCapture } =
   require("../src/services/zk1DevOffSignedLargeCloudCapture");
@@ -93,7 +94,7 @@ test("actual held writable FD A→B→A mutation during pinned capture cannot fa
     await assert.rejects(f.run(), /ZK_DEV_OFF_CAPTURE_UNAVAILABLE/);
   } finally { fs.readSync = native; }
   assert.equal(attacked, true);
-  assert.deepEqual(fs.readFileSync(f.sourcePath), original);
+  assert.deepEqual(readPinnedFixtureFileSync(f.sourcePath), original);
   assert.equal(fs.statSync(f.sourcePath, { bigint: true }).ino, inode);
 });
 
@@ -358,6 +359,6 @@ test("native Linux other-UID retained writable FD A→B→A is denied against ow
   try { await assert.rejects(f.run(), /ZK_DEV_OFF_CAPTURE_UNAVAILABLE/); }
   finally { fs.readSync = read; }
   assert.equal(attacked, true);
-  assert.deepEqual(fs.readFileSync(f.sourcePath), original);
+  assert.deepEqual(readPinnedFixtureFileSync(f.sourcePath), original);
   assert.equal(fs.statSync(f.sourcePath, { bigint: true }).ino, inode);
 });

@@ -68,8 +68,10 @@ function isZipSymlink(entry) {
   return madeByUnix && (unixMode & 0xf000) === 0xa000;
 }
 
-async function preflightDocx(filePath) {
-  const archive = await unzipper.Open.file(filePath);
+async function preflightDocx(filePathOrBytes) {
+  const archive = Buffer.isBuffer(filePathOrBytes)
+    ? await unzipper.Open.buffer(filePathOrBytes)
+    : await unzipper.Open.file(filePathOrBytes);
   if (archive.files.length > MAX_DOCX_ENTRIES) throw parserFailure("PREVIEW_DOCX_TOO_MANY_ENTRIES", "PREVIEW_DOCX_TOO_MANY_ENTRIES");
   let totalUncompressed = 0;
   const normalized = new Set();
@@ -104,7 +106,7 @@ async function preflightDocx(filePath) {
   }
 }
 
-async function parseDocumentInChildProcessUnbounded(filePath, extension, options = {}) {
+async function parseDocumentInChildProcessUnbounded(bytes, extension, options = {}) {
   const spawnProcess = options.spawnImpl || spawn;
   const timeout = Number(options.timeoutMs ?? TIMEOUT_MS);
   const maxOutputBytes = Number(options.maxOutputBytes ?? Math.max(16_384, MAX_OUTPUT_CHARS * 8));
@@ -149,8 +151,8 @@ async function parseDocumentInChildProcessUnbounded(filePath, extension, options
       if (closeConfirmed) finish(pendingError);
     };
     try {
-      child = spawnProcess(process.execPath, [PARSER_WORKER, JSON.stringify({ filePath, extension })], {
-        stdio: ["ignore", "pipe", "pipe"],
+      child = spawnProcess(process.execPath, [PARSER_WORKER, JSON.stringify({ extension, maxInputBytes: MAX_INPUT_BYTES })], {
+        stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         detached: process.platform !== "win32",
         env: childEnvironment(),
@@ -190,22 +192,63 @@ async function parseDocumentInChildProcessUnbounded(filePath, extension, options
         finish(parserFailure("Resposta de parser invalida", "PREVIEW_PARSER_FAILED"));
       }
     });
+    if (child.stdin) {
+      child.stdin.once("error", () => stop(parserFailure("Falha no envio ao parser", "PREVIEW_PARSER_FAILED")));
+      child.stdin.end(bytes);
+    }
   });
 }
 
-async function parseDocumentInChildProcess(filePath, extension, options = {}) {
-  if (extension === ".docx") await preflightDocx(filePath);
+function readPreviewBytes(filePath) {
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    const named = fs.lstatSync(filePath);
+    if (!opened.isFile() || !named.isFile() || opened.size > MAX_INPUT_BYTES ||
+        opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error("PREVIEW_TOO_LARGE");
+    }
+    const chunks = [];
+    let total = 0;
+    while (total <= MAX_INPUT_BYTES) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_INPUT_BYTES + 1 - total));
+      const length = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (!length) break;
+      chunks.push(chunk.subarray(0, length));
+      total += length;
+    }
+    const finalStat = fs.fstatSync(fd);
+    if (total > MAX_INPUT_BYTES || finalStat.size !== opened.size ||
+        finalStat.mtimeMs !== opened.mtimeMs || total !== opened.size) {
+      throw new Error("PREVIEW_TOO_LARGE");
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function parseDocumentInChildProcess(filePathOrBytes, extension, options = {}) {
+  // Reserve the bounded parser admission slot BEFORE retaining snapshot bytes
+  // or starting ZIP preflight. Queued/overflow requests must not hold 5 MiB
+  // buffers while waiting for the parser or an attacker-stalled archive.
   const release = await acquireParserSlot();
-  try { return await parseDocumentInChildProcessUnbounded(filePath, extension, options); }
+  try {
+    const bytes = Buffer.isBuffer(filePathOrBytes) ? filePathOrBytes : readPreviewBytes(filePathOrBytes);
+    if (bytes.length > MAX_INPUT_BYTES) throw new Error("PREVIEW_TOO_LARGE");
+    if (extension === ".docx") await preflightDocx(bytes);
+    return await parseDocumentInChildProcessUnbounded(bytes, extension, options);
+  }
   finally { release(); }
 }
 
 async function previewText(filePath, fileName, options = {}) {
   const extension = path.extname(fileName || filePath).toLowerCase();
   if (!TEXT_EXTENSIONS.has(extension) && extension !== ".doc" && extension !== ".docx") throw new Error("PREVIEW_UNSUPPORTED");
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile() || stat.size > MAX_INPUT_BYTES) throw new Error("PREVIEW_TOO_LARGE");
-  if (TEXT_EXTENSIONS.has(extension)) return { content: bounded(fs.readFileSync(filePath, "utf8")), format: "text", language: extension.slice(1) || "text" };
+  if (TEXT_EXTENSIONS.has(extension)) {
+    const bytes = readPreviewBytes(filePath);
+    return { content: bounded(bytes.toString("utf8")), format: "text", language: extension.slice(1) || "text" };
+  }
   const content = await parseDocumentInChildProcess(filePath, extension, options);
   return { content, format: "document", language: extension.slice(1) };
 }

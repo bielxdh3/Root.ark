@@ -5,6 +5,8 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFileSync, writeExistingFixtureFileSync } =
+  require("./support/pinned-fixture-file");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
@@ -397,12 +399,12 @@ test("cached CAS lookup rechecks signatures when equal size and timestamp concea
   await anchor.append(q, ticket, "committed", manifest, seal);
   assert.ok(anchor.get(q.reservation_id));
   const stat = fs.statSync(filename);
-  const original = fs.readFileSync(filename, "utf8");
+  const original = readPinnedFixtureFileSync(filename, "utf8");
   const lines = original.trimEnd().split("\n");
   const event = JSON.parse(lines[1]);
   event.signature = (event.signature[0] === "A" ? "B" : "A") + event.signature.slice(1);
   lines[1] = JSON.stringify(event);
-  fs.writeFileSync(filename, lines.join("\n") + "\n");
+  writeExistingFixtureFileSync(filename, lines.join("\n") + "\n");
   assert.equal(fs.statSync(filename).size, stat.size);
   const nativeStat = fs.statSync;
   try {

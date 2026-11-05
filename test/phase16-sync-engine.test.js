@@ -856,9 +856,19 @@ test("cache eviction rollback surfaces a failed rollback persist and the next sy
 test("cache eviction keeps the staged copy and the marker when the local path is recreated before restore", async (t) => {
   const { key, store, adapter, root, sync, before, localPath, trash } = await evictionFixture(t, "restore-recreated");
   const originalLstat = fsp.lstat;
+  let recreated = false;
   fsp.lstat = async function injectedLstat(target, options) {
-    if (String(target).includes(`${path.sep}.rootark-trash${path.sep}`) && await originalLstat(localPath).then(() => false, () => true)) {
-      await fsp.writeFile(localPath, "user recreated file");
+    if (!recreated && String(target).includes(`${path.sep}.rootark-trash${path.sep}`)) {
+      // Exclusive creation is itself the atomic existence check: no prior
+      // lstat/reopen window. The first staging check occurs before the original
+      // is moved, so EEXIST must leave that pathname untouched and retry later.
+      try {
+        await fsp.writeFile(localPath, "user recreated file", { flag: "wx", mode: 0o600 });
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        return originalLstat.call(fsp, target, options);
+      }
+      recreated = true;
       throw Object.assign(new Error("injected identity check failure"), { code: "EIO" });
     }
     return originalLstat.call(fsp, target, options);

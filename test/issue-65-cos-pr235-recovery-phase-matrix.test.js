@@ -11,6 +11,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFile } = require("./support/pinned-fixture-file");
 
 const { SyncJournal } = require("../sync-client/rootark-sync-journal");
 const { LocalSyncWebDavBridge } = require("../sync-client/rootark-sync-webdav");
@@ -100,7 +101,7 @@ async function matrixFixture(t, { kind, phase, overwrite = false }) {
     const handle = await fsp.open(temporary, "wx", 0o600);
     try { await handle.writeFile(BODY); await handle.sync(); }
     finally { await handle.close(); }
-    assert.deepEqual(await fsp.readFile(temporary), BODY);
+    assert.deepEqual(await readPinnedFixtureFile(temporary), BODY);
   }
 
   // PUT/MOVE overwrite stage: link original destination to trusted backup,
@@ -191,7 +192,9 @@ async function physicalSnapshot(f) {
       type: stat.isSymbolicLink() ? "symlink"
         : stat.isFile() ? "file" : stat.isDirectory() ? "directory" : "other",
       ...(stat.isSymbolicLink() ? { link: await fsp.readlink(filename) }
-        : stat.isFile() ? { sha256: digest(await fsp.readFile(filename)) } : {}) };
+        // This adversarial matrix intentionally snapshots additional hardlinks.
+        : stat.isFile() ? { sha256: digest(await readPinnedFixtureFile(filename,
+          undefined, { allowHardlinks: true })) } : {}) };
   }
   return result;
 }

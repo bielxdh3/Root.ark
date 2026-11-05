@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { readPinnedFixtureFileSync } = require("./support/pinned-fixture-file");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -77,7 +80,7 @@ function readJson(target) {
 function state(target) {
   if (!fs.existsSync(target)) return { type: "absent" };
   const stat = fs.lstatSync(target);
-  if (stat.isFile()) return { type: "file", hash: crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex") };
+  if (stat.isFile()) return { type: "file", hash: crypto.createHash("sha256").update(readPinnedFixtureFileSync(target)).digest("hex") };
   const entries = [];
   const visit = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -93,7 +96,7 @@ function state(target) {
 
 async function createHarness(t, { folders = [], items = [], autoCleanup = false, beforeStart } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-local-"));
+  const dir = createPrivateAuthorityFixture("rootark-trash-local-");
   fs.mkdirSync(path.join(dir, "data"), { recursive: true });
   fs.cpSync(PUBLIC, path.join(dir, "public"), { recursive: true });
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([

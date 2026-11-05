@@ -87,9 +87,22 @@ function checkSecrets() {
   const matches = [];
   for (const relative of files) {
     const absolute = path.join(root, relative);
-    if (!fs.existsSync(absolute) || fs.statSync(absolute).size > 2 * 1024 * 1024) continue;
-    const text = fs.readFileSync(absolute, "utf8");
-    if (patterns.some((pattern) => pattern.test(text))) matches.push(relative.replace(/\\/g, "/"));
+    let fd;
+    try {
+      fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const opened = fs.fstatSync(fd);
+      const named = fs.lstatSync(absolute);
+      if (!opened.isFile() || !named.isFile() || opened.size > 2 * 1024 * 1024 ||
+          opened.dev !== named.dev || opened.ino !== named.ino) continue;
+      const text = fs.readFileSync(fd, "utf8");
+      if (patterns.some((pattern) => pattern.test(text))) matches.push(relative.replace(/\\/g, "/"));
+    } catch (error) {
+      // Git may list a symlink or a path removed during the scan. Neither
+      // should make this gate follow a different file outside the checkout.
+      if (!["ENOENT", "ELOOP", "EISDIR", "EPERM", "EACCES"].includes(error.code)) throw error;
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
   }
   if (matches.length) record("secret-material pattern scan", "FAIL", `${matches.length} file(s) matched`);
   else record("secret-material pattern scan", "PASS", `${files.length} repository files scanned; no material pattern matches`);

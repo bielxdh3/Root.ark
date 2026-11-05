@@ -146,6 +146,54 @@ function saveTrashItem(item) {
   return normalized;
 }
 
+// Finish a remote deletion only while the persisted record still belongs to
+// the calling worker. A long-running provider call may outlive its lease and
+// another worker may reclaim it, or a replacement may cancel the operation.
+// SQLite's conditional UPDATE is atomic across processes; no auxiliary claim
+// coordinator lock is held while accessing the application database.
+function usesSqliteTrashStore() {
+  return isDbEnabled() && hasTrashTable();
+}
+
+function saveRemoteDeletionIfExpectedLease(id, expectedToken, operationId, update) {
+  if (!id || !operationId || typeof update !== "function") {
+    throw new TypeError("A remote operation and updater are required");
+  }
+  const isOwner = (entry) => entry?.status === "remote_delete_pending"
+    && (entry.metadata?.remoteDeletion?.leaseToken ?? null) === (expectedToken ?? null)
+    && entry.metadata?.remoteDeletion?.operationId === operationId
+    && ["pending", "retry_wait", "failed"].includes(entry.metadata.remoteDeletion.state);
+  if (usesSqliteTrashStore()) {
+    const current = getTrashItem(id);
+    if (!isOwner(current)) return current;
+    const next = normalizeTrashItem(update(current));
+    const result = getDb().prepare(`
+      UPDATE trash_items SET status = ?, metadata_json = ?
+      WHERE id = ? AND status = 'remote_delete_pending'
+        AND json_extract(metadata_json, '$.remoteDeletion.leaseToken') IS ?
+        AND json_extract(metadata_json, '$.remoteDeletion.operationId') = ?
+        AND json_extract(metadata_json, '$.remoteDeletion.state') IN ('pending', 'retry_wait', 'failed')
+    `).run(next.status, jsonStringify(next.metadata), id, expectedToken ?? null, operationId);
+    return result.changes === 1 ? next : getTrashItem(id);
+  }
+  // The legacy JSON mode performs a synchronous read/compare/write without
+  // yielding the event loop. SQLite mode above is the cross-process authority.
+  const items = loadJsonItems();
+  const index = items.findIndex((entry) => entry.id === id);
+  if (index < 0) return null;
+  const current = items[index];
+  if (!isOwner(current)) return current;
+  const next = normalizeTrashItem(update(current));
+  items[index] = next;
+  saveJsonItems(items);
+  return next;
+}
+
+function saveRemoteDeletionIfLeaseOwner(id, token, operationId, update) {
+  if (!token) throw new TypeError("A remote claim token is required");
+  return saveRemoteDeletionIfExpectedLease(id, token, operationId, update);
+}
+
 function isFileTrashed(folderId, fileName) {
   const name = path.basename(fileName || "");
   if (!name) return false;
@@ -190,4 +238,7 @@ module.exports = {
   listPendingFileRemoteDeletions,
   listTrashItems,
   saveTrashItem,
+  saveRemoteDeletionIfLeaseOwner,
+  saveRemoteDeletionIfExpectedLease,
+  usesSqliteTrashStore,
 };

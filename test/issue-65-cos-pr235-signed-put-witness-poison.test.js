@@ -13,6 +13,7 @@ const fsp = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFile } = require("./support/pinned-fixture-file");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } =
   require("../sync-client/rootark-sync-authorization");
@@ -218,7 +219,7 @@ async function realSignedUnacknowledgedPut(t, phase) {
   assert.equal(event.putSha256, sha(ORIGINAL));
   assert.deepEqual(event.installedIdentity,
     identity(await fsp.lstat(f.target, { bigint: true })));
-  assert.deepEqual(await fsp.readFile(f.target), ORIGINAL);
+  assert.deepEqual(await readPinnedFixtureFile(f.target), ORIGINAL);
   assert.deepEqual(proof.outbox.pending(), JSON.parse(JSON.stringify(f.signed)),
     "the outbox must actually survive an independent on-disk journal reopen");
   const originalSigned = proof.outbox.pending()[0];
@@ -285,7 +286,7 @@ for (const phase of ["source-moved", "protocol-queued"]) {
     await fsp.writeFile(f.target, attackerBytes);
     assert.deepEqual(identity(await fsp.lstat(f.target, { bigint: true })),
       before.inode, "attack must keep EXACT physical inode; not a replaced path");
-    assert.deepEqual(await fsp.readFile(f.target), attackerBytes);
+    assert.deepEqual(await readPinnedFixtureFile(f.target), attackerBytes);
     const local = await new SyncJournal(f.localPath).open();
     await local.update(event.operationId, {
       putBytes: attackerBytes.length, putSha256: sha(attackerBytes),

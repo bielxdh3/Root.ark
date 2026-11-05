@@ -288,25 +288,38 @@ class Zk1SyncAtomicCasFloorLedgerDevOff {
     requireValid(existed || bootstrapNew === true);
     requireValid(!preflight || (preflight.kind === "absent"
       ? !existed : preflight.kind === "existing" && existed));
+    let pinned;
     try {
       if (existed) {
-        const inspected = assertPrivateSqliteFile(absolute);
+        pinned = assertPrivateSqliteFile(absolute);
         if (preflight?.kind === "existing") {
-          requireValid(inspected.dev === preflight.dev
-            && inspected.ino === preflight.ino);
+          requireValid(pinned.dev === preflight.dev
+            && pinned.ino === preflight.ino);
         }
       }
       else {
         ensurePrivateSqliteDirectory(absolute);
         const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
           | fs.constants.O_RDWR, 0o600);
-        fs.closeSync(fd);
+        try {
+          // Bind bootstrap to the created inode while its descriptor is open.
+          // Checking only the pathname after close can adopt a foreign DB.
+          const created = fs.fstatSync(fd, { bigint: true });
+          requireValid(created.isFile() && created.nlink === 1n
+            && (process.platform === "win32"
+              || (created.uid === BigInt(process.getuid())
+                && (created.mode & 0o077n) === 0n)));
+          pinned = Object.freeze({ dev: created.dev, ino: created.ino });
+        } finally { fs.closeSync(fd); }
       }
       assertPrivateSqliteAuthorityDirectory(absolute);
-      assertPrivateSqliteFile(absolute);
+      const current = assertPrivateSqliteFile(absolute);
+      requireValid(current.dev === pinned.dev && current.ino === pinned.ino);
     } catch { throw deny(); }
     try {
       this.#db = new Database(absolute, { fileMustExist: true });
+      const opened = assertPrivateSqliteFile(absolute);
+      requireValid(opened.dev === pinned.dev && opened.ino === pinned.ino);
       requireValid(this.#db.pragma("journal_mode = WAL", { simple: true }) === "wal");
       this.#db.pragma("synchronous = FULL");
       requireValid(this.#db.pragma("synchronous", { simple: true }) === 2);

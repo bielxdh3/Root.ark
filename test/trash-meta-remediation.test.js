@@ -3,8 +3,10 @@ const os = require("os");
 const path = require("path");
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-meta-"));
+const runtime = createPrivateAuthorityFixture("rootark-trash-meta-");
 process.chdir(runtime);
 const trashRepository = require("../repositories/trashRepository");
 const trashService = require("../services/trashService");
@@ -133,6 +135,79 @@ test("trash remote deletion meta-remediation matrix", async (t) => {
     const second = trashService.claimRemoteDeletion({ item: value, clock });
     assert.ok(first);
     assert.equal(second, null);
+  });
+  await t.test("stale lock reclamation cannot erase a competing fresh claim", () => {
+    const value = queue();
+    const expired = trashService.claimRemoteDeletion({ item: value, clock, leaseMs: 1000 });
+    assert.ok(expired);
+    const stale = new Date(clock.now() - 120_000);
+    fs.utimesSync(expired.path, stale, stale);
+    const originalRemove = fs.rmSync;
+    let competingClaim = null;
+    let nested = false;
+    fs.rmSync = function (...args) {
+      if (args[0] === expired.path && !nested) {
+        nested = true;
+        try { competingClaim = trashService.claimRemoteDeletion({ item: value, clock, leaseMs: 1000 }); }
+        catch (error) { competingClaim = error; }
+      }
+      return originalRemove.apply(this, args);
+    };
+    let outerClaim;
+    try { outerClaim = trashService.claimRemoteDeletion({ item: value, clock, leaseMs: 1000 }); }
+    finally { fs.rmSync = originalRemove; }
+    assert.equal(Boolean(outerClaim && competingClaim && !(competingClaim instanceof Error)), false,
+      "two workers must never own one remote deletion after stale lock recovery");
+  });
+  await t.test("provider A cannot finalize after worker B reclaims its expired lease", async () => {
+    const value = queue();
+    let started;
+    let finish;
+    const entered = new Promise((resolve) => { started = resolve; });
+    const held = new Promise((resolve) => { finish = resolve; });
+    const localClock = { now: () => Date.now() };
+    const a = trashService.processRemoteDeletion({
+      item: value, clock: localClock, leaseMs: 1000, workerId: "worker-A",
+      provider: async () => { started(); await held; },
+    });
+    await entered;
+    const old = trashRepository.getTrashItem(value.id);
+    assert.equal(old.metadata.remoteDeletion.workerId, "worker-A");
+    const b = trashService.claimRemoteDeletion({
+      item: value, clock: { now: () => Date.now() + 30_000 },
+      leaseMs: 1000, workerId: "worker-B",
+    });
+    assert.ok(b, "B must really reclaim the expired file lease");
+    assert.notEqual(b.token, old.metadata.remoteDeletion.leaseToken);
+    finish();
+    await a;
+    const persisted = trashRepository.getTrashItem(value.id);
+    assert.equal(persisted.status, "remote_delete_pending");
+    assert.equal(persisted.metadata.remoteDeletion.state, "pending");
+    assert.equal(persisted.metadata.remoteDeletion.leaseToken, b.token,
+      "A's stale completion must not overwrite B's current DB claim");
+    const final = trashService.completeRemoteDeletion(persisted, { claimToken: b.token });
+    assert.equal(final.metadata.remoteDeletion.state, "completed",
+      "B remains able to finish its own idempotent deletion");
+  });
+  await t.test("cancelled remote deletion cannot be re-completed by delayed provider A", async () => {
+    const value = queue();
+    let started;
+    let finish;
+    const entered = new Promise((resolve) => { started = resolve; });
+    const held = new Promise((resolve) => { finish = resolve; });
+    const a = trashService.processRemoteDeletion({
+      item: value, clock: { now: () => Date.now() }, leaseMs: 1000,
+      provider: async () => { started(); await held; },
+    });
+    await entered;
+    trashService.cancelRemoteDeletion(trashRepository.getTrashItem(value.id),
+      "replacement_active", { status: "permanently_deleted" });
+    finish();
+    await a;
+    const persisted = trashRepository.getTrashItem(value.id);
+    assert.equal(persisted.metadata.remoteDeletion.state, "cancelled");
+    assert.equal(persisted.status, "permanently_deleted");
   });
   await t.test("duplicate request is idempotent", () => {
     const value = queue();

@@ -9,6 +9,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { readPinnedFixtureFile } = require("./support/pinned-fixture-file");
 
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { SyncJournal } = require("../sync-client/rootark-sync-journal");
@@ -234,7 +235,7 @@ test("Phase 16 WebDAV staged MOVE restores only identity-proven backup; ambiguit
     await fsp.rm(privateJournalDir, { recursive: true, force: true });
   });
   assert.deepEqual(await fsp.readFile(path.join(dir, "restored.txt")), previousDestinationBytes);
-  assert.deepEqual(await fsp.readFile(source), sourceBytes,
+  assert.deepEqual(await readPinnedFixtureFile(source), sourceBytes,
     "staged MOVE cannot delete a source it has not yet published");
   assert.equal(fs.existsSync(backup), false, "successfully restored backup must be unlinked");
   const restored = await fsp.lstat(path.join(dir, "restored.txt"), { bigint: true });
@@ -270,7 +271,7 @@ test("Phase 16 WebDAV staged MOVE restores only identity-proven backup; ambiguit
     "indeterminate status must remain durable after a real journal reopen");
   assert.equal(fs.existsSync(unresolvedSource), false);
   assert.deepEqual(await fsp.readFile(unresolvedTarget), foreignDestinationBytes);
-  assert.deepEqual(await fsp.readFile(unresolvedBackup), foreignBackupBytes);
+  assert.deepEqual(await readPinnedFixtureFile(unresolvedBackup), foreignBackupBytes);
 });
 
 test("Phase 12 server route stores opaque records and rejects conflict/replay", async (t) => {
