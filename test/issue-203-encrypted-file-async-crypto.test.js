@@ -51,13 +51,21 @@ test("encrypted upload and download request paths await asynchronous encryption 
 
 test("encrypted upload revalidates permission after async key derivation and before replacing staged bytes", () => {
   const encryption = sourceBetween("async function encryptFileInPlace(", "async function decryptEncryptedFileBuffer(");
-  const singleUpload = sourceBetween('app.post("/upload",', 'app.put("/file-temporary"');
-  const chunkUpload = sourceBetween('app.post("/upload-chunk", authenticate', 'app.post("/upload",');
+  // Normal POST and strict legacy-sync PUT share the exact same finalization
+  // handler. Audit that handler, rather than the one-line route registrations:
+  // a route refactor must not silently lose the authorization recheck.
+  const singleUpload = sourceBetween('const finalizeSimpleUpload = async (req, res) => {', 'app.post("/upload",');
+  const chunkUpload = sourceBetween('app.post("/upload-chunk", authenticate', 'app.get("/legacy-sync/capabilities",');
+  const simpleRoutes = sourceBetween('app.post("/upload",', 'app.put("/file-temporary"');
 
   assert.match(encryption, /await options\.revalidateBeforeWrite\(\)/);
   assert.match(encryption, /if \(!authorizedToWrite\)/);
   for (const route of [singleUpload, chunkUpload]) {
     assert.match(route, /revalidateBeforeWrite:\s*\(\)\s*=>\s*revalidateEncryptedUploadAuthorization\(req, res, folderId\)/);
+  }
+  assert.match(singleUpload, /if \(!revalidateEncryptedUploadAuthorization\(req, res, folderId\)\) return/);
+  for (const verb of ["post", "put"]) {
+    assert.match(simpleRoutes, new RegExp(`app\\.${verb}\\(\\"/upload\\", authenticate, requirePermission\\(\\"upload\\"\\), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, finalizeSimpleUpload\\)`));
   }
 });
 
