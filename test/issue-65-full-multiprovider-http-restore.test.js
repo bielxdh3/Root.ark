@@ -12,6 +12,7 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
+const tls = require("node:tls");
 const express = require("express");
 const { shouldDeferZk1JsonParsing } = require("../src/middlewares/zk1DeferredJsonParsing");
 const jwt = require("jsonwebtoken");
@@ -84,8 +85,12 @@ async function secureGet(uri, ca) {
 async function secureTransfer(uri, ca, method, data = null) {
   return new Promise((resolve, reject) => {
     const parsed = fixtureHttpsUrl(uri);
+    // A file-sourced CA is a local TLS verification input, never request data.
+    // Keep the pinned fixture trust anchor in a TLS context rather than in
+    // request options, without relaxing rejectUnauthorized or loopback checks.
+    const secureContext = tls.createSecureContext({ ca });
     const req = https.request({ hostname: "127.0.0.1",
-      port: parsed.port, path: parsed.pathname + parsed.search, ca, rejectUnauthorized: true,
+      port: parsed.port, path: parsed.pathname + parsed.search, secureContext, rejectUnauthorized: true,
       method, timeout: 5000 }, (res) => {
       const parts = [];
       res.on("data", (chunk) => parts.push(chunk));

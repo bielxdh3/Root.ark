@@ -95,3 +95,70 @@ test("remote lock directory migration refuses a group-writable runtime ancestor"
     process.chdir(originalCwd);
   }
 });
+
+test("existing owner-only write-and-search POSIX claim directories remain usable", (t) => {
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    return t.skip("requires an unprivileged POSIX owner");
+  }
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-private-wx-"));
+  const data = path.join(runtime, "data");
+  const directory = path.join(data, "trash-remote-locks");
+  const originalCwd = process.cwd();
+  fs.mkdirSync(data, { mode: 0o300 });
+  fs.mkdirSync(directory, { mode: 0o300 });
+  fs.chmodSync(data, 0o300);
+  fs.chmodSync(directory, 0o300);
+  try {
+    assert.equal(fs.lstatSync(data).mode & 0o777, 0o300);
+    assert.equal(fs.lstatSync(directory).mode & 0o777, 0o300);
+    process.chdir(runtime);
+    const svc = loadTrashServiceWithoutDatabase();
+    const claim = svc.claimRemoteDeletion({ item: {
+      id: "private-wx-fixture", metadata: { remoteDeletion: {
+        operationId: "private-wx-fixture", state: "pending",
+      } },
+    } });
+    assert.ok(claim, "an existing owner-private wx directory needs no migration or read permission");
+    assert.equal(fs.lstatSync(directory).mode & 0o777, 0o300);
+  } finally {
+    process.chdir(originalCwd);
+    fs.chmodSync(data, 0o700);
+    fs.chmodSync(directory, 0o700);
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("failed exclusive claim-token writes close their pinned descriptor", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX fault-injection fixture");
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-claim-write-failure-"));
+  const originalCwd = process.cwd();
+  const originalOpen = fs.openSync;
+  const originalWrite = fs.writeFileSync;
+  let tokenFd = null;
+  try {
+    process.chdir(runtime);
+    const svc = loadTrashServiceWithoutDatabase();
+    fs.openSync = function (file, flags, ...args) {
+      const fd = originalOpen.call(this, file, flags, ...args);
+      if (String(file).endsWith(".lock") && flags === "wx") tokenFd = fd;
+      return fd;
+    };
+    fs.writeFileSync = function (file, ...args) {
+      if (file === tokenFd) throw new Error("INJECTED_CLAIM_TOKEN_WRITE_FAILURE");
+      return originalWrite.call(this, file, ...args);
+    };
+    assert.throws(() => svc.claimRemoteDeletion({ item: {
+      id: "write-failure-fixture", metadata: { remoteDeletion: {
+        operationId: "write-failure-fixture", state: "pending",
+      } },
+    } }), /INJECTED_CLAIM_TOKEN_WRITE_FAILURE/);
+    assert.ok(Number.isInteger(tokenFd), "exclusive file descriptor was acquired");
+    assert.throws(() => fs.fstatSync(tokenFd), { code: "EBADF" },
+      "a failed write must not leak a usable claim-lock descriptor");
+  } finally {
+    fs.openSync = originalOpen;
+    fs.writeFileSync = originalWrite;
+    process.chdir(originalCwd);
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});

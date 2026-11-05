@@ -208,6 +208,23 @@ async function isSafeLocalFile(rootDir, filePath) {
   return true;
 }
 
+async function openPinnedLocalSnapshot(filePath, expectedStat) {
+  // Encapsulate the authority acquisition: O_NOFOLLOW rejects POSIX leaf
+  // symlinks at open, and the first fstat must match the already validated
+  // pathname identity before the descriptor is allowed to supply any bytes.
+  const handle = await fsp.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  let admitted = false;
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size > MAX_FILE_BYTES ||
+        opened.dev !== expectedStat.dev || opened.ino !== expectedStat.ino) return null;
+    admitted = true;
+    return { handle, opened };
+  } finally {
+    if (!admitted) await handle.close();
+  }
+}
+
 async function getStableFileInfo(filePath, waitMs, rootDir) {
   if (!(await isSafeLocalFile(rootDir, filePath))) return null;
   const first = await fsp.lstat(filePath);
@@ -221,10 +238,10 @@ async function getStableFileInfo(filePath, waitMs, rootDir) {
   if (second.size > MAX_FILE_BYTES) return {
     size: second.size, mtimeMs: second.mtimeMs, hash: null, bytes: null,
   };
-  const handle = await fsp.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const pinned = await openPinnedLocalSnapshot(filePath, second);
+  if (!pinned) return null;
+  const { handle, opened } = pinned;
   try {
-    const opened = await handle.stat();
-    if (!opened.isFile() || opened.size > MAX_FILE_BYTES || opened.dev !== second.dev || opened.ino !== second.ino) return null;
     // FileHandle.readFile internally sizes its allocation from a fresh stat.
     // A writer could grow the same opened inode after our size check, so use
     // bounded reads from that descriptor and reject any growth past the cap.

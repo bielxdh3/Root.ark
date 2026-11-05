@@ -12,6 +12,7 @@ const path = require("node:path");
 const { execFileSync, spawnSync } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
+const tls = require("node:tls");
 const express = require("express");
 const { shouldDeferZk1JsonParsing } = require("../src/middlewares/zk1DeferredJsonParsing");
 const jwt = require("jsonwebtoken");
@@ -134,8 +135,11 @@ async function secureGet(uri, ca) {
 async function secureTransfer(uri, ca, method, data = null) {
   return new Promise((resolve, reject) => {
     const parsed = fixtureHttpsUrl(uri);
+    // The generated CA stays within local TLS verification; it is not sent
+    // as HTTP body or headers. Preserve the certificate verification policy.
+    const secureContext = tls.createSecureContext({ ca });
     const req = https.request({ hostname: "127.0.0.1",
-      port: parsed.port, path: parsed.pathname + parsed.search, ca, rejectUnauthorized: true,
+      port: parsed.port, path: parsed.pathname + parsed.search, secureContext, rejectUnauthorized: true,
       method, timeout: 5000 }, (res) => {
       const parts = [];
       res.on("data", (chunk) => parts.push(chunk));

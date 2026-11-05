@@ -71,6 +71,16 @@ function lockFile(operationId) {
   return path.join(REMOTE_LOCK_DIR, `${safeName(operationId)}.lock`);
 }
 
+function isAlreadyPrivateOwnedPosixDirectory(directoryPath, owner) {
+  const directory = fs.lstatSync(directoryPath, { bigint: true });
+  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== owner) {
+    throw new Error("Remote deletion claim directory is unsafe");
+  }
+  // Existing owner-only write/search (0300) directories are legitimate and
+  // require no migration; opening those with O_RDONLY would fail EACCES.
+  return (directory.mode & 0o077n) === 0n;
+}
+
 function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
   // Never try to repair a child underneath a replaceable parent. Historical
   // installs often have both data/ and its lock directory at umask-0002 0775.
@@ -82,15 +92,13 @@ function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
   }
   try { fs.mkdirSync(directoryPath, { mode: 0o700 }); }
   catch (error) { if (error.code !== "EEXIST") throw error; }
-  const directory = fs.lstatSync(directoryPath, { bigint: true });
-  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== owner) {
-    throw new Error("Remote deletion claim directory is unsafe");
-  }
-  if ((directory.mode & 0o077n) === 0n) return;
+  if (isAlreadyPrivateOwnedPosixDirectory(directoryPath, owner)) return;
   if (!fs.constants.O_NOFOLLOW || !fs.constants.O_DIRECTORY) {
     throw new Error("Remote deletion claim directory cannot be pinned");
   }
 
+  // Pin the directory before inspecting the pathname. O_NOFOLLOW rejects a
+  // substituted symlink at the kernel boundary rather than trusting lstat.
   const fd = fs.openSync(directoryPath,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
   try {
@@ -101,6 +109,7 @@ function ensurePrivateOwnedPosixDirectory(directoryPath, parentPath) {
         opened.dev !== named.dev || opened.ino !== named.ino) {
       throw new Error("Remote deletion claim directory changed during migration");
     }
+    if ((opened.mode & 0o077n) === 0n) return;
     fs.fchmodSync(fd, 0o700);
     const after = fs.fstatSync(fd, { bigint: true });
     const afterName = fs.lstatSync(directoryPath, { bigint: true });
@@ -293,11 +302,21 @@ function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = cryp
   }
 }
 
+function createRemoteClaimExclusive(target, token) {
+  // An exclusive create remains atomic even after a competing stale-lock
+  // reclamation. Never reuse a pathname check as authority to overwrite it.
+  const fd = fs.openSync(target, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, token, "utf8");
+  } finally {
+    // A failed token write must not strand a live writable descriptor.
+    fs.closeSync(fd);
+  }
+}
+
 function reserveRemoteClaimPath(target, token, now, leaseMs) {
   try {
-    const fd = fs.openSync(target, "wx");
-    fs.writeFileSync(fd, token, "utf8");
-    fs.closeSync(fd);
+    createRemoteClaimExclusive(target, token);
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     try {
@@ -308,9 +327,7 @@ function reserveRemoteClaimPath(target, token, now, leaseMs) {
       return false;
     }
     try {
-      const fd = fs.openSync(target, "wx");
-      fs.writeFileSync(fd, token, "utf8");
-      fs.closeSync(fd);
+      createRemoteClaimExclusive(target, token);
     } catch {
       return false;
     }
