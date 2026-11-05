@@ -337,6 +337,7 @@ async function getStableFileInfo(filePath, waitMs, rootDir) {
 
 async function scanFiles(rootDir) {
   const result = [];
+  const remoteBasenames = new Map();
 
   async function walk(currentDir) {
     const entries = await fsp.readdir(currentDir, { withFileTypes: true });
@@ -351,6 +352,18 @@ async function scanFiles(rootDir) {
       if (stats.isDirectory()) {
         await walk(safePath);
       } else if (stats.isFile()) {
+        // The legacy upload endpoint places path.basename(relativePath) in a
+        // single remote folder, NOT in the corresponding local subfolder.
+        // Two distinct relative paths with the same basename would become
+        // competing versions of one remote object, while both local cache
+        // entries falsely claim successful independent upload. Fail closed
+        // before the scan schedules ANY write instead of silently flattening.
+        const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+        const earlier = remoteBasenames.get(basename);
+        if (earlier !== undefined && earlier !== relativePath) {
+          throw new Error(`SYNC_REMOTE_BASENAME_COLLISION: ${earlier} conflicts with ${relativePath}`);
+        }
+        remoteBasenames.set(basename, relativePath);
         result.push({ fullPath: safePath, relativePath, stats });
       }
     }
@@ -426,6 +439,8 @@ class SyncClient {
     this.scanPending = false;
     this.deferredWatcherPaths = new Map();
     this.needsFullRescan = false;
+    this.remoteBasenameOwners = new Map();
+    this.remoteBasenameCollision = null;
   }
 
   async init() {
@@ -477,9 +492,19 @@ class SyncClient {
   schedule(relativePath, reason = "change") {
     // An aborted HTTP write can still COMMIT remotely after the socket dies.
     // The same running process must not send a newer write while uncertain.
-    if (this.uncertainRemoteOutcome) return;
+    if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
     const fullPath = safeResolveInside(this.config.localFolder, path.join(this.config.localFolder, relativePath));
     if (!fullPath) return;
+    const basename = path.basename(relativePath).normalize("NFC").toLowerCase();
+    const earlier = this.remoteBasenameOwners.get(basename);
+    if (earlier !== undefined && earlier !== relativePath) {
+      this.remoteBasenameCollision = new Error(
+        `SYNC_REMOTE_BASENAME_COLLISION: ${earlier} conflicts with ${relativePath}`);
+      log(`ERRO: ${this.remoteBasenameCollision.message}`);
+      this.stop();
+      return;
+    }
+    this.remoteBasenameOwners.set(basename, relativePath);
     const key = syncPathKey(relativePath);
     const kind = ["scan", "interval", "initial"].includes(reason)
       ? "audit" : "watcher";
@@ -551,7 +576,7 @@ class SyncClient {
   }
 
   async scanAndSchedule(reason = "scan") {
-    if (this.uncertainRemoteOutcome) return;
+    if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
     if (this.scanInProgress) {
       this.scanPending = true;
       return;
@@ -560,7 +585,15 @@ class SyncClient {
     try {
       do {
         this.scanPending = false;
-        await this.scanAndScheduleOnePass(reason);
+        try {
+          await this.scanAndScheduleOnePass(reason);
+        } catch (error) {
+          if (String(error?.message).includes("SYNC_REMOTE_BASENAME_COLLISION")) {
+            this.remoteBasenameCollision = error;
+            this.stop();
+          }
+          throw error;
+        }
       } while (this.scanPending && this.running && !this.uncertainRemoteOutcome);
     } finally {
       this.scanInProgress = false;
@@ -568,7 +601,7 @@ class SyncClient {
   }
 
   async scanAndScheduleOnePass(reason) {
-    if (this.uncertainRemoteOutcome) return;
+    if (this.uncertainRemoteOutcome || this.remoteBasenameCollision) return;
     // Deferred watcher paths get their own capped budget. Audit work keeps
     // reserved capacity, so even sustained watcher floods cannot suppress
     // every digest-sweep lane.
@@ -578,6 +611,9 @@ class SyncClient {
       this.schedule(relativePath, "deferred-watcher");
     }
     const files = await scanFiles(this.config.localFolder);
+    this.remoteBasenameOwners = new Map(files.map((file) => [
+      path.basename(file.relativePath).normalize("NFC").toLowerCase(), file.relativePath,
+    ]));
     if (files.length === 0) return;
     // Round-robin admission prevents low-sorted unchanged files from always
     // taking the entire bounded budget while newer/renamed paths starve.
@@ -625,6 +661,7 @@ class SyncClient {
   }
 
   async syncOneWithSlot(filePath, relativePath, reason) {
+    if (this.remoteBasenameCollision) throw this.remoteBasenameCollision;
     if (this.uncertainRemoteOutcome) {
       throw new Error("SYNC_REMOTE_OUTCOME_UNCERTAIN: reconcile remote writes before resuming");
     }

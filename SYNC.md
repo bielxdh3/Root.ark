@@ -16,6 +16,11 @@ Estes dois comandos se referem **somente ao uploader legado (dev opt-in)**.
 O caminho padrao do legado e `%APPDATA%\Rootark\sync\config.json` no Windows e `${XDG_CONFIG_HOME:-~/.config}/Rootark/sync/config.json` em POSIX. `--config <caminho>` aceita apenas um diretorio com permissoes privadas e arquivo regular do usuario; links simbolicos, hardlinks e configuracoes legiveis por outros usuarios sao recusados. Um `.rootark-sync.json` legado antigo no diretorio atual so pode ser reutilizado pelo `sync:start:legacy-dev` se for seguro e nao contiver uma politica do v2. `sync:init` sem `--config` nao sobrescreve esse arquivo antigo.
 
 `sync:start:legacy-dev` monitora a pasta local, ignora arquivos sensiveis/temporarios e envia arquivos novos ou alterados para `/upload`. URLs remotas exigem HTTPS; HTTP so e permitido para destinos locais aprovados. Redirects autenticados sao bloqueados.
+O uploader legado envia apenas o **nome base** ao folder remoto, sem preservar
+subpastas. Por isso, se duas subpastas contiverem arquivos com o mesmo nome
+(inclusive diferencas somente de caixa), a varredura falha com
+`SYNC_REMOTE_BASENAME_COLLISION` antes de enviar dados. Separe os destinos ou
+renomeie os arquivos para evitar sobrescrita sem sinalizacao.
 
 Para o **Sync v2**, use `npm run sync:start -- --config <config-v2-privado> --once` depois do provisionamento independente da identidade e politica dos dispositivos e das chaves mantidas apenas em memoria. O v2 recusa uma configuracao sem `trustedDevicePublicKeys` e `revokedDeviceIds`; nao reutilize a configuracao do uploader legado. O arquivo v2 deve estar em pasta privada e protegido contra substituicao local.
 

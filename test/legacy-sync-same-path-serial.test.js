@@ -214,7 +214,7 @@ test("once mode finishes more files than the bounded admission queue", {
       `CONTENT_${index}`);
   }
   await fs.writeFile(path.join(selected, "A.txt"), "CASE_UPPER");
-  await fs.writeFile(path.join(selected, "a.txt"), "CASE_LOWER");
+  await fs.writeFile(path.join(selected, "b.txt"), "CASE_LOWER");
   const uploads = [];
   const server = http.createServer((req, res) => {
     if (req.url.startsWith("/list?")) {
@@ -226,7 +226,7 @@ test("once mode finishes more files than the bounded admission queue", {
       req.on("data", (chunk) => chunks.push(chunk));
       req.on("end", () => {
         const body = Buffer.concat(chunks).toString("utf8");
-        const match = /filename="(file-\d{3}\.txt|A\.txt|a\.txt)"/.exec(body);
+        const match = /filename="(file-\d{3}\.txt|A\.txt|b\.txt)"/.exec(body);
         uploads.push(match?.[1] || "INVALID_FILENAME");
         res.writeHead(200, { "content-type": "application/json" })
           .end(JSON.stringify({ fileName: match?.[1] || "unknown" }));
@@ -260,7 +260,7 @@ test("once mode finishes more files than the bounded admission queue", {
   assert.equal(code, 0, output);
   assert.equal(uploads.length, 72, "bounded --once must not silently omit the final batch");
   assert.equal(new Set(uploads).size, 72,
-    "every source, including distinct case-sensitive A.txt/a.txt, must upload exactly once");
+    "every source, including distinct names, must upload exactly once");
   assert.match(output, /Sync --once concluido/);
 });
 
