@@ -121,6 +121,24 @@ test("legacy PID-temporary symlink cannot clobber a private external file", asyn
   await fsp.writeFile(path.join(f.selected, "new.txt"), "REQUIRED_UPLOAD");
   const sentinel = path.join(f.configRoot, "private-sentinel");
   await fsp.writeFile(sentinel, "DO_NOT_CLOBBER", { mode: 0o600 });
+  // Hosted Windows runners may lack SeCreateSymbolicLinkPrivilege. Skip
+  // only when that platform cannot create the adversarial fixture at all;
+  // POSIX must execute the actual planted-symlink regression.
+  const probe = path.join(f.selected, ".rootark-test-symlink-probe");
+  try {
+    await fsp.symlink(sentinel, probe, "file");
+  } catch (error) {
+    if (process.platform === "win32"
+      && ["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+      t.skip("Windows runner lacks symlink fixture permission");
+      return;
+    }
+    throw error;
+  } finally {
+    await fsp.unlink(probe).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
   const result = await runClient(f.dir, f.config, { ROOTARK_TEST_SELECTED: f.selected },
     { symlinkSentinel: sentinel });
   assert.equal(result.code, 0, result.output);
