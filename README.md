@@ -363,9 +363,9 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
 - [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
 - [ ] Harden deployment defaults and document a reviewed production profile
-- [ ] Expand restore testing and disaster-recovery evidence
+- [x] Expand restore testing and disaster-recovery evidence ([bounded local verification](docs/validation/2026-11-06-rootark-recovery-and-adapters.md); live operator drill remains part of R1)
 - [ ] Strengthen suspicious-file isolation and scanning integrations
-- [ ] Review every external adapter independently
+- [ ] Review every external adapter independently ([simulated local/S3/Drive restore evidence](docs/validation/2026-11-06-rootark-recovery-and-adapters.md); independent review and live provider acceptance remain separate)
 - [ ] Reconcile roadmap status and exact-HEAD evidence after each completed mission
 
 ## Project direction
