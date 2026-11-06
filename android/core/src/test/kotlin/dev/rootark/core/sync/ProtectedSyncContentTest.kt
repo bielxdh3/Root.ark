@@ -17,12 +17,13 @@ import kotlin.test.assertTrue
 class ProtectedSyncContentTest {
     private val encoder = Base64.getUrlEncoder().withoutPadding()
     private val decoder = Base64.getUrlDecoder()
-    private val nodeRecord: SyncRecord by lazy {
+    private fun nodeFixture(name: String): SyncRecord {
         val stream = javaClass.classLoader.getResourceAsStream("server-responses.json")
             ?: error("Missing signed real-Node fixture")
         val root = JSONObject(stream.bufferedReader(Charsets.UTF_8).use { it.readText() })
-        root.getJSONObject("responses").getJSONObject("sync.post.201").getJSONObject("body").asRecord()
+        return root.getJSONObject("responses").getJSONObject(name).getJSONObject("body").asRecord()
     }
+    private val nodeRecord: SyncRecord by lazy { nodeFixture("sync.post.201") }
 
     private fun String.binary() = decoder.decode(this)
     private fun ByteArray.b64() = encoder.encodeToString(this)
@@ -131,6 +132,20 @@ class ProtectedSyncContentTest {
         }
         assertFailsWith<ProtectedSyncException> {
             ProtectedSyncContent.verifySignedEnvelopeAt(nodeRecord, context(nodeRecord, now), proof.expiresAt)
+        }
+    }
+
+    @Test
+    fun verifiesActualNodeSignedUpdateWithBaseRevisionAndRejectsRevisionTamper() {
+        val update = nodeFixture("sync.put.200.update")
+        val proof = update.authorization!!
+        val now = proof.expiresAt - 10_000
+        ProtectedSyncContent.verifySignedEnvelopeAt(update, context(update, now), now)
+        assertFailsWith<ProtectedSyncException> {
+            ProtectedSyncContent.verifySignedEnvelopeAt(
+                update.copy(baseRevision = update.baseRevision?.copy(counter = 100)),
+                context(update, now), now,
+            )
         }
     }
 
