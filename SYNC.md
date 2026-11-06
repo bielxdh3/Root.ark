@@ -3,6 +3,14 @@
 O protocolo v2 e o uploader legado de desenvolvimento sao clientes diferentes.
 O `sync:init` legado **nao** provisiona as chaves ou a politica de confianca exigidas pelo v2.
 
+No protocolo `/sync/v1`, `GET /sync/v1/objects/:objectId/history` permite ao
+usuario autenticado com `listFiles` consultar as versoes cifradas ainda retidas,
+inclusive depois de um DELETE logico. Outra conta, falta de permissao ou
+historico inexistente nao revelam os registros. Essa rota nao descriptografa,
+nao restaura automaticamente e nao altera a politica de retencao; a recuperacao
+efetiva continua exigindo uma operacao autorizada do cliente. Ela nao concede
+acesso aos objetos protegidos do ZK-1 por outro protocolo nem encerra a issue #67.
+
 ## Comandos
 
 ```powershell
