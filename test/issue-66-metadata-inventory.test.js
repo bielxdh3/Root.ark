@@ -175,7 +175,7 @@ test("issue 66 inventory: cached pages revalidate external writer commits and re
   const first = await get("/sync/v1/objects?view=metadata&limit=1");
   assert.equal(first.status, 200);
   assert.equal(first.body.objects[0].objectId, "object-a");
-  assert.equal(store.inventoryCache.username, "alice");
+  assert.equal(store.inventoryCache.get("alice")?.username, "alice");
   const sibling = await new SyncObjectStore(storagePath).open();
   await seed("alice", "object-aa", Buffer.from("fresh"), {}, sibling);
   const stale = await get(`/sync/v1/objects?view=metadata&limit=1&cursor=${encodeURIComponent(first.body.nextCursor)}`);
@@ -190,6 +190,60 @@ test("issue 66 inventory: cached pages revalidate external writer commits and re
     "a cached metadata index cannot bypass a writer lock");
   await fsp.rm(lockPath);
   assert.equal((await get("/sync/v1/objects?view=metadata&limit=1")).status, 200);
+});
+
+test("issue 66 inventory: two active tenants reuse positive pages without rereading the entire store", async (t) => {
+  const { get, seed, store, storagePath } = await fixture(t);
+  for (const id of ["a-1", "a-2", "a-3"]) await seed("alice", id);
+  for (const id of ["b-1", "b-2", "b-3"]) await seed("bob", id);
+  const originalReadSnapshot = store.readSnapshot.bind(store);
+  let reads = 0;
+  store.readSnapshot = () => { reads += 1; return originalReadSnapshot(); };
+  const route = "/sync/v1/objects?view=metadata&limit=1";
+  const aFirst = await get(route);
+  const bFirst = await get(route, "bob");
+  assert.equal(aFirst.status, 200);
+  assert.equal(bFirst.status, 200);
+  assert.equal(reads, 2, "each tenant needs one initial verified snapshot");
+  const aSecond = await get(`${route}&cursor=${encodeURIComponent(aFirst.body.nextCursor)}`);
+  const bSecond = await get(`${route}&cursor=${encodeURIComponent(bFirst.body.nextCursor)}`, "bob");
+  assert.equal(aSecond.status, 200);
+  assert.equal(bSecond.status, 200);
+  assert.deepEqual(aSecond.body.objects.map((entry) => entry.objectId), ["a-2"]);
+  assert.deepEqual(bSecond.body.objects.map((entry) => entry.objectId), ["b-2"]);
+  assert.equal(reads, 2, "A/B/A/B cursor paging must not re-read unchanged shared JSON");
+  assert.deepEqual([...store.inventoryCache.keys()], ["alice", "bob"]);
+  assert.equal(store.inventoryCache.size, 2);
+  assert.ok(store.inventoryCacheBytes <= 64 * 1024 * 1024);
+
+  const sibling = await new SyncObjectStore(storagePath).open();
+  await seed("alice", "a-extra", Buffer.from("fresh"), {}, sibling);
+  const stale = await get(`${route}&cursor=${encodeURIComponent(aSecond.body.nextCursor)}`);
+  assert.equal(stale.status, 409, "Alice's metadata change invalidates her old cursor");
+  assert.equal(reads, 3, "fresh generation requires exactly one recheck");
+  const continuedBob = await get(`${route}&cursor=${encodeURIComponent(bSecond.body.nextCursor)}`, "bob");
+  assert.equal(continuedBob.status, 200, "Bob's unchanged metadata keeps his tenant-scoped cursor valid");
+  assert.equal(reads, 4, "cross-process generation still invalidates Bob's cached state");
+});
+
+test("issue 66 inventory: positive cache evicts least recently used tenant after two entries", async (t) => {
+  const { get, seed, store } = await fixture(t);
+  for (const username of ["alice", "bob", "carol"]) await seed(username, `object-${username}`, Buffer.from("x"));
+  const originalReadSnapshot = store.readSnapshot.bind(store);
+  let reads = 0;
+  store.readSnapshot = () => { reads += 1; return originalReadSnapshot(); };
+  const route = "/sync/v1/objects?view=metadata&limit=1";
+  for (const username of ["alice", "bob", "alice", "carol"]) {
+    assert.equal((await get(route, username)).status, 200);
+  }
+  assert.equal(reads, 3, "an A hit refreshes LRU before C evicts B");
+  assert.deepEqual([...store.inventoryCache.keys()], ["alice", "carol"]);
+  assert.ok(store.inventoryCacheBytes <= 64 * 1024 * 1024);
+  assert.equal((await get(route, "alice")).status, 200);
+  assert.equal(reads, 3, "cached A still reuses its snapshot");
+  assert.equal((await get(route, "bob")).status, 200);
+  assert.equal(reads, 4, "evicted third tenant needs one fresh read");
+  assert.equal(store.inventoryCache.size, 2);
 });
 
 test("issue 66 inventory: bounded metadata index fails closed and never re-reads an oversized snapshot per page", async (t) => {

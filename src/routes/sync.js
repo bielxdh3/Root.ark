@@ -118,6 +118,8 @@ const INVENTORY_MAX_PAGE_ITEMS = 64;
 const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
 const INVENTORY_MAX_CURSOR_CHARS = 1024;
 const INVENTORY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const INVENTORY_CACHE_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
+const INVENTORY_CACHE_MAX_TENANTS = 2;
 const INVENTORY_OVERFLOW_MARKERS_MAX_TENANTS = 32;
 
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
@@ -349,11 +351,12 @@ class SyncObjectStore {
     this.burstGuard = burstGuard;
     this.retentionMs = retentionMs;
     this.now = now;
-    // Only one tenant's metadata index is retained, never its ciphertext.
-    // A changed durable inode/mtime/ctime discards the index on the next read.
-    this.inventoryCache = null;
+    // At most two positive metadata indexes (64 MiB of serialized entries
+    // combined), never ciphertext; each read rechecks the durable file stamp.
+    this.inventoryCache = new Map();
+    this.inventoryCacheBytes = 0;
     this.inventoryCacheMaxBytes = INVENTORY_CACHE_MAX_BYTES;
-    // Tiny per-tenant negative LRU is independent of the ONE positive index.
+    // Tiny per-tenant negative LRU is independent of the positive indexes.
     // Browsing tenant B must not force a large unchanged tenant A to re-parse.
     this.inventoryOverflowMarkers = new Map();
   }
@@ -933,8 +936,19 @@ class SyncObjectStore {
 
   inventoryIndex(username) {
     const before = this.inventoryFileStamp();
-    const cached = this.inventoryCache;
-    if (cached && cached.username === username && cached.stamp === before) return cached;
+    for (const [tenant, entry] of this.inventoryCache) {
+      if (entry.stamp !== before || entry.maxBytes !== this.inventoryCacheMaxBytes) {
+        this.inventoryCache.delete(tenant);
+        this.inventoryCacheBytes -= entry.metadataBytes;
+      }
+    }
+    const cached = this.inventoryCache.get(username);
+    if (cached) {
+      // Refresh LRU position without re-attesting the same durable generation.
+      this.inventoryCache.delete(username);
+      this.inventoryCache.set(username, cached);
+      return cached;
+    }
     const rejected = this.inventoryOverflowMarkers.get(username);
     if (rejected && rejected.stamp === before && rejected.maxBytes === this.inventoryCacheMaxBytes) {
       // Refresh the bounded LRU position; no disk read or hash on retries.
@@ -979,8 +993,17 @@ class SyncObjectStore {
       entries.push(entry);
       byId.set(objectId, entries.length - 1);
     }
-    const result = { username, stamp: after, entries, byId, fingerprint: hash.digest("hex") };
-    this.inventoryCache = result;
+    const result = { username, stamp: after, entries, byId, fingerprint: hash.digest("hex"),
+      metadataBytes, maxBytes: this.inventoryCacheMaxBytes };
+    while (this.inventoryCache.size >= INVENTORY_CACHE_MAX_TENANTS
+      || this.inventoryCacheBytes + metadataBytes > INVENTORY_CACHE_TOTAL_MAX_BYTES) {
+      const oldest = this.inventoryCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.inventoryCacheBytes -= this.inventoryCache.get(oldest).metadataBytes;
+      this.inventoryCache.delete(oldest);
+    }
+    this.inventoryCache.set(username, result);
+    this.inventoryCacheBytes += metadataBytes;
     return result;
   }
 

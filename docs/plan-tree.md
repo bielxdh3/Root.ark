@@ -47,10 +47,20 @@ compartilhado entre indice positivo e marcador de excesso. No fluxo
 A (indice grande, 507), A (507), B (indice pequeno, 200), A (507), a
 ultima chamada relia o estado completo sem nova escrita. Marcadores
 negativos agora ficam num LRU independente de ate 32 contas, por
-identidade duravel e teto vigente, preservando o indice positivo
-unico. Teste adversarial RED→GREEN: na sequencia A→B→A, a contagem
+identidade duravel e teto vigente. Teste adversarial RED→GREEN: na sequencia A→B→A, a contagem
 de readSnapshot caiu de 3 para 2; escrita da instancia irma ainda
 invalida o marcador. Revalidar no HEAD da PR antes de qualquer GO.
+
+Revisao posterior da #255: a retencao de apenas um indice **positivo**
+fazia A(200)→B(200)→A(200)→B(200) ler novamente todo o JSON a cada
+pagina, apesar de ambos terem metadados validos. O cache positivo agora
+usa LRU de **ate duas contas e 64 MiB serializados no total**, com
+**32 MiB no maximo por conta**; o LRU negativo de 32 contas permanece
+separado. Teste HTTP RED 4 leituras completas em A/B/A/B; GREEN 2
+leituras, uma por conta. Troca duravel por escritor externo continua
+invalidando ambos os indices; expiracao por terceira conta e limitada
+e documentada. Sem alterar a admissao criptografica nem o fluxo
+`syncOnce`.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

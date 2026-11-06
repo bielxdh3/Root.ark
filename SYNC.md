@@ -51,8 +51,12 @@ eviction contra escritor externo com arquivo aberto ou a migracao automatica
 do `syncOnce` para inventarios por pagina.
 
 Para evitar reler o arquivo de objetos inteiro em cada pagina, o servidor
-guarda no maximo o indice de metadados de **uma conta por instancia** (ate
-32 MiB de registros JSON serializados), sem manter ciphertext nesse cache.
+guarda em LRU **ate dois indices positivos de contas por instancia**, com
+limite individual de **32 MiB** e total de **64 MiB de registros JSON
+serializados**, sem manter ciphertext nesse cache. Alternar paginas entre
+duas contas nao exige revalidacao completa de todo o JSON a cada acesso.
+Uma terceira conta pode expulsar a menos recentemente usada; essa conta
+precisara de nova leitura na proxima consulta.
 O teto mede os registros serializados, **nao o RSS total do processo**:
 um volume maior de objetos ou metadados pode atingir o teto. Se o indice
 da conta exceder 32 MiB, a rota retorna **HTTP 507** com codigo estavel
