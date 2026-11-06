@@ -821,9 +821,10 @@
       + '<label>Chave historica de metadados do arquivo ANTES da rotacao (raw 32 bytes; importada somente para leitura local)<input type="file" data-zk1-field="catalog-restore-source-metadata-key"></label>'
       + '<label>CEK NOVA do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-cek"></label>'
       + '<label>Chave NOVA de metadados do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-metadata"></label>'
+      + '<label>Busca por nome (somente neste navegador; vazio lista todos)<input type="search" data-zk1-field="catalog-delta-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
-      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Listar nomes localmente (AES-GCM)</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Buscar / listar nomes localmente (AES-GCM)</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-trash-inspect">Conferir tombstone assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button>'
@@ -1268,14 +1269,17 @@
           finally { raw.fill(0); }
           const list = field("catalog-delta-private-list");
           list.replaceChildren();
-          const opened = await held.client.readPrivateListing(held.baseline, metadataKey);
+          const term = field("catalog-delta-query")?.value || "";
+          const opened = await held.client.readPrivateListing(held.baseline, metadataKey, term);
           assertLive();
           if (opened.independentlySignedCatalog !== true
             || opened.plaintextSentToServer !== false
             || opened.authorizesMutation !== false
             || opened.head.sequence !== held.baseline.head.sequence
             || opened.head.digest !== held.baseline.head.digest
-            || !Array.isArray(opened.entries)) fail();
+            || !Array.isArray(opened.entries)
+            || !Number.isSafeInteger(opened.totalMatches)
+            || opened.totalMatches < opened.entries.length) fail();
           const content = document.createDocumentFragment();
           for (const entry of opened.entries) {
             if ((typeof entry.name !== "string" || !entry.name)
@@ -1288,8 +1292,11 @@
           }
           assertLive();
           list.replaceChildren(content);
-          field("catalog-delta-summary").textContent = "Listagem local de "
-            + opened.entries.length + " versão(ões) · CAS #" + opened.head.sequence;
+          field("catalog-delta-summary").textContent = term.trim()
+            ? "Busca local: " + opened.totalMatches + " correspondência(s), "
+              + opened.entries.length + " exibida(s) (máximo 100) · CAS #" + opened.head.sequence
+            : "Listagem local de " + opened.entries.length + " versão(ões) · CAS #"
+              + opened.head.sequence;
           status("Metadados autenticados via CAS/witness e abertos só neste navegador. "
             + "Nenhum nome ou chave enviado ao servidor.");
           return;

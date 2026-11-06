@@ -276,8 +276,10 @@
             plaintextMetadataExposed: false, productionDurabilityProven: false });
         } catch (_) { deny(); }
       }
-      async function readPrivateListing(previous, metadataKey) {
+      async function readPrivateListing(previous, metadataKey, term = "") {
         try {
+          if (typeof term !== "string" || term.length > 120) deny();
+          const query = term.trim().normalize("NFC").toLowerCase();
           const state = tracked.get(previous);
           if (!state || state.owner !== writer || previous !== latest
             || previous.head.sequence !== state.head.sequence
@@ -300,6 +302,7 @@
               from64(state.head.digest, 32))
             || current.rows.length !== state.snapshot.rows.length) deny();
           const entries = [];
+          let totalMatches = 0;
           for (const row of current.rows) {
             assertLive();
             const name = await catalog.openMetadata({
@@ -308,15 +311,23 @@
               ciphertext: bytes(row.metadata_ciphertext, 284),
             });
             assertLive();
-            entries.push(Object.freeze({ objectId: row.object_id,
-              revision: row.revision, epoch: row.epoch,
-              name: name === TRASH_NAME ? null : name,
-              logicalTrashCandidate: name === TRASH_NAME }));
+            // Validate/decrypt EVERY signed row, including nonmatches and
+            // after the display cap; a bad row must fail the entire search.
+            if (!query || (name !== TRASH_NAME
+              && name.normalize("NFC").toLowerCase().includes(query))) {
+              totalMatches++;
+              if (!query || entries.length < 100) {
+                entries.push(Object.freeze({ objectId: row.object_id,
+                  revision: row.revision, epoch: row.epoch,
+                  name: name === TRASH_NAME ? null : name,
+                  logicalTrashCandidate: name === TRASH_NAME }));
+              }
+            }
           }
           assertLive();
           // One bad entry/key invalidates the ENTIRE list; no partial results.
           return Object.freeze({ head: Object.freeze({ ...state.head }),
-            entries: Object.freeze(entries),
+            entries: Object.freeze(entries), totalMatches,
             plaintextSentToServer: false, independentlySignedCatalog: true,
             authorizesMutation: false });
         } catch (_) { deny(); }
