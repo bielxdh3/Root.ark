@@ -205,6 +205,9 @@ function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy
 async function start(options = {}) {
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
+  if (config.filesOnDemand !== undefined && typeof config.filesOnDemand !== "boolean") {
+    throw new Error("Sync v2 filesOnDemand must be a boolean");
+  }
   // The historical witness mode requires pins provisioned by the embedding
   // trusted process, outside the mutable sync config and local JSON journal.
   // The standalone CLI deliberately fails closed until a real independent
@@ -287,6 +290,7 @@ async function start(options = {}) {
     adapter,
     selectedPaths: config.selectedPaths,
     excludedPaths: config.excludedPaths,
+    filesOnDemand: config.filesOnDemand === true,
     deviceId: config.deviceId,
     keyEpoch: config.keyEpoch,
     compartmentId: config.compartmentId || "private",
@@ -364,10 +368,28 @@ async function start(options = {}) {
     requireAuthorization: true,
     reverifySeenIncoming: strictHistorical,
   }).open();
+  if (options.action === "browse") {
+    const page = await engine.browseRemoteInventory({
+      limit: options.limit === undefined ? 64 : Number(options.limit),
+      cursor: options.cursor === undefined ? null : options.cursor,
+    });
+    console.log(JSON.stringify(page));
+    return engine;
+  }
+  if (options.action === "hydrate" || options.action === "evict") {
+    if (config.filesOnDemand !== true) throw new Error("Enable filesOnDemand in the private sync config");
+    if (typeof options.path !== "string") throw new Error("Files On-Demand requires --path");
+    const result = options.action === "hydrate"
+      ? await engine.materializeRemote(options.path) : await engine.evictLocal(options.path);
+    console.log(JSON.stringify({ path: options.path, action: options.action, applied: result }));
+    return engine;
+  }
   const once = options.once === true || options.once === "true";
   do {
     const summary = await engine.syncOnce();
-    console.log(JSON.stringify({ pushed: summary.pushed, pulled: summary.pulled, conflicts: summary.conflicts.length, offline: summary.offline }));
+    console.log(JSON.stringify({ pushed: summary.pushed, pulled: summary.pulled,
+      ...(config.filesOnDemand ? { available: summary.available || 0 } : {}),
+      conflicts: summary.conflicts.length, offline: summary.offline }));
     if (!once) await new Promise((resolve) => setTimeout(resolve, Number(config.scanIntervalMs) || 5000));
   } while (!once);
   return engine;
@@ -375,8 +397,13 @@ async function start(options = {}) {
 
 if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
-  if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once");
+  if (["start", "browse", "hydrate", "evict"].includes(command)) {
+    start({ ...args(rest), action: command }).catch((error) => {
+      console.error(`Sync v2 failed: ${error.message}`);
+      process.exitCode = 1;
+    });
+  } else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\n"
+    + "Files On-Demand: node sync-client/rootark-sync-v2.js browse|hydrate|evict --config <private-config> [--path relative/file]");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,

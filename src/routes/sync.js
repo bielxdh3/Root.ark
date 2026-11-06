@@ -632,6 +632,20 @@ class SyncObjectStore {
       if (destructive && isPausedDevice(user, input.deviceId)) return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
       if (input.operation === "create" && current) return { kind: "conflict", current };
       if (input.operation !== "create" && !current) return { kind: "conflict", current: null };
+      if (this.atomicDeviceRegistry && input.operation === "create"
+        && Object.values(user.objects).some((record) =>
+          record && !record.tombstone && record.objectId !== input.objectId
+          && typeof record.metadata?.path === "string"
+          && record.metadata.path.toLowerCase() === input.metadata.path.toLowerCase())) {
+        // Every protected CREATE races against other devices, even after a
+        // successful metadata preflight. Resolve occupancy from the freshly
+        // loaded tenant state INSIDE the exclusive cross-process writer lock.
+        // Check portable case aliases even on Linux: the same tenant may
+        // later sync to a case-insensitive Windows filesystem.
+        // A tombstone releases its path; UPDATE/MOVE/DELETE retain their
+        // existing identity and revision semantics.
+        return { kind: "path_conflict" };
+      }
       if (current && input.baseRevision && compareRevisions(input.baseRevision, current.revision) !== 0) return { kind: "conflict", current };
       if (current && !input.baseRevision) return { kind: "conflict", current };
       if (current && compareRevisions(input.revision, current.revision) <= 0) return { kind: "stale", current };
@@ -1287,6 +1301,8 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       return errorResponse(res, 423, "sync_burst_paused", { code: "sync_burst_paused", deviceId: result.deviceId });
     }
     if (result.kind === "replay") return errorResponse(res, 409, "Replay rejected");
+    if (result.kind === "path_conflict") return errorResponse(res, 409,
+      "Remote path occupied by another active object", { code: "remote_path_collision" });
     if (result.kind === "stale") return errorResponse(res, 409, "Stale revision rejected", { currentRevision: result.current.revision, current: publicRecord(result.current) });
     if (result.kind === "conflict") return errorResponse(res, 409, "Base revision conflict", { currentRevision: result.current?.revision || null, current: result.current ? publicRecord(result.current) : null });
     return res.status(req.method === "POST" ? 201 : 200).json(publicRecord(result.record));
