@@ -12,9 +12,11 @@ import android.widget.ScrollView
 import android.widget.TextView
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
+import dev.rootark.core.sync.ReadOnlyFileListPolicy
+import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.RootArkApiException
 
-/** Online authentication only. Protected files and device keys remain gated. */
+/** Online auth and read-only metadata listing; protected files and device keys remain gated. */
 class MainActivity : Activity() {
     private val transport = AuthHttpTransport()
     private var serverField: EditText? = null
@@ -24,6 +26,8 @@ class MainActivity : Activity() {
     private var activeOrigin: ServerOrigin? = null
     private var challengeId: String? = null
     private var sessionToken: String? = null
+    private var sessionUsername: String? = null
+    private var sessionCanListFiles = false
     private var generation = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -41,6 +45,8 @@ class MainActivity : Activity() {
 
     private fun clearSensitiveState() {
         sessionToken = null
+        sessionUsername = null
+        sessionCanListFiles = false
         challengeId = null
         activeOrigin = null
         passwordField?.text?.clear()
@@ -77,7 +83,7 @@ class MainActivity : Activity() {
                     return@runRequest
                 }
                 when (result) {
-                    is LoginOutcome.Authenticated -> showAuthenticated(result)
+                    is LoginOutcome.Authenticated -> showAuthenticated(result, origin)
                     is LoginOutcome.ChallengeRequired -> {
                         activeOrigin = origin
                         challengeId = result.challengeId
@@ -106,18 +112,64 @@ class MainActivity : Activity() {
             }
             codeField?.text?.clear()
             runRequest({ transport.completeTwoFactorLogin(origin, challenge, code) }) { result, failure ->
-                if (result != null) showAuthenticated(result)
+                if (result != null) showAuthenticated(result, origin)
                 else showTwoFactor(errorText(failure))
             }
         }
         button(layout, "Voltar ao login") { showLogin() }
     }
 
-    private fun showAuthenticated(result: LoginOutcome.Authenticated) {
+    private fun showAuthenticated(result: LoginOutcome.Authenticated, origin: ServerOrigin) {
         clearSensitiveState()
         sessionToken = result.token
-        val layout = screen("Acesso confirmado", "Sessão de ${result.username} autenticada em memória.")
-        text(layout, "Sincronização e recuperação exigem chaves e autorização de dispositivo.")
+        activeOrigin = origin
+        sessionUsername = result.username
+        sessionCanListFiles = ReadOnlyFileListPolicy.canList(result.permissions)
+        showSession()
+    }
+
+    private fun showSession(message: String? = null) {
+        val username = sessionUsername ?: return showLogin()
+        val layout = screen("Acesso confirmado", "Sessão de $username autenticada em memória.")
+        text(layout, "Somente metadados de sincronização. O conteúdo criptografado permanece inacessível.")
+        if (message != null) text(layout, message)
+        if (sessionCanListFiles) {
+            button(layout, "Listar arquivos (somente leitura)") { loadFileList() }
+        } else {
+            text(layout, "Esta conta não possui permissão listFiles.")
+        }
+        button(layout, "Encerrar acesso local") { showLogin() }
+    }
+
+    private fun loadFileList() {
+        if (!sessionCanListFiles) return
+        val origin = activeOrigin ?: return
+        val token = sessionToken ?: return
+        runRequest({ transport.listSyncObjects(origin, token) }) { rows, failure ->
+            if (rows != null) {
+                showFileList(rows)
+            } else when ((failure as? RootArkApiException)?.statusCode) {
+                401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
+                403 -> showSession("Servidor negou acesso à lista (403).")
+                else -> showSession("Não foi possível carregar a lista. A resposta pode exceder o limite do protótipo (1 MiB / 128 registros).")
+            }
+        }
+    }
+
+    private fun showFileList(rows: List<ReadOnlyFileRow>) {
+        val layout = screen("Arquivos · somente leitura", "${rows.size} registro(s) de sincronização. Nenhum conteúdo descriptografado.")
+        if (rows.isEmpty()) text(layout, "Nenhum registro disponível.")
+        for (row in rows) {
+            text(layout, row.name + if (row.deleted) " (excluído)" else "")
+            val details = listOfNotNull(
+                row.path?.let { "Caminho: $it" },
+                row.size?.let { "Tamanho: $it bytes" },
+                row.contentType?.let { "Tipo: $it" },
+            ).joinToString(" · ")
+            if (details.isNotEmpty()) text(layout, details)
+        }
+        button(layout, "Atualizar lista") { loadFileList() }
+        button(layout, "Voltar") { showSession() }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
