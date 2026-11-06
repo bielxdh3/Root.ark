@@ -134,6 +134,20 @@ async function captureSync(responses) {
     responses["sync.get.200"] = expectStatus(await call(base, "GET", "/sync/v1/objects/fixture-object-1", undefined), 200, "get");
     responses["sync.get.404"] = expectStatus(await call(base, "GET", "/sync/v1/objects/missing-object", undefined), 404, "get missing");
 
+    // A real signed second object carries metadata allowed by the server at
+    // lengths 257..512. Keep the normal single-object fixture above stable.
+    // Android must display BOTH rows rather than rejecting the entire list.
+    const longMetadata = protocol.createOperation({
+      ...common, objectId: "fixture-object-long-metadata", fileId: "fixture-file-long-metadata",
+      versionId: "fixture-version-long-metadata", operationId: "fixture-op-long-metadata",
+      operation: "create", revision: { counter: 1, deviceId },
+      metadata: { path: "docs/long.txt", name: "n".repeat(300),
+        contentType: `application/${"x".repeat(500)}`, size: 3 },
+      plaintext: Buffer.from("abc"),
+    });
+    expectStatus(await call(base, "POST", "/sync/v1/objects", await signed(longMetadata)), 201, "long metadata create");
+    responses["sync.list.long-metadata.200"] = expectStatus(await call(base, "GET", "/sync/v1/objects", undefined), 200, "long metadata list");
+
     const update = protocol.createOperation({
       ...common, operation: "update", operationId: "fixture-op-update", revision: { counter: 2, deviceId },
       baseRevision: { counter: 1, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },

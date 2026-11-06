@@ -20,6 +20,18 @@ test("read-only client list is backed by canonical authenticated server route an
   assert.equal(typeof objects[0].ciphertext, "string", "the server currently transfers ciphertext: client must not display it");
 });
 
+test("real signed server listing with protocol-accepted 300 name and 512 contentType has two visible records", () => {
+  const capture = JSON.parse(read("android/core/src/test/resources/server-responses.json"));
+  const signedList = capture.responses["sync.list.long-metadata.200"];
+  assert.equal(signedList.status, 200);
+  assert.equal(signedList.body.protocolVersion, 2);
+  assert.equal(signedList.body.objects.length, 2, "valid long metadata must not hide sibling files");
+  const long = signedList.body.objects.find((record) => record.metadata.name.length === 300);
+  assert.ok(long && long.metadata.contentType.length === 512);
+  assert.equal(long.protocolVersion, 2);
+  assert.equal(typeof long.authorization.signature, "string", "record is from signed write, not a synthetic response");
+});
+
 test("native list limits responses, checks listFiles, handles denied sessions and renders a metadata-only projection", () => {
   const transport = read("android/app/src/main/java/dev/rootark/android/AuthHttpTransport.kt");
   const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
@@ -33,6 +45,8 @@ test("native list limits responses, checks listFiles, handles denied sessions an
   assert.match(transport, /ReadOnlyFileListPolicy\.checkEnvelope/);
   assert.match(transport, /ReadOnlyFileListPolicy\.project/);
   assert.match(policy, /listFiles/);
+  assert.match(policy, /validText\(name, 512\)/, "name must obey server metadata limit");
+  assert.match(policy, /validText\(contentType, 512\)/, "contentType must obey server metadata limit");
   assert.match(activity, /ReadOnlyFileListPolicy\.canList/);
   assert.match(activity, /401/);
   assert.match(activity, /403/);
