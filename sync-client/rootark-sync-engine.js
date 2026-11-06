@@ -861,6 +861,18 @@ class SyncEngine {
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
       || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return false;
 
+    // Reconciliation can stage/rename the origin and then discard its tracked
+    // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
+    // sidestep the local pin policy merely because _apply() is not called.
+    // Fold case on every OS so a POSIX path remains safe after Windows replay.
+    const originKey = sourcePath.toLowerCase();
+    if (Object.values(this.snapshot.pinnedFiles || {}).some((pin) => {
+      const pinnedPath = pin.path.toLowerCase();
+      return pinnedPath === originKey || pinnedPath.startsWith(`${originKey}/`);
+    })) {
+      fail("Pinned local origin cannot be reconciled outside selected paths", "file_pinned");
+    }
+
     const pending = (await this.journal.recover()).filter((item) => item.protocolVersion && item.objectId === operation.objectId);
     const target = await contained(this.rootDir, sourcePath, true);
     const sourceExists = await exists(target);

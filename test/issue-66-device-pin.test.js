@@ -68,7 +68,7 @@ async function fixture(t) {
       username: "alice", privateKey: signer.privateKey, publicKey, expiresAt: Date.now() + 60_000,
     }),
   }).open();
-  return { rootDir, open, adapter, state, remote };
+  return { rootDir, open, adapter, state, remote, trusted };
 }
 
 test("issue 66: pin hydrates signed file, survives restart/offline and blocks explicit eviction; unpin retains bytes", async (t) => {
@@ -133,6 +133,86 @@ test("issue 66: an independently signed remote DELETE cannot silently remove pin
   await assert.rejects(client.apply(deletion), { code: "file_pinned" });
   assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: signed MOVE outside selected paths cannot evict a pinned origin across restart", async (t) => {
+  const { rootDir, open, remote, state, trusted } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  // A previously pinned root may later reopen with Files-On-Demand disabled.
+  // That switches to the ordinary signed LIST reconciliation path.
+  const eager = await open([], true, false, ["docs"]);
+  const beforeIndex = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  const beforeJournal = await fsp.readFile(eager.journal.filePath);
+  const signedMove = await remote("move", "object-a", "outside/a.txt",
+    "authenticated remote bytes", 2, "docs/a.txt");
+  assert.equal(await verifyAuthorizationProof(signedMove.authorization, signedMove, trusted),
+    true, "the remote MOVE is authentically signed");
+  // This fixture's default LIST is object-filtered. Model the real unscoped
+  // signed LIST used by pullRemote without bypassing envelope verification.
+  const listOne = eager.adapter.list.bind(eager.adapter);
+  eager.adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()] : listOne(objectId);
+  await assert.rejects(eager.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+    conflicts: [], offline: false }), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), beforeIndex,
+    "rejected reconciliation must not remove the durable pin or tracked origin");
+  const priorJournal = JSON.parse(beforeJournal.toString("utf8"));
+  const afterJournal = JSON.parse(await fsp.readFile(eager.journal.filePath, "utf8"));
+  assert.deepEqual(afterJournal.pending, priorJournal.pending,
+    "rejected reconciliation cannot enqueue a mutation");
+  assert.deepEqual(afterJournal.seen, priorJournal.seen,
+    "a verified but blocked MOVE cannot become applied or seen");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  const restarted = await open();
+  assert.equal((await restarted.pinStatus("docs/a.txt")).pinned, true);
+  await assert.rejects(restarted.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+    conflicts: [], offline: false }), { code: "file_pinned" },
+  "a restarted client must not consume the previously rejected signed MOVE");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: signed out-of-scope directory relocation cannot drop a pinned descendant", async (t) => {
+  const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "directory-object", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const beforeIndex = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  const movedDirectory = await remote("update", "directory-object", "archive", "", 2,
+    undefined, "inode/directory");
+  assert.equal(await verifyAuthorizationProof(movedDirectory.authorization,
+    movedDirectory, trusted), true);
+  const originalList = adapter.list.bind(adapter);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [movedDirectory] : originalList(objectId);
+  const eager = await open([], true, false, ["docs"]);
+  await assert.rejects(eager.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+    conflicts: [], offline: false }), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")),
+    beforeIndex);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: explicit unpin permits a signed out-of-scope MOVE without remote DELETE", async (t) => {
+  const { rootDir, open, remote, adapter, state } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  await client.unpinLocal("docs/a.txt");
+  const moved = await remote("move", "object-a", "outside/a.txt",
+    "authenticated remote bytes", 2, "docs/a.txt");
+  const originalList = adapter.list.bind(adapter);
+  adapter.list = async (objectId) => objectId === undefined ? [moved] : originalList(objectId);
+  const eager = await open([], true, false, ["docs"]);
+  await eager.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+    conflicts: [], offline: false });
+  assert.equal(fs.existsSync(path.join(rootDir, "docs/a.txt")), false);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, false);
   assert.equal(state.pushes, 0);
 });
 
