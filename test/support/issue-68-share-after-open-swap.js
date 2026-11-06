@@ -8,27 +8,30 @@ const fs = require("node:fs");
 const path = require("node:path");
 const fileReader = require("../../services/fileReadHandle");
 
-if (process.env.NODE_ENV !== "test") throw new Error("Test-only file swap hook");
-
 const filePath = process.env.ROOTARK_TEST_SHARE_SWAP_FILE;
 const savedPath = process.env.ROOTARK_TEST_SHARE_SWAP_SAVED_FILE;
 const markerPath = process.env.ROOTARK_TEST_SHARE_SWAP_MARKER;
-if (!filePath || !savedPath || !markerPath) throw new Error("Incomplete test swap paths");
+// Node's full test discovery also loads support/*.js as standalone tests.
+// Stay inert without a configured attack; reject partially configured hooks.
+if (filePath || savedPath || markerPath) {
+  if (process.env.NODE_ENV !== "test") throw new Error("Test-only file swap hook");
+  if (!filePath || !savedPath || !markerPath) throw new Error("Incomplete test swap paths");
 
-const originalOpen = fileReader.openReadHandle;
-fileReader.openReadHandle = function openWithAfterFdSwap(candidate) {
-  const readHandle = originalOpen(candidate);
-  if (path.resolve(candidate) !== path.resolve(filePath) || !fs.existsSync(markerPath)) {
+  const originalOpen = fileReader.openReadHandle;
+  fileReader.openReadHandle = function openWithAfterFdSwap(candidate) {
+    const readHandle = originalOpen(candidate);
+    if (path.resolve(candidate) !== path.resolve(filePath) || !fs.existsSync(markerPath)) {
+      return readHandle;
+    }
+
+    try {
+      fs.renameSync(filePath, `${filePath}.untrusted-opened`);
+      fs.renameSync(savedPath, filePath);
+      fs.unlinkSync(markerPath);
+    } catch (error) {
+      fs.closeSync(readHandle.fd);
+      throw error;
+    }
     return readHandle;
-  }
-
-  try {
-    fs.renameSync(filePath, `${filePath}.untrusted-opened`);
-    fs.renameSync(savedPath, filePath);
-    fs.unlinkSync(markerPath);
-  } catch (error) {
-    fs.closeSync(readHandle.fd);
-    throw error;
-  }
-  return readHandle;
-};
+  };
+}
