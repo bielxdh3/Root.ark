@@ -25,6 +25,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     + "<script defer src='/client/rootark-zk1-protected-local-search.js'></script>"
     + "<script defer src='/client/rootark-zk1-file-content.js'></script>"
     + "<script defer src='/client/rootark-zk1-selected-local-preview.js'></script>"
+    + "<script defer src='/client/rootark-zk1-protected-text-batch.js'></script>"
     + "<script defer src='/probe.js'></script>";
   const bootstrap = "window.RootarkApi={get:async()=>({enabled:true,"
     + "securityVersion:2,signedHistoryRequired:true,opaqueCatalogV1:true})};";
@@ -52,7 +53,9 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const target=dialog.querySelector('[data-zk1-field="catalog-write-id"]');
       const revision=dialog.querySelector('[data-zk1-field="catalog-delta-read-revision"]');
       const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
-      if(!list||!target||!revision||!getButton||getButton.type!=="button")
+      const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
+      if(!list||!target||!revision||!getButton||getButton.type!=="button"
+        ||!batchButton||batchButton.type!=="button")
         throw Error("MISSING_EXPLICIT_PROTECTED_GET");
       const id="AAAAAAAAAAAAAAAAAAAAAA";
       const malicious="<img src=x onerror=alert(1)> secret-local-only";
@@ -115,11 +118,37 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!pane||!opened.text.includes("secret-local-only"))throw Error("PREVIEW_DENIED");
       pane.textContent=opened.text;
       if(pane.querySelector("img"))throw Error("PREVIEW_XSS");
+      let batchGets=0;
+      const found=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"SECRET-LOCAL-ONLY",
+        items:[{selected,metadata,rawCek:raw,cekSha256Pin:hash}],
+        grant:{...scope,device_id:"device",current_epoch:2,
+          manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null},
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:{head:{sequence:11,digest:ownerDigest},entries:[selected]},
+        assertLive:()=>true,
+        getChecked:async(objectId,rev)=>{
+          batchGets++;
+          if(objectId!==id||rev!==7)throw Error("BATCH_ID_LEAK");
+          return checked;
+        }
+      });
+      if(found.totalSearched!==1||found.totalMatches!==1||batchGets!==1
+        ||found.plaintextSentToServer!==false
+        ||!found.matches[0].excerpt.includes("secret-local-only"))
+        throw Error("BATCH_TEXT_SEARCH_DENIED");
+      const batchPane=dialog.querySelector('[data-zk1-field="catalog-delta-text-results"]');
+      if(!batchPane)throw Error("MISSING_LOCAL_BATCH_RESULTS");
+      batchPane.textContent=found.matches[0].excerpt;
+      if(batchPane.querySelector("img"))throw Error("BATCH_PREVIEW_XSS");
       target.dispatchEvent(new Event("input",{bubbles:true}));
-      if(pane.textContent!=="")throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
+      if(pane.textContent!==""||batchPane.textContent!=="")
+        throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
       pane.textContent=opened.text;
+      batchPane.textContent=found.matches[0].excerpt;
       window.dispatchEvent(new Event("rootark:logout"));
-      if(pane.textContent!=="")throw Error("PREVIEW_NOT_ZEROED_ON_LOGOUT");
+      if(pane.textContent!==""||batchPane.textContent!=="")
+        throw Error("PREVIEW_NOT_ZEROED_ON_LOGOUT");
       raw.fill(0);
       out.textContent="EDGE_PROTECTED_SELECT_PASS";
     }catch(error){out.textContent="EDGE_PROTECTED_SELECT_FAIL:"+error.message;}
@@ -135,7 +164,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       : request.url === "/bootstrap.js" ? bootstrap
         : request.url === "/probe.js" ? probe
         : ["rootark-zk1-authenticated-workspace", "rootark-zk1-protected-local-search",
-          "rootark-zk1-file-content", "rootark-zk1-selected-local-preview"]
+          "rootark-zk1-file-content", "rootark-zk1-selected-local-preview",
+          "rootark-zk1-protected-text-batch"]
             .includes(file) ? fs.readFileSync(path.join(root, file + ".js"), "utf8") : null;
     response.writeHead(content === null ? 404 : 200, {
       "Content-Type": request.url === "/" ? "text/html; charset=utf-8"
