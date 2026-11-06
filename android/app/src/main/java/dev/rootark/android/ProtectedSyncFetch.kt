@@ -22,6 +22,7 @@ import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
 import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * The 32-byte CEK is caller-owned, ephemeral and consumed by this boundary.
@@ -171,7 +172,9 @@ private object StrictSyncRecordJson {
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(raw)).toString()
-            val json = JSONObject(chars)
+            val tokens = JSONTokener(chars)
+            val json = JSONObject(tokens)
+            if (tokens.nextClean() != '\u0000') throw IOException()
             exactKeys(json, FIELDS)
             val metadata = metadata(obj(json, "metadata"))
             val proof = proof(obj(json, "authorization"))

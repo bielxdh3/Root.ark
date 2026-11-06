@@ -9,12 +9,21 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.net.URL
 import java.net.URLConnection
 import java.security.Principal
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.Signature
 import java.security.cert.Certificate
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.HttpsURLConnection
 
 class ProtectedSyncFetchTest {
@@ -27,6 +36,73 @@ class ProtectedSyncFetchTest {
         val fixture = JSONObject(File(path).readText(Charsets.UTF_8))
         fixture.getJSONObject("responses").getJSONObject("sync.get.200")
             .getJSONObject("body").toString().toByteArray(Charsets.UTF_8)
+    }
+    private val base64 = Base64.getUrlEncoder().withoutPadding()
+    private fun ByteArray.base64Url() = base64.encodeToString(this)
+    private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).base64Url()
+
+    /** Independent test-only deterministic RFC 8949 CBOR encoder; no production crypto helpers. */
+    private fun canonicalCbor(value: Any?): ByteArray {
+        val out = ByteArrayOutputStream()
+        fun header(type: Int, size: Long) {
+            require(size >= 0)
+            when {
+                size < 24 -> out.write((type shl 5) or size.toInt())
+                size <= 255 -> { out.write((type shl 5) or 24); out.write(size.toInt()) }
+                size <= 65535 -> {
+                    out.write((type shl 5) or 25)
+                    out.write((size shr 8).toInt())
+                    out.write(size.toInt())
+                }
+                size <= 0xffffffffL -> {
+                    out.write((type shl 5) or 26)
+                    for (shift in 24 downTo 0 step 8) out.write((size shr shift).toInt())
+                }
+                else -> {
+                    out.write((type shl 5) or 27)
+                    for (shift in 56 downTo 0 step 8) out.write((size shr shift).toInt())
+                }
+            }
+        }
+        fun encode(item: Any?) {
+            when (item) {
+                null -> out.write(0xf6)
+                is Boolean -> out.write(if (item) 0xf5 else 0xf4)
+                is Int -> header(0, item.toLong())
+                is Long -> header(0, item)
+                is String -> {
+                    val bytes = item.toByteArray(Charsets.UTF_8)
+                    header(3, bytes.size.toLong())
+                    out.write(bytes)
+                }
+                is Map<*, *> -> {
+                    val pairs = item.entries.map { entry ->
+                        val key = entry.key as String
+                        key to entry.value
+                    }.sortedWith { a, b ->
+                        val left = a.first.toByteArray(Charsets.UTF_8)
+                        val right = b.first.toByteArray(Charsets.UTF_8)
+                        val sizeDiff = left.size.compareTo(right.size)
+                        if (sizeDiff != 0) sizeDiff else {
+                            var diff = 0
+                            for (i in left.indices) {
+                                diff = (left[i].toInt() and 255) - (right[i].toInt() and 255)
+                                if (diff != 0) break
+                            }
+                            diff
+                        }
+                    }
+                    header(5, pairs.size.toLong())
+                    for ((key, itemValue) in pairs) {
+                        encode(key)
+                        encode(itemValue)
+                    }
+                }
+                else -> error("Unsupported test-only CBOR data")
+            }
+        }
+        encode(value)
+        return out.toByteArray()
     }
 
     private class SecureResponse(
@@ -139,6 +215,10 @@ class ProtectedSyncFetchTest {
             SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response, encoding = "gzip"),
             SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response, mime = "text/html"),
             SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = "{}".toByteArray()),
+            SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response + " {} ".toByteArray()),
+            SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = JSONObject(String(response)).put("objectId", "other").toString().toByteArray()),
+            SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = JSONObject(String(response)).put("unexpected", "injected").toString().toByteArray()),
+            SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = JSONObject(String(response)).put("protocolVersion", 1).toString().toByteArray()),
             SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response, mime = null),
         )
         for (fake in cases) {
@@ -175,6 +255,88 @@ class ProtectedSyncFetchTest {
         }
         assertFalse(called)
         assertTrue(key.all { it == 0.toByte() })
+        assertTrue(fake.disconnected)
+    }
+
+    @Test fun rejectsGrantIdentityMismatchBeforeFetchingAndErasesTransferredKey() {
+        val transport = Transport()
+        val gateway = ProtectedSyncFetch(transport::open)
+        val now = System.currentTimeMillis()
+        val disposableKey = ByteArray(32) { 42 }
+        val badContext = PinnedSyncReadContext(
+            username = "bob", objectId = "fixture-object-1",
+            fileId = "fixture-file-1", versionId = "fixture-version-1",
+            compartmentId = "private", keyEpoch = "epoch-1",
+            trustedDevicePublicKeys = mapOf("fixture-device-a" to "independently-pinned-only"),
+            revokedDeviceIds = emptySet(),
+            snapshotObtainedAtMillis = now,
+            snapshotValidUntilMillis = now + 30_000,
+        )
+        assertThrows(ProtectedSyncException::class.java) {
+            gateway.withVerifiedContent(
+                origin, session, "fixture-object-1",
+                TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(badContext, disposableKey) },
+            ) { fail("Plaintext callback must remain gated") }
+        }
+        assertEquals(0, transport.calls)
+        assertTrue(disposableKey.all { it == 0.toByte() })
+    }
+
+    @Test fun verifiedSignedHttpsObjectDecryptsInEphemeralCallbackAndWipesCekAndPlaintext() {
+        val record = JSONObject(String(response, Charsets.UTF_8))
+        val proof = record.getJSONObject("authorization")
+        val keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val now = System.currentTimeMillis()
+        val nonce = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val cek = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val expectedPlaintext = "hello".toByteArray(Charsets.UTF_8)
+        val aad = Base64.getUrlDecoder().decode(record.getString("aad"))
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(cek, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        val encrypted = cipher.doFinal(expectedPlaintext)
+        val ciphertext = encrypted.copyOfRange(0, encrypted.size - 16)
+        val tag = encrypted.copyOfRange(encrypted.size - 16, encrypted.size)
+        record.put("ciphertext", ciphertext.base64Url())
+        record.put("nonce", nonce.base64Url())
+        record.put("tag", tag.base64Url())
+        proof.put("aadDigest", digest(aad))
+        proof.put("ciphertextDigest", digest(ciphertext))
+        proof.put("nonceDigest", digest(nonce))
+        proof.put("tagDigest", digest(tag))
+        proof.put("expiresAt", now + 60_000)
+        proof.put("publicKey", keyPair.public.encoded.base64Url())
+        proof.remove("signature")
+        val unsigned: Map<String, Any?> = proof.toMap()
+        val signedBytes = "Root.ark/zk-1/authorization-manifest/v1".toByteArray(Charsets.US_ASCII) +
+            byteArrayOf(0) + canonicalCbor(unsigned)
+        val signer = Signature.getInstance("Ed25519")
+        signer.initSign(keyPair.private)
+        signer.update(signedBytes)
+        proof.put("signature", signer.sign().base64Url())
+        val context = PinnedSyncReadContext(
+            username = "alice", objectId = "fixture-object-1",
+            fileId = "fixture-file-1", versionId = "fixture-version-1",
+            compartmentId = "private", keyEpoch = "epoch-1",
+            trustedDevicePublicKeys = mapOf("fixture-device-a" to proof.getString("publicKey")),
+            revokedDeviceIds = emptySet(),
+            snapshotObtainedAtMillis = now - 2000L,
+            snapshotValidUntilMillis = now + 30_000L,
+        )
+        val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
+        val gateway = ProtectedSyncFetch { fake }
+        var observed: ByteArray? = null
+        var observedReference: ByteArray? = null
+        gateway.withVerifiedContent(
+            origin, session, "fixture-object-1",
+            TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, cek) },
+        ) { bytes ->
+            observed = bytes.copyOf()
+            observedReference = bytes
+        }
+        assertArrayEquals(expectedPlaintext, observed)
+        assertTrue(observedReference!!.all { it == 0.toByte() })
+        assertTrue(cek.all { it == 0.toByte() })
         assertTrue(fake.disconnected)
     }
 }
