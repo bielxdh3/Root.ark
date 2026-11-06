@@ -104,6 +104,7 @@ async function run() {
     const host = await newPage();
     const guest1 = await newPage();
     const guest2 = await newPage();
+    assert.equal(await host.evaluate('document.getElementById("rootarkReturn").hidden'), true);
     await host.evaluate('window.__poc.createRoom()');
     const room = await until(() => host.evaluate('window.__poc.snapshot().role === "host" && window.__poc.snapshot().roomId'), 'host did not join');
     async function addGuest(guest, priorCount) {
@@ -384,4 +385,5 @@ async function run() {
     catch { /* Disposable OS temp profile can be removed after Edge exits. */ }
   }
 }
-run().catch(e => { console.error('FAIL: ' + e.message); process.exitCode = 1; });
+if (require.main === module) run().catch(e => { console.error('FAIL: ' + e.message); process.exitCode = 1; });
+module.exports = { Cdp, until, port };
