@@ -11,6 +11,10 @@ class ServerOriginTest {
         assertEquals("https://vault.example.test:8443/auth/login", origin.loginUrl().toString())
         assertEquals("https://vault.example.test:8443/auth/login/2fa", origin.twoFactorUrl().toString())
         assertEquals("https://vault.example.test:8443/sync/v1/objects", origin.syncListUrl().toString())
+        assertEquals("https://vault.example.test:8443/sync/v1/objects?view=metadata&limit=64", origin.syncInventoryUrl().toString())
+        assertEquals("https://vault.example.test:8443/sync/v1/objects?view=metadata&limit=64&cursor=a_-Z09", origin.syncInventoryUrl("a_-Z09").toString())
+        assertEquals("https://vault.example.test:8443/sync/v1/objects/fixture-01", origin.syncObjectUrl("fixture-01").toString())
+        assertThrows(IllegalArgumentException::class.java) { origin.syncInventoryUrl("x&view=full") }
         assertEquals("https://vault.example.test/auth/login", ServerOrigin.parse("https://vault.example.test").loginUrl().toString())
         assertEquals("https://[::1]:443/auth/login", ServerOrigin.parse("https://[::1]:443").loginUrl().toString())
     }
