@@ -181,6 +181,7 @@ class Zk1ProtectedCiphertextSharing {
         if (!Buffer.from(await z.encodeDeterministic(canonical)).equals(row.statement)
           || statement.type !== canonical.type
           || statement.issuer_device_id !== canonical.issuer_device_id
+          || current.expires_at !== statement.expires_at
           || !row.scope || scopeKey(statement) !== row.scope
           || statement.recipient_username !== recipientUsername
           || statement.recipient_device_id !== authorization.device_id
@@ -197,7 +198,15 @@ class Zk1ProtectedCiphertextSharing {
         verifySignature(issuer.authorization_public_key,
           Buffer.concat([DOMAIN, current.statement]), current.signature);
         guard();
-        this.getGrant(scope, grantId, recipientUsername);
+        // There must be no await between this final fence and res.json():
+        // SQLite's mutable expiry must never outlive the owner-signed expiry,
+        // even if the witness admission or CBOR verification awaited earlier.
+        const final = this.getGrant(scope, grantId, recipientUsername);
+        const now = this.store.nowSeconds();
+        if (!final.statement.equals(current.statement)
+          || !final.signature.equals(current.signature)
+          || final.expires_at !== statement.expires_at
+          || !Number.isSafeInteger(now) || now >= statement.expires_at) deny();
         return emit({ id: result.id, revision: result.revision, epoch: result.epoch,
           ciphertextBase64: result.ciphertext.toString("base64url"),
           shareStatementBase64: current.statement.toString("base64url"),
