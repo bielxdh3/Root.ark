@@ -36,9 +36,9 @@ object ReadOnlyFileListPolicy {
         require(operation in setOf("create", "update", "move", "delete"))
         require(tombstone == (operation == "delete"))
         require(validText(objectId, 256) && objectId.isNotBlank())
-        require(name == null || validText(name, 256))
+        require(name == null || validText(name, 512))
         require(path == null || validText(path, 512))
-        require(contentType == null || validText(contentType, 256))
+        require(contentType == null || validText(contentType, 512))
         require(size == null || size >= 0L)
 
         return ReadOnlyFileRow(
