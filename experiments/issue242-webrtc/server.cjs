@@ -195,7 +195,9 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       res.end(JSON.stringify({ roomId: room.id, hostKey: room.hostKey, expires: room.expires }));
       return;
     }
-    const route = req.method === 'GET' && { '/': 'index.html', '/client.js': 'client.js' }[url.pathname];
+    const route = req.method === 'GET' && {
+      '/': 'index.html', '/client.js': 'client.js', '/transfer-protocol.js': 'transfer-protocol.js'
+    }[url.pathname];
     if (route) {
       res.setHeader('Content-Type', route.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8');
       res.end(readFileSync(join(__dirname, route)));

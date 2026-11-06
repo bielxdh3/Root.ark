@@ -16,8 +16,10 @@
   const toHex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
   const wsUrl = location.origin.replace(/^http/, 'ws') + '/signal';
-  const MAX_FILE = 1024 * 1024;
-  const MAX_FILE_CHUNKS = MAX_FILE / (8 * 1024); // Honest sender emits at most 64.
+  const fileWire = window.P2PFileWire;
+  const MAX_FILE = fileWire.MAX_FILE;
+  const BUFFER_HIGH = 256 * 1024;
+  let preparingFile = false;
   let ws, roomId, hostKey, selfId, role;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
@@ -107,7 +109,7 @@
         } catch (e) { log('Negociação falhou: ' + e.name); }
       } else if (m.type === 'peer-left') {
         const p = peers.get(m.peerId);
-        if (p) p.pc.close();
+        if (p) closePeer(p);
         peers.delete(m.peerId);
         document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
           if (el.dataset.peerId === m.peerId) el.remove();
@@ -117,7 +119,7 @@
     };
     ws.onclose = () => {
       $('invite').disabled = true;
-      for (const p of peers.values()) p.pc.close();
+      for (const p of peers.values()) closePeer(p);
       peers.clear();
       log('Conexão de sinalização encerrada');
     };
@@ -129,142 +131,299 @@
     if (peers.has(id)) return peers.get(id);
     // No STUN/TURN: prove only same-host WebRTC, never claim cross-NAT functionality.
     const pc = new RTCPeerConnection({ iceServers: [] });
-    const p = { id, pc, initiator, dc: null, candidates: [], outgoing: null, incoming: null, pendingOffer: null };
+    const p = { id, pc, initiator, dc: null, candidates: [], outgoing: null, incoming: null,
+      pendingOffer: null, outgoingUi: null, incomingUi: null, saved: null, peakBuffered: 0 };
     peers.set(id, p);
     pc.onicecandidate = e => {
       if (e.candidate) wire({ type: 'signal', to: id, signal: { kind: 'ice', candidate: e.candidate.toJSON() } });
     };
     pc.ondatachannel = e => attachChannel(p, e.channel);
-    pc.onconnectionstatechange = () => log('WebRTC (' + id.slice(0, 5) + '): ' + pc.connectionState);
+    pc.onconnectionstatechange = () => {
+      log('WebRTC (' + id.slice(0, 5) + '): ' + pc.connectionState);
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) resetTransfers(p);
+    };
     return p;
   }
+  function sendControl(p, message) {
+    if (p.dc?.readyState !== 'open') return;
+    try { p.dc.send(JSON.stringify(message)); } catch { resetTransfers(p); }
+  }
+  function clearPending(p) {
+    p.pendingOffer?.element.remove();
+    p.pendingOffer = null;
+  }
+  function clearIncoming(p) {
+    if (p.incoming) {
+      p.incoming.chunks.length = 0;
+      p.incoming.chunksSize = 0;
+      p.incoming = null;
+    }
+    p.incomingUi?.node.remove();
+    p.incomingUi = null;
+  }
+  function clearOutgoing(p) {
+    if (p.outgoing) {
+      p.outgoing.abort.abort(); // Wakes a sender paused on bufferedamountlow.
+      clearTimeout(p.outgoing.timer);
+      p.outgoing.file = null;
+      p.outgoing = null;
+    }
+    p.outgoingUi?.node.remove();
+    p.outgoingUi = null;
+  }
+  function resetTransfers(p) {
+    clearPending(p);
+    clearIncoming(p);
+    clearOutgoing(p);
+  }
+  function closePeer(p) {
+    resetTransfers(p);
+    if (p.saved) {
+      URL.revokeObjectURL(p.saved.url);
+      p.saved.element.remove();
+      p.saved = null;
+    }
+    p.pc.close();
+  }
+  function transferUi(p, title, direction, cancel) {
+    const node = document.createElement('div');
+    node.className = 'entry';
+    const status = document.createElement('span');
+    status.textContent = title + ' ';
+    const button = document.createElement('button');
+    button.dataset.testid = direction === 'incoming' ? 'cancel-incoming' : 'cancel-outgoing';
+    button.textContent = 'Cancelar';
+    button.addEventListener('click', cancel);
+    node.append(status, button);
+    $('transfers').append(node);
+    return { node, status };
+  }
+  function showVerifiedDownload(p, rx, blob) {
+    if (p.saved) {
+      URL.revokeObjectURL(p.saved.url);
+      p.saved.element.remove();
+    }
+    const url = URL.createObjectURL(blob);
+    const element = document.createElement('div');
+    element.className = 'entry';
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    // The sender's filename is untrusted: no paths, control characters or executable MIME.
+    anchor.download = rx.name.replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').slice(0, 100) || 'arquivo.bin';
+    anchor.textContent = 'Baixar arquivo verificado: ' + anchor.download + ' (' + rx.size + ' bytes)';
+    element.append(anchor);
+    $('downloads').append(element);
+    p.saved = { url, element };
+  }
   function attachChannel(p, dc) {
+    // One reliable, ordered channel per consented peer. A second or unordered
+    // peer-created channel must never replace the active transfer state.
+    if (p.dc || dc.label !== 'fixture-transfer' || !dc.ordered ||
+      dc.maxRetransmits !== null || dc.maxPacketLifeTime !== null) {
+      dc.close();
+      record(diagnostics.rejected, 'INVALID_CHANNEL');
+      return;
+    }
     p.dc = dc;
     dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 32 * 1024;
+    dc.bufferedAmountLowThreshold = 64 * 1024;
     dc.onopen = () => {
       record(diagnostics.channels, p.id);
       log('DataChannel aberto: ' + p.id.slice(0, 5));
     };
     dc.onclose = () => {
-      p.incoming = null;
-      p.outgoing = null;
+      resetTransfers(p);
       log('DataChannel fechado: ' + p.id.slice(0, 5));
     };
-    function abortIncoming() {
+    function abortIncoming(code) {
       const rx = p.incoming;
-      if (rx) {
-        p.incoming = null;
-        rx.chunks.length = 0;
-        rx.chunksSize = 0;
-        if (dc.readyState === 'open') dc.send(JSON.stringify({ type: 'abort-file', id: rx.id }));
-      }
-      record(diagnostics.rejected, 'INVALID_CHUNK');
-      log('Chunk rejeitado');
+      clearIncoming(p);
+      if (rx) sendControl(p, { type: 'abort-file', id: rx.id });
+      record(diagnostics.rejected, code);
+      log('Arquivo rejeitado: ' + code);
     }
     dc.onmessage = async event => {
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
-        if (!rx || event.data.byteLength === 0 || rx.chunks.length >= MAX_FILE_CHUNKS ||
-          rx.chunksSize + event.data.byteLength > rx.size ||
-          rx.chunksSize + event.data.byteLength > MAX_FILE) return abortIncoming();
-        rx.chunks.push(new Uint8Array(event.data));
-        rx.chunksSize += event.data.byteLength;
+        if (!rx) { record(diagnostics.rejected, 'UNEXPECTED_CHUNK'); return; }
+        if (rx.phase !== 'receiving' || rx.chunks.length >= fileWire.MAX_CHUNKS) {
+          return abortIncoming('INVALID_CHUNK');
+        }
+        try {
+          const chunk = fileWire.parseFrame(event.data, rx.id, rx.chunksSize, rx.size);
+          rx.chunks.push(chunk.slice());
+          rx.chunksSize += chunk.byteLength;
+          if (rx.chunksSize % (256 * 1024) === 0 && p.incomingUi) {
+            p.incomingUi.status.textContent = 'Recebido ' + rx.chunksSize + '/' + rx.size + ' bytes ';
+          }
+        } catch { abortIncoming('INVALID_CHUNK'); }
         return;
+      }
+      if (typeof event.data !== 'string' || event.data.length > 4096) {
+        record(diagnostics.rejected, 'INVALID_CONTROL'); return;
       }
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
         } else record(diagnostics.rejected, 'TEXT_DIGEST');
-      } else if (m.type === 'offer-file' && typeof m.id === 'string' &&
-        typeof m.name === 'string' && m.name.length <= 100 &&
-        Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
-        /^[0-9a-f]{64}$/.test(m.digest) && !p.incoming && !p.pendingOffer) {
-        p.pendingOffer = m.id;
+      } else if (m.type === 'offer-file') {
+        if (!fileWire.validOffer(m)) {
+          record(diagnostics.rejected, 'BAD_OFFER'); return;
+        }
+        if (p.incoming || p.pendingOffer) {
+          sendControl(p, { type: 'decline-file', id: m.id }); return;
+        }
         const div = document.createElement('div');
         div.className = 'entry';
         div.textContent = 'Arquivo ' + m.name + ' (' + m.size + ' bytes) ';
+        p.pendingOffer = { id: m.id, element: div };
         const button = document.createElement('button');
         button.textContent = 'Aceitar arquivo';
         button.dataset.testid = 'accept-file';
         button.addEventListener('click', () => {
-          p.incoming = { ...m, chunksSize: 0, chunks: [] };
-          p.pendingOffer = null;
-          dc.send(JSON.stringify({ type: 'accept-file', id: m.id }));
-          div.remove();
+          if (p.pendingOffer?.id !== m.id || dc.readyState !== 'open') return;
+          clearPending(p);
+          p.incoming = { ...m, chunksSize: 0, chunks: [], phase: 'receiving' };
+          p.incomingUi = transferUi(p, 'Recebendo ' + m.name, 'incoming', () => {
+            if (p.incoming?.id !== m.id) return;
+            clearIncoming(p);
+            sendControl(p, { type: 'cancel-file', id: m.id });
+            log('Recebimento cancelado');
+          });
+          sendControl(p, { type: 'accept-file', id: m.id });
         });
         const decline = document.createElement('button');
         decline.textContent = 'Recusar arquivo';
         decline.addEventListener('click', () => {
-          p.pendingOffer = null;
-          dc.send(JSON.stringify({ type: 'decline-file', id: m.id }));
-          div.remove();
+          if (p.pendingOffer?.id !== m.id) return;
+          clearPending(p);
+          sendControl(p, { type: 'decline-file', id: m.id });
         });
         div.append(button, decline);
         $('incoming').append(div);
-      } else if (m.type === 'accept-file' && p.outgoing && m.id === p.outgoing.id) {
-        await sendChunks(p);
+      } else if (m.type === 'accept-file' && p.outgoing?.id === m.id && p.outgoing.phase === 'offered') {
+        clearTimeout(p.outgoing.timer);
+        p.outgoing.phase = 'sending';
+        void sendChunks(p, p.outgoing);
       } else if (m.type === 'decline-file' && p.outgoing && m.id === p.outgoing.id) {
-        p.outgoing = null;
+        clearOutgoing(p);
         log('Arquivo recusado pelo destinatário');
       } else if (m.type === 'abort-file' && p.outgoing && m.id === p.outgoing.id) {
-        p.outgoing = null;
+        clearOutgoing(p);
         log('Arquivo abortado pelo destinatário');
+      } else if (m.type === 'cancel-file' && fileWire.validId(m.id)) {
+        if (p.outgoing?.id === m.id) clearOutgoing(p);
+        if (p.incoming?.id === m.id) clearIncoming(p);
+        if (p.pendingOffer?.id === m.id) clearPending(p);
+        log('Transferência cancelada pelo par');
       } else if (m.type === 'end-file' && p.incoming && m.id === p.incoming.id) {
         const rx = p.incoming;
-        p.incoming = null;
-        if (rx.chunksSize !== rx.size) { record(diagnostics.rejected, 'SIZE_MISMATCH'); return log('Arquivo incompleto'); }
-        const bytes = new Uint8Array(rx.size);
-        let offset = 0;
-        for (const chunk of rx.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        const digest = await sha(bytes);
-        if (digest !== rx.digest) { record(diagnostics.rejected, 'FILE_DIGEST'); return log('Arquivo corrompido'); }
-        record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
-        log('Arquivo SHA-256 OK: ' + rx.name);
+        if (rx.phase !== 'receiving') return abortIncoming('INVALID_CONTROL');
+        rx.phase = 'verifying';
+        if (rx.chunksSize !== rx.size) return abortIncoming('SIZE_MISMATCH');
+        try {
+          const blob = new Blob(rx.chunks, { type: 'application/octet-stream' });
+          const digest = await sha(await blob.arrayBuffer());
+          if (p.incoming !== rx) return; // Receiver canceled during hashing.
+          if (digest !== rx.digest) return abortIncoming('FILE_DIGEST');
+          clearIncoming(p);
+          showVerifiedDownload(p, rx, blob);
+          record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
+          sendControl(p, { type: 'verified-file', id: rx.id, digest });
+          log('Arquivo SHA-256 OK: ' + rx.name);
+        } catch { if (p.incoming === rx) abortIncoming('VERIFY_FAILED'); }
+      } else if (m.type === 'verified-file' && p.outgoing?.id === m.id &&
+        p.outgoing.phase === 'verifying' && m.digest === p.outgoing.digest) {
+        const name = p.outgoing.name;
+        clearOutgoing(p);
+        log('Recebimento confirmado SHA-256: ' + name);
       }
     };
   }
-  async function sendChunks(p) {
-    const { dc, outgoing } = p;
-    if (!outgoing) return;
-    for (let offset = 0; offset < outgoing.bytes.byteLength; offset += 16 * 1024) {
-      if (p.outgoing !== outgoing) return;
-      if (dc.readyState !== 'open') { p.outgoing = null; return; }
-      while (dc.bufferedAmount > 64 * 1024) {
-        await new Promise(resolve => {
-          const wake = () => {
-            dc.removeEventListener('bufferedamountlow', wake);
-            dc.removeEventListener('close', wake);
-            resolve();
-          };
-          dc.addEventListener('bufferedamountlow', wake, { once: true });
-          dc.addEventListener('close', wake, { once: true });
-        });
-        if (p.outgoing !== outgoing) return;
-        if (dc.readyState !== 'open') { p.outgoing = null; return; }
+  async function awaitBufferSpace(dc, signal) {
+    if (dc.bufferedAmount < BUFFER_HIGH || signal.aborted || dc.readyState !== 'open') return;
+    await new Promise(resolve => {
+      const finish = () => {
+        dc.removeEventListener('bufferedamountlow', finish);
+        dc.removeEventListener('close', finish);
+        signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      dc.addEventListener('bufferedamountlow', finish);
+      dc.addEventListener('close', finish);
+      signal.addEventListener('abort', finish, { once: true });
+      if (signal.aborted || dc.readyState !== 'open' || dc.bufferedAmount < BUFFER_HIGH) finish();
+    });
+  }
+  async function sendChunks(p, tx) {
+    const { dc } = p;
+    try {
+      for (let offset = 0; offset < tx.size; offset += fileWire.CHUNK_BYTES) {
+        await awaitBufferSpace(dc, tx.abort.signal);
+        if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
+        const bytes = new Uint8Array(await tx.file.slice(offset, offset + fileWire.CHUNK_BYTES).arrayBuffer());
+        if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
+        dc.send(fileWire.packFrame(tx.id, offset, bytes));
+        p.peakBuffered = Math.max(p.peakBuffered, dc.bufferedAmount);
+        if (p.outgoingUi && offset % (256 * 1024) === 0) {
+          p.outgoingUi.status.textContent = 'Enviando ' + (offset + bytes.byteLength) + '/' + tx.size + ' bytes ';
+        }
       }
-      dc.send(outgoing.bytes.slice(offset, offset + 16 * 1024));
+      if (p.outgoing !== tx || dc.readyState !== 'open') return;
+      tx.file = null; // Only the recipient's final SHA-256 acknowledgement completes the send.
+      tx.phase = 'verifying';
+      p.outgoingUi.status.textContent = 'Aguardando verificação SHA-256 ';
+      sendControl(p, { type: 'end-file', id: tx.id });
+      if (p.outgoing !== tx) return;
+      tx.timer = setTimeout(() => {
+        if (p.outgoing !== tx) return;
+        cancelOutgoing(p, true);
+        log('Confirmação de integridade expirou');
+      }, 30_000);
+    } catch {
+      if (p.outgoing !== tx) return;
+      cancelOutgoing(p, true);
+      record(diagnostics.rejected, 'SEND_FAILED');
     }
-    if (p.outgoing !== outgoing) return;
-    dc.send(JSON.stringify({ type: 'end-file', id: outgoing.id }));
-    p.outgoing = null;
-    log('Enviado: ' + outgoing.name);
+  }
+  function cancelOutgoing(p, notify) {
+    const tx = p.outgoing;
+    if (!tx) return;
+    clearOutgoing(p);
+    if (notify) sendControl(p, { type: 'cancel-file', id: tx.id });
   }
   async function sendFile(file) {
-    if (!file || file.size === 0 || file.size > MAX_FILE) return log('Arquivo fora do limite de 1 MiB');
-    const bytes = await file.arrayBuffer();
-    const digest = await sha(bytes);
-    const receivers = [...peers.values()].filter(p => p.dc && p.dc.readyState === 'open' && !p.outgoing);
-    for (const p of receivers) {
-      const id = crypto.randomUUID();
-      p.outgoing = { id, name: file.name.slice(0, 100), bytes, digest };
-      p.dc.send(JSON.stringify({ type: 'offer-file', id, name: file.name.slice(0, 100), size: bytes.byteLength, digest }));
+    if (!file || file.size === 0 || file.size > MAX_FILE || preparingFile) {
+      return log('Selecione arquivo de até 32 MiB');
     }
-    log('Arquivo oferecido a ' + receivers.length + ' destinatário(s)');
+    const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing);
+    if (!receivers.length) return log('Nenhum par disponível');
+    preparingFile = true;
+    try {
+      const digest = await sha(await file.arrayBuffer());
+      const name = file.name.slice(0, 100) || 'arquivo.bin';
+      for (const p of receivers) {
+        if (p.dc?.readyState !== 'open' || p.outgoing) continue;
+        const id = crypto.randomUUID().replace(/-/g, '');
+        const tx = { id, name, size: file.size, digest, file, phase: 'offered',
+          abort: new AbortController(), timer: null };
+        p.outgoing = tx;
+        p.outgoingUi = transferUi(p, 'Aguardando aceite de ' + p.id.slice(0, 5), 'outgoing',
+          () => cancelOutgoing(p, true));
+        sendControl(p, { type: 'offer-file', id, name, size: file.size, digest });
+        if (p.outgoing !== tx) continue;
+        tx.timer = setTimeout(() => {
+          if (p.outgoing === tx) cancelOutgoing(p, true);
+        }, 60_000);
+      }
+      log('Arquivo oferecido a ' + receivers.length + ' destinatário(s)');
+    } catch { log('Falha ao ler ou oferecer arquivo'); }
+    finally { preparingFile = false; }
   }
   async function sendText(value) {
     if (!value || value.length > 1000) return;
@@ -303,7 +462,11 @@
     snapshot: () => ({ roomId, role, peerId: selfId, peers: [...peers.values()].map(p => ({
       id: p.id, channel: p.dc?.readyState || 'none',
       incomingChunks: p.incoming?.chunks.length ?? 0,
-      incomingBytes: p.incoming?.chunksSize ?? 0
+      incomingBytes: p.incoming?.chunksSize ?? 0,
+      outgoingPhase: p.outgoing?.phase || null,
+      pendingOffer: Boolean(p.pendingOffer),
+      savedDownload: Boolean(p.saved),
+      peakBuffered: p.peakBuffered
     })), diagnostics })
   };
 })();
