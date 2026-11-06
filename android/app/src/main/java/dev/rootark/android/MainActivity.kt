@@ -154,8 +154,9 @@ class MainActivity : Activity() {
         runRequest({ transport.listInventoryPage(origin, token, cursor) }) { page, failure ->
             if (page != null) {
                 val used = usedCursors + listOfNotNull(cursor)
-                if (page.nextCursor != null && runCatching {
-                    PagedInventoryPolicy.checkCursor(page.nextCursor, used)
+                val next = page.nextCursor
+                if (next != null && runCatching {
+                    PagedInventoryPolicy.checkCursor(next, used)
                 }.isFailure) {
                     showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
                 } else {
