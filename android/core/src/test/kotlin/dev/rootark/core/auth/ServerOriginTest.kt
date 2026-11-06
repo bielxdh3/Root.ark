@@ -25,9 +25,7 @@ class ServerOriginTest {
             "https://", "https://vault.example.test\n", "ftp://vault.example.test"
         )
         for (candidate in invalid) {
-            assertThrows(IllegalArgumentException::class.java, "accepted $candidate") {
-                ServerOrigin.parse(candidate)
-            }
+            assertThrows(IllegalArgumentException::class.java, { ServerOrigin.parse(candidate) }, "accepted $candidate")
         }
     }
 }
