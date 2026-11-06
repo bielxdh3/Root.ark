@@ -12318,8 +12318,8 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
-    beforeSend: () => {
-      const rejection = access.reserveDownload();
+    beforeSend: (readHandle) => {
+      const rejection = access.reserveDownload(readHandle);
       if (!rejection) setShareDownloadReceiptCookie(req, res, shareToken);
       return rejection;
     },
