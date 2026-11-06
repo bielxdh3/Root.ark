@@ -5,10 +5,11 @@
   "description": "Isolated loopback-only WebRTC room proof of concept, not Root.ark production code",
   "scripts": {
     "start": "node server.cjs",
-    "test": "node --test tests/signal.test.cjs",
+    "test": "node --test tests/signal.test.cjs tests/session.test.cjs",
     "test:browser": "node tests/browser.cjs"
   },
   "dependencies": {
+    "jsonwebtoken": "9.0.3",
     "ws": "^8.22.0"
   }
 }
