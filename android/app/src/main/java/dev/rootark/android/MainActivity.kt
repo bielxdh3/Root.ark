@@ -18,6 +18,7 @@ import dev.rootark.core.sync.ReadOnlyFileListPolicy
 import dev.rootark.core.sync.RootArkApiException
 import dev.rootark.core.sync.OfflineSession
 import dev.rootark.core.sync.SessionOfflineInventory
+import java.io.File
 import java.util.UUID
 
 /** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
@@ -36,6 +37,8 @@ class MainActivity : Activity() {
     private var sessionCanListFiles = false
     private var offlineSession: OfflineSession? = null
     private var offlineInventory: SessionOfflineInventory? = null
+    private var ciphertextCache: SessionCiphertextCache? = null
+    private val ciphertextRoot: File get() = File(noBackupFilesDir, "ciphertext-staging-v1")
     @Volatile private var generation = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +55,11 @@ class MainActivity : Activity() {
     }
 
     private fun clearSensitiveState() {
+        val cache = ciphertextCache
+        ciphertextCache = null
+        runCatching { cache?.clear() }
+        runCatching { LocalCipherCacheKey.erase() }
+        runCatching { SessionCiphertextCache.purgeStale(ciphertextRoot) }
         offlineInventory?.clear()
         offlineInventory = null
         offlineSession = null
@@ -147,6 +155,9 @@ class MainActivity : Activity() {
                 UUID.randomUUID().toString(),
             )
             offlineInventory = SessionOfflineInventory(offlineSession!!)
+            ciphertextCache = runCatching {
+                SessionCiphertextCache(ciphertextRoot, offlineSession!!, LocalCipherCacheKey.rotateForLogin())
+            }.getOrNull()
         }
         showSession()
     }
@@ -165,6 +176,33 @@ class MainActivity : Activity() {
                 button(layout, "Apagar inventário desta sessão") {
                     cache.clear()
                     showSession("Inventário temporário apagado.")
+                }
+            }
+            val candidate = if (binding != null) runCatching { ciphertextCache?.snapshot(binding) }.getOrNull() else null
+            if (candidate != null) {
+                text(layout, "Ciphertext criptografado em armazenamento privado: ${candidate.objectId} " +
+                    "(época ${candidate.epoch}, revisão ${candidate.revisionCounter}). " +
+                    "Integridade local e assinatura são verificações distintas; conteúdo continua bloqueado.")
+                button(layout, "Conferir integridade da captura local") {
+                    val stored = ciphertextCache ?: return@button
+                    val requestGeneration = ++generation
+                    screen("Verificação offline", "Conferindo apenas AES-GCM e integridade dos bytes armazenados...")
+                    Thread {
+                        val intact = runCatching { stored.inspect(binding!!, candidate.objectId) }.isSuccess
+                        runOnUiThread {
+                            if (generation == requestGeneration && !isFinishing && !isDestroyed) {
+                                showSession(if (intact) "Captura local íntegra. Assinatura e autorização NÃO verificadas."
+                                    else "Captura local corrompida ou indisponível; os bytes foram descartados.")
+                            }
+                        }
+                    }.start()
+                }
+                button(layout, "Apagar captura de ciphertext") {
+                    val stored = ciphertextCache
+                    ciphertextCache = null
+                    runCatching { stored?.clear() }
+                    runCatching { LocalCipherCacheKey.erase() }
+                    showSession("Captura criptografada encerrada para esta sessão.")
                 }
             }
         } else {
@@ -204,6 +242,9 @@ class MainActivity : Activity() {
                 403 -> showLogin("Acesso à lista revogado (403). Faça login novamente.")
                 409 -> {
                     offlineInventory?.clear()
+                    runCatching { ciphertextCache?.clear() }
+                    ciphertextCache = null
+                    runCatching { LocalCipherCacheKey.erase() }
                     showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
                 }
                 else -> showSession("Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros).")
@@ -251,6 +292,11 @@ class MainActivity : Activity() {
                 "Pode estar desatualizada; não é prova assinada, autorização atual ou conteúdo verificado.",
         )
         if (page.rows.isEmpty()) text(layout, "Nenhum registro capturado nesta página.")
+        val candidate = runCatching { ciphertextCache?.snapshot(binding) }.getOrNull()
+        if (candidate != null) {
+            text(layout, "Há uma captura de ciphertext criptografada de ${candidate.objectId}. " +
+                "Assinatura, dispositivo e autorização atual NÃO verificados. Sem acesso ao conteúdo offline.")
+        }
         for (row in page.rows) {
             text(layout, row.name + if (row.deleted) " (excluído no momento da captura)" else "")
             val details = listOfNotNull(
@@ -308,8 +354,45 @@ class MainActivity : Activity() {
                         }
                     } else when ((failure as? RootArkApiException)?.statusCode) {
                         401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
-                        403 -> showSession("Servidor negou acesso ao arquivo (403).")
+                        403 -> showLogin("Acesso ao arquivo revogado (403). Faça login novamente.")
                         else -> showSession("Conteúdo indisponível. Autorização ou verificação criptográfica não confirmada.")
+                    }
+                }
+            }
+        }
+        val binding = offlineSession
+        val stored = ciphertextCache
+        if (binding != null && stored != null) {
+            text(layout, "É possível guardar até 4 MiB de ciphertext assinado recebido via HTTPS. " +
+                "O cache local é cifrado com Android Keystore e NÃO autoriza abrir conteúdo offline.")
+            button(layout, "Capturar ciphertext criptografado") {
+                runRequest({
+                    val packet = ProtectedSyncFetch().fetchPacket(
+                        origin, session, objectId, SessionCiphertextCache.MAX_PACKET_BYTES
+                    )
+                    try { stored.save(binding, objectId, packet.bytes) }
+                    finally { packet.bytes.fill(0) }
+                }) { captured, failure ->
+                    if (captured != null) {
+                        showSession("Ciphertext capturado em AES-GCM local. A assinatura e a autoridade do dispositivo " +
+                            "ainda precisam ser verificadas independentemente; conteúdo indisponível offline.")
+                    } else when ((failure as? RootArkApiException)?.statusCode) {
+                        401, 403 -> showLogin("Sessão ou autorização revogada. Faça login novamente.")
+                        409 -> {
+                            offlineInventory?.clear()
+                            runCatching { stored.clear() }
+                            ciphertextCache = null
+                            runCatching { LocalCipherCacheKey.erase() }
+                            showSession("Objeto mudou no servidor. Captura descartada.")
+                        }
+                        else -> {
+                            if (failure is SecurityException || failure is java.io.IOException) {
+                                runCatching { stored.clear() }
+                                ciphertextCache = null
+                                runCatching { LocalCipherCacheKey.erase() }
+                            }
+                            showSession("Não foi possível capturar ciphertext. Limite de 4 MiB ou integridade inválida.")
+                        }
                     }
                 }
             }
