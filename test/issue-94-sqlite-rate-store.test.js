@@ -1,9 +1,31 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 const SqliteSlidingWindowStore = require("../src/middlewares/sqliteSlidingWindowStore");
+
+test("invalid chunk limiter store configuration fails closed before server startup", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "issue-94-store-config-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const child = spawnSync(process.execPath, [path.resolve(__dirname, "../server.js")], {
+    cwd: directory,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 10_000,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      UPLOAD_CHUNK_RATE_LIMIT_STORE: "sqltie",
+    },
+  });
+  assert.notEqual(child.status, null, "invalid configuration must terminate startup promptly");
+  assert.notEqual(child.status, 0);
+  assert.match(child.stderr, /Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE/);
+});
 
 function withClock(t, start) {
   const originalNow = Date.now;
