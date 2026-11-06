@@ -34,6 +34,15 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   });
   let now = 1400;
   let allowed = true;
+  let pausedReadAdmission = null;
+  const pauseNextReadAdmission = () => {
+    let entered;
+    let release;
+    const started = new Promise((resolve) => { entered = resolve; });
+    const wait = new Promise((resolve) => { release = resolve; });
+    pausedReadAdmission = { entered, wait };
+    return { started, release };
+  };
   const witness = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);
   const witnessProvider = {
@@ -48,8 +57,14 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
         Buffer.concat([HEAD_DOMAIN, Buffer.from(await z.encodeDeterministic(body))]),
         witness.privateKey) });
     },
-    async beginIoAdmission() {
+    async beginIoAdmission({ action }) {
       if (!allowed) throw Error("revoked gate");
+      if (action === "get" && pausedReadAdmission) {
+        const gate = pausedReadAdmission;
+        pausedReadAdmission = null;
+        gate.entered();
+        await gate.wait;
+      }
       return { admissionId: crypto.randomBytes(16), proceed: true };
     },
     async finishIoAdmission() { return { status: "completed" }; },
@@ -241,12 +256,45 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     shareSignatureBase64: b64(expiringSignature),
   });
   assert.equal(expiringCreated.status, 201, JSON.stringify(expiringCreated.body));
-  now += 6;
+  const changePersistedExpiry = store.db.prepare(
+    "UPDATE zk_content_share SET expires_at=? WHERE grant_id=?");
+  const readExpiring = async () => {
+    const proof = await sign(recipient, "get", id, 1, digest);
+    return post("/zk-1/v1/share/read", "recipient", {
+      grantId: expiresGrantId, authorization: wire(proof.authorization),
+      signatureBase64: b64(proof.signature),
+    });
+  };
+  changePersistedExpiry.run(now + 3600, expiresGrantId);
+  assert.equal((await readExpiring()).status, 403,
+    "extending a SQLite expiry must not override the immutable owner-signed expiry");
+  changePersistedExpiry.run(expiresGrantInput.expiresAt, expiresGrantId);
+
+  const delayedRead = pauseNextReadAdmission();
+  const pendingRead = readExpiring();
+  try {
+    await delayedRead.started;
+    changePersistedExpiry.run(now + 3600, expiresGrantId);
+  } finally { delayedRead.release(); }
+  assert.equal((await pendingRead).status, 403,
+    "an expiry overwritten while awaiting physical admission must fail before HTTP egress");
+  changePersistedExpiry.run(expiresGrantInput.expiresAt, expiresGrantId);
+
+  const expiringDuringAdmission = pauseNextReadAdmission();
+  const pendingExpiry = readExpiring();
+  try {
+    await expiringDuringAdmission.started;
+    now = expiresGrantInput.expiresAt;
+  } finally { expiringDuringAdmission.release(); }
+  assert.equal((await pendingExpiry).status, 403,
+    "signed expiry reached during an await must reject final ciphertext emission");
+
+  changePersistedExpiry.run(now + 3600, expiresGrantId);
   const expiredRead = await sign(recipient, "get", id, 1, digest);
   assert.equal((await post("/zk-1/v1/share/read", "recipient", {
     grantId: expiresGrantId, authorization: wire(expiredRead.authorization),
     signatureBase64: b64(expiredRead.signature),
-  })).status, 403, "expired signed grant fails closed before content admission");
+  })).status, 403, "expired owner-signed grant fails closed despite longer SQLite expiry");
   assert.equal((await readAs("recipient")).status, 200,
     "expiring one grant cannot affect another grant for the same ciphertext");
 
