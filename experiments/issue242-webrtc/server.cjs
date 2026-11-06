@@ -9,6 +9,8 @@ const WebSocket = require('ws');
 
 const MAX_MEMBERS = 4;
 const ROOM_TTL_MS = 5 * 60_000;
+const UNJOINED_ROOM_TTL_MS = 15_000;
+const MAX_ACTIVE_ROOMS_PER_OWNER = 2;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
 const token = () => randomBytes(32).toString('hex');
@@ -66,7 +68,10 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     room.allowed.clear();
   }
   function validRoom(room) {
-    if (!room || now() >= room.expires) {
+    // A room reserved by HTTP but never activated by its signed-session host
+    // must not consume scarce global capacity for the full five-minute TTL.
+    if (!room || now() >= room.expires ||
+      (!room.hostJoined && now() >= room.hostJoinDeadline)) {
       if (room) expireRoom(room);
       return false;
     }
@@ -115,6 +120,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       const peer = { id, role, roomId: room.id, ws, username: ws.identity?.username };
       participants.set(ws, peer);
       room.members.set(id, peer);
+      if (role === 'host') room.hostJoined = true;
       send(ws, { type: 'joined', peerId: id, role, username: peer.username,
         members: [...room.members.values()].filter(p => p.id !== id).map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
       for (const other of room.members.values()) if (other.id !== id) send(other.ws, { type: 'peer-joined', peerId: id, role, username: peer.username });
@@ -209,8 +215,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   function createRoom(req) {
     const user = identify(req);
     if (authenticated && !user) return { status: 401 };
+    // Reclaim immediately at the HTTP boundary too (do not wait for the
+    // background sweep) so an unused reservation cannot block a new owner.
+    for (const room of rooms.values()) validRoom(room);
+    if (authenticated && [...rooms.values()].filter(room => room.owner === user.username).length
+      >= MAX_ACTIVE_ROOMS_PER_OWNER) return { status: 429 };
     if (rooms.size >= 16) return { status: 429 };
-    const room = { id: shortId(), hostKey: token(), expires: now() + roomTtlMs,
+    const timestamp = now();
+    const room = { id: shortId(), hostKey: token(), expires: timestamp + roomTtlMs,
+      hostJoinDeadline: timestamp + (authenticated ? Math.min(roomTtlMs, UNJOINED_ROOM_TTL_MS) : roomTtlMs),
+      hostJoined: false,
       owner: user?.username, ownerSessionVersion: user?.sessionVersion,
       members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
     rooms.set(room.id, room);
