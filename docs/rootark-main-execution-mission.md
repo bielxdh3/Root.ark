@@ -31,3 +31,4 @@ Complete relevant Root.ark security and reliability work first, then the remaini
 ## Progress ledger
 
 - **2026-11-05 — Plan initiated.** Initial SHA and live issue/PR states verified through GitHub. Work on #203 not yet certified; no vulnerability or test result claimed from this plan alone.
+- **2026-11-05 — #203 resumed:** code/test/source and prior issue comments reviewed. #207/#220/#223 already cover the primary old findings; outstanding are bounded performance, advisory and deployment-specific acceptance. Recorded [source-only checkpoint](https://github.com/bielxdh3/Root.ark/issues/203#issuecomment-6675814775) in #203; no repeated implementation or unverified closure. Fresh local worktree was unexpectedly dirty on checkout and preserved without edits; tests not run in this checkpoint. README obsolete integration milestone replaced and mission cross-linked in draft PR #251.
