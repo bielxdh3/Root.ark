@@ -5,7 +5,7 @@ const path = require("node:path");
 const protocol = require("./rootark-sync-protocol");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { readPrivateV2Config } = require("./rootark-sync-v2-private-config");
-const { SyncEngine } = require("./rootark-sync-engine");
+const { SyncEngine, normalizeHistoricalRestorePlan } = require("./rootark-sync-engine");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { createAuthorizationProof, verifyAuthorizationProof,
@@ -203,6 +203,10 @@ function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy
 }
 
 async function start(options = {}) {
+  if (options.previewPlan === true) {
+    // Validate the complete selection before reading private keys or config.
+    options = { ...options, requests: normalizeHistoricalRestorePlan(options.requests) };
+  }
   if (options.restore === true || options.preview === true) {
     for (const key of ["object-id", "version-id"]) {
       if (typeof options[key] !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(options[key])) {
@@ -210,7 +214,8 @@ async function start(options = {}) {
       }
     }
   }
-  if (options.preview === true && options.requireIndependentHistoricalAdmission !== true
+  if ((options.preview === true || options.previewPlan === true)
+    && options.requireIndependentHistoricalAdmission !== true
     && process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY !== "1") {
     throw new Error("Historical preview requires externally enforced independent custody");
   }
@@ -375,7 +380,12 @@ async function start(options = {}) {
     requireAuthorization: true,
     reverifySeenIncoming: strictHistorical,
     requireIndependentHistoricalAdmission: strictHistorical,
-  }).open({ readOnly: options.preview === true });
+  }).open({ readOnly: options.preview === true || options.previewPlan === true });
+  if (options.previewPlan === true) {
+    const outcome = await engine.previewHistoricalRestorePlan(options.requests);
+    console.log(JSON.stringify(outcome));
+    return engine;
+  }
   if (options.preview === true) {
     const outcome = await engine.previewHistoricalRestore(options["object-id"], options["version-id"]);
     // Advisory metadata only, no recovered plaintext or decrypted key bytes.
@@ -467,6 +477,40 @@ async function readResumeCredentials(stream = process.stdin) {
   return parsed;
 }
 
+async function readHistoricalRestorePlanInput(stream = process.stdin) {
+  let size = 0;
+  const chunks = [];
+  let parsed;
+  try {
+    for await (const chunk of stream) {
+      if (size + Buffer.byteLength(chunk) > 16384) {
+        throw new Error("Invalid historical restore plan on stdin");
+      }
+      const bytes = Buffer.from(chunk);
+      size += bytes.length;
+      chunks.push(bytes);
+    }
+    const input = Buffer.concat(chunks);
+    try { parsed = JSON.parse(input.toString("utf8")); }
+    catch { throw new Error("Invalid historical restore plan on stdin"); }
+    finally { input.fill(0); }
+  } finally { chunks.forEach((bytes) => bytes.fill(0)); }
+  return normalizeHistoricalRestorePlan(parsed);
+}
+
+async function previewPlan(options = {}) {
+  if (options["plan-stdin"] !== true
+    || Object.keys(options).some((key) => !["plan-stdin", "config"].includes(key))) {
+    throw new Error("Historical recovery plan requires --plan-stdin and optional --config");
+  }
+  // The standalone CLI cannot manufacture an independent custody authority.
+  if (process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY !== "1") {
+    throw new Error("Historical preview requires externally enforced independent custody");
+  }
+  const requests = await readHistoricalRestorePlanInput();
+  return start({ ...options, previewPlan: true, requests });
+}
+
 async function resume(options = {}) {
   const deviceId = options["device-id"];
   // The requested device and explicit credentials transport are validated
@@ -514,11 +558,12 @@ if (require.main === module) {
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "history") history({ ...args(rest) }).catch((error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "preview") start({ ...args(rest), preview: true }).catch((error) => { console.error(`Sync preview failed: ${error.message}`); process.exitCode = 1; });
+  else if (command === "preview-plan") previewPlan(args(rest)).catch((error) => { console.error(`Sync preview plan failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "resume") resume({ ...args(rest) }).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js preview --config <private-config> --object-id <id> --version-id <id> (requires independently injected custody and current grant; never mutates files)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js preview --config <private-config> --object-id <id> --version-id <id> (requires independently injected custody and current grant; never mutates files)\nOr: node sync-client/rootark-sync-v2.js preview-plan --config <private-config> --plan-stdin (JSON array of up to 32 {objectId,versionId}; independent custody required; never mutates)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
   trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity,
-  start, history, resume, readResumeCredentials };
+  start, history, resume, readResumeCredentials, previewPlan, readHistoricalRestorePlanInput };

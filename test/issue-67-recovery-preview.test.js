@@ -6,11 +6,13 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { Readable } = require("node:stream");
 const test = require("node:test");
 
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { readHistoricalRestorePlanInput } = require("../sync-client/rootark-sync-v2");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 async function fixture(t, { strict = true } = {}) {
@@ -311,4 +313,197 @@ test("#67: preview refuses untracked and unsent local bytes but accepts clean tr
   assert.equal(outcome.localAction, "replace-clean-tracked");
   assert.deepEqual(await fsp.readFile(target), synchronized);
   assert.equal(f.pushes(), 0);
+});
+
+async function attachSecondSignedHistory(f, secondPath = "second.txt") {
+  const first = await f.sign({ objectId: "object-2", fileId: "file-2", operation: "create",
+    operationId: "second-create", versionId: "second-v1",
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: secondPath }, plaintext: Buffer.from("second retained bytes") });
+  const deleted = await f.sign({ objectId: "object-2", fileId: "file-2", operation: "delete",
+    operationId: "second-delete", versionId: "second-v2", baseRevision: first.revision,
+    revision: { counter: 2, deviceId: "device-a" }, metadata: { path: secondPath } });
+  const secondVersions = [first, deleted];
+  const oldHistory = f.adapter.history;
+  const oldList = f.adapter.list;
+  f.adapter.history = async (objectId) => objectId === "object-2"
+    ? { protocolVersion: 2, versions: structuredClone(secondVersions) } : oldHistory(objectId);
+  f.adapter.list = async (objectId) => objectId === "object-2"
+    ? structuredClone(deleted) : oldList(objectId);
+  return secondVersions;
+}
+
+const TWO_RESTORES = [
+  { objectId: "object-1", versionId: "v1" },
+  { objectId: "object-2", versionId: "second-v1" },
+];
+
+test("#67: multi-object preflight verifies two retained signed histories without writes", async (t) => {
+  const f = await fixture(t);
+  await attachSecondSignedHistory(f);
+  const journal = await fsp.readFile(path.join(f.local, ".rootark-sync-journal.json"));
+  const snapshot = await fsp.readFile(path.join(f.local, ".rootark-sync-index.json"));
+  const plan = await f.engine.previewHistoricalRestorePlan(TWO_RESTORES);
+  assert.equal(plan.readOnly, true);
+  assert.equal(plan.ready, true);
+  assert.equal(plan.atomic, false);
+  assert.equal(plan.objectCount, 2);
+  assert.equal(plan.localOverwriteCount, 0);
+  assert.equal(plan.requiresFreshRestoreCheck, true);
+  assert.deepEqual(plan.entries.map((entry) => [entry.objectId, entry.path,
+    entry.verifiedRetainedVersions, entry.localAction]), [
+    ["object-1", "note.txt", 2, "create-from-deleted"],
+    ["object-2", "second.txt", 2, "create-from-deleted"],
+  ]);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-sync-journal.json")), journal);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-sync-index.json")), snapshot);
+  assert.equal(fs.existsSync(path.join(f.local, "note.txt")), false);
+  assert.equal(fs.existsSync(path.join(f.local, "second.txt")), false);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: plan validates bounded unique IDs before any remote history read", async (t) => {
+  const f = await fixture(t);
+  let histories = 0;
+  f.adapter.history = async () => { histories++; throw new Error("History must not be read"); };
+  for (const invalid of [[], Array.from({ length: 33 }, () => TWO_RESTORES[0]),
+    [TWO_RESTORES[0], TWO_RESTORES[0]],
+    [{ objectId: "object-1", versionId: "../../bad" }],
+    [{ objectId: "object-1", versionId: "v1", hidden: "extra" }]]) {
+    await assert.rejects(f.engine.previewHistoricalRestorePlan(invalid),
+      (error) => error.code === "invalid_restore_plan");
+  }
+  assert.equal(histories, 0);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: multi-object plan rejects case-folded file collisions and ancestor targets", async (t) => {
+  const f = await fixture(t);
+  await attachSecondSignedHistory(f, "NOTE.TXT");
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "restore_plan_conflict");
+  const g = await fixture(t);
+  await attachSecondSignedHistory(g, "note.txt/child.txt");
+  await assert.rejects(g.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "restore_plan_conflict");
+  assert.equal(f.pushes() + g.pushes(), 0);
+});
+
+test("#67: any invalid retained history, revoked grant or local overwrite rejects entire plan", async (t) => {
+  const f = await fixture(t);
+  const second = await attachSecondSignedHistory(f);
+  second[0] = { ...second[0], metadata: { ...second[0].metadata, path: "tampered.txt" } };
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES));
+  second[0] = await f.sign({ objectId: "object-2", fileId: "file-2", operation: "create",
+    operationId: "second-create", versionId: "second-v1",
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "second.txt" }, plaintext: Buffer.from("second retained bytes") });
+  f.setGrant(false);
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "authorization_rejected");
+  f.setGrant(true);
+  await fsp.writeFile(path.join(f.local, "second.txt"), "unsent local bytes");
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "restore_local_conflict");
+  assert.equal(f.pushes(), 0);
+  assert.equal(fs.existsSync(path.join(f.local, "note.txt")), false);
+});
+
+test("#67: journal loss during second history read rejects full plan without recreating state", async (t) => {
+  const f = await fixture(t);
+  await attachSecondSignedHistory(f);
+  const journalPath = path.join(f.local, ".rootark-sync-journal.json");
+  const oldHistory = f.adapter.history;
+  f.adapter.history = async (id) => {
+    const result = await oldHistory(id);
+    if (id === "object-2") await fsp.unlink(journalPath);
+    return result;
+  };
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "history_preview_unavailable");
+  assert.equal(fs.existsSync(journalPath), false);
+  assert.equal(fs.existsSync(path.join(f.local, ".rootark-sync.lock")), false);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: batch preview counts clean local replacements as explicit overwrite risk", async (t) => {
+  const f = await fixture(t);
+  await attachSecondSignedHistory(f);
+  const synchronized = Buffer.from("clean synchronized bytes");
+  f.engine.snapshot.files["note.txt"] = {
+    objectId: "object-1", fileId: "file-1", versionId: "v2",
+    revision: f.deleted.revision,
+    hash: crypto.createHash("sha256").update(synchronized).digest("hex"),
+    directory: false, deleted: false,
+  };
+  await f.engine.persistSnapshot();
+  await fsp.writeFile(path.join(f.local, "note.txt"), synchronized);
+  const plan = await f.engine.previewHistoricalRestorePlan(TWO_RESTORES);
+  assert.equal(plan.localOverwriteCount, 1);
+  assert.equal(plan.entries[0].localAction, "replace-clean-tracked");
+  assert.equal(plan.entries[1].localAction, "create-from-deleted");
+  assert.deepEqual(await fsp.readFile(path.join(f.local, "note.txt")), synchronized);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: plan rejects first HEAD advancing while second signed history is fetched", async (t) => {
+  const f = await fixture(t);
+  await attachSecondSignedHistory(f);
+  const advanced = await f.sign({ operation: "delete", versionId: "v3", operationId: "op3",
+    baseRevision: f.deleted.revision, revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "note.txt" } });
+  const oldHistory = f.adapter.history;
+  f.adapter.history = async (objectId) => {
+    const result = await oldHistory(objectId);
+    if (objectId === "object-2") f.setHead(advanced);
+    return result;
+  };
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "history_preview_stale");
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: plan rechecks earlier local destination after a later asynchronous fetch", async (t) => {
+  const f = await fixture(t);
+  await attachSecondSignedHistory(f);
+  const oldHistory = f.adapter.history;
+  f.adapter.history = async (objectId) => {
+    const result = await oldHistory(objectId);
+    if (objectId === "object-2") await fsp.writeFile(path.join(f.local, "note.txt"), "late unsent bytes");
+    return result;
+  };
+  await assert.rejects(f.engine.previewHistoricalRestorePlan(TWO_RESTORES),
+    (error) => error.code === "restore_local_conflict");
+  assert.equal(await fsp.readFile(path.join(f.local, "note.txt"), "utf8"), "late unsent bytes");
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: bounded stdin plan rejects malformed data and secret-bearing extras", async () => {
+  const good = await readHistoricalRestorePlanInput(Readable.from([JSON.stringify(TWO_RESTORES)]));
+  assert.deepEqual(good, TWO_RESTORES);
+  for (const value of ["{}", "[", JSON.stringify([{ ...TWO_RESTORES[0], token: "sensitive" }]),
+    "x".repeat(16385)]) {
+    await assert.rejects(readHistoricalRestorePlanInput(Readable.from([value])),
+      /plan/i);
+  }
+});
+
+test("#67: preview-plan CLI denies absent custody and validates stdin before reading config", () => {
+  const cli = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
+  const missingCustody = spawnSync(process.execPath,
+    [cli, "preview-plan", "--config", "missing-private-config", "--plan-stdin"], {
+      encoding: "utf8", windowsHide: true, input: JSON.stringify(TWO_RESTORES),
+      env: { ...process.env, ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY: "0" },
+    });
+  assert.equal(missingCustody.status, 1);
+  assert.match(missingCustody.stderr, /independent custody/i);
+  const badInput = spawnSync(process.execPath,
+    [cli, "preview-plan", "--config", "missing-private-config", "--plan-stdin"], {
+      encoding: "utf8", windowsHide: true,
+      input: JSON.stringify([{ ...TWO_RESTORES[0], token: "never-echo-me" }]),
+      env: { ...process.env, ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY: "1" },
+    });
+  assert.equal(badInput.status, 1);
+  assert.match(badInput.stderr, /plan/i);
+  assert.doesNotMatch(badInput.stdout + badInput.stderr, /never-echo-me|ROOTARK_SYNC_FILE_KEY|privateKey/);
 });
