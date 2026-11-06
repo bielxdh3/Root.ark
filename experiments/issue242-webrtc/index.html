@@ -23,6 +23,15 @@
   <button id="invite" disabled>Gerar convite único (60 s)</button>
   <div id="invites"></div>
 </fieldset>
+<fieldset id="boundObjectControls" hidden>
+  <legend>Sala com permissão de arquivo criptografado Root.ark</legend>
+  <p>Informe o caminho lógico de um arquivo criptografado do qual você é proprietário e cujo destinatário possui acesso explícito. Esta verificação usa a ACL do servidor; ela não comprova assinatura ZK nem valida os bytes do arquivo local selecionado.</p>
+  <label for="objectFolderInput">ID da pasta</label>
+  <input id="objectFolderInput" autocomplete="off" value="root" maxlength="80">
+  <label for="objectFileInput">Nome exato do arquivo criptografado</label>
+  <input id="objectFileInput" autocomplete="off" maxlength="100" placeholder="arquivo.enc">
+  <button id="createObjectRoom">Criar sala vinculada à ACL</button>
+</fieldset>
 <fieldset>
   <legend>Entrar em sala existente</legend>
   <input id="roomInput" placeholder="Room ID" autocomplete="off">
