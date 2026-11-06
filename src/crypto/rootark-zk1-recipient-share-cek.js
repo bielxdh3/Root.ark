@@ -24,6 +24,7 @@ const SHARE = ["type", "grant_id", "account_id", "compartment_id", "keyring_id",
 const GRANT = ["grantId", "expiresAt", "shareStatementBase64", "shareSignatureBase64"];
 const RECIPIENT_PIN = ["recipientUsername", "deviceId",
   "authorizationPublicKey", "hpkePublicKey"];
+const ISSUER_PIN = ["deviceId", "authorizationPublicKey"];
 const OFFER = ["schema", "grant", "recipientUsername", "recipientDeviceId",
   "metadata", "envelope", "authorizesProductionIo", "externalCustodyProven"];
 function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
@@ -91,9 +92,17 @@ function snapshotAuthority(value) {
   });
   return { scope, head, devices };
 }
-async function verifyOfferAuthority(authority, statement, bytes, signature, pin) {
+async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
+  issuerPin) {
   const current = snapshotAuthority(await authority());
   currentAuthority(current, statement, signature, bytes);
+  // Independent roster membership does NOT grant issuer/owner authority:
+  // a recipient may have a legitimate active Ed25519 signing device.
+  const issuer = current.devices.filter((device) =>
+    device.deviceId === issuerPin.deviceId);
+  if (issuer.length !== 1
+    || !same(issuer[0].authorizationPublicKey,
+      from64(issuerPin.authorizationPublicKey, 32))) denyOffer();
   const recipient = current.devices.filter((device) =>
     device.deviceId === pin.deviceId);
   if (recipient.length !== 1
@@ -101,20 +110,21 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin)
       from64(pin.authorizationPublicKey, 32))) denyOffer();
   return current;
 }
-// Owner-side DEV-OFF portable offer. A grant must already have been issued by
-// the authenticated ciphertext server. The owner explicitly pins the contact
-// username and both keys out of band, and provides independently verified
-// current authority. We never fetch recipient keys from the share endpoint.
+// Owner-side DEV-OFF portable offer. The owner MUST independently pin the
+// authorized issuer's device ID and Ed25519 key; a candidate server ACK has no
+// independently verifiable issuance proof and MUST NOT be a source of trust.
+// The owner also pins recipient keys outside the untrusted grant/ACK.
 async function createProtectedRecipientShareOffer(input) {
   let ownerCek, ciphertext;
   try {
-    strict(input, ["grant", "recipientPin", "readIndependentAuthority",
+    strict(input, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
       "ciphertext", "ciphertextRoot", "authority", "nowSeconds"]);
     const d = Object.getOwnPropertyDescriptors(input);
     if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))) denyOffer();
     const grant = snapshot(d.grant.value, GRANT);
     const pin = snapshot(d.recipientPin.value, RECIPIENT_PIN);
+    const issuerPin = snapshot(d.issuerPin.value, ISSUER_PIN);
     const metadata = snapshot(d.metadata.value, METADATA);
     if (typeof d.readIndependentAuthority.value !== "function"
       || typeof pin.recipientUsername !== "string"
@@ -122,6 +132,10 @@ async function createProtectedRecipientShareOffer(input) {
       || typeof pin.deviceId !== "string" || !pin.deviceId
       || pin.deviceId.length > 64
       || /[\x00-\x1f\x7f]/.test(pin.deviceId)
+      || typeof issuerPin.deviceId !== "string"
+      || !issuerPin.deviceId || issuerPin.deviceId.length > 64
+      || /[\x00-\x1f\x7f]/.test(issuerPin.deviceId)
+      || issuerPin.deviceId === pin.deviceId
       || !Number.isSafeInteger(d.nowSeconds.value)
       || Math.abs(Math.floor(Date.now() / 1000) - d.nowSeconds.value) > 30
       || !Number.isSafeInteger(d.objectRevision.value)
@@ -135,6 +149,9 @@ async function createProtectedRecipientShareOffer(input) {
       || d.ciphertextRoot.value.length !== 32) denyOffer();
     from64(pin.authorizationPublicKey, 32);
     from64(pin.hpkePublicKey, 32);
+    from64(issuerPin.authorizationPublicKey, 32);
+    if (same(from64(issuerPin.authorizationPublicKey, 32),
+      from64(pin.authorizationPublicKey, 32))) denyOffer();
     from64(grant.grantId, 32);
     from64(metadata.object_id, 16);
     ownerCek = Buffer.from(d.ownerHeldCek.value);
@@ -157,6 +174,7 @@ async function createProtectedRecipientShareOffer(input) {
       || statement.expires_at - statement.issued_at > 86400
       || statement.recipient_username !== pin.recipientUsername
       || statement.recipient_device_id !== pin.deviceId
+      || statement.issuer_device_id !== issuerPin.deviceId
       || statement.object_id !== metadata.object_id
       || statement.object_revision !== d.objectRevision.value
       || statement.epoch !== metadata.epoch
@@ -167,7 +185,7 @@ async function createProtectedRecipientShareOffer(input) {
     }
     const signature = from64(grant.shareSignatureBase64, 64);
     await verifyOfferAuthority(d.readIndependentAuthority.value,
-      statement, statementBytes, signature, pin);
+      statement, statementBytes, signature, pin, issuerPin);
     // Existing owner ceremony verifies an independent owner pin, an authentic
     // V2 approval + PoP, witness receipt, matching signed X25519 roster key,
     // real file AEAD and signed HPKE CEK envelope.
@@ -186,8 +204,14 @@ async function createProtectedRecipientShareOffer(input) {
       || envelope.core.owner_epoch !== statement.epoch
       || envelope.core.epoch !== statement.epoch) denyOffer();
     await verifyOfferAuthority(d.readIndependentAuthority.value,
-      statement, statementBytes, signature, pin);
-    if (Math.floor(Date.now() / 1000) >= statement.expires_at) denyOffer();
+      statement, statementBytes, signature, pin, issuerPin);
+    // The independently verified second authority read can outlast the
+    // owner-approved HPKE envelope even while the share grant remains valid.
+    // Neither lease may expire before releasing the portable CEK offer.
+    const releaseSeconds = Math.floor(Date.now() / 1000);
+    if (!Number.isSafeInteger(envelope.core.expires_at)
+      || releaseSeconds >= envelope.core.expires_at
+      || releaseSeconds >= statement.expires_at) denyOffer();
     return Object.freeze({
       schema: "rootark-zk1-recipient-share-offer-dev/v1",
       grant: Object.freeze({ ...grant }),
