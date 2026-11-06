@@ -145,6 +145,27 @@ test("#67: restore never overwrites untracked local data or accepts a cross-obje
   assert.equal(f.pushes(), 0);
 });
 
+test("#67: restore rejects unsent edits to a tracked local file before enqueuing or pushing", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const lastSynced = Buffer.from("last synchronized content");
+  await fsp.writeFile(target, lastSynced);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(lastSynced).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const unsent = Buffer.from("UNSENT LOCAL MODIFICATION");
+  await fsp.writeFile(target, unsent);
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict");
+  assert.deepEqual(await fsp.readFile(target), unsent);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+  assert.equal(fs.existsSync(path.join(f.local, ".rootark-trash")), false);
+});
+
 test("#67: real atomic device registry durably admits a newly signed historical restore", async (t) => {
   const f = await fixture(t);
   const storagePath = path.join(f.root, "physical-store.json");
