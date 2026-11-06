@@ -15,10 +15,11 @@ async function setup(t, files) {
   t.after(() => fsp.rm(directory, { recursive: true, force: true }));
   const key = crypto.randomBytes(32);
   const store = await new SyncObjectStore(path.join(directory, "objects.json")).open();
-  const state = { offline: false, fullReads: [], inventoryReads: 0 };
+  const state = { offline: false, fullReads: [], inventoryReads: 0, pushes: 0 };
   const adapter = {
     async push(operation) {
       if (state.offline) throw Object.assign(new Error("offline"), { code: "offline" });
+      state.pushes++;
       const result = await store.put("alice", operation);
       return { status: 201, record: result.record };
     },
@@ -50,6 +51,7 @@ async function setup(t, files) {
   await writer.syncOnce();
   state.fullReads.length = 0;
   state.inventoryReads = 0;
+  state.pushes = 0;
   const root = path.join(directory, "consumer");
   const open = (selectedPaths = ["docs"]) => new SyncEngine({
     rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
@@ -62,6 +64,94 @@ async function setup(t, files) {
 async function exists(filePath) {
   return fsp.stat(filePath).then(() => true, () => false);
 }
+
+async function seedRemote(store, key, relative, objectId = `external-${crypto.randomUUID()}`) {
+  const operation = protocol.createOperation({
+    operation: "create", objectId, fileId: `file-${crypto.randomUUID()}`,
+    versionId: `version-${crypto.randomUUID()}`, operationId: `operation-${crypto.randomUUID()}`,
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: relative, name: path.posix.basename(relative), size: 15 },
+    plaintext: Buffer.from("remote original"), fileKey: key,
+  });
+  assert.equal((await store.put("alice", operation)).kind, "stored");
+  return operation;
+}
+
+test("issue 66 P2: a fresh local CREATE cannot duplicate an existing remote opaque path", async (t) => {
+  const { root, open, store, key, state } = await setup(t, {});
+  const remote = await seedRemote(store, key, "docs/collision.txt");
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "collision.txt"), "different local content");
+  const client = await open();
+  await assert.rejects(client.syncOnce(), { code: "remote_path_collision" });
+  assert.equal(state.pushes, 0, "no CREATE may be sent before remote-path preflight");
+  assert.equal(state.fullReads.length, 0, "preflight must not fetch the full ciphertext inventory");
+  assert.equal(store.list("alice").length, 1);
+  assert.equal(store.list("alice")[0].operationId, remote.operationId);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "collision.txt"), "utf8"), "different local content");
+  await assert.rejects(client.materializeRemote("docs/collision.txt"), { code: "local_changes_pending" });
+  const resumed = await open();
+  await assert.rejects(resumed.syncOnce(), { code: "remote_path_collision" });
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 1);
+});
+
+test("issue 66 P2: an offline CREATE stays queued; reconnect rechecks remote identity before push", async (t) => {
+  const { root, open, store, state, key } = await setup(t, {});
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "collision.txt"), "local offline version");
+  state.offline = true;
+  const offline = await open();
+  assert.equal((await offline.syncOnce()).offline, true);
+  assert.equal(state.pushes, 0);
+  assert.equal((await offline.journal.recover()).length, 1);
+  await seedRemote(store, key, "docs/collision.txt");
+  state.offline = false;
+  const restarted = await open();
+  await assert.rejects(restarted.syncOnce(), { code: "remote_path_collision" });
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 1);
+  assert.equal((await restarted.journal.recover()).length, 1);
+});
+
+test("issue 66 P2: stale or invalid paged inventory fails closed before CREATE, then retries", async (t) => {
+  const { root, open, adapter, store, key, state } = await setup(t, {});
+  await seedRemote(store, key, "docs/other.txt");
+  await seedRemote(store, key, "docs/collision.txt");
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "collision.txt"), "local same path");
+  const listInventory = adapter.listInventory;
+  adapter.listInventory = async (params) => {
+    const page = await listInventory({ ...params, limit: 1 });
+    if (params.cursor !== null) throw Object.assign(new Error("stale inventory cursor"), { status: 409 });
+    return page;
+  };
+  const client = await open();
+  await assert.rejects(client.syncOnce(), { code: "inventory_changed" });
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 2);
+  assert.equal((await client.journal.recover()).length, 1,
+    "stale inventory must not consume or mark the queued CREATE seen");
+  adapter.listInventory = listInventory;
+  await assert.rejects((await open()).syncOnce(), { code: "remote_path_collision" });
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 2);
+});
+
+test("issue 66 P2: unrelated local CREATE still publishes after a clean metadata preflight", async (t) => {
+  const { root, open, store, key, state } = await setup(t, {});
+  await seedRemote(store, key, "docs/existing.txt");
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "new.txt"), "brand new");
+  const client = await open();
+  const summary = await client.syncOnce();
+  assert.equal(summary.pushed, 1);
+  assert.equal(state.pushes, 1);
+  assert.equal(state.fullReads.length, 0);
+  assert.deepEqual(store.list("alice").map((r) => r.metadata.path).sort(),
+    ["docs/existing.txt", "docs/new.txt"]);
+});
 
 test("issue 66: lazy sync pages metadata and hydrates only the selected signed object", async (t) => {
   const { root, open, state, store } = await setup(t, {

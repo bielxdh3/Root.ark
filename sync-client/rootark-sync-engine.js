@@ -1568,6 +1568,29 @@ class SyncEngine {
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
+        if (this.filesOnDemand && operation.operation === "create") {
+          // A metadata-only pull cannot establish that a new local path is free remotely.
+          // Recheck EVERY pending CREATE immediately before push, including old outbox
+          // entries replayed after a crash/offline interval. Never treat the mutable
+          // local snapshot (or a previous successful inventory read) as a path lock.
+          let inventory;
+          try {
+            inventory = await this.scanOnDemandInventory(operation.metadata.path);
+          } catch (error) {
+            // A 409 on metadata paging signals a stale inventory cursor, NOT
+            // a rejected outgoing push. Never run remote-wins conflict recovery
+            // or mark a pending local CREATE seen because metadata changed.
+            if (error?.status === 409 || error?.code === "sync_conflict"
+              || error instanceof SyncConflictError) {
+              fail("Metadata inventory changed during CREATE preflight", "inventory_changed");
+            }
+            throw error;
+          }
+          if (inventory.matching) {
+            fail("A remote object already owns the Files On-Demand CREATE path",
+              "remote_path_collision");
+          }
+        }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
