@@ -134,6 +134,68 @@ async function run() {
     assert.equal(r2.diagnostics.verifiedTexts[0].text, 'Root.ark issue 242 fixture');
     assert.deepEqual(r1.diagnostics.rejected, []);
     assert.deepEqual(r2.diagnostics.rejected, []);
+    // Adversarial real DataChannel: 256 empty frames before valid final byte.
+    // The prior receiver kept every zero-length Uint8Array and still verified the file.
+    const oneByteDigest = await host.evaluate(`crypto.subtle.digest('SHA-256',Uint8Array.of(1)).then(
+      bytes => Array.from(new Uint8Array(bytes)).map(b=>b.toString(16).padStart(2,'0')).join(''))`);
+    await host.evaluate(`window.__poc.testChannel(0).send(JSON.stringify({
+      type:'offer-file',id:'zero-frame-attack',name:'zero.bin',size:1,digest:${JSON.stringify(oneByteDigest)}
+    }))`);
+    await until(() => guest1.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'attack offer missing');
+    await guest1.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    await host.evaluate(`(() => {
+      const dc = window.__poc.testChannel(0);
+      for (let i=0;i<256;i++) dc.send(new Uint8Array(0));
+      dc.send(Uint8Array.of(1));
+      dc.send(JSON.stringify({type:'end-file',id:'zero-frame-attack'}));
+    })()`);
+    await until(() => guest1.evaluate(`(() => {
+      const s=window.__poc.snapshot();
+      return s.diagnostics.rejected.includes('INVALID_CHUNK') || s.diagnostics.verifiedFiles.length>1;
+    })()`), 'empty frames were not processed', 6000);
+    const postEmpty = await guest1.evaluate('window.__poc.snapshot()');
+    assert.equal(postEmpty.diagnostics.verifiedFiles.length, 1, 'malformed transfer must not be verified');
+    assert.ok(postEmpty.diagnostics.rejected.includes('INVALID_CHUNK'), 'empty frames must be rejected');
+    assert.equal(postEmpty.peers[0].incomingChunks, 0, 'aborted file must release all retained chunks');
+    // Even non-empty tiny chunks cannot allocate unbounded objects for a 1MiB offer.
+    await host.evaluate(`window.__poc.testChannel(0).send(JSON.stringify({
+      type:'offer-file',id:'tiny-chunk-attack',name:'tiny.bin',size:512,digest:'0'.repeat(64)
+    }))`);
+    await until(() => guest1.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'tiny offer missing');
+    await guest1.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    const digestTinyDone = await host.evaluate(`crypto.subtle.digest('SHA-256',new TextEncoder().encode('tiny-flood-complete')).then(
+      bytes => Array.from(new Uint8Array(bytes)).map(b=>b.toString(16).padStart(2,'0')).join(''))`);
+    await host.evaluate(`(() => {
+      const dc = window.__poc.testChannel(0);
+      for (let i=0;i<129;i++) dc.send(Uint8Array.of(1));
+      dc.send(JSON.stringify({type:'text',text:'tiny-flood-complete',digest:${JSON.stringify(digestTinyDone)}}));
+    })()`);
+    await until(() => guest1.evaluate(`window.__poc.snapshot().diagnostics.verifiedTexts.some(
+      x=>x.text==='tiny-flood-complete')`), 'chunk count flood was not processed', 6000);
+    const postTiny = await guest1.evaluate('window.__poc.snapshot()');
+    assert.equal(postTiny.peers[0].incomingChunks, 0, 'chunk limit must abort and release buffer');
+    // Valid but frequent text notifications must not accumulate diagnostics/DOM forever.
+    const digestText = await host.evaluate(`crypto.subtle.digest('SHA-256',new TextEncoder().encode('flood')).then(
+      bytes => Array.from(new Uint8Array(bytes)).map(b=>b.toString(16).padStart(2,'0')).join(''))`);
+    const digestLast = await host.evaluate(`crypto.subtle.digest('SHA-256',new TextEncoder().encode('flood-last')).then(
+      bytes => Array.from(new Uint8Array(bytes)).map(b=>b.toString(16).padStart(2,'0')).join(''))`);
+    await host.evaluate(`(() => {
+      const dc = window.__poc.testChannel(0);
+      const payload = JSON.stringify({type:'text',text:'flood',digest:${JSON.stringify(digestText)}});
+      for (let i=0;i<256;i++) dc.send(payload);
+      dc.send(JSON.stringify({type:'text',text:'flood-last',digest:${JSON.stringify(digestLast)}}));
+    })()`);
+    await until(() => guest1.evaluate(`window.__poc.snapshot().diagnostics.verifiedTexts.some(x=>x.text==='flood-last')`), 'text flood processing incomplete', 6000);
+    const afterFlood = await guest1.evaluate(`({
+      lengths:Object.fromEntries(Object.entries(window.__poc.snapshot().diagnostics).map(([k,v])=>[k,v.length])),
+      lines:document.getElementById('events').textContent.split('\\n').filter(Boolean).length,
+      characters:document.getElementById('events').textContent.length
+    })`);
+    assert.ok(Object.values(afterFlood.lengths).every(n=>n<=100), 'diagnostic arrays must remain bounded');
+    assert.ok(afterFlood.lines<=100 && afterFlood.characters<=16000, 'visible log must remain bounded');
+    console.log('PASS Edge P2 flood: 256 zero-byte frames rejected and transfer aborted, 129 tiny chunks aborted, 257 verified text events bounded');
+    console.log('Flood evidence:', JSON.stringify({ maxDiagnosticEntries: Math.max(...Object.values(afterFlood.lengths)),
+      logLines: afterFlood.lines, logCharacters: afterFlood.characters, incomingChunksAfterAbort: postTiny.peers[0].incomingChunks }));
     console.log('PASS Edge actual WebRTC DataChannel: 1:1 and 1:2, per-guest consent, text SHA-256 and 32KiB fixture SHA-256');
     console.log('Evidence:', JSON.stringify({ browser: 'Microsoft Edge headless', guests: 2,
       channelOpen: 2, verifiedTexts: 2, verifiedFiles: 2, fileBytesPerGuest: 32768,
