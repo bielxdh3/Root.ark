@@ -197,7 +197,8 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
-const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE || "memory";
+const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
+  ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
 if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
   throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
 }
