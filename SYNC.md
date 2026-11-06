@@ -72,7 +72,8 @@ Um erro em qualquer objeto rejeita o plano inteiro, sem resposta parcial `ready`
 
 O resultado JSON inclui `readOnly:true`, `ready:true`, `atomic:false`,
 `objectCount`, `localOverwriteCount` e `entries` com os IDs, revisoes, caminhos,
-quantidade de versoes verificadas e `localAction` de cada arquivo. O valor
+quantidade de versoes verificadas, digests SHA-256 dos envelopes assinados e
+`localAction` de cada arquivo. O valor
 `replace-clean-tracked` significa que uma restauracao posterior **substituiria
 bytes locais atualmente limpos**; `create-from-deleted` exige destino ausente.
 Nenhum plaintext, chave ou ciphertext e impresso, e nenhuma operacao e assinada,
@@ -94,6 +95,54 @@ objeto pode deixar restauracoes anteriores concluidas e as posteriores intactas.
 O fluxo `resume` de outro dispositivo confiavel continua separado, com prova
 de senha/2FA e persistencia pelo servidor. Nenhum desses previews certifica a
 custodia independente de producao ou o encerramento da issue #67.
+
+### Execucao controlada e retomada parcial de restores historicos (#67)
+
+Uma integracao **ja autenticada e provisionada com custodia externa** pode
+obter `const plan = await engine.previewHistoricalRestorePlan(requests)` e,
+somente apos confirmacao explicita do usuario, chamar
+`await engine.restoreHistoricalPlan(plan, {confirm: true})`. A chamada exige
+1–32 objetos distintos, compara o plano original com um **preflight integral
+novo** antes de qualquer mutacao e revalida a entrada imediatamente antes de
+cada `restoreHistoricalVersion`. Usa a assinatura Ed25519, o CAS remoto e as
+provas historicas do cliente existente. Um plano alterado ou desatualizado e
+recusado antes do primeiro arquivo. A autorizacao atual e exigida em cada
+operacao; o plano persistido nunca serve como concessao de acesso.
+Se alguma entrada tiver `localAction: "replace-clean-tracked"`, a execucao
+exige confirmacao adicional explicita `confirmCleanOverwrite: true`; o resultado
+inclui `localOverwriteCount` e a acao proposta por objeto.
+
+O progresso e mantido em arquivo local reservado
+`.rootark-recovery-execution-<digest>.json`, persistido com fsync. Ele registra
+somente IDs, digests de envelopes assinados e estados por objeto (`pending`,
+`blocked`, `committed`, `indeterminate`); nao contem conteudo ou chaves. O
+retorno oferece `atomic:false`, `completed`, `remaining`, `partial`, `planDigest`
+e `items` com resultados individuais. Os commits ja concluidos nao sao
+reemitidos. Para continuar um plano parcialmente bloqueado depois de resolver
+o problema, um cliente confiavel deve passar o **mesmo** plano:
+
+```js
+await engine.restoreHistoricalPlan(plan, {confirm: true, resume: true});
+```
+
+Antes de retomar, o cliente confirma cada sucesso por envelope assinado no
+HEAD, registro duravel local do outbox, verificacao externa de admissao,
+identidade da revisao-base, conteudo original autenticado, AEAD e bytes locais.
+Os objetos ainda pendentes passam novamente pela verificacao completa. Se o
+processo caiu apos gravar a intencao assinada, houve falha de fsync, perda de
+ACK ou um envio ficou pendente, esse item permanece `indeterminate`. Na
+retomada, somente uma confirmacao independente do **mesmo HEAD assinado ja
+admitido**, com fonte historica, bytes locais e snapshot duravel identicos,
+permite recuperar o sucesso sem um segundo PUT. Na ausencia dessa prova,
+a retomada **recusa novas assinaturas** ate reconciliacao explicita externa.
+Isso preserva o outbox assinado e evita uma segunda restauracao
+sob um estado remoto desconhecido. Uma falha em um objeto pode deixar os
+anteriores concluidos: **nao existe transacao multiobjeto nem rollback global**.
+
+Nao ha CLI standalone de execucao: ela nao dispoe da autoridade de custodia
+independente exigida. O comando `resume --device-id` para liberar um dispositivo
+pausado e uma operacao separada, que verifica senha/2FA no servidor. Estes
+controles sao de engenharia local; nao comprovam custodia R1 de producao.
 
 ### Revisao de falso positivo e retomada de dispositivo pausado (#67)
 
