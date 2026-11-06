@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -55,9 +56,10 @@ async function fixture(t) {
       throw Object.assign(new Error("outgoing push forbidden in pin fixture"), { code: "push_unexpected" });
     },
   };
-  const open = (excludedPaths = [], requireAuthorization = true) => new SyncEngine({
+  const open = (excludedPaths = [], requireAuthorization = true, filesOnDemand = true,
+    selectedPaths = ["docs"]) => new SyncEngine({
     rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
-    compartmentId: "private", selectedPaths: ["docs"], excludedPaths, filesOnDemand: true,
+    compartmentId: "private", selectedPaths, excludedPaths, filesOnDemand,
     fileKeyResolver: () => key, requireAuthorization,
     verifyIncoming: requireAuthorization
       ? async (operation) => verifyAuthorizationProof(operation.authorization, operation, trusted) : null,
@@ -155,6 +157,108 @@ test("issue 66: direct non-strict engine cannot pin without independently truste
   assert.equal(state.fullReads.length, 0);
   assert.equal(state.inventoryReads, 0);
   assert.equal((await nonStrict.pinStatus("docs/a.txt")).pinned, false);
+});
+
+test("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second device pin or poison restart", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX case-distinct filesystem regression; Windows coverage in shared tests");
+  const { rootDir, open, state, remote } = await fixture(t);
+  await remote("create", "object-b", "Docs/A.txt", "independent signed legacy bytes");
+  const client = await open([], true, true, ["docs", "Docs"]);
+  // Legacy distinct signed objects exist despite the current protected
+  // CREATE server guard: neither one's local bytes may be discarded.
+  assert.equal(await client.materializeRemote("Docs/A.txt"), true);
+  assert.equal((await client.pinLocal("docs/a.txt")).objectId, "object-a");
+  const before = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"), "utf8");
+  assert.equal((await client.pinStatus("Docs/A.txt")).pinned, false,
+    "POSIX status must not alias a case-distinct pinned path");
+  assert.equal((await client.unpinLocal("Docs/A.txt")).applied, false,
+    "POSIX unpin must not affect a different case-distinct pin");
+  await assert.rejects(client.pinLocal("Docs/A.txt"), { code: "pinned_path_alias" },
+    "a second portable-case alias must be rejected before snapshot persistence");
+  assert.equal(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"), "utf8"), before,
+    "denied second pin must not alter the durable first pin");
+  const resumed = await open([], true, true, ["docs", "Docs"]);
+  assert.equal((await resumed.pinStatus("docs/a.txt")).pinned, true);
+  assert.equal((await resumed.pinStatus("Docs/A.txt")).pinned, false);
+  assert.deepEqual((await resumed.pinStatus()).files.map((item) => item.path), ["docs/a.txt"]);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(await fsp.readFile(path.join(rootDir, "Docs/A.txt"), "utf8"), "independent signed legacy bytes");
+  assert.equal(state.pushes, 0);
+});
+
+// Force the exact post-rename directory durability barrier to fail, not an
+// early JSON write: at this point the new snapshot is already visible on disk.
+function interceptSnapshotDirectoryFsync(t, directory, failures) {
+  const realOpen = fsp.open;
+  let injected = 0;
+  fsp.open = async (...args) => {
+    const handle = await realOpen(...args);
+    if (String(args[0]) !== directory || args[1] !== fs.constants.O_RDONLY
+      || injected >= failures) return handle;
+    injected++;
+    return {
+      close: () => handle.close(),
+      sync: async () => { throw Object.assign(new Error("injected EIO after durable rename"), { code: "EIO" }); },
+    };
+  };
+  t.after(() => { fsp.open = realOpen; });
+  return { restore: () => { fsp.open = realOpen; }, count: () => injected };
+}
+
+test("issue 66 P2 POSIX: post-rename unpin fsync EIO compensates durable pin before allowing restart", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  const injector = interceptSnapshotDirectoryFsync(t, rootDir, 1);
+  try {
+    await assert.rejects(client.unpinLocal("docs/a.txt"), { code: "EIO" });
+    assert.equal(injector.count(), 1, "failure must hit AFTER rename, before directory fsync");
+  } finally { injector.restore(); }
+  const resumed = await open();
+  assert.equal((await resumed.pinStatus("docs/a.txt")).pinned, true,
+    "a failed unpin cannot silently become effective on restart");
+  await assert.rejects(resumed.evictLocal("docs/a.txt"), { code: "file_pinned" });
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 POSIX: indeterminate unpin plus failed compensation quarantines root on restart", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  const injector = interceptSnapshotDirectoryFsync(t, rootDir, 2);
+  try {
+    await assert.rejects(client.unpinLocal("docs/a.txt"), { code: "pinned_policy_indeterminate" });
+    assert.equal(injector.count(), 2, "both the unpin and its compensation were non-durable");
+  } finally { injector.restore(); }
+  await assert.rejects(open(), { code: "sync_root_busy" },
+    "a failed rollback must retain the root process-lock marker for explicit recovery");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: signed other-object MOVE/CREATE/UPDATE cannot overwrite a pinned destination", async (t) => {
+  const { rootDir, open, remote, state } = await fixture(t);
+  const pinned = await open();
+  await pinned.pinLocal("docs/a.txt");
+  const source = await remote("create", "object-b", "docs/b.txt", "other signed original bytes");
+  await pinned.apply(source);
+  const moved = await remote("move", "object-b", "docs/a.txt", "other signed original bytes", 2, "docs/b.txt");
+  // Retention must be enforced even by direct apply() in a client reopened
+  // with Files-On-Demand disabled (not just hydrate/evict CLI operations).
+  const nonFod = await open([], true, false);
+  await assert.rejects(nonFod.apply(moved), { code: "file_pinned" });
+  await assert.rejects(nonFod.apply(await remote("update", "object-b", "docs/a.txt",
+    "other signed edit", 3)), { code: "file_pinned" });
+  await assert.rejects(nonFod.apply(await remote("create", "object-c", "docs/a.txt",
+    "other signed create")), { code: "file_pinned" });
+  const restarted = await open();
+  assert.equal((await restarted.pinStatus("docs/a.txt")).pinned, true);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/b.txt"), "utf8"), "other signed original bytes");
+  assert.equal(state.pushes, 0);
 });
 
 test("issue 66: failed local pin journal commit never claims pin; a verified MOVE retains pinned identity", async (t) => {
