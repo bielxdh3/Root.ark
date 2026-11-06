@@ -361,6 +361,8 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 
 **Current non-production progress:** [exact-PR wave execution matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md), with implemented draft slices, independent reviews and unverified acceptance explicitly separated. None of these drafts are merged into `Root/main` by this roadmap entry.
 
+**New functional drafts (2026-11-06):** historical signed restore [#262](https://github.com/bielxdh3/Root.ark/pull/262), Files On-Demand lazy materialization and atomic same-path CREATE fencing [#263](https://github.com/bielxdh3/Root.ark/pull/263), protected local encrypted search [#264](https://github.com/bielxdh3/Root.ark/pull/264), scoped share capabilities [#265](https://github.com/bielxdh3/Root.ark/pull/265), owner-bound experimental P2P [#266](https://github.com/bielxdh3/Root.ark/pull/266), and Android protected cryptographic core [#267](https://github.com/bielxdh3/Root.ark/pull/267) are under review as **draft** work. They are not deployed, merged, fully interoperable, externally certified or globally enabled. See the [mission ledger](docs/rootark-main-execution-mission.md) for exact HEADs and remaining acceptance.
+
 - [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
 - [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
