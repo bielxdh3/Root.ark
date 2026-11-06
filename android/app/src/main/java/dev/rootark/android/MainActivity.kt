@@ -16,7 +16,7 @@ import dev.rootark.core.sync.ReadOnlyFileListPolicy
 import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.RootArkApiException
 
-/** Online auth and read-only metadata listing; protected files and device keys remain gated. */
+/** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
 class MainActivity : Activity() {
     private val transport = AuthHttpTransport()
     private var serverField: EditText? = null
@@ -27,6 +27,8 @@ class MainActivity : Activity() {
     private var challengeId: String? = null
     private var sessionToken: String? = null
     private var sessionUsername: String? = null
+    private var authenticatedSession: LoginOutcome.Authenticated? = null
+    private var securePreviewText: TextView? = null
     private var sessionCanListFiles = false
     private var generation = 0
 
@@ -44,8 +46,11 @@ class MainActivity : Activity() {
     }
 
     private fun clearSensitiveState() {
+        securePreviewText?.text = ""
+        securePreviewText = null
         sessionToken = null
         sessionUsername = null
+        authenticatedSession = null
         sessionCanListFiles = false
         challengeId = null
         activeOrigin = null
@@ -57,7 +62,7 @@ class MainActivity : Activity() {
 
     private fun showLogin(message: String? = null, savedServer: String = "", savedUser: String = "") {
         clearSensitiveState()
-        val layout = screen("Root.ark", "Acesso online. Arquivos protegidos ainda não estão disponíveis no Android.")
+        val layout = screen("Root.ark", "Acesso online. A visualização protegida exige confiança independente do dispositivo.")
         serverField = field(layout, "Servidor HTTPS", savedServer, false)
         usernameField = field(layout, "Usuário", savedUser, false)
         passwordField = field(layout, "Senha", "", true)
@@ -122,6 +127,7 @@ class MainActivity : Activity() {
     private fun showAuthenticated(result: LoginOutcome.Authenticated, origin: ServerOrigin) {
         clearSensitiveState()
         sessionToken = result.token
+        authenticatedSession = result
         activeOrigin = origin
         sessionUsername = result.username
         sessionCanListFiles = ReadOnlyFileListPolicy.canList(result.permissions)
@@ -131,7 +137,7 @@ class MainActivity : Activity() {
     private fun showSession(message: String? = null) {
         val username = sessionUsername ?: return showLogin()
         val layout = screen("Acesso confirmado", "Sessão de $username autenticada em memória.")
-        text(layout, "Somente metadados de sincronização. O conteúdo criptografado permanece inacessível.")
+        text(layout, "Listagem de metadados. Conteúdo protegido só é aberto após verificação local e autorização independente.")
         if (message != null) text(layout, message)
         if (sessionCanListFiles) {
             button(layout, "Listar arquivos (somente leitura)") { loadFileList() }
@@ -167,10 +173,53 @@ class MainActivity : Activity() {
                 row.contentType?.let { "Tipo: $it" },
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
+            if (!row.deleted) button(layout, "Conteúdo protegido") { showProtectedObject(row.objectId) }
         }
         button(layout, "Atualizar lista") { loadFileList() }
         button(layout, "Voltar") { showSession() }
         button(layout, "Encerrar acesso local") { showLogin() }
+    }
+
+    /**
+     * Explicit integration gate for a future independently approved Android
+     * enrollment/recovery authority. The server login and wire JSON cannot
+     * manufacture CEKs, device pins, revocation state or epoch authority.
+     * The current product deliberately has no such provider.
+     */
+    private fun independentlyProvisionedGrantProvider(): TrustedContentGrantProvider? = null
+
+    private fun showProtectedObject(objectId: String) {
+        val origin = activeOrigin ?: return showLogin()
+        val session = authenticatedSession ?: return showLogin()
+        if (!sessionCanListFiles) return showSession("Sem permissão para ler arquivos.")
+        val preview = VerifiedTextPreview(independentlyProvisionedGrantProvider())
+        val layout = screen("Conteúdo protegido", "Apenas texto UTF-8 verificado localmente pode ser exibido.")
+        if (!preview.available) {
+            text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
+        } else {
+            button(layout, "Abrir texto verificado") {
+                runRequest({ preview.open(origin, session, objectId) }) { characters, failure ->
+                    if (characters != null) {
+                        try {
+                            val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")
+                            securePreviewText = text(view, String(characters)).apply {
+                                isSaveEnabled = false
+                                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                                setTextIsSelectable(false)
+                            }
+                            button(view, "Fechar conteúdo") { showSession() }
+                        } finally {
+                            characters.fill('\u0000')
+                        }
+                    } else when ((failure as? RootArkApiException)?.statusCode) {
+                        401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
+                        403 -> showSession("Servidor negou acesso ao arquivo (403).")
+                        else -> showSession("Conteúdo indisponível. Autorização ou verificação criptográfica não confirmada.")
+                    }
+                }
+            }
+        }
+        button(layout, "Voltar") { showSession() }
     }
 
     private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) {
@@ -186,6 +235,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (generation == started && !isFinishing && !isDestroyed) done(response, failure)
+                else if (response is CharArray) response.fill('\u0000')
             }
         }.start()
     }
@@ -198,6 +248,8 @@ class MainActivity : Activity() {
     }
 
     private fun screen(title: String, description: String): LinearLayout {
+        securePreviewText?.text = ""
+        securePreviewText = null
         val scroll = ScrollView(this)
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

@@ -344,6 +344,7 @@ class ProtectedSyncFetchTest {
         )
         val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
         val gateway = ProtectedSyncFetch { fake }
+        val previewKey = cek.copyOf()
         var observed: ByteArray? = null
         var observedReference: ByteArray? = null
         gateway.withVerifiedContent(
@@ -357,5 +358,39 @@ class ProtectedSyncFetchTest {
         assertTrue(observedReference!!.all { it == 0.toByte() })
         assertTrue(cek.all { it == 0.toByte() })
         assertTrue(fake.disconnected)
+
+        // The same real Ed25519/AES-GCM signed HTTP fixture reaches the user
+        // interaction only through an independently supplied context and CEK.
+        val viewer = VerifiedTextPreview(
+            TrustedContentGrantProvider { username, id ->
+                assertEquals("alice", username)
+                assertEquals("fixture-object-1", id)
+                ProtectedContentGrant(context, previewKey)
+            },
+            ProtectedSyncFetch {
+                SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
+            },
+        )
+        assertTrue(viewer.available)
+        val text = viewer.open(origin, session, "fixture-object-1")
+        try {
+            assertEquals("hello", String(text))
+        } finally {
+            text.fill('\u0000')
+        }
+        assertTrue(previewKey.all { it == 0.toByte() })
+
+        val invalid = JSONObject(record.toString()).put("ciphertext", "AAAA")
+        val corruptedKey = ByteArray(32) { 11 }
+        val corruptedViewer = VerifiedTextPreview(
+            TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, corruptedKey) },
+            ProtectedSyncFetch {
+                SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = invalid.toString().toByteArray())
+            },
+        )
+        assertThrows(ProtectedSyncException::class.java) {
+            corruptedViewer.open(origin, session, "fixture-object-1")
+        }
+        assertTrue(corruptedKey.all { it == 0.toByte() })
     }
 }
