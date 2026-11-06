@@ -20,7 +20,8 @@ const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
-const { openProtectedRecipientShareFile } = (() => {
+const { openProtectedRecipientShareFile, createProtectedRecipientShareOffer,
+  openPortableProtectedRecipientShareFile } = (() => {
   try { return require("../src/crypto/rootark-zk1-recipient-share-cek"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
@@ -778,6 +779,94 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       authority: { ...linked, nowSeconds: now + 9 },
       operatorMinimumSequence: signedCommittedHead.sequence,
       metadata, deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 };
+    assert.equal(typeof createProtectedRecipientShareOffer, "function",
+      "owner must be able to prepare one transferable, recipient-pinned signed offer");
+    assert.equal(typeof openPortableProtectedRecipientShareFile, "function",
+      "recipient must be able to import the portable offer without owner CEK material");
+    const recipientPin = { recipientUsername: "recipient", deviceId: fresh.request.device_id,
+      authorizationPublicKey: fresh.request.authorization_public_key,
+      hpkePublicKey: fresh.request.hpke_public_key };
+    const ownerOfferArgs = { grant, recipientPin, readIndependentAuthority,
+      ownerPrivateKey: owner.privateKey, ownerHeldCek: Buffer.from(ownerHeldCek),
+      metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
+      ciphertextRoot: Buffer.from(root), authority: publicAuthority,
+      nowSeconds: now + 9 };
+    const offer = await createProtectedRecipientShareOffer(ownerOfferArgs);
+    assert.equal(offer.schema, "rootark-zk1-recipient-share-offer-dev/v1");
+    assert.equal(offer.authorizesProductionIo, false);
+    assert.equal(offer.externalCustodyProven, false);
+    assert.equal(JSON.stringify(offer).includes(b64(ownerHeldCek)), false,
+      "portable handoff must not contain an unwrapped owner CEK");
+    const openedOffer = await openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)), redeemInput: recipientShareInput,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 });
+    assert.deepEqual(Buffer.from(openedOffer.data), bytes,
+      "a separately authenticated recipient account/device opens the real AEAD bytes");
+    openedOffer.data.fill(0);
+    for (const [label, changes] of [
+      ["wrong cross-account user", { recipientPin: { ...recipientPin,
+        recipientUsername: "attacker" } }],
+      ["different recipient Ed25519", { recipientPin: { ...recipientPin,
+        authorizationPublicKey: b64(crypto.randomBytes(32)) } }],
+      ["different recipient X25519", { recipientPin: { ...recipientPin,
+        hpkePublicKey: b64(crypto.randomBytes(32)) } }],
+      ["different recipient device", { recipientPin: { ...recipientPin,
+        deviceId: "other-device" } }],
+      ["forged owner share proof", { grant: { ...grant,
+        shareSignatureBase64: b64(crypto.randomBytes(64)) } }],
+      ["expired grant", { grant: { ...grant, expiresAt: now + 7 } }],
+      ["wrong object ciphertext", { ciphertext: crypto.randomBytes(sealed.length) }],
+      ["wrong owner epoch", { metadata: { ...metadata, epoch: metadata.epoch + 1 } }],
+      ["missing external authority", { readIndependentAuthority: null }],
+      ["owner revoked", { readIndependentAuthority: async () => ({
+        ...await readIndependentAuthority(), devices: (await readIndependentAuthority()).devices
+          .map((row) => row.deviceId === originalDevice.device_id
+            ? { ...row, revokedAtEpoch: metadata.epoch } : row) }) }],
+    ]) {
+      await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+        ...changes }), /ZK_SHARE_OFFER_DENIED/, label);
+    }
+    let offerReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++offerReads === 2) current.devices.find((row) =>
+          row.deviceId === fresh.request.device_id).revokedAtEpoch = metadata.epoch;
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "revocation after real AEAD + HPKE sealing must stop owner offer release");
+    assert.equal(offerReads, 2);
+    const maliciousOffer = { ...ownerOfferArgs };
+    let getterRuns = 0;
+    Object.defineProperty(maliciousOffer, "recipientPin", { enumerable: true,
+      get() { getterRuns++; throw Error("GETTER_CALLED"); } });
+    await assert.rejects(createProtectedRecipientShareOffer(maliciousOffer),
+      /ZK_SHARE_OFFER_DENIED/);
+    assert.equal(getterRuns, 0, "owner input getters must not run");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: { ...offer, grant: { ...offer.grant, grantId: b64(crypto.randomBytes(32)) } },
+      redeemInput: recipientShareInput, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "tampered portable grant must fail before ciphertext release");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer, redeemInput: { ...recipientShareInput, recipientUsername: "attacker" },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "recipient login cannot be relabelled while importing");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer, redeemInput: { ...recipientShareInput,
+        fetchImpl: async () => new Response(JSON.stringify({ error: "ZK_SHARE_DENIED" }),
+          { status: 403, headers: { "content-type": "application/json" } }) },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "revoked server grant cannot be bypassed by an otherwise valid portable CEK offer");
     const shared = await openProtectedRecipientShareFile(bridgeArgs);
     assert.deepEqual(Buffer.from(shared.data), bytes);
     assert.equal(shared.authorizesProductionIo, false);
