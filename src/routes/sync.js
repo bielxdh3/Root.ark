@@ -25,6 +25,9 @@ const MAX_HISTORY_PER_OBJECT = 32;
 const MAX_SEEN_OPERATIONS = 10000;
 const MAX_REQUEST_BYTES = 9 * 1024 * 1024;
 const MAX_CIPHERTEXT_BYTES = 8 * 1024 * 1024;
+const INVENTORY_MAX_PAGE_ITEMS = 64;
+const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
+const INVENTORY_MAX_CURSOR_CHARS = 1024;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
 const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 const SYNC_LOCK_WAIT_MS = 2000;
@@ -177,6 +180,54 @@ function publicRecord(record) {
     aad: record.aad ?? null,
     ...(record.authorization ? { authorization: record.authorization } : {}),
   };
+}
+
+// Inventory is advisory metadata. It must never be passed to a signed
+// operation admission path: callers fetch the full envelope by objectId
+// before verifying, decrypting, materializing, or changing local state.
+function inventoryRecord(record) {
+  return {
+    protocolVersion: record.protocolVersion,
+    operationId: record.operationId,
+    objectId: record.objectId,
+    fileId: record.fileId,
+    versionId: record.versionId,
+    operation: record.operation,
+    revision: record.revision,
+    baseRevision: record.baseRevision,
+    keyEpoch: record.keyEpoch,
+    compartmentId: record.compartmentId,
+    deviceId: record.deviceId,
+    metadata: record.metadata,
+    tombstone: Boolean(record.tombstone),
+  };
+}
+
+function inventoryInputError() {
+  return Object.assign(new Error("Invalid inventory cursor or limit"), { code: "SYNC_INVENTORY_INPUT" });
+}
+
+function parseInventoryCursor(value) {
+  if (typeof value !== "string" || !value || value.length > INVENTORY_MAX_CURSOR_CHARS
+    || !/^[A-Za-z0-9_-]+$/.test(value)) throw inventoryInputError();
+  let cursor;
+  try {
+    const binary = Buffer.from(value, "base64url");
+    if (binary.toString("base64url") !== value) throw inventoryInputError();
+    cursor = JSON.parse(binary.toString("utf8"));
+  } catch { throw inventoryInputError(); }
+  if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)
+    || Object.keys(cursor).sort().join(",") !== "after,snapshot,version"
+    || cursor.version !== 1 || typeof cursor.after !== "string"
+    || !cursor.after || cursor.after.length > 160
+    || typeof cursor.snapshot !== "string" || !/^[a-f0-9]{64}$/.test(cursor.snapshot)) {
+    throw inventoryInputError();
+  }
+  return cursor;
+}
+
+function inventoryCursor(snapshot, after) {
+  return Buffer.from(JSON.stringify({ version: 1, snapshot, after }), "utf8").toString("base64url");
 }
 
 const DEFAULT_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -851,6 +902,53 @@ class SyncObjectStore {
     return Object.values(objects).map(publicRecord);
   }
 
+  listInventory(username, { limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > INVENTORY_MAX_PAGE_ITEMS) throw inventoryInputError();
+    const snapshot = this.readSnapshot();
+    const user = ownRecord(snapshot.users, username) || { objects: {} };
+    const objects = ownRecord(user, "objects") || {};
+    const ids = Object.keys(objects).sort();
+    // An object version/change invalidates existing cursors so paging cannot
+    // silently omit newly inserted or modified entries between requests.
+    // Bind the snapshot marker to the authenticated tenant.
+    const hash = crypto.createHash("sha256").update(JSON.stringify(username), "utf8");
+    for (const objectId of ids) {
+      const record = ownRecord(objects, objectId);
+      hash.update(JSON.stringify([objectId, record.operationId, record.versionId,
+        record.revision, record.metadata]), "utf8");
+    }
+    const fingerprint = hash.digest("hex");
+    let start = 0;
+    if (cursor !== null) {
+      const parsed = parseInventoryCursor(cursor);
+      if (parsed.snapshot !== fingerprint) {
+        throw Object.assign(new Error("Sync inventory changed"), { code: "SYNC_INVENTORY_CHANGED" });
+      }
+      const index = ids.indexOf(parsed.after);
+      if (index < 0) throw inventoryInputError();
+      start = index + 1;
+    }
+    const entries = [];
+    // Reserve space for response metadata and the next cursor as well as the
+    // records. This caps HTTP response size independently of library size.
+    let bytes = 1024;
+    while (entries.length < limit && start + entries.length < ids.length) {
+      const record = inventoryRecord(ownRecord(objects, ids[start + entries.length]));
+      const entryBytes = Buffer.byteLength(JSON.stringify(record), "utf8") + 1;
+      if (bytes + entryBytes > INVENTORY_MAX_RESPONSE_BYTES) break;
+      entries.push(record);
+      bytes += entryBytes;
+    }
+    if (!entries.length && start < ids.length) {
+      throw Object.assign(new Error("Sync inventory entry exceeds page limit"), { code: "SYNC_INVENTORY_OVERSIZED" });
+    }
+    const nextIndex = start + entries.length;
+    return {
+      protocolVersion: PROTOCOL_VERSION, view: "metadata", objects: entries,
+      nextCursor: nextIndex < ids.length ? inventoryCursor(fingerprint, ids[nextIndex - 1]) : null,
+    };
+  }
+
   history(username, objectId) {
     const user = ownRecord(this.readSnapshot().users, username) || { versions: {} };
     const versions = ownRecord(user, "versions") || {};
@@ -1101,10 +1199,28 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     try {
       lease?.assertActive();
+      if (req.query.view !== undefined || req.query.limit !== undefined || req.query.cursor !== undefined) {
+        if (req.query.view !== "metadata" || req.query.objectId !== undefined
+          || Object.keys(req.query).some((key) => !["view", "limit", "cursor"].includes(key))
+          || (req.query.limit !== undefined && (typeof req.query.limit !== "string"
+            || !/^[1-9][0-9]*$/.test(req.query.limit)))) {
+          return errorResponse(res, 400, "Invalid sync inventory request");
+        }
+        const limit = req.query.limit === undefined ? INVENTORY_MAX_PAGE_ITEMS : Number(req.query.limit);
+        const inventory = store.listInventory(req.user.username, {
+          limit, cursor: req.query.cursor === undefined ? null : req.query.cursor,
+        });
+        lease?.assertActive();
+        return res.json(inventory);
+      }
       const objects = store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null);
       lease?.assertActive();
       res.json({ protocolVersion: PROTOCOL_VERSION, objects });
-    } catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
+    } catch (error) {
+      if (error?.code === "SYNC_INVENTORY_INPUT") return errorResponse(res, 400, "Invalid sync inventory request");
+      if (error?.code === "SYNC_INVENTORY_CHANGED") return errorResponse(res, 409, "Sync inventory changed; restart pagination");
+      return errorResponse(res, 503, "Sync inventory unavailable");
+    }
   }));
   app.get("/sync/v1/objects/:objectId", authenticate, requirePermission("listFiles"), fenceLegacySync("read", async (req, res, lease) => {
     await ready;

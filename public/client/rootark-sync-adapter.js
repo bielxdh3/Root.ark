@@ -17,7 +17,9 @@
   }
 
   const PROTOCOL_VERSION = 2;
+  const INVENTORY_MAX_PAGE_ITEMS = 64;
   const OPERATION_FIELDS = ["protocolVersion", "operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "deviceId", "metadata", "tombstone", "ciphertext", "nonce", "tag", "aad", "authorization"];
+  const INVENTORY_FIELDS = OPERATION_FIELDS.filter((field) => !["ciphertext", "nonce", "tag", "aad", "authorization"].includes(field));
   const OPTIONAL_FIELDS = new Set(["authorization"]);
   const AUTHORIZATION_FIELDS = ["schemaVersion", "type", "suite", "protocolVersion", "username", "deviceId", "operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest", "expiresAt", "replayId", "idempotencyKey", "publicKey", "signature"];
   const METADATA = {
@@ -131,6 +133,26 @@
     return { ...operation, ciphertext: input.ciphertext, nonce: input.nonce, tag: input.tag, aad: input.aad };
   }
 
+  function assertInventoryEntry(input) {
+    // Metadata-only listings are advisory. They do not establish signed
+    // admission, and must never substitute for a full verified envelope.
+    exact(input, INVENTORY_FIELDS, "inventory entry");
+    if (input.protocolVersion !== PROTOCOL_VERSION || !["create", "update", "move", "delete"].includes(input.operation)) {
+      fail("Invalid inventory operation");
+    }
+    if (typeof input.tombstone !== "boolean" || input.tombstone !== (input.operation === "delete")) fail("Invalid inventory tombstone");
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      operationId: id(input.operationId), objectId: id(input.objectId),
+      fileId: id(input.fileId), versionId: id(input.versionId),
+      operation: input.operation, revision: revision(input.revision),
+      baseRevision: revision(input.baseRevision, true),
+      keyEpoch: id(input.keyEpoch), compartmentId: id(input.compartmentId),
+      deviceId: id(input.deviceId), metadata: metadata(input.metadata, input.operation),
+      tombstone: input.tombstone,
+    };
+  }
+
   function createOpaqueSyncAdapter({ fetchImpl = fetch, baseUrl = "" } = {}) {
     const request = async (url, options = {}) => {
       // A 307/308 replays the complete signed encrypted operation to the
@@ -145,6 +167,20 @@
       return payload;
     };
     return {
+      listInventory: async ({ limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) => {
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > INVENTORY_MAX_PAGE_ITEMS) fail("Invalid inventory page limit");
+        if (cursor !== null && (typeof cursor !== "string" || !cursor || cursor.length > 1024
+          || !/^[A-Za-z0-9_-]+$/.test(cursor))) fail("Invalid inventory cursor");
+        const query = `?view=metadata&limit=${limit}${cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`}`;
+        const payload = await request(`/sync/v1/objects${query}`);
+        if (!payload || payload.protocolVersion !== PROTOCOL_VERSION || payload.view !== "metadata"
+          || !Array.isArray(payload.objects) || payload.objects.length > limit
+          || (payload.nextCursor !== null && (typeof payload.nextCursor !== "string"
+            || !payload.nextCursor || payload.nextCursor.length > 1024
+            || !/^[A-Za-z0-9_-]+$/.test(payload.nextCursor)))) fail("Invalid inventory response");
+        return { protocolVersion: PROTOCOL_VERSION, view: "metadata",
+          objects: payload.objects.map(assertInventoryEntry), nextCursor: payload.nextCursor };
+      },
       list: async (objectId = "") => {
         const payload = await request(`/sync/v1/objects${objectId ? `/${encodeURIComponent(objectId)}` : ""}`);
         // LIST is an untrusted historical read, not ingress authorization.

@@ -24,6 +24,32 @@ renomeie os arquivos para evitar sobrescrita sem sinalizacao.
 
 Para o **Sync v2**, use `npm run sync:start -- --config <config-v2-privado> --once` depois do provisionamento independente da identidade e politica dos dispositivos e das chaves mantidas apenas em memoria. O v2 recusa uma configuracao sem `trustedDevicePublicKeys` e `revokedDeviceIds`; nao reutilize a configuracao do uploader legado. O arquivo v2 deve estar em pasta privada e protegido contra substituicao local.
 
+### Inventario remoto paginado (issue #66, parcial)
+
+Clientes v2 autenticados com permissao `listFiles` podem consultar
+`GET /sync/v1/objects?view=metadata&limit=64` e seguir `nextCursor`
+usando `&cursor=<cursor>`. As paginas tem no maximo 64 registros e 128 KiB
+de resposta JSON. Cada registro inclui identificadores, revisao, operacao,
+metadados e estado de exclusao, mas omite ciphertext, nonce, tag e AAD.
+`GET /sync/v1/objects` e `GET /sync/v1/objects/:objectId` continuam
+retornando os envelopes completos para clientes existentes.
+
+O cliente pode usar `adapter.listInventory({ limit, cursor })` ou
+`engine.browseRemoteInventory({ limit, cursor })` para navegar sem baixar
+conteudo cifrado. `selectedOnDevice` e apenas a politica local dessa
+instancia do engine; o inventario e **informativo, sem verificacao de assinatura**.
+Antes de materializar, reconciliar ou admitir operacoes protegidas, o cliente
+continua usando a leitura completa por `objectId` com validacao independente
+de assinatura, dispositivo e revogacao. O fluxo normal `syncOnce` preserva
+essas garantias e ainda utiliza o LIST completo.
+
+Os cursores sao vinculados ao conjunto atual de metadados da conta autenticada;
+se o conjunto mudar durante a navegacao, a proxima pagina retorna HTTP 409 e
+o cliente deve recomeçar pela primeira pagina. Cursor e limite invalidos
+retornam HTTP 400. Esta etapa ainda nao implementa placeholder nativo,
+eviction contra escritor externo com arquivo aberto ou a migracao automatica
+do `syncOnce` para inventarios por pagina.
+
 ## Opcoes
 
 ```powershell

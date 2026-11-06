@@ -9,6 +9,16 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-06 — Issue #66, etapa parcial em revisao: inventario de metadados
+autenticado, paginado e limitado por resposta, com cursores invalidaveis por
+mudanca na biblioteca e isolamento por conta. Adapter e SyncEngine expõem
+navegacao apenas informativa e leitura completa por objeto permanece a fronteira
+de verificacao assinada. 13/13 testes focados de inventario e sync seletivo
+passaram localmente em Windows, antes da publicacao da PR. A implementacao
+normal de `syncOnce` ainda usa LIST completo. A issue continua aberta para
+integracao de sync paginado, placeholders nativos e garantia de eviction com
+escritor externo.
+
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
