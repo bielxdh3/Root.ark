@@ -276,21 +276,13 @@
             plaintextMetadataExposed: false, productionDurabilityProven: false });
         } catch (_) { deny(); }
       }
-      async function readPrivateListing(previous, metadataKey, term = "") {
+      async function freshPrivateListing(previous) {
         try {
-          if (typeof term !== "string" || term.length > 120) deny();
-          const query = term.trim().normalize("NFC").toLowerCase();
           const state = tracked.get(previous);
           if (!state || state.owner !== writer || previous !== latest
             || previous.head.sequence !== state.head.sequence
             || previous.head.digest !== state.head.digest
-            || previous.entries.length !== state.snapshot.rows.length
-            || typeof catalog.openMetadata !== "function"
-            || metadataKey?.type !== "secret"
-            || metadataKey?.algorithm?.name !== "AES-GCM"
-            || metadataKey.algorithm.length !== 256
-            || metadataKey.extractable !== false
-            || !metadataKey.usages?.includes("decrypt")) deny();
+            || previous.entries.length !== state.snapshot.rows.length) deny();
           assertLive();
           // Never decrypt the caller-supplied or cached rows: re-read the
           // complete owner/witness/CAS signed page set at the exact pinned
@@ -301,6 +293,31 @@
             || !equal(bytes(current.head.digest, 32),
               from64(state.head.digest, 32))
             || current.rows.length !== state.snapshot.rows.length) deny();
+          for (let index = 0; index < current.rows.length; index++) {
+            const signed = rowWire(current.rows[index]);
+            const baseline = previous.entries[index];
+            if (Object.keys(signed).some((key) => signed[key] !== baseline[key])) deny();
+          }
+          return { current, head: Object.freeze({ ...state.head }),
+            scope: Object.freeze(scopeFor(trust.signedDeviceGrant)) };
+        } catch (_) { deny(); }
+      }
+      async function verifyPrivateListingHead(previous) {
+        const { head, scope } = await freshPrivateListing(previous);
+        assertLive();
+        return Object.freeze({ head, scope });
+      }
+      async function readPrivateListing(previous, metadataKey, term = "") {
+        try {
+          if (typeof term !== "string" || term.length > 120) deny();
+          const query = term.trim().normalize("NFC").toLowerCase();
+          if (typeof catalog.openMetadata !== "function"
+            || metadataKey?.type !== "secret"
+            || metadataKey?.algorithm?.name !== "AES-GCM"
+            || metadataKey.algorithm.length !== 256
+            || metadataKey.extractable !== false
+            || !metadataKey.usages?.includes("decrypt")) deny();
+          const { current, head, scope } = await freshPrivateListing(previous);
           const entries = [];
           let totalMatches = 0;
           for (const row of current.rows) {
@@ -326,7 +343,7 @@
           }
           assertLive();
           // One bad entry/key invalidates the ENTIRE list; no partial results.
-          return Object.freeze({ head: Object.freeze({ ...state.head }),
+          return Object.freeze({ head, scope,
             entries: Object.freeze(entries), totalMatches,
             plaintextSentToServer: false, independentlySignedCatalog: true,
             authorizesMutation: false });
@@ -832,6 +849,7 @@
         }
       }
       return Object.freeze({ readCurrent, pullDelta, readPrivateListing,
+        verifyPrivateListingHead,
         commitVersion: (value) => commitVersion(value, false), trashVersion, readTrash, restoreVersion });
     }
     return Object.freeze({ createClient });
