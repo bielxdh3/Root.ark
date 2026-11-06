@@ -141,6 +141,33 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal((await post("/zk-1/v1/share/grant", "owner", grantBody)).status, 409,
     "owner request nonce cannot mint a second grant");
 
+  const forgedGrantId = b64(crypto.randomBytes(32));
+  const forgedProof = await sign(owner, "get", id, 1, digest);
+  const forgedFields = { grantId: forgedGrantId, recipientUsername: "recipient",
+    recipientDeviceId: recipient.device_id, expiresAt: now + 120 };
+  const forgedBody = { ...forgedFields, authorization: wire(forgedProof.authorization),
+    signatureBase64: b64(forgedProof.signature),
+    shareSignatureBase64: b64(crypto.sign(null, await shareGrantMessageV1({
+      authorization: forgedProof.authorization, ...forgedFields,
+    }), crypto.generateKeyPairSync("ed25519").privateKey)) };
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", forgedBody)).status, 403,
+    "a valid GET proof cannot substitute an unknown grant signing key");
+  const validUnconsumedSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: forgedProof.authorization, ...forgedFields,
+  }), forgedProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...forgedBody, shareSignatureBase64: b64(validUnconsumedSignature),
+  })).status, 201, "bad grant signature must not consume the owner authorization nonce");
+
+  const foreignScopeProof = await sign(owner, "get", id, 1, digest);
+  const forgedTenantScope = { ...foreignScopeProof.authorization,
+    account_id: crypto.randomBytes(16) };
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...grantBody, grantId: b64(crypto.randomBytes(32)),
+    authorization: wire(forgedTenantScope),
+    signatureBase64: b64(foreignScopeProof.signature),
+  })).status, 403, "cross-tenant scope substitution must fail before grant persistence");
+
   const readAs = async (username, device = recipient, overrides = {}) => {
     const request = await sign(device, "get", id, 1, digest);
     return post("/zk-1/v1/share/read", username, { grantId,
