@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
@@ -15,9 +15,24 @@ const { createPrivateAuthorityFixture } = require("./support/issue-65-private-au
 
 const ps = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const picker = path.resolve(__dirname, "../sync-client/rootark-sync-windows-picker.ps1");
+const cli = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
+
+test("issue 66: malformed or ambiguous --path fails before reading config", () => {
+  for (const flags of [
+    ["--config", "dummy", "--path"],
+    ["--config", "dummy", "--path", "--config", "other"],
+    ["--config", "dummy", "--path="],
+    ["--config", "dummy", "--path", "--other"],
+  ]) {
+    const result = spawnSync(process.execPath, [cli, "hydrate", ...flags], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, flags.join(" "));
+    assert.match(result.stderr, /Invalid Sync v2 .*path/i, flags.join(" "));
+  }
+});
 
 const chooser = `
 $ErrorActionPreference = 'Stop'
+if ($env:ROOTARK_TEST_CWD) { Set-Location -LiteralPath $env:ROOTARK_TEST_CWD }
 function Out-GridView {
   [CmdletBinding()]
   param([string]$Title, [switch]$PassThru, [Parameter(ValueFromPipeline = $true)]$InputObject)
@@ -33,7 +48,8 @@ try { & $env:ROOTARK_TEST_PICKER -Config $env:ROOTARK_TEST_CONFIG } catch { Writ
 async function runPowershell(env) {
   return new Promise((resolve, reject) => {
     const process = spawn(ps, ["-NoProfile", "-NonInteractive", "-Command", chooser], {
-      env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+      env, cwd: env.ROOTARK_TEST_START_CWD || undefined,
+      windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
@@ -45,18 +61,29 @@ async function runPowershell(env) {
   });
 }
 
-test("issue 66 Windows: picker invokes real CLI, HTTP signed hydrate and verified local plaintext", { skip: process.platform !== "win32", timeout: 30000 }, async (t) => {
+for (const { filename, relativeRoot } of [
+  { filename: "relatório verão.txt", relativeRoot: false },
+  { filename: "--relatorio.txt", relativeRoot: false },
+  { filename: "arquivo relativo.txt", relativeRoot: true },
+]) {
+test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${relativeRoot}`, { skip: process.platform !== "win32", timeout: 30000 }, async (t) => {
   const root = createPrivateAuthorityFixture("rootark-picker-live-");
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const localFolder = path.join(root, "sync-data");
   await fsp.mkdir(localFolder);
+  const staleCwd = path.join(root, "stale-cwd");
+  const remotePath = filename.startsWith("--") ? filename : `docs/${filename}`;
+  if (relativeRoot) {
+    const staleFile = path.join(staleCwd, "sync-data", remotePath);
+    await fsp.mkdir(path.dirname(staleFile), { recursive: true });
+    await fsp.writeFile(staleFile, "UNVERIFIED STALE FILE");
+  }
   const keys = crypto.generateKeyPairSync("ed25519");
   const publicKey = keys.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
   const epoch = "epoch-test";
   const master = crypto.randomBytes(32);
   const fileId = "picker-verified-file";
   const objectId = "picker-verified-object";
-  const filename = "relatório verão.txt";
   const fileKey = crypto.createHmac("sha256", master).update(`${fileId}\0${epoch}`).digest();
   const original = Buffer.from("owner signed Windows hydrated bytes", "utf8");
   const operation = createOperation({
@@ -64,7 +91,7 @@ test("issue 66 Windows: picker invokes real CLI, HTTP signed hydrate and verifie
     versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
     keyEpoch: epoch, compartmentId: "private",
     revision: { counter: 1, deviceId: "device-a" },
-    metadata: { path: `docs/${filename}`, name: filename, size: original.length },
+    metadata: { path: remotePath, name: filename, size: original.length },
     plaintext: original, fileKey,
   });
   operation.authorization = await createAuthorizationProof(operation, {
@@ -90,8 +117,8 @@ test("issue 66 Windows: picker invokes real CLI, HTTP signed hydrate and verifie
   const launch = path.join(root, "launch.json");
   await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "alice", token: "fixture-bearer", localFolder, deviceId: "device-a",
-    keyEpoch: epoch, filesOnDemand: true, selectedPaths: ["docs"],
+    username: "alice", token: "fixture-bearer", localFolder: relativeRoot ? "sync-data" : localFolder, deviceId: "device-a",
+    keyEpoch: epoch, filesOnDemand: true, selectedPaths: filename.startsWith("--") ? [filename] : ["docs"],
     trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [],
   }));
   const env = { ...process.env,
@@ -99,20 +126,27 @@ test("issue 66 Windows: picker invokes real CLI, HTTP signed hydrate and verifie
     ROOTARK_SYNC_DEVICE_PRIVATE_KEY: keys.privateKey.export({ type: "pkcs8", format: "der" }).toString("base64url"),
     ROOTARK_SYNC_DEVICE_PUBLIC_KEY: publicKey,
     ROOTARK_TEST_CONFIG: config, ROOTARK_TEST_PICKER: picker, ROOTARK_TEST_LAUNCH: launch,
+    ...(relativeRoot ? { ROOTARK_TEST_CWD: root, ROOTARK_TEST_START_CWD: staleCwd } : {}),
   };
 
   const good = await runPowershell(env);
   assert.equal(good.status, 0, good.stderr);
-  assert.deepEqual(await fsp.readFile(path.join(localFolder, "docs", filename)), original);
+  assert.deepEqual(await fsp.readFile(path.join(localFolder, remotePath)), original);
   assert.equal(requests.filter((request) => request === `/sync/v1/objects/${objectId}`).length, 1);
   const reveal = JSON.parse((await fsp.readFile(launch, "utf8")).replace(/^\uFEFF/, ""));
   assert.match(reveal.executable, /explorer\.exe$/i);
   assert.ok(reveal.args.join(" ").includes(filename));
+  assert.ok(reveal.args.join(" ").includes(path.join(localFolder, remotePath)),
+    "Explorer must reveal exactly the signed hydrated file under Node's resolved root");
+  if (relativeRoot) {
+    assert.equal((await fsp.readFile(path.join(staleCwd, "sync-data", remotePath), "utf8")), "UNVERIFIED STALE FILE");
+  }
 
   await fsp.unlink(launch);
   tamper = true;
   const denied = await runPowershell(env);
   assert.notEqual(denied.status, 0);
   assert.equal(fs.existsSync(launch), false, "tampered envelope must not reveal Explorer");
-  assert.deepEqual(await fsp.readFile(path.join(localFolder, "docs", filename)), original);
+  assert.deepEqual(await fsp.readFile(path.join(localFolder, remotePath)), original);
 });
+}
