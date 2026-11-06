@@ -108,9 +108,9 @@ jobs:
           packages: 'platform-tools'
       - name: Install pinned Android platform for native app compile
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Compile Kotlin core tests and real Android launcher
+      - name: Compile Kotlin core, Android app JVM transport tests and real launcher
         working-directory: android
-        run: gradle --no-daemon :core:test :app:assembleDebug
+        run: gradle --no-daemon :core:test :app:testDebugUnitTest :app:assembleDebug
       - name: Verify Kotlin tests did not change tracked files
         run: git diff --exit-code
       - name: Diagnose Gradle-generated untracked paths without reading contents
