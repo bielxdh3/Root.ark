@@ -786,7 +786,11 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const recipientPin = { recipientUsername: "recipient", deviceId: fresh.request.device_id,
       authorizationPublicKey: fresh.request.authorization_public_key,
       hpkePublicKey: fresh.request.hpke_public_key };
-    const ownerOfferArgs = { grant, recipientPin, readIndependentAuthority,
+    // This issuer pin is obtained from the owner's independently trusted
+    // device identity, NOT from a candidate grant, server ACK or recipient.
+    const issuerPin = { deviceId: originalDevice.device_id,
+      authorizationPublicKey: b64(originalDevice.authorization_public_key) };
+    const ownerOfferArgs = { grant, recipientPin, issuerPin, readIndependentAuthority,
       ownerPrivateKey: owner.privateKey, ownerHeldCek: Buffer.from(ownerHeldCek),
       metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
       ciphertextRoot: Buffer.from(root), authority: publicAuthority,
@@ -839,6 +843,84 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }), /ZK_SHARE_OFFER_DENIED/,
     "revocation after real AEAD + HPKE sealing must stop owner offer release");
     assert.equal(offerReads, 2);
+    // A recipient controls their own valid enrolled Ed25519 signer and can
+    // locally manufacture an ACK with the exact server response shape.
+    // Independent V2 roster membership is NOT proof that they are an owner
+    // trusted to authorize a share of the owner's retained file CEK.
+    const fakeGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      authorization: { ...shareAuthorization, device_id: fresh.request.device_id } };
+    const fakeGrantMessage = await shareGrantMessageV1(fakeGrantInput);
+    const fakeGrant = { grantId: fakeGrantInput.grantId,
+      expiresAt: fakeGrantInput.expiresAt,
+      shareStatementBase64: b64(fakeGrantMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, fakeGrantMessage,
+        fresh.signer.privateKey)) };
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, grant: fakeGrant,
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "recipient-signed fake server-looking grant ACK may not unlock owner's CEK");
+    for (const [label, badPin] of [
+      ["recipient self-pins issuer", { deviceId: fresh.request.device_id,
+        authorizationPublicKey: fresh.request.authorization_public_key }],
+      ["wrong issuer identity", { ...issuerPin, deviceId: fresh.request.device_id }],
+      ["wrong issuer Ed25519 pin", { ...issuerPin,
+        authorizationPublicKey: fresh.request.authorization_public_key }],
+    ]) {
+      await assert.rejects(createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, grant: fakeGrant, issuerPin: badPin,
+      }), /ZK_SHARE_OFFER_DENIED/, label);
+    }
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, issuerPin: { ...issuerPin,
+        authorizationPublicKey: b64(crypto.randomBytes(32)) },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "even a genuine owner signature cannot substitute an independently pinned issuer key");
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, issuerPin: null,
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "an absent independently trusted issuer identity fails closed");
+    let issuerReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++issuerReads === 2) current.devices.find((row) =>
+          row.deviceId === issuerPin.deviceId).revokedAtEpoch = metadata.epoch;
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "owner-pinned issuer revoked after genuine HPKE sealing fails before export");
+    assert.equal(issuerReads, 2);
+    // The authentic owner-approved HPKE envelope has a shorter lifetime than
+    // this independently owner-signed grant. Advance only the wall clock in
+    // the SECOND authority read, after the real AEAD + HPKE sealing awaits.
+    const longGrantInput = { ...grantInput,
+      expiresAt: envelope.core.expires_at + 120 };
+    const longGrantBytes = await shareGrantMessageV1(longGrantInput);
+    const longGrant = { grantId: longGrantInput.grantId,
+      expiresAt: longGrantInput.expiresAt,
+      shareStatementBase64: b64(longGrantBytes.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, longGrantBytes, originalActor)) };
+    assert.ok(longGrant.expiresAt > envelope.core.expires_at,
+      "signed grant remains current after the real CEK offer expires");
+    const expiryOriginalWallClock = Date.now;
+    let expiryReads = 0;
+    try {
+      await assert.rejects(createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, grant: longGrant,
+        readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++expiryReads === 2) {
+            Date.now = () => (envelope.core.expires_at + 1) * 1000;
+          }
+          return current;
+        },
+      }), /ZK_SHARE_OFFER_DENIED/,
+      "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
+    } finally { Date.now = expiryOriginalWallClock; }
+    assert.equal(expiryReads, 2,
+      "the test must expire the envelope only at the second independent authority read");
     const maliciousOffer = { ...ownerOfferArgs };
     let getterRuns = 0;
     Object.defineProperty(maliciousOffer, "recipientPin", { enumerable: true,
