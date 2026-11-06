@@ -364,11 +364,11 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [ ] Expand restore testing and disaster-recovery evidence
 - [ ] Strengthen suspicious-file isolation and scanning integrations
 - [ ] Review every external adapter independently
-- [ ] Define any BielOS integration as a separate approved architecture
+- [ ] Reconcile roadmap status and exact-HEAD evidence after each completed mission
 
 ## Project direction
 
-Root.ark remains an independent project. Future integration or selective reuse with BielOS requires an explicit architecture, security review, migration plan, and authorization. Similar goals do not make the two systems interchangeable.
+Root.ark remains an independent project. Integrations with BielOS or Virki are outside this roadmap.
 
 ## License
 
