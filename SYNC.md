@@ -50,6 +50,23 @@ retornam HTTP 400. Esta etapa ainda nao implementa placeholder nativo,
 eviction contra escritor externo com arquivo aberto ou a migracao automatica
 do `syncOnce` para inventarios por pagina.
 
+Para evitar reler o arquivo de objetos inteiro em cada pagina, o servidor
+guarda no maximo o indice de metadados de **uma conta por instancia** (ate
+16 MiB), sem manter ciphertext nesse cache. Cada requisicao confere o lock
+do escritor, a politica de armazenamento privado quando aplicavel e a
+identidade duravel do arquivo (dispositivo, inode, tamanho, mtime e ctime
+com precisao de nanossegundos). Escritas atomicas de outro processo
+invalidam o indice antes da pagina seguinte; o cursor antigo recebe 409.
+Bibliotecas cujo indice ultrapasse 16 MiB continuam funcionais, sem cache.
+
+Benchmark reproduzivel local, Windows Node 24.14.1, 10 mil operacoes
+cifradas v2 com historico de uma versao cada (78,29 MiB em JSON):
+no baseline as primeiras 10 paginas levaram 23.595 ms; com o indice,
+as 157 paginas dos 10 mil itens levaram 2.625 ms no total (primeira
+pagina 2.337 ms, 156 paginas seguintes 288 ms). O primeiro carregamento
+ainda precisa validar o estado completo; nao e um indice persistido ou
+uma API de buscas em plaintext no servidor.
+
 ## Opcoes
 
 ```powershell

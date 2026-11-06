@@ -25,9 +25,6 @@ const MAX_HISTORY_PER_OBJECT = 32;
 const MAX_SEEN_OPERATIONS = 10000;
 const MAX_REQUEST_BYTES = 9 * 1024 * 1024;
 const MAX_CIPHERTEXT_BYTES = 8 * 1024 * 1024;
-const INVENTORY_MAX_PAGE_ITEMS = 64;
-const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
-const INVENTORY_MAX_CURSOR_CHARS = 1024;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
 const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 const SYNC_LOCK_WAIT_MS = 2000;
@@ -116,6 +113,11 @@ function ensureOwnMap(record, key) {
   }
   return value;
 }
+
+const INVENTORY_MAX_PAGE_ITEMS = 64;
+const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
+const INVENTORY_MAX_CURSOR_CHARS = 1024;
+const INVENTORY_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
   const directory = path.dirname(filePath);
@@ -341,6 +343,9 @@ class SyncObjectStore {
     this.burstGuard = burstGuard;
     this.retentionMs = retentionMs;
     this.now = now;
+    // Only one tenant's metadata index is retained, never its ciphertext.
+    // A changed durable inode/mtime/ctime discards the index on the next read.
+    this.inventoryCache = null;
   }
 
   // Exclusive-create on the SAME local filesystem fences independent Node
@@ -902,50 +907,90 @@ class SyncObjectStore {
     return Object.values(objects).map(publicRecord);
   }
 
-  listInventory(username, { limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > INVENTORY_MAX_PAGE_ITEMS) throw inventoryInputError();
+  inventoryFileStamp() {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
+    if (this.atomicDeviceRegistry) assertAtomicRegistryStoragePermissions(this.filePath);
+    if (fsSync.existsSync(`${this.filePath}.writer-lock`)) {
+      throw Object.assign(new Error("Sync inventory writer is active"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
+    // Writers publish by atomic rename. These BigInt attributes distinguish
+    // the new durable file even across independent Node processes; don't
+    // rely on a process-local generation counter or a TTL for correctness.
+    const stat = fsSync.statSync(this.filePath, { bigint: true });
+    if (!stat.isFile()) throw new Error("Invalid sync inventory file");
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  }
+
+  inventoryIndex(username) {
+    const before = this.inventoryFileStamp();
+    const cached = this.inventoryCache;
+    if (cached && cached.username === username && cached.stamp === before) return cached;
+
     const snapshot = this.readSnapshot();
+    const after = this.inventoryFileStamp();
+    if (before !== after) {
+      throw Object.assign(new Error("Sync inventory changed while reading"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
     const user = ownRecord(snapshot.users, username) || { objects: {} };
     const objects = ownRecord(user, "objects") || {};
     const ids = Object.keys(objects).sort();
-    // An object version/change invalidates existing cursors so paging cannot
-    // silently omit newly inserted or modified entries between requests.
-    // Bind the snapshot marker to the authenticated tenant.
+    const entries = [];
+    const byId = new Map();
     const hash = crypto.createHash("sha256").update(JSON.stringify(username), "utf8");
+    let metadataBytes = 0;
     for (const objectId of ids) {
       const record = ownRecord(objects, objectId);
       hash.update(JSON.stringify([objectId, record.operationId, record.versionId,
         record.revision, record.metadata]), "utf8");
+      const entry = inventoryRecord(record);
+      metadataBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+      entries.push(entry);
+      byId.set(objectId, entries.length - 1);
     }
-    const fingerprint = hash.digest("hex");
+    const result = { username, stamp: after, entries, byId, fingerprint: hash.digest("hex") };
+    // Larger libraries can still page safely without permanently retaining a
+    // large index. Releasing the old cache also limits cross-account memory.
+    this.inventoryCache = metadataBytes <= INVENTORY_CACHE_MAX_BYTES ? result : null;
+    return result;
+  }
+
+  listInventory(username, { limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > INVENTORY_MAX_PAGE_ITEMS) throw inventoryInputError();
+    const index = this.inventoryIndex(username);
     let start = 0;
     if (cursor !== null) {
       const parsed = parseInventoryCursor(cursor);
-      if (parsed.snapshot !== fingerprint) {
+      if (parsed.snapshot !== index.fingerprint) {
         throw Object.assign(new Error("Sync inventory changed"), { code: "SYNC_INVENTORY_CHANGED" });
       }
-      const index = ids.indexOf(parsed.after);
-      if (index < 0) throw inventoryInputError();
-      start = index + 1;
+      const after = index.byId.get(parsed.after);
+      if (after === undefined) throw inventoryInputError();
+      start = after + 1;
     }
     const entries = [];
     // Reserve space for response metadata and the next cursor as well as the
     // records. This caps HTTP response size independently of library size.
     let bytes = 1024;
-    while (entries.length < limit && start + entries.length < ids.length) {
-      const record = inventoryRecord(ownRecord(objects, ids[start + entries.length]));
+    while (entries.length < limit && start + entries.length < index.entries.length) {
+      const record = index.entries[start + entries.length];
       const entryBytes = Buffer.byteLength(JSON.stringify(record), "utf8") + 1;
       if (bytes + entryBytes > INVENTORY_MAX_RESPONSE_BYTES) break;
       entries.push(record);
       bytes += entryBytes;
     }
-    if (!entries.length && start < ids.length) {
+    if (!entries.length && start < index.entries.length) {
       throw Object.assign(new Error("Sync inventory entry exceeds page limit"), { code: "SYNC_INVENTORY_OVERSIZED" });
     }
     const nextIndex = start + entries.length;
+    // Cross-process writes may replace the store while we build a page; do
+    // not ship a page from an uncommitted/replaced source or an orphaned lock.
+    if (this.inventoryFileStamp() !== index.stamp) {
+      throw Object.assign(new Error("Sync inventory changed while paging"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
     return {
       protocolVersion: PROTOCOL_VERSION, view: "metadata", objects: entries,
-      nextCursor: nextIndex < ids.length ? inventoryCursor(fingerprint, ids[nextIndex - 1]) : null,
+      nextCursor: nextIndex < index.entries.length
+        ? inventoryCursor(index.fingerprint, index.entries[nextIndex - 1].objectId) : null,
     };
   }
 

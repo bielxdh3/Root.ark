@@ -10,7 +10,7 @@ const test = require("node:test");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
-const { registerSyncRoutes } = require("../src/routes/sync");
+const { registerSyncRoutes, SyncObjectStore } = require("../src/routes/sync");
 
 async function fixture(t) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-inventory-"));
@@ -44,7 +44,8 @@ async function fixture(t) {
     return { status: response.status, body, bytes: Buffer.byteLength(JSON.stringify(body)) };
   };
   const key = crypto.randomBytes(32);
-  const seed = async (username, objectId, content = Buffer.alloc(100 * 1024, 0x41), extraMetadata = {}) => {
+  const seed = async (username, objectId, content = Buffer.alloc(100 * 1024, 0x41),
+    extraMetadata = {}, targetStore = store) => {
     const operation = createOperation({
       operation: "create", objectId, fileId: `file-${objectId}`,
       versionId: `version-${objectId}`, operationId: `operation-${objectId}`,
@@ -54,10 +55,10 @@ async function fixture(t) {
         ...extraMetadata },
       plaintext: content, fileKey: key,
     });
-    assert.equal((await store.put(username, operation)).kind, "stored");
+    assert.equal((await targetStore.put(username, operation)).kind, "stored");
     return operation;
   };
-  return { url, get, seed };
+  return { url, get, seed, storagePath: path.join(dir, "objects.json"), store };
 }
 
 test("issue 66 inventory: authenticated, tenant-only, deterministic pages without ciphertext; legacy GET unchanged", async (t) => {
@@ -166,4 +167,27 @@ test("issue 66 inventory: metadata-heavy library is fully paged within 128 KiB H
   } while (cursor);
   assert.equal(names.length, 70);
   assert.equal(new Set(names).size, 70);
+});
+
+test("issue 66 inventory: cached pages revalidate external writer commits and refuse orphaned writer locks", async (t) => {
+  const { get, seed, storagePath, store } = await fixture(t);
+  for (const id of ["object-a", "object-b", "object-c"]) await seed("alice", id);
+  const first = await get("/sync/v1/objects?view=metadata&limit=1");
+  assert.equal(first.status, 200);
+  assert.equal(first.body.objects[0].objectId, "object-a");
+  assert.equal(store.inventoryCache.username, "alice");
+  const sibling = await new SyncObjectStore(storagePath).open();
+  await seed("alice", "object-aa", Buffer.from("fresh"), {}, sibling);
+  const stale = await get(`/sync/v1/objects?view=metadata&limit=1&cursor=${encodeURIComponent(first.body.nextCursor)}`);
+  assert.equal(stale.status, 409, "external commit must invalidate cached cursor");
+  assert.deepEqual((await get("/sync/v1/objects?view=metadata&limit=4")).body.objects
+    .map((record) => record.objectId), ["object-a", "object-aa", "object-b", "object-c"]);
+
+  const lockPath = storagePath + ".writer-lock";
+  await fsp.writeFile(lockPath, "external writer is running");
+  t.after(() => fsp.rm(lockPath, { force: true }));
+  assert.equal((await get("/sync/v1/objects?view=metadata&limit=1")).status, 503,
+    "a cached metadata index cannot bypass a writer lock");
+  await fsp.rm(lockPath);
+  assert.equal((await get("/sync/v1/objects?view=metadata&limit=1")).status, 200);
 });

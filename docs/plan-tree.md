@@ -19,6 +19,16 @@ normal de `syncOnce` ainda usa LIST completo. A issue continua aberta para
 integracao de sync paginado, placeholders nativos e garantia de eviction com
 escritor externo.
 
+Revisao de escala da PR draft #255 (2026-11-06): o custo de uma leitura,
+attestation, ordenacao e hash completos por pagina era concreto (10 mil
+objetos; as primeiras 10 paginas custaram 23,595 s, 78,29 MiB de estado).
+Um cache somente de metadados, para uma conta, limitado a 16 MiB, com
+invalidação por identidade do arquivo persistido e lock de escritores,
+passou teste adversarial de segunda instancia de armazenamento e trava
+externa. No mesmo fixture, o conjunto completo de 157 paginas levou
+2,625 s, sendo 2,337 s no primeiro acesso. Esta otimizacao continua
+sem usar metadados para admissao criptografica.
+
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
