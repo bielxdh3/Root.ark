@@ -164,6 +164,12 @@ test("issue 66 P2: signed MOVE outside selected paths cannot evict a pinned orig
     "rejected reconciliation cannot enqueue a mutation");
   assert.deepEqual(afterJournal.seen, priorJournal.seen,
     "a verified but blocked MOVE cannot become applied or seen");
+  assert.deepEqual(afterJournal.observed, priorJournal.observed,
+    "a pinned-rejected signed MOVE must not consume a durable pre-admission slot");
+  assert.deepEqual(afterJournal.admitted, priorJournal.admitted,
+    "a pinned-rejected signed MOVE must not establish signed admission");
+  assert.equal(eager.journal.hasLocalAdmission(signedMove.operationId,
+    crypto.createHash("sha256").update(protocol.canonicalJson(signedMove)).digest("hex")), false);
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
     "authenticated remote bytes");
   const restarted = await open();
@@ -171,6 +177,21 @@ test("issue 66 P2: signed MOVE outside selected paths cannot evict a pinned orig
   await assert.rejects(restarted.pullRemote({ pushed: 0, pulled: 0, applied: 0,
     conflicts: [], offline: false }), { code: "file_pinned" },
   "a restarted client must not consume the previously rejected signed MOVE");
+  const afterRestartJournal = JSON.parse(await fsp.readFile(restarted.journal.filePath, "utf8"));
+  assert.deepEqual(afterRestartJournal.observed, priorJournal.observed,
+    "retrying after restart cannot reserve rejected operation IDs");
+  assert.deepEqual(afterRestartJournal.admitted, priorJournal.admitted);
+  for (let counter = 3; counter <= 5; counter++) {
+    const denied = await remote("move", "object-a", `outside/attempt-${counter}.txt`,
+      "authenticated remote bytes", counter, "docs/a.txt");
+    assert.equal(await verifyAuthorizationProof(denied.authorization, denied, trusted), true);
+    await assert.rejects(restarted.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+      conflicts: [], offline: false }), { code: "file_pinned" });
+    const repeatedJournal = JSON.parse(await fsp.readFile(restarted.journal.filePath, "utf8"));
+    assert.deepEqual(repeatedJournal.observed, priorJournal.observed,
+      "distinct signed rejected MOVE IDs cannot exhaust the observed journal window");
+    assert.deepEqual(repeatedJournal.admitted, priorJournal.admitted);
+  }
   assert.equal(state.pushes, 0);
 });
 
@@ -181,6 +202,7 @@ test("issue 66 P2: signed out-of-scope directory relocation cannot drop a pinned
     undefined, "inode/directory"));
   await client.pinLocal("docs/a.txt");
   const beforeIndex = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  const beforeJournal = JSON.parse(await fsp.readFile(client.journal.filePath, "utf8"));
   const movedDirectory = await remote("update", "directory-object", "archive", "", 2,
     undefined, "inode/directory");
   assert.equal(await verifyAuthorizationProof(movedDirectory.authorization,
@@ -191,6 +213,8 @@ test("issue 66 P2: signed out-of-scope directory relocation cannot drop a pinned
   const eager = await open([], true, false, ["docs"]);
   await assert.rejects(eager.pullRemote({ pushed: 0, pulled: 0, applied: 0,
     conflicts: [], offline: false }), { code: "file_pinned" });
+  assert.deepEqual(JSON.parse(await fsp.readFile(eager.journal.filePath, "utf8")).observed, beforeJournal.observed,
+    "rejected directory relocation must not reserve a signed observation");
   assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")),
     beforeIndex);
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
@@ -211,6 +235,14 @@ test("issue 66 P2: explicit unpin permits a signed out-of-scope MOVE without rem
   const eager = await open([], true, false, ["docs"]);
   await eager.pullRemote({ pushed: 0, pulled: 0, applied: 0,
     conflicts: [], offline: false });
+  const journal = JSON.parse(await fsp.readFile(eager.journal.filePath, "utf8"));
+  const digest = crypto.createHash("sha256").update(protocol.canonicalJson(moved)).digest("hex");
+  assert.equal(journal.admitted[moved.operationId], digest,
+    "allowed signed MOVE must persist exact admission after pre-observation");
+  assert.equal(Object.hasOwn(journal.observed, moved.operationId), false,
+    "a completed signed MOVE must promote its observation to admitted");
+  assert.equal((await (await open()).journal.hasLocalAdmission(moved.operationId, digest)), true,
+    "signed MOVE admission survives restart");
   assert.equal(fs.existsSync(path.join(rootDir, "docs/a.txt")), false);
   assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, false);
   assert.equal(state.pushes, 0);

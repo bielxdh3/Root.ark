@@ -826,19 +826,12 @@ class SyncEngine {
     };
   }
 
-  async reconcileOutOfScopeMove(operation, summary, options = {}) {
-    // No pull/reconciliation entry point may separately advance a member of
-    // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
-    // or out-of-scope sweep is not a two-envelope atomic admission receipt.
-    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
-      fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
-        "sync_atomic_batch_indeterminate");
-    }
+  preflightOutOfScopeMove(operation) {
     const tombstone = Boolean(operation.tombstone || operation.operation === "delete");
     const directoryMove = operation.operation === "update" && operation.metadata?.contentType === "inode/directory";
     if ((operation.operation !== "move" && !directoryMove && !tombstone)
-      || typeof operation.metadata?.path !== "string" || this.isSelected(operation.metadata.path)) return false;
-    if (!tombstone && !directoryMove && !operation.metadata?.sourcePath) return false;
+      || typeof operation.metadata?.path !== "string" || this.isSelected(operation.metadata.path)) return null;
+    if (!tombstone && !directoryMove && !operation.metadata?.sourcePath) return null;
 
     let sourcePath;
     if (tombstone) {
@@ -854,12 +847,12 @@ class SyncEngine {
         && !this.snapshot.files[operation.metadata.sourcePath]?.directory
         ? operation.metadata.sourcePath : null);
     }
-    if (!sourcePath || !this.isSelected(sourcePath)) return false;
+    if (!sourcePath || !this.isSelected(sourcePath)) return null;
 
     const prior = this.snapshot.files[sourcePath];
     const directoryRecord = directoryMove || (tombstone && Boolean(prior?.directory));
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
-      || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return false;
+      || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return null;
 
     // Reconciliation can stage/rename the origin and then discard its tracked
     // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
@@ -872,6 +865,23 @@ class SyncEngine {
     })) {
       fail("Pinned local origin cannot be reconciled outside selected paths", "file_pinned");
     }
+
+    return { sourcePath, prior, tombstone, directoryRecord };
+  }
+
+  async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    // The same side-effect-free check runs BEFORE signature pre-observation.
+    // Keep it here too for direct callers and changes during verification.
+    const source = this.preflightOutOfScopeMove(operation);
+    // No pull/reconciliation entry point may separately advance a member of
+    // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
+    // or out-of-scope sweep is not a two-envelope atomic admission receipt.
+    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
+      fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
+        "sync_atomic_batch_indeterminate");
+    }
+    if (!source) return false;
+    const { sourcePath, prior, tombstone, directoryRecord } = source;
 
     const pending = (await this.journal.recover()).filter((item) => item.protocolVersion && item.objectId === operation.objectId);
     const target = await contained(this.rootDir, sourcePath, true);
@@ -1707,6 +1717,9 @@ class SyncEngine {
               }
             }
           }
+          if (current && !this.operationDestinationIsSelected(current)) {
+            this.preflightOutOfScopeMove(current);
+          }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
           if (current) {
@@ -2530,6 +2543,9 @@ class SyncEngine {
     };
     for (const operation of inspected) {
       if (!this.operationDestinationIsSelected(operation)) {
+        // A refused pinned origin must not consume the finite, durable
+        // observed[] window before reconciliation rejects its signed MOVE.
+        this.preflightOutOfScopeMove(operation);
         const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
