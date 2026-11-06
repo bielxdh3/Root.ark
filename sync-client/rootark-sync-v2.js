@@ -1,7 +1,6 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const fsp = require("node:fs/promises");
 const path = require("node:path");
 const protocol = require("./rootark-sync-protocol");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
@@ -293,18 +292,6 @@ async function start(options = {}) {
     baseUrl: config.serverUrl,
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
   });
-  if (options.preview === true) {
-    // Engine.open() bootstraps missing journal/snapshot files. Do not allow a
-    // read-only preview to initialize persistent state on an unknown folder.
-    for (const filename of [".rootark-sync-journal.json", ".rootark-sync-index.json"]) {
-      let stats;
-      try { stats = await fsp.lstat(path.join(config.localFolder, filename)); }
-      catch { throw new Error("Historical preview requires an existing initialized sync root"); }
-      if (!stats.isFile() || stats.isSymbolicLink()) {
-        throw new Error("Historical preview requires regular existing sync state files");
-      }
-    }
-  }
   const engine = await new SyncEngine({
     ...atomicWitness,
     rootDir: config.localFolder,
@@ -388,7 +375,7 @@ async function start(options = {}) {
     requireAuthorization: true,
     reverifySeenIncoming: strictHistorical,
     requireIndependentHistoricalAdmission: strictHistorical,
-  }).open();
+  }).open({ readOnly: options.preview === true });
   if (options.preview === true) {
     const outcome = await engine.previewHistoricalRestore(options["object-id"], options["version-id"]);
     // Advisory metadata only, no recovered plaintext or decrypted key bytes.

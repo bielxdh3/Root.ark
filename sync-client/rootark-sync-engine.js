@@ -540,7 +540,7 @@ class SyncEngine {
     });
   }
 
-  withReadOnlyRoot(work) {
+  withReadOnlyRoot(work, { allowUnopened = false } = {}) {
     // Join the same in-process writer queue without creating the on-disk
     // exclusive writer marker. Preview is advisory; restore always rechecks.
     const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
@@ -574,7 +574,7 @@ class SyncEngine {
       return stamps;
     };
     const run = async () => {
-      if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+      if (!this.opened && !allowUnopened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
       const before = await checkDiskState();
       await this._open({ readOnly: true });
       const result = await ROOT_MUTATION_CONTEXT.run(queueKey, work);
@@ -591,8 +591,10 @@ class SyncEngine {
     });
   }
 
-  async open() {
-    return this.withMutationLock(async () => this);
+  async open({ readOnly = false } = {}) {
+    return readOnly
+      ? this.withReadOnlyRoot(() => this, { allowUnopened: true })
+      : this.withMutationLock(async () => this);
   }
 
   async acquireProcessLock() {

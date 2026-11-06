@@ -197,6 +197,40 @@ test("#67 P2: journal loss during async historical fetch cannot return a ready p
   assert.equal(f.pushes(), 0);
 });
 
+test("#67 P2: read-only bootstrap on an existing sync root never acquires the writer lock", async (t) => {
+  const f = await fixture(t);
+  const journalPath = path.join(f.local, ".rootark-sync-journal.json");
+  const snapshotPath = path.join(f.local, ".rootark-sync-index.json");
+  const beforeJournal = await fsp.readFile(journalPath);
+  const beforeSnapshot = await fsp.readFile(snapshotPath);
+  const reopened = new SyncEngine({ rootDir: f.local, adapter: f.adapter });
+  reopened.acquireProcessLock = async () => { throw new Error("Read-only bootstrap acquired writer lock"); };
+  await reopened.open({ readOnly: true });
+  assert.equal(reopened.opened, true);
+  assert.deepEqual(await fsp.readFile(journalPath), beforeJournal);
+  assert.deepEqual(await fsp.readFile(snapshotPath), beforeSnapshot);
+  assert.equal(fs.existsSync(path.join(f.local, ".rootark-sync.lock")), false);
+});
+
+test("#67 P2: journal loss between preview bootstrap preflight and open never recreates security state", async (t) => {
+  const f = await fixture(t);
+  const journalPath = path.join(f.local, ".rootark-sync-journal.json");
+  const snapshotPath = path.join(f.local, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshotPath);
+  const reopened = new SyncEngine({ rootDir: f.local, adapter: f.adapter });
+  const originalJournalOpen = reopened.journal.open.bind(reopened.journal);
+  reopened.journal.open = async (options) => {
+    await fsp.unlink(journalPath);
+    return originalJournalOpen(options);
+  };
+  await assert.rejects(reopened.open({ readOnly: true }),
+    (error) => error.code === "history_preview_unavailable");
+  assert.equal(fs.existsSync(journalPath), false, "lost evidence must stay absent");
+  assert.equal(fs.existsSync(path.join(f.local, ".rootark-sync.lock")), false);
+  assert.deepEqual(await fsp.readFile(snapshotPath), beforeSnapshot);
+  assert.equal(f.pushes(), 0);
+});
+
 test("#67: preview refuses missing independent evidence, revoked current device and missing custody", async (t) => {
   const f = await fixture(t, { strict: false });
   await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),

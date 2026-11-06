@@ -42,6 +42,8 @@ posterior repete todas as checagens e pode falhar por mudanca de HEAD, grants
 ou arquivos locais.
 
 O preview exige que **snapshot e journal ja existam e sejam arquivos regulares**.
+Inclusive a inicializacao pela CLI usa `open({ readOnly: true })`, sem a
+abertura normal de escrita que poderia recriar o journal entre duas checagens.
 Nao cria nem recria journal/snapshot ou `.rootark-sync.lock`. Espera a fila de
 escritores do processo, recusa um lock de outro processo e compara identidade,
 tamanho e tempos dos dois arquivos antes/depois da consulta; ausencia ou mudanca
