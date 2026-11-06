@@ -1,14 +1,23 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
+  const MAX_EVENTS = 100;
+  const logLines = [];
+  const record = (list, value) => {
+    if (list.length >= MAX_EVENTS) list.shift();
+    list.push(value);
+  };
   const log = message => {
-    $('events').textContent += message + '\n';
-    $('state').textContent = message;
+    const line = String(message).slice(0, 150).replace(/[\r\n]/g, ' ');
+    record(logLines, line);
+    $('events').textContent = logLines.join('\n') + '\n';
+    $('state').textContent = line;
   };
   const toHex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
   const wsUrl = location.origin.replace(/^http/, 'ws') + '/signal';
   const MAX_FILE = 1024 * 1024;
+  const MAX_FILE_CHUNKS = MAX_FILE / (8 * 1024); // Honest sender emits at most 64.
   let ws, roomId, hostKey, selfId, role;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
@@ -21,7 +30,7 @@
     ws.onmessage = async event => {
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
-      if (m.type === 'error') { diagnostics.rejected.push(m.code); return log('Erro: ' + m.code); }
+      if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
         $('invite').disabled = role !== 'host';
@@ -133,17 +142,31 @@
     dc.binaryType = 'arraybuffer';
     dc.bufferedAmountLowThreshold = 32 * 1024;
     dc.onopen = () => {
-      diagnostics.channels.push(p.id);
+      record(diagnostics.channels, p.id);
       log('DataChannel aberto: ' + p.id.slice(0, 5));
     };
-    dc.onclose = () => log('DataChannel fechado: ' + p.id.slice(0, 5));
+    dc.onclose = () => {
+      p.incoming = null;
+      p.outgoing = null;
+      log('DataChannel fechado: ' + p.id.slice(0, 5));
+    };
+    function abortIncoming() {
+      const rx = p.incoming;
+      if (rx) {
+        p.incoming = null;
+        rx.chunks.length = 0;
+        rx.chunksSize = 0;
+        if (dc.readyState === 'open') dc.send(JSON.stringify({ type: 'abort-file', id: rx.id }));
+      }
+      record(diagnostics.rejected, 'INVALID_CHUNK');
+      log('Chunk rejeitado');
+    }
     dc.onmessage = async event => {
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
-        if (!rx || rx.chunksSize + event.data.byteLength > rx.size || rx.chunksSize + event.data.byteLength > MAX_FILE) {
-          diagnostics.rejected.push('INVALID_CHUNK');
-          return log('Chunk rejeitado');
-        }
+        if (!rx || event.data.byteLength === 0 || rx.chunks.length >= MAX_FILE_CHUNKS ||
+          rx.chunksSize + event.data.byteLength > rx.size ||
+          rx.chunksSize + event.data.byteLength > MAX_FILE) return abortIncoming();
         rx.chunks.push(new Uint8Array(event.data));
         rx.chunksSize += event.data.byteLength;
         return;
@@ -153,9 +176,9 @@
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
         if (hash === m.digest) {
-          diagnostics.verifiedTexts.push({ from: p.id, text: m.text, sha256: hash });
+          record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
-        } else diagnostics.rejected.push('TEXT_DIGEST');
+        } else record(diagnostics.rejected, 'TEXT_DIGEST');
       } else if (m.type === 'offer-file' && typeof m.id === 'string' &&
         typeof m.name === 'string' && m.name.length <= 100 &&
         Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
@@ -187,16 +210,19 @@
       } else if (m.type === 'decline-file' && p.outgoing && m.id === p.outgoing.id) {
         p.outgoing = null;
         log('Arquivo recusado pelo destinatário');
+      } else if (m.type === 'abort-file' && p.outgoing && m.id === p.outgoing.id) {
+        p.outgoing = null;
+        log('Arquivo abortado pelo destinatário');
       } else if (m.type === 'end-file' && p.incoming && m.id === p.incoming.id) {
         const rx = p.incoming;
         p.incoming = null;
-        if (rx.chunksSize !== rx.size) { diagnostics.rejected.push('SIZE_MISMATCH'); return log('Arquivo incompleto'); }
+        if (rx.chunksSize !== rx.size) { record(diagnostics.rejected, 'SIZE_MISMATCH'); return log('Arquivo incompleto'); }
         const bytes = new Uint8Array(rx.size);
         let offset = 0;
         for (const chunk of rx.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         const digest = await sha(bytes);
-        if (digest !== rx.digest) { diagnostics.rejected.push('FILE_DIGEST'); return log('Arquivo corrompido'); }
-        diagnostics.verifiedFiles.push({ from: p.id, name: rx.name, size: rx.size, sha256: digest });
+        if (digest !== rx.digest) { record(diagnostics.rejected, 'FILE_DIGEST'); return log('Arquivo corrompido'); }
+        record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
         log('Arquivo SHA-256 OK: ' + rx.name);
       }
     };
@@ -205,6 +231,7 @@
     const { dc, outgoing } = p;
     if (!outgoing) return;
     for (let offset = 0; offset < outgoing.bytes.byteLength; offset += 16 * 1024) {
+      if (p.outgoing !== outgoing) return;
       if (dc.readyState !== 'open') { p.outgoing = null; return; }
       while (dc.bufferedAmount > 64 * 1024) {
         await new Promise(resolve => {
@@ -216,10 +243,12 @@
           dc.addEventListener('bufferedamountlow', wake, { once: true });
           dc.addEventListener('close', wake, { once: true });
         });
+        if (p.outgoing !== outgoing) return;
         if (dc.readyState !== 'open') { p.outgoing = null; return; }
       }
       dc.send(outgoing.bytes.slice(offset, offset + 16 * 1024));
     }
+    if (p.outgoing !== outgoing) return;
     dc.send(JSON.stringify({ type: 'end-file', id: outgoing.id }));
     p.outgoing = null;
     log('Enviado: ' + outgoing.name);
@@ -268,6 +297,12 @@
     createRoom, joinRoom, sendFile, sendText,
     invite: () => wire({ type: 'invite' }),
     invitations: () => [...invites.values()],
-    snapshot: () => ({ roomId, role, peerId: selfId, peers: [...peers.values()].map(p => ({ id: p.id, channel: p.dc?.readyState || 'none' })), diagnostics })
+    // Exposed only for disposable Edge CDP adversarial regression tests.
+    testChannel: index => [...peers.values()][index]?.dc,
+    snapshot: () => ({ roomId, role, peerId: selfId, peers: [...peers.values()].map(p => ({
+      id: p.id, channel: p.dc?.readyState || 'none',
+      incomingChunks: p.incoming?.chunks.length ?? 0,
+      incomingBytes: p.incoming?.chunksSize ?? 0
+    })), diagnostics })
   };
 })();
