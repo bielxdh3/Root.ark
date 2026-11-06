@@ -212,8 +212,14 @@
             iv, additionalData: aad, tagLength: 128 }, secret, raw);
           raw.fill(0);
           live(input.assertLive);
-          await database.write(key, { format: FORMAT, context: JSON.stringify(pinned),
-            iv: encode64(iv), ciphertext: encode64(new Uint8Array(ciphertext)) });
+          try {
+            await database.write(key, { format: FORMAT, context: JSON.stringify(pinned),
+              iv: encode64(iv), ciphertext: encode64(new Uint8Array(ciphertext)) });
+          } catch (_) {
+            // Persistence is optional; the full catalog is already authenticated.
+            // Continue in-memory, never falling back to unverified cached bytes.
+            database = null;
+          }
           live(input.assertLive);
         }
       }

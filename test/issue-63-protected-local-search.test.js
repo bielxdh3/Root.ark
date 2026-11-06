@@ -8,8 +8,10 @@ const search = require("../public/client/rootark-zk1-protected-local-search");
 function indexedDBMemory() {
   const rows = new Map();
   let opened = false;
+  let rejectWrites = false;
   return {
     rows,
+    denyWrites() { rejectWrites = true; },
     open() {
       const req = {};
       const db = {
@@ -24,6 +26,11 @@ function indexedDBMemory() {
                 get(key) { return request(() => rows.get(key)); },
                 put(value, key) {
                   assert.equal(mode, "readwrite");
+                  if (rejectWrites) {
+                    const call = {};
+                    queueMicrotask(() => { call.onerror?.(); tx.onabort?.(); });
+                    return call;
+                  }
                   return request(() => { rows.set(key, structuredClone(value)); return key; });
                 },
                 delete(key) {
@@ -147,6 +154,25 @@ test("explicit local invalidation deletes only the scoped encrypted index", asyn
   const offline = await search.search({ ...input, indexedDBImpl: null });
   assert.equal(offline.persistedIndex, false);
   assert.equal(offline.totalMatches, 1);
+});
+
+test("a denied IndexedDB write returns authenticated ephemeral matches without weakening revocation", async () => {
+  const database = indexedDBMemory();
+  database.denyWrites();
+  const f = fixture(database);
+  const key = crypto.randomBytes(32);
+  const result = await search.search(f.input(key, "secret"));
+  assert.equal(result.totalMatches, 1);
+  assert.equal(result.entries[0].name, "secret-private-name.txt");
+  assert.equal(result.persistedIndex, false);
+  assert.equal(database.rows.size, 0);
+  assert.equal(f.opened, 1);
+  const repeated = await search.search(f.input(key, "secret"));
+  assert.equal(repeated.totalMatches, 1);
+  assert.equal(repeated.persistedIndex, false);
+  assert.equal(f.opened, 2);
+  f.revoke();
+  await assert.rejects(search.search(f.input(key, "secret")), /ZK_LOCAL_SEARCH_DENIED/);
 });
 
 test("wrong key, tampered ciphertext, epoch change and stale CAS cannot reveal cached names", async () => {
