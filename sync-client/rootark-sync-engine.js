@@ -699,6 +699,7 @@ class SyncEngine {
     try {
       const { sourcePath: _oldMoveSource, ...historicalMetadata } = historical.metadata;
       restored = await this.buildOperation({ operation: "update", objectId, fileId: current.fileId,
+        operationId: `histrestore-${crypto.randomUUID()}`,
         baseRevision: current.revision, revision: protocol.nextRevision(current.revision, this.deviceId),
         metadata: { ...historicalMetadata, path: relative, name: path.basename(relative), size: plaintext.length },
         plaintext, fileKey: await this.keyFor({ ...current, keyEpoch: this.keyEpoch }) });
@@ -1619,6 +1620,23 @@ class SyncEngine {
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
+        if (operation.operationId.startsWith("histrestore-")) {
+          // The signed outbox can survive a crash between staging and local
+          // materialization. Never dispatch that restore without actual bytes.
+          const expected = await this.hashPendingPayload(operation);
+          let observed;
+          try {
+            const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+            const local = await readContainedFile(this.rootDir, relative);
+            try { observed = crypto.createHash("sha256").update(local).digest("hex"); }
+            finally { local.fill(0); }
+          } catch {
+            fail("Historical restore was not materialized locally", "restore_local_materialization_missing");
+          }
+          if (observed !== expected) {
+            fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
+          }
+        }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
