@@ -13,7 +13,8 @@ import android.widget.TextView
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
-import dev.rootark.core.sync.ReadOnlyFileRow
+import dev.rootark.core.sync.InventoryPage
+import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.RootArkApiException
 
 /** Online auth and read-only metadata listing; protected files and device keys remain gated. */
@@ -134,32 +135,45 @@ class MainActivity : Activity() {
         text(layout, "Somente metadados de sincronização. O conteúdo criptografado permanece inacessível.")
         if (message != null) text(layout, message)
         if (sessionCanListFiles) {
-            button(layout, "Listar arquivos (somente leitura)") { loadFileList() }
+            button(layout, "Listar arquivos (somente leitura)") { loadInventoryPage() }
         } else {
             text(layout, "Esta conta não possui permissão listFiles.")
         }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
-    private fun loadFileList() {
+    private fun loadInventoryPage(cursor: String? = null, pageNumber: Int = 1, usedCursors: Set<String> = emptySet()) {
         if (!sessionCanListFiles) return
         val origin = activeOrigin ?: return
         val token = sessionToken ?: return
-        runRequest({ transport.listSyncObjects(origin, token) }) { rows, failure ->
-            if (rows != null) {
-                showFileList(rows)
+        if (cursor != null && (pageNumber <= 1 || pageNumber > 100_000 ||
+                runCatching { PagedInventoryPolicy.checkCursor(cursor, usedCursors) }.isFailure)) {
+            showSession("Cursor de inventário inválido. Reinicie a listagem.")
+            return
+        }
+        runRequest({ transport.listInventoryPage(origin, token, cursor) }) { page, failure ->
+            if (page != null) {
+                val used = usedCursors + listOfNotNull(cursor)
+                if (page.nextCursor != null && runCatching {
+                    PagedInventoryPolicy.checkCursor(page.nextCursor, used)
+                }.isFailure) {
+                    showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
+                } else {
+                    showInventoryPage(page, pageNumber, used)
+                }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                 403 -> showSession("Servidor negou acesso à lista (403).")
-                else -> showSession("Não foi possível carregar a lista. A resposta pode exceder o limite do protótipo (1 MiB / 128 registros).")
+                409 -> showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
+                else -> showSession("Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros).")
             }
         }
     }
 
-    private fun showFileList(rows: List<ReadOnlyFileRow>) {
-        val layout = screen("Arquivos · somente leitura", "${rows.size} registro(s) de sincronização. Nenhum conteúdo descriptografado.")
-        if (rows.isEmpty()) text(layout, "Nenhum registro disponível.")
-        for (row in rows) {
+    private fun showInventoryPage(page: InventoryPage, pageNumber: Int, usedCursors: Set<String>) {
+        val layout = screen("Inventário · página $pageNumber", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
+        if (page.rows.isEmpty()) text(layout, "Nenhum registro disponível.")
+        for (row in page.rows) {
             text(layout, row.name + if (row.deleted) " (excluído)" else "")
             val details = listOfNotNull(
                 row.path?.let { "Caminho: $it" },
@@ -168,7 +182,9 @@ class MainActivity : Activity() {
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
         }
-        button(layout, "Atualizar lista") { loadFileList() }
+        val next = page.nextCursor
+        if (next != null) button(layout, "Próxima página") { loadInventoryPage(next, pageNumber + 1, usedCursors) }
+        button(layout, "Atualizar desde o início") { loadInventoryPage() }
         button(layout, "Voltar") { showSession() }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
