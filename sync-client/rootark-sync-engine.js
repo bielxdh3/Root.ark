@@ -1780,8 +1780,32 @@ class SyncEngine {
     };
     operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
+    // A signed operation may target a directory which contains a device-local
+    // pinned file. stageExisting() moves whole directory trees, so check every
+    // path it could remove or relocate BEFORE recording admission or touching
+    // the filesystem. Use portable case-folding even on POSIX: a source made
+    // on Linux must not become destructive if replayed on Windows.
+    const protectedPaths = Object.values(this.snapshot.pinnedFiles || {});
+    const affectedPaths = [metadata.path];
+    if (operation.operation === "move" && metadata.sourcePath) {
+      affectedPaths.push(metadata.sourcePath);
+    }
+    if (["update", "move", "delete"].includes(operation.operation)) {
+      for (const [relativePath, entry] of Object.entries(this.snapshot.files)) {
+        if (entry && !entry.deleted && entry.objectId === operation.objectId
+          && entry.fileId === operation.fileId) affectedPaths.push(relativePath);
+      }
+    }
+    if (protectedPaths.some((pin) => affectedPaths.some((candidate) =>
+      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)))) {
+      fail("A pinned file is inside a directory affected by the signed operation", "file_pinned");
+    }
+    if (operation.operation === "delete"
+      && this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)]?.fileId === operation.fileId) {
+      fail("Pinned file must be unpinned before applying a remote delete", "file_pinned");
+    }
     if (["create", "update", "move"].includes(operation.operation)
-      && Object.values(this.snapshot.pinnedFiles || {}).some((pin) =>
+      && protectedPaths.some((pin) =>
         pin.path.toLowerCase() === metadata.path.toLowerCase()
         && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId))) {
       // Guard the destination BEFORE the first journal observation, mkdir,
@@ -1796,10 +1820,6 @@ class SyncEngine {
     if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
     let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
-      const protectedPin = this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)];
-      if (protectedPin && protectedPin.fileId === operation.fileId) {
-        fail("Pinned file must be unpinned before applying a remote delete", "file_pinned");
-      }
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
         && priorAtTarget.objectId === operation.objectId && priorAtTarget.fileId === operation.fileId;

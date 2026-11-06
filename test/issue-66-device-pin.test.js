@@ -20,7 +20,7 @@ async function fixture(t) {
   const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
   const trusted = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
   const state = { offline: false, fullReads: [], inventoryReads: 0, pushes: 0, records: new Map() };
-  async function remote(kind, objectId, relative, plaintext, counter = 1, sourcePath) {
+  async function remote(kind, objectId, relative, plaintext, counter = 1, sourcePath, contentType) {
     const previous = state.records.get(objectId);
     const op = protocol.createOperation({
       operation: kind, objectId, fileId: previous?.fileId || `file-${objectId}`,
@@ -28,7 +28,8 @@ async function fixture(t) {
       deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
       revision: { counter, deviceId: "device-a" },
       baseRevision: counter === 1 ? null : previous.revision,
-      metadata: { path: relative, ...(sourcePath ? { sourcePath } : {}) },
+      metadata: { path: relative, ...(sourcePath ? { sourcePath } : {}),
+        ...(contentType ? { contentType } : {}) },
       plaintext: kind === "move" ? protocol.encodeMovePayload(Buffer.from(plaintext), key)
         : Buffer.from(plaintext), fileKey: key,
     });
@@ -259,6 +260,81 @@ test("issue 66 P2: signed other-object MOVE/CREATE/UPDATE cannot overwrite a pin
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/b.txt"), "utf8"), "other signed original bytes");
   assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: signed other-object ancestor mutations cannot stage a directory containing a pinned file", async (t) => {
+  for (const action of ["delete", "create", "update", "move"]) {
+    for (const ancestorPath of ["docs", "Docs"]) {
+      await t.test(`${action} at ${ancestorPath} refuses before journal or filesystem mutation`, async (subtest) => {
+        const { rootDir, open, remote, state } = await fixture(subtest);
+        const client = await open();
+        if (action === "delete") {
+          const directory = await remote("create", "other-directory", "docs", "", 1,
+            undefined, "inode/directory");
+          await client.apply(directory);
+        }
+        if (["update", "move"].includes(action)) {
+          await client.apply(await remote("create", "object-b", "docs/b.txt", "other signed bytes"));
+        }
+        await client.pinLocal("docs/a.txt");
+        const original = await fsp.readFile(path.join(rootDir, "docs/a.txt"));
+        const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+        const beforeSnapshot = await fsp.readFile(snapshotPath);
+        const beforeJournal = await fsp.readFile(client.journal.filePath);
+
+        const operation = action === "delete"
+          ? await remote("delete", "other-directory", ancestorPath, "", 2)
+          : action === "move"
+            ? await remote("move", "object-b", ancestorPath, "other signed bytes", 2, "docs/b.txt")
+            : action === "update"
+              ? await remote("update", "object-b", ancestorPath, "other signed replacement", 2)
+              : await remote("create", "object-c", ancestorPath, "other signed replacement");
+        await assert.rejects(client.apply(operation), { code: "file_pinned" });
+        assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+          "rejected signed ancestor must not be observed or enqueued");
+        assert.deepEqual(await fsp.readFile(snapshotPath), beforeSnapshot,
+          "rejected signed ancestor must not persist any snapshot change");
+        assert.deepEqual(await fsp.readFile(path.join(rootDir, "docs/a.txt")), original,
+          "pinned descendant bytes must survive the rejected ancestor replacement");
+        assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+        assert.equal(state.pushes, 0);
+      });
+    }
+  }
+});
+
+test("issue 66 P2: signed relocation of a tracked ancestor cannot move a pinned subtree", async (t) => {
+  for (const action of ["move", "update"]) {
+    await t.test(`${action} of tracked docs refuses before any journal observation`, async (subtest) => {
+      const { rootDir, open, remote } = await fixture(subtest);
+      const client = await open();
+      await client.apply(await remote("create", "other-directory", "docs", "", 1,
+        undefined, "inode/directory"));
+      await client.pinLocal("docs/a.txt");
+      const priorJournal = await fsp.readFile(client.journal.filePath);
+      const priorSnapshot = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+      const operation = action === "move"
+        ? await remote("move", "other-directory", "archived", "", 2, "docs")
+        : await remote("update", "other-directory", "archived", "", 2,
+          undefined, "inode/directory");
+      await assert.rejects(client.apply(operation), { code: "file_pinned" });
+      assert.deepEqual(await fsp.readFile(client.journal.filePath), priorJournal);
+      assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), priorSnapshot);
+      assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+        "authenticated remote bytes");
+      assert.equal(await fsp.stat(path.join(rootDir, "archived")).then(() => true, () => false), false);
+    });
+  }
+});
+
+test("issue 66 P2: a sibling path must not be mistaken for an ancestor of a pinned file", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  await client.apply(await remote("create", "object-sibling", "docs-old", "signed sibling bytes"));
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs-old"), "utf8"), "signed sibling bytes");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
 });
 
 test("issue 66: failed local pin journal commit never claims pin; a verified MOVE retains pinned identity", async (t) => {
