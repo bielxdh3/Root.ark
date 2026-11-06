@@ -1,0 +1,14 @@
+{
+  "name": "rootark-issue242-disposable-webrtc",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Isolated loopback-only WebRTC room proof of concept, not Root.ark production code",
+  "scripts": {
+    "start": "node server.cjs",
+    "test": "node --test tests/signal.test.cjs",
+    "test:browser": "node tests/browser.cjs"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}
