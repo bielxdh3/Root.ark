@@ -373,11 +373,52 @@ async function start(options = {}) {
   return engine;
 }
 
+async function history(options = {}) {
+  const objectId = options["object-id"];
+  // Validate user-supplied identifiers before reading private credentials or
+  // contacting any endpoint. The HTTP route is for one exact object only.
+  if (typeof objectId !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(objectId)) {
+    throw new Error("Valid --object-id is required");
+  }
+  const config = readPrivateV2Config(path.resolve(options.config || DEFAULT_CONFIG));
+  if (!config || typeof config.serverUrl !== "string" || !config.serverUrl
+    || typeof config.username !== "string" || !config.username
+    || typeof config.token !== "string" || !config.token) {
+    throw new Error("History requires private Sync v2 serverUrl, username and token");
+  }
+  const adapter = createOpaqueSyncAdapter({
+    baseUrl: normalizeTrustedSyncServerUrl(config.serverUrl),
+    fetchImpl: (url, request = {}) => fetch(url, { ...request,
+      headers: { ...request.headers, Authorization: `Bearer ${config.token}` },
+    }),
+  });
+  const response = await adapter.history(objectId);
+  // Display only owner-readable metadata; ciphertext, proofs and credentials
+  // never enter stdout. These are remote claims, not independently verified
+  // historical admission evidence and cannot authorize a restore.
+  const summary = {
+    objectId,
+    signatureVerified: false,
+    versions: response.versions.map((record) => ({
+      versionId: record.versionId,
+      operation: record.operation,
+      revision: record.revision,
+      deviceId: record.deviceId,
+      keyEpoch: record.keyEpoch,
+      path: record.metadata.path,
+      tombstone: record.tombstone,
+    })),
+  };
+  console.log(JSON.stringify(summary));
+  return summary;
+}
+
 if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once");
+  else if (command === "history") history({ ...args(rest) }).catch((error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; });
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
-  trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity, start };
+  trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity, start, history };
