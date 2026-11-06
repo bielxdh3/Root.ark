@@ -163,6 +163,37 @@
       persistedIndex: persisted, plaintextSentToServer: false,
       independentlySignedCatalog: true, authorizesMutation: false });
   }
+  function renderVerifiedResults(container, entries, selectedInput, assertLive) {
+    if (!container?.ownerDocument || typeof container.replaceChildren !== "function"
+      || !selectedInput || typeof assertLive !== "function"
+      || !Array.isArray(entries) || entries.length > 4096) deny();
+    const fragment = container.ownerDocument.createDocumentFragment();
+    for (const entry of entries) {
+      if (!entry || !id.test(entry.objectId)
+        || !Number.isSafeInteger(entry.revision) || entry.revision < 1
+        || typeof entry.logicalTrashCandidate !== "boolean"
+        || (entry.logicalTrashCandidate ? entry.name !== null
+          : typeof entry.name !== "string" || !entry.name || entry.name.length > 220)) deny();
+      const item = container.ownerDocument.createElement("div");
+      item.textContent = (entry.logicalTrashCandidate
+        ? "Lixeira lógica (verifique o tombstone assinado)" : entry.name)
+        + " · revisão " + entry.revision + " ";
+      const button = container.ownerDocument.createElement("button");
+      button.type = "button";
+      button.className = "button button-quiet";
+      button.textContent = "Selecionar objeto";
+      button.addEventListener("click", () => {
+        try {
+          if (!container.contains(button) || assertLive() === false) return;
+          selectedInput.value = entry.objectId;
+          selectedInput.focus();
+        } catch (_) { /* Logout/session switch invalidates this local selection. */ }
+      });
+      item.append(button);
+      fragment.append(item);
+    }
+    container.replaceChildren(fragment);
+  }
   async function search(input) {
     try {
       if (typeof input?.assertLive !== "function" || typeof input.term !== "string"
@@ -235,5 +266,5 @@
       live(input.assertLive);
     } catch (_) { deny(); }
   }
-  return Object.freeze({ search, clear });
+  return Object.freeze({ search, clear, renderVerifiedResults });
 }));
