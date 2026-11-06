@@ -2660,7 +2660,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   // concurrent requests cannot consume the same final view/download allowance
   // or overwrite link metadata saved while this request was waiting.
   await pauseShareAccessForTest("reload");
-  const currentLinks = loadPublicLinks();
+  let currentLinks = loadPublicLinks();
   let currentLink = currentLinks[token];
   if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
     return { status: 404, error: "Link indisponivel." };
@@ -2688,7 +2688,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 415, error: "Preview indisponivel" };
   }
   const currentLimits = getShareLimitState(currentLink);
-  const currentShareViewer = getActiveShareViewer(req, token, currentLink);
+  let currentShareViewer = getActiveShareViewer(req, token, currentLink);
   const currentViewerAlreadyActive = Boolean(currentShareViewer);
   downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && currentShareViewer?.viewer.downloadCounted);
   if (options.countView && viewPermitted && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
@@ -2772,8 +2772,56 @@ async function resolveShareAccess(req, res, token, options = {}) {
     if (viewPermitted) logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
   }
 
+  // Run synchronously as close as possible to streaming the bytes. The link
+  // may change while the file lookup and authorization requests are awaited.
+  const revalidateStreamAccess = () => {
+    const latestLinks = loadPublicLinks();
+    const latestLink = latestLinks[token];
+    if (!latestLink || latestLink.fileName !== currentLink.fileName
+      || (latestLink.folderId || ROOT_FOLDER_ID) !== (currentLink.folderId || ROOT_FOLDER_ID)) {
+      return { status: 404, error: "Link indisponivel." };
+    }
+    const latestExpiresAt = new Date(latestLink.expiresAt).getTime();
+    if (!Number.isFinite(latestExpiresAt) || latestExpiresAt <= Date.now()) {
+      logShareAudit(req, "share.expired", token, latestLink, "expired", "failure");
+      return { status: 410, error: "Link indisponivel." };
+    }
+    const latestPasswordHash = latestLink.passwordHash || latestLink.password_hash || null;
+    if (latestPasswordHash && !hasValidSharePasswordSession(req, token, latestLink)
+      && latestPasswordHash !== verifiedPasswordHash) {
+      return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
+    }
+    if (options.operation && !getShareLinkPermissions(latestLink).includes(options.operation)) {
+      logShareAudit(req, "share.operation_denied", token, latestLink, options.operation, "failure", { operation: options.operation });
+      return { status: 403, error: "Operacao nao permitida por este link." };
+    }
+    const latestViewer = getActiveShareViewer(req, token, latestLink);
+    if (options.requireViewer && getShareAccessCookieRequired(latestLink, options.countDownloadOncePerViewer) && !latestViewer) {
+      return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+    }
+    const latestAlreadyCounted = Boolean(options.countDownloadOncePerViewer && latestViewer?.viewer.downloadCounted);
+    if (options.requireDownloadCountedViewer && (Number(latestLink.maxDownloads) || 0) > 0 && !latestAlreadyCounted) {
+      return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+    }
+    const latestLimits = getShareLimitState(latestLink);
+    if (options.countDownload && !latestAlreadyCounted && latestLimits.maxDownloads > 0 && latestLimits.downloads >= latestLimits.maxDownloads) {
+      logShareAudit(req, "share.limit_reached", token, latestLink, "download", "failure", { limit: "downloads" });
+      return { status: 410, error: "Link indisponivel." };
+    }
+    currentLinks = latestLinks;
+    currentLink = latestLink;
+    currentShareViewer = latestViewer;
+    downloadAlreadyCounted = latestAlreadyCounted;
+    return null;
+  };
+
   const reserveDownloadQuota = () => {
-    if (!options.countDownload || downloadAlreadyCounted) return null;
+    if (!options.countDownload) return null;
+    if (!shouldUseDatabase()) {
+      const failure = revalidateStreamAccess();
+      if (failure) return failure;
+    }
+    if (downloadAlreadyCounted) return null;
     if (shouldUseDatabase()) {
       const failure = reserveDatabaseShareQuota(
         "download",
@@ -2811,6 +2859,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     limits: getShareLimitState(currentLink),
     expiresAt: currentExpiresAt,
     ...(options.deferDownloadReservation ? { reserveDownload: reserveDownloadQuota } : {}),
+    ...(options.requireDownloadCountedViewer ? { revalidateStreamAccess } : {}),
   };
 }
 
@@ -12206,6 +12255,7 @@ app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePre
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.revalidateStreamAccess,
   });
 });
 

@@ -4,10 +4,10 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
-const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -42,7 +42,7 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
 }
 
 async function startFixture(t, mode, extraEnv = {}) {
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), `rootark-share-permissions-${mode}-`));
+  const sandbox = createPrivateAuthorityFixture(`rootark-share-permissions-${mode}-`);
   const dataDir = path.join(sandbox, "data");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
@@ -354,6 +354,74 @@ test("an in-flight download is re-authorized inside the quota transaction (sqlit
   assert.equal(result.status, 403, result.body);
   assert.ok(result.body.includes(DENIED));
   assert.equal(result.body.includes(FILE_CONTENT), false);
+});
+
+test("an in-flight download is re-authorized at the final quota reservation (json storage)", { timeout: 60_000 }, async (t) => {
+  const { authed, publicPost, dataDir } = await startFixture(t, "json", { ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve", ROOTARK_TEST_SHARE_PAUSE_MS: "1500" });
+  const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+
+  const pending = publicPost(token, "download");
+  await sleep(500);
+  setLinkPermissions("json", dataDir, token, ["view"]);
+  const result = await pending;
+  assert.equal(result.status, 403, result.body);
+  assert.ok(result.body.includes(DENIED));
+  assert.equal(result.body.includes(FILE_CONTENT), false);
+
+  const revoked = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
+  assert.equal(revoked.status, 201, revoked.body);
+  const revokedToken = JSON.parse(revoked.body).token;
+  const pendingRevocation = publicPost(revokedToken, "download");
+  await sleep(500);
+  const linksPath = path.join(dataDir, "public-links.json");
+  const beforeRevocation = JSON.parse(fs.readFileSync(linksPath, "utf8"));
+  delete beforeRevocation[revokedToken];
+  fs.writeFileSync(linksPath, JSON.stringify(beforeRevocation));
+  const afterRevocation = await pendingRevocation;
+  assert.equal(afterRevocation.status, 404, "revoked share must not finish its in-flight download");
+  assert.equal(afterRevocation.body.includes(FILE_CONTENT), false);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(linksPath, "utf8")), revokedToken), false,
+    "the in-flight request must not resurrect a revoked link");
+
+  const exhausted = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
+  assert.equal(exhausted.status, 201, exhausted.body);
+  const exhaustedToken = JSON.parse(exhausted.body).token;
+  const pendingExhaustion = publicPost(exhaustedToken, "download");
+  await sleep(500);
+  const beforeExhaustion = JSON.parse(fs.readFileSync(linksPath, "utf8"));
+  beforeExhaustion[exhaustedToken].maxDownloads = 1;
+  beforeExhaustion[exhaustedToken].downloads = 1;
+  fs.writeFileSync(linksPath, JSON.stringify(beforeExhaustion));
+  const afterExhaustion = await pendingExhaustion;
+  assert.equal(afterExhaustion.status, 410, "exhausted share must fail at final reservation");
+  assert.equal(afterExhaustion.body.includes(FILE_CONTENT), false);
+});
+
+test("an in-flight preview GET rechecks capabilities before streaming (json storage)", { timeout: 60_000 }, async (t) => {
+  const { authed, publicPost, port, origin, dataDir } = await startFixture(t, "json",
+    { ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve", ROOTARK_TEST_SHARE_PAUSE_MS: "1500" });
+  const created = await authed("/share", {
+    name: PNG_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["preview"], maxDownloads: 1,
+  });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+  const session = await publicPost(token, "view");
+  assert.equal(session.status, 200);
+  const viewerCookie = viewerCookieFrom(session);
+  assert.ok(viewerCookie);
+  const firstPreview = await publicPost(token, "preview", viewerCookie);
+  assert.equal(firstPreview.status, 200, firstPreview.body);
+
+  const pendingGet = request(port, `/share/${token}/preview`, {
+    headers: { origin, cookie: viewerCookie },
+  });
+  await sleep(500);
+  setLinkPermissions("json", dataDir, token, ["download"]);
+  const result = await pendingGet;
+  assert.equal(result.status, 403, "preview GET must not stream after losing the preview capability");
+  assert.ok(result.body.includes(DENIED));
 });
 
 test("permissions null and malformed stored values fail closed, legacy absence stays all operations", { timeout: 60_000 }, async (t) => {
