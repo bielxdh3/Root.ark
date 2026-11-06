@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const z = require("./rootark-zk-1");
 const { redeemProtectedCiphertextShare } =
   require("../../public/client/rootark-zk1-recipient-share");
-const { openOwnerAuthorizedFileCek } =
+const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek } =
   require("./rootark-zk1-owner-authorized-file-cek-transfer");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
@@ -17,8 +17,28 @@ const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const METADATA = [...SCOPE, "object_id", "version_id", "parent_version_id", "epoch", "kind"];
 const ENVELOPE = ["schema", "core", "enc", "ciphertext", "owner_signature",
   "authorizesProductionRestore", "externalCustodyProven"];
+const SHARE = ["type", "grant_id", "account_id", "compartment_id", "keyring_id",
+  "object_id", "object_revision", "ciphertext_digest", "epoch", "manifest_revision",
+  "manifest_digest", "issuer_device_id", "request_nonce", "issued_at", "expires_at",
+  "recipient_username", "recipient_device_id"];
+const GRANT = ["grantId", "expiresAt", "shareStatementBase64", "shareSignatureBase64"];
+const RECIPIENT_PIN = ["recipientUsername", "deviceId",
+  "authorizationPublicKey", "hpkePublicKey"];
+const OFFER = ["schema", "grant", "recipientUsername", "recipientDeviceId",
+  "metadata", "envelope", "authorizesProductionIo", "externalCustodyProven"];
 function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
+function denyOffer() { throw Error("ZK_SHARE_OFFER_DENIED"); }
 const b64 = (value) => Buffer.from(value).toString("base64url");
+function from64(value, length) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
+    || value.length > Math.ceil(length * 4 / 3) + 4) denyOffer();
+  const bytes = Buffer.from(value, "base64url");
+  if (bytes.length !== length || b64(bytes) !== value) denyOffer();
+  return bytes;
+}
+function same(a, b) {
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 function strict(value, names) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -37,6 +57,146 @@ function snapshot(value, names) {
     copy[name] = part;
   }
   return Object.freeze(copy);
+}
+// Recipient contact pins come from the owner's separately authenticated
+// contact/device enrollment. Neither the server response nor its grant may
+// populate them. Reject accessors before any crypto or network await.
+function snapshotAuthority(value) {
+  strict(value, ["scope", "head", "devices"]);
+  const fields = Object.getOwnPropertyDescriptors(value);
+  if (["scope", "head", "devices"].some((key) =>
+    !Object.hasOwn(fields[key], "value"))) denyOffer();
+  const scope = snapshot(fields.scope.value, SCOPE);
+  const headValue = fields.head.value;
+  strict(headValue, ["revision", "epoch", "digest"]);
+  const h = Object.getOwnPropertyDescriptors(headValue);
+  if (["revision", "epoch", "digest"].some((key) =>
+    !Object.hasOwn(h[key], "value"))
+    || !(h.digest.value instanceof Uint8Array)
+    || h.digest.value.length !== 32) denyOffer();
+  const head = { revision: h.revision.value, epoch: h.epoch.value,
+    digest: Buffer.from(h.digest.value) };
+  const sourceDevices = fields.devices.value;
+  if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
+  const devices = sourceDevices.map((device) => {
+    strict(device, ["deviceId", "authorizationPublicKey",
+      "enrolledEpoch", "revokedAtEpoch"]);
+    const d = Object.getOwnPropertyDescriptors(device);
+    if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
+      || !(d.authorizationPublicKey.value instanceof Uint8Array)
+      || d.authorizationPublicKey.value.length !== 32) denyOffer();
+    return { deviceId: d.deviceId.value,
+      authorizationPublicKey: Buffer.from(d.authorizationPublicKey.value),
+      enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
+  });
+  return { scope, head, devices };
+}
+async function verifyOfferAuthority(authority, statement, bytes, signature, pin) {
+  const current = snapshotAuthority(await authority());
+  currentAuthority(current, statement, signature, bytes);
+  const recipient = current.devices.filter((device) =>
+    device.deviceId === pin.deviceId);
+  if (recipient.length !== 1
+    || !same(recipient[0].authorizationPublicKey,
+      from64(pin.authorizationPublicKey, 32))) denyOffer();
+  return current;
+}
+// Owner-side DEV-OFF portable offer. A grant must already have been issued by
+// the authenticated ciphertext server. The owner explicitly pins the contact
+// username and both keys out of band, and provides independently verified
+// current authority. We never fetch recipient keys from the share endpoint.
+async function createProtectedRecipientShareOffer(input) {
+  let ownerCek, ciphertext;
+  try {
+    strict(input, ["grant", "recipientPin", "readIndependentAuthority",
+      "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
+      "ciphertext", "ciphertextRoot", "authority", "nowSeconds"]);
+    const d = Object.getOwnPropertyDescriptors(input);
+    if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))) denyOffer();
+    const grant = snapshot(d.grant.value, GRANT);
+    const pin = snapshot(d.recipientPin.value, RECIPIENT_PIN);
+    const metadata = snapshot(d.metadata.value, METADATA);
+    if (typeof d.readIndependentAuthority.value !== "function"
+      || typeof pin.recipientUsername !== "string"
+      || !/^[A-Za-z0-9_.@-]{1,128}$/.test(pin.recipientUsername)
+      || typeof pin.deviceId !== "string" || !pin.deviceId
+      || pin.deviceId.length > 64
+      || /[\x00-\x1f\x7f]/.test(pin.deviceId)
+      || !Number.isSafeInteger(d.nowSeconds.value)
+      || Math.abs(Math.floor(Date.now() / 1000) - d.nowSeconds.value) > 30
+      || !Number.isSafeInteger(d.objectRevision.value)
+      || d.objectRevision.value < 1
+      || !(d.ownerHeldCek.value instanceof Uint8Array)
+      || d.ownerHeldCek.value.length !== 32
+      || !(d.ciphertext.value instanceof Uint8Array)
+      || d.ciphertext.value.length < 16
+      || d.ciphertext.value.length > 4 * 1024 * 1024
+      || !(d.ciphertextRoot.value instanceof Uint8Array)
+      || d.ciphertextRoot.value.length !== 32) denyOffer();
+    from64(pin.authorizationPublicKey, 32);
+    from64(pin.hpkePublicKey, 32);
+    from64(grant.grantId, 32);
+    from64(metadata.object_id, 16);
+    ownerCek = Buffer.from(d.ownerHeldCek.value);
+    ciphertext = Buffer.from(d.ciphertext.value);
+    const ciphertextRoot = Buffer.from(d.ciphertextRoot.value);
+    if (typeof grant.shareStatementBase64 !== "string"
+      || grant.shareStatementBase64.length > 5470) denyOffer();
+    const statementBytes = from64(grant.shareStatementBase64,
+      Buffer.from(grant.shareStatementBase64, "base64url").length);
+    if (statementBytes.length < 1 || statementBytes.length > 4096) denyOffer();
+    const statement = await z.decodeDeterministic(statementBytes);
+    strict(statement, SHARE);
+    if (!same(Buffer.from(await z.encodeDeterministic(statement)), statementBytes)
+      || statement.type !== "rootark-zk1-protected-ciphertext-share/v1"
+      || !same(Buffer.from(statement.grant_id || []), from64(grant.grantId, 32))
+      || statement.expires_at !== grant.expiresAt
+      || !Number.isSafeInteger(statement.issued_at) || statement.issued_at < 1
+      || !Number.isSafeInteger(statement.expires_at)
+      || statement.expires_at <= Math.max(d.nowSeconds.value, statement.issued_at)
+      || statement.expires_at - statement.issued_at > 86400
+      || statement.recipient_username !== pin.recipientUsername
+      || statement.recipient_device_id !== pin.deviceId
+      || statement.object_id !== metadata.object_id
+      || statement.object_revision !== d.objectRevision.value
+      || statement.epoch !== metadata.epoch
+      || !same(Buffer.from(statement.ciphertext_digest || []),
+        crypto.createHash("sha256").update(ciphertext).digest())) denyOffer();
+    for (const field of SCOPE) {
+      if (metadata[field] !== b64(statement[field])) denyOffer();
+    }
+    const signature = from64(grant.shareSignatureBase64, 64);
+    await verifyOfferAuthority(d.readIndependentAuthority.value,
+      statement, statementBytes, signature, pin);
+    // Existing owner ceremony verifies an independent owner pin, an authentic
+    // V2 approval + PoP, witness receipt, matching signed X25519 roster key,
+    // real file AEAD and signed HPKE CEK envelope.
+    const envelope = await sealOwnerAuthorizedFileCek({
+      ownerPrivateKey: d.ownerPrivateKey.value, ownerHeldCek: ownerCek,
+      metadata, objectRevision: d.objectRevision.value, ciphertext,
+      ciphertextRoot, authority: d.authority.value,
+    });
+    if (envelope.core.device_id !== pin.deviceId
+      || envelope.core.hpke_public_key !== pin.hpkePublicKey
+      || envelope.core.object_id !== statement.object_id
+      || envelope.core.object_revision !== statement.object_revision
+      || envelope.core.ciphertext_sha256 !== b64(statement.ciphertext_digest)
+      || envelope.core.owner_revision !== statement.manifest_revision
+      || envelope.core.owner_digest !== b64(statement.manifest_digest)
+      || envelope.core.owner_epoch !== statement.epoch
+      || envelope.core.epoch !== statement.epoch) denyOffer();
+    await verifyOfferAuthority(d.readIndependentAuthority.value,
+      statement, statementBytes, signature, pin);
+    if (Math.floor(Date.now() / 1000) >= statement.expires_at) denyOffer();
+    return Object.freeze({
+      schema: "rootark-zk1-recipient-share-offer-dev/v1",
+      grant: Object.freeze({ ...grant }),
+      recipientUsername: pin.recipientUsername, recipientDeviceId: pin.deviceId,
+      metadata: Object.freeze({ ...metadata }), envelope,
+      authorizesProductionIo: false, externalCustodyProven: false,
+    });
+  } catch (_) { denyOffer(); }
+  finally { ownerCek?.fill(0); ciphertext?.fill(0); }
 }
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
@@ -153,4 +313,34 @@ async function openProtectedRecipientShareFile(input) {
   finally { opened?.cek?.fill(0); plaintext?.data?.fill(0); }
 }
 
-module.exports = { openProtectedRecipientShareFile };
+async function openPortableProtectedRecipientShareFile(input) {
+  try {
+    strict(input, ["offer", "redeemInput", "authority", "operatorMinimumSequence",
+      "deviceHpkePrivateKey", "nowSeconds"]);
+    const inputDescriptors = Object.getOwnPropertyDescriptors(input);
+    if (Object.values(inputDescriptors).some((entry) =>
+      !Object.hasOwn(entry, "value"))) deny();
+    const offer = inputDescriptors.offer.value;
+    strict(offer, OFFER);
+    const offerDescriptors = Object.getOwnPropertyDescriptors(offer);
+    if (Object.values(offerDescriptors).some((entry) =>
+      !Object.hasOwn(entry, "value"))) deny();
+    if (offer.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
+      || offer.authorizesProductionIo !== false
+      || offer.externalCustodyProven !== false) deny();
+    const grant = snapshot(offer.grant, GRANT);
+    const expectedGrant = snapshot(input.redeemInput?.grant, GRANT);
+    if (GRANT.some((key) => grant[key] !== expectedGrant[key])
+      || offer.recipientUsername !== input.redeemInput.recipientUsername
+      || offer.recipientDeviceId !== input.redeemInput.recipientDeviceId) deny();
+    return await openProtectedRecipientShareFile({
+      redeemInput: input.redeemInput, envelope: offer.envelope,
+      authority: input.authority,
+      operatorMinimumSequence: input.operatorMinimumSequence,
+      metadata: offer.metadata, deviceHpkePrivateKey: input.deviceHpkePrivateKey,
+      nowSeconds: input.nowSeconds,
+    });
+  } catch (_) { deny(); }
+}
+module.exports = { openProtectedRecipientShareFile,
+  createProtectedRecipientShareOffer, openPortableProtectedRecipientShareFile };
