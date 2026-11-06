@@ -309,6 +309,117 @@ test("#67 P2: failed initial fsynced progress creation cannot permanently brick 
   assert.equal(f.pushes(), 1);
 });
 
+test("#67 P2: crash after final hardlink publication with two links safely resumes once", async (t) => {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const originalUnlink = fsp.unlink;
+  let interrupted = false;
+  fsp.unlink = async (filePath) => {
+    if (!interrupted && String(filePath).includes(".rootark-recovery-execution-")
+      && String(filePath).includes(".tmp-")) {
+      interrupted = true;
+      throw Object.assign(new Error("simulated crash before temp unlink"), { code: "EIO" });
+    }
+    return originalUnlink(filePath);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
+      (error) => error.code === "EIO");
+  } finally { fsp.unlink = originalUnlink; }
+  assert.equal(interrupted, true);
+  assert.equal(f.pushes(), 0);
+  const names = await fsp.readdir(f.local);
+  const final = names.find((name) => /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name));
+  const temporary = names.find((name) => name.startsWith(`${final}.tmp-`));
+  assert.ok(final && temporary);
+  const before = await fsp.lstat(path.join(f.local, final), { bigint: true });
+  const sibling = await fsp.lstat(path.join(f.local, temporary), { bigint: true });
+  assert.equal(before.nlink, 2n);
+  assert.equal(before.ino, sibling.ino);
+  const reopened = await new SyncEngine(f.opts).open();
+  const result = await reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true });
+  assert.equal(result.completed, 1);
+  assert.equal(f.pushes(), 1);
+  assert.equal((await fsp.lstat(path.join(f.local, final), { bigint: true })).nlink, 1n);
+  assert.equal(fs.existsSync(path.join(f.local, temporary)), false);
+});
+
+test("#67 P2: unknown foreign hardlink to valid final progress is never unlinked or trusted", async (t) => {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const originalUnlink = fsp.unlink;
+  let interrupted = false;
+  fsp.unlink = async (filePath) => {
+    if (!interrupted && String(filePath).includes(".rootark-recovery-execution-")
+      && String(filePath).includes(".tmp-")) {
+      interrupted = true;
+      throw Object.assign(new Error("simulated post-link crash"), { code: "EIO" });
+    }
+    return originalUnlink(filePath);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
+      (error) => error.code === "EIO");
+  } finally { fsp.unlink = originalUnlink; }
+  const names = await fsp.readdir(f.local);
+  const final = names.find((name) => /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name));
+  const temporary = names.find((name) => name.startsWith(`${final}.tmp-`));
+  const foreign = path.join(f.local, "foreign-duplicate-link");
+  await fsp.rename(path.join(f.local, temporary), foreign);
+  const reopened = await new SyncEngine(f.opts).open();
+  await assert.rejects(reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true }),
+    (error) => error.code === "restore_plan_unavailable");
+  assert.equal((await fsp.lstat(path.join(f.local, final), { bigint: true })).nlink, 2n);
+  assert.equal(fs.existsSync(foreign), true);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67 P2: directory fsync failure after no-replace publication retains valid resumable final", async (t) => {
+  if (process.platform === "win32") return t.skip("Windows does not support portable directory fsync");
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const originalOpen = fsp.open;
+  const originalLink = fsp.link;
+  let published = false;
+  let injected = false;
+  fsp.link = async (...args) => {
+    const result = await originalLink(...args);
+    if (String(args[1]).includes(".rootark-recovery-execution-")) published = true;
+    return result;
+  };
+  fsp.open = async (filePath, flags, ...rest) => {
+    const handle = await originalOpen(filePath, flags, ...rest);
+    if (published && !injected && filePath === f.local && flags === fs.constants.O_RDONLY) {
+      injected = true;
+      return new Proxy(handle, { get(target, key) {
+        if (key === "sync") return async () => {
+          throw Object.assign(new Error("simulated post-publication dir fsync EIO"), { code: "EIO" });
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
+      (error) => error.code === "EIO");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.link = originalLink;
+  }
+  assert.equal(injected, true);
+  assert.equal(f.pushes(), 0);
+  const final = (await fsp.readdir(f.local)).find((name) =>
+    /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name));
+  assert.ok(final);
+  assert.equal((await fsp.lstat(path.join(f.local, final), { bigint: true })).nlink, 1n);
+  const reopened = await new SyncEngine(f.opts).open();
+  const resumed = await reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true });
+  assert.equal(resumed.completed, 1);
+  assert.equal(f.pushes(), 1);
+});
+
 test("#67 P2: final grant revocation before enqueue permits safe retry only after proof of no dispatch", async (t) => {
   const f = await fixture(t);
   const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);

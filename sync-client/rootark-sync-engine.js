@@ -381,30 +381,69 @@ async function createDurableRestoreProgress(filePath, value) {
   } finally { await handle.close(); }
   await containedAbsolute(path.dirname(filePath), temporary, false);
   await fsp.link(temporary, filePath);
+  // Minimize the nlink=2 crash window. A torn process can still leave both
+  // aliases, so readDurableRestoreProgress validates and repairs that exact
+  // known temporary identity under the exclusive root lock.
+  await fsp.unlink(temporary);
   if (process.platform !== "win32") {
     const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
     try { await directory.sync(); } finally { await directory.close(); }
   }
-  // Retain a temporary on failed publication as evidence, but remove the
-  // caller-created hard-link after its complete final inode is durable.
-  await fsp.unlink(temporary);
 }
 
-async function readDurableRestoreProgress(filePath) {
+async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expectedScope }) {
   let handle;
   try {
     const before = await fsp.lstat(filePath, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
+    if (!before.isFile() || before.isSymbolicLink()
+      || (before.nlink !== 1n && before.nlink !== 2n)
       || before.size > 65536n) throw Error();
     handle = await fsp.open(filePath, fs.constants.O_RDONLY
       | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || opened.nlink !== 1n || !sameFileVersion(before, opened)) throw Error();
+    if (!opened.isFile() || opened.nlink !== before.nlink || !sameFileVersion(before, opened)) throw Error();
     const contents = await handle.readFile();
     const after = await handle.stat({ bigint: true });
     const pathname = await fsp.lstat(filePath, { bigint: true });
     if (!sameFileVersion(opened, after) || !sameFileVersion(after, pathname)) throw Error();
-    return JSON.parse(contents.toString("utf8"));
+    const parsed = JSON.parse(contents.toString("utf8"));
+    if (parsed?.version !== 1 || parsed.planDigest !== expectedPlanDigest
+      || protocol.canonicalJson(parsed.scope) !== protocol.canonicalJson(expectedScope)
+      || !Array.isArray(parsed.items)) throw Error();
+    if (before.nlink === 2n) {
+      // Recover only our own *complete*, pre-fsynced, dual-linked manifest.
+      // Never unlink a foreign hardlink or accept nlink>2. Other unrelated
+      // abandoned temporaries (e.g. older ENOSPC) remain untouched.
+      const basename = path.basename(filePath);
+      if (!/^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(basename)) throw Error();
+      const prefix = `${basename}.tmp-`;
+      const candidates = (await fsp.readdir(path.dirname(filePath)))
+        .filter((name) => name.startsWith(prefix)
+          && /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(name.slice(prefix.length)));
+      const matching = [];
+      for (const name of candidates) {
+        const target = path.join(path.dirname(filePath), name);
+        const stats = await fsp.lstat(target, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink()) continue;
+        if (sameFileIdentity(stats, before)) {
+          if (!sameFileVersion(stats, before)) throw Error();
+          matching.push(target);
+        }
+      }
+      if (matching.length !== 1) throw Error();
+      await containedAbsolute(path.dirname(filePath), matching[0], false);
+      await fsp.unlink(matching[0]);
+      if (process.platform !== "win32") {
+        const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+      const restored = await fsp.lstat(filePath, { bigint: true });
+      if (!restored.isFile() || restored.isSymbolicLink() || restored.nlink !== 1n
+        || !sameFileIdentity(restored, before)
+        || restored.size !== before.size || restored.mtimeNs !== before.mtimeNs
+        || restored.birthtimeNs !== before.birthtimeNs || restored.mode !== before.mode) throw Error();
+    }
+    return parsed;
   } catch {
     fail("Controlled restore progress is missing or untrusted", "restore_plan_unavailable");
   } finally { if (handle) await handle.close(); }
@@ -856,7 +895,8 @@ class SyncEngine {
       let lastPersisted = null;
       const persist = async (state) => {
         await containedAbsolute(this.rootDir, filePath, true);
-        const onDisk = await readDurableRestoreProgress(filePath);
+        const onDisk = await readDurableRestoreProgress(filePath,
+          { expectedPlanDigest: planDigest, expectedScope: scope });
         if (lastPersisted === null
           || protocol.canonicalJson(onDisk) !== lastPersisted) {
           fail("Controlled restore progress changed during execution", "restore_plan_unavailable");
@@ -866,7 +906,8 @@ class SyncEngine {
       };
       let state;
       if (resume) {
-        state = await readDurableRestoreProgress(filePath);
+        state = await readDurableRestoreProgress(filePath,
+          { expectedPlanDigest: planDigest, expectedScope: scope });
         if (state?.version !== 1 || state.planDigest !== planDigest
           || protocol.canonicalJson(state.scope) !== protocol.canonicalJson(scope)
           || !Array.isArray(state.items) || state.items.length !== requests.length

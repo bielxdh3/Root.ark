@@ -120,10 +120,18 @@ arquivo inicial e publicado somente apos gravacao e fsync de um temporario
 privado completo, via hardlink **sem substituicao**. Falha/ENOSPC anterior a
 essa publicacao deixa apenas temporario ignorado e preservado para exame;
 nao cria progresso final parcial nem bloqueia um plano ainda nao iniciado.
+Se uma queda ocorrer depois do hardlink final, mas antes do unlink do
+temporario ou do fsync do diretorio, o progresso completo pode aparecer com
+dois nomes para **o mesmo inode**. Na retomada sob lock exclusivo, o cliente
+so regulariza esse caso ao encontrar exatamente o temporario privado gerado
+com nome reconhecivel, identidade de inode/conteudo igual, `nlink=2` e JSON
+com o mesmo digest/escopo do plano; a remocao desse alias recebe fsync do
+diretorio no POSIX. Hardlinks desconhecidos ou multiplos aliases permanecem
+bloqueados, preservados para verificacao externa.
 Um arquivo final preexistente invalido continua bloqueado ate reconciliacao
 externa: ele nunca e apagado, substituido ou tratado como prova de ausencia
 de envio.
-retorno oferece `atomic:false`, `completed`, `remaining`, `partial`, `planDigest`
+O retorno oferece `atomic:false`, `completed`, `remaining`, `partial`, `planDigest`
 e `items` com resultados individuais. Os commits ja concluidos nao sao
 reemitidos. Para continuar um plano parcialmente bloqueado depois de resolver
 o problema, um cliente confiavel deve passar o **mesmo** plano:
