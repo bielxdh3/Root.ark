@@ -107,7 +107,8 @@ object ProtectedSyncContent {
             check(record.protocolVersion == SYNC_PROTOCOL_VERSION)
             check(record.operation == SyncOperationType.CREATE || record.operation == SyncOperationType.UPDATE)
             check(!record.tombstone)
-            check(nowMillis > 0 && context.snapshotObtainedAtMillis in 1..nowMillis)
+            check(nowMillis in 1..9_007_199_254_740_990L)
+            check(context.snapshotObtainedAtMillis in 1..nowMillis)
             check(nowMillis < context.snapshotValidUntilMillis)
             check(context.username.isNotBlank() && context.username.length <= 512)
             check(record.objectId == context.objectId && record.fileId == context.fileId)
@@ -121,10 +122,10 @@ object ProtectedSyncContent {
             id(record.deviceId)
             id(record.compartmentId)
             id(record.keyEpoch)
-            check(record.revision.counter >= 0 && record.revision.deviceId == record.deviceId)
+            check(record.revision.counter in 0..9_007_199_254_740_991L && record.revision.deviceId == record.deviceId)
             id(record.revision.deviceId)
             record.baseRevision?.let {
-                check(it.counter >= 0)
+                check(it.counter in 0..9_007_199_254_740_991L)
                 id(it.deviceId)
             }
             val metadata = validatedMetadata(record)
@@ -148,7 +149,7 @@ object ProtectedSyncContent {
             check(proof.schemaVersion == 1 && proof.type == PROOF_TYPE)
             check(proof.suite == SUITE && proof.protocolVersion == 2)
             check(proof.username == context.username && proof.deviceId == record.deviceId)
-            check(proof.expiresAt > nowMillis)
+            check(proof.expiresAt in (nowMillis + 1)..9_007_199_254_740_991L)
             check(proof.operationId == record.operationId && proof.objectId == record.objectId)
             check(proof.fileId == record.fileId && proof.versionId == record.versionId)
             check(proof.operation == record.operation.wire && proof.revision == record.revision)
@@ -203,7 +204,7 @@ object ProtectedSyncContent {
         for (value in listOf(m.name, m.contentType)) {
             value?.let { check(it.isNotEmpty() && it.length <= 512 && !CONTROL.containsMatchIn(it)) }
         }
-        check(m.size == null || m.size >= 0)
+        check(m.size == null || m.size in 0..9_007_199_254_740_991L)
         val metadata = linkedMapOf<String, Any?>(
             "fileId" to m.fileId, "versionId" to m.versionId,
             "path" to m.path, "parentId" to m.parentId,
