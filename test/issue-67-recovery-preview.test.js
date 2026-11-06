@@ -181,6 +181,22 @@ test("#67 P2: preview refuses an active writer lock or a missing initialized sna
   assert.equal(f.pushes(), 0);
 });
 
+test("#67 P2: journal loss during async historical fetch cannot return a ready preview", async (t) => {
+  const f = await fixture(t);
+  const journalPath = path.join(f.local, ".rootark-sync-journal.json");
+  const originalHistory = f.adapter.history;
+  f.adapter.history = async (...args) => {
+    const history = await originalHistory(...args);
+    await fsp.unlink(journalPath);
+    return history;
+  };
+  await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
+    (error) => error.code === "history_preview_unavailable");
+  assert.equal(fs.existsSync(journalPath), false);
+  assert.equal(fs.existsSync(path.join(f.local, ".rootark-sync.lock")), false);
+  assert.equal(f.pushes(), 0);
+});
+
 test("#67: preview refuses missing independent evidence, revoked current device and missing custody", async (t) => {
   const f = await fixture(t, { strict: false });
   await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
