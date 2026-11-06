@@ -265,6 +265,77 @@ test("#67: staged content hash rejects same-size edits with restored mtime and s
   assert.equal((await f.engine.journal.recover()).length, 0);
 });
 
+test("#67: a restart cannot dispatch a signed restore whose file was not materialized", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const old = Buffer.from("previous clean on-disk bytes");
+  await fsp.writeFile(target, old);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(old).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const stage = f.engine.stageHistoricalRestore.bind(f.engine);
+  f.engine.stageHistoricalRestore = async (...args) => {
+    await stage(...args);
+    throw new Error("simulated process halt after moving original to trash");
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /simulated process halt/);
+  assert.equal(fs.existsSync(target), false);
+  assert.equal((await f.engine.journal.recover()).length, 1);
+  f.adapter.list = async (id) => id ? structuredClone(f.current()) : [structuredClone(f.current())];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  await assert.rejects(reopened.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0, "an unmaterialized local restore must never be pushed after restart");
+  assert.equal((await reopened.journal.recover()).length, 1);
+  assert.equal(fs.existsSync(target), false);
+  const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  assert.equal(trash.length, 1);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), old);
+  // Explicit recovery is possible without a new signature: materialize the
+  // exact authenticated pending bytes, then let the existing CAS path resume.
+  await fsp.writeFile(target, protocol.decryptPayload(f.original, f.privateFileKey));
+  const resumed = await reopened.syncOnce();
+  assert.equal(resumed.pushed, 1);
+  assert.equal(f.pushes(), 1);
+  assert.equal((await reopened.journal.recover()).length, 0);
+});
+
+test("#67: hardlink permission failure preserves local bytes and blocks remote restore", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const old = Buffer.from("newer synchronized local bytes");
+  await fsp.writeFile(target, old);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(old).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const originalLink = fsp.link;
+  fsp.link = async (source, destination) => {
+    if (destination === target && source.includes(".tmp-")) {
+      throw Object.assign(new Error("simulated hardlink permission denial"), { code: "EACCES" });
+    }
+    return originalLink(source, destination);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /hardlink permission denial/);
+  } finally { fsp.link = originalLink; }
+  assert.deepEqual(await fsp.readFile(target), old);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 1);
+  await assert.rejects(f.engine.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0);
+});
+
 test("#67: an untracked file created after enqueue is never replaced by restore", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
