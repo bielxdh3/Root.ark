@@ -52,12 +52,21 @@ do `syncOnce` para inventarios por pagina.
 
 Para evitar reler o arquivo de objetos inteiro em cada pagina, o servidor
 guarda no maximo o indice de metadados de **uma conta por instancia** (ate
-16 MiB), sem manter ciphertext nesse cache. Cada requisicao confere o lock
+32 MiB de registros JSON serializados), sem manter ciphertext nesse cache.
+O teto mede os registros serializados, **nao o RSS total do processo**:
+um volume maior de objetos ou metadados pode atingir o teto. Se o indice
+da conta exceder 32 MiB, a rota retorna **HTTP 507** com codigo estavel
+`metadata_index_too_large`, em vez de voltar a reler o JSON a cada pagina.
+O servidor memoriza apenas um marcador de excesso por conta e revisao
+duravel, evitando reprocessamento em tentativas subsequentes.
+Cada requisicao confere o lock
 do escritor, a politica de armazenamento privado quando aplicavel e a
 identidade duravel do arquivo (dispositivo, inode, tamanho, mtime e ctime
 com precisao de nanossegundos). Escritas atomicas de outro processo
 invalidam o indice antes da pagina seguinte; o cursor antigo recebe 409.
-Bibliotecas cujo indice ultrapasse 16 MiB continuam funcionais, sem cache.
+O limite e por **tamanho do indice**, nao por numero fixo de arquivos:
+bibliotecas que o excedam precisam de um mecanismo de indexacao separado
+antes de poderem usar esta API paginada. As rotas legadas nao mudam.
 
 Benchmark reproduzivel local, Windows Node 24.14.1, 10 mil operacoes
 cifradas v2 com historico de uma versao cada (78,29 MiB em JSON):
@@ -66,6 +75,15 @@ as 157 paginas dos 10 mil itens levaram 2.625 ms no total (primeira
 pagina 2.337 ms, 156 paginas seguintes 288 ms). O primeiro carregamento
 ainda precisa validar o estado completo; nao e um indice persistido ou
 uma API de buscas em plaintext no servidor.
+
+Teste adicional com **10 mil objetos** com metadados longos
+(nome e content-type de 500 caracteres, caminho de quase 500 caracteres
+e parentId de 160): estado cifrado com historico de 149,62 MiB,
+indice serializado de 20,50 MiB. Todas as 167 paginas, limitadas por
+bytes, retornaram em 4.288 ms: primeira 3.586 ms, demais 702 ms.
+Uma regressao com teto artificialmente baixo garante que o estouro
+retorne 507, sem repetir a leitura pesada, e que uma escrita externa
+invalide o marcador de excesso.
 
 ## Opcoes
 

@@ -191,3 +191,42 @@ test("issue 66 inventory: cached pages revalidate external writer commits and re
   await fsp.rm(lockPath);
   assert.equal((await get("/sync/v1/objects?view=metadata&limit=1")).status, 200);
 });
+
+test("issue 66 inventory: bounded metadata index fails closed and never re-reads an oversized snapshot per page", async (t) => {
+  const { get, seed, store, storagePath } = await fixture(t);
+  for (let n = 0; n < 8; n += 1) {
+    await seed("alice", `heavy-${n}`, Buffer.from("x"), {
+      name: "n".repeat(500), contentType: "t".repeat(500),
+      path: `docs/${"p".repeat(470)}/file-${n}.txt`, parentId: "p".repeat(160),
+    });
+  }
+  await seed("bob", "small", Buffer.from("x"));
+  // Force a small cap in the isolated fixture instead of generating a
+  // multi-gigabyte repo test. Production always uses the default bound.
+  store.inventoryCacheMaxBytes = 1024;
+  const readSnapshot = store.readSnapshot.bind(store);
+  let reads = 0;
+  store.readSnapshot = () => { reads += 1; return readSnapshot(); };
+  const route = "/sync/v1/objects?view=metadata&limit=1";
+  const first = await get(route);
+  assert.equal(first.status, 507);
+  assert.equal(first.body.code, "metadata_index_too_large");
+  assert.equal(reads, 1, "oversized inventory should incur at most one initial parse");
+  for (let n = 0; n < 4; n += 1) {
+    const retry = await get(route);
+    assert.equal(retry.status, 507);
+    assert.equal(retry.body.code, "metadata_index_too_large");
+  }
+  assert.equal(reads, 1, "a cached overflow marker must prevent repeated JSON parses");
+  assert.equal((await get(route, "bob")).status, 200, "smaller authenticated tenant must remain usable");
+
+  // Independent process/instance commits must invalidate the overflow
+  // marker, even if new inventory still exceeds the configured bound.
+  const sibling = await new SyncObjectStore(storagePath).open();
+  await seed("alice", "heavy-new", Buffer.from("x"), {}, sibling);
+  reads = 0;
+  assert.equal((await get(route)).status, 507);
+  assert.equal(reads, 1, "new durable file identity forces revalidation");
+  assert.equal((await get(route)).status, 507);
+  assert.equal(reads, 1);
+});

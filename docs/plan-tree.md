@@ -22,12 +22,25 @@ escritor externo.
 Revisao de escala da PR draft #255 (2026-11-06): o custo de uma leitura,
 attestation, ordenacao e hash completos por pagina era concreto (10 mil
 objetos; as primeiras 10 paginas custaram 23,595 s, 78,29 MiB de estado).
-Um cache somente de metadados, para uma conta, limitado a 16 MiB, com
+Um cache somente de metadados, para uma conta, inicialmente limitado a 16 MiB, com
 invalidação por identidade do arquivo persistido e lock de escritores,
 passou teste adversarial de segunda instancia de armazenamento e trava
 externa. No mesmo fixture, o conjunto completo de 157 paginas levou
 2,625 s, sendo 2,337 s no primeiro acesso. Esta otimizacao continua
 sem usar metadados para admissao criptografica.
+
+Revisao independente adicional da #255 confirmou caso adversarial
+de biblioteca com 10 mil objetos e metadados longos: indice de
+20,50 MiB superava o teto de 16 MiB e fazia a rota reler todo o
+estado a cada pagina. O teto passa a 32 MiB **serializados** por
+conta/instancia; excedê-lo gera 507 `metadata_index_too_large` com
+marcador de erro invalidado por mudanca do arquivo, nunca fallback
+O(N²). Um teste RED→GREEN com teto artificialmente baixo verifica
+erro estavel, ausencia de releituras em retries, isolamento entre
+contas e invalidação por outra instancia. Benchmark 10 mil objetos,
+indice 20,50 MiB, JSON 149,62 MiB: 167 paginas, 4,288 s total,
+sendo 3,586 s no primeiro acesso. Bibliotecas acima do teto exigem
+indice persistido em trabalho separado; #66 continua parcial.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

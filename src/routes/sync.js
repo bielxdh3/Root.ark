@@ -117,7 +117,7 @@ function ensureOwnMap(record, key) {
 const INVENTORY_MAX_PAGE_ITEMS = 64;
 const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
 const INVENTORY_MAX_CURSOR_CHARS = 1024;
-const INVENTORY_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const INVENTORY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
   const directory = path.dirname(filePath);
@@ -207,6 +207,11 @@ function inventoryRecord(record) {
 
 function inventoryInputError() {
   return Object.assign(new Error("Invalid inventory cursor or limit"), { code: "SYNC_INVENTORY_INPUT" });
+}
+
+function inventoryIndexTooLarge() {
+  return Object.assign(new Error("Metadata inventory exceeds the bounded server index"),
+    { code: "SYNC_INVENTORY_INDEX_TOO_LARGE" });
 }
 
 function parseInventoryCursor(value) {
@@ -346,6 +351,7 @@ class SyncObjectStore {
     // Only one tenant's metadata index is retained, never its ciphertext.
     // A changed durable inode/mtime/ctime discards the index on the next read.
     this.inventoryCache = null;
+    this.inventoryCacheMaxBytes = INVENTORY_CACHE_MAX_BYTES;
   }
 
   // Exclusive-create on the SAME local filesystem fences independent Node
@@ -924,7 +930,10 @@ class SyncObjectStore {
   inventoryIndex(username) {
     const before = this.inventoryFileStamp();
     const cached = this.inventoryCache;
-    if (cached && cached.username === username && cached.stamp === before) return cached;
+    if (cached && cached.username === username && cached.stamp === before) {
+      if (cached.tooLarge) throw inventoryIndexTooLarge();
+      return cached;
+    }
 
     const snapshot = this.readSnapshot();
     const after = this.inventoryFileStamp();
@@ -944,13 +953,20 @@ class SyncObjectStore {
         record.revision, record.metadata]), "utf8");
       const entry = inventoryRecord(record);
       metadataBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+      if (metadataBytes > this.inventoryCacheMaxBytes) {
+        // Never silently rebuild a too-large index on every page. Retain
+        // only a tiny failure marker for this tenant/durable generation.
+        if (this.inventoryFileStamp() !== after) {
+          throw Object.assign(new Error("Sync inventory changed while indexing"), { code: "SYNC_STORE_LOCK_BUSY" });
+        }
+        this.inventoryCache = { username, stamp: after, tooLarge: true };
+        throw inventoryIndexTooLarge();
+      }
       entries.push(entry);
       byId.set(objectId, entries.length - 1);
     }
     const result = { username, stamp: after, entries, byId, fingerprint: hash.digest("hex") };
-    // Larger libraries can still page safely without permanently retaining a
-    // large index. Releasing the old cache also limits cross-account memory.
-    this.inventoryCache = metadataBytes <= INVENTORY_CACHE_MAX_BYTES ? result : null;
+    this.inventoryCache = result;
     return result;
   }
 
@@ -1264,6 +1280,9 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     } catch (error) {
       if (error?.code === "SYNC_INVENTORY_INPUT") return errorResponse(res, 400, "Invalid sync inventory request");
       if (error?.code === "SYNC_INVENTORY_CHANGED") return errorResponse(res, 409, "Sync inventory changed; restart pagination");
+      if (error?.code === "SYNC_INVENTORY_INDEX_TOO_LARGE") {
+        return errorResponse(res, 507, "metadata_index_too_large", { code: "metadata_index_too_large" });
+      }
       return errorResponse(res, 503, "Sync inventory unavailable");
     }
   }));
