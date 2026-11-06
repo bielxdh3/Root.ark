@@ -42,8 +42,12 @@
     activeBoundObject = null;
     ws = new WebSocket(wsUrl);
     const eventSocket = ws;
-    ws.onopen = () => wire({ type: 'join', roomId, ...credentials });
+    ws.onopen = () => {
+      if (ws !== eventSocket) return;
+      wire({ type: 'join', roomId, ...credentials });
+    };
     ws.onmessage = async event => {
+      if (ws !== eventSocket) return;
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
@@ -104,6 +108,7 @@
         const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
         attachChannel(p, dc);
         await p.pc.setLocalDescription(await p.pc.createOffer());
+        if (ws !== eventSocket) return;
         wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
       } else if (m.type === 'peer-allowed') {
         preparePeer(m.peerId, false);
@@ -120,12 +125,13 @@
             await p.pc.setRemoteDescription(m.signal.sdp);
             await flushIce(p);
             await p.pc.setLocalDescription(await p.pc.createAnswer());
+            if (ws !== eventSocket) return;
             wire({ type: 'signal', to: p.id, signal: { kind: 'answer', sdp: p.pc.localDescription } });
           } else if (m.signal.kind === 'answer') {
             await p.pc.setRemoteDescription(m.signal.sdp);
             await flushIce(p);
           }
-        } catch (e) { log('Negociação falhou: ' + e.name); }
+        } catch (e) { if (ws === eventSocket) log('Negociação falhou: ' + e.name); }
       } else if (m.type === 'peer-left') {
         const p = peers.get(m.peerId);
         if (p) closePeer(p);
