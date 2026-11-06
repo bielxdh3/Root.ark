@@ -349,6 +349,32 @@
             authorizesMutation: false });
         } catch (_) { deny(); }
       }
+      async function readSelectedCiphertext(previous, objectId, revision) {
+        try {
+          if (typeof objectId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(objectId)
+            || !Number.isSafeInteger(revision) || revision < 1) deny();
+          from64(objectId, 16);
+          const { current, head } = await freshPrivateListing(previous);
+          const rows = current.rows.filter((row) =>
+            row.object_id === objectId && row.revision === revision);
+          if (rows.length !== 1) deny();
+          const selected = rowWire(rows[0]);
+          const fetched = await writer.readVerifiedCiphertext(current, objectId, revision);
+          assertLive();
+          if (fetched.objectId !== selected.objectId
+            || fetched.revision !== selected.revision
+            || fetched.epoch !== selected.epoch
+            || fetched.ciphertextDigestBase64 !== selected.ciphertextDigestBase64) deny();
+          const sealed = from64(fetched.ciphertextBase64, 16, MAX);
+          const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", sealed));
+          if (!equal(actual, bytes(rows[0].ciphertext_digest, 32))) deny();
+          const after = await freshPrivateListing(previous);
+          assertLive();
+          if (after.head.sequence !== head.sequence || after.head.digest !== head.digest) deny();
+          return Object.freeze({ ...fetched, verifiedCiphertext: true,
+            plaintextAvailable: false, authorizesMutation: false });
+        } catch (_) { deny(); }
+      }
       async function commitVersion(inputVersion, internalTrash = false,
         internalRestore = false, predecessorMetadataKey = null,
         restoreAdmission = null) {
@@ -849,7 +875,7 @@
         }
       }
       return Object.freeze({ readCurrent, pullDelta, readPrivateListing,
-        verifyPrivateListingHead,
+        verifyPrivateListingHead, readSelectedCiphertext,
         commitVersion: (value) => commitVersion(value, false), trashVersion, readTrash, restoreVersion });
     }
     return Object.freeze({ createClient });
