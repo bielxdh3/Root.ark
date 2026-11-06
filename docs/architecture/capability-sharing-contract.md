@@ -1,8 +1,23 @@
 # Capability-based sharing contract
 
-Status: architecture proposal for approved roadmap issue #68. The goal is approved; this document does not implement capability links or claim that existing public links satisfy the Zero-Knowledge design.
+Status: partial implementation for issue #68. A bounded local-file capability API exists; protected Zero-Knowledge sharing remains a design requirement and is disabled.
 
 Related decisions: issue #68, the Zero-Knowledge baseline in `zero-knowledge-migration-contract.md`, and product decision D-009 in `../product-discovery.md`.
+
+## Implemented first slice: scoped local-file access
+
+Authenticated file owners with `listFiles` may `POST /share/capabilities` with `name`, `folderId`, `expiresInMinutes`, an **explicit** `permissions` array (`view`, `preview`, `download`), and optional `maxViews`, `maxDownloads`, or `password`. The response contains a one-time public bearer URL and token plus `{ capability: true, scope: { type: "file", folderId, fileName } }`. No other fields are accepted; unimplemented recipient restrictions and decryption-key inputs fail with HTTP 400. Creation still checks the current owner, file permission, expiry and absence of server-side encrypted-file metadata. Cloud-backed files return 409 instead of assuming a hydrated cache is an immutable resource.
+
+The bearer uses a reserved uppercase `C` followed by 47 lowercase hexadecimal characters (188 bits of random content). Old automatically generated legacy bearer tokens remain lowercase. The reserved prefix forces a capability without valid `shareKind`, resource binding, or matching file identity to fail closed even if its metadata was lost or malformed. The capability record pins the folder and filename plus a SHA-256 digest of local filesystem device, inode, size, birth time and modification time; after file hydration and immediately before serving an already-opened file handle, all values must still match. A replaced or normally edited file requires a new grant. This is a local filesystem generation binding, **not** a cryptographic content or signed Zero-Knowledge version proof.
+
+Public `/share/:token/...` requests reuse the existing operation allowlist, password sessions, expiry, preview/download quota reservations and final byte-stream authorization. `maxViews` and `maxDownloads` are optional, with `0` meaning unlimited. The authenticated issuer may `DELETE /share/capabilities/:token`; a different account cannot revoke it. SQLite records a revoked tombstone, and JSON removes the active record. Already issued bearer URLs then fail. Audits use a non-authorizing digest of the token; new capability audit events omit file names and folder paths.
+
+### Boundaries that remain open
+
+- Capability tokens are still stored as bearer identifiers by the legacy `public_links` persistence API and appear in the public URL. Logs outside this app (notably reverse proxies) must be configured separately not to record them. This slice does **not** implement a hashed-verifier-only database design or a secret-free URL.
+- JSON quota updates are synchronous within one Node process but are not cross-process transactional; SQLite quota reservations are atomic. Do not claim multi-replica exact-count limits on JSON storage.
+- Only one current local-file generation is supported. Folder/object sets, upload/add/list permissions, recipient identity requirements, durable cloud object IDs, cryptographically bound ZK versions and offline recipients remain unsupported.
+- Encryption-enabled files remain blocked by the existing share creator and resolver. No decryption key or key envelope is accepted; there is no client-side recipient key transfer, device trust, epoch rotation or cross-device ZK sharing proof. Existing legacy links are unchanged and must not be described as Zero-Knowledge capabilities.
 
 ## Current evidence and boundary
 
