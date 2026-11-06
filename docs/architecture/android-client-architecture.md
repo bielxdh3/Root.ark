@@ -1,5 +1,7 @@
 # Root.ark Android client architecture and threat model
 
+> 2026-11-06 bounded implementation update: owner continuation explicitly authorized an incremental native Android implementation after the original design-only tracker. `android/app` now contains an online authentication launcher/2FA flow backed by the existing `/auth/login` routes, with an HTTPS-only origin guard. This does **not** implement ZK envelopes, device enrollment, secure offline state, sync, protected content or release acceptance. The historical 2026-10-01 evidence baseline and outstanding design/owner gates below remain scoped to their original dates; no claim of full Android security acceptance is implied.
+
 Status: design proposal for issue [#64](https://github.com/bielxdh3/Root.ark/issues/64). The issue approves a future native Android client and this design gate only; it explicitly does not authorize implementation, app-store publication, or release.
 
 Evidence baseline: `Root/main` / `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (2026-10-01). Repository citations below refer to reviewed source or documents; platform references are official Android documentation. The app described here does not yet exist.

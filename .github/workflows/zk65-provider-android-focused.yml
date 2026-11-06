@@ -18,6 +18,7 @@ on:
       - 'scripts/issue-64-android-fixtures.js'
       - 'test/issue-65-full-multiprovider-http-restore.test.js'
       - 'test/issue-64-android-contract.test.js'
+      - 'test/issue-64-android-entry.test.js'
       - 'test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js'
       - 'test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js'
       - 'src/services/zk1SyncAtomicCasFloorLedgerDevOff.js'
@@ -37,6 +38,8 @@ on:
       - 'src/services/zk1CasTerminalAnchor.js'
       - 'test/issue-65-private-fifo-open-nonblock.test.js'
       - 'android/core/**'
+      - 'android/app/**'
+      - 'android/README.md'
       - 'android/build.gradle.kts'
       - 'android/settings.gradle.kts'
       - 'android/gradle.properties'
@@ -72,7 +75,7 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
       - name: Real signed remote-provider TLS, Android routes and atomic CAS floor negatives
-        run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js test/issue-65-private-fifo-open-nonblock.test.js
+        run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-64-android-entry.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js test/issue-65-private-fifo-open-nonblock.test.js
       - name: Verify tests did not change repository files
         run: git diff --exit-code
       - name: Verify tests did not create untracked files
@@ -96,9 +99,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Compile Kotlin and deserialize captured server responses in JVM
+      - uses: android-actions/setup-android@v3
+      - name: Install pinned Android platform for native app compile
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Compile Kotlin core tests and real Android launcher
         working-directory: android
-        run: gradle --no-daemon :core:test
+        run: gradle --no-daemon :core:test :app:assembleDebug
       - name: Verify Kotlin tests did not change tracked files
         run: git diff --exit-code
       - name: Diagnose Gradle-generated untracked paths without reading contents
