@@ -80,3 +80,29 @@ test('feature flag off leaves the real Root.ark app and navigation unchanged', {
   assert.equal((await f.request('/p2p/', { session: alice })).status, 404);
   assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 404);
 });
+
+test('P2: 16 hostile room creates by one real user cannot globally starve another user', { timeout: 110_000 }, async t => {
+  const f = await fixture();
+  t.after(f.close);
+  const alice = await f.login('alice');
+  const bob = await f.login('bob');
+  const attempts = [];
+  for (let i = 0; i < 16; i++) {
+    attempts.push(await f.request('/p2p/rooms', { method: 'POST', session: alice }));
+  }
+  // Same owner should be allowed simultaneous legitimate browser instances,
+  // but cannot consume the entire shared 16-room capacity without joining.
+  const accepted = attempts.filter(result => result.status === 200);
+  assert.equal(accepted.length, 2, 'a single owner is limited to two active rooms');
+  assert.ok(attempts.slice(2).every(result => result.status === 429));
+  const other = await f.request('/p2p/rooms', { method: 'POST', session: bob });
+  assert.equal(other.status, 200, 'other authenticated users must not be starved');
+  const rooms = [JSON.parse(accepted[0].text), JSON.parse(accepted[1].text), JSON.parse(other.text)];
+  const clients = await Promise.all([f.connect(alice), f.connect(alice), f.connect(bob)]);
+  t.after(() => clients.forEach(client => client.socket.terminate()));
+  for (let i = 0; i < 3; i++) {
+    clients[i].send({ type: 'join', roomId: rooms[i].roomId, hostKey: rooms[i].hostKey });
+    assert.equal((await clients[i].next('joined')).role, 'host',
+      'normal multi-client host join must remain functional');
+  }
+});
