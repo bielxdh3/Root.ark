@@ -166,6 +166,93 @@ test("#67: restore rejects unsent edits to a tracked local file before enqueuing
   assert.equal(fs.existsSync(path.join(f.local, ".rootark-trash")), false);
 });
 
+test("#67: a clean tracked file can be restored and its former bytes remain recoverable in trash", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const clean = Buffer.from("clean synchronized newer content");
+  await fsp.writeFile(target, clean);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "newer",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(clean).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const result = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(result.pushed, true);
+  assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+  const trash = path.join(f.local, ".rootark-trash");
+  const files = await fsp.readdir(trash);
+  assert.equal(files.length, 1);
+  assert.deepEqual(await fsp.readFile(path.join(trash, files[0])), clean);
+});
+
+test("#67: a local write while the signed restore enters its durable outbox cannot be overwritten or pushed", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const clean = Buffer.from("last synchronized content");
+  await fsp.writeFile(target, clean);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(clean).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+
+  const enqueue = f.engine.journal.enqueue.bind(f.engine.journal);
+  const unsent = Buffer.from("UNSENT LOCAL MODIFICATION DURING ENQUEUE");
+  f.engine.journal.enqueue = async (operation) => {
+    const result = await enqueue(operation);
+    await fsp.writeFile(target, unsent);
+    return result;
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict");
+  assert.deepEqual(await fsp.readFile(target), unsent);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0,
+    "rejected restore must not remain eligible for retry/push after restart");
+});
+
+test("#67: staging detects an edit after final hash read and restores changed bytes to their path", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const clean = Buffer.from("clean snapshot");
+  await fsp.writeFile(target, clean);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(clean).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const stage = f.engine.stageExisting.bind(f.engine);
+  const edit = Buffer.from("NEW EDIT BETWEEN CHECK AND STAGING");
+  f.engine.stageExisting = async (requested) => {
+    await fsp.writeFile(target, edit);
+    return stage(requested);
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict");
+  assert.deepEqual(await fsp.readFile(target), edit);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+});
+
+test("#67: an untracked file created after enqueue is never replaced by restore", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const enqueue = f.engine.journal.enqueue.bind(f.engine.journal);
+  f.engine.journal.enqueue = async (operation) => {
+    const result = await enqueue(operation);
+    await fsp.writeFile(target, "NEW UNTRACKED FILE");
+    return result;
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict");
+  assert.equal(await fsp.readFile(target, "utf8"), "NEW UNTRACKED FILE");
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+});
+
 test("#67: real atomic device registry durably admits a newly signed historical restore", async (t) => {
   const f = await fixture(t);
   const storagePath = path.join(f.root, "physical-store.json");

@@ -709,7 +709,12 @@ class SyncEngine {
     // The outbox is durable BEFORE local materialization. Failure to send is
     // recoverable by the existing signed journal; no old operation is replayed.
     await this.assertOutgoingAuthorized(restored, () => this.journal.enqueue(restored));
-    await this._apply(restored);
+    try {
+      await this._apply(restored, null, existing && !existing.deleted ? existing.hash : null);
+    } catch (error) {
+      if (error?.code === "restore_local_conflict") await this.journal.discardUnsent(restored);
+      throw error;
+    }
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
     await this._pushPending(summary);
     if (summary.offline) return { restored: true, pushed: false, pending: true,
@@ -1721,11 +1726,58 @@ class SyncEngine {
     return trashTarget;
   }
 
+  async stageHistoricalRestore(target, relative, expectedHash) {
+    const present = await exists(target);
+    if (expectedHash === null) {
+      if (present) fail("Historical restore would overwrite a new local file", "restore_local_conflict");
+      return null;
+    }
+    if (!present) fail("Historical restore would overwrite an unsent local deletion", "restore_local_conflict");
+    let before;
+    try {
+      before = await fsp.lstat(target, { bigint: true });
+      const current = await readContainedFile(this.rootDir, relative, before);
+      if (crypto.createHash("sha256").update(current).digest("hex") !== expectedHash) {
+        fail("Historical restore would overwrite unsent local edits", "restore_local_conflict");
+      }
+    } catch (error) {
+      if (error?.code === "restore_local_conflict") throw error;
+      fail("Historical restore target changed before replacement", "restore_local_conflict");
+    }
+    const staged = await this.stageExisting(target);
+    if (!staged) fail("Historical restore target disappeared", "restore_local_conflict");
+    let unchanged = false;
+    try {
+      const after = await fsp.lstat(staged, { bigint: true });
+      // Windows can change ctimeNs on a pathname rename even when no file
+      // content changed. Match the stable inode plus content/mtime/birthtime
+      // identity; comparing ctimeNs here would reject every legitimate restore.
+      unchanged = after.isFile() && !after.isSymbolicLink() && after.nlink === 1n
+        && sameFileIdentity(before, after) && before.size === after.size
+        && before.mtimeNs === after.mtimeNs && before.birthtimeNs === after.birthtimeNs
+        && before.mode === after.mode;
+    } catch { /* Reject unexpected staging identity and preserve the old bytes. */ }
+    if (!unchanged) {
+      await this.replaceStagedIfVacant(staged, target);
+      fail("Historical restore target changed during replacement", "restore_local_conflict");
+    }
+    return staged;
+  }
+
+  async replaceStagedIfVacant(staged, target) {
+    try {
+      // A hard link claims an absent path atomically; unlike rename, it never
+      // replaces another writer's file. The staged bytes remain if it fails.
+      await fsp.link(staged, target);
+      await fsp.unlink(staged);
+    } catch { /* Retain the staged data for manual recovery when path is occupied. */ }
+  }
+
   async apply(operation, summary = null) {
     return this.withMutationLock(() => this._apply(operation, summary));
   }
 
-  async _apply(operation, summary = null) {
+  async _apply(operation, summary = null, historicalRestoreHash = undefined) {
     operation = envelopeCopy(operation);
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
@@ -1846,8 +1898,21 @@ class SyncEngine {
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
         await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
         try {
-          if (await exists(target)) await this.stageExisting(target);
-          await fsp.rename(temporary, target);
+          if (historicalRestoreHash !== undefined) {
+            const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
+            try {
+              // Atomic no-replace materialization; do not clobber files
+              // created by another process after the last restore preflight.
+              await fsp.link(temporary, target);
+            } catch (error) {
+              if (staged) await this.replaceStagedIfVacant(staged, target);
+              if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
+              throw error;
+            }
+          } else {
+            if (await exists(target)) await this.stageExisting(target);
+            await fsp.rename(temporary, target);
+          }
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
