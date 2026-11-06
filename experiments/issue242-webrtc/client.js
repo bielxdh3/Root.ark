@@ -24,6 +24,7 @@
   const BUFFER_HIGH = 256 * 1024;
   let preparingFile = false;
   let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
+  let roomIntent = 0;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
@@ -474,15 +475,31 @@
   async function sendText(value) {
     if (activeBoundObject) return log('Sala vinculada aceita somente ciphertext do arquivo selecionado');
     if (!value || value.length > 1000) return;
+    const sendingSocket = ws;
+    const sendingRoom = roomId;
+    const sendingPeerId = selfId;
+    const sendingRole = role;
+    const sendingIntent = roomIntent;
+    const receivers = [...peers.values()].map(peer => ({ peer, dc: peer.dc }));
+    const sameRoom = () => ws === sendingSocket && roomId === sendingRoom &&
+      selfId === sendingPeerId && role === sendingRole &&
+      roomIntent === sendingIntent && !activeBoundObject;
     const digest = await sha(new TextEncoder().encode(value));
+    if (!sameRoom()) {
+      record(diagnostics.rejected, 'ROOM_CHANGED');
+      return log('Envio de texto cancelado após troca de sala');
+    }
     let count = 0;
-    for (const p of peers.values()) if (p.dc?.readyState === 'open') {
-      p.dc.send(JSON.stringify({ type: 'text', text: value, digest }));
+    for (const { peer, dc } of receivers) {
+      if (!sameRoom()) break;
+      if (peers.get(peer.id) !== peer || peer.dc !== dc || dc?.readyState !== 'open') continue;
+      dc.send(JSON.stringify({ type: 'text', text: value, digest }));
       count++;
     }
     log('Texto enviado a ' + count + ' destinatário(s)');
   }
   async function createRoom(boundObject = null) {
+    const intent = ++roomIntent;
     const headers = {};
     if (inRootark) {
       const csrf = document.cookie.split(';').map(value => value.trim())
@@ -493,8 +510,10 @@
     const body = inRootark && boundObject ? JSON.stringify({ boundObject }) : undefined;
     const response = await fetch(inRootark ? '/p2p/rooms' : '/rooms',
       { method: 'POST', headers, body, credentials: 'same-origin' });
+    if (intent !== roomIntent) return;
     if (!response.ok) throw new Error('room creation failed');
     const result = await response.json();
+    if (intent !== roomIntent) return;
     ({ roomId, hostKey } = result);
     $('room').textContent = roomId;
     if (result.boundObject) log('Sala vinculada à ACL e SHA-256: ' +
@@ -502,6 +521,7 @@
     connect({ hostKey });
   }
   function joinRoom(room, invitation) {
+    ++roomIntent;
     roomId = room; $('room').textContent = roomId;
     connect({ invitation });
   }
