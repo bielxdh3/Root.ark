@@ -1,4 +1,4 @@
-﻿const assert = require("node:assert/strict");
+const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -295,5 +295,3 @@ for (const mode of ["json", "sqlite"]) {
       assert.equal(originalLegacy.status, 200, "legacy application remains reachable");
     });
 }
-
-
