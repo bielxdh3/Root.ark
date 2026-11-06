@@ -3,6 +3,7 @@ package dev.rootark.android
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.ProtectedSyncException
+import dev.rootark.core.sync.RootArkApiException
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -57,6 +58,11 @@ internal class VerifiedTextPreview(
                 characters = decodeVerifiedText(plaintext)
             }
             return characters ?: throw ProtectedSyncException()
+        } catch (error: RootArkApiException) {
+            characters?.fill('\u0000')
+            // Preserve 401 and 403 so the Activity can erase a revoked
+            // session and distinguish server denial without rendering data.
+            throw error
         } catch (_: Exception) {
             characters?.fill('\u0000')
             throw ProtectedSyncException()
