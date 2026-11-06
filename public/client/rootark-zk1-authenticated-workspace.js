@@ -1308,18 +1308,13 @@
             || !Array.isArray(opened.entries)
             || !Number.isSafeInteger(opened.totalMatches)
             || opened.totalMatches < opened.entries.length) fail();
-          const content = document.createDocumentFragment();
-          for (const entry of opened.entries) {
-            if ((typeof entry.name !== "string" || !entry.name)
-              && !(entry.name === null && entry.logicalTrashCandidate === true)) fail();
-            const item = document.createElement("div");
-            item.textContent = (entry.logicalTrashCandidate === true
-              ? "Lixeira lógica (verifique o tombstone assinado)" : entry.name)
-              + " · revisão " + entry.revision;
-            content.appendChild(item);
-          }
-          assertLive();
-          list.replaceChildren(content);
+          // Selection only fills the opaque ID used by existing independent
+          // authorization gates; it never triggers protected I/O or a mutation.
+          window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+            list, opened.entries, field("catalog-write-id"), () => {
+              assertLive();
+              return !busy && verifiedOpaqueDelta === held;
+            });
           field("catalog-delta-summary").textContent = term.trim()
             ? "Busca local: " + opened.totalMatches + " correspondência(s), "
               + opened.entries.length + " exibida(s) (máximo 100) · CAS #" + opened.head.sequence
