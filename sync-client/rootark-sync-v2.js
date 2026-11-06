@@ -426,13 +426,87 @@ async function history(options = {}) {
   return summary;
 }
 
+async function readResumeCredentials(stream = process.stdin) {
+  let size = 0;
+  const chunks = [];
+  let parsed;
+  try {
+    for await (const chunk of stream) {
+      const bytes = Buffer.from(chunk);
+      size += bytes.length;
+      if (size > 2048) {
+        bytes.fill(0);
+        throw new Error("Invalid resume credentials on stdin");
+      }
+      chunks.push(bytes);
+    }
+    const input = Buffer.concat(chunks);
+    try { parsed = JSON.parse(input.toString("utf8")); }
+    catch { throw new Error("Invalid resume credentials on stdin"); }
+    finally { input.fill(0); }
+  } finally { chunks.forEach((bytes) => bytes.fill(0)); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+    || Object.keys(parsed).some((key) => !["password", "code"].includes(key))
+    || typeof parsed.password !== "string" || !parsed.password
+    || parsed.password.length > 1024
+    || (parsed.code !== undefined && (typeof parsed.code !== "string"
+      || parsed.code.length > 256))) {
+    throw new Error("Invalid resume credentials on stdin");
+  }
+  return parsed;
+}
+
+async function resume(options = {}) {
+  const deviceId = options["device-id"];
+  // The requested device and explicit credentials transport are validated
+  // before reading a private config or accepting passwords from stdin.
+  if (typeof deviceId !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)) {
+    throw new Error("Valid --device-id is required");
+  }
+  if (options["credentials-stdin"] !== true || "password" in options
+    || "code" in options) {
+    throw new Error("Resume requires --credentials-stdin; never pass secrets as command arguments");
+  }
+  const config = readPrivateV2Config(path.resolve(options.config || DEFAULT_CONFIG));
+  if (!config || typeof config.serverUrl !== "string" || !config.serverUrl
+    || typeof config.username !== "string" || !config.username
+    || typeof config.token !== "string" || !config.token
+    || typeof config.deviceId !== "string"
+    || !/^[A-Za-z0-9._:-]{1,160}$/.test(config.deviceId)) {
+    throw new Error("Resume requires private Sync v2 serverUrl, username, token and deviceId");
+  }
+  if (deviceId === config.deviceId) throw new Error("Paused device cannot resume itself");
+  const credentials = await readResumeCredentials(options.credentialsStream || process.stdin);
+  const adapter = createOpaqueSyncAdapter({
+    baseUrl: normalizeTrustedSyncServerUrl(config.serverUrl),
+    fetchImpl: (url, request = {}) => fetch(url, { ...request,
+      headers: { ...request.headers, Authorization: `Bearer ${config.token}` },
+    }),
+  });
+  let outcome;
+  try {
+    outcome = await adapter.resumeDevice(deviceId, {
+      deviceId: config.deviceId, password: credentials.password, code: credentials.code,
+    });
+  } catch (error) {
+    // An untrusted server error could reflect the submitted password/OTP.
+    // Never print remote error text or the request body to the terminal.
+    if (Number.isInteger(error?.status)) throw new Error(`Sync resume denied (HTTP ${error.status})`);
+    throw new Error("Sync resume failed; no credentials disclosed");
+  }
+  console.log(JSON.stringify(outcome));
+  return outcome;
+}
+
 if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "history") history({ ...args(rest) }).catch((error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)");
+  else if (command === "resume") resume({ ...args(rest) }).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
-  trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity, start, history };
+  trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity,
+  start, history, resume, readResumeCredentials };

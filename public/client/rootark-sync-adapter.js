@@ -168,6 +168,32 @@
         }
         return { protocolVersion: PROTOCOL_VERSION, versions };
       },
+      // Releasing a ransomware-shield pause is NEVER a sync-device proof or
+      // a new ciphertext admission. The server independently re-authenticates
+      // the account and (when enabled) consumes a one-use second factor.
+      resumeDevice: async (targetDeviceId, credentials) => {
+        const target = id(targetDeviceId);
+        if (!credentials || typeof credentials !== "object" || Array.isArray(credentials)
+          || typeof credentials.password !== "string" || !credentials.password
+          || credentials.password.length > 1024) fail("Resume password required");
+        const caller = id(credentials.deviceId);
+        if (target === caller) fail("Paused device cannot resume itself");
+        if (credentials.code !== undefined
+          && (typeof credentials.code !== "string" || credentials.code.length > 256)) {
+          fail("Invalid second factor");
+        }
+        const body = { password: credentials.password, deviceId: caller };
+        if (credentials.code !== undefined) body.code = credentials.code;
+        const payload = await request(`/sync/v1/devices/${encodeURIComponent(target)}/resume`, {
+          method: "POST", body: JSON.stringify(body),
+        });
+        if (payload.protocolVersion !== PROTOCOL_VERSION || payload.deviceId !== target
+          || payload.paused !== false || typeof payload.wasPaused !== "boolean") {
+          fail("Invalid sync resume response");
+        }
+        return { protocolVersion: PROTOCOL_VERSION, deviceId: target,
+          paused: false, wasPaused: payload.wasPaused };
+      },
       push: (envelope) => {
         const normalized = assertOpaqueEnvelope(envelope);
         const deleteRequest = normalized.operation === "delete";
