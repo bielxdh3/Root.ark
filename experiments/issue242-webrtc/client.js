@@ -50,13 +50,14 @@
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
         $('invite').disabled = role !== 'host';
-        log('Entrou na sala como ' + role);
+        log('Entrou na sala como ' + role + (m.username ? ' (' + m.username + ')' : ''));
       } else if (m.type === 'invited') {
         invites.set(m.inviteId, m);
         const div = document.createElement('div');
         div.className = 'entry';
         const title = document.createElement('span');
-        title.textContent = 'Convite: ' + m.invitation + ' (60 s) ';
+        title.textContent = 'Convite' + (m.recipient ? ' para ' + m.recipient : '') +
+          ': ' + m.invitation + ' (60 s) ';
         const revoke = document.createElement('button');
         revoke.textContent = 'Revogar';
         revoke.addEventListener('click', () => wire({ type: 'revoke', inviteId: m.inviteId }));
@@ -71,7 +72,7 @@
         const line = document.createElement('div');
         line.className = 'entry';
         line.dataset.peerId = m.peerId;
-        line.textContent = 'Convidado ' + m.peerId.slice(0, 5) + ' ';
+        line.textContent = 'Convidado ' + (m.username || m.peerId.slice(0, 5)) + ' ';
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
         kick.addEventListener('click', () => wire({ type: 'kick', to: m.peerId }));
@@ -81,7 +82,7 @@
       } else if (m.type === 'peer-request') {
         const div = document.createElement('div');
         div.className = 'entry';
-        div.textContent = 'Host solicita conexão: ';
+        div.textContent = (m.username ? 'Host ' + m.username : 'Host') + ' solicita conexão: ';
         for (const accept of [true, false]) {
           const button = document.createElement('button');
           button.textContent = accept ? 'Aceitar conexão' : 'Recusar';
@@ -307,14 +308,14 @@
     connect({ invitation });
   }
   $('create').onclick = () => createRoom().catch(e => log(e.message));
-  $('invite').onclick = () => wire({ type: 'invite' });
+  $('invite').onclick = () => wire({ type: 'invite', recipient: $('recipientInput').value.trim() });
   $('join').onclick = () => joinRoom($('roomInput').value, $('inviteInput').value);
   $('sendFile').onclick = () => sendFile($('fileInput').files[0]);
   $('sendText').onclick = () => sendText($('textInput').value);
   // Diagnostic surface is in-memory and only used by the disposable Edge CDP test.
   window.__poc = {
     createRoom, joinRoom, sendFile, sendText,
-    invite: () => wire({ type: 'invite' }),
+    invite: recipient => wire({ type: 'invite', recipient }),
     invitations: () => [...invites.values()],
     // Exposed only for disposable Edge CDP adversarial regression tests.
     testChannel: index => [...peers.values()][index]?.dc,
