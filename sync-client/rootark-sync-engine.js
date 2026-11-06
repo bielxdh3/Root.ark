@@ -498,6 +498,9 @@ class SyncEngine {
     }
     this.verifyIncoming = options.verifyIncoming || null;
     this.reverifySeenIncoming = options.reverifySeenIncoming === true;
+    // Only a trusted embedding process may activate independent historical
+    // custody. A mutable config, remote history or local journal is not proof.
+    this.requireIndependentHistoricalAdmission = options.requireIndependentHistoricalAdmission === true;
     this.authorizationFactory = options.authorizationFactory || null;
     this.requireAuthorization = options.requireAuthorization === true;
     this.translateWebDavOperation = options.translateWebDavOperation || null;
@@ -635,7 +638,58 @@ class SyncEngine {
     return this.withMutationLock(() => this._restoreHistoricalVersion(objectId, versionId));
   }
 
-  async _restoreHistoricalVersion(objectId, versionId) {
+  // An advisory, read-only preflight. It does NOT reserve the current head or
+  // grant permission for a later restore; restore rechecks every condition.
+  async previewHistoricalRestore(objectId, versionId) {
+    // Opening a new engine would create a journal/snapshot. Require an
+    // initialized root so preview itself never creates durable state.
+    if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+    return this.withMutationLock(() => this._previewHistoricalRestore(objectId, versionId));
+  }
+
+  async _previewHistoricalRestore(objectId, versionId) {
+    if (!this.requireIndependentHistoricalAdmission || !this.requireAuthorization
+      || !this.reverifySeenIncoming || !this.requireCurrentOutgoingAuthorization
+      || typeof this.verifyIncoming !== "function"
+      || typeof this.currentDeviceAuthorization !== "function"
+      || typeof this.authorizationFactory !== "function") {
+      fail("Independent historical custody and current device grant are required",
+        "authorization_required");
+    }
+    const { historical, current, relative, existing, versions, assertCleanDestination } =
+      await this._inspectHistoricalRestore(objectId, versionId, { verifyRetained: true });
+    const proposed = { ...current, deviceId: this.deviceId, keyEpoch: this.keyEpoch };
+    // This validates the live grant but never signs/enqueues a new envelope.
+    await this.assertOutgoingAuthorized(proposed);
+    const key = await this.keyFor(historical);
+    const decrypted = protocol.decryptPayload(historical, key);
+    let bytes = decrypted;
+    try {
+      if (historical.operation === "move") {
+        bytes = protocol.decodeMovePayload(decrypted, key);
+        if (bytes === null) fail("Historical MOVE has no recoverable content", "history_version_unavailable");
+      }
+      // The current head must also have decryptable signed AEAD, including
+      // deleted heads. A signature over corrupted ciphertext is insufficient.
+      const headKey = await this.keyFor(current);
+      const headBytes = protocol.decryptPayload(current, headKey);
+      headBytes.fill(0);
+      await assertCleanDestination();
+      await this.assertOutgoingAuthorized(proposed);
+      return {
+        readOnly: true, ready: true, objectId, sourceVersionId: versionId,
+        currentVersionId: current.versionId, baseRevision: { ...current.revision },
+        path: relative, sizeBytes: bytes.length,
+        localAction: existing && !existing.deleted ? "replace-clean-tracked" : "create-from-deleted",
+        verifiedRetainedVersions: versions.length, requiresFreshRestoreCheck: true,
+      };
+    } finally {
+      if (bytes && bytes !== decrypted) bytes.fill(0);
+      decrypted.fill(0);
+    }
+  }
+
+  async _inspectHistoricalRestore(objectId, versionId, { verifyRetained = false } = {}) {
     if (!this.opened) await this._open();
     const validId = (value) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value);
     if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
@@ -659,8 +713,18 @@ class SyncEngine {
       || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
       fail("Current signed version does not match history", "invalid_history");
     }
-    await this.verifyIncomingOperation(historical, { preObserve: false });
-    await this.verifyIncomingOperation(current, { preObserve: false });
+    if (verifyRetained) {
+      if (versions.some((record) => record.fileId !== historical.fileId
+        || record.compartmentId !== historical.compartmentId)) {
+        fail("Retained history mixes file or compartment identities", "invalid_history");
+      }
+      for (const record of versions) {
+        await this.verifyIncomingOperation(record, { preObserve: false });
+      }
+    } else {
+      await this.verifyIncomingOperation(historical, { preObserve: false });
+      await this.verifyIncomingOperation(current, { preObserve: false });
+    }
     if (historical.metadata.contentType === "inode/directory"
       || (!current.tombstone && current.metadata.contentType === "inode/directory")) {
       fail("Directory restoration is not supported", "history_version_unavailable");
@@ -690,6 +754,12 @@ class SyncEngine {
       }
     };
     await assertCleanDestination();
+    return { historical, current, relative, existing, versions, assertCleanDestination };
+  }
+
+  async _restoreHistoricalVersion(objectId, versionId) {
+    const { historical, current, relative, existing, assertCleanDestination } =
+      await this._inspectHistoricalRestore(objectId, versionId);
     const key = await this.keyFor(historical);
     const decrypted = protocol.decryptPayload(historical, key);
     const plaintext = historical.operation === "move"

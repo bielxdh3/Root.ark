@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 const protocol = require("./rootark-sync-protocol");
 const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
@@ -203,12 +204,16 @@ function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy
 }
 
 async function start(options = {}) {
-  if (options.restore === true) {
+  if (options.restore === true || options.preview === true) {
     for (const key of ["object-id", "version-id"]) {
       if (typeof options[key] !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(options[key])) {
-        throw new Error(`Valid --${key} is required for historical restore`);
+        throw new Error(`Valid --${key} is required for historical restore or preview`);
       }
     }
+  }
+  if (options.preview === true && options.requireIndependentHistoricalAdmission !== true
+    && process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY !== "1") {
+    throw new Error("Historical preview requires externally enforced independent custody");
   }
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
@@ -288,6 +293,18 @@ async function start(options = {}) {
     baseUrl: config.serverUrl,
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
   });
+  if (options.preview === true) {
+    // Engine.open() bootstraps missing journal/snapshot files. Do not allow a
+    // read-only preview to initialize persistent state on an unknown folder.
+    for (const filename of [".rootark-sync-journal.json", ".rootark-sync-index.json"]) {
+      let stats;
+      try { stats = await fsp.lstat(path.join(config.localFolder, filename)); }
+      catch { throw new Error("Historical preview requires an existing initialized sync root"); }
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        throw new Error("Historical preview requires regular existing sync state files");
+      }
+    }
+  }
   const engine = await new SyncEngine({
     ...atomicWitness,
     rootDir: config.localFolder,
@@ -370,7 +387,14 @@ async function start(options = {}) {
     authorizationFactory: (operation) => createAuthorizationProof(operation, { username: config.username, privateKey: config.privateKey, publicKey: config.publicKey }),
     requireAuthorization: true,
     reverifySeenIncoming: strictHistorical,
+    requireIndependentHistoricalAdmission: strictHistorical,
   }).open();
+  if (options.preview === true) {
+    const outcome = await engine.previewHistoricalRestore(options["object-id"], options["version-id"]);
+    // Advisory metadata only, no recovered plaintext or decrypted key bytes.
+    console.log(JSON.stringify(outcome));
+    return engine;
+  }
   if (options.restore === true) {
     const outcome = await engine.restoreHistoricalVersion(options["object-id"], options["version-id"]);
     // Never print recovered plaintext, ciphertext, signing material or bearer.
@@ -502,9 +526,10 @@ if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "history") history({ ...args(rest) }).catch((error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; });
+  else if (command === "preview") start({ ...args(rest), preview: true }).catch((error) => { console.error(`Sync preview failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "resume") resume({ ...args(rest) }).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js preview --config <private-config> --object-id <id> --version-id <id> (requires independently injected custody and current grant; never mutates files)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,

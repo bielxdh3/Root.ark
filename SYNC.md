@@ -25,6 +25,27 @@ imprime ciphertext nem chaves. O campo `signatureVerified: false` informa que
 esses metadados historicos ainda nao possuem verificacao independente de
 assinatura, admissao ou custodia; a consulta **nao** autoriza uma restauracao.
 
+### Preflight de restauracao historica (#67)
+
+O processo confiavel que ja provisiona o Sync v2 com **evidencia fisica
+independente**, politica atual do dispositivo e chaves privadas pode consultar
+`SyncEngine.previewHistoricalRestore(objectId, versionId)` antes de restaurar.
+O mesmo preflight de `restoreHistoricalVersion` valida a versao selecionada,
+o HEAD atual e a seguranca do destino local; o preview tambem valida todas
+as versoes retidas com as provas de assinatura/admissao do provedor independente
+e descriptografa somente em memoria para autenticar AEAD/AAD. Nao cria uma
+nova operacao assinada, nao altera os arquivos do usuario, snapshot ou journal
+e nao envia dados ao servidor. A saida contem apenas caminho, IDs, revisao,
+tamanho, tipo de acao local e quantidade de versoes verificadas, **nunca**
+plaintext/chave. Um preview bem-sucedido e **consultivo**: uma restauracao
+posterior repete todas as checagens e pode falhar por mudanca de HEAD, grants
+ou arquivos locais.
+
+O subcomando `preview --config <privado> --object-id <id> --version-id <id>`
+existe para integracoes que injetem as autoridades independentes do cliente.
+Na CLI isolada, sem esse provedor e os pins externos, **falha fechado**;
+`--config` e a resposta de `history` nao substituem custodia verificavel.
+
 ### Revisao de falso positivo e retomada de dispositivo pausado (#67)
 
 Quando a protecao contra alteracoes destrutivas devolve `sync_burst_paused`
