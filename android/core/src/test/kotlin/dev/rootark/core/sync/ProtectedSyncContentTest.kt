@@ -272,6 +272,8 @@ class ProtectedSyncContentTest {
             trust.copy(username = "other"),
             trust.copy(snapshotValidUntilMillis = now),
             trust.copy(snapshotObtainedAtMillis = now + 1),
+            trust.copy(snapshotObtainedAtMillis = now - 600_000),
+            trust.copy(snapshotValidUntilMillis = now + 600_000),
         )
         for (bad in badContexts) {
             assertFailsWith<ProtectedSyncException> {
