@@ -46,6 +46,7 @@
   // silently fetch/apply data in the generic workspace.
   let verifiedOpaqueDelta = null;
   let verifiedRevocationHead = null;
+  let previewGeneration = 0;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function supportsOwnerRootedV2(value) {
@@ -56,6 +57,11 @@
   function status(value) {
     const target = field("status");
     if (target) target.textContent = value;
+  }
+  function clearLocalPreview() {
+    previewGeneration++;
+    const target = field("catalog-delta-preview");
+    if (target) target.textContent = "";
   }
   function from64(value) {
     if (typeof value !== "string" || !base64.test(value)) fail();
@@ -838,11 +844,16 @@
       + '<label>Busca por nome (índice local AES-GCM; vazio lista todos)<input type="search" data-zk1-field="catalog-delta-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
       + '<p class="muted">O catálogo assinado é revalidado a cada busca. O índice cifrado fica no armazenamento deste navegador, até uma mudança do catálogo ou limpeza dos dados do site. Nome e consulta não são enviados ao servidor.</p>'
       + '<label>Revisão protegida selecionada para GET cifrado<input type="number" min="1" step="1" data-zk1-field="catalog-delta-read-revision" readonly></label>'
-      + '<p class="muted">Selecione um resultado e confirme o GET assinado. O download é somente ciphertext: sem a CEK do arquivo, a prévia do conteúdo permanece bloqueada. Nenhum texto claro é enviado ao servidor.</p>'
+      + '<p class="muted">Selecione um resultado e confirme o GET assinado. Para abrir texto localmente, importe os metadados exatos da versão e a CEK guardados pelo proprietário fora do servidor. O SHA-256 da CEK deve estar fixado em fonte independente; um hash fornecido pelo próprio servidor não prova custódia.</p>'
+      + '<label>Metadados canônicos da versão escolhida (.json, arquivo externo ao servidor)<input type="file" data-zk1-field="catalog-preview-metadata" accept=".json,application/json"></label>'
+      + '<label>CEK da versão escolhida (arquivo binário offline de 32 bytes)<input type="file" data-zk1-field="catalog-preview-cek" accept=".bin,application/octet-stream"></label>'
+      + '<label>SHA-256 da CEK fixado pelo proprietário separadamente (base64url, 32 bytes)<input data-zk1-field="catalog-preview-cek-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
+      + '<p class="muted">Prévia efêmera de texto UTF-8, até 64 KiB. AES-GCM, IDs, epoch, revisão, grant ativo, CAS e GET assinado são conferidos antes de exibir. Fecha ao mudar seleção ou sessão. Não executa HTML ou scripts.</p>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Buscar / listar nomes localmente (AES-GCM)</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-get">GET assinado do ciphertext selecionado</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-preview">GET assinado e prévia de texto com CEK offline</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-trash-inspect">Conferir tombstone assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button>'
@@ -850,6 +861,7 @@
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-restore">Restaurar ciphertext histórico autenticado (sem delete)</button></div>'
       + '<p class="muted">Restore exige tombstone Ed25519 válido, GET histórico assinado, CEK original offline e piso CAS/witness atual. Entre epochs, o tombstone deve ter sido assinado pelo dispositivo atual após rotação, e a versão antiga deve ter seu conteúdo e CEK preservados; o grant de rekey atual e duas chaves novas produzem revisão AEAD sem reutilizar CEK antiga. Fixe e preserve as novas chaves fora do servidor para recuperação futura. Sem deleção física.</p>'
       + '<div data-zk1-field="catalog-delta-private-list" role="region" aria-label="Nomes locais abertos após CAS e witness assinados"></div>'
+      + '<pre data-zk1-field="catalog-delta-preview" role="region" aria-label="Prévia de texto protegida localmente"></pre>'
       + '<output data-zk1-field="catalog-delta-summary" role="status" aria-live="polite"></output>'
       + '</fieldset>'
       + '</fieldset>'
@@ -950,7 +962,12 @@
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
+    dialog.addEventListener("close", clearLocalPreview);
+    dialog.addEventListener("input", clearLocalPreview);
+    dialog.addEventListener("change", clearLocalPreview);
     dialog.addEventListener("click", (event) => {
+      if (event.target.closest('[data-zk1-field="catalog-delta-private-list"] button'))
+        clearLocalPreview();
       const button = event.target.closest("[data-zk1-action]");
       if (button) void perform(button.dataset.zk1Action);
     });
@@ -959,6 +976,7 @@
   async function perform(action) {
     if (busy) return;
     if (action === "close") {
+      clearLocalPreview();
       committedDeviceApproval = null;
       verifiedCatalog = null;
       verifiedOpaqueDelta = null;
@@ -982,9 +1000,11 @@
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
-      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-pull", "catalog-delta-import",
+      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
+    clearLocalPreview();
+    const operationPreviewGeneration = previewGeneration;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1120,7 +1140,7 @@
       }
       const trust = await grantAndOwner();
       assertLive();
-      if (["catalog-delta-list", "catalog-delta-get", "catalog-delta-pull", "catalog-delta-import",
+      if (["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-pull", "catalog-delta-import",
         "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
         "catalog-delta-restore"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
@@ -1147,7 +1167,7 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
-        if (!["catalog-delta-list", "catalog-delta-get"].includes(action))
+        if (!["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview"].includes(action))
           field("catalog-delta-private-list")?.replaceChildren();
         if (["catalog-delta-trash", "catalog-delta-trash-inspect",
           "catalog-delta-restore"].includes(action)) {
@@ -1353,6 +1373,56 @@
           status("GET Ed25519/CAS e SHA-256 conferidos: objeto " + objectId
             + " · revisão " + revision + ". Ciphertext salvo localmente; "
             + "prévia bloqueada sem CEK confiável. Nenhum plaintext saiu do dispositivo.");
+          return;
+        }
+        if (action === "catalog-delta-preview") {
+          const objectId = field("catalog-write-id")?.value.trim();
+          const revisionRaw = field("catalog-delta-read-revision")?.value;
+          const revision = Number(revisionRaw);
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)
+            || !Number.isSafeInteger(revision) || revision < 1) fail();
+          const selected = held.baseline.entries.filter((entry) =>
+            entry.objectId === objectId && entry.revision === revision);
+          if (selected.length !== 1 || !held.client.readSelectedCiphertext) fail();
+          const assertPreviewLive = () => {
+            assertLive();
+            if (previewGeneration !== operationPreviewGeneration
+              || verifiedOpaqueDelta !== held
+              || field("catalog-write-id")?.value.trim() !== objectId
+              || field("catalog-delta-read-revision")?.value !== revisionRaw) fail();
+          };
+          const metadataRaw = await fileBytes("catalog-preview-metadata", 2, 2048);
+          let metadata;
+          try { metadata = JSON.parse(decoder.decode(metadataRaw)); }
+          finally { metadataRaw.fill(0); }
+          const cekRaw = await fileBytes("catalog-preview-cek", 32, 32);
+          try {
+            assertPreviewLive();
+            if (!window.RootarkZk1SelectedLocalPreview?.open)
+              await loadScript("rootark-zk1-selected-local-preview");
+            assertPreviewLive();
+            if (!window.RootarkZk1SelectedLocalPreview?.open) fail();
+            const checked = await held.client.readSelectedCiphertext(
+              held.baseline, objectId, revision);
+            assertPreviewLive();
+            const preview = await window.RootarkZk1SelectedLocalPreview.open({
+              checked, selected: selected[0], metadata, rawCek: cekRaw,
+              cekSha256Pin: field("catalog-preview-cek-sha")?.value.trim(),
+              grant: trust.signedDeviceGrant,
+              ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                epoch: trust.pinnedCurrentHead.epoch,
+                digest: to64(trust.pinnedCurrentHead.digest) },
+              baseline: held.baseline, assertLive: assertPreviewLive,
+            });
+            assertPreviewLive();
+            if (preview.plaintextSentToServer !== false
+              || preview.objectId !== objectId || preview.revision !== revision
+              || preview.epoch !== selected[0].epoch) fail();
+            field("catalog-delta-preview").textContent = preview.name
+              + " · revisão " + revision + "\n" + preview.text;
+            status("Prévia UTF-8 conferida localmente por AEAD, CAS e GET assinado. "
+              + "A autenticidade do pin SHA-256 da CEK depende da fonte offline do proprietário.");
+          } finally { cekRaw.fill(0); }
           return;
         }
         if (action === "catalog-delta-publish") {
@@ -2610,7 +2680,7 @@
         "catalog-cas-key", "catalog-signer-grant", "catalog-metadata-key",
         "catalog-lifecycle-history", "catalog-lifecycle-ceks",
         "catalog-write-ciphertext", "catalog-write-key", "catalog-witness-key",
-        "catalog-delta-package",
+        "catalog-delta-package", "catalog-preview-metadata", "catalog-preview-cek",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
@@ -2656,6 +2726,7 @@
   });
   window.addEventListener("rootark:logout", () => {
     sessionEpoch++;
+    clearLocalPreview();
     verifiedCatalog = null;
     verifiedOpaqueDelta = null;
     const deltaSummary = field("catalog-delta-summary");
@@ -2673,4 +2744,5 @@
     if (dialog?.open) dialog.close();
     dialog?.querySelector("form")?.reset();
   });
+  window.addEventListener("pagehide", clearLocalPreview);
 }());
