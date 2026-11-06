@@ -2081,6 +2081,12 @@ class SyncEngine {
 
   async _pinLocal(relativePath) {
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
+    if (!this.requireAuthorization || typeof this.verifyIncoming !== "function") {
+      // Ordinary non-strict sync is allowed to use a caller-supplied AEAD
+      // key without any device signature. That is insufficient to establish
+      // a new durable PIN from an adversarial remote metadata inventory.
+      fail("Pinning requires independently verified signed remote authorization", "authorization_required");
+    }
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     if (!this.isSelected(safePath)) fail("Pinned file must be selected and not excluded", "path_not_selected");
     const oldPins = this.snapshot.pinnedFiles || {};
