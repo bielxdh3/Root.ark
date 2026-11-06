@@ -386,6 +386,31 @@ class SyncJournal {
     return operation;
   }
 
+  async discardUnsent(operation) {
+    // Only the caller that created an exact never-dispatched signed envelope
+    // may cancel it after a local preflight conflict. Never erase an admitted,
+    // acknowledged, or atomic-group operation.
+    const digest = signedEnvelopeDigest(operation);
+    if (!digest || !VALID_OPERATION_ID.test(operation.operationId)) {
+      throw new Error("A signed outbox operation is required for cancellation");
+    }
+    await this.commit((next) => {
+      const index = next.pending.findIndex((item) => item.operationId === operation.operationId);
+      if (index < 0 || signedEnvelopeDigest(next.pending[index]) !== digest
+        || next.seen.includes(operation.operationId)
+        || Object.hasOwn(next.admitted, operation.operationId)
+        || !Object.hasOwn(next.committedSigned, operation.operationId)
+        || next.committedSigned[operation.operationId] !== digest
+        || Object.values(next.atomicSignedGroups).some((group) =>
+          group.deleteId === operation.operationId || group.moveId === operation.operationId)) {
+        throw new Error("Cannot discard an ineligible signed outbox operation");
+      }
+      next.pending.splice(index, 1);
+      delete next.committedSigned[operation.operationId];
+      delete next.observed[operation.operationId];
+    });
+  }
+
   async enqueueMany(operations) {
     if (!Array.isArray(operations) || operations.some((operation) =>
       typeof operation?.operationId !== "string"
