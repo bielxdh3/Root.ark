@@ -517,6 +517,9 @@ class SyncEngine {
     }
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
     this.snapshotDiskRevision = null;
+    // If a failed pin-policy compensation cannot be durably verified, keep
+    // the pre-existing process lock on disk: no restart may silently evict.
+    this.pinnedPolicyIndeterminate = false;
     this.opened = false;
   }
 
@@ -537,7 +540,10 @@ class SyncEngine {
         await this._open();
         return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
       } finally {
-        await this.releaseProcessLock(processLock);
+        // The same exclusive mkdir marker is understood by fresh processes.
+        // Never release it after an indeterminate failed unpin rollback;
+        // explicit operator recovery is required instead of trusting disk.
+        if (!this.pinnedPolicyIndeterminate) await this.releaseProcessLock(processLock);
       }
     };
     const operation = previous.then(run, run);
@@ -1774,6 +1780,16 @@ class SyncEngine {
     };
     operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
+    if (["create", "update", "move"].includes(operation.operation)
+      && Object.values(this.snapshot.pinnedFiles || {}).some((pin) =>
+        pin.path.toLowerCase() === metadata.path.toLowerCase()
+        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId))) {
+      // Guard the destination BEFORE the first journal observation, mkdir,
+      // stageExisting or rename. Signed operations from another object can
+      // never replace a device-pinned target, even via direct apply() or
+      // when Files-On-Demand is disabled on the reopened client.
+      fail("A pinned file owns the destination path", "file_pinned");
+    }
     // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
     // envelope before the first filesystem or snapshot mutation; failure here
     // must not leave an applied object with no restart-safe observation.
@@ -2091,10 +2107,13 @@ class SyncEngine {
     if (!this.isSelected(safePath)) fail("Pinned file must be selected and not excluded", "path_not_selected");
     const oldPins = this.snapshot.pinnedFiles || {};
     if (Object.values(oldPins).some((entry) =>
-      pathsEqual(entry.path, safePath) && entry.path !== safePath)) {
-      fail("Ambiguous pinned file path", "invalid_snapshot");
+      entry.path.toLowerCase() === safePath.toLowerCase() && entry.path !== safePath)) {
+      // Match the portable validation performed on restart, not POSIX
+      // pathsEqual: legacy signed case-distinct objects may exist on Linux.
+      // Reject the alias BEFORE hydration or any snapshot mutation.
+      fail("Portable case-fold alias collides with a pinned path", "pinned_path_alias");
     }
-    const priorPinned = Object.values(oldPins).find((entry) => pathsEqual(entry.path, safePath));
+    const priorPinned = Object.values(oldPins).find((entry) => entry.path === safePath);
     if (priorPinned && (!this.snapshot.files[safePath]
       || this.snapshot.files[safePath].objectId !== priorPinned.objectId
       || this.snapshot.files[safePath].fileId !== priorPinned.fileId)) {
@@ -2141,6 +2160,23 @@ class SyncEngine {
     catch (error) {
       this.snapshot.pinnedFiles = previous;
       this.snapshot.pendingEvictions = priorPending;
+      // A directory fsync can fail AFTER atomic rename: restoring only the
+      // in-memory pin would leave a durably unpinned file on restart. Rewrite
+      // the previous policy under the SAME root lock, fsync it and read it
+      // back before returning the original failed-unpin error.
+      try {
+        await this.persistSnapshot();
+        const disk = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
+        if (JSON.stringify(disk.pinnedFiles || {}) !== JSON.stringify(previous)
+          || JSON.stringify(disk.pendingEvictions || {}) !== JSON.stringify(priorPending || {})) {
+          throw new Error("Compensated pin policy does not match durable snapshot");
+        }
+      } catch (rollbackError) {
+        this.pinnedPolicyIndeterminate = true;
+        throw Object.assign(new Error("Pinned policy persistence is indeterminate; recover the root explicitly", {
+          cause: error,
+        }), { code: "pinned_policy_indeterminate", rollbackCause: rollbackError });
+      }
       throw error;
     }
     // Removing retention intent does not remove local bytes or write to server.
