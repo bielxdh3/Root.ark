@@ -222,7 +222,7 @@ class SyncJournal {
     this.queue = Promise.resolve();
   }
 
-  async open() {
+  async open({ requireExisting = false } = {}) {
     try {
       this.state = JSON.parse(await fsp.readFile(this.filePath, "utf8"));
       if (this.state.version !== JOURNAL_VERSION || !Array.isArray(this.state.pending)
@@ -285,6 +285,13 @@ class SyncJournal {
       }
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
+      // Recovery previews are advisory READS. They must never replace lost
+      // journal evidence with an empty outbox if a file vanished after open.
+      if (requireExisting) {
+        throw Object.assign(new Error("Existing sync journal is unavailable for read-only preview"), {
+          code: "history_preview_unavailable",
+        });
+      }
       await durableWrite(this.filePath, this.state);
     }
     return this;

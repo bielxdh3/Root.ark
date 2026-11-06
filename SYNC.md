@@ -41,6 +41,14 @@ plaintext/chave. Um preview bem-sucedido e **consultivo**: uma restauracao
 posterior repete todas as checagens e pode falhar por mudanca de HEAD, grants
 ou arquivos locais.
 
+O preview exige que **snapshot e journal ja existam e sejam arquivos regulares**.
+Nao cria nem recria journal/snapshot ou `.rootark-sync.lock`. Espera a fila de
+escritores do processo, recusa um lock de outro processo e compara identidade,
+tamanho e tempos dos dois arquivos antes/depois da consulta; ausencia ou mudanca
+intermediaria faz o preview falhar fechado. Essa checagem otimista nao reserva
+o HEAD remoto nem impede futuras alteracoes por outros processos: executar
+`restore` exige nova autorizacao e revalidacao independente.
+
 O subcomando `preview --config <privado> --object-id <id> --version-id <id>`
 existe para integracoes que injetem as autoridades independentes do cliente.
 Na CLI isolada, sem esse provedor e os pins externos, **falha fechado**;

@@ -540,6 +540,57 @@ class SyncEngine {
     });
   }
 
+  withReadOnlyRoot(work) {
+    // Join the same in-process writer queue without creating the on-disk
+    // exclusive writer marker. Preview is advisory; restore always rechecks.
+    const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
+    if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
+      fail("Sync root operation cannot be re-entered", "sync_root_busy");
+    }
+    const previous = ROOT_MUTATION_QUEUES.get(queueKey) || Promise.resolve();
+    let releaseQueue;
+    const queueGate = new Promise((resolve) => { releaseQueue = resolve; });
+    ROOT_MUTATION_QUEUES.set(queueKey, queueGate);
+    const checkDiskState = async () => {
+      try {
+        await fsp.lstat(path.join(this.rootDir, ".rootark-sync.lock"));
+        fail("Another sync writer may own this root", "sync_root_busy");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const stamps = [];
+      for (const filePath of [this.snapshotPath, this.journal.filePath]) {
+        let stats;
+        try { stats = await fsp.lstat(filePath, { bigint: true }); }
+        catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          fail("Required read-only preview state is missing", "history_preview_unavailable");
+        }
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          fail("Read-only preview state is not a regular file", "history_preview_unavailable");
+        }
+        stamps.push(stats);
+      }
+      return stamps;
+    };
+    const run = async () => {
+      if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+      const before = await checkDiskState();
+      await this._open({ readOnly: true });
+      const result = await ROOT_MUTATION_CONTEXT.run(queueKey, work);
+      const after = await checkDiskState();
+      if (before.some((stamp, index) => !sameSnapshotRevision(stamp, after[index]))) {
+        fail("Sync state changed during read-only historical preview", "history_preview_stale");
+      }
+      return result;
+    };
+    const operation = previous.then(run, run);
+    return operation.finally(() => {
+      releaseQueue();
+      if (ROOT_MUTATION_QUEUES.get(queueKey) === queueGate) ROOT_MUTATION_QUEUES.delete(queueKey);
+    });
+  }
+
   async open() {
     return this.withMutationLock(async () => this);
   }
@@ -571,15 +622,15 @@ class SyncEngine {
     }
   }
 
-  async _open() {
-    await fsp.mkdir(this.rootDir, { recursive: true });
+  async _open({ readOnly = false } = {}) {
+    if (!readOnly) await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
-    this.journal = await this.journal.open();
+    this.journal = await this.journal.open({ requireExisting: readOnly });
     let snapshotStats;
     try {
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     } catch (error) {
-      if (error.code !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
+      if (error.code !== "ENOENT" || this.opened || readOnly) fail("Sync snapshot is unavailable", "invalid_snapshot");
       await durableJson(this.snapshotPath, this.snapshot);
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     }
@@ -644,7 +695,7 @@ class SyncEngine {
     // Opening a new engine would create a journal/snapshot. Require an
     // initialized root so preview itself never creates durable state.
     if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
-    return this.withMutationLock(() => this._previewHistoricalRestore(objectId, versionId));
+    return this.withReadOnlyRoot(() => this._previewHistoricalRestore(objectId, versionId));
   }
 
   async _previewHistoricalRestore(objectId, versionId) {

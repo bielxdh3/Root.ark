@@ -118,6 +118,69 @@ test("#67: preview on unopened root refuses before creating a snapshot or journa
   assert.equal(fs.existsSync(path.join(root, ".rootark-sync-index.json")), false);
 });
 
+test("#67 P2: preview never recreates a missing journal after an initialized root", async (t) => {
+  const f = await fixture(t);
+  const journalPath = path.join(f.local, ".rootark-sync-journal.json");
+  const lockPath = path.join(f.local, ".rootark-sync.lock");
+  const snapshotPath = path.join(f.local, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  await fsp.unlink(journalPath);
+  const entriesBefore = (await fsp.readdir(f.local)).sort();
+
+  await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
+    (error) => error.code === "history_preview_unavailable");
+  assert.equal(fs.existsSync(journalPath), false, "missing security evidence must not be recreated");
+  assert.equal(fs.existsSync(lockPath), false, "preview must not persist a process lock");
+  assert.deepEqual((await fsp.readdir(f.local)).sort(), entriesBefore);
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67 P2: preview uses no process lock writes and detects changed on-disk snapshot", async (t) => {
+  const f = await fixture(t);
+  const originalAcquire = f.engine.acquireProcessLock;
+  f.engine.acquireProcessLock = async () => {
+    throw new Error("Read-only preview attempted to create the writer lock");
+  };
+  try {
+    const valid = await f.engine.previewHistoricalRestore("object-1", "v1");
+    assert.equal(valid.ready, true);
+    const originalHistory = f.adapter.history;
+    f.adapter.history = async (...args) => {
+      const result = await originalHistory(...args);
+      const snapshotPath = path.join(f.local, ".rootark-sync-index.json");
+      const snapshot = JSON.parse(await fsp.readFile(snapshotPath, "utf8"));
+      snapshot.untrustedConcurrentEdit = true;
+      await fsp.writeFile(snapshotPath, JSON.stringify(snapshot));
+      return result;
+    };
+    await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
+      (error) => error.code === "history_preview_stale");
+    assert.equal(fs.existsSync(path.join(f.local, ".rootark-sync.lock")), false);
+    assert.equal(f.pushes(), 0);
+  } finally {
+    f.engine.acquireProcessLock = originalAcquire;
+  }
+});
+
+test("#67 P2: preview refuses an active writer lock or a missing initialized snapshot", async (t) => {
+  const f = await fixture(t);
+  const lockPath = path.join(f.local, ".rootark-sync.lock");
+  await fsp.mkdir(lockPath);
+  await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
+    (error) => error.code === "sync_root_busy");
+  assert.equal(fs.existsSync(lockPath), true, "preview must never replace a writer marker");
+  await fsp.rmdir(lockPath);
+
+  const snapshotPath = path.join(f.local, ".rootark-sync-index.json");
+  await fsp.unlink(snapshotPath);
+  await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
+    (error) => error.code === "history_preview_unavailable");
+  assert.equal(fs.existsSync(snapshotPath), false, "a lost snapshot must not be recreated");
+  assert.equal(fs.existsSync(lockPath), false);
+  assert.equal(f.pushes(), 0);
+});
+
 test("#67: preview refuses missing independent evidence, revoked current device and missing custody", async (t) => {
   const f = await fixture(t, { strict: false });
   await assert.rejects(f.engine.previewHistoricalRestore("object-1", "v1"),
