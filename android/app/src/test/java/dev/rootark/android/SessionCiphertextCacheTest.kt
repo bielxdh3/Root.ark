@@ -73,6 +73,11 @@ class SessionCiphertextCacheTest {
         assertThrows(SecurityException::class.java) {
             cache.save(binding, "fixture-object-1", changedCiphertext.toString().toByteArray())
         }
+        val mismatchedProof = JSONObject(String(body, Charsets.UTF_8))
+        mismatchedProof.getJSONObject("authorization").put("operationId", "different-operation")
+        assertThrows(SecurityException::class.java) {
+            cache.save(binding, "fixture-object-1", mismatchedProof.toString().toByteArray())
+        }
         assertTrue(root.listFiles().isNullOrEmpty())
         cache.save(binding, "fixture-object-1", body)
         assertThrows(SecurityException::class.java) { cache.save(binding, "fixture-object-1", body) }
