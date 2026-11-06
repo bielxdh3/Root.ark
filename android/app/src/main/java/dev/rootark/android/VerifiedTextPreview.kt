@@ -50,11 +50,16 @@ internal class VerifiedTextPreview(
 
     val available: Boolean get() = trustedGrants != null
 
-    fun open(origin: ServerOrigin, session: LoginOutcome.Authenticated, objectId: String): CharArray {
+    fun open(
+        origin: ServerOrigin,
+        session: LoginOutcome.Authenticated,
+        objectId: String,
+        stillActive: () -> Boolean = { true },
+    ): CharArray {
         val provider = trustedGrants ?: throw ProtectedSyncException()
         var characters: CharArray? = null
         try {
-            fetch.withVerifiedContent(origin, session, objectId, provider) { plaintext ->
+            fetch.withVerifiedContent(origin, session, objectId, provider, stillActive) { plaintext ->
                 characters = decodeVerifiedText(plaintext)
             }
             return characters ?: throw ProtectedSyncException()
