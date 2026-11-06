@@ -47,6 +47,7 @@ data class PinnedSyncReadContext(
 object ProtectedSyncContent {
     private const val MAX_CIPHERTEXT_BYTES = 8 * 1024 * 1024
     private const val MAX_METADATA_BYTES = 16 * 1024
+    private const val MAX_TRUST_SNAPSHOT_AGE_MS = 5 * 60 * 1000L
     private const val SIGNING_DOMAIN = "Root.ark/zk-1/authorization-manifest/v1"
     private const val PROOF_TYPE = "rootark-sync-device-authorization-v1"
     private const val SUITE = "rootark-zk-1"
@@ -110,6 +111,8 @@ object ProtectedSyncContent {
             check(nowMillis in 1..9_007_199_254_740_990L)
             check(context.snapshotObtainedAtMillis in 1..nowMillis)
             check(nowMillis < context.snapshotValidUntilMillis)
+            check(nowMillis - context.snapshotObtainedAtMillis <= MAX_TRUST_SNAPSHOT_AGE_MS)
+            check(context.snapshotValidUntilMillis - context.snapshotObtainedAtMillis <= MAX_TRUST_SNAPSHOT_AGE_MS)
             check(context.username.isNotBlank() && context.username.length <= 512)
             check(record.objectId == context.objectId && record.fileId == context.fileId)
             check(record.versionId == context.versionId)
