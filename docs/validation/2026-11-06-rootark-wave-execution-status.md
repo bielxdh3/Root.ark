@@ -29,6 +29,8 @@ Checkpoint: **2026-11-06, non-production, no merges or deploys**. Exact hashes b
 
 **Cross-PR execution evidence:** two exact-head virtual trees, [#253+#255 (56/56) and #252+#256 (35/35)](2026-11-06-rootark-cross-pr-virtual-tree.md), passed **91/91 targeted tests** on Windows Node24. No merge commit, branch checkout change, deployment or all-PR certification occurred.
 
+**#68 additional scoped review:** a separate clean worktree inspected public file/folder scope, view/preview/download/file routes, JSON/SQLite permission/quota/expiry and revocation after #256. No further reproducible cross-resource/operation HTTP flaw was demonstrated, so **no speculative PR was created**. The remaining folder/object-set, upload/add/list, recipient and protected ZK object/version/compartment features need a bounded authorization/capability design rather than broadening existing legacy permissions. [Issue checkpoint](https://github.com/bielxdh3/Root.ark/issues/68#issuecomment-6687203637).
+
 1. Finish independent last-head reviews and hosted gates for drafts #251–#261; forward-fix only proven regressions, without mutating other worktrees or history.
 2. Deliver specific missing recovery and feature slices in separate bounded drafts where tests prove a real gap. Do not restart merged work or introduce unnecessary frameworks/dependencies.
 3. Record real operator/deployment requirements as **future acceptance**, not as emergency blockers to nonproduction engineering, and never turn a simulated adapter into a claim of live durability or owner key custody.
