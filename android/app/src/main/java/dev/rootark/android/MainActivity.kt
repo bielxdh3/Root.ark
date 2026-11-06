@@ -30,7 +30,7 @@ class MainActivity : Activity() {
     private var authenticatedSession: LoginOutcome.Authenticated? = null
     private var securePreviewText: TextView? = null
     private var sessionCanListFiles = false
-    private var generation = 0
+    @Volatile private var generation = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(null)
@@ -198,7 +198,10 @@ class MainActivity : Activity() {
             text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
         } else {
             button(layout, "Abrir texto verificado") {
-                runRequest({ preview.open(origin, session, objectId) }) { characters, failure ->
+                val requestGeneration = generation + 1
+                runRequest({
+                    preview.open(origin, session, objectId) { generation == requestGeneration }
+                }) { characters, failure ->
                     if (characters != null) {
                         try {
                             val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")

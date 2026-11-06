@@ -407,5 +407,27 @@ class ProtectedSyncFetchTest {
             assertEquals(status, denied.statusCode)
             assertTrue(deniedKey.all { it == 0.toByte() })
         }
+
+        // Simulates onStop while the bounded HTTPS request is in flight.
+        // A consumed grant is erased, and no AES-GCM decrypt/preview runs
+        // after foreground generation changes.
+        val backgroundKey = ByteArray(32) { 17 }
+        var checks = 0
+        var networkOpens = 0
+        val pausedViewer = VerifiedTextPreview(
+            TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, backgroundKey) },
+            ProtectedSyncFetch {
+                networkOpens++
+                SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
+            },
+        )
+        assertThrows(ProtectedSyncException::class.java) {
+            pausedViewer.open(origin, session, "fixture-object-1") {
+                checks++
+                checks == 1
+            }
+        }
+        assertEquals(1, networkOpens)
+        assertTrue(backgroundKey.all { it == 0.toByte() })
     }
 }
