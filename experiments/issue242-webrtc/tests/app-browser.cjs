@@ -39,6 +39,14 @@ async function run() {
       pages.push(page);
       await page.call('Page.enable');
       await page.call('Network.enable');
+      if (username === 'alice') {
+        // Capture real Edge sockets before the protected page loads, then
+        // deterministically deliver a delayed event from the prior room.
+        await page.call('Page.addScriptToEvaluateOnNewDocument', { source:
+          'window.__testSockets=[]; const NativeSocket=WebSocket; ' +
+          'window.WebSocket=class extends NativeSocket { constructor(...args) { super(...args); window.__testSockets.push(this); } };'
+        });
+      }
       for (const cookie of session.cookie.split('; ')) {
         const [name, value] = cookie.split('=');
         await page.call('Network.setCookie', { name, value, url: f.origin,
@@ -128,6 +136,10 @@ async function run() {
       'window.__poc.snapshot().boundObject?.sha256 && window.__poc.snapshot().roomId'),
     'ciphertext ACL room not opened', 12_000);
     assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject.sha256'), expectedDigest);
+    await alice.evaluate('window.__testSockets[0].onmessage({data:JSON.stringify({type:"joined",role:"guest",peerId:"old-room"})})');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject?.sha256'), expectedDigest,
+      'stale unbound join stripped the current signed ciphertext room policy');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), 'host');
     await alice.evaluate('window.__poc.invite("carol")');
     await until(() => alice.evaluate(
       'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_ACCESS_DENIED")'),
