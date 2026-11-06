@@ -635,10 +635,13 @@ class SyncObjectStore {
       if (this.atomicDeviceRegistry && input.operation === "create"
         && Object.values(user.objects).some((record) =>
           record && !record.tombstone && record.objectId !== input.objectId
-          && record.metadata?.path === input.metadata.path)) {
+          && typeof record.metadata?.path === "string"
+          && record.metadata.path.toLowerCase() === input.metadata.path.toLowerCase())) {
         // Every protected CREATE races against other devices, even after a
         // successful metadata preflight. Resolve occupancy from the freshly
         // loaded tenant state INSIDE the exclusive cross-process writer lock.
+        // Check portable case aliases even on Linux: the same tenant may
+        // later sync to a case-insensitive Windows filesystem.
         // A tombstone releases its path; UPDATE/MOVE/DELETE retain their
         // existing identity and revision semantics.
         return { kind: "path_conflict" };

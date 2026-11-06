@@ -97,6 +97,29 @@ test("issue 66 P2: a fresh local CREATE cannot duplicate an existing remote opaq
   assert.equal(store.list("alice").length, 1);
 });
 
+test("issue 66 P2: tombstoned remote path does not block a new Files On-Demand CREATE", async (t) => {
+  const { root, open, store, key, state } = await setup(t, {});
+  const original = await seedRemote(store, key, "docs/reused.txt");
+  const removed = protocol.createOperation({
+    operation: "delete", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: original.revision,
+    metadata: { path: "docs/reused.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", removed)).kind, "stored");
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "reused.txt"), "new independent local file");
+  const client = await open();
+  const summary = await client.syncOnce();
+  assert.equal(summary.pushed, 1);
+  assert.equal(state.pushes, 1);
+  assert.equal((await client.journal.recover()).length, 0);
+  const versions = store.list("alice");
+  assert.equal(versions.filter((record) => !record.tombstone && record.metadata.path === "docs/reused.txt").length, 1);
+  assert.equal(versions.filter((record) => record.tombstone).length, 1);
+});
+
 test("issue 66 P2: an offline CREATE stays queued; reconnect rechecks remote identity before push", async (t) => {
   const { root, open, store, state, key } = await setup(t, {});
   await fsp.mkdir(path.join(root, "docs"), { recursive: true });

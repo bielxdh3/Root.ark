@@ -62,6 +62,16 @@ test("issue 66 P2 atomic: simultaneous protected CREATE after both clients' empt
   assert.equal(reloaded.list("alice").length, 1, "collision cannot reappear after restart");
 });
 
+test("issue 66 P2 atomic: case-only remote paths cannot double-book a Windows filename", async (t) => {
+  const { first, second, sign } = await fixture(t);
+  const [a, b] = await Promise.all([
+    first.put("alice", await sign("create", "object-a", "Docs/File.txt")),
+    second.put("alice", await sign("create", "object-b", "docs/file.txt")),
+  ]);
+  assert.deepEqual([a.kind, b.kind].sort(), ["path_conflict", "stored"]);
+  assert.equal(first.list("alice").filter((record) => !record.tombstone).length, 1);
+});
+
 test("issue 66 P2 atomic: same pathname belongs to tenant only, active owner blocks but deleted owner releases", async (t) => {
   const { first, second, sign, publicKey } = await fixture(t);
   await first.enrollDevice({ username: "bob", deviceId: "device-a",

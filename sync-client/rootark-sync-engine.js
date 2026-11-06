@@ -754,7 +754,7 @@ class SyncEngine {
         const remotePath = protocol.safeRelativePath(entry.metadata?.path, "path");
         if (!this.isSelected(remotePath)) continue;
         if (!entry.tombstone && entry.metadata?.contentType !== "inode/directory") available += 1;
-        if (requestedPath !== null && pathsEqual(remotePath, requestedPath)) {
+        if (requestedPath !== null && !entry.tombstone && pathsEqual(remotePath, requestedPath)) {
           if (matching) fail("More than one remote object matches this path", "remote_object_ambiguous");
           matching = entry;
         }
