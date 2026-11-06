@@ -1594,6 +1594,10 @@ class SyncEngine {
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
+          if (result.status === 409 && (result.code === "remote_path_collision"
+            || result.payload?.code === "remote_path_collision")) {
+            fail("A protected remote CREATE path was occupied after preflight", "remote_path_collision");
+          }
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
           throw new SyncConflictError(result);
         }
@@ -1618,6 +1622,10 @@ class SyncEngine {
         await this.journal.markSeen(operation.operationId, acknowledgedDigest);
         summary.pushed += 1;
       } catch (error) {
+        if (error?.code === "remote_path_collision"
+          || error?.payload?.code === "remote_path_collision") {
+          fail("A protected remote CREATE path was occupied after preflight", "remote_path_collision");
+        }
         // A local authorization failure is never an HTTP conflict. Even a
         // callback that throws status:409 must not consume a pending journal
         // operation or trigger remote-wins recovery without a real response.
