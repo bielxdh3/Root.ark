@@ -243,7 +243,23 @@ Comportamento de `excludedPaths`:
 - A lista aplicada fica persistida no indice do sync (`excludedPaths`) e a reconciliacao so roda quando a lista muda.
 - Falha transitoria de despejo (`EBUSY`, `EPERM`, `EAGAIN`, por exemplo arquivo aberto no Windows) e registrada em `pendingEvictions` no indice e tentada de novo nos syncs seguintes, no maximo 3 vezes. Depois disso o item aparece em `summary.excluded.failed` sem novas tentativas. Arquivos com alteracao local nunca entram nessa fila; nenhuma tentativa envia delete remoto.
 
-Limitacoes: nao ha comando CLI dedicado (a configuracao e o ponto de controle); nao ha placeholder nativo nem Files On-Demand; pastas vazias excluidas nao sao removidas localmente; metadados remotos ainda sao listados completos antes do filtro local.
+Limitacoes: exclusoes sao controladas pela configuracao; nao ha placeholder nativo do sistema operacional; pastas vazias excluidas nao sao removidas localmente.
+
+## Files On-Demand no sync v2 (issue #66)
+
+Ative `"filesOnDemand": true` na configuracao privada do sync v2. Em `start`, o cliente consulta apenas paginas de metadados (`GET /sync/v1/objects?view=metadata`, ate 64 itens/pagina) e informa `available`, sem baixar ciphertext de todos os arquivos. O inventario remoto e **apenas informativo** e nao autoriza gravar um arquivo ou persistir pins locais. `selectedPaths` e `excludedPaths` continuam valendo.
+
+Para listar e baixar um arquivo especifico, use:
+
+```powershell
+node sync-client/rootark-sync-v2.js browse --config E:\sync-private\.rootark-sync.json --limit 64
+node sync-client/rootark-sync-v2.js hydrate --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
+node sync-client/rootark-sync-v2.js evict --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
+```
+
+`hydrate` identifica o objeto pelo inventario e baixa **somente** seu envelope completo; o motor valida identidade, revisao, autorizacao assinada e integridade AEAD antes de materializar os bytes. Se houver modificacao local nao sincronizada, arquivo nao rastreado, ambiguidades ou mudanca entre a consulta de metadados e o download, a hidratacao e recusada sem sobrescrever o arquivo. `evict` preserva a copia remota e exige que o arquivo local esteja limpo e que seus bytes sejam iguais ao objeto remoto verificado. Arquivos evictados continuam remotos, nao viram tombstones; offline, os arquivos ja materializados permanecem acessiveis e novas hidratacoes aguardam conexao.
+
+Nao existe placeholder nativo de Windows/Explorer, nem download automatico ao abrir um caminho: a hidratacao e solicitada explicitamente por `hydrate` ou `SyncEngine.materializeRemote(caminho)`. Inventarios com mais de 65.536 objetos nao sao percorridos por uma unica operacao do cliente neste modo; o limite evita loops de paginacao ilimitados.
 
 ## Phase 12: protocolo bidirecional protegido
 
