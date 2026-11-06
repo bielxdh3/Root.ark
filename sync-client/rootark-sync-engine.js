@@ -397,6 +397,12 @@ function pathKey(relativePath) {
   return process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
 }
 
+function pinnedKey(objectId) {
+  // Never index a parsed JSON object by an untrusted objectId such as
+  // "__proto__"; a SHA-256 hex key also stays portable across devices.
+  return crypto.createHash("sha256").update(objectId, "utf8").digest("hex");
+}
+
 function sameSnapshotRevision(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs);
@@ -603,6 +609,34 @@ class SyncEngine {
         for (const entry of Object.values(parsed.pendingEvictions)) {
           if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
           try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
+        }
+      }
+      if (parsed.pinnedFiles !== undefined) {
+        if (!parsed.pinnedFiles || typeof parsed.pinnedFiles !== "object"
+          || Array.isArray(parsed.pinnedFiles)
+          || Object.keys(parsed.pinnedFiles).length > 65536) {
+          fail("Invalid local pinned-file policy", "invalid_snapshot");
+        }
+        const pinnedPaths = new Set();
+        for (const [key, item] of Object.entries(parsed.pinnedFiles)) {
+          if (!item || typeof item !== "object" || Array.isArray(item)
+            || Object.keys(item).sort().join(",") !== "fileId,objectId,path"
+            || typeof item.objectId !== "string" || !item.objectId
+            || typeof item.fileId !== "string" || !item.fileId
+            || key !== pinnedKey(item.objectId)
+            || typeof item.path !== "string") {
+            fail("Invalid local pinned-file identity", "invalid_snapshot");
+          }
+          try { protocol.safeRelativePath(item.path, "pinnedPath"); }
+          catch { fail("Invalid local pinned-file path", "invalid_snapshot"); }
+          const portablePath = item.path.toLowerCase();
+          if (pinnedPaths.has(portablePath)) fail("Ambiguous local pinned-file path", "invalid_snapshot");
+          pinnedPaths.add(portablePath);
+          const tracked = parsed.files[item.path];
+          if (!tracked || tracked.deleted || tracked.directory
+            || tracked.objectId !== item.objectId || tracked.fileId !== item.fileId) {
+            fail("Pinned-file identity differs from the local snapshot", "invalid_snapshot");
+          }
         }
       }
       for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
@@ -1746,6 +1780,10 @@ class SyncEngine {
     if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
     let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
+      const protectedPin = this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)];
+      if (protectedPin && protectedPin.fileId === operation.fileId) {
+        fail("Pinned file must be unpinned before applying a remote delete", "file_pinned");
+      }
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
         && priorAtTarget.objectId === operation.objectId && priorAtTarget.fileId === operation.fileId;
@@ -1953,6 +1991,9 @@ class SyncEngine {
       if (protectedPaths.has(pathKey(relative))) continue;
       if (!this.isSelected(relative)) continue;
       if (prior.deleted || current[relative]) continue;
+      if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
+        fail("Pinned local file is missing; refusing to enqueue remote DELETE", "pinned_file_missing");
+      }
       const eviction = this.snapshot.remoteOnly[prior.objectId];
       if (eviction?.reason === "evicted" && pathsEqual(eviction.path, relative)) {
         delete this.snapshot.files[relative];
@@ -2016,11 +2057,103 @@ class SyncEngine {
         ? Boolean(prior.directory)
         : operation.metadata?.contentType === "inode/directory",
     };
+    // A verified MOVE retains object/file identity; carry device-local
+    // retention intent without trusting advisory inventory metadata.
+    if (operation.operation === "move") {
+      const pin = this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)];
+      if (pin && pin.fileId === operation.fileId) {
+        this.snapshot.pinnedFiles[pinnedKey(operation.objectId)] = { ...pin, path: pathName };
+      }
+    }
     delete this.snapshot.remoteOnly[operation.objectId];
   }
 
   async evictLocal(relativePath) {
     return this.withMutationLock(() => this._evictLocal(relativePath));
+  }
+
+  // Pinning is a durable DEVICE-LOCAL retention policy, not a remote trust pin
+  // or an authorization to decrypt. A successful pin first materializes the
+  // exact signed full envelope through the regular Files On-Demand verifier.
+  async pinLocal(relativePath) {
+    return this.withMutationLock(() => this._pinLocal(relativePath));
+  }
+
+  async _pinLocal(relativePath) {
+    if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
+    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
+    if (!this.isSelected(safePath)) fail("Pinned file must be selected and not excluded", "path_not_selected");
+    const oldPins = this.snapshot.pinnedFiles || {};
+    if (Object.values(oldPins).some((entry) =>
+      pathsEqual(entry.path, safePath) && entry.path !== safePath)) {
+      fail("Ambiguous pinned file path", "invalid_snapshot");
+    }
+    const priorPinned = Object.values(oldPins).find((entry) => pathsEqual(entry.path, safePath));
+    if (priorPinned && (!this.snapshot.files[safePath]
+      || this.snapshot.files[safePath].objectId !== priorPinned.objectId
+      || this.snapshot.files[safePath].fileId !== priorPinned.fileId)) {
+      fail("Pinned identity must not be silently replaced", "pinned_identity_changed");
+    }
+    await this._materializeOnDemand(safePath);
+    const tracked = this.snapshot.files[safePath];
+    if (!tracked || tracked.deleted || tracked.directory || !/^[a-f0-9]{64}$/.test(tracked.hash || "")) {
+      fail("Only a verified hydrated regular file can be pinned", "cache_entry_unavailable");
+    }
+    if (priorPinned && (priorPinned.objectId !== tracked.objectId || priorPinned.fileId !== tracked.fileId)) {
+      fail("Pinned identity changed during hydration", "pinned_identity_changed");
+    }
+    const previous = this.snapshot.pinnedFiles;
+    this.snapshot.pinnedFiles = { ...oldPins,
+      [pinnedKey(tracked.objectId)]: { objectId: tracked.objectId, fileId: tracked.fileId, path: safePath } };
+    try { await this.persistSnapshot(); }
+    catch (error) { this.snapshot.pinnedFiles = previous; throw error; }
+    return { path: safePath, pinned: true, objectId: tracked.objectId };
+  }
+
+  async unpinLocal(relativePath) {
+    return this.withMutationLock(() => this._unpinLocal(relativePath));
+  }
+
+  async _unpinLocal(relativePath) {
+    if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
+    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
+    const previous = this.snapshot.pinnedFiles || {};
+    const match = Object.values(previous).find((entry) => pathsEqual(entry.path, safePath));
+    if (!match) return { path: safePath, pinned: false, applied: false };
+    const next = { ...previous };
+    delete next[pinnedKey(match.objectId)];
+    this.snapshot.pinnedFiles = next;
+    const priorPending = this.snapshot.pendingEvictions;
+    if (this.isExcluded(safePath)) {
+      // Exclusion may already be marked applied while retention prevented
+      // eviction. Keep one durable retry intent together with the unpin,
+      // so the next sync can apply its existing verified eviction path.
+      this.snapshot.pendingEvictions = { ...(priorPending || {}),
+        [match.objectId]: { path: safePath, code: "file_unpinned", attempts: 0 } };
+    }
+    try { await this.persistSnapshot(); }
+    catch (error) {
+      this.snapshot.pinnedFiles = previous;
+      this.snapshot.pendingEvictions = priorPending;
+      throw error;
+    }
+    // Removing retention intent does not remove local bytes or write to server.
+    return { path: safePath, pinned: false, applied: true };
+  }
+
+  async pinStatus(relativePath = null) {
+    return this.withMutationLock(async () => {
+      if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
+      const status = async (safePath) => {
+        const pin = Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
+        const target = await contained(this.rootDir, safePath, true);
+        const present = await exists(target);
+        return { path: safePath, pinned: Boolean(pin), localPresent: present, objectId: pin?.objectId || null };
+      };
+      if (relativePath !== null) return status(await canonicalRelativePath(this.rootDir, relativePath));
+      const all = Object.values(this.snapshot.pinnedFiles || {}).sort((a, b) => a.path.localeCompare(b.path));
+      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path))) };
+    });
   }
 
   async _evictLocal(relativePath) {
@@ -2029,6 +2162,9 @@ class SyncEngine {
     if (!this.isInScope(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
     const prior = this.snapshot.files[safePath];
     if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
+    if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
+      fail("Pinned file cannot be evicted before unpin", "file_pinned");
+    }
     const pending = await this.journal.recover();
     if (pending.some((operation) => operation.objectId === prior.objectId
       || operation.metadata?.path === safePath || operation.metadata?.sourcePath === safePath)) {
@@ -2368,6 +2504,11 @@ class SyncEngine {
       const retry = pendingEvictions[prior.objectId];
       if (!listChanged && !retry) continue;
       excludedObjectIds.add(prior.objectId);
+      if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
+        delete pendingEvictions[prior.objectId];
+        report.kept.push({ path: relative, code: "file_pinned" });
+        continue;
+      }
       if (retry && retry.attempts >= MAX_EVICTION_ATTEMPTS) {
         report.failed.push({ path: relative, code: retry.code });
         continue;
