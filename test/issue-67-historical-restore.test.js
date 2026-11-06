@@ -237,6 +237,34 @@ test("#67: staging detects an edit after final hash read and restores changed by
   assert.equal((await f.engine.journal.recover()).length, 0);
 });
 
+test("#67: staged content hash rejects same-size edits with restored mtime and stable inode", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const clean = Buffer.from("clean synchronized bytes");
+  const altered = Buffer.from("dirty synchronized bytes");
+  assert.equal(clean.length, altered.length);
+  const timestamp = new Date("2023-11-14T00:00:00.000Z");
+  await fsp.writeFile(target, clean);
+  await fsp.utimes(target, timestamp, timestamp);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(clean).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const stage = f.engine.stageExisting.bind(f.engine);
+  f.engine.stageExisting = async (requested) => {
+    await fsp.writeFile(target, altered);
+    await fsp.utimes(target, timestamp, timestamp);
+    return stage(requested);
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict");
+  assert.deepEqual(await fsp.readFile(target), altered);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+});
+
 test("#67: an untracked file created after enqueue is never replaced by restore", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");

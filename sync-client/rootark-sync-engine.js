@@ -1756,6 +1756,32 @@ class SyncEngine {
         && sameFileIdentity(before, after) && before.size === after.size
         && before.mtimeNs === after.mtimeNs && before.birthtimeNs === after.birthtimeNs
         && before.mode === after.mode;
+      if (unchanged) {
+        // Inode/size/mtime alone are insufficient: a concurrent writer can
+        // overwrite bytes in place, then restore the original mtime before
+        // stageExisting renames the file. Validate the actual staged payload
+        // through a no-follow FD before unlinking or materializing anything.
+        await containedAbsolute(this.rootDir, staged, false);
+        const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_NONBLOCK || 0);
+        const handle = await fsp.open(staged, flags);
+        try {
+          const opened = await handle.stat({ bigint: true });
+          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n
+            || !sameFileIdentity(after, opened)) {
+            unchanged = false;
+          } else {
+            const bytes = await handle.readFile();
+            try {
+              const readEnd = await handle.stat({ bigint: true });
+              const pathEnd = await fsp.lstat(staged, { bigint: true });
+              unchanged = sameFileVersion(opened, readEnd)
+                && sameFileVersion(readEnd, pathEnd)
+                && crypto.createHash("sha256").update(bytes).digest("hex") === expectedHash;
+            } finally { bytes.fill(0); }
+          }
+        } finally { await handle.close(); }
+      }
     } catch { /* Reject unexpected staging identity and preserve the old bytes. */ }
     if (!unchanged) {
       await this.replaceStagedIfVacant(staged, target);
