@@ -273,3 +273,97 @@ test("#67: clean tracked overwrite requires separate explicit consent and preser
   assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])),
     previousBytes);
 });
+
+test("#67 P2: failed initial fsynced progress creation cannot permanently brick a never-started plan", async (t) => {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const originalOpen = fsp.open;
+  let injected = false;
+  fsp.open = async (filePath, flags, ...rest) => {
+    const handle = await originalOpen(filePath, flags, ...rest);
+    if (!injected && flags === "wx" && String(filePath).includes(".rootark-recovery-execution-")) {
+      injected = true;
+      return new Proxy(handle, { get(target, key) {
+        if (key === "writeFile") return async () => {
+          throw Object.assign(new Error("injected write before initial fsync"), { code: "ENOSPC" });
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
+      (error) => error.code === "ENOSPC");
+  } finally { fsp.open = originalOpen; }
+  assert.equal(injected, true);
+  assert.equal(f.pushes(), 0);
+  const names = await fsp.readdir(f.local);
+  assert.equal(names.some((name) => /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name)),
+    false, "no final progress file may exist before a complete fsynced write");
+  assert.ok(names.some((name) => name.includes(".rootark-recovery-execution-") && name.includes(".tmp-")),
+    "uncommitted temporary evidence is preserved");
+  const outcome = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+  assert.equal(outcome.completed, 1);
+  assert.equal(f.pushes(), 1);
+});
+
+test("#67 P2: final grant revocation before enqueue permits safe retry only after proof of no dispatch", async (t) => {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  let signedChecks = 0;
+  f.engine.authorizeOutgoing = (operation) => {
+    if (operation.operationId.startsWith("histrestore-")) signedChecks += 1;
+    return !operation.operationId.startsWith("histrestore-") || signedChecks !== 3;
+  };
+  const denied = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+  assert.equal(denied.completed, 0);
+  assert.equal(denied.items[0].status, "blocked");
+  assert.equal(denied.items[0].neverDispatched, true);
+  assert.equal(signedChecks, 3);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+  assert.equal(f.pushes(), 0);
+  assert.equal(f.store.history("alice", "object-1").length, 2);
+  const reopened = await new SyncEngine(f.opts).open();
+  const resumed = await reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true });
+  assert.equal(resumed.completed, 1);
+  assert.equal(f.pushes(), 1, "only one new signed PUT after fresh authorization");
+  assert.equal(f.store.history("alice", "object-1").length, 3);
+});
+
+test("#67 P2: discarded unsent local-conflict intent stays blocked until clean and safely resumes", async (t) => {
+  const f = await fixture(t);
+  const original = Buffer.from("last synchronized local content");
+  const target = path.join(f.local, "file-1.txt");
+  await fsp.writeFile(target, original);
+  f.engine.snapshot.files["file-1.txt"] = {
+    objectId: "object-1", fileId: "file-1", versionId: "deleted-1",
+    revision: { counter: 2, deviceId: "device-a" }, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(original).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const enqueue = f.engine.journal.enqueue.bind(f.engine.journal);
+  f.engine.journal.enqueue = async (operation) => {
+    const result = await enqueue(operation);
+    await fsp.writeFile(target, "unsent owner modification");
+    return result;
+  };
+  const denied = await f.engine.restoreHistoricalPlan(preview,
+    { confirm: true, confirmCleanOverwrite: true });
+  assert.equal(denied.items[0].status, "blocked");
+  assert.equal(denied.items[0].neverDispatched, true);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+  assert.equal(f.pushes(), 0);
+  const reopened = await new SyncEngine(f.opts).open();
+  await assert.rejects(reopened.restoreHistoricalPlan(preview,
+    { confirm: true, confirmCleanOverwrite: true, resume: true }),
+  (error) => error.code === "restore_local_conflict");
+  assert.equal(await fsp.readFile(target, "utf8"), "unsent owner modification");
+  await fsp.writeFile(target, original);
+  const resumed = await reopened.restoreHistoricalPlan(preview,
+    { confirm: true, confirmCleanOverwrite: true, resume: true });
+  assert.equal(resumed.completed, 1);
+  assert.equal(f.pushes(), 1);
+});

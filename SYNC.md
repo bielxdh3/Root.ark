@@ -116,6 +116,13 @@ O progresso e mantido em arquivo local reservado
 `.rootark-recovery-execution-<digest>.json`, persistido com fsync. Ele registra
 somente IDs, digests de envelopes assinados e estados por objeto (`pending`,
 `blocked`, `committed`, `indeterminate`); nao contem conteudo ou chaves. O
+arquivo inicial e publicado somente apos gravacao e fsync de um temporario
+privado completo, via hardlink **sem substituicao**. Falha/ENOSPC anterior a
+essa publicacao deixa apenas temporario ignorado e preservado para exame;
+nao cria progresso final parcial nem bloqueia um plano ainda nao iniciado.
+Um arquivo final preexistente invalido continua bloqueado ate reconciliacao
+externa: ele nunca e apagado, substituido ou tratado como prova de ausencia
+de envio.
 retorno oferece `atomic:false`, `completed`, `remaining`, `partial`, `planDigest`
 e `items` com resultados individuais. Os commits ja concluidos nao sao
 reemitidos. Para continuar um plano parcialmente bloqueado depois de resolver
@@ -129,6 +136,13 @@ Antes de retomar, o cliente confirma cada sucesso por envelope assinado no
 HEAD, registro duravel local do outbox, verificacao externa de admissao,
 identidade da revisao-base, conteudo original autenticado, AEAD e bytes locais.
 Os objetos ainda pendentes passam novamente pela verificacao completa. Se o
+ultimo gate de autorizacao recusar **antes de chamar enqueue**, ou um conflito
+local fizer `discardUnsent` remover duravelmente a operacao ainda nao enviada,
+o progresso marca `blocked` com `neverDispatched:true`. Ao retomar exige que
+o journal continue sem outbox/recibo/observacao para o ID, e que HISTORY/HEAD
+assinados ainda comprovem o estado anterior, antes de qualquer nova assinatura.
+Esse campo nao autoriza nada sozinho. Se a remocao/ausencia nao for comprovada,
+a operacao continua indeterminada. Se o
 processo caiu apos gravar a intencao assinada, houve falha de fsync, perda de
 ACK ou um envio ficou pendente, esse item permanece `indeterminate`. Na
 retomada, somente uma confirmacao independente do **mesmo HEAD assinado ja

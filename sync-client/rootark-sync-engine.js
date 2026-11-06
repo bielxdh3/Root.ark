@@ -368,17 +368,26 @@ async function durableJson(filePath, value) {
 }
 
 async function createDurableRestoreProgress(filePath, value) {
-  // O_EXCL is required: two invocations of the same selection may not
-  // silently replace the earlier execution's signed progress.
-  const handle = await fsp.open(filePath, "wx", 0o600);
+  // Never publish an incomplete final manifest. Hard-linking a completely
+  // fsynced private temporary inode is atomic and NO-REPLACE on both NTFS and
+  // POSIX, including when another invocation already owns the destination.
+  // A failure before link leaves only an ignored temporary, never a final
+  // empty/partial manifest that would brick an otherwise untouched plan.
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const handle = await fsp.open(temporary, "wx", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`);
     await handle.sync();
   } finally { await handle.close(); }
+  await containedAbsolute(path.dirname(filePath), temporary, false);
+  await fsp.link(temporary, filePath);
   if (process.platform !== "win32") {
     const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
     try { await directory.sync(); } finally { await directory.close(); }
   }
+  // Retain a temporary on failed publication as evidence, but remove the
+  // caller-created hard-link after its complete final inode is durable.
+  await fsp.unlink(temporary);
 }
 
 async function readDurableRestoreProgress(filePath) {
@@ -892,6 +901,16 @@ class SyncEngine {
           const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
           await this._verifyCommittedRestorePlanItem(item, requested);
         }
+        // An intent whose enqueue was proven never to begin (or whose exact
+        // never-dispatched outbox entry was durably discarded) may be retried.
+        // Require fresh signed remote absence plus an empty authoritative
+        // journal; a bare editable 'blocked' field grants no retry authority.
+        for (const item of state.items.filter((record) => record.status !== "committed")) {
+          if (item.operationId || item.envelopeDigest || item.versionId) {
+            const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+            await this._assertNeverDispatchedRestoreIntent(item, requested);
+          }
+        }
       } else {
         let current;
         try { current = await fsp.lstat(filePath); }
@@ -944,6 +963,7 @@ class SyncEngine {
       for (const item of remaining) {
         const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
         let intentStored = false;
+        let provenNeverDispatched = false;
         try {
           await this._assertRestorablePlanMember(requested);
           // An unrelated writer's pending outbox cannot be safely pushed by
@@ -954,9 +974,19 @@ class SyncEngine {
           const result = await this._restoreHistoricalVersion(item.objectId, item.sourceVersionId,
             { beforeEnqueue: async (intent) => {
               item.status = "indeterminate";
+              delete item.neverDispatched;
               Object.assign(item, intent);
               await persist(state);
               intentStored = true;
+            }, onProvenUnsent: async (error) => {
+              // Invoked only when the final authorization gate never called
+              // enqueue OR when discardUnsent fsynced the exact envelope.
+              // This callback itself must commit before retry becomes legal.
+              item.status = "blocked";
+              item.neverDispatched = true;
+              item.code = safeErrorCode(error);
+              await persist(state);
+              provenNeverDispatched = true;
             } });
           if (result?.pushed !== true || result.pending === true) {
             await persist(state);
@@ -970,7 +1000,12 @@ class SyncEngine {
           item.envelopeDigest = signedEnvelopeDigest(committed);
           await persist(state);
         } catch (error) {
-          if (!intentStored) {
+          if (provenNeverDispatched) {
+            // Persisted signed never-dispatched proof is retained for a fresh
+            // journal + remote HEAD check on resume; no new PUT in this turn.
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+          } else if (!intentStored) {
             item.status = "blocked";
             item.code = safeErrorCode(error);
           } else {
@@ -985,6 +1020,40 @@ class SyncEngine {
       }
       return response();
     }, { requireExistingState: true });
+  }
+
+  async _assertNeverDispatchedRestoreIntent(item, requested) {
+    if (item.status !== "blocked" || item.neverDispatched !== true
+      || typeof item.operationId !== "string"
+      || !/^histrestore-[A-Za-z0-9-]{36}$/.test(item.operationId)
+      || typeof item.envelopeDigest !== "string"
+      || !/^[a-f0-9]{64}$/.test(item.envelopeDigest)) {
+      fail("Unproven historical restore retry", "restore_plan_indeterminate");
+    }
+    if ((await this.journal.recover()).length || this.journal.hasSeen(item.operationId)
+      || this.journal.hasDurableSignedReceipt(item.operationId)
+      || this.journal.hasLocalAdmission(item.operationId, item.envelopeDigest)) {
+      fail("Signed restore outbox or admission exists", "restore_plan_indeterminate");
+    }
+    const history = await this.adapter.history(item.objectId);
+    const versions = Array.isArray(history?.versions) ? history.versions : [];
+    if (!versions.length || versions.length > 256) {
+      fail("Untrusted historical retry history", "restore_plan_indeterminate");
+    }
+    const validated = versions.map((operation) => protocol.validateStoredOperation(operation));
+    if (validated.some((operation) => operation.operationId === item.operationId)
+      || signedEnvelopeDigest(validated[validated.length - 1]) !== requested.currentEnvelopeDigest) {
+      fail("Signed restore may already have been admitted", "restore_plan_indeterminate");
+    }
+    const head = await this.adapter.list(item.objectId);
+    const records = Array.isArray(head) ? head : Array.isArray(head?.objects)
+      ? head.objects : head ? [head] : [];
+    if (records.length !== 1
+      || signedEnvelopeDigest(protocol.validateStoredOperation(records[0]))
+        !== requested.currentEnvelopeDigest) {
+      fail("Signed restore HEAD is not unchanged", "restore_plan_indeterminate");
+    }
+    await this.verifyIncomingOperation(records[0], { preObserve: false });
   }
 
   async _verifyCommittedRestorePlanItem(item, requested) {
@@ -1191,7 +1260,8 @@ class SyncEngine {
     return { historical, current, relative, existing, versions, assertCleanDestination };
   }
 
-  async _restoreHistoricalVersion(objectId, versionId, { beforeEnqueue = null } = {}) {
+  async _restoreHistoricalVersion(objectId, versionId,
+    { beforeEnqueue = null, onProvenUnsent = null } = {}) {
     const { historical, current, relative, existing, assertCleanDestination } =
       await this._inspectHistoricalRestore(objectId, versionId);
     const key = await this.keyFor(historical);
@@ -1219,11 +1289,29 @@ class SyncEngine {
     });
     // The outbox is durable BEFORE local materialization. Failure to send is
     // recoverable by the existing signed journal; no old operation is replayed.
-    await this.assertOutgoingAuthorized(restored, () => this.journal.enqueue(restored));
+    let enqueueStarted = false;
+    try {
+      await this.assertOutgoingAuthorized(restored, () => {
+        enqueueStarted = true;
+        return this.journal.enqueue(restored);
+      });
+    } catch (error) {
+      // A final authorization denial BEFORE the callback is a proven
+      // never-enqueued envelope. If enqueue even started, its fsync outcome
+      // may be ambiguous: preserve the indeterminate recovery gate instead.
+      if (!enqueueStarted && onProvenUnsent) await onProvenUnsent(error);
+      throw error;
+    }
     try {
       await this._apply(restored, null, existing && !existing.deleted ? existing.hash : null);
     } catch (error) {
-      if (error?.code === "restore_local_conflict") await this.journal.discardUnsent(restored);
+      if (error?.code === "restore_local_conflict") {
+        // discardUnsent guarantees this exact signed envelope has never been
+        // admitted or dispatched; report recoverable status only AFTER its
+        // durable removal. Any failure to discard stays indeterminate.
+        await this.journal.discardUnsent(restored);
+        if (onProvenUnsent) await onProvenUnsent(error);
+      }
       throw error;
     }
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
