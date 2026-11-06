@@ -163,6 +163,23 @@ function setLinkPermissions(mode, dataDir, token, permissions) {
   fs.writeFileSync(file, JSON.stringify(links, null, 2));
 }
 
+function revokeStoredLink(mode, dataDir, token) {
+  if (mode === "sqlite") {
+    const Database = require("better-sqlite3");
+    const db = new Database(path.join(dataDir, "rootark.sqlite"));
+    try {
+      db.prepare("DELETE FROM public_links WHERE token = ?").run(token);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  const file = path.join(dataDir, "public-links.json");
+  const links = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete links[token];
+  fs.writeFileSync(file, JSON.stringify(links));
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function passwordPost(port, origin, token, password) {
@@ -399,8 +416,9 @@ test("an in-flight download is re-authorized at the final quota reservation (jso
   assert.equal(afterExhaustion.body.includes(FILE_CONTENT), false);
 });
 
-test("an in-flight preview GET rechecks capabilities before streaming (json storage)", { timeout: 60_000 }, async (t) => {
-  const { authed, publicPost, port, origin, dataDir } = await startFixture(t, "json",
+for (const mode of ["json", "sqlite"]) {
+test(`an in-flight preview GET rechecks capabilities before streaming (${mode} storage)`, { timeout: 60_000 }, async (t) => {
+  const { authed, publicPost, port, origin, dataDir } = await startFixture(t, mode,
     { ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve", ROOTARK_TEST_SHARE_PAUSE_MS: "1500" });
   const created = await authed("/share", {
     name: PNG_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["preview"], maxDownloads: 1,
@@ -418,11 +436,45 @@ test("an in-flight preview GET rechecks capabilities before streaming (json stor
     headers: { origin, cookie: viewerCookie },
   });
   await sleep(500);
-  setLinkPermissions("json", dataDir, token, ["download"]);
+  setLinkPermissions(mode, dataDir, token, ["download"]);
   const result = await pendingGet;
   assert.equal(result.status, 403, "preview GET must not stream after losing the preview capability");
   assert.ok(result.body.includes(DENIED));
 });
+
+test(`an already-counted preview POST must recheck permission and revocation (${mode} storage)`, { timeout: 60_000 }, async (t) => {
+  const { authed, publicPost, dataDir } = await startFixture(t, mode,
+    { ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve", ROOTARK_TEST_SHARE_PAUSE_MS: "1500" });
+  const createCountedPreview = async () => {
+    const created = await authed("/share", {
+      name: PNG_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["preview"], maxDownloads: 1,
+    });
+    assert.equal(created.status, 201, created.body);
+    const token = JSON.parse(created.body).token;
+    const session = await publicPost(token, "view");
+    assert.equal(session.status, 200);
+    const viewerCookie = viewerCookieFrom(session);
+    const first = await publicPost(token, "preview", viewerCookie);
+    assert.equal(first.status, 200, first.body);
+    return { token, viewerCookie };
+  };
+
+  const permitted = await createCountedPreview();
+  const pendingPermission = publicPost(permitted.token, "preview", permitted.viewerCookie);
+  await sleep(500);
+  setLinkPermissions(mode, dataDir, permitted.token, ["download"]);
+  const denied = await pendingPermission;
+  assert.equal(denied.status, 403, "repeat preview must not bypass current capability");
+  assert.ok(denied.body.includes(DENIED));
+
+  const revoked = await createCountedPreview();
+  const pendingRevoked = publicPost(revoked.token, "preview", revoked.viewerCookie);
+  await sleep(500);
+  revokeStoredLink(mode, dataDir, revoked.token);
+  const unavailable = await pendingRevoked;
+  assert.equal(unavailable.status, 404, "repeat preview must not serve a revoked token");
+});
+}
 
 test("permissions null and malformed stored values fail closed, legacy absence stays all operations", { timeout: 60_000 }, async (t) => {
   const { publicPost, dataDir, legacyToken } = await startFixture(t, "json");

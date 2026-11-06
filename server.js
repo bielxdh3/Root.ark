@@ -2817,10 +2817,10 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
   const reserveDownloadQuota = () => {
     if (!options.countDownload) return null;
-    if (!shouldUseDatabase()) {
-      const failure = revalidateStreamAccess();
-      if (failure) return failure;
-    }
+    // A repeat preview can already have paid its quota. Recheck its
+    // capability and token even then, in both SQLite and JSON storage.
+    const failure = revalidateStreamAccess();
+    if (failure) return failure;
     if (downloadAlreadyCounted) return null;
     if (shouldUseDatabase()) {
       const failure = reserveDatabaseShareQuota(
