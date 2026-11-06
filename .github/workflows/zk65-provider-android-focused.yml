@@ -100,6 +100,9 @@ jobs:
         with:
           gradle-version: '8.10.2'
       - uses: android-actions/setup-android@v3
+        with:
+          # The action's default includes the removed SDK 'tools' package.
+          packages: 'platform-tools'
       - name: Install pinned Android platform for native app compile
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Compile Kotlin core tests and real Android launcher
