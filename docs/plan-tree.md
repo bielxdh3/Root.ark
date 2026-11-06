@@ -42,6 +42,16 @@ indice 20,50 MiB, JSON 149,62 MiB: 167 paginas, 4,288 s total,
 sendo 3,586 s no primeiro acesso. Bibliotecas acima do teto exigem
 indice persistido em trabalho separado; #66 continua parcial.
 
+Revisao final adicional da PR #255: um unico slot de cache era
+compartilhado entre indice positivo e marcador de excesso. No fluxo
+A (indice grande, 507), A (507), B (indice pequeno, 200), A (507), a
+ultima chamada relia o estado completo sem nova escrita. Marcadores
+negativos agora ficam num LRU independente de ate 32 contas, por
+identidade duravel e teto vigente, preservando o indice positivo
+unico. Teste adversarial RED→GREEN: na sequencia A→B→A, a contagem
+de readSnapshot caiu de 3 para 2; escrita da instancia irma ainda
+invalida o marcador. Revalidar no HEAD da PR antes de qualquer GO.
+
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).

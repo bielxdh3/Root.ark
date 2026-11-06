@@ -219,6 +219,12 @@ test("issue 66 inventory: bounded metadata index fails closed and never re-reads
   }
   assert.equal(reads, 1, "a cached overflow marker must prevent repeated JSON parses");
   assert.equal((await get(route, "bob")).status, 200, "smaller authenticated tenant must remain usable");
+  const afterOtherTenant = await get(route);
+  assert.equal(afterOtherTenant.status, 507, "A must still fail closed after B populates the positive cache");
+  assert.equal(afterOtherTenant.body.code, "metadata_index_too_large");
+  assert.equal(reads, 2, "B must cause only its own first full read; A must reuse its overflow marker");
+  assert.equal(store.inventoryOverflowMarkers.get("alice")?.maxBytes, 1024);
+  assert.ok(store.inventoryOverflowMarkers.size <= 32, "negative tenant markers must remain bounded");
 
   // Independent process/instance commits must invalidate the overflow
   // marker, even if new inventory still exceeds the configured bound.

@@ -59,6 +59,10 @@ da conta exceder 32 MiB, a rota retorna **HTTP 507** com codigo estavel
 `metadata_index_too_large`, em vez de voltar a reler o JSON a cada pagina.
 O servidor memoriza apenas um marcador de excesso por conta e revisao
 duravel, evitando reprocessamento em tentativas subsequentes.
+Os marcadores de excesso ficam num LRU separado, com no maximo
+**32 contas por instancia**: a consulta de uma conta pequena nao
+descarta o marcador de uma conta grande. Uma conta evictada do LRU
+pode exigir uma nova validacao integral quando consultar novamente.
 Cada requisicao confere o lock
 do escritor, a politica de armazenamento privado quando aplicavel e a
 identidade duravel do arquivo (dispositivo, inode, tamanho, mtime e ctime
@@ -83,7 +87,9 @@ indice serializado de 20,50 MiB. Todas as 167 paginas, limitadas por
 bytes, retornaram em 4.288 ms: primeira 3.586 ms, demais 702 ms.
 Uma regressao com teto artificialmente baixo garante que o estouro
 retorne 507, sem repetir a leitura pesada, e que uma escrita externa
-invalide o marcador de excesso.
+invalide o marcador de excesso. Ela tambem testa a sequencia
+conta A grande (507), conta A novamente (507), conta B pequena (200),
+conta A novamente (507): B nao deve causar nova leitura da conta A.
 
 ## Opcoes
 

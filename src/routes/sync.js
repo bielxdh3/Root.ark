@@ -118,6 +118,7 @@ const INVENTORY_MAX_PAGE_ITEMS = 64;
 const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
 const INVENTORY_MAX_CURSOR_CHARS = 1024;
 const INVENTORY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const INVENTORY_OVERFLOW_MARKERS_MAX_TENANTS = 32;
 
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
   const directory = path.dirname(filePath);
@@ -352,6 +353,9 @@ class SyncObjectStore {
     // A changed durable inode/mtime/ctime discards the index on the next read.
     this.inventoryCache = null;
     this.inventoryCacheMaxBytes = INVENTORY_CACHE_MAX_BYTES;
+    // Tiny per-tenant negative LRU is independent of the ONE positive index.
+    // Browsing tenant B must not force a large unchanged tenant A to re-parse.
+    this.inventoryOverflowMarkers = new Map();
   }
 
   // Exclusive-create on the SAME local filesystem fences independent Node
@@ -930,10 +934,15 @@ class SyncObjectStore {
   inventoryIndex(username) {
     const before = this.inventoryFileStamp();
     const cached = this.inventoryCache;
-    if (cached && cached.username === username && cached.stamp === before) {
-      if (cached.tooLarge) throw inventoryIndexTooLarge();
-      return cached;
+    if (cached && cached.username === username && cached.stamp === before) return cached;
+    const rejected = this.inventoryOverflowMarkers.get(username);
+    if (rejected && rejected.stamp === before && rejected.maxBytes === this.inventoryCacheMaxBytes) {
+      // Refresh the bounded LRU position; no disk read or hash on retries.
+      this.inventoryOverflowMarkers.delete(username);
+      this.inventoryOverflowMarkers.set(username, rejected);
+      throw inventoryIndexTooLarge();
     }
+    if (rejected) this.inventoryOverflowMarkers.delete(username);
 
     const snapshot = this.readSnapshot();
     const after = this.inventoryFileStamp();
@@ -959,7 +968,12 @@ class SyncObjectStore {
         if (this.inventoryFileStamp() !== after) {
           throw Object.assign(new Error("Sync inventory changed while indexing"), { code: "SYNC_STORE_LOCK_BUSY" });
         }
-        this.inventoryCache = { username, stamp: after, tooLarge: true };
+        this.inventoryOverflowMarkers.set(username, {
+          stamp: after, maxBytes: this.inventoryCacheMaxBytes,
+        });
+        if (this.inventoryOverflowMarkers.size > INVENTORY_OVERFLOW_MARKERS_MAX_TENANTS) {
+          this.inventoryOverflowMarkers.delete(this.inventoryOverflowMarkers.keys().next().value);
+        }
         throw inventoryIndexTooLarge();
       }
       entries.push(entry);
