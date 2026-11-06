@@ -72,3 +72,41 @@ search term or plaintext. No persistent plaintext cache, automatic grant
 redemption, encrypted key transfer, cross-device CEK provisioning or
 production recovery guarantee is introduced; the separate #68 key-transfer
 work is not changed.
+
+## Follow-up: bounded local text search across owner-selected versions
+
+The DEV workspace now offers an explicit **Search inside selected versions**
+action. It examines **1–8** exact object/revision pairs in a freshly signed
+current catalog, with a nonempty NFC/case-insensitive literal text query
+(maximum 120 UTF-16 units). Each version gets its own fresh signed GET,
+current independent owner/head/CAS and device grant checks, matching
+ciphertext digest, separately pinned owner-held CEK SHA-256 and local AEAD/UTF-8
+opening using the existing single-version preview. Supported text is bounded
+to 64 KiB per file; matches show at most a 160-character local excerpt.
+A single revoked, tampered, malformed or wrong-key version aborts the **whole**
+batch without revealing even earlier matches. No plaintext/query/CEK is sent
+to Root.ark, and no persistent plaintext/content index, PUT, rollback, server
+search, automatic key delivery, off-host custody or production release is
+claimed.
+
+The user imports a JSON manifest no larger than 16 KiB. It has exactly
+`schema: "rootark-zk1-local-text-batch/v1"` and `entries` (1–8 records).
+Each entry has exactly `objectId` (opaque 16-byte base64url), positive
+`revision`, the canonical eight-field `metadata` document from the
+original protected version, `cekFile` (local filename), and `cekSha256Pin`
+(base64url SHA-256 of the 32-byte file key). Import exactly one separately
+preserved 32-byte CEK file per record, all with distinct names. Independently
+confirm the manifest's SHA-256 using the additional **manifest pin** input.
+The opt-in checkbox is an operator assertion of independent verification,
+not server-provided proof. Obtaining that pin from the same untrusted source
+as the manifest would offer no provenance.
+
+All CEK Uint8Array buffers imported by the dialog are zeroed in a finally
+block, and ephemeral search results are cleared on input change, logout,
+dialog close and pagehide. Browser-managed JavaScript strings cannot
+promise deterministic memory scrubbing. Real signed two-device HTTP GET,
+local AES-GCM, two-file matching, tamper of the second entry (no partial
+results), grant/scope/epoch negative cases, bounded input and real Edge CSP
+`textContent`/logout tests cover the slice. General protected content
+indexing, persistence, safe key provisioning and external acceptance remain
+unresolved Issue #63 scope.
