@@ -359,6 +359,8 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 
 **Active execution mission:** [priorities, workflow and progress](docs/rootark-main-execution-mission.md). Historical checklists below are not automatically current.
 
+**Current non-production progress:** [exact-PR wave execution matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md), with implemented draft slices, independent reviews and unverified acceptance explicitly separated. None of these drafts are merged into `Root/main` by this roadmap entry.
+
 - [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
 - [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
