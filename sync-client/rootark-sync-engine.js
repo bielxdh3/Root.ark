@@ -672,9 +672,24 @@ class SyncEngine {
       fail("Historical restore would overwrite a different local object", "restore_local_conflict");
     }
     const destination = await contained(this.rootDir, relative, true);
-    if (await exists(destination) && (!existing || existing.deleted)) {
-      fail("Historical restore would overwrite an untracked local file", "restore_local_conflict");
-    }
+    const assertCleanDestination = async () => {
+      const present = await exists(destination);
+      if (present && (!existing || existing.deleted)) {
+        fail("Historical restore would overwrite an untracked local file", "restore_local_conflict");
+      }
+      if (existing && !existing.deleted) {
+        // A tracked identity is not permission to overwrite unsent local edits
+        // (including local deletion). Require the exact last-synchronized bytes.
+        if (!present || existing.directory || !/^[a-f0-9]{64}$/.test(existing.hash || "")) {
+          fail("Historical restore requires a clean local file", "restore_local_conflict");
+        }
+        const actual = await readContainedFile(this.rootDir, relative);
+        if (crypto.createHash("sha256").update(actual).digest("hex") !== existing.hash) {
+          fail("Historical restore would overwrite unsent local edits", "restore_local_conflict");
+        }
+      }
+    };
+    await assertCleanDestination();
     const key = await this.keyFor(historical);
     const decrypted = protocol.decryptPayload(historical, key);
     const plaintext = historical.operation === "move"
@@ -688,6 +703,9 @@ class SyncEngine {
         metadata: { ...historicalMetadata, path: relative, name: path.basename(relative), size: plaintext.length },
         plaintext, fileKey: await this.keyFor({ ...current, keyEpoch: this.keyEpoch }) });
     } finally { plaintext.fill(0); }
+    // Signing may await an external key provider. Recheck after that boundary,
+    // before the signed outbox can cause a later remote write.
+    await assertCleanDestination();
     // The outbox is durable BEFORE local materialization. Failure to send is
     // recoverable by the existing signed journal; no old operation is replayed.
     await this.assertOutgoingAuthorized(restored, () => this.journal.enqueue(restored));
