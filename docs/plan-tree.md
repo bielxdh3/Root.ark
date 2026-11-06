@@ -9,6 +9,19 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+## Current execution overlay — 2026-11-06 (unmerged drafts)
+
+The July–October closure history below is preserved for provenance, not as the active roadmap. The [ongoing main mission](rootark-main-execution-mission.md) and [exact-HEAD evidence matrix](validation/2026-11-06-rootark-wave-execution-status.md) now track the functional drafts and their remaining acceptance gates:
+
+- **#67 recovery:** signed historical restore [#262](https://github.com/bielxdh3/Root.ark/pull/262), session-burst resume [#271](https://github.com/bielxdh3/Root.ark/pull/271), and advisory read-only preflight [#279](https://github.com/bielxdh3/Root.ark/pull/279). #279's first reviewed HEAD recreated a missing journal; current `eb418139` fixes that with no writer lock and missing-state rejection, but independent final review is pending. Off-host custodian/witness R1 is not validated.
+- **#66 Files On-Demand:** metadata inventory [#255](https://github.com/bielxdh3/Root.ark/pull/255), verified selective hydration [#263](https://github.com/bielxdh3/Root.ark/pull/263), and per-device pin/unpin/status [#278](https://github.com/bielxdh3/Root.ark/pull/278). Three reproduced pin/rollback/MOVE P2 were forward-fixed on `32799bbf`; final independent review is pending. No Windows-native placeholder provider or external durable acceptance.
+- **#68 capability sharing:** scoped local capabilities [#265](https://github.com/bielxdh3/Root.ark/pull/265), protected owner-signed grants [#270](https://github.com/bielxdh3/Root.ark/pull/270), recipient authenticated ciphertext redemption [#276](https://github.com/bielxdh3/Root.ark/pull/276). External recipient key enrollment, CEK transport, independently attested custody and complete revocation semantics are not established.
+- **#63 protected search:** encrypted browser index [#264](https://github.com/bielxdh3/Root.ark/pull/264), result selection [#274](https://github.com/bielxdh3/Root.ark/pull/274), explicit verified ciphertext GET [#280](https://github.com/bielxdh3/Root.ark/pull/280). Protected search terms/names are not sent to server; independent review of #280 remains outstanding.
+- **#64 Android:** strict HTTPS/JSON protected read [#272](https://github.com/bielxdh3/Root.ark/pull/272), bounded metadata pagination [#273](https://github.com/bielxdh3/Root.ark/pull/273), trusted-grant-gated viewer [#275](https://github.com/bielxdh3/Root.ark/pull/275), combined build [#281](https://github.com/bielxdh3/Root.ark/pull/281). The Android build tests pass but no real device enrollment/Keystore grant is provisioned; independent review of #281 remains outstanding.
+- **#242 P2P:** isolated feasibility [#254](https://github.com/bielxdh3/Root.ark/pull/254) through signed-session experimental app [#277](https://github.com/bielxdh3/Root.ark/pull/277); its initial orphan-room starvation P2 was corrected with independent final GO. Product storage/CEK ACL, TURN/cross-NAT, native mobile and release approval remain out of scope.
+
+All these feature issues remain open. No draft is merged, deployed, made Ready for Review, or used as a fabricated production/R1 certificate.
+
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
