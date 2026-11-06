@@ -168,6 +168,36 @@
         }
         return { protocolVersion: PROTOCOL_VERSION, versions };
       },
+      // Read-only review: no pause nonces, staged second-factor material or
+      // ciphertext may be reflected into this local operator inventory.
+      pausedDevices: async () => {
+        const payload = await request("/sync/v1/devices/paused");
+        if (!payload || payload.protocolVersion !== PROTOCOL_VERSION
+          || !Array.isArray(payload.pausedDevices)
+          || payload.pausedDevices.length > 1024
+          || Object.keys(payload).sort().join(",") !== "pausedDevices,protocolVersion") {
+          fail("Invalid paused devices response");
+        }
+        const seen = new Set();
+        const entries = payload.pausedDevices.map((record) => {
+          if (!record || typeof record !== "object" || Array.isArray(record)
+            || Object.keys(record).sort().join(",") !== "deviceId,limit,pausedAt,reason,windowMs") {
+            fail("Invalid paused device record");
+          }
+          const deviceId = id(record.deviceId);
+          if (seen.has(deviceId) || typeof record.pausedAt !== "string"
+            || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(record.pausedAt)
+            || !["destructive_burst", "object_burst"].includes(record.reason)
+            || !Number.isSafeInteger(record.limit) || record.limit <= 0
+            || !Number.isSafeInteger(record.windowMs) || record.windowMs <= 0) {
+            fail("Invalid paused device record");
+          }
+          seen.add(deviceId);
+          return { deviceId, pausedAt: record.pausedAt,
+            reason: record.reason, limit: record.limit, windowMs: record.windowMs };
+        });
+        return { protocolVersion: PROTOCOL_VERSION, pausedDevices: entries };
+      },
       // Releasing a ransomware-shield pause is NEVER a sync-device proof or
       // a new ciphertext admission. The server independently re-authenticates
       // the account and (when enabled) consumes a one-use second factor.

@@ -28,8 +28,20 @@ assinatura, admissao ou custodia; a consulta **nao** autoriza uma restauracao.
 ### Revisao de falso positivo e retomada de dispositivo pausado (#67)
 
 Quando a protecao contra alteracoes destrutivas devolve `sync_burst_paused`
-(HTTP 423), revise primeiro o historico e os arquivos afetados. De **outro
-dispositivo confiavel** da mesma conta, o Sync v2 oferece o comando:
+(HTTP 423), consulte os dispositivos pausados e revise o historico e os
+arquivos afetados **antes** de liberar as escritas:
+
+```powershell
+node sync-client/rootark-sync-v2.js pauses --config <config-v2-privado>
+```
+
+Esse comando faz `GET /sync/v1/devices/paused` como usuario autenticado com
+permissao `upload`, somente leitura. Mostra `deviceId`, data, causa e limites
+do bloqueio; nao inclui nonce/fence, proof, token, ciphertext, nomes ou
+caminhos de arquivos. Outra conta nao recebe bloqueios desta. Se nao houver
+bloqueios, `pausedDevices` sera um array vazio. A lista nao autoriza resume.
+
+De **outro dispositivo confiavel** da mesma conta, o Sync v2 oferece entao:
 
 ```powershell
 node sync-client/rootark-sync-v2.js resume --config <config-v2-privado> --device-id <dispositivo-pausado> --credentials-stdin

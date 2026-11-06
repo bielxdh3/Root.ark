@@ -426,6 +426,29 @@ async function history(options = {}) {
   return summary;
 }
 
+async function pauses(options = {}) {
+  const config = readPrivateV2Config(path.resolve(options.config || DEFAULT_CONFIG));
+  if (!config || typeof config.serverUrl !== "string" || !config.serverUrl
+    || typeof config.username !== "string" || !config.username
+    || typeof config.token !== "string" || !config.token) {
+    throw new Error("Paused device review requires private Sync v2 serverUrl, username and token");
+  }
+  const adapter = createOpaqueSyncAdapter({
+    baseUrl: normalizeTrustedSyncServerUrl(config.serverUrl),
+    fetchImpl: (url, request = {}) => fetch(url, { ...request,
+      headers: { ...request.headers, Authorization: `Bearer ${config.token}` },
+    }),
+  });
+  let result;
+  try { result = await adapter.pausedDevices(); }
+  catch (error) {
+    if (Number.isInteger(error?.status)) throw new Error(`Sync pause review denied (HTTP ${error.status})`);
+    throw new Error("Sync pause review failed; no response payload disclosed");
+  }
+  console.log(JSON.stringify(result));
+  return result;
+}
+
 async function readResumeCredentials(stream = process.stdin) {
   let size = 0;
   const chunks = [];
@@ -502,11 +525,12 @@ if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "history") history({ ...args(rest) }).catch((error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; });
+  else if (command === "pauses") pauses({ ...args(rest) }).catch((error) => { console.error(`Sync pause review failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "resume") resume({ ...args(rest) }).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js pauses --config <private-config> (read-only paused devices, no nonce)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
   trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity,
-  start, history, resume, readResumeCredentials };
+  start, history, pauses, resume, readResumeCredentials };

@@ -41,6 +41,24 @@ function runResume(config, target, credentials) {
   });
 }
 
+function runPauses(config) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, "pauses", "--config", config], {
+      windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => child.kill(), 12000);
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+    child.once("close", (status) => {
+      clearTimeout(timeout);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
 function operation(index, kind, parent, key) {
   return protocol.createOperation({
     operation: kind, objectId: `object-${index}`, fileId: `file-${index}`,
@@ -60,15 +78,18 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   app.use("/sync/v1", express.json());
   const passwordHash = bcrypt.hashSync(PASSWORD, 4);
   const user = { username: "alice", password: passwordHash, sessionVersion: 0 };
+  let currentUsername = "alice";
+  let mayUpload = true;
   const authenticate = (req, res, next) => {
     if (req.get("authorization") !== "Bearer test-resume-token") {
       return res.status(401).json({ error: "Denied" });
     }
-    req.user = { username: "alice", permissions: { upload: true, delete: true, listFiles: true } };
+    req.user = { username: currentUsername, permissions: { upload: mayUpload, delete: true, listFiles: true } };
     next();
   };
   const routes = registerSyncRoutes({ app, storagePath, authenticate,
-    requirePermission: () => (_req, _res, next) => next(), bcrypt,
+    requirePermission: (name) => (req, res, next) => req.user.permissions[name]
+      ? next() : res.status(403).json({ error: "Denied" }), bcrypt,
     loadUsers: () => [{ ...user }], saveUsers: () => {},
     burstGuard: createSyncBurstGuard({ maxDestructive: 1, windowMs: 600000, env: {} }),
   });
@@ -93,6 +114,28 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   const config = path.join(root, "sync-config.json");
   await writePrivateSyncConfig(config, JSON.stringify({ serverUrl: baseUrl,
     username: "alice", token: "test-resume-token", deviceId: "device-b" }));
+  const paused = await adapter.pausedDevices();
+  const rawPauseResponse = await fetch(`${baseUrl}/sync/v1/devices/paused`, {
+    headers: { Authorization: "Bearer test-resume-token" },
+  });
+  assert.equal(rawPauseResponse.status, 200);
+  assert.equal(rawPauseResponse.headers.get("cache-control"), "no-store");
+  assert.doesNotMatch(await rawPauseResponse.text(), /pauseNonce|codeMac|resumeIntent|password|ciphertext|test-resume-token/i);
+  assert.deepEqual(paused, { protocolVersion: 2, pausedDevices: [{
+    deviceId: "device-a", reason: "destructive_burst", limit: 1,
+    windowMs: 600000, pausedAt: paused.pausedDevices[0].pausedAt,
+  }] });
+  assert.match(paused.pausedDevices[0].pausedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.doesNotMatch(JSON.stringify(paused), /pauseNonce|authorization|token|ciphertext|password/i);
+  assert.deepEqual(JSON.parse((await runPauses(config)).stdout), paused);
+  currentUsername = "bob";
+  assert.deepEqual(await adapter.pausedDevices(), { protocolVersion: 2, pausedDevices: [] });
+  currentUsername = "alice";
+  mayUpload = false;
+  await assert.rejects(adapter.pausedDevices(), (error) => error.status === 403);
+  mayUpload = true;
+  await assert.rejects(createOpaqueSyncAdapter({ baseUrl }).pausedDevices(),
+    (error) => error.status === 401);
   const credentials = JSON.stringify({ password: PASSWORD });
   const denied = await runResume(config, "device-a", JSON.stringify({ password: "wrong-password" }));
   assert.notEqual(denied.status, 0);
@@ -106,6 +149,7 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   });
   assert.doesNotMatch(resumed.stdout + resumed.stderr, /secret-resume-password|test-resume-token/);
   assert.equal(routes.store.pauseFence("alice", "device-a"), null);
+  assert.deepEqual(await adapter.pausedDevices(), { protocolVersion: 2, pausedDevices: [] });
   const again = await runResume(config, "device-a", credentials);
   assert.equal(JSON.parse(again.stdout).wasPaused, false);
 });
@@ -152,4 +196,24 @@ test("#67: private credential stdin rejects oversize, unexpected keys and malfor
   await assert.rejects(readResumeCredentials(Readable.from(['broken-json'])), /credentials/i);
   assert.deepEqual(await readResumeCredentials(Readable.from(['{"password":"ok","code":"123456"}'])),
     { password: "ok", code: "123456" });
+});
+
+test("#67: adapter refuses malformed, unexpected, oversized or duplicate paused-device inventories", async () => {
+  let payload = { protocolVersion: 2, pausedDevices: [{
+    deviceId: "device-a", pausedAt: new Date().toISOString(),
+    reason: "destructive_burst", limit: 10, windowMs: 60000,
+  }] };
+  const adapter = createOpaqueSyncAdapter({ baseUrl: "https://example.invalid",
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => payload }),
+  });
+  assert.deepEqual(await adapter.pausedDevices(), payload);
+  payload = { ...payload, pausedDevices: [{ ...payload.pausedDevices[0], pauseNonce: "should-not-leak" }] };
+  await assert.rejects(adapter.pausedDevices(), /paused/i);
+  payload = { protocolVersion: 2, pausedDevices: Array(1025).fill({
+    deviceId: "device-a", pausedAt: new Date().toISOString(),
+    reason: "destructive_burst", limit: 10, windowMs: 60000,
+  }) };
+  await assert.rejects(adapter.pausedDevices(), /paused/i);
+  payload.pausedDevices = [payload.pausedDevices[0], payload.pausedDevices[0]];
+  await assert.rejects(adapter.pausedDevices(), /paused/i);
 });

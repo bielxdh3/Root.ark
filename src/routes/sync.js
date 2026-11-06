@@ -841,6 +841,32 @@ class SyncObjectStore {
     return isPausedDevice(ownRecord(this.readSnapshot().users, username) || {}, deviceId);
   }
 
+  listPausedDevices(username) {
+    const user = ownRecord(this.readSnapshot().users, username) || {};
+    const paused = ownRecord(user, "pausedDevices") || {};
+    if (!paused || typeof paused !== "object" || Array.isArray(paused)) {
+      throw new Error("Invalid persisted device pauses");
+    }
+    const entries = Object.entries(paused);
+    if (entries.length > 1024) throw new Error("Too many paused devices");
+    // Project ONLY reviewable state. pauseNonce and staged resume secrets
+    // must never cross the sync API, even to an authenticated user.
+    return entries.map(([key, state]) => {
+      const deviceId = key.startsWith("d:") ? key.slice(2) : "";
+      if (!/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)
+        || !state || typeof state !== "object" || Array.isArray(state)
+        || typeof state.pausedAt !== "string"
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(state.pausedAt)
+        || !["destructive_burst", "object_burst"].includes(state.reason)
+        || !Number.isSafeInteger(state.limit) || state.limit <= 0
+        || !Number.isSafeInteger(state.windowMs) || state.windowMs <= 0) {
+        throw new Error("Invalid persisted device pause");
+      }
+      return { deviceId, pausedAt: state.pausedAt,
+        reason: state.reason, limit: state.limit, windowMs: state.windowMs };
+    }).sort((a, b) => a.deviceId.localeCompare(b.deviceId, "en"));
+  }
+
   list(username, objectId = null) {
     const user = ownRecord(this.readSnapshot().users, username) || { objects: {} };
     const objects = ownRecord(user, "objects") || {};
@@ -1125,6 +1151,16 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (!versions.length) return errorResponse(res, 404, "Sync object not found");
     lease?.assertActive();
     res.json({ protocolVersion: PROTOCOL_VERSION, versions });
+  }));
+  app.get("/sync/v1/devices/paused", authenticate, requirePermission("upload"), fenceLegacySync("read", async (req, res, lease) => {
+    await ready;
+    if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
+    let pausedDevices;
+    try { pausedDevices = store.listPausedDevices(req.user.username); }
+    catch { return errorResponse(res, 503, "Sync pause status unavailable"); }
+    lease?.assertActive();
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ protocolVersion: PROTOCOL_VERSION, pausedDevices });
   }));
   app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"),
     fenceLegacySync("write", (req, res, lease) => write(req, res, undefined, lease)));
