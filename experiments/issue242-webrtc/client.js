@@ -286,6 +286,10 @@
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
       if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      if (m.type === 'text' && activeBoundObject) {
+        record(diagnostics.rejected, 'BOUND_ROOM_TEXT');
+        return;
+      }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
         if (hash === m.digest) {

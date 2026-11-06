@@ -148,6 +148,16 @@ async function run() {
     await refreshedBob.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
     await until(() => refreshedBob.evaluate('window.__poc.snapshot().peers.some(p=>p.channel==="open")'),
       'object DataChannel did not open', 20_000);
+    // A malicious consented sender can bypass sendText and send a valid
+    // SHA-256 text control frame directly over the bound DataChannel.
+    const forgedText = 'ciphertext-room-must-not-display-text';
+    const forgedDigest = createHash('sha256').update(forgedText).digest('hex');
+    await alice.evaluate('window.__poc.testChannel(0).send(' +
+      JSON.stringify(JSON.stringify({ type: 'text', text: forgedText, digest: forgedDigest })) + ')');
+    await until(() => refreshedBob.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("BOUND_ROOM_TEXT")'),
+    'bound room recipient accepted direct plaintext from consented peer');
+    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedTexts.length'), 0);
     await alice.evaluate('window.__poc.sendFile(new File([new Uint8Array(92)],"sealed.bin"))');
     await until(() => alice.evaluate(
       'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_DIGEST_MISMATCH")'),

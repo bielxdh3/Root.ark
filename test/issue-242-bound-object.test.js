@@ -99,3 +99,58 @@ test('real signed sessions require an exact current encrypted object ACL for bou
     'replacement under same filename invalidates bound room grant');
   assert.ok(other.socket.readyState <= 1);
 });
+
+test('a bounded ciphertext signal flood leaves the real HTTP event loop responsive', { timeout: 115_000 }, async t => {
+  const f = await fixture();
+  t.after(f.close);
+  const alice = await f.login('alice');
+  const bob = await f.login('bob');
+  const ciphertext = Buffer.alloc(32 * 1024 * 1024, 0xa7);
+  mkdirSync(join(f.directory, 'uploads'), { recursive: true });
+  writeFileSync(join(f.directory, 'uploads', 'load.bin'), ciphertext);
+  writeFileSync(join(f.directory, 'data', 'encrypted-files.json'), JSON.stringify({
+    'root/load.bin': {
+      fileName: 'load.bin', folderId: 'root', uploadedAt: '2026-11-06T12:00:00.000Z',
+      size: ciphertext.length - 28, encryptedSize: ciphertext.length,
+      encryptionLevel: 'user-key', algorithm: 'aes-256-gcm',
+      layers: [{ type: 'user', iv: '0011', authTag: '0022' }],
+      accessControl: { owner: 'alice', authorizedUsers: ['alice', 'bob'], expiresAt: null },
+    },
+  }));
+  writeFileSync(join(f.directory, 'data', 'file-permissions.json'), JSON.stringify({
+    'root/load.bin': { owner: 'alice', public: false, users: { bob: { read: true } } },
+  }));
+  const created = await f.request('/p2p/rooms', { method: 'POST', session: alice,
+    body: JSON.stringify({ boundObject: { folderId: 'root', fileName: 'load.bin' } }) });
+  assert.equal(created.status, 200);
+  const room = JSON.parse(created.text);
+  const host = await f.connect(alice);
+  const guest = await f.connect(bob);
+  t.after(() => { host.socket.terminate(); guest.socket.terminate(); });
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  const hostJoined = await host.next('joined');
+  host.send({ type: 'invite', recipient: 'bob' });
+  const invitation = (await host.next('invited')).invitation;
+  guest.send({ type: 'join', roomId: room.roomId, invitation });
+  const joined = await guest.next('joined');
+  host.send({ type: 'request-peer', to: joined.peerId });
+  const request = await guest.next('peer-request');
+  guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  for (let i = 0; i < 12; i++) guest.send({ type: 'signal', to: hostJoined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'load-' + i } } });
+  await host.next('signal', 30_000);
+  const before = performance.now();
+  const heartbeat = await f.request('/login.html');
+  const elapsed = performance.now() - before;
+  assert.equal(heartbeat.status, 200);
+  assert.ok(elapsed < 700, `HTTP event loop stalled for ${Math.round(elapsed)}ms under bounded signaling load`);
+  const closed = new Promise(resolve => guest.socket.once('close', resolve));
+  writeFileSync(join(f.directory, 'uploads', 'load.bin'), Buffer.alloc(ciphertext.length, 0xb8));
+  let closeTimeout;
+  try {
+    assert.equal(await Promise.race([closed, new Promise((_, reject) => {
+      closeTimeout = setTimeout(() => reject(new Error('changed ciphertext kept an authorized peer alive')), 30_000);
+    })]), 1000, 'same-size replacement during queued signaling must close the pinned room');
+  } finally { clearTimeout(closeTimeout); }
+});
