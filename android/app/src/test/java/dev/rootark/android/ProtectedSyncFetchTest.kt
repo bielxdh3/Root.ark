@@ -392,5 +392,20 @@ class ProtectedSyncFetchTest {
             corruptedViewer.open(origin, session, "fixture-object-1")
         }
         assertTrue(corruptedKey.all { it == 0.toByte() })
+
+        for (status in listOf(401, 403)) {
+            val deniedKey = ByteArray(32) { 7 }
+            val deniedViewer = VerifiedTextPreview(
+                TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, deniedKey) },
+                ProtectedSyncFetch {
+                    SecureResponse(origin.syncObjectUrl("fixture-object-1"), status = status)
+                },
+            )
+            val denied = assertThrows(RootArkApiException::class.java) {
+                deniedViewer.open(origin, session, "fixture-object-1")
+            }
+            assertEquals(status, denied.statusCode)
+            assertTrue(deniedKey.all { it == 0.toByte() })
+        }
     }
 }
