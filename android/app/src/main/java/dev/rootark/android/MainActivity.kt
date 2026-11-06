@@ -236,9 +236,11 @@ class MainActivity : Activity() {
             } catch (caught: Exception) {
                 failure = caught
             }
+            val completedResponse = response
+            val completedFailure = failure
             runOnUiThread {
-                if (generation == started && !isFinishing && !isDestroyed) done(response, failure)
-                else if (response is CharArray) response.fill('\u0000')
+                if (generation == started && !isFinishing && !isDestroyed) done(completedResponse, completedFailure)
+                else if (completedResponse is CharArray) completedResponse.fill('\u0000')
             }
         }.start()
     }
