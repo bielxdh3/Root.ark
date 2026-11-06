@@ -55,11 +55,12 @@ async function fixture(t) {
       throw Object.assign(new Error("outgoing push forbidden in pin fixture"), { code: "push_unexpected" });
     },
   };
-  const open = (excludedPaths = []) => new SyncEngine({
+  const open = (excludedPaths = [], requireAuthorization = true) => new SyncEngine({
     rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
     compartmentId: "private", selectedPaths: ["docs"], excludedPaths, filesOnDemand: true,
-    fileKeyResolver: () => key, requireAuthorization: true,
-    verifyIncoming: async (operation) => verifyAuthorizationProof(operation.authorization, operation, trusted),
+    fileKeyResolver: () => key, requireAuthorization,
+    verifyIncoming: requireAuthorization
+      ? async (operation) => verifyAuthorizationProof(operation.authorization, operation, trusted) : null,
     authorizationFactory: (operation) => createAuthorizationProof(operation, {
       username: "alice", privateKey: signer.privateKey, publicKey, expiresAt: Date.now() + 60_000,
     }),
@@ -145,6 +146,15 @@ test("issue 66: unsigned/tampered ciphertext cannot establish a pin and invalid 
   persisted.pinnedFiles = { "object-a": { objectId: "object-other", path: "../escape", fileId: "file-object-a" } };
   await fsp.writeFile(snapshot, JSON.stringify(persisted));
   await assert.rejects(open(), { code: "invalid_snapshot" });
+});
+
+test("issue 66: direct non-strict engine cannot pin without independently trusted signed verification", async (t) => {
+  const { open, state } = await fixture(t);
+  const nonStrict = await open([], false);
+  await assert.rejects(nonStrict.pinLocal("docs/a.txt"), { code: "authorization_required" });
+  assert.equal(state.fullReads.length, 0);
+  assert.equal(state.inventoryReads, 0);
+  assert.equal((await nonStrict.pinStatus("docs/a.txt")).pinned, false);
 });
 
 test("issue 66: failed local pin journal commit never claims pin; a verified MOVE retains pinned identity", async (t) => {
