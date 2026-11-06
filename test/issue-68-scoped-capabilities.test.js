@@ -94,7 +94,25 @@ async function startFixture(t, mode, extraEnv = {}) {
   for (const key of Object.keys(env)) if (/^(AWS_|GOOGLE_DRIVE_)/.test(key)) delete env[key];
   delete env.TRUSTED_PROXIES;
   const port = await getUnusedPort();
-  const child = spawn(process.execPath, [SERVER], { cwd: sandbox, env: { ...env, PORT: String(port) }, stdio: "ignore", windowsHide: true });
+  const swapAfterOpen = extraEnv.ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN === "1";
+  const swapFile = path.join(sandbox, "uploads", FILE_NAME);
+  const child = spawn(process.execPath, [
+    ...(swapAfterOpen ? ["--require", path.join(ROOT, "test", "support", "issue-68-share-after-open-swap.js")] : []),
+    SERVER,
+  ], {
+    cwd: sandbox,
+    env: {
+      ...env,
+      PORT: String(port),
+      ...(swapAfterOpen ? {
+        ROOTARK_TEST_SHARE_SWAP_FILE: swapFile,
+        ROOTARK_TEST_SHARE_SWAP_SAVED_FILE: `${swapFile}.granted`,
+        ROOTARK_TEST_SHARE_SWAP_MARKER: path.join(sandbox, "swap-after-open.marker"),
+      } : {}),
+    },
+    stdio: "ignore",
+    windowsHide: true,
+  });
 
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -144,6 +162,47 @@ async function startFixture(t, mode, extraEnv = {}) {
 
 function viewerCookieFrom(response) {
   return (response.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]).join("; ");
+}
+
+for (const mode of ["json", "sqlite"]) {
+  test(`download checks the actual opened descriptor before stream (${mode})`, { timeout: 60_000 }, async (t) => {
+    const { authed, publicPost, dataDir } = await startFixture(t, mode, {
+      ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve",
+      ROOTARK_TEST_SHARE_PAUSE_MS: "1800",
+      ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN: "1",
+    });
+
+    const created = await authed("/share/capabilities", {
+      name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+      permissions: ["download"], maxDownloads: 1,
+    });
+    assert.equal(created.status, 201, created.body);
+    const { token } = JSON.parse(created.body);
+    const viewer = await publicPost(token, "view");
+    assert.equal(viewer.status, 200, viewer.body);
+
+    const pending = publicPost(token, "download", viewerCookieFrom(viewer));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const originalPath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
+    const grantedPath = `${originalPath}.granted`;
+    fs.renameSync(originalPath, grantedPath);
+    fs.writeFileSync(originalPath, "FORBIDDEN_AFTER_OPEN_BYTES\n");
+    const marker = path.join(path.dirname(dataDir), "swap-after-open.marker");
+    fs.writeFileSync(marker, "swap once after verified open");
+
+    const response = await pending;
+    assert.equal(fs.existsSync(marker), false, "hook must have restored the pathname after fd open");
+    assert.equal(fs.readFileSync(originalPath, "utf8"), FILE_CONTENT,
+      "the path is authorized again while the open descriptor remains foreign");
+    assert.equal(fs.readFileSync(`${originalPath}.untrusted-opened`, "utf8"), "FORBIDDEN_AFTER_OPEN_BYTES\n",
+      "the foreign file is retained only by the outgoing descriptor");
+    assert.equal(response.status, 404, "never stream bytes from a descriptor outside the capability generation");
+    assert.equal(response.body.includes("FORBIDDEN_AFTER_OPEN_BYTES"), false);
+    const authorizedRetry = await publicPost(token, "download", viewerCookieFrom(viewer));
+    assert.equal(authorizedRetry.status, 200, "rejected foreign descriptor must not spend the download quota");
+    assert.equal(authorizedRetry.body, FILE_CONTENT);
+  });
 }
 
 for (const mode of ["json", "sqlite"]) {
