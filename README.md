@@ -367,7 +367,7 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [x] Harden deployment defaults and document a reviewed production profile ([single-process R2 profile and fail-closed configuration, draft PR #252](https://github.com/bielxdh3/Root.ark/pull/252); real operator/TLS acceptance remains R1)
 - [x] Expand restore testing and disaster-recovery evidence ([bounded local verification](docs/validation/2026-11-06-rootark-recovery-and-adapters.md); live operator drill remains part of R1)
 - [x] Strengthen suspicious-file isolation and scanning integrations ([existing fail-closed ClamAV/upload/quarantine source gates reviewed](docs/validation/2026-11-06-rootark-recovery-and-adapters.md#r4--already-merged-upload-scanner-and-suspicious-file-isolation-controls); live scanner/volume acceptance remains in R1)
-- [ ] Review every external adapter independently ([independent local/S3/Drive/WebDAV source review and simulated restore evidence](docs/validation/2026-11-06-rootark-recovery-and-adapters.md) passed; live-provider and broader adapter acceptance remain separate)
+- [x] Review every implemented external adapter independently ([Local/S3/Google Drive/WebDAV source review and simulated restore evidence](docs/validation/2026-11-06-rootark-recovery-and-adapters.md) passed; actual provider durability and operator acceptance remain under R1)
 - [ ] Reconcile roadmap status and exact-HEAD evidence after each completed mission
 
 ## Project direction
