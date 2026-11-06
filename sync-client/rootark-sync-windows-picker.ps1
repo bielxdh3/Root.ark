@@ -55,7 +55,7 @@ if ($chosen.Count -ne 1) { throw 'Select exactly one file.' }
 
 # Only the existing engine may turn advisory metadata into bytes; it rechecks
 # remote identity, signed authorization, AEAD, journal and local overwrite safety.
-$hydratedJson = & node $syncCli hydrate --config $Config --path $chosen[0].Path
+$hydratedJson = & node $syncCli hydrate --config $Config ('--path=' + [string]$chosen[0].Path)
 if ($LASTEXITCODE -ne 0) { throw 'Root.ark refused hydration; Explorer was not opened.' }
 $hydrated = ($hydratedJson -join "`n") | ConvertFrom-Json
 if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydrated.result -ne $true) {
@@ -65,7 +65,11 @@ if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydra
 # Reveal only. Opening an associated app automatically could execute remote content.
 $localFolder = [string]((Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json).localFolder)
 if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
-$root = [IO.Path]::GetFullPath($localFolder)
+$root = if ([IO.Path]::IsPathRooted($localFolder)) {
+  [IO.Path]::GetFullPath($localFolder)
+} else {
+  [IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $localFolder))
+}
 $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$chosen[0].Path -replace '/', '\')))
 $rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
