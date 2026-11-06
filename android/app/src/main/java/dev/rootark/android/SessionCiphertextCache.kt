@@ -148,10 +148,13 @@ internal class SessionCiphertextCache(
     private fun captureIdentity(record: SyncRecord, requested: String, body: ByteArray): CapturedCiphertextSnapshot {
         val proof = record.authorization ?: throw SecurityException()
         fun id(value: String) = value.matches(Regex("[A-Za-z0-9._:-]{1,160}"))
-        if (record.objectId != requested || listOf(record.objectId, record.fileId, record.versionId,
+        if (record.objectId != requested || listOf(record.operationId, record.objectId, record.fileId, record.versionId,
                 record.deviceId, record.keyEpoch, record.compartmentId).any { !id(it) } ||
             record.revision.deviceId != record.deviceId || record.revision.counter !in 0..9_007_199_254_740_991L ||
+            proof.schemaVersion != 1 || proof.protocolVersion != 2 ||
+            proof.type != "rootark-sync-device-authorization-v1" || proof.suite != "rootark-zk-1" ||
             proof.username != session.account || proof.deviceId != record.deviceId ||
+            proof.operationId != record.operationId || proof.baseRevision != record.baseRevision ||
             proof.objectId != record.objectId || proof.fileId != record.fileId ||
             proof.versionId != record.versionId || proof.revision != record.revision ||
             proof.operation != record.operation.wire || proof.keyEpoch != record.keyEpoch ||

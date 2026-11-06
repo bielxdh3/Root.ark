@@ -355,6 +355,13 @@ class MainActivity : Activity() {
                     } else when ((failure as? RootArkApiException)?.statusCode) {
                         401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                         403 -> showLogin("Acesso ao arquivo revogado (403). Faça login novamente.")
+                        409 -> {
+                            offlineInventory?.clear()
+                            runCatching { ciphertextCache?.clear() }
+                            ciphertextCache = null
+                            runCatching { LocalCipherCacheKey.erase() }
+                            showSession("Época ou objeto alterado. Captura local descartada.")
+                        }
                         else -> showSession("Conteúdo indisponível. Autorização ou verificação criptográfica não confirmada.")
                     }
                 }
