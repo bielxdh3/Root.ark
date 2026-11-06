@@ -274,6 +274,8 @@ Um `CREATE` local no modo Files On-Demand consulta todas as paginas do inventari
 
 Nao existe placeholder nativo de Windows/Explorer, nem download automatico ao abrir um caminho: a hidratacao e solicitada explicitamente por `hydrate` ou `SyncEngine.materializeRemote(caminho)`. Inventarios com mais de 65.536 objetos nao sao percorridos por uma unica operacao do cliente neste modo; o limite evita loops de paginacao ilimitados.
 
+No Windows PowerShell 5.1, um seletor visual opcional usa `Out-GridView` para escolher arquivos do inventario remoto e os revela no Explorer somente apos `hydrate` validar a operacao assinada e o conteudo. Execute `powershell.exe -NoProfile -File sync-client/rootark-sync-windows-picker.ps1 -Config E:\sync-private\.rootark-sync.json` a partir da raiz do projeto. O seletor le metadados consultivos, respeita `selectedPaths` e `excludedPaths`, nao altera pins e nao abre o conteudo automaticamente. Ele **nao** registra uma raiz Cloud Files API nem cria placeholders: o usuario seleciona o arquivo manualmente, e o download exige conexao e autorizacao valida.
+
 ## Phase 12: protocolo bidirecional protegido
 
 O modulo `sync-client/rootark-sync-protocol.js` define a versao 2 do protocolo
