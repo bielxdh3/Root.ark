@@ -37,11 +37,14 @@
   <input id="textInput" maxlength="1000" placeholder="Texto de teste">
   <button id="sendText">Enviar texto</button>
   <input type="file" id="fileInput">
-  <button id="sendFile">Enviar arquivo de teste (até 1 MiB)</button>
+  <button id="sendFile">Enviar arquivo (até 32 MiB)</button>
   <div id="incoming"></div>
+  <div id="transfers" aria-live="polite"></div>
+  <div id="downloads"></div>
 </fieldset>
 <p id="state">Sem conexão</p>
 <pre id="events" aria-live="polite"></pre>
-<small>Não testa TURN, NAT externo, persistência, retomada, streaming maior que RAM ou autenticação Root.ark.</small>
+<small>O destinatário deve aceitar o arquivo. Baixe somente após SHA-256 OK. O limite é 32 MiB por arquivo, em memória; não testa TURN, NAT externo, retomada nem armazenamento permanente. Autenticação Root.ark somente no modo de sessão assinado.</small>
+<script src="/transfer-protocol.js"></script>
 <script src="/client.js"></script>
 </html>

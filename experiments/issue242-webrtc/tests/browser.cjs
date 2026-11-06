@@ -3,7 +3,7 @@
 // browser with three tabs against one loopback broker. No Playwright required.
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const { existsSync, mkdtempSync, rmSync } = require('node:fs');
+const { existsSync, mkdtempSync, mkdirSync, readFileSync, unlinkSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const net = require('node:net');
@@ -11,7 +11,7 @@ const WebSocket = require('ws');
 const { makeBroker } = require('../server.cjs');
 const { createRealtimeAuthenticator, parseCookies } = require('../../../src/middlewares/auth');
 const jwt = require('jsonwebtoken');
-const { randomBytes } = require('node:crypto');
+const { randomBytes, createHash } = require('node:crypto');
 const edge = process.env.EDGE_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const deadline = ms => Date.now() + ms;
@@ -143,7 +143,7 @@ async function run() {
     const oneByteDigest = await host.evaluate(`crypto.subtle.digest('SHA-256',Uint8Array.of(1)).then(
       bytes => Array.from(new Uint8Array(bytes)).map(b=>b.toString(16).padStart(2,'0')).join(''))`);
     await host.evaluate(`window.__poc.testChannel(0).send(JSON.stringify({
-      type:'offer-file',id:'zero-frame-attack',name:'zero.bin',size:1,digest:${JSON.stringify(oneByteDigest)}
+      type:'offer-file',id:'11111111111111111111111111111111',name:'zero.bin',size:1,digest:${JSON.stringify(oneByteDigest)}
     }))`);
     await until(() => guest1.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'attack offer missing');
     await guest1.evaluate('document.querySelector("[data-testid=accept-file]").click()');
@@ -151,19 +151,21 @@ async function run() {
       const dc = window.__poc.testChannel(0);
       for (let i=0;i<256;i++) dc.send(new Uint8Array(0));
       dc.send(Uint8Array.of(1));
-      dc.send(JSON.stringify({type:'end-file',id:'zero-frame-attack'}));
+      dc.send(JSON.stringify({type:'end-file',id:'11111111111111111111111111111111'}));
     })()`);
     await until(() => guest1.evaluate(`(() => {
       const s=window.__poc.snapshot();
-      return s.diagnostics.rejected.includes('INVALID_CHUNK') || s.diagnostics.verifiedFiles.length>1;
+      return s.diagnostics.rejected.some(c=>c==='INVALID_CHUNK'||c==='UNEXPECTED_CHUNK') ||
+        s.diagnostics.verifiedFiles.length>1;
     })()`), 'empty frames were not processed', 6000);
     const postEmpty = await guest1.evaluate('window.__poc.snapshot()');
     assert.equal(postEmpty.diagnostics.verifiedFiles.length, 1, 'malformed transfer must not be verified');
-    assert.ok(postEmpty.diagnostics.rejected.includes('INVALID_CHUNK'), 'empty frames must be rejected');
+    assert.ok(postEmpty.diagnostics.rejected.some(c=>c==='INVALID_CHUNK'||c==='UNEXPECTED_CHUNK'),
+      'empty frames must be rejected even when the bounded rejection ring evicts the first event');
     assert.equal(postEmpty.peers[0].incomingChunks, 0, 'aborted file must release all retained chunks');
-    // Even non-empty tiny chunks cannot allocate unbounded objects for a 1MiB offer.
+    // Even non-empty tiny chunks cannot accumulate for a valid bounded offer.
     await host.evaluate(`window.__poc.testChannel(0).send(JSON.stringify({
-      type:'offer-file',id:'tiny-chunk-attack',name:'tiny.bin',size:512,digest:'0'.repeat(64)
+      type:'offer-file',id:'22222222222222222222222222222222',name:'tiny.bin',size:512,digest:'0'.repeat(64)
     }))`);
     await until(() => guest1.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'tiny offer missing');
     await guest1.evaluate('document.querySelector("[data-testid=accept-file]").click()');
@@ -200,6 +202,15 @@ async function run() {
     console.log('PASS Edge P2 flood: 256 zero-byte frames rejected and transfer aborted, 129 tiny chunks aborted, 257 verified text events bounded');
     console.log('Flood evidence:', JSON.stringify({ maxDiagnosticEntries: Math.max(...Object.values(afterFlood.lengths)),
       logLines: afterFlood.lines, logCharacters: afterFlood.characters, incomingChunksAfterAbort: postTiny.peers[0].incomingChunks }));
+    // Closing a live channel must drop both ends' pending transfers.
+    await until(() => host.evaluate('window.__poc.snapshot().peers.every(p=>p.outgoingPhase===null)'), 'prior send acknowledgement pending');
+    await host.evaluate('window.__poc.sendFile(new File([new Uint8Array(2*1024*1024)], "disconnect.bin"))');
+    await until(() => guest1.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'disconnect offer missing');
+    await guest1.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    await guest1.evaluate('window.__poc.testChannel(0).close()');
+    await until(() => guest1.evaluate('window.__poc.snapshot().peers[0].incomingBytes===0'), 'disconnect kept partial incoming');
+    await until(() => host.evaluate('window.__poc.snapshot().peers[0].outgoingPhase===null'), 'disconnect kept outgoing');
+    console.log('PASS Edge actual channel disconnect: pending transfer discarded on both ends');
     // RED/GREEN: real Root.ark JWT verifier, disposable users and three separate
     // headless Edge cookie jars. No production secrets, accounts or storage.
     const secret = randomBytes(48).toString('hex');
@@ -216,9 +227,14 @@ async function run() {
     const browser = await new Cdp(version.webSocketDebuggerUrl).connect();
     pages.push(browser);
     const contexts = [];
+    const downloadDir = join(profile, 'downloads');
+    mkdirSync(downloadDir);
     async function signedPage(username) {
       const { browserContextId } = await browser.call('Target.createBrowserContext');
       contexts.push(browserContextId);
+      await browser.call('Browser.setDownloadBehavior', {
+        behavior: 'allow', downloadPath: downloadDir, browserContextId
+      });
       const { targetId } = await browser.call('Target.createTarget', {
         url: 'about:blank', browserContextId
       });
@@ -273,6 +289,82 @@ async function run() {
       await until(() => page.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.some(x=>x.name==="scoped.bin")'),
         'signed file digest mismatch', 18000);
     }
+    await until(() => alice.evaluate('window.__poc.snapshot().peers.every(p=>p.outgoingPhase===null)'), 'signed SHA acknowledgement missing');
+    // Real 1:N browser transfer beyond the old 1 MiB limit. Byte-for-byte
+    // download is verified through the Blob URL, with no broker content storage.
+    await alice.evaluate('window.__poc.sendFile(new File([Uint8Array.from({length:3*1024*1024},(_,i)=>i%239)],"large-3m.bin"))');
+    for (const page of [bob, carol]) {
+      await until(() => page.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'large file offer missing');
+      await page.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+      await until(() => page.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.some(x=>x.name==="large-3m.bin")'),
+        'large file SHA mismatch', 30000);
+      const download = await page.evaluate(`(() => {
+        const a = document.querySelector('#downloads a');
+        const name = a.download;
+        a.click();
+        return { name, href:a.href.startsWith('blob:') };
+      })()`);
+      assert.equal(download.name, 'large-3m.bin');
+      assert.equal(download.href, true, 'verified file must use browser-local Blob URL');
+      const target = join(downloadDir, download.name);
+      await until(() => existsSync(target), 'Edge did not save verified Blob download', 18000);
+      const bytes = readFileSync(target);
+      assert.equal(bytes.byteLength, 3 * 1024 * 1024);
+      assert.deepEqual([...bytes.subarray(0, 256)], Array.from({ length: 256 }, (_, i) => i % 239));
+      const expected = await page.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.at(-1).sha256');
+      assert.equal(createHash('sha256').update(bytes).digest('hex'), expected);
+      unlinkSync(target);
+    }
+    await until(() => alice.evaluate('window.__poc.snapshot().peers.every(p=>p.outgoingPhase===null)'), 'large SHA acknowledgements missing', 30000);
+    const bounded = await alice.evaluate('window.__poc.snapshot().peers.map(p=>p.peakBuffered)');
+    assert.ok(bounded.every(n=>n>0 && n<=256*1024+8192+24), 'WebRTC sender exceeded high-water buffer');
+    console.log('PASS Edge signed 2-recipient 3MiB P2P: SHA-256 ACK + verified Blob download; peak buffered', bounded);
+    // Malicious peer offers a well-formed transfer, then sends a binary frame
+    // for a different transfer ID. The recipient must not save it.
+    await alice.evaluate(`window.__poc.testChannel(0).send(JSON.stringify({
+      type:'offer-file',id:'33333333333333333333333333333333',name:'attacker.bin',
+      size:8192,digest:'0'.repeat(64)
+    }))`);
+    await until(() => bob.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'malicious offer missing');
+    await bob.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    await alice.evaluate(`window.__poc.testChannel(0).send(window.P2PFileWire.packFrame(
+      '44444444444444444444444444444444',0,new Uint8Array(8192)))`);
+    await until(() => bob.evaluate('window.__poc.snapshot().diagnostics.rejected.includes("INVALID_CHUNK")'), 'cross-transfer frame accepted');
+    assert.equal(await bob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 2);
+    assert.equal(await bob.evaluate('window.__poc.snapshot().peers[0].incomingBytes'), 0);
+    await alice.evaluate(`window.__poc.testChannel(0).send(JSON.stringify({
+      type:'offer-file',id:'55555555555555555555555555555555',name:'corrupted.bin',
+      size:8192,digest:'0'.repeat(64)
+    }))`);
+    await until(() => bob.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'corruption offer missing');
+    await bob.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    await alice.evaluate(`(() => {
+      const dc = window.__poc.testChannel(0);
+      dc.send(window.P2PFileWire.packFrame('55555555555555555555555555555555',0,new Uint8Array(8192)));
+      dc.send(JSON.stringify({type:'end-file',id:'55555555555555555555555555555555'}));
+    })()`);
+    await until(() => bob.evaluate('window.__poc.snapshot().diagnostics.rejected.includes("FILE_DIGEST")'),
+      'corrupted file accepted');
+    assert.equal(await bob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 2);
+    // Sender is intentionally slowed between real DataChannel chunks so the
+    // browser can cancel after reception begins, including an in-flight read.
+    await alice.evaluate(`(() => {
+      const file = new File([new Uint8Array(8*1024*1024)], 'cancel.bin');
+      const slice = file.slice.bind(file);
+      file.slice = (start,end) => ({arrayBuffer:()=>new Promise((resolve,reject) =>
+        setTimeout(()=>slice(start,end).arrayBuffer().then(resolve,reject),4))});
+      return window.__poc.sendFile(file);
+    })()`);
+    await until(() => bob.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'cancel offer missing');
+    await bob.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    await until(() => bob.evaluate('window.__poc.snapshot().peers[0].incomingBytes>0'), 'cancel fixture did not begin streaming', 15000);
+    await bob.evaluate('document.querySelector("[data-testid=cancel-incoming]").click()');
+    await until(() => carol.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'other peer offer missing');
+    await carol.evaluate('document.querySelector("[data-testid=accept-file]").nextElementSibling.click()');
+    await until(() => alice.evaluate('window.__poc.snapshot().peers.every(p=>p.outgoingPhase===null)'), 'cancel not propagated', 15000);
+    assert.equal(await bob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 2);
+    assert.equal(await bob.evaluate('window.__poc.snapshot().peers[0].incomingBytes'), 0);
+    console.log('PASS Edge signed cancel during active 8MiB sender: partial data discarded, sender stopped, sibling decline scoped');
     users.get('bob').sessionVersion = 2;
     await until(() => bob.evaluate('window.__poc.snapshot().peers.length===0'), 'revoked user RTC not closed', 6000);
     await until(() => alice.evaluate('window.__poc.snapshot().peers.length===1'), 'revoked peer remains in host', 6000);
