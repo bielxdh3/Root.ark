@@ -6108,6 +6108,61 @@ const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseErr
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 
+// Deliberately opt-in, development/test only. The shared /ws socket already
+// authenticates and limits the session; the room broker rechecks the current
+// authoritative user/permission record for every room action and delivery.
+const ROOTARK_P2P_EXPERIMENTAL = ["development", "test"].includes(NODE_ENV)
+  && process.env.ROOTARK_P2P_EXPERIMENTAL === "true";
+function registerExperimentalP2p() {
+  if (!ROOTARK_P2P_EXPERIMENTAL) return;
+  const { makeBroker } = require("./experiments/issue242-webrtc/server.cjs");
+  const p2pUser = (username) => loadUsers({ failOnDatabaseError: true, allowJsonFallback: false })
+    .find((user) => user.username === username);
+  const p2pAuthenticator = createRealtimeAuthenticator({
+    jwt, jwtSecret: JWT_SECRET, loadUser: p2pUser, normalizeUserPermissions,
+  });
+  const p2pBroker = makeBroker({
+    sharedWss: wss,
+    authenticateSession: (req) => {
+      const user = p2pAuthenticator(parseCookies(req.headers.cookie).get("rootark_session"));
+      return user?.permissions.listFiles === true ? user : null;
+    },
+    authorizeRecipient: (_host, username) => {
+      const recipient = p2pUser(username);
+      return recipient && !recipient.disabled && normalizeUserPermissions(recipient).listFiles === true
+        ? { username: recipient.username, sessionVersion: recipient.sessionVersion || 0 } : null;
+    },
+  });
+  const p2pDir = path.join(__dirname, "experiments", "issue242-webrtc");
+  const p2pCsp = [
+    "default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'",
+    "connect-src 'self' ws: wss:", "img-src 'self'", "object-src 'none'",
+    "base-uri 'none'", "form-action 'none'", "frame-ancestors 'self'",
+  ].join("; ");
+  const p2pHeaders = (res) => res.set({
+    "Cache-Control": "no-store", "Content-Security-Policy": p2pCsp,
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
+  app.get("/p2p", authenticate, requirePermission("listFiles"), (req, res, next) =>
+    req.path === "/p2p" ? res.redirect(302, "/p2p/") : next());
+  app.get("/p2p/", authenticate, requirePermission("listFiles"), (_req, res) =>
+    p2pHeaders(res).type("text/html").send(fs.readFileSync(path.join(p2pDir, "index.html"))));
+  for (const asset of ["client.js", "transfer-protocol.js"]) {
+    app.get("/p2p/" + asset, authenticate, requirePermission("listFiles"), (_req, res) =>
+      p2pHeaders(res).type("application/javascript").send(fs.readFileSync(path.join(p2pDir, asset))));
+  }
+  app.post("/p2p/rooms", authenticate, requirePermission("listFiles"), (req, res) => {
+    if (req.get("origin") !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+      return res.status(403).json({ error: "Origin denied" });
+    }
+    const result = p2pBroker.createRoom(req);
+    if (result.status !== 200) return res.status(result.status).json({ error: "Sala indisponivel" });
+    const { roomId, hostKey, expires } = result;
+    return p2pHeaders(res).json({ roomId, hostKey, expires });
+  });
+  server.once("close", () => { void p2pBroker.close(); });
+}
+
 // DEV-OFF deny-only guard for authenticated legacy HTTP reads. JWT proves a
 // session, NOT an independently signed immutable owner/account cutover state.
 // There is no off-host monotonic floor or external authority in this process.
@@ -6258,6 +6313,7 @@ wss.on("connection", (socket, req) => {
 });
 
 const requirePermission = createRequirePermission();
+registerExperimentalP2p();
 
 // Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
 // This is an experimental single-scope integration, not a replacement for
