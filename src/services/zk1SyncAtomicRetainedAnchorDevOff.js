@@ -210,11 +210,49 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
       this.#minimum.set(head.scope, head);
     }
     const filenameAbs = path.resolve(filename);
-    const existed = fs.existsSync(filenameAbs);
-    requireValid(existed || bootstrapNew === true);
     const signer = fingerprint(crypto.createPublicKey(signerPrivateKey));
     let observed;
+    let existed = true;
     try {
+      // Do not derive a create-vs-open decision from existsSync. A different
+      // process can publish a database immediately after that pathname probe.
+      // Only the atomic O_EXCL result can establish whether WE created it.
+      if (bootstrapNew === true && [...this.#minimum.values()].every((head) =>
+        head.sequence === 0 && head.headHash === GENESIS)) {
+        // Existing directory authority is already checked recursively by the
+        // native Windows verifier. Do not repeat a second, bulk bootstrap
+        // scan of the entire tree just because the DB might be absent.
+        // Only ENOENT may authorize creation of missing private ancestors.
+        try {
+          assertPrivateSqliteAuthorityDirectory(filenameAbs);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+          ensurePrivateSqliteDirectory(filenameAbs);
+          assertPrivateSqliteAuthorityDirectory(filenameAbs);
+        }
+        let fd;
+        try {
+          fd = fs.openSync(filenameAbs, fs.constants.O_CREAT | fs.constants.O_EXCL
+            | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0), 0o600);
+        } catch (error) {
+          // EEXIST grants no authority. The other creator's file must pass
+          // the full existing-file read-only preflight before any SQLite write.
+          if (error?.code !== "EEXIST") throw error;
+        }
+        if (fd !== undefined) {
+          existed = false;
+          try {
+            // A closed bootstrap descriptor cannot authorize a later SQLite
+            // pathname open: another same-UID actor may substitute its own DB.
+            const created = fs.fstatSync(fd, { bigint: true });
+            requireValid(created.isFile() && created.nlink === 1n
+              && (process.platform === "win32"
+                || (created.uid === BigInt(process.getuid())
+                  && (created.mode & 0o077n) === 0n)));
+            observed = Object.freeze({ dev: created.dev, ino: created.ino });
+          } finally { fs.closeSync(fd); }
+        }
+      }
       if (existed) {
         observed = assertPrivateSqliteFile(filenameAbs);
         assertPrivateSqliteAuthorityDirectory(filenameAbs);
@@ -233,22 +271,6 @@ class Zk1SyncAtomicRetainedAnchorDevOff {
         } finally { observer.close(); }
         const after = assertPrivateSqliteFile(filenameAbs);
         requireValid(after.dev === observed.dev && after.ino === observed.ino);
-      } else {
-        requireValid([...this.#minimum.values()].every((head) =>
-          head.sequence === 0 && head.headHash === GENESIS));
-        ensurePrivateSqliteDirectory(filenameAbs);
-        const fd = fs.openSync(filenameAbs, fs.constants.O_CREAT | fs.constants.O_EXCL
-          | fs.constants.O_RDWR, 0o600);
-        try {
-          // A closed bootstrap descriptor cannot authorize a later SQLite
-          // pathname open: another same-UID actor may substitute its own DB.
-          const created = fs.fstatSync(fd, { bigint: true });
-          requireValid(created.isFile() && created.nlink === 1n
-            && (process.platform === "win32"
-              || (created.uid === BigInt(process.getuid())
-                && (created.mode & 0o077n) === 0n)));
-          observed = Object.freeze({ dev: created.dev, ino: created.ino });
-        } finally { fs.closeSync(fd); }
       }
       assertPrivateSqliteAuthorityDirectory(filenameAbs);
       const beforeOpen = assertPrivateSqliteFile(filenameAbs);
