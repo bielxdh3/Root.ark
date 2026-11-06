@@ -629,6 +629,83 @@ class SyncEngine {
     return key;
   }
 
+  // Restore by creating a NEW signed CAS update. A historical envelope is
+  // untrusted until the existing incoming authority and AEAD checks accept it.
+  async restoreHistoricalVersion(objectId, versionId) {
+    return this.withMutationLock(() => this._restoreHistoricalVersion(objectId, versionId));
+  }
+
+  async _restoreHistoricalVersion(objectId, versionId) {
+    if (!this.opened) await this._open();
+    const validId = (value) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value);
+    if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
+    if (typeof this.adapter.history !== "function") fail("Sync history is unavailable", "history_unavailable");
+    if ((await this.journal.recover()).length) fail("Sync pending writes must be settled before restore", "sync_operation_pending");
+    const result = await this.adapter.history(objectId);
+    if (!Array.isArray(result?.versions) || result.versions.length < 1 || result.versions.length > 256) {
+      fail("Invalid historical version list", "invalid_history");
+    }
+    const versions = result.versions.map((record) => protocol.validateStoredOperation(record));
+    if (versions.some((record) => record.objectId !== objectId)) fail("History contains another object", "invalid_history");
+    const selected = versions.filter((record) => record.versionId === versionId);
+    if (selected.length !== 1 || selected[0].tombstone) fail("Restorable historical version not found", "history_version_unavailable");
+    const remote = await this.adapter.list(objectId);
+    const records = Array.isArray(remote) ? remote : Array.isArray(remote?.objects) ? remote.objects : remote ? [remote] : [];
+    if (records.length !== 1) fail("Current sync version unavailable", "history_version_unavailable");
+    const current = protocol.validateStoredOperation(records[0]);
+    const historical = selected[0];
+    if (current.objectId !== objectId || current.fileId !== historical.fileId
+      || current.compartmentId !== historical.compartmentId
+      || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
+      fail("Current signed version does not match history", "invalid_history");
+    }
+    await this.verifyIncomingOperation(historical, { preObserve: false });
+    await this.verifyIncomingOperation(current, { preObserve: false });
+    if (historical.metadata.contentType === "inode/directory"
+      || (!current.tombstone && current.metadata.contentType === "inode/directory")) {
+      fail("Directory restoration is not supported", "history_version_unavailable");
+    }
+    const relative = await canonicalRelativePath(this.rootDir, current.metadata.path);
+    if (!this.isSelected(relative)) fail("Historical restore path is excluded", "path_not_selected");
+    const existing = this.snapshot.files[relative];
+    if (existing && !existing.deleted && (existing.objectId !== objectId || existing.fileId !== current.fileId)) {
+      fail("Historical restore would overwrite a different local object", "restore_local_conflict");
+    }
+    const destination = await contained(this.rootDir, relative, true);
+    if (await exists(destination) && (!existing || existing.deleted)) {
+      fail("Historical restore would overwrite an untracked local file", "restore_local_conflict");
+    }
+    const key = await this.keyFor(historical);
+    const decrypted = protocol.decryptPayload(historical, key);
+    const plaintext = historical.operation === "move"
+      ? protocol.decodeMovePayload(decrypted, key) : decrypted;
+    if (plaintext === null) fail("Historical MOVE has no recoverable content", "history_version_unavailable");
+    let restored;
+    try {
+      const { sourcePath: _oldMoveSource, ...historicalMetadata } = historical.metadata;
+      restored = await this.buildOperation({ operation: "update", objectId, fileId: current.fileId,
+        baseRevision: current.revision, revision: protocol.nextRevision(current.revision, this.deviceId),
+        metadata: { ...historicalMetadata, path: relative, name: path.basename(relative), size: plaintext.length },
+        plaintext, fileKey: await this.keyFor({ ...current, keyEpoch: this.keyEpoch }) });
+    } finally { plaintext.fill(0); }
+    // The outbox is durable BEFORE local materialization. Failure to send is
+    // recoverable by the existing signed journal; no old operation is replayed.
+    await this.assertOutgoingAuthorized(restored, () => this.journal.enqueue(restored));
+    await this._apply(restored);
+    const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+    await this._pushPending(summary);
+    if (summary.offline) return { restored: true, pushed: false, pending: true,
+      objectId, sourceVersionId: versionId, versionId: restored.versionId };
+    const readback = await this.adapter.list(objectId);
+    const committed = Array.isArray(readback) ? readback[0]
+      : Array.isArray(readback?.objects) ? readback.objects[0] : readback;
+    if (!committed || signedEnvelopeDigest(protocol.validateStoredOperation(committed)) !== signedEnvelopeDigest(restored)) {
+      fail("Historical restore could not verify the committed revision", "restore_commit_unverified");
+    }
+    return { restored: true, pushed: true, objectId, sourceVersionId: versionId,
+      versionId: restored.versionId, operationId: restored.operationId };
+  }
+
   async verifyIncomingOperation(operation, { preObserve = true } = {}) {
     // Strict mode is local policy, never a request-controlled proof opt-in.
     // Historical expiry is allowed only for a structurally bound SIGNED

@@ -203,6 +203,13 @@ function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy
 }
 
 async function start(options = {}) {
+  if (options.restore === true) {
+    for (const key of ["object-id", "version-id"]) {
+      if (typeof options[key] !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(options[key])) {
+        throw new Error(`Valid --${key} is required for historical restore`);
+      }
+    }
+  }
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
   // The historical witness mode requires pins provisioned by the embedding
@@ -364,6 +371,12 @@ async function start(options = {}) {
     requireAuthorization: true,
     reverifySeenIncoming: strictHistorical,
   }).open();
+  if (options.restore === true) {
+    const outcome = await engine.restoreHistoricalVersion(options["object-id"], options["version-id"]);
+    // Never print recovered plaintext, ciphertext, signing material or bearer.
+    console.log(JSON.stringify(outcome));
+    return engine;
+  }
   const once = options.once === true || options.once === "true";
   do {
     const summary = await engine.syncOnce();
@@ -417,7 +430,8 @@ if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "history") history({ ...args(rest) }).catch((error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; });
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>");
+  else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
