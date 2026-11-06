@@ -357,6 +357,8 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 
 ## Roadmap
 
+**Active execution mission:** [priorities, workflow and progress](docs/rootark-main-execution-mission.md). Historical checklists below are not automatically current.
+
 - [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
 - [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
