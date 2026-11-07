@@ -408,7 +408,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     ws.on('close', () => removePeer(ws));
   }
   wss.on('connection', onConnection);
-  async function createRoom(req) {
+  async function createRoom(req, response = null) {
     const user = identify(req);
     if (authenticated && !user) return { status: 401 };
     let boundObject = null;
@@ -439,8 +439,28 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     pendingRoomCreates++;
     if (authenticated) pendingRoomCreatesByOwner.set(owner,
       (pendingRoomCreatesByOwner.get(owner) || 0) + 1);
+    let createdRoom = null;
+    let canceled = req.aborted === true ||
+      (response?.destroyed === true && response.writableFinished !== true);
+    // After the HTTP body has finished, IncomingMessage.aborted stays false.
+    // A premature ServerResponse.close is the cancellation signal instead.
+    const detachResponseListeners = () => {
+      response?.off('close', onResponseClose);
+      response?.off('finish', onResponseFinish);
+    };
+    const onResponseClose = () => {
+      if (response.writableFinished !== true) {
+        canceled = true;
+        if (createdRoom && rooms.get(createdRoom.id) === createdRoom) expireRoom(createdRoom);
+      }
+      detachResponseListeners();
+    };
+    const onResponseFinish = () => detachResponseListeners();
+    response?.once('close', onResponseClose);
+    response?.once('finish', onResponseFinish);
     try {
       if (boundObject) {
+        if (canceled) return { status: 403 };
         try {
           const grant = await authorizeObject({ owner: user.username, recipient: null, boundObject, pin: null });
           if (!object(grant) || typeof grant.fingerprint !== 'string' ||
@@ -455,7 +475,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       }
       // Hashing may complete after the HTTP request was canceled or the session
       // changed. Never turn that stale result into a room.
-      if (req.aborted) return { status: 403 };
+      if (req.aborted || canceled) return { status: 403 };
       if (authenticated) {
         const current = identify(req);
         if (!current || current.username !== owner ||
@@ -469,9 +489,13 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         boundObject, objectPin, objectDigest, objectSize,
         members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
       rooms.set(room.id, room);
+      createdRoom = room;
       return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires,
         ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest, size: objectSize } } : {}) };
     } finally {
+      // Retain close/finish listeners for an allocated room until HTTP delivery
+      // completes. A disconnect before delivery then reclaims its orphan room.
+      if (!createdRoom || canceled) detachResponseListeners();
       pendingRoomCreates--;
       if (authenticated) {
         const remaining = pendingRoomCreatesByOwner.get(owner) - 1;
@@ -487,8 +511,9 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws://127.0.0.1:*; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'");
     if (req.method === 'POST' && url.pathname === '/rooms' && req.headers.origin === origin) {
       let result;
-      try { result = await createRoom(req); }
-      catch { res.writeHead(403).end(); return; }
+      try { result = await createRoom(req, res); }
+      catch { if (!res.destroyed) res.writeHead(403).end(); return; }
+      if (res.destroyed) return;
       if (result.status !== 200) { res.writeHead(result.status).end(); return; }
       res.setHeader('Content-Type', 'application/json');
       const { roomId, hostKey, expires } = result;
