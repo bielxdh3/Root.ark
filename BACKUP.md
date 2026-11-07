@@ -62,6 +62,20 @@ BACKUP_COMPRESS=true
 
 Essas exclusões são por caminho/nome; o backup não inspeciona o conteúdo de arquivos arbitrários em busca de credenciais. A criação do backup e a reconciliação do inventário cloud falham fechadas se um arquivo elegível tiver hardlinks, para impedir que um nome comum contorne a exclusão de outro caminho.
 
+**Cobertura das fontes selecionadas:** quando BACKUP_INCLUDE_UPLOADS ou
+BACKUP_INCLUDE_TEMP habilita uma árvore, o coletor recusa a criação de um
+ZIP marcado como success se encontrar um symlink/junction na raiz ou em
+uma entrada elegível, ou um arquivo especial que não seja diretório ou arquivo
+regular. Anteriormente essas entradas eram ignoradas silenciosamente e
+sumiam tanto do ZIP quanto da lista included_files, ocultando a incompletude.
+As exclusões sensíveis e de quarentena definidas acima continuam explícitas
+e não entram nesse requisito. A ausência de uma árvore opcional permanece
+permitida e **não é prova de que todos os arquivos de uma conta existem na
+origem**. Essa verificação de coleta local não substitui inventário cloud
+autenticado, retenção imutável, manifestos globais assinados pelo dono nem
+custódia independente R1. Nenhum ZIP local concede autorização para restaurar
+conteúdo protegido sob ZK10.
+
 ## Backup manual
 
 Pelo painel:

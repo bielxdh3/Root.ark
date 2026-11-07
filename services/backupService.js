@@ -326,9 +326,19 @@ function createVerifiedArchiveStream(file) {
 }
 
 function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
-  if (!fs.existsSync(rootPath)) return [];
   const rootAbsolute = path.resolve(rootPath);
-  if (fs.lstatSync(rootAbsolute).isSymbolicLink()) return [];
+  // An absent optional root is different from an existing dangling symlink.
+  // A configured archive source may NOT be marked complete after silently
+  // omitting a symlinked/junction root or an unsupported source entry.
+  let rootStat;
+  try { rootStat = fs.lstatSync(rootAbsolute, { bigint: true }); }
+  catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error("Backup source root is not a real directory");
+  }
   const archiveRoot = archiveRootInfo(rootAbsolute);
   const excludedPaths = (options.excludePaths || []).filter(Boolean).map((excludedPath) => {
     const absolute = path.resolve(excludedPath);
@@ -344,14 +354,19 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     if (identity && options.excludeFileIdentities?.has(identity)) return true;
     return Boolean(options.excludePredicate?.(absolute, stat));
   };
-  const rootStat = fs.lstatSync(rootAbsolute, { bigint: true });
-  if (rootStat.isSymbolicLink() || isExcluded(rootAbsolute, rootStat)) return [];
+  if (isExcluded(rootAbsolute, rootStat)) return [];
   const files = [];
   const stack = [{ absolutePath: rootAbsolute, entryPath: entryPrefix }];
   while (stack.length) {
     const current = stack.pop();
     const stat = fs.lstatSync(current.absolutePath, { bigint: true });
-    if (stat.isSymbolicLink() || isExcluded(current.absolutePath, stat)) continue;
+    if (isExcluded(current.absolutePath, stat)) continue;
+    // Explicit security-policy exclusions above are intentional. Every
+    // remaining unsafe inode is evidence of INCOMPLETE archive coverage, not
+    // a file that may be quietly absent from included_files and a success ZIP.
+    if (stat.isSymbolicLink()) {
+      throw new Error("Backup source contains a symbolic link or junction");
+    }
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
         if (options.excludeNamePrefixes?.some((prefix) => name.startsWith(prefix))) continue;
@@ -363,7 +378,9 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
       }
       continue;
     }
-    if (!stat.isFile()) continue;
+    if (!stat.isFile()) {
+      throw new Error("Backup source contains an unsupported filesystem entry");
+    }
     const identity = fileIdentity(stat);
     if (options.maxBytes && stat.size > options.maxBytes) continue;
     files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: Number(stat.size), archiveRoot, sourceStat: stat });
