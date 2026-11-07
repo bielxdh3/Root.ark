@@ -826,19 +826,12 @@ class SyncEngine {
     };
   }
 
-  async reconcileOutOfScopeMove(operation, summary, options = {}) {
-    // No pull/reconciliation entry point may separately advance a member of
-    // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
-    // or out-of-scope sweep is not a two-envelope atomic admission receipt.
-    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
-      fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
-        "sync_atomic_batch_indeterminate");
-    }
+  preflightOutOfScopeMove(operation) {
     const tombstone = Boolean(operation.tombstone || operation.operation === "delete");
     const directoryMove = operation.operation === "update" && operation.metadata?.contentType === "inode/directory";
     if ((operation.operation !== "move" && !directoryMove && !tombstone)
-      || typeof operation.metadata?.path !== "string" || this.isSelected(operation.metadata.path)) return false;
-    if (!tombstone && !directoryMove && !operation.metadata?.sourcePath) return false;
+      || typeof operation.metadata?.path !== "string" || this.isSelected(operation.metadata.path)) return null;
+    if (!tombstone && !directoryMove && !operation.metadata?.sourcePath) return null;
 
     let sourcePath;
     if (tombstone) {
@@ -854,13 +847,33 @@ class SyncEngine {
         && !this.snapshot.files[operation.metadata.sourcePath]?.directory
         ? operation.metadata.sourcePath : null);
     }
-    if (!sourcePath || !this.isSelected(sourcePath)) return false;
+    if (!sourcePath || !this.isSelected(sourcePath)) return null;
 
     const prior = this.snapshot.files[sourcePath];
     const directoryRecord = directoryMove || (tombstone && Boolean(prior?.directory));
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
-      || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return false;
+      || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return null;
 
+    // This path bypasses _apply and can move an offline pinned source into
+    // trash. Refuse before signed pre-observation or snapshot/journal changes.
+    const sourceKey = sourcePath.toLowerCase();
+    if (Object.values(this.snapshot.pinnedFiles || {}).some((pin) => {
+      const pinnedPath = pin.path.toLowerCase();
+      return pinnedPath === sourceKey || pinnedPath.startsWith(`${sourceKey}/`);
+    })) fail("Pinned local origin cannot be reconciled outside selected paths", "file_pinned");
+
+    return { sourcePath, prior, tombstone, directoryRecord };
+  }
+
+  async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    const source = this.preflightOutOfScopeMove(operation);
+    // A signed DELETE+MOVE remote transaction cannot be separately admitted.
+    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
+      fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
+        "sync_atomic_batch_indeterminate");
+    }
+    if (!source) return false;
+    const { sourcePath, prior, tombstone, directoryRecord } = source;
     const pending = (await this.journal.recover()).filter((item) => item.protocolVersion && item.objectId === operation.objectId);
     const target = await contained(this.rootDir, sourcePath, true);
     const sourceExists = await exists(target);
@@ -1695,6 +1708,9 @@ class SyncEngine {
               }
             }
           }
+          if (current && !this.operationDestinationIsSelected(current)) {
+            this.preflightOutOfScopeMove(current);
+          }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
           if (current) {
@@ -1796,8 +1812,32 @@ class SyncEngine {
           && entry.fileId === operation.fileId) affectedPaths.push(relativePath);
       }
     }
-    if (protectedPaths.some((pin) => affectedPaths.some((candidate) =>
-      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)))) {
+    const pinnedDescendant = protectedPaths.some((pin) => affectedPaths.some((candidate) =>
+      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)));
+    // A signed CREATE can record the identity of an existing directory
+    // without touching that directory or its pinned descendants. This is
+    // common after hydration of a child while the parent CREATE was unseen.
+    let existingAncestorCreate = false;
+    if (pinnedDescendant && operation.operation === "create"
+      && metadata.contentType === "inode/directory") {
+      const ancestorPrefix = `${metadata.path}/`;
+      // A second case-distinct POSIX directory can be replayed as an alias on
+      // Windows. It is not the pinned child's actual ancestor, even if both
+      // physical directories happen to exist on the originating device.
+      const sameSpelling = protectedPaths.every((pin) =>
+        !pin.path.toLowerCase().startsWith(ancestorPrefix.toLowerCase())
+        || pin.path.startsWith(ancestorPrefix));
+      const existing = Object.entries(this.snapshot.files).find(([relative, entry]) =>
+        relative.toLowerCase() === metadata.path.toLowerCase());
+      if (sameSpelling && (!existing || (!existing[1].deleted && existing[1].directory
+        && existing[1].objectId === operation.objectId && existing[1].fileId === operation.fileId))) {
+        let stats;
+        try { stats = await fsp.lstat(target); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        existingAncestorCreate = Boolean(stats?.isDirectory() && !stats.isSymbolicLink());
+      }
+    }
+    if (pinnedDescendant && !existingAncestorCreate) {
       fail("A pinned file is inside a directory affected by the signed operation", "file_pinned");
     }
     if (operation.operation === "delete"
@@ -1807,7 +1847,8 @@ class SyncEngine {
     if (["create", "update", "move"].includes(operation.operation)
       && protectedPaths.some((pin) =>
         pin.path.toLowerCase() === metadata.path.toLowerCase()
-        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId))) {
+        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId
+          || metadata.contentType === "inode/directory"))) {
       // Guard the destination BEFORE the first journal observation, mkdir,
       // stageExisting or rename. Signed operations from another object can
       // never replace a device-pinned target, even via direct apply() or
@@ -1879,6 +1920,12 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
+        if (existingAncestorCreate) {
+          const still = await fsp.lstat(target);
+          if (!still.isDirectory() || still.isSymbolicLink()) {
+            fail("Pinned ancestor directory changed during admission", "file_pinned");
+          }
+        }
         const sourcePath = operation.operation === "update" ? activeIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         let relocated = false;
         if (sourcePath) {
@@ -1892,7 +1939,7 @@ class SyncEngine {
             relocated = true;
           }
         }
-        if (!relocated) {
+        if (!relocated && !existingAncestorCreate) {
           try {
             await fsp.mkdir(target, { recursive: false });
           } catch (error) {
@@ -1999,6 +2046,16 @@ class SyncEngine {
     for (const [relative, file] of Object.entries(scanned)) {
       const canonical = process.platform === "win32" ? snapshotPathByKey.get(pathKey(relative)) || relative : relative;
       current[canonical] = file;
+    }
+    // A local inode/directory at the path of a pinned regular file is not an
+    // authorized edit to that identity. Block before enqueuing any operations
+    // or persisting a restart-invalid tracked directory beside the pin.
+    const currentByPortablePath = new Map(Object.entries(current)
+      .map(([relative, entry]) => [relative.toLowerCase(), entry]));
+    for (const pin of Object.values(this.snapshot.pinnedFiles || {})) {
+      if (currentByPortablePath.get(pin.path.toLowerCase())?.directory) {
+        fail("Pinned regular file cannot become a directory", "file_pinned");
+      }
     }
     const evictedByPath = new Map();
     for (const item of Object.values(this.snapshot.remoteOnly)) {
@@ -2206,15 +2263,15 @@ class SyncEngine {
   async pinStatus(relativePath = null) {
     return this.withMutationLock(async () => {
       if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
-      const status = async (safePath) => {
-        const pin = Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
+      const status = async (safePath, knownPin = null) => {
+        const pin = knownPin || Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
         const target = await contained(this.rootDir, safePath, true);
         const present = await exists(target);
         return { path: safePath, pinned: Boolean(pin), localPresent: present, objectId: pin?.objectId || null };
       };
       if (relativePath !== null) return status(await canonicalRelativePath(this.rootDir, relativePath));
       const all = Object.values(this.snapshot.pinnedFiles || {}).sort((a, b) => a.path.localeCompare(b.path));
-      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path))) };
+      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path, item))) };
     });
   }
 
@@ -2518,6 +2575,7 @@ class SyncEngine {
     };
     for (const operation of inspected) {
       if (!this.operationDestinationIsSelected(operation)) {
+        this.preflightOutOfScopeMove(operation);
         const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
