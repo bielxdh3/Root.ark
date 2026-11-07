@@ -416,14 +416,13 @@ async function collectBackupFiles(options = {}) {
     const absolutePath = path.join(dataDir, name);
     const entryPath = normalizeEntryPath(path.posix.join("data", name));
     if (isSensitivePath(entryPath)) continue;
+    if (!(name.endsWith(".json") || name === "README.md")) continue;
     const stat = fs.lstatSync(absolutePath, { bigint: true });
-    if (stat.isSymbolicLink()) continue;
-    if (stat.isFile() && (
-      name.endsWith(".json") ||
-      name === "README.md"
-    ) && !quarantineExclusions.isPayloadPath(absolutePath, stat)) {
-      files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
-    }
+    if (quarantineExclusions.isPayloadPath(absolutePath, stat)) continue;
+    // An eligible data entry cannot silently disappear from a successful ZIP.
+    if (stat.isSymbolicLink()) throw new Error("Backup data source contains a symbolic link or junction");
+    if (!stat.isFile()) throw new Error("Backup data source is not a regular file");
+    files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
   }
   if (options.jsonArchiveSnapshotPath) {
     // The runtime keeps an immutable legacy JSON archive plus a FULL/WAL
