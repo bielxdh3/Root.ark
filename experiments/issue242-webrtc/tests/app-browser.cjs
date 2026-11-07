@@ -2,7 +2,8 @@
 // Real Root.ark HTTP + cookie session + /ws + WebRTC in one disposable Edge.
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const { mkdtempSync, rmSync, existsSync, writeFileSync } = require('node:fs');
+const { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } = require('node:fs');
+const { createHash } = require('node:crypto');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { fixture } = require('../../../test/support/issue242-app-fixture');
@@ -38,6 +39,14 @@ async function run() {
       pages.push(page);
       await page.call('Page.enable');
       await page.call('Network.enable');
+      if (username === 'alice') {
+        // Capture real Edge sockets before the protected page loads, then
+        // deterministically deliver a delayed event from the prior room.
+        await page.call('Page.addScriptToEvaluateOnNewDocument', { source:
+          'window.__testSockets=[]; const NativeSocket=WebSocket; ' +
+          'window.WebSocket=class extends NativeSocket { constructor(...args) { super(...args); window.__testSockets.push(this); } };'
+        });
+      }
       for (const cookie of session.cookie.split('; ')) {
         const [name, value] = cookie.split('=');
         await page.call('Network.setCookie', { name, value, url: f.origin,
@@ -103,7 +112,85 @@ async function run() {
       'revoked Root.ark session left live P2P peer', 8_000);
     await until(() => alice.evaluate('window.__poc.snapshot().peers.length===1'),
       'revoked peer not removed from real server', 8_000);
-    console.log('PASS real Root.ark app Edge: signed-cookie login, ACL recipient gate, /ws peer consent, 1:N 2MiB SHA-256 and session revocation');
+    // Protected-object mode reads the actual locally retained *ciphertext*
+    // bytes for the expected SHA-256 and rechecks the authoritative file ACL.
+    const ciphertext = Buffer.from(Array.from({ length: 92 }, (_, i) => i + 11));
+    mkdirSync(join(f.directory, 'uploads'), { recursive: true });
+    writeFileSync(join(f.directory, 'uploads', 'sealed.bin'), ciphertext);
+    const objectMetadata = {
+      fileName: 'sealed.bin', folderId: 'root', uploadedAt: '2026-11-06T12:00:00.000Z',
+      size: 64, encryptedSize: ciphertext.length, encryptionLevel: 'user-key',
+      algorithm: 'aes-256-gcm', layers: [{ type: 'user', iv: '0011', authTag: '0022' }],
+      accessControl: { owner: 'alice', authorizedUsers: ['alice', 'bob'], expiresAt: null },
+    };
+    const saveObject = () => writeFileSync(join(f.directory, 'data', 'encrypted-files.json'),
+      JSON.stringify({ 'root/sealed.bin': objectMetadata }));
+    saveObject();
+    writeFileSync(join(f.directory, 'data', 'file-permissions.json'),
+      JSON.stringify({ 'root/sealed.bin': { owner: 'alice', public: false,
+        users: { bob: { read: true, edit: false } } } }));
+    const expectedDigest = createHash('sha256').update(ciphertext).digest('hex');
+    assert.equal(await alice.evaluate('document.getElementById("boundObjectControls").hidden'), false);
+    await alice.evaluate('window.__poc.createRoom({folderId:"root",fileName:"sealed.bin"})');
+    const boundRoom = await until(() => alice.evaluate(
+      'window.__poc.snapshot().boundObject?.sha256 && window.__poc.snapshot().roomId'),
+    'ciphertext ACL room not opened', 12_000);
+    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject.sha256'), expectedDigest);
+    await alice.evaluate('window.__testSockets[0].onmessage({data:JSON.stringify({type:"joined",role:"guest",peerId:"old-room"})})');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject?.sha256'), expectedDigest,
+      'stale unbound join stripped the current signed ciphertext room policy');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), 'host');
+    await alice.evaluate('window.__poc.invite("carol")');
+    await until(() => alice.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_ACCESS_DENIED")'),
+    'unlisted account received an object grant');
+    const invitationsBefore = await alice.evaluate('window.__poc.invitations().length');
+    await alice.evaluate('window.__poc.invite("bob")');
+    const boundInvitation = await until(() => alice.evaluate(
+      'window.__poc.invitations().length>' + invitationsBefore +
+      ' && window.__poc.invitations().at(-1)?.recipient==="bob" && window.__poc.invitations().at(-1)?.invitation'),
+    'authorized object recipient did not get an invitation');
+    const refreshedBob = await pageFor('bob');
+    await refreshedBob.evaluate('window.__poc.joinRoom(' + JSON.stringify(boundRoom) + ',' +
+      JSON.stringify(boundInvitation) + ')');
+    await until(() => refreshedBob.evaluate('window.__poc.snapshot().boundObject?.sha256===' +
+      JSON.stringify(expectedDigest)), 'guest did not receive trusted ciphertext SHA-256');
+    await until(() => refreshedBob.evaluate('Boolean(document.querySelector("[data-testid=accept-peer]"))'),
+      'object peer consent missing');
+    await refreshedBob.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
+    await until(() => refreshedBob.evaluate('window.__poc.snapshot().peers.some(p=>p.channel==="open")'),
+      'object DataChannel did not open', 20_000);
+    // A malicious consented sender can bypass sendText and send a valid
+    // SHA-256 text control frame directly over the bound DataChannel.
+    const forgedText = 'ciphertext-room-must-not-display-text';
+    const forgedDigest = createHash('sha256').update(forgedText).digest('hex');
+    await alice.evaluate('window.__poc.testChannel(0).send(' +
+      JSON.stringify(JSON.stringify({ type: 'text', text: forgedText, digest: forgedDigest })) + ')');
+    await until(() => refreshedBob.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("BOUND_ROOM_TEXT")'),
+    'bound room recipient accepted direct plaintext from consented peer');
+    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedTexts.length'), 0);
+    await alice.evaluate('window.__poc.sendFile(new File([new Uint8Array(92)],"sealed.bin"))');
+    await until(() => alice.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_DIGEST_MISMATCH")'),
+    'sender accepted different same-length bytes');
+    await alice.evaluate('window.__poc.testChannel(0).send(JSON.stringify({type:"offer-file",id:"1234567890abcdef1234567890abcdef",name:"sealed.bin",size:92,digest:"' +
+      '0'.repeat(64) + '"}))');
+    await until(() => refreshedBob.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_DIGEST_MISMATCH")'),
+    'recipient accepted a forged peer offer');
+    await alice.evaluate('window.__poc.sendFile(new File([Uint8Array.from({length:92},(_,i)=>i+11)],"sealed.bin"))');
+    await until(() => refreshedBob.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'),
+      'real sealed ciphertext was not offered');
+    await refreshedBob.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+    await until(() => refreshedBob.evaluate(
+      'window.__poc.snapshot().diagnostics.verifiedFiles.some(f=>f.name==="sealed.bin")'),
+    'bound ciphertext bytes did not verify', 15_000);
+    objectMetadata.accessControl.authorizedUsers = ['alice'];
+    saveObject();
+    await until(() => refreshedBob.evaluate('window.__poc.snapshot().peers.length===0'),
+      'revoked object guest kept live browser channel', 8_000);
+    console.log('PASS real Root.ark Edge: signed-cookie 1:N 2MiB, ciphertext-bound SHA-256 and ACL, forged bytes denied, consent, tenant exclusion and revocation');
   } finally {
     for (const page of pages) page.close();
     child.kill();

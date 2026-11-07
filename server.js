@@ -6121,6 +6121,108 @@ function registerExperimentalP2p() {
   const p2pAuthenticator = createRealtimeAuthenticator({
     jwt, jwtSecret: JWT_SECRET, loadUser: p2pUser, normalizeUserPermissions,
   });
+  const MAX_P2P_CIPHERTEXT = 32 * 1024 * 1024;
+  async function currentP2pCiphertext(folderId, fileName, expectedSize) {
+    // This remains local-only and dev/test-only: no reads from cloud caches,
+    // no symlinks, no hardlinked aliases and never decrypt any stored bytes.
+    let handle;
+    try {
+      if (!Number.isSafeInteger(expectedSize) || expectedSize < 1
+        || expectedSize > MAX_P2P_CIPHERTEXT) return null;
+      const directory = getFolderStoragePath("./uploads", folderId);
+      const source = path.resolve(directory, fileName);
+      if (!isSafeChildPath("./uploads", directory) ||
+        !isSafeFolderChildPath(directory, source)) return null;
+      const realDirectory = path.normalize(await fs.promises.realpath(directory));
+      const expectedDirectory = path.normalize(directory);
+      if (process.platform === "win32"
+        ? realDirectory.toLowerCase() !== expectedDirectory.toLowerCase()
+        : realDirectory !== expectedDirectory) return null;
+      const before = await fs.promises.lstat(source);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+        || before.size !== expectedSize) return null;
+      handle = await fs.promises.open(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
+        || opened.size !== expectedSize) return null;
+      const hash = crypto.createHash("sha256");
+      const bytes = Buffer.allocUnsafe(512 * 1024);
+      for (let offset = 0; offset < expectedSize;) {
+        const { bytesRead } = await handle.read(bytes, 0, Math.min(bytes.length, expectedSize - offset), offset);
+        if (bytesRead <= 0) return null;
+        hash.update(bytes.subarray(0, bytesRead));
+        offset += bytesRead;
+      }
+      const after = await handle.stat();
+      const current = await fs.promises.lstat(source);
+      if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
+        || after.dev !== opened.dev || after.ino !== opened.ino
+        || current.dev !== opened.dev || current.ino !== opened.ino
+        || after.size !== expectedSize || current.size !== expectedSize
+        || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+        || current.mtimeMs !== opened.mtimeMs || current.ctimeMs !== opened.ctimeMs) return null;
+      return { bytes: expectedSize, sha256: hash.digest("hex") };
+    } catch { return null; }
+    finally { if (handle) await handle.close(); }
+  }
+  // This gate deliberately uses the existing, explicit per-file encrypted ACL.
+  // It is NOT a ZK owner-signed capability: no grant from another branch or
+  // decryption key is accepted. Exact folder+filename and object metadata are
+  // pinned to each room so replacing an object cannot inherit an old invite.
+  const authorizeP2pObject = async ({ owner, recipient, boundObject, pin }) => {
+    const { folderId, fileName } = boundObject || {};
+    if (typeof folderId !== "string" || typeof fileName !== "string"
+      || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderId)
+      || fileName.length < 1 || fileName.length > 100
+      || path.basename(fileName) !== fileName
+      || /[/\\\x00-\x1f\x7f]/.test(fileName) || isCloudStorageEnabled()) return null;
+    // Read bytes asynchronously before the final fresh ACL/metadata check.
+    // No path/mtime cache can substitute for the current ciphertext SHA-256.
+    const prior = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const ciphertext = await currentP2pCiphertext(folderId, fileName, prior?.encryptedSize);
+    if (!ciphertext) return null;
+    const ownerUser = p2pUser(owner);
+    const recipientUser = recipient === null ? null : p2pUser(recipient);
+    if (!ownerUser || ownerUser.disabled || normalizeUserPermissions(ownerUser).listFiles !== true
+      || (recipient !== null && (!recipientUser || recipientUser.disabled
+        || normalizeUserPermissions(recipientUser).listFiles !== true))) return null;
+    const folder = getFolderById(folderId);
+    if (!folder || !isFolderAvailable(folderId) || isFileExpired(folderId, fileName)
+      || isFileInTrash(folderId, fileName) || isStoredVersionFile(folderId, fileName)
+      || restoreProviderOrphans.isSuppressed(folderId, fileName, "uploads")) return null;
+    const metadata = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const acl = metadata?.accessControl;
+    // Legacy hasFileAccess defaults an absent file-permissions record to
+    // public. A protected room may not treat missing/failed ACL storage as an
+    // affirmative recipient grant: require the private explicit owner ACL.
+    const fileAclEntry = getFilePermissionEntry(folderId, fileName, loadFilePermissions());
+    const fileAcl = fileAclEntry && normalizeFilePermissionEntry(fileAclEntry);
+    if (!metadata || metadata.folderId !== folderId || metadata.fileName !== fileName
+      || !["user-key", "dual"].includes(metadata.encryptionLevel)
+      || metadata.algorithm !== "aes-256-gcm"
+      || !Number.isSafeInteger(metadata.encryptedSize) || metadata.encryptedSize < 1
+      || !Number.isSafeInteger(metadata.size) || metadata.size < 1
+      || !Array.isArray(metadata.layers) || metadata.layers.length < 1
+      || typeof metadata.uploadedAt !== "string" || !Number.isFinite(Date.parse(metadata.uploadedAt))
+      || !acl || acl.owner !== owner || !Array.isArray(acl.authorizedUsers)
+      || !acl.authorizedUsers.includes(owner)
+      || !fileAclEntry || fileAclEntry.public !== false || fileAcl?.owner !== owner
+      || (recipient !== null && !fileAcl.users[recipient]?.read)
+      || (acl.expiresAt !== null && acl.expiresAt !== undefined &&
+        (!Number.isFinite(Date.parse(acl.expiresAt)) || Date.parse(acl.expiresAt) <= Date.now()))) return null;
+    const permitted = (user) => hasFolderAccess({ user }, folder) &&
+      hasFileAccess({ user }, folder, fileName);
+    if (!permitted(ownerUser) || (recipient !== null &&
+      (!acl.authorizedUsers.includes(recipient) || !permitted(recipientUser)))) return null;
+    if (metadata.encryptedSize !== ciphertext.bytes) return null;
+    // Ignore only mutable ACL membership and its timestamp. Every other
+    // security-relevant metadata field must remain byte-for-byte stable.
+    const { accessControl: _acl, updatedAt: _updatedAt, ...pinnedMetadata } = metadata;
+    const fingerprint = crypto.createHash("sha256")
+      .update(JSON.stringify(pinnedMetadata)).update(ciphertext.sha256).digest("hex");
+    if (pin !== null && fingerprint !== pin) return null;
+    return { fingerprint, ...ciphertext };
+  };
   const p2pBroker = makeBroker({
     sharedWss: wss,
     authenticateSession: (req) => {
@@ -6132,6 +6234,7 @@ function registerExperimentalP2p() {
       return recipient && !recipient.disabled && normalizeUserPermissions(recipient).listFiles === true
         ? { username: recipient.username, sessionVersion: recipient.sessionVersion || 0 } : null;
     },
+    authorizeObject: authorizeP2pObject,
   });
   const p2pDir = path.join(__dirname, "experiments", "issue242-webrtc");
   const p2pCsp = [
@@ -6151,14 +6254,16 @@ function registerExperimentalP2p() {
     app.get("/p2p/" + asset, authenticate, requirePermission("listFiles"), (_req, res) =>
       p2pHeaders(res).type("application/javascript").send(fs.readFileSync(path.join(p2pDir, asset))));
   }
-  app.post("/p2p/rooms", authenticate, requirePermission("listFiles"), (req, res) => {
+  app.post("/p2p/rooms", authenticate, requirePermission("listFiles"), async (req, res) => {
     if (req.get("origin") !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
       return res.status(403).json({ error: "Origin denied" });
     }
-    const result = p2pBroker.createRoom(req);
+    let result;
+    try { result = await p2pBroker.createRoom(req); }
+    catch { return res.status(403).json({ error: "Sala indisponivel" }); }
     if (result.status !== 200) return res.status(result.status).json({ error: "Sala indisponivel" });
-    const { roomId, hostKey, expires } = result;
-    return p2pHeaders(res).json({ roomId, hostKey, expires });
+    const { roomId, hostKey, expires, boundObject } = result;
+    return p2pHeaders(res).json({ roomId, hostKey, expires, ...(boundObject ? { boundObject } : {}) });
   });
   server.once("close", () => { void p2pBroker.close(); });
 }
