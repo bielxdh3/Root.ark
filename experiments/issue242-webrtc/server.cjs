@@ -197,6 +197,57 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       send(recipient.ws, { type: 'signal', peerId: sender.id, signal });
     }
   }
+  function cheapActionError(room, current, message) {
+    // Rejection must precede expensive per-member ciphertext hashes. These are
+    // only preflight checks; live ACL and room state are checked again before
+    // every authorized action, especially SDP/ICE egress.
+    const target = typeof message.to === 'string' && message.to.length === 16
+      ? room.members.get(message.to) : null;
+    switch (message.type) {
+      case 'invite': {
+        if (current.role !== 'host') return 'FORBIDDEN';
+        const recipient = message.recipient;
+        if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
+          recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
+          recipient === current.username)) return 'BAD_RECIPIENT';
+        if (typeof authorizeRecipient === 'function') {
+          let grant = null;
+          try { grant = authorizeRecipient(current.username, recipient); } catch { /* deny */ }
+          if (grant !== true && (!object(grant) || grant.username !== recipient ||
+            !Number.isSafeInteger(grant.sessionVersion) || grant.sessionVersion < 0)) {
+            return 'BAD_RECIPIENT';
+          }
+        }
+        const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
+        return outstanding + room.members.size >= MAX_MEMBERS ? 'FULL' : null;
+      }
+      case 'revoke':
+        return current.role === 'host' && typeof message.inviteId === 'string' &&
+          /^[a-f0-9]{16}$/.test(message.inviteId) &&
+          [...room.invites.values()].some(i => i.id === message.inviteId && i.expires > now())
+          ? null : 'FORBIDDEN';
+      case 'kick':
+        return current.role === 'host' && target?.role === 'guest' ? null : 'FORBIDDEN';
+      case 'request-peer':
+        if (current.role !== 'host' || target?.role !== 'guest' ||
+          room.allowed.has(pair(current.id, target.id))) return 'FORBIDDEN';
+        return room.pending.size >= MAX_MEMBERS ? 'FULL' : null;
+      case 'consent': {
+        if (typeof message.requestId !== 'string' || message.requestId.length !== 16 ||
+          typeof message.accept !== 'boolean') return 'FORBIDDEN';
+        const pending = room.pending.get(message.requestId);
+        return pending && pending.to === current.id && room.members.has(pending.from)
+          ? null : 'FORBIDDEN';
+      }
+      case 'signal':
+        return target && room.allowed.has(pair(current.id, target.id)) &&
+          object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
+          JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256
+          ? null : 'FORBIDDEN';
+      default:
+        return 'FORBIDDEN';
+    }
+  }
   async function onMessage(ws, raw) {
     if (!sessionCurrent(ws)) return;
     if (raw.length > MAX_SIGNAL_BYTES) return ws.close(1009, 'too large');
@@ -251,6 +302,9 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
     const room = roomOf(ws);
     if (!validRoom(room)) return error(ws, 'ROOM_CLOSED');
+    if (!activePeer(room, current)) return;
+    const cheapError = cheapActionError(room, current, message);
+    if (cheapError) return error(ws, cheapError);
     if (!await recheckBoundRoom(room) || participants.get(ws) !== current ||
       !activePeer(room, current)) return;
     const target = typeof message.to === 'string' && room.members.get(message.to);
@@ -280,7 +334,10 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         recipient: authenticated ? recipient : null, recipientSessionVersion });
       send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
     } else if (message.type === 'revoke' && current.role === 'host' && typeof message.inviteId === 'string') {
-      for (const [k, i] of room.invites) if (i.id === message.inviteId) room.invites.delete(k);
+      const match = [...room.invites].find(([, invite]) =>
+        invite.id === message.inviteId && invite.expires > now());
+      if (!match) return error(ws, 'FORBIDDEN');
+      room.invites.delete(match[0]);
       send(ws, { type: 'revoked', inviteId: message.inviteId });
     } else if (message.type === 'kick' && current.role === 'host' && target && target.role === 'guest') {
       error(target.ws, 'REVOKED');
