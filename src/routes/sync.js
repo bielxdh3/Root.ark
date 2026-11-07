@@ -114,6 +114,14 @@ function ensureOwnMap(record, key) {
   return value;
 }
 
+const INVENTORY_MAX_PAGE_ITEMS = 64;
+const INVENTORY_MAX_RESPONSE_BYTES = 128 * 1024;
+const INVENTORY_MAX_CURSOR_CHARS = 1024;
+const INVENTORY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const INVENTORY_CACHE_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
+const INVENTORY_CACHE_MAX_TENANTS = 2;
+const INVENTORY_OVERFLOW_MARKERS_MAX_TENANTS = 32;
+
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
   const directory = path.dirname(filePath);
   if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
@@ -177,6 +185,59 @@ function publicRecord(record) {
     aad: record.aad ?? null,
     ...(record.authorization ? { authorization: record.authorization } : {}),
   };
+}
+
+// Inventory is advisory metadata. It must never be passed to a signed
+// operation admission path: callers fetch the full envelope by objectId
+// before verifying, decrypting, materializing, or changing local state.
+function inventoryRecord(record) {
+  return {
+    protocolVersion: record.protocolVersion,
+    operationId: record.operationId,
+    objectId: record.objectId,
+    fileId: record.fileId,
+    versionId: record.versionId,
+    operation: record.operation,
+    revision: record.revision,
+    baseRevision: record.baseRevision,
+    keyEpoch: record.keyEpoch,
+    compartmentId: record.compartmentId,
+    deviceId: record.deviceId,
+    metadata: record.metadata,
+    tombstone: Boolean(record.tombstone),
+  };
+}
+
+function inventoryInputError() {
+  return Object.assign(new Error("Invalid inventory cursor or limit"), { code: "SYNC_INVENTORY_INPUT" });
+}
+
+function inventoryIndexTooLarge() {
+  return Object.assign(new Error("Metadata inventory exceeds the bounded server index"),
+    { code: "SYNC_INVENTORY_INDEX_TOO_LARGE" });
+}
+
+function parseInventoryCursor(value) {
+  if (typeof value !== "string" || !value || value.length > INVENTORY_MAX_CURSOR_CHARS
+    || !/^[A-Za-z0-9_-]+$/.test(value)) throw inventoryInputError();
+  let cursor;
+  try {
+    const binary = Buffer.from(value, "base64url");
+    if (binary.toString("base64url") !== value) throw inventoryInputError();
+    cursor = JSON.parse(binary.toString("utf8"));
+  } catch { throw inventoryInputError(); }
+  if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)
+    || Object.keys(cursor).sort().join(",") !== "after,snapshot,version"
+    || cursor.version !== 1 || typeof cursor.after !== "string"
+    || !cursor.after || cursor.after.length > 160
+    || typeof cursor.snapshot !== "string" || !/^[a-f0-9]{64}$/.test(cursor.snapshot)) {
+    throw inventoryInputError();
+  }
+  return cursor;
+}
+
+function inventoryCursor(snapshot, after) {
+  return Buffer.from(JSON.stringify({ version: 1, snapshot, after }), "utf8").toString("base64url");
 }
 
 const DEFAULT_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -290,6 +351,14 @@ class SyncObjectStore {
     this.burstGuard = burstGuard;
     this.retentionMs = retentionMs;
     this.now = now;
+    // At most two positive metadata indexes (64 MiB of serialized entries
+    // combined), never ciphertext; each read rechecks the durable file stamp.
+    this.inventoryCache = new Map();
+    this.inventoryCacheBytes = 0;
+    this.inventoryCacheMaxBytes = INVENTORY_CACHE_MAX_BYTES;
+    // Tiny per-tenant negative LRU is independent of the positive indexes.
+    // Browsing tenant B must not force a large unchanged tenant A to re-parse.
+    this.inventoryOverflowMarkers = new Map();
   }
 
   // Exclusive-create on the SAME local filesystem fences independent Node
@@ -851,6 +920,133 @@ class SyncObjectStore {
     return Object.values(objects).map(publicRecord);
   }
 
+  inventoryFileStamp() {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
+    if (this.atomicDeviceRegistry) assertAtomicRegistryStoragePermissions(this.filePath);
+    if (fsSync.existsSync(`${this.filePath}.writer-lock`)) {
+      throw Object.assign(new Error("Sync inventory writer is active"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
+    // Writers publish by atomic rename. These BigInt attributes distinguish
+    // the new durable file even across independent Node processes; don't
+    // rely on a process-local generation counter or a TTL for correctness.
+    const stat = fsSync.statSync(this.filePath, { bigint: true });
+    if (!stat.isFile()) throw new Error("Invalid sync inventory file");
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  }
+
+  inventoryIndex(username) {
+    const before = this.inventoryFileStamp();
+    for (const [tenant, entry] of this.inventoryCache) {
+      if (entry.stamp !== before || entry.maxBytes !== this.inventoryCacheMaxBytes) {
+        this.inventoryCache.delete(tenant);
+        this.inventoryCacheBytes -= entry.metadataBytes;
+      }
+    }
+    const cached = this.inventoryCache.get(username);
+    if (cached) {
+      // Refresh LRU position without re-attesting the same durable generation.
+      this.inventoryCache.delete(username);
+      this.inventoryCache.set(username, cached);
+      return cached;
+    }
+    const rejected = this.inventoryOverflowMarkers.get(username);
+    if (rejected && rejected.stamp === before && rejected.maxBytes === this.inventoryCacheMaxBytes) {
+      // Refresh the bounded LRU position; no disk read or hash on retries.
+      this.inventoryOverflowMarkers.delete(username);
+      this.inventoryOverflowMarkers.set(username, rejected);
+      throw inventoryIndexTooLarge();
+    }
+    if (rejected) this.inventoryOverflowMarkers.delete(username);
+
+    const snapshot = this.readSnapshot();
+    const after = this.inventoryFileStamp();
+    if (before !== after) {
+      throw Object.assign(new Error("Sync inventory changed while reading"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
+    const user = ownRecord(snapshot.users, username) || { objects: {} };
+    const objects = ownRecord(user, "objects") || {};
+    const ids = Object.keys(objects).sort();
+    const entries = [];
+    const byId = new Map();
+    const hash = crypto.createHash("sha256").update(JSON.stringify(username), "utf8");
+    let metadataBytes = 0;
+    for (const objectId of ids) {
+      const record = ownRecord(objects, objectId);
+      hash.update(JSON.stringify([objectId, record.operationId, record.versionId,
+        record.revision, record.metadata]), "utf8");
+      const entry = inventoryRecord(record);
+      metadataBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+      if (metadataBytes > this.inventoryCacheMaxBytes) {
+        // Never silently rebuild a too-large index on every page. Retain
+        // only a tiny failure marker for this tenant/durable generation.
+        if (this.inventoryFileStamp() !== after) {
+          throw Object.assign(new Error("Sync inventory changed while indexing"), { code: "SYNC_STORE_LOCK_BUSY" });
+        }
+        this.inventoryOverflowMarkers.set(username, {
+          stamp: after, maxBytes: this.inventoryCacheMaxBytes,
+        });
+        if (this.inventoryOverflowMarkers.size > INVENTORY_OVERFLOW_MARKERS_MAX_TENANTS) {
+          this.inventoryOverflowMarkers.delete(this.inventoryOverflowMarkers.keys().next().value);
+        }
+        throw inventoryIndexTooLarge();
+      }
+      entries.push(entry);
+      byId.set(objectId, entries.length - 1);
+    }
+    const result = { username, stamp: after, entries, byId, fingerprint: hash.digest("hex"),
+      metadataBytes, maxBytes: this.inventoryCacheMaxBytes };
+    while (this.inventoryCache.size >= INVENTORY_CACHE_MAX_TENANTS
+      || this.inventoryCacheBytes + metadataBytes > INVENTORY_CACHE_TOTAL_MAX_BYTES) {
+      const oldest = this.inventoryCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.inventoryCacheBytes -= this.inventoryCache.get(oldest).metadataBytes;
+      this.inventoryCache.delete(oldest);
+    }
+    this.inventoryCache.set(username, result);
+    this.inventoryCacheBytes += metadataBytes;
+    return result;
+  }
+
+  listInventory(username, { limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > INVENTORY_MAX_PAGE_ITEMS) throw inventoryInputError();
+    const index = this.inventoryIndex(username);
+    let start = 0;
+    if (cursor !== null) {
+      const parsed = parseInventoryCursor(cursor);
+      if (parsed.snapshot !== index.fingerprint) {
+        throw Object.assign(new Error("Sync inventory changed"), { code: "SYNC_INVENTORY_CHANGED" });
+      }
+      const after = index.byId.get(parsed.after);
+      if (after === undefined) throw inventoryInputError();
+      start = after + 1;
+    }
+    const entries = [];
+    // Reserve space for response metadata and the next cursor as well as the
+    // records. This caps HTTP response size independently of library size.
+    let bytes = 1024;
+    while (entries.length < limit && start + entries.length < index.entries.length) {
+      const record = index.entries[start + entries.length];
+      const entryBytes = Buffer.byteLength(JSON.stringify(record), "utf8") + 1;
+      if (bytes + entryBytes > INVENTORY_MAX_RESPONSE_BYTES) break;
+      entries.push(record);
+      bytes += entryBytes;
+    }
+    if (!entries.length && start < index.entries.length) {
+      throw Object.assign(new Error("Sync inventory entry exceeds page limit"), { code: "SYNC_INVENTORY_OVERSIZED" });
+    }
+    const nextIndex = start + entries.length;
+    // Cross-process writes may replace the store while we build a page; do
+    // not ship a page from an uncommitted/replaced source or an orphaned lock.
+    if (this.inventoryFileStamp() !== index.stamp) {
+      throw Object.assign(new Error("Sync inventory changed while paging"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
+    return {
+      protocolVersion: PROTOCOL_VERSION, view: "metadata", objects: entries,
+      nextCursor: nextIndex < index.entries.length
+        ? inventoryCursor(index.fingerprint, index.entries[nextIndex - 1].objectId) : null,
+    };
+  }
+
   history(username, objectId) {
     const user = ownRecord(this.readSnapshot().users, username) || { versions: {} };
     const versions = ownRecord(user, "versions") || {};
@@ -1101,10 +1297,31 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     try {
       lease?.assertActive();
+      if (req.query.view !== undefined || req.query.limit !== undefined || req.query.cursor !== undefined) {
+        if (req.query.view !== "metadata" || req.query.objectId !== undefined
+          || Object.keys(req.query).some((key) => !["view", "limit", "cursor"].includes(key))
+          || (req.query.limit !== undefined && (typeof req.query.limit !== "string"
+            || !/^[1-9][0-9]*$/.test(req.query.limit)))) {
+          return errorResponse(res, 400, "Invalid sync inventory request");
+        }
+        const limit = req.query.limit === undefined ? INVENTORY_MAX_PAGE_ITEMS : Number(req.query.limit);
+        const inventory = store.listInventory(req.user.username, {
+          limit, cursor: req.query.cursor === undefined ? null : req.query.cursor,
+        });
+        lease?.assertActive();
+        return res.json(inventory);
+      }
       const objects = store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null);
       lease?.assertActive();
       res.json({ protocolVersion: PROTOCOL_VERSION, objects });
-    } catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
+    } catch (error) {
+      if (error?.code === "SYNC_INVENTORY_INPUT") return errorResponse(res, 400, "Invalid sync inventory request");
+      if (error?.code === "SYNC_INVENTORY_CHANGED") return errorResponse(res, 409, "Sync inventory changed; restart pagination");
+      if (error?.code === "SYNC_INVENTORY_INDEX_TOO_LARGE") {
+        return errorResponse(res, 507, "metadata_index_too_large", { code: "metadata_index_too_large" });
+      }
+      return errorResponse(res, 503, "Sync inventory unavailable");
+    }
   }));
   app.get("/sync/v1/objects/:objectId", authenticate, requirePermission("listFiles"), fenceLegacySync("read", async (req, res, lease) => {
     await ready;
