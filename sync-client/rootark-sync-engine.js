@@ -14,7 +14,7 @@ const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
-const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
+const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-", ".rootark-recovery-execution-"];
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
@@ -367,6 +367,88 @@ async function durableJson(filePath, value) {
   }
 }
 
+async function createDurableRestoreProgress(filePath, value) {
+  // Never publish an incomplete final manifest. Hard-linking a completely
+  // fsynced private temporary inode is atomic and NO-REPLACE on both NTFS and
+  // POSIX, including when another invocation already owns the destination.
+  // A failure before link leaves only an ignored temporary, never a final
+  // empty/partial manifest that would brick an otherwise untouched plan.
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const handle = await fsp.open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`);
+    await handle.sync();
+  } finally { await handle.close(); }
+  await containedAbsolute(path.dirname(filePath), temporary, false);
+  await fsp.link(temporary, filePath);
+  // Minimize the nlink=2 crash window. A torn process can still leave both
+  // aliases, so readDurableRestoreProgress validates and repairs that exact
+  // known temporary identity under the exclusive root lock.
+  await fsp.unlink(temporary);
+  if (process.platform !== "win32") {
+    const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
+    try { await directory.sync(); } finally { await directory.close(); }
+  }
+}
+
+async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expectedScope }) {
+  let handle;
+  try {
+    const before = await fsp.lstat(filePath, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()
+      || (before.nlink !== 1n && before.nlink !== 2n)
+      || before.size > 65536n) throw Error();
+    handle = await fsp.open(filePath, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.nlink !== before.nlink || !sameFileVersion(before, opened)) throw Error();
+    const contents = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const pathname = await fsp.lstat(filePath, { bigint: true });
+    if (!sameFileVersion(opened, after) || !sameFileVersion(after, pathname)) throw Error();
+    const parsed = JSON.parse(contents.toString("utf8"));
+    if (parsed?.version !== 1 || parsed.planDigest !== expectedPlanDigest
+      || protocol.canonicalJson(parsed.scope) !== protocol.canonicalJson(expectedScope)
+      || !Array.isArray(parsed.items)) throw Error();
+    if (before.nlink === 2n) {
+      // Recover only our own *complete*, pre-fsynced, dual-linked manifest.
+      // Never unlink a foreign hardlink or accept nlink>2. Other unrelated
+      // abandoned temporaries (e.g. older ENOSPC) remain untouched.
+      const basename = path.basename(filePath);
+      if (!/^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(basename)) throw Error();
+      const prefix = `${basename}.tmp-`;
+      const candidates = (await fsp.readdir(path.dirname(filePath)))
+        .filter((name) => name.startsWith(prefix)
+          && /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(name.slice(prefix.length)));
+      const matching = [];
+      for (const name of candidates) {
+        const target = path.join(path.dirname(filePath), name);
+        const stats = await fsp.lstat(target, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink()) continue;
+        if (sameFileIdentity(stats, before)) {
+          if (!sameFileVersion(stats, before)) throw Error();
+          matching.push(target);
+        }
+      }
+      if (matching.length !== 1) throw Error();
+      await containedAbsolute(path.dirname(filePath), matching[0], false);
+      await fsp.unlink(matching[0]);
+      if (process.platform !== "win32") {
+        const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+      const restored = await fsp.lstat(filePath, { bigint: true });
+      if (!restored.isFile() || restored.isSymbolicLink() || restored.nlink !== 1n
+        || !sameFileIdentity(restored, before)
+        || restored.size !== before.size || restored.mtimeNs !== before.mtimeNs
+        || restored.birthtimeNs !== before.birthtimeNs || restored.mode !== before.mode) throw Error();
+    }
+    return parsed;
+  } catch {
+    fail("Controlled restore progress is missing or untrusted", "restore_plan_unavailable");
+  } finally { if (handle) await handle.close(); }
+}
+
 function normalizeWebDavPath(value) {
   let decoded;
   try { decoded = decodeURIComponent(String(value || "")); } catch { fail("Invalid WebDAV path", "unsafe_path"); }
@@ -406,6 +488,36 @@ function pinnedKey(objectId) {
 function sameSnapshotRevision(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs);
+}
+
+function normalizeHistoricalRestorePlan(requests) {
+  if (!Array.isArray(requests) || requests.length < 1 || requests.length > 32) {
+    fail("Historical restore plan must contain 1 to 32 objects", "invalid_restore_plan");
+  }
+  const seen = new Set();
+  const entries = [];
+  for (const request of requests) {
+    let fields;
+    try {
+      if (!request || typeof request !== "object" || Array.isArray(request)) throw Error();
+      fields = Object.getOwnPropertyDescriptors(request);
+      const names = Reflect.ownKeys(fields);
+      if (names.length !== 2 || names.some((name) => !["objectId", "versionId"].includes(name))
+        || !Object.hasOwn(fields.objectId, "value") || !Object.hasOwn(fields.versionId, "value")) {
+        throw Error();
+      }
+    } catch { fail("Invalid historical restore plan entry", "invalid_restore_plan"); }
+    const objectId = fields.objectId.value;
+    const versionId = fields.versionId.value;
+    if (typeof objectId !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(objectId)
+      || typeof versionId !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(versionId)
+      || seen.has(objectId)) {
+      fail("Invalid or duplicate historical restore identifier", "invalid_restore_plan");
+    }
+    seen.add(objectId);
+    entries.push(Object.freeze({ objectId, versionId }));
+  }
+  return Object.freeze(entries);
 }
 
 function activeIdentityPath(files, operation, exceptPath) {
@@ -504,6 +616,9 @@ class SyncEngine {
     }
     this.verifyIncoming = options.verifyIncoming || null;
     this.reverifySeenIncoming = options.reverifySeenIncoming === true;
+    // Only a trusted embedding process may activate independent historical
+    // custody. A mutable config, remote history or local journal is not proof.
+    this.requireIndependentHistoricalAdmission = options.requireIndependentHistoricalAdmission === true;
     this.authorizationFactory = options.authorizationFactory || null;
     this.requireAuthorization = options.requireAuthorization === true;
     this.translateWebDavOperation = options.translateWebDavOperation || null;
@@ -523,7 +638,7 @@ class SyncEngine {
     this.opened = false;
   }
 
-  withMutationLock(work) {
+  withMutationLock(work, { requireExistingState = false } = {}) {
     const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
     if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
       fail("Sync mutations cannot re-enter a root operation", "sync_root_busy");
@@ -533,11 +648,11 @@ class SyncEngine {
     const queueGate = new Promise((resolve) => { releaseQueue = resolve; });
     ROOT_MUTATION_QUEUES.set(queueKey, queueGate);
     const run = async () => {
-      await fsp.mkdir(this.rootDir, { recursive: true });
+      if (!requireExistingState) await fsp.mkdir(this.rootDir, { recursive: true });
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
       try {
-        await this._open();
+        await this._open({ readOnly: requireExistingState });
         return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
       } finally {
         // The same exclusive mkdir marker is understood by fresh processes.
@@ -553,8 +668,61 @@ class SyncEngine {
     });
   }
 
-  async open() {
-    return this.withMutationLock(async () => this);
+  withReadOnlyRoot(work, { allowUnopened = false } = {}) {
+    // Join the same in-process writer queue without creating the on-disk
+    // exclusive writer marker. Preview is advisory; restore always rechecks.
+    const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
+    if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
+      fail("Sync root operation cannot be re-entered", "sync_root_busy");
+    }
+    const previous = ROOT_MUTATION_QUEUES.get(queueKey) || Promise.resolve();
+    let releaseQueue;
+    const queueGate = new Promise((resolve) => { releaseQueue = resolve; });
+    ROOT_MUTATION_QUEUES.set(queueKey, queueGate);
+    const checkDiskState = async () => {
+      try {
+        await fsp.lstat(path.join(this.rootDir, ".rootark-sync.lock"));
+        fail("Another sync writer may own this root", "sync_root_busy");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const stamps = [];
+      for (const filePath of [this.snapshotPath, this.journal.filePath]) {
+        let stats;
+        try { stats = await fsp.lstat(filePath, { bigint: true }); }
+        catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          fail("Required read-only preview state is missing", "history_preview_unavailable");
+        }
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          fail("Read-only preview state is not a regular file", "history_preview_unavailable");
+        }
+        stamps.push(stats);
+      }
+      return stamps;
+    };
+    const run = async () => {
+      if (!this.opened && !allowUnopened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+      const before = await checkDiskState();
+      await this._open({ readOnly: true });
+      const result = await ROOT_MUTATION_CONTEXT.run(queueKey, work);
+      const after = await checkDiskState();
+      if (before.some((stamp, index) => !sameSnapshotRevision(stamp, after[index]))) {
+        fail("Sync state changed during read-only historical preview", "history_preview_stale");
+      }
+      return result;
+    };
+    const operation = previous.then(run, run);
+    return operation.finally(() => {
+      releaseQueue();
+      if (ROOT_MUTATION_QUEUES.get(queueKey) === queueGate) ROOT_MUTATION_QUEUES.delete(queueKey);
+    });
+  }
+
+  async open({ readOnly = false } = {}) {
+    return readOnly
+      ? this.withReadOnlyRoot(() => this, { allowUnopened: true })
+      : this.withMutationLock(async () => this);
   }
 
   async acquireProcessLock() {
@@ -584,15 +752,15 @@ class SyncEngine {
     }
   }
 
-  async _open() {
-    await fsp.mkdir(this.rootDir, { recursive: true });
+  async _open({ readOnly = false } = {}) {
+    if (!readOnly) await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
-    this.journal = await this.journal.open();
+    this.journal = await this.journal.open({ requireExisting: readOnly });
     let snapshotStats;
     try {
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     } catch (error) {
-      if (error.code !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
+      if (error.code !== "ENOENT" || this.opened || readOnly) fail("Sync snapshot is unavailable", "invalid_snapshot");
       await durableJson(this.snapshotPath, this.snapshot);
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     }
@@ -671,6 +839,578 @@ class SyncEngine {
     const key = await this.fileKeyResolver(operation);
     if (!key) fail("No authorized file key is available", "key_unavailable");
     return key;
+  }
+
+  // Restore by creating a NEW signed CAS update. A historical envelope is
+  // untrusted until the existing incoming authority and AEAD checks accept it.
+  async restoreHistoricalVersion(objectId, versionId) {
+    return this.withMutationLock(() => this._restoreHistoricalVersion(objectId, versionId));
+  }
+
+  // An advisory, read-only preflight. It does NOT reserve the current head or
+  // grant permission for a later restore; restore rechecks every condition.
+  async previewHistoricalRestore(objectId, versionId) {
+    // Opening a new engine would create a journal/snapshot. Require an
+    // initialized root so preview itself never creates durable state.
+    if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+    return this.withReadOnlyRoot(() => this._previewHistoricalRestore(objectId, versionId));
+  }
+
+  // One advisory answer for a bounded selection. No signed operation, journal
+  // entry or local file is written; a later restore still runs per-object CAS.
+  async previewHistoricalRestorePlan(requests) {
+    const selected = normalizeHistoricalRestorePlan(requests);
+    if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+    return this.withReadOnlyRoot(() => this._previewHistoricalRestorePlan(selected));
+  }
+
+  async _previewHistoricalRestorePlan(selected) {
+      const entries = [];
+      const destinations = [];
+      const rechecks = [];
+      for (const { objectId, versionId } of selected) {
+        const preview = await this._previewHistoricalRestore(objectId, versionId,
+          { rechecks, includeDigests: true });
+        // Protect mixed Windows/POSIX restore targets, including case aliases
+        // and file-vs-descendant collisions, before presenting a ready plan.
+        const destination = preview.path.normalize("NFC").toLowerCase();
+        if (destinations.some((prior) => prior === destination
+          || prior.startsWith(`${destination}/`) || destination.startsWith(`${prior}/`))) {
+          fail("Historical restore plan targets conflicting local paths", "restore_plan_conflict");
+        }
+        destinations.push(destination);
+        entries.push(preview);
+      }
+      // The first destination and HEAD can change while a later history is
+      // fetched. Recheck all observed state after the last item; still advisory.
+      for (const recheck of rechecks) await recheck();
+      return {
+        readOnly: true, ready: true, atomic: false,
+        objectCount: entries.length,
+        localOverwriteCount: entries.filter((entry) => entry.localAction === "replace-clean-tracked").length,
+        requiresFreshRestoreCheck: true, entries,
+      };
+  }
+
+  async _assertRestorablePlanMember(requested) {
+    const actual = await this._previewHistoricalRestore(requested.objectId,
+      requested.sourceVersionId, { includeDigests: true });
+    if (protocol.canonicalJson(actual) !== protocol.canonicalJson(requested)) {
+      fail("Historical restore plan changed before execution", "restore_plan_stale");
+    }
+    return actual;
+  }
+
+  // Explicit execution of a previously reviewed advisory plan. Every first
+  // run re-previews ALL entries before writing any state; every subsequent
+  // mutation re-previews the selected entry and runs the normal signed CAS
+  // restore. The progress file is only a stop/retry journal, never authority.
+  async restoreHistoricalPlan(expectedPlan,
+    { confirm = false, confirmCleanOverwrite = false, resume = false } = {}) {
+    if (confirm !== true || typeof resume !== "boolean") {
+      fail("Controlled historical restore requires explicit confirmation", "restore_plan_confirmation_required");
+    }
+    let detached;
+    try {
+      const serialized = protocol.canonicalJson(expectedPlan);
+      if (Buffer.byteLength(serialized) > 32768) throw Error();
+      detached = JSON.parse(serialized);
+    } catch { fail("Invalid controlled restore plan", "invalid_restore_plan"); }
+    if (detached?.readOnly !== true || detached.ready !== true
+      || detached.atomic !== false || !Array.isArray(detached.entries)
+      || detached.objectCount !== detached.entries.length
+      || detached.requiresFreshRestoreCheck !== true) {
+      fail("Valid signed historical preview plan is required", "invalid_restore_plan");
+    }
+    const requests = normalizeHistoricalRestorePlan(detached.entries.map((item) =>
+      ({ objectId: item?.objectId, versionId: item?.sourceVersionId })));
+    if (detached.entries.some((item) => item.localAction === "replace-clean-tracked")
+      && confirmCleanOverwrite !== true) {
+      fail("Controlled restore requires separate confirmation to replace clean files",
+        "restore_plan_overwrite_confirmation_required");
+    }
+    if (!this.opened) fail("Historical restore requires initialized sync root", "history_preview_unavailable");
+    const scope = { rootDir: this.rootDir, deviceId: this.deviceId,
+      keyEpoch: this.keyEpoch, compartmentId: this.compartmentId };
+    const planDigest = crypto.createHash("sha256")
+      .update(protocol.canonicalJson({ scope, plan: detached })).digest("hex");
+    const filePath = path.join(this.rootDir, `.rootark-recovery-execution-${planDigest}.json`);
+    return this.withMutationLock(async () => {
+      let lastPersisted = null;
+      const persist = async (state) => {
+        await containedAbsolute(this.rootDir, filePath, true);
+        const onDisk = await readDurableRestoreProgress(filePath,
+          { expectedPlanDigest: planDigest, expectedScope: scope });
+        if (lastPersisted === null
+          || protocol.canonicalJson(onDisk) !== lastPersisted) {
+          fail("Controlled restore progress changed during execution", "restore_plan_unavailable");
+        }
+        await durableJson(filePath, state);
+        lastPersisted = protocol.canonicalJson(state);
+      };
+      let state;
+      if (resume) {
+        state = await readDurableRestoreProgress(filePath,
+          { expectedPlanDigest: planDigest, expectedScope: scope });
+        if (state?.version !== 1 || state.planDigest !== planDigest
+          || protocol.canonicalJson(state.scope) !== protocol.canonicalJson(scope)
+          || !Array.isArray(state.items) || state.items.length !== requests.length
+          || state.items.some((item, index) => item?.objectId !== requests[index].objectId
+            || item?.sourceVersionId !== requests[index].versionId
+            || !["pending", "blocked", "committed", "indeterminate"].includes(item?.status))) {
+          fail("Controlled restore progress does not match this trusted selection", "restore_plan_unavailable");
+        }
+        lastPersisted = protocol.canonicalJson(state);
+        // Only independently verified ALREADY-COMMITTED exact signed heads
+        // may resolve an uncertain ACK. Never re-send a pending operation or
+        // manufacture a new signature from an interrupted progress record.
+        for (const item of state.items.filter((record) => record.status === "indeterminate")) {
+          const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+          try {
+            const pending = await this.journal.recover();
+            if (pending.length > 1 || (pending.length === 1
+              && (pending[0].operationId !== item.operationId
+                || signedEnvelopeDigest(pending[0]) !== item.envelopeDigest))) {
+              fail("Unrelated pending signed operation blocks reconciliation", "restore_plan_indeterminate");
+            }
+            await this._verifyCommittedRestorePlanItem(item, requested);
+            if (pending.length === 1) await this.journal.markSeen(item.operationId);
+            item.status = "committed";
+            delete item.code;
+            await persist(state);
+          } catch {
+            fail("Controlled restore has an unproven signed operation", "restore_plan_indeterminate");
+          }
+        }
+        for (const item of state.items.filter((record) => record.status === "committed")) {
+          const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+          await this._verifyCommittedRestorePlanItem(item, requested);
+        }
+        // An intent whose enqueue was proven never to begin (or whose exact
+        // never-dispatched outbox entry was durably discarded) may be retried.
+        // Require fresh signed remote absence plus an empty authoritative
+        // journal; a bare editable 'blocked' field grants no retry authority.
+        for (const item of state.items.filter((record) => record.status !== "committed")) {
+          if (item.operationId || item.envelopeDigest || item.versionId) {
+            const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+            await this._assertNeverDispatchedRestoreIntent(item, requested);
+          }
+        }
+      } else {
+        let current;
+        try { current = await fsp.lstat(filePath); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (current) fail("Controlled restore plan already has durable progress", "restore_plan_exists");
+        const actual = await this._previewHistoricalRestorePlan(requests);
+        if (protocol.canonicalJson(actual) !== protocol.canonicalJson(detached)) {
+          fail("Historical restore plan changed before execution", "restore_plan_stale");
+        }
+        state = { version: 1, planDigest, scope,
+          items: requests.map(({ objectId, versionId }) => ({
+            objectId, sourceVersionId: versionId, status: "pending",
+          })) };
+        await containedAbsolute(this.rootDir, filePath, true);
+        await createDurableRestoreProgress(filePath, state);
+      }
+      lastPersisted = protocol.canonicalJson(state);
+      const response = () => {
+        const items = state.items.map((item, index) => ({
+          ...item, path: detached.entries[index].path,
+          localAction: detached.entries[index].localAction,
+        }));
+        const completed = items.filter((item) => item.status === "committed").length;
+        return { atomic: false, completed, remaining: items.length - completed,
+          partial: completed !== items.length,
+          localOverwriteCount: detached.localOverwriteCount,
+          planDigest, items };
+      };
+      const safeErrorCode = (error) => typeof error?.code === "string"
+        && /^[a-z0-9_]{1,64}$/.test(error.code)
+        ? error.code : "restore_preflight_failed";
+      const remaining = state.items.filter((item) => item.status !== "committed");
+      // A fully validated selection can go stale while previous items commit.
+      // On resume, check ALL remaining entries before starting a new write;
+      // committed entries were independently re-verified above.
+      for (const item of remaining) {
+        try {
+          const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+          await this._assertRestorablePlanMember(requested);
+        } catch (error) {
+          if (resume && state.items.some((item) => item.status === "committed")) {
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+            await persist(state);
+            return response();
+          }
+          throw error;
+        }
+      }
+      for (const item of remaining) {
+        const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+        let intentStored = false;
+        let provenNeverDispatched = false;
+        try {
+          await this._assertRestorablePlanMember(requested);
+          // An unrelated writer's pending outbox cannot be safely pushed by
+          // this execution. The standard restore itself requires an empty one.
+          if ((await this.journal.recover()).length !== 0) {
+            fail("Controlled restore requires settled signed outbox", "sync_operation_pending");
+          }
+          const result = await this._restoreHistoricalVersion(item.objectId, item.sourceVersionId,
+            { beforeEnqueue: async (intent) => {
+              item.status = "indeterminate";
+              delete item.neverDispatched;
+              Object.assign(item, intent);
+              await persist(state);
+              intentStored = true;
+            }, onProvenUnsent: async (error) => {
+              // Invoked only when the final authorization gate never called
+              // enqueue OR when discardUnsent fsynced the exact envelope.
+              // This callback itself must commit before retry becomes legal.
+              item.status = "blocked";
+              item.neverDispatched = true;
+              item.code = safeErrorCode(error);
+              await persist(state);
+              provenNeverDispatched = true;
+            } });
+          if (result?.pushed !== true || result.pending === true) {
+            await persist(state);
+            return response();
+          }
+          const committed = await this._verifyCommittedRestorePlanItem(item, requested);
+          item.status = "committed";
+          item.code = undefined;
+          item.operationId = committed.operationId;
+          item.versionId = committed.versionId;
+          item.envelopeDigest = signedEnvelopeDigest(committed);
+          await persist(state);
+        } catch (error) {
+          if (provenNeverDispatched) {
+            // Persisted signed never-dispatched proof is retained for a fresh
+            // journal + remote HEAD check on resume; no new PUT in this turn.
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+          } else if (!intentStored) {
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+          } else {
+            // The operation may already have committed remotely. Retain its
+            // signed identity and refuse automatic re-issuance after a crash.
+            item.status = "indeterminate";
+            item.code = "restore_plan_indeterminate";
+          }
+          await persist(state);
+          return response();
+        }
+      }
+      return response();
+    }, { requireExistingState: true });
+  }
+
+  async _assertNeverDispatchedRestoreIntent(item, requested) {
+    if (item.status !== "blocked" || item.neverDispatched !== true
+      || typeof item.operationId !== "string"
+      || !/^histrestore-[A-Za-z0-9-]{36}$/.test(item.operationId)
+      || typeof item.envelopeDigest !== "string"
+      || !/^[a-f0-9]{64}$/.test(item.envelopeDigest)) {
+      fail("Unproven historical restore retry", "restore_plan_indeterminate");
+    }
+    if ((await this.journal.recover()).length || this.journal.hasSeen(item.operationId)
+      || this.journal.hasDurableSignedReceipt(item.operationId)
+      || this.journal.hasLocalAdmission(item.operationId, item.envelopeDigest)) {
+      fail("Signed restore outbox or admission exists", "restore_plan_indeterminate");
+    }
+    const history = await this.adapter.history(item.objectId);
+    const versions = Array.isArray(history?.versions) ? history.versions : [];
+    if (!versions.length || versions.length > 256) {
+      fail("Untrusted historical retry history", "restore_plan_indeterminate");
+    }
+    const validated = versions.map((operation) => protocol.validateStoredOperation(operation));
+    if (validated.some((operation) => operation.operationId === item.operationId)
+      || signedEnvelopeDigest(validated[validated.length - 1]) !== requested.currentEnvelopeDigest) {
+      fail("Signed restore may already have been admitted", "restore_plan_indeterminate");
+    }
+    const head = await this.adapter.list(item.objectId);
+    const records = Array.isArray(head) ? head : Array.isArray(head?.objects)
+      ? head.objects : head ? [head] : [];
+    if (records.length !== 1
+      || signedEnvelopeDigest(protocol.validateStoredOperation(records[0]))
+        !== requested.currentEnvelopeDigest) {
+      fail("Signed restore HEAD is not unchanged", "restore_plan_indeterminate");
+    }
+    await this.verifyIncomingOperation(records[0], { preObserve: false });
+  }
+
+  async _verifyCommittedRestorePlanItem(item, requested) {
+    if (typeof item.operationId !== "string" || !/^histrestore-[A-Za-z0-9-]{36}$/.test(item.operationId)
+      || typeof item.envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(item.envelopeDigest)
+      || typeof item.versionId !== "string") {
+      fail("Controlled restore lacks signed outcome identity", "restore_plan_indeterminate");
+    }
+    const remote = await this.adapter.list(item.objectId);
+    const records = Array.isArray(remote) ? remote : Array.isArray(remote?.objects)
+      ? remote.objects : remote ? [remote] : [];
+    if (records.length !== 1) fail("Signed restore HEAD is unavailable", "restore_plan_indeterminate");
+    const current = protocol.validateStoredOperation(records[0]);
+    if (current.objectId !== item.objectId || current.operation !== "update"
+      || current.operationId !== item.operationId
+      || current.versionId !== item.versionId
+      || current.metadata.path !== requested.path
+      || protocol.compareRevisions(current.baseRevision, requested.baseRevision) !== 0
+      || signedEnvelopeDigest(current) !== item.envelopeDigest
+      || this.journal.durableSignedReceiptDigest(item.operationId) !== item.envelopeDigest) {
+      fail("Signed restore HEAD differs from durable progress", "restore_plan_indeterminate");
+    }
+    await this.verifyIncomingOperation(current, { preObserve: false });
+    await this.assertOutgoingAuthorized({ ...current, deviceId: this.deviceId });
+    const history = await this.adapter.history(item.objectId);
+    if (!Array.isArray(history?.versions)
+      || history.versions.length < 1 || history.versions.length > 256) {
+      fail("Bounded signed restore history unavailable", "restore_plan_indeterminate");
+    }
+    const versions = history.versions.map((entry) => protocol.validateStoredOperation(entry));
+    if (versions.some((entry) => entry.objectId !== current.objectId
+      || entry.fileId !== current.fileId || entry.compartmentId !== current.compartmentId)
+      || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
+      fail("Signed restore history identity or HEAD changed", "restore_plan_indeterminate");
+    }
+    for (const entry of versions) await this.verifyIncomingOperation(entry, { preObserve: false });
+    const source = versions.filter((entry) => entry.versionId === item.sourceVersionId);
+    if (source.length !== 1
+      || signedEnvelopeDigest(protocol.validateStoredOperation(source[0]))
+        !== requested.sourceEnvelopeDigest) {
+      fail("Original signed restore source is missing", "restore_plan_indeterminate");
+    }
+    const sourceKey = await this.keyFor(source[0]);
+    const sourceRaw = protocol.decryptPayload(source[0], sourceKey);
+    let sourceBytes = sourceRaw;
+    try {
+      if (source[0].operation === "move") {
+        sourceBytes = protocol.decodeMovePayload(sourceRaw, sourceKey);
+        if (sourceBytes === null) fail("Original signed MOVE is unavailable", "restore_plan_indeterminate");
+      }
+      const key = await this.keyFor(current);
+      const plain = protocol.decryptPayload(current, key);
+      try {
+        if (!crypto.createHash("sha256").update(plain).digest().equals(
+          crypto.createHash("sha256").update(sourceBytes).digest())) {
+          fail("Restored signed content differs from selected history", "restore_plan_indeterminate");
+        }
+        const relative = await canonicalRelativePath(this.rootDir, current.metadata.path);
+        const local = await readContainedFile(this.rootDir, relative);
+        try {
+          const snapshot = this.snapshot.files[relative];
+          if (!snapshot || snapshot.deleted || snapshot.objectId !== current.objectId
+            || snapshot.fileId !== current.fileId || snapshot.versionId !== current.versionId
+            || snapshot.hash !== crypto.createHash("sha256").update(plain).digest("hex")) {
+            fail("Signed restore snapshot is not durable", "restore_plan_indeterminate");
+          }
+          if (crypto.createHash("sha256").update(local).digest("hex")
+            !== crypto.createHash("sha256").update(plain).digest("hex")) {
+            fail("Signed restore local bytes differ from committed contents", "restore_plan_indeterminate");
+          }
+        } finally { local.fill(0); }
+      } finally { plain.fill(0); }
+    } finally {
+      if (sourceBytes && sourceBytes !== sourceRaw) sourceBytes.fill(0);
+      sourceRaw.fill(0);
+    }
+    return current;
+  }
+
+  async _previewHistoricalRestore(objectId, versionId,
+    { rechecks = null, includeDigests = false } = {}) {
+    if (!this.requireIndependentHistoricalAdmission || !this.requireAuthorization
+      || !this.reverifySeenIncoming || !this.requireCurrentOutgoingAuthorization
+      || typeof this.verifyIncoming !== "function"
+      || typeof this.currentDeviceAuthorization !== "function"
+      || typeof this.authorizationFactory !== "function") {
+      fail("Independent historical custody and current device grant are required",
+        "authorization_required");
+    }
+    const { historical, current, relative, existing, versions, assertCleanDestination } =
+      await this._inspectHistoricalRestore(objectId, versionId, { verifyRetained: true });
+    const proposed = { ...current, deviceId: this.deviceId, keyEpoch: this.keyEpoch };
+    // This validates the live grant but never signs/enqueues a new envelope.
+    await this.assertOutgoingAuthorized(proposed);
+    const key = await this.keyFor(historical);
+    const decrypted = protocol.decryptPayload(historical, key);
+    let bytes = decrypted;
+    try {
+      if (historical.operation === "move") {
+        bytes = protocol.decodeMovePayload(decrypted, key);
+        if (bytes === null) fail("Historical MOVE has no recoverable content", "history_version_unavailable");
+      }
+      // The current head must also have decryptable signed AEAD, including
+      // deleted heads. A signature over corrupted ciphertext is insufficient.
+      const headKey = await this.keyFor(current);
+      const headBytes = protocol.decryptPayload(current, headKey);
+      headBytes.fill(0);
+      await assertCleanDestination();
+      await this.assertOutgoingAuthorized(proposed);
+      if (rechecks) rechecks.push(async () => {
+        const head = await this.adapter.list(objectId);
+        const records = Array.isArray(head) ? head : Array.isArray(head?.objects)
+          ? head.objects : head ? [head] : [];
+        if (records.length !== 1
+          || signedEnvelopeDigest(protocol.validateStoredOperation(records[0]))
+            !== signedEnvelopeDigest(current)) {
+          fail("Historical restore plan HEAD changed during preview", "history_preview_stale");
+        }
+        await assertCleanDestination();
+        await this.assertOutgoingAuthorized(proposed);
+      });
+      return {
+        readOnly: true, ready: true, objectId, sourceVersionId: versionId,
+        currentVersionId: current.versionId, baseRevision: { ...current.revision },
+        path: relative, sizeBytes: bytes.length,
+        localAction: existing && !existing.deleted ? "replace-clean-tracked" : "create-from-deleted",
+        verifiedRetainedVersions: versions.length, requiresFreshRestoreCheck: true,
+        ...(includeDigests ? {
+          sourceEnvelopeDigest: signedEnvelopeDigest(historical),
+          currentEnvelopeDigest: signedEnvelopeDigest(current),
+        } : {}),
+      };
+    } finally {
+      if (bytes && bytes !== decrypted) bytes.fill(0);
+      decrypted.fill(0);
+    }
+  }
+
+  async _inspectHistoricalRestore(objectId, versionId, { verifyRetained = false } = {}) {
+    if (!this.opened) await this._open();
+    const validId = (value) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value);
+    if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
+    if (typeof this.adapter.history !== "function") fail("Sync history is unavailable", "history_unavailable");
+    if ((await this.journal.recover()).length) fail("Sync pending writes must be settled before restore", "sync_operation_pending");
+    const result = await this.adapter.history(objectId);
+    if (!Array.isArray(result?.versions) || result.versions.length < 1 || result.versions.length > 256) {
+      fail("Invalid historical version list", "invalid_history");
+    }
+    const versions = result.versions.map((record) => protocol.validateStoredOperation(record));
+    if (versions.some((record) => record.objectId !== objectId)) fail("History contains another object", "invalid_history");
+    const selected = versions.filter((record) => record.versionId === versionId);
+    if (selected.length !== 1 || selected[0].tombstone) fail("Restorable historical version not found", "history_version_unavailable");
+    const remote = await this.adapter.list(objectId);
+    const records = Array.isArray(remote) ? remote : Array.isArray(remote?.objects) ? remote.objects : remote ? [remote] : [];
+    if (records.length !== 1) fail("Current sync version unavailable", "history_version_unavailable");
+    const current = protocol.validateStoredOperation(records[0]);
+    const historical = selected[0];
+    if (current.objectId !== objectId || current.fileId !== historical.fileId
+      || current.compartmentId !== historical.compartmentId
+      || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
+      fail("Current signed version does not match history", "invalid_history");
+    }
+    if (verifyRetained) {
+      if (versions.some((record) => record.fileId !== historical.fileId
+        || record.compartmentId !== historical.compartmentId)) {
+        fail("Retained history mixes file or compartment identities", "invalid_history");
+      }
+      for (const record of versions) {
+        await this.verifyIncomingOperation(record, { preObserve: false });
+      }
+    } else {
+      await this.verifyIncomingOperation(historical, { preObserve: false });
+      await this.verifyIncomingOperation(current, { preObserve: false });
+    }
+    if (historical.metadata.contentType === "inode/directory"
+      || (!current.tombstone && current.metadata.contentType === "inode/directory")) {
+      fail("Directory restoration is not supported", "history_version_unavailable");
+    }
+    const relative = await canonicalRelativePath(this.rootDir, current.metadata.path);
+    if (!this.isSelected(relative)) fail("Historical restore path is excluded", "path_not_selected");
+    const existing = this.snapshot.files[relative];
+    if (existing && !existing.deleted && (existing.objectId !== objectId || existing.fileId !== current.fileId)) {
+      fail("Historical restore would overwrite a different local object", "restore_local_conflict");
+    }
+    const destination = await contained(this.rootDir, relative, true);
+    const assertCleanDestination = async () => {
+      const present = await exists(destination);
+      if (present && (!existing || existing.deleted)) {
+        fail("Historical restore would overwrite an untracked local file", "restore_local_conflict");
+      }
+      if (existing && !existing.deleted) {
+        // A tracked identity is not permission to overwrite unsent local edits
+        // (including local deletion). Require the exact last-synchronized bytes.
+        if (!present || existing.directory || !/^[a-f0-9]{64}$/.test(existing.hash || "")) {
+          fail("Historical restore requires a clean local file", "restore_local_conflict");
+        }
+        const actual = await readContainedFile(this.rootDir, relative);
+        if (crypto.createHash("sha256").update(actual).digest("hex") !== existing.hash) {
+          fail("Historical restore would overwrite unsent local edits", "restore_local_conflict");
+        }
+      }
+    };
+    await assertCleanDestination();
+    return { historical, current, relative, existing, versions, assertCleanDestination };
+  }
+
+  async _restoreHistoricalVersion(objectId, versionId,
+    { beforeEnqueue = null, onProvenUnsent = null } = {}) {
+    const { historical, current, relative, existing, assertCleanDestination } =
+      await this._inspectHistoricalRestore(objectId, versionId);
+    const key = await this.keyFor(historical);
+    const decrypted = protocol.decryptPayload(historical, key);
+    const plaintext = historical.operation === "move"
+      ? protocol.decodeMovePayload(decrypted, key) : decrypted;
+    if (plaintext === null) fail("Historical MOVE has no recoverable content", "history_version_unavailable");
+    let restored;
+    try {
+      const { sourcePath: _oldMoveSource, ...historicalMetadata } = historical.metadata;
+      restored = await this.buildOperation({ operation: "update", objectId, fileId: current.fileId,
+        operationId: `histrestore-${crypto.randomUUID()}`,
+        baseRevision: current.revision, revision: protocol.nextRevision(current.revision, this.deviceId),
+        metadata: { ...historicalMetadata, path: relative, name: path.basename(relative), size: plaintext.length },
+        plaintext, fileKey: await this.keyFor({ ...current, keyEpoch: this.keyEpoch }) });
+    } finally { plaintext.fill(0); }
+    // Signing may await an external key provider. Recheck after that boundary,
+    // before the signed outbox can cause a later remote write.
+    await assertCleanDestination();
+    // An execution coordinator persists an exact signed intent BEFORE the
+    // outbox fsync. A crash afterwards must never create a second signature.
+    if (beforeEnqueue) await beforeEnqueue({
+      operationId: restored.operationId, versionId: restored.versionId,
+      envelopeDigest: signedEnvelopeDigest(restored),
+    });
+    // The outbox is durable BEFORE local materialization. Failure to send is
+    // recoverable by the existing signed journal; no old operation is replayed.
+    let enqueueStarted = false;
+    try {
+      await this.assertOutgoingAuthorized(restored, () => {
+        enqueueStarted = true;
+        return this.journal.enqueue(restored);
+      });
+    } catch (error) {
+      // A final authorization denial BEFORE the callback is a proven
+      // never-enqueued envelope. If enqueue even started, its fsync outcome
+      // may be ambiguous: preserve the indeterminate recovery gate instead.
+      if (!enqueueStarted && onProvenUnsent) await onProvenUnsent(error);
+      throw error;
+    }
+    try {
+      await this._apply(restored, null, existing && !existing.deleted ? existing.hash : null);
+    } catch (error) {
+      if (error?.code === "restore_local_conflict") {
+        // discardUnsent guarantees this exact signed envelope has never been
+        // admitted or dispatched; report recoverable status only AFTER its
+        // durable removal. Any failure to discard stays indeterminate.
+        await this.journal.discardUnsent(restored);
+        if (onProvenUnsent) await onProvenUnsent(error);
+      }
+      throw error;
+    }
+    const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+    await this._pushPending(summary);
+    if (summary.offline) return { restored: true, pushed: false, pending: true,
+      objectId, sourceVersionId: versionId, versionId: restored.versionId };
+    const readback = await this.adapter.list(objectId);
+    const committed = Array.isArray(readback) ? readback[0]
+      : Array.isArray(readback?.objects) ? readback.objects[0] : readback;
+    if (!committed || signedEnvelopeDigest(protocol.validateStoredOperation(committed)) !== signedEnvelopeDigest(restored)) {
+      fail("Historical restore could not verify the committed revision", "restore_commit_unverified");
+    }
+    return { restored: true, pushed: true, objectId, sourceVersionId: versionId,
+      versionId: restored.versionId, operationId: restored.operationId };
   }
 
   async verifyIncomingOperation(operation, { preObserve = true } = {}) {
@@ -1630,6 +2370,23 @@ class SyncEngine {
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
+        if (operation.operationId.startsWith("histrestore-")) {
+          // The signed outbox can survive a crash between staging and local
+          // materialization. Never dispatch that restore without actual bytes.
+          const expected = await this.hashPendingPayload(operation);
+          let observed;
+          try {
+            const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+            const local = await readContainedFile(this.rootDir, relative);
+            try { observed = crypto.createHash("sha256").update(local).digest("hex"); }
+            finally { local.fill(0); }
+          } catch {
+            fail("Historical restore was not materialized locally", "restore_local_materialization_missing");
+          }
+          if (observed !== expected) {
+            fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
+            }
+          }
         if (this.filesOnDemand && operation.operation === "create") {
           // A metadata-only pull cannot establish that a new local path is free remotely.
           // Recheck EVERY pending CREATE immediately before push, including old outbox
@@ -1771,11 +2528,84 @@ class SyncEngine {
     return trashTarget;
   }
 
+  async stageHistoricalRestore(target, relative, expectedHash) {
+    const present = await exists(target);
+    if (expectedHash === null) {
+      if (present) fail("Historical restore would overwrite a new local file", "restore_local_conflict");
+      return null;
+    }
+    if (!present) fail("Historical restore would overwrite an unsent local deletion", "restore_local_conflict");
+    let before;
+    try {
+      before = await fsp.lstat(target, { bigint: true });
+      const current = await readContainedFile(this.rootDir, relative, before);
+      if (crypto.createHash("sha256").update(current).digest("hex") !== expectedHash) {
+        fail("Historical restore would overwrite unsent local edits", "restore_local_conflict");
+      }
+    } catch (error) {
+      if (error?.code === "restore_local_conflict") throw error;
+      fail("Historical restore target changed before replacement", "restore_local_conflict");
+    }
+    const staged = await this.stageExisting(target);
+    if (!staged) fail("Historical restore target disappeared", "restore_local_conflict");
+    let unchanged = false;
+    try {
+      const after = await fsp.lstat(staged, { bigint: true });
+      // Windows can change ctimeNs on a pathname rename even when no file
+      // content changed. Match the stable inode plus content/mtime/birthtime
+      // identity; comparing ctimeNs here would reject every legitimate restore.
+      unchanged = after.isFile() && !after.isSymbolicLink() && after.nlink === 1n
+        && sameFileIdentity(before, after) && before.size === after.size
+        && before.mtimeNs === after.mtimeNs && before.birthtimeNs === after.birthtimeNs
+        && before.mode === after.mode;
+      if (unchanged) {
+        // Inode/size/mtime alone are insufficient: a concurrent writer can
+        // overwrite bytes in place, then restore the original mtime before
+        // stageExisting renames the file. Validate the actual staged payload
+        // through a no-follow FD before unlinking or materializing anything.
+        await containedAbsolute(this.rootDir, staged, false);
+        const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_NONBLOCK || 0);
+        const handle = await fsp.open(staged, flags);
+        try {
+          const opened = await handle.stat({ bigint: true });
+          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n
+            || !sameFileIdentity(after, opened)) {
+            unchanged = false;
+          } else {
+            const bytes = await handle.readFile();
+            try {
+              const readEnd = await handle.stat({ bigint: true });
+              const pathEnd = await fsp.lstat(staged, { bigint: true });
+              unchanged = sameFileVersion(opened, readEnd)
+                && sameFileVersion(readEnd, pathEnd)
+                && crypto.createHash("sha256").update(bytes).digest("hex") === expectedHash;
+            } finally { bytes.fill(0); }
+          }
+        } finally { await handle.close(); }
+      }
+    } catch { /* Reject unexpected staging identity and preserve the old bytes. */ }
+    if (!unchanged) {
+      await this.replaceStagedIfVacant(staged, target);
+      fail("Historical restore target changed during replacement", "restore_local_conflict");
+    }
+    return staged;
+  }
+
+  async replaceStagedIfVacant(staged, target) {
+    try {
+      // A hard link claims an absent path atomically; unlike rename, it never
+      // replaces another writer's file. The staged bytes remain if it fails.
+      await fsp.link(staged, target);
+      await fsp.unlink(staged);
+    } catch { /* Retain the staged data for manual recovery when path is occupied. */ }
+  }
+
   async apply(operation, summary = null) {
     return this.withMutationLock(() => this._apply(operation, summary));
   }
 
-  async _apply(operation, summary = null, beforeHydrationWrite = null) {
+  async _apply(operation, summary = null, historicalRestoreHash = undefined, beforeHydrationWrite = null) {
     operation = envelopeCopy(operation);
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
@@ -1932,8 +2762,21 @@ class SyncEngine {
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
         await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
         try {
-          if (await exists(target)) await this.stageExisting(target);
-          await fsp.rename(temporary, target);
+          if (historicalRestoreHash !== undefined) {
+            const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
+            try {
+              // Atomic no-replace materialization; do not clobber files
+              // created by another process after the last restore preflight.
+              await fsp.link(temporary, target);
+            } catch (error) {
+              if (staged) await this.replaceStagedIfVacant(staged, target);
+              if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
+              throw error;
+            }
+          } else {
+            if (await exists(target)) await this.stageExisting(target);
+            await fsp.rename(temporary, target);
+          }
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
@@ -2469,7 +3312,7 @@ class SyncEngine {
       }
     };
     await checkBeforeWrite();
-    const verifiedFreshDigest = await this._apply(operation, null, checkBeforeWrite);
+    const verifiedFreshDigest = await this._apply(operation, null, undefined, checkBeforeWrite);
     await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
     return true;
   }
@@ -2674,4 +3517,5 @@ class SyncEngine {
   }
 }
 
-module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };
+module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths,
+  normalizeHistoricalRestorePlan };

@@ -1,0 +1,49 @@
+name: Issue 67 Historical Recovery Preview
+
+# A focused hosted regression for the read-only recovery preflight. This is
+# additional coverage; it never substitutes for canonical security gates.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue67-recovery-preview.yml'
+      - 'sync-client/rootark-sync-engine.js'
+      - 'sync-client/rootark-sync-paths.js'
+      - 'sync-client/rootark-sync-v2.js'
+      - 'sync-client/rootark-sync-authorization.js'
+      - 'sync-client/rootark-sync-protocol.js'
+      - 'test/issue-67-recovery-preview.test.js'
+      - 'test/issue-67-controlled-restore.test.js'
+      - 'test/issue-67-historical-restore.test.js'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue67-recovery-preview-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-preview:
+    name: Signed history preview and restore (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Verify signed historical restore, preview and controlled execution
+        run: node --test --test-reporter=tap test/issue-67-historical-restore.test.js test/issue-67-recovery-preview.test.js test/issue-67-controlled-restore.test.js
+      - name: Verify tests did not modify the checkout
+        shell: bash
+        run: git diff --exit-code && test -z "$(git status --porcelain)"
