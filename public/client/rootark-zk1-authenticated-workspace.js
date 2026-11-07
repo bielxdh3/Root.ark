@@ -855,6 +855,7 @@
       + '<fieldset><legend>Busca em conteúdo protegido (DEV, somente local)</legend>'
       + '<p class="muted">Busque texto em 1–64 versões cifradas presentes no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; a pesquisa não armazena conteúdo ou chave e só revela resultados ao concluir todas as verificações.</p>'
       + '<label>Texto a buscar (UTF-8 NFC, até 120 caracteres)<input type="search" data-zk1-field="catalog-batch-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-all-terms"> Todas as palavras (AND): 2–4 termos literais distintos, até 40 caracteres cada; espaços separam termos. Desmarcado: frase literal exata.</label>'
       + '<label>Manifesto de seleção do proprietário (.json, 1–64 entradas, até 64 KiB)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
       + '<label>SHA-256 do manifesto fixado fora do servidor (base64url, 32 bytes)<input data-zk1-field="catalog-batch-manifest-pin" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<label>CEKs locais das revisões selecionadas (até 64 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
@@ -1513,6 +1514,7 @@
             if (!window.RootarkZk1ProtectedTextBatch?.search) fail();
             const result = await window.RootarkZk1ProtectedTextBatch.search({
               query: field("catalog-batch-query")?.value,
+              matchMode: field("catalog-batch-all-terms")?.checked ? "all-terms" : "phrase",
               items: manifest.entries,
               grant: trust.signedDeviceGrant,
               ownerHead: { revision: trust.pinnedCurrentHead.revision,

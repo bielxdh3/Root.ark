@@ -89,6 +89,19 @@ not a persistent or aggregate full-text cache.
 A single revoked, tampered, malformed or wrong-key version aborts the **whole**
 batch without revealing even earlier matches. Progress reports the count
 of revisions verified (0/64, 8/64, etc.), never matches/names/terms.
+An optional **Todas as palavras (AND)** checkbox switches from the default
+contiguous literal phrase to a conjunction of **2–4 distinct literal tokens**,
+independent of order. The entire query remains at most 120 UTF-16 code units;
+each token is 1–40 UTF-16 code units. NFC normalization and locale lowercase
+apply before local matching; Unicode whitespace separates tokens (multiple
+spaces collapse), while C0/C1 controls, DEL and Unicode line separators are
+rejected. Repeated tokens after normalization/case-folding are rejected rather
+than silently collapsed; punctuation is literal, not a regex or search operator.
+Every token must appear somewhere in the **same** verified UTF-8 version;
+the excerpt anchors to the earliest occurrence of any required token, and
+matching does not trigger extra HTTP requests, keys, catalog reads or indexing.
+Invalid input fails before any signed GET. The unchecked default preserves
+the original single-phrase behavior, including embedded spaces.
 An explicit cancel button remains enabled during verification; cancellation
 stops subsequent windows and drops the result atomically, although an already
 in-flight signed GET may complete before the final cancellation check.

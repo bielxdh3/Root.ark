@@ -68,6 +68,52 @@ test("bounded signed GET and separately owner-pinned CEKs search several protect
   assert.equal(JSON.stringify(f.queried).includes("ORC"), false);
 });
 
+test("opt-in ALL TERMS matches reordered NFC/case-folded literals; default phrase remains unchanged", async () => {
+  const f = await fixture();
+  const query = "SeCrEtO   ORC\u0327AMENTO";
+  const phrase = await search.search({ ...f.input, query });
+  assert.equal(phrase.totalMatches, 0, "default still requires the whole phrase in order");
+  const all = await search.search({ ...f.input, query, matchMode: "all-terms" });
+  assert.equal(all.totalSearched, 2);
+  assert.equal(all.totalMatches, 1);
+  assert.equal(all.matches[0].name, "plan.txt");
+  assert.match(all.matches[0].excerpt, /orçamento secreto/i);
+  assert.equal(all.plaintextSentToServer, false);
+  assert.equal(all.authorizesMutation, false);
+  assert.equal(f.queried.length, 4, "each mode uses only the existing signed GET per selected revision");
+  assert.ok(f.queried.every((entry) => Object.keys(entry).sort().join(",") === "objectId,revision"));
+  assert.ok(!JSON.stringify(f.queried).includes("SeCrEtO"));
+  const unicodeSpacing = await search.search({ ...f.input,
+    query: "SECRETO\u00a0orçamento", matchMode: "all-terms" });
+  assert.equal(unicodeSpacing.totalMatches, 1, "Unicode whitespace separates tokens locally");
+  const missing = await search.search({ ...f.input,
+    query: "secreto inexistente", matchMode: "all-terms" });
+  assert.equal(missing.totalMatches, 0, "AND requires every literal term");
+});
+
+test("ALL TERMS validates 2-4 distinct bounded tokens before any network or key access", async () => {
+  const f = await fixture();
+  for (const patch of [
+    { matchMode: "all-terms", query: "secreto" },
+    { matchMode: "all-terms", query: "um dois tres quatro cinco" },
+    { matchMode: "all-terms", query: "x".repeat(41) + " segredo" },
+    { matchMode: "all-terms", query: "ORC\u0327AMENTO orçamento" },
+    { matchMode: "all-terms", query: "secreto SECRETO" },
+    { matchMode: "all-terms", query: "secreto\tsegredo" },
+    { matchMode: "all-terms", query: "secreto\u0000segredo" },
+    { matchMode: "all-terms", query: "x".repeat(121) },
+    { matchMode: "unsupported", query: "secreto orçamento" },
+    { matchMode: true, query: "secreto orçamento" },
+  ]) {
+    await assert.rejects(search.search({ ...f.input, ...patch }),
+      /ZK_BATCH_TEXT_SEARCH_DENIED/, JSON.stringify(patch));
+  }
+  assert.equal(f.queried.length, 0, "bad options never start signed GET");
+  const exactlyFour = await search.search({ ...f.input, matchMode: "all-terms",
+    query: "No surprises: protected document" });
+  assert.equal(exactlyFour.totalMatches, 1);
+});
+
 test("64 owner-selected exact revisions run in eight bounded windows with disposable CEKs and progress-only callbacks", async () => {
   const f = await fixture(64);
   const keys = new Map();
@@ -104,7 +150,7 @@ test("64 owner-selected exact revisions run in eight bounded windows with dispos
 });
 
 test("window 2 tamper or cancellation denies ALL earlier-window matches and never reads later keys", async () => {
-  for (const mode of ["tamper", "cancel"]) {
+  for (const mode of ["tamper", "cancel", "all-terms-cancel"]) {
     const f = await fixture(17);
     const keys = new Map();
     const items = f.items.map(({ rawCek, ...rest }, index) => {
@@ -118,10 +164,12 @@ test("window 2 tamper or cancellation denies ALL earlier-window matches and neve
       ciphertextBase64: b64(crypto.randomBytes(47)) });
     const progress = [];
     let readCount = 0;
-    await assert.rejects(search.search({ ...f.input, items, query: "orçamento",
+    await assert.rejects(search.search({ ...f.input, items,
+      query: mode === "all-terms-cancel" ? "owner-only orçamento" : "orçamento",
+      ...(mode === "all-terms-cancel" ? { matchMode: "all-terms" } : {}),
       readCek: async (name) => { readCount++; return new Uint8Array(keys.get(name)); },
       onProgress: ({ completed }) => { progress.push(completed); },
-      isCancelled: () => mode === "cancel" && progress.length >= 1,
+      isCancelled: () => mode.includes("cancel") && progress.length >= 1,
     }), /ZK_BATCH_TEXT_SEARCH_DENIED/);
     assert.deepEqual(progress, [8], "no progress or verified result from failed window");
     assert.ok(readCount <= 9, "late windows and keys must never be touched");
@@ -176,7 +224,7 @@ test("nine sealed revisions across two windows use signed disposable HTTP; forge
     files.set(cekFile, rawCek);
     return { ...item, cekFile };
   });
-  const run = () => search.search({ ...f.input, items, query: "orçamento",
+  const run = (options = {}) => search.search({ ...f.input, items, query: "orçamento", ...options,
     readCek: async (name) => new Uint8Array(files.get(name)),
     getChecked: async (objectId, revision) => {
       const auth = { scope: f.input.grant.account_id, objectId, revision,
@@ -196,6 +244,13 @@ test("nine sealed revisions across two windows use signed disposable HTTP; forge
   assert.ok(observed.every((wire) => !wire.includes("orçamento")
     && !wire.includes("Confidential") && !wire.includes("cekSha256Pin")
     && !wire.includes("rawCek") && !wire.includes("ciphertextBase64")));
+  observed.length = 0;
+  const allTerms = await run({ matchMode: "all-terms", query: "OWNER-ONLY   ORÇAMENTO" });
+  assert.equal(allTerms.totalSearched, 9);
+  assert.equal(allTerms.totalMatches, 7, "only seven ledger versions contain both terms");
+  assert.equal(observed.length, 9, "ALL TERMS adds no extra signed GETs");
+  assert.ok(observed.every((wire) => !/OWNER-ONLY|ORÇAMENTO/i.test(wire)
+    && !wire.includes("cekSha256Pin") && !wire.includes("rawCek")));
   observed.length = 0;
   tamperLast = true;
   await assert.rejects(run(), /ZK_BATCH_TEXT_SEARCH_DENIED/);

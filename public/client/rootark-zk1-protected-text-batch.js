@@ -14,6 +14,8 @@
   const WINDOW = 8;
   const MAX_QUERY = 120;
   const MAX_EXCERPT = 160;
+  const MAX_TERMS = 4;
+  const MAX_TERM_LENGTH = 40;
   function deny() { throw Error("ZK_BATCH_TEXT_SEARCH_DENIED"); }
   function checkedQuery(raw) {
     if (typeof raw !== "string" || raw.length > MAX_QUERY
@@ -21,6 +23,29 @@
     const normalized = raw.normalize("NFC").trim();
     if (!normalized || normalized.length > MAX_QUERY) deny();
     return normalized.toLocaleLowerCase();
+  }
+  function checkedMatcher(input) {
+    const term = checkedQuery(input.query);
+    if (input.matchMode === undefined || input.matchMode === "phrase")
+      return (text) => text.indexOf(term);
+    if (input.matchMode !== "all-terms") deny();
+    // DEV-OFF opt-in: 2-4 distinct literal tokens of 1-40 UTF-16 units;
+    // NFC + locale lowercasing and Unicode whitespace splitting are local only.
+    // Reject control/line separators and duplicates; never treat terms as regex.
+    if (/[\u0080-\u009f\u2028\u2029]/u.test(term)) deny();
+    const terms = term.split(/\s+/u);
+    if (terms.length < 2 || terms.length > MAX_TERMS
+      || terms.some((word) => !word || word.length > MAX_TERM_LENGTH)
+      || new Set(terms).size !== terms.length) deny();
+    return (text) => {
+      let first = text.length;
+      for (const word of terms) {
+        const at = text.indexOf(word);
+        if (at < 0) return -1;
+        if (at < first) first = at;
+      }
+      return first;
+    };
   }
   function checkedItems(input) {
     if (!Array.isArray(input.items) || input.items.length < 1
@@ -59,7 +84,7 @@
         || (input.isCancelled !== undefined && typeof input.isCancelled !== "function")
         || typeof preview?.open !== "function"
         || !input.grant || !input.ownerHead || !input.baseline) deny();
-      const term = checkedQuery(input.query);
+      const match = checkedMatcher(input);
       const items = checkedItems(input);
       const matches = [];
       const live = () => {
@@ -97,7 +122,7 @@
               || typeof opened.name !== "string"
               || typeof opened.text !== "string") deny();
             const normalized = opened.text.normalize("NFC");
-            const hit = normalized.toLocaleLowerCase().indexOf(term);
+            const hit = match(normalized.toLocaleLowerCase());
             if (hit >= 0) {
               const begin = Math.max(0, hit - 44);
               matches.push(Object.freeze({

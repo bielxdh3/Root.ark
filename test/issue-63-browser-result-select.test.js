@@ -54,8 +54,10 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const revision=dialog.querySelector('[data-zk1-field="catalog-delta-read-revision"]');
       const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
       const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
+      const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
       if(!list||!target||!revision||!getButton||getButton.type!=="button"
-        ||!batchButton||batchButton.type!=="button")
+        ||!batchButton||batchButton.type!=="button"
+        ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked)
         throw Error("MISSING_EXPLICIT_PROTECTED_GET");
       const progress=dialog.querySelector('[data-zk1-field="catalog-batch-progress"]');
       const cancel=dialog.querySelector('[data-zk1-action="catalog-delta-text-cancel"]');
@@ -194,6 +196,19 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(completed.totalSearched!==9||completed.totalMatches!==9
         ||progressCalls.join()!=="8/9,9/9")
         throw Error("EDGE_MULTI_WINDOW_WRONG");
+      const allTerms=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"SECRET-LOCAL-ONLY local-window",matchMode:"all-terms",
+        items:nine,grant:multiple,
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:batchBaseline,assertLive:()=>true,
+        getChecked:async(oid,rev)=>signed.get(nine.find(item=>
+          item.selected.objectId===oid&&item.selected.revision===rev)?.cekFile)?.checked,
+        readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+        isCancelled:()=>false
+      });
+      if(allTerms.totalMatches!==9||allTerms.totalSearched!==9
+        ||allTerms.plaintextSentToServer!==false)
+        throw Error("EDGE_ALL_TERMS_FAILED");
       batchPane.textContent=completed.matches.map(item=>item.excerpt).join(String.fromCharCode(10));
       if(batchPane.querySelector("img"))throw Error("MULTI_WINDOW_HTML_LEAK");
       const abortProgress=[];
