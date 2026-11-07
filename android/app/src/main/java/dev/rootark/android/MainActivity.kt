@@ -355,7 +355,7 @@ class MainActivity : Activity() {
                     } else when ((failure as? RootArkApiException)?.statusCode) {
                         401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                         403 -> showLogin("Acesso ao arquivo revogado (403). Faça login novamente.")
-                        409 -> {
+                        404, 409 -> {
                             offlineInventory?.clear()
                             runCatching { ciphertextCache?.clear() }
                             ciphertextCache = null
@@ -385,7 +385,7 @@ class MainActivity : Activity() {
                             "ainda precisam ser verificadas independentemente; conteúdo indisponível offline.")
                     } else when ((failure as? RootArkApiException)?.statusCode) {
                         401, 403 -> showLogin("Sessão ou autorização revogada. Faça login novamente.")
-                        409 -> {
+                        404, 409 -> {
                             offlineInventory?.clear()
                             runCatching { stored.clear() }
                             ciphertextCache = null
