@@ -141,3 +141,30 @@ All three PRs remain OPEN/DRAFT with correct stacked bases. No merge, deploy, Re
 **Never infer platform boot from this matrix.** The branch `Root/main` remains `ea0445df8ccd8f17da2c70572786d298491fd2c2`; none of these Drafts are merged/deployed/Ready, and issues stay OPEN. Real owner-signed SyncV2↔ZK1 mapping, R1 physical operator custody/TLS/provider durability, native Windows 10 CFAPI, Android trusted physical enrollment/CEK and production P2P TURN have not been certified.
 
 **#294 full CI exception:** [Security Regression 42328729476](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) Windows canonical returned nonzero after about 195 seconds without a new TAP result; logged 165 TAP results, zero test/assertion failures and no stderr. This job is **FAILED**, source causality unverified; hosted PG18 and independent P1/P2 GO are narrower and do not make full CI green. Same SHA must be retried or a reproduced root cause repaired forward.
+
+## 2026-11-07 live GitHub status
+
+Historical failing attempts and prior exact-SHA reviewer decisions remain recorded above. [#293 run 42328562537 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328562537) and [#294 run 42328729476 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) **both finished SUCCESS**, including mandatory and canonical Windows jobs; the attempt-1 #294 stall was not itself an assertion failure or proof of a code defect. GitHub initially counted 28 OPEN Ready/18 Draft; during the checkpoint, #293 and #294 advanced to Ready without changing their HEADs: **30 OPEN Ready for review, 16 OPEN Draft** on refresh. The original 28 Ready PRs were left unchanged. No label certifies release or merge.
+
+~~~mermaid
+flowchart LR
+  A["#292 READY #66 pin"] --> B["#295 DRAFT #66 verified picker integration"]
+  C["#283 READY #67 plan"] --> D["#288 READY #67 signed restore"]
+  B --> X["677e4d4c virtual scratch tree"]
+  D --> X
+  E["#294 READY #68 offer"] --> F["#296 DRAFT #68 object-set redeem"]
+  X -. "combined validation + mapping not certified" .-> G["R1/cross-protocol gate BLOCKED"]
+~~~
+
+| Issue | Implemented source / GitHub PR status | Verified hosted gate / unmet requirement |
+| --- | --- | --- |
+| #63 | [#293](https://github.com/bielxdh3/Root.ark/pull/293) **READY**, 4ea7f7cd4430af9967a39410065f73259ed9ef87; up to 64 explicitly owner-pinned encrypted revisions | [42328562537 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328562537) SUCCESS; automatic CEK enrollment and release acceptance remain open. |
+| #64 | [#291](https://github.com/bielxdh3/Root.ark/pull/291) **READY**, 68a3fc0a54a1e014876a86fa00e0977ff83f9dd3; encrypted Android session cache | Focused [42329455067](https://github.com/bielxdh3/Root.ark/actions/runs/42329455067) 3/3 SUCCESS; independently pinned enrollment, Keystore/CEK on physical hardware and authorized offline access unproven. |
+| #66 | [#292](https://github.com/bielxdh3/Root.ark/pull/292) **READY**, df59cd1c901a71834bb464b04e8c691520dad7b6; [#295](https://github.com/bielxdh3/Root.ark/pull/295) **DRAFT**, 0b39561164074c83efe31b37b57ae088c379c826; prior pin safety + Windows picker truly combined in #295 | #295 focused 4/4 SUCCESS, but [42368335353 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42368335353) completed FAILURE: mandatory Windows FAIL, canonical Windows and Ubuntu SUCCESS; native Windows 10 CFAPI and cross-PR #67 proof absent. |
+| #67 | [#288](https://github.com/bielxdh3/Root.ark/pull/288) **READY**, 737304bf7681b3d0175164d96150292eac23ae86; bounded 1–32-object non-atomic restore | Previously verified focused/hosted gates in the mission ledger; virtual tree 677e4d4c combines #288 with #295 only as a Git tree. No current combined validation or signed SyncV2↔ZK1 bridge certified. |
+| #68 | [#294](https://github.com/bielxdh3/Root.ark/pull/294) **READY**, d2cc72ec76a05180c0d1b421ec4559b6b4d077d7; [#296](https://github.com/bielxdh3/Root.ark/pull/296) **DRAFT**, 2312412018042b3978078b1362d3d113e6a2a319; 1–8 fixed pre-issued DEV-OFF offers | #294 [42328729476 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) SUCCESS. #296 [42370102210 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42370102210): Ubuntu SUCCESS, Windows mandatory/canonical IN PROGRESS; partial output is not atomic rollback or custodial authorization. |
+| #242 | [#284](https://github.com/bielxdh3/Root.ark/pull/284) **READY**, 859adf0b0c234d5cafb71dff5c87e4588fbca2b7; bounded protected-room WebRTC research | Exact focused 4/4 previously SUCCESS; no production TURN/cross-NAT or owner-signed ZK grant. |
+| #94 / #203 | Both issues **OPEN**; R2 reviewed source profile and old security corrections retain their own exact evidence | External deployment topology, operator/TLS and live ingress remain under R1; no invented production acceptance. |
+| Mission #251 | [#251](https://github.com/bielxdh3/Root.ark/pull/251) **DRAFT**, a4f327f2749bf1bc3065e38d337c9a8a2dbfe81b | [42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711): Ubuntu and mandatory Windows SUCCESS, canonical IN PROGRESS. Any later doc commit requires its own checks. |
+
+The [main mission ledger](../rootark-main-execution-mission.md#2026-11-07-live-dependency-graph) owns the detailed dependency interpretation. The uncommitted virtual object **677e4d4c** is not a release tree and was not tested by this documentation update. R1 owner-independent custody/external provider durability/TLS, owner-signed version mapping, native Windows 10 CFAPI, physical Android enrollment/CEK and P2P TURN remain **BLOCKED** for production. Do not infer a unified working ZK system from isolated successful PR CI.

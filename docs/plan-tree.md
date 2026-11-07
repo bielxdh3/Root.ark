@@ -554,3 +554,15 @@ When completing a task:
 6. link the PR, issue, validation report, or architecture decision;
 7. select the next item based on remaining risk, not novelty;
 8. stop instead of inventing filler phases.
+
+## 10. Current mission dependencies — 2026-11-07 GitHub checkpoint
+
+**Snapshot only; historical phases above remain unchanged.** The current [mission dependency graph](rootark-main-execution-mission.md#2026-11-07-live-dependency-graph) and [exact PR/CI status matrix](validation/2026-11-06-rootark-wave-execution-status.md#2026-11-07-live-github-status) distinguish implemented feature code, reviewed **Ready for review** PRs, Draft integration stacks, and blocked operational gates.
+
+- [IMPLEMENTED / READY] #63 protected 64-revision search (#293 4ea7f7cd); #64 Android ciphertext staging (#291 68a3fc0a); #67 non-atomic signed historical 1–32-object restore (#288 737304bf); #242 experimental session-bound WebRTC (#284 859adf0b); and #68 portable owner-issued offer CLI (#294 d2cc72ec). Ready is GitHub reviewer state, not release certification.
+- [IMPLEMENTED / DRAFT] #66 real manual verified picker combined with prior pin/journal safeguards in #295 0b395611; #68 fixed 1–8 pre-issued object offer redemption in #296 23124120, DEV-OFF only. Previous reviewed #292 df59cd1c pin guard and #294 d2cc72ec remain unchanged.
+- [VIRTUAL / UNVERIFIED] #288 + #295 cross-composition exists only as Git tree 677e4d4c; current combined RED/GREEN/CI and owner-signed SyncV2↔ZK1 account/object/revision/digest/epoch authority mapping are not certified. Never publish the tree as a real merged branch.
+- [CI / INCOMPLETE] #293 [42328562537 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328562537) and #294 [42328729476 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) passed. #295 [42368335353 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42368335353) completed FAILURE (mandatory Windows FAIL, canonical Windows and Ubuntu PASS); #296 [42370102210](https://github.com/bielxdh3/Root.ark/actions/runs/42370102210) Windows jobs running; #251 [42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) Windows canonical running.
+- [BLOCKED / EXTERNAL] R1 independent custody/TLS/provider durability/cutover; real Windows 10 CFAPI placeholder provider; physical Android owner-pinned device enrollment and CEK; production TURN/cross-NAT. #63/#64/#66/#67/#68/#94/#203/#242 remain OPEN; Root/main baseline remains ea0445df8ccd8f17da2c70572786d298491fd2c2. GitHub refreshed to 30 Ready/16 Draft (original 28 Ready untouched; #293/#294 newly Ready). No Ready PR was modified by this documentation change.
+
+**NEXT:** resolve the exact Windows CI exceptions; obtain verified scratch cross-composition evidence and owner-signed bridge design before claiming integrated release; keep external R1/platform acceptance separate. Do not merge, deploy, activate cutover or close issues based on this checkpoint.

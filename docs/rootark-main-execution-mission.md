@@ -144,3 +144,37 @@ Fresh independent review also reproduced a #291 `453d5ffb` P2 despite earlier GO
 **Boot and issue closure remain OPEN:** #63/#64/#66/#67/#68/#242 are not fully released/integrated on `Root/main`; #203/#94 deployment topology and R2/R5 acceptance still require concrete operator evidence, and R1 owner-independent key custody, TLS/external durability and signed SyncV2↔ZK1 identity/revision/digest/epoch mapping are not available. Windows 10 native CFAPI, real Android hardware enrollment and TURN also remain unverified. Do not close issues, merge, deploy, mark Ready, rewrite history or infer a globally working ZK cutover from unrelated Draft CIs.
 
 **New CI investigation, not approval:** the first [#294 full Security Regression 42328729476](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) Windows canonical job exited nonzero after a 195-second TAP-output stall (165 TAP results, **zero reported assertion failures**) at about 300 seconds. This is a **FAILED CI gate**, not evidence of source correctness or a confirmed new code defect; the same-SHA diagnosis/rerun must be separated from #294's independently reviewed focused owner/recipient HTTP and PG18 successes. The prior owner-dismissed #255 GHAS CodeQL finding #483 (js/remote-property-injection) remains a reviewed existing baseline, not grounds for artificial suppression or an unrelated security rewrite.
+
+## 2026-11-07 live dependency graph
+
+This is a **new snapshot**, not a retroactive change to the dated GO/NO-GO evidence above. GitHub reported [Root/main](https://github.com/bielxdh3/Root.ark/tree/Root/main) at ea0445df8ccd8f17da2c70572786d298491fd2c2 and **46 OPEN PRs**: the first read counted 28 Ready/18 Draft; a same-day refresh counted **30 Ready for review / 16 Draft** because #293 and #294 advanced to Ready (their SHAs stayed unchanged). All original 28 Ready remain untouched. Issues [#63](https://github.com/bielxdh3/Root.ark/issues/63), [#64](https://github.com/bielxdh3/Root.ark/issues/64), [#66](https://github.com/bielxdh3/Root.ark/issues/66), [#67](https://github.com/bielxdh3/Root.ark/issues/67), [#68](https://github.com/bielxdh3/Root.ark/issues/68), [#242](https://github.com/bielxdh3/Root.ark/issues/242), [#94](https://github.com/bielxdh3/Root.ark/issues/94) and [#203](https://github.com/bielxdh3/Root.ark/issues/203) remained OPEN. **Ready means the GitHub review state; it does not mean merge approved, production ready or externally certified.**
+
+~~~mermaid
+flowchart LR
+  P66["#292 df59cd1c READY: #66 pin/journal"] --> I66["#295 0b395611 DRAFT: #66 picker + pin integrated in one PR"]
+  P67["#283 eb33ee2a READY: #67 signed recovery plan"] --> I67["#288 737304bf READY: bounded restore executor"]
+  I66 --> V["Virtual tree 677e4d4c: #66 + #67 scratch composition, NOT published"]
+  I67 --> V
+  P68["#294 d2cc72ec READY: #68 portable offer"] --> I68["#296 23124120 DRAFT: DEV-OFF fixed 1-8 object redemption"]
+  S63["#293 4ea7f7cd READY: #63 64-revision local search"]
+  S64["#291 68a3fc0a READY: #64 Android ciphertext staging"]
+  S242["#284 859adf0b READY: #242 experimental WebRTC"]
+  V -. "requires independent combined tests and explicit authority bridge" .-> G["BLOCKED R1 / SyncV2-to-ZK1 identity and custody"]
+  I66 -. "native provider absent" .-> CF["BLOCKED Windows 10 CFAPI"]
+  S64 -. "device trust absent" .-> AND["BLOCKED physical Android enrollment"]
+  S242 -. "network gate absent" .-> TURN["BLOCKED production TURN"]
+~~~
+
+The arrows denote a **reviewed feature dependency or proposed scratch composition**, not deployment or a merged topology. The isolated #295 stack combines [#292](https://github.com/bielxdh3/Root.ark/pull/292) and the reviewed manual verified picker [#286](https://github.com/bielxdh3/Root.ark/pull/286): exact #295 **0b39561164074c83efe31b37b57ae088c379c826**, independently reviewed GO with 34 Windows focused passes/3 POSIX skips, four focused hosted checks SUCCESS; it is **Draft**, not a native Cloud Files API provider. [#288](https://github.com/bielxdh3/Root.ark/pull/288) stays Ready at **737304bf7681b3d0175164d96150292eac23ae86** and does actual non-atomic 1–32-object signed restore after per-object checks. The Git object **677e4d4c** exists and is a tree, but the combined #288 + #295 source is **scratch only**; no verified current combined test result, independent GO, new branch, PR or release CI is attributed to it. It must never be committed as though it were a merged release.
+
+**Separate current #68 dependency:** [#294](https://github.com/bielxdh3/Root.ark/pull/294) READY exact **d2cc72ec76a05180c0d1b421ec4559b6b4d077d7** precedes [#296](https://github.com/bielxdh3/Root.ark/pull/296) DRAFT exact **2312412018042b3978078b1362d3d113e6a2a319**. The latter accepts 1–8 genuine existing owner-issued offers, preflights independent signed context and private paths, and reports partial completion without atomic rollback. Its exact-SHA peer review and 5/5 focused local checks passed; neither PR provisions custody, owner keys, recipient enrollment or post-egress plaintext revocation. [#293](https://github.com/bielxdh3/Root.ark/pull/293) READY **4ea7f7cd4430af9967a39410065f73259ed9ef87** implements bounded 64-revision selected local search, not automatic CEK provenance. #291 and #284 remain reviewed feature slices with the physical Android and cross-NAT/TURN limits above.
+
+| Current exact source | Security Regression run | GitHub result at checkpoint |
+| --- | --- | --- |
+| [#251](https://github.com/bielxdh3/Root.ark/pull/251) DRAFT a4f327f2749bf1bc3065e38d337c9a8a2dbfe81b | [42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) | Ubuntu + mandatory Windows SUCCESS; canonical Windows IN PROGRESS. No all-green claim. |
+| [#293](https://github.com/bielxdh3/Root.ark/pull/293) READY 4ea7f7cd4430af9967a39410065f73259ed9ef87 | [42328562537 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328562537) | Completed SUCCESS: Ubuntu, Windows mandatory, Windows canonical and aggregator. |
+| [#294](https://github.com/bielxdh3/Root.ark/pull/294) READY d2cc72ec76a05180c0d1b421ec4559b6b4d077d7 | [42328729476 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) | Completed SUCCESS: Ubuntu, Windows mandatory, Windows canonical and aggregator. Initial failure above is historical attempt 1. |
+| [#295](https://github.com/bielxdh3/Root.ark/pull/295) DRAFT 0b39561164074c83efe31b37b57ae088c379c826 | [42368335353 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42368335353) | Completed FAILURE: Ubuntu SUCCESS, canonical Windows SUCCESS, mandatory Windows FAILURE (aggregator FAILURE). Root cause not yet established. |
+| [#296](https://github.com/bielxdh3/Root.ark/pull/296) DRAFT 2312412018042b3978078b1362d3d113e6a2a319 | [42370102210 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42370102210) | Ubuntu SUCCESS; Windows mandatory and canonical IN PROGRESS. |
+
+**Execution next:** finish triage of the failing/in-progress Windows jobs without inventing a source defect; run independent combined #66/#67 RED/GREEN and exact-tree validation before integration or review of any result; resolve real owner-signed SyncV2↔ZK1 account/object/revision/digest/epoch mapping; obtain off-host R1 custody, TLS, provider durability, Windows 10 CFAPI, physical Android trust and TURN only through their separate verified gates. None of these statuses changes the 28 existing Ready PRs or authorizes merge, deployment, cutover or issue closure.
