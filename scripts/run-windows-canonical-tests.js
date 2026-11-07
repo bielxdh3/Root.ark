@@ -21,6 +21,12 @@ const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
 const SAFE_FAILURE_TYPES = new Set(["testCodeFailure", "hookFailed", "cancelledByParent",
   "uncaughtException", "unhandledRejection", "subtestsFailed"]);
 const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
+// Only a complete, trailing TAP directive token excuses "not ok". A title
+// containing e.g. "# TODOS", "# TODO:" or a bare trailing space remains FAIL.
+function tapExemption(title) {
+  const directive = / # (TODO|SKIP)(?:[ \t]+\S.*)?$/i.exec(title);
+  return directive ? directive[1].toUpperCase() : null;
+}
 function categoryFor(code) {
   if (code === "ERR_ASSERTION") return "assertion";
   if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(code)) return "sqlite_busy";
@@ -47,7 +53,9 @@ function canonicalWindowsTestEnvironment(environment = process.env,
 function createTapProgressRecorder(write) {
   const state = { results: 0, failures: 0, plan: false, tests: null, reportedFailures: null,
     lastResultHash: "none", lastSubtestHash: "none", subtests: 0,
-    nestedResults: 0, nestedFailures: 0, lastNestedFailureHash: "none",
+    observedFailures: 0, topLevelTodos: 0, topLevelSkips: 0,
+    nestedResults: 0, nestedObservedFailures: 0, nestedFailures: 0,
+    nestedTodos: 0, nestedSkips: 0, lastNestedFailureHash: "none",
     fileBoundaries: 0, lastFileHash: "none" };
   const categories = { assertion: 0, sqlite_busy: 0, filesystem: 0,
     network_timeout: 0, dependency: 0, runtime: 0, unknown: 0 };
@@ -108,7 +116,7 @@ function createTapProgressRecorder(write) {
       const topNestedFailurePaths = [...nestedFailurePaths].sort((a, b) => b[1] - a[1]
         || a[0].localeCompare(b[0])).slice(0, 4)
         .map(([pathHash, count]) => `${pathHash}:${count}`).join(",") || "none";
-      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths} subtests=${state.subtests} lastSubtestSha256=${state.lastSubtestHash} lastResultSha256=${state.lastResultHash} nestedResults=${state.nestedResults} nestedFailures=${state.nestedFailures} nestedPending=${nestedPending ? 1 : 0} nestedFailureDepths=${Object.entries(nestedFailureDepths).map(([depth, count]) => `${depth}:${count}`).join(",")} nestedDetails=${nestedDetailed} nestedFailurePathGroups=${nestedFailurePaths.size} topNestedFailurePaths=${topNestedFailurePaths} lastNestedFailureSha256=${state.lastNestedFailureHash} fileBoundaries=${state.fileBoundaries} lastFileSha256=${state.lastFileHash}`;
+      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths} subtests=${state.subtests} lastSubtestSha256=${state.lastSubtestHash} lastResultSha256=${state.lastResultHash} observedFailures=${state.observedFailures} topLevelTodos=${state.topLevelTodos} topLevelSkips=${state.topLevelSkips} nestedResults=${state.nestedResults} nestedObservedFailures=${state.nestedObservedFailures} nestedFailures=${state.nestedFailures} nestedTodos=${state.nestedTodos} nestedSkips=${state.nestedSkips} nestedPending=${nestedPending ? 1 : 0} nestedFailureDepths=${Object.entries(nestedFailureDepths).map(([depth, count]) => `${depth}:${count}`).join(",")} nestedDetails=${nestedDetailed} nestedFailurePathGroups=${nestedFailurePaths.size} topNestedFailurePaths=${topNestedFailurePaths} lastNestedFailureSha256=${state.lastNestedFailureHash} fileBoundaries=${state.fileBoundaries} lastFileSha256=${state.lastFileHash}`;
     },
     accept(line) {
       const subtest = /^\s{0,8}# Subtest: (.{1,4096})$/.exec(line);
@@ -123,13 +131,19 @@ function createTapProgressRecorder(write) {
         finishNested();
         state.nestedResults++;
         if (nestedResult[2] === "not ok") {
-          const depth = nestedResult[1].length;
-          const bucket = Object.hasOwn(nestedFailureDepths, depth) ? depth : "other";
-          nestedFailureDepths[bucket]++;
-          state.nestedFailures++;
-          state.lastNestedFailureHash = hash(nestedResult[4]);
-          nestedPending = { depth, index: nestedResult[3], nameHash: state.lastNestedFailureHash,
-            pathHash: "none", failureType: "unknown", code: "unknown" };
+          state.nestedObservedFailures++;
+          const exemption = tapExemption(nestedResult[4]);
+          if (exemption === "TODO") state.nestedTodos++;
+          else if (exemption === "SKIP") state.nestedSkips++;
+          else {
+            const depth = nestedResult[1].length;
+            const bucket = Object.hasOwn(nestedFailureDepths, depth) ? depth : "other";
+            nestedFailureDepths[bucket]++;
+            state.nestedFailures++;
+            state.lastNestedFailureHash = hash(nestedResult[4]);
+            nestedPending = { depth, index: nestedResult[3], nameHash: state.lastNestedFailureHash,
+              pathHash: "none", failureType: "unknown", code: "unknown" };
+          }
         }
       }
       const result = /^(ok|not ok) ([1-9]\d{0,8}) - (.{1,4096})$/.exec(line);
@@ -143,11 +157,17 @@ function createTapProgressRecorder(write) {
           state.lastFileHash = hash(`test/${fileBoundary[1]}`);
         }
         if (result[1] === "not ok") {
-          state.failures += 1;
-          const nameHash = hash(result[3]);
-          write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
-          pending = { index: result[2], nameHash, pathHash: "none",
-            failureType: "unknown", code: "unknown" };
+          state.observedFailures++;
+          const exemption = tapExemption(result[3]);
+          if (exemption === "TODO") state.topLevelTodos++;
+          else if (exemption === "SKIP") state.topLevelSkips++;
+          else {
+            state.failures += 1;
+            const nameHash = hash(result[3]);
+            write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
+            pending = { index: result[2], nameHash, pathHash: "none",
+              failureType: "unknown", code: "unknown" };
+          }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
         }
