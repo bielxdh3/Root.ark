@@ -360,7 +360,7 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
 - [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
-- [ ] Harden deployment defaults and document a reviewed production profile
+- [ ] Harden deployment defaults and document a reviewed production profile ([single-instance profile](docs/security/single-instance-execution-profile.md) documented; real deployment acceptance pending)
 - [ ] Expand restore testing and disaster-recovery evidence
 - [ ] Strengthen suspicious-file isolation and scanning integrations
 - [ ] Review every external adapter independently
