@@ -71,6 +71,26 @@ The private CommonJS module exports one async function `buildTrusted(role, artif
 
 The CLI accepts only basenames inside the preexisting owner-only directory; uses the existing local owner-workflow private directory, trusted module and native NTFS/POSIX checks; refuses overwrites and symlink outputs; creates the offer or recovered plaintext as a new owner-only file; clears the opened plaintext buffer; and prints **only** fixed status tokens. It never prints a username, filename, key, plaintext or server response. A write failure may leave a partial artifact in the *private* directory rather than unlinking an attacker-replaced pathname; inspect/remove that private artifact before retrying. The recipient retains any successfully recovered plaintext, so later revocation cannot revoke that already-released copy; future signed HTTP GETs remain subject to live server revocation. This DEV-OFF workflow is not automatic public sharing and is not enabled without an operator-supplied genuine authority.
 
+### Explicit fixed object-set recipient import (DEV-OFF)
+
+An operator may choose **one to eight distinct objects** by putting independently owner-issued portable offer files into the same preprotected recipient directory and writing a private `selected-set.json` with the exact shape below (each offer must come from the existing individual owner export and a separately trusted delivery channel):
+
+```json
+{
+  "schema": "rootark-zk1-recipient-object-set-dev/v1",
+  "entries": [
+    { "offer": "first-offer.json", "output": "first-private.bin" },
+    { "offer": "second-offer.json", "output": "second-private.bin" }
+  ]
+}
+```
+
+```sh
+node scripts/zk1-recipient-offer-local.js redeem-batch --owned-dir /absolute/private-recipient-dir --context-module trusted-share.js --manifest selected-set.json
+```
+
+The manifest is only a **local selection**, not an owner signature or a new multi-object grant. The CLI checks the bounded manifest, distinct offer/object/grant identifiers and unique, unused private leaf names before any plaintext or HTTP read. It then calls the unchanged signed HTTP/HPKE/AEAD redemption and the independently provisioned trusted `buildTrusted("redeem", offer)` **separately for every offer**. The existing live authorization, expiry, recipient and owner checks apply per object. On full completion it prints `ZK_RECIPIENT_BATCH_REDEEMED_N_OF_N`; if a later item fails, it exits nonzero with `ZK_RECIPIENT_BATCH_INCOMPLETE_K_OF_N_INSPECT_PRIVATE_OUTPUTS`, where `K` counts only completely written outputs. Previously written plaintext files remain in the private directory, and a failed write may have left a partial leaf requiring manual inspection. No rollback, all-or-nothing delivery, public sharing, folder delegation, new server-issued set capability, or production authorization is implied.
+
 ## Current evidence and boundary
 
 The existing public-link system still uses bearer links in `server.js` and `public-links.json`/`public_links`. The separate authenticated DEV-only ciphertext grant is bounded to a pre-enrolled device and has no independent recipient key delivery, so full public Zero-Knowledge sharing remains incomplete. Existing links remain explicitly legacy until separately reviewed compatibility or migration is approved.
