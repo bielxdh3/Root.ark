@@ -248,3 +248,33 @@ The [timestamped validation ledger](validation/2026-11-07-rootark-wave-execution
 ## 2026-11-07 22:44 UTC — publicação posterior e correção de evidência
 
 O [ledger de validação](validation/2026-11-07-rootark-wave-execution-status.md) mantém o snapshot de 18:23 UTC como histórico e registra a publicação posterior do merge `eaabb9db` no PR #293 **OPEN/Draft**; PR #306 permanece **OPEN/Draft** em `b13b29f9`. A correção factual do CI main registra que **ambos** os jobs Windows canonical e syntax/tests já haviam **falhado** antes do snapshot (16:34:36 e 18:09:07 UTC), enquanto Ubuntu full, Windows mandatory, CodeQL e Dependency Review foram **SUCCESS**. As falhas mantêm o main **NO-GO**. Nenhum teste local ou publicação de branch equivale a aceite hospedado, custódia externa R1, Ready, merge no GitHub ou deploy.
+
+## 2026-11-07 23:37 UTC — fluxograma de execução e bloqueios
+
+Novo corte **somente de estado**, sem reescrever os snapshots de 18:23 e 22:44 UTC. O [checkpoint de dependências](validation/2026-11-07-rootark-wave-execution-status.md) fixa os HEADs do GitHub e os gates. A cadeia histórica #231 → #232 → #233 → #234 → #235 → #236 foi **MERGED em 2026-11-04**, antes desta missão; os **cinco merges desta missão** (#252, #253, #255, #256, #258) são outra contagem. O #228 foi **CLOSED UNMERGED** pelo proprietário em 2026-11-02 e permanece intocado.
+
+~~~mermaid
+flowchart TD
+  H["04/11: #231 → #232 → #233 → #234 → #235 → #236 MERGED (histórico)"]
+  M["Root/main d5fbc110: cinco merges desta missão, #252 #253 #255 #256 #258"]
+  D["OPEN/Draft: #284 #291 #293 #298 #299 #302"]
+  T["OPEN/Draft #288: TOCTOU Windows residual"]
+  R["OPEN/Ready #306: ainda não merged"]
+  P{"Peer GO no SHA exato, hosted CI GREEN e main verificada?"}
+  WAIT["NO-GO merge: main Windows canonical e syntax/tests FAILED"]
+  ELIG["Apenas elegível à avaliação de merge normal; revalidar composição"]
+  EXT["R1 externo pendente: inventário original assinado, versões/CEK, custódia monotônica off-host, signer/issuer, cold Windows 120s"]
+  CUT{"R1 físico comprovado e cutover autorizado?"}
+  HOLD["Sem cutover ou deploy"]
+  AUTH["Revisar aprovação operacional específica"]
+  H --> M
+  M --> D & T & R
+  D & T & R --> P
+  P -->|Não| WAIT
+  P -->|Sim| ELIG
+  EXT --> CUT
+  CUT -->|Não| HOLD
+  CUT -->|Sim| AUTH
+~~~
+
+Os ramos de merge de PR e de cutover são **gates distintos**; nenhum ramo positivo significa que a ação foi executada. #251 permanece OPEN/Draft no HEAD 7796bba1, com conflitos preexistentes em README.md e docs/plan-tree.md; nenhum desses arquivos foi alterado neste checkpoint.
