@@ -31,6 +31,7 @@ const OPER = /^[a-z][a-z0-9:_-]{0,63}$/;
 const NOW = Date.now.bind(Date);
 const MAX_LEASE_SERIAL = 100_000; // Bounded DEV-OFF journal; no unsafe reset/rotation.
 const STORED_FLOOR_FIELDS = [...HEAD_FIELDS, "journal_count", "journal_tip"];
+const dbPins = new WeakMap();
 
 function deny() {
   const error = new Error("ZK10_CUSTODIAN_UNAVAILABLE");
@@ -136,8 +137,36 @@ function verifyUsedJournal(db, floor) {
   if (tip !== floor.journal_tip) deny();
 }
 function sameFile(stat, candidate) {
+  const one = typeof candidate.nlink === "bigint" ? 1n : 1;
+  const zero = typeof stat.ino === "bigint" ? 0n : 0;
   return stat.isFile() && candidate.isFile() && !candidate.isSymbolicLink()
-    && candidate.nlink === 1 && stat.dev === candidate.dev && stat.ino === candidate.ino;
+    && candidate.nlink === one && stat.nlink === one
+    && stat.ino !== zero && stat.dev === candidate.dev && stat.ino === candidate.ino;
+}
+function checkDbPin(db) {
+  const pin = dbPins.get(db);
+  if (!pin || pin.failed) deny();
+  try {
+    // SQLite has a separate native handle. Keep our file descriptor pinned
+    // and recheck its inode against the complete path on every critical use.
+    // This is not a native atomic no-reparse SQLite open on Windows.
+    safeFileName(pin.file);
+    const held = fs.fstatSync(pin.fd, { bigint: true });
+    const named = fs.lstatSync(pin.file, { bigint: true });
+    if (!sameFile(pin.identity, held) || !sameFile(held, named)
+      || held.mode !== pin.identity.mode || named.mode !== pin.identity.mode
+      || held.size !== named.size) deny();
+  } catch (_) {
+    pin.failed = true;
+    deny();
+  }
+}
+function closeDb(db) {
+  if (!db) return;
+  const pin = dbPins.get(db);
+  dbPins.delete(db);
+  try { db.close(); }
+  finally { if (pin) fs.closeSync(pin.fd); }
 }
 function openDb(file) {
   let db, descriptor;
@@ -148,11 +177,11 @@ function openDb(file) {
     safeFileName(file);
     descriptor = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT |
       (fs.constants.O_NOFOLLOW || 0), 0o600);
-    const opened = fs.fstatSync(descriptor);
-    if (!sameFile(opened, fs.lstatSync(file))) deny();
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameFile(opened, fs.lstatSync(file, { bigint: true }))) deny();
     db = new Database(file, { timeout: 2000 });
     safeFileName(file);
-    if (!sameFile(opened, fs.lstatSync(file))) deny();
+    if (!sameFile(opened, fs.lstatSync(file, { bigint: true }))) deny();
     db.pragma("journal_mode = DELETE");
     db.pragma("synchronous = EXTRA"); // fsync journal, DB and DELETE-mode journal directory.
     if (db.pragma("synchronous", { simple: true }) !== 3
@@ -170,6 +199,12 @@ function openDb(file) {
       nonce TEXT NOT NULL UNIQUE, lease_id TEXT NOT NULL UNIQUE,
       lease_serial INTEGER NOT NULL UNIQUE, chain_tip TEXT NOT NULL
     );`);
+    safeFileName(file);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameFile(opened, after)
+      || !sameFile(after, fs.lstatSync(file, { bigint: true }))) deny();
+    dbPins.set(db, { file, fd: descriptor, identity: opened, failed: false });
+    descriptor = undefined; // Keep the pin until closeDb, not just startup.
     return db;
   } catch (_) {
     try { db?.close(); } catch (_) { /* unavailable */ }
@@ -181,36 +216,51 @@ function openDb(file) {
   }
 }
 function read(db, ownerHash, signerHash, primary = false) {
+  checkDbPin(db);
   const row = db.prepare("SELECT * FROM floor WHERE singleton = 1").get();
   if (row && (row.owner_spki !== ownerHash || row.custodian_spki !== signerHash)) deny();
   const floor = mapFloor(row);
   if (primary && floor) verifyUsedJournal(db, floor);
+  checkDbPin(db);
   return floor;
 }
 function insertGenesis(db, head, ownerHash, signerHash) {
+  checkDbPin(db);
   db.transaction(() => {
+    checkDbPin(db);
     if (db.prepare("SELECT 1 FROM floor").get()) deny();
+    checkDbPin(db);
     db.prepare(`INSERT INTO floor (singleton, sequence, head_digest, enrollment_root,
       immutable_account_id, identity_digest, lease_serial, journal_count, journal_tip,
       owner_spki, custodian_spki)
       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...STORED_FLOOR_FIELDS.map(f => head[f]),
         ownerHash, signerHash);
+    checkDbPin(db);
   }).immediate();
+  checkDbPin(db);
 }
 function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge, primary) {
+  checkDbPin(db);
   db.transaction(() => {
+    checkDbPin(db);
     const current = read(db, expectedOwner, expectedSigner, primary);
     if (!same(current, previous)) deny();
+    checkDbPin(db);
     const result = db.prepare(`UPDATE floor SET sequence = ?, head_digest = ?,
       enrollment_root = ?, immutable_account_id = ?, identity_digest = ?,
       lease_serial = ?, journal_count = ?, journal_tip = ?
       WHERE singleton = 1 AND lease_serial = ?`)
       .run(...STORED_FLOOR_FIELDS.map(f => next[f]), previous.lease_serial);
     if (result.changes !== 1) deny();
-    if (primary) db.prepare(`INSERT INTO used_lease (nonce, lease_id, lease_serial, chain_tip)
-      VALUES (?, ?, ?, ?)`).run(challenge.nonce, challenge.lease_id,
-        next.lease_serial, next.journal_tip);
+    checkDbPin(db);
+    if (primary) {
+      db.prepare(`INSERT INTO used_lease (nonce, lease_id, lease_serial, chain_tip)
+        VALUES (?, ?, ?, ?)`).run(challenge.nonce, challenge.lease_id,
+          next.lease_serial, next.journal_tip);
+      checkDbPin(db);
+    }
   }).immediate();
+  checkDbPin(db);
 }
 
 function createDevOffZk10MonotonicFloorCustodian(options) {
@@ -252,12 +302,16 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
       independentOffServerCustodyProven: false,
       retainedMinimum() {
         if (closed || poisoned) deny();
+        checkDbPin(anchor);
+        checkDbPin(main);
         return { ...minimum };
       },
       attest(request, ownerLease) {
         if (closed || poisoned) deny();
         let writeStarted = false;
         try {
+          checkDbPin(anchor);
+          checkDbPin(main);
           const r = strict(request, REQUEST_FIELDS);
           const signed = unsignedSigned(ownerLease, LEASE_FIELDS,
             "rootark-zk10-custodian-owner-lease/v1", LEASE_DOMAIN, owner);
@@ -283,6 +337,8 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           bytes(r.lease_id, 16);
           const next = Object.freeze({ ...nextHead, journal_count: minimum.journal_count + 1,
             journal_tip: nextJournalTip(minimum.journal_tip, r, nextHead.lease_serial) });
+          checkDbPin(anchor);
+          checkDbPin(main);
           // Check the separate minimum afresh before every admission; a
           // process that observes any externally edited state must stop.
           if (!same(minimum, read(anchor, ownerHash, signerHash))
@@ -293,7 +349,11 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           // A crash between these two commits blocks all future attestations.
           writeStarted = true;
           advanceDb(anchor, minimum, next, ownerHash, signerHash, r, false);
+          checkDbPin(anchor);
+          checkDbPin(main);
           advanceDb(main, minimum, next, ownerHash, signerHash, r, true);
+          checkDbPin(anchor);
+          checkDbPin(main);
           minimum = next;
           const issuedAt = NOW();
           if (!Number.isSafeInteger(issuedAt)
@@ -311,6 +371,10 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           const floor = Object.fromEntries(FLOOR_FIELDS.map(field => [field, response[field]]));
           const signature = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
             signer).toString("base64url");
+          // Signer hooks are synchronous and may rename files. Never return
+          // signed bytes without checking both DB inodes once more.
+          checkDbPin(anchor);
+          checkDbPin(main);
           return { floor: { ...floor, signature } };
         } catch (_) {
           // SQLite fsync/commit ambiguity or unexpected sign failure must not
@@ -322,13 +386,13 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
       close() {
         if (closed) return;
         closed = true;
-        try { main.close(); } finally { anchor.close(); }
+        try { closeDb(main); } finally { closeDb(anchor); }
       },
     };
     return Object.freeze(api);
   } catch (_) {
-    try { main?.close(); } catch (_) { /* unavailable */ }
-    try { anchor?.close(); } catch (_) { /* unavailable */ }
+    try { closeDb(main); } catch (_) { /* unavailable */ }
+    try { closeDb(anchor); } catch (_) { /* unavailable */ }
     deny();
   }
 }

@@ -382,3 +382,170 @@ test("P2 regression: an existing parent symlink is refused without creating data
   assert.equal(fs.existsSync(path.join(realDir, "hidden.sqlite")), false);
   assert.equal(fs.existsSync(x.paths.databasePath), false);
 });
+
+for (const store of ["databasePath", "anchorDatabasePath"]) {
+  test(`P1: ${store} swapped for another inode during signed lease verification never attests`, (t) => {
+    if (process.platform === "win32") return t.skip("POSIX rename of open SQLite inode required");
+    const x = setup(t, `swapped-${store}`);
+    const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+    const challenge = x.offer();
+    const original = x.paths[store];
+    const oldInode = path.join(x.root, `orphan-${store}.sqlite`);
+    const substituted = path.join(x.root, `foreign-${store}.sqlite`);
+    fs.copyFileSync(original, substituted);
+    const verify = crypto.verify;
+    const transaction = Database.prototype.transaction;
+    let swapped = false;
+    let attemptedWrites = 0;
+    Database.prototype.transaction = function (...args) {
+      attemptedWrites += 1;
+      return transaction.apply(this, args);
+    };
+    crypto.verify = (...args) => {
+      const valid = verify(...args);
+      if (valid && !swapped) {
+        swapped = true;
+        fs.renameSync(original, oldInode);
+        fs.renameSync(substituted, original);
+      }
+      return valid;
+    };
+    try {
+      assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
+        /ZK10_CUSTODIAN_UNAVAILABLE/);
+    } finally {
+      crypto.verify = verify;
+      Database.prototype.transaction = transaction;
+    }
+    assert.equal(swapped, true, "real replacement occurs after owner lease verification");
+    assert.equal(attemptedWrites, 0, "identity mismatch must deny before any SQLite write transaction");
+    assert.notEqual(fs.statSync(original).ino, fs.statSync(oldInode).ino);
+    assert.equal(c.independentOffServerCustodyProven, false);
+    assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "a detected path replacement permanently invalidates this handle");
+    const actual = new Database(oldInode, { readonly: true, fileMustExist: true });
+    try { assert.equal(actual.prepare("SELECT lease_serial FROM floor").get().lease_serial, 0); }
+    finally { actual.close(); }
+  });
+}
+
+test("P1 POSIX: symlinked primary during lease verification is rejected before signing", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX symlink after opened SQLite handle required");
+  const x = setup(t, "lease-symlink");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const challenge = x.offer();
+  const previous = path.join(x.root, "orphan-primary.sqlite");
+  const original = x.paths.databasePath;
+  const verify = crypto.verify;
+  let swapped = false;
+  crypto.verify = (...args) => {
+    const valid = verify(...args);
+    if (valid && !swapped) {
+      swapped = true;
+      fs.renameSync(original, previous);
+      fs.symlinkSync(x.paths.anchorDatabasePath, original);
+    }
+    return valid;
+  };
+  try {
+    assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/);
+  } finally { crypto.verify = verify; }
+  assert.equal(swapped, true);
+  assert.equal(fs.lstatSync(original).isSymbolicLink(), true);
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+});
+
+test("P1 POSIX: anchor switched inside signer callback cannot return a signed attestation", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX rename of opened SQLite required");
+  const x = setup(t, "sign-time-anchor-swap");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const challenge = x.offer();
+  const original = x.paths.anchorDatabasePath;
+  const previous = path.join(x.root, "orphan-anchor.sqlite");
+  const signFloor = crypto.sign;
+  let swapped = false;
+  crypto.sign = (...args) => {
+    const signature = signFloor(...args);
+    if (!swapped) {
+      swapped = true;
+      fs.renameSync(original, previous);
+      fs.symlinkSync(x.paths.databasePath, original);
+    }
+    return signature;
+  };
+  try {
+    assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/);
+  } finally { crypto.sign = signFloor; }
+  assert.equal(swapped, true);
+  assert.equal(fs.lstatSync(original).isSymbolicLink(), true);
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "ambiguous post-write commit must poison instance");
+});
+
+test("P1 Windows: simulated reparse during signed lease is rejected without another database open", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows path-validation regression");
+  const x = setup(t, "win-reparse-late");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const challenge = x.offer();
+  const lstat = fs.lstatSync;
+  const open = fs.openSync;
+  const verify = crypto.verify;
+  let redirected = false;
+  let openCalls = 0;
+  fs.openSync = (...args) => {
+    if (args[0] === x.paths.databasePath || args[0] === x.paths.anchorDatabasePath) openCalls += 1;
+    return open(...args);
+  };
+  fs.lstatSync = (file, ...args) => {
+    const stat = lstat(file, ...args);
+    if (redirected && file === x.paths.anchorDatabasePath) {
+      return new Proxy(stat, { get(target, field) {
+        if (field === "isSymbolicLink") return () => true;
+        const value = Reflect.get(target, field, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    return stat;
+  };
+  crypto.verify = (...args) => {
+    const valid = verify(...args);
+    if (valid) redirected = true;
+    return valid;
+  };
+  try {
+    assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/);
+  } finally {
+    crypto.verify = verify;
+    fs.lstatSync = lstat;
+    fs.openSync = open;
+  }
+  assert.equal(redirected, true);
+  assert.equal(openCalls, 0, "late reparse must be rejected without opening another path");
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "observed fake reparse must permanently poison the affected pin");
+});
+
+test("P1: both SQLite identity descriptors remain pinned until close without leaking", (t) => {
+  const x = setup(t, "live-fd-pins");
+  const originalOpen = fs.openSync;
+  const pins = new Map();
+  fs.openSync = (...args) => {
+    const fd = originalOpen(...args);
+    if ([x.paths.databasePath, x.paths.anchorDatabasePath].includes(args[0])) pins.set(args[0], fd);
+    return fd;
+  };
+  let c;
+  try { c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config)); }
+  finally { fs.openSync = originalOpen; }
+  assert.equal(pins.size, 2);
+  for (const fd of pins.values()) assert.ok(fs.fstatSync(fd).isFile(), "pin stays open after bootstrap");
+  const first = x.offer();
+  assert.ok(c.attest(first.request, first.ownerLease).floor.signature);
+  for (const fd of pins.values()) assert.ok(fs.fstatSync(fd).isFile(), "pin survives signed transaction");
+  c.close();
+  for (const fd of pins.values()) assert.throws(() => fs.fstatSync(fd), { code: "EBADF" });
+  c.close();
+});
