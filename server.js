@@ -6133,34 +6133,58 @@ function registerExperimentalP2p() {
       const source = path.resolve(directory, fileName);
       if (!isSafeChildPath("./uploads", directory) ||
         !isSafeFolderChildPath(directory, source)) return null;
-      const realDirectory = path.normalize(await fs.promises.realpath(directory));
       const expectedDirectory = path.normalize(directory);
-      if (process.platform === "win32"
-        ? realDirectory.toLowerCase() !== expectedDirectory.toLowerCase()
-        : realDirectory !== expectedDirectory) return null;
-      const before = await fs.promises.lstat(source);
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
-        || before.size !== expectedSize) return null;
-      handle = await fs.promises.open(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-      const opened = await handle.stat();
-      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
-        || opened.size !== expectedSize) return null;
+      const directoryStillTrusted = async () => {
+        const real = path.normalize(await fs.promises.realpath(directory));
+        return process.platform === "win32"
+          ? real.toLowerCase() === expectedDirectory.toLowerCase()
+          : real === expectedDirectory;
+      };
+      if (!await directoryStillTrusted()) return null;
+      const expectedBytes = BigInt(expectedSize);
+      const validFile = (stats) => stats.isFile() && !stats.isSymbolicLink()
+        && stats.ino !== 0n && stats.nlink === 1n && stats.size === expectedBytes;
+      const sameVersion = (a, b) => a.dev === b.dev && a.ino === b.ino
+        && a.size === b.size && a.nlink === b.nlink
+        && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
+        && a.birthtimeNs === b.birthtimeNs && a.mode === b.mode;
+      // Windows Node has no O_NOFOLLOW: deny a preexisting reparse point
+      // BEFORE open. This precheck alone is NOT an atomic native no-reparse
+      // guarantee against a privileged concurrent filesystem attacker.
+      let windowsPrecheck = null;
+      if (process.platform === "win32") {
+        windowsPrecheck = await fs.promises.lstat(source, { bigint: true });
+        if (!validFile(windowsPrecheck)) return null;
+      }
+      // POSIX opens the pinned FD FIRST (O_NOFOLLOW also rejects a symlink
+      // atomically). O_NONBLOCK prevents blocking on a hostile FIFO before
+      // fstat can reject its type.
+      handle = await fs.promises.open(source, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+      const opened = await handle.stat({ bigint: true });
+      if (!validFile(opened)) return null;
+      const pathname = await fs.promises.lstat(source, { bigint: true });
+      if (!validFile(pathname) || !sameVersion(opened, pathname)
+        || (windowsPrecheck && !sameVersion(windowsPrecheck, pathname))
+        || !await directoryStillTrusted()) return null;
       const hash = crypto.createHash("sha256");
       const bytes = Buffer.allocUnsafe(512 * 1024);
-      for (let offset = 0; offset < expectedSize;) {
-        const { bytesRead } = await handle.read(bytes, 0, Math.min(bytes.length, expectedSize - offset), offset);
-        if (bytesRead <= 0) return null;
-        hash.update(bytes.subarray(0, bytesRead));
-        offset += bytesRead;
+      try {
+        for (let offset = 0; offset < expectedSize;) {
+          const { bytesRead } = await handle.read(bytes, 0,
+            Math.min(bytes.length, expectedSize - offset), offset);
+          if (bytesRead <= 0) return null;
+          hash.update(bytes.subarray(0, bytesRead));
+          offset += bytesRead;
+        }
+      } finally {
+        bytes.fill(0);
       }
-      const after = await handle.stat();
-      const current = await fs.promises.lstat(source);
-      if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
-        || after.dev !== opened.dev || after.ino !== opened.ino
-        || current.dev !== opened.dev || current.ino !== opened.ino
-        || after.size !== expectedSize || current.size !== expectedSize
-        || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
-        || current.mtimeMs !== opened.mtimeMs || current.ctimeMs !== opened.ctimeMs) return null;
+      const after = await handle.stat({ bigint: true });
+      const current = await fs.promises.lstat(source, { bigint: true });
+      if (!validFile(after) || !validFile(current)
+        || !sameVersion(opened, after) || !sameVersion(after, current)
+        || !await directoryStillTrusted()) return null;
       return { bytes: expectedSize, sha256: hash.digest("hex") };
     } catch { return null; }
     finally { if (handle) await handle.close(); }
