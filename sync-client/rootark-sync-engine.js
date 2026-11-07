@@ -484,6 +484,10 @@ function sameSnapshotRevision(left, right) {
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs);
 }
 
+// The largest accepted plan has 32 independently signed 512-character paths.
+// Use one bound in preview and execution so a ready plan remains executable.
+const MAX_RESTORE_PLAN_BYTES = 128 * 1024;
+const MAX_SERVER_HISTORY_PER_OBJECT = 32;
 function normalizeHistoricalRestorePlan(requests) {
   if (!Array.isArray(requests) || requests.length < 1 || requests.length > 32) {
     fail("Historical restore plan must contain 1 to 32 objects", "invalid_restore_plan");
@@ -840,12 +844,16 @@ class SyncEngine {
       // The first destination and HEAD can change while a later history is
       // fetched. Recheck all observed state after the last item; still advisory.
       for (const recheck of rechecks) await recheck();
-      return {
+      const plan = {
         readOnly: true, ready: true, atomic: false,
         objectCount: entries.length,
         localOverwriteCount: entries.filter((entry) => entry.localAction === "replace-clean-tracked").length,
         requiresFreshRestoreCheck: true, entries,
       };
+      if (Buffer.byteLength(protocol.canonicalJson(plan)) > MAX_RESTORE_PLAN_BYTES) {
+        fail("Historical restore plan is too large", "invalid_restore_plan");
+      }
+      return plan;
   }
 
   async _assertRestorablePlanMember(requested) {
@@ -869,7 +877,7 @@ class SyncEngine {
     let detached;
     try {
       const serialized = protocol.canonicalJson(expectedPlan);
-      if (Buffer.byteLength(serialized) > 32768) throw Error();
+      if (Buffer.byteLength(serialized) > MAX_RESTORE_PLAN_BYTES) throw Error();
       detached = JSON.parse(serialized);
     } catch { fail("Invalid controlled restore plan", "invalid_restore_plan"); }
     if (detached?.readOnly !== true || detached.ready !== true
@@ -1013,7 +1021,7 @@ class SyncEngine {
             fail("Controlled restore requires settled signed outbox", "sync_operation_pending");
           }
           const result = await this._restoreHistoricalVersion(item.objectId, item.sourceVersionId,
-            { beforeEnqueue: async (intent) => {
+            { reviewedPlanEntry: requested, beforeEnqueue: async (intent) => {
               item.status = "indeterminate";
               delete item.neverDispatched;
               Object.assign(item, intent);
@@ -1247,6 +1255,17 @@ class SyncEngine {
     if (versions.some((record) => record.objectId !== objectId)) fail("History contains another object", "invalid_history");
     const selected = versions.filter((record) => record.versionId === versionId);
     if (selected.length !== 1 || selected[0].tombstone) fail("Restorable historical version not found", "history_version_unavailable");
+    // A restore appends one signed revision. Server retention guarantees only
+    // the newest 31 after append; older source rows may be pruned immediately.
+    // With no independent checkpoint/paused-device retention attestation, reject
+    // such selections BEFORE signing, mutating local bytes or sending a PUT.
+    const sourceIndex = versions.findIndex((record) => record.versionId === versionId);
+    const guaranteedAfterAppend = versions.length + 1 - (MAX_SERVER_HISTORY_PER_OBJECT - 1);
+    if (versions.length >= MAX_SERVER_HISTORY_PER_OBJECT
+      && sourceIndex < guaranteedAfterAppend) {
+      fail("Selected signed historical source may be pruned by its restore",
+        "history_source_prune_risk");
+    }
     const remote = await this.adapter.list(objectId);
     const records = Array.isArray(remote) ? remote : Array.isArray(remote?.objects) ? remote.objects : remote ? [remote] : [];
     if (records.length !== 1) fail("Current sync version unavailable", "history_version_unavailable");
@@ -1302,9 +1321,25 @@ class SyncEngine {
   }
 
   async _restoreHistoricalVersion(objectId, versionId,
-    { beforeEnqueue = null, onProvenUnsent = null } = {}) {
+    { reviewedPlanEntry = null, beforeEnqueue = null, onProvenUnsent = null } = {}) {
     const { historical, current, relative, existing, assertCleanDestination } =
       await this._inspectHistoricalRestore(objectId, versionId);
+    // A valid signed HEAD may change after the plan re-preview but before this
+    // second async inspection. Never adopt an unreviewed CAS base.
+    if (reviewedPlanEntry !== null) {
+      if (reviewedPlanEntry.objectId !== objectId
+        || reviewedPlanEntry.sourceVersionId !== versionId
+        || reviewedPlanEntry.currentVersionId !== current.versionId
+        || typeof reviewedPlanEntry.currentEnvelopeDigest !== "string"
+        || !/^[a-f0-9]{64}$/.test(reviewedPlanEntry.currentEnvelopeDigest)
+        || reviewedPlanEntry.currentEnvelopeDigest !== signedEnvelopeDigest(current)
+        || typeof reviewedPlanEntry.sourceEnvelopeDigest !== "string"
+        || !/^[a-f0-9]{64}$/.test(reviewedPlanEntry.sourceEnvelopeDigest)
+        || reviewedPlanEntry.sourceEnvelopeDigest !== signedEnvelopeDigest(historical)
+        || protocol.compareRevisions(current.revision, reviewedPlanEntry.baseRevision) !== 0) {
+        fail("Signed restore HEAD differs from reviewed plan", "restore_plan_stale");
+      }
+    }
     const key = await this.keyFor(historical);
     const decrypted = protocol.decryptPayload(historical, key);
     const plaintext = historical.operation === "move"
