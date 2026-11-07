@@ -80,8 +80,65 @@ class SessionCiphertextCacheTest {
         }
         assertTrue(root.listFiles().isNullOrEmpty())
         cache.save(binding, "fixture-object-1", body)
-        assertThrows(SecurityException::class.java) { cache.save(binding, "fixture-object-1", body) }
+        assertThrows(DuplicateCiphertextCaptureException::class.java) {
+            cache.save(binding, "fixture-object-1", body)
+        }
         assertEquals("fixture-object-1", cache.inspect(binding, "fixture-object-1").objectId)
+    }
+
+    @Test fun identicalReplayKeepsTheUiCaptureAndKeyButChangedBytesDoNot() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        val original = cache.save(binding, "fixture-object-1", body)
+        val encrypted = File(root, "packet.bin").readBytes()
+        val duplicate = assertThrows(DuplicateCiphertextCaptureException::class.java) {
+            cache.save(binding, "fixture-object-1", body)
+        }
+        var wipes = 0
+        assertEquals(CiphertextCaptureUiResult.ALREADY_CAPTURED,
+            CiphertextCaptureFailurePolicy.handle(duplicate) {
+                wipes++
+                cache.clear()
+            })
+        assertEquals(0, wipes)
+        assertArrayEquals(encrypted, File(root, "packet.bin").readBytes())
+        assertEquals(original, cache.inspect(binding, "fixture-object-1"))
+
+        // The same revision and authorization with different GET bytes is still a replay.
+        val differentBytes = JSONObject(String(body, Charsets.UTF_8)).toString(2).toByteArray()
+        assertFalse(body.contentEquals(differentBytes))
+        val replay = assertThrows(SecurityException::class.java) {
+            cache.save(binding, "fixture-object-1", differentBytes)
+        }
+        assertFalse(replay is DuplicateCiphertextCaptureException)
+        assertEquals(CiphertextCaptureUiResult.FAILED,
+            CiphertextCaptureFailurePolicy.handle(replay) {
+                wipes++
+                cache.clear()
+            })
+        assertEquals(1, wipes)
+        assertTrue(root.listFiles().isNullOrEmpty())
+        assertThrows(SecurityException::class.java) { cache.inspect(binding, "fixture-object-1") }
+    }
+
+    @Test fun corruptedCachedCiphertextCannotBeReusedByAnIdenticalGet() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        cache.save(binding, "fixture-object-1", body)
+        val file = File(root, "packet.bin")
+        val bytes = file.readBytes()
+        bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte()
+        file.writeBytes(bytes)
+        val failure = assertThrows(SecurityException::class.java) {
+            cache.save(binding, "fixture-object-1", body)
+        }
+        assertFalse(failure is DuplicateCiphertextCaptureException)
+        var wiped = false
+        assertEquals(CiphertextCaptureUiResult.FAILED,
+            CiphertextCaptureFailurePolicy.handle(failure) {
+                wiped = true
+                cache.clear()
+            })
+        assertTrue(wiped)
+        assertTrue(root.listFiles().isNullOrEmpty())
     }
 
     @Test fun logoutErasesTheCiphertextAndRejectsInFlightCapture() {
