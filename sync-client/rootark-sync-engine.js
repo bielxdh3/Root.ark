@@ -394,18 +394,23 @@ async function createDurableRestoreProgress(filePath, value) {
 async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expectedScope }) {
   let handle;
   try {
-    const before = await fsp.lstat(filePath, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink()
-      || (before.nlink !== 1n && before.nlink !== 2n)
-      || before.size > 65536n) throw Error();
     handle = await fsp.open(filePath, fs.constants.O_RDONLY
       | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || opened.nlink !== before.nlink || !sameFileVersion(before, opened)) throw Error();
+    if (!opened.isFile() || opened.isSymbolicLink()
+      || (opened.nlink !== 1n && opened.nlink !== 2n)
+      || opened.size > 65536n) throw Error();
+    // Bind pathname inspection to the already-open descriptor. No pathname
+    // bytes are trusted before this FD's type, links and version are checked.
+    const before = await fsp.lstat(filePath, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== opened.nlink
+      || !sameFileVersion(opened, before)) throw Error();
     const contents = await handle.readFile();
     const after = await handle.stat({ bigint: true });
     const pathname = await fsp.lstat(filePath, { bigint: true });
-    if (!sameFileVersion(opened, after) || !sameFileVersion(after, pathname)) throw Error();
+    if (!after.isFile() || after.nlink !== opened.nlink || !sameFileVersion(opened, after)
+      || !pathname.isFile() || pathname.isSymbolicLink()
+      || pathname.nlink !== opened.nlink || !sameFileVersion(after, pathname)) throw Error();
     const parsed = JSON.parse(contents.toString("utf8"));
     if (parsed?.version !== 1 || parsed.planDigest !== expectedPlanDigest
       || protocol.canonicalJson(parsed.scope) !== protocol.canonicalJson(expectedScope)

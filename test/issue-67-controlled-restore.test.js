@@ -401,6 +401,158 @@ test("#67 P2: failed initial fsynced progress creation cannot permanently brick 
   assert.equal(f.pushes(), 1);
 });
 
+async function completedRestoreProgress(t) {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const completed = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+  assert.equal(completed.completed, 1);
+  assert.equal(f.pushes(), 1);
+  const name = (await fsp.readdir(f.local))
+    .find((entry) => /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(entry));
+  assert.ok(name);
+  const progress = path.join(f.local, name);
+  const reopened = await new SyncEngine(f.opts).open();
+  return { f, preview, progress, reopened };
+}
+
+test("#67 CodeQL: durable progress opens pinned descriptor before pathname bigint lstat", async (t) => {
+  const { f, preview, progress, reopened } = await completedRestoreProgress(t);
+  const originalOpen = fsp.open;
+  const originalLstat = fsp.lstat;
+  const order = [];
+  fsp.open = async (name, flags, ...rest) => {
+    if (name === progress) order.push("open");
+    return originalOpen(name, flags, ...rest);
+  };
+  fsp.lstat = async (name, options, ...rest) => {
+    if (name === progress && options?.bigint === true) order.push("lstat");
+    return originalLstat(name, options, ...rest);
+  };
+  try {
+    const resumed = await reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true });
+    assert.equal(resumed.completed, 1);
+  } finally {
+    fsp.open = originalOpen;
+    fsp.lstat = originalLstat;
+  }
+  assert.deepEqual(order.slice(0, 2), ["open", "lstat"]);
+  assert.equal(f.pushes(), 1, "a completed signed restore is never dispatched twice");
+});
+
+test("#67 CodeQL: POSIX pathname swap after pinned fstat denies before journal read", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX allows renaming an open inode");
+  const { f, preview, progress, reopened } = await completedRestoreProgress(t);
+  const originalOpen = fsp.open;
+  let swapped = false;
+  let reads = 0;
+  fsp.open = async (name, flags, ...rest) => {
+    const handle = await originalOpen(name, flags, ...rest);
+    if (name !== progress) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === "stat") return async (...args) => {
+        const stats = await target.stat(...args);
+        if (!swapped) {
+          swapped = true;
+          await fsp.rename(progress, `${progress}.held`);
+          await fsp.writeFile(progress, "foreign replacement progress");
+        }
+        return stats;
+      };
+      if (key === "readFile") return async (...args) => {
+        reads += 1;
+        return target.readFile(...args);
+      };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  try {
+    await assert.rejects(reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true }),
+      (error) => error.code === "restore_plan_unavailable");
+  } finally { fsp.open = originalOpen; }
+  assert.equal(swapped, true);
+  assert.equal(reads, 0, "a replaced pathname is denied before reading journal bytes");
+  assert.equal(f.pushes(), 1, "no additional signed PUT is dispatched");
+  assert.equal((await reopened.journal.recover()).length, 0);
+});
+
+test("#67 CodeQL: symlinked durable progress never reaches journal read or signed PUT", async (t) => {
+  const { f, preview, progress, reopened } = await completedRestoreProgress(t);
+  const original = `${progress}.held`;
+  await fsp.rename(progress, original);
+  try {
+    await fsp.symlink(original, progress);
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+      return t.skip("symlink creation is unavailable in this Windows environment");
+    }
+    throw error;
+  }
+  const originalOpen = fsp.open;
+  let reads = 0;
+  fsp.open = async (name, flags, ...rest) => {
+    const handle = await originalOpen(name, flags, ...rest);
+    if (name !== progress) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === "readFile") return async (...args) => {
+        reads += 1;
+        return target.readFile(...args);
+      };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  try {
+    await assert.rejects(reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true }),
+      (error) => error.code === "restore_plan_unavailable");
+  } finally { fsp.open = originalOpen; }
+  assert.equal(reads, 0);
+  assert.equal(f.pushes(), 1);
+});
+
+test("#67 CodeQL: Windows reparse pathname reported after open denies without journal read", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows reparse metadata contract");
+  const { f, preview, progress, reopened } = await completedRestoreProgress(t);
+  const originalOpen = fsp.open;
+  const originalLstat = fsp.lstat;
+  let progressOpens = 0;
+  let reads = 0;
+  fsp.open = async (name, flags, ...rest) => {
+    const handle = await originalOpen(name, flags, ...rest);
+    if (name !== progress) return handle;
+    progressOpens += 1;
+    return new Proxy(handle, { get(target, key) {
+      if (key === "readFile") return async (...args) => {
+        reads += 1;
+        return target.readFile(...args);
+      };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  fsp.lstat = async (name, options, ...rest) => {
+    const stats = await originalLstat(name, options, ...rest);
+    if (name !== progress || options?.bigint !== true) return stats;
+    // Windows may deny creating real symlinks without Developer Mode.
+    // Emulate the reparse result from lstat, preserving all real inode fields.
+    return new Proxy(stats, { get(target, key) {
+      if (key === "isSymbolicLink") return () => true;
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  try {
+    await assert.rejects(reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true }),
+      (error) => error.code === "restore_plan_unavailable");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.lstat = originalLstat;
+  }
+  assert.equal(progressOpens, 1, "the descriptor must be opened before inspecting reparse metadata");
+  assert.equal(reads, 0);
+  assert.equal(f.pushes(), 1);
+});
+
 test("#67 P2: crash after final hardlink publication with two links safely resumes once", async (t) => {
   const f = await fixture(t);
   const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
