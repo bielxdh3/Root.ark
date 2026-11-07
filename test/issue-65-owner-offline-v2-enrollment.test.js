@@ -27,6 +27,8 @@ const { openProtectedRecipientShareFile, createProtectedRecipientShareOffer,
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
+const { Zk1ProtectedCiphertextSharing } =
+  require("../src/services/zk1ProtectedCiphertextSharing");
 const portableCli = (() => {
   try { return require("../scripts/zk1-recipient-offer-local"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -921,6 +923,105 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(fs.readFileSync(path.join(dir, "recipient-open.bin")), bytes,
       "CLI owner export -> recipient signed real HTTP GET -> HPKE/AEAD open bytes");
     assert.ok(realShareReads >= 2, "CLI recipient performs a fresh signed HTTP GET");
+    // A batch is only an explicit operator-selected set of independently
+    // owner-issued offers. Add a second encrypted object and a REAL owner
+    // grant through the same disposable signed HTTP route.
+    const bundleSecondMeta = { ...metadata, object_id: b64(crypto.randomBytes(16)),
+      version_id: b64(crypto.randomBytes(16)) };
+    const bundleSecondCek = crypto.randomBytes(32);
+    const bundleSecondBytes = Buffer.from("second-distinct-owner-approved-object");
+    const bundleSecondCipher = await content.encryptFile({
+      cek: await content.importFileCek(bundleSecondCek), metadata: bundleSecondMeta,
+      name: "second-private.txt", mediaType: "text/plain", data: bundleSecondBytes });
+    const secondPut = await protectedClient.signProtectedContentOperation({
+      ...signing, operation: "put", objectId: bundleSecondMeta.object_id,
+      expectedObjectRevision: null, ciphertext: bundleSecondCipher });
+    assert.equal((await protectedClient.postProtectedCiphertextPut({
+      origin, request: secondPut, fetchImpl })).revision, 1);
+    const bundleSecondDigest = crypto.createHash("sha256").update(bundleSecondCipher).digest();
+    const bundleSecondAuth = { ...shareAuthorization, object_id: bundleSecondMeta.object_id,
+      ciphertext_digest: bundleSecondDigest, nonce: crypto.randomBytes(32) };
+    const bundleSecondGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      authorization: bundleSecondAuth };
+    const bundleSecondAck = await fetch(origin + "/zk-1/v1/share/grant", {
+      method: "POST", headers: { "content-type": "application/json",
+        "x-fixture-session": "owner" }, body: JSON.stringify({
+        grantId: bundleSecondGrantInput.grantId,
+        recipientUsername: bundleSecondGrantInput.recipientUsername,
+        recipientDeviceId: bundleSecondGrantInput.recipientDeviceId,
+        expiresAt: bundleSecondGrantInput.expiresAt,
+        authorization: Object.fromEntries(Object.entries(bundleSecondAuth)
+          .map(([key, value]) => [key, value instanceof Uint8Array ? b64(value) : value])),
+        signatureBase64: b64(crypto.sign(null,
+          await contentAuthorizationMessageV1(bundleSecondAuth), originalActor)),
+        shareSignatureBase64: b64(crypto.sign(null,
+          await shareGrantMessageV1(bundleSecondGrantInput), originalActor)),
+      }),
+    });
+    assert.equal(bundleSecondAck.status, 201, "second object has a genuine owner-issued grant");
+    const bundleSecondGrant = await bundleSecondAck.json();
+    const bundleSecondOffer = await createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, grant: bundleSecondGrant, metadata: bundleSecondMeta,
+      ownerHeldCek: Buffer.from(bundleSecondCek), ciphertext: Buffer.from(bundleSecondCipher),
+      ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([bundleSecondCipher]),
+    });
+    bundleSecondCek.fill(0);
+    fs.writeFileSync(path.join(dir, "second-offer.json"), JSON.stringify(bundleSecondOffer),
+      { mode: 0o600, flag: "wx" });
+    const batch = (filename, entries) => {
+      fs.writeFileSync(path.join(dir, filename), JSON.stringify({
+        schema: "rootark-zk1-recipient-object-set-dev/v1", entries,
+      }), { mode: 0o600, flag: "wx" });
+      return portableCli.run(["redeem-batch", "--owned-dir", dir,
+        "--context-module", "trusted-share.js", "--manifest", filename]);
+    };
+    assert.equal(await batch("two-objects.json", [
+      { offer: "portable-offer.json", output: "batch-first.bin" },
+      { offer: "second-offer.json", output: "batch-second.bin" },
+    ]), "ZK_RECIPIENT_BATCH_REDEEMED_2_OF_2");
+    assert.deepEqual(fs.readFileSync(path.join(dir, "batch-first.bin")), bytes);
+    assert.deepEqual(fs.readFileSync(path.join(dir, "batch-second.bin")), bundleSecondBytes);
+    assert.ok(realShareReads >= 4, "each offered object caused a signed HTTP GET");
+    for (const [name, entries] of [
+      ["duplicate-object.json", [
+        { offer: "portable-offer.json", output: "dup-a.bin" },
+        { offer: "portable-offer.json", output: "dup-b.bin" }]],
+      ["duplicate-output.json", [
+        { offer: "portable-offer.json", output: "shared.bin" },
+        { offer: "second-offer.json", output: "shared.bin" }]],
+      ["aliased-output.json", [
+        { offer: "portable-offer.json", output: "trusted-share.js" }]],
+      ["overflow-batch.json", Array.from({ length: 9 }, (_, i) => ({
+        offer: "portable-offer.json", output: "overflow-" + i + ".bin" }))],
+      ["traversal-batch.json", [
+        { offer: "portable-offer.json", output: "../escape.bin" }]],
+    ]) {
+      await assert.rejects(batch(name, entries), /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+        name + " must fail before any output");
+    }
+    for (const filename of ["dup-a.bin", "dup-b.bin", "shared.bin",
+      "overflow-0.bin", "escape.bin"]) {
+      assert.equal(fs.existsSync(path.join(dir, filename)), false);
+    }
+    // Even with a valid first object, the second owner grant is checked
+    // independently after server-side revocation; first plaintext persists.
+    assert.deepEqual(new Zk1ProtectedCiphertextSharing(store).revoke(
+      state.scope, bundleSecondGrant.grantId, "owner"), { revoked: true });
+    await assert.rejects(batch("revoked-batch.json", [
+      { offer: "portable-offer.json", output: "partial-first.bin" },
+      { offer: "second-offer.json", output: "revoked-second.bin" },
+    ]), /ZK_RECIPIENT_BATCH_INCOMPLETE_1_OF_2_INSPECT_PRIVATE_OUTPUTS/);
+    assert.deepEqual(fs.readFileSync(path.join(dir, "partial-first.bin")), bytes);
+    assert.equal(fs.existsSync(path.join(dir, "revoked-second.bin")), false);
+    const forgedSecondOffer = { ...bundleSecondOffer, grant: { ...bundleSecondOffer.grant,
+      shareSignatureBase64: b64(crypto.randomBytes(64)) } };
+    fs.writeFileSync(path.join(dir, "forged-second-offer.json"),
+      JSON.stringify(forgedSecondOffer), { mode: 0o600, flag: "wx" });
+    await assert.rejects(batch("forged-batch.json", [
+      { offer: "portable-offer.json", output: "forged-partial-first.bin" },
+      { offer: "forged-second-offer.json", output: "forged-second.bin" },
+    ]), /ZK_RECIPIENT_BATCH_INCOMPLETE_1_OF_2_INSPECT_PRIVATE_OUTPUTS/);
+    assert.equal(fs.existsSync(path.join(dir, "forged-second.bin")), false);
     withoutTrustedAuthority = true;
     await assert.rejects(runOwnerExport("grant-ack.json", "no-authority-offer.json"),
       /ZK_RECIPIENT_OFFER_CLI_DENIED/,
