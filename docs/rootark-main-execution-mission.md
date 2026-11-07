@@ -257,7 +257,7 @@ Novo corte **somente de estado**, sem reescrever os snapshots de 18:23 e 22:44 U
 flowchart TD
   H["04/11: #231 → #232 → #233 → #234 → #235 → #236 MERGED (histórico)"]
   M["Root/main d5fbc110: cinco merges desta missão, #252 #253 #255 #256 #258"]
-  D["OPEN/Draft: #284 #291 #293 #298 #299 #302"]
+  D["OPEN/Draft: #284 (CodeQL GREEN), #291 #293 #298 #299 #302"]
   T["OPEN/Draft #288: TOCTOU Windows residual"]
   R["OPEN/Ready #306: ainda não merged"]
   P{"Peer GO no SHA exato, hosted CI GREEN e main verificada?"}
@@ -278,3 +278,7 @@ flowchart TD
 ~~~
 
 Os ramos de merge de PR e de cutover são **gates distintos**; nenhum ramo positivo significa que a ação foi executada. #251 permanece OPEN/Draft no HEAD 7796bba1, com conflitos preexistentes em README.md e docs/plan-tree.md; nenhum desses arquivos foi alterado neste checkpoint.
+
+## 2026-11-07 23:47 UTC — correção de CI e publicação posterior
+
+A [atualização temporal do ledger](validation/2026-11-07-rootark-wave-execution-status.md#correção-e-atualização-posterior--2026-11-07-2347-utc) corrige o **P2 documental** do checkpoint 23:37: o [CodeQL de #284](https://github.com/bielxdh3/Root.ark/actions/runs/42425618613) já havia concluído **SUCCESS às 23:34:02 UTC**, e JS Analyze às **23:34:08 UTC**; o Security Regression completo segue pendente. Depois do checkpoint, [#299](https://github.com/bielxdh3/Root.ark/pull/299) publicou o merge de dois pais `43a2af02` (reunindo #284 `45a91a6a` e a fonte `d9eeb5fd`, peer33 GO), e [#302](https://github.com/bielxdh3/Root.ark/pull/302) avançou para `0f2000fe` (peer13 GO, ainda **DEV-OFF**). Ambos permanecem OPEN/Draft. Main Windows canonical/syntax continua RED; nenhum merge em Root/main, cutover ou R1 físico foi certificado.
