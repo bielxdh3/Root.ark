@@ -132,7 +132,11 @@ class Zk1ProtectedCiphertextSharing {
             || error?.code === "SQLITE_CONSTRAINT_UNIQUE") deny("ZK_SHARE_CONFLICT");
           deny("ZK_SHARE_UNAVAILABLE");
         }
-        return { grantId, expiresAt };
+        // Return the existing, owner-signed envelope for explicit out-of-band
+        // handoff. Neither signature nor statement gives the recipient a CEK.
+        return { grantId, expiresAt,
+          shareStatementBase64: signedBytes.toString("base64url"),
+          shareSignatureBase64: bytes(shareSignature, 64).toString("base64url") };
       }, (approval) => {
         guard();
         activeDevice(approval.verifiedHeadManifest, recipientDeviceId);
