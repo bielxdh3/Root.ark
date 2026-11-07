@@ -10,6 +10,7 @@ class ServerOriginTest {
         val origin = ServerOrigin.parse("https://vault.example.test:8443/")
         assertEquals("https://vault.example.test:8443/auth/login", origin.loginUrl().toString())
         assertEquals("https://vault.example.test:8443/auth/login/2fa", origin.twoFactorUrl().toString())
+        assertEquals("https://vault.example.test:8443/sync/v1/objects", origin.syncListUrl().toString())
         assertEquals("https://vault.example.test/auth/login", ServerOrigin.parse("https://vault.example.test").loginUrl().toString())
         assertEquals("https://[::1]:443/auth/login", ServerOrigin.parse("https://[::1]:443").loginUrl().toString())
     }
