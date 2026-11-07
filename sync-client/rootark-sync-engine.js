@@ -629,6 +629,107 @@ class SyncEngine {
     return key;
   }
 
+  // Restore by creating a NEW signed CAS update. A historical envelope is
+  // untrusted until the existing incoming authority and AEAD checks accept it.
+  async restoreHistoricalVersion(objectId, versionId) {
+    return this.withMutationLock(() => this._restoreHistoricalVersion(objectId, versionId));
+  }
+
+  async _restoreHistoricalVersion(objectId, versionId) {
+    if (!this.opened) await this._open();
+    const validId = (value) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value);
+    if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
+    if (typeof this.adapter.history !== "function") fail("Sync history is unavailable", "history_unavailable");
+    if ((await this.journal.recover()).length) fail("Sync pending writes must be settled before restore", "sync_operation_pending");
+    const result = await this.adapter.history(objectId);
+    if (!Array.isArray(result?.versions) || result.versions.length < 1 || result.versions.length > 256) {
+      fail("Invalid historical version list", "invalid_history");
+    }
+    const versions = result.versions.map((record) => protocol.validateStoredOperation(record));
+    if (versions.some((record) => record.objectId !== objectId)) fail("History contains another object", "invalid_history");
+    const selected = versions.filter((record) => record.versionId === versionId);
+    if (selected.length !== 1 || selected[0].tombstone) fail("Restorable historical version not found", "history_version_unavailable");
+    const remote = await this.adapter.list(objectId);
+    const records = Array.isArray(remote) ? remote : Array.isArray(remote?.objects) ? remote.objects : remote ? [remote] : [];
+    if (records.length !== 1) fail("Current sync version unavailable", "history_version_unavailable");
+    const current = protocol.validateStoredOperation(records[0]);
+    const historical = selected[0];
+    if (current.objectId !== objectId || current.fileId !== historical.fileId
+      || current.compartmentId !== historical.compartmentId
+      || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
+      fail("Current signed version does not match history", "invalid_history");
+    }
+    await this.verifyIncomingOperation(historical, { preObserve: false });
+    await this.verifyIncomingOperation(current, { preObserve: false });
+    if (historical.metadata.contentType === "inode/directory"
+      || (!current.tombstone && current.metadata.contentType === "inode/directory")) {
+      fail("Directory restoration is not supported", "history_version_unavailable");
+    }
+    const relative = await canonicalRelativePath(this.rootDir, current.metadata.path);
+    if (!this.isSelected(relative)) fail("Historical restore path is excluded", "path_not_selected");
+    const existing = this.snapshot.files[relative];
+    if (existing && !existing.deleted && (existing.objectId !== objectId || existing.fileId !== current.fileId)) {
+      fail("Historical restore would overwrite a different local object", "restore_local_conflict");
+    }
+    const destination = await contained(this.rootDir, relative, true);
+    const assertCleanDestination = async () => {
+      const present = await exists(destination);
+      if (present && (!existing || existing.deleted)) {
+        fail("Historical restore would overwrite an untracked local file", "restore_local_conflict");
+      }
+      if (existing && !existing.deleted) {
+        // A tracked identity is not permission to overwrite unsent local edits
+        // (including local deletion). Require the exact last-synchronized bytes.
+        if (!present || existing.directory || !/^[a-f0-9]{64}$/.test(existing.hash || "")) {
+          fail("Historical restore requires a clean local file", "restore_local_conflict");
+        }
+        const actual = await readContainedFile(this.rootDir, relative);
+        if (crypto.createHash("sha256").update(actual).digest("hex") !== existing.hash) {
+          fail("Historical restore would overwrite unsent local edits", "restore_local_conflict");
+        }
+      }
+    };
+    await assertCleanDestination();
+    const key = await this.keyFor(historical);
+    const decrypted = protocol.decryptPayload(historical, key);
+    const plaintext = historical.operation === "move"
+      ? protocol.decodeMovePayload(decrypted, key) : decrypted;
+    if (plaintext === null) fail("Historical MOVE has no recoverable content", "history_version_unavailable");
+    let restored;
+    try {
+      const { sourcePath: _oldMoveSource, ...historicalMetadata } = historical.metadata;
+      restored = await this.buildOperation({ operation: "update", objectId, fileId: current.fileId,
+        operationId: `histrestore-${crypto.randomUUID()}`,
+        baseRevision: current.revision, revision: protocol.nextRevision(current.revision, this.deviceId),
+        metadata: { ...historicalMetadata, path: relative, name: path.basename(relative), size: plaintext.length },
+        plaintext, fileKey: await this.keyFor({ ...current, keyEpoch: this.keyEpoch }) });
+    } finally { plaintext.fill(0); }
+    // Signing may await an external key provider. Recheck after that boundary,
+    // before the signed outbox can cause a later remote write.
+    await assertCleanDestination();
+    // The outbox is durable BEFORE local materialization. Failure to send is
+    // recoverable by the existing signed journal; no old operation is replayed.
+    await this.assertOutgoingAuthorized(restored, () => this.journal.enqueue(restored));
+    try {
+      await this._apply(restored, null, existing && !existing.deleted ? existing.hash : null);
+    } catch (error) {
+      if (error?.code === "restore_local_conflict") await this.journal.discardUnsent(restored);
+      throw error;
+    }
+    const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+    await this._pushPending(summary);
+    if (summary.offline) return { restored: true, pushed: false, pending: true,
+      objectId, sourceVersionId: versionId, versionId: restored.versionId };
+    const readback = await this.adapter.list(objectId);
+    const committed = Array.isArray(readback) ? readback[0]
+      : Array.isArray(readback?.objects) ? readback.objects[0] : readback;
+    if (!committed || signedEnvelopeDigest(protocol.validateStoredOperation(committed)) !== signedEnvelopeDigest(restored)) {
+      fail("Historical restore could not verify the committed revision", "restore_commit_unverified");
+    }
+    return { restored: true, pushed: true, objectId, sourceVersionId: versionId,
+      versionId: restored.versionId, operationId: restored.operationId };
+  }
+
   async verifyIncomingOperation(operation, { preObserve = true } = {}) {
     // Strict mode is local policy, never a request-controlled proof opt-in.
     // Historical expiry is allowed only for a structurally bound SIGNED
@@ -1519,6 +1620,23 @@ class SyncEngine {
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
+        if (operation.operationId.startsWith("histrestore-")) {
+          // The signed outbox can survive a crash between staging and local
+          // materialization. Never dispatch that restore without actual bytes.
+          const expected = await this.hashPendingPayload(operation);
+          let observed;
+          try {
+            const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+            const local = await readContainedFile(this.rootDir, relative);
+            try { observed = crypto.createHash("sha256").update(local).digest("hex"); }
+            finally { local.fill(0); }
+          } catch {
+            fail("Historical restore was not materialized locally", "restore_local_materialization_missing");
+          }
+          if (observed !== expected) {
+            fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
+          }
+        }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
@@ -1626,11 +1744,84 @@ class SyncEngine {
     return trashTarget;
   }
 
+  async stageHistoricalRestore(target, relative, expectedHash) {
+    const present = await exists(target);
+    if (expectedHash === null) {
+      if (present) fail("Historical restore would overwrite a new local file", "restore_local_conflict");
+      return null;
+    }
+    if (!present) fail("Historical restore would overwrite an unsent local deletion", "restore_local_conflict");
+    let before;
+    try {
+      before = await fsp.lstat(target, { bigint: true });
+      const current = await readContainedFile(this.rootDir, relative, before);
+      if (crypto.createHash("sha256").update(current).digest("hex") !== expectedHash) {
+        fail("Historical restore would overwrite unsent local edits", "restore_local_conflict");
+      }
+    } catch (error) {
+      if (error?.code === "restore_local_conflict") throw error;
+      fail("Historical restore target changed before replacement", "restore_local_conflict");
+    }
+    const staged = await this.stageExisting(target);
+    if (!staged) fail("Historical restore target disappeared", "restore_local_conflict");
+    let unchanged = false;
+    try {
+      const after = await fsp.lstat(staged, { bigint: true });
+      // Windows can change ctimeNs on a pathname rename even when no file
+      // content changed. Match the stable inode plus content/mtime/birthtime
+      // identity; comparing ctimeNs here would reject every legitimate restore.
+      unchanged = after.isFile() && !after.isSymbolicLink() && after.nlink === 1n
+        && sameFileIdentity(before, after) && before.size === after.size
+        && before.mtimeNs === after.mtimeNs && before.birthtimeNs === after.birthtimeNs
+        && before.mode === after.mode;
+      if (unchanged) {
+        // Inode/size/mtime alone are insufficient: a concurrent writer can
+        // overwrite bytes in place, then restore the original mtime before
+        // stageExisting renames the file. Validate the actual staged payload
+        // through a no-follow FD before unlinking or materializing anything.
+        await containedAbsolute(this.rootDir, staged, false);
+        const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_NONBLOCK || 0);
+        const handle = await fsp.open(staged, flags);
+        try {
+          const opened = await handle.stat({ bigint: true });
+          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n
+            || !sameFileIdentity(after, opened)) {
+            unchanged = false;
+          } else {
+            const bytes = await handle.readFile();
+            try {
+              const readEnd = await handle.stat({ bigint: true });
+              const pathEnd = await fsp.lstat(staged, { bigint: true });
+              unchanged = sameFileVersion(opened, readEnd)
+                && sameFileVersion(readEnd, pathEnd)
+                && crypto.createHash("sha256").update(bytes).digest("hex") === expectedHash;
+            } finally { bytes.fill(0); }
+          }
+        } finally { await handle.close(); }
+      }
+    } catch { /* Reject unexpected staging identity and preserve the old bytes. */ }
+    if (!unchanged) {
+      await this.replaceStagedIfVacant(staged, target);
+      fail("Historical restore target changed during replacement", "restore_local_conflict");
+    }
+    return staged;
+  }
+
+  async replaceStagedIfVacant(staged, target) {
+    try {
+      // A hard link claims an absent path atomically; unlike rename, it never
+      // replaces another writer's file. The staged bytes remain if it fails.
+      await fsp.link(staged, target);
+      await fsp.unlink(staged);
+    } catch { /* Retain the staged data for manual recovery when path is occupied. */ }
+  }
+
   async apply(operation, summary = null) {
     return this.withMutationLock(() => this._apply(operation, summary));
   }
 
-  async _apply(operation, summary = null) {
+  async _apply(operation, summary = null, historicalRestoreHash = undefined) {
     operation = envelopeCopy(operation);
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
@@ -1751,8 +1942,21 @@ class SyncEngine {
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
         await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
         try {
-          if (await exists(target)) await this.stageExisting(target);
-          await fsp.rename(temporary, target);
+          if (historicalRestoreHash !== undefined) {
+            const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
+            try {
+              // Atomic no-replace materialization; do not clobber files
+              // created by another process after the last restore preflight.
+              await fsp.link(temporary, target);
+            } catch (error) {
+              if (staged) await this.replaceStagedIfVacant(staged, target);
+              if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
+              throw error;
+            }
+          } else {
+            if (await exists(target)) await this.stageExisting(target);
+            await fsp.rename(temporary, target);
+          }
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
