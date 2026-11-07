@@ -234,7 +234,7 @@ Review of commit `c47d2dbb` was **bounded source GO** before the newer #288 P1 w
 
 The [2026-11-07 status ledger](validation/2026-11-07-rootark-wave-execution-status.md) and [time-stamped PR #251 checkpoint](https://github.com/bielxdh3/Root.ark/pull/251#issuecomment-6708652569) supersede earlier **current-state counts** without replacing historical SHA-level evidence. At verification: `Root/main` was `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, five merges had actually landed, and **47 PRs were still open (20 Ready / 27 Draft)**. The 39 reviewed PR dependency edges include ten divergent ancestry relationships, so mergeability is not proof that a child carries its parent's latest source.
 
-The user explicitly changed the former no-merge rule: normal GitHub merges are authorized **only after independent exact-SHA GO and every applicable hosted mandatory gate GREEN**, with verified main composition and no P1/P2. **No deploy, cutover, force, destructive rewrite or direct Root/main edit** is authorized. #257 source-reviewed protected search was promoted to Ready; no new merge has been performed because the current main hosted baseline remains queued. #254 remains a research-only Draft per its issue-specific restriction.
+**Historical policy only:** an earlier session considered conditional GitHub merges after independent exact-SHA GO, every mandatory hosted gate GREEN and verified main composition. **The current 2026-11-07 instruction supersedes that conditional policy: no GitHub PR merge is authorized in this work round, even after all checks pass.** No deploy, cutover, force, destructive rewrite or direct Root/main edit is authorized. #257 source-reviewed protected search was promoted to Ready; no new merge was performed in this checkpoint. #254 remains a research-only Draft per its issue-specific restriction.
 
 Remaining hard blockers, tracked in the linked ledger, include selected/excluded pinned-path case aliases on #66/#67, independent native CFAPI callback completion, an admission-cost DoS in experimental WebRTC room creation, #288 CodeQL high race annotation, external monotonic R1 custody, physical Android/Windows10 and real TURN/cross-NAT. Earlier green tests are explicitly not considered approvals for these uncovered cases.
 ## 2026-11-07 published integration follow-up
@@ -278,6 +278,8 @@ flowchart TD
 ~~~
 
 Os ramos de merge de PR e de cutover são **gates distintos**; nenhum ramo positivo significa que a ação foi executada. #251 permanece OPEN/Draft no HEAD 7796bba1, com conflitos preexistentes em README.md e docs/plan-tree.md; nenhum desses arquivos foi alterado neste checkpoint.
+
+**Regra operacional vigente:** por instrução posterior do proprietário, nenhum merge de PR ou deploy é permitido nesta rodada, mesmo com `Peer GO` e CI integralmente verdes. O ramo `ELIG` representa apenas um candidato tecnicamente avaliável em futura decisão específica, não uma autorização de merge. A cadeia histórica #231→#236 e os cinco merges antigos são fatos passados, não operações desta rodada.
 
 ## 2026-11-07 23:47 UTC — correção de CI e publicação posterior
 
