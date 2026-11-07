@@ -380,3 +380,75 @@ test('a bound room rejects an authority revision rollback after an earlier autho
     signal: { kind: 'ice', candidate: { candidate: 'old-authority' } } });
   assert.equal(await outcome, 'closed', 'older accepted authority epoch cannot regain signaling');
 });
+
+test('fake revokes and invalid room frames are rejected without hashing 32 MiB ciphertext', async t => {
+  let hashes = 0;
+  const f = await fixture(t, async () => { hashes++; return authorized(); });
+  const room = await f.room();
+  const host = await f.connect('owner');
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  await host.next('joined');
+  const { guest, joined } = await inviteJoin(host, room, f.connect, 'guest1');
+
+  // A real peer request + consent is allowed to recheck current object ACL.
+  host.send({ type: 'request-peer', to: joined.peerId });
+  const request = await guest.next('peer-request');
+  guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await guest.next('peer-allowed');
+  const before = hashes;
+
+  for (let i = 0; i < 20; i++) {
+    host.send({ type: 'revoke', inviteId: i.toString(16).padStart(16, '0') });
+    assert.equal((await host.next('error')).code, 'FORBIDDEN',
+      'a non-existent invitation must never receive a revoke ACK');
+  }
+  const invalid = [
+    [host, { type: 'signal', to: 'invalid-peer-id', signal: { kind: 'ice', candidate: {} } }, 'FORBIDDEN'],
+    [host, { type: 'request-peer', to: 'invalid-peer-id' }, 'FORBIDDEN'],
+    [host, { type: 'kick', to: 'invalid-peer-id' }, 'FORBIDDEN'],
+    [host, { type: 'consent', requestId: 'absent', accept: true }, 'FORBIDDEN'],
+    [host, { type: 'unknown-event' }, 'FORBIDDEN'],
+    [host, { type: 'invite', recipient: '' }, 'BAD_RECIPIENT'],
+    [guest, { type: 'invite', recipient: 'guest2' }, 'FORBIDDEN'],
+    [guest, { type: 'revoke', inviteId: '0'.repeat(16) }, 'FORBIDDEN'],
+    [guest, { type: 'signal', to: 'wrong-peer-id', signal: { kind: 'offer', sdp: 'fake' } }, 'FORBIDDEN'],
+  ];
+  for (const [peer, message, expected] of invalid) {
+    peer.send(message);
+    assert.equal((await peer.next('error')).code, expected);
+  }
+  assert.equal(hashes, before, 'invalid frames must never trigger object ACL hashing');
+  assert.equal(host.received.some(message => message.type === 'revoked'), false);
+  assert.equal(guest.received.some(message => message.type === 'signal'), false);
+});
+
+test('valid revoke rechecks current ACL and never ACKs a revoked owner', async t => {
+  let hashes = 0;
+  let ownerAllowed = true;
+  const f = await fixture(t, async ({ recipient }) => {
+    hashes++;
+    return recipient === null && !ownerAllowed ? null : authorized();
+  });
+  const room = await f.room();
+  const host = await f.connect('owner');
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  await host.next('joined');
+  host.send({ type: 'invite', recipient: 'guest1' });
+  const first = await host.next('invited');
+  const beforeValid = hashes;
+  host.send({ type: 'revoke', inviteId: first.inviteId });
+  assert.equal((await host.next('revoked')).inviteId, first.inviteId);
+  assert.ok(hashes > beforeValid, 'genuine revoke must still check the authoritative ACL');
+
+  host.send({ type: 'invite', recipient: 'guest2' });
+  const second = await host.next('invited');
+  const beforeRevoked = hashes;
+  ownerAllowed = false;
+  const closed = new Promise(resolve => host.ws.once('close', resolve));
+  host.send({ type: 'revoke', inviteId: second.inviteId });
+  await closed;
+  assert.ok(hashes > beforeRevoked, 'revoked owner must trigger the ACL guard');
+  assert.equal(host.received.some(message => message.type === 'revoked' &&
+    message.inviteId === second.inviteId), false, 'stale ACL cannot authorize a revoke');
+});
