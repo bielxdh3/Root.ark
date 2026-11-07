@@ -2686,8 +2686,30 @@ class SyncEngine {
           && entry.fileId === operation.fileId) affectedPaths.push(relativePath);
       }
     }
-    if (protectedPaths.some((pin) => affectedPaths.some((candidate) =>
-      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)))) {
+    const pinnedDescendant = protectedPaths.some((pin) => affectedPaths.some((candidate) =>
+      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)));
+    // A signed CREATE can register an existing directory after child hydration
+    // without replacing it. Never allow a case-distinct alias, conflicting
+    // tracked identity or non-directory target to bypass pin protection.
+    let existingAncestorCreate = false;
+    if (pinnedDescendant && operation.operation === "create"
+      && !operation.tombstone && !metadata.sourcePath
+      && metadata.contentType === "inode/directory") {
+      const ancestorPrefix = `${metadata.path}/`;
+      const sameSpelling = protectedPaths.every((pin) =>
+        !pin.path.toLowerCase().startsWith(ancestorPrefix.toLowerCase())
+        || pin.path.startsWith(ancestorPrefix));
+      const existing = Object.entries(this.snapshot.files).find(([relative]) =>
+        relative.toLowerCase() === metadata.path.toLowerCase());
+      if (sameSpelling && (!existing || (!existing[1].deleted && existing[1].directory
+        && existing[1].objectId === operation.objectId && existing[1].fileId === operation.fileId))) {
+        let stats;
+        try { stats = await fsp.lstat(target); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        existingAncestorCreate = Boolean(stats?.isDirectory() && !stats.isSymbolicLink());
+      }
+    }
+    if (pinnedDescendant && !existingAncestorCreate) {
       fail("A pinned file is inside a directory affected by the signed operation", "file_pinned");
     }
     if (operation.operation === "delete"
@@ -2697,7 +2719,8 @@ class SyncEngine {
     if (["create", "update", "move"].includes(operation.operation)
       && protectedPaths.some((pin) =>
         pin.path.toLowerCase() === metadata.path.toLowerCase()
-        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId))) {
+        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId
+          || metadata.contentType === "inode/directory"))) {
       // Guard the destination BEFORE the first journal observation, mkdir,
       // stageExisting or rename. Signed operations from another object can
       // never replace a device-pinned target, even via direct apply() or
@@ -2769,6 +2792,12 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
+        if (existingAncestorCreate) {
+          const still = await fsp.lstat(target);
+          if (!still.isDirectory() || still.isSymbolicLink()) {
+            fail("Pinned ancestor directory changed during admission", "file_pinned");
+          }
+        }
         const sourcePath = operation.operation === "update" ? activeIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         let relocated = false;
         if (sourcePath) {
@@ -2782,7 +2811,7 @@ class SyncEngine {
             relocated = true;
           }
         }
-        if (!relocated) {
+        if (!relocated && !existingAncestorCreate) {
           try {
             await fsp.mkdir(target, { recursive: false });
           } catch (error) {
@@ -2887,8 +2916,70 @@ class SyncEngine {
     return this.withMutationLock(() => this._reconcileLocal());
   }
 
+  async assertPinnedLocalTree() {
+    const pinned = Object.values(this.snapshot.pinnedFiles || {});
+    if (!pinned.length) return;
+    // A selected/excluded scan can omit the *actual* pinned inode while still
+    // yielding a case-fold alias. Inspect the filesystem namespace independently
+    // of picker filters before enqueueing anything or changing the snapshot.
+    const root = path.resolve(this.rootDir);
+    const rootStats = await fsp.lstat(root);
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+      fail("Pinned sync root is not an ordinary directory", "unsafe_path");
+    }
+    const bucketsByDirectory = new Map();
+    const buckets = async (directory) => {
+      if (bucketsByDirectory.has(directory)) return bucketsByDirectory.get(directory);
+      const groups = new Map();
+      for (const name of await fsp.readdir(directory)) {
+        const key = name.toLowerCase();
+        const matches = groups.get(key) || [];
+        matches.push(name);
+        groups.set(key, matches);
+      }
+      bucketsByDirectory.set(directory, groups);
+      return groups;
+    };
+    for (const pin of pinned) {
+      let directory = root;
+      const segments = pin.path.split("/");
+      for (const [index, segment] of segments.entries()) {
+        const matches = (await buckets(directory)).get(segment.toLowerCase()) || [];
+        if (matches.length > 1 || (matches.length === 1 && matches[0] !== segment)) {
+          fail("Pinned path has a case-fold directory or file alias", "file_pinned");
+        }
+        // A genuinely absent pin retains the existing pinned_file_missing
+        // handling for selected paths; a hidden excluded pin stays unmodified.
+        if (!matches.length) break;
+        const target = path.join(directory, segment);
+        const stats = await fsp.lstat(target);
+        if (stats.isSymbolicLink() || (index === segments.length - 1
+          ? !stats.isFile() : !stats.isDirectory())) {
+          fail("Pinned path is a symlink or has changed its inode type", "file_pinned");
+        }
+        directory = target;
+      }
+    }
+  }
+
   async _reconcileLocal() {
+    await this.assertPinnedLocalTree();
     const scanned = await this.scanFiles();
+    // Keep every scanned spelling when checking pinned regular files. A Map
+    // built directly from lowercased entries can let docs/a.txt overwrite a
+    // directory at pinned docs/A.txt on case-sensitive filesystems.
+    const pinnedPortablePaths = new Set(Object.values(this.snapshot.pinnedFiles || {})
+      .map((pin) => pin.path.toLowerCase()));
+    const seenPinnedPaths = new Map();
+    for (const [relative, file] of Object.entries(scanned)) {
+      const key = relative.toLowerCase();
+      if (!pinnedPortablePaths.has(key)) continue;
+      const previous = seenPinnedPaths.get(key);
+      if (file.directory || (previous && previous !== relative)) {
+        fail("Pinned regular file has a directory or case-fold path collision", "file_pinned");
+      }
+      seenPinnedPaths.set(key, relative);
+    }
     const current = {};
     const snapshotPathByKey = new Map();
     if (process.platform === "win32") {
@@ -3109,15 +3200,15 @@ class SyncEngine {
   async pinStatus(relativePath = null) {
     return this.withMutationLock(async () => {
       if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
-      const status = async (safePath) => {
-        const pin = Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
+      const status = async (safePath, knownPin = null) => {
+        const pin = knownPin || Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
         const target = await contained(this.rootDir, safePath, true);
         const present = await exists(target);
         return { path: safePath, pinned: Boolean(pin), localPresent: present, objectId: pin?.objectId || null };
       };
       if (relativePath !== null) return status(await canonicalRelativePath(this.rootDir, relativePath));
       const all = Object.values(this.snapshot.pinnedFiles || {}).sort((a, b) => a.path.localeCompare(b.path));
-      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path))) };
+      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path, item))) };
     });
   }
 
