@@ -847,9 +847,9 @@ test("quarantine files under data are excluded from generic backup collection", 
   }
 });
 
-test("generic data backup collection skips symlinked files", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-data-symlink-runtime-"));
-  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-data-symlink-external-"));
+test("generic data backup rejects eligible symlinks without publishing an incomplete ZIP", { timeout: 30_000 }, (t) => {
+  const runtime = createPrivateAuthorityFixture("rootark-data-symlink-runtime-");
+  const external = createPrivateAuthorityFixture("rootark-data-symlink-external-");
   try {
     const dataDir = path.join(runtime, "data");
     const ordinaryPath = path.join(dataDir, "ordinary.json");
@@ -869,14 +869,24 @@ test("generic data backup collection skips symlinked files", { timeout: 30_000 }
     }
     const script = `
       const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
       const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
       const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       (async () => {
-        const backup = await backupService.createBackup({ createdBy: "fixture" });
-        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
-        const entries = zip.files.map((entry) => entry.path);
-        assert.ok(entries.includes("data/ordinary.json"));
-        assert.equal(entries.includes("data/public.json"), false);
+        const failure = await backupService.createBackup({ createdBy: "fixture" }).then(
+          () => null, (error) => error);
+        assert.ok(failure, "an eligible symlink must abort the entire backup");
+        assert.match(failure.message, /Backup data source contains a symbolic link or junction/);
+        assert.equal(failure.backup?.status, "failed");
+        assert.equal(failure.backup?.sizeBytes, 0);
+        assert.equal(failure.backup?.checksum, null);
+        const archive = backupService.getArchivePath(failure.backup.filename);
+        assert.equal(fs.existsSync(archive), false);
+        assert.equal(fs.readdirSync(path.dirname(archive))
+          .some((name) => /\.zip(?:\.|$)/i.test(name)), false,
+          "no successful or partial ZIP can survive a failed eligible source");
+        assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "ordinary.json"), "utf8"), "ordinary data");
         console.log(JSON.stringify({ ok: true }));
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;
@@ -893,9 +903,9 @@ test("generic data backup collection skips symlinked files", { timeout: 30_000 }
   }
 });
 
-test("generic uploads and temp backup collection skip symlinked roots and entries", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-root-symlink-runtime-"));
-  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-root-symlink-external-"));
+test("generic uploads and temp backups reject opted-in symlink roots and entries", { timeout: 30_000 }, (t) => {
+  const runtime = createPrivateAuthorityFixture("rootark-backup-root-symlink-runtime-");
+  const external = createPrivateAuthorityFixture("rootark-backup-root-symlink-external-");
   try {
     const uploadRoot = path.join(runtime, "uploads");
     const tempRoot = path.join(runtime, "temp");
@@ -925,31 +935,53 @@ test("generic uploads and temp backup collection skip symlinked roots and entrie
       const path = require("node:path");
       const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
       const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const uploadRoot = path.join(process.cwd(), "uploads");
       const tempRoot = path.join(process.cwd(), "temp");
       const externalTempEntry = process.env.EXTERNAL_TEMP_ENTRY;
       const linkType = process.platform === "win32" ? "junction" : "dir";
       (async () => {
-        const rootBackup = await backupService.createBackup({ createdBy: "fixture" });
-        const rootZip = await unzipper.Open.file(backupService.getArchivePath(rootBackup.filename));
-        const rootEntries = rootZip.files.map((entry) => entry.path);
-        assert.equal(rootEntries.includes("uploads/root-secret.txt"), false);
-        assert.equal(rootEntries.includes("temp/root-secret.txt"), false);
-
+        const expectIncomplete = async (message) => {
+          const failure = await backupService.createBackup({ createdBy: "fixture" }).then(
+            () => null, (error) => error);
+          assert.ok(failure, "unsafe opted-in source must fail the entire backup");
+          assert.match(failure.message, message);
+          assert.equal(failure.backup?.status, "failed");
+          assert.equal(failure.backup?.sizeBytes, 0);
+          assert.equal(failure.backup?.checksum, null);
+          const archive = backupService.getArchivePath(failure.backup.filename);
+          assert.equal(fs.existsSync(archive), false);
+          assert.equal(fs.readdirSync(path.dirname(archive))
+            .some((name) => /\.zip(?:\.|$)/i.test(name)), false);
+        };
+        await expectIncomplete(/Backup source root is not a real directory/);
+        fs.rmSync(uploadRoot, { recursive: true, force: true });
         fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.mkdirSync(uploadRoot, { recursive: true });
         fs.mkdirSync(tempRoot, { recursive: true });
+        fs.writeFileSync(path.join(uploadRoot, "ordinary.txt"), "ordinary upload file");
         fs.writeFileSync(path.join(tempRoot, "ordinary.txt"), "ordinary temp file");
         fs.symlinkSync(externalTempEntry, path.join(tempRoot, "external-alias"), linkType);
-        const entryBackup = await backupService.createBackup({ createdBy: "fixture" });
-        const entryZip = await unzipper.Open.file(backupService.getArchivePath(entryBackup.filename));
-        const entryPaths = entryZip.files.map((entry) => entry.path);
-        assert.ok(entryPaths.includes("temp/ordinary.txt"));
-        assert.equal(entryPaths.includes("temp/external-alias/entry-secret.txt"), false);
+        await expectIncomplete(/Backup source contains a symbolic link or junction/);
+        fs.rmSync(path.join(tempRoot, "external-alias"), { recursive: true, force: true });
+        fs.symlinkSync(process.env.EXTERNAL_UPLOAD_ROOT,
+          path.join(uploadRoot, ".rootark-cloud-cache-explicit"), linkType);
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
+        const entries = zip.files.map((entry) => entry.path);
+        assert.ok(entries.includes("uploads/ordinary.txt"));
+        assert.ok(entries.includes("temp/ordinary.txt"));
+        assert.equal(entries.some((entry) => entry.includes(".rootark-cloud-cache-explicit")), false,
+          "explicit cloud-cache policy exclusions remain successful");
+        assert.equal(entries.some((entry) => entry.includes("root-secret.txt")
+          || entry.includes("entry-secret.txt")), false);
+        assert.equal(fs.readFileSync(path.join(process.env.EXTERNAL_UPLOAD_ROOT, "root-secret.txt"), "utf8"),
+          "external upload root bytes", "rejecting a junction must not change its external target");
         console.log(JSON.stringify({ ok: true }));
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;
     const result = spawnSync(process.execPath, ["-e", script], {
       cwd: runtime,
-      env: { ...process.env, EXTERNAL_TEMP_ENTRY: externalTempEntry, DB_ENABLED: "false", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "true", BACKUP_RETENTION_COUNT: "20" },
+      env: { ...process.env, EXTERNAL_TEMP_ENTRY: externalTempEntry, EXTERNAL_UPLOAD_ROOT: externalUploadRoot, DB_ENABLED: "false", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "true", BACKUP_RETENTION_COUNT: "20" },
       encoding: "utf8",
     });
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -1041,9 +1073,9 @@ test("backup fails closed when a collected source path is swapped before it open
   }
 });
 
-test("quarantine backups exclude external payloads reached through upload aliases", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-runtime-"));
-  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-payloads-"));
+test("quarantine backup rejects eligible upload aliases while preserving explicit quarantine exclusions", { timeout: 30_000 }, (t) => {
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-alias-runtime-");
+  const quarantineDir = createPrivateAuthorityFixture("rootark-quarantine-alias-payloads-");
   try {
     const uploadsDir = path.join(runtime, "uploads");
     const aliasPath = path.join(uploadsDir, ".quarantine-alias");
@@ -1079,6 +1111,18 @@ test("quarantine backups exclude external payloads reached through upload aliase
         { id: "safe", storedQuarantineFilename: safeName, originalFilename: "document.bin" },
       ] }));
       (async () => {
+        const failure = await backupService.createBackup({ createdBy: "fixture" }).then(
+          () => null, (error) => error);
+        assert.ok(failure, "an eligible upload junction cannot silently disappear from backup");
+        assert.match(failure.message, /Backup source contains a symbolic link or junction/);
+        assert.equal(failure.backup?.status, "failed");
+        assert.equal(failure.backup?.sizeBytes, 0);
+        assert.equal(failure.backup?.checksum, null);
+        const failedArchive = backupService.getArchivePath(failure.backup.filename);
+        assert.equal(fs.existsSync(failedArchive), false);
+        assert.equal(fs.readdirSync(path.dirname(failedArchive))
+          .some((name) => /\.zip(?:\.|$)/i.test(name)), false);
+        fs.rmSync(path.join(uploadsDir, ".quarantine-alias"), { recursive: true, force: true });
         const backup = await backupService.createBackup({ createdBy: "fixture" });
         const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
         const entries = zip.files.map((entry) => entry.path);
