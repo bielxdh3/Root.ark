@@ -68,6 +68,9 @@ ZIP marcado como success se encontrar um symlink/junction na raiz ou em
 uma entrada elegível, ou um arquivo especial que não seja diretório ou arquivo
 regular. Anteriormente essas entradas eram ignoradas silenciosamente e
 sumiam tanto do ZIP quanto da lista included_files, ocultando a incompletude.
+Mesmo sem cloud habilitado, entradas locais com caminhos distintos apenas
+por maiúsculas/minúsculas interrompem o backup: o restore rejeita essa colisão
+e não conseguiria recuperar o ZIP integralmente.
 As exclusões sensíveis e de quarentena definidas acima continuam explícitas
 e não entram nesse requisito. A ausência de uma árvore opcional permanece
 permitida e **não é prova de que todos os arquivos de uma conta existem na

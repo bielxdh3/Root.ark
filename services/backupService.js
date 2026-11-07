@@ -509,16 +509,23 @@ async function collectBackupFiles(options = {}) {
   const syncFile = unsuppressedFiles.find((file) => file.entryPath === "data/sync-objects.json");
   if (syncFile) attestCiphertextOnlyFile(syncFile.absolutePath);
 
-  if (!cloudStorage?.enabled()) return unsuppressedFiles.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
-
-  const stageDir = options.stageDir;
-  if (!stageDir) throw new Error("Cloud backup staging is required");
-  const known = new Map();
+  // ZIP restore rejects case-folded destination collisions on every platform.
+  // Check locally collected entries even when cloud inventory is disabled;
+  // otherwise POSIX case-distinct files can create a success ZIP that cannot
+  // be restored as a complete, unambiguous selection.
   const collisions = new Map();
   for (const file of unsuppressedFiles) {
     const key = collisionKey(file.entryPath);
     if (collisions.has(key) && collisions.get(key) !== file.entryPath) throw new Error("Backup entry collision");
     collisions.set(key, file.entryPath);
+  }
+
+  if (!cloudStorage?.enabled()) return unsuppressedFiles.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
+
+  const stageDir = options.stageDir;
+  if (!stageDir) throw new Error("Cloud backup staging is required");
+  const known = new Map();
+  for (const file of unsuppressedFiles) {
     known.set(file.entryPath, file);
   }
   const areas = ["uploads", ...(includeTemp || includePending ? ["temp"] : [])];
