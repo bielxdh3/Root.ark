@@ -23,8 +23,15 @@ the storage server. The verifier is created with three independent bundles:
    `readCurrentHead(challenge)` implementation. The verifier creates a new
    random 32-byte challenge and accepts only that challenge in the external
    authority's Ed25519 signature over current mapping digest, account IDs and
-   monotonic sequence. The authority key must differ from owner, provisioner,
-   witness and CAS signer keys.
+   monotonic sequence. The authority key must differ from **all owner signing
+   keys, including valid owner rotations**, provisioner, witness and CAS keys.
+
+Before owner-rotation and cutover verification, both signed histories are
+recursively snapshotted through own data descriptors. The snapshot rejects
+Proxies and accessor properties; both signature verification and cutover digest
+therefore use the **same immutable copy of the signed cutover chain**. Two
+separately valid owner-signed cutovers cannot be spliced to pair the inventory
+root of one with the independently retained cutover digest of another.
 
 The owner-signed canonical map binds exact SyncV2 account/store/compartment,
 operation/object/file/version IDs, revision counter + device, `epoch-N` key

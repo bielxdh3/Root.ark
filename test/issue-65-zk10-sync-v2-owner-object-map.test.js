@@ -6,7 +6,7 @@ const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { DOMAIN: SOURCE_DOMAIN } = require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
-const { signOwnerCutover, digestOwnerCutover } =
+const { signOwnerCutover, digestOwnerCutover, signOwnerRotation, spkiHash } =
   require("../src/crypto/rootark-zk10-account-cutover-v1");
 const { buildSparseObjectInventoryProof } =
   require("../src/crypto/rootark-zk10-anonymous-object-binding-v1");
@@ -241,4 +241,101 @@ test("wrong source owner provisioning, signer pin or current revocation fail", a
     currentDevicePolicy: () => ({ username: identity.username,
       trustedDevicePublicKeys: { "source-device-4": b64(keys.device) },
       revokedDeviceIds: ["source-device-4"] }) })(f.input), deny);
+});
+
+test("P2 rotated owner signer must NEVER double as independently pinned mapping head signer", async () => {
+  const f = await fixture();
+  const rotated = crypto.generateKeyPairSync("ed25519");
+  const rotation = signOwnerRotation({
+    type: "rootark-zk10-owner-rotation/v1", immutable_account_id: immutableId,
+    generation: 1, from_spki_sha256: spkiHash(keys.owner.publicKey),
+    next_public_key: b64(rotated), previous_rotation_digest: null,
+  }, keys.owner.privateKey, rotated.privateKey);
+  const { signature: _oldSignature, ...cutoverBody } = f.zkAuthority.ownerCutoverHistory[0];
+  const cutover = signOwnerCutover(cutoverBody, rotated.privateKey);
+  const cutoverDigest = digestOwnerCutover(cutover);
+  const mapping = signOwnerObjectMap({ ...f.payload,
+    owner_cutover_digest: cutoverDigest }, rotated.privateKey);
+  const mappingDigest = digestOwnerObjectMap(mapping);
+  const zkAuthority = { ...f.zkAuthority, ownerRotations: [rotation],
+    ownerCutoverHistory: [cutover], independentlyRetainedCutoverDigest: cutoverDigest };
+  const makeHead = (privateKey) => async (challenge) => signCurrentMappingHead({
+    type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+    sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+    mapping_sequence: f.payload.mapping_sequence, mapping_digest: mappingDigest,
+  }, privateKey);
+  // Positive control: the legitimate rotation remains valid with a genuinely
+  // distinct authority, rather than rejecting rotations outright.
+  const distinct = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority, mappingAuthority: {
+      ...f.authority, readCurrentHead: makeHead(keys.authority.privateKey),
+    },
+  });
+  assert.equal((await distinct({ ...f.input, ownerMapping: mapping })).authorizesIo, false);
+  // Same K owns the freshly rotated owner certificate AND the separately
+  // claimed external head: signatures are valid but independence is false.
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority, mappingAuthority: {
+      ...f.authority, pinnedPublicKey: rotated.publicKey,
+      readCurrentHead: makeHead(rotated.privateKey),
+    },
+  }), deny);
+});
+
+test("P2 owner cutover is snapshotted: two distinct valid signatures cannot splice a foreign inventory root", async () => {
+  const f = await fixture();
+  const signedA = f.zkAuthority.ownerCutoverHistory[0];
+  const { signature: _signature, ...cutoverBody } = signedA;
+  const signedB = signOwnerCutover({ ...cutoverBody, inventory_head: hex(99) },
+    keys.owner.privateKey);
+  const digestB = digestOwnerCutover(signedB);
+  const mapping = signOwnerObjectMap({ ...f.payload,
+    owner_cutover_digest: digestB }, keys.owner.privateKey);
+  const digestBMap = digestOwnerObjectMap(mapping);
+  const authority = { ...f.authority,
+    readCurrentHead: async (challenge) => signCurrentMappingHead({
+      type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+      sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+      mapping_sequence: f.payload.mapping_sequence, mapping_digest: digestBMap,
+    }, keys.authority.privateKey),
+  };
+  let observedReads = 0;
+  const swappedByProxy = new Proxy([signedA], {
+    get(target, field, receiver) {
+      if (field === "0") return ++observedReads === 1 ? signedA : signedB;
+      return Reflect.get(target, field, receiver);
+    },
+  });
+  const attempted = () => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority,
+    zkAuthority: { ...f.zkAuthority, ownerCutoverHistory: swappedByProxy,
+      independentlyRetainedCutoverDigest: digestB },
+    mappingAuthority: authority,
+  });
+  // The current retained digest B is not the inventory root A whose sparse
+  // membership proof is supplied. A/B are BOTH legitimately owner signed.
+  await assert.rejects(async () => {
+    const verifier = attempted();
+    await verifier({ ...f.input, ownerMapping: mapping });
+  }, deny);
+  // A genuine array accessor is also forbidden, rather than allowing a
+  // mutable getter to change the cutover between cryptographic operations.
+  const withGetter = [signedA];
+  Object.defineProperty(withGetter, "0", {
+    enumerable: true, configurable: true,
+    get: () => ++observedReads % 2 ? signedA : signedB,
+  });
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority,
+    zkAuthority: { ...f.zkAuthority, ownerCutoverHistory: withGetter,
+      independentlyRetainedCutoverDigest: digestB },
+    mappingAuthority: authority,
+  }), deny);
+  // Fixed inputs with A under a retained B digest are rejected even without
+  // hostile callbacks. No independent custody or actual migration is implied.
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority,
+    zkAuthority: { ...f.zkAuthority, independentlyRetainedCutoverDigest: digestB },
+    mappingAuthority: authority,
+  }), deny);
 });
