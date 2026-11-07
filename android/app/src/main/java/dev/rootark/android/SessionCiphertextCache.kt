@@ -31,6 +31,9 @@ internal data class CapturedCiphertextSnapshot(
     val ciphertextDigest: String,
 )
 
+/** Exact previously captured GET; local integrity was rechecked before this signal. */
+internal class DuplicateCiphertextCaptureException : SecurityException("Identical signed-envelope already staged")
+
 /** One bounded signed-envelope candidate encrypted for one login, never a plaintext cache. */
 internal class SessionCiphertextCache(
     private val root: File,
@@ -64,6 +67,12 @@ internal class SessionCiphertextCache(
         val previous = saved
         if (previous != null && previous.objectId == snapshot.objectId &&
             snapshot.revisionCounter <= previous.revisionCounter) {
+            if (snapshot == previous) {
+                // Only an identical byte digest plus a still-intact local AEAD packet
+                // qualifies. Different bytes/revision or corrupted storage still fail.
+                inspect(requester, expectedObjectId)
+                throw DuplicateCiphertextCaptureException()
+            }
             throw SecurityException("Replay or conflicting revision")
         }
         val encrypted = try {

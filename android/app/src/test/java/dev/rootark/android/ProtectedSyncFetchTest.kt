@@ -199,6 +199,45 @@ class ProtectedSyncFetchTest {
         assertTrue(tooLarge.disconnected)
     }
 
+    @Test fun repeatedSignedHttpsGetPreservesUiCacheWithoutErasingKeystore() {
+        val responses = mutableListOf<SecureResponse>()
+        val gateway = ProtectedSyncFetch { url ->
+            SecureResponse(url, payload = response).also { responses.add(it) }
+        }
+        val binding = OfflineSession("https://files.example.org:9443", "alice", "same-login")
+        val root = Files.createTempDirectory("rootark-cipher-duplicate-get").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        try {
+            val cache = SessionCiphertextCache(root, binding, key)
+            val firstGet = gateway.fetchPacket(origin, session, "fixture-object-1", SessionCiphertextCache.MAX_PACKET_BYTES)
+            val captured = try {
+                cache.save(binding, "fixture-object-1", firstGet.bytes)
+            } finally { firstGet.bytes.fill(0) }
+            val firstSealed = File(root, "packet.bin").readBytes()
+
+            val repeatedGet = gateway.fetchPacket(origin, session, "fixture-object-1", SessionCiphertextCache.MAX_PACKET_BYTES)
+            val duplicate = try {
+                assertThrows(DuplicateCiphertextCaptureException::class.java) {
+                    cache.save(binding, "fixture-object-1", repeatedGet.bytes)
+                }
+            } finally { repeatedGet.bytes.fill(0) }
+            var discarded = false
+            assertEquals(CiphertextCaptureUiResult.ALREADY_CAPTURED,
+                CiphertextCaptureFailurePolicy.handle(duplicate) {
+                    discarded = true
+                    cache.clear()
+                })
+            assertFalse(discarded)
+            assertEquals(captured, cache.inspect(binding, "fixture-object-1"))
+            assertArrayEquals(firstSealed, File(root, "packet.bin").readBytes())
+            assertEquals(2, responses.size)
+            assertTrue(responses.all { it.disconnected && it.requestMethod == "GET" })
+            assertFalse(VerifiedTextPreview(null).available)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun failsClosedBeforeNetworkForUnprovisionedTrustOrMissingListPermission() {
         val transport = Transport()
         val gateway = ProtectedSyncFetch(transport::open)

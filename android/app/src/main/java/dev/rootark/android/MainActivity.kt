@@ -393,12 +393,15 @@ class MainActivity : Activity() {
                             showSession("Objeto mudou no servidor. Captura descartada.")
                         }
                         else -> {
-                            if (failure is SecurityException || failure is java.io.IOException) {
+                            val state = CiphertextCaptureFailurePolicy.handle(failure) {
                                 runCatching { stored.clear() }
                                 ciphertextCache = null
                                 runCatching { LocalCipherCacheKey.erase() }
                             }
-                            showSession("Não foi possível capturar ciphertext. Limite de 4 MiB ou integridade inválida.")
+                            showSession(if (state == CiphertextCaptureUiResult.ALREADY_CAPTURED)
+                                "Este ciphertext já estava capturado e íntegro nesta sessão. " +
+                                    "Assinatura e autorização independente continuam pendentes."
+                            else "Não foi possível capturar ciphertext. Limite de 4 MiB ou integridade inválida.")
                         }
                     }
                 }
