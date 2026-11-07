@@ -140,7 +140,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     epoch: former.current_epoch,
   };
   const fresh = await newDeviceRequest();
-  const now = Math.floor(Date.now() / 1000);
+  let now = Math.floor(Date.now() / 1000);
   const priorCommitment = signReceipt({ revision: former.revision,
     digest: externalCurrentHead.digest, epoch: former.current_epoch,
     sequence: 10, issued_at: now, expires_at: now + 600 });
@@ -391,7 +391,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     trustedPriorCommitment: priorCommitment, nowSeconds: now - 60,
   }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/, "caller clock rollback cannot extend PoP");
 
-  await t.test("DEV-OFF: owner-signed file CEK rewrap lets independent B decrypt signed HTTP after real SQLite restart", async (sub) => {
+  for (const [payloadLabel, bytes] of [
+    ["zero-byte", Buffer.alloc(0)],
+    ["nonempty", Buffer.from("distinct-B-HPKE-signed-http-sqlite-restart-evidence")],
+  ]) await t.test(`DEV-OFF: owner-signed ${payloadLabel} file CEK rewrap decrypts signed HTTP after real SQLite restart`, async (sub) => {
+    // Each independent fixture starts with a fresh wall-clock window.
+    now = Math.floor(Date.now() / 1000);
     const dir = createPrivateAuthorityFixture("zk65-distinct-b-restore-");
     const filename = path.join(dir, "protected.sqlite");
     const currentManifest = candidate.manifest;
@@ -473,7 +478,6 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       epoch: currentManifest.current_epoch, kind: "file" };
     const ownerHeldCek = crypto.randomBytes(32);
     const originalCek = await content.importFileCek(ownerHeldCek);
-    const bytes = Buffer.from("distinct-B-HPKE-signed-http-sqlite-restart-evidence");
     const sealed = await content.encryptFile({ cek: originalCek, metadata,
       name: "private.txt", mediaType: "text/plain", data: bytes });
     const put = await protectedClient.signProtectedContentOperation({
@@ -494,7 +498,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const persisted = store.db.prepare("SELECT revision, ciphertext FROM zk_content_object WHERE id=?")
       .get(metadata.object_id);
     assert.equal(persisted.revision, 1, "physical SQLite reopened with committed ciphertext");
-    assert.equal(Buffer.from(persisted.ciphertext).includes(bytes), false,
+    if (bytes.length) assert.equal(Buffer.from(persisted.ciphertext).includes(bytes), false,
       "protected SQLite must never contain file plaintext");
     assert.equal(Buffer.from(persisted.ciphertext).equals(Buffer.from(sealed)), true);
     const currentEpoch = currentManifest.epochs.find((row) => row.epoch === metadata.epoch);
@@ -921,6 +925,16 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(fs.readFileSync(path.join(dir, "recipient-open.bin")), bytes,
       "CLI owner export -> recipient signed real HTTP GET -> HPKE/AEAD open bytes");
     assert.ok(realShareReads >= 2, "CLI recipient performs a fresh signed HTTP GET");
+    if (bytes.length === 0) {
+      assert.equal(fs.statSync(path.join(dir, "recipient-open.bin")).size, 0,
+        "owner-granted empty ciphertext decrypts to an actual zero-byte recipient file");
+      await assert.rejects(runRecipientRedeem("portable-offer.json", "recipient-open.bin"),
+        /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+        "exclusive output cannot overwrite an existing empty recipient file");
+      assert.equal(fs.statSync(path.join(dir, "recipient-open.bin")).size, 0);
+      ownerHeldCek.fill(0);
+      return;
+    }
     withoutTrustedAuthority = true;
     await assert.rejects(runOwnerExport("grant-ack.json", "no-authority-offer.json"),
       /ZK_RECIPIENT_OFFER_CLI_DENIED/,

@@ -54,8 +54,7 @@ function parse(argv) {
   return { mode, opts };
 }
 function privateOutput(root, name, bytes) {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1
-    || bytes.byteLength > MAX_OUTPUT) deny();
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_OUTPUT) deny();
   // Refuse an existing name: never clobber recipient plaintext or a trusted
   // input, even when it is a symlink. An exclusive private leaf inherits the
   // already independently verified owner-only directory ACL.
