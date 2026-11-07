@@ -21,10 +21,11 @@ const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
 const SAFE_FAILURE_TYPES = new Set(["testCodeFailure", "hookFailed", "cancelledByParent",
   "uncaughtException", "unhandledRejection", "subtestsFailed"]);
 const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
-// Only a complete, trailing TAP directive token excuses "not ok". A title
-// containing e.g. "# TODOS", "# TODO:" or a bare trailing space remains FAIL.
+// Only a complete, trailing TAP directive token excuses "not ok". Node's
+// TAP emitter preserves whitespace-only reasons (todo: " " -> "# TODO  ").
+// Keep rejecting a single stray trailing blank and malformed tokens.
 function tapExemption(title) {
-  const directive = / # (TODO|SKIP)(?:[ \t]+\S.*)?$/i.exec(title);
+  const directive = / # (TODO|SKIP)(?:[ \t]+\S.*|[ \t]{2,})?$/i.exec(title);
   return directive ? directive[1].toUpperCase() : null;
 }
 function categoryFor(code) {

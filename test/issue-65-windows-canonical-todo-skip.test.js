@@ -17,7 +17,7 @@ test("genuine Node TAP nested TODO fails by design but must not block a valid su
   // standalone Node invocation needs that context removed for genuine text TAP.
   const environment = { ...process.env };
   delete environment.NODE_TEST_CONTEXT;
-  const child = spawnSync(process.execPath, ["-e", script], {
+  const child = spawnSync(process.execPath, ["--test-reporter=tap", "-e", script], {
     encoding: "utf8", timeout: 10_000, windowsHide: true, env: environment,
   });
   assert.equal(child.status, 0, "TODO's intentional failure must leave Node suite successful");
@@ -38,6 +38,38 @@ test("genuine Node TAP nested TODO fails by design but must not block a valid su
   assert.equal(recorder.state.nestedSkips, 0);
   assert.match(recorder.safeSummary(), /nestedObservedFailures=1 nestedFailures=0/);
   assert.doesNotMatch(out.join("\n"), /FAIL nested detail/);
+});
+
+test("real Node TAP whitespace-only TODO reasons remain valid at nested and top level", () => {
+  const script = [
+    "const test=require('node:test');",
+    "test('outer',async(t)=>{",
+    "await t.test('nested whitespace',{todo:' '},()=>{throw Error('expected')});",
+    "});",
+    "test('top whitespace',{todo:' '},()=>{throw Error('expected')});",
+  ].join("");
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const child = spawnSync(process.execPath, ["--test-reporter=tap", "-e", script], {
+    encoding: "utf8", timeout: 10_000, windowsHide: true, env: environment,
+  });
+  assert.equal(child.status, 0, "Node must allow deliberate TODO failures");
+  assert.match(child.stdout, /^    not ok 1 - nested whitespace # TODO  $/m);
+  assert.match(child.stdout, /^not ok 2 - top whitespace # TODO  $/m);
+  assert.match(child.stdout, /^# fail 0$/m);
+  const recorder = createTapProgressRecorder(() => {});
+  for (const line of child.stdout.split(/\r?\n/)) recorder.accept(line);
+  recorder.finish();
+  assert.equal(recorder.state.plan, true);
+  assert.equal(recorder.state.reportedFailures, 0);
+  assert.equal(recorder.state.nestedObservedFailures, 1);
+  assert.equal(recorder.state.observedFailures, 1);
+  assert.equal(recorder.state.nestedFailures, 0,
+    "real nested TODO with whitespace reason must not fail release gate");
+  assert.equal(recorder.state.failures, 0,
+    "real top-level TODO with whitespace reason must not fail release gate");
+  assert.equal(recorder.state.nestedTodos, 1);
+  assert.equal(recorder.state.topLevelTodos, 1);
 });
 
 test("nested TODO and SKIP directives are case insensitive with strict token boundaries", () => {
