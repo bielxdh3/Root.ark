@@ -353,3 +353,90 @@ test("issue 66 W2 P2: lifetime request-key budget quarantines boundary without r
   assert.deepEqual(calls.fail.map((entry) => entry.key), ["first", "second"]);
   await within(gate.shutdown());
 });
+
+test("issue 66 W22 P2: timed-out native ACK retains its capacity until it really settles", async (t) => {
+  const { native, gate, request, calls } = await fixture(t,
+    { maxInFlight: 1, maxLifetimeRequests: 5, ackTimeoutMs: 15 });
+  const releases = [];
+  const signals = [];
+  native.failFetch = (_key, _code, { signal }) => new Promise((resolve) => {
+    releases.push(resolve);
+    signals.push(signal);
+  });
+  assert.deepEqual(await within(gate.fetchData(request({ requestKey: "orphan-0" })), 180),
+    { status: "denied", code: "failure_ack_timeout" });
+  assert.equal(signals[0].aborted, true);
+  for (let index = 1; index < 5; index++) {
+    assert.deepEqual(await gate.fetchData(request({ requestKey: `orphan-${index}` })),
+      { status: "denied", code: "capacity_exceeded" });
+  }
+  assert.equal(releases.length, 1, "one noncooperative native ACK must exhaust the one-slot budget");
+  releases[0]();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(await within(gate.fetchData(request({ requestKey: "orphan-1" })), 180),
+    { status: "denied", code: "failure_ack_timeout" },
+    "an actual late settlement frees the ACK budget for exactly one new attempt");
+  assert.equal(releases.length, 2);
+  await within(gate.shutdown());
+  assert.deepEqual(calls.transfer, []);
+  assert.deepEqual(calls.register, []);
+});
+
+test("issue 66 W22 P2: orphan ACKs and admitted callbacks share the same concurrency cap", async (t) => {
+  const { native, gate, request } = await fixture(t,
+    { maxInFlight: 2, ackTimeoutMs: 15 });
+  let releaseInspection;
+  let inspectionEntered;
+  const inspectionStarted = new Promise((resolve) => { inspectionEntered = resolve; });
+  let failed = 0;
+  native.failFetch = () => {
+    failed++;
+    return new Promise(() => {});
+  };
+  assert.equal((await within(gate.fetchData(request({ requestKey: "orphan-a" })), 180)).code,
+    "failure_ack_timeout");
+  native.inspectPlaceholder = () => new Promise((resolve) => {
+    releaseInspection = resolve;
+    inspectionEntered();
+  });
+  const second = gate.fetchData(request({ requestKey: "active-b" }));
+  await within(inspectionStarted);
+  assert.deepEqual(await gate.fetchData(request({ requestKey: "overflow-c" })),
+    { status: "denied", code: "capacity_exceeded" });
+  assert.equal(failed, 1);
+  assert.equal(gate.cancelFetch("active-b"), true);
+  assert.equal((await within(second, 180)).code, "failure_ack_timeout");
+  assert.equal(failed, 2);
+  releaseInspection({ placeholder: true, reparsePoint: true, syncRootMatch: true });
+  await within(gate.shutdown());
+});
+
+test("issue 66 W22 P2: callback identity is captured once from the own data descriptor", async (t) => {
+  const { gate, calls, request } = await fixture(t);
+  let descriptorReads = 0;
+  let getterReads = 0;
+  const raw = new Proxy(request({ requestKey: "original" }), {
+    getOwnPropertyDescriptor(target, property) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      if (property === "requestKey") {
+        descriptorReads++;
+        return { ...descriptor, value: descriptorReads === 1 ? "snapshot-A" : "snapshot-B" };
+      }
+      return descriptor;
+    },
+    get(target, property, receiver) {
+      if (property === "requestKey") {
+        getterReads++;
+        return "getter-B";
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  assert.deepEqual(await gate.fetchData(raw),
+    { status: "denied", code: "authority_unavailable" });
+  assert.equal(descriptorReads, 1, "identity descriptor must never be fetched twice");
+  assert.equal(getterReads, 0, "callback identity getter must never be consulted");
+  assert.deepEqual(calls.fail, [{ key: "snapshot-A", code: "authority_unavailable" }]);
+  assert.deepEqual(calls.transfer, []);
+});

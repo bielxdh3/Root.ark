@@ -25,7 +25,7 @@ This does **not** validate Windows 10 or exercise an actual registered sync root
   hardlinks, reparse redirection or ordinary-file claims, a native inspection
   result that must positively identify a placeholder in the expected sync
   root, cancellation, duplicate request identity and draining shutdown.
-  All requests end in `native.failFetch`; a spoofed `signedAdmission`, local
+  Each admitted request attempts `native.failFetch` once; a spoofed `signedAdmission`, local
   journal flag or CAS number cannot create authorization. `native` is an
   injected **mock interface**, not a connected production provider.
 
@@ -52,6 +52,19 @@ an unresponsive ACK returns `failure_ack_timeout` and is never retried under
 the same request key. `shutdown()` aborts outstanding inspection requests and
 awaits only their bounded failure ACKs, then refuses new callbacks. Late
 positive inspection results are ignored and do not transfer data.
+
+The native failure-ACK promise also retains its own bounded slot until it
+actually settles, even after `failure_ack_timeout` has returned to JavaScript.
+An outstanding ACK and an admitted callback count toward the same
+`maxInFlight` budget without double-counting the same request key. Late native
+ACK settlement releases capacity, but a native adapter that ignores abort
+indefinitely cannot be forcibly recovered by JavaScript. A defensive
+`ack_capacity_exceeded` response likewise delegates failure completion to the
+native dispatcher, without attempting an additional over-capacity ACK.
+
+The callback identity and shape are captured from a single set of own data
+descriptors before validation. Proxy getters or a later conflicting descriptor
+cannot change the key used for native failure completion.
 
 When an unadmitted request exceeds concurrency or the lifetime key limit,
 `fetchData` returns `capacity_exceeded` without calling `failFetch`: the

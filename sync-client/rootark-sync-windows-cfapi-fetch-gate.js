@@ -33,9 +33,30 @@ function trustedValue(value, props) {
     && Object.values(desc).every((entry) => Object.hasOwn(entry, "value"));
 }
 
-function validateRequest(raw) {
-  if (!trustedValue(raw, ALLOWED)) return null;
-  const input = Object.fromEntries(ALLOWED.map((key) => [key, raw[key]]));
+function snapshotRequest(raw) {
+  // Obtain callback identity and all other data from ONE descriptor snapshot.
+  // A Proxy may return A for its own descriptor and B for a later property get
+  // or descriptor query. Never consult the untrusted raw object again.
+  let key = null;
+  let input = null;
+  try {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { key, input };
+    const descriptors = Object.getOwnPropertyDescriptors(raw);
+    const identity = descriptors.requestKey;
+    if (identity && Object.hasOwn(identity, "value")
+      && typeof identity.value === "string" && ID.test(identity.value)) key = identity.value;
+    if (key && Object.getPrototypeOf(raw) === Object.prototype
+      && Reflect.ownKeys(descriptors).length === ALLOWED.length
+      && ALLOWED.every((field) => Object.hasOwn(descriptors, field)
+        && Object.hasOwn(descriptors[field], "value"))) {
+      input = Object.freeze(Object.fromEntries(ALLOWED.map((field) => [field, descriptors[field].value])));
+    }
+  } catch { /* Malformed Proxy cannot establish a trusted callback body. */ }
+  return { key, input };
+}
+
+function validateRequest(input) {
+  if (!input) return null;
   if (input.type !== "FETCH_DATA"
     || typeof input.requestKey !== "string" || !ID.test(input.requestKey)
     || typeof input.placeholderId !== "string" || !ID.test(input.placeholderId)
@@ -45,7 +66,7 @@ function validateRequest(raw) {
     || typeof input.relativePath !== "string") return null;
   try { validatePortableRelativePath(input.relativePath); }
   catch { return null; }
-  return Object.freeze(input);
+  return input;
 }
 
 async function inspectNoLink(rootDir, relativePath) {
@@ -89,6 +110,9 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
   boundedOption(maxLifetimeRequests, 1, MAX_SEEN_REQUEST_KEYS);
   const root = path.resolve(rootDir);
   const inFlight = new Map();
+  // A timed-out JS failure response does not mean the native failure ACK has
+  // settled. Charge that callback's slot until the actual native promise does.
+  const pendingAcks = new Map();
   // An abandoned path scan OR native inspection may never settle. Keep its
   // promise in the inspection budget until it really settles, including after
   // the JS request has timed out or returned its failure ACK.
@@ -97,6 +121,12 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
   // ACK after timeout; the finite receipt budget also bounds memory growth.
   const seenKeys = new Set();
   let stopping = false;
+
+  function occupiedSlots() {
+    let total = inFlight.size;
+    for (const key of pendingAcks.keys()) if (!inFlight.has(key)) total++;
+    return total;
+  }
 
   function interrupt(context, reason) {
     if (context.reason) return false;
@@ -112,9 +142,9 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
     return interrupt(active, "cancelled");
   }
 
-  async function inspect(context, raw) {
+  async function inspect(context, snapshot) {
     try {
-      const input = validateRequest(raw);
+      const input = validateRequest(snapshot);
       if (!input) return "invalid_callback";
       if (context.reason) return context.reason;
       if (!await inspectNoLink(root, input.relativePath)) return "unsafe_path";
@@ -132,9 +162,9 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
     }
   }
 
-  function boundedInspect(context, raw) {
+  function boundedInspect(context, snapshot) {
     if (inspections.size >= maxInFlight) return Promise.resolve("inspector_capacity_exceeded");
-    const pending = inspect(context, raw);
+    const pending = inspect(context, snapshot);
     inspections.add(pending);
     // Late fulfillment/rejection only frees the occupied slot. It cannot
     // execute a second failure ACK or authorize the cancelled request.
@@ -144,9 +174,11 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
   }
 
   async function failOnce(key, code) {
-    // At most one native failure completion is attempted. If an adapter never
-    // acknowledges it, abort the advisory signal, report indeterminate ACK,
-    // and release the JS shutdown gate without retrying the request key.
+    // Even a late rejection/fulfillment must free the native ACK slot. If the
+    // native adapter ignores cancellation, JS cannot reclaim this capacity.
+    if (pendingAcks.size >= maxInFlight) {
+      return { status: "denied", code: "ack_capacity_exceeded" };
+    }
     const controller = new AbortController();
     let timer;
     const timedOut = new Promise((resolve) => {
@@ -155,10 +187,12 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
         resolve(true);
       }, ackTimeoutMs);
     });
+    const ack = Promise.resolve().then(() => native.failFetch(key, code,
+      { signal: controller.signal }));
+    pendingAcks.set(key, ack);
+    void ack.then(() => pendingAcks.delete(key), () => pendingAcks.delete(key));
     try {
-      const ack = Promise.resolve().then(() => native.failFetch(key, code,
-        { signal: controller.signal })).then(() => false);
-      return await Promise.race([ack, timedOut])
+      return await Promise.race([ack.then(() => false), timedOut])
         ? { status: "denied", code: "failure_ack_timeout" }
         : { status: "denied", code };
     } finally { clearTimeout(timer); }
@@ -167,19 +201,13 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
   async function fetchData(raw) {
     // Keep a bounded opaque callback key for reporting a failure. Never pass
     // an invalid path or untrusted raw request back into the native runtime.
-    let key = null;
-    try {
-      const desc = raw && typeof raw === "object"
-        ? Object.getOwnPropertyDescriptor(raw, "requestKey") : null;
-      if (desc && Object.hasOwn(desc, "value")
-        && typeof desc.value === "string" && ID.test(desc.value)) key = desc.value;
-    } catch { /* A throwing Proxy cannot establish a callback identity. */ }
+    const { key, input } = snapshotRequest(raw);
     if (!key) return { status: "denied", code: "invalid_callback" };
     if (stopping) return { status: "denied", code: "shutdown" };
     if (seenKeys.has(key)) return { status: "denied", code: "duplicate_request" };
     // Overflow requests are not admitted: the native dispatcher must reject
     // them on its own boundary, including their CFAPI failure completion.
-    if (inFlight.size >= maxInFlight || seenKeys.size >= maxLifetimeRequests) {
+    if (occupiedSlots() >= maxInFlight || seenKeys.size >= maxLifetimeRequests) {
       if (seenKeys.size >= maxLifetimeRequests) stopping = true;
       return { status: "denied", code: "capacity_exceeded" };
     }
@@ -193,7 +221,7 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
       const timer = setTimeout(() => interrupt(context, "inspection_timeout"), inspectionTimeoutMs);
       let code;
       try {
-        code = await Promise.race([boundedInspect(context, raw), interrupted]);
+        code = await Promise.race([boundedInspect(context, input), interrupted]);
       } finally { clearTimeout(timer); }
       code = context.reason || code;
       // A local journal or the caller's claim of a signed receipt is not an
@@ -208,8 +236,9 @@ function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
   async function shutdown() {
     stopping = true;
     for (const active of inFlight.values()) interrupt(active, "shutdown");
-    // Each admitted request has a bounded ACK. Do not await noncooperative
-    // native inspections: those stay charged to the native inspection budget.
+    // Each JS response has a bounded ACK wait. Noncooperative native ACKs and
+    // inspections remain charged until they settle; the native dispatcher must
+    // independently bound and reject callbacks that this gate cannot ACK.
     await Promise.allSettled([...inFlight.values()].map((item) => item.promise));
   }
 
