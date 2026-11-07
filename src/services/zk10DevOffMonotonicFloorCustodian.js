@@ -12,6 +12,8 @@ const { signatureBytes } = require("../crypto/rootark-zk10-account-cutover-v1");
 const GENESIS_DOMAIN = Buffer.from("Root.ark/zk10/custodian-owner-genesis/v1\0");
 const LEASE_DOMAIN = Buffer.from("Root.ark/zk10/custodian-owner-lease/v1\0");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk10/external-floor-current/v1\0");
+const JOURNAL_DOMAIN = Buffer.from("Root.ark/zk10/custodian-used-lease-journal/v1\0");
+const EMPTY_JOURNAL_TIP = crypto.createHash("sha256").update(JOURNAL_DOMAIN).digest("hex");
 const GENESIS_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
   "immutable_account_id", "identity_digest", "lease_serial"];
 const LEASE_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
@@ -28,6 +30,7 @@ const HEX = /^[a-f0-9]{64}$/;
 const OPER = /^[a-z][a-z0-9:_-]{0,63}$/;
 const NOW = Date.now.bind(Date);
 const MAX_LEASE_SERIAL = 100_000; // Bounded DEV-OFF journal; no unsafe reset/rotation.
+const STORED_FLOOR_FIELDS = [...HEAD_FIELDS, "journal_count", "journal_tip"];
 
 function deny() {
   const error = new Error("ZK10_CUSTODIAN_UNAVAILABLE");
@@ -84,25 +87,72 @@ function safeFileName(value) {
   if (typeof value !== "string" || !path.isAbsolute(value)) deny();
   const absolute = path.resolve(value);
   if (absolute !== value || absolute.includes("\0")) deny();
-  const parent = path.dirname(absolute);
-  const stat = fs.lstatSync(parent);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) deny();
-  if (fs.existsSync(absolute)) {
-    const current = fs.lstatSync(absolute);
-    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1) deny();
+  // existsSync is FALSE for dangling symlinks: lstat all existing components.
+  const root = path.parse(absolute).root;
+  const pieces = path.dirname(absolute).slice(root.length).split(path.sep).filter(Boolean);
+  let currentPath = root;
+  for (const piece of pieces) {
+    currentPath = path.join(currentPath, piece);
+    const stat = fs.lstatSync(currentPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) deny();
   }
+  let current;
+  try { current = fs.lstatSync(absolute); }
+  catch (error) { if (error?.code !== "ENOENT") deny(); }
+  if (current && (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1)) deny();
   return absolute;
 }
 function same(a, b) {
-  return HEAD_FIELDS.every(field => a[field] === b[field]);
+  return !!a && !!b && STORED_FLOOR_FIELDS.every(field => a[field] === b[field]);
 }
 function mapFloor(row) {
   if (!row) return null;
-  return validateHead(Object.fromEntries(HEAD_FIELDS.map(field => [field, row[field]])));
+  const head = validateHead(Object.fromEntries(HEAD_FIELDS.map(field => [field, row[field]])));
+  if (!Number.isSafeInteger(row.journal_count)
+    || row.journal_count !== head.lease_serial
+    || typeof row.journal_tip !== "string" || !HEX.test(row.journal_tip)
+    || (row.journal_count === 0 && row.journal_tip !== EMPTY_JOURNAL_TIP)) deny();
+  return Object.freeze({ ...head, journal_count: row.journal_count, journal_tip: row.journal_tip });
+}
+function nextJournalTip(previousTip, challenge, serial) {
+  bytes(challenge.nonce, 32);
+  bytes(challenge.lease_id, 16);
+  if (!HEX.test(previousTip) || !Number.isSafeInteger(serial)
+    || serial < 1 || serial > MAX_LEASE_SERIAL) deny();
+  const entry = { nonce: challenge.nonce, lease_id: challenge.lease_id, lease_serial: serial };
+  return crypto.createHash("sha256").update(Buffer.from(previousTip, "hex"))
+    .update(signatureBytes(JOURNAL_DOMAIN, entry)).digest("hex");
+}
+function verifyUsedJournal(db, floor) {
+  const rows = db.prepare("SELECT nonce, lease_id, lease_serial, chain_tip FROM used_lease ORDER BY lease_serial").all();
+  if (rows.length !== floor.journal_count) deny();
+  let tip = EMPTY_JOURNAL_TIP;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row.lease_serial !== index + 1) deny();
+    tip = nextJournalTip(tip, row, row.lease_serial);
+    if (row.chain_tip !== tip) deny();
+  }
+  if (tip !== floor.journal_tip) deny();
+}
+function sameFile(stat, candidate) {
+  return stat.isFile() && candidate.isFile() && !candidate.isSymbolicLink()
+    && candidate.nlink === 1 && stat.dev === candidate.dev && stat.ino === candidate.ino;
 }
 function openDb(file) {
-  const db = new Database(file, { timeout: 2000 });
+  let db, descriptor;
   try {
+    // SQLite opens its own file handle. Keep a no-follow descriptor open and
+    // check the inode plus every parent before and after SQLite opens.
+    // A fully hostile local filesystem still requires OS-level isolation.
+    safeFileName(file);
+    descriptor = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT |
+      (fs.constants.O_NOFOLLOW || 0), 0o600);
+    const opened = fs.fstatSync(descriptor);
+    if (!sameFile(opened, fs.lstatSync(file))) deny();
+    db = new Database(file, { timeout: 2000 });
+    safeFileName(file);
+    if (!sameFile(opened, fs.lstatSync(file))) deny();
     db.pragma("journal_mode = DELETE");
     db.pragma("synchronous = EXTRA"); // fsync journal, DB and DELETE-mode journal directory.
     if (db.pragma("synchronous", { simple: true }) !== 3
@@ -113,43 +163,53 @@ function openDb(file) {
       sequence INTEGER NOT NULL, head_digest TEXT NOT NULL,
       enrollment_root TEXT NOT NULL, immutable_account_id TEXT NOT NULL,
       identity_digest TEXT NOT NULL, lease_serial INTEGER NOT NULL,
+      journal_count INTEGER NOT NULL, journal_tip TEXT NOT NULL,
       owner_spki TEXT NOT NULL, custodian_spki TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS used_lease (
       nonce TEXT NOT NULL UNIQUE, lease_id TEXT NOT NULL UNIQUE,
-      lease_serial INTEGER NOT NULL UNIQUE
+      lease_serial INTEGER NOT NULL UNIQUE, chain_tip TEXT NOT NULL
     );`);
     return db;
   } catch (_) {
-    try { db.close(); } catch (_) { /* unavailable */ }
+    try { db?.close(); } catch (_) { /* unavailable */ }
     deny();
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch (_) { deny(); }
+    }
   }
 }
-function read(db, ownerHash, signerHash) {
+function read(db, ownerHash, signerHash, primary = false) {
   const row = db.prepare("SELECT * FROM floor WHERE singleton = 1").get();
   if (row && (row.owner_spki !== ownerHash || row.custodian_spki !== signerHash)) deny();
-  return mapFloor(row);
+  const floor = mapFloor(row);
+  if (primary && floor) verifyUsedJournal(db, floor);
+  return floor;
 }
 function insertGenesis(db, head, ownerHash, signerHash) {
   db.transaction(() => {
     if (db.prepare("SELECT 1 FROM floor").get()) deny();
     db.prepare(`INSERT INTO floor (singleton, sequence, head_digest, enrollment_root,
-      immutable_account_id, identity_digest, lease_serial, owner_spki, custodian_spki)
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...HEAD_FIELDS.map(f => head[f]),
-      ownerHash, signerHash);
+      immutable_account_id, identity_digest, lease_serial, journal_count, journal_tip,
+      owner_spki, custodian_spki)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...STORED_FLOOR_FIELDS.map(f => head[f]),
+        ownerHash, signerHash);
   }).immediate();
 }
 function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge, primary) {
   db.transaction(() => {
-    const current = read(db, expectedOwner, expectedSigner);
+    const current = read(db, expectedOwner, expectedSigner, primary);
     if (!same(current, previous)) deny();
     const result = db.prepare(`UPDATE floor SET sequence = ?, head_digest = ?,
       enrollment_root = ?, immutable_account_id = ?, identity_digest = ?,
-      lease_serial = ? WHERE singleton = 1 AND lease_serial = ?`)
-      .run(...HEAD_FIELDS.map(f => next[f]), previous.lease_serial);
+      lease_serial = ?, journal_count = ?, journal_tip = ?
+      WHERE singleton = 1 AND lease_serial = ?`)
+      .run(...STORED_FLOOR_FIELDS.map(f => next[f]), previous.lease_serial);
     if (result.changes !== 1) deny();
-    if (primary) db.prepare(`INSERT INTO used_lease (nonce, lease_id, lease_serial)
-      VALUES (?, ?, ?)`).run(challenge.nonce, challenge.lease_id, next.lease_serial);
+    if (primary) db.prepare(`INSERT INTO used_lease (nonce, lease_id, lease_serial, chain_tip)
+      VALUES (?, ?, ?, ?)`).run(challenge.nonce, challenge.lease_id,
+        next.lease_serial, next.journal_tip);
   }).immediate();
 }
 
@@ -175,6 +235,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
         "rootark-zk10-custodian-owner-genesis/v1", GENESIS_DOMAIN, owner);
       genesis = validateHead(Object.fromEntries(HEAD_FIELDS.map(f => [f, payload[f]])));
       if (genesis.lease_serial !== 0) deny();
+      genesis = Object.freeze({ ...genesis, journal_count: 0, journal_tip: EMPTY_JOURNAL_TIP });
     }
     anchor = openDb(anchorPath);
     main = openDb(mainPath);
@@ -185,7 +246,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
       insertGenesis(main, genesis, ownerHash, signerHash);
     }
     let minimum = read(anchor, ownerHash, signerHash);
-    if (!minimum || !same(minimum, read(main, ownerHash, signerHash))) deny();
+    if (!minimum || !same(minimum, read(main, ownerHash, signerHash, true))) deny();
     let closed = false, poisoned = false;
     const api = {
       independentOffServerCustodyProven: false,
@@ -201,17 +262,17 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           const signed = unsignedSigned(ownerLease, LEASE_FIELDS,
             "rootark-zk10-custodian-owner-lease/v1", LEASE_DOMAIN, owner);
           for (const field of REQUEST_FIELDS) if (r[field] !== signed[field]) deny();
-          const next = validateHead(Object.fromEntries(
+          const nextHead = validateHead(Object.fromEntries(
             HEAD_FIELDS.map(field => [field, signed[field]])));
           const at = NOW();
-          if (next.immutable_account_id !== minimum.immutable_account_id
-            || next.identity_digest !== minimum.identity_digest
-            || next.lease_serial !== minimum.lease_serial + 1
-            || next.sequence < minimum.sequence
-            || next.sequence > minimum.sequence + 1
-            || (next.sequence === minimum.sequence
-              && (next.head_digest !== minimum.head_digest
-                || next.enrollment_root !== minimum.enrollment_root))
+          if (nextHead.immutable_account_id !== minimum.immutable_account_id
+            || nextHead.identity_digest !== minimum.identity_digest
+            || nextHead.lease_serial !== minimum.lease_serial + 1
+            || nextHead.sequence < minimum.sequence
+            || nextHead.sequence > minimum.sequence + 1
+            || (nextHead.sequence === minimum.sequence
+              && (nextHead.head_digest !== minimum.head_digest
+                || nextHead.enrollment_root !== minimum.enrollment_root))
             || !OPER.test(r.operation)
             || !Number.isSafeInteger(signed.issued_at_ms)
             || signed.issued_at_ms < at - 30_000 || signed.issued_at_ms > at + 1_000
@@ -220,10 +281,12 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
             || r.lease_expires_at_ms > at + 10_000) deny();
           bytes(r.nonce, 32);
           bytes(r.lease_id, 16);
+          const next = Object.freeze({ ...nextHead, journal_count: minimum.journal_count + 1,
+            journal_tip: nextJournalTip(minimum.journal_tip, r, nextHead.lease_serial) });
           // Check the separate minimum afresh before every admission; a
           // process that observes any externally edited state must stop.
           if (!same(minimum, read(anchor, ownerHash, signerHash))
-            || !same(minimum, read(main, ownerHash, signerHash))
+            || !same(minimum, read(main, ownerHash, signerHash, true))
             || main.prepare("SELECT 1 FROM used_lease WHERE nonce = ? OR lease_id = ?")
               .get(r.nonce, r.lease_id)) deny();
           // Externally retained minimum is advanced BEFORE the primary.

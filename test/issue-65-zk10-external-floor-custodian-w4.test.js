@@ -7,6 +7,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const Database = require("better-sqlite3");
+const { fork } = require("node:child_process");
 const { Worker } = require("node:worker_threads");
 const { signatureBytes } = require("../src/crypto/rootark-zk10-account-cutover-v1");
 const {
@@ -210,4 +212,173 @@ test("erased independent anchor, mismatched key or incomplete bootstrap fails cl
   fs.renameSync(x.paths.anchorDatabasePath, path.join(x.root, "missing-anchor.fixture"));
   assert.throws(() => createDevOffZk10MonotonicFloorCustodian(x.config),
     /ZK10_CUSTODIAN_UNAVAILABLE/);
+});
+
+test("P2 regression: deleting consumed nonce journal in primary alone fails closed on restart", (t) => {
+  const x = setup(t, "deleted-primary-journal");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const initial = x.offer();
+  c.attest(initial.request, initial.ownerLease);
+  c.close();
+  const db = new Database(x.paths.databasePath);
+  try {
+    assert.equal(db.prepare("SELECT COUNT(*) AS total FROM used_lease").get().total, 1);
+    db.prepare("DELETE FROM used_lease").run();
+  } finally { db.close(); }
+  // Independent minimum retains the authentic high-water row. Omitting a
+  // single consumed nonce must be detected before the next lease is signed.
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }), /ZK10_CUSTODIAN_UNAVAILABLE/);
+});
+
+test("P2 regression: modified/reordered journal bytes fail closed with intact anchored count", (t) => {
+  const x = setup(t, "edited-primary-journal");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const first = x.offer();
+  c.attest(first.request, first.ownerLease);
+  const second = x.offer();
+  c.attest(second.request, second.ownerLease);
+  c.close();
+  const db = new Database(x.paths.databasePath);
+  try {
+    const rows = db.prepare("SELECT nonce, lease_id, lease_serial FROM used_lease ORDER BY lease_serial").all();
+    assert.equal(rows.length, 2);
+    // Mutating one consumed nonce while preserving the serial/count cannot
+    // impersonate a valid historical chain or defeat the anchor commitment.
+    db.prepare("UPDATE used_lease SET nonce = ? WHERE lease_serial = 1")
+      .run(b64(crypto.randomBytes(32)));
+  } finally { db.close(); }
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }), /ZK10_CUSTODIAN_UNAVAILABLE/);
+});
+
+test("P2 regression: swapping serial order of two consumed leases cannot match original chain tip", (t) => {
+  const x = setup(t, "reordered-primary-journal");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  for (let i = 0; i < 2; i += 1) {
+    const offer = x.offer();
+    c.attest(offer.request, offer.ownerLease);
+  }
+  c.close();
+  const db = new Database(x.paths.databasePath);
+  try {
+    db.transaction(() => {
+      db.prepare("UPDATE used_lease SET lease_serial = 3 WHERE lease_serial = 1").run();
+      db.prepare("UPDATE used_lease SET lease_serial = 1 WHERE lease_serial = 2").run();
+      db.prepare("UPDATE used_lease SET lease_serial = 2 WHERE lease_serial = 3").run();
+    }).immediate();
+    assert.deepEqual(db.prepare("SELECT lease_serial FROM used_lease ORDER BY lease_serial").all()
+      .map(row => row.lease_serial), [1, 2]);
+  } finally { db.close(); }
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }), /ZK10_CUSTODIAN_UNAVAILABLE/);
+});
+
+test("P2 regression: two actual OS processes cannot both commit the same signed journal serial", async (t) => {
+  const x = setup(t, "os-process-race");
+  x.track(createDevOffZk10MonotonicFloorCustodian(x.config)).close();
+  const signed = x.offer();
+  const childPath = path.join(__dirname, "support/issue-65-zk10-floor-custodian-worker.js");
+  function processRace() {
+    const child = fork(childPath, [], {
+      cwd: path.join(__dirname, ".."),
+      env: { ...process.env, ROOTARK_ZK10_CUSTODIAN_PROCESS_FIXTURE: "1" },
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    t.after(() => { if (child.connected) child.kill(); });
+    let readyResolve, readyReject, finishResolve, finishReject;
+    let readySettled = false, finishSettled = false;
+    const ready = new Promise((resolve, reject) => {
+      readyResolve = resolve;
+      readyReject = reject;
+    });
+    const finished = new Promise((resolve, reject) => {
+      finishResolve = resolve;
+      finishReject = reject;
+    });
+    child.on("message", (message) => {
+      if (typeof message.ready === "boolean" && !readySettled) {
+        readySettled = true;
+        if (message.ready) readyResolve();
+        else readyReject(new Error("disposable process refused to start"));
+      }
+      if (typeof message.signed === "boolean" && !finishSettled) {
+        finishSettled = true;
+        finishResolve(message.signed);
+      }
+    });
+    child.once("error", (error) => {
+      if (!readySettled) { readySettled = true; readyReject(error); }
+      if (!finishSettled) { finishSettled = true; finishReject(error); }
+    });
+    child.once("exit", () => {
+      if (!readySettled) { readySettled = true; readyReject(new Error("process exited before ready")); }
+      if (!finishSettled) { finishSettled = true; finishReject(new Error("process exited before result")); }
+    });
+    child.send({
+      kind: "init",
+      config: { ...x.config, ownerPublicKey: undefined,
+        custodianPrivateKey: undefined, bootstrap: undefined },
+      ownerSpki: b64(x.owner.publicKey.export({ type: "spki", format: "der" })),
+      custodianPkcs8: b64(x.custodian.privateKey.export({ type: "pkcs8", format: "der" })),
+      request: signed.request, ownerLease: signed.ownerLease,
+    });
+    return { ready, finished, start: () => child.send({ kind: "sign" }) };
+  }
+  // Open the two independent SQLite handles before releasing the race gate.
+  const first = processRace();
+  await first.ready;
+  const second = processRace();
+  await second.ready;
+  first.start();
+  second.start();
+  const results = await Promise.all([first.finished, second.finished]);
+  assert.deepEqual(results.sort(), [false, true]);
+  const restarted = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }));
+  assert.equal(restarted.retainedMinimum().journal_count, 1);
+  assert.equal(restarted.retainedMinimum().lease_serial, 1);
+});
+
+test("P2 regression: dangling direct symlinks never redirect either SQLite store", (t) => {
+  const x = setup(t, "dangling-link");
+  const redirect = path.join(x.root, "outside-expected-anchor.sqlite");
+  const anchor = x.paths.anchorDatabasePath;
+  try {
+    fs.symlinkSync(redirect, anchor, "file");
+  } catch (error) {
+    if (process.platform === "win32" && ["EPERM", "EACCES"].includes(error.code)) {
+      t.skip("Windows symlink privileges unavailable; POSIX/WSL test is mandatory");
+      return;
+    }
+    throw error;
+  }
+  assert.equal(fs.existsSync(anchor), false, "dangling link is invisible to existsSync");
+  assert.ok(fs.lstatSync(anchor).isSymbolicLink());
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian(x.config),
+    /ZK10_CUSTODIAN_UNAVAILABLE/);
+  assert.equal(fs.existsSync(redirect), false, "SQLite must not follow the hostile link");
+  assert.equal(fs.existsSync(x.paths.databasePath), false,
+    "failure must happen before any DB is created");
+});
+
+test("P2 regression: an existing parent symlink is refused without creating database", (t) => {
+  const x = setup(t, "symlink-parent");
+  const realDir = path.join(x.root, "real");
+  fs.mkdirSync(realDir);
+  const linkDir = path.join(x.root, "alias");
+  try {
+    fs.symlinkSync(realDir, linkDir, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (process.platform === "win32" && ["EPERM", "EACCES"].includes(error.code)) {
+      t.skip("Windows junction privileges unavailable; POSIX/WSL test is mandatory");
+      return;
+    }
+    throw error;
+  }
+  const aliasDb = path.join(linkDir, "hidden.sqlite");
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, anchorDatabasePath: aliasDb }), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  assert.equal(fs.existsSync(path.join(realDir, "hidden.sqlite")), false);
+  assert.equal(fs.existsSync(x.paths.databasePath), false);
 });
