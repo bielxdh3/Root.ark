@@ -5,7 +5,7 @@
   "description": "Isolated loopback-only WebRTC room proof of concept, not Root.ark production code",
   "scripts": {
     "start": "node server.cjs",
-    "test": "node --test tests/signal.test.cjs tests/session.test.cjs tests/transfer.test.cjs tests/stale-room-vm.test.cjs tests/client-room-races.test.cjs tests/create-room-capacity.test.cjs",
+    "test": "node --test tests/signal.test.cjs tests/session.test.cjs tests/transfer.test.cjs tests/stale-room-vm.test.cjs tests/client-room-races.test.cjs tests/create-room-capacity.test.cjs tests/create-room-http-disconnect.test.cjs",
     "test:browser": "node tests/browser.cjs",
     "test:app-browser": "node tests/app-browser.cjs"
   },

@@ -6313,8 +6313,12 @@ function registerExperimentalP2p() {
       return res.status(403).json({ error: "Origin denied" });
     }
     let result;
-    try { result = await p2pBroker.createRoom(req); }
-    catch { return res.status(403).json({ error: "Sala indisponivel" }); }
+    try { result = await p2pBroker.createRoom(req, res); }
+    catch {
+      if (res.destroyed) return;
+      return res.status(403).json({ error: "Sala indisponivel" });
+    }
+    if (res.destroyed) return;
     if (result.status !== 200) return res.status(result.status).json({ error: "Sala indisponivel" });
     const { roomId, hostKey, expires, boundObject } = result;
     return p2pHeaders(res).json({ roomId, hostKey, expires, ...(boundObject ? { boundObject } : {}) });
