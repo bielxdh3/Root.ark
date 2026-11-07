@@ -115,6 +115,20 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
   let base = await mount();
+  const restart = async () => {
+    await new Promise((resolve) => server.close(resolve)); server = null;
+    store.close();
+    store = new Zk1ProtectedObjectStore(filename, { witnessProvider,
+      witnessPinned: { keyId: witnessKeyId, publicKey: witness.publicKey },
+      trustedScope: scope, bootstrapNew: false, admissionRequired: true,
+      signedHistoryRequired: true,
+      signedHistoryGenesisDigest: await manifestV2.recoveryManifestDigestV2(state.baseManifest),
+      verifiedHistoryProvider: async () => verifiedHistory,
+      minimumHead: { revision: 1, witnessSequence: 1,
+        digest: await manifestV2.recoveryManifestDigestV2(state.baseManifest) },
+      manifestProvider: () => z.encodeDeterministic(manifest), nowSeconds: () => now });
+    base = await mount();
+  };
   const post = async (endpoint, username, body) => {
     const response = await fetch(base + endpoint, { method: "POST",
       headers: { "content-type": "application/json", ...(username
@@ -337,10 +351,28 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     },
   }), /ZK_SHARE_REDEMPTION_DENIED/,
   "signed expiry reached after HTTP await cannot return a usable receipt");
-  // A separate valid grant can be permanently revoked while the issuer,
-  // recipient, epoch and object revision all remain active.
-  assert.equal((await post("/zk-1/v1/share/revoke", "owner",
-    { grantId: secondIssued.body.grantId })).status, 200);
+  // A valid grant may be revoked while the recipient waits on physical I/O
+  // admission. Neither the in-flight nor later response may expose ciphertext.
+  const revocationAdmission = pauseNextReadAdmission();
+  const inFlightRevokedRead = readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId });
+  try {
+    await revocationAdmission.started;
+    assert.equal((await post("/zk-1/v1/share/revoke", "owner",
+      { grantId: secondIssued.body.grantId })).status, 200);
+  } finally { revocationAdmission.release(); }
+  const revokedInFlight = await inFlightRevokedRead;
+  assert.equal(revokedInFlight.status, 403,
+    "revoke while awaiting I/O admission denies in-flight ciphertext");
+  assert.equal(revokedInFlight.body?.ciphertextBase64, undefined,
+    "denied in-flight read must not emit ciphertext");
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId })).status, 403,
+    "subsequent read must reject revoked grant");
+  await restart();
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId })).status, 403,
+    "revocation survives SQLite restart while owner is still active");
   await assert.rejects(redeem({ grant: secondIssued.body }),
     /ZK_SHARE_REDEMPTION_DENIED/,
     "durable grant tombstone rejects recipient redemption over real authenticated HTTP");
@@ -444,17 +476,6 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal((await post("/zk-1/v1/share/revoke", "owner", { grantId })).status, 200);
 
   // A durable share survives process restart, but revocation tombstones stay closed.
-  await new Promise((resolve) => server.close(resolve)); server = null;
-  store.close();
-  store = new Zk1ProtectedObjectStore(filename, { witnessProvider,
-    witnessPinned: { keyId: witnessKeyId, publicKey: witness.publicKey },
-    trustedScope: scope, bootstrapNew: false, admissionRequired: true,
-    signedHistoryRequired: true,
-    signedHistoryGenesisDigest: await manifestV2.recoveryManifestDigestV2(state.baseManifest),
-    verifiedHistoryProvider: async () => verifiedHistory,
-    minimumHead: { revision: 1, witnessSequence: 1,
-      digest: await manifestV2.recoveryManifestDigestV2(state.baseManifest) },
-    manifestProvider: () => z.encodeDeterministic(manifest), nowSeconds: () => now });
-  base = await mount();
+  await restart();
   assert.equal((await readAs("recipient")).status, 403);
 });
