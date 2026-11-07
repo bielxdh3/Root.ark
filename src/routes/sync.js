@@ -1116,6 +1116,16 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     lease?.assertActive();
     res.json(objects[0]);
   }));
+  app.get("/sync/v1/objects/:objectId/history", authenticate, requirePermission("listFiles"), fenceLegacySync("read", async (req, res, lease) => {
+    await ready;
+    if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
+    let versions;
+    try { versions = store.history(req.user.username, req.params.objectId); }
+    catch { return errorResponse(res, 503, "Sync history unavailable"); }
+    if (!versions.length) return errorResponse(res, 404, "Sync object not found");
+    lease?.assertActive();
+    res.json({ protocolVersion: PROTOCOL_VERSION, versions });
+  }));
   app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"),
     fenceLegacySync("write", (req, res, lease) => write(req, res, undefined, lease)));
   app.post("/sync/v1/objects/batch", sizeGuard, authenticate, requirePermission("upload"), async (req, res) => {
