@@ -402,6 +402,36 @@ function sameSnapshotRevision(left, right) {
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs);
 }
 
+function normalizeHistoricalRestorePlan(requests) {
+  if (!Array.isArray(requests) || requests.length < 1 || requests.length > 32) {
+    fail("Historical restore plan must contain 1 to 32 objects", "invalid_restore_plan");
+  }
+  const seen = new Set();
+  const entries = [];
+  for (const request of requests) {
+    let fields;
+    try {
+      if (!request || typeof request !== "object" || Array.isArray(request)) throw Error();
+      fields = Object.getOwnPropertyDescriptors(request);
+      const names = Reflect.ownKeys(fields);
+      if (names.length !== 2 || names.some((name) => !["objectId", "versionId"].includes(name))
+        || !Object.hasOwn(fields.objectId, "value") || !Object.hasOwn(fields.versionId, "value")) {
+        throw Error();
+      }
+    } catch { fail("Invalid historical restore plan entry", "invalid_restore_plan"); }
+    const objectId = fields.objectId.value;
+    const versionId = fields.versionId.value;
+    if (typeof objectId !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(objectId)
+      || typeof versionId !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(versionId)
+      || seen.has(objectId)) {
+      fail("Invalid or duplicate historical restore identifier", "invalid_restore_plan");
+    }
+    seen.add(objectId);
+    entries.push(Object.freeze({ objectId, versionId }));
+  }
+  return Object.freeze(entries);
+}
+
 function activeIdentityPath(files, operation, exceptPath) {
   return Object.entries(files).find(([relativePath, prior]) => relativePath !== exceptPath
     && !prior.deleted && prior.directory
@@ -700,7 +730,40 @@ class SyncEngine {
     return this.withReadOnlyRoot(() => this._previewHistoricalRestore(objectId, versionId));
   }
 
-  async _previewHistoricalRestore(objectId, versionId) {
+  // One advisory answer for a bounded selection. No signed operation, journal
+  // entry or local file is written; a later restore still runs per-object CAS.
+  async previewHistoricalRestorePlan(requests) {
+    const selected = normalizeHistoricalRestorePlan(requests);
+    if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+    return this.withReadOnlyRoot(async () => {
+      const entries = [];
+      const destinations = [];
+      const rechecks = [];
+      for (const { objectId, versionId } of selected) {
+        const preview = await this._previewHistoricalRestore(objectId, versionId, { rechecks });
+        // Protect mixed Windows/POSIX restore targets, including case aliases
+        // and file-vs-descendant collisions, before presenting a ready plan.
+        const destination = preview.path.normalize("NFC").toLowerCase();
+        if (destinations.some((prior) => prior === destination
+          || prior.startsWith(`${destination}/`) || destination.startsWith(`${prior}/`))) {
+          fail("Historical restore plan targets conflicting local paths", "restore_plan_conflict");
+        }
+        destinations.push(destination);
+        entries.push(preview);
+      }
+      // The first destination and HEAD can change while a later history is
+      // fetched. Recheck all observed state after the last item; still advisory.
+      for (const recheck of rechecks) await recheck();
+      return {
+        readOnly: true, ready: true, atomic: false,
+        objectCount: entries.length,
+        localOverwriteCount: entries.filter((entry) => entry.localAction === "replace-clean-tracked").length,
+        requiresFreshRestoreCheck: true, entries,
+      };
+    });
+  }
+
+  async _previewHistoricalRestore(objectId, versionId, { rechecks = null } = {}) {
     if (!this.requireIndependentHistoricalAdmission || !this.requireAuthorization
       || !this.reverifySeenIncoming || !this.requireCurrentOutgoingAuthorization
       || typeof this.verifyIncoming !== "function"
@@ -729,6 +792,18 @@ class SyncEngine {
       headBytes.fill(0);
       await assertCleanDestination();
       await this.assertOutgoingAuthorized(proposed);
+      if (rechecks) rechecks.push(async () => {
+        const head = await this.adapter.list(objectId);
+        const records = Array.isArray(head) ? head : Array.isArray(head?.objects)
+          ? head.objects : head ? [head] : [];
+        if (records.length !== 1
+          || signedEnvelopeDigest(protocol.validateStoredOperation(records[0]))
+            !== signedEnvelopeDigest(current)) {
+          fail("Historical restore plan HEAD changed during preview", "history_preview_stale");
+        }
+        await assertCleanDestination();
+        await this.assertOutgoingAuthorized(proposed);
+      });
       return {
         readOnly: true, ready: true, objectId, sourceVersionId: versionId,
         currentVersionId: current.versionId, baseRevision: { ...current.revision },
@@ -2597,4 +2672,5 @@ class SyncEngine {
   }
 }
 
-module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };
+module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths,
+  normalizeHistoricalRestorePlan };
