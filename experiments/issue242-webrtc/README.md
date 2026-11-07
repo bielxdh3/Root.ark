@@ -40,6 +40,41 @@ To prevent one authenticated account from exhausting the shared signaling capaci
 
 **Security boundary:** unbound rooms are session-scoped manual browser-to-browser sharing: `listFiles` only gates the feature and sender-advertised SHA-256 does not establish stored-object identity. The explicitly bound mode additionally checks the **server-authoritative legacy encrypted-file ACL** and stored local ciphertext SHA-256/size. It does **not** verify an independent owner signature, device identity, file CEK or Zero-Knowledge decryption grant. No stored file is downloaded automatically. No TURN, NAT fallback, real-world cross-network assurance, streaming-to-disk, resume, production credential delegation or cutover. The feature flag is ignored in production.
 
+## 2026-11-07 critical bound signaling NO-GO (supersedes earlier success descriptions)
+
+The earlier text describes what the owner/recipient ACL checks and client-side
+DataChannel validation could do; it is NOT proof of current safe bound signaling.
+Sequential asynchronous authorizeObject checks can leak SDP/ICE: a revoked
+guest can lose access while the final owner hash awaits, or a revoked owner
+while a later guest's hash awaits. The room action queue does not serialize
+HTTP ACL mutations. Reordering those awaits cannot repair this TOCTOU.
+
+A bound signal now requires a trusted, **synchronous all-party ACL snapshot**
+via the makeBroker authorizeSignalSnapshot callback. The contract covers owner,
+all currently joined guests, exact object metadata fingerprint, digest, size,
+and a monotonic shared authority revision. The callback must read a single
+consistent authority view protected against **all** in-process and external
+ACL writers; per-user hashes, independently mutable JSON/SQLite reads,
+cached grants and a made-up revision do not qualify. The broker verifies the
+snapshot shape and match, then sends immediately without another await.
+Absent, asynchronous, malformed or denied snapshots close the room before
+any bound SDP/ICE signal. Only the trusted adapter can guarantee the
+consistency contract: shape checks alone cannot prove atomicity.
+
+The existing Root.ark server application reads independently mutable legacy
+ACL metadata and **does not** implement a shared snapshot transaction or
+writer lock. It deliberately supplies no such callback. Therefore its current
+DEV/TEST ACL-bound rooms can be created and invited, but bound SDP/ICE is
+**fail-closed**: no bound DataChannel transfer is authorized. The separate
+loopback unit fixture demonstrates functioning 1:1 and 1:N with a coherent
+in-memory test authority only; that test does not enable the real app.
+Manual, unbound single-peer and 1:N signed-session rooms continue to work.
+The actual app/Edge tests now prove manual transfers and bound admission/
+denial, not a functioning bound transfer. Before enabling bound signaling,
+review a real transactional multi-user ACL revision/fence shared with every
+mutation path (including cross-process writers), plus independently signed
+object/version/device grants and external TURN acceptance.
+
 ## Security and scope
 
 - Server binds to `127.0.0.1`, accepts matching WebSocket origin only, caps each room at 4 members, each message at 16 KiB, 120 messages per 10 seconds, and 16 rooms. An invitation is a random 256-bit one-use token with 60-second TTL, not a human PIN. Rooms expire after 5 minutes, and host disconnect closes a room. Invite revocation invalidates an **unredeemed** token; already-joined guests need an explicit kick.

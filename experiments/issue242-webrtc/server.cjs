@@ -20,7 +20,7 @@ const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-p
 
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
   authenticateSession = null, sharedWss = null, authorizeRecipient = null,
-  authorizeObject = null } = {}) {
+  authorizeObject = null, authorizeSignalSnapshot = null } = {}) {
   const rooms = new Map();
   const participants = new Map();
   const wss = sharedWss || new WebSocket.WebSocketServer({
@@ -129,10 +129,8 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   }
   async function forwardLiveSignal(room, sender, recipient, signal) {
     if (!activePeer(room, sender) || !activePeer(room, recipient)) return;
-    // A room-wide hash can await a later guest while an earlier recipient's
-    // ACL is revoked. Validate guests first, then recheck the owner LAST:
-    // owner revocation during the final guest hash must not forward signaling.
-    // This is sequential fail-closed revalidation, not an atomic ACL snapshot.
+    // Hash checks are useful fail-closed preflights, NOT an atomic ACL view.
+    // An owner or guest can lose access during any later asynchronous check.
     for (const peer of [sender, recipient]) {
       if (!room.boundObject || peer.role !== 'guest') continue;
       if (!await objectAllowed(room, peer.username)) {
@@ -148,7 +146,52 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (rooms.get(room.id) === room) expireRoom(room);
       return;
     }
-    // Send in this same continuation, without another await at the caller.
+    if (room.boundObject) {
+      // A protected signal requires an independently trusted, synchronous
+      // all-party snapshot from one mutation-serialized authority. The broker
+      // cannot manufacture this from sequential authorizeObject() promises.
+      // The app's legacy JSON ACL adapter does NOT supply such a snapshot;
+      // until a shared ACL mutation fence exists, deny protected signaling.
+      const usernames = [...new Set([...room.members.values()]
+        .filter(peer => peer.role === 'guest').map(peer => peer.username))].sort();
+      let accepted = false;
+      if (typeof authorizeSignalSnapshot === 'function') {
+        try {
+          const view = authorizeSignalSnapshot(Object.freeze({
+            owner: room.owner,
+            recipients: Object.freeze(usernames),
+            boundObject: Object.freeze({ ...room.boundObject }),
+            pin: room.objectPin, sha256: room.objectDigest, bytes: room.objectSize,
+          }));
+          // Strict sync result only. Reject Promise, accessors and partial/
+          // self-asserted per-user decisions; the trusted adapter MUST read
+          // all ACL writers' serialized authority in a single critical view.
+          if (object(view) && Object.getPrototypeOf(view) === Object.prototype) {
+            const fields = ['owner', 'recipients', 'pin', 'sha256', 'bytes', 'revision'];
+            const descriptors = Object.getOwnPropertyDescriptors(view);
+            if (Reflect.ownKeys(view).length === fields.length &&
+              fields.every(key => descriptors[key] &&
+                Object.hasOwn(descriptors[key], 'value'))) {
+              const values = Object.fromEntries(fields.map(key => [key, descriptors[key].value]));
+              accepted = values.owner === room.owner &&
+                Array.isArray(values.recipients) &&
+                values.recipients.length === usernames.length &&
+                values.recipients.every((name, i) => name === usernames[i]) &&
+                values.pin === room.objectPin && values.sha256 === room.objectDigest &&
+                values.bytes === room.objectSize &&
+                Number.isSafeInteger(values.revision) && values.revision >= 0 &&
+                values.revision >= (room.signalAuthorityRevision ?? 0);
+              if (accepted) room.signalAuthorityRevision = values.revision;
+            }
+          }
+        } catch { accepted = false; }
+      }
+      if (!accepted) {
+        if (rooms.get(room.id) === room) expireRoom(room);
+        return;
+      }
+    }
+    // No await between synchronous authority snapshot and final signal egress.
     if (activePeer(room, sender) && activePeer(room, recipient) &&
       room.allowed.has(pair(sender.id, recipient.id))) {
       send(recipient.ws, { type: 'signal', peerId: sender.id, signal });
