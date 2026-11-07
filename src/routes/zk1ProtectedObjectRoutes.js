@@ -97,10 +97,12 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
       if (!approved || rejectedStatus !== null || !probe.user
         || probe.user.username !== originalUser.username
         || probe.user.sessionVersion !== originalUser.sessionVersion) denied();
-      const scope = resolveTrustedScope(probe.user);
-      if (!scope || ["account_id", "compartment_id", "keyring_id"].some((field) =>
-        !Buffer.isBuffer(scope[field]) || !Buffer.isBuffer(originalScope[field])
-        || !scope[field].equals(originalScope[field]))) denied();
+      if (originalScope !== null) {
+        const scope = resolveTrustedScope(probe.user);
+        if (!scope || ["account_id", "compartment_id", "keyring_id"].some((field) =>
+          !Buffer.isBuffer(scope[field]) || !Buffer.isBuffer(originalScope[field])
+          || !scope[field].equals(originalScope[field]))) denied();
+      }
     } catch (error) {
       if (error?.code === "ZK_CONTENT_DENIED") throw error;
       denied();
@@ -217,6 +219,16 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     requirePermission("listFiles"), parseSealedContent, checked("get"));
   app.post("/zk-1/v1/content/put", fenceHeaders, protectedRequestLimit, authenticate,
     requirePermission("upload"), parseSealedContent, checked("put"));
+  // Reuse the sealed archive, owner/device history and physical admissions;
+  // only the operator-provisioned V2 store may expose recipient ciphertext.
+  if (store.signedHistoryRequired && store.admissionRequired) {
+    const { Zk1ProtectedObjectStore } = require("../services/zk1ProtectedObjectStore");
+    if (!(store instanceof Zk1ProtectedObjectStore)) invalid();
+    const { registerZk1ProtectedShareRoutes } = require("./zk1ProtectedShareRoutes");
+    registerZk1ProtectedShareRoutes({ app, store, authenticate, requirePermission,
+      resolveTrustedScope, fenceHeaders, protectedRequestLimit, parseSealedContent,
+      exact, b64, authorizationWire, recheckSession });
+  }
   // Opt-in only: a separate pinned, independent signed CAS authority must
   // be configured to register these routes. No generic sync-v2 metadata.
   if (opaqueCatalog !== null) {
