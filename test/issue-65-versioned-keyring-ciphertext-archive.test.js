@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const os = require("node:os");
 const { spawn, execFileSync } = require("node:child_process");
+const { readEdgeDevToolsPort } = require("./support/issue-65-edge-devtools-port");
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
 const z = require("../src/crypto/rootark-zk-1");
@@ -625,8 +626,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     throw Error("EDGE_V2_TIMEOUT_" + label);
   };
   const port = await wait(() => {
-    const p = path.join(profile, "DevToolsActivePort");
-    return fs.existsSync(p) ? Number(fs.readFileSync(p, "utf8").split(/\r?\n/)[0]) : null;
+    return readEdgeDevToolsPort(profile);
   }, "debug-port");
   const pages = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
   socket = new WebSocket(pages.find((p) => p.type === "page").webSocketDebuggerUrl);
