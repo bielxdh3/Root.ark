@@ -21,7 +21,6 @@
   const wsUrl = location.origin.replace(/^http/, 'ws') + (inRootark ? '/ws' : '/signal');
   const fileWire = window.P2PFileWire;
   const MAX_FILE = fileWire.MAX_FILE;
-  const BUFFER_HIGH = 256 * 1024;
   let preparingFile = false;
   let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
   let roomIntent = 0;
@@ -390,26 +389,11 @@
       }
     };
   }
-  async function awaitBufferSpace(dc, signal) {
-    if (dc.bufferedAmount < BUFFER_HIGH || signal.aborted || dc.readyState !== 'open') return;
-    await new Promise(resolve => {
-      const finish = () => {
-        dc.removeEventListener('bufferedamountlow', finish);
-        dc.removeEventListener('close', finish);
-        signal.removeEventListener('abort', finish);
-        resolve();
-      };
-      dc.addEventListener('bufferedamountlow', finish);
-      dc.addEventListener('close', finish);
-      signal.addEventListener('abort', finish, { once: true });
-      if (signal.aborted || dc.readyState !== 'open' || dc.bufferedAmount < BUFFER_HIGH) finish();
-    });
-  }
   async function sendChunks(p, tx) {
     const { dc } = p;
     try {
       for (let offset = 0; offset < tx.size; offset += fileWire.CHUNK_BYTES) {
-        await awaitBufferSpace(dc, tx.abort.signal);
+        await fileWire.waitForSendWindow(dc, tx.abort.signal);
         if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
         const bytes = new Uint8Array(await tx.file.slice(offset, offset + fileWire.CHUNK_BYTES).arrayBuffer());
         if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
@@ -430,10 +414,11 @@
         cancelOutgoing(p, true);
         log('Confirmação de integridade expirou');
       }, 30_000);
-    } catch {
+    } catch (error) {
       if (p.outgoing !== tx) return;
       cancelOutgoing(p, true);
-      record(diagnostics.rejected, 'SEND_FAILED');
+      record(diagnostics.rejected, error?.message === 'P2P_SEND_BUFFER_STALLED'
+        ? 'P2P_SEND_BUFFER_STALLED' : 'SEND_FAILED');
     }
   }
   function cancelOutgoing(p, notify) {
