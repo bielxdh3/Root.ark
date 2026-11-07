@@ -147,6 +147,8 @@ Fresh independent review also reproduced a #291 `453d5ffb` P2 despite earlier GO
 
 ## 2026-11-07 live dependency graph
 
+**Historical snapshot:** the facts below were captured before the later 13:02 UTC refresh and are preserved as earlier evidence. For subsequent PR heads, CI and the committed successor to virtual tree `677e4d4c`, use the [dated update below](#2026-11-07-1302-utc-dependency-update).
+
 This is a **new snapshot**, not a retroactive change to the dated GO/NO-GO evidence above. GitHub reported [Root/main](https://github.com/bielxdh3/Root.ark/tree/Root/main) at ea0445df8ccd8f17da2c70572786d298491fd2c2 and **46 OPEN PRs**: the first read counted 28 Ready/18 Draft; a same-day refresh counted **30 Ready for review / 16 Draft** because #293 and #294 advanced to Ready (their SHAs stayed unchanged). All original 28 Ready remain untouched. Issues [#63](https://github.com/bielxdh3/Root.ark/issues/63), [#64](https://github.com/bielxdh3/Root.ark/issues/64), [#66](https://github.com/bielxdh3/Root.ark/issues/66), [#67](https://github.com/bielxdh3/Root.ark/issues/67), [#68](https://github.com/bielxdh3/Root.ark/issues/68), [#242](https://github.com/bielxdh3/Root.ark/issues/242), [#94](https://github.com/bielxdh3/Root.ark/issues/94) and [#203](https://github.com/bielxdh3/Root.ark/issues/203) remained OPEN. **Ready means the GitHub review state; it does not mean merge approved, production ready or externally certified.**
 
 ~~~mermaid
@@ -178,3 +180,53 @@ The arrows denote a **reviewed feature dependency or proposed scratch compositio
 | [#296](https://github.com/bielxdh3/Root.ark/pull/296) DRAFT 2312412018042b3978078b1362d3d113e6a2a319 | [42370102210 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42370102210) | Ubuntu SUCCESS; Windows mandatory and canonical IN PROGRESS. |
 
 **Execution next:** finish triage of the failing/in-progress Windows jobs without inventing a source defect; run independent combined #66/#67 RED/GREEN and exact-tree validation before integration or review of any result; resolve real owner-signed SyncV2↔ZK1 account/object/revision/digest/epoch mapping; obtain off-host R1 custody, TLS, provider durability, Windows 10 CFAPI, physical Android trust and TURN only through their separate verified gates. None of these statuses changes the 28 existing Ready PRs or authorizes merge, deployment, cutover or issue closure.
+
+## 2026-11-07 13:02 UTC dependency update
+
+This **later GitHub snapshot** supersedes the earlier 46-PR/30-Ready/16-Draft count for current planning without rewriting that historical observation. At verification GitHub showed **49 OPEN: 30 Ready for review and 19 Draft**, with [Root/main](https://github.com/bielxdh3/Root.ark/tree/Root/main) still at `ea0445df8ccd8f17da2c70572786d298491fd2c2`. The counts may change again. [#294](https://github.com/bielxdh3/Root.ark/pull/294) returned to Draft on a genuine reviewer P2 (zero-byte CLI); newly created [#299](https://github.com/bielxdh3/Root.ark/pull/299) was already Ready for review. Ready does **not** mean approved to merge, released or production certified.
+
+~~~mermaid
+flowchart LR
+  A66["#292 Ready: #66 pin/journal"] --> B66["#295 Draft 5bac9e8e: picker plus Edge fix"]
+  B66 --> C67["#298 Draft c47d2dbb: committed #66 plus #67"]
+  A67["#288 Ready: #67 signed historical restore"] --> C67
+  B66 --> C300["#300 Draft 9f3e3ffa: CFAPI read-only probe"]
+  A68["#294 Draft d2cc72ec: zero-byte CLI P2"] --> B68["#296 Draft 14f7dc6e: bounded redemption"]
+  A63["#293 Ready: #63 64-revision selected search"] --> V["Virtual d327552b: #63 plus #68 cross tests pending"]
+  B68 --> V
+  A242["#284 Ready: #242 experimental WebRTC"] --> B242["#299 Ready 71784ed0: experimental P2P"]
+  C67 -.-> R1["BLOCKED: owner-signed SyncV2/ZK10 bridge and external R1 custody"]
+  C300 -.-> W10["BLOCKED: native Windows 10 provider proof"]
+  A64["#291 Ready: Android ciphertext session"] -.-> P64["Unpublished Android 4a3db203: two P2 findings"]
+  B242 -.-> TURN["BLOCKED: production TURN/cross-NAT"]
+~~~
+
+The arrows show **source dependencies and review blockers**, never deployed connections. The earlier `677e4d4c69fe3a839ac437e733323cfd9dda82f9` virtual **tree** is now the exact tree of linear commit `c47d2dbb55202630f228dd84b64bfa0edddd1b6a`, parent `0b39561164074c83efe31b37b57ae088c379c826`, published on [Draft #298](https://github.com/bielxdh3/Root.ark/pull/298). A bounded independent **source review GO** on that exact SHA does not cover full hosted CI, real physical platform acceptance or R1 custody. [#295](https://github.com/bielxdh3/Root.ark/pull/295) advanced to `5bac9e8e20656634c83cccefbaf7b5450b02a273`, and separate child [#300](https://github.com/bielxdh3/Root.ark/pull/300) is a read-only native CFAPI preflight only. [#296](https://github.com/bielxdh3/Root.ark/pull/296) advanced to `14f7dc6e241eb39ecad194daa1cf37b9ff45205b`; its owner/recipient offer path and #294's independent P2 still need separate closure. Experimental #299 is not proven production TURN.
+
+| PR / artifact at 13:02 UTC | State and exact evidence | Remaining gate |
+| --- | --- | --- |
+| [#251](https://github.com/bielxdh3/Root.ark/pull/251) `a4f327f2749bf1bc3065e38d337c9a8a2dbfe81b` | DRAFT; [Security Regression 42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) completed **SUCCESS** on that exact existing head | This later documentation commit requires its own verification before push |
+| [#294](https://github.com/bielxdh3/Root.ark/pull/294) `d2cc72ec` / [#296](https://github.com/bielxdh3/Root.ark/pull/296) `14f7dc6e` | Both DRAFT; #294 old full regression success remains SHA-scoped; #296 updated head not inferred green | Zero-byte CLI P2; custody and owner/recipient provisioning |
+| [#295](https://github.com/bielxdh3/Root.ark/pull/295) `5bac9e8e` / [#300](https://github.com/bielxdh3/Root.ark/pull/300) `9f3e3ffa` | Both DRAFT; #295 [42374437851](https://github.com/bielxdh3/Root.ark/actions/runs/42374437851) **IN PROGRESS** when checked; #300 read-only native probe | No all-green inference; Windows 10 physical provider absent |
+| [#298](https://github.com/bielxdh3/Root.ark/pull/298) `c47d2dbb` / [#299](https://github.com/bielxdh3/Root.ark/pull/299) `71784ed0` | #298 DRAFT, source tree verified `677e4d4c`; #299 READY for review as experimental P2P | No deployed #66/#67 joint system; TURN/cross-NAT unproven |
+| Local-only `4a3db203`, `dddee9b8`, virtual `d327552b` | Android offline grant and SyncV2↔ZK10 map each have **two independent P2s**; #63+#68 virtual composition cross tests pending | No publication of these local candidates or acceptance of independent R1 custody |
+
+**Production NO-GO remains:** separately operated monotonic floor/owner-approved genesis, independently pinned issuer and actual TLS custody, owner-signed object/identity/epoch/digest mapping, real Windows 10 CFAPI provider, physical Android enrollment/CEK and production TURN are not demonstrated. Do not infer a globally working zero-knowledge cutover from the Git tree, Draft PRs or scoped successful tests.
+
+## 2026-11-07 13:06 UTC review-blocker update
+
+The 13:02 UTC graph and **49 OPEN / 30 Ready / 19 Draft** count are preserved as an intermediate snapshot. A new GitHub check returned **49 OPEN / 26 Ready / 23 Draft** at 13:06 UTC. [#278](https://github.com/bielxdh3/Root.ark/pull/278) exact `5e1c79b2` (**one independent P1 and three P2**), [#288](https://github.com/bielxdh3/Root.ark/pull/288) exact `737304bf` (**one P1, two P2**) and [#284](https://github.com/bielxdh3/Root.ark/pull/284) exact `859adf0b` (**three P2**) were returned to Draft. [#294](https://github.com/bielxdh3/Root.ark/pull/294) exact `d2cc72ec` remains Draft with a separately found zero-byte CLI P2; [#299](https://github.com/bielxdh3/Root.ark/pull/299) exact `71784ed0` also returned to Draft because its #284 ancestor has unresolved P2s. These are external **peer-reported** findings, not issues reproduced by this document author.
+
+~~~mermaid
+flowchart LR
+  U278["#278 DRAFT: P1 plus three P2"] --> I295["#295 DRAFT: 5bac9e8e integration"]
+  I295 --> I298["#298 DRAFT: c47d2dbb joint source"]
+  U288["#288 DRAFT: P1 plus two P2"] --> I298
+  U284["#284 DRAFT: three P2"] --> I299["#299 DRAFT: 71784ed0 dependent P2P"]
+  U294["#294 DRAFT: zero-byte CLI P2"] --> I296["#296 DRAFT: 14f7dc6e child"]
+  I298 -.-> R["Blocked: ancestor P1, owner signed bridge, external R1"]
+  I299 -.-> T["Blocked: production TURN and cross-NAT"]
+  I295 -.-> W["Blocked: physical Windows 10 CFAPI"]
+~~~
+
+Review of commit `c47d2dbb` was **bounded source GO** before the newer #288 P1 was reported. That earlier GO is **not** approval to merge #298 or an override of the ancestor finding; investigate and repair the parent, then independently re-review the dependent stack. The #251 [Security Regression 42329893711](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) SUCCESS still refers only to `a4f327f2`; #295 [42374437851](https://github.com/bielxdh3/Root.ark/actions/runs/42374437851) was in progress at the prior check. No new all-green CI is asserted here. The local Android `4a3db203` and SyncV2↔ZK10 mapping `dddee9b8` still carry two independent P2s each, and R1 custody, physical Android/Windows 10 and TURN remain unverified.

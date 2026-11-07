@@ -144,6 +144,8 @@ All three PRs remain OPEN/DRAFT with correct stacked bases. No merge, deploy, Re
 
 ## 2026-11-07 live GitHub status
 
+**Historical observation:** this matrix reflects the earlier checkpoint before 13:02 UTC. The [later follow-up](#2026-11-07-1302-utc-follow-up) supersedes its changing GitHub counts and heads while retaining its earlier CI evidence.
+
 Historical failing attempts and prior exact-SHA reviewer decisions remain recorded above. [#293 run 42328562537 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328562537) and [#294 run 42328729476 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) **both finished SUCCESS**, including mandatory and canonical Windows jobs; the attempt-1 #294 stall was not itself an assertion failure or proof of a code defect. GitHub initially counted 28 OPEN Ready/18 Draft; during the checkpoint, #293 and #294 advanced to Ready without changing their HEADs: **30 OPEN Ready for review, 16 OPEN Draft** on refresh. The original 28 Ready PRs were left unchanged. No label certifies release or merge.
 
 ~~~mermaid
@@ -168,3 +170,33 @@ flowchart LR
 | Mission #251 | [#251](https://github.com/bielxdh3/Root.ark/pull/251) **DRAFT**, a4f327f2749bf1bc3065e38d337c9a8a2dbfe81b | [42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711): Ubuntu and mandatory Windows SUCCESS, canonical IN PROGRESS. Any later doc commit requires its own checks. |
 
 The [main mission ledger](../rootark-main-execution-mission.md#2026-11-07-live-dependency-graph) owns the detailed dependency interpretation. The uncommitted virtual object **677e4d4c** is not a release tree and was not tested by this documentation update. R1 owner-independent custody/external provider durability/TLS, owner-signed version mapping, native Windows 10 CFAPI, physical Android enrollment/CEK and P2P TURN remain **BLOCKED** for production. Do not infer a unified working ZK system from isolated successful PR CI.
+
+## 2026-11-07 13:02 UTC follow-up
+
+**Later evidence, not retroactive success:** live GitHub query returned **49 OPEN, 30 Ready for review, 19 Draft** at this timestamp (earlier 46/30/16 remains preserved above). [#294](https://github.com/bielxdh3/Root.ark/pull/294) reverted to Draft on the independently reported zero-byte CLI P2, while newly opened [#299](https://github.com/bielxdh3/Root.ark/pull/299) was Ready. This project still has open issues and no combined operational release. All PR heads below are source-scope identities; unrelated successful CI does not carry to newer SHAs.
+
+| Stream | New source / review state | CI / outstanding verification |
+| --- | --- | --- |
+| Mission #251 | DRAFT `a4f327f2749bf1bc3065e38d337c9a8a2dbfe81b` (this document's original base) | [42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) completed **SUCCESS**, scoped to `a4f327f2` only |
+| #66 #295 | DRAFT `5bac9e8e20656634c83cccefbaf7b5450b02a273`; forward Edge focused fix | [42374437851](https://github.com/bielxdh3/Root.ark/actions/runs/42374437851) **IN PROGRESS** at checkpoint; no overall SUCCESS claim |
+| #67 + #66 #298 | NEW DRAFT `c47d2dbb55202630f228dd84b64bfa0edddd1b6a`; its exact Git tree is `677e4d4c69fe3a839ac437e733323cfd9dda82f9`, formerly virtual | Bounded independent source GO; combined hosted/regression gates and external authority unproven |
+| #68 #294 / #296 | #294 reverted to DRAFT `d2cc72ec76a05180c0d1b421ec4559b6b4d077d7` on a zero-byte CLI P2; #296 DRAFT advanced to `14f7dc6e241eb39ecad194daa1cf37b9ff45205b` | Previous passing #294 CI does not fix its new P2 or certify #296's updated head |
+| #242 #299 | NEW READY for review `71784ed023a2dc710e7e29b2b3bec990eac69422`, experimental P2P grant | No production TURN, cross-NAT or owner-signed ZK authorization |
+| #66 #300 | NEW DRAFT `9f3e3ffa8213dd3be310790485c1f3c6708455d6`, CFAPI read-only probe | No registered native Windows 10 provider, hydration or on-device acceptance |
+| Local #64 / SyncV2↔ZK10 | `4a3db203` Android offline lab and `dddee9b8` map each have two independent P2 findings; virtual #63+#68 `d327552b` remains under cross-suite validation | Local/unpublished or not yet finalized; no physical Android CEK or R1 custody proof |
+
+The newer [13:02 UTC mission graph](../rootark-main-execution-mission.md#2026-11-07-1302-utc-dependency-update) replaces the former **virtual-only** dependency claim for `677e4d4c`. All new commits/CI need SHA-specific review before later publication. Owner-provisioned R1 external monotonic custody, TLS/provider durability, real Android hardware and Windows 10 CFAPI, signed bridge and production TURN remain **NO-GO**.
+
+## 2026-11-07 13:06 UTC review blockers
+
+The previous **49 OPEN, 30 Ready / 19 Draft** figure is an intermediate snapshot. Live GitHub then showed **49 OPEN, 26 Ready / 23 Draft**. A later independent review reported P1/P2 defects and four additional Draft states; their specific security findings were **not independently reproduced in this docs-only task**.
+
+| Exact PR | Live review state | Reported security finding / impact |
+| --- | --- | --- |
+| [#278](https://github.com/bielxdh3/Root.ark/pull/278) `5e1c79b24c66955d7c11d3550f7fdba85e9a464a` | DRAFT | Independent P1 + three P2; blocks unqualified #66 lineage approval |
+| [#288](https://github.com/bielxdh3/Root.ark/pull/288) `737304bf7681b3d0175164d96150292eac23ae86` | DRAFT | Independent P1 + two P2; new #298 `c47d2dbb` requires ancestor reconciliation despite earlier bounded source GO |
+| [#284](https://github.com/bielxdh3/Root.ark/pull/284) `859adf0b0c234d5cafb71dff5c87e4588fbca2b7` | DRAFT | Three independent P2 findings; dependent #299 also returned to Draft |
+| [#299](https://github.com/bielxdh3/Root.ark/pull/299) `71784ed023a2dc710e7e29b2b3bec990eac69422` | DRAFT | Parent #284 review blockers remain open; Ready was revoked, no production TURN proof |
+| [#294](https://github.com/bielxdh3/Root.ark/pull/294) `d2cc72ec76a05180c0d1b421ec4559b6b4d077d7` | DRAFT | Zero-byte CLI P2; previous full same-SHA regression passing does not close the reviewer finding or approve child #296 |
+
+Use the latest [dependency update](../rootark-main-execution-mission.md#2026-11-07-1306-utc-review-blocker-update) for the corrected graph. [#251](https://github.com/bielxdh3/Root.ark/pull/251)'s previous `a4f327f2` full CI success remains historical and exact-SHA scoped. R1 independent monotonic custody/owner-approved genesis, SyncV2↔ZK10 signed identity mapping, physical CFAPI and Android, and production TURN still have no operational acceptance.
