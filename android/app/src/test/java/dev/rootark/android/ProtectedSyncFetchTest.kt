@@ -230,6 +230,25 @@ class ProtectedSyncFetchTest {
         }
     }
 
+    @Test fun actualHttpsGetRejectsAmbiguousDuplicateAndNonStandardJsonBeforeOrgJson() {
+        val original = String(response, Charsets.UTF_8)
+        assertTrue(original.contains("\"objectId\":"))
+        val badBodies = listOf(
+            original.replaceFirst("\"objectId\":", "\"objectId\":\"wrong\",\"objectId\":"),
+            original.replaceFirst("\"objectId\":", "\"obj\\u0065ctId\":\"wrong\",\"objectId\":"),
+            original.replaceFirst("\"authorization\":{", "\"authorization\":{\"deviceId\":\"wrong\","),
+            original.replaceFirst("\"objectId\":", "\"objectId\"="),
+            "/* comment */$original",
+        )
+        badBodies.forEach { body ->
+            val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = body.toByteArray(Charsets.UTF_8))
+            assertThrows(IOException::class.java) {
+                ProtectedSyncFetch { fake }.fetchCiphertext(origin, session, "fixture-object-1")
+            }
+            assertTrue(fake.disconnected)
+        }
+    }
+
     @Test fun expiredOrUnpinnedContentCannotReachPlaintextCallbackAndCekIsCleared() {
         val source = JSONObject(String(response, Charsets.UTF_8))
         val proof = source.getJSONObject("authorization")
