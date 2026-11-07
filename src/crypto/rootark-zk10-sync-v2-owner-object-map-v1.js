@@ -5,6 +5,7 @@
 // must be provisioned independently of SyncV2 config, the storage server, JWT,
 // or the owner-selected mapping. No current runtime wires these dependencies.
 const crypto = require("node:crypto");
+const { types: { isProxy } } = require("node:util");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
@@ -145,6 +146,10 @@ function bytes(value, max = 12 * 1024 * 1024) {
 // on an accessor/Proxy can change a field after it was bound to a signature.
 function copyJson(value, depth = 0, budget = { nodes: 0, bytes: 0 }) {
   if (++budget.nodes > 20000) deny();
+  // A Proxy can return different legitimate signed records from successive
+  // get traps. A one-time descriptor snapshot avoids repeated reads; reject
+  // proxies altogether rather than trusting arbitrary synthetic descriptors.
+  if (isProxy(value)) deny();
   if (typeof value === "string") {
     budget.bytes += Buffer.byteLength(value, "utf8");
     if (budget.bytes > 9 * 1024 * 1024) deny();
@@ -188,13 +193,18 @@ function createOwnerObjectMapVerifier(config) {
       || identity.compartmentId !== id(identity.compartmentId)) deny();
     decode(z.immutableAccountId, 16);
     const ownerRoot = key(z.ownerRootPublicKey, "public");
-    const ownerKeys = verifyOwnerRotationKeys(z.ownerRotations, ownerRoot, z.immutableAccountId);
-    const cutover = verifyOwnerCutoverHistory(z.ownerCutoverHistory, ownerKeys,
+    // The underlying cutover verifier may inspect history entries once for
+    // signature/root and again for digest. Snapshot the entire chain before
+    // either operation; never let a mutable caller splice two signed heads.
+    const rotations = copyJson(z.ownerRotations);
+    const cutoverHistory = copyJson(z.ownerCutoverHistory);
+    const ownerKeys = verifyOwnerRotationKeys(rotations, ownerRoot, z.immutableAccountId);
+    const cutover = verifyOwnerCutoverHistory(cutoverHistory, ownerKeys,
       z.immutableAccountId);
     if (cutover.digest !== hex(z.independentlyRetainedCutoverDigest)) deny();
     const authorityKey = key(a.pinnedPublicKey, "public");
     const authorityHash = spkiHash(authorityKey);
-    if (authorityHash === spkiHash(ownerRoot)
+    if (ownerKeys.some((ownerKey) => authorityHash === spkiHash(ownerKey))
       || authorityHash === spkiHash(nativePublic(s.provisionerPublicKey))
       || authorityHash === spkiHash(nativePublic(s.witnessPublicKey))
       || authorityHash === spkiHash(nativePublic(s.casPublicKey))) deny();
