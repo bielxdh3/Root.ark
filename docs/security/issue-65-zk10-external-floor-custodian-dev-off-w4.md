@@ -91,6 +91,11 @@ before completing the durable writes. Failure reports generic codes only.
 - An older primary file restored alongside the newer minimum is rejected,
   including after restart. Missing anchor, key mismatch, incomplete pair,
   expired signed lease or replay also fails closed.
+- A live handle's retainedMinimum() revalidates the two stored floor records
+  and the primary consumed-lease journal before reporting its cached minimum.
+  If another legitimate writer has advanced either file, the old handle
+  permanently denies stale reads; callers must reopen and revalidate both
+  stores instead of treating a pre-revocation snapshot as current.
 - This is **not an atomic distributed transaction across two SQLite stores**.
   A crash between commits can make the custodian unavailable until a separately
   owner-authorized and audited recovery procedure is designed.

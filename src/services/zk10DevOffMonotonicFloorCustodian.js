@@ -302,9 +302,20 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
       independentOffServerCustodyProven: false,
       retainedMinimum() {
         if (closed || poisoned) deny();
-        checkDbPin(anchor);
-        checkDbPin(main);
-        return { ...minimum };
+        try {
+          // Another legitimate process can advance both SQLite stores while
+          // this instance keeps its previous in-memory minimum. A stale
+          // snapshot must never be reported as the CURRENT retained floor.
+          // The primary journal commitment is checked on every read too.
+          if (!same(minimum, read(anchor, ownerHash, signerHash))
+            || !same(minimum, read(main, ownerHash, signerHash, true))) deny();
+          return { ...minimum };
+        } catch (_) {
+          // State changed outside this handle, or an ambiguous read failed.
+          // Reopen and revalidate both files before trusting a new minimum.
+          poisoned = true;
+          deny();
+        }
       },
       attest(request, ownerLease) {
         if (closed || poisoned) deny();

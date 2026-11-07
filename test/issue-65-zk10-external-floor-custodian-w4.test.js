@@ -171,6 +171,36 @@ test("concurrent same lease signs once; high-water survives restart and catches 
     ...x.config, bootstrap: undefined }), /ZK10_CUSTODIAN_UNAVAILABLE/);
 });
 
+test("P2: retained minimum never reports an obsolete signed head after a second writer commits", (t) => {
+  const x = setup(t, "cross-writer-retained");
+  const observer = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const writer = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }));
+  assert.equal(observer.retainedMinimum().lease_serial, 0);
+  const newer = x.offer({
+    sequence: 2, head_digest: sha(15), enrollment_root: sha(16),
+  });
+  const issued = writer.attest(newer.request, newer.ownerLease).floor;
+  assert.equal(issued.sequence, 2);
+  assert.ok(crypto.verify(null, signatureBytes(DOMAIN_FLOOR, Object.fromEntries(
+    Object.entries(issued).filter(([field]) => field !== "signature"))),
+  x.custodian.publicKey, Buffer.from(issued.signature, "base64url")));
+  assert.equal(writer.retainedMinimum().lease_serial, 1);
+  // An old in-memory snapshot cannot be offered as a CURRENT retained floor
+  // after another legitimate, owner-authorized writer advanced both journals.
+  // In particular the obsolete sequence=1 is potentially pre-revocation.
+  assert.throws(() => observer.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  assert.throws(() => observer.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "once divergence is observed the old handle stays unavailable");
+  observer.close();
+  const refreshed = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }));
+  assert.equal(refreshed.retainedMinimum().lease_serial, 1);
+  assert.equal(refreshed.retainedMinimum().head_digest, sha(15));
+});
+
 test("two genuinely parallel worker-thread SQLite handles cannot both attest the same signed lease", async (t) => {
   const x = setup(t);
   const first = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
