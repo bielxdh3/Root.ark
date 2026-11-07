@@ -2482,6 +2482,7 @@ function getShareAuditActor(req) {
 
 function logShareAudit(req, eventType, token, link, action, result, details = {}) {
   const auditTokenId = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+  const capability = link?.shareKind === "capability-v1" || token.startsWith("C");
   auditLog(
     eventType,
     redactShareTokenFromAuditValue(getShareAuditActor(req), token),
@@ -2489,8 +2490,8 @@ function logShareAudit(req, eventType, token, link, action, result, details = {}
     action,
     result,
     redactShareTokenFromAuditValue({
-      fileName: link?.fileName || null,
-      folderId: link?.folderId || ROOT_FOLDER_ID,
+      fileName: capability ? null : link?.fileName || null,
+      folderId: capability ? null : link?.folderId || ROOT_FOLDER_ID,
       ...details,
     }, token)
   );
@@ -2503,6 +2504,42 @@ function getShareFileInfo(link) {
 
   const filePath = path.join(getFolderStoragePath("./uploads", folderId), fileName);
   return { folderId, fileName, filePath };
+}
+
+// A capability pins the opened file generation, not the mutable filename. Use
+// the same verified file-handle path as byte serving and bind to its inode and
+// change timestamps. Cloud cache hydration has no durable inode, so issuing
+// these local-file capabilities is disabled for cloud providers.
+function shareFileIdentity(filePath, openedStats = null) {
+  let handle;
+  try {
+    const stats = openedStats || (handle = openReadHandle(filePath)).stats;
+    const values = [stats.dev, stats.ino, stats.size, stats.birthtimeMs, stats.mtimeMs];
+    if (values.some((value) => !Number.isFinite(value))) return null;
+    return crypto.createHash("sha256").update(JSON.stringify(values)).digest("hex");
+  } catch {
+    return null;
+  } finally {
+    if (handle) fs.closeSync(handle.fd);
+  }
+}
+
+function shareCapabilityMatches(link, fileInfo, token, openedStats = null) {
+  // Legacy tokens are lowercase; the reserved uppercase C prefix survives
+  // loss of metadata_json, so corrupt capability records cannot downgrade.
+  if (!token.startsWith("C") && link.shareKind === undefined) return true;
+  const binding = link.resourceBinding;
+  if (link.shareKind !== "capability-v1" || binding?.version !== 1
+    || binding.folderId !== fileInfo.folderId || binding.fileName !== fileInfo.fileName
+    || typeof binding.identity !== "string" || !/^[a-f0-9]{64}$/.test(binding.identity)) return false;
+  const currentIdentity = shareFileIdentity(fileInfo.filePath, openedStats);
+  return currentIdentity !== null && currentIdentity === binding.identity;
+}
+
+function shareCapabilityPageAvailable(link, token) {
+  if (!token.startsWith("C")) return true;
+  const fileInfo = getShareFileInfo(link);
+  return Boolean(fileInfo && shareCapabilityMatches(link, fileInfo, token));
 }
 
 async function ensureShareFileAvailable(link) {
@@ -2654,7 +2691,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   }
 
   const fileInfo = await ensureShareFileAvailable(link);
-  if (!fileInfo) return { status: 404, error: "Link indisponivel." };
+  if (!fileInfo || !shareCapabilityMatches(link, fileInfo, token)) return { status: 404, error: "Link indisponivel." };
 
   // Provider hydration yields the event loop. Reload and revalidate the link so
   // concurrent requests cannot consume the same final view/download allowance
@@ -2665,6 +2702,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
     return { status: 404, error: "Link indisponivel." };
   }
+  if (!shareCapabilityMatches(currentLink, fileInfo, token)) return { status: 404, error: "Link indisponivel." };
   const currentExpiresAt = new Date(currentLink.expiresAt).getTime();
   if (!Number.isFinite(currentExpiresAt) || currentExpiresAt <= Date.now()) {
     logShareAudit(req, "share.expired", token, currentLink, "expired", "failure");
@@ -2774,11 +2812,14 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
   // Run synchronously as close as possible to streaming the bytes. The link
   // may change while the file lookup and authorization requests are awaited.
-  const revalidateStreamAccess = () => {
+  const revalidateStreamAccess = (readHandle = null) => {
     const latestLinks = loadPublicLinks();
     const latestLink = latestLinks[token];
     if (!latestLink || latestLink.fileName !== currentLink.fileName
       || (latestLink.folderId || ROOT_FOLDER_ID) !== (currentLink.folderId || ROOT_FOLDER_ID)) {
+      return { status: 404, error: "Link indisponivel." };
+    }
+    if (!shareCapabilityMatches(latestLink, fileInfo, token, readHandle?.stats)) {
       return { status: 404, error: "Link indisponivel." };
     }
     const latestExpiresAt = new Date(latestLink.expiresAt).getTime();
@@ -2815,11 +2856,11 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return null;
   };
 
-  const reserveDownloadQuota = () => {
+  const reserveDownloadQuota = (readHandle = null) => {
     if (!options.countDownload) return null;
     // A repeat preview can already have paid its quota. Recheck its
     // capability and token even then, in both SQLite and JSON storage.
-    const failure = revalidateStreamAccess();
+    const failure = revalidateStreamAccess(readHandle);
     if (failure) return failure;
     if (downloadAlreadyCounted) return null;
     if (shouldUseDatabase()) {
@@ -4040,7 +4081,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
   if (typeof options.beforeSend === "function") {
     let rejection;
     try {
-      rejection = options.beforeSend();
+      rejection = options.beforeSend(readHandle);
     } catch {
       try { fs.closeSync(fd); } catch {}
       return res.status(500).send("Erro ao autorizar transmissao");
@@ -11991,7 +12032,17 @@ registerTrashRoutes(app, {
   trashService,
 });
 
-app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
+const createPublicShare = async (req, res) => {
+  const isCapability = req.route.path === "/share/capabilities";
+  // A capability must never silently ignore a requested broader operation,
+  // recipient restriction, or client-provided decryption material.
+  if (isCapability && (!req.body || typeof req.body !== "object" || Array.isArray(req.body)
+    || !Object.hasOwn(req.body, "permissions")
+    || Object.keys(req.body).some((key) => ![
+      "name", "folderId", "expiresInMinutes", "maxViews", "maxDownloads", "password", "permissions",
+    ].includes(key)))) {
+    return res.status(400).json({ error: "Escopo de capacidade invalido" });
+  }
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
@@ -12036,6 +12087,10 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     return res.status(400).json({ error: "Permissoes do link invalidas. Use uma lista sem repeticao de: view, preview, download." });
   }
 
+  if (isCapability && isCloudStorageEnabled()) {
+    return res.status(409).json({ error: "Capacidades de arquivo local indisponiveis para cache remoto" });
+  }
+
   if (!hasPublicShareAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
@@ -12074,8 +12129,16 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   if (getEncryptedFileMetadata(finalFolder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
+  const resourceBinding = isCapability ? (() => {
+    const info = getShareFileInfo({ folderId: finalFolder.id, fileName: name });
+    const identity = info && shareFileIdentity(info.filePath);
+    return identity ? { version: 1, folderId: finalFolder.id, fileName: name, identity } : null;
+  })() : null;
+  if (isCapability && !resourceBinding) return res.status(404).json({ error: "Arquivo nao encontrado" });
   const links = cleanupExpiredPublicLinks();
-  const shareToken = crypto.randomBytes(24).toString("hex");
+  const shareToken = isCapability
+    ? `C${crypto.randomBytes(24).toString("hex").slice(1)}`
+    : crypto.randomBytes(24).toString("hex");
   const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
   links[shareToken] = {
     fileName: name,
@@ -12089,21 +12152,23 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     maxDownloads,
     passwordHash,
     permissions: sharePermissions,
+    ...(isCapability ? { shareKind: "capability-v1", resourceBinding } : {}),
     activeViewers: {},
   };
   savePublicLinks(links);
-  addActionHistory("share_created", name, req.user.username, {
+  addActionHistory(isCapability ? "share_capability_created" : "share_created",
+    isCapability ? "" : name, req.user.username, {
     expiresAt,
-    folderId: currentFolder.id,
-    folderName: currentFolder.name,
+    ...(!isCapability ? { folderId: currentFolder.id, folderName: currentFolder.name } : {}),
     maxViews,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
     permissions: sharePermissions,
   });
-  auditLog("share.created", getAuditActor(req), { type: "file", id: name }, "created", "success", {
-    folderId: currentFolder.id,
-    token: shareToken,
+  auditLog(isCapability ? "share.capability_created" : "share.created", getAuditActor(req),
+    isCapability ? { type: "public_link", id: crypto.createHash("sha256").update(shareToken).digest("hex") }
+      : { type: "file", id: name }, "created", "success", {
+    ...(!isCapability ? { folderId: currentFolder.id, token: shareToken } : {}),
     expiresAt,
     maxViews,
     maxDownloads,
@@ -12121,10 +12186,33 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
     permissions: sharePermissions,
+    ...(isCapability ? { capability: true, scope: { type: "file", folderId: finalFolder.id, fileName: name } } : {}),
     remainingViews: maxViews > 0 ? maxViews : null,
     remainingDownloads: maxDownloads > 0 ? maxDownloads : null,
   });
   }, res);
+};
+
+app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), createPublicShare);
+app.post("/share/capabilities", shareRateLimit, authenticate, requirePermission("listFiles"), createPublicShare);
+
+app.delete("/share/capabilities/:token", shareRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+  const token = validateShareToken(req.params.token);
+  if (!token) return res.status(404).json({ error: "Capacidade indisponivel" });
+  const links = loadPublicLinks();
+  const link = links[token];
+  if (!link || link.shareKind !== "capability-v1") {
+    return res.status(404).json({ error: "Capacidade indisponivel" });
+  }
+  if (!sameUsername(link.createdBy, req.user.username)) {
+    return res.status(403).json({ error: "Acesso negado" });
+  }
+  delete links[token];
+  savePublicLinks(links);
+  auditLog("share.capability_revoked", getAuditActor(req),
+    { type: "public_link", id: crypto.createHash("sha256").update(token).digest("hex") },
+    "revoked", "success", { scope: "file" });
+  return res.status(204).end();
 });
 
 app.get("/share/:token", shareRateLimit, (req, res) => {
@@ -12135,7 +12223,7 @@ app.get("/share/:token", shareRateLimit, (req, res) => {
 
   const links = loadPublicLinks();
   const link = links[shareToken];
-  if (!link) {
+  if (!link || !shareCapabilityPageAvailable(link, shareToken)) {
     return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
   }
 
@@ -12176,7 +12264,7 @@ app.post("/share/:token/status", shareRateLimit, requireSameOriginPublicShareMut
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
   const link = loadPublicLinks()[shareToken];
-  if (!link) return res.status(404).json({ error: "Link indisponivel." });
+  if (!link || !shareCapabilityPageAvailable(link, shareToken)) return res.status(404).json({ error: "Link indisponivel." });
 
   const expiresAt = new Date(link.expiresAt).getTime();
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
@@ -12230,8 +12318,8 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
-    beforeSend: () => {
-      const rejection = access.reserveDownload();
+    beforeSend: (readHandle) => {
+      const rejection = access.reserveDownload(readHandle);
       if (!rejection) setShareDownloadReceiptCookie(req, res, shareToken);
       return rejection;
     },
