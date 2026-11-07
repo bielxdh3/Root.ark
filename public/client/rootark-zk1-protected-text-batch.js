@@ -19,7 +19,7 @@
   function deny() { throw Error("ZK_BATCH_TEXT_SEARCH_DENIED"); }
   function checkedQuery(raw) {
     if (typeof raw !== "string" || raw.length > MAX_QUERY
-      || /[\u0000-\u001f\u007f]/.test(raw)) deny();
+      || /[\u0000-\u001f\u007f\u2028\u2029]/.test(raw)) deny();
     const normalized = raw.normalize("NFC").trim();
     if (!normalized || normalized.length > MAX_QUERY) deny();
     return normalized.toLocaleLowerCase();
@@ -46,6 +46,20 @@
       }
       return first;
     };
+  }
+  function sourceOffsetForFolded(normalized, foldedOffset) {
+    // Lowercasing may expand Unicode (e.g. İ -> i + combining dot).
+    // Binary-search source prefixes rather than slicing NFC with a folded offset.
+    // The signed opener already limits plaintext to 64 KiB.
+    let low = 0;
+    let high = normalized.length;
+    while (low < high) {
+      const mid = low + Math.floor((high - low + 1) / 2);
+      if (normalized.slice(0, mid).toLocaleLowerCase().length <= foldedOffset)
+        low = mid;
+      else high = mid - 1;
+    }
+    return low;
   }
   function checkedItems(input) {
     if (!Array.isArray(input.items) || input.items.length < 1
@@ -124,7 +138,7 @@
             const normalized = opened.text.normalize("NFC");
             const hit = match(normalized.toLocaleLowerCase());
             if (hit >= 0) {
-              const begin = Math.max(0, hit - 44);
+              const begin = Math.max(0, sourceOffsetForFolded(normalized, hit) - 44);
               matches.push(Object.freeze({
                 objectId: opened.objectId, revision: opened.revision,
                 name: opened.name, mediaType: opened.mediaType,

@@ -10,7 +10,7 @@ const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
 const sha = (bytes) => b64(crypto.createHash("sha256").update(bytes).digest());
 const id = () => b64(crypto.randomBytes(16));
 
-async function fixture(count = 2) {
+async function fixture(count = 2, replacements = {}) {
   const scope = { account_id: id(), compartment_id: id(), keyring_id: id() };
   const digest = b64(crypto.randomBytes(32));
   const grant = { ...scope, device_id: id(), current_epoch: 3,
@@ -25,7 +25,8 @@ async function fixture(count = 2) {
     ["groceries.txt", "arroz, leite, pão e batatas"],
     ...Array.from({ length: Math.max(0, count - 2) }, (_, index) =>
       ["ledger-" + index + ".txt", "Confidential owner-only content orçamento #" + index]),
-  ].slice(0, count)) {
+  ].slice(0, count).map(([name, content]) =>
+    [name, replacements[name] ?? content])) {
     const selected = { objectId: id(), revision: 1, epoch: 3 };
     const metadata = { ...scope, object_id: selected.objectId, version_id: id(),
       parent_version_id: null, epoch: 3, kind: "file" };
@@ -89,6 +90,45 @@ test("opt-in ALL TERMS matches reordered NFC/case-folded literals; default phras
   const missing = await search.search({ ...f.input,
     query: "secreto inexistente", matchMode: "all-terms" });
   assert.equal(missing.totalMatches, 0, "AND requires every literal term");
+});
+
+test("ALL TERMS excerpts map folded offsets back to NFC source for expanding Unicode folds", async () => {
+  for (const { source, query, expected } of [
+    { source: "İ".repeat(100) + "needle word", query: "needle word",
+      expected: "needle word" },
+    { source: "İ".repeat(100) + "STRAẞE Cafe\u0301", query: "café straße",
+      expected: "STRAẞE Café" },
+    { source: "İ".repeat(100) + "EARLY middle LATE", query: "late early",
+      expected: "EARLY" },
+  ]) {
+    const f = await fixture(1, { "plan.txt": source });
+    const found = await search.search({ ...f.input, query, matchMode: "all-terms" });
+    assert.equal(found.totalMatches, 1, "all required terms match under NFC/lowercase");
+    assert.ok(found.matches[0].excerpt.length > 0, "excerpt cannot be empty");
+    assert.ok(found.matches[0].excerpt.includes(expected), "excerpt must use original NFC text");
+    assert.ok(found.matches[0].excerpt.length <= 160, "excerpt remains bounded");
+    assert.equal(found.plaintextSentToServer, false);
+    assert.equal(f.queried.length, 1);
+    assert.deepEqual(Object.keys(f.queried[0]).sort(), ["objectId", "revision"]);
+  }
+  const f = await fixture(1, { "plan.txt": "İ".repeat(100) + "needle word" });
+  const phrase = await search.search({ ...f.input, query: "needle word" });
+  assert.equal(phrase.totalMatches, 1, "phrase search still matches exact literal");
+  assert.ok(phrase.matches[0].excerpt.includes("needle word"),
+    "phrase mode also gets the safe Unicode offset correction");
+  const missing = await search.search({ ...f.input,
+    query: "needle absent", matchMode: "all-terms" });
+  assert.equal(missing.totalMatches, 0, "missing term prevents a partial AND match");
+});
+
+test("invalid Unicode line separators before and after ALL TERMS never start signed GET", async () => {
+  const f = await fixture();
+  for (const query of ["\u2028alpha beta", "alpha beta\u2029",
+    "\u2029alpha beta", "alpha beta\u2028", "alpha\u2028beta", "alpha\u2029beta"]) {
+    await assert.rejects(search.search({ ...f.input, matchMode: "all-terms", query }),
+      /ZK_BATCH_TEXT_SEARCH_DENIED/);
+  }
+  assert.equal(f.queried.length, 0, "forbidden separators never reach GET");
 });
 
 test("ALL TERMS validates 2-4 distinct bounded tokens before any network or key access", async () => {
@@ -189,7 +229,8 @@ test("selected set max 64 and cancellation callback bounds reject before any sig
 });
 
 test("nine sealed revisions across two windows use signed disposable HTTP; forged last reply reveals no earlier matches", async (t) => {
-  const f = await fixture(9);
+  const f = await fixture(9, { "ledger-6.txt":
+    "İ".repeat(100) + "needle word Confidential owner-only content orçamento #6" });
   const signer = crypto.generateKeyPairSync("ed25519");
   const domain = Buffer.from("Root.ark/zk-1/disposable-window-signed-read/v1\0");
   let tamperLast = false;
@@ -251,6 +292,17 @@ test("nine sealed revisions across two windows use signed disposable HTTP; forge
   assert.equal(observed.length, 9, "ALL TERMS adds no extra signed GETs");
   assert.ok(observed.every((wire) => !/OWNER-ONLY|ORÇAMENTO/i.test(wire)
     && !wire.includes("cekSha256Pin") && !wire.includes("rawCek")));
+  observed.length = 0;
+  const unicode = await run({ matchMode: "all-terms", query: "needle word" });
+  assert.equal(unicode.totalSearched, 9);
+  assert.equal(unicode.totalMatches, 1);
+  assert.ok(unicode.matches[0].excerpt.includes("needle word"),
+    "signed HTTP + AEAD last-window result must include source literal");
+  assert.ok(unicode.matches[0].excerpt.length > 0);
+  assert.equal(observed.length, 9, "query adds no extra authenticated GETs");
+  assert.ok(observed.every((wire) => !wire.includes("needle")
+    && !wire.includes("word") && !wire.includes("rawCek")
+    && !wire.includes("cekSha256Pin")));
   observed.length = 0;
   tamperLast = true;
   await assert.rejects(run(), /ZK_BATCH_TEXT_SEARCH_DENIED/);
