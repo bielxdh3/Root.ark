@@ -194,3 +194,49 @@ test('guest revoked while later guest hash awaits receives no authorized signal'
     'late ACL change after an earlier guest hash must fence signal egress');
   assert.equal(hostJoined.role, 'host');
 });
+
+test('owner revoked during final guest ACL await cannot signal or retain room members', async t => {
+  let ownerAllowed = true;
+  let countGuestChecks = false, guestChecks = 0;
+  const enteredFinalGuest = deferred(), finishFinalGuest = deferred();
+  const f = await fixture(t, async ({ recipient }) => {
+    if (recipient === null) return ownerAllowed ? authorized() : null;
+    if (recipient === 'guest1' && countGuestChecks && ++guestChecks === 2) {
+      // The room-wide check has already read the owner. This second guest
+      // check is the guest await in forwardLiveSignal after the initial
+      // room-wide owner recheck. The final owner check must follow this wait.
+      enteredFinalGuest.release();
+      await finishFinalGuest.promise;
+    }
+    return authorized();
+  });
+  const room = await f.room();
+  const host = await f.connect('owner');
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  const hostJoined = await host.next('joined');
+  const first = await inviteJoin(host, room, f.connect, 'guest1');
+  const second = await inviteJoin(host, room, f.connect, 'guest2');
+  host.send({ type: 'request-peer', to: first.joined.peerId });
+  const request = await first.guest.next('peer-request');
+  first.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await first.guest.next('peer-allowed');
+  const hostClose = new Promise(resolve => host.ws.once('close', resolve));
+  const firstClose = new Promise(resolve => first.guest.ws.once('close', resolve));
+  const secondClose = new Promise(resolve => second.guest.ws.once('close', resolve));
+  countGuestChecks = true;
+  host.send({ type: 'signal', to: first.joined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'owner-revoked-during-guest' } } });
+  await enteredFinalGuest.promise;
+  assert.equal(guestChecks, 2, 'test must block after owner check, at final guest await');
+  ownerAllowed = false;
+  finishFinalGuest.release();
+  await Promise.all([hostClose, firstClose, secondClose]);
+  assert.equal(first.guest.received.filter(message => message.type === 'signal').length, 0,
+    'owner ACL revoked during final guest await must block signaling');
+  assert.equal(hostJoined.role, 'host');
+  const late = await f.connect('owner');
+  late.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  assert.equal((await late.next('error')).code, 'INVALID_INVITE',
+    'stale owner/member room must not survive an ACL revocation');
+});
