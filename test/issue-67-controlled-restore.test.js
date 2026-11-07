@@ -209,6 +209,100 @@ test("#67: new epoch or concurrent untracked destination rejects controlled exec
   assert.equal(f.pushes(), 0);
 });
 
+test("#67 reviewer P2: full retention cannot prune a selected second-oldest signed source", async (t) => {
+  const f = await fixture(t);
+  const operations = [];
+  let prior = null;
+  for (let counter = 1; counter <= 32; counter++) {
+    const operation = await f.sign(3, { operation: counter === 1 ? "create" : "update",
+      operationId: `retained-source-op-${counter}`,
+      versionId: `retained-source-version-${counter}`,
+      ...(prior ? { baseRevision: prior.revision } : {}),
+      revision: { counter, deviceId: "device-a" },
+      metadata: { path: "retained-source.txt" }, plaintext: Buffer.from(`content-${counter}`) });
+    operations.push(operation);
+    prior = operation;
+  }
+  const existingHistory = f.adapter.history;
+  const existingList = f.adapter.list;
+  f.adapter.history = async (objectId) => objectId === "object-3"
+    ? { protocolVersion: 2, versions: operations } : existingHistory(objectId);
+  f.adapter.list = async (objectId) => objectId === "object-3"
+    ? operations[operations.length - 1] : existingList(objectId);
+  await assert.rejects(f.engine.previewHistoricalRestorePlan([
+    { objectId: "object-3", versionId: "retained-source-version-2" },
+  ]), (error) => error.code === "history_source_prune_risk");
+  assert.equal(f.pushes(), 0, "unsafe retention never mutates signed history");
+});
+
+test("#67 reviewer P2: 32 valid 511-character paths fit the execution plan admission budget", async (t) => {
+  const f = await fixture(t);
+  const histories = new Map();
+  const requests = [];
+  for (let index = 1; index <= 32; index++) {
+    const objectId = `large-plan-${index}-${"x".repeat(36)}`;
+    const versionId = `large-source-${index}-${"y".repeat(36)}`;
+    const relativePath = `p${String(index).padStart(2, "0")}/${"a".repeat(180)}/${"b".repeat(180)}/${"c".repeat(145)}`;
+    assert.equal(relativePath.length, 511);
+    const created = await f.sign(index, { objectId, operation: "create",
+      operationId: `large-plan-create-${index}`, versionId,
+      revision: { counter: 1, deviceId: "device-a" },
+      metadata: { path: relativePath }, plaintext: Buffer.from("owner data") });
+    const removed = await f.sign(index, { objectId, operation: "delete",
+      operationId: `large-plan-delete-${index}`,
+      versionId: `deleted-${index}`, baseRevision: created.revision,
+      revision: { counter: 2, deviceId: "device-a" },
+      metadata: { path: relativePath } });
+    histories.set(objectId, [created, removed]);
+    requests.push({ objectId, versionId });
+  }
+  f.adapter.history = async (objectId) => ({ protocolVersion: 2,
+    versions: histories.get(objectId) || [] });
+  f.adapter.list = async (objectId) => histories.get(objectId)?.at(-1) || null;
+  const plan = await f.engine.previewHistoricalRestorePlan(requests);
+  assert.equal(plan.ready, true);
+  assert.equal(plan.objectCount, 32);
+  assert.ok(Buffer.byteLength(protocol.canonicalJson(plan)) > 32768,
+    "a valid bounded 32-object plan legitimately exceeds the previous cap");
+  f.engine.withMutationLock = async () => {
+    throw Object.assign(new Error("stop before any mutation"), { code: "test_execution_reached" });
+  };
+  await assert.rejects(f.engine.restoreHistoricalPlan(plan, { confirm: true }),
+    (error) => error.code === "test_execution_reached",
+    "the exact preview must not be rejected by a smaller execution-only byte cap");
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67 reviewer P1: late signed remote update cannot become an unreviewed restore CAS base", async (t) => {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const expected = preview.entries[0];
+  const originalRestore = f.engine._restoreHistoricalVersion.bind(f.engine);
+  let injected = false;
+  f.engine._restoreHistoricalVersion = async (objectId, sourceVersionId, options) => {
+    if (!injected) {
+      injected = true;
+      const old = f.store.list("alice", objectId)[0];
+      assert.equal(old.versionId, expected.currentVersionId);
+      const concurrent = await f.sign(1, { operation: "delete",
+        operationId: "unreviewed-remote-delete", versionId: "unreviewed-remote-version",
+        baseRevision: old.revision,
+        revision: { counter: old.revision.counter + 1, deviceId: "device-a" },
+        metadata: { path: "file-1.txt" } });
+      assert.equal((await f.store.put("alice", concurrent)).kind, "stored");
+    }
+    return originalRestore(objectId, sourceVersionId, options);
+  };
+  const result = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+  assert.equal(injected, true);
+  assert.equal(result.completed, 0, "late remote update cannot be silently replaced");
+  assert.equal(result.items[0].status, "blocked");
+  assert.equal(f.pushes(), 0, "no signed restore is dispatched using unreviewed HEAD");
+  assert.equal(f.store.list("alice", "object-1")[0].operationId,
+    "unreviewed-remote-delete", "concurrent signed HEAD remains authoritative");
+  assert.equal((await f.engine.journal.recover()).length, 0);
+});
+
 test("#67: signed remote HEAD change after preview denies all writes before first mutation", async (t) => {
   const f = await fixture(t);
   const preview = await f.engine.previewHistoricalRestorePlan(f.requests);
