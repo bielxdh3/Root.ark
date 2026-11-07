@@ -109,6 +109,10 @@ object OwnerPinnedOfflineAdmission {
     ): T {
         try {
             verifiedHead(head, pin, nowMillis)
+            // Persist the independently pinned, owner-signed head even if the
+            // accompanying grant is revoked, invalid, or otherwise denied.
+            // Keystore/floor failures must abort BEFORE any CEK callback.
+            store.advance(pin, head.ownerRevision, head.ownerDigest, nowMillis)
             check(grant.schema == GRANT_SCHEMA)
             check(grant.origin == pin.origin && grant.username == pin.username)
             check(grant.readerDeviceId == pin.readerDeviceId)
@@ -133,9 +137,6 @@ object OwnerPinnedOfflineAdmission {
                 MessageDigest.getInstance("SHA-256").digest(fileKey),
                 decode(grant.cekSha256, 32),
             ))
-            // An inaccessible/replaced Keystore key or rollbacked state aborts
-            // BEFORE the key is exposed to a decrypting callback.
-            store.advance(pin, head.ownerRevision, head.ownerDigest, nowMillis)
             val context = PinnedSyncReadContext(
                 username = pin.username, objectId = grant.objectId,
                 fileId = grant.fileId, versionId = grant.versionId,

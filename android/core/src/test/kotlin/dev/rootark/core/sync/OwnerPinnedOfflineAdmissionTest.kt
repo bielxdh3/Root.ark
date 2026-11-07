@@ -110,6 +110,89 @@ class OwnerPinnedOfflineAdmissionTest {
         assertTrue(bytes.all { it == 0.toByte() })
     }
 
+    @Test fun revokedSignedGrantPersistsNewerOwnerFloorBeforeDenialAcrossRestart() {
+        val olderHead = head()
+        val olderGrant = grant()
+        val olderPin = pin()
+        val initialCek = cek()
+        OwnerPinnedOfflineAdmission.withAuthorizedCek(olderGrant, olderHead, olderPin,
+            initialCek, OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true), at,
+        ) { _, _ -> Unit }
+        assertTrue(initialCek.all { it == 0.toByte() })
+
+        val revoked = head(fixture.getJSONObject("revoked"))
+        val revokedGrant = grant(fixture.getJSONObject("revokedGrant"))
+        val newerPin = olderPin.copy(exactRevision = revoked.ownerRevision,
+            exactDigest = revoked.ownerDigest)
+        val revokedCek = cek()
+        var invoked = false
+        assertThrows(ProtectedSyncException::class.java) {
+            OwnerPinnedOfflineAdmission.withAuthorizedCek(revokedGrant, revoked, newerPin,
+                revokedCek, OwnerOfflineFloorStore(root.toFile(), key()), at + 1000,
+            ) { _, _ -> invoked = true }
+        }
+        assertTrue(!invoked && revokedCek.all { it == 0.toByte() },
+            "revoked grant must not consume or retain caller CEK")
+
+        // The newer owner head was signed and independently pinned, so its
+        // revocation MUST survive even when the accompanying grant is denied.
+        val replayCek = cek()
+        assertThrows(ProtectedSyncException::class.java) {
+            OwnerPinnedOfflineAdmission.withAuthorizedCek(olderGrant, olderHead, olderPin,
+                replayCek, OwnerOfflineFloorStore(root.toFile(), key()), at + 2000,
+            ) { _, _ -> invoked = true }
+        }
+        assertTrue(!invoked && replayCek.all { it == 0.toByte() },
+            "restarted reader must not replay the pre-revocation head and grant")
+
+        // Explicit observeHead and repeated observation at the same revision
+        // remain idempotent; neither path can lower the established floor.
+        OwnerPinnedOfflineAdmission.observeHead(revoked, newerPin,
+            OwnerOfflineFloorStore(root.toFile(), key()), at + 3000)
+        OwnerPinnedOfflineAdmission.observeHead(revoked, newerPin,
+            OwnerOfflineFloorStore(root.toFile(), key()), at + 4000)
+        val duplicateCek = cek()
+        assertThrows(ProtectedSyncException::class.java) {
+            OwnerPinnedOfflineAdmission.withAuthorizedCek(revokedGrant, revoked, newerPin,
+                duplicateCek, OwnerOfflineFloorStore(root.toFile(), key()), at + 5000,
+            ) { _, _ -> invoked = true }
+        }
+        assertTrue(!invoked && duplicateCek.all { it == 0.toByte() })
+    }
+
+    @Test fun forgedUnsignedOrUnpinnedNewerHeadCannotPoisonPriorAuthorizedFloor() {
+        val olderHead = head()
+        val olderGrant = grant()
+        val olderPin = pin()
+        OwnerPinnedOfflineAdmission.observeHead(olderHead, olderPin,
+            OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true), at)
+        val revoked = head(fixture.getJSONObject("revoked"))
+        val revokedGrant = grant(fixture.getJSONObject("revokedGrant"))
+        val newerPin = olderPin.copy(exactRevision = revoked.ownerRevision,
+            exactDigest = revoked.ownerDigest)
+        for ((candidateHead, candidatePin) in listOf(
+            revoked.copy(signature = "") to newerPin,
+            revoked.copy(revokedDeviceIds = emptyList()) to newerPin,
+            revoked to olderPin,
+        )) {
+            val attemptedCek = cek()
+            assertThrows(ProtectedSyncException::class.java) {
+                OwnerPinnedOfflineAdmission.withAuthorizedCek(
+                    revokedGrant, candidateHead, candidatePin, attemptedCek,
+                    OwnerOfflineFloorStore(root.toFile(), key()), at + 1000,
+                ) { _, _ -> error("unauthorized head released CEK") }
+            }
+            assertTrue(attemptedCek.all { it == 0.toByte() })
+        }
+        val validCek = cek()
+        var accepted = false
+        OwnerPinnedOfflineAdmission.withAuthorizedCek(olderGrant, olderHead, olderPin,
+            validCek, OwnerOfflineFloorStore(root.toFile(), key()), at + 2000,
+        ) { _, _ -> accepted = true }
+        assertTrue(accepted && validCek.all { it == 0.toByte() },
+            "invalid newer heads must never poison the earlier valid owner floor")
+    }
+
     @Test fun forgedOwnerFieldsAndUnsignedRevocationFailClosed() {
         val fixed = pin()
         val authorized = grant()
