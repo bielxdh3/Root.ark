@@ -127,24 +127,32 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       room.members.get(peer.id) === peer && participants.get(peer.ws) === peer &&
       peer.ws.readyState === WebSocket.OPEN && sessionCurrent(peer.ws));
   }
-  async function liveSignalPair(room, sender, recipient) {
-    if (!activePeer(room, sender) || !activePeer(room, recipient)) return false;
+  async function forwardLiveSignal(room, sender, recipient, signal) {
+    if (!activePeer(room, sender) || !activePeer(room, recipient)) return;
     // A room-wide hash can await a later guest while an earlier recipient's
-    // ACL is revoked. Validate the actual signal endpoints after that await.
+    // ACL is revoked. Validate guests first, then recheck the owner LAST:
+    // owner revocation during the final guest hash must not forward signaling.
+    // This is sequential fail-closed revalidation, not an atomic ACL snapshot.
     for (const peer of [sender, recipient]) {
-      if (!room.boundObject) continue;
-      if (!await objectAllowed(room, peer.role === 'guest' ? peer.username : null)) {
-        if (peer.role === 'host') expireRoom(room);
-        else if (activePeer(room, peer)) {
+      if (!room.boundObject || peer.role !== 'guest') continue;
+      if (!await objectAllowed(room, peer.username)) {
+        if (activePeer(room, peer)) {
           peer.ws.close(1008, 'object access revoked');
           removePeer(peer.ws);
         }
-        return false;
+        return;
       }
-      if (!activePeer(room, sender) || !activePeer(room, recipient)) return false;
+      if (!activePeer(room, sender) || !activePeer(room, recipient)) return;
     }
-    return activePeer(room, sender) && activePeer(room, recipient) &&
-      room.allowed.has(pair(sender.id, recipient.id));
+    if (room.boundObject && !await objectAllowed(room, null)) {
+      if (rooms.get(room.id) === room) expireRoom(room);
+      return;
+    }
+    // Send in this same continuation, without another await at the caller.
+    if (activePeer(room, sender) && activePeer(room, recipient) &&
+      room.allowed.has(pair(sender.id, recipient.id))) {
+      send(recipient.ws, { type: 'signal', peerId: sender.id, signal });
+    }
   }
   async function onMessage(ws, raw) {
     if (!sessionCurrent(ws)) return;
@@ -256,8 +264,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     } else if (message.type === 'signal' && target && room.allowed.has(pair(current.id, target.id)) &&
       object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
       JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256) {
-      if (!await liveSignalPair(room, current, target)) return;
-      send(target.ws, { type: 'signal', peerId: current.id, signal: message.signal });
+      await forwardLiveSignal(room, current, target, message.signal);
     } else {
       error(ws, 'FORBIDDEN');
     }
