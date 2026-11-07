@@ -836,6 +836,14 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertextRoot: Buffer.from(root), authority: publicAuthority,
       nowSeconds: now + 9 };
     const offer = await createProtectedRecipientShareOffer(ownerOfferArgs);
+    // Each later export is a new owner action: the independently trusted
+    // adapter supplies a fresh clock, not a timestamp from fixture setup.
+    const testWallSeconds = () => Math.floor(Date.now() / 1000);
+    Object.defineProperties(ownerOfferArgs, {
+      nowSeconds: { enumerable: true, get: testWallSeconds },
+      authority: { enumerable: true,
+        get: () => ({ ...publicAuthority, nowSeconds: testWallSeconds() }) },
+    });
     assert.equal(offer.schema, "rootark-zk1-recipient-share-offer-dev/v1");
     assert.equal(offer.authorizesProductionIo, false);
     assert.equal(offer.externalCustodyProven, false);
@@ -1203,25 +1211,27 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(getterRuns, 0, "owner input getters must not run");
     await assert.rejects(openPortableProtectedRecipientShareFile({
       offer: { ...offer, grant: { ...offer.grant, grantId: b64(crypto.randomBytes(32)) } },
-      redeemInput: recipientShareInput, authority: { ...linked, nowSeconds: now + 9 },
+      redeemInput: recipientShareInput, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
-      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: testWallSeconds(),
     }), /ZK_SHARE_FILE_OPEN_DENIED/, "tampered portable grant must fail before ciphertext release");
     await assert.rejects(openPortableProtectedRecipientShareFile({
       offer, redeemInput: { ...recipientShareInput, recipientUsername: "attacker" },
-      authority: { ...linked, nowSeconds: now + 9 },
+      authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
-      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: testWallSeconds(),
     }), /ZK_SHARE_FILE_OPEN_DENIED/, "recipient login cannot be relabelled while importing");
     await assert.rejects(openPortableProtectedRecipientShareFile({
       offer, redeemInput: { ...recipientShareInput,
         fetchImpl: async () => new Response(JSON.stringify({ error: "ZK_SHARE_DENIED" }),
           { status: 403, headers: { "content-type": "application/json" } }) },
-      authority: { ...linked, nowSeconds: now + 9 },
+      authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
-      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: testWallSeconds(),
     }), /ZK_SHARE_FILE_OPEN_DENIED/,
     "revoked server grant cannot be bypassed by an otherwise valid portable CEK offer");
+    bridgeArgs.nowSeconds = testWallSeconds();
+    bridgeArgs.authority = { ...bridgeArgs.authority, nowSeconds: bridgeArgs.nowSeconds };
     const shared = await openProtectedRecipientShareFile(bridgeArgs);
     assert.deepEqual(Buffer.from(shared.data), bytes);
     assert.equal(shared.authorizesProductionIo, false);
@@ -1291,6 +1301,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         ciphertextRoot: await ciphertextRoots.computeCiphertextRoot([otherCiphertext]),
         ownerHeldCek: Buffer.from(otherCek) },
     ];
+    publicAuthority.nowSeconds = testWallSeconds();
     const bundle = await cekBatch.sealOwnerAuthorizedVersionedCeks({
       ownerPrivateKey: owner.privateKey, authority: publicAuthority, versions: versionRows,
       assertLive: () => undefined,
@@ -1318,9 +1329,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(realSeals, versionRows.length,
       "owner-side revocation must occur after all genuine CEK seals");
     const openBatch = (overrides = {}) => cekBatch.openOwnerAuthorizedVersionedCeks({
-      bundle, authority: { ...linked, nowSeconds: now + 9 },
+      bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
-      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9,
+      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: testWallSeconds(),
       assertLive: () => undefined,
       ...overrides,
     });
@@ -1347,9 +1358,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     };
     try {
       await assert.rejects(cekBatch.openOwnerAuthorizedVersionedCeks({
-        bundle, authority: { ...linked, nowSeconds: now + 9 },
+        bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
         operatorMinimumSequence: signedCommittedHead.sequence,
-        recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9,
+        recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: testWallSeconds(),
         assertLive: () => { if (!localSessionLive) throw Error("SESSION_REVOKED"); },
       }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
       "revocation after last real HPKE open must fence all CEKs at final release");
@@ -1378,9 +1389,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
     "a false session result cannot authorize CEK release");
     let hostileGetterRuns = 0;
-    const hostileInput = { bundle, authority: { ...linked, nowSeconds: now + 9 },
+    const hostileInput = { bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
-      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: now + 9 };
+      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: testWallSeconds() };
     Object.defineProperty(hostileInput, "assertLive", {
       enumerable: true, get() { hostileGetterRuns++; throw Error("UNTRUSTED_GETTER"); },
     });
