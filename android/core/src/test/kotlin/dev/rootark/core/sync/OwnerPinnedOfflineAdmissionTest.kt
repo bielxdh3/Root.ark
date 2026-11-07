@@ -160,6 +160,86 @@ class OwnerPinnedOfflineAdmissionTest {
         assertTrue(!invoked && duplicateCek.all { it == 0.toByte() })
     }
 
+    @Test fun newerRevocationCannotCommitWhileEarlierCekConsumerIsRunning() {
+        val oldPin = pin()
+        val revokedHead = head(fixture.getJSONObject("revoked"))
+        val newerPin = oldPin.copy(exactRevision = revokedHead.ownerRevision,
+            exactDigest = revokedHead.ownerDigest)
+        OwnerPinnedOfflineAdmission.observeHead(head(), oldPin,
+            OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true), at)
+
+        val callbackEntered = CountDownLatch(1)
+        val revocationAttemptFinished = CountDownLatch(1)
+        val workers = Executors.newFixedThreadPool(2)
+        val input = cek()
+        try {
+            // Two separate store instances use the REAL OS FileLock. Thread A
+            // pauses inside the synchronous callback, before consuming CEK;
+            // thread B attempts to persist a genuine signed revoked head.
+            val reader = workers.submit<Boolean> {
+                OwnerPinnedOfflineAdmission.withAuthorizedCek(grant(), head(), oldPin,
+                    input, OwnerOfflineFloorStore(root.toFile(), key()), at + 1000) { _, secret ->
+                    callbackEntered.countDown()
+                    assertTrue(revocationAttemptFinished.await(10, TimeUnit.SECONDS),
+                        "revocation contender must reach the same floor while callback is active")
+                    assertTrue(secret.contentEquals(cek()))
+                    true
+                }
+            }
+            val revocation = workers.submit<Boolean> {
+                assertTrue(callbackEntered.await(10, TimeUnit.SECONDS))
+                try {
+                    OwnerPinnedOfflineAdmission.observeHead(revokedHead, newerPin,
+                        OwnerOfflineFloorStore(root.toFile(), key()), at + 2000)
+                    true
+                } catch (_: ProtectedSyncException) {
+                    false
+                } finally {
+                    revocationAttemptFinished.countDown()
+                }
+            }
+            assertTrue(reader.get(15, TimeUnit.SECONDS))
+            assertTrue(!revocation.get(15, TimeUnit.SECONDS),
+                "revocation must not commit between authorization and CEK consumption")
+            assertTrue(input.all { it == 0.toByte() })
+        } finally {
+            workers.shutdownNow()
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS))
+        }
+
+        // After thread A finishes, the revoked signed head can durably advance;
+        // an old grant cannot be replayed after the serialization point.
+        OwnerPinnedOfflineAdmission.observeHead(revokedHead, newerPin,
+            OwnerOfflineFloorStore(root.toFile(), key()), at + 3000)
+        val replay = cek()
+        assertThrows(ProtectedSyncException::class.java) {
+            OwnerPinnedOfflineAdmission.withAuthorizedCek(grant(), head(), oldPin,
+                replay, OwnerOfflineFloorStore(root.toFile(), key()), at + 4000) {
+                _, _ -> error("revoked floor replayed")
+            }
+        }
+        assertTrue(replay.all { it == 0.toByte() })
+    }
+
+    @Test fun reentrantOwnerFloorObservationInsideConsumerFailsClosedAndWipesCek() {
+        val currentPin = pin()
+        val sameStore = OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true)
+        val secret = cek()
+        var nestedSucceeded = false
+        assertThrows(ProtectedSyncException::class.java) {
+            OwnerPinnedOfflineAdmission.withAuthorizedCek(grant(), head(), currentPin,
+                secret, sameStore, at) { _, _ ->
+                OwnerPinnedOfflineAdmission.observeHead(head(), currentPin, sameStore, at + 1000)
+                nestedSucceeded = true
+            }
+        }
+        assertTrue(!nestedSucceeded && secret.all { it == 0.toByte() },
+            "reentrant OS FileLock must reject and wipe the caller's CEK")
+        // The outer transaction must still have persisted the signed head.
+        OwnerPinnedOfflineAdmission.observeHead(head(), currentPin,
+            OwnerOfflineFloorStore(root.toFile(), key()), at + 2000)
+    }
+
     @Test fun forgedUnsignedOrUnpinnedNewerHeadCannotPoisonPriorAuthorizedFloor() {
         val olderHead = head()
         val olderGrant = grant()

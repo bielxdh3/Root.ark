@@ -112,41 +112,44 @@ object OwnerPinnedOfflineAdmission {
             // Persist the independently pinned, owner-signed head even if the
             // accompanying grant is revoked, invalid, or otherwise denied.
             // Keystore/floor failures must abort BEFORE any CEK callback.
-            store.advance(pin, head.ownerRevision, head.ownerDigest, nowMillis)
-            check(grant.schema == GRANT_SCHEMA)
-            check(grant.origin == pin.origin && grant.username == pin.username)
-            check(grant.readerDeviceId == pin.readerDeviceId)
-            check(grant.ownerRevision == head.ownerRevision &&
-                grant.ownerDigest == head.ownerDigest)
-            for (id in listOf(grant.objectId, grant.fileId, grant.versionId,
-                    grant.compartmentId, grant.keyEpoch, grant.signerDeviceId)) {
-                check(id.matches(IDENTIFIER))
+            return store.advanceAndUse(pin, head.ownerRevision, head.ownerDigest, nowMillis) {
+                check(grant.schema == GRANT_SCHEMA)
+                check(grant.origin == pin.origin && grant.username == pin.username)
+                check(grant.readerDeviceId == pin.readerDeviceId)
+                check(grant.ownerRevision == head.ownerRevision &&
+                    grant.ownerDigest == head.ownerDigest)
+                for (id in listOf(grant.objectId, grant.fileId, grant.versionId,
+                        grant.compartmentId, grant.keyEpoch, grant.signerDeviceId)) {
+                    check(id.matches(IDENTIFIER))
+                }
+                check(grant.readerDeviceId !in head.revokedDeviceIds &&
+                    grant.signerDeviceId !in head.revokedDeviceIds)
+                validWindow(grant.issuedAtMillis, grant.expiresAtMillis, nowMillis)
+                check(grant.issuedAtMillis >= head.issuedAtMillis - 30_000L)
+                check(grant.expiresAtMillis <= head.expiresAtMillis)
+                decode(grant.nonce, 16)
+                decode(grant.cekSha256, 32)
+                val signingSpki = decode(grant.signerPublicKeySpki, 44)
+                check(signingSpki.copyOfRange(0, 12).contentEquals(SPKI_PREFIX))
+                verifySignature(pin.ownerPublicSpki, "cek-read", grant.fields(), grant.signature)
+                check(fileKey.size == 32)
+                check(MessageDigest.isEqual(
+                    MessageDigest.getInstance("SHA-256").digest(fileKey),
+                    decode(grant.cekSha256, 32),
+                ))
+                val context = PinnedSyncReadContext(
+                    username = pin.username, objectId = grant.objectId,
+                    fileId = grant.fileId, versionId = grant.versionId,
+                    compartmentId = grant.compartmentId, keyEpoch = grant.keyEpoch,
+                    trustedDevicePublicKeys = mapOf(grant.signerDeviceId to grant.signerPublicKeySpki),
+                    revokedDeviceIds = head.revokedDeviceIds.toSet(),
+                    snapshotObtainedAtMillis = nowMillis,
+                    snapshotValidUntilMillis = minOf(grant.expiresAtMillis, head.expiresAtMillis),
+                )
+                // Erase the caller's CEK before releasing the floor FileLock;
+                // the outer finally also covers failures before this point.
+                try { consume(context, fileKey) } finally { fileKey.fill(0) }
             }
-            check(grant.readerDeviceId !in head.revokedDeviceIds &&
-                grant.signerDeviceId !in head.revokedDeviceIds)
-            validWindow(grant.issuedAtMillis, grant.expiresAtMillis, nowMillis)
-            check(grant.issuedAtMillis >= head.issuedAtMillis - 30_000L)
-            check(grant.expiresAtMillis <= head.expiresAtMillis)
-            decode(grant.nonce, 16)
-            decode(grant.cekSha256, 32)
-            val signingSpki = decode(grant.signerPublicKeySpki, 44)
-            check(signingSpki.copyOfRange(0, 12).contentEquals(SPKI_PREFIX))
-            verifySignature(pin.ownerPublicSpki, "cek-read", grant.fields(), grant.signature)
-            check(fileKey.size == 32)
-            check(MessageDigest.isEqual(
-                MessageDigest.getInstance("SHA-256").digest(fileKey),
-                decode(grant.cekSha256, 32),
-            ))
-            val context = PinnedSyncReadContext(
-                username = pin.username, objectId = grant.objectId,
-                fileId = grant.fileId, versionId = grant.versionId,
-                compartmentId = grant.compartmentId, keyEpoch = grant.keyEpoch,
-                trustedDevicePublicKeys = mapOf(grant.signerDeviceId to grant.signerPublicKeySpki),
-                revokedDeviceIds = head.revokedDeviceIds.toSet(),
-                snapshotObtainedAtMillis = nowMillis,
-                snapshotValidUntilMillis = minOf(grant.expiresAtMillis, head.expiresAtMillis),
-            )
-            return consume(context, fileKey)
         } catch (_: Exception) {
             throw ProtectedSyncException()
         } finally {
@@ -301,9 +304,17 @@ class OwnerOfflineFloorStore(
         FileChannel.open(root.toPath(), StandardOpenOption.READ).use { it.force(true) }
     }
 
-    @Synchronized fun advance(
+    fun advance(
         pin: IndependentOfflineOwnerPin, revision: Long, digest: String, nowMillis: Long,
     ) {
+        advanceAndUse(pin, revision, digest, nowMillis) { Unit }
+    }
+
+    /** The signed head's durable floor and CEK consumer share one OS FileLock. */
+    @Synchronized internal fun <T> advanceAndUse(
+        pin: IndependentOfflineOwnerPin, revision: Long, digest: String, nowMillis: Long,
+        consume: () -> T,
+    ): T {
         try {
             val secret = key ?: throw ProtectedSyncException()
             check(secret.algorithm == "AES" && secret.encoded?.size != 0)
@@ -338,7 +349,7 @@ class OwnerOfflineFloorStore(
             } else {
                 OwnerFloorOpenedLock(FileChannel.open(lockFile.toPath(), *options), null)
             }
-            opened.use { bound ->
+            return opened.use { bound ->
                 bound.channel.tryLock().use { lock ->
                     check(lock != null && lock.isValid)
                     val lockedIdentity = lockIdentity()
@@ -419,6 +430,12 @@ class OwnerOfflineFloorStore(
                         iv.fill(0)
                         encrypted.fill(0)
                     }
+                    // The callback is synchronous and runs while the SAME
+                    // descriptor-bound lock remains valid. A newer signed
+                    // observeHead cannot commit between floor validation and
+                    // CEK use, even through a different store instance.
+                    check(lock.isValid && lockIdentity() == lockedIdentity)
+                    consume()
                 }
             }
         } catch (_: Exception) {
