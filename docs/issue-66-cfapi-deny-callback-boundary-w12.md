@@ -34,6 +34,38 @@ evict, pin, unpin, register, hydrate or transfer plaintext. Native path checks
 are advisory and cannot defend against a live handle/path swap; they are
 therefore never used as a positive authorization signal.
 
+## Bounded callback lifetime (follow-up to W2 P2)
+
+The mock-boundary JS gate now uses an abortable request state machine. Its
+defaults are **1,500 ms inspection deadline**, **250 ms failure-ACK deadline**,
+**32 concurrently admitted requests**, and **4,096 distinct lifetime request
+keys** (constructor options are validated and capped). On cancellation,
+shutdown, or inspection timeout it aborts an `AbortSignal` supplied as the
+second `native.inspectPlaceholder(path, { signal })` argument. The gate returns
+after an attempted failure completion even if the inspector ignores cancellation.
+
+The entire asynchronous inspection, including filesystem path checks, keeps
+one inspection slot until it actually settles, so non-cooperative operations
+cannot accumulate without a bound by timing out repeatedly. An admitted
+request triggers **one** best-effort `native.failFetch(key, code, { signal })`;
+an unresponsive ACK returns `failure_ack_timeout` and is never retried under
+the same request key. `shutdown()` aborts outstanding inspection requests and
+awaits only their bounded failure ACKs, then refuses new callbacks. Late
+positive inspection results are ignored and do not transfer data.
+
+When an unadmitted request exceeds concurrency or the lifetime key limit,
+`fetchData` returns `capacity_exceeded` without calling `failFetch`: the
+future native dispatcher must complete such CFAPI requests with its **own**
+fail-closed error, as no callback has been admitted by the mock JS gate.
+Similarly, this interface cannot guarantee a native failure completion if
+the callback process crashes, the native adapter hangs, or an ACK times out.
+Cooperative cancellation and an independent bounded native fallback are still
+required before any real registration. A JavaScript AbortSignal cannot forcibly
+stop a non-cooperative native operation, so those operations retain their
+inspection budget until they settle or the process exits.
+The JavaScript deadline also cannot preempt a synchronous native call that
+blocks the event loop; an actual native dispatcher needs a separate watchdog.
+
 ## Verification
 
 Windows tests (native compiler discovered using `vswhere -prerelease`):

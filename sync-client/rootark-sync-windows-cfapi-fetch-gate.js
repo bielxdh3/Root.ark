@@ -15,6 +15,15 @@ const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const ALLOWED = ["length", "offset", "placeholderId", "relativePath", "requestKey", "type"];
 const ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const MAX_RANGE = 1024 * 1024;
+const MAX_SEEN_REQUEST_KEYS = 4096;
+
+function boundedOption(value, minimum, maximum) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw Object.assign(new Error("Invalid bounded CFAPI callback option"),
+      { code: "invalid_cfapi_boundary" });
+  }
+  return value;
+}
 
 function trustedValue(value, props) {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -65,22 +74,94 @@ async function inspectNoLink(rootDir, relativePath) {
   return true;
 }
 
-function createCfapiFetchGate({ rootDir, native } = {}) {
+function createCfapiFetchGate({ rootDir, native, inspectionTimeoutMs = 1500,
+  ackTimeoutMs = 250, maxInFlight = 32,
+  maxLifetimeRequests = MAX_SEEN_REQUEST_KEYS } = {}) {
   if (typeof rootDir !== "string" || !path.isAbsolute(rootDir) || !native
     || typeof native.inspectPlaceholder !== "function"
     || typeof native.failFetch !== "function") {
     throw Object.assign(new Error("CFAPI fail-closed callback boundary is required"),
       { code: "invalid_cfapi_boundary" });
   }
+  boundedOption(inspectionTimeoutMs, 5, 30000);
+  boundedOption(ackTimeoutMs, 5, 10000);
+  boundedOption(maxInFlight, 1, 64);
+  boundedOption(maxLifetimeRequests, 1, MAX_SEEN_REQUEST_KEYS);
   const root = path.resolve(rootDir);
   const inFlight = new Map();
+  // An abandoned path scan OR native inspection may never settle. Keep its
+  // promise in the inspection budget until it really settles, including after
+  // the JS request has timed out or returned its failure ACK.
+  const inspections = new Set();
+  // A requestKey is connection-scoped. Do not replay an indeterminate failure
+  // ACK after timeout; the finite receipt budget also bounds memory growth.
+  const seenKeys = new Set();
   let stopping = false;
+
+  function interrupt(context, reason) {
+    if (context.reason) return false;
+    context.reason = reason;
+    context.controller.abort();
+    context.resolveInterrupt(reason);
+    return true;
+  }
 
   function cancelFetch(key) {
     const active = inFlight.get(key);
     if (!active) return false;
-    active.cancelled = true;
-    return true;
+    return interrupt(active, "cancelled");
+  }
+
+  async function inspect(context, raw) {
+    try {
+      const input = validateRequest(raw);
+      if (!input) return "invalid_callback";
+      if (context.reason) return context.reason;
+      if (!await inspectNoLink(root, input.relativePath)) return "unsafe_path";
+      if (context.reason) return context.reason;
+      // The second argument is optional for legacy mocks, but a cooperating
+      // native boundary can abort its work when the signal becomes aborted.
+      const actual = await native.inspectPlaceholder(input.relativePath,
+        { signal: context.controller.signal });
+      if (context.reason) return context.reason;
+      return trustedValue(actual, ["placeholder", "reparsePoint", "syncRootMatch"])
+        && actual.placeholder === true && actual.syncRootMatch === true
+        && actual.reparsePoint === true ? "authority_unavailable" : "placeholder_untrusted";
+    } catch {
+      return context.reason || "unsafe_path";
+    }
+  }
+
+  function boundedInspect(context, raw) {
+    if (inspections.size >= maxInFlight) return Promise.resolve("inspector_capacity_exceeded");
+    const pending = inspect(context, raw);
+    inspections.add(pending);
+    // Late fulfillment/rejection only frees the occupied slot. It cannot
+    // execute a second failure ACK or authorize the cancelled request.
+    void pending.then(() => inspections.delete(pending),
+      () => inspections.delete(pending));
+    return pending;
+  }
+
+  async function failOnce(key, code) {
+    // At most one native failure completion is attempted. If an adapter never
+    // acknowledges it, abort the advisory signal, report indeterminate ACK,
+    // and release the JS shutdown gate without retrying the request key.
+    const controller = new AbortController();
+    let timer;
+    const timedOut = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve(true);
+      }, ackTimeoutMs);
+    });
+    try {
+      const ack = Promise.resolve().then(() => native.failFetch(key, code,
+        { signal: controller.signal })).then(() => false);
+      return await Promise.race([ack, timedOut])
+        ? { status: "denied", code: "failure_ack_timeout" }
+        : { status: "denied", code };
+    } finally { clearTimeout(timer); }
   }
 
   async function fetchData(raw) {
@@ -94,29 +175,30 @@ function createCfapiFetchGate({ rootDir, native } = {}) {
         && typeof desc.value === "string" && ID.test(desc.value)) key = desc.value;
     } catch { /* A throwing Proxy cannot establish a callback identity. */ }
     if (!key) return { status: "denied", code: "invalid_callback" };
-    if (inFlight.has(key)) return { status: "denied", code: "duplicate_request" };
-    const context = { cancelled: false, promise: null };
+    if (stopping) return { status: "denied", code: "shutdown" };
+    if (seenKeys.has(key)) return { status: "denied", code: "duplicate_request" };
+    // Overflow requests are not admitted: the native dispatcher must reject
+    // them on its own boundary, including their CFAPI failure completion.
+    if (inFlight.size >= maxInFlight || seenKeys.size >= maxLifetimeRequests) {
+      if (seenKeys.size >= maxLifetimeRequests) stopping = true;
+      return { status: "denied", code: "capacity_exceeded" };
+    }
+    let resolveInterrupt;
+    const interrupted = new Promise((resolve) => { resolveInterrupt = resolve; });
+    const context = { reason: null, controller: new AbortController(),
+      resolveInterrupt, interrupted, promise: null };
+    seenKeys.add(key);
     inFlight.set(key, context);
     const work = (async () => {
-      let code = "authority_unavailable";
+      const timer = setTimeout(() => interrupt(context, "inspection_timeout"), inspectionTimeoutMs);
+      let code;
       try {
-        const input = validateRequest(raw);
-        if (!input) code = "invalid_callback";
-        else if (stopping || context.cancelled) code = stopping ? "shutdown" : "cancelled";
-        else if (!await inspectNoLink(root, input.relativePath)) code = "unsafe_path";
-        else if (stopping || context.cancelled) code = stopping ? "shutdown" : "cancelled";
-        else {
-          const actual = await native.inspectPlaceholder(input.relativePath);
-          if (stopping || context.cancelled) code = stopping ? "shutdown" : "cancelled";
-          else if (!trustedValue(actual, ["placeholder", "reparsePoint", "syncRootMatch"])
-            || actual.placeholder !== true || actual.syncRootMatch !== true
-            || actual.reparsePoint !== true) code = "placeholder_untrusted";
-        }
-      } catch { code = "unsafe_path"; }
+        code = await Promise.race([boundedInspect(context, raw), interrupted]);
+      } finally { clearTimeout(timer); }
+      code = context.reason || code;
       // A local journal or the caller's claim of a signed receipt is not an
       // independently pinned authority. Never call native.transferData.
-      await native.failFetch(key, code);
-      return { status: "denied", code };
+      return failOnce(key, code);
     })();
     context.promise = work;
     try { return await work; }
@@ -125,7 +207,9 @@ function createCfapiFetchGate({ rootDir, native } = {}) {
 
   async function shutdown() {
     stopping = true;
-    // No new callback may start while outstanding failure ACKs drain.
+    for (const active of inFlight.values()) interrupt(active, "shutdown");
+    // Each admitted request has a bounded ACK. Do not await noncooperative
+    // native inspections: those stay charged to the native inspection budget.
     await Promise.allSettled([...inFlight.values()].map((item) => item.promise));
   }
 

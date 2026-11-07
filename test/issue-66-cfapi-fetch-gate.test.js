@@ -7,7 +7,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { createCfapiFetchGate } = require("../sync-client/rootark-sync-windows-cfapi-fetch-gate");
 
-async function fixture(t) {
+async function fixture(t, gateOptions = {}) {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-fetch-"));
   t.after(() => fs.rm(rootDir, { recursive: true, force: true }));
   await fs.mkdir(path.join(rootDir, "docs"));
@@ -22,7 +22,7 @@ async function fixture(t) {
     async transferData(...args) { calls.transfer.push(args); throw new Error("TRANSFER FORBIDDEN"); },
     async registerSyncRoot(...args) { calls.register.push(args); throw new Error("REGISTRATION FORBIDDEN"); },
   };
-  const gate = createCfapiFetchGate({ rootDir, native });
+  const gate = createCfapiFetchGate({ rootDir, native, ...gateOptions });
   const request = (overrides = {}) => ({ type: "FETCH_DATA", requestKey: "request-1",
     relativePath: "docs/file.bin", placeholderId: "opaque-object-1", offset: 0,
     length: 16, ...overrides });
@@ -162,4 +162,194 @@ test("issue 66 CFAPI: duplicate request keys are never completed twice and shutd
   assert.equal(calls.fail.filter((item) => item.key === "request-1").length, 1);
   assert.deepEqual(calls.transfer, []);
   assert.deepEqual(calls.register, []);
+});
+
+async function within(promise, milliseconds = 80) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`operation did not settle within ${milliseconds} ms`)), milliseconds);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+test("issue 66 W2 P2: cancel drains never-resolving native inspection, aborts signal and fails exactly once", async (t) => {
+  const { native, gate, calls, request } = await fixture(t);
+  let inspectorSignal;
+  let inspectStarted;
+  const entered = new Promise((resolve) => { inspectStarted = resolve; });
+  native.inspectPlaceholder = (_path, options) => {
+    inspectorSignal = options?.signal;
+    inspectStarted();
+    return new Promise(() => {});
+  };
+  const first = gate.fetchData(request());
+  await within(entered);
+  assert.ok(inspectorSignal instanceof AbortSignal, "native inspector must receive a cancelable signal");
+  assert.equal(gate.cancelFetch("request-1"), true);
+  assert.equal((await within(first)).code, "cancelled");
+  await within(gate.shutdown());
+  assert.equal(inspectorSignal.aborted, true);
+  assert.deepEqual(calls.fail, [{ key: "request-1", code: "cancelled" }]);
+  assert.deepEqual(calls.transfer, []);
+  assert.deepEqual(calls.register, []);
+});
+
+test("issue 66 W2 P2: cooperative inspector receives AbortSignal and rejects without a second ACK", async (t) => {
+  const { native, gate, calls, request } = await fixture(t);
+  let started;
+  const entered = new Promise((resolve) => { started = resolve; });
+  let aborts = 0;
+  native.inspectPlaceholder = (_relative, { signal }) => new Promise((_, reject) => {
+    signal.addEventListener("abort", () => {
+      aborts++;
+      reject(new Error("cooperatively aborted"));
+    }, { once: true });
+    started();
+  });
+  const first = gate.fetchData(request());
+  await within(entered);
+  assert.equal(gate.cancelFetch("request-1"), true);
+  assert.deepEqual(await within(first), { status: "denied", code: "cancelled" });
+  await within(gate.shutdown());
+  assert.equal(aborts, 1);
+  assert.deepEqual(calls.fail, [{ key: "request-1", code: "cancelled" }]);
+});
+
+test("issue 66 W2 P2: shutdown drains noncooperative native inspector and rejects all later callbacks", async (t) => {
+  const { native, gate, calls, request } = await fixture(t);
+  let inspectStarted;
+  const entered = new Promise((resolve) => { inspectStarted = resolve; });
+  native.inspectPlaceholder = () => { inspectStarted(); return new Promise(() => {}); };
+  const first = gate.fetchData(request());
+  await within(entered);
+  await within(gate.shutdown());
+  assert.deepEqual(await within(first), { status: "denied", code: "shutdown" });
+  assert.deepEqual(await gate.fetchData(request({ requestKey: "after-stop" })),
+    { status: "denied", code: "shutdown" });
+  assert.equal(gate.cancelFetch("request-1"), false);
+  assert.deepEqual(calls.fail, [{ key: "request-1", code: "shutdown" }]);
+});
+
+test("issue 66 W2 P2: idle native inspection reaches deadline and never accepts a late positive result", async (t) => {
+  const { native, gate, calls, request } = await fixture(t, { inspectionTimeoutMs: 25 });
+  let release;
+  let observedSignal;
+  native.inspectPlaceholder = (_path, options) => {
+    observedSignal = options?.signal;
+    return new Promise((resolve) => { release = resolve; });
+  };
+  const result = await within(gate.fetchData(request()), 150);
+  assert.deepEqual(result, { status: "denied", code: "inspection_timeout" });
+  assert.equal(observedSignal.aborted, true);
+  release({ placeholder: true, reparsePoint: true, syncRootMatch: true });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(calls.fail, [{ key: "request-1", code: "inspection_timeout" }]);
+  assert.deepEqual(calls.transfer, []);
+  assert.equal(gate.cancelFetch("request-1"), false);
+  assert.deepEqual(await gate.fetchData(request()), { status: "denied", code: "duplicate_request" },
+    "do not retry a completed/indeterminate CFAPI request key");
+});
+
+test("issue 66 W2 P2: limit accepted callback concurrency and retain unresolved native inspection capacity", async (t) => {
+  const { native, gate, calls, request } = await fixture(t,
+    { maxInFlight: 2, inspectionTimeoutMs: 1000 });
+  const releases = [];
+  let started;
+  let startedCount = 0;
+  const both = new Promise((resolve) => { started = resolve; });
+  native.inspectPlaceholder = () => new Promise((resolve) => {
+    releases.push(resolve);
+    if (++startedCount === 2) started();
+  });
+  const a = gate.fetchData(request({ requestKey: "one" }));
+  const b = gate.fetchData(request({ requestKey: "two" }));
+  await within(both);
+  assert.deepEqual(await gate.fetchData(request({ requestKey: "overload" })),
+    { status: "denied", code: "capacity_exceeded" });
+  assert.equal(gate.cancelFetch("one"), true);
+  assert.equal(gate.cancelFetch("two"), true);
+  assert.equal((await within(a)).code, "cancelled");
+  assert.equal((await within(b)).code, "cancelled");
+  assert.deepEqual(await within(gate.fetchData(request({ requestKey: "three" }))),
+    { status: "denied", code: "inspector_capacity_exceeded" },
+    "orphaned native promises must continue consuming the bounded inspector budget");
+  assert.equal(releases.length, 2);
+  releases.forEach((release) => release({ placeholder: true, reparsePoint: true, syncRootMatch: true }));
+  await within(gate.shutdown());
+  assert.deepEqual(calls.fail.map((item) => item.key).sort(), ["one", "three", "two"]);
+  assert.deepEqual(calls.transfer, []);
+});
+
+test("issue 66 W2 P2: an unresolved path lstat also consumes the bounded inspector budget", async (t) => {
+  const { rootDir, gate, calls, request } = await fixture(t,
+    { maxInFlight: 1, inspectionTimeoutMs: 1000 });
+  const actualLstat = fs.lstat;
+  let started;
+  const entered = new Promise((resolve) => { started = resolve; });
+  fs.lstat = (candidate, ...args) => {
+    if (candidate === rootDir) {
+      started();
+      return new Promise(() => {});
+    }
+    return actualLstat(candidate, ...args);
+  };
+  try {
+    const first = gate.fetchData(request());
+    await within(entered);
+    assert.equal(gate.cancelFetch("request-1"), true);
+    assert.equal((await within(first)).code, "cancelled");
+    assert.deepEqual(await within(gate.fetchData(request({ requestKey: "second" }))),
+      { status: "denied", code: "inspector_capacity_exceeded" });
+    await within(gate.shutdown());
+  } finally { fs.lstat = actualLstat; }
+  assert.deepEqual(calls.fail.map((entry) => entry.key), ["request-1", "second"]);
+  assert.deepEqual(calls.inspect, []);
+});
+
+test("issue 66 W2 P2: even stalled failure acknowledgement cannot block callback or shutdown forever", async (t) => {
+  const { native, gate, request, calls } = await fixture(t, { ackTimeoutMs: 25 });
+  let acks = 0;
+  let ackSignal;
+  native.failFetch = (_key, _code, options) => {
+    ++acks;
+    ackSignal = options?.signal;
+    return new Promise(() => {});
+  };
+  const result = await within(gate.fetchData(request()), 150);
+  assert.deepEqual(result, { status: "denied", code: "failure_ack_timeout" });
+  assert.equal(acks, 1);
+  assert.equal(ackSignal.aborted, true);
+  await within(gate.shutdown());
+  assert.deepEqual(await gate.fetchData(request({ requestKey: "another" })),
+    { status: "denied", code: "shutdown" });
+  assert.deepEqual(calls.transfer, []);
+});
+
+test("issue 66 W2 P2: invalid timeout/concurrency options fail before constructing boundary", async (t) => {
+  const { rootDir, native } = await fixture(t);
+  for (const invalid of [
+    { inspectionTimeoutMs: 0 }, { inspectionTimeoutMs: Infinity },
+    { inspectionTimeoutMs: -1 }, { inspectionTimeoutMs: 300001 },
+    { ackTimeoutMs: 0 }, { ackTimeoutMs: Infinity },
+    { ackTimeoutMs: 300001 }, { maxInFlight: 0 },
+    { maxInFlight: 100000 }, { maxInFlight: 1.5 },
+    { maxLifetimeRequests: 0 }, { maxLifetimeRequests: 4097 },
+  ]) {
+    assert.throws(() => createCfapiFetchGate({ rootDir, native, ...invalid }),
+      { code: "invalid_cfapi_boundary" });
+  }
+});
+
+test("issue 66 W2 P2: lifetime request-key budget quarantines boundary without reusing retired keys", async (t) => {
+  const { gate, request, calls } = await fixture(t, { maxLifetimeRequests: 2 });
+  assert.equal((await gate.fetchData(request({ requestKey: "first" }))).code, "authority_unavailable");
+  assert.equal((await gate.fetchData(request({ requestKey: "second" }))).code, "authority_unavailable");
+  assert.deepEqual(await gate.fetchData(request({ requestKey: "third" })),
+    { status: "denied", code: "capacity_exceeded" });
+  assert.deepEqual(await gate.fetchData(request({ requestKey: "fourth" })),
+    { status: "denied", code: "shutdown" });
+  assert.deepEqual(calls.fail.map((entry) => entry.key), ["first", "second"]);
+  await within(gate.shutdown());
 });
