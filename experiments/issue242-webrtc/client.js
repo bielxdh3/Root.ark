@@ -25,12 +25,15 @@
   let preparingFile = false;
   let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
   let roomIntent = 0;
+  let protectedRoomRequired = false;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
-  function connect(credentials) {
-    if (ws && ws.readyState < 2) ws.close();
+  function retireRoom() {
+    const oldSocket = ws;
+    ws = null; // Ignore callbacks from the previous room immediately.
+    if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
     // A room switch must not reuse peer channels, offers or invitations from
     // the previous authenticated room while its old socket is still closing.
     for (const peer of peers.values()) closePeer(peer);
@@ -41,6 +44,9 @@
     selfId = null;
     role = null;
     activeBoundObject = null;
+  }
+  function connect(credentials) {
+    retireRoom();
     ws = new WebSocket(wsUrl);
     const eventSocket = ws;
     ws.onopen = () => {
@@ -173,7 +179,7 @@
     return p;
   }
   function sendControl(p, message) {
-    if (p.dc?.readyState !== 'open') return;
+    if (peers.get(p.id) !== p || p.dc?.readyState !== 'open') return;
     try { p.dc.send(JSON.stringify(message)); } catch { resetTransfers(p); }
   }
   function clearPending(p) {
@@ -271,6 +277,7 @@
       log('Arquivo rejeitado: ' + code);
     }
     dc.onmessage = async event => {
+      if (peers.get(p.id) !== p || p.dc !== dc) return;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
         if (!rx) { record(diagnostics.rejected, 'UNEXPECTED_CHUNK'); return; }
@@ -436,6 +443,10 @@
     if (notify) sendControl(p, { type: 'cancel-file', id: tx.id });
   }
   async function sendFile(file) {
+    if (protectedRoomRequired && !activeBoundObject) {
+      record(diagnostics.rejected, 'ROOM_CHANGED');
+      return log('Aguarde a confirmação da sala vinculada');
+    }
     if (!file || file.size === 0 || file.size > MAX_FILE || preparingFile) {
       return log('Selecione arquivo de até 32 MiB');
     }
@@ -446,16 +457,22 @@
     }
     const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing);
     if (!receivers.length) return log('Nenhum par disponível');
+    const sendingIntent = roomIntent;
     preparingFile = true;
     try {
       const digest = await sha(await file.arrayBuffer());
+      if (sendingIntent !== roomIntent || (protectedRoomRequired && !activeBoundObject)) {
+        record(diagnostics.rejected, 'ROOM_CHANGED');
+        return log('Envio de arquivo cancelado após troca de sala');
+      }
       if (activeBoundObject && digest !== activeBoundObject.sha256) {
         record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
         return log('O SHA-256 não corresponde ao ciphertext da sala');
       }
       const name = file.name.slice(0, 100) || 'arquivo.bin';
       for (const p of receivers) {
-        if (p.dc?.readyState !== 'open' || p.outgoing) continue;
+        if (sendingIntent !== roomIntent) break;
+        if (peers.get(p.id) !== p || p.dc?.readyState !== 'open' || p.outgoing) continue;
         const id = crypto.randomUUID().replace(/-/g, '');
         const tx = { id, name, size: file.size, digest, file, phase: 'offered',
           abort: new AbortController(), timer: null };
@@ -473,7 +490,9 @@
     finally { preparingFile = false; }
   }
   async function sendText(value) {
-    if (activeBoundObject) return log('Sala vinculada aceita somente ciphertext do arquivo selecionado');
+    if (protectedRoomRequired || activeBoundObject) {
+      return log('Sala vinculada aceita somente ciphertext do arquivo selecionado');
+    }
     if (!value || value.length > 1000) return;
     const sendingSocket = ws;
     const sendingRoom = roomId;
@@ -483,7 +502,7 @@
     const receivers = [...peers.values()].map(peer => ({ peer, dc: peer.dc }));
     const sameRoom = () => ws === sendingSocket && roomId === sendingRoom &&
       selfId === sendingPeerId && role === sendingRole &&
-      roomIntent === sendingIntent && !activeBoundObject;
+      roomIntent === sendingIntent && !protectedRoomRequired && !activeBoundObject;
     const digest = await sha(new TextEncoder().encode(value));
     if (!sameRoom()) {
       record(diagnostics.rejected, 'ROOM_CHANGED');
@@ -500,6 +519,8 @@
   }
   async function createRoom(boundObject = null) {
     const intent = ++roomIntent;
+    protectedRoomRequired = Boolean(boundObject);
+    if (protectedRoomRequired) retireRoom();
     const headers = {};
     if (inRootark) {
       const csrf = document.cookie.split(';').map(value => value.trim())
@@ -522,6 +543,7 @@
   }
   function joinRoom(room, invitation) {
     ++roomIntent;
+    protectedRoomRequired = false;
     roomId = room; $('room').textContent = roomId;
     connect({ invitation });
   }
