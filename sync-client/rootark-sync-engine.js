@@ -1821,8 +1821,30 @@ class SyncEngine {
           && entry.fileId === operation.fileId) affectedPaths.push(relativePath);
       }
     }
-    if (protectedPaths.some((pin) => affectedPaths.some((candidate) =>
-      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)))) {
+    const pinnedDescendant = protectedPaths.some((pin) => affectedPaths.some((candidate) =>
+      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)));
+    // A signed CREATE can register an existing directory after child hydration
+    // without replacing it. Never allow a case-distinct alias, conflicting
+    // tracked identity or non-directory target to bypass pin protection.
+    let existingAncestorCreate = false;
+    if (pinnedDescendant && operation.operation === "create"
+      && !operation.tombstone && !metadata.sourcePath
+      && metadata.contentType === "inode/directory") {
+      const ancestorPrefix = `${metadata.path}/`;
+      const sameSpelling = protectedPaths.every((pin) =>
+        !pin.path.toLowerCase().startsWith(ancestorPrefix.toLowerCase())
+        || pin.path.startsWith(ancestorPrefix));
+      const existing = Object.entries(this.snapshot.files).find(([relative]) =>
+        relative.toLowerCase() === metadata.path.toLowerCase());
+      if (sameSpelling && (!existing || (!existing[1].deleted && existing[1].directory
+        && existing[1].objectId === operation.objectId && existing[1].fileId === operation.fileId))) {
+        let stats;
+        try { stats = await fsp.lstat(target); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        existingAncestorCreate = Boolean(stats?.isDirectory() && !stats.isSymbolicLink());
+      }
+    }
+    if (pinnedDescendant && !existingAncestorCreate) {
       fail("A pinned file is inside a directory affected by the signed operation", "file_pinned");
     }
     if (operation.operation === "delete"
@@ -1832,7 +1854,8 @@ class SyncEngine {
     if (["create", "update", "move"].includes(operation.operation)
       && protectedPaths.some((pin) =>
         pin.path.toLowerCase() === metadata.path.toLowerCase()
-        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId))) {
+        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId
+          || metadata.contentType === "inode/directory"))) {
       // Guard the destination BEFORE the first journal observation, mkdir,
       // stageExisting or rename. Signed operations from another object can
       // never replace a device-pinned target, even via direct apply() or
@@ -1904,6 +1927,12 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
+        if (existingAncestorCreate) {
+          const still = await fsp.lstat(target);
+          if (!still.isDirectory() || still.isSymbolicLink()) {
+            fail("Pinned ancestor directory changed during admission", "file_pinned");
+          }
+        }
         const sourcePath = operation.operation === "update" ? activeIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         let relocated = false;
         if (sourcePath) {
@@ -1917,7 +1946,7 @@ class SyncEngine {
             relocated = true;
           }
         }
-        if (!relocated) {
+        if (!relocated && !existingAncestorCreate) {
           try {
             await fsp.mkdir(target, { recursive: false });
           } catch (error) {
@@ -2024,6 +2053,15 @@ class SyncEngine {
     for (const [relative, file] of Object.entries(scanned)) {
       const canonical = process.platform === "win32" ? snapshotPathByKey.get(pathKey(relative)) || relative : relative;
       current[canonical] = file;
+    }
+    // A local directory at the path of a pinned regular file is not an
+    // authorized edit to its identity. Fail before journal/snapshot mutation.
+    const currentByPortablePath = new Map(Object.entries(current)
+      .map(([relative, entry]) => [relative.toLowerCase(), entry]));
+    for (const pin of Object.values(this.snapshot.pinnedFiles || {})) {
+      if (currentByPortablePath.get(pin.path.toLowerCase())?.directory) {
+        fail("Pinned regular file cannot become a directory", "file_pinned");
+      }
     }
     const evictedByPath = new Map();
     for (const item of Object.values(this.snapshot.remoteOnly)) {
@@ -2231,15 +2269,15 @@ class SyncEngine {
   async pinStatus(relativePath = null) {
     return this.withMutationLock(async () => {
       if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
-      const status = async (safePath) => {
-        const pin = Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
+      const status = async (safePath, knownPin = null) => {
+        const pin = knownPin || Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
         const target = await contained(this.rootDir, safePath, true);
         const present = await exists(target);
         return { path: safePath, pinned: Boolean(pin), localPresent: present, objectId: pin?.objectId || null };
       };
       if (relativePath !== null) return status(await canonicalRelativePath(this.rootDir, relativePath));
       const all = Object.values(this.snapshot.pinnedFiles || {}).sort((a, b) => a.path.localeCompare(b.path));
-      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path))) };
+      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path, item))) };
     });
   }
 
