@@ -22,6 +22,8 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   authenticateSession = null, sharedWss = null, authorizeRecipient = null,
   authorizeObject = null, authorizeSignalSnapshot = null } = {}) {
   const rooms = new Map();
+  const pendingRoomCreatesByOwner = new Map();
+  let pendingRoomCreates = 0;
   const participants = new Map();
   const wss = sharedWss || new WebSocket.WebSocketServer({
     noServer: true, maxPayload: MAX_SIGNAL_BYTES, perMessageDeflate: false
@@ -427,34 +429,56 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         !input.fileName || /[/\\\x00-\x1f\x7f]/.test(input.fileName) ||
         input.fileName === '.' || input.fileName === '..') return { status: 403 };
       boundObject = { folderId: input.folderId, fileName: input.fileName };
-      try {
-        const grant = await authorizeObject({ owner: user.username, recipient: null, boundObject, pin: null });
-        if (!object(grant) || typeof grant.fingerprint !== 'string' ||
-          !/^[a-f0-9]{64}$/.test(grant.fingerprint) ||
-          typeof grant.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(grant.sha256) ||
-          !Number.isSafeInteger(grant.bytes) || grant.bytes < 1 ||
-          grant.bytes > 32 * 1024 * 1024) return { status: 403 };
-        objectPin = grant.fingerprint;
-        objectDigest = grant.sha256;
-        objectSize = grant.bytes;
-      } catch { return { status: 403 }; }
     }
-    // Reclaim immediately at the HTTP boundary too (do not wait for the
-    // background sweep) so an unused reservation cannot block a new owner.
+    // Reserve capacity before any async hashing; simultaneous requests count.
     for (const room of rooms.values()) validRoom(room);
-    if (authenticated && [...rooms.values()].filter(room => room.owner === user.username).length
-      >= MAX_ACTIVE_ROOMS_PER_OWNER) return { status: 429 };
-    if (rooms.size >= 16) return { status: 429 };
-    const timestamp = now();
-    const room = { id: shortId(), hostKey: token(), expires: timestamp + roomTtlMs,
-      hostJoinDeadline: timestamp + (authenticated ? Math.min(roomTtlMs, UNJOINED_ROOM_TTL_MS) : roomTtlMs),
-      hostJoined: false,
-      owner: user?.username, ownerSessionVersion: user?.sessionVersion,
-      boundObject, objectPin, objectDigest, objectSize,
-      members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
-    rooms.set(room.id, room);
-    return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires,
-      ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest, size: objectSize } } : {}) };
+    const owner = user?.username;
+    if (authenticated && [...rooms.values()].filter(room => room.owner === owner).length +
+      (pendingRoomCreatesByOwner.get(owner) || 0) >= MAX_ACTIVE_ROOMS_PER_OWNER) return { status: 429 };
+    if (rooms.size + pendingRoomCreates >= 16) return { status: 429 };
+    pendingRoomCreates++;
+    if (authenticated) pendingRoomCreatesByOwner.set(owner,
+      (pendingRoomCreatesByOwner.get(owner) || 0) + 1);
+    try {
+      if (boundObject) {
+        try {
+          const grant = await authorizeObject({ owner: user.username, recipient: null, boundObject, pin: null });
+          if (!object(grant) || typeof grant.fingerprint !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(grant.fingerprint) ||
+            typeof grant.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(grant.sha256) ||
+            !Number.isSafeInteger(grant.bytes) || grant.bytes < 1 ||
+            grant.bytes > 32 * 1024 * 1024) return { status: 403 };
+          objectPin = grant.fingerprint;
+          objectDigest = grant.sha256;
+          objectSize = grant.bytes;
+        } catch { return { status: 403 }; }
+      }
+      // Hashing may complete after the HTTP request was canceled or the session
+      // changed. Never turn that stale result into a room.
+      if (req.aborted) return { status: 403 };
+      if (authenticated) {
+        const current = identify(req);
+        if (!current || current.username !== owner ||
+          current.sessionVersion !== user.sessionVersion) return { status: 401 };
+      }
+      const timestamp = now();
+      const room = { id: shortId(), hostKey: token(), expires: timestamp + roomTtlMs,
+        hostJoinDeadline: timestamp + (authenticated ? Math.min(roomTtlMs, UNJOINED_ROOM_TTL_MS) : roomTtlMs),
+        hostJoined: false,
+        owner: user?.username, ownerSessionVersion: user?.sessionVersion,
+        boundObject, objectPin, objectDigest, objectSize,
+        members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
+      rooms.set(room.id, room);
+      return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires,
+        ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest, size: objectSize } } : {}) };
+    } finally {
+      pendingRoomCreates--;
+      if (authenticated) {
+        const remaining = pendingRoomCreatesByOwner.get(owner) - 1;
+        if (remaining) pendingRoomCreatesByOwner.set(owner, remaining);
+        else pendingRoomCreatesByOwner.delete(owner);
+      }
+    }
   }
   const server = sharedWss ? null : createHttpServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
