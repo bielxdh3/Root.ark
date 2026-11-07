@@ -339,3 +339,177 @@ test("P2 owner cutover is snapshotted: two distinct valid signatures cannot spli
     mappingAuthority: authority,
   }), deny);
 });
+
+function signedHead(f, challenge) {
+  return signCurrentMappingHead({
+    type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+    sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+    mapping_sequence: f.payload.mapping_sequence, mapping_digest: f.mappingDigest,
+  }, keys.authority.privateKey);
+}
+
+async function withinHeadDeadline(promise, milliseconds = 400) {
+  let timeout;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("head read never settled")), milliseconds);
+    })]);
+  } finally { clearTimeout(timeout); }
+}
+
+test("W26: never-settling external head is aborted and retains its occupied slot", async () => {
+  const f = await fixture();
+  const signals = [];
+  const authority = { ...f.authority, readCurrentHead: (_challenge, { signal } = {}) => {
+    signals.push(signal);
+    return new Promise(() => {});
+  } };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].aborted, true);
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(signals.length, 1, "noncooperative head read must retain the one-slot budget");
+});
+
+test("W26: late valid signed head cannot settle a timed-out verification", async () => {
+  const f = await fixture();
+  const calls = [];
+  const authority = { ...f.authority, readCurrentHead: (challenge, { signal } = {}) =>
+    new Promise((resolve) => calls.push({ challenge, signal, resolve })) };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+  const expired = verify(f.input);
+  await withinHeadDeadline(assert.rejects(expired, deny));
+  assert.equal(calls[0].signal.aborted, true);
+  calls[0].resolve(signedHead(f, calls[0].challenge));
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  const fresh = verify(f.input);
+  await withinHeadDeadline(new Promise((resolve) => {
+    const poll = () => {
+      if (calls.length === 2) resolve();
+      else setImmediate(poll);
+    };
+    poll();
+  }));
+  calls[1].resolve(signedHead(f, calls[1].challenge));
+  const result = await withinHeadDeadline(fresh);
+  assert.equal(result.authorizesIo, false);
+  assert.equal(result.independentCustodyProven, false);
+  assert.equal(calls.length, 2, "a stale head cannot be reused for a new challenge");
+});
+
+test("W26: caller cancellation aborts native head read without later acceptance", async () => {
+  const f = await fixture();
+  const controller = new AbortController();
+  const calls = [];
+  const authority = { ...f.authority, readCurrentHead: (challenge, { signal } = {}) =>
+    new Promise((resolve) => calls.push({ challenge, signal, resolve })) };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  }, { headTimeoutMs: 1000, maxPendingHeadReads: 1 });
+  const cancelled = verify(f.input, { signal: controller.signal });
+  await withinHeadDeadline(new Promise((resolve) => {
+    const poll = () => {
+      if (calls.length === 1) resolve();
+      else setImmediate(poll);
+    };
+    poll();
+  }));
+  controller.abort();
+  await withinHeadDeadline(assert.rejects(cancelled, deny));
+  assert.equal(calls[0].signal.aborted, true);
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(calls.length, 1, "cancelled native promise continues consuming budget");
+  calls[0].resolve(signedHead(f, calls[0].challenge));
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+});
+
+test("W26: concurrent external head calls share strict outstanding budget", async () => {
+  const f = await fixture();
+  const calls = [];
+  const authority = { ...f.authority, readCurrentHead: (challenge, { signal } = {}) =>
+    new Promise((resolve) => calls.push({ challenge, signal, resolve })) };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  }, { headTimeoutMs: 80, maxPendingHeadReads: 2 });
+  const first = verify(f.input);
+  const second = verify(f.input);
+  await withinHeadDeadline(new Promise((resolve) => {
+    const poll = () => {
+      if (calls.length === 2) resolve();
+      else setImmediate(poll);
+    };
+    poll();
+  }));
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(calls.length, 2, "overflow cannot dispatch another native read");
+  await withinHeadDeadline(Promise.all([
+    assert.rejects(first, deny), assert.rejects(second, deny),
+  ]));
+  assert.equal(calls.every(({ signal }) => signal.aborted), true);
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(calls.length, 2, "timeout does not release noncooperative capacity");
+  calls[0].resolve(signedHead(f, calls[0].challenge));
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  const next = verify(f.input);
+  await withinHeadDeadline(new Promise((resolve) => {
+    const poll = () => {
+      if (calls.length === 3) resolve();
+      else setImmediate(poll);
+    };
+    poll();
+  }));
+  calls[2].resolve(signedHead(f, calls[2].challenge));
+  const result = await withinHeadDeadline(next);
+  assert.equal(result.authorizesIo, false);
+  assert.equal(result.independentCustodyProven, false);
+  calls[1].resolve(signedHead(f, calls[1].challenge));
+});
+
+test("W26: event-loop-blocking external callback cannot slip a late valid head past deadline", async () => {
+  const f = await fixture();
+  let signal;
+  const authority = { ...f.authority, readCurrentHead: (challenge, { signal: nativeSignal }) => {
+    signal = nativeSignal;
+    // The event loop cannot run setTimeout during this real synchronous stall.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
+    return signedHead(f, challenge);
+  } };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  }, { headTimeoutMs: 10, maxPendingHeadReads: 1 });
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(signal.aborted, true);
+});
+
+test("W26: invalid head limits and pre-aborted signal fail before native work", async () => {
+  const f = await fixture();
+  for (const limits of [
+    { headTimeoutMs: 0, maxPendingHeadReads: 1 },
+    { headTimeoutMs: Infinity, maxPendingHeadReads: 1 },
+    { headTimeoutMs: 5001, maxPendingHeadReads: 1 },
+    { headTimeoutMs: 100, maxPendingHeadReads: 0 },
+    { headTimeoutMs: 100, maxPendingHeadReads: 65 },
+  ]) {
+    assert.throws(() => createOwnerObjectMapVerifier({
+      sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+      mappingAuthority: f.authority,
+    }, limits), deny);
+  }
+  let reads = 0;
+  const authority = { ...f.authority, readCurrentHead: async (challenge) => {
+    reads++;
+    return signedHead(f, challenge);
+  } };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  });
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(verify(f.input, { signal: cancelled.signal }), deny);
+  assert.equal(reads, 0);
+});

@@ -37,6 +37,12 @@ const HEAD_FIELDS = Object.freeze([
   "type", "challenge", "sync_account_id", "zk_immutable_account_id",
   "mapping_sequence", "mapping_digest",
 ]);
+const DEFAULT_HEAD_TIMEOUT_MS = 1500;
+const DEFAULT_MAX_PENDING_HEAD_READS = 16;
+const MAX_GLOBAL_PENDING_HEAD_READS = 64;
+// Timeout/cancellation returns control to JS, but a noncooperative external
+// adapter still owns its underlying promise until it actually settles.
+const globalPendingHeadReads = new Set();
 const SOURCE_FIELDS = Object.freeze([
   "identity", "provisioning", "provisionerPublicKey", "provisioningDigest",
   "witnessPublicKey", "casPublicKey", "scope", "pinnedDevicePolicy", "currentDevicePolicy",
@@ -175,8 +181,22 @@ function copyJson(value, depth = 0, budget = { nodes: 0, bytes: 0 }) {
   return result;
 }
 
-function createOwnerObjectMapVerifier(config) {
+function headLimits(value) {
+  const limits = value === undefined
+    ? { headTimeoutMs: DEFAULT_HEAD_TIMEOUT_MS,
+      maxPendingHeadReads: DEFAULT_MAX_PENDING_HEAD_READS }
+    : exact(value, ["headTimeoutMs", "maxPendingHeadReads"]);
+  if (!Number.isSafeInteger(limits.headTimeoutMs)
+    || limits.headTimeoutMs < 5 || limits.headTimeoutMs > 5000
+    || !Number.isSafeInteger(limits.maxPendingHeadReads)
+    || limits.maxPendingHeadReads < 1
+    || limits.maxPendingHeadReads > MAX_GLOBAL_PENDING_HEAD_READS) deny();
+  return limits;
+}
+
+function createOwnerObjectMapVerifier(config, headReadOptions) {
   try {
+    const { headTimeoutMs, maxPendingHeadReads } = headLimits(headReadOptions);
     const c = exact(config, ["sourceAuthority", "zkAuthority", "mappingAuthority"]);
     const s = exact(c.sourceAuthority, SOURCE_FIELDS);
     const z = exact(c.zkAuthority, ZK_FIELDS);
@@ -212,9 +232,64 @@ function createOwnerObjectMapVerifier(config) {
     number(floor.sequence);
     hex(floor.digest);
     if (typeof a.readCurrentHead !== "function") deny();
-    let lastAcceptedSequence = 0;
-    return async function verifyOwnerSignedMapping(input) {
+    const pendingHeadReads = new Set();
+    async function boundedCurrentHead(challenge, signal) {
+      if (signal?.aborted || pendingHeadReads.size >= maxPendingHeadReads
+        || globalPendingHeadReads.size >= MAX_GLOBAL_PENDING_HEAD_READS) deny();
+      const controller = new AbortController();
+      // Timers can run late if an adapter blocks the JS event loop. Reject a
+      // result even if its microtask beats an overdue timeout callback.
+      const expiresAt = process.hrtime.bigint() + BigInt(headTimeoutMs) * 1000000n;
+      let timer, onCancel;
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve({ settled: false });
+        }, headTimeoutMs);
+      });
+      const cancelled = new Promise((resolve) => {
+        if (signal) {
+          onCancel = () => {
+            controller.abort();
+            resolve({ settled: false });
+          };
+          signal.addEventListener("abort", onCancel, { once: true });
+        }
+      });
+      // Reserve capacity BEFORE invoking an untrusted async adapter. A late
+      // result never re-enters verification and never frees its slot early.
+      const pending = Promise.resolve().then(() => {
+        if (controller.signal.aborted) deny();
+        return a.readCurrentHead(challenge, { signal: controller.signal });
+      });
+      pendingHeadReads.add(pending);
+      globalPendingHeadReads.add(pending);
+      void pending.then(
+        () => { pendingHeadReads.delete(pending); globalPendingHeadReads.delete(pending); },
+        () => { pendingHeadReads.delete(pending); globalPendingHeadReads.delete(pending); });
       try {
+        const result = await Promise.race([
+          pending.then((value) => ({ settled: true, value }),
+            () => ({ settled: false })),
+          deadline, cancelled,
+        ]);
+        if (!result.settled || controller.signal.aborted || signal?.aborted
+          || process.hrtime.bigint() >= expiresAt) {
+          controller.abort();
+          deny();
+        }
+        return result.value;
+      } finally {
+        clearTimeout(timer);
+        if (onCancel) signal.removeEventListener("abort", onCancel);
+      }
+    }
+    let lastAcceptedSequence = 0;
+    return async function verifyOwnerSignedMapping(input, control) {
+      try {
+        const signal = control === undefined ? undefined : exact(control, ["signal"]).signal;
+        if (signal !== undefined && !(signal instanceof AbortSignal)) deny();
+        if (signal?.aborted) deny();
         const r = exact(input, INPUT_FIELDS);
         const { payload, signature } = unpackMap(r.ownerMapping);
         const digest = sha(Buffer.concat([signedBytes(OWNER_DOMAIN, payload), signature]));
@@ -269,7 +344,8 @@ function createOwnerObjectMapVerifier(config) {
         // Generate the challenge here. A signed old head with an old nonce is
         // not acceptable after a restart, even if its Ed25519 signature is valid.
         const challenge = crypto.randomBytes(32).toString("base64url");
-        const wire = exact(await a.readCurrentHead(challenge), [...HEAD_FIELDS, "signature"]);
+        const wire = exact(await boundedCurrentHead(challenge, signal),
+          [...HEAD_FIELDS, "signature"]);
         const head = currentHeadPayload(Object.fromEntries(
           HEAD_FIELDS.map((field) => [field, wire[field]])));
         if (head.challenge !== challenge || head.mapping_digest !== digest
@@ -286,7 +362,7 @@ function createOwnerObjectMapVerifier(config) {
           || localPolicy.revokedDeviceIds.includes(device)) deny();
         // Two concurrent readbacks may both be valid. The sequence is consumed
         // only after the awaited authority verification, on the same JS turn.
-        if (payload.mapping_sequence <= lastAcceptedSequence) deny();
+        if (signal?.aborted || payload.mapping_sequence <= lastAcceptedSequence) deny();
         lastAcceptedSequence = payload.mapping_sequence;
         return Object.freeze({
           status: "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING",

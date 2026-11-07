@@ -46,6 +46,20 @@ challenge response; a head behind the independent floor is refused. A map at
 until an independently verified/re-pinned intermediate floor exists. A single
 verifier rejects repeated or concurrent reuse of an accepted sequence.
 
+The injected `readCurrentHead(challenge, { signal })` is bounded to a 1500 ms
+deadline by default (configurable only within 5–5000 ms). Each verifier admits
+at most 16 outstanding native read promises by default, with an additional
+process-wide ceiling of 64; explicit bounded options may adjust the per-verifier
+limit within 1–64. An expired or caller-aborted read is denied without waiting
+for its native promise to settle, and a late signed
+head cannot re-enter verification or consume the mapping sequence. If the
+native callback ignores its AbortSignal, its slot stays occupied until its
+promise actually settles. A monotonic deadline check also rejects a late
+valid return from a synchronous callback that blocked the JS event loop;
+JavaScript cannot preempt that native blockage. Callers may supply an
+`AbortSignal` as the optional `verify(input, { signal })` argument. These
+budgets do not attest an independently operated mapping authority.
+
 **Remaining external blockers:** This module does not implement a trusted
 SyncV2↔ZK account enrollment ceremony, independently operated mapping signer,
 authenticated fresh readback, independently durable monotonic floor/CAS, or
