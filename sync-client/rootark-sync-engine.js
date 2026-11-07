@@ -394,12 +394,23 @@ async function createDurableRestoreProgress(filePath, value) {
 async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expectedScope }) {
   let handle;
   try {
+    // Node on Windows has no O_NOFOLLOW. Refuse a preexisting reparse/symlink
+    // before opening its target, then bind the descriptor to this exact inode.
+    // POSIX retains open-first O_NOFOLLOW to avoid a pathname check/use gap.
+    let windowsBefore;
+    if (process.platform === "win32") {
+      windowsBefore = await fsp.lstat(filePath, { bigint: true });
+      if (!windowsBefore.isFile() || windowsBefore.isSymbolicLink()
+        || (windowsBefore.nlink !== 1n && windowsBefore.nlink !== 2n)
+        || windowsBefore.size > 65536n) throw Error();
+    }
     handle = await fsp.open(filePath, fs.constants.O_RDONLY
       | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const opened = await handle.stat({ bigint: true });
     if (!opened.isFile() || opened.isSymbolicLink()
       || (opened.nlink !== 1n && opened.nlink !== 2n)
-      || opened.size > 65536n) throw Error();
+      || opened.size > 65536n
+      || (windowsBefore && !sameFileVersion(windowsBefore, opened))) throw Error();
     // Bind pathname inspection to the already-open descriptor. No pathname
     // bytes are trusted before this FD's type, links and version are checked.
     const before = await fsp.lstat(filePath, { bigint: true });

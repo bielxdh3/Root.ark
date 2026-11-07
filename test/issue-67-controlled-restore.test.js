@@ -415,7 +415,7 @@ async function completedRestoreProgress(t) {
   return { f, preview, progress, reopened };
 }
 
-test("#67 CodeQL: durable progress opens pinned descriptor before pathname bigint lstat", async (t) => {
+test("#67 CodeQL: POSIX opens FD first; Windows checks reparse before opening progress", async (t) => {
   const { f, preview, progress, reopened } = await completedRestoreProgress(t);
   const originalOpen = fsp.open;
   const originalLstat = fsp.lstat;
@@ -435,7 +435,8 @@ test("#67 CodeQL: durable progress opens pinned descriptor before pathname bigin
     fsp.open = originalOpen;
     fsp.lstat = originalLstat;
   }
-  assert.deepEqual(order.slice(0, 2), ["open", "lstat"]);
+  assert.deepEqual(order.slice(0, process.platform === "win32" ? 3 : 2),
+    process.platform === "win32" ? ["lstat", "open", "lstat"] : ["open", "lstat"]);
   assert.equal(f.pushes(), 1, "a completed signed restore is never dispatched twice");
 });
 
@@ -510,7 +511,7 @@ test("#67 CodeQL: symlinked durable progress never reaches journal read or signe
   assert.equal(f.pushes(), 1);
 });
 
-test("#67 CodeQL: Windows reparse pathname reported after open denies without journal read", async (t) => {
+test("#67 CodeQL: Windows preexisting reparse pathname denies without any open or journal read", async (t) => {
   if (process.platform !== "win32") return t.skip("Windows reparse metadata contract");
   const { f, preview, progress, reopened } = await completedRestoreProgress(t);
   const originalOpen = fsp.open;
@@ -548,9 +549,53 @@ test("#67 CodeQL: Windows reparse pathname reported after open denies without jo
     fsp.open = originalOpen;
     fsp.lstat = originalLstat;
   }
-  assert.equal(progressOpens, 1, "the descriptor must be opened before inspecting reparse metadata");
+  assert.equal(progressOpens, 0, "Windows must refuse preexisting reparse without opening its target");
   assert.equal(reads, 0);
   assert.equal(f.pushes(), 1);
+});
+
+test("#67 CodeQL: Windows path replacement after pre-open lstat is denied before FD read", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows open-time path swap contract");
+  const { f, preview, progress, reopened } = await completedRestoreProgress(t);
+  const originalOpen = fsp.open;
+  const originalLstat = fsp.lstat;
+  let prechecked = false;
+  let replaced = false;
+  let readCount = 0;
+  fsp.lstat = async (name, options, ...rest) => {
+    const stats = await originalLstat(name, options, ...rest);
+    if (name === progress && options?.bigint === true) prechecked = true;
+    return stats;
+  };
+  fsp.open = async (name, flags, ...rest) => {
+    if (name === progress && prechecked && !replaced) {
+      replaced = true;
+      await fsp.rename(progress, `${progress}.held`);
+      await fsp.writeFile(progress, await fsp.readFile(`${progress}.held`));
+    }
+    const handle = await originalOpen(name, flags, ...rest);
+    if (name !== progress) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === "readFile") return async (...args) => {
+        readCount += 1;
+        return target.readFile(...args);
+      };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  try {
+    await assert.rejects(reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true }),
+      (error) => error.code === "restore_plan_unavailable");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.lstat = originalLstat;
+  }
+  assert.equal(prechecked, true);
+  assert.equal(replaced, true);
+  assert.equal(readCount, 0, "replacement can never supply trusted journal bytes");
+  assert.equal(f.pushes(), 1, "no second signed PUT after path replacement");
+  assert.equal((await reopened.journal.recover()).length, 0);
 });
 
 test("#67 P2: crash after final hardlink publication with two links safely resumes once", async (t) => {
