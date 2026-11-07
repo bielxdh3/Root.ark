@@ -63,7 +63,11 @@ After the high-water commits, the component signs exactly the 12 W170 fields
 in the documented order with its separately pinned custodian Ed25519 key,
 domain Root.ark/zk10/external-floor-current/v1 followed by a NUL byte. Its
 response is a floor wrapper with a base64url signature, and it never signs
-before completing the durable writes. Failure reports generic codes only.
+before completing the durable writes. After signing, it re-reads and matches
+both durable floor records and reconstructs the entire primary used-lease
+journal before returning CURRENT bytes. Same-inode SQLite modifications
+during signing deny the response and poison that handle; inode/path checks
+alone are insufficient. Failure reports generic codes only.
 
 ## High-water and crash behavior
 

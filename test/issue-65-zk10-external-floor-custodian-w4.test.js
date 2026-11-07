@@ -514,6 +514,66 @@ test("P1 POSIX: anchor switched inside signer callback cannot return a signed at
     "ambiguous post-write commit must poison instance");
 });
 
+for (const target of ["anchor floor", "primary used-lease journal"]) {
+  test(`P2: same-inode ${target} change inside custodian signer cannot return stale signed CURRENT`, (t) => {
+    const x = setup(t, `signer-inplace-${target.replaceAll(" ", "-")}`);
+    const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+    const ownerSigned = x.offer({
+      sequence: 2, head_digest: sha(22), enrollment_root: sha(23),
+    });
+    const ownerSignature = ownerSigned.ownerLease.signature;
+    assert.ok(crypto.verify(null, signatureBytes(DOMAIN_LEASE,
+      Object.fromEntries(Object.entries(ownerSigned.ownerLease)
+        .filter(([field]) => field !== "signature"))),
+    x.owner.publicKey, Buffer.from(ownerSignature, "base64url")));
+    const targetFile = target === "anchor floor"
+      ? x.paths.anchorDatabasePath : x.paths.databasePath;
+    const fileBefore = fs.statSync(targetFile, { bigint: true });
+    const sign = crypto.sign;
+    let changed = false;
+    crypto.sign = (algorithm, data, key, ...rest) => {
+      const signature = sign(algorithm, data, key, ...rest);
+      // Only the pinned CUSTODIAN's W170 signature triggers this synchronous
+      // adversarial callback; never intercept owner bootstrap/lease signatures.
+      if (key === x.custodian.privateKey
+        && Buffer.isBuffer(data) && data.subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
+        assert.equal(changed, false);
+        changed = true;
+        const outside = new Database(targetFile);
+        try {
+          if (target === "anchor floor") {
+            // Row changes inside the SAME DB inode, but no inode/path swap.
+            outside.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1")
+              .run(sha(24));
+          } else {
+            // The anchored floor remains unchanged; the primary's consumed
+            // nonce row no longer hashes to the anchored used-journal tip.
+            outside.prepare("UPDATE used_lease SET nonce = ? WHERE lease_serial = 1")
+              .run(b64(crypto.randomBytes(32)));
+          }
+        } finally { outside.close(); }
+      }
+      return signature;
+    };
+    try {
+      assert.throws(() => c.attest(ownerSigned.request, ownerSigned.ownerLease),
+        /ZK10_CUSTODIAN_UNAVAILABLE/,
+        "signer must not return a CURRENT certificate for a changed stored floor/journal");
+    } finally { crypto.sign = sign; }
+    assert.equal(changed, true, "the real DB write ran during custodian's signature");
+    const fileAfter = fs.statSync(targetFile, { bigint: true });
+    assert.equal(fileAfter.ino, fileBefore.ino, "the SQLite inode was not replaced");
+    assert.equal(fileAfter.size, fileBefore.size, "file size stayed unchanged");
+    assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "ambiguous post-sign write must permanently poison this custodian handle");
+    c.close();
+    assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, bootstrap: undefined,
+    }), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "a restarted custodian must not normalize an externally inconsistent journal");
+  });
+}
+
 test("P1 Windows: simulated reparse during signed lease is rejected without another database open", (t) => {
   if (process.platform !== "win32") return t.skip("Windows path-validation regression");
   const x = setup(t, "win-reparse-late");

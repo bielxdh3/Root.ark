@@ -382,10 +382,13 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           const floor = Object.fromEntries(FLOOR_FIELDS.map(field => [field, response[field]]));
           const signature = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
             signer).toString("base64url");
-          // Signer hooks are synchronous and may rename files. Never return
-          // signed bytes without checking both DB inodes once more.
-          checkDbPin(anchor);
-          checkDbPin(main);
+          // Signer hooks are synchronous and may mutate SQLite records
+          // in-place without replacing either inode. Never return CURRENT
+          // bytes unless BOTH committed floors still match the signed head
+          // and the primary consumed-lease journal still matches its tip.
+          const confirmedAnchor = read(anchor, ownerHash, signerHash);
+          const confirmedPrimary = read(main, ownerHash, signerHash, true);
+          if (!same(next, confirmedAnchor) || !same(next, confirmedPrimary)) deny();
           return { floor: { ...floor, signature } };
         } catch (_) {
           // SQLite fsync/commit ambiguity or unexpected sign failure must not
