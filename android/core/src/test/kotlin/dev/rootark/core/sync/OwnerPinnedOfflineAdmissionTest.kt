@@ -240,6 +240,65 @@ class OwnerPinnedOfflineAdmissionTest {
             OwnerOfflineFloorStore(root.toFile(), key()), at + 2000)
     }
 
+    @Test fun sameStoreCrossThreadObserveHeadCannotDeadlockCekConsumer() {
+        val oldPin = pin()
+        val signedRevocation = head(fixture.getJSONObject("revoked"))
+        val newerPin = oldPin.copy(exactRevision = signedRevocation.ownerRevision,
+            exactDigest = signedRevocation.ownerDigest)
+        val store = OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true)
+        OwnerPinnedOfflineAdmission.observeHead(head(), oldPin, store, at)
+        val secret = cek()
+        val worker = Executors.newSingleThreadExecutor()
+        val observeStarted = CountDownLatch(1)
+        var callbackFinished = false
+        try {
+            // The synchronous CEK consumer waits on another thread calling
+            // observeHead on the SAME store. A Java monitor held around this
+            // callback deadlocks both threads; a real nonblocking OS tryLock
+            // must instead fail closed before any revocation can commit.
+            val admitted = try {
+                OwnerPinnedOfflineAdmission.withAuthorizedCek(grant(), head(), oldPin,
+                    secret, store, at + 1000) { _, cekBytes ->
+                    val observing = worker.submit<Boolean> {
+                        observeStarted.countDown()
+                        try {
+                            OwnerPinnedOfflineAdmission.observeHead(
+                                signedRevocation, newerPin, store, at + 2000)
+                            true
+                        } catch (_: ProtectedSyncException) {
+                            false
+                        }
+                    }
+                    assertTrue(observeStarted.await(5, TimeUnit.SECONDS))
+                    val committed = observing.get(1500, TimeUnit.MILLISECONDS)
+                    assertTrue(!committed, "floor cannot advance while CEK callback holds FileLock")
+                    assertTrue(cekBytes.contentEquals(cek()))
+                    callbackFinished = true
+                }
+                true
+            } catch (_: ProtectedSyncException) {
+                false
+            }
+            assertTrue(admitted && callbackFinished,
+                "same-store observer must finish promptly without blocking CEK callback on monitor")
+            assertTrue(secret.all { it == 0.toByte() })
+        } finally {
+            worker.shutdownNow()
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS))
+        }
+        // Once the callback and its FileLock have ended, the signed revocation
+        // can advance; an older owner head must then be rejected.
+        OwnerPinnedOfflineAdmission.observeHead(signedRevocation, newerPin, store, at + 3000)
+        val replay = cek()
+        assertThrows(ProtectedSyncException::class.java) {
+            OwnerPinnedOfflineAdmission.withAuthorizedCek(
+                grant(), head(), oldPin, replay, store, at + 4000) {
+                _, _ -> error("stale grant cannot consume CEK")
+            }
+        }
+        assertTrue(replay.all { it == 0.toByte() })
+    }
+
     @Test fun forgedUnsignedOrUnpinnedNewerHeadCannotPoisonPriorAuthorizedFloor() {
         val olderHead = head()
         val olderGrant = grant()

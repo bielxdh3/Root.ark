@@ -276,7 +276,9 @@ class OwnerOfflineFloorStore(
     private val random = SecureRandom()
     private data class Floor(val revision: Long, val digest: String,
         val seenMillis: Long, val lockIdentity: String)
-    private var bootstrapPending = allowFirstWrite
+    // The OS FileLock serializes floor I/O. Volatile preserves visibility for
+    // the pre-open fail-closed bootstrap check across same-store JVM threads.
+    @Volatile private var bootstrapPending = allowFirstWrite
 
     private fun validateRootPath() {
         var at: java.nio.file.Path? = root.toPath().toAbsolutePath().normalize()
@@ -311,7 +313,7 @@ class OwnerOfflineFloorStore(
     }
 
     /** The signed head's durable floor and CEK consumer share one OS FileLock. */
-    @Synchronized internal fun <T> advanceAndUse(
+    internal fun <T> advanceAndUse(
         pin: IndependentOfflineOwnerPin, revision: Long, digest: String, nowMillis: Long,
         consume: () -> T,
     ): T {
