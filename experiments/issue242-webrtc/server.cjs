@@ -118,6 +118,34 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     if (peer.role === 'host') expireRoom(room);
   }
   const pair = (a, b) => [a, b].sort().join(':');
+  function liveAdmission(ws, room) {
+    return ws.readyState === WebSocket.OPEN && !participants.has(ws) &&
+      validRoom(room) && rooms.get(room.id) === room && sessionCurrent(ws);
+  }
+  function activePeer(room, peer) {
+    return Boolean(peer && rooms.get(room.id) === room && validRoom(room) &&
+      room.members.get(peer.id) === peer && participants.get(peer.ws) === peer &&
+      peer.ws.readyState === WebSocket.OPEN && sessionCurrent(peer.ws));
+  }
+  async function liveSignalPair(room, sender, recipient) {
+    if (!activePeer(room, sender) || !activePeer(room, recipient)) return false;
+    // A room-wide hash can await a later guest while an earlier recipient's
+    // ACL is revoked. Validate the actual signal endpoints after that await.
+    for (const peer of [sender, recipient]) {
+      if (!room.boundObject) continue;
+      if (!await objectAllowed(room, peer.role === 'guest' ? peer.username : null)) {
+        if (peer.role === 'host') expireRoom(room);
+        else if (activePeer(room, peer)) {
+          peer.ws.close(1008, 'object access revoked');
+          removePeer(peer.ws);
+        }
+        return false;
+      }
+      if (!activePeer(room, sender) || !activePeer(room, recipient)) return false;
+    }
+    return activePeer(room, sender) && activePeer(room, recipient) &&
+      room.allowed.has(pair(sender.id, recipient.id));
+  }
   async function onMessage(ws, raw) {
     if (!sessionCurrent(ws)) return;
     if (raw.length > MAX_SIGNAL_BYTES) return ws.close(1009, 'too large');
@@ -129,24 +157,35 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (message.type !== 'join' || typeof message.roomId !== 'string') return error(ws, 'NOT_JOINED');
       const room = rooms.get(message.roomId);
       if (!validRoom(room)) return error(ws, 'INVALID_INVITE');
+      // Cheap credential/capacity checks must precede hashing every bound
+      // owner's and guest's current 32 MiB object. Invalid joins are untrusted.
+      if (room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
+      const hostEligible = message.hostKey === room.hostKey && (!authenticated || (room.owner === ws.identity.username &&
+        room.ownerSessionVersion === ws.identity.sessionVersion)) &&
+        ![...room.members.values()].some(p => p.role === 'host');
+      const invite = !hostEligible && typeof message.invitation === 'string' &&
+        room.invites.get(message.invitation);
+      const inviteValid = () => Boolean(invite &&
+        room.invites.get(message.invitation) === invite && !invite.used &&
+        invite.expires > now() &&
+        (!authenticated || (invite.recipient === ws.identity.username &&
+          (!Number.isSafeInteger(invite.recipientSessionVersion) ||
+            invite.recipientSessionVersion === ws.identity.sessionVersion))));
+      if (!hostEligible && !inviteValid()) return error(ws, 'INVALID_INVITE');
       if (!await recheckBoundRoom(room)) return error(ws, 'INVALID_INVITE');
+      if (!liveAdmission(ws, room)) return;
       if (room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
       let role;
-      if (message.hostKey === room.hostKey && (!authenticated || (room.owner === ws.identity.username &&
-        room.ownerSessionVersion === ws.identity.sessionVersion)) &&
-        ![...room.members.values()].some(p => p.role === 'host')) {
+      if (hostEligible && ![...room.members.values()].some(p => p.role === 'host')) {
         role = 'host';
       } else {
-        const invite = typeof message.invitation === 'string' && room.invites.get(message.invitation);
-        if (!invite || invite.used || invite.expires <= now() ||
-          (authenticated && (invite.recipient !== ws.identity.username ||
-            (Number.isSafeInteger(invite.recipientSessionVersion) &&
-              invite.recipientSessionVersion !== ws.identity.sessionVersion))) ||
-          !await objectAllowed(room, ws.identity?.username) || !validRoom(room) ||
-          !sessionCurrent(ws)) return error(ws, 'INVALID_INVITE');
+        if (!inviteValid() || !await objectAllowed(room, ws.identity?.username) ||
+          !liveAdmission(ws, room) ||
+          !inviteValid()) return error(ws, 'INVALID_INVITE');
         room.invites.delete(message.invitation); // One-time join, never eligible for replay.
         role = 'guest';
       }
+      if (!liveAdmission(ws, room) || room.members.size >= MAX_MEMBERS) return;
       const id = shortId();
       const peer = { id, role, roomId: room.id, ws, username: ws.identity?.username };
       participants.set(ws, peer);
@@ -161,7 +200,8 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
     const room = roomOf(ws);
     if (!validRoom(room)) return error(ws, 'ROOM_CLOSED');
-    if (!await recheckBoundRoom(room) || !participants.has(ws) || !sessionCurrent(ws)) return;
+    if (!await recheckBoundRoom(room) || participants.get(ws) !== current ||
+      !activePeer(room, current)) return;
     const target = typeof message.to === 'string' && room.members.get(message.to);
     if (message.type === 'invite' && current.role === 'host') {
       const recipient = message.recipient;
@@ -216,6 +256,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     } else if (message.type === 'signal' && target && room.allowed.has(pair(current.id, target.id)) &&
       object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
       JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256) {
+      if (!await liveSignalPair(room, current, target)) return;
       send(target.ws, { type: 'signal', peerId: current.id, signal: message.signal });
     } else {
       error(ws, 'FORBIDDEN');
