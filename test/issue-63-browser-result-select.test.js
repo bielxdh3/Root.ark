@@ -57,6 +57,21 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!list||!target||!revision||!getButton||getButton.type!=="button"
         ||!batchButton||batchButton.type!=="button")
         throw Error("MISSING_EXPLICIT_PROTECTED_GET");
+      const progress=dialog.querySelector('[data-zk1-field="catalog-batch-progress"]');
+      const cancel=dialog.querySelector('[data-zk1-action="catalog-delta-text-cancel"]');
+      if(!progress||progress.getAttribute("role")!=="status"
+        ||!cancel||cancel.textContent!=="Cancelar busca"||!cancel.disabled)
+        throw Error("MISSING_ACCESSIBLE_CANCEL_PROGRESS");
+      document.cookie="rootark_csrf=disposable-browser-session; SameSite=Strict";
+      if(batchButton.disabled)throw Error("BATCH_BUTTON_INITIAL_DISABLED");
+      batchButton.click();
+      if(cancel.disabled)throw Error("CANCEL_NOT_AVAILABLE_DURING_BUSY");
+      cancel.click();
+      if(!progress.textContent.includes("Cancelando"))
+        throw Error("CANCEL_NOT_ACKNOWLEDGED");
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled||!cancel.disabled)
+        throw Error("CANCEL_NOT_CLEANED");
       const id="AAAAAAAAAAAAAAAAAAAAAA";
       const malicious="<img src=x onerror=alert(1)> secret-local-only";
       let active=true;
@@ -141,6 +156,66 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!batchPane)throw Error("MISSING_LOCAL_BATCH_RESULTS");
       batchPane.textContent=found.matches[0].excerpt;
       if(batchPane.querySelector("img"))throw Error("BATCH_PREVIEW_XSS");
+      const nine=[];
+      const signed=new Map();
+      for(let index=0;index<9;index++){
+        const oid=b64(crypto.getRandomValues(new Uint8Array(16)));
+        const rec={...metadata,object_id:oid};
+        const keyRaw=crypto.getRandomValues(new Uint8Array(32));
+        const key=await window.RootarkZk1FileContent.importFileCek(keyRaw);
+        const cipher=await window.RootarkZk1FileContent.encryptFile({cek:key,
+          metadata:rec,name:"doc-"+index+".txt",mediaType:"text/plain",
+          data:new TextEncoder().encode("local-window secret-local-only "+index)});
+        const exact={objectId:oid,revision:7,epoch:2,
+          ciphertextDigestBase64:b64(new Uint8Array(
+            await crypto.subtle.digest("SHA-256",cipher)))};
+        nine.push({selected:exact,metadata:rec,cekFile:"key-"+index,
+          cekSha256Pin:b64(new Uint8Array(
+            await crypto.subtle.digest("SHA-256",keyRaw)))});
+        signed.set("key-"+index,{keyRaw,checked:{...exact,
+          ciphertextBase64:b64(cipher),verifiedCiphertext:true,
+          plaintextAvailable:false,authorizesMutation:false}});
+      }
+      const multiple={...scope,device_id:"device",current_epoch:2,
+        manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null};
+      const batchBaseline={head:{sequence:11,digest:ownerDigest},
+        entries:nine.map(row=>row.selected)};
+      const progressCalls=[];
+      const completed=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"secret-local-only",items:nine,grant:multiple,
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:batchBaseline,assertLive:()=>true,
+        getChecked:async(oid,rev)=>signed.get(nine.find(item=>
+          item.selected.objectId===oid&&item.selected.revision===rev)?.cekFile)?.checked,
+        readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+        onProgress:({completed,total})=>progressCalls.push(completed+"/"+total),
+        isCancelled:()=>false
+      });
+      if(completed.totalSearched!==9||completed.totalMatches!==9
+        ||progressCalls.join()!=="8/9,9/9")
+        throw Error("EDGE_MULTI_WINDOW_WRONG");
+      batchPane.textContent=completed.matches.map(item=>item.excerpt).join(String.fromCharCode(10));
+      if(batchPane.querySelector("img"))throw Error("MULTI_WINDOW_HTML_LEAK");
+      const abortProgress=[];
+      let stopped=false, getCount=0;
+      let rejected=false;
+      try{
+        await window.RootarkZk1ProtectedTextBatch.search({
+          query:"secret-local-only",items:nine,grant:multiple,
+          ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+          baseline:batchBaseline,assertLive:()=>true,
+          getChecked:async(oid,rev)=>{
+            getCount++;
+            return signed.get(nine.find(item=>item.selected.objectId===oid
+              &&item.selected.revision===rev)?.cekFile)?.checked;
+          },
+          readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+          onProgress:({completed})=>{abortProgress.push(completed);stopped=true;},
+          isCancelled:()=>stopped
+        });
+      }catch(error){rejected=error.message==="ZK_BATCH_TEXT_SEARCH_DENIED";}
+      if(!rejected||getCount!==8||abortProgress.join()!=="8")
+        throw Error("EDGE_CANCEL_RELEASED_PARTIAL");
       target.dispatchEvent(new Event("input",{bubbles:true}));
       if(pane.textContent!==""||batchPane.textContent!=="")
         throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");

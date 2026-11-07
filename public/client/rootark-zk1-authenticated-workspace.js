@@ -47,6 +47,7 @@
   let verifiedOpaqueDelta = null;
   let verifiedRevocationHead = null;
   let previewGeneration = 0;
+  let activeTextBatch = null;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function supportsOwnerRootedV2(value) {
@@ -852,13 +853,15 @@
       + '<label>SHA-256 da CEK fixado pelo proprietário separadamente (base64url, 32 bytes)<input data-zk1-field="catalog-preview-cek-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<p class="muted">Prévia efêmera de texto UTF-8, até 64 KiB. AES-GCM, IDs, epoch, revisão, grant ativo, CAS e GET assinado são conferidos antes de exibir. Fecha ao mudar seleção ou sessão. Não executa HTML ou scripts.</p>'
       + '<fieldset><legend>Busca em conteúdo protegido (DEV, somente local)</legend>'
-      + '<p class="muted">Busque texto em 1–8 versões cifradas já presentes no catálogo assinado. Importe um manifesto local JSON com schema rootark-zk1-local-text-batch/v1 e entries {objectId, revision, metadata, cekFile, cekSha256Pin}; forneça as CEKs binárias de 32 bytes nomeadas no manifesto. Confirme o SHA-256 do manifesto obtido fora do servidor e a origem independente de cada CEK/pin. Cada arquivo exige novo GET Ed25519/CAS e AEAD; nenhuma consulta, CEK, nome ou texto sai do dispositivo. Não há busca offline nem índice de conteúdo persistente.</p>'
+      + '<p class="muted">Busque texto em 1–64 versões cifradas presentes no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; a pesquisa não armazena conteúdo ou chave e só revela resultados ao concluir todas as verificações.</p>'
       + '<label>Texto a buscar (UTF-8 NFC, até 120 caracteres)<input type="search" data-zk1-field="catalog-batch-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
-      + '<label>Manifesto de seleção do proprietário (.json, 1–8 entradas)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
+      + '<label>Manifesto de seleção do proprietário (.json, 1–64 entradas, até 64 KiB)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
       + '<label>SHA-256 do manifesto fixado fora do servidor (base64url, 32 bytes)<input data-zk1-field="catalog-batch-manifest-pin" maxlength="43" autocomplete="off" spellcheck="false"></label>'
-      + '<label>CEKs das versões selecionadas (8 arquivos binários de 32 bytes no máximo)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
+      + '<label>CEKs locais das revisões selecionadas (até 64 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-confirm"> Verifiquei offline o manifesto, cada pin de CEK e a autorização atual do proprietário.</label>'
-      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-search">Buscar dentro das versões selecionadas</button></div>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-search">Buscar dentro das versões selecionadas</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-cancel" disabled>Cancelar busca</button></div>'
+      + '<output data-zk1-field="catalog-batch-progress" role="status" aria-live="polite" aria-atomic="true"></output>'
       + '<pre data-zk1-field="catalog-delta-text-results" role="region" aria-label="Correspondências protegidas verificadas localmente"></pre>'
       + '</fieldset>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
@@ -986,6 +989,15 @@
     return dialog;
   }
   async function perform(action) {
+    if (action === "catalog-delta-text-cancel") {
+      if (activeTextBatch) {
+        activeTextBatch.cancelled = true;
+        clearLocalPreview();
+        field("catalog-batch-progress").textContent = "Cancelando; nenhuma correspondência será exibida.";
+        status("Cancelamento solicitado; a leitura em andamento será descartada.");
+      }
+      return;
+    }
     if (busy) return;
     if (action === "close") {
       clearLocalPreview();
@@ -1017,8 +1029,13 @@
       "catalog-delta-restore"].includes(action)) return;
     clearLocalPreview();
     const operationPreviewGeneration = previewGeneration;
+    const textBatch = action === "catalog-delta-text-search"
+      ? { cancelled: false } : null;
+    activeTextBatch = textBatch;
     busy = true;
-    dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+    dialog.querySelectorAll("button").forEach((button) => {
+      button.disabled = !textBatch || button.dataset.zk1Action !== "catalog-delta-text-cancel";
+    });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
     let privateDer;
     let data;
@@ -1031,7 +1048,8 @@
       const operationEpoch = sessionEpoch;
       const initialCsrf = currentCsrf();
       const assertLive = () => {
-        if (sessionEpoch !== operationEpoch || dialog?.open !== true
+        if (sessionEpoch !== operationEpoch || textBatch?.cancelled
+          || dialog?.open !== true
           || currentCsrf() !== initialCsrf) fail();
       };
       const guardedFetch = async (url, options) => {
@@ -1445,7 +1463,7 @@
             if (previewGeneration !== operationPreviewGeneration
               || verifiedOpaqueDelta !== held) fail();
           };
-          const rawManifest = await fileBytes("catalog-batch-manifest", 2, 16 * 1024);
+          const rawManifest = await fileBytes("catalog-batch-manifest", 2, 64 * 1024);
           let manifest;
           try {
             const expectedPin = field("catalog-batch-manifest-pin")?.value.trim();
@@ -1459,7 +1477,9 @@
           exactly(manifest, ["schema", "entries"]);
           if (manifest.schema !== "rootark-zk1-local-text-batch/v1"
             || !Array.isArray(manifest.entries)
-            || manifest.entries.length < 1 || manifest.entries.length > 8) fail();
+            || manifest.entries.length < 1 || manifest.entries.length > 64) fail();
+          field("catalog-batch-progress").textContent =
+            "0 / " + manifest.entries.length + " revisões conferidas";
           const filesControl = field("catalog-batch-ceks")?.files;
           if (!filesControl || filesControl.length !== manifest.entries.length) fail();
           const files = new Map();
@@ -1467,9 +1487,8 @@
             if (file.size !== 32 || files.has(localName(file.name))) fail();
             files.set(file.name, file);
           }
-          const imported = [];
           const usedFiles = new Set();
-          try {
+          {
             for (const record of manifest.entries) {
               exactly(record, ["objectId", "revision", "metadata", "cekFile",
                 "cekSha256Pin"]);
@@ -1481,13 +1500,8 @@
               const match = held.baseline.entries.filter((row) =>
                 row.objectId === record.objectId && row.revision === record.revision);
               if (match.length !== 1) fail();
-              const rawCek = new Uint8Array(await files.get(record.cekFile).arrayBuffer());
-              imported.push(rawCek);
               assertBatchLive();
-              if (rawCek.length !== 32) fail();
-              imported[imported.length - 1] = rawCek;
               record.selected = match[0];
-              record.rawCek = rawCek;
             }
             if (usedFiles.size !== files.size) fail();
             assertBatchLive();
@@ -1507,6 +1521,20 @@
               baseline: held.baseline, assertLive: assertBatchLive,
               getChecked: async (objectId, revision) =>
                 held.client.readSelectedCiphertext(held.baseline, objectId, revision),
+              readCek: async (fileName) => {
+                assertBatchLive();
+                const file = files.get(fileName);
+                if (!file || file.size !== 32) fail();
+                const rawCek = new Uint8Array(await file.arrayBuffer());
+                try { assertBatchLive(); return rawCek; }
+                catch (error) { rawCek.fill(0); throw error; }
+              },
+              isCancelled: () => textBatch.cancelled,
+              onProgress: ({ completed, total }) => {
+                assertBatchLive();
+                field("catalog-batch-progress").textContent =
+                  completed + " / " + total + " revisões conferidas";
+              },
             });
             assertBatchLive();
             if (result.plaintextSentToServer !== false
@@ -1519,8 +1547,6 @@
               text || "Nenhum conteúdo correspondente nas versões verificadas.";
             status("Busca protegida local: " + result.totalMatches + " de "
               + result.totalSearched + " versões conferidas. Nenhum texto/consulta/CEK enviado.");
-          } finally {
-            for (const rawCek of imported) rawCek.fill(0);
           }
           return;
         }
@@ -2757,7 +2783,14 @@
         }
       }
     } catch (_) {
-      status("Operação recusada: autoridade, permissão, sessão ou ciphertext não verificado.");
+      if (textBatch?.cancelled) {
+        field("catalog-batch-progress").textContent = "Busca cancelada; resultados descartados.";
+        status("Busca cancelada; nenhuma correspondência parcial foi exibida.");
+      } else {
+        if (textBatch) field("catalog-batch-progress").textContent =
+          "Verificação incompleta; resultados descartados.";
+        status("Operação recusada: autoridade, permissão, sessão ou ciphertext não verificado.");
+      }
     } finally {
       privateDer?.fill(0);
       data?.fill(0);
@@ -2792,7 +2825,10 @@
         if (control) control.value = "";
       }
       busy = false;
-      dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+      if (activeTextBatch === textBatch) activeTextBatch = null;
+      dialog.querySelectorAll("button").forEach((button) => {
+        button.disabled = button.dataset.zk1Action === "catalog-delta-text-cancel";
+      });
     }
   }
   function showEntry() {
