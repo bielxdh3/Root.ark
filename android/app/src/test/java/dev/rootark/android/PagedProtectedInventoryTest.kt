@@ -4,6 +4,8 @@ import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.ProtectedSyncException
 import dev.rootark.core.sync.RootArkApiException
+import dev.rootark.core.sync.OfflineSession
+import dev.rootark.core.sync.SessionOfflineInventory
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.net.URL
@@ -125,6 +127,31 @@ class PagedProtectedInventoryTest {
             assertEquals(status, failure.statusCode)
             assertTrue(response.disconnected)
         }
+    }
+
+    @Test fun realHttpCaptureCanBeReadOfflineOnlyByOriginalLogin() {
+        val pages = fixture.getJSONArray("pages")
+        val binding = OfflineSession("https://files.example.org:9443", "alice", "ephemeral-login-A")
+        val cache = SessionOfflineInventory(binding)
+        var requests = 0
+        val adapter = AuthHttpTransport { url ->
+            val body = pages.getJSONObject(requests++).getJSONObject("body").toString().toByteArray(Charsets.UTF_8)
+            SecureResponse(url, payload = body)
+        }
+        var cursor: String? = null
+        for (number in 1..3) {
+            val page = adapter.listInventoryPage(origin, "one-session-token", cursor)
+            assertTrue(cache.capture(binding, number, page))
+            cursor = page.nextCursor
+        }
+        assertEquals(130, cache.pages(binding).flatMap { it.rows }.size)
+        assertEquals(130, cache.pages(binding).flatMap { it.rows }.map { it.objectId }.distinct().size)
+        assertThrows(IllegalArgumentException::class.java) { cache.pages(binding.copy(sessionNonce = "relogin")) }
+        assertThrows(IllegalArgumentException::class.java) { cache.pages(binding.copy(account = "bob")) }
+        val display = cache.pages(binding).flatMap { it.rows }.joinToString { it.name }
+        assertFalse(display.contains("one-session-token"))
+        cache.clear()
+        assertTrue(cache.pages(binding).isEmpty())
     }
 
     @Test fun rejectUntrustedMetadataAndRfc8259AmbiguitiesBeforeProjection() {

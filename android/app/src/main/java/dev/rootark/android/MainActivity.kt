@@ -16,6 +16,9 @@ import dev.rootark.core.sync.InventoryPage
 import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
 import dev.rootark.core.sync.RootArkApiException
+import dev.rootark.core.sync.OfflineSession
+import dev.rootark.core.sync.SessionOfflineInventory
+import java.util.UUID
 
 /** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
 class MainActivity : Activity() {
@@ -31,6 +34,8 @@ class MainActivity : Activity() {
     private var authenticatedSession: LoginOutcome.Authenticated? = null
     private var securePreviewText: TextView? = null
     private var sessionCanListFiles = false
+    private var offlineSession: OfflineSession? = null
+    private var offlineInventory: SessionOfflineInventory? = null
     @Volatile private var generation = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,6 +52,9 @@ class MainActivity : Activity() {
     }
 
     private fun clearSensitiveState() {
+        offlineInventory?.clear()
+        offlineInventory = null
+        offlineSession = null
         securePreviewText?.text = ""
         securePreviewText = null
         sessionToken = null
@@ -132,6 +140,14 @@ class MainActivity : Activity() {
         activeOrigin = origin
         sessionUsername = result.username
         sessionCanListFiles = ReadOnlyFileListPolicy.canList(result.permissions)
+        if (sessionCanListFiles) {
+            offlineSession = OfflineSession(
+                origin.loginUrl().toString().removeSuffix("/auth/login"),
+                result.username,
+                UUID.randomUUID().toString(),
+            )
+            offlineInventory = SessionOfflineInventory(offlineSession!!)
+        }
         showSession()
     }
 
@@ -142,6 +158,15 @@ class MainActivity : Activity() {
         if (message != null) text(layout, message)
         if (sessionCanListFiles) {
             button(layout, "Listar arquivos (somente leitura)") { loadInventoryPage() }
+            val binding = offlineSession
+            val cache = offlineInventory
+            if (binding != null && cache != null && cache.pages(binding).isNotEmpty()) {
+                button(layout, "Consultar páginas capturadas (offline)") { showOfflineInventory(0) }
+                button(layout, "Apagar inventário desta sessão") {
+                    cache.clear()
+                    showSession("Inventário temporário apagado.")
+                }
+            }
         } else {
             text(layout, "Esta conta não possui permissão listFiles.")
         }
@@ -166,12 +191,21 @@ class MainActivity : Activity() {
                 }.isFailure) {
                     showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
                 } else {
+                    val binding = offlineSession
+                    val cache = offlineInventory
+                    if (binding != null && cache != null &&
+                        runCatching { cache.capture(binding, pageNumber, page) }.isFailure) {
+                        cache.clear()
+                    }
                     showInventoryPage(page, pageNumber, used)
                 }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
-                403 -> showSession("Servidor negou acesso à lista (403).")
-                409 -> showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
+                403 -> showLogin("Acesso à lista revogado (403). Faça login novamente.")
+                409 -> {
+                    offlineInventory?.clear()
+                    showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
+                }
                 else -> showSession("Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros).")
             }
         }
@@ -194,7 +228,46 @@ class MainActivity : Activity() {
         }
         val next = page.nextCursor
         if (next != null) button(layout, "Próxima página") { loadInventoryPage(next, pageNumber + 1, usedCursors) }
+        val binding = offlineSession
+        val cache = offlineInventory
+        if (binding != null && cache != null && cache.pages(binding).isNotEmpty()) {
+            button(layout, "Consultar cópia temporária (offline)") { showOfflineInventory(0) }
+        }
         button(layout, "Atualizar desde o início") { loadInventoryPage() }
+        button(layout, "Voltar") { showSession() }
+        button(layout, "Encerrar acesso local") { showLogin() }
+    }
+
+    private fun showOfflineInventory(index: Int) {
+        if (!sessionCanListFiles || sessionToken == null) return showLogin()
+        val binding = offlineSession ?: return showLogin()
+        val cache = offlineInventory ?: return showLogin()
+        val pages = cache.pages(binding)
+        if (index !in pages.indices) return showSession("Não há página salva nesta sessão.")
+        val page = pages[index]
+        val layout = screen(
+            "Inventário offline · página ${page.number}",
+            "Cópia temporária de metadados recebidos por HTTPS autenticado nesta sessão. " +
+                "Pode estar desatualizada; não é prova assinada, autorização atual ou conteúdo verificado.",
+        )
+        if (page.rows.isEmpty()) text(layout, "Nenhum registro capturado nesta página.")
+        for (row in page.rows) {
+            text(layout, row.name + if (row.deleted) " (excluído no momento da captura)" else "")
+            val details = listOfNotNull(
+                row.path?.let { "Caminho capturado: $it" },
+                row.size?.let { "Tamanho informado: $it bytes" },
+                row.contentType?.let { "Tipo informado: $it" },
+            ).joinToString(" · ")
+            if (details.isNotEmpty()) text(layout, details)
+        }
+        if (index > 0) button(layout, "Página capturada anterior") { showOfflineInventory(index - 1) }
+        if (index + 1 < pages.size) button(layout, "Próxima página capturada") { showOfflineInventory(index + 1) }
+        text(layout, "Somente as primeiras ${SessionOfflineInventory.MAX_PAGES} páginas podem ficar em memória. " +
+            "O inventário é apagado ao encerrar a sessão ou sair do aplicativo.")
+        button(layout, "Apagar cópia temporária") {
+            cache.clear()
+            showSession("Inventário temporário apagado.")
+        }
         button(layout, "Voltar") { showSession() }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
