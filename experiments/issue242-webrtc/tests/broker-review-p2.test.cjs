@@ -16,8 +16,9 @@ function authenticateSession(req) {
   return typeof username === 'string' && username.length > 0
     ? { username, sessionVersion: 1, expiresAt: Date.now() + 60_000 } : null;
 }
-async function fixture(t, authorizeObject) {
+async function fixture(t, authorizeObject, authorizeSignalSnapshot = null) {
   const broker = makeBroker({ authenticateSession, authorizeObject,
+    authorizeSignalSnapshot,
     authorizeRecipient: (_owner, recipient) => ({ username: recipient, sessionVersion: 1 }) });
   const origin = await broker.listen();
   const sockets = [];
@@ -67,6 +68,17 @@ async function fixture(t, authorizeObject) {
   return { connect, room };
 }
 function authorized() { return { fingerprint, sha256, bytes: 32 * 1024 * 1024 }; }
+function authority() {
+  const current = new Map([['owner', true], ['guest1', true], ['guest2', true]]);
+  let revision = 1;
+  return {
+    revoke(username) { current.set(username, false); revision++; },
+    snapshot({ owner, recipients, pin, sha256: digest, bytes }) {
+      if (!current.get(owner) || !recipients.every(name => current.get(name))) return null;
+      return { owner, recipients, pin, sha256: digest, bytes, revision };
+    },
+  };
+}
 async function inviteJoin(host, room, connect, recipient) {
   host.send({ type: 'invite', recipient });
   const invitation = (await host.next('invited')).invitation;
@@ -161,6 +173,7 @@ test('bad credentials and full rooms do not hash 32 MiB object for each join', a
 });
 
 test('guest revoked while later guest hash awaits receives no authorized signal', async t => {
+  const acl = authority();
   let delaySecondGuest = false;
   let firstGuestAllowed = true;
   const entered = deferred(), gate = deferred();
@@ -170,7 +183,7 @@ test('guest revoked while later guest hash awaits receives no authorized signal'
       await gate.promise;
     }
     return recipient === 'guest1' && !firstGuestAllowed ? null : authorized();
-  });
+  }, input => acl.snapshot(input));
   const room = await f.room();
   const host = await f.connect('owner');
   host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
@@ -182,20 +195,25 @@ test('guest revoked while later guest hash awaits receives no authorized signal'
   first.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
   await host.next('peer-accepted');
   await first.guest.next('peer-allowed');
-  const closed = new Promise(resolve => first.guest.ws.once('close', resolve));
+  const outcome = Promise.race([
+    new Promise(resolve => first.guest.ws.once('close', () => resolve('closed'))),
+    first.guest.next('signal').then(() => 'unauthorized-signal'),
+  ]);
   delaySecondGuest = true;
   host.send({ type: 'signal', to: first.joined.peerId,
     signal: { kind: 'ice', candidate: { candidate: 'must-not-arrive' } } });
   await entered.promise;
   firstGuestAllowed = false;
+  acl.revoke('guest1');
   gate.release();
-  await closed;
+  assert.equal(await outcome, 'closed', 'revoked guest must not receive ICE/SDP');
   assert.equal(first.guest.received.filter(message => message.type === 'signal').length, 0,
     'late ACL change after an earlier guest hash must fence signal egress');
   assert.equal(hostJoined.role, 'host');
 });
 
 test('owner revoked during final guest ACL await cannot signal or retain room members', async t => {
+  const acl = authority();
   let ownerAllowed = true;
   let countGuestChecks = false, guestChecks = 0;
   const enteredFinalGuest = deferred(), finishFinalGuest = deferred();
@@ -209,7 +227,7 @@ test('owner revoked during final guest ACL await cannot signal or retain room me
       await finishFinalGuest.promise;
     }
     return authorized();
-  });
+  }, input => acl.snapshot(input));
   const room = await f.room();
   const host = await f.connect('owner');
   host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
@@ -230,6 +248,7 @@ test('owner revoked during final guest ACL await cannot signal or retain room me
   await enteredFinalGuest.promise;
   assert.equal(guestChecks, 2, 'test must block after owner check, at final guest await');
   ownerAllowed = false;
+  acl.revoke('owner');
   finishFinalGuest.release();
   await Promise.all([hostClose, firstClose, secondClose]);
   assert.equal(first.guest.received.filter(message => message.type === 'signal').length, 0,
@@ -239,4 +258,125 @@ test('owner revoked during final guest ACL await cannot signal or retain room me
   late.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
   assert.equal((await late.next('error')).code, 'INVALID_INVITE',
     'stale owner/member room must not survive an ACL revocation');
+});
+
+test('guest revocation during the final async owner check cannot forward a 1:N signal', async t => {
+  const acl = authority();
+  let ownerChecks = 0;
+  let trapFinalOwner = false;
+  const entered = deferred(), resume = deferred();
+  const f = await fixture(t, async ({ recipient }) => {
+    if (recipient === null && trapFinalOwner && ++ownerChecks === 2) {
+      entered.release();
+      await resume.promise;
+    }
+    return authorized(); // stale per-principal grant can still appear valid
+  }, input => acl.snapshot(input));
+  const room = await f.room();
+  const host = await f.connect('owner');
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  await host.next('joined');
+  const first = await inviteJoin(host, room, f.connect, 'guest1');
+  await inviteJoin(host, room, f.connect, 'guest2');
+  host.send({ type: 'request-peer', to: first.joined.peerId });
+  const request = await first.guest.next('peer-request');
+  first.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await first.guest.next('peer-allowed');
+  const outcome = Promise.race([
+    new Promise(resolve => first.guest.ws.once('close', () => resolve('closed'))),
+    first.guest.next('signal').then(() => 'unauthorized-signal'),
+  ]);
+  trapFinalOwner = true;
+  host.send({ type: 'signal', to: first.joined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'must-not-leak-after-guest-revoke' } } });
+  await entered.promise;
+  assert.equal(ownerChecks, 2, 'the adverse join must pause on final owner await');
+  acl.revoke('guest1');
+  resume.release();
+  assert.equal(await outcome, 'closed', 'revoked guest must not receive ICE/SDP');
+  assert.equal(first.guest.received.filter(message => message.type === 'signal').length, 0,
+    'multi-party ACL must be read in a single synchronous authority view');
+});
+
+test('unavailable, asynchronous and partial authority snapshots fail closed for bound signaling', async t => {
+  for (const impl of [null, async input => authority().snapshot(input),
+    input => ({ ...authority().snapshot(input), revision: -1 })]) {
+    await t.test(impl === null ? 'absent' : 'invalid or asynchronous', async sub => {
+      const f = await fixture(sub, async () => authorized(), impl);
+      const room = await f.room();
+      const host = await f.connect('owner');
+      host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+      await host.next('joined');
+      const first = await inviteJoin(host, room, f.connect, 'guest1');
+      host.send({ type: 'request-peer', to: first.joined.peerId });
+      const request = await first.guest.next('peer-request');
+      first.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+      await host.next('peer-accepted');
+      await first.guest.next('peer-allowed');
+      const outcome = Promise.race([
+        new Promise(resolve => first.guest.ws.once('close', () => resolve('closed'))),
+        first.guest.next('signal').then(() => 'unauthorized-signal'),
+      ]);
+      host.send({ type: 'signal', to: first.joined.peerId,
+        signal: { kind: 'ice', candidate: { candidate: 'denied-without-atomic-ACL' } } });
+      assert.equal(await outcome, 'closed', 'missing coherent snapshot must deny signal');
+      assert.equal(first.guest.received.some(message => message.type === 'signal'), false);
+    });
+  }
+});
+
+test('consented one-guest and 1:N bound signals work with a synchronous common ACL authority', async t => {
+  const acl = authority();
+  const f = await fixture(t, async () => authorized(), input => acl.snapshot(input));
+  const room = await f.room();
+  const host = await f.connect('owner');
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  const hostJoin = await host.next('joined');
+  const first = await inviteJoin(host, room, f.connect, 'guest1');
+  host.send({ type: 'request-peer', to: first.joined.peerId });
+  let request = await first.guest.next('peer-request');
+  first.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await first.guest.next('peer-allowed');
+  host.send({ type: 'signal', to: first.joined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'single-guest-live' } } });
+  assert.equal((await first.guest.next('signal')).signal.candidate.candidate, 'single-guest-live');
+  const second = await inviteJoin(host, room, f.connect, 'guest2');
+  host.send({ type: 'request-peer', to: second.joined.peerId });
+  request = await second.guest.next('peer-request');
+  second.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await second.guest.next('peer-allowed');
+  second.guest.send({ type: 'signal', to: hostJoin.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'multi-guest-live' } } });
+  assert.equal((await host.next('signal')).signal.candidate.candidate, 'multi-guest-live');
+});
+
+test('a bound room rejects an authority revision rollback after an earlier authorized signal', async t => {
+  const acl = authority();
+  let revision = 2;
+  const f = await fixture(t, async () => authorized(),
+    input => ({ ...acl.snapshot(input), revision }));
+  const room = await f.room();
+  const host = await f.connect('owner');
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  await host.next('joined');
+  const first = await inviteJoin(host, room, f.connect, 'guest1');
+  host.send({ type: 'request-peer', to: first.joined.peerId });
+  const request = await first.guest.next('peer-request');
+  first.guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await first.guest.next('peer-allowed');
+  host.send({ type: 'signal', to: first.joined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'new-authority' } } });
+  assert.equal((await first.guest.next('signal')).signal.candidate.candidate, 'new-authority');
+  revision = 1;
+  const outcome = Promise.race([
+    new Promise(resolve => first.guest.ws.once('close', () => resolve('closed'))),
+    first.guest.next('signal').then(() => 'stale-authority-leak'),
+  ]);
+  host.send({ type: 'signal', to: first.joined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'old-authority' } } });
+  assert.equal(await outcome, 'closed', 'older accepted authority epoch cannot regain signaling');
 });

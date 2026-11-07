@@ -158,39 +158,13 @@ async function run() {
     await until(() => refreshedBob.evaluate('Boolean(document.querySelector("[data-testid=accept-peer]"))'),
       'object peer consent missing');
     await refreshedBob.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
-    await until(() => refreshedBob.evaluate('window.__poc.snapshot().peers.some(p=>p.channel==="open")'),
-      'object DataChannel did not open', 20_000);
-    // A malicious consented sender can bypass sendText and send a valid
-    // SHA-256 text control frame directly over the bound DataChannel.
-    const forgedText = 'ciphertext-room-must-not-display-text';
-    const forgedDigest = createHash('sha256').update(forgedText).digest('hex');
-    await alice.evaluate('window.__poc.testChannel(0).send(' +
-      JSON.stringify(JSON.stringify({ type: 'text', text: forgedText, digest: forgedDigest })) + ')');
-    await until(() => refreshedBob.evaluate(
-      'window.__poc.snapshot().diagnostics.rejected.includes("BOUND_ROOM_TEXT")'),
-    'bound room recipient accepted direct plaintext from consented peer');
-    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedTexts.length'), 0);
-    await alice.evaluate('window.__poc.sendFile(new File([new Uint8Array(92)],"sealed.bin"))');
-    await until(() => alice.evaluate(
-      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_DIGEST_MISMATCH")'),
-    'sender accepted different same-length bytes');
-    await alice.evaluate('window.__poc.testChannel(0).send(JSON.stringify({type:"offer-file",id:"1234567890abcdef1234567890abcdef",name:"sealed.bin",size:92,digest:"' +
-      '0'.repeat(64) + '"}))');
-    await until(() => refreshedBob.evaluate(
-      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_DIGEST_MISMATCH")'),
-    'recipient accepted a forged peer offer');
-    await alice.evaluate('window.__poc.sendFile(new File([Uint8Array.from({length:92},(_,i)=>i+11)],"sealed.bin"))');
-    await until(() => refreshedBob.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'),
-      'real sealed ciphertext was not offered');
-    await refreshedBob.evaluate('document.querySelector("[data-testid=accept-file]").click()');
-    await until(() => refreshedBob.evaluate(
-      'window.__poc.snapshot().diagnostics.verifiedFiles.some(f=>f.name==="sealed.bin")'),
-    'bound ciphertext bytes did not verify', 15_000);
-    objectMetadata.accessControl.authorizedUsers = ['alice'];
-    saveObject();
+    // No shared mutation-serialized ACL authority exists in this legacy app.
+    // The broker must close the bound room rather than relay the WebRTC offer.
     await until(() => refreshedBob.evaluate('window.__poc.snapshot().peers.length===0'),
-      'revoked object guest kept live browser channel', 8_000);
-    console.log('PASS real Root.ark Edge: signed-cookie 1:N 2MiB, ciphertext-bound SHA-256 and ACL, forged bytes denied, consent, tenant exclusion and revocation');
+      'bound signaling bypassed the missing all-party authority fence', 20_000);
+    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 0,
+      'no bound ciphertext transfer can be received without snapshot authority');
+    console.log('PASS real Root.ark Edge: signed-cookie manual 1:N transfer, bound owner ACL/digest admission, and bound signaling fail-closed without atomic authority');
   } finally {
     for (const page of pages) page.close();
     child.kill();

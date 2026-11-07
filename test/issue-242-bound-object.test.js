@@ -6,7 +6,7 @@ const { createHash } = require('node:crypto');
 const { join } = require('node:path');
 const { fixture } = require('./support/issue242-app-fixture');
 
-test('real signed sessions require an exact current encrypted object ACL for bound P2P signaling', { timeout: 115_000 }, async t => {
+test('real signed sessions bind ciphertext ACL but deny signaling without an atomic all-party authority', { timeout: 115_000 }, async t => {
   const f = await fixture();
   t.after(f.close);
   const alice = await f.login('alice');
@@ -71,13 +71,16 @@ test('real signed sessions require an exact current encrypted object ACL for bou
   const offer = await target.next('peer-request');
   target.send({ type: 'consent', requestId: offer.requestId, accept: true });
   await host.next('peer-accepted');
-  target.send({ type: 'signal', to: hostJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'fixture' } } });
-  assert.equal((await host.next('signal')).peerId, bobJoined.peerId);
+  const delivered = [];
+  host.socket.on('message', raw => {
+    if (JSON.parse(raw.toString()).type === 'signal') delivered.push(true);
+  });
   const closed = new Promise(resolve => target.socket.once('close', resolve));
+  target.send({ type: 'signal', to: hostJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'fixture' } } });
+  assert.equal(await closed, 1000, 'legacy file ACL cannot establish a multi-principal atomic signaling fence');
+  assert.deepEqual(delivered, [], 'no signaling bytes forwarded without a coherent authority snapshot');
   metadata.accessControl.authorizedUsers = ['alice']; // revocation in the real authoritative JSON store.
   save();
-  host.send({ type: 'signal', to: bobJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'forbidden' } } });
-  assert.equal(await closed, 1008, 'revoked recipient loses signaling admission even when already consented');
   const second = await create(alice, boundObject);
   assert.equal(second.status, 200);
   const nextRoom = JSON.parse(second.text);
@@ -100,7 +103,7 @@ test('real signed sessions require an exact current encrypted object ACL for bou
   assert.ok(other.socket.readyState <= 1);
 });
 
-test('a bounded ciphertext signal flood leaves the real HTTP event loop responsive', { timeout: 115_000 }, async t => {
+test('a bounded protected-signal flood fails closed without blocking the real HTTP event loop', { timeout: 115_000 }, async t => {
   const f = await fixture();
   t.after(f.close);
   const alice = await f.login('alice');
@@ -137,20 +140,19 @@ test('a bounded ciphertext signal flood leaves the real HTTP event loop responsi
   const request = await guest.next('peer-request');
   guest.send({ type: 'consent', requestId: request.requestId, accept: true });
   await host.next('peer-accepted');
+  const closed = new Promise(resolve => guest.socket.once('close', resolve));
   for (let i = 0; i < 12; i++) guest.send({ type: 'signal', to: hostJoined.peerId,
     signal: { kind: 'ice', candidate: { candidate: 'load-' + i } } });
-  await host.next('signal', 30_000);
+  assert.equal(await closed, 1000, 'no all-party snapshot: reject even a correctly pinned 32 MiB room');
   const before = performance.now();
   const heartbeat = await f.request('/login.html');
   const elapsed = performance.now() - before;
   assert.equal(heartbeat.status, 200);
   assert.ok(elapsed < 700, `HTTP event loop stalled for ${Math.round(elapsed)}ms under bounded signaling load`);
-  const closed = new Promise(resolve => guest.socket.once('close', resolve));
   writeFileSync(join(f.directory, 'uploads', 'load.bin'), Buffer.alloc(ciphertext.length, 0xb8));
-  let closeTimeout;
-  try {
-    assert.equal(await Promise.race([closed, new Promise((_, reject) => {
-      closeTimeout = setTimeout(() => reject(new Error('changed ciphertext kept an authorized peer alive')), 30_000);
-    })]), 1000, 'same-size replacement during queued signaling must close the pinned room');
-  } finally { clearTimeout(closeTimeout); }
+  const stale = await f.connect(alice);
+  t.after(() => stale.socket.terminate());
+  stale.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  assert.equal((await stale.next('error')).code, 'INVALID_INVITE',
+    'a room closed by missing atomic authority cannot be reactivated after file replacement');
 });
