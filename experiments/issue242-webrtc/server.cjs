@@ -20,7 +20,7 @@ const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-p
 
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
   authenticateSession = null, sharedWss = null, authorizeRecipient = null,
-  authorizeObject = null } = {}) {
+  authorizeObject = null, authorizeSignalSnapshot = null } = {}) {
   const rooms = new Map();
   const participants = new Map();
   const wss = sharedWss || new WebSocket.WebSocketServer({
@@ -118,6 +118,136 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     if (peer.role === 'host') expireRoom(room);
   }
   const pair = (a, b) => [a, b].sort().join(':');
+  function liveAdmission(ws, room) {
+    return ws.readyState === WebSocket.OPEN && !participants.has(ws) &&
+      validRoom(room) && rooms.get(room.id) === room && sessionCurrent(ws);
+  }
+  function activePeer(room, peer) {
+    return Boolean(peer && rooms.get(room.id) === room && validRoom(room) &&
+      room.members.get(peer.id) === peer && participants.get(peer.ws) === peer &&
+      peer.ws.readyState === WebSocket.OPEN && sessionCurrent(peer.ws));
+  }
+  async function forwardLiveSignal(room, sender, recipient, signal) {
+    if (!activePeer(room, sender) || !activePeer(room, recipient)) return;
+    // Hash checks are useful fail-closed preflights, NOT an atomic ACL view.
+    // An owner or guest can lose access during any later asynchronous check.
+    for (const peer of [sender, recipient]) {
+      if (!room.boundObject || peer.role !== 'guest') continue;
+      if (!await objectAllowed(room, peer.username)) {
+        if (activePeer(room, peer)) {
+          peer.ws.close(1008, 'object access revoked');
+          removePeer(peer.ws);
+        }
+        return;
+      }
+      if (!activePeer(room, sender) || !activePeer(room, recipient)) return;
+    }
+    if (room.boundObject && !await objectAllowed(room, null)) {
+      if (rooms.get(room.id) === room) expireRoom(room);
+      return;
+    }
+    if (room.boundObject) {
+      // A protected signal requires an independently trusted, synchronous
+      // all-party snapshot from one mutation-serialized authority. The broker
+      // cannot manufacture this from sequential authorizeObject() promises.
+      // The app's legacy JSON ACL adapter does NOT supply such a snapshot;
+      // until a shared ACL mutation fence exists, deny protected signaling.
+      const usernames = [...new Set([...room.members.values()]
+        .filter(peer => peer.role === 'guest').map(peer => peer.username))].sort();
+      let accepted = false;
+      if (typeof authorizeSignalSnapshot === 'function') {
+        try {
+          const view = authorizeSignalSnapshot(Object.freeze({
+            owner: room.owner,
+            recipients: Object.freeze(usernames),
+            boundObject: Object.freeze({ ...room.boundObject }),
+            pin: room.objectPin, sha256: room.objectDigest, bytes: room.objectSize,
+          }));
+          // Strict sync result only. Reject Promise, accessors and partial/
+          // self-asserted per-user decisions; the trusted adapter MUST read
+          // all ACL writers' serialized authority in a single critical view.
+          if (object(view) && Object.getPrototypeOf(view) === Object.prototype) {
+            const fields = ['owner', 'recipients', 'pin', 'sha256', 'bytes', 'revision'];
+            const descriptors = Object.getOwnPropertyDescriptors(view);
+            if (Reflect.ownKeys(view).length === fields.length &&
+              fields.every(key => descriptors[key] &&
+                Object.hasOwn(descriptors[key], 'value'))) {
+              const values = Object.fromEntries(fields.map(key => [key, descriptors[key].value]));
+              accepted = values.owner === room.owner &&
+                Array.isArray(values.recipients) &&
+                values.recipients.length === usernames.length &&
+                values.recipients.every((name, i) => name === usernames[i]) &&
+                values.pin === room.objectPin && values.sha256 === room.objectDigest &&
+                values.bytes === room.objectSize &&
+                Number.isSafeInteger(values.revision) && values.revision >= 0 &&
+                values.revision >= (room.signalAuthorityRevision ?? 0);
+              if (accepted) room.signalAuthorityRevision = values.revision;
+            }
+          }
+        } catch { accepted = false; }
+      }
+      if (!accepted) {
+        if (rooms.get(room.id) === room) expireRoom(room);
+        return;
+      }
+    }
+    // No await between synchronous authority snapshot and final signal egress.
+    if (activePeer(room, sender) && activePeer(room, recipient) &&
+      room.allowed.has(pair(sender.id, recipient.id))) {
+      send(recipient.ws, { type: 'signal', peerId: sender.id, signal });
+    }
+  }
+  function cheapActionError(room, current, message) {
+    // Rejection must precede expensive per-member ciphertext hashes. These are
+    // only preflight checks; live ACL and room state are checked again before
+    // every authorized action, especially SDP/ICE egress.
+    const target = typeof message.to === 'string' && message.to.length === 16
+      ? room.members.get(message.to) : null;
+    switch (message.type) {
+      case 'invite': {
+        if (current.role !== 'host') return 'FORBIDDEN';
+        const recipient = message.recipient;
+        if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
+          recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
+          recipient === current.username)) return 'BAD_RECIPIENT';
+        if (typeof authorizeRecipient === 'function') {
+          let grant = null;
+          try { grant = authorizeRecipient(current.username, recipient); } catch { /* deny */ }
+          if (grant !== true && (!object(grant) || grant.username !== recipient ||
+            !Number.isSafeInteger(grant.sessionVersion) || grant.sessionVersion < 0)) {
+            return 'BAD_RECIPIENT';
+          }
+        }
+        const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
+        return outstanding + room.members.size >= MAX_MEMBERS ? 'FULL' : null;
+      }
+      case 'revoke':
+        return current.role === 'host' && typeof message.inviteId === 'string' &&
+          /^[a-f0-9]{16}$/.test(message.inviteId) &&
+          [...room.invites.values()].some(i => i.id === message.inviteId && i.expires > now())
+          ? null : 'FORBIDDEN';
+      case 'kick':
+        return current.role === 'host' && target?.role === 'guest' ? null : 'FORBIDDEN';
+      case 'request-peer':
+        if (current.role !== 'host' || target?.role !== 'guest' ||
+          room.allowed.has(pair(current.id, target.id))) return 'FORBIDDEN';
+        return room.pending.size >= MAX_MEMBERS ? 'FULL' : null;
+      case 'consent': {
+        if (typeof message.requestId !== 'string' || message.requestId.length !== 16 ||
+          typeof message.accept !== 'boolean') return 'FORBIDDEN';
+        const pending = room.pending.get(message.requestId);
+        return pending && pending.to === current.id && room.members.has(pending.from)
+          ? null : 'FORBIDDEN';
+      }
+      case 'signal':
+        return target && room.allowed.has(pair(current.id, target.id)) &&
+          object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
+          JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256
+          ? null : 'FORBIDDEN';
+      default:
+        return 'FORBIDDEN';
+    }
+  }
   async function onMessage(ws, raw) {
     if (!sessionCurrent(ws)) return;
     if (raw.length > MAX_SIGNAL_BYTES) return ws.close(1009, 'too large');
@@ -129,24 +259,35 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (message.type !== 'join' || typeof message.roomId !== 'string') return error(ws, 'NOT_JOINED');
       const room = rooms.get(message.roomId);
       if (!validRoom(room)) return error(ws, 'INVALID_INVITE');
+      // Cheap credential/capacity checks must precede hashing every bound
+      // owner's and guest's current 32 MiB object. Invalid joins are untrusted.
+      if (room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
+      const hostEligible = message.hostKey === room.hostKey && (!authenticated || (room.owner === ws.identity.username &&
+        room.ownerSessionVersion === ws.identity.sessionVersion)) &&
+        ![...room.members.values()].some(p => p.role === 'host');
+      const invite = !hostEligible && typeof message.invitation === 'string' &&
+        room.invites.get(message.invitation);
+      const inviteValid = () => Boolean(invite &&
+        room.invites.get(message.invitation) === invite && !invite.used &&
+        invite.expires > now() &&
+        (!authenticated || (invite.recipient === ws.identity.username &&
+          (!Number.isSafeInteger(invite.recipientSessionVersion) ||
+            invite.recipientSessionVersion === ws.identity.sessionVersion))));
+      if (!hostEligible && !inviteValid()) return error(ws, 'INVALID_INVITE');
       if (!await recheckBoundRoom(room)) return error(ws, 'INVALID_INVITE');
+      if (!liveAdmission(ws, room)) return;
       if (room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
       let role;
-      if (message.hostKey === room.hostKey && (!authenticated || (room.owner === ws.identity.username &&
-        room.ownerSessionVersion === ws.identity.sessionVersion)) &&
-        ![...room.members.values()].some(p => p.role === 'host')) {
+      if (hostEligible && ![...room.members.values()].some(p => p.role === 'host')) {
         role = 'host';
       } else {
-        const invite = typeof message.invitation === 'string' && room.invites.get(message.invitation);
-        if (!invite || invite.used || invite.expires <= now() ||
-          (authenticated && (invite.recipient !== ws.identity.username ||
-            (Number.isSafeInteger(invite.recipientSessionVersion) &&
-              invite.recipientSessionVersion !== ws.identity.sessionVersion))) ||
-          !await objectAllowed(room, ws.identity?.username) || !validRoom(room) ||
-          !sessionCurrent(ws)) return error(ws, 'INVALID_INVITE');
+        if (!inviteValid() || !await objectAllowed(room, ws.identity?.username) ||
+          !liveAdmission(ws, room) ||
+          !inviteValid()) return error(ws, 'INVALID_INVITE');
         room.invites.delete(message.invitation); // One-time join, never eligible for replay.
         role = 'guest';
       }
+      if (!liveAdmission(ws, room) || room.members.size >= MAX_MEMBERS) return;
       const id = shortId();
       const peer = { id, role, roomId: room.id, ws, username: ws.identity?.username };
       participants.set(ws, peer);
@@ -161,7 +302,11 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
     const room = roomOf(ws);
     if (!validRoom(room)) return error(ws, 'ROOM_CLOSED');
-    if (!await recheckBoundRoom(room) || !participants.has(ws) || !sessionCurrent(ws)) return;
+    if (!activePeer(room, current)) return;
+    const cheapError = cheapActionError(room, current, message);
+    if (cheapError) return error(ws, cheapError);
+    if (!await recheckBoundRoom(room) || participants.get(ws) !== current ||
+      !activePeer(room, current)) return;
     const target = typeof message.to === 'string' && room.members.get(message.to);
     if (message.type === 'invite' && current.role === 'host') {
       const recipient = message.recipient;
@@ -189,7 +334,10 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         recipient: authenticated ? recipient : null, recipientSessionVersion });
       send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
     } else if (message.type === 'revoke' && current.role === 'host' && typeof message.inviteId === 'string') {
-      for (const [k, i] of room.invites) if (i.id === message.inviteId) room.invites.delete(k);
+      const match = [...room.invites].find(([, invite]) =>
+        invite.id === message.inviteId && invite.expires > now());
+      if (!match) return error(ws, 'FORBIDDEN');
+      room.invites.delete(match[0]);
       send(ws, { type: 'revoked', inviteId: message.inviteId });
     } else if (message.type === 'kick' && current.role === 'host' && target && target.role === 'guest') {
       error(target.ws, 'REVOKED');
@@ -216,7 +364,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     } else if (message.type === 'signal' && target && room.allowed.has(pair(current.id, target.id)) &&
       object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
       JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256) {
-      send(target.ws, { type: 'signal', peerId: current.id, signal: message.signal });
+      await forwardLiveSignal(room, current, target, message.signal);
     } else {
       error(ws, 'FORBIDDEN');
     }
