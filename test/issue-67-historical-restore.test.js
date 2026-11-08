@@ -301,7 +301,20 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), old);
   // Explicit recovery is possible without a new signature: materialize the
   // exact authenticated pending bytes, then let the existing CAS path resume.
-  await fsp.writeFile(target, protocol.decryptPayload(f.original, f.privateFileKey));
+  // Manual recovery must never replace a file created by another writer
+  // between the absent-path assertion and this materialization. O_EXCL is
+  // the actual no-clobber boundary; a prior exists/lstat check is not.
+  const restoredBytes = protocol.decryptPayload(f.original, f.privateFileKey);
+  let recoveryOutput;
+  try {
+    recoveryOutput = await fsp.open(target,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    await recoveryOutput.writeFile(restoredBytes);
+    await recoveryOutput.sync();
+  } finally {
+    restoredBytes.fill(0);
+    if (recoveryOutput) await recoveryOutput.close();
+  }
   const resumed = await reopened.syncOnce();
   assert.equal(resumed.pushed, 1);
   assert.equal(f.pushes(), 1);
