@@ -154,6 +154,36 @@ function pathIdentityKey(value) {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
+function assertSyncHistoryArchiveCoverage() {
+  // The signed SyncObjectStore history is backed up by one canonical file.
+  // Reject external, ambiguous, or case-aliased names rather than certify a
+  // complete ZIP which silently omitted its historical revisions.
+  const configured = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json";
+  const canonicalName = "sync-objects.json";
+  const invalid = () => {
+    throw Object.assign(new Error("Signed sync history must use the physical canonical data/sync-objects.json filename"), {
+      code: "SYNC_HISTORY_NOT_ARCHIVED",
+    });
+  };
+  if (pathIdentityKey(configured) !== pathIdentityKey(resolveRuntimePath("data", canonicalName))
+    || path.basename(path.resolve(configured)) !== canonicalName) invalid();
+  const dataDir = resolveRuntimePath("data");
+  let root;
+  try { root = fs.lstatSync(dataDir); }
+  catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!root.isDirectory() || root.isSymbolicLink()) invalid();
+  const physical = fs.readdirSync(dataDir)
+    .filter((name) => name.toLowerCase() === canonicalName);
+  if (physical.length > 1 || physical.some((name) => name !== canonicalName)) invalid();
+  if (!physical.length) return false;
+  const history = fs.lstatSync(path.join(dataDir, canonicalName));
+  if (!history.isFile() || history.isSymbolicLink() || history.nlink !== 1) invalid();
+  return true;
+}
+
 function fileIdentity(stat) {
   return stat?.isFile?.() && stat.ino ? `${stat.dev}:${stat.ino}` : null;
 }
@@ -507,6 +537,11 @@ async function collectBackupFiles(options = {}) {
   });
 
   const syncFile = unsuppressedFiles.find((file) => file.entryPath === "data/sync-objects.json");
+  if (assertSyncHistoryArchiveCoverage() && !syncFile) {
+    throw Object.assign(new Error("Signed sync object history was omitted from backup inventory"), {
+      code: "SYNC_HISTORY_NOT_ARCHIVED",
+    });
+  }
   if (syncFile) attestCiphertextOnlyFile(syncFile.absolutePath);
 
   // ZIP restore rejects case-folded destination collisions on every platform.
@@ -1556,6 +1591,7 @@ async function createBackup(options = {}) {
   let outcomeError = null;
 
   try {
+    assertSyncHistoryArchiveCoverage();
     if (options.backupId != null && backupRepository.getBackup(id)) {
       throw Object.assign(new Error("Backup ID already exists"), { code: "BACKUP_ID_COLLISION" });
     }
@@ -1823,6 +1859,7 @@ function latestStatus() {
 }
 
 module.exports = {
+  assertSyncHistoryArchiveCoverage,
   BACKUPS_DIR,
   LOCK_FILE,
   LOCK_TAKEOVER_DIR,
