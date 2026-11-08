@@ -3,14 +3,16 @@
 // DEV-only: an owner-device-signed, recipient-account + recipient-device bound
 // ciphertext grant. Key distribution is deliberately outside this API.
 const crypto = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const z = require("../crypto/rootark-zk-1");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0", "ascii");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
 const EGRESS_DRAIN_MS = 10000;
 const EGRESS_ABORT_GRACE_MS = 1000;
-// Multiple route registrations over the same protected SQLite store share the
-// same local HTTP-egress fence; this does not claim cross-process custody.
+const EGRESS_POLL_MS = 50;
+// Local references exist only to abort sockets owned by this Node process.
+// The durable registry below is authoritative across SQLite connections.
 const activeEgressByStore = new WeakMap();
 const ID = /^[A-Za-z0-9_-]{43}$/;
 const USER = /^[A-Za-z0-9_.@-]{1,128}$/;
@@ -41,14 +43,6 @@ function scopeKey(scope) {
 }
 function grantKey(scope, grantId) {
   return `${scopeKey(scope)}:${canonicalId(grantId)}`;
-}
-function waitBounded(pending, milliseconds) {
-  let timer;
-  const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(false), milliseconds);
-  });
-  return Promise.race([pending.then(() => true), deadline])
-    .finally(() => clearTimeout(timer));
 }
 function shareStatement(input) {
   const a = input.authorization;
@@ -124,6 +118,20 @@ class Zk1ProtectedCiphertextSharing {
     this.insert = store.db.prepare(`INSERT INTO zk_content_share
       (grant_id,scope,statement,signature,owner_username,recipient_username,expires_at)
       VALUES(?,?,?,?,?,?,?)`);
+    // An orphan may have handed bytes to an HTTP transport. Never TTL-prune it.
+    store.db.exec("CREATE TABLE IF NOT EXISTS zk_content_share_egress (" +
+      "lease_id TEXT PRIMARY KEY, grant_id TEXT NOT NULL, scope TEXT NOT NULL)");
+    store.db.exec("CREATE INDEX IF NOT EXISTS zk_content_share_egress_by_grant " +
+      "ON zk_content_share_egress(grant_id,scope)");
+    // One SQLite statement serializes admission against the revoke tombstone
+    // for all connections/processes using this same durable SQLite file.
+    this.admitEgress = store.db.prepare("INSERT INTO zk_content_share_egress " +
+      "(lease_id,grant_id,scope) SELECT ?,grant_id,scope FROM zk_content_share " +
+      "WHERE grant_id=? AND scope=? AND revoked=0 AND expires_at>?");
+    this.releaseEgress = store.db.prepare("DELETE FROM zk_content_share_egress " +
+      "WHERE lease_id=? AND grant_id=? AND scope=?");
+    this.pendingEgress = store.db.prepare("SELECT 1 AS pending FROM zk_content_share_egress " +
+      "WHERE grant_id=? AND scope=? LIMIT 1");
     this.find = store.db.prepare("SELECT * FROM zk_content_share WHERE grant_id=? AND scope=?");
     this.revokeRow = store.db.prepare(`UPDATE zk_content_share SET revoked=1
       WHERE grant_id=? AND scope=? AND owner_username=?`);
@@ -242,48 +250,110 @@ class Zk1ProtectedCiphertextSharing {
   }
 
   emitTracked(scope, grantId, emit, payload) {
+    // A signed read may outlive its HTTP client while physical admission is
+    // awaiting an independent witness. Reject a response already known closed
+    // BEFORE registering any durable egress lease. There is no await between
+    // this check and the SQLite INSERT, so a normal JS close callback cannot
+    // interleave and turn this admission into a phantom orphaned lease.
+    if (typeof emit.isTerminal === "function" && emit.isTerminal()) {
+      deny("ZK_SHARE_UNAVAILABLE");
+    }
     const key = grantKey(scope, grantId);
+    const scopeId = scopeKey(scope);
+    const id = canonicalId(grantId);
+    const leaseId = crypto.randomBytes(24).toString("hex");
+    let admission;
+    try {
+      const now = this.store.nowSeconds();
+      if (!Number.isSafeInteger(now)) deny("ZK_SHARE_UNAVAILABLE");
+      admission = this.admitEgress.run(leaseId, id, scopeId, now);
+    } catch (_) { deny("ZK_SHARE_UNAVAILABLE"); }
+    if (admission.changes !== 1) deny("ZK_SHARE_UNAVAILABLE");
     let active = this.activeEgress.get(key);
     if (!active) {
       active = new Set();
       this.activeEgress.set(key, active);
     }
     const tracker = { abort: typeof emit.abort === "function" ? emit.abort : null };
-    tracker.finished = new Promise((resolve) => { tracker.settled = resolve; });
     active.add(tracker);
     const release = () => {
-      active.delete(tracker);
-      if (active.size === 0) this.activeEgress.delete(key);
-      tracker.settled();
+      try {
+        const removed = this.releaseEgress.run(leaseId, id, scopeId);
+        if (removed.changes !== 1) deny("ZK_SHARE_UNAVAILABLE");
+      } catch (_) { deny("ZK_SHARE_UNAVAILABLE"); }
+      finally {
+        active.delete(tracker);
+        if (active.size === 0) this.activeEgress.delete(key);
+      }
     };
-    // Registration precedes res.json() without an await. A concurrent owner
-    // tombstone can therefore either deny the final grant read or wait for
-    // this already admitted response to finish/close before acknowledging.
-    try { return Promise.resolve(emit(payload)).finally(release); }
-    catch (error) { release(); throw error; }
+    // Durable registration precedes res.json() without an await. A rejected
+    // or synchronously throwing emitter proves NOTHING about HTTP finish/close.
+    // Keep that row as an unresolved lease (fail-closed for revocation) rather
+    // than prematurely treating a potentially half-written socket as drained.
+    let sending;
+    try { sending = emit(payload); }
+    catch (error) {
+      try { tracker.abort?.(); } catch (_) { /* durable lease stays orphaned */ }
+      throw error;
+    }
+    return Promise.resolve(sending).then(
+      (value) => { release(); return value; },
+      (error) => {
+        try { tracker.abort?.(); } catch (_) { /* durable lease stays orphaned */ }
+        throw error;
+      });
   }
 
   revoke(scope, grantId, ownerUsername) {
     if (!USER.test(ownerUsername)) deny();
-    const result = this.revokeRow.run(canonicalId(grantId), scopeKey(scope), ownerUsername);
+    const id = canonicalId(grantId);
+    const scoped = scopeKey(scope);
+    // SQLite WAL readers can still inspect the last committed owner while a
+    // separate writer holds BEGIN IMMEDIATE. Preserve a genuine wrong-owner
+    // 403 even under that lock; the UPDATE predicate remains authoritative
+    // if this preflight and the write race with a grant modification.
+    let grant;
+    try { grant = this.find.get(id, scoped); }
+    catch (_) { deny("ZK_SHARE_UNAVAILABLE"); }
+    if (!grant || grant.owner_username !== ownerUsername) deny();
+    let result;
+    try {
+      result = this.revokeRow.run(id, scoped, ownerUsername);
+    } catch (_) {
+      // A concurrent SQLite writer, I/O failure or closed database is NOT an
+      // authorization denial. Never ACK an uncommitted tombstone as success.
+      deny("ZK_SHARE_UNAVAILABLE");
+    }
     if (result.changes !== 1) deny();
     return { revoked: true };
   }
 
+  async waitDurableEgress(scopeId, grantId, timeoutMs) {
+    const deadline = performance.now() + timeoutMs;
+    while (true) {
+      try {
+        if (!this.pendingEgress.get(grantId, scopeId)) return true;
+      } catch (_) { deny("ZK_SHARE_UNAVAILABLE"); }
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return false;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, EGRESS_POLL_MS)));
+    }
+  }
+
   async revokeAndDrain(scope, grantId, ownerUsername) {
-    // Persist the tombstone synchronously FIRST to deny all new admissions.
-    // Only then await existing approved HTTP egress before returning 200.
+    // Persist the tombstone synchronously FIRST. Only ACK after every durable
+    // lease has ended, including leases in independent Node processes.
     const result = this.revoke(scope, grantId, ownerUsername);
+    const scopeId = scopeKey(scope);
+    const id = canonicalId(grantId);
+    if (await this.waitDurableEgress(scopeId, id, EGRESS_DRAIN_MS)) return result;
+    // Only this store's local sockets can be aborted. Remote orphans stay
+    // durable and force 503 until explicitly reconciled.
     const active = [...(this.activeEgress.get(grantKey(scope, grantId)) ?? [])];
-    if (!active.length) return result;
-    const drained = Promise.all(active.map((entry) => entry.finished));
-    if (await waitBounded(drained, EGRESS_DRAIN_MS)) return result;
-    // An unresponsive/slow consumer cannot hold owner revocation forever.
-    // Abort the old sockets and require their close/finish to be observed.
     for (const entry of active) {
       try { entry.abort?.(); } catch (_) { /* final timeout denies ACK */ }
     }
-    if (!await waitBounded(drained, EGRESS_ABORT_GRACE_MS)) {
+    if (!await this.waitDurableEgress(scopeId, id, EGRESS_ABORT_GRACE_MS)) {
       deny("ZK_SHARE_UNAVAILABLE");
     }
     return result;
