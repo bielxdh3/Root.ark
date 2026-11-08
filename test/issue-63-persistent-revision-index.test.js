@@ -213,6 +213,51 @@ test("unrelated valid signed catalog CAS advance preserves previously selected h
   assert.deepEqual(now.entries.map((row) => row.revision), [1, 2, 3]);
 });
 
+test("one explicitly owner-selected 128-revision batch verifies all 16 windows before one encrypted commit", async () => {
+  const f = await fixture(128);
+  let saves = 0;
+  const progress = [];
+  const { final, result } = await f.scan(undefined, {
+    onProgress({ completed, total }) { progress.push([completed, total]); },
+    async onVerifiedBatch(entries) {
+      saves++;
+      assert.equal(f.gets, 128, "persist only after the final signed GET succeeds");
+      assert.equal(entries.length, 128, "never split the verified set into partial commits");
+      assert.equal(f.database.rows.size, 0, "no early partial IndexedDB persistence");
+      return index.append({ ...f.core(), entries });
+    },
+  });
+  assert.equal(saves, 1);
+  assert.equal(final, null, "the test supplies a one-shot callback");
+  assert.equal(result.totalSearched, 128);
+  assert.equal(result.totalMatches, 128);
+  assert.deepEqual(progress, Array.from({ length: 16 }, (_, i) => [(i + 1) * 8, 128]));
+  const stored = [...f.database.rows.values()][0];
+  assert.equal(stored.format, "rootark-zk1-protected-revision-index/v1");
+  assert.doesNotMatch(JSON.stringify(stored), /Histórico revisão|relatorio-confidencial|orçamento reservado/);
+  const page = await index.search({ ...f.core(), query: "orçamento" });
+  assert.equal(page.indexedCount, 128);
+  assert.equal(page.entries.length, 50);
+  assert.equal((await page.readPage(50)).entries.length, 50);
+  assert.equal((await page.readPage(100)).entries.length, 28);
+  assert.equal(page.coverage, "owner-selected-revisions-only");
+});
+
+test("late revision 128 ciphertext tamper denies the entire selected set without any IndexedDB write", async () => {
+  const f = await fixture(128);
+  const last = f.selected[127].selected;
+  const key = last.objectId + ":" + last.revision;
+  f.checked.set(key, { ...f.checked.get(key), ciphertextBase64: "###" });
+  let writes = 0;
+  await assert.rejects(f.scan(undefined, { onVerifiedBatch: async (entries) => {
+    writes++;
+    return index.append({ ...f.core(), entries });
+  } }), /ZK_BATCH_TEXT_SEARCH_DENIED/);
+  assert.equal(f.gets, 128, "signed GET of the final selected revision is performed");
+  assert.equal(writes, 0, "partial verified subsets cannot persist");
+  assert.equal(f.database.rows.size, 0);
+});
+
 test("a removed or digest-diverged signed revision is explicitly excluded on CAS advance", async () => {
   for (const change of [{ removeRevision: 1 }, { changeRevisionDigest: 1 }]) {
     const f = await fixture(3);
@@ -626,4 +671,17 @@ test("4 MiB aggregate serialized plaintext cap rejects a 64-revision oversized s
   await assert.rejects(index.append({ ...f.core(), entries }),
     /ZK_REVISION_INDEX_DENIED/);
   assert.equal(f.database.rows.size, 0);
+});
+
+test("single 128-selection keeps the existing 4 MiB encrypted-index size gate", async () => {
+  const f = await fixture(128);
+  const entries = f.core().baseline.entries.map((entry) => ({
+    objectId: entry.objectId, revision: entry.revision, epoch: entry.epoch,
+    ciphertextDigestBase64: entry.ciphertextDigestBase64,
+    name: "owner-only.txt", mediaType: "text/plain", text: "X".repeat(34 * 1024),
+  }));
+  await assert.rejects(index.append({ ...f.core(), entries }),
+    /ZK_REVISION_INDEX_DENIED/);
+  assert.equal(f.database.rows.size, 0,
+    "oversized 128-item input may not leave a partially persisted index");
 });

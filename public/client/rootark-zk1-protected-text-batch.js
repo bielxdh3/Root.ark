@@ -10,7 +10,9 @@
   // rechecks the current catalog/owner/CAS around each ciphertext retrieval.
   // Neither the search query nor imported CEKs are arguments to that GET.
   // Pins and CEKs MUST have been authenticated separately from Root.ark.
-  const MAX_ITEMS = 64;
+  // One explicitly owner-selected manifest can cover the same 128 revisions
+  // already supported by the encrypted index. Still not a complete corpus.
+  const MAX_ITEMS = 128;
   const WINDOW = 8;
   const MAX_QUERY = 120;
   const MAX_EXCERPT = 160;

@@ -189,6 +189,38 @@ test("64 owner-selected exact revisions run in eight bounded windows with dispos
   assert.ok(result.matches.every((match) => !Object.hasOwn(match, "text")));
 });
 
+test("128 explicit revisions can be searched ephemerally in 16 windows without persistence or extra key exposure", async () => {
+  const f = await fixture(128);
+  const keys = new Map();
+  const items = f.items.map(({ rawCek, ...item }, i) => {
+    const cekFile = `owner-pinned-${i}.bin`;
+    keys.set(cekFile, rawCek);
+    return { ...item, cekFile };
+  });
+  let previous = null;
+  const progress = [];
+  const result = await search.search({ ...f.input, items, query: "orçamento",
+    readCek: async (filename) => {
+      if (previous) assert.ok(previous.every((byte) => byte === 0));
+      previous = new Uint8Array(keys.get(filename));
+      return previous;
+    },
+    onProgress: ({ completed, total }) => progress.push([completed, total]),
+  });
+  assert.equal(result.totalSearched, 128);
+  assert.equal(result.totalMatches, 127);
+  assert.equal(result.plaintextSentToServer, false);
+  assert.equal(result.authorizesMutation, false);
+  assert.equal(Object.hasOwn(result, "indexedDiscardedCount"), false,
+    "no persistence callback means no durable index side effect");
+  assert.deepEqual(progress, Array.from({ length: 16 }, (_, i) => [(i + 1) * 8, 128]));
+  assert.equal(f.queried.length, 128);
+  assert.ok(f.queried.every((request) => Object.keys(request).sort().join(",")
+    === "objectId,revision"), "GETs carry only exact opaque object/revision");
+  assert.ok(previous.every((byte) => byte === 0));
+  assert.ok(result.matches.every((row) => !Object.hasOwn(row, "text")));
+});
+
 test("window 2 tamper or cancellation denies ALL earlier-window matches and never reads later keys", async () => {
   for (const mode of ["tamper", "cancel", "all-terms-cancel"]) {
     const f = await fixture(17);
@@ -216,8 +248,8 @@ test("window 2 tamper or cancellation denies ALL earlier-window matches and neve
   }
 });
 
-test("selected set max 64 and cancellation callback bounds reject before any signed GET", async () => {
-  const f = await fixture(65);
+test("selected set max 128 and cancellation callback bounds reject before any signed GET", async () => {
+  const f = await fixture(129);
   await assert.rejects(search.search(f.input), /ZK_BATCH_TEXT_SEARCH_DENIED/);
   assert.equal(f.queried.length, 0);
   await assert.rejects(search.search({ ...f.input, items: f.items.slice(0, 9) }),

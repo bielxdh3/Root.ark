@@ -860,12 +860,12 @@
       + '<label>SHA-256 da CEK fixado pelo proprietário separadamente (base64url, 32 bytes)<input data-zk1-field="catalog-preview-cek-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<p class="muted">Prévia efêmera de texto UTF-8, até 64 KiB. AES-GCM, IDs, epoch, revisão, grant ativo, CAS e GET assinado são conferidos antes de exibir. Fecha ao mudar seleção ou sessão. Não executa HTML ou scripts.</p>'
       + '<fieldset><legend>Busca em conteúdo protegido (DEV, somente local)</legend>'
-      + '<p class="muted">Busque texto em 1–64 versões cifradas presentes no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; os resultados só aparecem após todas as verificações. A persistência de conteúdo é opcional e exclusivamente cifrada neste navegador.</p>'
+      + '<p class="muted">Busque texto em 1–128 versões cifradas explicitamente selecionadas no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; os resultados só aparecem após todas as verificações. A persistência de conteúdo é opcional e exclusivamente cifrada neste navegador; limite de 4 MiB serializados, cobertura parcial e nunca universal.</p>'
       + '<label>Texto a buscar (UTF-8 NFC, até 120 caracteres)<input type="search" data-zk1-field="catalog-batch-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-all-terms"> Todas as palavras (AND): 2–4 termos literais distintos, até 40 caracteres cada; espaços separam termos. Desmarcado: frase literal exata.</label>'
-      + '<label>Manifesto de seleção do proprietário (.json, 1–64 entradas, até 64 KiB)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
+      + '<label>Manifesto de seleção do proprietário (.json, 1–128 entradas, até 64 KiB)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
       + '<label>SHA-256 do manifesto fixado fora do servidor (base64url, 32 bytes)<input data-zk1-field="catalog-batch-manifest-pin" maxlength="43" autocomplete="off" spellcheck="false"></label>'
-      + '<label>CEKs locais das revisões selecionadas (até 64 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
+      + '<label>CEKs locais das revisões selecionadas (até 128 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-confirm"> Verifiquei offline o manifesto, cada pin de CEK e a autorização atual do proprietário.</label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-persist"> Após concluir todo o lote, guardar até 128 revisões selecionadas no índice local AES-GCM/HKDF (até 4 MiB de JSON antes da cifragem). Requer a chave local de metadados acima. Não indexa automaticamente todo o histórico.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-search">Buscar dentro das versões selecionadas</button>'
@@ -1629,7 +1629,7 @@
           exactly(manifest, ["schema", "entries"]);
           if (manifest.schema !== "rootark-zk1-local-text-batch/v1"
             || !Array.isArray(manifest.entries)
-            || manifest.entries.length < 1 || manifest.entries.length > 64) fail();
+            || manifest.entries.length < 1 || manifest.entries.length > 128) fail();
           const persistBatch = field("catalog-batch-persist")?.checked === true;
           if (persistBatch) {
             if (field("catalog-write-key")?.files?.length !== 1

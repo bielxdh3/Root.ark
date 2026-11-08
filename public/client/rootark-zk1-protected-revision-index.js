@@ -302,7 +302,7 @@
       assertCurrent();
       if (cacheKey(pinned.scope) !== key) deny();
       const incoming = checkRows(input.entries, input.baseline);
-      if (incoming.length > 64) deny(); // One complete verified batch only.
+      if (incoming.length > MAX_ROWS) deny(); // One complete verified batch only.
       const tombstone = record?.format === CLEARED;
       if (record && (!opaque.test(record.nonce)
         || (tombstone && Object.keys(record).sort().join(",") !== "format,nonce")

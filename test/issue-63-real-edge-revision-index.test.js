@@ -66,6 +66,12 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
             signedGrant,ownerWire()))throw Error("OWNER_GRANT_REVOKED");
           return {verifiedCurrent:true,grant,ownerHead};
         }});
+      phase="real-idb-single-owner-selected-128-batch";
+      const oneShot=await index.append({...input(),entries:rows});
+      if(oneShot.indexedCount!==128||!oneShot.persistedIndex
+        ||oneShot.coverage!=="owner-selected-revisions-only")
+        throw Error("SINGLE_VERIFIED_128_NOT_COMMITTED");
+      await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
       phase="real-idb-insert";
       const one=await index.append({...input(),entries:rows.slice(0,64)});
       const two=await index.append({...input(),entries:rows.slice(64)});
