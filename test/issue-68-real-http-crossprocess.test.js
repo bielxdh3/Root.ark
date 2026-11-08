@@ -229,3 +229,38 @@ test("real cross-process HTTP: an expired grant cannot admit another response or
         { status: 200, body: "revoked" }, "no stale lease blocks later owner ACK");
     } finally { await Promise.all([guest.stop(), owner.stop()]); }
   });
+
+test("helper refuses missing IPC configuration instead of starting an unauthenticated HTTP peer",
+  { timeout: 18000 }, async (t) => {
+    const f = fixture(t);
+    const keys = { guest: crypto.generateKeyPairSync("ed25519"),
+      owner: crypto.generateKeyPairSync("ed25519") };
+    const validEnv = {
+      ...process.env, W3_DB: f.filename, W3_GRANT: f.grantId,
+      W3_SCOPE: JSON.stringify(Object.fromEntries(Object.entries(f.scope)
+        .map(([field, value]) => [field, value.toString("hex")]))),
+      W3_GUEST_PUBLIC: keys.guest.publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+      W3_OWNER_PUBLIC: keys.owner.publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+    };
+    for (const missing of ["W3_DB", "W3_SCOPE", "W3_GRANT", "W3_GUEST_PUBLIC", "W3_OWNER_PUBLIC"]) {
+      const env = { ...validEnv };
+      delete env[missing];
+      const child = fork(childFile, ["guest"], {
+        execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"], env,
+      });
+      let stderr = "";
+      let announcedReady = false;
+      child.stderr.on("data", (bytes) => { stderr = (stderr + bytes.toString()).slice(-1500); });
+      child.on("message", (message) => {
+        if (message?.kind === "ready") announcedReady = true;
+      });
+      const exit = new Promise((resolve) => child.once("exit", resolve));
+      const timer = setTimeout(() => child.kill(), 2500);
+      const code = await exit;
+      clearTimeout(timer);
+      assert.notEqual(code, 0, `${missing} omitted: helper must fail closed`);
+      assert.equal(announcedReady, false, `${missing} omitted: no listener may be exposed`);
+      assert.match(stderr, /ZK_SHARE_HTTP_FIXTURE_INVALID_IPC_ENV/,
+        `${missing} omitted: reject at the IPC configuration gate`);
+    }
+  });

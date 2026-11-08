@@ -3,12 +3,20 @@
 // Disposable two-process transport fixture. Ed25519 HTTP authentication here
 // is test-only; production device/witness authentication is exercised by the
 // separate signed /zk-1/v1/share/read integration test.
+// Node --test discovers this support file too. Only a fork with an IPC channel
+// may launch the disposable HTTP/SQLite fixture; direct discovery stays inert.
+if (typeof process.send === "function") {
 const crypto = require("node:crypto");
 const http = require("node:http");
 const Database = require("better-sqlite3");
 const { Zk1ProtectedCiphertextSharing } =
   require("../../src/services/zk1ProtectedCiphertextSharing");
 
+if (!["guest", "owner"].includes(process.argv[2])
+  || ["W3_DB", "W3_SCOPE", "W3_GRANT", "W3_GUEST_PUBLIC", "W3_OWNER_PUBLIC"]
+    .some((name) => typeof process.env[name] !== "string" || !process.env[name])) {
+  throw new Error("ZK_SHARE_HTTP_FIXTURE_INVALID_IPC_ENV");
+}
 const db = new Database(process.env.W3_DB);
 db.pragma("journal_mode = WAL");
 db.pragma("busy_timeout = 50");
@@ -92,3 +100,4 @@ process.on("message", (message) => {
   }
 });
 server.listen(0, "127.0.0.1", () => notify("ready", { port: server.address().port }));
+}
