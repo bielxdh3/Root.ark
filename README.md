@@ -386,15 +386,20 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
 - [ ] Independently certify production key custody, deployment configuration, external durability and authorized ZK-1 cutover
-- [x] Harden deployment defaults and document a reviewed production profile ([single-process R2 profile and fail-closed configuration, draft PR #252](https://github.com/bielxdh3/Root.ark/pull/252); real operator/TLS acceptance remains R1)
-- [x] Expand restore testing and disaster-recovery evidence ([bounded local verification](docs/validation/2026-11-06-rootark-recovery-and-adapters.md); live operator drill remains part of R1)
-- [x] Strengthen suspicious-file isolation and scanning integrations ([existing fail-closed ClamAV/upload/quarantine source gates reviewed](docs/validation/2026-11-06-rootark-recovery-and-adapters.md#r4--already-merged-upload-scanner-and-suspicious-file-isolation-controls); live scanner/volume acceptance remains in R1)
-- [x] Review every implemented external adapter independently ([Local/S3/Google Drive/WebDAV source review and simulated restore evidence](docs/validation/2026-11-06-rootark-recovery-and-adapters.md) passed; actual provider durability and operator acceptance remain under R1)
+- [ ] Harden deployment defaults and document a reviewed production profile ([single-instance profile](docs/security/single-instance-execution-profile.md) documented; real deployment acceptance pending)
+- [ ] Expand restore testing and disaster-recovery evidence
+- [ ] Strengthen suspicious-file isolation and scanning integrations
+- [ ] Review every external adapter independently
+- [ ] Define any BielOS integration as a separate approved architecture
 - [ ] Reconcile roadmap status and exact-HEAD evidence after each completed mission
+
+**Scoped source-only progress (2026-11-06, not completion of the broad goals above):** the [single-process R2 configuration and fail-closed defaults in Draft #252](https://github.com/bielxdh3/Root.ark/pull/252) underwent bounded review; the [recovery and adapter evidence report](docs/validation/2026-11-06-rootark-recovery-and-adapters.md) records local restore/disaster-recovery tests, existing ClamAV/upload/quarantine source safeguards and independent Local/S3/Google Drive/WebDAV source review using simulated providers. This evidence does **not** certify an actual operator deployment, ingress/TLS, scanner volume, live cloud durability, full-account restore or external R1 custody/cutover. The overall checklist remains **unchecked** until its separate acceptance gates pass.
 
 ## Project direction
 
-Root.ark remains an independent project. Integrations with BielOS or Virki are outside this roadmap.
+Root.ark remains an independent project. Future integration or selective reuse with BielOS requires an explicit architecture, security review, migration plan, and authorization. Similar goals do not make the two systems interchangeable.
+
+Integrations with BielOS or Virki remain outside this execution roadmap.
 
 ## License
 

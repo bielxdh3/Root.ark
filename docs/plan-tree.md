@@ -9,6 +9,59 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-06 — Issue #66, etapa parcial em revisao: inventario de metadados
+autenticado, paginado e limitado por resposta, com cursores invalidaveis por
+mudanca na biblioteca e isolamento por conta. Adapter e SyncEngine expõem
+navegacao apenas informativa e leitura completa por objeto permanece a fronteira
+de verificacao assinada. 13/13 testes focados de inventario e sync seletivo
+passaram localmente em Windows, antes da publicacao da PR. A implementacao
+normal de `syncOnce` ainda usa LIST completo. A issue continua aberta para
+integracao de sync paginado, placeholders nativos e garantia de eviction com
+escritor externo.
+
+Revisao de escala da PR draft #255 (2026-11-06): o custo de uma leitura,
+attestation, ordenacao e hash completos por pagina era concreto (10 mil
+objetos; as primeiras 10 paginas custaram 23,595 s, 78,29 MiB de estado).
+Um cache somente de metadados, para uma conta, inicialmente limitado a 16 MiB, com
+invalidação por identidade do arquivo persistido e lock de escritores,
+passou teste adversarial de segunda instancia de armazenamento e trava
+externa. No mesmo fixture, o conjunto completo de 157 paginas levou
+2,625 s, sendo 2,337 s no primeiro acesso. Esta otimizacao continua
+sem usar metadados para admissao criptografica.
+
+Revisao independente adicional da #255 confirmou caso adversarial
+de biblioteca com 10 mil objetos e metadados longos: indice de
+20,50 MiB superava o teto de 16 MiB e fazia a rota reler todo o
+estado a cada pagina. O teto passa a 32 MiB **serializados** por
+conta/instancia; excedê-lo gera 507 `metadata_index_too_large` com
+marcador de erro invalidado por mudanca do arquivo, nunca fallback
+O(N²). Um teste RED→GREEN com teto artificialmente baixo verifica
+erro estavel, ausencia de releituras em retries, isolamento entre
+contas e invalidação por outra instancia. Benchmark 10 mil objetos,
+indice 20,50 MiB, JSON 149,62 MiB: 167 paginas, 4,288 s total,
+sendo 3,586 s no primeiro acesso. Bibliotecas acima do teto exigem
+indice persistido em trabalho separado; #66 continua parcial.
+
+Revisao final adicional da PR #255: um unico slot de cache era
+compartilhado entre indice positivo e marcador de excesso. No fluxo
+A (indice grande, 507), A (507), B (indice pequeno, 200), A (507), a
+ultima chamada relia o estado completo sem nova escrita. Marcadores
+negativos agora ficam num LRU independente de ate 32 contas, por
+identidade duravel e teto vigente. Teste adversarial RED→GREEN: na sequencia A→B→A, a contagem
+de readSnapshot caiu de 3 para 2; escrita da instancia irma ainda
+invalida o marcador. Revalidar no HEAD da PR antes de qualquer GO.
+
+Revisao posterior da #255: a retencao de apenas um indice **positivo**
+fazia A(200)→B(200)→A(200)→B(200) ler novamente todo o JSON a cada
+pagina, apesar de ambos terem metadados validos. O cache positivo agora
+usa LRU de **ate duas contas e 64 MiB serializados no total**, com
+**32 MiB no maximo por conta**; o LRU negativo de 32 contas permanece
+separado. Teste HTTP RED 4 leituras completas em A/B/A/B; GREEN 2
+leituras, uma por conta. Troca duravel por escritor externo continua
+invalidando ambos os indices; expiracao por terceira conta e limitada
+e documentada. Sem alterar a admissao criptografica nem o fluxo
+`syncOnce`.
+
 ## Current execution overlay — 2026-11-06 (unmerged drafts)
 
 The July–October closure history below is preserved for provenance, not as the active roadmap. The [ongoing main mission](rootark-main-execution-mission.md) and [exact-HEAD evidence matrix](validation/2026-11-06-rootark-wave-execution-status.md) now track the functional drafts and their remaining acceptance gates:
