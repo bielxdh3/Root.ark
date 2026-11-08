@@ -663,6 +663,12 @@
         grant, indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
         assertLive,
       });
+      if (window.RootarkZk1ProtectedRevisionIndex?.clear) {
+        await window.RootarkZk1ProtectedRevisionIndex.clear({
+          grant, indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+          assertLive,
+        });
+      }
     } catch (_) { /* signed head fencing still excludes stale records */ }
     assertLive();
   }
@@ -853,15 +859,17 @@
       + '<label>SHA-256 da CEK fixado pelo proprietário separadamente (base64url, 32 bytes)<input data-zk1-field="catalog-preview-cek-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<p class="muted">Prévia efêmera de texto UTF-8, até 64 KiB. AES-GCM, IDs, epoch, revisão, grant ativo, CAS e GET assinado são conferidos antes de exibir. Fecha ao mudar seleção ou sessão. Não executa HTML ou scripts.</p>'
       + '<fieldset><legend>Busca em conteúdo protegido (DEV, somente local)</legend>'
-      + '<p class="muted">Busque texto em 1–64 versões cifradas presentes no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; a pesquisa não armazena conteúdo ou chave e só revela resultados ao concluir todas as verificações.</p>'
+      + '<p class="muted">Busque texto em 1–64 versões cifradas presentes no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; os resultados só aparecem após todas as verificações. A persistência de conteúdo é opcional e exclusivamente cifrada neste navegador.</p>'
       + '<label>Texto a buscar (UTF-8 NFC, até 120 caracteres)<input type="search" data-zk1-field="catalog-batch-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-all-terms"> Todas as palavras (AND): 2–4 termos literais distintos, até 40 caracteres cada; espaços separam termos. Desmarcado: frase literal exata.</label>'
       + '<label>Manifesto de seleção do proprietário (.json, 1–64 entradas, até 64 KiB)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
       + '<label>SHA-256 do manifesto fixado fora do servidor (base64url, 32 bytes)<input data-zk1-field="catalog-batch-manifest-pin" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<label>CEKs locais das revisões selecionadas (até 64 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-confirm"> Verifiquei offline o manifesto, cada pin de CEK e a autorização atual do proprietário.</label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-persist"> Após concluir todo o lote, guardar até 128 revisões selecionadas no índice local AES-GCM/HKDF (até 4 MiB de JSON antes da cifragem). Requer a chave local de metadados acima. Não indexa automaticamente todo o histórico.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-search">Buscar dentro das versões selecionadas</button>'
-      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-cancel" disabled>Cancelar busca</button></div>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-cancel" disabled>Cancelar busca</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-index-search">Buscar nas revisões já indexadas (sem CEKs)</button></div>'
       + '<output data-zk1-field="catalog-batch-progress" role="status" aria-live="polite" aria-atomic="true"></output>'
       + '<pre data-zk1-field="catalog-delta-text-results" role="region" aria-label="Correspondências protegidas verificadas localmente"></pre>'
       + '</fieldset>'
@@ -1025,7 +1033,7 @@
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
-      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-pull", "catalog-delta-import",
+      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
     clearLocalPreview();
@@ -1171,7 +1179,7 @@
       }
       const trust = await grantAndOwner();
       assertLive();
-      if (["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-pull", "catalog-delta-import",
+      if (["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search", "catalog-delta-pull", "catalog-delta-import",
         "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
         "catalog-delta-restore"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
@@ -1198,7 +1206,7 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
-        if (!["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search"].includes(action))
+        if (!["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search"].includes(action))
           field("catalog-delta-private-list")?.replaceChildren();
         if (["catalog-delta-trash", "catalog-delta-trash-inspect",
           "catalog-delta-restore"].includes(action)) {
@@ -1471,6 +1479,48 @@
           } finally { cekRaw.fill(0); }
           return;
         }
+        if (action === "catalog-delta-index-search") {
+          const assertIndexLive = () => {
+            assertLive();
+            if (previewGeneration !== operationPreviewGeneration
+              || verifiedOpaqueDelta !== held) fail();
+          };
+          if (!window.RootarkZk1ProtectedRevisionIndex?.search)
+            await loadScript("rootark-zk1-protected-revision-index");
+          assertIndexLive();
+          if (!window.RootarkZk1ProtectedRevisionIndex?.search) fail();
+          const metadataRaw = await fileBytes("catalog-write-key", 32, 32);
+          let result;
+          try {
+            result = await window.RootarkZk1ProtectedRevisionIndex.search({
+              query: field("catalog-batch-query")?.value,
+              matchMode: field("catalog-batch-all-terms")?.checked ? "all-terms" : "phrase",
+              grant: trust.signedDeviceGrant,
+              ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                epoch: trust.pinnedCurrentHead.epoch,
+                digest: to64(trust.pinnedCurrentHead.digest) },
+              baseline: held.baseline, client: held.client, metadataRaw,
+              indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+              assertLive: assertIndexLive,
+            });
+          } finally { metadataRaw.fill(0); }
+          assertIndexLive();
+          if (result.plaintextSentToServer !== false
+            || result.authorizesMutation !== false
+            || result.coverage !== "owner-selected-revisions-only"
+            || !Array.isArray(result.entries)
+            || result.entries.length > 50
+            || result.totalMatches < result.entries.length
+            || result.indexedCount > 128) fail();
+          field("catalog-delta-text-results").textContent = result.entries.map((row) =>
+            row.name + " · revisão " + row.revision + "\n" + row.excerpt).join("\n\n")
+            || "Nenhuma correspondência nas revisões já indexadas.";
+          status("Índice local cifrado: " + result.totalMatches + " correspondência(s), "
+            + result.entries.length + " exibidas, de " + result.indexedCount
+            + " revisões selecionadas previamente. Cobertura parcial do histórico; "
+            + "CAS/grant revalidados, sem CEK nem consulta enviada ao servidor.");
+          return;
+        }
         if (action === "catalog-delta-text-search") {
           if (field("catalog-batch-confirm")?.checked !== true
             || !held.client.readSelectedCiphertext) fail();
@@ -1494,6 +1544,15 @@
           if (manifest.schema !== "rootark-zk1-local-text-batch/v1"
             || !Array.isArray(manifest.entries)
             || manifest.entries.length < 1 || manifest.entries.length > 64) fail();
+          const persistBatch = field("catalog-batch-persist")?.checked === true;
+          if (persistBatch) {
+            if (field("catalog-write-key")?.files?.length !== 1
+              || field("catalog-write-key").files[0].size !== 32) fail();
+            if (!window.RootarkZk1ProtectedRevisionIndex?.append)
+              await loadScript("rootark-zk1-protected-revision-index");
+            assertBatchLive();
+            if (!window.RootarkZk1ProtectedRevisionIndex?.append) fail();
+          }
           field("catalog-batch-progress").textContent =
             "0 / " + manifest.entries.length + " revisões conferidas";
           const filesControl = field("catalog-batch-ceks")?.files;
@@ -1552,6 +1611,23 @@
                 field("catalog-batch-progress").textContent =
                   completed + " / " + total + " revisões conferidas";
               },
+              ...(persistBatch ? { onVerifiedBatch: async (entries) => {
+                assertBatchLive();
+                const metadataRaw = await fileBytes("catalog-write-key", 32, 32);
+                try {
+                  const saved = await window.RootarkZk1ProtectedRevisionIndex.append({
+                    entries, grant: trust.signedDeviceGrant,
+                    ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                      epoch: trust.pinnedCurrentHead.epoch,
+                      digest: to64(trust.pinnedCurrentHead.digest) },
+                    baseline: held.baseline, client: held.client, metadataRaw,
+                    indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+                    assertLive: assertBatchLive,
+                  });
+                  assertBatchLive();
+                  return saved;
+                } finally { metadataRaw.fill(0); }
+              } } : {}),
             });
             assertBatchLive();
             if (result.plaintextSentToServer !== false
@@ -1563,7 +1639,10 @@
             field("catalog-delta-text-results").textContent =
               text || "Nenhum conteúdo correspondente nas versões verificadas.";
             status("Busca protegida local: " + result.totalMatches + " de "
-              + result.totalSearched + " versões conferidas. Nenhum texto/consulta/CEK enviado.");
+              + result.totalSearched + " versões conferidas. "
+              + (persistBatch ? "Lote completo acrescentado ao índice local cifrado. "
+                : "Conteúdo não persistido. ")
+              + "Nenhum texto/consulta/CEK enviado.");
           }
           return;
         }

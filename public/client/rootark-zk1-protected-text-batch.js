@@ -94,6 +94,9 @@
         || typeof input.assertLive !== "function"
         || typeof input.getChecked !== "function"
         || (input.readCek !== undefined && typeof input.readCek !== "function")
+        || (input.onVerifiedBatch !== undefined
+          && (typeof input.onVerifiedBatch !== "function"
+            || typeof input.readCek !== "function"))
         || (input.onProgress !== undefined && typeof input.onProgress !== "function")
         || (input.isCancelled !== undefined && typeof input.isCancelled !== "function")
         || typeof preview?.open !== "function"
@@ -101,6 +104,9 @@
       const match = checkedMatcher(input);
       const items = checkedItems(input);
       const matches = [];
+      // The optional encrypted revision index only receives a complete batch.
+      // Never commit an earlier window if a later signed GET/CEK fails.
+      const indexRows = input.onVerifiedBatch ? [] : null;
       const live = () => {
         const current = input.assertLive();
         const cancelled = input.isCancelled?.();
@@ -136,6 +142,12 @@
               || typeof opened.name !== "string"
               || typeof opened.text !== "string") deny();
             const normalized = opened.text.normalize("NFC");
+            if (indexRows) indexRows.push(Object.freeze({
+              objectId: opened.objectId, revision: opened.revision,
+              epoch: opened.epoch,
+              ciphertextDigestBase64: item.selected.ciphertextDigestBase64,
+              name: opened.name, mediaType: opened.mediaType, text: opened.text,
+            }));
             const hit = match(normalized.toLocaleLowerCase());
             if (hit >= 0) {
               const begin = Math.max(0, sourceOffsetForFolded(normalized, hit) - 44);
@@ -156,6 +168,16 @@
         }
       }
       live();
+      // All disposable CEKs have already been wiped by the per-revision finally.
+      // No partial plaintext is persisted if any verification or cancellation fails.
+      if (indexRows) {
+        const indexed = await input.onVerifiedBatch(Object.freeze(indexRows));
+        live();
+        if (indexed?.persistedIndex !== true
+          || indexed.indexedCount < indexRows.length
+          || indexed.plaintextSentToServer !== false
+          || indexed.authorizesMutation !== false) deny();
+      }
       return Object.freeze({ totalSearched: items.length,
         totalMatches: matches.length, matches: Object.freeze(matches),
         plaintextSentToServer: false, authorizesMutation: false });
