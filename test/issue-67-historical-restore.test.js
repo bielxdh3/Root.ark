@@ -268,6 +268,12 @@ test("#67: staged content hash rejects same-size edits with restored mtime and s
 test("#67: a restart cannot dispatch a signed restore whose file was not materialized", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
+  // Assert the expected missing name without following or reopening a
+  // checked target pathname. O_EXCL below remains the real atomic guard.
+  const assertNoMaterializedName = async () => {
+    const names = await fsp.readdir(f.local);
+    assert.equal(names.some((name) => name.toLowerCase() === "document.txt"), false);
+  };
   const old = Buffer.from("previous clean on-disk bytes");
   await fsp.writeFile(target, old);
   f.engine.snapshot.files["document.txt"] = {
@@ -282,7 +288,7 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
     throw new Error("simulated process halt after moving original to trash");
   };
   await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /simulated process halt/);
-  assert.equal(fs.existsSync(target), false);
+  await assertNoMaterializedName();
   assert.equal((await f.engine.journal.recover()).length, 1);
   f.adapter.list = async (id) => id ? structuredClone(f.current()) : [structuredClone(f.current())];
   const reopened = await new SyncEngine({
@@ -295,15 +301,15 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   await assert.rejects(reopened.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
   assert.equal(f.pushes(), 0, "an unmaterialized local restore must never be pushed after restart");
   assert.equal((await reopened.journal.recover()).length, 1);
-  assert.equal(fs.existsSync(target), false);
+  await assertNoMaterializedName();
   const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
   assert.equal(trash.length, 1);
   assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), old);
   // Explicit recovery is possible without a new signature: materialize the
   // exact authenticated pending bytes, then let the existing CAS path resume.
   // Manual recovery must never replace a file created by another writer
-  // between the absent-path assertion and this materialization. O_EXCL is
-  // the actual no-clobber boundary; a prior exists/lstat check is not.
+  // between directory enumeration and this materialization. O_EXCL is
+  // the actual no-clobber boundary; directory enumeration is only an assertion.
   const restoredBytes = protocol.decryptPayload(f.original, f.privateFileKey);
   let recoveryOutput;
   try {
