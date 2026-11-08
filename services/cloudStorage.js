@@ -386,7 +386,14 @@ function createCloudStorage(options = {}) {
     if (!enabled()) return [];
     // The opt-in owner-scoped migration probe MUST bound remote pages before
     // accumulating provider metadata; normal historical callers are unchanged.
-    const bounded = readOnlyBounds !== undefined;
+    // The backup must certify the full selected namespace, while historical
+    // direct inventory callers may still ignore objects moved to an old parent.
+    const backupComplete = readOnlyBounds !== null
+      && typeof readOnlyBounds === "object" && !Array.isArray(readOnlyBounds)
+      && Object.getPrototypeOf(readOnlyBounds) === Object.prototype
+      && Reflect.ownKeys(readOnlyBounds).length === 1
+      && readOnlyBounds.backupComplete === true;
+    const bounded = readOnlyBounds !== undefined && !backupComplete;
     if (bounded && (!readOnlyBounds || typeof readOnlyBounds !== "object"
       || Array.isArray(readOnlyBounds)
       || Reflect.ownKeys(readOnlyBounds).length !== 3
@@ -473,14 +480,20 @@ function createCloudStorage(options = {}) {
         pageSize: 100,
       }, bounded ? { signal: readOnlyBounds.abortSignal } : undefined);
       fence();
-      if (bounded && (!Array.isArray(page?.data?.files) || page.data.files.length > 100)) {
+      // Whole-backup inventory also certifies cloud_complete. A missing or
+      // malformed provider page must never look like an empty last page.
+      if (!Array.isArray(page?.data?.files) || page.data.files.length > 100) {
         throw cloudError("provider_error", "Incomplete Google Drive inventory page");
       }
-      for (const file of page.data.files || []) {
+      for (const file of page.data.files) {
         if (!Array.isArray(file.parents)) {
           throw cloudError("invalid_inventory_identity", "Drive object is missing its parent metadata");
         }
         if (!file.parents.includes(folder())) {
+          // The backup query selects this parent. A contradictory response
+          // cannot certify cloud_complete, even if a legacy inventory reader
+          // is allowed to ignore stale objects from a previous Drive parent.
+          if (backupComplete) throw cloudError("outside_configured_parent", "Drive backup inventory returned a foreign parent");
           if (bounded) throw cloudError("provider_error", "Foreign Drive parent in bounded inventory");
           continue;
         }
@@ -501,10 +514,16 @@ function createCloudStorage(options = {}) {
         if (!file.id) throw cloudError("invalid_inventory_identity", "Drive object is missing its identity");
         add({ provider, providerIdentity: String(file.id), id: String(file.id), ...parsed });
       }
-      token = page.data.nextPageToken;
-      if (bounded && token && (typeof token !== "string" || token.length > 4096
-        || visited.has(token))) throw cloudError("provider_error", "Repeated Drive inventory token");
-      if (bounded && token) visited.add(token);
+      const nextToken = page.data.nextPageToken;
+      if (nextToken != null && (typeof nextToken !== "string"
+        || !nextToken || nextToken.length > 4096)) {
+        throw cloudError("provider_error", "Invalid Drive inventory token");
+      }
+      if (nextToken && visited.has(nextToken)) {
+        throw cloudError("provider_error", "Repeated Drive inventory token");
+      }
+      token = nextToken || undefined;
+      if (token) visited.add(token);
     } while (token);
     return objects;
   }
