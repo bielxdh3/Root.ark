@@ -29,6 +29,7 @@ const HEAD_FIELDS = ["sequence", "head_digest", "enrollment_root",
 const HEX = /^[a-f0-9]{64}$/;
 const OPER = /^[a-z][a-z0-9:_-]{0,63}$/;
 const NOW = Date.now.bind(Date);
+const MONOTONIC_NOW_NS = process.hrtime.bigint.bind(process.hrtime);
 const MAX_LEASE_SERIAL = 100_000; // Bounded DEV-OFF journal; no unsafe reset/rotation.
 const STORED_FLOOR_FIELDS = [...HEAD_FIELDS, "journal_count", "journal_tip"];
 const dbPins = new WeakMap();
@@ -329,8 +330,12 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           for (const field of REQUEST_FIELDS) if (r[field] !== signed[field]) deny();
           const nextHead = validateHead(Object.fromEntries(
             HEAD_FIELDS.map(field => [field, signed[field]])));
+          // Sample monotonic time before wall time so any intervening delay
+          // consumes budget instead of enlarging the owner's signed lease.
+          const admittedNs = MONOTONIC_NOW_NS();
           const at = NOW();
-          if (nextHead.immutable_account_id !== minimum.immutable_account_id
+          if (!Number.isSafeInteger(at)
+            || nextHead.immutable_account_id !== minimum.immutable_account_id
             || nextHead.identity_digest !== minimum.identity_digest
             || nextHead.lease_serial !== minimum.lease_serial + 1
             || nextHead.sequence < minimum.sequence
@@ -390,8 +395,14 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           // check. Never issue a CURRENT attestation whose owner lease has
           // already expired; its durable nonce is consumed, so fail closed.
           const completedAt = NOW();
+          const elapsedNs = MONOTONIC_NOW_NS() - admittedNs;
+          // A partial wall-clock rollback can conceal a lease that expired
+          // while the synchronous signer was running. The monotonic elapsed
+          // budget catches this without trusting a second wall-clock value.
+          const remainingNs = (BigInt(r.lease_expires_at_ms) - BigInt(at)) * 1_000_000n;
           if (!Number.isSafeInteger(completedAt) || completedAt < issuedAt
-            || completedAt + 100 >= r.lease_expires_at_ms) deny();
+            || completedAt + 100 >= r.lease_expires_at_ms
+            || elapsedNs < 0n || elapsedNs + 100_000_000n >= remainingNs) deny();
           return { floor: { ...floor, signature } };
         } catch (_) {
           // SQLite fsync/commit ambiguity or unexpected sign failure must not

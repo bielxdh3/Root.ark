@@ -619,3 +619,65 @@ test("P2: an owner-authorized floor expiring during signing must never be return
   assert.equal(restarted.retainedMinimum().lease_serial, 2,
     "a fresh owner-signed lease resumes at the next durable journal serial");
 });
+
+test("P2: partial wall-clock rollback during signing cannot hide an elapsed owner lease", (t) => {
+  const x = setup(t, "signing-partial-clock-rollback");
+  const modulePath = require.resolve("../src/services/zk10DevOffMonotonicFloorCustodian");
+  const cached = require.cache[modulePath];
+  const genuineNow = Date.now;
+  const startedAt = genuineNow();
+  let wallNow = startedAt;
+  let createWithClock;
+  try {
+    // The module captures Date.now at import, just as a real OS clock can
+    // change after startup. Keep the injection private to this fresh module.
+    Date.now = () => wallNow;
+    delete require.cache[modulePath];
+    ({ createDevOffZk10MonotonicFloorCustodian: createWithClock } = require(modulePath));
+  } finally {
+    Date.now = genuineNow;
+    delete require.cache[modulePath];
+    if (cached) require.cache[modulePath] = cached;
+  }
+  const c = x.track(createWithClock(x.config));
+  const challenge = x.offer({ lease_expires_at_ms: startedAt + 2200 });
+  const originalSign = crypto.sign;
+  let custodianSignCalls = 0;
+  crypto.sign = (...args) => {
+    const signed = originalSign(...args);
+    if (args[2] === x.custodian.privateKey) {
+      custodianSignCalls++;
+      // Real time passes beyond expiry, but a partial clock rollback leaves
+      // the reported time AFTER issuedAt and BEFORE the expiry timestamp.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2550);
+      wallNow = startedAt + 500;
+    }
+    return signed;
+  };
+  try {
+    assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "a backwards wall-clock step cannot conceal expiry during synchronous Ed25519 signing");
+  } finally { crypto.sign = originalSign; }
+  assert.equal(custodianSignCalls, 1, "real custodian Ed25519 signing was delayed");
+  assert.ok(genuineNow() >= challenge.request.lease_expires_at_ms,
+    "the signed owner lease truly expired during the signing operation");
+  assert.ok(wallNow >= challenge.ownerLease.issued_at_ms
+    && wallNow + 100 < challenge.request.lease_expires_at_ms,
+  "wall-clock checks alone would incorrectly accept this partial rollback");
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  for (const file of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(db.prepare("SELECT lease_serial FROM floor WHERE singleton = 1")
+        .get().lease_serial, 1);
+    } finally { db.close(); }
+  }
+  c.close();
+  const restarted = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }));
+  const next = x.offer();
+  assert.equal(restarted.attest(next.request, next.ownerLease).floor.sequence, 1);
+  assert.equal(restarted.retainedMinimum().lease_serial, 2);
+});
