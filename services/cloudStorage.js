@@ -435,14 +435,25 @@ function createCloudStorage(options = {}) {
           || (page.IsTruncated !== Boolean(page.NextContinuationToken)))) {
           throw cloudError("provider_error", "Incomplete S3 inventory page");
         }
+        // Ordinary backup inventories also certify whole-account coverage.
+        // Never treat an explicitly truncated page with no continuation token
+        // as the final page: that would mark an incomplete ZIP cloud_complete.
+        const nextToken = page?.NextContinuationToken;
+        if (!page || (page.IsTruncated === true && !nextToken)
+          || (page.IsTruncated === false && Boolean(nextToken))) {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
+        if (nextToken != null && (typeof nextToken !== "string" || !nextToken
+          || nextToken.length > 4096)) {
+          throw cloudError("provider_error", "Invalid S3 inventory token");
+        }
+        if (nextToken && visited.has(nextToken)) throw cloudError("provider_error", "Repeated S3 inventory token");
         for (const object of page.Contents || []) {
           const parsed = parseInventoryKey(object.Key);
           add({ provider, providerIdentity: parsed.key, ...parsed });
         }
-        token = page.NextContinuationToken;
-        if (bounded && token && (typeof token !== "string" || token.length > 4096
-          || visited.has(token))) throw cloudError("provider_error", "Repeated S3 inventory token");
-        if (bounded && token) visited.add(token);
+        token = nextToken;
+        if (token) visited.add(token);
       } while (token);
       return objects;
     }

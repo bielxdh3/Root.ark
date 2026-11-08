@@ -67,6 +67,7 @@ async function runBackup(objects = [], options = {}) {
     enabled: () => options.enabled !== false,
     inventory: async () => {
       if (options.failInventory) throw new Error("inventory unavailable");
+      if (options.inventory) return options.inventory();
       return objects;
     },
     download: async (_folderId, name, target, area) => {
@@ -129,8 +130,33 @@ function syncBackup(entries) {
 test("authoritative cloud backup and restore matrix", async (t) => {
   await t.test("S3 global pagination", async () => {
     let page = 0;
-    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => page++ === 0 ? { Contents: [{ Key: "rootark/uploads/root/a.txt" }], NextContinuationToken: "next" } : { Contents: [{ Key: "rootark/uploads/orphan/b.txt" }] } }) });
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => page++ === 0 ? { IsTruncated: true, Contents: [{ Key: "rootark/uploads/root/a.txt" }], NextContinuationToken: "next" } : { IsTruncated: false, Contents: [{ Key: "rootark/uploads/orphan/b.txt" }] } }) });
     assert.equal((await storage.inventory()).length, 2);
+  });
+  await t.test("S3 repeated pagination token fails closed instead of looping", async () => {
+    let pages = 0;
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => {
+        pages += 1;
+        return { IsTruncated: true, NextContinuationToken: "same-token", Contents: [] };
+      } }) });
+    await assert.rejects(storage.inventory(), (error) => error.code === "provider_error");
+    assert.equal(pages, 2, "a repeated provider token must not trigger unlimited pagination");
+  });
+  await t.test("S3 truncated page without continuation cannot certify a complete ZIP", async () => {
+    let pages = 0;
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => {
+        pages += 1;
+        return { IsTruncated: true, Contents: [{ Key: "rootark/uploads/root/present.txt" }] };
+      } }) });
+    const result = await runBackup([object("present.txt")], { inventory: () => storage.inventory() });
+    assert.equal(pages, 1);
+    assert.equal(result.ok, false, "a partial provider page must never produce success/cloud_complete");
+    assert.equal(result.error.code, "provider_error", "incomplete inventory must use the retryable provider error boundary");
+    assert.deepEqual(result.zips, [], "no incomplete ZIP may survive");
+    assert.equal(result.history.some((entry) => entry.status === "success"), false);
+    assert.equal(result.history.some((entry) => entry.status === "failed"), true);
   });
   await t.test("Drive configured-namespace pagination", async () => {
     let page = 0;
