@@ -58,12 +58,15 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
       const persistToggle=dialog.querySelector('[data-zk1-field="catalog-batch-persist"]');
       const storedIndexButton=dialog.querySelector('[data-zk1-action="catalog-delta-index-search"]');
+      const indexPages=dialog.querySelector('[data-zk1-field="catalog-index-pages"]');
       if(!list||!target||!revision||!getButton||getButton.type!=="button"
         ||!batchButton||batchButton.type!=="button"
         ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked
         ||!persistToggle||persistToggle.type!=="checkbox"||persistToggle.checked
         ||!storedIndexButton||storedIndexButton.type!=="button"
-        ||storedIndexButton.disabled)
+        ||storedIndexButton.disabled||!indexPages
+        ||indexPages.getAttribute("role")!=="navigation"
+        ||indexPages.children.length!==0)
         throw Error("MISSING_EXPLICIT_PROTECTED_GET");
       persistToggle.click();
       if(!persistToggle.checked)throw Error("EXPLICIT_REVISION_INDEX_OPT_IN_DENIED");

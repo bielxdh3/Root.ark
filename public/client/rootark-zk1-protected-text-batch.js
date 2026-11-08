@@ -170,16 +170,23 @@
       live();
       // All disposable CEKs have already been wiped by the per-revision finally.
       // No partial plaintext is persisted if any verification or cancellation fails.
+      let indexChange = null;
       if (indexRows) {
         const indexed = await input.onVerifiedBatch(Object.freeze(indexRows));
         live();
         if (indexed?.persistedIndex !== true
           || indexed.indexedCount < indexRows.length
+          || !Number.isSafeInteger(indexed.discardedCount)
+          || indexed.discardedCount < 0
+          || typeof indexed.replacedIncompatibleIndex !== "boolean"
           || indexed.plaintextSentToServer !== false
           || indexed.authorizesMutation !== false) deny();
+        indexChange = { indexedDiscardedCount: indexed.discardedCount,
+          indexedReplacedIncompatible: indexed.replacedIncompatibleIndex };
       }
       return Object.freeze({ totalSearched: items.length,
         totalMatches: matches.length, matches: Object.freeze(matches),
+        ...(indexChange || {}),
         plaintextSentToServer: false, authorizesMutation: false });
     } catch (_) { deny(); }
   }

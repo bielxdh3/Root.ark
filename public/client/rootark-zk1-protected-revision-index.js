@@ -47,7 +47,7 @@
     from64(scope.keyring_id, 16);
     return scope;
   }
-  function context(input) {
+  async function context(input) {
     const { grant, ownerHead, baseline } = input;
     if (!grant || !ownerHead || !baseline
       || grant.revoked_at_epoch !== null
@@ -65,7 +65,12 @@
       || baseline.head.sequence < 1 || !digest.test(baseline.head.digest)
       || !Array.isArray(baseline.entries) || baseline.entries.length > 4096) deny();
     const scope = scopeOf(grant);
-    return { format: FORMAT, scope, deviceId: grant.device_id,
+    // A device can receive a newly signed grant at the same owner head.
+    // Bind cached text to the exact grant, including its permissions, rather
+    // than merely to device_id/manifest_revision/epoch.
+    const grantDigest = to64(new Uint8Array(await webCrypto.subtle.digest(
+      "SHA-256", encoder.encode(JSON.stringify(grant)))));
+    return { format: FORMAT, scope, deviceId: grant.device_id, grantDigest,
       ownerHead: { revision: ownerHead.revision, epoch: ownerHead.epoch,
         digest: ownerHead.digest },
       catalogHead: { sequence: baseline.head.sequence, digest: baseline.head.digest } };
@@ -76,7 +81,7 @@
   function checkRows(rows, baseline) {
     if (!Array.isArray(rows) || !rows.length || rows.length > MAX_ROWS) deny();
     const signed = new Map();
-    for (const entry of baseline.entries) {
+    for (const entry of baseline?.entries || []) {
       const key = entry.objectId + ":" + entry.revision;
       if (signed.has(key)) deny();
       signed.set(key, entry);
@@ -96,8 +101,8 @@
         || typeof row.text !== "string" || encoder.encode(row.text).length > 64 * 1024) deny();
       const key = row.objectId + ":" + row.revision;
       const original = signed.get(key);
-      if (seen.has(key) || !original || original.epoch !== row.epoch
-        || original.ciphertextDigestBase64 !== row.ciphertextDigestBase64) deny();
+      if (seen.has(key) || baseline && (!original || original.epoch !== row.epoch
+        || original.ciphertextDigestBase64 !== row.ciphertextDigestBase64)) deny();
       seen.add(key);
     }
     return rows;
@@ -170,6 +175,21 @@
       || !["account_id", "compartment_id", "keyring_id"]
         .every((name) => result.scope?.[name] === pinned.scope[name])) deny();
   }
+  async function verifiedOwnerGrant(input, pinned) {
+    // The caller independently re-imports and validates the current signed
+    // owner/grant evidence against its monotonic trust floor. Catalog CAS alone
+    // cannot detect a revoked device if its snapshot head has not changed.
+    live(input.assertLive);
+    if (typeof input.verifyOwnerGrant !== "function") deny();
+    const current = await input.verifyOwnerGrant();
+    live(input.assertLive);
+    if (current?.verifiedCurrent !== true
+      || !current.grant || current.grant.revoked_at_epoch !== null
+      || JSON.stringify(current.grant) !== JSON.stringify(input.grant)
+      || current.ownerHead?.revision !== pinned.ownerHead.revision
+      || current.ownerHead?.epoch !== pinned.ownerHead.epoch
+      || current.ownerHead?.digest !== pinned.ownerHead.digest) deny();
+  }
   async function openRows(record, pinned, secret, baseline) {
     if (!record || record.format !== FORMAT
       || record.context !== JSON.stringify(pinned)
@@ -183,12 +203,39 @@
       return checkRows(JSON.parse(decoder.decode(plaintext)), baseline);
     } finally { plaintext.fill(0); }
   }
+  function recordContext(record) {
+    if (typeof record?.context !== "string" || record.context.length > 2048) deny();
+    let stored;
+    try { stored = JSON.parse(record.context); } catch (_) { deny(); }
+    if (!stored || JSON.stringify(stored) !== record.context
+      || stored.format !== FORMAT || !stored.scope
+      || !Number.isSafeInteger(stored.catalogHead?.sequence)
+      || !digest.test(stored.catalogHead?.digest)) deny();
+    return stored;
+  }
+  function sameAuthority(previous, pinned) {
+    return previous.grantDigest === pinned.grantDigest
+      && previous.deviceId === pinned.deviceId
+      && JSON.stringify(previous.scope) === JSON.stringify(pinned.scope)
+      && JSON.stringify(previous.ownerHead) === JSON.stringify(pinned.ownerHead);
+  }
+  function signedRowSet(baseline) {
+    const signed = new Map();
+    for (const entry of baseline.entries) {
+      const key = entry.objectId + ":" + entry.revision;
+      if (signed.has(key)) deny();
+      signed.set(key, entry);
+    }
+    return signed;
+  }
   async function append(input) {
     try {
       live(input?.assertLive);
-      const pinned = context(input);
+      const pinned = await context(input);
+      live(input.assertLive);
       const incoming = checkRows(input.entries, input.baseline);
       if (incoming.length > 64) deny(); // One complete verified batch only.
+      await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
       const db = store(input.indexedDBImpl);
       const key = cacheKey(pinned.scope);
@@ -197,8 +244,34 @@
       if (record && (!opaque.test(record.nonce) || record.format !== FORMAT)) deny();
       const secret = await keyFor(input.metadataRaw, pinned.scope);
       live(input.assertLive);
-      const current = record?.context === JSON.stringify(pinned)
-        ? await openRows(record, pinned, secret, input.baseline) : [];
+      let current = [], discardedCount = 0, replacedIncompatibleIndex = false;
+      if (record) {
+        const previous = recordContext(record);
+        // A newly supplied signed-but-historical catalog or owner epoch must
+        // not roll back the scope's existing encrypted index version.
+        if (previous.catalogHead.sequence > pinned.catalogHead.sequence
+          || previous.catalogHead.sequence === pinned.catalogHead.sequence
+            && previous.catalogHead.digest !== pinned.catalogHead.digest
+          || previous.ownerHead?.epoch > pinned.ownerHead.epoch
+          || previous.ownerHead?.revision > pinned.ownerHead.revision) deny();
+        if (sameAuthority(previous, pinned)) {
+          // The old ciphertext is AEAD-authenticated to its original signed
+          // CAS head. On a new signed CAS, retain only exact surviving digests.
+          const original = await openRows(record, previous, secret, null);
+          const signed = signedRowSet(input.baseline);
+          current = original.filter((row) => {
+            const entry = signed.get(row.objectId + ":" + row.revision);
+            const retain = entry?.epoch === row.epoch
+              && entry.ciphertextDigestBase64 === row.ciphertextDigestBase64;
+            if (!retain) discardedCount++;
+            return retain;
+          });
+        } else {
+          // Old-format indexes cannot prove identical complete grant. Owner
+          // rotation and grant replacement must never import old plaintext.
+          replacedIncompatibleIndex = true;
+        }
+      }
       live(input.assertLive);
       const combined = new Map(current.map((row) => [row.objectId + ":" + row.revision, row]));
       for (const row of incoming) {
@@ -217,6 +290,7 @@
         secret, plain);
       } finally { plain.fill(0); }
       live(input.assertLive);
+      await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
       await db.save(key, { format: FORMAT, context: JSON.stringify(pinned),
         nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
@@ -224,6 +298,7 @@
       record?.nonce ?? null, input.assertLive);
       live(input.assertLive);
       return Object.freeze({ indexedCount: rows.length, persistedIndex: true,
+        discardedCount, replacedIncompatibleIndex,
         coverage: "owner-selected-revisions-only", plaintextSentToServer: false,
         authorizesMutation: false });
     } catch (_) { deny(); }
@@ -261,35 +336,56 @@
     try {
       live(input?.assertLive);
       const match = checkedMatcher(input.query, input.matchMode);
-      const pinned = context(input);
+      const pinned = await context(input);
+      live(input.assertLive);
+      await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
       const record = await store(input.indexedDBImpl).read(cacheKey(pinned.scope));
       live(input.assertLive);
       const secret = await keyFor(input.metadataRaw, pinned.scope);
       live(input.assertLive);
-      const rows = await openRows(record, pinned, secret, input.baseline);
+      let rows = await openRows(record, pinned, secret, input.baseline);
       live(input.assertLive);
+      await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
-      const entries = [];
-      let totalMatches = 0;
+      const matches = [];
       for (const row of rows) {
         const normalized = row.text.normalize("NFC");
         const at = match(normalized.toLocaleLowerCase());
         if (at >= 0) {
-          if (entries.length < PAGE) {
-            const start = Math.max(0, sourceOffsetForFolded(normalized, at) - 44);
-            entries.push(Object.freeze({ objectId: row.objectId, revision: row.revision,
-              name: row.name, mediaType: row.mediaType,
-              excerpt: normalized.slice(start, start + 160) }));
-          }
-          totalMatches++;
+          const start = Math.max(0, sourceOffsetForFolded(normalized, at) - 44);
+          matches.push(Object.freeze({ objectId: row.objectId, revision: row.revision,
+            name: row.name, mediaType: row.mediaType,
+            excerpt: normalized.slice(start, start + 160) }));
         }
       }
       live(input.assertLive);
-      return Object.freeze({ entries: Object.freeze(entries), indexedCount: rows.length,
-        totalMatches, pageSize: PAGE, hasMore: totalMatches > entries.length,
-        coverage: "owner-selected-revisions-only", plaintextSentToServer: false,
-        authorizesMutation: false });
+      const indexedCount = rows.length;
+      // Only bounded excerpts remain in the asynchronous page navigation
+      // closure; never retain all decrypted historical source text there.
+      rows = null;
+      const totalMatches = matches.length;
+      const paged = (offset) => {
+        if (!Number.isSafeInteger(offset) || offset < 0 || offset % PAGE !== 0
+          || offset > 100 || (offset !== 0 && offset >= totalMatches)) deny();
+        const entries = Object.freeze(matches.slice(offset, offset + PAGE));
+        return Object.freeze({ entries, indexedCount, totalMatches,
+          offset, pageSize: PAGE, hasMore: offset + entries.length < totalMatches,
+          hasNext: offset + entries.length < totalMatches,
+          hasPrevious: offset > 0,
+          coverage: "owner-selected-revisions-only", plaintextSentToServer: false,
+          authorizesMutation: false, readPage });
+      };
+      const readPage = async (offset) => {
+        try {
+          live(input.assertLive);
+          await verifiedOwnerGrant(input, pinned);
+          await verifiedHead(input, pinned);
+          live(input.assertLive);
+          return paged(offset);
+        } catch (_) { deny(); }
+      };
+      return paged(input.offset === undefined ? 0 : input.offset);
     } catch (_) { deny(); }
   }
   async function clear(input) {

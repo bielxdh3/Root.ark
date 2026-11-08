@@ -104,17 +104,38 @@ async function fixture(count = 2) {
     selected.push({ selected: entry, metadata, cekFile, cekSha256Pin: sha(rawCek) });
   }
   let rejected = false, verified = 0, gets = 0, requested = [];
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signed = () => crypto.sign(null, Buffer.from(JSON.stringify({
+    head: baseline.head, entries: baseline.entries,
+  })), signer.privateKey);
+  let signature = signed();
+  let trustedGrant = structuredClone(grant), trustedHead = structuredClone(ownerHead);
+  const ownerSigned = () => crypto.sign(null, Buffer.from(JSON.stringify({
+    grant: trustedGrant, ownerHead: trustedHead,
+  })), signer.privateKey);
+  let ownerSignature = ownerSigned();
   const client = {
     async verifyPrivateListingHead(...args) {
       requested.push(args);
       verified++;
       if (rejected) throw Error("REVOKED");
+      if (!crypto.verify(null, Buffer.from(JSON.stringify({
+        head: baseline.head, entries: baseline.entries,
+      })), signer.publicKey, signature)) throw Error("INVALID_SIGNED_CATALOG");
       return { scope, head: baseline.head };
     },
   };
   const database = memoryDB(), metadataRaw = crypto.randomBytes(32);
   const core = () => ({ grant, ownerHead, baseline, client,
     indexedDBImpl: database, metadataRaw,
+    async verifyOwnerGrant() {
+      const signed = crypto.verify(null, Buffer.from(JSON.stringify({
+        grant: trustedGrant, ownerHead: trustedHead,
+      })), signer.publicKey, ownerSignature);
+      if (!signed) throw Error("INVALID_OWNER_GRANT_SIGNATURE");
+      return { verifiedCurrent: true, grant: structuredClone(trustedGrant),
+        ownerHead: structuredClone(trustedHead) };
+    },
     assertLive() { if (rejected) throw Error("LOGOUT"); } });
   const scan = async (rows = selected, extras = {}) => {
     let final = null, lastCek = null;
@@ -137,8 +158,147 @@ async function fixture(count = 2) {
   return { scan, core, selected, checked, database, metadataRaw,
     get gets() { return gets; }, get verified() { return verified; },
     get requested() { return requested; },
-    revoke() { rejected = true; }, objectId };
+    revoke() { rejected = true; },
+    advanceCatalog({ removeRevision, changeRevisionDigest } = {}) {
+      baseline.head = { sequence: baseline.head.sequence + 1,
+        digest: b64(crypto.randomBytes(32)) };
+      if (removeRevision) baseline.entries = baseline.entries.filter((entry) =>
+        entry.revision !== removeRevision);
+      if (changeRevisionDigest) baseline.entries = baseline.entries.map((entry) =>
+        entry.revision === changeRevisionDigest ? {
+          ...entry, ciphertextDigestBase64: b64(crypto.randomBytes(32)),
+        } : entry);
+      signature = signed();
+    },
+    updateOwnerGrant(nextGrant, nextHead = ownerHead) {
+      trustedGrant = structuredClone(nextGrant);
+      trustedHead = structuredClone(nextHead);
+      ownerSignature = ownerSigned();
+    },
+    invalidateSignature() { baseline.head.sequence++; }, objectId };
 }
+
+test("unrelated valid signed catalog CAS advance preserves previously selected historical revisions", async () => {
+  const f = await fixture(3);
+  await f.scan([f.selected[0]]);
+  await f.scan([f.selected[1]]);
+  f.advanceCatalog();
+  const migrated = await f.scan([f.selected[2]]);
+  assert.equal(migrated.result.indexedDiscardedCount, 0);
+  const now = await index.search({ ...f.core(), query: "histórico" });
+  assert.equal(now.indexedCount, 3, "unchanged signed old row digests survive benign CAS");
+  assert.deepEqual(now.entries.map((row) => row.revision), [1, 2, 3]);
+});
+
+test("a removed or digest-diverged signed revision is explicitly excluded on CAS advance", async () => {
+  for (const change of [{ removeRevision: 1 }, { changeRevisionDigest: 1 }]) {
+    const f = await fixture(3);
+    await f.scan([f.selected[0]]);
+    f.advanceCatalog(change);
+    const migrated = await f.scan([f.selected[2]]);
+    assert.equal(migrated.result.indexedDiscardedCount, 1,
+      "removed or digest-diverged versions must be reported explicitly");
+    const now = await index.search({ ...f.core(), query: "histórico" });
+    assert.equal(now.indexedCount, 1);
+    assert.equal(now.entries[0].revision, 3);
+    const persisted = await f.scan([f.selected[1]]);
+    assert.equal(persisted.result.totalSearched, 1);
+    assert.equal(persisted.final.length, 1);
+    assert.equal(persisted.result.indexedDiscardedCount, 0);
+  }
+});
+
+test("new owner epoch/grant cannot inherit previous decrypted texts", async () => {
+  const f = await fixture(2);
+  await f.scan([f.selected[0]]);
+  const old = f.core();
+  f.advanceCatalog();
+  const grant = { ...old.grant, current_epoch: 4 };
+  const ownerHead = { ...old.ownerHead, epoch: 4 };
+  f.updateOwnerGrant(grant, ownerHead);
+  await assert.rejects(index.search({ ...old, grant, ownerHead, query: "histórico" }),
+    /ZK_REVISION_INDEX_DENIED/);
+  const replaced = await index.append({ ...old, grant, ownerHead, entries: [{
+    objectId: f.selected[1].selected.objectId,
+    revision: 2, epoch: 3,
+    ciphertextDigestBase64: f.selected[1].selected.ciphertextDigestBase64,
+    name: "safe", mediaType: "text/plain", text: "fresh",
+  }] });
+  assert.equal(replaced.indexedCount, 1);
+  assert.equal(replaced.replacedIncompatibleIndex, true);
+  const now = await index.search({ ...old, grant, ownerHead, query: "original" });
+  assert.equal(now.totalMatches, 0, "previous owner epoch text must not be inherited");
+  await assert.rejects(index.append({ ...old, entries: [{
+    objectId: f.selected[0].selected.objectId, revision: 1, epoch: 3,
+    ciphertextDigestBase64: f.selected[0].selected.ciphertextDigestBase64,
+    name: "old", mediaType: "text/plain", text: "historical proof",
+  }], verifyOwnerGrant: async () => ({
+    verifiedCurrent: true, grant: old.grant, ownerHead: old.ownerHead,
+  }) }), /ZK_REVISION_INDEX_DENIED/,
+  "even a previously signed owner/grant must not roll back a newer local epoch");
+});
+
+test("changed signed grant fields at unchanged owner head never inherit old index content", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const changedGrant = { ...f.core().grant, permission: "restricted-read" };
+  f.updateOwnerGrant(changedGrant);
+  const fresh = f.selected[1];
+  const result = await index.append({ ...f.core(), grant: changedGrant, entries: [{
+    objectId: fresh.selected.objectId, revision: fresh.selected.revision,
+    epoch: fresh.selected.epoch, ciphertextDigestBase64: fresh.selected.ciphertextDigestBase64,
+    name: "new grant", mediaType: "text/plain", text: "only-new-authorization",
+  }] });
+  assert.equal(result.replacedIncompatibleIndex, true);
+  assert.equal(result.indexedCount, 1);
+  const indexed = await index.search({ ...f.core(), grant: changedGrant,
+    query: "histórico" });
+  assert.equal(indexed.totalMatches, 0);
+});
+
+test("all 128 historical matches are reachable at offsets 0,50,100 after fresh signed CAS", async () => {
+  const f = await fixture(128);
+  await f.scan(f.selected.slice(0, 64));
+  await f.scan(f.selected.slice(64));
+  const first = await index.search({ ...f.core(), query: "histórico" });
+  assert.equal(first.offset, 0);
+  assert.equal(first.hasNext, true);
+  assert.equal(first.hasPrevious, false);
+  const second = await first.readPage(50);
+  const third = await first.readPage(100);
+  assert.deepEqual([first.entries.length, second.entries.length, third.entries.length], [50, 50, 28]);
+  assert.deepEqual([first.entries[0].revision, second.entries[0].revision,
+    third.entries[0].revision, third.entries.at(-1).revision], [1, 51, 101, 128]);
+  assert.equal(third.hasNext, false);
+  assert.equal(third.hasPrevious, true);
+  await assert.rejects(first.readPage(125), /ZK_REVISION_INDEX_DENIED/);
+  await assert.rejects(first.readPage(150), /ZK_REVISION_INDEX_DENIED/);
+  f.advanceCatalog();
+  await assert.rejects(first.readPage(50), /ZK_REVISION_INDEX_DENIED/,
+    "old pages are invalid after a freshly signed CAS change");
+});
+
+test("old pending page denied on session revocation and no unverified page emitted", async () => {
+  const f = await fixture(51);
+  await f.scan(f.selected);
+  const first = await index.search({ ...f.core(), query: "histórico" });
+  const verifiedBefore = f.verified;
+  await first.readPage(50);
+  assert.ok(f.verified > verifiedBefore);
+  f.revoke();
+  await assert.rejects(first.readPage(50), /ZK_REVISION_INDEX_DENIED/);
+});
+
+test("owner-signed grant revocation blocks old cached page although catalog CAS remains identical", async () => {
+  const f = await fixture(51);
+  await f.scan(f.selected);
+  const page = await index.search({ ...f.core(), query: "histórico" });
+  const originalHead = f.core().baseline.head.digest;
+  f.updateOwnerGrant({ ...f.core().grant, revoked_at_epoch: 3 });
+  assert.equal(f.core().baseline.head.digest, originalHead,
+    "catalog CAS deliberately unchanged while independent owner revokes grant");
+  await assert.rejects(page.readPage(50), /ZK_REVISION_INDEX_DENIED/);
+});
 
 test("two historical revisions persist after completed signed batch; later searches reverify CAS without CEKs", async () => {
   const f = await fixture();

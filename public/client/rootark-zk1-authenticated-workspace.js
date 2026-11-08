@@ -65,6 +65,7 @@
     if (target) target.textContent = "";
     const batch = field("catalog-delta-text-results");
     if (batch) batch.textContent = "";
+    field("catalog-index-pages")?.replaceChildren();
   }
   function from64(value) {
     if (typeof value !== "string" || !base64.test(value)) fail();
@@ -872,6 +873,7 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-index-search">Buscar nas revisões já indexadas (sem CEKs)</button></div>'
       + '<output data-zk1-field="catalog-batch-progress" role="status" aria-live="polite" aria-atomic="true"></output>'
       + '<pre data-zk1-field="catalog-delta-text-results" role="region" aria-label="Correspondências protegidas verificadas localmente"></pre>'
+      + '<div data-zk1-field="catalog-index-pages" class="zk1-workspace-actions" role="navigation" aria-label="Páginas do índice local cifrado"></div>'
       + '</fieldset>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
@@ -1206,6 +1208,34 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
+        const verifyCurrentIndexOwnerGrant = async (assertOperationLive) => {
+          assertOperationLive();
+          // Re-import owner/grant/history and independently check the device
+          // trust floor on EVERY index read, write and navigation page.
+          const current = await grantAndOwner();
+          assertOperationLive();
+          if (JSON.stringify(current.signedDeviceGrant)
+              !== JSON.stringify(trust.signedDeviceGrant)
+            || current.pinnedCurrentHead.revision !== trust.pinnedCurrentHead.revision
+            || current.pinnedCurrentHead.epoch !== trust.pinnedCurrentHead.epoch
+            || to64(current.pinnedCurrentHead.digest)
+              !== to64(trust.pinnedCurrentHead.digest)
+            || to64(current.independentOwnerSpkiSha256)
+              !== to64(trust.independentOwnerSpkiSha256)) fail();
+          await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+            ownerPublicKey: current.ownerPublicKey,
+            independentOwnerSpkiSha256: current.independentOwnerSpkiSha256,
+            pinnedCurrentHead: current.pinnedCurrentHead,
+            signedDeviceGrant: current.signedDeviceGrant,
+            ownerHistoryCheckpoint: current.ownerHistoryCheckpoint,
+            previousOwnerHistoryProof: current.previousOwnerHistoryProof,
+          });
+          assertOperationLive();
+          return { verifiedCurrent: true, grant: current.signedDeviceGrant,
+            ownerHead: { revision: current.pinnedCurrentHead.revision,
+              epoch: current.pinnedCurrentHead.epoch,
+              digest: to64(current.pinnedCurrentHead.digest) } };
+        };
         if (!["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search"].includes(action))
           field("catalog-delta-private-list")?.replaceChildren();
         if (["catalog-delta-trash", "catalog-delta-trash-inspect",
@@ -1480,10 +1510,14 @@
           return;
         }
         if (action === "catalog-delta-index-search") {
+          const originalQuery = field("catalog-batch-query")?.value;
+          const originalMatchMode = field("catalog-batch-all-terms")?.checked;
           const assertIndexLive = () => {
             assertLive();
             if (previewGeneration !== operationPreviewGeneration
-              || verifiedOpaqueDelta !== held) fail();
+              || verifiedOpaqueDelta !== held
+              || field("catalog-batch-query")?.value !== originalQuery
+              || field("catalog-batch-all-terms")?.checked !== originalMatchMode) fail();
           };
           if (!window.RootarkZk1ProtectedRevisionIndex?.search)
             await loadScript("rootark-zk1-protected-revision-index");
@@ -1493,32 +1527,84 @@
           let result;
           try {
             result = await window.RootarkZk1ProtectedRevisionIndex.search({
-              query: field("catalog-batch-query")?.value,
-              matchMode: field("catalog-batch-all-terms")?.checked ? "all-terms" : "phrase",
+              query: originalQuery,
+              matchMode: originalMatchMode ? "all-terms" : "phrase",
               grant: trust.signedDeviceGrant,
               ownerHead: { revision: trust.pinnedCurrentHead.revision,
                 epoch: trust.pinnedCurrentHead.epoch,
                 digest: to64(trust.pinnedCurrentHead.digest) },
               baseline: held.baseline, client: held.client, metadataRaw,
+              verifyOwnerGrant: () => verifyCurrentIndexOwnerGrant(assertIndexLive),
               indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
               assertLive: assertIndexLive,
             });
           } finally { metadataRaw.fill(0); }
           assertIndexLive();
-          if (result.plaintextSentToServer !== false
-            || result.authorizesMutation !== false
-            || result.coverage !== "owner-selected-revisions-only"
-            || !Array.isArray(result.entries)
-            || result.entries.length > 50
-            || result.totalMatches < result.entries.length
-            || result.indexedCount > 128) fail();
-          field("catalog-delta-text-results").textContent = result.entries.map((row) =>
-            row.name + " · revisão " + row.revision + "\n" + row.excerpt).join("\n\n")
-            || "Nenhuma correspondência nas revisões já indexadas.";
-          status("Índice local cifrado: " + result.totalMatches + " correspondência(s), "
-            + result.entries.length + " exibidas, de " + result.indexedCount
-            + " revisões selecionadas previamente. Cobertura parcial do histórico; "
-            + "CAS/grant revalidados, sem CEK nem consulta enviada ao servidor.");
+          const resultPane = field("catalog-delta-text-results");
+          const pages = field("catalog-index-pages");
+          if (!resultPane || !pages || typeof result.readPage !== "function") fail();
+          const validatePage = (page, offset) => {
+            if (page?.plaintextSentToServer !== false
+              || page.authorizesMutation !== false
+              || page.coverage !== "owner-selected-revisions-only"
+              || !Array.isArray(page.entries) || page.entries.length > 50
+              || page.totalMatches < page.entries.length
+              || page.indexedCount > 128 || page.indexedCount < page.totalMatches
+              || page.totalMatches !== result.totalMatches
+              || page.indexedCount !== result.indexedCount
+              || page.pageSize !== 50 || page.offset !== offset
+              || page.hasPrevious !== (offset > 0)
+              || page.hasNext !== (offset + page.entries.length < page.totalMatches)
+              || typeof page.readPage !== "function") fail();
+          };
+          let navigationGeneration = 0;
+          const renderPage = (page, offset) => {
+            validatePage(page, offset);
+            navigationGeneration++;
+            resultPane.textContent = page.entries.map((row) =>
+              row.name + " · revisão " + row.revision + "\n" + row.excerpt).join("\n\n")
+              || "Nenhuma correspondência nas revisões já indexadas.";
+            const navigation = document.createDocumentFragment();
+            const counter = document.createElement("span");
+            counter.textContent = "Resultados " + (page.entries.length ? offset + 1 : 0)
+              + "–" + (offset + page.entries.length) + " de " + page.totalMatches;
+            navigation.append(counter);
+            const addNav = (nextOffset, title) => {
+              const button = document.createElement("button");
+              button.type = "button";
+              button.className = "button button-quiet";
+              button.dataset.zk1IndexPage = title === "Anterior" ? "previous" : "next";
+              button.textContent = title;
+              button.addEventListener("click", async () => {
+                if (!pages.contains(button) || busy) return;
+                const generation = navigationGeneration;
+                try {
+                  assertIndexLive();
+                  button.disabled = true;
+                  const next = await result.readPage(nextOffset);
+                  if (generation !== navigationGeneration || !pages.contains(button)) return;
+                  assertIndexLive();
+                  if (busy) fail();
+                  renderPage(next, nextOffset);
+                } catch (_) {
+                  if (generation === navigationGeneration && pages.contains(button)) {
+                    clearLocalPreview();
+                    status("Página negada: CAS, grant, sessão ou consulta alterados.");
+                  }
+                } finally { button.disabled = false; }
+              });
+              navigation.append(button);
+            };
+            if (page.hasPrevious) addNav(offset - 50, "Anterior");
+            if (page.hasNext) addNav(offset + 50, "Próxima");
+            pages.replaceChildren(navigation);
+            status("Índice local cifrado: " + page.totalMatches + " correspondência(s), "
+              + (page.entries.length ? offset + 1 : 0) + "–"
+              + (offset + page.entries.length) + " exibidas, de " + page.indexedCount
+              + " revisões selecionadas previamente. Cobertura parcial; "
+              + "CAS/grant revalidados, sem CEK nem consulta enviada ao servidor.");
+          };
+          renderPage(result, 0);
           return;
         }
         if (action === "catalog-delta-text-search") {
@@ -1621,6 +1707,7 @@
                       epoch: trust.pinnedCurrentHead.epoch,
                       digest: to64(trust.pinnedCurrentHead.digest) },
                     baseline: held.baseline, client: held.client, metadataRaw,
+                    verifyOwnerGrant: () => verifyCurrentIndexOwnerGrant(assertBatchLive),
                     indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
                     assertLive: assertBatchLive,
                   });
@@ -1642,6 +1729,11 @@
               + result.totalSearched + " versões conferidas. "
               + (persistBatch ? "Lote completo acrescentado ao índice local cifrado. "
                 : "Conteúdo não persistido. ")
+              + (result.indexedDiscardedCount > 0
+                ? result.indexedDiscardedCount + " revisão(ões) anteriores removidas "
+                  + "por ausência ou digest diferente no novo catálogo assinado. " : "")
+              + (result.indexedReplacedIncompatible
+                ? "Índice anterior descartado por mudança de autoridade ou formato antigo. " : "")
               + "Nenhum texto/consulta/CEK enviado.");
           }
           return;
