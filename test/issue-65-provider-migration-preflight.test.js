@@ -78,7 +78,8 @@ test("existing S3 inventory adapter is consumed read-only using a disposable fak
         assert.equal(command.constructor.name, "ListObjectsV2Command");
         assert.equal(command.input.Bucket, "disposable-bucket");
         assert.equal(command.input.Prefix, "rootark/");
-        return { Contents: [{ Key: "rootark/uploads/folder/private-name.bin" }],
+        return { IsTruncated: false,
+          Contents: [{ Key: "rootark/uploads/folder/private-name.bin" }],
           NextContinuationToken: undefined };
       },
     }),
