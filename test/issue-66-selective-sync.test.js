@@ -187,6 +187,51 @@ test("issue 66: excluded paths are validated and match whole path segments only"
   assert.equal(await fsp.readFile(path.join(rootDir, "private", "secret.txt"), "utf8"), "secret");
 });
 
+test("issue 66 W22 P2: portable case alias of excluded folder never uploads local bytes after restart", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-posix-excluded-egress-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const root = path.join(dir, "device");
+  await fsp.mkdir(path.join(root, "PRIVATE"), { recursive: true });
+  await fsp.writeFile(path.join(root, "PRIVATE", "secret.txt"), "local confidential bytes");
+  await fsp.mkdir(path.join(root, "public"), { recursive: true });
+  await fsp.writeFile(path.join(root, "public", "safe.txt"), "public bytes");
+
+  for (let restart = 0; restart < 2; restart += 1) {
+    const client = await engine(root, adapter, key, { excludedPaths: ["private"] });
+    const summary = await client.syncOnce();
+    assert.equal(summary.pushed, restart === 0 ? 1 : 0,
+      "only the non-excluded public file may be uploaded, including after restart");
+    assert.equal(recordFor(store, "PRIVATE/secret.txt"), undefined);
+    assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "secret.txt"), "utf8"),
+      "local confidential bytes");
+  }
+  assert.equal(recordFor(store, "public/safe.txt")?.tombstone, false);
+});
+
+test("issue 66 W22 P2: portable excluded case aliases are remote-only and never hydrated", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-posix-excluded-ingress-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": "remote confidential bytes", "public/safe.txt": "public bytes" });
+  const remote = recordFor(store, "PRIVATE/secret.txt");
+  const root = path.join(dir, "device");
+
+  for (let restart = 0; restart < 2; restart += 1) {
+    const client = await engine(root, adapter, key, { excludedPaths: ["private"] });
+    const summary = await client.syncOnce();
+    assert.equal(summary.pushed, 0);
+    assert.equal(await exists(path.join(root, "PRIVATE", "secret.txt")), false);
+    assert.equal(client.snapshot.remoteOnly[remote.objectId].reason, "excluded");
+    assert.equal(await fsp.readFile(path.join(root, "public", "safe.txt"), "utf8"), "public bytes");
+  }
+  assert.equal(recordFor(store, "PRIVATE/secret.txt")?.tombstone, false);
+});
+
 async function exclusionFixture(t, name) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-issue66-${name}-`));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

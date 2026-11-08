@@ -741,7 +741,16 @@ class SyncEngine {
   }
 
   isExcluded(relativePath) {
-    return this.excludedPaths.some((excluded) => pathWithin(relativePath, excluded));
+    // Exclusion is a DENY policy, so apply the portable Windows case-fold
+    // comparison on POSIX too. Otherwise an excluded "private" silently
+    // permits "PRIVATE/secret.txt" to be uploaded or hydrated on Linux.
+    // Keep selectedPaths and object-identity comparisons platform-specific:
+    // those positive decisions must not gain access through a case alias.
+    const portablePath = relativePath.toLowerCase();
+    return this.excludedPaths.some((excluded) => {
+      const portableExcluded = excluded.toLowerCase();
+      return portablePath === portableExcluded || portablePath.startsWith(`${portableExcluded}/`);
+    });
   }
 
   isSelected(relativePath) {
