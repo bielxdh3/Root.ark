@@ -242,9 +242,12 @@
                 onPage: paging.onPage, onDenied: paging.onDenied });
             paging.onPage?.(page);
           } catch (_) {
-            // A revoked grant, changed CAS or stale session must remove names.
-            container.replaceChildren();
-            try { paging.onDenied?.(); } catch (_) { /* Fail closed. */ }
+            // Only the still-mounted page may clear results on denial.
+            // An older pending request must never erase a newer verified search.
+            if (container.contains(button)) {
+              container.replaceChildren();
+              try { paging.onDenied?.(); } catch (_) { /* Fail closed. */ }
+            }
           } finally { button.disabled = false; }
         });
         navigation.append(button);

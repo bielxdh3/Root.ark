@@ -126,6 +126,33 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       await sleep(40);
       if(pageReads!==1)throw Error("STALE_PAGE_NAVIGATION");
       active=true;
+      let rejectObsolete, staleDenials=0, currentSummary="old query";
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,readPage:()=>new Promise((_,reject)=>{rejectObsolete=reject;}),
+          onDenied:()=>{staleDenials++;currentSummary="old denied";}});
+      const obsoleteNext=list.querySelector('[data-zk1-page="next"]');
+      obsoleteNext.click();
+      if(typeof rejectObsolete!=="function")throw Error("OLD_PAGE_NOT_PENDING");
+      const fresh={...pageOne,name:"fresh authenticated query"};
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[fresh],target,verify,revision);
+      currentSummary="fresh query";
+      rejectObsolete(Error("OLD_CAS_REVOKED"));
+      await sleep(20);
+      if(!list.textContent.includes("fresh authenticated query")
+        ||staleDenials!==0||currentSummary!=="fresh query")
+        throw Error("STALE_REJECTION_ERASED_NEW_QUERY");
+      let rejectCurrent, currentDenials=0;
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,readPage:()=>new Promise((_,reject)=>{rejectCurrent=reject;}),
+          onDenied:()=>{currentDenials++;}});
+      list.querySelector('[data-zk1-page="next"]').click();
+      rejectCurrent(Error("CURRENT_GRANT_REVOKED"));
+      await sleep(20);
+      if(list.childNodes.length!==0||currentDenials!==1)
+        throw Error("CURRENT_REVOKED_PAGE_WAS_NOT_CLEARED");
       list.replaceChildren();
       getButton.click();
       for(let i=0;i<100;i++){
