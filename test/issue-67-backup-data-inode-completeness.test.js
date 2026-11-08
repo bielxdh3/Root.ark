@@ -61,7 +61,12 @@ for (const [kind, name] of [
     const result = runCase(kind, name);
     if (result.skipped) return t.skip("symlink unavailable: " + result.skipped);
     assert.equal(result.ok, false, JSON.stringify(result));
-    assert.match(result.error, /backup (?:data )?source.*(symbolic link|junction|regular file|unsupported filesystem entry)/i);
+    // The signed-history guard now rejects a noncanonical physical inode
+    // before the generic backup-source scanner can inspect the symlink.
+    const expected = name === "sync-objects.json"
+      ? /(?:backup (?:data )?source.*(?:symbolic link|junction|regular file|unsupported filesystem entry)|signed sync history must use the physical canonical data\/sync-objects\.json filename)/i
+      : /backup (?:data )?source.*(symbolic link|junction|regular file|unsupported filesystem entry)/i;
+    assert.match(result.error, expected);
     assert.deepEqual(result.zips, []);
     assert.equal(result.success, 0);
     assert.equal(result.failed, 1);
