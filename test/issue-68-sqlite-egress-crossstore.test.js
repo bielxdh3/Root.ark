@@ -2,6 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const http = require("node:http");
 const { fork } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -131,6 +132,77 @@ test("real concurrent BEGIN IMMEDIATE makes owner revoke unavailable, not denied
   assert.equal(f.b.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
     .get(f.grantId).revoked, 1);
 });
+
+test("real HTTP finish under SQLite writer lock retains terminal proof and reconciles lease", { timeout: 18000 },
+  async (t) => {
+    const f = fixture(t);
+    f.a.pragma("busy_timeout = 30");
+    let response;
+    let sending;
+    let arrived;
+    let observedFinish;
+    const ready = new Promise((resolve) => { arrived = resolve; });
+    const finished = new Promise((resolve) => { observedFinish = resolve; });
+    let finishedAt = false;
+    const server = http.createServer((_req, res) => {
+      response = res;
+      res.once("finish", () => { finishedAt = true; observedFinish(); });
+      // Real Node ServerResponse, no fake or freely resolved emit callback.
+      // Completion signal is linked exclusively to HTTP finish/close.
+      const emit = () => new Promise((resolve) => {
+        res.once("finish", resolve);
+        res.once("close", resolve);
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        arrived();
+      });
+      emit.abort = () => res.destroy();
+      sending = f.owner.emitTracked(f.scope, f.grantId, emit,
+        { ciphertextBase64: "ciphertext-only" }).then(
+        () => ({ ok: true }), (error) => ({ error: error.code || error.message }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => server.closeAllConnections());
+    t.after(() => server.close());
+    const received = new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${server.address().port}/`, (res) => {
+        let body = "";
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode, body }));
+        res.on("error", reject);
+      }).on("error", reject);
+    });
+    await ready;
+    assert.equal(f.b.prepare("SELECT count(*) AS pending FROM zk_content_share_egress " +
+      "WHERE grant_id=?").get(f.grantId).pending, 1);
+    f.b.exec("BEGIN IMMEDIATE");
+    try {
+      response.end("ciphertext-only");
+      await finished;
+      assert.equal((await received).status, 200);
+      const attempt = await sending;
+      assert.equal(attempt.error, "ZK_SHARE_UNAVAILABLE",
+        "release under true SQLITE_BUSY does not invent a successful cleanup");
+      assert.equal(f.b.prepare("SELECT count(*) AS pending FROM zk_content_share_egress " +
+        "WHERE grant_id=?").get(f.grantId).pending, 1);
+      assert.equal(finishedAt, true, "the HTTP application egress really finished");
+      const retained = [...f.owner.activeEgress.values()]
+        .flatMap((trackers) => [...trackers]);
+      assert.equal(retained.length, 1,
+        "a busy release must retain one local tracker instead of dropping proof");
+      assert.equal(retained[0].terminal, true,
+        "only the observed terminal HTTP transport can become reconcilable");
+    } finally { f.b.exec("ROLLBACK"); }
+    // An owner call after unlock must reconcile only the *proven terminal*
+    // local HTTP lease; it must not be stuck with an irrevocable orphan.
+    assert.deepEqual(await f.owner.revokeAndDrain(f.scope, f.grantId, "owner"),
+      { revoked: true });
+    assert.equal(f.a.prepare("SELECT count(*) AS pending FROM zk_content_share_egress " +
+      "WHERE grant_id=?").get(f.grantId).pending, 0);
+    assert.equal(f.owner.activeEgress.size, 0,
+      "successful reconciliation removes exactly the completed local tracker");
+    assert.equal(f.b.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(f.grantId).revoked, 1);
+  });
 
 test("throwing or rejecting emitter leaves durable lease until independently settled", async (t) => {
   for (const mode of ["sync", "async"]) {
