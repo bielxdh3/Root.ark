@@ -146,12 +146,17 @@ function storedSnapshot(dir) {
     catch (error) { if (error.code === "ENOENT") continue; throw error; }
     const walk = (folder, ancestors) => {
       assertAncestry(ancestors);
-      for (const name of fs.readdirSync(folder).sort()) {
+      const entries = fs.readdirSync(folder, { withFileTypes: true })
+        .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      for (const entry of entries) {
         assertAncestry(ancestors);
+        const name = entry.name;
         const absolute = path.join(folder, name);
         const relative = path.relative(dir, absolute).replaceAll("\\", "/");
-        const before = fs.lstatSync(absolute, { bigint: true });
-        if (before.isDirectory() && !before.isSymbolicLink()) {
+        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+          const before = fs.lstatSync(absolute, { bigint: true });
+          assert.ok(before.isDirectory() && !before.isSymbolicLink(),
+            `Snapshot directory changed: ${relative}`);
           result[relative] = "DIR";
           walk(absolute, [...ancestors, { folder: absolute, stat: before }]);
           assertAncestry(ancestors);
@@ -160,13 +165,19 @@ function storedSnapshot(dir) {
         // The snapshot is a security regression assertion, not permission to
         // follow a server-created link outside the isolated test directory.
         // Hash the verified file descriptor, never re-open the checked path.
-        assert.ok(before.isFile() && !before.isSymbolicLink() && before.nlink === 1n,
+        assert.ok(entry.isFile() && !entry.isSymbolicLink(),
           `Unexpected nonregular snapshot entry: ${relative}`);
         assertAncestry(ancestors);
+        // Open first, then inspect both the path and the same descriptor
+        // before reading any bytes. A stat(path) followed by open(path) can
+        // otherwise race even in a single-use disposable regression fixture.
         const fd = fs.openSync(absolute,
           fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
         try {
           const opened = fs.fstatSync(fd, { bigint: true });
+          const before = fs.lstatSync(absolute, { bigint: true });
+          assert.ok(before.isFile() && !before.isSymbolicLink() && before.nlink === 1n,
+            `Unexpected nonregular snapshot entry: ${relative}`);
           assert.ok(opened.isFile() && opened.nlink === 1n
             && opened.dev === before.dev && opened.ino === before.ino,
           `Snapshot file identity changed: ${relative}`);
@@ -187,7 +198,7 @@ function storedSnapshot(dir) {
   return result;
 }
 
-test("strict ingress snapshots reject root and nested junctions before reading external data", (t) => {
+test("strict ingress snapshots reject root, nested and leaf links before external open or read", (t) => {
   const base = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const scratch = fs.mkdtempSync(path.join(base, "zk10-snapshot-junction-"));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
@@ -207,7 +218,8 @@ test("strict ingress snapshots reject root and nested junctions before reading e
   const linkType = process.platform === "win32" ? "junction" : "dir";
   const assertNoExternalRead = (root) => {
     const read = fs.readFileSync;
-    let externalReads = 0;
+    const open = fs.openSync;
+    let externalReads = 0, externalOpens = 0;
     fs.readFileSync = function (file, ...args) {
       if (typeof file === "number") {
         const stat = fs.fstatSync(file, { bigint: true });
@@ -215,14 +227,29 @@ test("strict ingress snapshots reject root and nested junctions before reading e
       }
       return read.call(this, file, ...args);
     };
+    fs.openSync = function (file, ...args) {
+      const fd = open.call(this, file, ...args);
+      try {
+        const stat = fs.fstatSync(fd, { bigint: true });
+        if (externalIds.has(`${stat.dev}:${stat.ino}`)) externalOpens++;
+      } catch (error) { fs.closeSync(fd); throw error; }
+      return fd;
+    };
     try { assert.throws(() => storedSnapshot(root), /snapshot|nonregular|directory|symbolic/i); }
-    finally { fs.readFileSync = read; }
+    finally { fs.readFileSync = read; fs.openSync = open; }
+    assert.equal(externalOpens, 0, "snapshot must reject links before opening external canaries");
     assert.equal(externalReads, 0, "snapshot must reject junctions before reading external canaries");
   };
 
   fs.symlinkSync(outside, path.join(inside, "uploads"), linkType);
   assertNoExternalRead(inside);
   fs.rmSync(path.join(inside, "uploads"));
+
+  const uploads = path.join(inside, "uploads");
+  fs.mkdirSync(uploads);
+  fs.symlinkSync(canaries[0], path.join(uploads, "file-alias.txt"), "file");
+  assertNoExternalRead(inside);
+  fs.rmSync(path.join(uploads, "file-alias.txt"));
 
   const data = path.join(inside, "data");
   fs.mkdirSync(data);
