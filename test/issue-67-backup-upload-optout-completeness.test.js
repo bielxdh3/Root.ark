@@ -8,15 +8,22 @@ const test = require("node:test");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
+  // Fixed, data-free stage markers survive a spawnSync timeout. They let the
+  // parent distinguish slow test setup, backup creation, and a child that
+  // finished the ZIP assertions but did not exit (without printing fixtures).
+  const stage = (name) => fs.writeSync(2, `[backup-optout-stage:${name}]\n`);
+  stage("child-started");
   const dataDir = path.join(process.cwd(), "data");
   const uploadsDir = path.join(process.cwd(), "uploads");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(uploadsDir, { recursive: true });
   fs.writeFileSync(path.join(dataDir, "settings.json"), "{}");
   fs.writeFileSync(path.join(uploadsDir, "local-only.txt"), "local bytes");
+  stage("fixture-created");
 
   const backupService = require("../services/backupService");
   const unzipper = require("unzipper");
+  stage("modules-loaded");
   let inventoryCalls = 0;
   let downloadCalls = 0;
   backupService.setCloudStorage({
@@ -36,9 +43,12 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
   });
 
   (async () => {
+    stage("backup-started");
     const saved = await backupService.createBackup({ createdBy: "disposable-test" });
+    stage("backup-created");
     const zip = await unzipper.Open.file(path.join(dataDir, "backups", saved.filename));
     const manifest = JSON.parse((await zip.files.find((entry) => entry.path === "backup-manifest.json").buffer()).toString("utf8"));
+    stage("manifest-read");
     console.log(JSON.stringify({
       status: saved.status,
       cloudComplete: manifest.cloud_complete,
@@ -47,6 +57,7 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
       listed: manifest.included_files.map((entry) => entry.path),
       inventoryCalls, downloadCalls,
     }));
+    stage("child-completed");
   })().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
 } else {
   function runFixture(includeUploads) {
@@ -64,7 +75,13 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
           ROOTARK_TEST_UPLOAD_OPTOUT_CHILD: "1",
         },
       });
-      assert.equal(result.status, 0, result.stderr || result.error?.message || result.stdout);
+      assert.equal(result.status, 0, [
+        `child_exit=${String(result.status)}`,
+        `child_error=${result.error?.code || "none"}`,
+        `child_signal=${result.signal || "none"}`,
+        `child_json_emitted=${result.stdout?.trim().endsWith("}") === true}`,
+        result.stderr || "child_stage=unavailable",
+      ].join("\n"));
       return JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
     } finally {
       fs.rmSync(runtime, { recursive: true, force: true });
