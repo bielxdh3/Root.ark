@@ -438,6 +438,161 @@ test("issue 66 P2: previously completed v1 migration rechecks stranded local cas
   assert.equal(recordFor(store, "PRIVATE/secret.txt").tombstone, false);
 });
 
+test("issue 66 P2: case-only renamed excluded directory evicts verified clean bytes after dirty watch restart", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-rename-case-watch-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const verified = "independently verified original confidential bytes";
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": verified });
+  const root = path.join(dir, "device");
+  const oldDir = path.join(root, "PRIVATE");
+  const newDir = path.join(root, "private");
+  const first = await engine(root, adapter, key, { deviceId: "device-b" });
+  await first.syncOnce();
+  const tracked = first.snapshot.files["PRIVATE/secret.txt"];
+  const remoteBefore = recordFor(store, "PRIVATE/secret.txt");
+  first.snapshot.excludedPaths = ["private"];
+  first.snapshot.excludedPathsCasefoldVersion = 1;
+  await first.persistSnapshot();
+  await fsp.writeFile(path.join(oldDir, "secret.txt"), "local unsynced private changes");
+
+  const upgraded = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  assert.deepEqual((await upgraded.syncOnce()).excluded.kept,
+    [{ path: "PRIVATE/secret.txt", code: "local_changes_pending" }]);
+  assert.equal(upgraded.snapshot.pendingEvictions?.[tracked.objectId]?.code, "local_changes_pending");
+
+  await fsp.rename(oldDir, newDir);
+  if ((await fsp.readdir(root)).includes("PRIVATE")) {
+    const intermediate = path.join(root, "case-rename-stage");
+    await fsp.rename(oldDir, intermediate);
+    await fsp.rename(intermediate, newDir);
+  }
+  assert.ok((await fsp.readdir(root)).includes("private"), "the directory case must really change");
+  const renamedDirty = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  assert.deepEqual((await renamedDirty.syncOnce()).excluded?.kept,
+    [{ path: "PRIVATE/secret.txt", code: "local_changes_pending" }],
+    "case-only rename of a dirty file must preserve unsynced local edits");
+  assert.equal(renamedDirty.snapshot.pendingEvictions[tracked.objectId].localPath, "private/secret.txt");
+  const repeatedDirty = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  assert.equal((await repeatedDirty.syncOnce()).excluded, undefined,
+    "an unchanged dirty alias must not be repeatedly hashed");
+  assert.equal(await fsp.readFile(path.join(newDir, "secret.txt"), "utf8"),
+    "local unsynced private changes");
+  await fsp.writeFile(path.join(newDir, "secret.txt"), verified);
+
+  const restarted = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const summary = await restarted.syncOnce();
+  assert.equal(summary.excluded?.evicted, 1, "case-only rename must not strand verified local bytes");
+  assert.equal(summary.excluded?.released, 0, "physical aliased bytes must never be reported absent");
+  assert.equal(summary.pushed, 0);
+  assert.equal(await exists(path.join(newDir, "secret.txt")), false);
+  assert.equal(restarted.snapshot.files["PRIVATE/secret.txt"], undefined);
+  assert.equal(restarted.snapshot.remoteOnly[tracked.objectId]?.reason, "evicted");
+  assert.equal(restarted.snapshot.pendingEvictions, undefined);
+  const remoteAfter = recordFor(store, "PRIVATE/secret.txt");
+  assert.equal(remoteAfter.operationId, remoteBefore.operationId);
+  assert.equal(remoteAfter.tombstone, false, "a local exclusion must never send remote DELETE");
+  const repeated = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  assert.equal((await repeated.syncOnce()).excluded, undefined);
+});
+
+test("issue 66 P2 POSIX: ambiguous portable case aliases never cause local eviction or false release", async (t) => {
+  if (process.platform === "win32") return t.skip("Windows filesystem is case-insensitive");
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-ambiguous-case-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": "original protected bytes" });
+  const root = path.join(dir, "device");
+  const original = await engine(root, adapter, key, { deviceId: "device-b" });
+  await original.syncOnce();
+  original.snapshot.excludedPaths = ["private"];
+  original.snapshot.excludedPathsCasefoldVersion = 1;
+  await original.persistSnapshot();
+  const other = path.join(root, "private", "secret.txt");
+  await fsp.mkdir(path.dirname(other), { recursive: true });
+  await fsp.writeFile(other, "unrelated private bytes");
+  const migrated = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  await assert.rejects(migrated.syncOnce(), { code: "unsafe_path" });
+  assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "secret.txt"), "utf8"), "original protected bytes");
+  assert.equal(await fsp.readFile(other, "utf8"), "unrelated private bytes");
+  assert.equal(migrated.snapshot.files["PRIVATE/secret.txt"]?.deleted, false);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt")?.tombstone, false);
+});
+
+test("issue 66 P2 POSIX: a case alias outside positive selection is durably blocked", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX positive-selection boundaries are case-sensitive");
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-scope-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": "verified retained bytes" });
+  const root = path.join(dir, "device");
+  const legacy = await engine(root, adapter, key, {
+    deviceId: "device-b", selectedPaths: ["PRIVATE"],
+  });
+  await legacy.syncOnce();
+  const original = legacy.snapshot.files["PRIVATE/secret.txt"];
+  legacy.snapshot.excludedPaths = ["private"];
+  legacy.snapshot.excludedPathsCasefoldVersion = 1;
+  await legacy.persistSnapshot();
+  await fsp.rename(path.join(root, "PRIVATE"), path.join(root, "private"));
+  const args = { deviceId: "device-b", selectedPaths: ["PRIVATE"], excludedPaths: ["private"] };
+  const migrated = await engine(root, adapter, key, args);
+  const first = await migrated.syncOnce();
+  assert.deepEqual(first.excluded?.failed, [{ path: "PRIVATE/secret.txt", code: "path_not_selected" }]);
+  assert.equal(migrated.snapshot.pendingEvictions?.[original.objectId]?.attempts, 3);
+  const resumed = await engine(root, adapter, key, args);
+  const second = await resumed.syncOnce();
+  assert.deepEqual(second.excluded?.failed, [{ path: "PRIVATE/secret.txt", code: "path_not_selected" }]);
+  assert.equal(await fsp.readFile(path.join(root, "private", "secret.txt"), "utf8"), "verified retained bytes");
+  assert.equal(resumed.snapshot.files["PRIVATE/secret.txt"]?.objectId, original.objectId);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt")?.tombstone, false);
+});
+
+test("issue 66 P2: casefold alias is retained when the latest verified remote bytes diverge", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-remote-divergence-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const original = "original remote version";
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": original });
+  const root = path.join(dir, "device");
+  const previous = await engine(root, adapter, key, { deviceId: "device-b" });
+  await previous.syncOnce();
+  const tracked = previous.snapshot.files["PRIVATE/secret.txt"];
+  previous.snapshot.excludedPaths = ["private"];
+  previous.snapshot.excludedPathsCasefoldVersion = 1;
+  await previous.persistSnapshot();
+  const renamedDir = path.join(root, "private");
+  await fsp.rename(path.join(root, "PRIVATE"), renamedDir);
+  if ((await fsp.readdir(root)).includes("PRIVATE")) {
+    const intermediate = path.join(root, "case-stage-remote");
+    await fsp.rename(path.join(root, "PRIVATE"), intermediate);
+    await fsp.rename(intermediate, renamedDir);
+  }
+  const sourceFile = path.join(dir, "source", "PRIVATE", "secret.txt");
+  await fsp.writeFile(sourceFile, "newer remote version has different bytes");
+  const source = await engine(path.join(dir, "source"), adapter, key);
+  await source.syncOnce();
+  const remoteBefore = recordFor(store, "PRIVATE/secret.txt");
+  assert.notEqual(remoteBefore.operationId, tracked.operationId);
+
+  const migrated = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const result = await migrated.syncOnce();
+  assert.deepEqual(result.excluded?.failed,
+    [{ path: "PRIVATE/secret.txt", code: "remote_content_changed" }]);
+  assert.equal(migrated.snapshot.pendingEvictions[tracked.objectId].attempts, 3);
+  assert.equal(await fsp.readFile(path.join(renamedDir, "secret.txt"), "utf8"), original);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").operationId, remoteBefore.operationId);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").tombstone, false);
+});
+
 test("issue 66 P2: casefold migration retries eviction when a guarded sync operation settles", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-pending-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

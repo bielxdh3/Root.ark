@@ -341,6 +341,37 @@ async function canonicalRelativePath(rootDir, relativePath) {
   return path.relative(root, current).split(path.sep).join("/");
 }
 
+// Resolve a *negative* (excluded) tracked path on both NTFS and POSIX, where
+// the casing on disk may differ from the remote/snapshot identity. This never
+// confers selection or authorization: callers must verify both the tracked
+// key and physical alias before evicting. Reject ambiguous aliases and links;
+// cap each directory read so a damaged root cannot trigger an unbounded scan.
+async function uniqueExcludedPhysicalPath(rootDir, trackedPath) {
+  const safe = protocol.safeRelativePath(trackedPath, "path");
+  const root = path.resolve(rootDir);
+  await containedAbsolute(root, root, false);
+  const segments = safe.split("/");
+  let current = root;
+  for (let i = 0; i < segments.length; i += 1) {
+    let chosen = null;
+    let count = 0;
+    for await (const entry of await fsp.opendir(current)) {
+      if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+      if (entry.name.toLowerCase() !== segments[i].toLowerCase()) continue;
+      if (chosen !== null) fail("Ambiguous excluded portable case alias", "unsafe_path");
+      chosen = entry.name;
+    }
+    if (chosen === null) return null;
+    current = path.join(current, chosen);
+    const stats = await fsp.lstat(current, { bigint: true });
+    if (stats.isSymbolicLink() || (i < segments.length - 1 && !stats.isDirectory())) {
+      fail("Excluded path contains a link or non-directory parent", "unsafe_path");
+    }
+  }
+  await containedAbsolute(root, current, false);
+  return path.relative(root, current).split(path.sep).join("/");
+}
+
 function canonicalMapPath(relativePath, ...maps) {
   if (process.platform !== "win32") return relativePath;
   for (const map of maps) {
@@ -638,6 +669,15 @@ class SyncEngine {
             && (entry.code !== "local_changes_pending" || typeof entry.localVersionStamp !== "string"
               || !/^[a-f0-9]{64}$/.test(entry.localVersionStamp))) {
             fail("Invalid retained excluded-file version", "invalid_snapshot");
+          }
+          if (entry.localPath !== undefined) {
+            try {
+              protocol.safeRelativePath(entry.localPath, "localPath");
+              if (entry.code !== "local_changes_pending" || entry.localVersionStamp === undefined
+                || entry.localPath.toLowerCase() !== entry.path.toLowerCase()) {
+                fail("Invalid retained excluded-file path", "invalid_snapshot");
+              }
+            } catch { fail("Invalid retained excluded-file path", "invalid_snapshot"); }
           }
         }
       }
@@ -2276,17 +2316,30 @@ class SyncEngine {
     });
   }
 
-  async _evictLocal(relativePath) {
+  async _evictLocal(relativePath, excludedTrackedPath = null) {
     if (!this.opened) await this._open();
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
-    if (!this.isInScope(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
-    const prior = this.snapshot.files[safePath];
+    const snapshotPath = excludedTrackedPath === null
+      ? safePath : protocol.safeRelativePath(excludedTrackedPath, "trackedPath");
+    if (!this.isInScope(safePath) || !this.isInScope(snapshotPath)) {
+      fail("Only selected paths can be evicted", "path_not_selected");
+    }
+    if (excludedTrackedPath !== null) {
+      if (!this.isExcluded(safePath) || !this.isExcluded(snapshotPath)
+        || snapshotPath.toLowerCase() !== safePath.toLowerCase()
+        || Object.keys(this.snapshot.files).filter((candidate) =>
+          candidate.toLowerCase() === snapshotPath.toLowerCase()).length !== 1) {
+        fail("Excluded tracked path does not uniquely match the physical alias", "unsafe_path");
+      }
+    }
+    const prior = this.snapshot.files[snapshotPath];
     if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
     if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
       fail("Pinned file cannot be evicted before unpin", "file_pinned");
     }
     const pending = await this.journal.recover();
     if (pending.some((operation) => operation.objectId === prior.objectId
+      || operation.metadata?.path === snapshotPath || operation.metadata?.sourcePath === snapshotPath
       || operation.metadata?.path === safePath || operation.metadata?.sourcePath === safePath)) {
       fail("A pending sync operation prevents cache eviction", "sync_operation_pending");
     }
@@ -2303,7 +2356,9 @@ class SyncEngine {
       : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
     const remote = protocol.validateStoredOperation(remoteRecords[0]);
-    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
+    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId
+      || (excludedTrackedPath !== null ? remote.metadata.path !== snapshotPath
+        : !pathsEqual(remote.metadata.path, safePath))) {
       fail("Current remote object no longer matches the local cache", "remote_object_changed");
     }
     await this.verifyIncomingOperation(remote);
@@ -2347,7 +2402,7 @@ class SyncEngine {
     // without a durable record that the remote object is the only copy.
     this.snapshot.remoteOnly[prior.objectId] = {
       objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
-      revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
+      revision: remote.revision, path: snapshotPath, directory: false, deleted: false, reason: "evicted", hash,
     };
     try {
       await this.persistSnapshot();
@@ -2388,7 +2443,7 @@ class SyncEngine {
     }
     // The eviction is committed and the file is out of its path, so a failed cleanup only leaves the staged copy in the trash folder.
     await fsp.unlink(staged).catch(() => {});
-    if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
+    if (this.snapshot.files[snapshotPath]?.objectId === prior.objectId) delete this.snapshot.files[snapshotPath];
     await this.persistSnapshot();
     return true;
   }
@@ -2643,15 +2698,22 @@ class SyncEngine {
         report.failed.push({ path: relative, code: retry.code });
         continue;
       }
-      const target = await contained(this.rootDir, relative, true);
+      // A path may be renamed only by case after the migration watch was
+      // stored. A missing old-cased path on POSIX is not proof of no local
+      // bytes; on Windows the filesystem may canonicalize to a different key.
+      const physicalPath = await uniqueExcludedPhysicalPath(this.rootDir, relative);
+      const target = physicalPath === null ? null : await contained(this.rootDir, physicalPath, false);
       // A dirty legacy alias is kept until its local file metadata changes.
       // With no change, do not hash potentially large private bytes repeatedly.
       // The final eviction still compares complete remote and local content.
       let localVersionStamp = null;
-      try { localVersionStamp = evictionFileVersionStamp(await fsp.lstat(target, { bigint: true })); }
+      try {
+        if (target !== null) localVersionStamp = evictionFileVersionStamp(await fsp.lstat(target, { bigint: true }));
+      }
       catch { /* The guarded eviction below classifies the actual failure. */ }
       if (retry?.code === "local_changes_pending" && localVersionStamp
-        && localVersionStamp === retry.localVersionStamp) continue;
+        && localVersionStamp === retry.localVersionStamp
+        && physicalPath === retry.localPath) continue;
       if (pending.some((operation) => operation.objectId === prior.objectId
         || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
         // The pending operation must settle first. Preserve a dirty-file watch
@@ -2667,7 +2729,7 @@ class SyncEngine {
       }
       needsPersistence = true;
       delete pendingEvictions[prior.objectId];
-      if (!(await exists(target))) {
+      if (target === null || !(await exists(target))) {
         this.snapshot.remoteOnly[prior.objectId] = {
           objectId: prior.objectId, fileId: prior.fileId, versionId: prior.versionId, revision: prior.revision,
           path: relative, directory: false, deleted: false, reason: "excluded", ...(prior.hash ? { hash: prior.hash } : {}),
@@ -2677,25 +2739,36 @@ class SyncEngine {
         continue;
       }
       try {
-        await this._evictLocal(relative);
+        await this._evictLocal(physicalPath, relative);
         report.evicted += 1;
       } catch (error) {
         const code = error?.code || "unknown";
         // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
         // Dirty local edits are retained, and rechecked only after an observed
-        // local metadata change; all other nontransient failures are reported once.
-        if (TRANSIENT_EVICTION_CODES.has(code)) {
+        // local metadata change; other nontransient failures are durably quarantined.
+        if (TRANSIENT_EVICTION_CODES.has(code) || code === "cache_entry_unavailable") {
           const attempts = (retry?.attempts || 0) + 1;
           pendingEvictions[prior.objectId] = { path: relative, code, attempts };
           if (attempts >= MAX_EVICTION_ATTEMPTS) report.failed.push({ path: relative, code });
           else report.kept.push({ path: relative, code });
         } else if (code === "local_changes_pending" && localVersionStamp) {
           pendingEvictions[prior.objectId] = {
-            path: relative, code, attempts: 0, localVersionStamp,
+            path: relative, code, attempts: 0, localVersionStamp, localPath: physicalPath,
           };
           report.kept.push({ path: relative, code });
-        } else {
+        } else if (code === "sync_operation_pending") {
+          // An operation can arrive after the initial journal check. Retain
+          // its retry intent until the operation settles, as above.
+          pendingEvictions[prior.objectId] = { path: relative, code, attempts: 0 };
           report.kept.push({ path: relative, code });
+        } else {
+          // A rejected physical alias must never be considered migrated. A
+          // bounded durable failure remains visible across restarts without
+          // retrying an unsafe unlink or scanning the tree indefinitely.
+          pendingEvictions[prior.objectId] = {
+            path: relative, code, attempts: MAX_EVICTION_ATTEMPTS,
+          };
+          report.failed.push({ path: relative, code });
         }
       }
     }
