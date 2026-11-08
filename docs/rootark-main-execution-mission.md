@@ -324,3 +324,28 @@ flowchart LR
 ~~~
 
 O desenho separa **implementado → integrado → testado → bloqueado → Ready → merged**: nenhum caminho concede automaticamente a última transição. #291 Android e #288 restore seguem sem hardware físico/TOCTOU Windows absoluto; #228 continua CLOSED/UNMERGED e intocado. A proibição atual de merge, deploy e alterações diretas em `Root/main` permanece prevalente mesmo que um check se torne verde.
+
+## 2026-11-08 01:30 UTC — atualização operacional do fluxo
+
+Este é um corte **posterior** ao grafo das 01:01 UTC, cuja evidência histórica permanece intacta. O [ledger do novo corte](validation/2026-11-07-rootark-wave-execution-status.md#corte-operacional-adicional--2026-11-08-0130-utc) mantém separados commit local, revisão de fonte, publicação Draft, teste hospedado e critérios físicos.
+
+- **ZK10 #65/#302:** `23e748f61127132ef25d5269529c4c903d925df4` foi **integrado, testado Windows/Ubuntu, revisado independentemente no SHA exato e publicado em Draft**. Juntou reservas SQLite de ambos os stores em assinatura/leitura do piso e expiração monotônica mesmo com recuo de relógio. O [hosted Security Regression 42434051637](https://github.com/bielxdh3/Root.ark/actions/runs/42434051637) está **pendente** neste corte. Um novo caso de reentrância instrumentada revelou retorno indevido de `CURRENT` após poison interno: o candidato local forward-only `7ca680b4` passou testes, mas **não foi publicado nem revisado independentemente**. R1 off-host continua **bloqueada**.
+- **Backup #67/#298:** o [hosted Security Regression 42431780149](https://github.com/bielxdh3/Root.ark/actions/runs/42431780149) do HEAD `df3dbaef` registrou **Ubuntu SUCCESS / Windows mandatory FAILURE** no teste `upload-security.test.js`, caso 9, durante `Upload security boundary`; Windows canonical ainda estava em execução. O mesmo teste isolado passou no Windows local, sem prova de causa para a diferença. **Não Ready.**
+- **Compartilhamento #68/#293:** embora o SHA `eaabb9db` possua hosted SUCCESS, revisão independente encontrou **P2**: revoke pode confirmar HTTP 200 enquanto uma resposta de ciphertext previamente admitida permanece em egress. Um novo teste de socket/backpressure e a correção de drain estão em desenvolvimento isolado, sem publicação e sem alegar cancelamento de bytes que já chegaram ao cliente.
+- **P2P #242/#299:** o candidato de duplo hashing `f2f24684` continua **SOURCE NO-GO P2** por janela de mutação após segunda leitura e amplificação do I/O; sem publicação. A solução requer snapshot imutável/fencing efetivo, não um número arbitrário de releituras.
+
+~~~mermaid
+flowchart TD
+  A["#302 23e748f6: integrado / peer GO / Draft publicado"] --> B{"Hosted full 42434051637 SUCCESS?"}
+  B -->|Pendente ou não| C["Não Ready; corrigir gates"]
+  B -->|Sim| D{"R1 externa e owner-signed pré-upload comprovadas?"}
+  D -->|Não| E["DEV-OFF: bloqueado para cutover"]
+  F["#298 df3dbaef: Ubuntu GREEN / Windows mandatory RED"] --> G["Upload ordinal 9: causa em investigação"]
+  H["#293 eaabb9db: hosted GREEN"] --> I["#68 revogação durante egress: P2"]
+  J["#299 43a2af: Windows canonical RED"] --> K["Snapshot/Fencing: P2 e TURN físico ausentes"]
+  C --> L["Nenhum merge / deploy / Root/main"]
+  E --> L
+  G --> L
+  I --> L
+  K --> L
+~~~
