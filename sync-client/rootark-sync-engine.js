@@ -13,6 +13,10 @@ const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
+// v1 added portable case-folding on POSIX, but marked migration complete even
+// when a dirty legacy alias was retained. Revisit v1 snapshots under v2 so
+// an already-stranded alias gets a durable watch when its bytes become clean.
+const EXCLUDED_PATHS_CASEFOLD_VERSION = 2;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
 const ROOT_MUTATION_QUEUES = new Map();
@@ -251,6 +255,17 @@ function sameFileVersion(left, right) {
     && left.birthtimeNs === right.birthtimeNs && left.mode === right.mode;
 }
 
+// Track metadata changes to a deliberately retained dirty excluded file without
+// rereading or hashing its private content on every future sync. Any detected
+// change still goes through the full verified _evictLocal guard before eviction.
+function evictionFileVersionStamp(stats) {
+  if (!stats.isFile() || stats.isSymbolicLink()) return null;
+  return crypto.createHash("sha256").update([
+    stats.dev, stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs,
+    stats.birthtimeNs, stats.mode, stats.nlink,
+  ].map(String).join(":"), "utf8").digest("hex");
+}
+
 function isWithinPath(root, target) {
   const relative = path.relative(root, target);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -324,6 +339,135 @@ async function canonicalRelativePath(rootDir, relativePath) {
   }
   await containedAbsolute(root, current, true);
   return path.relative(root, current).split(path.sep).join("/");
+}
+
+// Resolve a *negative* (excluded) tracked path on both NTFS and POSIX, where
+// the casing on disk may differ from the remote/snapshot identity. This never
+// confers selection or authorization: callers must verify both the tracked
+// key and physical alias before evicting. Reject ambiguous aliases and links;
+// cap each directory read so a damaged root cannot trigger an unbounded scan.
+async function uniqueExcludedPhysicalPath(rootDir, trackedPath, directoryCache) {
+  const safe = protocol.safeRelativePath(trackedPath, "path");
+  const root = path.resolve(rootDir);
+  await containedAbsolute(root, root, false);
+  const segments = safe.split("/");
+  let current = root;
+  for (let i = 0; i < segments.length; i += 1) {
+    const directoryStats = await fsp.lstat(current, { bigint: true });
+    if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+      fail("Excluded path parent is not a regular directory", "unsafe_path");
+    }
+    // Cache only for this migration pass. Validate directory identity/version
+    // on every lookup; if a concurrent rename/create changes it, rescan.
+    // This avoids opening the same parent N times for N dirty sibling files.
+    let cached = directoryCache.get(current);
+    if (!cached || !sameFileVersion(cached.stats, directoryStats)) {
+      const names = new Map();
+      let count = 0;
+      for await (const entry of await fsp.opendir(current)) {
+        if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+        const key = entry.name.toLowerCase();
+        if (names.has(key)) names.set(key, null); // ambiguous portable alias
+        else names.set(key, entry.name);
+      }
+      const afterRead = await fsp.lstat(current, { bigint: true });
+      if (!sameFileVersion(directoryStats, afterRead)) {
+        fail("Excluded path directory changed during casefold lookup", "unsafe_path");
+      }
+      cached = { stats: afterRead, names };
+      directoryCache.set(current, cached);
+    }
+    const chosen = cached.names.get(segments[i].toLowerCase());
+    if (chosen === null) fail("Ambiguous excluded portable case alias", "unsafe_path");
+    if (chosen === undefined) return null;
+    current = path.join(current, chosen);
+    const stats = await fsp.lstat(current, { bigint: true });
+    if (stats.isSymbolicLink() || (i < segments.length - 1 && !stats.isDirectory())) {
+      fail("Excluded path contains a link or non-directory parent", "unsafe_path");
+    }
+  }
+  await containedAbsolute(root, current, false);
+  return path.relative(root, current).split(path.sep).join("/");
+}
+
+// After a successful, *fully verified* eviction the sync engine itself moved
+// a single cache file out of its parent directory and rewrote its own snapshot
+// in the root. Account for only those known local operations in the in-pass
+// index, rather than rescanning N siblings for each of N safe evictions.
+// All affected directories are independently re-enumerated before a migration
+// is certified complete; unknown additions/aliases never become authorized.
+async function observeVerifiedExcludedEviction(rootDir, physicalPath, directoryCache) {
+  const root = path.resolve(rootDir);
+  const target = path.resolve(root, ...protocol.safeRelativePath(physicalPath, "path").split("/"));
+  const parent = path.dirname(target);
+  const parentCache = directoryCache.get(parent);
+  if (!parentCache) fail("Verified eviction lost its physical directory index", "unsafe_path");
+  const basename = path.basename(target);
+  const casefold = basename.toLowerCase();
+  if (parentCache.names.get(casefold) !== basename || await exists(target)) {
+    fail("Verified eviction left an unexpected physical cache entry", "unsafe_path");
+  }
+  const afterParent = await fsp.lstat(parent, { bigint: true });
+  if (!afterParent.isDirectory() || !sameFileIdentity(parentCache.stats, afterParent)) {
+    fail("Verified eviction changed its parent directory identity", "unsafe_path");
+  }
+  parentCache.names.delete(casefold);
+  parentCache.stats = afterParent;
+  await refreshExcludedInternalRoot(root, directoryCache);
+}
+
+// stageExisting creates the dedicated trash directory *before* a rename. A
+// transient EBUSY can therefore leave that empty, safe internal directory
+// behind even when no eviction succeeded. Keep that one known root entry in
+// the in-pass index, but still compare the entire directory at the end.
+async function refreshExcludedInternalRoot(rootDir, directoryCache) {
+  const root = path.resolve(rootDir);
+  const rootCache = directoryCache.get(root);
+  if (!rootCache) return;
+  const afterRoot = await fsp.lstat(root, { bigint: true });
+  if (!afterRoot.isDirectory() || !sameFileIdentity(rootCache.stats, afterRoot)) {
+    fail("Excluded sync root identity changed", "unsafe_path");
+  }
+  const trash = path.join(root, ".rootark-trash");
+  if (await exists(trash)) {
+    const stats = await fsp.lstat(trash);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe sync trash path", "unsafe_path");
+    if (rootCache.names.has(".rootark-trash") && rootCache.names.get(".rootark-trash") !== ".rootark-trash") {
+      fail("Ambiguous sync trash path", "unsafe_path");
+    }
+    rootCache.names.set(".rootark-trash", ".rootark-trash");
+  }
+  rootCache.stats = afterRoot;
+}
+
+// The engine's own removals were the only names subtracted from the cache.
+// Compare against physical names once per directory after the batch: external
+// concurrent additions, case collisions and unexpected replacements fail
+// closed instead of being recorded as an entirely applied exclusion.
+async function verifyExcludedDirectoryIndexes(directoryCache) {
+  for (const [directory, cached] of directoryCache) {
+    const before = await fsp.lstat(directory, { bigint: true });
+    if (!before.isDirectory() || !sameFileIdentity(cached.stats, before)) {
+      fail("Excluded directory identity changed during batch", "unsafe_path");
+    }
+    const actual = new Map();
+    let count = 0;
+    for await (const entry of await fsp.opendir(directory)) {
+      if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+      const key = entry.name.toLowerCase();
+      if (actual.has(key)) fail("Ambiguous excluded portable case alias", "unsafe_path");
+      actual.set(key, entry.name);
+    }
+    const after = await fsp.lstat(directory, { bigint: true });
+    if (!sameFileVersion(before, after) || actual.size !== cached.names.size) {
+      fail("Excluded directory changed outside verified evictions", "unsafe_path");
+    }
+    for (const [key, name] of actual) {
+      if (cached.names.get(key) !== name) {
+        fail("Excluded directory names changed outside verified evictions", "unsafe_path");
+      }
+    }
+  }
 }
 
 function canonicalMapPath(relativePath, ...maps) {
@@ -610,11 +754,29 @@ class SyncEngine {
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
       }
+      if (parsed.excludedPathsCasefoldVersion !== undefined
+        && ![1, EXCLUDED_PATHS_CASEFOLD_VERSION].includes(parsed.excludedPathsCasefoldVersion)) {
+        fail("Unknown excluded sync policy version", "invalid_snapshot");
+      }
       if (parsed.pendingEvictions !== undefined) {
         if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || Array.isArray(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
         for (const entry of Object.values(parsed.pendingEvictions)) {
           if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
           try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
+          if (entry.localVersionStamp !== undefined
+            && (entry.code !== "local_changes_pending" || typeof entry.localVersionStamp !== "string"
+              || !/^[a-f0-9]{64}$/.test(entry.localVersionStamp))) {
+            fail("Invalid retained excluded-file version", "invalid_snapshot");
+          }
+          if (entry.localPath !== undefined) {
+            try {
+              protocol.safeRelativePath(entry.localPath, "localPath");
+              if (entry.code !== "local_changes_pending" || entry.localVersionStamp === undefined
+                || entry.localPath.toLowerCase() !== entry.path.toLowerCase()) {
+                fail("Invalid retained excluded-file path", "invalid_snapshot");
+              }
+            } catch { fail("Invalid retained excluded-file path", "invalid_snapshot"); }
+          }
         }
       }
       if (parsed.pinnedFiles !== undefined) {
@@ -741,7 +903,16 @@ class SyncEngine {
   }
 
   isExcluded(relativePath) {
-    return this.excludedPaths.some((excluded) => pathWithin(relativePath, excluded));
+    // Exclusion is a DENY policy, so apply the portable Windows case-fold
+    // comparison on POSIX too. Otherwise an excluded "private" silently
+    // permits "PRIVATE/secret.txt" to be uploaded or hydrated on Linux.
+    // Keep selectedPaths and object-identity comparisons platform-specific:
+    // those positive decisions must not gain access through a case alias.
+    const portablePath = relativePath.toLowerCase();
+    return this.excludedPaths.some((excluded) => {
+      const portableExcluded = excluded.toLowerCase();
+      return portablePath === portableExcluded || portablePath.startsWith(`${portableExcluded}/`);
+    });
   }
 
   isSelected(relativePath) {
@@ -2243,17 +2414,36 @@ class SyncEngine {
     });
   }
 
-  async _evictLocal(relativePath) {
+  async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null) {
     if (!this.opened) await this._open();
-    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
-    if (!this.isInScope(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
-    const prior = this.snapshot.files[safePath];
+    // The internal exclusion path was already case-resolved with a bounded
+    // directory index; do not enumerate the same Windows parent 640 times.
+    const safePath = excludedTrackedPath === null
+      ? await canonicalRelativePath(this.rootDir, relativePath)
+      : protocol.safeRelativePath(relativePath, "path");
+    const snapshotPath = excludedTrackedPath === null
+      ? safePath : protocol.safeRelativePath(excludedTrackedPath, "trackedPath");
+    if (!this.isInScope(safePath) || !this.isInScope(snapshotPath)) {
+      fail("Only selected paths can be evicted", "path_not_selected");
+    }
+    if (excludedTrackedPath !== null) {
+      if (!this.isExcluded(safePath) || !this.isExcluded(snapshotPath)
+        || snapshotPath.toLowerCase() !== safePath.toLowerCase()
+        || (trustedCasefoldIndex
+          ? trustedCasefoldIndex.get(snapshotPath.toLowerCase()) !== snapshotPath
+          : Object.keys(this.snapshot.files).filter((candidate) =>
+            candidate.toLowerCase() === snapshotPath.toLowerCase()).length !== 1)) {
+        fail("Excluded tracked path does not uniquely match the physical alias", "unsafe_path");
+      }
+    }
+    const prior = this.snapshot.files[snapshotPath];
     if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
     if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
       fail("Pinned file cannot be evicted before unpin", "file_pinned");
     }
     const pending = await this.journal.recover();
     if (pending.some((operation) => operation.objectId === prior.objectId
+      || operation.metadata?.path === snapshotPath || operation.metadata?.sourcePath === snapshotPath
       || operation.metadata?.path === safePath || operation.metadata?.sourcePath === safePath)) {
       fail("A pending sync operation prevents cache eviction", "sync_operation_pending");
     }
@@ -2270,7 +2460,9 @@ class SyncEngine {
       : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
     const remote = protocol.validateStoredOperation(remoteRecords[0]);
-    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
+    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId
+      || (excludedTrackedPath !== null ? remote.metadata.path !== snapshotPath
+        : !pathsEqual(remote.metadata.path, safePath))) {
       fail("Current remote object no longer matches the local cache", "remote_object_changed");
     }
     await this.verifyIncomingOperation(remote);
@@ -2314,7 +2506,7 @@ class SyncEngine {
     // without a durable record that the remote object is the only copy.
     this.snapshot.remoteOnly[prior.objectId] = {
       objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
-      revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
+      revision: remote.revision, path: snapshotPath, directory: false, deleted: false, reason: "evicted", hash,
     };
     try {
       await this.persistSnapshot();
@@ -2355,7 +2547,7 @@ class SyncEngine {
     }
     // The eviction is committed and the file is out of its path, so a failed cleanup only leaves the staged copy in the trash folder.
     await fsp.unlink(staged).catch(() => {});
-    if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
+    if (this.snapshot.files[snapshotPath]?.objectId === prior.objectId) delete this.snapshot.files[snapshotPath];
     await this.persistSnapshot();
     return true;
   }
@@ -2583,18 +2775,32 @@ class SyncEngine {
   async _applyExcludedPaths() {
     const applied = this.snapshot.excludedPaths || [];
     const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
+    // A pre-upgrade snapshot may claim that ["private"] was already applied
+    // while retaining tracked "PRIVATE/secret.txt" bytes on POSIX. Revisit
+    // those entries once even if the configured list has not changed.
+    const needsCasefoldMigration = this.excludedPaths.length > 0
+      && this.snapshot.excludedPathsCasefoldVersion !== EXCLUDED_PATHS_CASEFOLD_VERSION;
     this.snapshot.pendingEvictions = this.snapshot.pendingEvictions || {};
     const pendingEvictions = this.snapshot.pendingEvictions;
-    if (!listChanged && !Object.keys(pendingEvictions).length) return null;
+    if (!listChanged && !needsCasefoldMigration && !Object.keys(pendingEvictions).length) return null;
     const report = { evicted: 0, released: 0, kept: [], failed: [] };
+    let needsPersistence = listChanged || needsCasefoldMigration;
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
+    const directoryCache = new Map(); // never persist stale filesystem names across syncs
+    const snapshotCasefoldIndex = new Map();
+    for (const relative of Object.keys(this.snapshot.files)) {
+      const folded = relative.toLowerCase();
+      if (snapshotCasefoldIndex.has(folded)) snapshotCasefoldIndex.set(folded, null);
+      else snapshotCasefoldIndex.set(folded, relative);
+    }
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
       if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
       const retry = pendingEvictions[prior.objectId];
-      if (!listChanged && !retry) continue;
+      if (!listChanged && !needsCasefoldMigration && !retry) continue;
       excludedObjectIds.add(prior.objectId);
       if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
+        if (retry) needsPersistence = true;
         delete pendingEvictions[prior.objectId];
         report.kept.push({ path: relative, code: "file_pinned" });
         continue;
@@ -2603,14 +2809,38 @@ class SyncEngine {
         report.failed.push({ path: relative, code: retry.code });
         continue;
       }
-      delete pendingEvictions[prior.objectId];
+      // A path may be renamed only by case after the migration watch was
+      // stored. A missing old-cased path on POSIX is not proof of no local
+      // bytes; on Windows the filesystem may canonicalize to a different key.
+      const physicalPath = await uniqueExcludedPhysicalPath(this.rootDir, relative, directoryCache);
+      const target = physicalPath === null ? null : await contained(this.rootDir, physicalPath, false);
+      // A dirty legacy alias is kept until its local file metadata changes.
+      // With no change, do not hash potentially large private bytes repeatedly.
+      // The final eviction still compares complete remote and local content.
+      // A failed metadata probe provides NO safe version evidence. Abort this
+      // pass (preserving the durable dirty watch / pending migration marker)
+      // rather than converting an EIO into terminal local_changes_pending.
+      const localVersionStamp = target === null ? null
+        : evictionFileVersionStamp(await fsp.lstat(target, { bigint: true }));
+      if (retry?.code === "local_changes_pending" && localVersionStamp
+        && localVersionStamp === retry.localVersionStamp
+        && physicalPath === retry.localPath) continue;
       if (pending.some((operation) => operation.objectId === prior.objectId
         || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
+        // The pending operation must settle first. Preserve a dirty-file watch
+        // so an alias that became clean during that operation is not stranded.
+        if (!retry) {
+          pendingEvictions[prior.objectId] = {
+            path: relative, code: "sync_operation_pending", attempts: 0,
+          };
+          needsPersistence = true;
+        }
         report.kept.push({ path: relative, code: "sync_operation_pending" });
         continue;
       }
-      const target = await contained(this.rootDir, relative, true);
-      if (!(await exists(target))) {
+      needsPersistence = true;
+      delete pendingEvictions[prior.objectId];
+      if (target === null || !(await exists(target))) {
         this.snapshot.remoteOnly[prior.objectId] = {
           objectId: prior.objectId, fileId: prior.fileId, versionId: prior.versionId, revision: prior.revision,
           path: relative, directory: false, deleted: false, reason: "excluded", ...(prior.hash ? { hash: prior.hash } : {}),
@@ -2620,31 +2850,63 @@ class SyncEngine {
         continue;
       }
       try {
-        await this._evictLocal(relative);
+        await this._evictLocal(physicalPath, relative, snapshotCasefoldIndex);
+        await observeVerifiedExcludedEviction(this.rootDir, physicalPath, directoryCache);
         report.evicted += 1;
       } catch (error) {
+        await refreshExcludedInternalRoot(this.rootDir, directoryCache);
         const code = error?.code || "unknown";
         // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
-        // Other failures, including local edits, are reported once and never retried.
-        if (TRANSIENT_EVICTION_CODES.has(code)) {
+        // Dirty local edits are retained, and rechecked only after an observed
+        // local metadata change; other nontransient failures are durably quarantined.
+        if (TRANSIENT_EVICTION_CODES.has(code) || code === "cache_entry_unavailable") {
           const attempts = (retry?.attempts || 0) + 1;
           pendingEvictions[prior.objectId] = { path: relative, code, attempts };
           if (attempts >= MAX_EVICTION_ATTEMPTS) report.failed.push({ path: relative, code });
           else report.kept.push({ path: relative, code });
-        } else {
+        } else if (code === "local_changes_pending" && localVersionStamp) {
+          pendingEvictions[prior.objectId] = {
+            path: relative, code, attempts: 0, localVersionStamp, localPath: physicalPath,
+          };
           report.kept.push({ path: relative, code });
+        } else if (code === "sync_operation_pending") {
+          // An operation can arrive after the initial journal check. Retain
+          // its retry intent until the operation settles, as above.
+          pendingEvictions[prior.objectId] = { path: relative, code, attempts: 0 };
+          report.kept.push({ path: relative, code });
+        } else {
+          // A rejected physical alias must never be considered migrated. A
+          // bounded durable failure remains visible across restarts without
+          // retrying an unsafe unlink or scanning the tree indefinitely.
+          pendingEvictions[prior.objectId] = {
+            path: relative, code, attempts: MAX_EVICTION_ATTEMPTS,
+          };
+          report.failed.push({ path: relative, code });
         }
       }
     }
     // Drop retry records for objects that are no longer tracked as excluded local files.
     for (const objectId of Object.keys(pendingEvictions)) {
-      if (!excludedObjectIds.has(objectId)) delete pendingEvictions[objectId];
+      if (!excludedObjectIds.has(objectId)) {
+        delete pendingEvictions[objectId];
+        needsPersistence = true;
+      }
     }
+    await verifyExcludedDirectoryIndexes(directoryCache);
+    if (!needsPersistence) return report.failed.length || report.kept.length ? report : null;
     if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
     else delete this.snapshot.pendingEvictions;
     // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
-    if (this.excludedPaths.length) this.snapshot.excludedPaths = [...this.excludedPaths];
-    else delete this.snapshot.excludedPaths;
+    if (this.excludedPaths.length) {
+      this.snapshot.excludedPaths = [...this.excludedPaths];
+      // Every tracked entry has been checked. Locally dirty legacy aliases
+      // retain a durable version watch until safely evicted, while pinned
+      // entries remain under explicit retention and unpin retry semantics.
+      this.snapshot.excludedPathsCasefoldVersion = EXCLUDED_PATHS_CASEFOLD_VERSION;
+    } else {
+      delete this.snapshot.excludedPaths;
+      delete this.snapshot.excludedPathsCasefoldVersion;
+    }
     await this.persistSnapshot();
     return report;
   }
