@@ -76,3 +76,20 @@ for (const name of [".", ".."]) {
     assert.deepEqual(result.downloads, [], "reject unsafe remote names before downloading");
   });
 }
+
+test("cloud alternate-data-stream filename is rejected on Windows before staging", () => {
+  const entryPath = "uploads/normal.txt:alternate";
+  const result = runCloudFixture(["normal.txt:alternate"]);
+  if (process.platform !== "win32") {
+    assert.equal(result.created, true, JSON.stringify(result));
+    assert.equal(result.payloads[entryPath], "distinct remote bytes 0");
+    assert.equal(result.success, 1);
+    return;
+  }
+  assert.equal(result.created, false, JSON.stringify(result));
+  assert.match(result.error, /unsafe path/i);
+  assert.deepEqual(result.zips, []);
+  assert.equal(result.success, 0);
+  assert.equal(result.failed, 1);
+  assert.deepEqual(result.downloads, [], "never write alternate data streams to a Windows stage path");
+});

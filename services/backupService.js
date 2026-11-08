@@ -543,6 +543,7 @@ async function collectBackupFiles(options = {}) {
     if (!folderId || folderId === "." || folderId === ".." || /[\\\\/]/.test(folderId)) throw new Error("Cloud backup inventory contains an unsafe folder");
     if (!name || name !== path.basename(name) || /[\\/]/.test(name) || isSensitivePath(`${remote.area}/${folderId}/${name}`)) throw new Error("Cloud backup inventory contains an unsafe path");
     if (name === "." || name === "..") throw new Error("Cloud backup inventory contains an unsafe path");
+    if (process.platform === "win32" && name.includes(":")) throw new Error("Cloud backup inventory contains an unsafe path");
     const entryPath = normalizeEntryPath(path.posix.join(remote.area, folderId === "root" ? "" : folderId, name));
     if (restoreProviderOrphans.isSuppressed(folderId, name, remote.area, suppressionSnapshot)) continue;
     const key = collisionKey(entryPath);
