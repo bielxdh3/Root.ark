@@ -428,6 +428,10 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
             if (NOW() + 100 >= r.lease_expires_at_ms) deny();
             if (!same(next, read(anchor, ownerHash, signerHash))
               || !same(next, read(main, ownerHash, signerHash, true))) deny();
+            // A synchronous signer hook can reenter retainedMinimum(), fail
+            // its nested reservation and poison this instance. Such a failure
+            // must never be swallowed into a successful signed CURRENT.
+            if (closed || poisoned) deny();
             return signedFloor;
           });
           // Signing and final DB checks can stall after the pre-sign expiry
@@ -439,7 +443,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           // while the synchronous signer was running. The monotonic elapsed
           // budget catches this without trusting a second wall-clock value.
           const remainingNs = (BigInt(r.lease_expires_at_ms) - BigInt(at)) * 1_000_000n;
-          if (!Number.isSafeInteger(completedAt) || completedAt < issuedAt
+          if (closed || poisoned || !Number.isSafeInteger(completedAt) || completedAt < issuedAt
             || completedAt + 100 >= r.lease_expires_at_ms
             || elapsedNs < 0n || elapsedNs + 100_000_000n >= remainingNs) deny();
           return { floor: { ...floor, signature } };

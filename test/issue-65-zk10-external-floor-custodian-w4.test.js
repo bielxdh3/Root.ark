@@ -946,3 +946,51 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
   assert.equal(restarted.attest(next.request, next.ownerLease).floor.sequence, 1);
   assert.equal(restarted.retainedMinimum().lease_serial, 2);
 });
+
+test("P2: reentrant retainedMinimum failure during genuine signing cannot escape a poisoned custodian", (t) => {
+  const x = setup(t, "reentrant-poison-sign");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const signed = x.offer({ sequence: 2, head_digest: sha(42), enrollment_root: sha(43) });
+  const realSign = crypto.sign;
+  let signedByCustodian = false, reentrantDenied = false;
+  crypto.sign = (algorithm, data, key, ...rest) => {
+    const proof = realSign(algorithm, data, key, ...rest);
+    if (key === x.custodian.privateKey && Buffer.isBuffer(data)
+      && data.subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
+      signedByCustodian = true;
+      // A synchronous instrumented signer reenters the same custodian while
+      // BOTH outer BEGIN IMMEDIATE reservations are held. A nested BEGIN on
+      // that handle fails; retainedMinimum() poisons it. Swallowing that
+      // nested failure must not let the outer CURRENT signature escape.
+      try { c.retainedMinimum(); }
+      catch (error) {
+        assert.equal(error.code, "ZK10_CUSTODIAN_UNAVAILABLE");
+        reentrantDenied = true;
+      }
+    }
+    return proof;
+  };
+  try {
+    assert.throws(() => c.attest(signed.request, signed.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "an already-poisoned instance must not return a signed CURRENT");
+  } finally { crypto.sign = realSign; }
+  assert.equal(signedByCustodian, true, "a real custodian Ed25519 signature was computed");
+  assert.equal(reentrantDenied, true, "the nested operation rejected and poisoned the instance");
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  for (const file of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(db.prepare("SELECT lease_serial FROM floor WHERE singleton = 1")
+        .get().lease_serial, 1, "committed serial must not roll back on nested failure");
+    } finally { db.close(); }
+  }
+  c.close();
+  const refreshed = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }));
+  assert.equal(refreshed.retainedMinimum().lease_serial, 1);
+  const next = x.offer({ sequence: 2, head_digest: sha(42), enrollment_root: sha(43) });
+  assert.ok(refreshed.attest(next.request, next.ownerLease).floor.signature);
+  assert.equal(refreshed.retainedMinimum().lease_serial, 2);
+});
