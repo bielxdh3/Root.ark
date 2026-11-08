@@ -177,6 +177,39 @@ test("authoritative cloud backup and restore matrix", async (t) => {
       assert.equal(result.history.some((entry) => entry.status === "failed"), true);
     });
   }
+  for (const [label, contents] of [
+    ["number-zero", 0], ["empty-string", ""], ["null", null], ["object", {}],
+  ]) {
+    await t.test(`S3 non-array Contents ${label} cannot certify a complete backup ZIP`, async () => {
+      let pages = 0;
+      const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+        createS3Client: async () => ({ send: async () => {
+          pages += 1;
+          return { IsTruncated: false, Contents: contents };
+        } }) });
+      const result = await runBackup([], { inventory: () => storage.inventory() });
+      assert.equal(pages, 1);
+      assert.equal(result.ok, false, "malformed provider Contents must not produce a success ZIP");
+      assert.equal(result.error.code, "provider_error");
+      assert.deepEqual(result.zips, [], "unverified cloud inventory must not leave a ZIP");
+      assert.equal(result.history.some((entry) => entry.status === "success"), false);
+      assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+    });
+  }
+  await t.test("S3 valid final empty inventory page may omit Contents", async () => {
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => ({ IsTruncated: false }) }) });
+    const result = await runBackup([], { inventory: () => storage.inventory() });
+    assert.equal(result.ok, true);
+    assert.equal(result.manifest.cloud_complete, true);
+  });
+  await t.test("S3 valid final empty inventory page accepts empty Contents array", async () => {
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => ({ IsTruncated: false, Contents: [] }) }) });
+    const result = await runBackup([], { inventory: () => storage.inventory() });
+    assert.equal(result.ok, true);
+    assert.equal(result.manifest.cloud_complete, true);
+  });
   await t.test("Drive configured-namespace pagination", async () => {
     let page = 0;
     const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" }, createGoogleDriveClient: async () => ({ files: { list: async () => page++ === 0 ? { data: { files: [{ id: "a", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/root/a.txt", rootArkFolderId: "root", rootArkArea: "uploads" } }], nextPageToken: "next" } } : { data: { files: [{ id: "b", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/orphan/b.txt", rootArkFolderId: "orphan", rootArkArea: "uploads" } }] } } } }) });

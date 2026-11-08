@@ -432,8 +432,13 @@ function createCloudStorage(options = {}) {
         if (!page || typeof page.IsTruncated !== "boolean") {
           throw cloudError("provider_error", "Incomplete S3 inventory page");
         }
-        if (bounded && ((page.Contents !== undefined && !Array.isArray(page.Contents))
-          || (page.Contents || []).length > 1000
+        // A malformed Contents value must not masquerade as an empty bucket
+        // in the ordinary unbounded backup path and certify cloud_complete.
+        // AWS can omit Contents for a genuinely empty page.
+        if (page.Contents !== undefined && !Array.isArray(page.Contents)) {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
+        if (bounded && ((page.Contents || []).length > 1000
           || (page.IsTruncated !== Boolean(page.NextContinuationToken)))) {
           throw cloudError("provider_error", "Incomplete S3 inventory page");
         }
