@@ -15,9 +15,11 @@ const id = () => b64(crypto.randomBytes(16));
 function memoryDB() {
   const rows = new Map();
   let ready = false, readonlySnapshot = null, beforeWriteGet = null;
+  let afterQueuedPut = null;
   return { rows, forceStaleReadonlySnapshot(record) {
     readonlySnapshot = record === null ? null : structuredClone(record);
-  }, beforeWriteReadOnce(callback) { beforeWriteGet = callback; }, open(_name, version) {
+  }, beforeWriteReadOnce(callback) { beforeWriteGet = callback; },
+    afterQueuedPutOnce(callback) { afterQueuedPut = callback; }, open(_name, version) {
     assert.equal(version, 1);
     const request = {};
     const db = {
@@ -26,8 +28,17 @@ function memoryDB() {
       close() {},
       transaction(name, mode) {
         assert.equal(name, "revisions");
-        let pending = 0, aborted = false;
-        const tx = { abort() { aborted = true; queueMicrotask(() => tx.onabort?.()); },
+        let pending = 0, aborted = false, lastWrite = null;
+        const tx = { abort() {
+          aborted = true;
+          // The disposable fixture models IndexedDB's rollback on abort,
+          // even if the put request was acknowledged inside this transaction.
+          if (lastWrite && rows.get(lastWrite.key) === lastWrite.inserted) {
+            if (lastWrite.previous === undefined) rows.delete(lastWrite.key);
+            else rows.set(lastWrite.key, lastWrite.previous);
+          }
+          queueMicrotask(() => tx.onabort?.());
+        },
           objectStore() {
             function action(fn) {
               const req = {};
@@ -52,7 +63,19 @@ function memoryDB() {
             }); },
               put(value, key) {
                 assert.equal(mode, "readwrite");
-                return action(() => { rows.set(key, structuredClone(value)); return key; });
+                // Logout in a microtask AFTER put is queued but BEFORE its
+                // IndexedDB completion event reproduces the real Edge race.
+                if (afterQueuedPut) {
+                  const callback = afterQueuedPut;
+                  afterQueuedPut = null;
+                  queueMicrotask(callback);
+                }
+                return action(() => {
+                  const inserted = structuredClone(value);
+                  lastWrite = { key, previous: rows.get(key), inserted };
+                  rows.set(key, inserted);
+                  return key;
+                });
               },
               delete(key) {
                 assert.equal(mode, "readwrite");
@@ -365,6 +388,28 @@ test("logout after encryption during IndexedDB conditional-put read aborts trans
   f.database.beforeWriteReadOnce(() => f.revoke());
   await assert.rejects(f.scan([f.selected[0]]), /ZK_BATCH_TEXT_SEARCH_DENIED/);
   assert.equal(f.database.rows.size, 0, "session invalidation aborts the queued write");
+});
+
+test("logout after put is queued aborts the entire IndexedDB transaction", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const previous = structuredClone([...f.database.rows.values()][0]);
+  f.database.afterQueuedPutOnce(() => f.revoke());
+  await assert.rejects(f.scan([f.selected[1]]), /ZK_BATCH_TEXT_SEARCH_DENIED/);
+  assert.equal(f.database.rows.size, 1);
+  assert.equal([...f.database.rows.values()][0].nonce, previous.nonce,
+    "a rejected queued put may not silently commit a new encrypted index");
+});
+
+test("a previously authorized result cannot page after a scoped index clear", async () => {
+  const f = await fixture(51);
+  await f.scan(f.selected);
+  const result = await index.search({ ...f.core(), query: "histórico" });
+  assert.equal((await result.readPage(50)).entries.length, 1);
+  await index.clear({ grant: f.core().grant, indexedDBImpl: f.database,
+    assertLive: f.core().assertLive });
+  assert.equal(f.database.rows.size, 0);
+  await assert.rejects(result.readPage(50), /ZK_REVISION_INDEX_DENIED/);
 });
 
 test("same explicit revision may be reverified without duplicate cache entries", async () => {

@@ -72,7 +72,7 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
       if(one.indexedCount!==64||two.indexedCount!==128||two.discardedCount!==0)
         throw Error("WRONG_INDEX_COUNT");
       phase="real-idb-at-rest";
-      const stored=await new Promise((resolve,reject)=>{
+      const readStored=()=>new Promise((resolve,reject)=>{
         const request=indexedDB.open("rootark-zk1-protected-revision-index-v1",1);
         request.onerror=()=>reject(Error("DB_OPEN"));
         request.onsuccess=()=>{
@@ -85,6 +85,7 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
           transaction.oncomplete=()=>db.close();
         };
       });
+      const stored=await readStored();
       if(!stored?.ciphertext||JSON.stringify(stored).includes("owner-private")
         ||JSON.stringify(stored).includes("browser-test-"))throw Error("PLAINTEXT_AT_REST");
       phase="real-idb-paging";
@@ -124,14 +125,59 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
       if(!expiredInside||!rejected)throw Error("LOGOUT_DID_NOT_ABORT_IDB_WRITE");
       const unaffected=await index.search({...input(),query:"needle"});
       if(unaffected.indexedCount!==128)throw Error("LOGOUT_CORRUPTED_DB");
+      phase="real-idb-post-put-logout";
+      const beforePostPut=await readStored();
+      const originalPut=IDBObjectStore.prototype.put;
+      let postPutQueued=false;
+      IDBObjectStore.prototype.put=function(value,key){
+        const req=originalPut.call(this,value,key);
+        if(!postPutQueued&&this.transaction.mode==="readwrite"){
+          postPutQueued=true;
+          queueMicrotask(()=>{live=false;});
+        }
+        return req;
+      };
+      let postPutDenied=false;
+      try { postPutDenied=await deny(()=>index.append({...input(),entries:rows.slice(127)})); }
+      finally { IDBObjectStore.prototype.put=originalPut; live=true; }
+      if(!postPutQueued||!postPutDenied)throw Error("POST_PUT_LOGOUT_NOT_DENIED");
+      const afterPostPut=await readStored();
+      if(afterPostPut?.nonce!==beforePostPut.nonce)
+        throw Error("POST_PUT_LOGOUT_PERSISTED_LOCAL_INDEX");
+      phase="real-idb-post-put-success-event-logout";
+      const beforeSuccessEvent=await readStored();
+      const originalSuccessPut=IDBObjectStore.prototype.put;
+      let successEventScheduled=false;
+      IDBObjectStore.prototype.put=function(value,key){
+        const req=originalSuccessPut.call(this,value,key);
+        if(!successEventScheduled&&this.transaction.mode==="readwrite"){
+          successEventScheduled=true;
+          // This microtask runs AFTER put.onsuccess dispatched, but before
+          // IndexedDB can autonomously commit the transaction.
+          req.addEventListener("success",()=>queueMicrotask(()=>{live=false;}),
+            {once:true});
+        }
+        return req;
+      };
+      let successEventDenied=false;
+      try { successEventDenied=await deny(()=>index.append({...input(),entries:rows.slice(127)})); }
+      finally { IDBObjectStore.prototype.put=originalSuccessPut; live=true; }
+      if(!successEventScheduled||!successEventDenied)
+        throw Error("POST_PUT_SUCCESS_EVENT_NOT_DENIED");
+      const afterSuccessEvent=await readStored();
+      if(afterSuccessEvent?.nonce!==beforeSuccessEvent.nonce)
+        throw Error("POST_PUT_SUCCESS_EVENT_PERSISTED_LOCAL_INDEX");
       phase="real-idb-revoke";
       live=false;
       if(!await deny(()=>unaffected.readPage(100)))throw Error("REVOKED_PAGE_RELEASED");
       live=true;
       phase="real-idb-clear";
+      const staleAfterClear=await index.search({...input(),query:"needle"});
       await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
       if(!await deny(()=>index.search({...input(),query:"needle"})))
         throw Error("CLEAR_STILL_EXPOSED_CACHE");
+      if(!await deny(()=>staleAfterClear.readPage(50)))
+        throw Error("STALE_PAGE_AFTER_SCOPED_CLEAR");
       metadataRaw.fill(0);
       output.textContent="EDGE_REVISION_INDEX_PASS";
     }catch(error){output.textContent="EDGE_REVISION_INDEX_FAIL:"+phase+":"+error.message;}

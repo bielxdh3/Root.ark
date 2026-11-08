@@ -139,6 +139,13 @@
                   return;
                 }
                 const write = objectStore.put(value, key);
+                // The asynchronous put can be queued while the device logs
+                // out. Check AGAIN when IndexedDB acknowledges the write,
+                // while the readwrite transaction can still be aborted.
+                write.onsuccess = () => {
+                  try { live(assertLive); }
+                  catch (_) { tx.abort(); }
+                };
                 write.onerror = () => reject(Error("INDEXEDDB_UNAVAILABLE"));
               } else result = request.result;
             };
@@ -381,7 +388,15 @@
           live(input.assertLive);
           await verifiedOwnerGrant(input, pinned);
           await verifiedHead(input, pinned);
+          // A previously loaded result may outlive a scoped clear or a new
+          // encrypted snapshot with the same signed catalog head. Never emit
+          // another page from an index that was deleted/replaced meanwhile.
+          const currentRecord = await store(input.indexedDBImpl)
+            .read(cacheKey(pinned.scope));
           live(input.assertLive);
+          if (!currentRecord || currentRecord.format !== FORMAT
+            || currentRecord.context !== record.context
+            || currentRecord.nonce !== record.nonce) deny();
           return paged(offset);
         } catch (_) { deny(); }
       };
