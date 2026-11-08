@@ -228,3 +228,14 @@ flowchart TD
 ~~~
 
 **Legenda:** `planejado` = critério; `objeto local` = commit ainda não publicado; `publicado Draft` = HEAD remoto sem aprovação global; `Ready` = estado de PR sem merge; `bloqueado` = gate negativo ou prova ausente; `liberado` = produção expressamente autorizada (**nenhuma** neste corte). Correções de workers ainda em andamento não são contadas como sucesso. Este adendo exige peer independente **do SHA exato** antes de eventual push; não executar push nesta tarefa, merge, deploy, cutover ou modificar `Root/main`, `README.md`, `docs/plan-tree.md` ou PR #228.
+
+## Evidência hash-equal do Windows canonical #299 — 2026-11-08 05:54 UTC
+
+**Novo corte exclusivamente forense, posterior às 05:47 UTC:** [#299](https://github.com/bielxdh3/Root.ark/pull/299) segue **OPEN/Draft** `95aec7c40855b6d21cd81955bdc7c3ea2409b221`. Ambos os Security Regression [`42448670330`](https://github.com/bielxdh3/Root.ark/actions/runs/42448670330) e [`42448666487`](https://github.com/bielxdh3/Root.ark/actions/runs/42448666487) têm Ubuntu Node22 full **SUCCESS** e Windows Node22 canonical **FAILURE**. Os jobs Windows `128632976336` e `128632966859` apontam o **mesmo** `ERR_ASSERTION`, índice TAP **551**, `testPathSha256=d4b3f1af3bf676b364ca223f` e `nameSha256=cfd4a608f6cac314f87ffe1c`. Recomputados como primeiros 24 caracteres hex do SHA-256 de strings UTF-8, correspondem respectivamente a:
+
+- `test/issue-242-p2p-ciphertext-fd-race.test.js`
+- `mutation during pinned hashing cannot inherit signed object fingerprint`
+
+O título foi encontrado no teste do próprio HEAD publicado. Essa igualdade identifica **uma regressão de integridade de ciphertext mutável conhecida e ainda falhando**, não um erro inespecífico de ambiente. [Run `42448670330`](https://github.com/bielxdh3/Root.ark/actions/runs/42448670330): Windows mandatory **SUCCESS**, Windows syntax/tests **FAILURE**, workflow **COMPLETED/FAILURE**. [Run `42448666487`](https://github.com/bielxdh3/Root.ark/actions/runs/42448666487): Windows mandatory **IN_PROGRESS** na consulta e workflow sem conclusão. Checks focados WebRTC, CodeQL e Dependency Review **SUCCESS** não sobrepõem o canonical RED. O PR não está Ready; nenhuma garantia owner-signed de bytes imutáveis, all-party ACL transacional, TURN/cross-NAT ou release foi certificada.
+
+**Estados verificados:** `Root/main d5fbc110944a5437dbd5e9175f39dd97f5e433bc` sem alteração; #293 publicado Draft `0918ffa9` e #298 publicado Draft `bf2dc700`. Os cortes anteriores foram preservados como observações datadas; nenhuma correção futura, merge de PR, deploy, cutover ou modificação de #228 é declarada.
