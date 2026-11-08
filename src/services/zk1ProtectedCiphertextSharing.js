@@ -13,6 +13,11 @@ const EGRESS_ABORT_GRACE_MS = 1000;
 const EGRESS_POLL_MS = 50;
 const EGRESS_RELEASE_RETRY_MS = 250;
 const EGRESS_RELEASE_RECHECK_MS = 1000;
+// better-sqlite3 blocks the Node event loop for the *connection's* SQLite
+// busy_timeout (normally 5000ms), even when our JS retry deadline is 250ms.
+// Temporarily bound ONLY the synchronous terminal DELETE, then restore the
+// store's original per-connection policy before yielding to other work.
+const EGRESS_RELEASE_SQLITE_BUSY_MS = 10;
 // Local references exist only to abort sockets owned by this Node process.
 // The durable registry below is authoritative across SQLite connections.
 const activeEgressByStore = new WeakMap();
@@ -320,9 +325,27 @@ class Zk1ProtectedCiphertextSharing {
   releaseTerminatedEgress(key, tracker) {
     if (!tracker.terminal || tracker.released) return tracker.released;
     let removed;
+    const db = this.store.db;
+    let restored = false;
     try {
-      removed = this.releaseEgress.run(tracker.leaseId, tracker.grantId, tracker.scopeId);
+      const previous = db.pragma("busy_timeout", { simple: true });
+      if (!Number.isSafeInteger(previous) || previous < 0) return false;
+      try {
+        // Both PRAGMA operations and .run() are synchronous on this single
+        // connection: no JS callback/await can observe the temporary policy.
+        // The owner's revocation UPDATE keeps its independent busy policy.
+        db.pragma(`busy_timeout = ${EGRESS_RELEASE_SQLITE_BUSY_MS}`);
+        removed = this.releaseEgress.run(tracker.leaseId, tracker.grantId, tracker.scopeId);
+      } finally {
+        try {
+          db.pragma(`busy_timeout = ${previous}`);
+          restored = db.pragma("busy_timeout", { simple: true }) === previous;
+        } catch (_) { /* deny success rather than silently changing policy */ }
+      }
     } catch (_) { return false; }
+    // A failed restore (even after DELETE) cannot become a release ACK.
+    // Retain the proven-terminal tracker, including on uncertain DB state.
+    if (!restored) return false;
     // A missing lease row, including unexplained external deletion, is not
     // acceptable proof of settlement. Leave the tracker fail-closed.
     if (removed.changes !== 1) return false;

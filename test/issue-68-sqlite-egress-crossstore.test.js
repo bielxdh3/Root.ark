@@ -7,6 +7,7 @@ const { fork } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const Database = require("better-sqlite3");
 const { Zk1ProtectedCiphertextSharing } =
   require("../src/services/zk1ProtectedCiphertextSharing");
@@ -67,6 +68,7 @@ if (process.argv[2] === "--egress-child") {
 
 test("two independent SQLite handles: revoke ACK waits for remote in-flight egress", async (t) => {
   const f = fixture(t);
+  f.a.pragma("busy_timeout = 731");
   let release;
   const pendingBytes = new Promise((resolve) => { release = resolve; });
   const sending = f.owner.emitTracked(f.scope, f.grantId, () => pendingBytes, {});
@@ -84,6 +86,8 @@ test("two independent SQLite handles: revoke ACK waits for remote in-flight egre
     release();
   }
   await sending;
+  assert.equal(f.a.pragma("busy_timeout", { simple: true }), 731,
+    "a successful release must also preserve caller-configured SQLite busy policy");
   assert.deepEqual(await revoking, { revoked: true });
   assert.equal(f.a.prepare("SELECT count(*) AS pending FROM zk_content_share_egress WHERE grant_id=?")
     .get(f.grantId).pending, 0);
@@ -136,7 +140,9 @@ test("real concurrent BEGIN IMMEDIATE makes owner revoke unavailable, not denied
 test("real HTTP finish under SQLite writer lock retains terminal proof and reconciles lease", { timeout: 18000 },
   async (t) => {
     const f = fixture(t);
-    f.a.pragma("busy_timeout = 30");
+    const previousBusyTimeout = f.a.pragma("busy_timeout", { simple: true });
+    assert.ok(previousBusyTimeout >= 1000,
+      "the unresolved-lease test must exercise the real multi-second default");
     let response;
     let sending;
     let arrived;
@@ -176,12 +182,17 @@ test("real HTTP finish under SQLite writer lock retains terminal proof and recon
       "WHERE grant_id=?").get(f.grantId).pending, 1);
     f.b.exec("BEGIN IMMEDIATE");
     try {
+      const releaseStarted = performance.now();
       response.end("ciphertext-only");
       await finished;
       assert.equal((await received).status, 200);
       const attempt = await sending;
+      assert.ok(performance.now() - releaseStarted < 1000,
+        "terminal release must not block the event loop for SQLite's default 5s timeout");
       assert.equal(attempt.error, "ZK_SHARE_UNAVAILABLE",
         "release under true SQLITE_BUSY does not invent a successful cleanup");
+      assert.equal(f.a.pragma("busy_timeout", { simple: true }), previousBusyTimeout,
+        "even repeated SQLITE_BUSY release failures restore the previous DB policy");
       assert.equal(f.b.prepare("SELECT count(*) AS pending FROM zk_content_share_egress " +
         "WHERE grant_id=?").get(f.grantId).pending, 1);
       assert.equal(finishedAt, true, "the HTTP application egress really finished");
@@ -202,6 +213,83 @@ test("real HTTP finish under SQLite writer lock retains terminal proof and recon
       "successful reconciliation removes exactly the completed local tracker");
     assert.equal(f.b.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
       .get(f.grantId).revoked, 1);
+  });
+
+test("HTTP finish release cannot starve a 100ms SQLite writer ROLLBACK timer", { timeout: 13000 },
+  async (t) => {
+    const f = fixture(t);
+    const previousBusyTimeout = f.a.pragma("busy_timeout", { simple: true });
+    assert.ok(previousBusyTimeout >= 1000,
+      "the fixture must reproduce the real better-sqlite3 multi-second default");
+    let response;
+    let sending;
+    let arrived;
+    let observedFinish;
+    const ready = new Promise((resolve) => { arrived = resolve; });
+    const finished = new Promise((resolve) => { observedFinish = resolve; });
+    const server = http.createServer((_req, res) => {
+      response = res;
+      res.once("finish", observedFinish);
+      const emit = () => new Promise((resolve) => {
+        res.once("finish", resolve);
+        res.once("close", resolve);
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        arrived();
+      });
+      emit.abort = () => res.destroy();
+      sending = f.owner.emitTracked(f.scope, f.grantId, emit,
+        { ciphertextBase64: "real-terminal" }).then(
+        () => ({ ok: true }), (error) => ({ error: error.code || error.message }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => server.closeAllConnections());
+    t.after(() => server.close());
+    const received = new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${server.address().port}/`, (res) => {
+        let body = "";
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode, body }));
+        res.on("error", reject);
+      }).on("error", reject);
+    });
+    await ready;
+    assert.equal(f.b.prepare("SELECT count(*) AS pending FROM zk_content_share_egress WHERE grant_id=?")
+      .get(f.grantId).pending, 1);
+    f.b.exec("BEGIN IMMEDIATE");
+    let rollbackTime = null;
+    let timer;
+    const started = performance.now();
+    const released = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        try {
+          f.b.exec("ROLLBACK");
+          rollbackTime = performance.now();
+          resolve();
+        } catch (error) { reject(error); }
+      }, 100);
+    });
+    try {
+      response.end("real-terminal");
+      await finished;
+      const result = await sending;
+      await released;
+      const httpResult = await received;
+      assert.equal(httpResult.status, 200);
+      assert.equal(httpResult.body, "real-terminal");
+      assert.ok(rollbackTime - started < 500,
+        `SQLITE_BUSY blocked the Node ROLLBACK timer for ${Math.round(rollbackTime - started)}ms`);
+      assert.deepEqual(result, { ok: true },
+        "real terminal HTTP lease must settle after the writer's bounded lock");
+      assert.equal(f.a.pragma("busy_timeout", { simple: true }), previousBusyTimeout,
+        "release must restore this connection's previous busy_timeout setting");
+      assert.equal(f.b.prepare("SELECT count(*) AS pending FROM zk_content_share_egress WHERE grant_id=?")
+        .get(f.grantId).pending, 0);
+      assert.equal(f.owner.activeEgress.size, 0,
+        "successful durable release must clear the terminal local tracker");
+    } finally {
+      clearTimeout(timer);
+      if (f.b.inTransaction) f.b.exec("ROLLBACK");
+    }
   });
 
 test("throwing or rejecting emitter leaves durable lease until independently settled", async (t) => {
