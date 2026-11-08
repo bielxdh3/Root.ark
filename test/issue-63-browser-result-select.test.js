@@ -57,12 +57,14 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
       const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
       const persistToggle=dialog.querySelector('[data-zk1-field="catalog-batch-persist"]');
+      const replaceToggle=dialog.querySelector('[data-zk1-field="catalog-batch-replace"]');
       const storedIndexButton=dialog.querySelector('[data-zk1-action="catalog-delta-index-search"]');
       const indexPages=dialog.querySelector('[data-zk1-field="catalog-index-pages"]');
       if(!list||!target||!revision||!getButton||getButton.type!=="button"
         ||!batchButton||batchButton.type!=="button"
         ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked
         ||!persistToggle||persistToggle.type!=="checkbox"||persistToggle.checked
+        ||!replaceToggle||replaceToggle.type!=="checkbox"||replaceToggle.checked
         ||!storedIndexButton||storedIndexButton.type!=="button"
         ||storedIndexButton.disabled||!indexPages
         ||indexPages.getAttribute("role")!=="navigation"
@@ -72,6 +74,10 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!persistToggle.checked)throw Error("EXPLICIT_REVISION_INDEX_OPT_IN_DENIED");
       persistToggle.click();
       if(persistToggle.checked)throw Error("REVISION_INDEX_OPT_IN_STUCK");
+      replaceToggle.click();
+      if(!replaceToggle.checked)throw Error("EXPLICIT_REPLACEMENT_OPT_IN_DENIED");
+      replaceToggle.click();
+      if(replaceToggle.checked)throw Error("EXPLICIT_REPLACEMENT_OPT_IN_STUCK");
       const progress=dialog.querySelector('[data-zk1-field="catalog-batch-progress"]');
       const cancel=dialog.querySelector('[data-zk1-action="catalog-delta-text-cancel"]');
       if(!progress||progress.getAttribute("role")!=="status"

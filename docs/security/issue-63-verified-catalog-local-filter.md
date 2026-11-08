@@ -76,7 +76,7 @@ work is not changed.
 ## Follow-up: bounded local text search across owner-selected versions
 
 The DEV workspace now offers an explicit **Search inside selected versions**
-action. It examines **1–64** exact object/revision pairs in a freshly signed
+action. It examines **1–128** exact object/revision pairs in a freshly signed
 current catalog, with a nonempty NFC/case-insensitive literal text query
 (maximum 120 UTF-16 units). Each version gets its own fresh signed GET,
 current independent owner/head/CAS and device grant checks, matching
@@ -84,11 +84,11 @@ ciphertext digest, separately pinned owner-held CEK SHA-256 and local AEAD/UTF-8
 opening using the existing single-version preview, **sequentially in windows
 of eight at most** (only one active GET/CEK/plaintext per iteration). Supported
 text is bounded to 64 KiB per file; matches show at most a 160-character local
-excerpt. The sole cross-window collection is up to 64 verified excerpts,
+excerpt. The sole cross-window collection is up to 128 verified excerpts,
 not a persistent or aggregate full-text cache.
 A single revoked, tampered, malformed or wrong-key version aborts the **whole**
 batch without revealing even earlier matches. Progress reports the count
-of revisions verified (0/64, 8/64, etc.), never matches/names/terms.
+of revisions verified (0/128, 8/128, etc.), never matches/names/terms.
 An optional **Todas as palavras (AND)** checkbox switches from the default
 contiguous literal phrase to a conjunction of **2–4 distinct literal tokens**,
 independent of order. The entire query remains at most 120 UTF-16 code units;
@@ -111,7 +111,7 @@ search, automatic key delivery, off-host custody or production release is
 claimed.
 
 The user imports a JSON manifest no larger than 64 KiB. It has exactly
-`schema: "rootark-zk1-local-text-batch/v1"` and `entries` (1–64 records).
+`schema: "rootark-zk1-local-text-batch/v1"` and `entries` (1–128 records).
 Each entry has exactly `objectId` (opaque 16-byte base64url), positive
 `revision`, the canonical eight-field `metadata` document from the
 original protected version, `cekFile` (local filename), and `cekSha256Pin`
@@ -138,3 +138,18 @@ the test HTTP adapter is disposable, not a production authority.
 General protected content
 indexing, persistence, safe key provisioning and external acceptance remain
 unresolved Issue #63 scope.
+
+## Explicit rotation of an existing protected revision index
+
+When the encrypted device-local index holds 128 selected revisions, the owner
+can explicitly opt to **replace** the previous selection using a new,
+independently pinned, fully verified 1–128-revision batch. Replacement requires
+both the normal persistence checkbox and a separate unchecked replacement
+checkbox. Older selected plaintext is not decrypted or retained. One
+conditional IndexedDB transaction replaces the AES-GCM snapshot; invalid
+inputs, an expired grant/session, concurrent scoped clear, or exceeding the
+4 MiB JSON limit deny the replacement write. A concurrent clear retains its
+durable tombstone; no rejected operation resurrects the previous plaintext.
+Old search pages are invalidated by the new snapshot nonce. Ordinary append
+still rejects overflow. This feature does not provide a complete historical
+index or increase the 128-revision resident limit.

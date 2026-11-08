@@ -94,6 +94,26 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
       const stored=await readStored();
       if(!stored?.ciphertext||JSON.stringify(stored).includes("owner-private")
         ||JSON.stringify(stored).includes("browser-test-"))throw Error("PLAINTEXT_AT_REST");
+      phase="real-idb-explicit-bounded-replacement";
+      const staleBeforeRotation=await index.search({...input(),query:"needle"});
+      const oldSealed=await readStored();
+      if(!await deny(()=>index.append({...input(),replaceExisting:true,
+        entries:[{...rows[127],text:"X".repeat(65537)}]})))
+        throw Error("OVERSIZE_ROTATION_NOT_DENIED");
+      if((await readStored())?.nonce!==oldSealed.nonce)
+        throw Error("REJECTED_ROTATION_CHANGED_OLD_INDEX");
+      const rotation=await index.append({...input(),replaceExisting:true,
+        entries:rows.slice(127)});
+      if(rotation.indexedCount!==1||!rotation.replacedSelectedIndex)
+        throw Error("EXPLICIT_ROTATION_NOT_ATOMIC");
+      const rotatedPage=await index.search({...input(),query:"needle"});
+      if(rotatedPage.indexedCount!==1||rotatedPage.entries[0]?.revision!==128
+        ||!await deny(()=>staleBeforeRotation.readPage(0)))
+        throw Error("ROTATION_LEAKED_OLD_RESULT");
+      const restored=await index.append({...input(),replaceExisting:true,entries:rows});
+      if(restored.indexedCount!==128||!restored.replacedSelectedIndex
+        ||JSON.stringify(await readStored()).includes("owner-private"))
+        throw Error("RESTORE_128_AFTER_ROTATION_FAILED");
       phase="real-idb-paging";
       const first=await index.search({...input(),query:"needle"});
       const priorChecks=checks;
@@ -193,7 +213,8 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
         if(++verificationCalls===2){reachedVerification();await verificationGate;}
         return originalVerifyHead(...args);
       };
-      const pendingAppend=index.append({...input(),entries:rows.slice(0,1)});
+      const pendingAppend=index.append({...input(),replaceExisting:true,
+        entries:rows.slice(0,1)});
       await Promise.race([verificationPaused,new Promise((_resolve,reject)=>
         setTimeout(()=>reject(Error("PENDING_APPEND_NOT_REACHED")),8000))]);
       try {

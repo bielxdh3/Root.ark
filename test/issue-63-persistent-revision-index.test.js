@@ -599,6 +599,43 @@ test("two 64-revision windows accumulate up to 128, report partial coverage, and
   assert.equal(after.entries[0].revision, 128);
 });
 
+test("explicit owner-selected replacement rotates a full 128-revision encrypted snapshot atomically", async () => {
+  const f = await fixture(129);
+  await f.scan(f.selected.slice(0, 128));
+  const oldPage = await index.search({ ...f.core(), query: "janeiro" });
+  assert.equal(oldPage.indexedCount, 128);
+  const oldRecord = structuredClone([...f.database.rows.values()][0]);
+  const last = f.selected[128].selected;
+  await assert.rejects(index.append({ ...f.core(), replaceExisting: true,
+    entries: [{ ...last, name: "new.txt", mediaType: "text/plain",
+      text: "X".repeat(65537) }] }), /ZK_REVISION_INDEX_DENIED/);
+  await assert.rejects(index.append({ ...f.core(), replaceExisting: true,
+    entries: f.core().baseline.entries.slice(0, 128).map((entry) => ({
+      ...entry, name: "oversize.txt", mediaType: "text/plain",
+      text: "X".repeat(34 * 1024),
+    })) }), /ZK_REVISION_INDEX_DENIED/,
+  "the 4 MiB cap also applies when replacing a previously full index");
+  assert.deepEqual([...f.database.rows.values()][0], oldRecord,
+    "failed replacement must retain the complete old encrypted snapshot");
+  const rotated = await f.scan(f.selected.slice(128), {
+    onVerifiedBatch: (entries) => index.append({ ...f.core(), entries,
+      replaceExisting: true }),
+  });
+  assert.equal(rotated.result.totalSearched, 1);
+  assert.equal(rotated.result.totalMatches, 1);
+  const fresh = await index.search({ ...f.core(), query: "revisão 129" });
+  assert.equal(fresh.indexedCount, 1);
+  assert.equal(fresh.totalMatches, 1);
+  assert.equal(fresh.entries[0].revision, 129);
+  const removed = await index.search({ ...f.core(), query: "janeiro" });
+  assert.equal(removed.totalMatches, 0);
+  await assert.rejects(oldPage.readPage(0), /ZK_REVISION_INDEX_DENIED/,
+    "old plaintext excerpts must not reappear after replacement");
+  const stored = [...f.database.rows.values()][0];
+  assert.notEqual(stored.nonce, oldRecord.nonce);
+  assert.doesNotMatch(JSON.stringify(stored), /Histórico revisão|relatorio-confidencial/);
+});
+
 test("cancellation after the eighth checked GET never persists earlier texts", async () => {
   const f = await fixture(9);
   let cancelled = false;

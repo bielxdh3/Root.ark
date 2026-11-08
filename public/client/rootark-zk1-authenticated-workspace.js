@@ -868,6 +868,7 @@
       + '<label>CEKs locais das revisões selecionadas (até 128 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-confirm"> Verifiquei offline o manifesto, cada pin de CEK e a autorização atual do proprietário.</label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-batch-persist"> Após concluir todo o lote, guardar até 128 revisões selecionadas no índice local AES-GCM/HKDF (até 4 MiB de JSON antes da cifragem). Requer a chave local de metadados acima. Não indexa automaticamente todo o histórico.</label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-replace"> Substituir explicitamente o índice local anterior pelo lote verificado acima (1–128 revisões). A seleção antiga deixa de ser pesquisável; mantém o limite de 4 MiB. Requer guardar no índice.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-search">Buscar dentro das versões selecionadas</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-cancel" disabled>Cancelar busca</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-index-search">Buscar nas revisões já indexadas (sem CEKs)</button></div>'
@@ -1631,6 +1632,8 @@
             || !Array.isArray(manifest.entries)
             || manifest.entries.length < 1 || manifest.entries.length > 128) fail();
           const persistBatch = field("catalog-batch-persist")?.checked === true;
+          const replaceExisting = field("catalog-batch-replace")?.checked === true;
+          if (replaceExisting && !persistBatch) fail();
           if (persistBatch) {
             if (field("catalog-write-key")?.files?.length !== 1
               || field("catalog-write-key").files[0].size !== 32) fail();
@@ -1702,7 +1705,7 @@
                 const metadataRaw = await fileBytes("catalog-write-key", 32, 32);
                 try {
                   const saved = await window.RootarkZk1ProtectedRevisionIndex.append({
-                    entries, grant: trust.signedDeviceGrant,
+                    entries, replaceExisting, grant: trust.signedDeviceGrant,
                     ownerHead: { revision: trust.pinnedCurrentHead.revision,
                       epoch: trust.pinnedCurrentHead.epoch,
                       digest: to64(trust.pinnedCurrentHead.digest) },
@@ -1727,7 +1730,8 @@
               text || "Nenhum conteúdo correspondente nas versões verificadas.";
             status("Busca protegida local: " + result.totalMatches + " de "
               + result.totalSearched + " versões conferidas. "
-              + (persistBatch ? "Lote completo acrescentado ao índice local cifrado. "
+              + (replaceExisting ? "Índice local anterior substituído atomicamente pelo lote selecionado. "
+                : persistBatch ? "Lote completo acrescentado ao índice local cifrado. "
                 : "Conteúdo não persistido. ")
               + (result.indexedDiscardedCount > 0
                 ? result.indexedDiscardedCount + " revisão(ões) anteriores removidas "

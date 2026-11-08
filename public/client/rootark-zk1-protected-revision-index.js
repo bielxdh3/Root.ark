@@ -286,6 +286,9 @@
   async function append(input) {
     try {
       live(input?.assertLive);
+      if (input.replaceExisting !== undefined
+        && typeof input.replaceExisting !== "boolean") deny();
+      const replaceExisting = input.replaceExisting === true;
       const key = cacheKey(scopeOf(input.grant));
       const initialGeneration = captureGeneration(key);
       const assertCurrent = () => {
@@ -314,6 +317,7 @@
       const secret = await keyFor(input.metadataRaw, pinned.scope);
       assertCurrent();
       let current = [], discardedCount = 0, replacedIncompatibleIndex = false;
+      let replacedSelectedIndex = false;
       if (record && !tombstone) {
         const previous = recordContext(record);
         // A newly supplied signed-but-historical catalog or owner epoch must
@@ -323,7 +327,14 @@
             && previous.catalogHead.digest !== pinned.catalogHead.digest
           || previous.ownerHead?.epoch > pinned.ownerHead.epoch
           || previous.ownerHead?.revision > pinned.ownerHead.revision) deny();
-        if (sameAuthority(previous, pinned)) {
+        if (replaceExisting) {
+          // An explicit, fully verified owner selection can rotate the fixed
+          // 128-row snapshot. Never decrypt/retain older selected plaintext.
+          // The conditional IndexedDB put below makes this a single commit;
+          // failed verification or revocation leaves the old snapshot intact.
+          replacedSelectedIndex = true;
+          replacedIncompatibleIndex = !sameAuthority(previous, pinned);
+        } else if (sameAuthority(previous, pinned)) {
           // The old ciphertext is AEAD-authenticated to its original signed
           // CAS head. On a new signed CAS, retain only exact surviving digests.
           const original = await openRows(record, previous, secret, null);
@@ -369,7 +380,7 @@
       record?.nonce ?? null, assertCurrent);
       assertCurrent();
       return Object.freeze({ indexedCount: rows.length, persistedIndex: true,
-        discardedCount, replacedIncompatibleIndex,
+        discardedCount, replacedIncompatibleIndex, replacedSelectedIndex,
         coverage: "owner-selected-revisions-only", plaintextSentToServer: false,
         authorizesMutation: false });
     } catch (_) { deny(); }
