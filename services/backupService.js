@@ -533,6 +533,19 @@ async function collectBackupFiles(options = {}) {
   let stageRootInfo = null;
   if (typeof cloudStorage.inventory !== "function") throw new Error("Authoritative cloud inventory is required");
   const remotes = await cloudStorage.inventory({ backupComplete: true });
+  // The archive has one destination per logical path, not per provider ID.
+  // Reject duplicates from any adapter BEFORE staging a single cloud object,
+  // even if its own inventory implementation missed two physical Drive IDs.
+  const remotePaths = new Set();
+  for (const remote of remotes) {
+    if (!areas.includes(remote.area)) continue;
+    const folderId = String(remote.folderId || "");
+    const name = String(remote.name || "");
+    const entryPath = normalizeEntryPath(path.posix.join(remote.area, folderId === "root" ? "" : folderId, name));
+    const key = collisionKey(entryPath);
+    if (remotePaths.has(key)) throw new Error("Cloud backup inventory contains a duplicate logical path");
+    remotePaths.add(key);
+  }
   for (const remote of remotes) {
     if (!areas.includes(remote.area)) continue;
     const folderId = String(remote.folderId || "");

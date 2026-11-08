@@ -413,6 +413,7 @@ function createCloudStorage(options = {}) {
     };
     const objects = [];
     const identities = new Set();
+    const logicalKeys = new Set();
     const add = (entry) => {
       fence();
       if (bounded && objects.length >= readOnlyBounds.maxEntries) {
@@ -420,7 +421,12 @@ function createCloudStorage(options = {}) {
       }
       const identity = `${entry.provider}:${entry.providerIdentity || entry.key}`;
       if (identities.has(identity)) throw cloudError("duplicate_inventory_identity", "Cloud inventory contains a duplicate identity");
+      // Drive can return different physical IDs with the same rootArkKey.
+      // A whole backup cannot represent both through one logical path: the
+      // downloader would repeatedly select one ID and omit the other bytes.
+      if (logicalKeys.has(entry.key)) throw cloudError("duplicate_inventory_identity", "Cloud inventory contains a duplicate logical key");
       identities.add(identity);
+      logicalKeys.add(entry.key);
       objects.push(entry);
     };
     if (provider === "s3") {

@@ -65,12 +65,13 @@ async function runBackup(objects = [], options = {}) {
   }
   const cloud = {
     enabled: () => options.enabled !== false,
-    inventory: async () => {
+    inventory: async (...args) => {
       if (options.failInventory) throw new Error("inventory unavailable");
-      if (options.inventory) return options.inventory();
+      if (options.inventory) return options.inventory(...args);
       return objects;
     },
     download: async (_folderId, name, target, area) => {
+      options.onDownload?.();
       if (options.failDownload) throw new Error("download unavailable");
       const remote = objects.find((entry) => entry.name === name && entry.area === area);
       if (!remote) return false;
@@ -214,6 +215,76 @@ test("authoritative cloud backup and restore matrix", async (t) => {
     let page = 0;
     const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" }, createGoogleDriveClient: async () => ({ files: { list: async () => page++ === 0 ? { data: { files: [{ id: "a", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/root/a.txt", rootArkFolderId: "root", rootArkArea: "uploads" } }], nextPageToken: "next" } } : { data: { files: [{ id: "b", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/orphan/b.txt", rootArkFolderId: "orphan", rootArkArea: "uploads" } }] } } } }) });
     assert.equal((await storage.inventory()).length, 2);
+  });
+  for (const splitPages of [false, true]) {
+    await t.test(`Drive duplicate logical key across ${splitPages ? "pages" : "physical IDs"} cannot certify whole backup ZIP`, async () => {
+      const physical = [
+        object("dup.txt", "good", { provider: "gdrive", providerIdentity: "a" }),
+        object("dup.txt", "evil", { provider: "gdrive", providerIdentity: "b" }),
+      ];
+      const rows = physical.map((entry) => ({
+        id: entry.providerIdentity, parents: ["drive-root"], appProperties: {
+          rootArkKey: entry.key, rootArkFolderId: entry.folderId, rootArkArea: entry.area,
+        },
+      }));
+      let pages = 0;
+      const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" },
+        createGoogleDriveClient: async () => ({ files: { list: async (request) => {
+          pages += 1;
+          assert.match(request.q, /'drive-root' in parents/);
+          if (!splitPages) return { data: { files: rows } };
+          return request.pageToken === "second"
+            ? { data: { files: [rows[1]] } }
+            : { data: { files: [rows[0]], nextPageToken: "second" } };
+        } } }) });
+      let downloads = 0;
+      // The backup's logical-key downloader resolves both physical IDs to
+      // the first bytes ("good"). The equal local copy lets the resulting
+      // ZIP succeed while omitting the second physical ID's "evil" bytes.
+      const result = await runBackup(physical, {
+        inventory: (...args) => storage.inventory(...args),
+        local: { name: "dup.txt", content: "good" },
+        onDownload: () => { downloads += 1; },
+      });
+      assert.equal(pages, splitPages ? 2 : 1);
+      assert.equal(result.ok, false, "two physical Drive objects cannot be certified by one logical ZIP entry");
+      assert.equal(result.error.code, "duplicate_inventory_identity");
+      assert.equal(downloads, 0, "duplicate identity must be denied before cloud staging");
+      assert.deepEqual(result.zips, [], "a false-complete ZIP must never be retained");
+      assert.equal(result.history.some((entry) => entry.status === "success"), false);
+      assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+    });
+  }
+  await t.test("Drive distinct keys on separate pages produce a complete ZIP", async () => {
+    const physical = [
+      object("a.txt", "good", { provider: "gdrive", providerIdentity: "a" }),
+      object("b.txt", "evil", { provider: "gdrive", providerIdentity: "b" }),
+    ];
+    const rows = physical.map((entry) => ({
+      id: entry.providerIdentity, parents: ["drive-root"], appProperties: {
+        rootArkKey: entry.key, rootArkFolderId: entry.folderId, rootArkArea: entry.area,
+      },
+    }));
+    const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" },
+      createGoogleDriveClient: async () => ({ files: { list: async ({ pageToken }) => pageToken
+        ? { data: { files: [rows[1]] } }
+        : { data: { files: [rows[0]], nextPageToken: "next" } } } }) });
+    const result = await runBackup(physical, { inventory: (...args) => storage.inventory(...args) });
+    assert.equal(result.ok, true);
+    assert.equal(result.manifest.cloud_complete, true);
+    assert.ok(result.entries.includes("uploads/a.txt"));
+    assert.ok(result.entries.includes("uploads/b.txt"));
+  });
+  await t.test("backup rejects duplicate remote logical paths even if a provider adapter returns them", async () => {
+    const result = await runBackup([
+      object("dup.txt", "good", { providerIdentity: "a" }),
+      object("dup.txt", "evil", { providerIdentity: "b" }),
+    ], { local: { name: "dup.txt", content: "good" } });
+    assert.equal(result.ok, false, "two remote objects sharing a path must not certify a complete ZIP");
+    assert.match(result.error.message, /duplicate logical path/);
+    assert.deepEqual(result.zips, []);
+    assert.equal(result.history.some((entry) => entry.status === "success"), false);
+    assert.equal(result.history.some((entry) => entry.status === "failed"), true);
   });
   await t.test("cloud-only unknown folder", async () => { const result = await runBackup([object("orphan.txt", "orphan", { folderId: "orphan" })]); assert.ok(result.entries.includes("uploads/orphan/orphan.txt")); });
   await t.test("cloud-only root upload", async () => { const result = await runBackup([object("root.txt")]); assert.ok(result.entries.includes("uploads/root.txt")); });
