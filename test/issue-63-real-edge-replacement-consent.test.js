@@ -37,6 +37,7 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
   const source = fs.readFileSync(path.join(root,
     "rootark-zk1-authenticated-workspace.js"), "utf8");
   const injections = [
+    ["let busy = false;", "let busy = false; window.__issue63IsBusy = () => busy;"],
     ["async function ensureScripts() {",
       "async function ensureScripts() { if (window.__issue63Fixture) return;"],
     ["async function grantAndOwner() {",
@@ -92,7 +93,7 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
         entries:baseline.entries}));
       const signature=new Uint8Array(await crypto.subtle.sign("Ed25519",
         signer.privateKey,serialized));
-      let verifiedGets=0;
+      let verifiedGets=0,pauseFirstGet=false;
       const client={
         async verifyPrivateListingHead() {
           if(!await crypto.subtle.verify("Ed25519",signer.publicKey,
@@ -100,6 +101,11 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
           return {scope,head:baseline.head};
         },
         async readSelectedCiphertext(_baseline,oid,rev){
+          if(pauseFirstGet){
+            pauseFirstGet=false;
+            window.__issue63EscPhase="busy-ready";
+            await new Promise(resolve=>{window.__issue63ReleaseFirstGet=resolve;});
+          }
           const row=checked.get(oid+":"+rev);
           if(!row||!await crypto.subtle.verify("Ed25519",signer.publicKey,
             signature,serialized))throw Error("SIGNED_GET_BAD");
@@ -134,6 +140,13 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
       const persisted=field("catalog-batch-persist");
       const replaced=field("catalog-batch-replace");
       const confirmed=field("catalog-batch-confirm");
+      dialog.addEventListener("cancel",event=>{
+        if(window.__issue63EscPhase==="busy-ready"){
+          window.__issue63BusyCancelSeen=true;
+          window.__issue63BusyCancelPrevented=event.defaultPrevented;
+          window.__issue63BusyCancelCancelable=event.cancelable;
+        }
+      });
       field("catalog-delta-opt-in").checked=true;
       field("catalog-write-sequence").value="11";
       field("catalog-write-digest").value=baseline.head.digest;
@@ -183,10 +196,11 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
           await sleep(20);
         }
         const success=status.textContent.includes("Busca protegida local:");
-        if(batchButton.disabled||success!==expected)
+        if(batchButton.disabled||expected!==null&&success!==expected)
           throw Error("UNEXPECTED_BATCH_OUTCOME_"+status.textContent);
         if(confirmed.checked||persisted.checked||replaced.checked)
           throw Error("CONSENT_NOT_ONE_SHOT");
+        return success;
       };
       const localIndex=window.RootarkZk1ProtectedRevisionIndex;
       const indexInput=()=>({grant,ownerHead:{revision:8,epoch:2,digest:b64(ownerDigest)},
@@ -194,14 +208,52 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
         assertLive:()=>true,verifyOwnerGrant:async()=>({
           verifiedCurrent:true,grant,ownerHead:{revision:8,epoch:2,
             digest:b64(ownerDigest)}})});
-      phase="owner-batch-A-succeeds";
+      phase="busy-native-escape-cancels-batch-atomically";
       await selection(selections.slice(0,128));
       clickConsent(true);
-      await run(true);
-      if(verifiedGets!==128)throw Error("A_NOT_ALL_VERIFIED");
+      pauseFirstGet=true;
+      const firstAttemptSucceeded=await run(null);
+      if(!firstAttemptSucceeded){
+        if(dialog.open)throw Error("BATCH_DENIED_WITHOUT_CLOSE");
+        const unexpectedlyIndexed=await (async()=>{
+          try {await localIndex.search({...indexInput(),query:"needle"});return true;}
+          catch(error){if(error?.message!=="ZK_REVISION_INDEX_DENIED")throw error;
+            return false;}
+        })();
+        if(unexpectedlyIndexed)throw Error("ESC_CANCELLED_BATCH_PERSISTED");
+        opener.click();
+        for(let i=0;i<100&&!dialog.open;i++)await sleep(20);
+        if(!dialog.open||confirmed.checked||persisted.checked||replaced.checked)
+          throw Error("BUSY_ESCAPE_REOPEN_STALE_CONSENT");
+        await selection(selections.slice(0,128));
+        clickConsent(true);
+      }
+      phase="owner-batch-A-succeeds";
+      if(!firstAttemptSucceeded)await run(true);
+      if(verifiedGets<128)throw Error("A_NOT_ALL_VERIFIED");
       const first=await localIndex.search({...indexInput(),query:"selected revision 0001"});
       if(first.indexedCount!==128||first.totalMatches!==1)
         throw Error("A_MISSING_FROM_ENCRYPTED_INDEX");
+      phase="native-escape-close-and-reopen-must-consume-consent";
+      let cancelEvents=0,closeEvents=0;
+      dialog.addEventListener("cancel",()=>cancelEvents++);
+      dialog.addEventListener("close",()=>closeEvents++);
+      clickConsent(true);
+      if(!confirmed.checked||!persisted.checked||!replaced.checked)
+        throw Error("ESC_CONSENT_NOT_SET");
+      window.__issue63EscPhase="ready";
+      for(let i=0;i<500&&dialog.open;i++)await sleep(20);
+      if(dialog.open)throw Error("NATIVE_ESCAPE_DID_NOT_CLOSE");
+      for(let i=0;i<50&&closeEvents===0;i++)await sleep(10);
+      if(cancelEvents!==1||closeEvents!==1)
+        throw Error("NATIVE_ESCAPE_CANCEL_CLOSE_EVENTS_MISSING");
+      opener.click();
+      for(let i=0;i<100&&!dialog.open;i++)await sleep(20);
+      if(!dialog.open||document.querySelector("dialog.zk1-workspace-dialog")!==dialog)
+        throw Error("ESC_REOPEN_DID_NOT_REUSE_DIALOG");
+      if(confirmed.checked||persisted.checked||replaced.checked)
+        throw Error("ESC_REOPEN_CARRIED_DESTRUCTIVE_CONSENT");
+      window.__issue63EscPhase="reopened";
       phase="fresh-B-default-append-denied-without-replace";
       await selection(selections.slice(1,129));
       if(confirmed.checked||persisted.checked||replaced.checked)
@@ -297,6 +349,63 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
     await send("Runtime.enable");
     await send("Page.navigate", {
       url: "http://127.0.0.1:" + server.address().port + "/",
+    });
+    const busyReady = await waitFor(async () => {
+      const evalResult = await send("Runtime.evaluate", {
+        expression: "window.__issue63EscPhase || document.getElementById('edge-result')?.textContent || null",
+        returnByValue: true,
+      });
+      const value = evalResult.result?.value;
+      return value === "busy-ready" || typeof value === "string"
+        && /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(value) ? value : null;
+    });
+    assert.equal(busyReady, "busy-ready");
+    const beforeBusyEscape = await send("Runtime.evaluate", {
+      expression: "({opened:document.querySelector('dialog.zk1-workspace-dialog')?.open,batchDisabled:document.querySelector('[data-zk1-action=\\\"catalog-delta-text-search\\\"]')?.disabled,marker:window.__issue63EscPhase,busy:window.__issue63IsBusy?.()})",
+      returnByValue: true,
+    });
+    assert.deepEqual(beforeBusyEscape.result?.value, {
+      opened: true, batchDisabled: true, marker: "busy-ready", busy: true,
+    });
+    await send("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+    await send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+    const duringBusy = await send("Runtime.evaluate", {
+      expression: "({opened:document.querySelector('dialog.zk1-workspace-dialog')?.open,cancelSeen:window.__issue63BusyCancelSeen===true,batchDisabled:document.querySelector('[data-zk1-action=\\\"catalog-delta-text-search\\\"]')?.disabled,stage:window.__issue63EscPhase,busy:window.__issue63IsBusy?.()})",
+      returnByValue: true,
+    });
+    assert.equal(duringBusy.result?.value?.batchDisabled, true);
+    assert.equal(duringBusy.result?.value?.busy, true);
+    assert.equal(duringBusy.result?.value?.stage, "busy-ready");
+    if (!duringBusy.result?.value?.opened)
+      assert.equal(duringBusy.result?.value?.cancelSeen, true,
+        "native busy Escape must emit cancel before closing");
+    await send("Runtime.evaluate", {
+      expression: "window.__issue63ReleaseFirstGet?.(); true",
+      returnByValue: true,
+    });
+    const escapeReady = await waitFor(async () => {
+      const evalResult = await send("Runtime.evaluate", {
+        expression: "window.__issue63EscPhase || document.getElementById('edge-result')?.textContent || null",
+        returnByValue: true,
+      });
+      const value = evalResult.result?.value;
+      return value === "ready" || typeof value === "string"
+        && /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(value) ? value : null;
+    });
+    if (escapeReady !== "ready") assert.equal(escapeReady, "ready");
+    await send("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+    await send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
     });
     const result = await waitFor(async () => {
       const evalResult = await send("Runtime.evaluate", {

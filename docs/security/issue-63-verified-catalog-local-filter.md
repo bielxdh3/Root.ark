@@ -163,3 +163,14 @@ unchecked replacement defaults to ordinary append and preserves the older
 encrypted index when the new selection would exceed its capacity. Real Edge
 same-window tests cover full batch A, batch B denied without fresh replacement
 consent, batch B accepted after fresh opt-in, and invalidation of old pages.
+
+Native Escape on a `<dialog>` follows `cancel`/`close`, bypassing the explicit
+Close button's form reset. The `close` event now also consumes all three
+consents before a reopened dialog can accept a different selection. Edge may
+emit a noncancelable `cancel` event during an in-flight verified batch: a
+resulting native close explicitly marks the batch cancelled, while its live
+session/modal checks prevent any partial encrypted-index commit. The real
+Edge regression sends Escape through browser keyboard input during a pending
+signed GET and again while idle, then reopens the same dialog before the next
+owner-selected manifest. It verifies no stale replacement permission or
+partial persisted index survives either transition.

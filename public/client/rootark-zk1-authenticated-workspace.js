@@ -998,7 +998,15 @@
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
-    dialog.addEventListener("close", clearLocalPreview);
+    // Native Escape closes <dialog> via cancel -> close without the explicit
+    // "close" action's form reset. Consume destructive consent on that path
+    // too. Some browsers emit a noncancelable native cancel during an active
+    // batch: explicitly cancel that batch before it can release any result.
+    dialog.addEventListener("close", () => {
+      if (activeTextBatch) activeTextBatch.cancelled = true;
+      resetRevisionBatchConsent();
+      clearLocalPreview();
+    });
     const invalidateInput = (event) => {
       clearLocalPreview();
       const changed = event.target?.getAttribute?.("data-zk1-field");
