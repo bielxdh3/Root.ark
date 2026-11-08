@@ -34,7 +34,12 @@ test("issue 66 CFAPI: real Windows native inspection identifies an ordinary file
   const file = path.join(directory, "ordinary.txt");
   const bytes = Buffer.from("preserve ordinary bytes");
   await fs.writeFile(file, bytes);
-  const before = await fs.stat(file);
+  // The probe must not mutate the original object. Keep its real file handle
+  // pinned throughout the native call so the post-probe assertion never
+  // reopens a pathname that another process could have replaced.
+  const original = await fs.open(file, "r");
+  t.after(() => original.close());
+  const before = await original.stat();
   const result = run(["-AllowNativeProbe", "-LiteralPath", file]);
   assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
   const info = JSON.parse(result.stdout.trim());
@@ -47,8 +52,8 @@ test("issue 66 CFAPI: real Windows native inspection identifies an ordinary file
   assert.equal(info.placeholderState, 0);
   assert.equal(info.reparsePoint, false);
   assert.equal(info.syncRootLookupSucceeded, false);
-  assert.deepEqual(await fs.readFile(file), bytes);
-  const after = await fs.stat(file);
+  assert.deepEqual(await original.readFile(), bytes);
+  const after = await original.stat();
   assert.equal(after.size, before.size);
   assert.equal(after.mtimeMs, before.mtimeMs);
 });
