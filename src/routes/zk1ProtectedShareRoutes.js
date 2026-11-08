@@ -22,17 +22,24 @@ function registerZk1ProtectedShareRoutes({ app, store, authenticate, requirePerm
   };
 
   const egress = (res) => {
-    const send = (payload) => new Promise((resolve, reject) => {
-      if (res.destroyed || res.writableEnded || res.headersSent) {
-        reject(new Error("ZK_SHARE_UNAVAILABLE")); return;
-      }
+    const send = (payload) => new Promise((resolve) => {
       const settled = () => {
         res.off("finish", settled); res.off("close", settled); resolve();
       };
       res.once("finish", settled); res.once("close", settled);
+      if (res.destroyed || res.writableEnded || res.headersSent) {
+        if (!res.destroyed) res.destroy();
+        // Never release a lease without observing finish/close, even when an
+        // unexpected response state prevents sending any ciphertext.
+        return;
+      }
       try { res.status(200).json(payload); }
-      catch (error) {
-        res.off("finish", settled); res.off("close", settled); reject(error);
+      catch (_) {
+        // res.json() may have already written part of the ciphertext before
+        // throwing. Destroy the socket immediately and keep the listeners
+        // active until 'close'; no more bytes may be emitted after revoke ACK.
+        try { if (!res.destroyed) res.destroy(); }
+        catch (_) { /* no close => unresolved durable lease, never a 200 ACK */ }
       }
     });
     send.abort = () => { if (!res.destroyed) res.destroy(); };

@@ -14,6 +14,7 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
   require("../src/services/zk1ProtectedObjectStore");
+const Database = require("better-sqlite3");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
 const { redeemProtectedCiphertextShare } = require("../public/client/rootark-zk1-recipient-share");
@@ -49,6 +50,7 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   let allowed = true;
   let pausedReadAdmission = null;
   let pausedShareResponse = null;
+  let partialShareResponse = null;
   let revokeReplies = 0;
   const pauseNextReadAdmission = () => {
     let entered;
@@ -64,6 +66,13 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     const gate = { arrived, flush: null };
     pausedShareResponse = gate;
     return { started, release() { gate.flush?.(); } };
+  };
+  const breakNextShareResponseAfterWrite = () => {
+    let entered;
+    const started = new Promise((resolve) => { entered = resolve; });
+    const gate = { entered, started, wrote: false, finished: false, closed: false };
+    partialShareResponse = gate;
+    return gate;
   };
   const witness = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);
@@ -108,6 +117,33 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     // Hold the real Express res.end() after a signed GET has passed admission
     // and prepared ciphertext, before the HTTP response reaches 'finish'.
     app.use((req, res, next) => {
+      if (req.path === "/zk-1/v1/share/read" && partialShareResponse) {
+        const gate = partialShareResponse;
+        partialShareResponse = null;
+        const originalEnd = res.end;
+        res.once("finish", () => { gate.finished = true; });
+        res.once("close", () => {
+          gate.closed = true;
+          if (gate.timer) clearTimeout(gate.timer);
+        });
+        res.end = function (chunk, encoding) {
+          res.end = originalEnd;
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk,
+            typeof encoding === "string" ? encoding : "utf8");
+          // Real TCP/HTTP: first bytes go onto the response while the rest
+          // remain buffered. Then Express' synchronous sender throws.
+          res.write(bytes.subarray(0, Math.ceil(bytes.length / 2)));
+          gate.wrote = true;
+          gate.entered();
+          gate.timer = setTimeout(() => {
+            if (!res.destroyed) {
+              try { originalEnd.call(res, bytes.subarray(Math.ceil(bytes.length / 2))); }
+              catch (_) { /* failure intentionally remains unacknowledged */ }
+            }
+          }, 1500);
+          throw new Error("fixture: partial response after first TCP write");
+        };
+      }
       if (req.path === "/zk-1/v1/share/read" && pausedShareResponse) {
         const gate = pausedShareResponse;
         pausedShareResponse = null;
@@ -387,6 +423,65 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     },
   }), /ZK_SHARE_REDEMPTION_DENIED/,
   "signed expiry reached after HTTP await cannot return a usable receipt");
+  // An unrelated SQLite connection can hold the WAL writer lock while an
+  // authentic owner revokes its already signed grant. Failure to commit the
+  // tombstone is an availability failure, never an owner permission denial.
+  const busyOriginal = store.db.pragma("busy_timeout", { simple: true });
+  const sqliteLocker = new Database(filename);
+  store.db.pragma("busy_timeout = 40");
+  sqliteLocker.exec("BEGIN IMMEDIATE");
+  try {
+    const ownerBusy = await post("/zk-1/v1/share/revoke", "owner",
+      { grantId: secondIssued.body.grantId });
+    assert.equal(ownerBusy.status, 503,
+      "a real SQLITE_BUSY must map to retryable unavailable, not permission 403");
+    assert.equal(ownerBusy.body.error, "ZK_SHARE_UNAVAILABLE");
+    assert.equal(sqliteLocker.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(secondIssued.body.grantId).revoked, 0,
+    "SQLITE_BUSY cannot claim a durable owner tombstone");
+    assert.equal((await post("/zk-1/v1/share/revoke", "attacker",
+      { grantId: secondIssued.body.grantId })).status, 403,
+    "non-owner cannot obtain 503 merely because SQLite is busy");
+  } finally {
+    sqliteLocker.exec("ROLLBACK");
+    sqliteLocker.close();
+    store.db.pragma(`busy_timeout = ${busyOriginal}`);
+  }
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId })).status, 200,
+  "failed owner revocation cannot silently block a legitimately signed read");
+
+  // Reproduce the second P2 on real Express HTTP, not only a mocked emit:
+  // the sender writes part of the ciphertext then throws before finish/close.
+  const partialGrantId = b64(crypto.randomBytes(32));
+  const partialOwnerProof = await sign(owner, "get", id, 1, digest);
+  const partialFields = { grantId: partialGrantId,
+    recipientUsername: "recipient", recipientDeviceId: recipient.device_id,
+    expiresAt: now + 120 };
+  const partialSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: partialOwnerProof.authorization, ...partialFields,
+  }), partialOwnerProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...partialFields, authorization: wire(partialOwnerProof.authorization),
+    signatureBase64: b64(partialOwnerProof.signature),
+    shareSignatureBase64: b64(partialSignature),
+  })).status, 201);
+  const tornResponse = breakNextShareResponseAfterWrite();
+  const incompleteRead = readAs("recipient", recipient,
+    { grantId: partialGrantId }).then(
+    () => "completed", () => "aborted");
+  await tornResponse.started;
+  assert.equal(tornResponse.wrote, true, "server actually wrote partial ciphertext HTTP");
+  const partialRevoke = await post("/zk-1/v1/share/revoke", "owner",
+    { grantId: partialGrantId });
+  assert.equal(partialRevoke.status, 200);
+  assert.equal(tornResponse.finished || tornResponse.closed, true,
+    "owner revoke ACK cannot precede HTTP finish/close after a partial-write throw");
+  assert.equal(await incompleteRead, "aborted",
+    "a broken partial ciphertext response must abort, not continue after revoke ACK");
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: partialGrantId })).status, 403);
+
   // A recipient or unrelated account cannot cancel an owner grant while its
   // legitimate ciphertext read is already waiting for physical admission.
   for (const guest of ["recipient", "attacker"]) {

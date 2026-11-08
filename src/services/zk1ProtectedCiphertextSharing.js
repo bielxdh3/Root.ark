@@ -278,15 +278,44 @@ class Zk1ProtectedCiphertextSharing {
         if (active.size === 0) this.activeEgress.delete(key);
       }
     };
-    // Durable registration precedes res.json() without an await. Release only
-    // after the HTTP callback observes finish/close, or leave an orphan.
-    try { return Promise.resolve(emit(payload)).finally(release); }
-    catch (error) { release(); throw error; }
+    // Durable registration precedes res.json() without an await. A rejected
+    // or synchronously throwing emitter proves NOTHING about HTTP finish/close.
+    // Keep that row as an unresolved lease (fail-closed for revocation) rather
+    // than prematurely treating a potentially half-written socket as drained.
+    let sending;
+    try { sending = emit(payload); }
+    catch (error) {
+      try { tracker.abort?.(); } catch (_) { /* durable lease stays orphaned */ }
+      throw error;
+    }
+    return Promise.resolve(sending).then(
+      (value) => { release(); return value; },
+      (error) => {
+        try { tracker.abort?.(); } catch (_) { /* durable lease stays orphaned */ }
+        throw error;
+      });
   }
 
   revoke(scope, grantId, ownerUsername) {
     if (!USER.test(ownerUsername)) deny();
-    const result = this.revokeRow.run(canonicalId(grantId), scopeKey(scope), ownerUsername);
+    const id = canonicalId(grantId);
+    const scoped = scopeKey(scope);
+    // SQLite WAL readers can still inspect the last committed owner while a
+    // separate writer holds BEGIN IMMEDIATE. Preserve a genuine wrong-owner
+    // 403 even under that lock; the UPDATE predicate remains authoritative
+    // if this preflight and the write race with a grant modification.
+    let grant;
+    try { grant = this.find.get(id, scoped); }
+    catch (_) { deny("ZK_SHARE_UNAVAILABLE"); }
+    if (!grant || grant.owner_username !== ownerUsername) deny();
+    let result;
+    try {
+      result = this.revokeRow.run(id, scoped, ownerUsername);
+    } catch (_) {
+      // A concurrent SQLite writer, I/O failure or closed database is NOT an
+      // authorization denial. Never ACK an uncommitted tombstone as success.
+      deny("ZK_SHARE_UNAVAILABLE");
+    }
     if (result.changes !== 1) deny();
     return { revoked: true };
   }

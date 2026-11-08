@@ -98,6 +98,60 @@ test("durable tombstone rejects new egress through another independent store", a
   assert.equal(emitted, false);
 });
 
+test("real concurrent BEGIN IMMEDIATE makes owner revoke unavailable, not denied", async (t) => {
+  const f = fixture(t);
+  f.a.pragma("busy_timeout = 40");
+  // A distinct live SQLite connection holds the WAL writer lock, so UPDATE
+  // actually throws SQLITE_BUSY. This is not an authorization failure.
+  f.b.exec("BEGIN IMMEDIATE");
+  try {
+    await assert.rejects(
+      f.owner.revokeAndDrain(f.scope, f.grantId, "attacker"),
+      { code: "ZK_SHARE_DENIED" },
+      "wrong owner remains a true 403 even while another writer holds the lock",
+    );
+    await assert.rejects(
+      f.owner.revokeAndDrain(f.scope, f.grantId, "owner"),
+      { code: "ZK_SHARE_UNAVAILABLE" },
+      "a locked durable tombstone must not become HTTP's ZK_SHARE_DENIED/403",
+    );
+    assert.equal(f.b.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(f.grantId).revoked, 0,
+    "a failed revoke cannot claim that its tombstone was persisted");
+  } finally { f.b.exec("ROLLBACK"); }
+  await assert.rejects(
+    f.owner.revokeAndDrain(f.scope, f.grantId, "attacker"),
+    { code: "ZK_SHARE_DENIED" },
+    "a healthy SQLite connection must not turn a wrong-owner denial into 503",
+  );
+  assert.equal(f.a.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+    .get(f.grantId).revoked, 0);
+  assert.deepEqual(await f.owner.revokeAndDrain(f.scope, f.grantId, "owner"),
+    { revoked: true }, "revoke succeeds after the independent writer releases its lock");
+  assert.equal(f.b.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+    .get(f.grantId).revoked, 1);
+});
+
+test("throwing or rejecting emitter leaves durable lease until independently settled", async (t) => {
+  for (const mode of ["sync", "async"]) {
+    const f = fixture(t);
+    const failure = () => { throw new Error("synthetic send interrupted"); };
+    if (mode === "sync") {
+      assert.throws(() => f.owner.emitTracked(f.scope, f.grantId, failure, {}),
+        /synthetic send interrupted/);
+    } else {
+      await assert.rejects(f.owner.emitTracked(f.scope, f.grantId,
+        () => Promise.reject(new Error("synthetic send interrupted")), {}),
+      /synthetic send interrupted/);
+    }
+    assert.equal(f.b.prepare("SELECT count(*) AS pending FROM zk_content_share_egress " +
+      "WHERE grant_id=?").get(f.grantId).pending, 1,
+    `${mode} emit failure cannot delete a lease before HTTP finish/close`);
+    assert.equal(f.a.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(f.grantId).revoked, 0);
+  }
+});
+
 test("orphaned durable egress row denies revoke ACK without TTL reclamation", { timeout: 16000 },
   async (t) => {
     const f = fixture(t);
