@@ -21,19 +21,23 @@ function registerZk1ProtectedShareRoutes({ app, store, authenticate, requirePerm
     return () => recheckSession(req, original, scope, "listFiles");
   };
 
-  const egress = (res) => (payload) => new Promise((resolve, reject) => {
-    if (res.destroyed || res.writableEnded || res.headersSent) {
-      reject(new Error("ZK_SHARE_UNAVAILABLE")); return;
-    }
-    const settled = () => {
-      res.off("finish", settled); res.off("close", settled); resolve();
-    };
-    res.once("finish", settled); res.once("close", settled);
-    try { res.status(200).json(payload); }
-    catch (error) {
-      res.off("finish", settled); res.off("close", settled); reject(error);
-    }
-  });
+  const egress = (res) => {
+    const send = (payload) => new Promise((resolve, reject) => {
+      if (res.destroyed || res.writableEnded || res.headersSent) {
+        reject(new Error("ZK_SHARE_UNAVAILABLE")); return;
+      }
+      const settled = () => {
+        res.off("finish", settled); res.off("close", settled); resolve();
+      };
+      res.once("finish", settled); res.once("close", settled);
+      try { res.status(200).json(payload); }
+      catch (error) {
+        res.off("finish", settled); res.off("close", settled); reject(error);
+      }
+    });
+    send.abort = () => { if (!res.destroyed) res.destroy(); };
+    return send;
+  };
 
   app.post("/zk-1/v1/share/grant", fenceHeaders, protectedRequestLimit, authenticate,
     requirePermission("listFiles"), parseSealedContent, async (req, res) => {
@@ -69,13 +73,17 @@ function registerZk1ProtectedShareRoutes({ app, store, authenticate, requirePerm
     });
 
   app.post("/zk-1/v1/share/revoke", fenceHeaders, protectedRequestLimit, authenticate,
-    requirePermission("listFiles"), parseSealedContent, (req, res) => {
+    requirePermission("listFiles"), parseSealedContent, async (req, res) => {
       try {
         exact(req.body, ["grantId"]);
         const scope = resolveTrustedScope(req.user);
         if (!scope) throw Error("ZK_SHARE_DENIED");
-        guardUser(req, scope)();
-        res.status(200).json(sharing.revoke(scope, req.body.grantId, req.user.username));
+        const guard = guardUser(req, scope);
+        guard();
+        const result = await sharing.revokeAndDrain(scope, req.body.grantId,
+          req.user.username);
+        guard();
+        if (!res.headersSent && !res.destroyed) res.status(200).json(result);
       } catch (error) { deny(res, error); }
     });
 }

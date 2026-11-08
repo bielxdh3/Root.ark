@@ -48,6 +48,8 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   let now = 1400;
   let allowed = true;
   let pausedReadAdmission = null;
+  let pausedShareResponse = null;
+  let revokeReplies = 0;
   const pauseNextReadAdmission = () => {
     let entered;
     let release;
@@ -55,6 +57,13 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     const wait = new Promise((resolve) => { release = resolve; });
     pausedReadAdmission = { entered, wait };
     return { started, release };
+  };
+  const pauseNextShareResponse = () => {
+    let arrived;
+    const started = new Promise((resolve) => { arrived = resolve; });
+    const gate = { arrived, flush: null };
+    pausedShareResponse = gate;
+    return { started, release() { gate.flush?.(); } };
   };
   const witness = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);
@@ -96,6 +105,33 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   let server;
   const mount = async () => {
     const app = express();
+    // Hold the real Express res.end() after a signed GET has passed admission
+    // and prepared ciphertext, before the HTTP response reaches 'finish'.
+    app.use((req, res, next) => {
+      if (req.path === "/zk-1/v1/share/read" && pausedShareResponse) {
+        const gate = pausedShareResponse;
+        pausedShareResponse = null;
+        const originalEnd = res.end;
+        res.end = function (...args) {
+          res.end = originalEnd;
+          gate.flush = () => {
+            if (!gate.flush) return;
+            gate.flush = null;
+            originalEnd.apply(res, args);
+          };
+          gate.arrived();
+          return res;
+        };
+      }
+      if (req.path === "/zk-1/v1/share/revoke") {
+        const originalJson = res.json;
+        res.json = function (payload) {
+          revokeReplies++;
+          return originalJson.call(res, payload);
+        };
+      }
+      next();
+    });
     const authenticate = (req, res, next) => {
       const username = req.get("x-fixture-account");
       if (!["owner", "recipient", "attacker"].includes(username)) return res.sendStatus(401);
@@ -351,6 +387,29 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     },
   }), /ZK_SHARE_REDEMPTION_DENIED/,
   "signed expiry reached after HTTP await cannot return a usable receipt");
+  // A recipient or unrelated account cannot cancel an owner grant while its
+  // legitimate ciphertext read is already waiting for physical admission.
+  for (const guest of ["recipient", "attacker"]) {
+    const guestAdmission = pauseNextReadAdmission();
+    const pendingAuthorizedRead = readAs("recipient", recipient,
+      { grantId: secondIssued.body.grantId });
+    try {
+      await guestAdmission.started;
+      const deniedGuestRevoke = await post("/zk-1/v1/share/revoke", guest,
+        { grantId: secondIssued.body.grantId });
+      assert.equal(deniedGuestRevoke.status, 403,
+        `${guest} cannot revoke an active owner's grant during admission`);
+      assert.equal(deniedGuestRevoke.body?.ciphertextBase64, undefined);
+    } finally { guestAdmission.release(); }
+    const uninterrupted = await pendingAuthorizedRead;
+    assert.equal(uninterrupted.status, 200,
+      `unauthorized ${guest} revoke cannot interrupt a live authorized read`);
+    assert.deepEqual(Buffer.from(uninterrupted.body.ciphertextBase64, "base64url"),
+      ciphertext, "concurrent guest revoke must not alter authorized ciphertext");
+    assert.equal((await readAs("recipient", recipient,
+      { grantId: secondIssued.body.grantId })).status, 200,
+    "unauthorized revoke must not persist an owner grant tombstone");
+  }
   // A valid grant may be revoked while the recipient waits on physical I/O
   // admission. Neither the in-flight nor later response may expose ciphertext.
   const revocationAdmission = pauseNextReadAdmission();
@@ -455,6 +514,79 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   })).status, 403, "expired owner-signed grant fails closed despite longer SQLite expiry");
   assert.equal((await readAs("recipient")).status, 200,
     "expiring one grant cannot affect another grant for the same ciphertext");
+
+  // A valid owner revocation is committed while an earlier authorized read is
+  // stuck inside HTTP egress. The owner must not receive a 200 until that
+  // response has finished or been aborted; queued network bytes are not recalled.
+  const heldResponse = pauseNextShareResponse();
+  const pendingEgress = readAs("recipient");
+  let revokeDuringEgress;
+  try {
+    await heldResponse.started;
+    assert.equal((await post("/zk-1/v1/share/revoke", "attacker",
+      { grantId })).status, 403,
+    "unrelated guest cannot revoke a grant while owner ciphertext egress is held");
+    assert.equal(store.db.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(grantId)?.revoked, 0,
+    "guest attempt must not mutate the grant tombstone");
+    const repliesBefore = revokeReplies;
+    revokeDuringEgress = post("/zk-1/v1/share/revoke", "owner", { grantId });
+    const revokedRow = store.db.prepare(
+      "SELECT revoked FROM zk_content_share WHERE grant_id=?");
+    const deadline = Date.now() + 5000;
+    while (revokedRow.get(grantId)?.revoked !== 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(revokedRow.get(grantId)?.revoked, 1,
+      "concurrent owner revocation must be committed during in-flight egress");
+    assert.equal(revokeReplies, repliesBefore,
+      "owner revoke 200 must wait for previous ciphertext HTTP egress to settle");
+    assert.equal((await readAs("recipient")).status, 403,
+      "durable revoke immediately rejects new reads while old egress is draining");
+  } finally { heldResponse.release(); }
+  const [originalEgress, revokeEgressAck] = await Promise.all([
+    pendingEgress, revokeDuringEgress,
+  ]);
+  assert.equal(originalEgress.status, 200,
+    "ciphertext already admitted before revocation may finish first");
+  assert.deepEqual(Buffer.from(originalEgress.body.ciphertextBase64, "base64url"),
+    ciphertext);
+  assert.equal(revokeEgressAck.status, 200,
+    "revocation ACK occurs only after prior physical HTTP egress is finished");
+  assert.equal((await readAs("recipient")).status, 403);
+  await restart();
+  assert.equal((await readAs("recipient")).status, 403,
+    "egress-fenced revocation tombstone persists across real SQLite reopen");
+
+  // A client that never consumes its already authorized response cannot make
+  // the owner's revoke request wait forever. At the bounded drain deadline,
+  // abort the socket, observe its close, and only then acknowledge revocation.
+  const timeoutGrantId = b64(crypto.randomBytes(32));
+  const timeoutOwnerProof = await sign(owner, "get", id, 1, digest);
+  const timeoutInput = { grantId: timeoutGrantId, recipientUsername: "recipient",
+    recipientDeviceId: recipient.device_id, expiresAt: now + 120 };
+  const timeoutSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: timeoutOwnerProof.authorization, ...timeoutInput,
+  }), timeoutOwnerProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...timeoutInput, authorization: wire(timeoutOwnerProof.authorization),
+    signatureBase64: b64(timeoutOwnerProof.signature),
+    shareSignatureBase64: b64(timeoutSignature),
+  })).status, 201);
+  const stuckSocket = pauseNextShareResponse();
+  // Attach the expected socket-failure handler before the 10s owner wait:
+  // otherwise Node reports a late-handled rejection as an unhandled test fail.
+  const abandonedRead = assert.rejects(readAs("recipient", recipient,
+    { grantId: timeoutGrantId }),
+  "stalled recipient socket is closed instead of outliving owner ACK");
+  await stuckSocket.started;
+  const timeoutRevoke = await post("/zk-1/v1/share/revoke", "owner",
+    { grantId: timeoutGrantId });
+  assert.equal(timeoutRevoke.status, 200,
+    "deadline must close stalled ciphertext socket before owner revoke ACK");
+  await abandonedRead;
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: timeoutGrantId })).status, 403);
 
   await fixtures.appendDeviceRevocation(state, owner.device_id);
   manifest = state.headManifest;
