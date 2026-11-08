@@ -533,6 +533,10 @@ const EVICTION_LEDGER_MAX = 16384;
 const EVICTION_LEDGER_HASH = /^[a-f0-9]{64}$/;
 const EVICTION_LEDGER_ZERO = "0".repeat(64);
 const EVICTION_LEDGER_ARCHIVE = ".rootark-sync-evictions-archive-";
+// v1 clients already ignore .rootark-trash. Atomically stage the synced
+// head file there until v2 is durable; a crash must not strand a half-built
+// genesis directory that would block startup before any PREPARE.
+const EVICTION_GENESIS_STAGE = ".rootark-eviction-genesis-head.json";
 const EVICTION_LEDGER_EPOCH = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 function evictionLedgerDirectory(rootDir) { return path.join(rootDir, EVICTION_LEDGER_DIR); }
 function evictionLedgerName(objectId, phase) {
@@ -579,6 +583,78 @@ async function openEvictionLedger(rootDir, create = false) {
   if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe eviction ledger directory", "invalid_snapshot");
   await containedAbsolute(rootDir, directory, false);
   return directory;
+}
+async function stagedEvictionGenesis(rootDir) {
+  const trash = path.join(rootDir, ".rootark-trash");
+  if (!(await exists(trash))) return null;
+  await containedAbsolute(rootDir, trash, false);
+  const trashStats = await fsp.lstat(trash, { bigint: true });
+  if (!trashStats.isDirectory() || trashStats.isSymbolicLink()) {
+    fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+  }
+  const names = await fsp.readdir(trash);
+  if (names.length > 16384) fail("Too many staged cache entries", "invalid_snapshot");
+  const candidates = names.filter((name) => name.toLowerCase() === EVICTION_GENESIS_STAGE);
+  if (!candidates.length) return null;
+  if (candidates.length !== 1 || candidates[0] !== EVICTION_GENESIS_STAGE) {
+    fail("Ambiguous staged eviction genesis", "invalid_snapshot");
+  }
+  const headFile = path.join(trash, EVICTION_GENESIS_STAGE);
+  const headStats = await fsp.lstat(headFile, { bigint: true });
+  if (!headStats.isFile() || headStats.isSymbolicLink()
+    || headStats.nlink !== 1n || headStats.size > 8192n) {
+    fail("Unsafe staged eviction genesis head", "invalid_snapshot");
+  }
+  let head;
+  try {
+    const raw = await readContainedFile(rootDir, `.rootark-trash/${EVICTION_GENESIS_STAGE}`,
+      headStats, true);
+    head = JSON.parse(raw.toString("utf8"));
+  } catch {
+    fail("Unreadable staged eviction genesis head", "invalid_snapshot");
+  }
+  if (!validEvictionLedgerHead(head) || head.sequence !== 0
+    || head.digest !== EVICTION_LEDGER_ZERO) {
+    fail("Invalid staged eviction genesis", "invalid_snapshot");
+  }
+  return { trash, file: headFile, head };
+}
+async function createStagedEvictionGenesis(rootDir) {
+  const existing = await stagedEvictionGenesis(rootDir);
+  if (existing) return existing;
+  const trash = path.join(rootDir, ".rootark-trash");
+  if (!(await exists(trash))) {
+    await fsp.mkdir(trash, { mode: 0o700 });
+    await fsyncEvictionDirectory(rootDir);
+  }
+  await containedAbsolute(rootDir, trash, false);
+  const stats = await fsp.lstat(trash, { bigint: true });
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+  }
+  const head = { epoch: crypto.randomUUID(), sequence: 0, digest: EVICTION_LEDGER_ZERO };
+  const file = path.join(trash, EVICTION_GENESIS_STAGE);
+  // durableJson fsyncs temporary bytes then atomically renames and fsyncs
+  // the parent on POSIX. A crash before rename leaves no visible genesis.
+  await durableJson(file, head);
+  return { trash, file, head };
+}
+async function promoteStagedEvictionGenesis(rootDir, staged) {
+  const active = await readEvictionLedger(rootDir);
+  if (active.head || active.entries.size) {
+    fail("Existing eviction journal prevents genesis promotion", "invalid_snapshot");
+  }
+  const directory = active.directory || await openEvictionLedger(rootDir, true);
+  const headFile = path.join(directory, "head.json");
+  if (await exists(headFile)) fail("Eviction head appeared during promotion", "invalid_snapshot");
+  await fsp.rename(staged.file, headFile);
+  await fsyncEvictionDirectory(directory);
+  await fsyncEvictionDirectory(staged.trash);
+  const promoted = await readEvictionLedger(rootDir, staged.head.epoch);
+  if (promoted.entries.size || !promoted.head
+    || promoted.head.sequence !== 0 || promoted.head.digest !== EVICTION_LEDGER_ZERO) {
+    fail("Durable genesis promotion is indeterminate", "invalid_snapshot");
+  }
 }
 function validateEvictionPrepare(item, filename) {
   if (!item || typeof item !== "object" || Array.isArray(item)
@@ -642,7 +718,11 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
     row[match[2]] = { item, filename };
     entries.set(match[1], row);
   }
-  if (Boolean(head) !== (entries.size > 0)) {
+  // A synced zero-sequence genesis may precede the snapshot's v2 upgrade.
+  // No cache file may leave its path until the v2 required marker is durable.
+  if ((!head && entries.size > 0)
+    || (head && entries.size === 0
+      && (head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO))) {
     fail("Missing eviction ledger head or PREPARE entries", "invalid_snapshot");
   }
   let sequence = 0;
@@ -692,8 +772,15 @@ async function writeEvictionPrepare(rootDir, prepare, currentHead) {
   const directory = await openEvictionLedger(rootDir, true);
   const file = path.join(directory, filename);
   const headPath = path.join(directory, "head.json");
-  if (currentHead.sequence === 0 ? await exists(headPath) : !(await exists(headPath))) {
+  if (!(await exists(headPath))) {
     fail("Unreconciled eviction journal head", "invalid_snapshot");
+  }
+  if (currentHead.sequence === 0) {
+    const initial = await readEvictionLedger(rootDir, currentHead.epoch);
+    if (initial.entries.size || !initial.head || initial.head.sequence !== 0
+      || initial.head.digest !== EVICTION_LEDGER_ZERO) {
+      fail("Missing or replaced durable eviction genesis", "invalid_snapshot");
+    }
   }
   // One in-flight version per object; never overwrite an earlier PREPARE
   // whose physical state might still be awaiting replay.
@@ -1061,12 +1148,36 @@ class SyncEngine {
 
   async replayEvictionLedger() {
     const { entries, head } = await readEvictionLedger(this.rootDir,
-      this.snapshot.evictionLedgerEpoch || null);
+      this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
+    const staged = await stagedEvictionGenesis(this.rootDir);
     if (this.snapshot.evictionLedgerRequired && !head) {
-      // After PREPARE was permitted, absence of the whole ledger (or a
-      // recreated empty directory) is ambiguous. A missing local file must
-      // never be inferred to be a user-signed DELETE.
-      fail("Required active eviction ledger is missing", "invalid_snapshot");
+      // A crash after the v2 snapshot but before promoting the genesis can
+      // leave the only durable head in v1's already-internal trash namespace.
+      // No PREPARE is allowed before promotion. Still demand full physical
+      // proof, since a forged staged genesis cannot attest to lost files.
+      if (!staged || staged.head.epoch !== this.snapshot.evictionLedgerEpoch) {
+        fail("Required active eviction ledger is missing", "invalid_snapshot");
+      }
+      await this.recoverUnstartedEvictionLedger(staged);
+      return;
+    }
+    if (head && !entries.size) {
+      if (staged) fail("Conflicting staged and active eviction genesis", "invalid_snapshot");
+      if (this.snapshot.evictionLedgerRequired) {
+        if (head.epoch !== this.snapshot.evictionLedgerEpoch
+          || head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO) {
+          fail("Eviction genesis is not anchored to required snapshot", "invalid_snapshot");
+        }
+        // An empty genesis alone could have been fabricated after losing a
+        // post-PREPARE ledger. Require all original plaintext cache files to
+        // be present and clean before disarming its required marker.
+        await this.recoverUnstartedEvictionLedger();
+      }
+      return;
+    }
+    if (entries.size && (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION
+      || head.epoch !== this.snapshot.evictionLedgerEpoch || staged)) {
+      fail("Eviction journal requires a matching v2 snapshot", "invalid_snapshot");
     }
     if (!entries.size) return;
     if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION) {
@@ -1162,6 +1273,91 @@ class SyncEngine {
     try { await this.persistSnapshot(); }
     catch (error) { this.snapshot = previous; throw error; }
     await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
+  }
+
+  async recoverUnstartedEvictionLedger(staged = null) {
+    // Called under the cross-process exclusive root lock, only when required
+    // is true and the anchored genesis exists without any PREPARE records.
+    // Repeated full-file verification is intentional: this exceptional path
+    // must not use a metadata-only stamp as proof of clean retained bytes.
+    const assertAllTrackedBytesPresent = async () => {
+      try {
+        const live = Object.entries(this.snapshot.files).filter(([, item]) => !item.deleted);
+        if (!live.some(([, item]) => !item.directory)) {
+          fail("Empty active eviction recovery has no tracked cache files", "invalid_snapshot");
+        }
+        const names = await fsp.readdir(this.rootDir);
+        if (names.length > 16384 || names.some((name) =>
+          (name.toLowerCase() === EVICTION_LEDGER_DIR && name !== EVICTION_LEDGER_DIR)
+          || name.toLowerCase().startsWith(EVICTION_LEDGER_ARCHIVE))) {
+          fail("An ambiguous or archived eviction ledger remains", "invalid_snapshot");
+        }
+        const scanned = await this.scanFiles();
+        const trackedKeys = new Set();
+        const physicalCache = new Map();
+        const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+        for (const [relative, prior] of live) {
+          protocol.safeRelativePath(relative, "path");
+          const folded = relative.toLowerCase();
+          if (trackedKeys.has(folded) || !EVICTION_LEDGER_HASH.test(prior.hash)) {
+            fail("Ambiguous or unhashable tracked cache file", "invalid_snapshot");
+          }
+          trackedKeys.add(folded);
+          // Reject case-only aliases even on POSIX: reconcileLocal could
+          // otherwise DELETE the old tracked spelling and CREATE the alias.
+          const physical = await uniqueExcludedPhysicalPath(this.rootDir, relative, physicalCache);
+          if (physical !== relative) fail("Tracked cache path is not physically intact", "invalid_snapshot");
+          const target = await contained(this.rootDir, relative, false);
+          const stats = await fsp.lstat(target, { bigint: true });
+          if (prior.directory) {
+            if (!stats.isDirectory() || stats.isSymbolicLink() || prior.hash !== emptyHash) {
+              fail("Tracked cache directory is not intact", "invalid_snapshot");
+            }
+          } else {
+            if (!stats.isFile() || stats.isSymbolicLink()) {
+              fail("Tracked cache file is not intact", "invalid_snapshot");
+            }
+            const bytes = await readContainedFile(this.rootDir, relative, stats);
+            if (crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash) {
+              fail("Tracked cache bytes differ from the last durable snapshot", "invalid_snapshot");
+            }
+          }
+          if (!Object.hasOwn(scanned, relative)
+            || scanned[relative].directory !== Boolean(prior.directory)
+            || scanned[relative].hash !== prior.hash) {
+            fail("Tracked file is absent from the complete local scan", "invalid_snapshot");
+          }
+        }
+        for (const relative of Object.keys(scanned)) {
+          if (!Object.hasOwn(this.snapshot.files, relative)
+            || this.snapshot.files[relative].deleted) {
+            fail("Untracked local content prevents empty-ledger recovery", "invalid_snapshot");
+          }
+        }
+      } catch {
+        fail("Unproven physical state after required eviction ledger loss", "invalid_snapshot");
+      }
+    };
+    await assertAllTrackedBytesPresent();
+    const reread = async () => {
+      const { entries, head } = await readEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
+      const stagedNow = staged ? await stagedEvictionGenesis(this.rootDir) : null;
+      if (entries.size || (staged ? (head || !stagedNow
+        || stagedNow.file !== staged.file || stagedNow.head.epoch !== staged.head.epoch)
+        : (!head || head.epoch !== this.snapshot.evictionLedgerEpoch
+          || head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO))) {
+        fail("Eviction genesis changed during physical proof", "invalid_snapshot");
+      }
+    };
+    await reread();
+    await assertAllTrackedBytesPresent();
+    await reread();
+    this.snapshot.evictionLedgerRequired = false;
+    try { await this.persistSnapshot(); }
+    catch (error) {
+      this.snapshot.evictionLedgerRequired = true;
+      throw error;
+    }
   }
 
   async persistSnapshot() {
@@ -2866,13 +3062,22 @@ class SyncEngine {
     } : null;
     if (prepare) {
       if (!this.evictionLedgerHead) {
-        // Fence old clients and anchor this migration epoch once, before any
-        // small PREPARE can protect a destructive local cache-file move.
+        // Stage the genesis under v1-recognized .rootark-trash. Old v1
+        // clients must NEVER see a new .rootark-sync-evictions name before
+        // the incompatible v2 snapshot is durable.
+        const { entries: pendingEntries, head: priorHead } =
+          await readEvictionLedger(this.rootDir);
+        if (pendingEntries.size || (priorHead
+          && (priorHead.sequence !== 0 || priorHead.digest !== EVICTION_LEDGER_ZERO))) {
+          fail("Unreconciled eviction ledger before snapshot upgrade", "invalid_snapshot");
+        }
+        const staged = priorHead ? null : await createStagedEvictionGenesis(this.rootDir);
+        const genesis = priorHead || staged.head;
         const priorVersion = this.snapshot.version;
         const priorEpoch = this.snapshot.evictionLedgerEpoch;
         const priorRequired = this.snapshot.evictionLedgerRequired;
         this.snapshot.version = EVICTION_LEDGER_SNAPSHOT_VERSION;
-        this.snapshot.evictionLedgerEpoch = crypto.randomUUID();
+        this.snapshot.evictionLedgerEpoch = genesis.epoch;
         this.snapshot.evictionLedgerRequired = true;
         try { await this.persistSnapshot(); }
         catch (error) {
@@ -2883,10 +3088,8 @@ class SyncEngine {
           else this.snapshot.evictionLedgerRequired = priorRequired;
           throw error;
         }
-        this.evictionLedgerHead = {
-          epoch: this.snapshot.evictionLedgerEpoch,
-          sequence: 0, digest: EVICTION_LEDGER_ZERO,
-        };
+        if (staged) await promoteStagedEvictionGenesis(this.rootDir, staged);
+        this.evictionLedgerHead = genesis;
       }
       if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION
         || this.snapshot.evictionLedgerEpoch !== this.evictionLedgerHead.epoch

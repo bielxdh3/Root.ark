@@ -233,7 +233,17 @@ test("issue 66 P1: pre-PREPARE snapshot upgrade EIO does not move bytes or relax
   const checkpoint = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
   assert.equal(checkpoint.version, 1, "failed pre-PREPARE migration cannot write a v2 fence");
   assert.equal(checkpoint.evictionLedgerRequired, undefined);
-  await assert.rejects(fsp.lstat(f.ledger), { code: "ENOENT" });
+  // The new pre-PREPARE protocol deliberately leaves a durable zero-sequence
+  // genesis after a failed snapshot upgrade. It is safe to reuse on retry.
+  await assert.rejects(fsp.lstat(f.ledger), { code: "ENOENT" },
+    "v1 must not see a new internal ledger before the downgrade fence is durable");
+  const staged = (await fsp.readdir(path.join(f.root, ".rootark-trash")))
+    .filter((name) => name === ".rootark-eviction-genesis-head.json");
+  assert.deepEqual(staged, [".rootark-eviction-genesis-head.json"]);
+  const genesis = JSON.parse(await fsp.readFile(
+    path.join(f.root, ".rootark-trash", staged[0]), "utf8"));
+  assert.equal(genesis.sequence, 0);
+  assert.equal(genesis.digest, "0".repeat(64));
   const beforeWrites = f.writes;
   const restarted = await f.create(f.root, []);
   await restarted.syncOnce();
