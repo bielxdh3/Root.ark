@@ -84,7 +84,7 @@ test("quarantine metadata is read from the validated file descriptor and rejects
 });
 
 test("quarantine readers reject dangling symlinks on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-dangling-link-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-dangling-link-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-dangling-link-payloads-"));
   const dataDir = path.join(runtime, "data");
   const metadataPath = path.join(dataDir, "quarantine.json");
@@ -127,7 +127,7 @@ test("quarantine readers reject dangling symlinks on Windows", { skip: process.p
 });
 
 test("quarantine startup recovery is serialized with cross-process restores", { timeout: 30_000 }, async () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-recovery-lock-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-recovery-lock-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-recovery-lock-payloads-"));
   const stagePath = path.join(quarantineDir, `.rootark-quarantine-restore-${crypto.randomUUID()}`);
   const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_RETENTION_COUNT: "20" };
@@ -202,7 +202,7 @@ test("quarantine startup recovery is serialized with cross-process restores", { 
 });
 
 test("backup and restore reject quarantine directories that equal or contain uploads", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-overlap-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-overlap-runtime-");
   const externalQuarantine = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-overlap-external-"));
   try {
     const script = `
@@ -264,7 +264,7 @@ test("backup and restore reject quarantine directories that equal or contain upl
 });
 
 test("quarantine backup and restore preserve external payloads and reject incomplete archives", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-restore-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-restore-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-payloads-"));
   try {
     const script = `
@@ -408,7 +408,7 @@ test("quarantine backup and restore preserve external payloads and reject incomp
 });
 
 test("quarantine backup excludes prefixed payloads inside included uploads", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-upload-exclusion-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-upload-exclusion-runtime-");
   try {
     const script = `
       const assert = require("node:assert/strict");
@@ -453,7 +453,7 @@ test("quarantine backup excludes prefixed payloads inside included uploads", { t
 });
 
 test("quarantine restore preserves payloads nested under uploads", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-nested-restore-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-nested-restore-runtime-");
   try {
     const script = `
       const assert = require("node:assert/strict");
@@ -514,7 +514,7 @@ test("quarantine restore preserves payloads addressed through a Windows short pa
     t.skip("Windows short-path aliases are not available on this platform");
     return;
   }
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-shortpath-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-shortpath-runtime-");
   try {
     const quarantineDir = path.join(runtime, "uploads", ".quarantine-store");
     fs.mkdirSync(quarantineDir, { recursive: true });
@@ -572,7 +572,7 @@ test("quarantine restore preserves payloads addressed through a Windows short pa
 });
 
 test("quarantine restore does not write through upload junction ancestors", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-junction-restore-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-junction-restore-runtime-");
   const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-junction-restore-external-"));
   try {
     const script = `
@@ -651,7 +651,7 @@ test("quarantine restore does not write through upload junction ancestors", { ti
 });
 
 test("quarantine restore rejects deep paths reached through an upload alias", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-restore-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-alias-restore-runtime-");
   try {
     const script = `
       const assert = require("node:assert/strict");
@@ -708,7 +708,7 @@ test("quarantine restore rejects deep paths reached through an upload alias", { 
 });
 
 test("quarantine restore fails closed if an upload alias becomes nested during restore", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-race-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-alias-race-runtime-");
   try {
     const script = `
       const assert = require("node:assert/strict");
@@ -801,7 +801,7 @@ test("quarantine restore fails closed if an upload alias becomes nested during r
 });
 
 test("quarantine files under data are excluded from generic backup collection", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-data-exclusion-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-data-exclusion-runtime-");
   try {
     const script = `
       const assert = require("node:assert/strict");
@@ -993,7 +993,7 @@ test("generic uploads and temp backups reject opted-in symlink roots and entries
 });
 
 test("backup fails closed when a collected source path is swapped before it opens", { timeout: 30_000 }, (t) => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-source-race-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-backup-source-race-runtime-");
   const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-source-race-external-"));
   try {
     const uploadsDir = path.join(runtime, "uploads");
@@ -1151,7 +1151,7 @@ test("quarantine backup rejects eligible upload aliases while preserving explici
 });
 
 test("quarantine restore keeps metadata renames on the data volume", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-volume-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-volume-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-volume-payloads-"));
   try {
     const script = `
@@ -1214,7 +1214,7 @@ test("quarantine restore keeps metadata renames on the data volume", { timeout: 
 });
 
 test("quarantine backup filters case-aliased metadata on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-case-backup-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-case-backup-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-case-backup-payloads-"));
   try {
     const script = `
@@ -1266,7 +1266,7 @@ test("quarantine backup filters case-aliased metadata on Windows", { skip: proce
 });
 
 test("restore rejects legacy dotenv archives before changing runtime files", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-dotenv-restore-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-dotenv-restore-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-dotenv-restore-payloads-"));
   try {
     const script = `
@@ -1320,7 +1320,7 @@ test("restore rejects legacy dotenv archives before changing runtime files", { t
 });
 
 test("restore rejects case-aliased quarantine control files on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-control-restore-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-control-restore-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-control-restore-payloads-"));
   try {
     const script = `
@@ -1374,7 +1374,7 @@ test("restore rejects case-aliased quarantine control files on Windows", { skip:
 });
 
 test("quarantine restore recovers its prior state after process interruption", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-crash-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-crash-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-crash-payloads-"));
   try {
     const setupScript = `
@@ -1434,7 +1434,7 @@ test("quarantine restore recovers its prior state after process interruption", {
 });
 
 test("quarantine restore recovery preserves missing metadata state across startup initialization", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-empty-crash-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-empty-crash-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-empty-crash-payloads-"));
   try {
     const setupScript = `
@@ -1611,7 +1611,7 @@ test("quarantine journal directory fsync failure preserves the published journal
 });
 
 test("quarantine restore startup finalizes a committed transaction after interruption", { timeout: 30_000 }, () => {
-  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-commit-crash-runtime-"));
+  const runtime = createPrivateAuthorityFixture("rootark-quarantine-commit-crash-runtime-");
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-commit-crash-payloads-"));
   try {
     const setupScript = `
@@ -1675,7 +1675,7 @@ test("quarantine restore startup finalizes a committed transaction after interru
 test("quarantine restore recovers after each payload and metadata rename boundary", { timeout: 60_000 }, () => {
   const cases = ["old-payload-1", "old-payload-2", "new-payload-1", "new-payload-2", "old-metadata", "new-metadata", "committed-marker"];
   for (const boundary of cases) {
-    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-rename-runtime-"));
+    const runtime = createPrivateAuthorityFixture("rootark-quarantine-rename-runtime-");
     const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-rename-payloads-"));
     try {
       const setupScript = `
