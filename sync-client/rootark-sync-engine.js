@@ -13,12 +13,16 @@ const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
+// A v2 snapshot fences old clients that do not know how to replay the
+// fsynced per-object eviction overlay. Upgrade durably BEFORE first PREPARE,
+// not after staging a file; old v1 binaries must reject version 2.
+const EVICTION_LEDGER_SNAPSHOT_VERSION = 2;
 // v1 added portable case-folding on POSIX, but marked migration complete even
 // when a dirty legacy alias was retained. Revisit v1 snapshots under v2 so
 // an already-stranded alias gets a durable watch when its bytes become clean.
 const EXCLUDED_PATHS_CASEFOLD_VERSION = 2;
-const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
-const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
+const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync-evictions", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
+const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-"];
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
@@ -271,9 +275,14 @@ function isWithinPath(root, target) {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-async function readContainedFile(rootDir, relativePath, expectedStats = null) {
+async function readContainedFile(rootDir, relativePath, expectedStats = null, internalLedgerRead = false) {
   const root = path.resolve(rootDir);
-  const target = await contained(root, relativePath, false);
+  // The internal eviction ledger must be invisible to normal local/remote
+  // sync paths, but still needs the same nofollow + FD/inode verification.
+  // Only its fixed, hash-validated record names take this internal branch.
+  const target = internalLedgerRead
+    ? await containedAbsolute(root, path.resolve(root, ...relativePath.split("/")), false)
+    : await contained(root, relativePath, false);
   const before = expectedStats || await fsp.lstat(target, { bigint: true });
   // A hardlink into the selected root can alias an unrelated file outside it.
   // Canonical path and FD identity checks alone cannot detect that provenance.
@@ -428,14 +437,15 @@ async function refreshExcludedInternalRoot(rootDir, directoryCache) {
   if (!afterRoot.isDirectory() || !sameFileIdentity(rootCache.stats, afterRoot)) {
     fail("Excluded sync root identity changed", "unsafe_path");
   }
-  const trash = path.join(root, ".rootark-trash");
-  if (await exists(trash)) {
-    const stats = await fsp.lstat(trash);
-    if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe sync trash path", "unsafe_path");
-    if (rootCache.names.has(".rootark-trash") && rootCache.names.get(".rootark-trash") !== ".rootark-trash") {
-      fail("Ambiguous sync trash path", "unsafe_path");
+  for (const internalName of [".rootark-trash", EVICTION_LEDGER_DIR]) {
+    const internalPath = path.join(root, internalName);
+    if (!(await exists(internalPath))) continue;
+    const stats = await fsp.lstat(internalPath);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe internal sync directory", "unsafe_path");
+    if (rootCache.names.has(internalName) && rootCache.names.get(internalName) !== internalName) {
+      fail("Ambiguous internal sync directory", "unsafe_path");
     }
-    rootCache.names.set(".rootark-trash", ".rootark-trash");
+    rootCache.names.set(internalName, internalName);
   }
   rootCache.stats = afterRoot;
 }
@@ -509,6 +519,215 @@ async function durableJson(filePath, value) {
     await fsp.rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
+}
+
+// A bounded, per-object write-ahead snapshot overlay. Full snapshots remain
+// the authoritative compaction format; small independently synced PREPARE and
+// COMMIT records only protect the window between verified remote content and
+// removing its local cache file. No record ever authorizes a remote write.
+const EVICTION_LEDGER_DIR = ".rootark-sync-evictions";
+const EVICTION_LEDGER_VERSION = 1;
+const EVICTION_LEDGER_MAX = 16384;
+const EVICTION_LEDGER_HASH = /^[a-f0-9]{64}$/;
+const EVICTION_LEDGER_ZERO = "0".repeat(64);
+const EVICTION_LEDGER_ARCHIVE = ".rootark-sync-evictions-archive-";
+const EVICTION_LEDGER_EPOCH = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+function evictionLedgerDirectory(rootDir) { return path.join(rootDir, EVICTION_LEDGER_DIR); }
+function evictionLedgerName(objectId, phase) {
+  return `${crypto.createHash("sha256").update(objectId, "utf8").digest("hex")}.${phase}.json`;
+}
+function evictionLedgerDigest(item) {
+  return crypto.createHash("sha256").update(protocol.canonicalJson(item), "utf8").digest("hex");
+}
+function validEvictionLedgerHead(head) {
+  return head && typeof head === "object" && !Array.isArray(head)
+    && Object.keys(head).sort().join(",") === "digest,epoch,sequence"
+    && typeof head.epoch === "string" && EVICTION_LEDGER_EPOCH.test(head.epoch)
+    && Number.isSafeInteger(head.sequence) && head.sequence >= 0 && head.sequence <= EVICTION_LEDGER_MAX
+    && typeof head.digest === "string" && EVICTION_LEDGER_HASH.test(head.digest);
+}
+async function fsyncEvictionDirectory(directory) {
+  if (process.platform === "win32") return;
+  const handle = await fsp.open(directory, fs.constants.O_RDONLY);
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+// Immutable ledger records must never overwrite an existing name between a
+// preflight and rename; a torn exclusive file is deliberately fail-closed.
+async function createDurableEvictionRecord(filePath, value) {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_SYNC || 0);
+  const handle = await fsp.open(filePath, flags, 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.sync();
+  } finally { await handle.close(); }
+  await fsyncEvictionDirectory(path.dirname(filePath));
+}
+async function openEvictionLedger(rootDir, create = false) {
+  const directory = evictionLedgerDirectory(rootDir);
+  if (create) {
+    const existed = await exists(directory);
+    await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+    if (!existed && process.platform !== "win32") {
+      const parent = await fsp.open(rootDir, fs.constants.O_RDONLY);
+      try { await parent.sync(); } finally { await parent.close(); }
+    }
+  } else if (!(await exists(directory))) return null;
+  const stats = await fsp.lstat(directory, { bigint: true });
+  if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe eviction ledger directory", "invalid_snapshot");
+  await containedAbsolute(rootDir, directory, false);
+  return directory;
+}
+function validateEvictionPrepare(item, filename) {
+  if (!item || typeof item !== "object" || Array.isArray(item)
+    || Object.keys(item).sort().join(",") !== "epoch,fileId,hash,objectId,path,physical,previousDigest,record,remoteDigest,sequence,tx,version"
+    || item.version !== EVICTION_LEDGER_VERSION
+    || typeof item.tx !== "string" || !/^[a-f0-9-]{36}$/.test(item.tx)
+    || typeof item.epoch !== "string" || !EVICTION_LEDGER_EPOCH.test(item.epoch)
+    || !Number.isSafeInteger(item.sequence) || item.sequence < 1 || item.sequence > EVICTION_LEDGER_MAX
+    || typeof item.previousDigest !== "string" || !EVICTION_LEDGER_HASH.test(item.previousDigest)
+    || typeof item.remoteDigest !== "string" || !EVICTION_LEDGER_HASH.test(item.remoteDigest)
+    || typeof item.objectId !== "string" || !item.objectId || item.objectId.length > 512
+    || ["__proto__", "prototype", "constructor"].includes(item.objectId)
+    || typeof item.fileId !== "string" || !item.fileId || item.fileId.length > 512
+    || !EVICTION_LEDGER_HASH.test(item.hash)
+    || filename !== evictionLedgerName(item.objectId, "prepare")) {
+    fail("Invalid durable eviction PREPARE", "invalid_snapshot");
+  }
+  try {
+    protocol.safeRelativePath(item.path, "path");
+    protocol.safeRelativePath(item.physical, "physical");
+  } catch { fail("Invalid durable eviction path", "invalid_snapshot"); }
+  if (item.path.toLowerCase() !== item.physical.toLowerCase()
+    || !item.record || item.record.objectId !== item.objectId
+    || item.record.fileId !== item.fileId || item.record.path !== item.path
+    || item.record.hash !== item.hash || item.record.reason !== "evicted"
+    || item.record.directory !== false || item.record.deleted !== false
+    || Object.keys(item.record).sort().join(",") !== "deleted,directory,fileId,hash,objectId,path,reason,revision,versionId") {
+    fail("Invalid durable eviction identity", "invalid_snapshot");
+  }
+  return item;
+}
+async function readEvictionLedger(rootDir, expectedEpoch = null) {
+  const directory = await openEvictionLedger(rootDir);
+  if (!directory) return { directory: null, entries: new Map(), head: null };
+  const files = await fsp.readdir(directory);
+  if (files.length > EVICTION_LEDGER_MAX * 2 + 1) fail("Eviction ledger capacity exceeded", "invalid_snapshot");
+  let head = null;
+  const entries = new Map();
+  for (const filename of files) {
+    const match = /^([a-f0-9]{64})\.(prepare|commit)\.json$/.exec(filename);
+    if (!match && filename !== "head.json") fail("Malformed or torn eviction ledger entry", "invalid_snapshot");
+    const file = path.join(directory, filename);
+    const stats = await fsp.lstat(file, { bigint: true });
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n || stats.size > 8192n) {
+      fail("Unsafe eviction ledger entry", "invalid_snapshot");
+    }
+    let item;
+    try {
+      const bytes = await readContainedFile(rootDir, `${EVICTION_LEDGER_DIR}/${filename}`, stats, true);
+      if (bytes.length > 8192) fail("Oversized eviction ledger entry", "invalid_snapshot");
+      item = JSON.parse(bytes.toString("utf8"));
+    }
+    catch { fail("Torn eviction ledger entry", "invalid_snapshot"); }
+    if (filename === "head.json") {
+      if (!validEvictionLedgerHead(item)) fail("Invalid eviction ledger head", "invalid_snapshot");
+      head = item;
+      continue;
+    }
+    const row = entries.get(match[1]) || {};
+    if (row[match[2]]) fail("Duplicated eviction ledger entry", "invalid_snapshot");
+    row[match[2]] = { item, filename };
+    entries.set(match[1], row);
+  }
+  if (Boolean(head) !== (entries.size > 0)) {
+    fail("Missing eviction ledger head or PREPARE entries", "invalid_snapshot");
+  }
+  let sequence = 0;
+  let digest = EVICTION_LEDGER_ZERO;
+  const ordered = [...entries.values()].sort((left, right) =>
+    left.prepare?.item?.sequence - right.prepare?.item?.sequence);
+  for (const row of ordered) {
+    if (!row.prepare) fail("Eviction COMMIT without PREPARE", "invalid_snapshot");
+    validateEvictionPrepare(row.prepare.item, row.prepare.filename);
+    if (row.prepare.item.sequence !== sequence + 1
+      || row.prepare.item.previousDigest !== digest
+      || row.prepare.item.epoch !== head.epoch) {
+      fail("Eviction journal sequence or chain is not monotonic", "invalid_snapshot");
+    }
+    sequence += 1;
+    digest = evictionLedgerDigest(row.prepare.item);
+  }
+  if (head && (head.sequence !== sequence || head.digest !== digest
+    || (expectedEpoch !== null && head.epoch !== expectedEpoch))) {
+    fail("Eviction ledger head is not anchored to the sync snapshot", "invalid_snapshot");
+  }
+  for (const [id, row] of entries) {
+    if (!row.prepare) fail("Eviction COMMIT without PREPARE", "invalid_snapshot");
+    validateEvictionPrepare(row.prepare.item, row.prepare.filename);
+    if (evictionLedgerName(row.prepare.item.objectId, "prepare").slice(0, 64) !== id) {
+      fail("Conflicting eviction ledger identity", "invalid_snapshot");
+    }
+    if (row.commit && (!row.commit.item || row.commit.item.version !== EVICTION_LEDGER_VERSION
+      || row.commit.item.tx !== row.prepare.item.tx
+      || row.commit.item.digest !== crypto.createHash("sha256")
+        .update(JSON.stringify(row.prepare.item)).digest("hex")
+      || Object.keys(row.commit.item).sort().join(",") !== "digest,tx,version")) {
+      fail("Eviction COMMIT differs from PREPARE", "invalid_snapshot");
+    }
+  }
+  if (entries.size > EVICTION_LEDGER_MAX) fail("Eviction ledger has too many objects", "invalid_snapshot");
+  return { directory, entries, head };
+}
+async function writeEvictionPrepare(rootDir, prepare, currentHead) {
+  const filename = evictionLedgerName(prepare.objectId, "prepare");
+  validateEvictionPrepare(prepare, filename);
+  if (!validEvictionLedgerHead(currentHead) || currentHead.epoch !== prepare.epoch
+    || prepare.sequence !== currentHead.sequence + 1
+    || prepare.previousDigest !== currentHead.digest) {
+    fail("Eviction PREPARE lost its monotonic snapshot anchor", "invalid_snapshot");
+  }
+  const directory = await openEvictionLedger(rootDir, true);
+  const file = path.join(directory, filename);
+  const headPath = path.join(directory, "head.json");
+  if (currentHead.sequence === 0 ? await exists(headPath) : !(await exists(headPath))) {
+    fail("Unreconciled eviction journal head", "invalid_snapshot");
+  }
+  // One in-flight version per object; never overwrite an earlier PREPARE
+  // whose physical state might still be awaiting replay.
+  if (await exists(file)
+    || await exists(path.join(directory, evictionLedgerName(prepare.objectId, "commit")))) {
+    fail("Unreconciled durable eviction PREPARE/COMMIT", "invalid_snapshot");
+  }
+  await createDurableEvictionRecord(file, prepare);
+  const head = { epoch: prepare.epoch, sequence: prepare.sequence,
+    digest: evictionLedgerDigest(prepare) };
+  await durableJson(headPath, head);
+  return head;
+}
+async function writeEvictionCommit(rootDir, prepare) {
+  const digest = crypto.createHash("sha256").update(JSON.stringify(prepare)).digest("hex");
+  await createDurableEvictionRecord(path.join(evictionLedgerDirectory(rootDir), evictionLedgerName(prepare.objectId, "commit")),
+    { version: EVICTION_LEDGER_VERSION, tx: prepare.tx, digest });
+}
+async function clearEvictionLedger(rootDir, expectedEpoch = null) {
+  const { directory, entries } = await readEvictionLedger(rootDir, expectedEpoch);
+  if (!directory || !entries.size) return;
+  // The full snapshot is durable. Atomically retire the whole old ledger
+  // before removing individual files, so a crash during cleanup cannot
+  // expose a partial active chain to the next process.
+  const archived = path.join(rootDir, `${EVICTION_LEDGER_ARCHIVE}${crypto.randomUUID()}`);
+  await fsp.rename(directory, archived);
+  await fsyncEvictionDirectory(rootDir);
+  await fsp.mkdir(directory, { mode: 0o700 });
+  await fsyncEvictionDirectory(rootDir);
+  for (const row of entries.values()) {
+    if (row.commit) await fsp.unlink(path.join(archived, row.commit.filename));
+    await fsp.unlink(path.join(archived, row.prepare.filename));
+  }
+  await fsp.unlink(path.join(archived, "head.json"));
+  await fsp.rmdir(archived);
+  await fsyncEvictionDirectory(rootDir);
 }
 
 function normalizeWebDavPath(value) {
@@ -661,6 +880,7 @@ class SyncEngine {
     }
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
     this.snapshotDiskRevision = null;
+    this.evictionLedgerHead = null;
     // If a failed pin-policy compensation cannot be durably verified, keep
     // the pre-existing process lock on disk: no restart may silently evict.
     this.pinnedPolicyIndeterminate = false;
@@ -748,7 +968,14 @@ class SyncEngine {
       } catch {
         fail("Invalid sync snapshot", "invalid_snapshot");
       }
-      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if (![SNAPSHOT_VERSION, EVICTION_LEDGER_SNAPSHOT_VERSION].includes(parsed.version)
+        || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if ((parsed.version === EVICTION_LEDGER_SNAPSHOT_VERSION
+        && (typeof parsed.evictionLedgerEpoch !== "string"
+          || !EVICTION_LEDGER_EPOCH.test(parsed.evictionLedgerEpoch)))
+        || (parsed.version === SNAPSHOT_VERSION && parsed.evictionLedgerEpoch !== undefined)) {
+        fail("Sync snapshot has an invalid eviction replay epoch", "invalid_snapshot");
+      }
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
       if (parsed.excludedPaths !== undefined) {
@@ -818,8 +1045,108 @@ class SyncEngine {
       this.snapshot = parsed;
       this.snapshotDiskRevision = snapshotStats;
     }
+    // A crash between a per-object durable PREPARE and the final full
+    // checkpoint must be recovered BEFORE local reconciliation or outbound
+    // sync. Replay never unlinks anything or authorizes a remote operation.
+    this.evictionLedgerHead = null;
+    await this.replayEvictionLedger();
     this.opened = true;
     return this;
+  }
+
+  async replayEvictionLedger() {
+    const { entries } = await readEvictionLedger(this.rootDir,
+      this.snapshot.evictionLedgerEpoch || null);
+    if (!entries.size) return;
+    if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION) {
+      fail("Eviction overlay requires durable snapshot version fence", "invalid_snapshot");
+    }
+    const recovered = JSON.parse(JSON.stringify(this.snapshot));
+    const directoryCache = new Map();
+    for (const row of entries.values()) {
+      const item = row.prepare.item;
+      const tracked = Object.hasOwn(recovered.files, item.path)
+        ? recovered.files[item.path] : null;
+      const marker = Object.hasOwn(recovered.remoteOnly, item.objectId)
+        ? recovered.remoteOnly[item.objectId] : null;
+      if (!tracked && (!marker
+        || protocol.canonicalJson(marker) !== protocol.canonicalJson(item.record))) {
+        fail("Eviction journal has neither its tracked file nor a committed marker", "invalid_snapshot");
+      }
+      if (tracked && (tracked.deleted || tracked.directory || tracked.objectId !== item.objectId
+        || tracked.fileId !== item.fileId || tracked.hash !== item.hash)) {
+        fail("Eviction journal no longer matches its tracked identity", "invalid_snapshot");
+      }
+      const physical = await uniqueExcludedPhysicalPath(this.rootDir, item.path, directoryCache);
+      if (physical === null) {
+        if (recovered.pinnedFiles?.[pinnedKey(item.objectId)]?.fileId === item.fileId) {
+          fail("Pinned file cannot be replay-evicted", "invalid_snapshot");
+        }
+        if (tracked) {
+          // A PREPARE is local intent, never proof that the remote copy still
+          // exists. Re-fetch its exact previously authenticated envelope and
+          // verify the owner signature/current revocation policy and AEAD
+          // plaintext hash before trusting a missing local cache file.
+          let remote;
+          try {
+            const response = await this.adapter.list(item.objectId);
+            const records = Array.isArray(response) ? response
+              : Array.isArray(response?.objects) ? response.objects : response ? [response] : [];
+            if (records.length !== 1) throw new Error("Missing exact remote eviction witness");
+            remote = protocol.validateStoredOperation(records[0]);
+            if (remote.objectId !== item.objectId || remote.fileId !== item.fileId
+              || remote.versionId !== item.record.versionId
+              || remote.metadata.path !== item.path
+              || remote.tombstone || remote.operation === "delete"
+              || signedEnvelopeDigest(remote) !== item.remoteDigest
+              || protocol.canonicalJson(remote.revision) !== protocol.canonicalJson(item.record.revision)) {
+              throw new Error("Remote eviction witness no longer matches PREPARE");
+            }
+            await this.verifyIncomingOperation(remote, { preObserve: false });
+            const key = await this.keyFor(remote);
+            const plaintext = protocol.decryptPayload(remote, key);
+            const content = remote.operation === "move"
+              ? protocol.decodeMovePayload(plaintext, key) || plaintext : plaintext;
+            if (crypto.createHash("sha256").update(content).digest("hex") !== item.hash) {
+              throw new Error("Remote content no longer matches evicted cache");
+            }
+          } catch {
+            fail("Missing or unauthenticated remote eviction replay witness", "invalid_snapshot");
+          }
+        }
+        // JSON object indexes may legally contain names like "__proto__";
+        // assigning through [] would mutate the prototype rather than store
+        // a durable own remote-only entry on those names.
+        Object.defineProperty(recovered.remoteOnly, item.objectId, {
+          value: item.record, enumerable: true, writable: true, configurable: true,
+        });
+        if (tracked) delete recovered.files[item.path];
+        if (recovered.pendingEvictions) delete recovered.pendingEvictions[item.objectId];
+      } else if (tracked) {
+        // PREPARE alone is not a deletion receipt. An existing local file
+        // could contain new dirty bytes; preserve it and arrange a fresh full
+        // signed verification once the engine resumes, never unlink on replay.
+        recovered.pendingEvictions = recovered.pendingEvictions || {};
+        if (!Object.hasOwn(recovered.pendingEvictions, item.objectId)) {
+          Object.defineProperty(recovered.pendingEvictions, item.objectId, {
+            value: { path: item.path, code: "sync_operation_pending", attempts: 0 },
+            enumerable: true, writable: true, configurable: true,
+          });
+        }
+      } else {
+        // A stale old journal record must not suppress an unrelated new file
+        // whose local identity was never part of this eviction.
+        fail("Untracked file occupies a recorded eviction path", "invalid_snapshot");
+      }
+    }
+    if (recovered.pendingEvictions && !Object.keys(recovered.pendingEvictions).length) {
+      delete recovered.pendingEvictions;
+    }
+    const previous = this.snapshot;
+    this.snapshot = recovered;
+    try { await this.persistSnapshot(); }
+    catch (error) { this.snapshot = previous; throw error; }
+    await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
   }
 
   async persistSnapshot() {
@@ -2414,7 +2741,7 @@ class SyncEngine {
     });
   }
 
-  async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null) {
+  async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
     if (!this.opened) await this._open();
     // The internal exclusion path was already case-resolved with a bounded
     // directory index; do not enumerate the same Windows parent 640 times.
@@ -2465,7 +2792,11 @@ class SyncEngine {
         : !pathsEqual(remote.metadata.path, safePath))) {
       fail("Current remote object no longer matches the local cache", "remote_object_changed");
     }
-    await this.verifyIncomingOperation(remote);
+    // Eviction verifies an existing signed remote object but does not APPLY
+    // that envelope. Its exact digest is separately persisted in PREPARE,
+    // so a per-file observed[] journal fsync would be redundant and turn a
+    // signed exclusion batch quadratic again.
+    await this.verifyIncomingOperation(remote, { preObserve: false });
     if (remote.tombstone || remote.operation === "delete") fail("Current remote object has been deleted", "remote_object_deleted");
     const remoteKey = await this.keyFor(remote);
     const remotePlaintext = protocol.decryptPayload(remote, remoteKey);
@@ -2494,6 +2825,10 @@ class SyncEngine {
     // next reconcile resolves (the file is local and the stale marker is dropped) without a remote delete.
     const rollbackEviction = async (cause) => {
       restoreMemoryMarker();
+      // In a batch the small PREPARE already protects the crash window. The
+      // previous full snapshot is still on disk, so no large rollback write
+      // is needed before restoring the same physically present local file.
+      if (batchDurable) throw cause;
       try {
         await this.persistSnapshot();
       } catch (persistError) {
@@ -2504,12 +2839,53 @@ class SyncEngine {
 
     // The marker is committed before the file leaves its path, so the file is never outside its path
     // without a durable record that the remote object is the only copy.
-    this.snapshot.remoteOnly[prior.objectId] = {
+    const evictedMarker = {
       objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
       revision: remote.revision, path: snapshotPath, directory: false, deleted: false, reason: "evicted", hash,
     };
+    const prepare = batchDurable ? {
+      version: EVICTION_LEDGER_VERSION, tx: crypto.randomUUID(),
+      objectId: prior.objectId, fileId: prior.fileId,
+      path: snapshotPath, physical: safePath, hash, record: evictedMarker,
+      remoteDigest: signedEnvelopeDigest(remote),
+    } : null;
+    if (prepare) {
+      if (!this.evictionLedgerHead) {
+        // Fence old clients and anchor this migration epoch once, before any
+        // small PREPARE can protect a destructive local cache-file move.
+        const priorVersion = this.snapshot.version;
+        const priorEpoch = this.snapshot.evictionLedgerEpoch;
+        this.snapshot.version = EVICTION_LEDGER_SNAPSHOT_VERSION;
+        this.snapshot.evictionLedgerEpoch = crypto.randomUUID();
+        try { await this.persistSnapshot(); }
+        catch (error) {
+          this.snapshot.version = priorVersion;
+          if (priorEpoch === undefined) delete this.snapshot.evictionLedgerEpoch;
+          else this.snapshot.evictionLedgerEpoch = priorEpoch;
+          throw error;
+        }
+        this.evictionLedgerHead = {
+          epoch: this.snapshot.evictionLedgerEpoch,
+          sequence: 0, digest: EVICTION_LEDGER_ZERO,
+        };
+      }
+      if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION
+        || this.snapshot.evictionLedgerEpoch !== this.evictionLedgerHead.epoch) {
+        fail("Eviction journal is not anchored to its durable snapshot", "invalid_snapshot");
+      }
+      prepare.epoch = this.evictionLedgerHead.epoch;
+      prepare.sequence = this.evictionLedgerHead.sequence + 1;
+      prepare.previousDigest = this.evictionLedgerHead.digest;
+      try {
+        this.evictionLedgerHead = await writeEvictionPrepare(this.rootDir,
+          prepare, this.evictionLedgerHead);
+      } catch (error) {
+        throw evictionError("invalid_snapshot", "Eviction PREPARE durability is indeterminate", error);
+      }
+    }
+    this.snapshot.remoteOnly[prior.objectId] = evictedMarker;
     try {
-      await this.persistSnapshot();
+      if (!batchDurable) await this.persistSnapshot();
     } catch (error) {
       await rollbackEviction(error);
     }
@@ -2519,6 +2895,13 @@ class SyncEngine {
       staged = await this.stageExisting(target);
       if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
     } catch (error) {
+      // A stage helper can move the file and then fail. A durable PREPARE is
+      // now the only restart-safe evidence that a missing local cache is not
+      // a user-requested deletion. Never roll it back or compact it away.
+      if (!(await exists(target))) {
+        throw evictionError("eviction_restore_failed",
+          "Eviction stage returned an error after the cache path disappeared; recover the durable PREPARE", error);
+      }
       await rollbackEviction(error);
     }
     // Renames the staged copy back only if nothing now occupies the path. Never deletes the staged copy.
@@ -2548,7 +2931,8 @@ class SyncEngine {
     // The eviction is committed and the file is out of its path, so a failed cleanup only leaves the staged copy in the trash folder.
     await fsp.unlink(staged).catch(() => {});
     if (this.snapshot.files[snapshotPath]?.objectId === prior.objectId) delete this.snapshot.files[snapshotPath];
-    await this.persistSnapshot();
+    if (prepare) await writeEvictionCommit(this.rootDir, prepare);
+    else await this.persistSnapshot();
     return true;
   }
 
@@ -2788,6 +3172,14 @@ class SyncEngine {
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
     const directoryCache = new Map(); // never persist stale filesystem names across syncs
+    // Never begin a ledger-backed destructive batch that cannot be fully
+    // recovered within the bounded ledger reader's object limit.
+    const candidateCount = Object.entries(this.snapshot.files).filter(([relative, prior]) =>
+      !prior.deleted && !prior.directory && this.isExcluded(relative)
+      && (listChanged || needsCasefoldMigration || pendingEvictions[prior.objectId])).length;
+    if (candidateCount > EVICTION_LEDGER_MAX) {
+      fail("Excluded cache migration exceeds durable ledger capacity", "eviction_capacity_exceeded");
+    }
     const snapshotCasefoldIndex = new Map();
     for (const relative of Object.keys(this.snapshot.files)) {
       const folded = relative.toLowerCase();
@@ -2850,10 +3242,16 @@ class SyncEngine {
         continue;
       }
       try {
-        await this._evictLocal(physicalPath, relative, snapshotCasefoldIndex);
+        await this._evictLocal(physicalPath, relative, snapshotCasefoldIndex, true);
         await observeVerifiedExcludedEviction(this.rootDir, physicalPath, directoryCache);
         report.evicted += 1;
       } catch (error) {
+        if (["invalid_snapshot", "eviction_restore_failed", "eviction_rollback_failed"].includes(error?.code)) {
+          // The file may be out of its former path while the durable
+          // PREPARE is the only crash-recovery witness. Never compact away
+          // that witness after a failed physical restore/ledger mutation.
+          throw error;
+        }
         await refreshExcludedInternalRoot(this.rootDir, directoryCache);
         const code = error?.code || "unknown";
         // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
@@ -2908,6 +3306,8 @@ class SyncEngine {
       delete this.snapshot.excludedPathsCasefoldVersion;
     }
     await this.persistSnapshot();
+    await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch || null);
+    this.evictionLedgerHead = null;
     return report;
   }
 
@@ -2918,7 +3318,17 @@ class SyncEngine {
   async _syncOnce() {
     if (!this.opened) await this._open();
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
-    const excluded = await this._applyExcludedPaths();
+    let excluded;
+    try { excluded = await this._applyExcludedPaths(); }
+    catch (error) {
+      // A partial batch may have durable PREPARE records but no compacted
+      // snapshot yet. Reopen from disk and replay them under the next lock,
+      // rather than retaining a speculative in-memory snapshot after EIO.
+      this.opened = false;
+      this.snapshotDiskRevision = null;
+      this.evictionLedgerHead = null;
+      throw error;
+    }
     if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
     await this._pushPending(summary);
