@@ -8,6 +8,10 @@ const test = require("node:test");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const SOURCE = path.resolve(__dirname, "..");
+// The disposable child runs with cwd outside this checkout. Its direct
+// `require("unzipper")` would resolve from that empty fixture directory even
+// though the dependency is installed for the actual repository test process.
+const UNZIPPER_MODULE = require.resolve("unzipper");
 const ORIGINAL_TAG = '"inventoried-etag"';
 const REPLACED_TAG = '"replacement-etag"';
 
@@ -19,7 +23,7 @@ function runRealBackup(mode) {
     const { Readable } = require("node:stream");
     const { createCloudStorage } = require(${JSON.stringify(path.join(SOURCE, "services", "cloudStorage"))});
     const backup = require(${JSON.stringify(path.join(SOURCE, "services", "backupService"))});
-    const unzipper = require("unzipper");
+    const unzipper = require(${JSON.stringify(UNZIPPER_MODULE)});
     const mode = ${JSON.stringify(mode)};
     const tagA = ${JSON.stringify(ORIGINAL_TAG)};
     const tagB = ${JSON.stringify(REPLACED_TAG)};
