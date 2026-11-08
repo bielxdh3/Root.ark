@@ -13,6 +13,17 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
   // finished the ZIP assertions but did not exit (without printing fixtures).
   const stage = (name) => fs.writeSync(2, `[backup-optout-stage:${name}]\n`);
   stage("child-started");
+  if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_ADVERSARIAL === "bad-json") {
+    fs.writeSync(1, "SYNTHETIC_STDOUT_SECRET_CANARY\nE:\\synthetic-private\\keys\\credential.txt\n");
+    process.exit(0);
+  }
+  if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_ADVERSARIAL === "1") {
+    fs.writeSync(2, "SYNTHETIC_SECRET_CANARY_DO_NOT_DISCLOSE\nE:\\synthetic-private\\keys\\credential.txt\n");
+    fs.writeSync(2, "[backup-optout-stage:untrusted]\n");
+    for (let index = 0; index < 64; index += 1) stage("child-started");
+    fs.writeSync(1, "SYNTHETIC_STDOUT_SECRET_CANARY\n");
+    process.exit(73);
+  }
   const dataDir = path.join(process.cwd(), "data");
   const uploadsDir = path.join(process.cwd(), "uploads");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -58,9 +69,47 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
       inventoryCalls, downloadCalls,
     }));
     stage("child-completed");
-  })().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
+  })().catch(() => { stage("backup-failed"); process.exitCode = 1; });
 } else {
-  function runFixture(includeUploads) {
+  // Child stderr/stdout can contain private paths, stack traces or provider
+  // messages. Treat them as untrusted: never copy either into TAP diagnostics.
+  const knownStages = new Set([
+    "child-started", "fixture-created", "modules-loaded", "backup-started",
+    "backup-created", "manifest-read", "child-completed", "backup-failed",
+  ]);
+
+  function safeChildDiagnostics(result) {
+    const seen = new Set();
+    const stages = [];
+    // Bound both the scanned input and the emitted stage list. Accept only
+    // exact whole-line markers with names from the fixed test-owned enum.
+    const lines = typeof result.stderr === "string"
+      ? result.stderr.slice(0, 8192).split(/\r?\n/, 128)
+      : [];
+    for (const line of lines) {
+      const match = /^\[backup-optout-stage:([a-z-]{1,32})\]$/.exec(line);
+      if (match && knownStages.has(match[1]) && !seen.has(match[1])) {
+        seen.add(match[1]);
+        stages.push(match[1]);
+      }
+    }
+    const exit = Number.isSafeInteger(result.status) && result.status >= 0 && result.status <= 255
+      ? result.status
+      : "unknown";
+    const signal = ["SIGTERM", "SIGKILL", "SIGINT", "SIGBREAK", "SIGABRT"].includes(result.signal)
+      ? result.signal
+      : result.signal == null ? "none" : "other";
+    return [
+      `child_exit=${exit}`,
+      `child_signal=${signal}`,
+      `child_timed_out=${result.error?.code === "ETIMEDOUT"}`,
+      `child_spawn_error=${Boolean(result.error)}`,
+      `child_json_emitted=${typeof result.stdout === "string" && result.stdout.trim().endsWith("}")}`,
+      `child_stages=${stages.length ? stages.join(",") : "none"}`,
+    ].join("\n");
+  }
+
+  function runFixture(includeUploads, adversarial = false) {
     const runtime = createPrivateAuthorityFixture("rootark-67-cloud-optout-");
     try {
       const result = spawnSync(process.execPath, [__filename], {
@@ -73,16 +122,15 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
           BACKUP_INCLUDE_TEMP: "false", BACKUP_INCLUDE_PENDING: "false",
           UPLOAD_QUARANTINE_DIR: path.join(runtime, "quarantine"),
           ROOTARK_TEST_UPLOAD_OPTOUT_CHILD: "1",
+          ROOTARK_TEST_UPLOAD_OPTOUT_ADVERSARIAL: adversarial === "bad-json" ? "bad-json" : adversarial ? "1" : "0",
         },
       });
-      assert.equal(result.status, 0, [
-        `child_exit=${String(result.status)}`,
-        `child_error=${result.error?.code || "none"}`,
-        `child_signal=${result.signal || "none"}`,
-        `child_json_emitted=${result.stdout?.trim().endsWith("}") === true}`,
-        result.stderr || "child_stage=unavailable",
-      ].join("\n"));
-      return JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+      assert.equal(result.status, 0, safeChildDiagnostics(result));
+      try {
+        return JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+      } catch {
+        assert.fail(`child_json_invalid=true\n${safeChildDiagnostics(result)}`);
+      }
     } finally {
       fs.rmSync(runtime, { recursive: true, force: true });
     }
@@ -111,5 +159,27 @@ if (process.env.ROOTARK_TEST_UPLOAD_OPTOUT_CHILD === "1") {
       assert.ok(result.entries.includes(name), `missing ZIP entry ${name}`);
       assert.ok(result.listed.includes(name), `missing manifest entry ${name}`);
     }
+  });
+
+  test("adversarial child error never leaks fake secrets, paths, stdout, or unbounded stages", () => {
+    assert.throws(() => runFixture(false, true), (error) => {
+      assert.equal(error.code, "ERR_ASSERTION");
+      assert.match(error.message, /child_exit=73/);
+      assert.doesNotMatch(error.message, /SYNTHETIC_SECRET_CANARY_DO_NOT_DISCLOSE/);
+      assert.doesNotMatch(error.message, /SYNTHETIC_STDOUT_SECRET_CANARY/);
+      assert.doesNotMatch(error.message, /synthetic-private|credential\.txt|untrusted/);
+      assert.ok(error.message.length < 400, "failure diagnostics must stay bounded");
+      return true;
+    });
+  });
+
+  test("invalid child JSON never leaks synthetic stdout in parsing failure", () => {
+    assert.throws(() => runFixture(false, "bad-json"), (error) => {
+      assert.equal(error.code, "ERR_ASSERTION");
+      assert.match(error.message, /child_json_invalid=true/);
+      assert.doesNotMatch(error.message, /SYNTHETIC_STDOUT_SECRET_CANARY|synthetic-private|credential\.txt/);
+      assert.ok(error.message.length < 400, "invalid-JSON failure diagnostics must stay bounded");
+      return true;
+    });
   });
 }
