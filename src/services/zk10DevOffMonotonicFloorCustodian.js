@@ -263,6 +263,43 @@ function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge,
   checkDbPin(db);
 }
 
+function signConsistentCurrent(anchor, main, expected, ownerHash, signerHash, sign) {
+  // Acquire write reservations in the same order as the normal floor advance.
+  // SQLite readers alone cannot prevent a second process from changing the
+  // anchor after its SELECT and before the primary SELECT. Holding BOTH
+  // BEGIN IMMEDIATE reservations throughout signing and the final reads does.
+  let lockedAnchor = false, lockedMain = false;
+  let failed = false, signature;
+  try {
+    checkDbPin(anchor);
+    checkDbPin(main);
+    anchor.exec("BEGIN IMMEDIATE");
+    lockedAnchor = true;
+    checkDbPin(anchor);
+    main.exec("BEGIN IMMEDIATE");
+    lockedMain = true;
+    checkDbPin(main);
+    if (!same(expected, read(anchor, ownerHash, signerHash))
+      || !same(expected, read(main, ownerHash, signerHash, true))) deny();
+    signature = sign();
+    if (!same(expected, read(anchor, ownerHash, signerHash))
+      || !same(expected, read(main, ownerHash, signerHash, true))) deny();
+  } catch (_) {
+    failed = true;
+  } finally {
+    // No writes occur in this reservation. ROLLBACK releases both locks even
+    // when signing or the journal verification throws; failed release denies.
+    if (lockedMain) {
+      try { main.exec("ROLLBACK"); } catch (_) { failed = true; }
+    }
+    if (lockedAnchor) {
+      try { anchor.exec("ROLLBACK"); } catch (_) { failed = true; }
+    }
+  }
+  if (failed) deny();
+  return signature;
+}
+
 function createDevOffZk10MonotonicFloorCustodian(options) {
   let main, anchor;
   try {
@@ -380,15 +417,15 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
             issued_at_ms: issuedAt, expires_at_ms: r.lease_expires_at_ms,
           };
           const floor = Object.fromEntries(FLOOR_FIELDS.map(field => [field, response[field]]));
-          const signature = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
-            signer).toString("base64url");
-          // Signer hooks are synchronous and may mutate SQLite records
-          // in-place without replacing either inode. Never return CURRENT
-          // bytes unless BOTH committed floors still match the signed head
-          // and the primary consumed-lease journal still matches its tip.
-          const confirmedAnchor = read(anchor, ownerHash, signerHash);
-          const confirmedPrimary = read(main, ownerHash, signerHash, true);
-          if (!same(next, confirmedAnchor) || !same(next, confirmedPrimary)) deny();
+          const signature = signConsistentCurrent(anchor, main, next, ownerHash, signerHash,
+            () => {
+              if (NOW() + 100 >= r.lease_expires_at_ms) deny();
+              const signedFloor = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
+                signer).toString("base64url");
+              if (NOW() + 100 >= r.lease_expires_at_ms) deny();
+              return signedFloor;
+            });
+          if (NOW() + 100 >= r.lease_expires_at_ms) deny();
           return { floor: { ...floor, signature } };
         } catch (_) {
           // SQLite fsync/commit ambiguity or unexpected sign failure must not

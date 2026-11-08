@@ -515,7 +515,7 @@ test("P1 POSIX: anchor switched inside signer callback cannot return a signed at
 });
 
 for (const target of ["anchor floor", "primary used-lease journal"]) {
-  test(`P2: same-inode ${target} change inside custodian signer cannot return stale signed CURRENT`, (t) => {
+  test(`P2: same-inode ${target} write during signer is blocked by held SQLite reservations`, (t) => {
     const x = setup(t, `signer-inplace-${target.replaceAll(" ", "-")}`);
     const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
     const ownerSigned = x.offer({
@@ -530,49 +530,171 @@ for (const target of ["anchor floor", "primary used-lease journal"]) {
       ? x.paths.anchorDatabasePath : x.paths.databasePath;
     const fileBefore = fs.statSync(targetFile, { bigint: true });
     const sign = crypto.sign;
-    let changed = false;
+    let attempted = false, blocked = false, committed = false;
     crypto.sign = (algorithm, data, key, ...rest) => {
       const signature = sign(algorithm, data, key, ...rest);
       // Only the pinned CUSTODIAN's W170 signature triggers this synchronous
       // adversarial callback; never intercept owner bootstrap/lease signatures.
       if (key === x.custodian.privateKey
         && Buffer.isBuffer(data) && data.subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
-        assert.equal(changed, false);
-        changed = true;
-        const outside = new Database(targetFile);
+        assert.equal(attempted, false);
+        attempted = true;
+        const outside = new Database(targetFile, { timeout: 1 });
         try {
-          if (target === "anchor floor") {
-            // Row changes inside the SAME DB inode, but no inode/path swap.
-            outside.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1")
-              .run(sha(24));
-          } else {
-            // The anchored floor remains unchanged; the primary's consumed
-            // nonce row no longer hashes to the anchored used-journal tip.
-            outside.prepare("UPDATE used_lease SET nonce = ? WHERE lease_serial = 1")
-              .run(b64(crypto.randomBytes(32)));
+          try {
+            if (target === "anchor floor") {
+              outside.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1")
+                .run(sha(24));
+            } else {
+              outside.prepare("UPDATE used_lease SET nonce = ? WHERE lease_serial = 1")
+                .run(b64(crypto.randomBytes(32)));
+            }
+            committed = true;
+          } catch (error) {
+            assert.match(error.message, /locked|busy/i);
+            blocked = true;
           }
         } finally { outside.close(); }
       }
       return signature;
     };
+    let result;
     try {
-      assert.throws(() => c.attest(ownerSigned.request, ownerSigned.ownerLease),
-        /ZK10_CUSTODIAN_UNAVAILABLE/,
-        "signer must not return a CURRENT certificate for a changed stored floor/journal");
+      result = c.attest(ownerSigned.request, ownerSigned.ownerLease);
     } finally { crypto.sign = sign; }
-    assert.equal(changed, true, "the real DB write ran during custodian's signature");
+    assert.equal(attempted, true, "second connection attempted a real write inside signing");
+    assert.equal(blocked, true, "the outside writer must encounter SQLite's exclusive reservation");
+    assert.equal(committed, false, "outside writer cannot change the signed head or journal");
+    assert.equal(result.floor.head_digest, sha(22));
     const fileAfter = fs.statSync(targetFile, { bigint: true });
     assert.equal(fileAfter.ino, fileBefore.ino, "the SQLite inode was not replaced");
     assert.equal(fileAfter.size, fileBefore.size, "file size stayed unchanged");
-    assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
-      "ambiguous post-sign write must permanently poison this custodian handle");
+    assert.equal(c.retainedMinimum().lease_serial, 1);
     c.close();
-    assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
-      ...x.config, bootstrap: undefined,
-    }), /ZK10_CUSTODIAN_UNAVAILABLE/,
-    "a restarted custodian must not normalize an externally inconsistent journal");
+    const restarted = x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, bootstrap: undefined }));
+    assert.equal(restarted.retainedMinimum().lease_serial, 1,
+      "a blocked writer leaves the committed floor and used journal intact");
   });
 }
+
+test("P2: a real second SQLite writer cannot slip between post-sign anchor and primary reads", (t) => {
+  const x = setup(t, "postsign-cross-store-race");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const lease = x.offer({ sequence: 2, head_digest: sha(52), enrollment_root: sha(53) });
+  const outsider = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
+  const mutate = outsider.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1");
+  const originalPrepare = Database.prototype.prepare;
+  const originalSign = crypto.sign;
+  let signed = false, intercepted = false, committed = false, blocked = false;
+  crypto.sign = (...args) => {
+    const signature = originalSign(...args);
+    if (args[2] === x.custodian.privateKey && Buffer.isBuffer(args[1])
+      && args[1].subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) signed = true;
+    return signature;
+  };
+  Database.prototype.prepare = function (sql, ...args) {
+    if (signed && !intercepted && this.name === x.paths.databasePath
+      && sql === "SELECT * FROM floor WHERE singleton = 1") {
+      intercepted = true;
+      try { mutate.run(sha(54)); committed = true; }
+      catch (error) {
+        assert.match(error.message, /locked|busy/i);
+        blocked = true;
+      }
+    }
+    return originalPrepare.call(this, sql, ...args);
+  };
+  let result;
+  try { result = c.attest(lease.request, lease.ownerLease); }
+  finally {
+    Database.prototype.prepare = originalPrepare;
+    crypto.sign = originalSign;
+    outsider.close();
+  }
+  assert.equal(signed, true, "pinned custodian signed the canonical floor");
+  assert.equal(intercepted, true, "outside writer attempted commit after anchor read");
+  assert.equal(committed, false, "second writer must not commit between floor reads");
+  assert.equal(blocked, true, "a real SQLite writer receives SQLITE_BUSY during held locks");
+  assert.equal(result.floor.head_digest, sha(52));
+  assert.equal(c.retainedMinimum().head_digest, sha(52));
+});
+
+test("P2: failed signer releases both SQLite reservations and poisons the lease handle", (t) => {
+  const x = setup(t, "signer-rollback-locks");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const offer = x.offer({ sequence: 2, head_digest: sha(62), enrollment_root: sha(63) });
+  const originalSign = crypto.sign;
+  let failedInsideSign = false;
+  crypto.sign = (...args) => {
+    if (args[2] === x.custodian.privateKey && Buffer.isBuffer(args[1])
+      && args[1].subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
+      failedInsideSign = true;
+      throw new Error("injected signer failure");
+    }
+    return originalSign(...args);
+  };
+  try {
+    assert.throws(() => c.attest(offer.request, offer.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/);
+  } finally { crypto.sign = originalSign; }
+  assert.equal(failedInsideSign, true);
+  const anchorWriter = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
+  const mainWriter = new Database(x.paths.databasePath, { timeout: 1 });
+  try {
+    assert.doesNotThrow(() => anchorWriter.exec("BEGIN IMMEDIATE"));
+    assert.doesNotThrow(() => mainWriter.exec("BEGIN IMMEDIATE"));
+  } finally {
+    if (mainWriter.inTransaction) mainWriter.exec("ROLLBACK");
+    if (anchorWriter.inTransaction) anchorWriter.exec("ROLLBACK");
+    mainWriter.close();
+    anchorWriter.close();
+  }
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  c.close();
+  const restarted = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }));
+  assert.equal(restarted.retainedMinimum().lease_serial, 1,
+    "failed signing cannot undo the already durably committed floor");
+});
+
+test("P2: bounded primary lock contention releases the anchor reservation and denies issuance", (t) => {
+  const x = setup(t, "primary-lock-contention");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const lease = x.offer({ sequence: 2, head_digest: sha(64), enrollment_root: sha(65) });
+  const blocker = new Database(x.paths.databasePath, { timeout: 1 });
+  const originalExec = Database.prototype.exec;
+  let blockedSign = false;
+  Database.prototype.exec = function (sql, ...args) {
+    if (!blockedSign && this.name === x.paths.databasePath && sql === "BEGIN IMMEDIATE") {
+      blockedSign = true;
+      // The anchor reservation is already held; a second real SQLite handle
+      // acquires primary first, so the custodian's bounded BEGIN must fail.
+      originalExec.call(blocker, "BEGIN IMMEDIATE");
+    }
+    return originalExec.call(this, sql, ...args);
+  };
+  try {
+    assert.throws(() => c.attest(lease.request, lease.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/);
+  } finally { Database.prototype.exec = originalExec; }
+  assert.equal(blockedSign, true, "the primary lock acquisition was contested");
+  const secondAnchor = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
+  try {
+    assert.doesNotThrow(() => secondAnchor.exec("BEGIN IMMEDIATE"),
+      "anchor write reservation was released despite the busy primary");
+  } finally {
+    if (secondAnchor.inTransaction) secondAnchor.exec("ROLLBACK");
+    secondAnchor.close();
+    if (blocker.inTransaction) blocker.exec("ROLLBACK");
+    blocker.close();
+  }
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  c.close();
+  const restarted = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }));
+  assert.equal(restarted.retainedMinimum().lease_serial, 1);
+});
 
 test("P1 Windows: simulated reparse during signed lease is rejected without another database open", (t) => {
   if (process.platform !== "win32") return t.skip("Windows path-validation regression");

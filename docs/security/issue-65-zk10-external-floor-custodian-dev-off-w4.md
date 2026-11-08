@@ -63,17 +63,25 @@ After the high-water commits, the component signs exactly the 12 W170 fields
 in the documented order with its separately pinned custodian Ed25519 key,
 domain Root.ark/zk10/external-floor-current/v1 followed by a NUL byte. Its
 response is a floor wrapper with a base64url signature, and it never signs
-before completing the durable writes. After signing, it re-reads and matches
-both durable floor records and reconstructs the entire primary used-lease
-journal before returning CURRENT bytes. Same-inode SQLite modifications
-during signing deny the response and poison that handle; inode/path checks
-alone are insufficient. Failure reports generic codes only.
+before completing the durable writes. Before signing, it acquires bounded
+SQLite `BEGIN IMMEDIATE` write reservations on both committed stores (anchor
+first, primary second), checks both floors and the entire primary used-lease
+journal, signs and repeats those checks while still holding both reservations.
+The helper attempts to release both reservations on every exit, including
+failed signing or reads; acquisition, verification or release failure denies
+the response and poisons the handle. Another ordinary SQLite writer cannot
+commit a same-inode change
+between the two post-sign reads. This is SQLite-writer serialization only,
+not protection against a hostile filesystem or an independently owned off-host
+oracle. Failure reports generic codes only.
 
 ## High-water and crash behavior
 
 - Both SQLite stores enforce journal_mode=DELETE and synchronous=EXTRA;
-  updates use BEGIN IMMEDIATE transactions. The separate minimum retains the
-  signed head, account, identity, lease serial **and committed SHA-256 used-lease
+  updates use BEGIN IMMEDIATE transactions and signature issuance takes bounded
+  BEGIN IMMEDIATE reservations on both stores in anchor-to-primary order. The
+  separate minimum retains the signed head, account, identity, lease serial
+  **and committed SHA-256 used-lease
   journal count/tip**. The primary retains the same commitment and the actual
   consumed nonce/lease-ID rows, in exact serial order. The journal tip chains
   its predecessor with a domain-separated canonical encoding of the nonce,
@@ -129,8 +137,11 @@ handles **and two actual OS processes** competing for one signed lease,
 owner-authorized head advance, restart and an older-primary rollback while
 the higher minimum is retained. Additional TDD RED-to-GREEN regression
 cases remove the primary-only nonce journal, mutate and swap its serial order
-with the anchor intact, reject dangling direct SQLite symlinks and reject
-parent-directory symlinks/junctions. On Windows, the dangling-symlink test
+with the anchor intact, test a real second SQLite writer attempting a commit
+between the two post-sign reads and inside both signer callbacks, verify
+failed-signature rollback and bounded primary lock contention, reject
+dangling direct SQLite symlinks and reject parent-directory symlinks/junctions.
+On Windows, the dangling-symlink test
 may skip when the local account cannot create symlinks; the POSIX/WSL gate
 must execute it. No test proves an actual independent off-host operator,
 network, physical crash durability, hostile-directory TOCTOU immunity,
