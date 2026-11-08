@@ -422,3 +422,34 @@ flowchart TD
 ~~~
 
 **Política vigente:** nenhum merge de PR, deploy, cutover, force push, reset destrutivo ou edição de `Root/main`/PR #228. Preservar worktrees e o histórico de cada revisão.
+
+## 2026-11-08 05:47 UTC — fluxograma de dependências e bloqueios de liberação
+
+**Novo corte** (consultas Git/GitHub 05:42–05:47 UTC). Os snapshots 03:57 e 04:50 UTC acima ficam preservados. O [ledger detalhado](validation/2026-11-07-rootark-wave-execution-status.md) identifica HEADs, testes e gates. `Root/main` continua em `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, com Windows canonical e syntax/tests **FAILED** no run `42380131258`. GitHub: **47 OPEN = 20 Ready / 27 Draft**. [#251](https://github.com/bielxdh3/Root.ark/pull/251) **Draft** `f0f4400a`, com conflitos antigos em `README.md`/`docs/plan-tree.md`. [#228](https://github.com/bielxdh3/Root.ark/pull/228) **CLOSED, não merged**, intocado.
+
+A cadeia de dependência #231→#232→#233→#234→#235→#236 foi **MERGED historicamente em 2026-11-04**, antes desta missão. Isso não certifica custódia independente, recuperação total ou prontidão operacional. R1 ainda requer assinatura pelo owner do digest dos **bytes originais antes do upload**, identidade e versão assinadas, inventário de conta inteira e todas as versões, custódia **independente off-host** com piso monotônico resistente a rollback, revogação e recuperação física comprovadas.
+
+~~~mermaid
+flowchart TD
+  A["#231 MERGED histórico: contratos criptográficos, wire e trust"]
+  B["#232 MERGED histórico: objetos cifrados, catálogo e histórico assinado"]
+  C["#233 MERGED histórico: S3, Drive, WebDAV e readback"]
+  D["#234 MERGED histórico: CAS, witness, PostgreSQL e fences"]
+  E["#235 MERGED histórico: navegador protegido e sync fence"]
+  F["#236 MERGED histórico: recuperação, backup e migração"]
+  A --> B --> C --> D --> E --> F
+  F --> G{"R1: todas as evidências externas verificadas?"}
+  OWNER["Owner-signed original-byte pre-upload; signer, versão e revogação"] --> G
+  CUST["Custódia independente off-host, quorum, piso monotônico antirollback"] --> G
+  BACK["#67 / #298: ZIP, jobs, conta inteira, todas as versões restauráveis"] --> G
+  PHYS["Android físico, CFAPI Windows10, TURN cross-NAT e testes reais"] --> G
+  CI["Peer GO no SHA exato, CI hospedado integral e autorização específica"] --> G
+  G -->|"Não: estado atual"| HOLD["BLOQUEADO: DEV-OFF / Draft / sem cutover"]
+  G -->|"Sim em decisão futura"| NEXT["Apenas candidato a aprovação futura; não liberado automaticamente"]
+~~~
+
+**Estados sem ambiguidade:** `planejado` = desenho/critério; `objeto local` = commit não publicado; `publicado Draft` = HEAD remoto sem aprovação global; `Ready` = estado do PR sem merge; `bloqueado` = gate vermelho ou evidência ausente; `liberado` = produção expressamente autorizada (**nenhum** neste corte).
+
+Os principais bloqueios desta consulta: [#298](https://github.com/bielxdh3/Root.ark/pull/298) `bf2dc700` **Draft**, [run 42444205015](https://github.com/bielxdh3/Root.ark/actions/runs/42444205015) **FAILURE**, local `4310bca9` **SOURCE NO-GO** por duplicidade de chave lógica Drive; [#293](https://github.com/bielxdh3/Root.ark/pull/293) `0918ffa9` **Draft**, local `2ede5aca` **SOURCE NO-GO** por espera síncrona SQLite de ~5 s; [#299](https://github.com/bielxdh3/Root.ark/pull/299) `95aec7c4` **Draft**, fail-closed DEV-OFF e Windows canonical **FAILED** no [run 42448666487](https://github.com/bielxdh3/Root.ark/actions/runs/42448666487); [#300](https://github.com/bielxdh3/Root.ark/pull/300) `b70e242f` **Draft**, Ubuntu full **FAILED** no [run 42448354634](https://github.com/bielxdh3/Root.ark/actions/runs/42448354634). Correções de outros workers ainda não verificadas **não** são dadas como concluídas.
+
+#284 `45a91a6a` continua Draft com CodeQL formal verde e Windows canonical/mandatory vermelho; #288 `ea3f8467` mantém ressalva de reparse ativo Windows, apesar dos checks estáticos. #291 `6d1c3fff` tem JVM/hosted verde sem Android físico; #302 `7ca680b4` tem gates DEV-OFF verdes sem custódia R1 externa. [#306](https://github.com/bielxdh3/Root.ark/pull/306) `b13b29f9` está **Ready, não merged**. Nenhum estado deste fluxograma autoriza PR merge, deploy, cutover, alterações de `Root/main`, `README.md`, `docs/plan-tree.md` ou PR #228 nesta rodada.

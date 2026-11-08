@@ -190,3 +190,41 @@ Novo corte posterior às 03:57 UTC; **não retrocede nem reescreve os estados hi
 | #64/#65/#67/#68 e R1 | #291 Android `6d1c3f` apenas JVM/SDK, sem aparelho; #302 `7ca680b4` hosted DEV-OFF SUCCESS mas dual SQLite rollback reproduzido, sem R1 independente; #67 ZIP/jobs/whole account e histórico multi-versão ainda parciais; #68 SQLite compartilhado não é custódia multi-host. | Não certificar readiness de produção sem plataforma física, owner-signed commitment pré-upload, inventário completo, custodiante off-host, restore real e revogação de I/O distribuída. |
 
 **Critério de publicação:** teste real + revisão independente do **SHA final exato** + pré-checagem Git de fast-forward, metadata, arquivos e diff, depois push normal em Draft e hosted específico desse SHA. A regra posterior do proprietário é absoluta: **não fazer merge de PR, deploy, cutover, alterações em `Root/main` ou PR #228**, mesmo quando algum check ou PR estiver `Ready`.
+
+## Corte provisório e DAG de gates — 2026-11-08 05:47 UTC
+
+**Proveniência:** consultas independentes Git/GitHub 05:42–05:47 UTC. Os snapshots 03:57 e 04:50 UTC permanecem históricos. `Root/main`: `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, inalterado; [run 42380131258](https://github.com/bielxdh3/Root.ark/actions/runs/42380131258) **FAILURE** (Windows canonical e syntax/tests FAILED; Ubuntu full e Windows mandatory SUCCESS). GitHub: **47 OPEN, 20 Ready, 27 Draft**. [#228](https://github.com/bielxdh3/Root.ark/pull/228) **CLOSED unmerged**; [#251](https://github.com/bielxdh3/Root.ark/pull/251) **OPEN/Draft `f0f4400ab5ae0f2624fda4b383234cfc4f0e4d78`**, com conflitos preexistentes `README.md`/`docs/plan-tree.md`. Sem novo merge em main, deploy ou cutover.
+
+| Frente | Estado e evidência no corte | Gate / bloqueio |
+| --- | --- | --- |
+| **Histórico #231→#236** | Os seis PRs foram **MERGED em 2026-11-04**: contratos/wire/trust → objetos/histórico → S3/Drive/WebDAV → CAS/witness → browser/sync → recovery/backup. | Ordem de dependências cumprida historicamente; **não** certifica custódia física R1, inventário completo ou produção. |
+| **#67 / [#298](https://github.com/bielxdh3/Root.ark/pull/298)** | Publicado **Draft `bf2dc700`**; [run 42444205015](https://github.com/bielxdh3/Root.ark/actions/runs/42444205015) **COMPLETED/FAILURE** nos quatro jobs Ubuntu full, Windows canonical, mandatory e syntax/tests. **LOCAL `4310bca9`** recebeu peer **SOURCE NO-GO P2** por chave lógica Drive duplicada. | Reparar com peer no novo SHA e full hosted. ZIP/jobs, backup de conta inteira e versões históricas ainda não certificados. |
+| **#63/#68 / [#293](https://github.com/bielxdh3/Root.ark/pull/293)** | Publicado **Draft `0918ffa9`**; [run 42435409628](https://github.com/bielxdh3/Root.ark/actions/runs/42435409628) **FAILURE** (Windows mandatory/syntax FAILED; Ubuntu/canonical SUCCESS). **LOCAL `2ede5aca`** tem testes focados, mas peer **SOURCE NO-GO P2**: `better-sqlite3` com WAL externo espera até ~5 s no `busy_timeout` síncrono e trava o timer de release no event loop. | Patch real RED/GREEN, prova terminal, retry limitado e peer cumulativo; sem dar ACK precoce nem alegar revogação de bytes entregues. |
+| **#242 / [#284](https://github.com/bielxdh3/Root.ark/pull/284)** | Publicado **Draft `45a91a6a`**; CodeQL formal/Analyze **SUCCESS**, mas [run 42425618588](https://github.com/bielxdh3/Root.ark/actions/runs/42425618588) Windows canonical e mandatory **FAILED** em caso de mutação de ciphertext após observação FD. | Versão owner-signed realmente imutável, serialização de writers/ACL, bounded I/O e validação em CI; CodeQL verde não autoriza bound P2P. |
+| **#242 / [#299](https://github.com/bielxdh3/Root.ark/pull/299)** | Publicado **Draft `95aec7c4`**, admissão bound fail-closed DEV-OFF; [run 42448666487](https://github.com/bielxdh3/Root.ark/actions/runs/42448666487): Ubuntu SUCCESS, Windows canonical **FAILURE**, Windows mandatory **IN_PROGRESS** na consulta; Edge, CodeQL e dependências verdes. | Windows RED e ausência de bytes imutáveis, snapshot ACL all-party, TURN/STUN/TLS real e cross-NAT; não afirmar transferência bound funcional. |
+| **#66 / [#300](https://github.com/bielxdh3/Root.ark/pull/300)** | Publicado **Draft `b70e242f`**; [run 42448354634](https://github.com/bielxdh3/Root.ark/actions/runs/42448354634): Ubuntu full **FAILED** em `legacy-sync-same-path-serial` (TAP2193, lock incerto após parada), Windows canonical SUCCESS e mandatory **IN_PROGRESS** na consulta. | Causa e semântica do lock pendentes; mock ABI TransferData não prova provider CFAPI positivo/hidratação física Windows10. |
+| **#64 / [#291](https://github.com/bielxdh3/Root.ark/pull/291)** | Publicado **Draft `6d1c3fff`**; JVM/Kotlin e gates hosted verificáveis **SUCCESS**. | Sem aparelho Android, Keystore/SELinux real, signer e CEK provisionados. |
+| **#67 / [#288](https://github.com/bielxdh3/Root.ark/pull/288)** | Publicado **Draft `ea3f8467`**; CodeQL e demais checks disponíveis verdes. | P2 residual de pathname/reparse Windows ativo, faltam reparo e peer específico; estático não prova ausência de corrida. |
+| **#65 / [#302](https://github.com/bielxdh3/Root.ark/pull/302)** | Publicado **Draft `7ca680b4`**; [run 42434733471](https://github.com/bielxdh3/Root.ark/actions/runs/42434733471) DEV-OFF SUCCESS. | Dois bancos SQLite locais admitem rollback coordenado; custódia off-host independente, piso monotônico e assinatura pré-upload ausentes. |
+| **[#306](https://github.com/bielxdh3/Root.ark/pull/306) / governança** | `b13b29f9` **Ready, não merged**; #251 Draft com conflitos herdados. | Ready não libera GitHub merge nem qualquer deploy. |
+
+~~~mermaid
+flowchart TD
+  HIST["#231 → #232 → #233 → #234 → #235 → #236: MERGED histórico 04/11"]
+  BACK["#298 Draft; hosted FAIL; 4310 LOCAL SOURCE NO-GO"]
+  SEARCH["#293 Draft; 2ede LOCAL SOURCE NO-GO SQLite"]
+  P2P["#284 / #299 Draft; Windows FAILED; owner-signed e TURN ausentes"]
+  CF["#300 Draft; Ubuntu FAILED; CFAPI físico ausente"]
+  R1["R1: owner-signed original pré-upload + custodiante off-host + monotonic floor"]
+  PHY["Android físico + restore whole-account + Windows10 + cross-NAT"]
+  VERIFY{"Peer do SHA final, hosted completo e autoridade externa comprovados?"}
+  HOLD["BLOQUEADO: sem Ready funcional, sem liberação"]
+  PLAN["PLANEJADO: apenas reavaliar com autorização específica futura"]
+  HIST --> BACK & SEARCH & P2P & CF
+  BACK & SEARCH & P2P & CF --> VERIFY
+  R1 & PHY --> VERIFY
+  VERIFY -->|"Não: RED ou falta prova"| HOLD
+  VERIFY -->|"Futuro com evidência + autorização"| PLAN
+~~~
+
+**Legenda:** `planejado` = critério; `objeto local` = commit ainda não publicado; `publicado Draft` = HEAD remoto sem aprovação global; `Ready` = estado de PR sem merge; `bloqueado` = gate negativo ou prova ausente; `liberado` = produção expressamente autorizada (**nenhuma** neste corte). Correções de workers ainda em andamento não são contadas como sucesso. Este adendo exige peer independente **do SHA exato** antes de eventual push; não executar push nesta tarefa, merge, deploy, cutover ou modificar `Root/main`, `README.md`, `docs/plan-tree.md` ou PR #228.
