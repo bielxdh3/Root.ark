@@ -107,15 +107,16 @@ test("periodic scan cannot overlap two uploads for the same local path", {
     releaseFirst = null;
     await until(() => uploads.includes("NEW"));
     assert.deepEqual(uploads.slice(0, 2), ["OLD", "NEW"]);
-    // Do not deliberately interrupt the second valid HTTP operation while
-    // asserting that normal quiescent exit releases its lock.
+    // Both ACKs and OLD -> NEW ordering establish same-path serialization.
+    // "OK" precedes the async active-task/slot cleanup: an immediate SIGINT
+    // may correctly retain the lock until verified recovery. Quiescent lock
+    // release is verified separately by the --once lifecycle tests.
     await until(() => (output.match(/OK a\.txt/g) || []).length >= 2);
   } finally {
     if (releaseFirst) releaseFirst();
     child.kill("SIGINT");
     await exited;
   }
-  assert.doesNotMatch(output, /SYNC_STATE_LOCK_RETAINED_UNCERTAIN_UPLOAD/);
 });
 
 test("ambiguous failed POST blocks further uploads in the still-running process", {
