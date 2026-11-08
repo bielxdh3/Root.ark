@@ -86,18 +86,25 @@ function signOwnerCutover(payload, privateKey) {
   return Object.freeze({ ...p, signature: crypto.sign(null,
     signatureBytes(DOMAIN_OWNER, p), key(privateKey, "private")).toString("base64url") });
 }
-function verifyOwnerCutover(wire, publicKey) {
+function snapshotOwnerCutover(wire) {
   const signed = exact(wire, [...OWNER_FIELDS, "signature"]);
   const p = ownerPayload(Object.fromEntries(OWNER_FIELDS.map((f) => [f, signed[f]])));
-  if (!crypto.verify(null, signatureBytes(DOMAIN_OWNER, p), key(publicKey, "public"),
-    decode(signed.signature, 64))) deny();
-  return Object.freeze(p);
+  // Keep the statement and its digest on the same byte snapshot. In particular,
+  // never re-read a Proxy wire after verifying its owner signature, and do not
+  // retain references to caller-controlled nested arrays.
+  const body = Object.freeze({ ...p, grants: Object.freeze([]),
+    covered_compartments: Object.freeze(p.covered_compartments) });
+  return { body, bytes: signatureBytes(DOMAIN_OWNER, body),
+    signature: decode(signed.signature, 64) };
+}
+function verifyOwnerCutover(wire, publicKey) {
+  const { body, bytes, signature } = snapshotOwnerCutover(wire);
+  if (!crypto.verify(null, bytes, key(publicKey, "public"), signature)) deny();
+  return body;
 }
 function digestOwnerCutover(wire) {
-  const record = exact(wire, [...OWNER_FIELDS, "signature"]);
-  const p = ownerPayload(Object.fromEntries(OWNER_FIELDS.map((f) => [f, record[f]])));
-  decode(record.signature, 64);
-  return H(signatureBytes(DOMAIN_OWNER, p), decode(record.signature, 64)).toString("hex");
+  const { bytes, signature } = snapshotOwnerCutover(wire);
+  return H(bytes, signature).toString("hex");
 }
 function rotationPayload(p) {
   const v = exact(p, ROTATION_FIELDS);
@@ -158,10 +165,16 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
   let keyIndex = 0;
   let last;
   for (let index = 0; index < history.length; index += 1) {
+    const { body, bytes, signature } = snapshotOwnerCutover(history[index]);
     let verified;
     for (let cursor = keyIndex; cursor < ownerKeys.length; cursor += 1) {
-      try { verified = verifyOwnerCutover(history[index], ownerKeys[cursor]);
-        keyIndex = cursor; break; } catch (_) { /* try later signed owner rotation */ }
+      try {
+        if (crypto.verify(null, bytes, key(ownerKeys[cursor], "public"), signature)) {
+          verified = body;
+          keyIndex = cursor;
+          break;
+        }
+      } catch (_) { /* try later signed owner rotation */ }
     }
     if (!verified || verified.immutable_account_id !== immutableAccountId
       || verified.generation !== index + 1 || verified.previous_cutover_digest !== previous
@@ -169,7 +182,7 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
         || verified.issued_at < last.issued_at
         || JSON.stringify(verified.covered_compartments)
           !== JSON.stringify(last.covered_compartments)))) deny();
-    previous = digestOwnerCutover(history[index]);
+    previous = H(bytes, signature).toString("hex");
     last = verified;
   }
   if (keyIndex !== ownerKeys.length - 1) deny();
