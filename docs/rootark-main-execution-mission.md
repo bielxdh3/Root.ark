@@ -349,3 +349,34 @@ flowchart TD
   I --> L
   K --> L
 ~~~
+
+## 2026-11-08 03:05 UTC — reconciliação posterior de HEADs e CI hospedado
+
+Este **novo corte** atualiza apenas estados comprovados após 01:30 UTC; não reescreve o significado dos snapshots anteriores. Consulta literal ao remoto manteve `Root/main` em `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`. O [ledger do corte](validation/2026-11-07-rootark-wave-execution-status.md#reconciliação-hospedada--2026-11-08-0305-utc) separa revisão de fonte, execução local, CI hospedado e bloqueios físicos.
+
+- **#251:** documentação já publicada em Draft no HEAD `21c938e3f2ca7a864fb0e1089f5c4494b4270bfc`, peer12 SOURCE GO exato. Conflitos preexistentes em `README.md`/`docs/plan-tree.md` não foram resolvidos nem alterados por esta atualização.
+- **#67/#298:** `5ab3dfe9edd58b55085c1ea7f80ffd1776c1595a` publicado em Draft e revisado por peer28 SOURCE GO. O [Security Regression 42435622100](https://github.com/bielxdh3/Root.ark/actions/runs/42435622100) **COMPLETED/SUCCESS**, inclusive Ubuntu, Windows canonical, Windows mandatory e agregador. O run anterior `42431780149` no SHA `df3dbaef` falhou no teste de upload sob concorrência: o sucesso do HEAD atual não prova a causa nem elimina a possibilidade de intermitência futura. Recovery completo, conta inteira e R1 off-host seguem abertos.
+- **#65/#302:** `7ca680b4fe853f84fac9e113ecb123105fe33718` publicado em Draft, com revisão independente peer43 SOURCE GO e [Security Regression 42434733471](https://github.com/bielxdh3/Root.ark/actions/runs/42434733471) **COMPLETED/SUCCESS** em todos os quatro gates, além do PostgreSQL18 focado. Continua **DEV-OFF**, não prova custódia física independente, piso global off-host, inventário completo ou preupload owner-signed original.
+- **#63/#68/#293:** `0918ffa9e97076d36cede0d03ea5e8b4678e7906` publicado em Draft após testes e peer33/45 SOURCE GO de escopo limitado (um processo/store). O [Security Regression 42435409628](https://github.com/bielxdh3/Root.ark/actions/runs/42435409628) **COMPLETED/FAILURE**: Ubuntu e Windows canonical **SUCCESS**, Windows mandatory **FAILURE** no passo de release gate, agregador downstream **FAILURE**. Nenhum status Ready; investigar a asserção concreta, não ampliar timeouts sem causa.
+- **#300:** docs de readiness CFAPI `f77cf6396fda42b6b9730751e27390db598a02db` publicados em Draft e revisados, mas sem novo full hosted confirmado para esse SHA; o run verde antigo corresponde a `03cac3a9`. Provider positivo nativo Windows10 não foi implementado. **#284/#299** continuam bloqueados por mutação de ciphertext após a última leitura FD; `f2f24684` é SOURCE NO-GO. **#64** não tem teste Android físico; **#242** não possui TURN/cross-NAT provisionado.
+
+~~~mermaid
+flowchart LR
+  MAIN["Root/main d5fbc110: sem alteração"]
+  DOC["#251 21c938e3: Draft docs, peer GO"]
+  B["#298 5ab3dfe9: Draft, hosted SUCCESS"]
+  Z["#302 7ca680b4: Draft DEV-OFF, hosted SUCCESS"]
+  S["#293 0918ffa9: Draft, Windows mandatory FAILED"]
+  P["#284/#299: ciphertext mutável, Windows canonical FAILED"]
+  EXT["R1 independente, recovery global, CFAPI positivo, Android físico, TURN reais: NO-GO"]
+  G{"Todos os gates do SHA exato + peer + dependências?"}
+  NO["Sem merge, deploy ou cutover nesta rodada"]
+  MAIN --> DOC & B & Z & S & P
+  B & Z & S & P --> G
+  G -->|Não / insuficiente| EXT
+  G -->|Sim, apenas elegibilidade futura| NO
+  DOC --> NO
+  EXT --> NO
+~~~
+
+`Implementado`, `integrado`, `testado`, `bloqueado`, `Ready` e `merged` não são sinônimos. Mesmo CI integralmente verde para um SHA não concede autoridade externa, não sana um P2 reconhecido e **não autoriza merge ou deploy**. PR #228 permanece intocado, e nenhum cutover da ZK10 foi autorizado.
