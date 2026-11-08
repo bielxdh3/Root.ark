@@ -26,6 +26,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     + "<script defer src='/client/rootark-zk1-file-content.js'></script>"
     + "<script defer src='/client/rootark-zk1-selected-local-preview.js'></script>"
     + "<script defer src='/client/rootark-zk1-protected-text-batch.js'></script>"
+    + "<script defer src='/client/rootark-zk1-protected-revision-index.js'></script>"
     + "<script defer src='/probe.js'></script>";
   const bootstrap = "window.RootarkApi={get:async()=>({enabled:true,"
     + "securityVersion:2,signedHistoryRequired:true,opaqueCatalogV1:true})};";
@@ -55,10 +56,22 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
       const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
       const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
+      const persistToggle=dialog.querySelector('[data-zk1-field="catalog-batch-persist"]');
+      const storedIndexButton=dialog.querySelector('[data-zk1-action="catalog-delta-index-search"]');
+      const indexPages=dialog.querySelector('[data-zk1-field="catalog-index-pages"]');
       if(!list||!target||!revision||!getButton||getButton.type!=="button"
         ||!batchButton||batchButton.type!=="button"
-        ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked)
+        ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked
+        ||!persistToggle||persistToggle.type!=="checkbox"||persistToggle.checked
+        ||!storedIndexButton||storedIndexButton.type!=="button"
+        ||storedIndexButton.disabled||!indexPages
+        ||indexPages.getAttribute("role")!=="navigation"
+        ||indexPages.children.length!==0)
         throw Error("MISSING_EXPLICIT_PROTECTED_GET");
+      persistToggle.click();
+      if(!persistToggle.checked)throw Error("EXPLICIT_REVISION_INDEX_OPT_IN_DENIED");
+      persistToggle.click();
+      if(persistToggle.checked)throw Error("REVISION_INDEX_OPT_IN_STUCK");
       const progress=dialog.querySelector('[data-zk1-field="catalog-batch-progress"]');
       const cancel=dialog.querySelector('[data-zk1-action="catalog-delta-text-cancel"]');
       if(!progress||progress.getAttribute("role")!=="status"
@@ -311,7 +324,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
         : request.url === "/probe.js" ? probe
         : ["rootark-zk1-authenticated-workspace", "rootark-zk1-protected-local-search",
           "rootark-zk1-file-content", "rootark-zk1-selected-local-preview",
-          "rootark-zk1-protected-text-batch"]
+          "rootark-zk1-protected-text-batch", "rootark-zk1-protected-revision-index"]
             .includes(file) ? fs.readFileSync(path.join(root, file + ".js"), "utf8") : null;
     response.writeHead(content === null ? 404 : 200, {
       "Content-Type": request.url === "/" ? "text/html; charset=utf-8"
@@ -331,7 +344,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     "--dump-dom", "http://127.0.0.1:" + server.address().port + "/"], {
     timeout: 35000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
   });
-  assert.match(response.stdout, /EDGE_PROTECTED_SELECT_PASS/);
-  assert.doesNotMatch(response.stdout, /EDGE_PROTECTED_SELECT_FAIL/);
+  const result = response.stdout.match(/<output id="edge-result">([^<]*)<\/output>/)?.[1] || "MISSING";
+  assert.match(result, /EDGE_PROTECTED_SELECT_PASS/);
+  assert.doesNotMatch(result, /EDGE_PROTECTED_SELECT_FAIL/);
   assert.equal(sensitiveRequests, 0);
 });
