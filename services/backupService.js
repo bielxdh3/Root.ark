@@ -565,7 +565,23 @@ async function collectBackupFiles(options = {}) {
     const staged = path.resolve(stageDir, entryPath);
     if (!staged.startsWith(`${path.resolve(stageDir)}${path.sep}`)) throw new Error("Cloud backup staging escaped its boundary");
     fs.mkdirSync(path.dirname(staged), { recursive: true });
-    if (!await cloudStorage.download(folderId, name, staged, remote.area)) throw new Error("Cloud backup object is unavailable");
+    // A Drive listing binds an inventoried logical key to one physical ID.
+    // Downloading by a second same-key lookup can silently substitute a
+    // newly created object B for enumerated object A mid-backup. The cloud
+    // adapter must GET the listed ID, or fail closed if it disappeared.
+    let backupInventoryPin;
+    if (remote.provider === "gdrive") {
+      const physicalId = remote.providerIdentity || remote.id;
+      if (typeof physicalId !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(physicalId)
+        || (remote.id != null && remote.id !== physicalId)) {
+        throw new Error("Cloud backup Drive inventory identity is invalid");
+      }
+      backupInventoryPin = { providerFileId: physicalId };
+    }
+    if (!await cloudStorage.download(folderId, name, staged, remote.area,
+      undefined, undefined, backupInventoryPin)) {
+      throw new Error("Cloud backup object is unavailable");
+    }
     const local = known.get(entryPath);
     if (local) {
       if (await calculateBackupEntryHash(local) !== await calculateFileHash(staged)) throw new Error("Cloud and local backup objects differ");

@@ -735,10 +735,28 @@ function createCloudStorage(options = {}) {
     }
   }
   async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true,
-    constraints = undefined) {
+    constraints = undefined, backupInventoryPin = undefined) {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
+    // An ordinary whole-account ZIP is unbounded, unlike a signed ZK GET,
+    // but its Drive inventory identified a SPECIFIC physical file ID. Never
+    // issue a second same-key list that can select a newer replacement ID:
+    // the ZIP would then certify an object it did not actually inventory.
+    let inventoriedId = null;
+    if (backupInventoryPin !== undefined) {
+      const data = backupInventoryPin && typeof backupInventoryPin === "object"
+        && !Array.isArray(backupInventoryPin)
+        && Object.getPrototypeOf(backupInventoryPin) === Object.prototype
+        && Reflect.ownKeys(backupInventoryPin).length === 1
+        && Object.getOwnPropertyDescriptor(backupInventoryPin, "providerFileId");
+      if (provider !== "gdrive" || constraints !== undefined
+        || !data || !Object.hasOwn(data, "value")
+        || typeof data.value !== "string" || !isDriveFileId(data.value)) {
+        throw cloudError("invalid_path", "Invalid pinned backup inventory identity");
+      }
+      inventoriedId = data.value;
+    }
     const pinId = constraints && Object.hasOwn(constraints, "providerFileId")
-      ? constraints.providerFileId : null;
+      ? constraints.providerFileId : inventoriedId;
     const externalSignal = constraints && Object.hasOwn(constraints, "abortSignal")
       ? constraints.abortSignal : undefined;
     const pinnedVersion = constraints && Object.hasOwn(constraints, "providerVersionId")
