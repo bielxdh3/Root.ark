@@ -201,6 +201,89 @@ test("P2: retained minimum never reports an obsolete signed head after a second 
   assert.equal(refreshed.retainedMinimum().head_digest, sha(15));
 });
 
+test("P2: retainedMinimum serializes both floor reads against a real anchor writer", (t) => {
+  const x = setup(t, "retained-anchor-interleave");
+  const observer = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const outside = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
+  const originalPrepare = Database.prototype.prepare;
+  let attempted = false, committed = false, blocked = false;
+  Database.prototype.prepare = function (sql, ...args) {
+    if (!attempted && this.name === x.paths.databasePath
+      && sql === "SELECT * FROM floor WHERE singleton = 1") {
+      // The observer already read old anchor. The second real SQLite handle
+      // attempts to change that same inode before observer reads primary.
+      attempted = true;
+      try {
+        outside.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1")
+          .run(sha(47));
+        committed = true;
+      } catch (error) {
+        assert.match(error.message, /busy|locked/i);
+        blocked = true;
+      }
+    }
+    return originalPrepare.call(this, sql, ...args);
+  };
+  let result;
+  try {
+    result = observer.retainedMinimum();
+  } finally {
+    Database.prototype.prepare = originalPrepare;
+  }
+  assert.equal(attempted, true, "second writer attempted its real SQLite update at read boundary");
+  assert.equal(blocked, true, "held anchor reservation must deny the concurrent update");
+  assert.equal(committed, false, "anchor must not be changed between the two reads");
+  assert.equal(result.head_digest, sha(1), "floor was valid while both reservations were held");
+  assert.equal(observer.retainedMinimum().head_digest, sha(1));
+  // This later write is deliberately AFTER the retainedMinimum linearization
+  // point: returning a verified snapshot does not promise a state at return.
+  try {
+    outside.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1")
+      .run(sha(47));
+  } finally { outside.close(); }
+  assert.throws(() => observer.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "a later call must detect the new floor and poison the old handle");
+  observer.close();
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }), /ZK10_CUSTODIAN_UNAVAILABLE/, "restart must reject mismatched stores");
+});
+
+test("P2: retainedMinimum releases anchor after bounded primary lock failure", (t) => {
+  const x = setup(t, "retained-primary-busy");
+  const observer = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const outsideMain = new Database(x.paths.databasePath, { timeout: 1 });
+  const originalExec = Database.prototype.exec;
+  let primaryContested = false;
+  Database.prototype.exec = function (sql, ...args) {
+    if (!primaryContested && this.name === x.paths.databasePath && sql === "BEGIN IMMEDIATE") {
+      primaryContested = true;
+      originalExec.call(outsideMain, "BEGIN IMMEDIATE");
+    }
+    return originalExec.call(this, sql, ...args);
+  };
+  try {
+    assert.throws(() => observer.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
+  } finally { Database.prototype.exec = originalExec; }
+  assert.equal(primaryContested, true);
+  const outsideAnchor = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
+  try {
+    assert.doesNotThrow(() => outsideAnchor.exec("BEGIN IMMEDIATE"),
+      "failed acquisition of primary must release the earlier anchor reservation");
+  } finally {
+    if (outsideAnchor.inTransaction) outsideAnchor.exec("ROLLBACK");
+    outsideAnchor.close();
+    if (outsideMain.inTransaction) outsideMain.exec("ROLLBACK");
+    outsideMain.close();
+  }
+  assert.throws(() => observer.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "ambiguous read remains unavailable after contention");
+  observer.close();
+  const fresh = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined }));
+  assert.equal(fresh.retainedMinimum().lease_serial, 0);
+});
+
 test("two genuinely parallel worker-thread SQLite handles cannot both attest the same signed lease", async (t) => {
   const x = setup(t);
   const first = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));

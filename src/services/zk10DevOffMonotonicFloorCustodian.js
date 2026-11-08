@@ -263,13 +263,12 @@ function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge,
   checkDbPin(db);
 }
 
-function signConsistentCurrent(anchor, main, expected, ownerHash, signerHash, sign) {
+function withBothFloorReservations(anchor, main, operation) {
   // Acquire write reservations in the same order as the normal floor advance.
-  // SQLite readers alone cannot prevent a second process from changing the
-  // anchor after its SELECT and before the primary SELECT. Holding BOTH
-  // BEGIN IMMEDIATE reservations throughout signing and the final reads does.
+  // A read of anchor followed by a read of main without BOTH reservations
+  // can return a stale state if another writer commits in between.
   let lockedAnchor = false, lockedMain = false;
-  let failed = false, signature;
+  let failed = false, result;
   try {
     checkDbPin(anchor);
     checkDbPin(main);
@@ -279,11 +278,7 @@ function signConsistentCurrent(anchor, main, expected, ownerHash, signerHash, si
     main.exec("BEGIN IMMEDIATE");
     lockedMain = true;
     checkDbPin(main);
-    if (!same(expected, read(anchor, ownerHash, signerHash))
-      || !same(expected, read(main, ownerHash, signerHash, true))) deny();
-    signature = sign();
-    if (!same(expected, read(anchor, ownerHash, signerHash))
-      || !same(expected, read(main, ownerHash, signerHash, true))) deny();
+    result = operation();
   } catch (_) {
     failed = true;
   } finally {
@@ -297,7 +292,7 @@ function signConsistentCurrent(anchor, main, expected, ownerHash, signerHash, si
     }
   }
   if (failed) deny();
-  return signature;
+  return result;
 }
 
 function createDevOffZk10MonotonicFloorCustodian(options) {
@@ -344,9 +339,11 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           // this instance keeps its previous in-memory minimum. A stale
           // snapshot must never be reported as the CURRENT retained floor.
           // The primary journal commitment is checked on every read too.
-          if (!same(minimum, read(anchor, ownerHash, signerHash))
-            || !same(minimum, read(main, ownerHash, signerHash, true))) deny();
-          return { ...minimum };
+          return withBothFloorReservations(anchor, main, () => {
+            if (!same(minimum, read(anchor, ownerHash, signerHash))
+              || !same(minimum, read(main, ownerHash, signerHash, true))) deny();
+            return { ...minimum };
+          });
         } catch (_) {
           // State changed outside this handle, or an ambiguous read failed.
           // Reopen and revalidate both files before trusting a new minimum.
@@ -417,14 +414,17 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
             issued_at_ms: issuedAt, expires_at_ms: r.lease_expires_at_ms,
           };
           const floor = Object.fromEntries(FLOOR_FIELDS.map(field => [field, response[field]]));
-          const signature = signConsistentCurrent(anchor, main, next, ownerHash, signerHash,
-            () => {
-              if (NOW() + 100 >= r.lease_expires_at_ms) deny();
-              const signedFloor = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
-                signer).toString("base64url");
-              if (NOW() + 100 >= r.lease_expires_at_ms) deny();
-              return signedFloor;
-            });
+          const signature = withBothFloorReservations(anchor, main, () => {
+            if (!same(next, read(anchor, ownerHash, signerHash))
+              || !same(next, read(main, ownerHash, signerHash, true))) deny();
+            if (NOW() + 100 >= r.lease_expires_at_ms) deny();
+            const signedFloor = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
+              signer).toString("base64url");
+            if (NOW() + 100 >= r.lease_expires_at_ms) deny();
+            if (!same(next, read(anchor, ownerHash, signerHash))
+              || !same(next, read(main, ownerHash, signerHash, true))) deny();
+            return signedFloor;
+          });
           if (NOW() + 100 >= r.lease_expires_at_ms) deny();
           return { floor: { ...floor, signature } };
         } catch (_) {

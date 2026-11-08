@@ -67,6 +67,11 @@ before completing the durable writes. Before signing, it acquires bounded
 SQLite `BEGIN IMMEDIATE` write reservations on both committed stores (anchor
 first, primary second), checks both floors and the entire primary used-lease
 journal, signs and repeats those checks while still holding both reservations.
+The signed CURRENT represents a verified floor at a linearization point while
+both reservations are held. A new ordinary writer can advance either SQLite
+store immediately after the reservations are released, including before the
+signed result reaches its caller. The response does not promise a snapshot
+that is current at the instant of return or authorize any later I/O by itself.
 The helper attempts to release both reservations on every exit, including
 failed signing or reads; acquisition, verification or release failure denies
 the response and poisons the handle. Another ordinary SQLite writer cannot
@@ -103,11 +108,14 @@ oracle. Failure reports generic codes only.
 - An older primary file restored alongside the newer minimum is rejected,
   including after restart. Missing anchor, key mismatch, incomplete pair,
   expired signed lease or replay also fails closed.
-- A live handle's retainedMinimum() revalidates the two stored floor records
-  and the primary consumed-lease journal before reporting its cached minimum.
-  If another legitimate writer has advanced either file, the old handle
-  permanently denies stale reads; callers must reopen and revalidate both
-  stores instead of treating a pre-revocation snapshot as current.
+- A live handle's retainedMinimum() takes bounded anchor-to-primary SQLite
+  write reservations over both floor reads and primary journal reconstruction,
+  and releases both reservations before returning its copied cached minimum.
+  Its linearization point occurs while both reservations are held; another
+  writer may advance after release, so this is not a guarantee of current
+  state at the instant of return or at a later I/O authorization. If either
+  store already differs when observed within those reservations, the old
+  handle permanently denies; callers must reopen and revalidate both stores.
 - This is **not an atomic distributed transaction across two SQLite stores**.
   A crash between commits can make the custodian unavailable until a separately
   owner-authorized and audited recovery procedure is designed.
@@ -138,8 +146,9 @@ owner-authorized head advance, restart and an older-primary rollback while
 the higher minimum is retained. Additional TDD RED-to-GREEN regression
 cases remove the primary-only nonce journal, mutate and swap its serial order
 with the anchor intact, test a real second SQLite writer attempting a commit
-between the two post-sign reads and inside both signer callbacks, verify
-failed-signature rollback and bounded primary lock contention, reject
+between the two post-sign reads, the retainedMinimum two-read boundary, and
+inside both signer callbacks; they verify failed-signature rollback and
+bounded primary lock contention, reject
 dangling direct SQLite symlinks and reject parent-directory symlinks/junctions.
 On Windows, the dangling-symlink test
 may skip when the local account cannot create symlinks; the POSIX/WSL gate
