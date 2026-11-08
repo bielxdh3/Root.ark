@@ -260,6 +260,93 @@ function blockTrashRenames(t, failures) {
   return { state, restore };
 }
 
+test("issue 66 W22 P2: legacy persisted exclusion migrates tracked case aliases once, preserving edited and pinned bytes", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-exclusion-upgrade-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, {
+    "PRIVATE/clean.txt": "verified unchanged bytes",
+    "PRIVATE/dirty.txt": "verified original bytes",
+    "PRIVATE/pinned.txt": "verified pinned bytes",
+    "public/open.txt": "allowed bytes",
+  });
+  const root = path.join(dir, "device");
+  const legacy = await engine(root, adapter, key, { deviceId: "device-b" });
+  await legacy.syncOnce();
+  const tracked = legacy.snapshot.files["PRIVATE/pinned.txt"];
+  const pinId = crypto.createHash("sha256").update(tracked.objectId, "utf8").digest("hex");
+  legacy.snapshot.pinnedFiles = { [pinId]: {
+    objectId: tracked.objectId, fileId: tracked.fileId, path: "PRIVATE/pinned.txt",
+  } };
+  // Before the portable DENY upgrade, this policy was considered applied:
+  // the case-distinct file remained tracked and physically present on POSIX.
+  legacy.snapshot.excludedPaths = ["private"];
+  await legacy.persistSnapshot();
+  await fsp.writeFile(path.join(root, "PRIVATE", "dirty.txt"), "unsynced confidential edits");
+  const original = recordFor(store, "PRIVATE/clean.txt");
+
+  const upgraded = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const summary = await upgraded.syncOnce();
+  assert.equal(summary.excluded.evicted, 1, "unchanged legacy alias must be evicted");
+  assert.ok(summary.excluded.kept.some((item) =>
+    item.path === "PRIVATE/dirty.txt" && item.code === "local_changes_pending"));
+  assert.ok(summary.excluded.kept.some((item) =>
+    item.path === "PRIVATE/pinned.txt" && item.code === "file_pinned"));
+  assert.equal(await exists(path.join(root, "PRIVATE", "clean.txt")), false);
+  assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "dirty.txt"), "utf8"),
+    "unsynced confidential edits");
+  assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "pinned.txt"), "utf8"),
+    "verified pinned bytes");
+  assert.equal(await fsp.readFile(path.join(root, "public", "open.txt"), "utf8"), "allowed bytes");
+  assert.equal(upgraded.snapshot.remoteOnly[original.objectId].reason, "evicted");
+  assert.equal(recordFor(store, "PRIVATE/clean.txt")?.operationId, original.operationId,
+    "policy migration must never issue remote DELETE");
+  assert.equal(upgraded.snapshot.excludedPathsCasefoldVersion, 1);
+
+  const restarted = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const repeated = await restarted.syncOnce();
+  assert.equal(repeated.excluded, undefined, "completed migration must not retry dirty or pinned files forever");
+  assert.equal(repeated.pushed, 0);
+  assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "dirty.txt"), "utf8"),
+    "unsynced confidential edits");
+});
+
+test("issue 66 W22 P2: old case-alias retry remains bounded after a transient eviction failure and restart", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-exclusion-retry-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": "verified confidential bytes" });
+  const root = path.join(dir, "device");
+  const legacy = await engine(root, adapter, key, { deviceId: "device-b" });
+  await legacy.syncOnce();
+  legacy.snapshot.excludedPaths = ["private"];
+  await legacy.persistSnapshot();
+  const marker = blockTrashRenames(t, Number.POSITIVE_INFINITY);
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const restarted = await engine(root, adapter, key, {
+      deviceId: "device-b", excludedPaths: ["private"],
+    });
+    const summary = await restarted.syncOnce();
+    assert.equal(restarted.snapshot.excludedPathsCasefoldVersion, 1);
+    assert.equal(marker.state.count, Math.min(3, attempt));
+    if (attempt >= 3) {
+      assert.equal(summary.excluded.failed[0].code, "EBUSY");
+    }
+  }
+  marker.restore();
+  assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "secret.txt"), "utf8"),
+    "verified confidential bytes", "a failed eviction must preserve the local bytes");
+  assert.equal(recordFor(store, "PRIVATE/secret.txt")?.tombstone, false);
+});
+
 test("issue 66: a transient eviction failure is retried on a later sync after restart", async (t) => {
   const { key, store, adapter, root, before, localPath } = await exclusionFixture(t, "retry-transient");
   const blocker = blockTrashRenames(t, 1);

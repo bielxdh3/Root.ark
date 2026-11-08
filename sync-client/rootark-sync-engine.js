@@ -13,6 +13,10 @@ const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
+// v1 evaluates excluded paths with portable case-folding even on POSIX.
+// Missing marker means an older snapshot may still contain case-alias files
+// which were incorrectly treated as in scope before this deny-policy change.
+const EXCLUDED_PATHS_CASEFOLD_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
 const ROOT_MUTATION_QUEUES = new Map();
@@ -609,6 +613,10 @@ class SyncEngine {
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
+      }
+      if (parsed.excludedPathsCasefoldVersion !== undefined
+        && parsed.excludedPathsCasefoldVersion !== EXCLUDED_PATHS_CASEFOLD_VERSION) {
+        fail("Unknown excluded sync policy version", "invalid_snapshot");
       }
       if (parsed.pendingEvictions !== undefined) {
         if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || Array.isArray(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
@@ -2592,16 +2600,21 @@ class SyncEngine {
   async _applyExcludedPaths() {
     const applied = this.snapshot.excludedPaths || [];
     const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
+    // A pre-upgrade snapshot may claim that ["private"] was already applied
+    // while retaining tracked "PRIVATE/secret.txt" bytes on POSIX. Revisit
+    // those entries once even if the configured list has not changed.
+    const needsCasefoldMigration = this.excludedPaths.length > 0
+      && this.snapshot.excludedPathsCasefoldVersion !== EXCLUDED_PATHS_CASEFOLD_VERSION;
     this.snapshot.pendingEvictions = this.snapshot.pendingEvictions || {};
     const pendingEvictions = this.snapshot.pendingEvictions;
-    if (!listChanged && !Object.keys(pendingEvictions).length) return null;
+    if (!listChanged && !needsCasefoldMigration && !Object.keys(pendingEvictions).length) return null;
     const report = { evicted: 0, released: 0, kept: [], failed: [] };
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
       if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
       const retry = pendingEvictions[prior.objectId];
-      if (!listChanged && !retry) continue;
+      if (!listChanged && !needsCasefoldMigration && !retry) continue;
       excludedObjectIds.add(prior.objectId);
       if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
         delete pendingEvictions[prior.objectId];
@@ -2652,8 +2665,15 @@ class SyncEngine {
     if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
     else delete this.snapshot.pendingEvictions;
     // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
-    if (this.excludedPaths.length) this.snapshot.excludedPaths = [...this.excludedPaths];
-    else delete this.snapshot.excludedPaths;
+    if (this.excludedPaths.length) {
+      this.snapshot.excludedPaths = [...this.excludedPaths];
+      // Mark the migration complete only after checking all tracked entries.
+      // Existing dirty/pinned guards and bounded transient retries still apply.
+      this.snapshot.excludedPathsCasefoldVersion = EXCLUDED_PATHS_CASEFOLD_VERSION;
+    } else {
+      delete this.snapshot.excludedPaths;
+      delete this.snapshot.excludedPathsCasefoldVersion;
+    }
     await this.persistSnapshot();
     return report;
   }
