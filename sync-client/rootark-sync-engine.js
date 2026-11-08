@@ -13,10 +13,10 @@ const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
-// v1 evaluates excluded paths with portable case-folding even on POSIX.
-// Missing marker means an older snapshot may still contain case-alias files
-// which were incorrectly treated as in scope before this deny-policy change.
-const EXCLUDED_PATHS_CASEFOLD_VERSION = 1;
+// v1 added portable case-folding on POSIX, but marked migration complete even
+// when a dirty legacy alias was retained. Revisit v1 snapshots under v2 so
+// an already-stranded alias gets a durable watch when its bytes become clean.
+const EXCLUDED_PATHS_CASEFOLD_VERSION = 2;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
 const ROOT_MUTATION_QUEUES = new Map();
@@ -253,6 +253,17 @@ function sameFileVersion(left, right) {
   return sameFileIdentity(left, right) && left.size === right.size
     && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
     && left.birthtimeNs === right.birthtimeNs && left.mode === right.mode;
+}
+
+// Track metadata changes to a deliberately retained dirty excluded file without
+// rereading or hashing its private content on every future sync. Any detected
+// change still goes through the full verified _evictLocal guard before eviction.
+function evictionFileVersionStamp(stats) {
+  if (!stats.isFile() || stats.isSymbolicLink()) return null;
+  return crypto.createHash("sha256").update([
+    stats.dev, stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs,
+    stats.birthtimeNs, stats.mode, stats.nlink,
+  ].map(String).join(":"), "utf8").digest("hex");
 }
 
 function isWithinPath(root, target) {
@@ -615,7 +626,7 @@ class SyncEngine {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
       }
       if (parsed.excludedPathsCasefoldVersion !== undefined
-        && parsed.excludedPathsCasefoldVersion !== EXCLUDED_PATHS_CASEFOLD_VERSION) {
+        && ![1, EXCLUDED_PATHS_CASEFOLD_VERSION].includes(parsed.excludedPathsCasefoldVersion)) {
         fail("Unknown excluded sync policy version", "invalid_snapshot");
       }
       if (parsed.pendingEvictions !== undefined) {
@@ -623,6 +634,11 @@ class SyncEngine {
         for (const entry of Object.values(parsed.pendingEvictions)) {
           if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
           try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
+          if (entry.localVersionStamp !== undefined
+            && (entry.code !== "local_changes_pending" || typeof entry.localVersionStamp !== "string"
+              || !/^[a-f0-9]{64}$/.test(entry.localVersionStamp))) {
+            fail("Invalid retained excluded-file version", "invalid_snapshot");
+          }
         }
       }
       if (parsed.pinnedFiles !== undefined) {
@@ -2609,6 +2625,7 @@ class SyncEngine {
     const pendingEvictions = this.snapshot.pendingEvictions;
     if (!listChanged && !needsCasefoldMigration && !Object.keys(pendingEvictions).length) return null;
     const report = { evicted: 0, released: 0, kept: [], failed: [] };
+    let needsPersistence = listChanged || needsCasefoldMigration;
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
@@ -2617,6 +2634,7 @@ class SyncEngine {
       if (!listChanged && !needsCasefoldMigration && !retry) continue;
       excludedObjectIds.add(prior.objectId);
       if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
+        if (retry) needsPersistence = true;
         delete pendingEvictions[prior.objectId];
         report.kept.push({ path: relative, code: "file_pinned" });
         continue;
@@ -2625,13 +2643,30 @@ class SyncEngine {
         report.failed.push({ path: relative, code: retry.code });
         continue;
       }
-      delete pendingEvictions[prior.objectId];
+      const target = await contained(this.rootDir, relative, true);
+      // A dirty legacy alias is kept until its local file metadata changes.
+      // With no change, do not hash potentially large private bytes repeatedly.
+      // The final eviction still compares complete remote and local content.
+      let localVersionStamp = null;
+      try { localVersionStamp = evictionFileVersionStamp(await fsp.lstat(target, { bigint: true })); }
+      catch { /* The guarded eviction below classifies the actual failure. */ }
+      if (retry?.code === "local_changes_pending" && localVersionStamp
+        && localVersionStamp === retry.localVersionStamp) continue;
       if (pending.some((operation) => operation.objectId === prior.objectId
         || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
+        // The pending operation must settle first. Preserve a dirty-file watch
+        // so an alias that became clean during that operation is not stranded.
+        if (!retry) {
+          pendingEvictions[prior.objectId] = {
+            path: relative, code: "sync_operation_pending", attempts: 0,
+          };
+          needsPersistence = true;
+        }
         report.kept.push({ path: relative, code: "sync_operation_pending" });
         continue;
       }
-      const target = await contained(this.rootDir, relative, true);
+      needsPersistence = true;
+      delete pendingEvictions[prior.objectId];
       if (!(await exists(target))) {
         this.snapshot.remoteOnly[prior.objectId] = {
           objectId: prior.objectId, fileId: prior.fileId, versionId: prior.versionId, revision: prior.revision,
@@ -2647,12 +2682,18 @@ class SyncEngine {
       } catch (error) {
         const code = error?.code || "unknown";
         // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
-        // Other failures, including local edits, are reported once and never retried.
+        // Dirty local edits are retained, and rechecked only after an observed
+        // local metadata change; all other nontransient failures are reported once.
         if (TRANSIENT_EVICTION_CODES.has(code)) {
           const attempts = (retry?.attempts || 0) + 1;
           pendingEvictions[prior.objectId] = { path: relative, code, attempts };
           if (attempts >= MAX_EVICTION_ATTEMPTS) report.failed.push({ path: relative, code });
           else report.kept.push({ path: relative, code });
+        } else if (code === "local_changes_pending" && localVersionStamp) {
+          pendingEvictions[prior.objectId] = {
+            path: relative, code, attempts: 0, localVersionStamp,
+          };
+          report.kept.push({ path: relative, code });
         } else {
           report.kept.push({ path: relative, code });
         }
@@ -2660,15 +2701,20 @@ class SyncEngine {
     }
     // Drop retry records for objects that are no longer tracked as excluded local files.
     for (const objectId of Object.keys(pendingEvictions)) {
-      if (!excludedObjectIds.has(objectId)) delete pendingEvictions[objectId];
+      if (!excludedObjectIds.has(objectId)) {
+        delete pendingEvictions[objectId];
+        needsPersistence = true;
+      }
     }
+    if (!needsPersistence) return report.failed.length || report.kept.length ? report : null;
     if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
     else delete this.snapshot.pendingEvictions;
     // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
     if (this.excludedPaths.length) {
       this.snapshot.excludedPaths = [...this.excludedPaths];
-      // Mark the migration complete only after checking all tracked entries.
-      // Existing dirty/pinned guards and bounded transient retries still apply.
+      // Every tracked entry has been checked. Locally dirty legacy aliases
+      // retain a durable version watch until safely evicted, while pinned
+      // entries remain under explicit retention and unpin retry semantics.
       this.snapshot.excludedPathsCasefoldVersion = EXCLUDED_PATHS_CASEFOLD_VERSION;
     } else {
       delete this.snapshot.excludedPaths;

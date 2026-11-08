@@ -305,7 +305,7 @@ test("issue 66 W22 P2: legacy persisted exclusion migrates tracked case aliases 
   assert.equal(upgraded.snapshot.remoteOnly[original.objectId].reason, "evicted");
   assert.equal(recordFor(store, "PRIVATE/clean.txt")?.operationId, original.operationId,
     "policy migration must never issue remote DELETE");
-  assert.equal(upgraded.snapshot.excludedPathsCasefoldVersion, 1);
+  assert.equal(upgraded.snapshot.excludedPathsCasefoldVersion, 2);
 
   const restarted = await engine(root, adapter, key, {
     deviceId: "device-b", excludedPaths: ["private"],
@@ -315,6 +315,173 @@ test("issue 66 W22 P2: legacy persisted exclusion migrates tracked case aliases 
   assert.equal(repeated.pushed, 0);
   assert.equal(await fsp.readFile(path.join(root, "PRIVATE", "dirty.txt"), "utf8"),
     "unsynced confidential edits");
+});
+
+test("issue 66 P2: legacy dirty case alias is evicted after its bytes are restored, without polling unchanged content", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-dirty-revert-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const originalBytes = "verified original confidential bytes";
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": originalBytes });
+
+  const root = path.join(dir, "device");
+  const original = await engine(root, adapter, key, { deviceId: "device-b" });
+  await original.syncOnce();
+  const tracked = original.snapshot.files["PRIVATE/secret.txt"];
+  const remoteBefore = recordFor(store, "PRIVATE/secret.txt");
+  original.snapshot.excludedPaths = ["private"];
+  await original.persistSnapshot();
+  const localPath = path.join(root, "PRIVATE", "secret.txt");
+  await fsp.writeFile(localPath, "unsynced changes retained for the owner");
+
+  const upgraded = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const first = await upgraded.syncOnce();
+  assert.deepEqual(first.excluded.kept, [{ path: "PRIVATE/secret.txt", code: "local_changes_pending" }]);
+  assert.equal(upgraded.snapshot.excludedPathsCasefoldVersion, 2);
+  assert.equal(upgraded.snapshot.pendingEvictions?.[tracked.objectId]?.code, "local_changes_pending",
+    "the migration must retain durable intent to evict if the local bytes become clean");
+
+  // A still-dirty excluded file should not be repeatedly read and hashed on
+  // every ordinary sync. A metadata-only change check is sufficient here.
+  const originalOpen = fsp.open;
+  let reopenedLocalBytes = 0;
+  fsp.open = async function inspectedOpen(filename, ...args) {
+    if (path.resolve(String(filename)) === path.resolve(localPath)) reopenedLocalBytes += 1;
+    return originalOpen.call(fsp, filename, ...args);
+  };
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const unchanged = await engine(root, adapter, key, {
+        deviceId: "device-b", excludedPaths: ["private"],
+      });
+      const again = await unchanged.syncOnce();
+      assert.equal(again.excluded, undefined, "unchanged dirty bytes should require no new eviction attempt");
+    }
+  } finally {
+    fsp.open = originalOpen;
+  }
+  assert.equal(reopenedLocalBytes, 0);
+  assert.equal(await fsp.readFile(localPath, "utf8"), "unsynced changes retained for the owner");
+
+  await fsp.writeFile(localPath, "a second changed local version is also private");
+  const editedAgain = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const stillDirty = await editedAgain.syncOnce();
+  assert.deepEqual(stillDirty.excluded.kept, [{ path: "PRIVATE/secret.txt", code: "local_changes_pending" }]);
+  assert.equal(await fsp.readFile(localPath, "utf8"), "a second changed local version is also private");
+
+  await fsp.writeFile(localPath, originalBytes);
+  const restored = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const recovered = await restored.syncOnce();
+  assert.equal(recovered.excluded.evicted, 1, "restored verified bytes must be evicted on restart");
+  assert.equal(recovered.pushed, 0);
+  assert.equal(await exists(localPath), false);
+  assert.equal(restored.snapshot.pendingEvictions, undefined);
+  assert.equal(restored.snapshot.remoteOnly[tracked.objectId].reason, "evicted");
+  const remoteAfter = recordFor(store, "PRIVATE/secret.txt");
+  assert.equal(remoteAfter.operationId, remoteBefore.operationId);
+  assert.equal(remoteAfter.tombstone, false, "no remote DELETE is permitted by a local exclusion");
+
+  const restarted = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  assert.equal((await restarted.syncOnce()).excluded, undefined);
+  assert.equal(await exists(localPath), false);
+});
+
+test("issue 66 P2: previously completed v1 migration rechecks stranded local case alias", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-v1-upgrade-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const verified = "unchanged signed remote bytes";
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": verified });
+
+  const root = path.join(dir, "device");
+  const original = await engine(root, adapter, key, { deviceId: "device-b" });
+  await original.syncOnce();
+  const tracked = original.snapshot.files["PRIVATE/secret.txt"];
+  const remoteBefore = recordFor(store, "PRIVATE/secret.txt");
+  const localPath = path.join(root, "PRIVATE", "secret.txt");
+  await fsp.writeFile(localPath, "uncommitted private changes");
+  // v1 incorrectly recorded completion even though a dirty file was kept.
+  original.snapshot.excludedPaths = ["private"];
+  original.snapshot.excludedPathsCasefoldVersion = 1;
+  await original.persistSnapshot();
+
+  const resumed = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const upgraded = await resumed.syncOnce();
+  assert.deepEqual(upgraded.excluded.kept, [{ path: "PRIVATE/secret.txt", code: "local_changes_pending" }]);
+  assert.equal(resumed.snapshot.excludedPathsCasefoldVersion, 2);
+  assert.equal(resumed.snapshot.pendingEvictions?.[tracked.objectId]?.code, "local_changes_pending");
+  assert.equal(await fsp.readFile(localPath, "utf8"), "uncommitted private changes");
+
+  await fsp.writeFile(localPath, verified);
+  const restart = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const clean = await restart.syncOnce();
+  assert.equal(clean.excluded.evicted, 1);
+  assert.equal(clean.pushed, 0);
+  assert.equal(await exists(localPath), false);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").operationId, remoteBefore.operationId);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").tombstone, false);
+});
+
+test("issue 66 P2: casefold migration retries eviction when a guarded sync operation settles", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-pending-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": "remote confirmed data" });
+  const root = path.join(dir, "device");
+  const legacy = await engine(root, adapter, key, { deviceId: "device-b" });
+  await legacy.syncOnce();
+  const prior = legacy.snapshot.files["PRIVATE/secret.txt"];
+  const remoteBefore = recordFor(store, "PRIVATE/secret.txt");
+  const pending = await legacy.buildOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), baseRevision: prior.revision,
+    revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: "device-b" },
+    metadata: { path: "PRIVATE/secret.txt", name: "secret.txt", size: 12 },
+    plaintext: Buffer.from("local pending"), fileKey: key,
+  });
+  await legacy.journal.enqueue(pending);
+  legacy.snapshot.excludedPaths = ["private"];
+  legacy.snapshot.excludedPathsCasefoldVersion = 1;
+  await legacy.persistSnapshot();
+
+  const upgraded = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const initially = await upgraded.syncOnce();
+  assert.deepEqual(initially.excluded.kept, [{ path: "PRIVATE/secret.txt", code: "sync_operation_pending" }]);
+  assert.equal(upgraded.snapshot.pendingEvictions?.[prior.objectId]?.code, "sync_operation_pending");
+  assert.equal(await exists(path.join(root, "PRIVATE", "secret.txt")), true);
+
+  // Independently settle the already queued local operation, as an explicit
+  // owner action would do. Excluded writes must never be pushed remotely.
+  await upgraded.journal.markSeen(pending.operationId);
+  const restarted = await engine(root, adapter, key, {
+    deviceId: "device-b", excludedPaths: ["private"],
+  });
+  const resumed = await restarted.syncOnce();
+  assert.equal(resumed.excluded.evicted, 1);
+  assert.equal(resumed.pushed, 0);
+  assert.equal(await exists(path.join(root, "PRIVATE", "secret.txt")), false);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").operationId, remoteBefore.operationId);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").tombstone, false);
 });
 
 test("issue 66 W22 P2: old case-alias retry remains bounded after a transient eviction failure and restart", async (t) => {
@@ -335,7 +502,7 @@ test("issue 66 W22 P2: old case-alias retry remains bounded after a transient ev
       deviceId: "device-b", excludedPaths: ["private"],
     });
     const summary = await restarted.syncOnce();
-    assert.equal(restarted.snapshot.excludedPathsCasefoldVersion, 1);
+    assert.equal(restarted.snapshot.excludedPathsCasefoldVersion, 2);
     assert.equal(marker.state.count, Math.min(3, attempt));
     if (attempt >= 3) {
       assert.equal(summary.excluded.failed[0].code, "EBUSY");
@@ -383,8 +550,8 @@ test("issue 66: a permanent eviction failure stops after the attempt bound and i
   assert.equal(recordFor(store, "private/secret.txt").operationId, before.operationId);
 });
 
-test("issue 66: a locally edited excluded file is reported once and never retried", async (t) => {
-  const { key, store, adapter, root, localPath } = await exclusionFixture(t, "retry-local-edit");
+test("issue 66: a locally edited excluded file is retained and watched without repeat eviction attempts", async (t) => {
+  const { key, store, adapter, root, before, localPath } = await exclusionFixture(t, "retry-local-edit");
   await fsp.writeFile(localPath, "local edit");
   const blocker = blockTrashRenames(t, 0);
   const first = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
@@ -393,8 +560,10 @@ test("issue 66: a locally edited excluded file is reported once and never retrie
   const secondSummary = await second.syncOnce();
   blocker.restore();
   assert.deepEqual(firstSummary.excluded.kept, [{ path: "private/secret.txt", code: "local_changes_pending" }]);
-  assert.equal(first.snapshot.pendingEvictions, undefined);
+  assert.equal(first.snapshot.pendingEvictions[before.objectId].code, "local_changes_pending");
   assert.equal(secondSummary.excluded, undefined);
+  assert.equal(second.snapshot.pendingEvictions[before.objectId].localVersionStamp,
+    first.snapshot.pendingEvictions[before.objectId].localVersionStamp);
   assert.equal(blocker.state.count, 0);
   assert.equal(await fsp.readFile(localPath, "utf8"), "local edit");
   assert.equal(recordFor(store, "private/secret.txt").tombstone, false);
