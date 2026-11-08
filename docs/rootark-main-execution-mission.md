@@ -393,3 +393,32 @@ Este addendum é **posterior** ao corte 03:05 UTC e não altera retrospectivamen
 - **#65/#302, #66/#300 e TURN:** #302 `7ca680b4` full hosted SUCCESS mas apenas floor/custodian **DEV-OFF** local; faltam custódia R1 independente off-host, digest original-byte owner-signed antes de upload e inventário global. #300 `f77cf639` documenta CFAPI positivo, não o implementa; Windows10 físico não validado. TURN/STUN/TLS e cross-NAT reais não provisionados. Recovery integral multiobjeto/multiversão/ZIP/jobs e ransomware shield seguem abertos.
 
 **Regra operacional mantida:** implementação → integração → testes reais → revisão independente do **SHA exato** → push fast-forward apenas no Draft → CI hospedado → atualização factual do fluxograma. `SOURCE GO`, TDD local, `Security Regression SUCCESS`, `Ready` e autoridade física são marcos distintos. **Não executar PR merge, deploy, cutover nem modificar `Root/main` ou PR #228.**
+
+## 2026-11-08 04:50 UTC — correção do CI, revisões integradas e CFAPI
+
+Este é um **novo corte de status**, sem reescrever os fatos observados às 03:57 UTC. `Root/main` segue `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, e o PR #228 não foi tocado. O [ledger com os SHAs e gates](validation/2026-11-07-rootark-wave-execution-status.md#reconciliação-de-integrações--2026-11-08-0450-utc) distingue publicação, fonte local e testes hospedados.
+
+- **#298 / #67 — duas falhas hospedadas identificadas, fonte ainda local:** o remoto Draft continua `bf2dc700`. No run [42444205015](https://github.com/bielxdh3/Root.ark/actions/runs/42444205015), Ubuntu full e Windows canonical falharam no **mesmo** teste `successful migrations before listener acknowledgement preserve the restore barrier and provider queue across restart`. O log Windows do job `128619610379` registra ordinal 272 e SHA-256 truncados `6cd12cfa4f2cd9a055e49821` (caminho `test/backup-restore-transaction-boundary.test.js`) e `6e4a51e7c837d1ce7dfba288` (nome da asserção), reproduzidos calculando o hash do texto literal. A fixture antiga usava `BACKUP_INCLUDE_UPLOADS=false`, contradizendo a expectativa de reconciliação cloud pendente; correção test-only `febffba8` usa `true` apenas naquele caso. Em paralelo, S3 agora rejeita páginas sem `IsTruncated` booleano, inclusive inventário unbounded; o fake preflight antigo precisava devolver `IsTruncated:false`. Merge local `fbc1e615` + filho test-only **`069c76fa7d3283166ab61a89e6da8496ba821548`**: Windows Node22 104 PASS/1 SKIP, Ubuntu Node22 ext4 105 PASS, mais migração focada 1 PASS em cada SO. **Ainda sem peer GO do SHA final, sem push nem hosted desse SHA**. Windows mandatory do *run antigo* estava em progresso às 04:47 UTC, não verde.
+- **#293 / #63 + #68 — teste integrado verde, segurança ainda NO-GO:** merge local `cd2ed41644529f321071bc86ae66be8c918a1fb2` (11 caminhos, dois pais) passou Windows Node22 **33 PASS / 7 SKIP** e Ubuntu Node22 **39 PASS / 1 SKIP**, `--test-concurrency=2`, sintaxe e dependências. Porém peer45 deu **SOURCE NO-GO P2**: após `finish/close` real, `releaseEgress` pode encontrar `SQLITE_BUSY` num writer WAL concorrente e abandonar definitivamente o tracker local, deixando lease durável órfão e `revokeAndDrain` retornando 503 mesmo após a liberação do banco. Reproduzido em HTTP + duas conexões SQLite reais, Windows e WSL. **Não publicar `cd2ed`**; corrigir com prova de terminal e reconciliação limitada, sem TTL que libere lease não comprovado.
+- **#300 / #66 — novo commit publicado somente como mock DEV-OFF:** `b70e242fa0673b50a448a8e776bcb87c37b51561` foi publicado por push normal no Draft #300 após peer33 SOURCE GO exato, Windows Node22 **25 PASS**, Ubuntu Node22 **22 PASS / 3 SKIP** e MSVC/SDK26100 nativo. Apenas demonstra formato/bounds do ABI `TRANSFER_DATA` em C++ de teste; **não** executa `CfRegisterSyncRoot`, `CfConnectSyncRoot`, `CfExecute` ou hidratação física. [Security Regression 42448354634](https://github.com/bielxdh3/Root.ark/actions/runs/42448354634) disparado uma vez, **sem resultado final neste corte**.
+- **#242 / #299 — mitigação interina LOCAL sem P2P protegido:** `95aec7c40855b6d21cd81955bdc7c3ea2409b221` exige duas capacidades confiáveis fornecidas na construção do broker **antes** de calcular hash/admitir sala bound. A integração real não as fornece; portanto recusa bound de forma fail-closed e não aloca sala/hash caro, preservando unbound manual 1:N. Windows e WSL Node22 **78/78 broker**, HTTP assinado **5/5 cada**, Edge real PASS; peer exato ainda pendente. Presença de callback não prova custódia owner-signed, bytes imutáveis, writer serializado ou RTCDataChannel cutoff. `f2f24684` e round-robin rejeitados continuam proibidos.
+- **Externos não resolvidos:** Android #64 sem aparelho/Keystore físico; #65 sem custodiante R1 independente off-host, provenance owner-signed original pré-upload e completude global; #66 sem CFAPI positivo Windows10 físico; #67 sem recuperação completa de conta/ZIP/jobs/multiversão e shield operacional; #68 sem quorum multi-host nem revogação de bytes já transmitidos; #242 sem TURN/STUN/TLS/cross-NAT e autoridade transacional de signaling. Não promover DEV-OFF ou teste de mock para `Ready` funcional.
+
+~~~mermaid
+flowchart TD
+  MAIN["Root/main d5fbc110 inalterada"]
+  B["#298 069c LOCAL: Windows/Ubuntu correções verificadas; peer pendente"]
+  S["#293 cd2 LOCAL: testes PASS; P2 SQLite lease NO-GO"]
+  C["#300 b70 publicado Draft: ABI mock peer GO; CI pendente"]
+  P["#299 95aec LOCAL: bound fail-closed; peer pendente"]
+  EXT["R1 off-host / Android real / CFAPI positivo / TURN real: sem prova"]
+  G{"Peer SHA exato e CI obrigatório completo?"}
+  HOLD["Bloqueado / Draft: não declarar Ready"]
+  DONE["Apenas elegibilidade futura: sem merge ou deploy"]
+  MAIN --> B & S & C & P & EXT
+  B & S & C & P & EXT --> G
+  G -->|Não| HOLD
+  G -->|Sim, com autoridade externa separada| DONE
+~~~
+
+**Política vigente:** nenhum merge de PR, deploy, cutover, force push, reset destrutivo ou edição de `Root/main`/PR #228. Preservar worktrees e o histórico de cada revisão.
