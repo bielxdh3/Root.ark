@@ -47,6 +47,11 @@ BACKUP_COMPRESS=true
 - `<runtime-root>/uploads`, se `BACKUP_INCLUDE_UPLOADS=true`.
 - metadados importantes em `<runtime-root>/data`.
 
+Quando `BACKUP_INCLUDE_UPLOADS=false`, a seleção também exclui os objetos
+`uploads/` do provedor cloud, sem baixá-los para o ZIP. Mesmo com inventário
+cloud disponível, o manifesto registra `cloud_complete: false`: esse backup
+parcial não é um baseline completo para reconciliação de uploads no restore.
+
 ## O que não entra
 
 - `node_modules`

@@ -528,7 +528,7 @@ async function collectBackupFiles(options = {}) {
   for (const file of unsuppressedFiles) {
     known.set(file.entryPath, file);
   }
-  const areas = ["uploads", ...(includeTemp || includePending ? ["temp"] : [])];
+  const areas = [...(includeUploads ? ["uploads"] : []), ...(includeTemp || includePending ? ["temp"] : [])];
   const remoteIdentities = new Set();
   let stageRootInfo = null;
   if (typeof cloudStorage.inventory !== "function") throw new Error("Authoritative cloud inventory is required");
@@ -564,7 +564,9 @@ async function collectBackupFiles(options = {}) {
       known.set(entryPath, { absolutePath: staged, entryPath, size: Number(sourceStat.size), cloudOnly: true, archiveRoot: stageRootInfo, sourceStat });
     }
   }
-  options.cloudComplete = true;
+  // A partial selection cannot certify a whole-upload restore baseline.
+  // Excluding local uploads must exclude provider uploads as well.
+  options.cloudComplete = includeUploads;
   return [...known.values()].sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 }
 
