@@ -17,6 +17,7 @@ tested commit does not inherit the CI result of a prior remote head.
 ## Security findings and precise dispositions
 
 - **#66 P1 found and corrected in the published source scope.** A lost entire `.rootark-sync-evictions` directory following a durable PREPARE and filesystem stage used to look like an empty ledger. If exclusion policy then reset, reconciliation could sign a remote DELETE. W8's `137ba07a` fixes this with `evictionLedgerRequired` persisted before PREPARE and a missing-ledger rejection before reconciliation; the corrective source was integrated as exact `3d0f687c` and independently reviewed. Negative tests use a real protected `SyncObjectStore` and assert no outbound signed DELETE. This is not a separately anchored off-host monotonic floor.
+- **#66 separate published-source P2 (availability) is OPEN.** Independently reproduced on the exact published `3d0f687c`: a crash/EIO in the interval **after** the snapshot v2 `evictionLedgerRequired=true` fsync but **before** the first eviction PREPARE/head is durably written leaves the ledger empty even though local files remain intact. On restart, `replayEvictionLedger()` rejects `invalid_snapshot` indefinitely; no unauthorized DELETE or data loss was observed. The conservative P1 guard must **not** be disabled to solve this: recovery needs separately durable evidence of the pre-PREPARE state. Candidate correction and exact-SHA review are pending, and the PR is not Ready.
 - **#66 separate batch NOT published.** Local `d9c66e953f452105f8919e154a5d393fee1d8305` reduces journal rewrites, but independent review found a distinct P2: signed remote-only admission can be lost if an invalid following record or crash occurs before batch durability; expired historical replay is then denied. Keep this branch NO-GO until independently corrected and re-reviewed. The published `3d0f` deliberately excludes it.
 - **#67 remains a recovery NO-GO.** Disposable native NTFS `CreateFileW` share-mode-0/FileIdInfo experiments prevent cooperating process writers while the handle lives, but cannot prove path/ancestor namespace exclusion, durable journal/ACL recovery after crash or absence of all races. Do not wire `restoreFileSet`, claim `recovered:true`, or treat scanner warnings as cosmetic.
 - **#302 local code-scanning work remains gated.** The earlier local `9d9a8198` test snapshot refactor was rejected because on Windows a leaf symlink could be opened outside the disposable root before FD verification. Another local candidate `ce3d7ec4` rejects nonregular/symlink Dirent before opening and tests zero external canary opens/reads on Windows and WSL; the formal CodeQL outcome on its exact SHA is not available and SOURCE review is still pending at this checkpoint.
@@ -28,7 +29,7 @@ tested commit does not inherit the CI result of a prior remote head.
 flowchart TD
   P293["#293 Draft: signed sharing / historical search"] --> G
   P298["#298 Draft: ZIP/restore; CodeQL HIGH and NTFS NO-GO"] --> G
-  P300["#300 Draft: eviction ledger P1 fixed / CFAPI deny-only"] --> G
+  P300["#300 Draft: eviction ledger P1 fixed; pre-PREPARE crash availability P2 OPEN / CFAPI deny-only"] --> G
   P302["#302 Draft: strict ZK10 DEV-OFF / CodeQL HIGH"] --> G
   OWNER["Owner-signed ORIGINAL bytes before upload, version and revocation"] --> G
   CUST["Independent off-host monotonic custody / R1 floor"] --> G
