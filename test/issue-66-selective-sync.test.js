@@ -498,6 +498,158 @@ test("issue 66 P2: case-only renamed excluded directory evicts verified clean by
   assert.equal((await repeated.syncOnce()).excluded, undefined);
 });
 
+test("issue 66 P2: one-shot metadata watch EIO keeps the dirty exclusion retry after restart", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-watch-eio-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const signedBytes = "known original signed encrypted object";
+  await seed(dir, adapter, key, { "PRIVATE/secret.txt": signedBytes });
+  const root = path.join(dir, "device");
+  const target = path.join(root, "PRIVATE", "secret.txt");
+  const original = await engine(root, adapter, key, { deviceId: "device-b" });
+  await original.syncOnce();
+  const tracked = original.snapshot.files["PRIVATE/secret.txt"];
+  const beforeRemote = recordFor(store, "PRIVATE/secret.txt");
+  original.snapshot.excludedPaths = ["private"];
+  original.snapshot.excludedPathsCasefoldVersion = 1;
+  await original.persistSnapshot();
+  await fsp.writeFile(target, "deliberate unsynced confidential changes");
+  const upgraded = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  assert.deepEqual((await upgraded.syncOnce()).excluded.kept,
+    [{ path: "PRIVATE/secret.txt", code: "local_changes_pending" }]);
+  assert.equal(upgraded.snapshot.pendingEvictions?.[tracked.objectId]?.code, "local_changes_pending");
+
+  const originalLstat = fsp.lstat;
+  let bigintReads = 0;
+  let injected = 0;
+  fsp.lstat = async function injectWatchEio(filename, options) {
+    if (path.resolve(String(filename)) === path.resolve(target) && options?.bigint) {
+      bigintReads += 1;
+      // First bigint lstat verifies the physical path; second is the watch.
+      if (bigintReads === 2) {
+        injected += 1;
+        throw Object.assign(new Error("one-shot metadata EIO"), { code: "EIO" });
+      }
+    }
+    return originalLstat.call(fsp, filename, options);
+  };
+  try {
+    const restarted = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+    await assert.rejects(restarted.syncOnce(), { code: "EIO" },
+      "unverified metadata must fail closed, not drop an exclusion watch");
+    assert.equal(injected, 1, "a real metadata probe was interrupted exactly once");
+    assert.equal(restarted.snapshot.pendingEvictions?.[tracked.objectId]?.code,
+      "local_changes_pending", "prior dirty watch is retained");
+  } finally {
+    fsp.lstat = originalLstat;
+  }
+  const retained = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  assert.equal(retained.snapshot.pendingEvictions?.[tracked.objectId]?.code, "local_changes_pending",
+    "the dirty watch must remain durable across an EIO and process restart");
+  assert.equal(await fsp.readFile(target, "utf8"), "deliberate unsynced confidential changes");
+  await fsp.writeFile(target, signedBytes);
+  const recovered = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const summary = await recovered.syncOnce();
+  assert.equal(summary.excluded?.evicted, 1, "verified recovered bytes must not remain stranded");
+  assert.equal(await exists(target), false);
+  assert.equal(recovered.snapshot.pendingEvictions, undefined);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").operationId, beforeRemote.operationId);
+  assert.equal(recordFor(store, "PRIVATE/secret.txt").tombstone, false);
+});
+
+test("issue 66 P2: excluded alias lookup scales with directories, not 160/640 sibling files", async (t) => {
+  // Instrument the physical directory hot path only. These are disposable
+  // dirty synthetic snapshot records, NOT signed authorization test data.
+  // Signed remote-identity and verified eviction are covered by the adjacent
+  // end-to-end tests; _evictLocal is deliberately blocked in this microcase.
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-scale-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const root = path.join(dir, "device");
+  const parent = path.join(root, "PRIVATE");
+  const active = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  await fsp.mkdir(parent, { recursive: true });
+  const records = {};
+  for (let i = 0; i < 640; i += 1) {
+    const name = `dirty-${String(i).padStart(4, "0")}.txt`;
+    const relative = `PRIVATE/${name}`;
+    await fsp.writeFile(path.join(parent, name), `unsynced private ${i}`);
+    records[relative] = {
+      objectId: `perf-object-${i}`, fileId: `perf-file-${i}`,
+      versionId: "test-only", revision: { counter: 1, deviceId: "device-b" },
+      path: relative, directory: false, deleted: false, hash: "0".repeat(64),
+    };
+  }
+  active._evictLocal = async () => {
+    throw Object.assign(new Error("local retained for microbenchmark"), { code: "local_changes_pending" });
+  };
+  const actualOpenDir = fsp.opendir;
+  const totalRecords = Object.entries(records);
+  for (const count of [160, 640]) {
+    active.snapshot.files = Object.fromEntries(totalRecords.slice(0, count));
+    active.snapshot.pendingEvictions = {};
+    active.snapshot.excludedPaths = ["private"];
+    active.snapshot.excludedPathsCasefoldVersion = 1;
+    let parentOpens = 0;
+    fsp.opendir = async function watchedOpenDir(filename, ...args) {
+      if (path.resolve(String(filename)) === path.resolve(parent)) parentOpens += 1;
+      return actualOpenDir.call(fsp, filename, ...args);
+    };
+    try {
+      const report = await active._applyExcludedPaths();
+      assert.equal(report.kept.length, count);
+    } finally {
+      fsp.opendir = actualOpenDir;
+    }
+    assert.ok(parentOpens <= 4,
+      `lookup for ${count} retained files reopened the parent ${parentOpens} times`);
+  }
+});
+
+test("issue 66 P2 POSIX: cached excluded alias lookup rechecks a changed directory", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX case-collision regression");
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-cache-mutation-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const root = path.join(dir, "device");
+  const active = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const parent = path.join(root, "PRIVATE");
+  await fsp.mkdir(parent, { recursive: true });
+  await fsp.writeFile(path.join(parent, "one.txt"), "private one");
+  await fsp.writeFile(path.join(parent, "two.txt"), "private two");
+  active.snapshot.files = {
+    "PRIVATE/one.txt": {
+      objectId: "fixture-one", fileId: "fixture-one", hash: "0".repeat(64),
+      directory: false, deleted: false,
+    },
+    "PRIVATE/two.txt": {
+      objectId: "fixture-two", fileId: "fixture-two", hash: "0".repeat(64),
+      directory: false, deleted: false,
+    },
+  };
+  active.snapshot.excludedPaths = ["private"];
+  active.snapshot.excludedPathsCasefoldVersion = 1;
+  let createdCollision = false;
+  active._evictLocal = async () => {
+    if (!createdCollision) {
+      createdCollision = true;
+      await fsp.writeFile(path.join(parent, "TWO.txt"), "a new colliding alias");
+    }
+    throw Object.assign(new Error("dirty synthetic bytes"), { code: "local_changes_pending" });
+  };
+  await assert.rejects(active._applyExcludedPaths(), { code: "unsafe_path" });
+  assert.equal(createdCollision, true);
+  assert.equal(await fsp.readFile(path.join(parent, "two.txt"), "utf8"), "private two");
+  assert.equal(await fsp.readFile(path.join(parent, "TWO.txt"), "utf8"), "a new colliding alias");
+  assert.equal(active.snapshot.files["PRIVATE/two.txt"].deleted, false);
+});
+
 test("issue 66 P2 POSIX: ambiguous portable case aliases never cause local eviction or false release", async (t) => {
   if (process.platform === "win32") return t.skip("Windows filesystem is case-insensitive");
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-ambiguous-case-"));

@@ -346,22 +346,40 @@ async function canonicalRelativePath(rootDir, relativePath) {
 // confers selection or authorization: callers must verify both the tracked
 // key and physical alias before evicting. Reject ambiguous aliases and links;
 // cap each directory read so a damaged root cannot trigger an unbounded scan.
-async function uniqueExcludedPhysicalPath(rootDir, trackedPath) {
+async function uniqueExcludedPhysicalPath(rootDir, trackedPath, directoryCache) {
   const safe = protocol.safeRelativePath(trackedPath, "path");
   const root = path.resolve(rootDir);
   await containedAbsolute(root, root, false);
   const segments = safe.split("/");
   let current = root;
   for (let i = 0; i < segments.length; i += 1) {
-    let chosen = null;
-    let count = 0;
-    for await (const entry of await fsp.opendir(current)) {
-      if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
-      if (entry.name.toLowerCase() !== segments[i].toLowerCase()) continue;
-      if (chosen !== null) fail("Ambiguous excluded portable case alias", "unsafe_path");
-      chosen = entry.name;
+    const directoryStats = await fsp.lstat(current, { bigint: true });
+    if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+      fail("Excluded path parent is not a regular directory", "unsafe_path");
     }
-    if (chosen === null) return null;
+    // Cache only for this migration pass. Validate directory identity/version
+    // on every lookup; if a concurrent rename/create changes it, rescan.
+    // This avoids opening the same parent N times for N dirty sibling files.
+    let cached = directoryCache.get(current);
+    if (!cached || !sameFileVersion(cached.stats, directoryStats)) {
+      const names = new Map();
+      let count = 0;
+      for await (const entry of await fsp.opendir(current)) {
+        if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+        const key = entry.name.toLowerCase();
+        if (names.has(key)) names.set(key, null); // ambiguous portable alias
+        else names.set(key, entry.name);
+      }
+      const afterRead = await fsp.lstat(current, { bigint: true });
+      if (!sameFileVersion(directoryStats, afterRead)) {
+        fail("Excluded path directory changed during casefold lookup", "unsafe_path");
+      }
+      cached = { stats: afterRead, names };
+      directoryCache.set(current, cached);
+    }
+    const chosen = cached.names.get(segments[i].toLowerCase());
+    if (chosen === null) fail("Ambiguous excluded portable case alias", "unsafe_path");
+    if (chosen === undefined) return null;
     current = path.join(current, chosen);
     const stats = await fsp.lstat(current, { bigint: true });
     if (stats.isSymbolicLink() || (i < segments.length - 1 && !stats.isDirectory())) {
@@ -2683,6 +2701,7 @@ class SyncEngine {
     let needsPersistence = listChanged || needsCasefoldMigration;
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
+    const directoryCache = new Map(); // never persist stale filesystem names across syncs
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
       if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
       const retry = pendingEvictions[prior.objectId];
@@ -2701,16 +2720,16 @@ class SyncEngine {
       // A path may be renamed only by case after the migration watch was
       // stored. A missing old-cased path on POSIX is not proof of no local
       // bytes; on Windows the filesystem may canonicalize to a different key.
-      const physicalPath = await uniqueExcludedPhysicalPath(this.rootDir, relative);
+      const physicalPath = await uniqueExcludedPhysicalPath(this.rootDir, relative, directoryCache);
       const target = physicalPath === null ? null : await contained(this.rootDir, physicalPath, false);
       // A dirty legacy alias is kept until its local file metadata changes.
       // With no change, do not hash potentially large private bytes repeatedly.
       // The final eviction still compares complete remote and local content.
-      let localVersionStamp = null;
-      try {
-        if (target !== null) localVersionStamp = evictionFileVersionStamp(await fsp.lstat(target, { bigint: true }));
-      }
-      catch { /* The guarded eviction below classifies the actual failure. */ }
+      // A failed metadata probe provides NO safe version evidence. Abort this
+      // pass (preserving the durable dirty watch / pending migration marker)
+      // rather than converting an EIO into terminal local_changes_pending.
+      const localVersionStamp = target === null ? null
+        : evictionFileVersionStamp(await fsp.lstat(target, { bigint: true }));
       if (retry?.code === "local_changes_pending" && localVersionStamp
         && localVersionStamp === retry.localVersionStamp
         && physicalPath === retry.localPath) continue;
