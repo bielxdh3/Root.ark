@@ -493,3 +493,7 @@ Em ambos os runs, Ubuntu Node22 full **SUCCESS**. No `42448670330`, Windows mand
 ## 2026-11-08 22:42 UTC — checkpoint de continuidade, SHA e fluxo
 
 O [checkpoint auditável de 22:42 UTC](validation/2026-11-08-rootark-mission-2242-utc.md) acrescenta a matriz de cinco PRs OPEN/Draft (#251, #293, #298, #300 e #302), commits publicados, resultados hospedados dos SHAs exatos, TDD/peer GO e NO-GOs locais, além de um fluxograma de gates atualizado. Registra explicitamente o P1 no ledger de exclusões #66, o rollback NTFS P2 #67, a falha CodeQL formal dos PRs #298/#300/#302 e a ausência das provas externas R1. Preservar os cortes anteriores como histórico; nenhuma alteração a Root/main, #228, merge, deploy ou cutover é autorizada por este checkpoint.
+
+## 2026-11-08 23:19 UTC — corte pós-ledger #300 e revisão ZK10
+
+O [checkpoint de execução de 23:19 UTC](validation/2026-11-08-rootark-mission-2319-utc.md) atualiza os cinco HEADs Draft, o fluxograma de dependências, as falhas hospedadas CodeQL/runner, e distingue o P1 do ledger #66 **corrigido e publicado no #300 `3d0f687c`** do batching #66 **NO-GO P2, não publicado**. Documenta também o bloqueio NTFS do #67 e a ausência de owner-signed original-byte e custódia off-host R1. Uma publicação posterior ao corte avançou apenas a branch Draft #302 ao SHA `ce3d7ec4`, com SOURCE GO e Win/WSL Node22 3/3, sem atestar o CodeQL hospedado ainda pendente. Root/main, #228, merge, deploy e cutover permanecem intocados.
