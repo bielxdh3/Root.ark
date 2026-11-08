@@ -10,6 +10,7 @@
   const DB = "rootark-zk1-protected-revision-index-v1";
   const STORE = "revisions";
   const FORMAT = "rootark-zk1-protected-revision-index/v1";
+  const CLEARED = "rootark-zk1-protected-revision-index-clear/v1";
   const MAX_ROWS = 128;
   const MAX_BYTES = 4 * 1024 * 1024;
   const PAGE = 50;
@@ -125,7 +126,7 @@
           try {
             const tx = database.transaction(STORE, mode);
             const objectStore = tx.objectStore(STORE);
-            const request = operation === "delete" ? objectStore.delete(key)
+            const request = operation === "clear" ? objectStore.put(value, key)
               : objectStore.get(key);
             request.onsuccess = () => {
               if (operation === "save") {
@@ -160,7 +161,9 @@
       read: (key) => transaction("readonly", "read", key),
       save: (key, value, expected, assertLive) =>
         transaction("readwrite", "save", key, value, expected, assertLive),
-      delete: (key) => transaction("readwrite", "delete", key),
+      // Keep the CAS slot occupied even when no encrypted record existed.
+      // IndexedDB serializes this replacement against conditional save writes.
+      clear: (key, value) => transaction("readwrite", "clear", key, value),
     };
   }
   async function keyFor(raw, scope) {
@@ -242,17 +245,24 @@
       live(input.assertLive);
       const incoming = checkRows(input.entries, input.baseline);
       if (incoming.length > 64) deny(); // One complete verified batch only.
-      await verifiedOwnerGrant(input, pinned);
-      await verifiedHead(input, pinned);
       const db = store(input.indexedDBImpl);
       const key = cacheKey(pinned.scope);
+      // Capture the nonce BEFORE any asynchronous owner/catalog verification.
+      // Clearing the scope replaces it with an unpredictable tombstone nonce;
+      // save must compare the captured nonce inside the final readwrite tx.
       const record = await db.read(key);
       live(input.assertLive);
-      if (record && (!opaque.test(record.nonce) || record.format !== FORMAT)) deny();
+      const tombstone = record?.format === CLEARED;
+      if (record && (!opaque.test(record.nonce)
+        || (tombstone && Object.keys(record).sort().join(",") !== "format,nonce")
+        || (!tombstone && record.format !== FORMAT))) deny();
+      await verifiedOwnerGrant(input, pinned);
+      await verifiedHead(input, pinned);
+      live(input.assertLive);
       const secret = await keyFor(input.metadataRaw, pinned.scope);
       live(input.assertLive);
       let current = [], discardedCount = 0, replacedIncompatibleIndex = false;
-      if (record) {
+      if (record && !tombstone) {
         const previous = recordContext(record);
         // A newly supplied signed-but-historical catalog or owner epoch must
         // not roll back the scope's existing encrypted index version.
@@ -406,7 +416,13 @@
   async function clear(input) {
     try {
       live(input?.assertLive);
-      await store(input.indexedDBImpl).delete(cacheKey(scopeOf(input.grant)));
+      // Never delete the compare-and-swap slot: an already-running append may
+      // have observed it empty, or may have pinned its old encrypted nonce.
+      // A durable random tombstone defeats both cases across tabs/processes.
+      await store(input.indexedDBImpl).clear(cacheKey(scopeOf(input.grant)), {
+        format: CLEARED,
+        nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
+      });
       live(input.assertLive);
     } catch (_) { deny(); }
   }

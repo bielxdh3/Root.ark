@@ -408,8 +408,67 @@ test("a previously authorized result cannot page after a scoped index clear", as
   assert.equal((await result.readPage(50)).entries.length, 1);
   await index.clear({ grant: f.core().grant, indexedDBImpl: f.database,
     assertLive: f.core().assertLive });
-  assert.equal(f.database.rows.size, 0);
+  const [marker] = [...f.database.rows.values()];
+  assert.equal(marker?.format, "rootark-zk1-protected-revision-index-clear/v1",
+    "clear must leave an opaque scoped tombstone, not an empty CAS slot");
+  assert.match(marker.nonce, /^[A-Za-z0-9_-]{22}$/);
+  assert.equal(Object.keys(marker).sort().join(","), "format,nonce");
   await assert.rejects(result.readPage(50), /ZK_REVISION_INDEX_DENIED/);
+});
+
+test("clear during an in-flight signed append cannot resurrect the scoped index", async () => {
+  const f = await fixture();
+  const input = f.core();
+  let calls = 0, release, reached;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const paused = new Promise((resolve) => { reached = resolve; });
+  const client = { async verifyPrivateListingHead(...args) {
+    if (++calls === 2) { reached(); await gate; }
+    return input.client.verifyPrivateListingHead(...args);
+  } };
+  const row = { ...f.selected[0].selected, name: "local-only.txt",
+    mediaType: "text/plain", text: "private local content" };
+  const pending = index.append({ ...input, client, entries: [row] });
+  await paused;
+  try {
+    await index.clear({ grant: input.grant,
+      indexedDBImpl: input.indexedDBImpl, assertLive: input.assertLive });
+  } finally { release(); }
+  await assert.rejects(pending, /ZK_REVISION_INDEX_DENIED/,
+    "append authorized before clear must be denied after clear completes");
+  const [marker] = [...f.database.rows.values()];
+  assert.equal(marker?.format, "rootark-zk1-protected-revision-index-clear/v1");
+  assert.equal(Object.keys(marker).sort().join(","), "format,nonce");
+  assert.equal(f.database.rows.size, 1);
+  const fresh = await index.append({ ...input, entries: [row] });
+  assert.equal(fresh.indexedCount, 1,
+    "a new signed append started after clear must be allowed");
+  const saved = [...f.database.rows.values()][0];
+  assert.notEqual(saved.nonce, marker.nonce, "fresh ciphertext must get a new nonce");
+  assert.doesNotMatch(JSON.stringify(saved), /private local content|local-only\.txt/);
+});
+
+test("repeated clears rotate durable tombstones even without an encrypted row", async () => {
+  const f = await fixture();
+  const input = f.core();
+  await index.clear({ grant: input.grant, indexedDBImpl: input.indexedDBImpl,
+    assertLive: input.assertLive });
+  const first = structuredClone([...f.database.rows.values()][0]);
+  assert.equal(first?.format, "rootark-zk1-protected-revision-index-clear/v1");
+  await index.clear({ grant: input.grant, indexedDBImpl: input.indexedDBImpl,
+    assertLive: input.assertLive });
+  const second = structuredClone([...f.database.rows.values()][0]);
+  assert.equal(second?.format, first.format);
+  assert.notEqual(second.nonce, first.nonce);
+  assert.equal(Object.keys(second).sort().join(","), "format,nonce");
+  await assert.rejects(index.search({ ...input, query: "histórico" }),
+    /ZK_REVISION_INDEX_DENIED/);
+  const selected = f.selected[0].selected;
+  await index.append({ ...input, entries: [{ ...selected, name: "new.txt",
+    mediaType: "text/plain", text: "verified after two clears" }] });
+  const current = [...f.database.rows.values()][0];
+  assert.notEqual(current.nonce, second.nonce);
+  assert.doesNotMatch(JSON.stringify(current), /verified after two clears|new\.txt/);
 });
 
 test("same explicit revision may be reverified without duplicate cache entries", async () => {

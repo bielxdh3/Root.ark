@@ -178,6 +178,43 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
         throw Error("CLEAR_STILL_EXPOSED_CACHE");
       if(!await deny(()=>staleAfterClear.readPage(50)))
         throw Error("STALE_PAGE_AFTER_SCOPED_CLEAR");
+      phase="real-idb-clear-inflight-append";
+      const originalVerifyHead=client.verifyPrivateListingHead;
+      let verificationCalls=0, unblockVerification, reachedVerification;
+      const verificationGate=new Promise(resolve=>{unblockVerification=resolve;});
+      const verificationPaused=new Promise(resolve=>{reachedVerification=resolve;});
+      client.verifyPrivateListingHead=async (...args)=>{
+        if(++verificationCalls===2){reachedVerification();await verificationGate;}
+        return originalVerifyHead(...args);
+      };
+      const pendingAppend=index.append({...input(),entries:rows.slice(0,1)});
+      await Promise.race([verificationPaused,new Promise((_resolve,reject)=>
+        setTimeout(()=>reject(Error("PENDING_APPEND_NOT_REACHED")),8000))]);
+      try {
+        await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
+      }finally{unblockVerification();client.verifyPrivateListingHead=originalVerifyHead;}
+      const rejectedAfterClear=await deny(()=>pendingAppend);
+      if(!rejectedAfterClear)throw Error("POST_CLEAR_APPEND_REPERSISTED");
+      const afterRacingClear=await readStored();
+      if(afterRacingClear?.format!=="rootark-zk1-protected-revision-index-clear/v1"
+        ||typeof afterRacingClear.nonce!=="string"
+        ||Object.keys(afterRacingClear).sort().join(",")!=="format,nonce")
+        throw Error("SCOPED_CLEAR_TOMBSTONE_MISSING");
+      phase="real-idb-append-after-clear";
+      const freshAppend=await index.append({...input(),entries:rows.slice(0,1)});
+      if(freshAppend.indexedCount!==1)throw Error("FRESH_APPEND_AFTER_CLEAR_FAILED");
+      const afterFresh=await readStored();
+      if(!afterFresh?.ciphertext||afterFresh.nonce===afterRacingClear.nonce
+        ||JSON.stringify(afterFresh).includes("owner-private"))
+        throw Error("POST_CLEAR_FRESH_APPEND_NOT_SEALED");
+      if(!await deny(()=>staleAfterClear.readPage(50)))
+        throw Error("STALE_PAGE_REOPENED_AFTER_FRESH_APPEND");
+      await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
+      const repeatedClear=await readStored();
+      if(repeatedClear?.format!=="rootark-zk1-protected-revision-index-clear/v1"
+        ||repeatedClear.nonce===afterRacingClear.nonce
+        ||JSON.stringify(repeatedClear).includes("owner-private"))
+        throw Error("REPEATED_CLEAR_TOMBSTONE_INVALID");
       metadataRaw.fill(0);
       output.textContent="EDGE_REVISION_INDEX_PASS";
     }catch(error){output.textContent="EDGE_REVISION_INDEX_FAIL:"+phase+":"+error.message;}
