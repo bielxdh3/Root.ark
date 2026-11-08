@@ -448,6 +448,61 @@ test("clear during an in-flight signed append cannot resurrect the scoped index"
   assert.doesNotMatch(JSON.stringify(saved), /private local content|local-only\.txt/);
 });
 
+test("clear invalidates append invoked before async context digest even if its first IDB read is later", async () => {
+  const f = await fixture();
+  const input = f.core();
+  const subtle = crypto.webcrypto.subtle;
+  const originalDigest = subtle.digest;
+  let reached, release, paused = false;
+  const waiting = new Promise((resolve) => { reached = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  subtle.digest = async function (...args) {
+    if (!paused && args[0] === "SHA-256") { paused = true; reached(); await gate; }
+    return originalDigest.apply(this, args);
+  };
+  const selected = f.selected[0].selected;
+  const row = { ...selected, name: "pre-context-clear-private.txt",
+    mediaType: "text/plain", text: "PRIVATE_PRE_CONTEXT_CLEAR_SENTINEL" };
+  let pending;
+  try {
+    pending = index.append({ ...input, entries: [row] });
+    await waiting;
+    await index.clear({ grant: input.grant, indexedDBImpl: input.indexedDBImpl,
+      assertLive: input.assertLive });
+  } finally { subtle.digest = originalDigest; release(); }
+  await assert.rejects(pending, /ZK_REVISION_INDEX_DENIED/);
+  const record = [...f.database.rows.values()][0];
+  assert.equal(record?.format, "rootark-zk1-protected-revision-index-clear/v1");
+  assert.equal(Object.keys(record).sort().join(","), "format,nonce");
+  const fresh = await index.append({ ...input, entries: [row] });
+  assert.equal(fresh.indexedCount, 1, "new operation after clear still works");
+  assert.doesNotMatch(JSON.stringify([...f.database.rows.values()][0]),
+    /PRIVATE_PRE_CONTEXT_CLEAR_SENTINEL|pre-context-clear-private/);
+});
+
+test("clear during signed search revalidation denies its FIRST page of decrypted private excerpts", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = f.core();
+  let count = 0, release, reached;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const waiting = new Promise((resolve) => { reached = resolve; });
+  const client = { async verifyPrivateListingHead(...args) {
+    if (++count === 2) { reached(); await gate; }
+    return input.client.verifyPrivateListingHead(...args);
+  } };
+  const pending = index.search({ ...input, client, query: "histórico" });
+  await waiting;
+  try {
+    await index.clear({ grant: input.grant, indexedDBImpl: input.indexedDBImpl,
+      assertLive: input.assertLive });
+  } finally { release(); }
+  await assert.rejects(pending, /ZK_REVISION_INDEX_DENIED/,
+    "a first page must not expose excerpts after a completed scoped clear");
+  const record = [...f.database.rows.values()][0];
+  assert.equal(record?.format, "rootark-zk1-protected-revision-index-clear/v1");
+});
+
 test("repeated clears rotate durable tombstones even without an encrypted row", async () => {
   const f = await fixture();
   const input = f.core();

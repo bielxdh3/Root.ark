@@ -16,6 +16,51 @@
   const PAGE = 50;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
+  // Synchronous same-realm fence: invocation of clear invalidates ALL older
+  // local async operations, including those waiting before the first IDB read.
+  const clearGenerations = new Map();
+  function generation(key) { return clearGenerations.get(key) || 0; }
+  function browserRealm() {
+    return typeof document === "object" || typeof WorkerGlobalScope !== "undefined";
+  }
+  function sharedGeneration(key) {
+    if (!browserRealm()) return null; // Node's disposable fake IndexedDB.
+    // Synchronous, same-origin, cross-tab invocation fence. Only an opaque
+    // CSPRNG nonce is stored; no text, CEK, query or grant content is saved.
+    // Workers or insecure contexts without synchronous origin storage DENY.
+    if (typeof localStorage === "undefined"
+      || typeof localStorage.getItem !== "function") deny();
+    const value = localStorage.getItem(DB + "/clear/" + key);
+    if (value !== null && !opaque.test(value)) deny();
+    return value;
+  }
+  function captureGeneration(key) {
+    return { local: generation(key), shared: sharedGeneration(key) };
+  }
+  function checkGeneration(key, expected) {
+    if (generation(key) !== expected.local
+      || sharedGeneration(key) !== expected.shared) deny();
+  }
+  function checkRecordGeneration(record, expected) {
+    if (!browserRealm()) return;
+    // A failed clear can update localStorage before the durable IDB commit.
+    // Do not reauthorize that older encrypted row or tombstone until a new
+    // successful clear reconciles both stores.
+    if (record.format === CLEARED && record.nonce !== expected.shared
+      || record.format === FORMAT
+        && (record.clearNonce ?? null) !== expected.shared) deny();
+  }
+  function scopeGate(key, work) {
+    // The initial append read and each scoped clear must be ordered across
+    // tabs before any asynchronous crypto/network work can move the read past
+    // the clear. A secure-context browser without Web Locks fails closed.
+    // Browsers can run this script in a Window or a Worker. Never silently
+    // downgrade either browser realm to single-realm locking when unsupported.
+    if (!browserRealm())
+      return work(); // Node's deterministic disposable IndexedDB test runtime.
+    if (typeof navigator?.locks?.request !== "function") deny();
+    return navigator.locks.request(DB + "/" + key, { mode: "exclusive" }, work);
+  }
   const opaque = /^[A-Za-z0-9_-]{22}$/;
   const digest = /^[A-Za-z0-9_-]{43}$/;
   const types = new Set(["text/plain", "text/markdown", "text/csv", "application/json"]);
@@ -241,26 +286,33 @@
   async function append(input) {
     try {
       live(input?.assertLive);
+      const key = cacheKey(scopeOf(input.grant));
+      const initialGeneration = captureGeneration(key);
+      const assertCurrent = () => {
+        live(input.assertLive);
+        checkGeneration(key, initialGeneration);
+      };
+      const db = store(input.indexedDBImpl);
+      // This first read must be requested at append INVOCATION, rather than
+      // after context()'s asynchronous SHA-256, so a clear cannot complete
+      // first and then be mistaken for an existing fresh baseline tombstone.
+      const record = await scopeGate(key, () => db.read(key));
+      assertCurrent();
       const pinned = await context(input);
-      live(input.assertLive);
+      assertCurrent();
+      if (cacheKey(pinned.scope) !== key) deny();
       const incoming = checkRows(input.entries, input.baseline);
       if (incoming.length > 64) deny(); // One complete verified batch only.
-      const db = store(input.indexedDBImpl);
-      const key = cacheKey(pinned.scope);
-      // Capture the nonce BEFORE any asynchronous owner/catalog verification.
-      // Clearing the scope replaces it with an unpredictable tombstone nonce;
-      // save must compare the captured nonce inside the final readwrite tx.
-      const record = await db.read(key);
-      live(input.assertLive);
       const tombstone = record?.format === CLEARED;
       if (record && (!opaque.test(record.nonce)
         || (tombstone && Object.keys(record).sort().join(",") !== "format,nonce")
         || (!tombstone && record.format !== FORMAT))) deny();
+      if (record) checkRecordGeneration(record, initialGeneration);
       await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
-      live(input.assertLive);
+      assertCurrent();
       const secret = await keyFor(input.metadataRaw, pinned.scope);
-      live(input.assertLive);
+      assertCurrent();
       let current = [], discardedCount = 0, replacedIncompatibleIndex = false;
       if (record && !tombstone) {
         const previous = recordContext(record);
@@ -289,7 +341,7 @@
           replacedIncompatibleIndex = true;
         }
       }
-      live(input.assertLive);
+      assertCurrent();
       const combined = new Map(current.map((row) => [row.objectId + ":" + row.revision, row]));
       for (const row of incoming) {
         const rowKey = row.objectId + ":" + row.revision;
@@ -306,14 +358,16 @@
           additionalData: encoder.encode(JSON.stringify(pinned)), tagLength: 128 },
         secret, plain);
       } finally { plain.fill(0); }
-      live(input.assertLive);
+      assertCurrent();
       await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
+      assertCurrent();
       await db.save(key, { format: FORMAT, context: JSON.stringify(pinned),
         nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
+        clearNonce: initialGeneration.shared,
         iv: to64(iv), ciphertext: to64(new Uint8Array(sealed)) },
-      record?.nonce ?? null, input.assertLive);
-      live(input.assertLive);
+      record?.nonce ?? null, assertCurrent);
+      assertCurrent();
       return Object.freeze({ indexedCount: rows.length, persistedIndex: true,
         discardedCount, replacedIncompatibleIndex,
         coverage: "owner-selected-revisions-only", plaintextSentToServer: false,
@@ -352,17 +406,27 @@
   async function search(input) {
     try {
       live(input?.assertLive);
+      const key = cacheKey(scopeOf(input.grant));
+      const initialGeneration = captureGeneration(key);
+      const assertCurrent = () => {
+        live(input.assertLive);
+        checkGeneration(key, initialGeneration);
+      };
       const match = checkedMatcher(input.query, input.matchMode);
       const pinned = await context(input);
-      live(input.assertLive);
+      assertCurrent();
+      if (cacheKey(pinned.scope) !== key) deny();
       await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
-      const record = await store(input.indexedDBImpl).read(cacheKey(pinned.scope));
-      live(input.assertLive);
+      const db = store(input.indexedDBImpl);
+      const record = await db.read(key);
+      assertCurrent();
+      if (record && (record.format === FORMAT || record.format === CLEARED))
+        checkRecordGeneration(record, initialGeneration);
       const secret = await keyFor(input.metadataRaw, pinned.scope);
-      live(input.assertLive);
+      assertCurrent();
       let rows = await openRows(record, pinned, secret, input.baseline);
-      live(input.assertLive);
+      assertCurrent();
       await verifiedOwnerGrant(input, pinned);
       await verifiedHead(input, pinned);
       const matches = [];
@@ -376,7 +440,7 @@
             excerpt: normalized.slice(start, start + 160) }));
         }
       }
-      live(input.assertLive);
+      assertCurrent();
       const indexedCount = rows.length;
       // Only bounded excerpts remain in the asynchronous page navigation
       // closure; never retain all decrypted historical source text there.
@@ -395,33 +459,66 @@
       };
       const readPage = async (offset) => {
         try {
-          live(input.assertLive);
+          assertCurrent();
           await verifiedOwnerGrant(input, pinned);
           await verifiedHead(input, pinned);
           // A previously loaded result may outlive a scoped clear or a new
           // encrypted snapshot with the same signed catalog head. Never emit
           // another page from an index that was deleted/replaced meanwhile.
-          const currentRecord = await store(input.indexedDBImpl)
-            .read(cacheKey(pinned.scope));
-          live(input.assertLive);
-          if (!currentRecord || currentRecord.format !== FORMAT
-            || currentRecord.context !== record.context
-            || currentRecord.nonce !== record.nonce) deny();
-          return paged(offset);
+          const page = await scopeGate(key, async () => {
+            const currentRecord = await db.read(key);
+            assertCurrent();
+            if (!currentRecord || currentRecord.format !== FORMAT
+              || currentRecord.context !== record.context
+              || currentRecord.nonce !== record.nonce) deny();
+            checkRecordGeneration(currentRecord, initialGeneration);
+            return paged(offset);
+          });
+          assertCurrent();
+          return page;
         } catch (_) { deny(); }
       };
-      return paged(input.offset === undefined ? 0 : input.offset);
+      // The FIRST page needs the same scoped current-record check as later
+      // navigation, after the last asynchronous signed owner/catalog check.
+      // Keep final check + page construction ordered against cross-tab clear.
+      const firstPage = await scopeGate(key, async () => {
+        const currentRecord = await db.read(key);
+        assertCurrent();
+        if (!currentRecord || currentRecord.format !== FORMAT
+          || currentRecord.context !== record.context
+          || currentRecord.nonce !== record.nonce) deny();
+        checkRecordGeneration(currentRecord, initialGeneration);
+        return paged(input.offset === undefined ? 0 : input.offset);
+      });
+      assertCurrent();
+      return firstPage;
     } catch (_) { deny(); }
   }
   async function clear(input) {
     try {
       live(input?.assertLive);
+      const key = cacheKey(scopeOf(input.grant));
+      // Increment synchronously at invocation, even while IndexedDB is still
+      // opening. The durable tombstone handles other tabs and restarts.
+      clearGenerations.set(key, generation(key) + 1);
+      const markerNonce = to64(webCrypto.getRandomValues(new Uint8Array(16)));
+      if (browserRealm()) {
+        if (typeof localStorage === "undefined"
+          || typeof localStorage.setItem !== "function") deny();
+        localStorage.setItem(DB + "/clear/" + key, markerNonce);
+      }
       // Never delete the compare-and-swap slot: an already-running append may
       // have observed it empty, or may have pinned its old encrypted nonce.
       // A durable random tombstone defeats both cases across tabs/processes.
-      await store(input.indexedDBImpl).clear(cacheKey(scopeOf(input.grant)), {
-        format: CLEARED,
-        nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
+      await scopeGate(key, () => {
+        // Other tabs can invoke a newer clear while this call waits on the
+        // lock. Persist the latest shared generation, never resurrect an
+        // older marker (ABA) or strand concurrent clears with a stale nonce.
+        const newest = browserRealm() ? sharedGeneration(key) : markerNonce;
+        if (newest === null) deny();
+        return store(input.indexedDBImpl).clear(key, {
+          format: CLEARED, nonce: newest,
+        });
       });
       live(input.assertLive);
     } catch (_) { deny(); }

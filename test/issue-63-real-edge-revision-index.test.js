@@ -215,6 +215,162 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
         ||repeatedClear.nonce===afterRacingClear.nonce
         ||JSON.stringify(repeatedClear).includes("owner-private"))
         throw Error("REPEATED_CLEAR_TOMBSTONE_INVALID");
+      phase="real-idb-pre-context-clear-race";
+      const originalDigest=crypto.subtle.digest;
+      let digestPaused=false,digestReleased,digestReached;
+      const digestGate=new Promise(resolve=>{digestReleased=resolve;});
+      const digestWaiting=new Promise(resolve=>{digestReached=resolve;});
+      crypto.subtle.digest=function(...args){
+        if(!digestPaused&&args[0]==="SHA-256"){
+          digestPaused=true;digestReached();
+          return digestGate.then(()=>originalDigest.apply(this,args));
+        }
+        return originalDigest.apply(this,args);
+      };
+      const earlyAppend=index.append({...input(),entries:rows.slice(0,1)});
+      try {
+        await Promise.race([digestWaiting,new Promise((_resolve,reject)=>
+          setTimeout(()=>reject(Error("EARLY_CONTEXT_DIGEST_NOT_PAUSED")),8000))]);
+        await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
+      }finally{crypto.subtle.digest=originalDigest;digestReleased();}
+      if(!await deny(()=>earlyAppend))throw Error("PRE_CONTEXT_CLEAR_APPEND_REPERSISTED");
+      const afterEarlyClear=await readStored();
+      if(afterEarlyClear?.format!=="rootark-zk1-protected-revision-index-clear/v1")
+        throw Error("PRE_CONTEXT_CLEAR_TOMBSTONE_LOST");
+      phase="real-idb-inflight-first-page-after-clear";
+      await index.append({...input(),entries:rows.slice(0,1)});
+      const beforeFirstPage=client.verifyPrivateListingHead;
+      let headCalls=0,firstPageUnblock,firstPageReached;
+      const firstPageGate=new Promise(resolve=>{firstPageUnblock=resolve;});
+      const firstPageWaiting=new Promise(resolve=>{firstPageReached=resolve;});
+      client.verifyPrivateListingHead=async (...args)=>{
+        if(++headCalls===2){firstPageReached();await firstPageGate;}
+        return beforeFirstPage(...args);
+      };
+      const inFlightFirstPage=index.search({...input(),query:"needle"});
+      try {
+        await Promise.race([firstPageWaiting,new Promise((_resolve,reject)=>
+          setTimeout(()=>reject(Error("FIRST_PAGE_VERIFY_NOT_PAUSED")),8000))]);
+        await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
+      }finally{client.verifyPrivateListingHead=beforeFirstPage;firstPageUnblock();}
+      if(!await deny(()=>inFlightFirstPage))
+        throw Error("PRIVATE_FIRST_PAGE_RELEASED_AFTER_CLEAR");
+      phase="real-idb-cross-realm-web-lock";
+      if(typeof navigator.locks?.request!=="function")
+        throw Error("BROWSER_WEB_LOCKS_UNAVAILABLE");
+      const frame=document.createElement("iframe");
+      frame.src="/frame.html";
+      document.body.append(frame);
+      await Promise.race([new Promise((resolve,reject)=>{
+        frame.addEventListener("load",resolve,{once:true});
+        frame.addEventListener("error",()=>reject(Error("FRAME_LOAD_FAILED")),{once:true});
+      }),new Promise((_resolve,reject)=>
+        setTimeout(()=>reject(Error("FRAME_LOAD_TIMEOUT")),8000))]);
+      const other=frame.contentWindow;
+      const otherIndex=other?.RootarkZk1ProtectedRevisionIndex;
+      if(!otherIndex?.append||!other?.indexedDB)
+        throw Error("CROSS_REALM_INDEX_NOT_LOADED");
+      const lockName="rootark-zk1-protected-revision-index-v1/"+
+        JSON.stringify([scope.account_id,scope.compartment_id,scope.keyring_id]);
+      let unblockHeldLock,heldLockReached;
+      const heldLockGate=new Promise(resolve=>{unblockHeldLock=resolve;});
+      const heldLockReady=new Promise(resolve=>{heldLockReached=resolve;});
+      const holdLock=navigator.locks.request(lockName,{mode:"exclusive"},async()=>{
+        heldLockReached();await heldLockGate;
+      });
+      await heldLockReady;
+      let otherHeadCalls=0,unblockOtherHead,otherHeadReached;
+      const otherHeadGate=new Promise(resolve=>{unblockOtherHead=resolve;});
+      const otherClient={...client,async verifyPrivateListingHead(...args){
+        if(++otherHeadCalls===1)await otherHeadGate;
+        return client.verifyPrivateListingHead(...args);
+      }};
+      const otherInput={...input(),client:otherClient,
+        indexedDBImpl:other.indexedDB,
+        metadataRaw:new other.Uint8Array(metadataRaw)};
+      const otherPending=otherIndex.append({...otherInput,entries:rows.slice(0,1)});
+      // Clear is invoked AFTER the other tab queued its initial scoped lock,
+      // while both are blocked by an unrelated same-origin lock holder.
+      const clearPending=index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live});
+      try {
+        unblockHeldLock();await holdLock;
+        await clearPending;
+      }finally{unblockHeldLock();unblockOtherHead();}
+      const crossRealmMarker=await readStored();
+      let crossRealmOutcome="RESOLVED";
+      try{await otherPending;}catch(error){crossRealmOutcome=error?.message||"UNKNOWN_ERROR";}
+      const parentAfterOther=await readStored();
+      const otherAfterOther=await new Promise((resolve,reject)=>{
+        const op=other.indexedDB.open("rootark-zk1-protected-revision-index-v1",1);
+        op.onerror=()=>reject(Error("FRAME_DB_OPEN"));
+        op.onsuccess=()=>{
+          const db=op.result;
+          const tx=db.transaction("revisions","readonly");
+          const get=tx.objectStore("revisions").get(JSON.stringify([
+            scope.account_id,scope.compartment_id,scope.keyring_id]));
+          get.onerror=()=>reject(Error("FRAME_DB_GET"));
+          get.onsuccess=()=>resolve(get.result);
+          tx.oncomplete=()=>db.close();
+        };
+      });
+      if(crossRealmOutcome!=="ZK_REVISION_INDEX_DENIED")
+        throw Error("CROSS_REALM_PRE_CLEAR_APPEND_REPERSISTED:"+crossRealmOutcome+
+          ":"+crossRealmMarker?.format+":"+parentAfterOther?.format+
+          ":"+otherAfterOther?.format+":"+location.origin+
+          ":"+other.location.origin);
+      if(crossRealmMarker?.format!=="rootark-zk1-protected-revision-index-clear/v1")
+        throw Error("CROSS_REALM_TOMBSTONE_LOST");
+      if(parentAfterOther?.format!==crossRealmMarker.format
+        ||otherAfterOther?.format!==crossRealmMarker.format)
+        throw Error("CROSS_REALM_OLD_APPEND_PERSISTED_AFTER_CLEAR");
+      const scopedStorageKey="rootark-zk1-protected-revision-index-v1/clear/"+
+        JSON.stringify([scope.account_id,scope.compartment_id,scope.keyring_id]);
+      const crossRealmStamp=localStorage.getItem(scopedStorageKey);
+      if(crossRealmStamp!==parentAfterOther.nonce
+        ||other.localStorage.getItem(scopedStorageKey)!==crossRealmStamp
+        ||!/^[-A-Za-z0-9_]{22}$/.test(crossRealmStamp)
+        ||crossRealmStamp.includes("owner-private"))
+        throw Error("CROSS_REALM_SHARED_GENERATION_NOT_OPAQUE");
+      const freshOther=await otherIndex.append({...otherInput,client,
+        entries:rows.slice(0,1)});
+      const freshCrossRealmRow=await readStored();
+      if(freshOther.indexedCount!==1
+        ||freshCrossRealmRow?.format!=="rootark-zk1-protected-revision-index/v1"
+        ||freshCrossRealmRow.clearNonce!==crossRealmStamp
+        ||JSON.stringify(freshCrossRealmRow).includes("owner-private"))
+        throw Error("FRESH_CROSS_REALM_APPEND_AFTER_CLEAR_FAILED");
+      phase="real-idb-cross-realm-first-page-clear";
+      let pageVerifications=0,unblockFramePage,framePageReached;
+      const framePageGate=new Promise(resolve=>{unblockFramePage=resolve;});
+      const framePageReady=new Promise(resolve=>{framePageReached=resolve;});
+      const frameSearchClient={...client,async verifyPrivateListingHead(...args){
+        if(++pageVerifications===2){framePageReached();await framePageGate;}
+        return client.verifyPrivateListingHead(...args);
+      }};
+      const frameSearch=otherIndex.search({...otherInput,client:frameSearchClient,
+        query:"needle"});
+      await Promise.race([framePageReady,new Promise((_resolve,reject)=>
+        setTimeout(()=>reject(Error("CROSS_REALM_FIRST_PAGE_NOT_PAUSED")),8000))]);
+      try { await index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live}); }
+      finally { unblockFramePage(); }
+      if(!await deny(()=>frameSearch))
+        throw Error("CROSS_REALM_PRIVATE_FIRST_PAGE_AFTER_CLEAR");
+      phase="real-idb-concurrent-cross-realm-clears";
+      await Promise.all([
+        index.clear({grant,indexedDBImpl:indexedDB,assertLive:()=>live}),
+        otherIndex.clear({grant,indexedDBImpl:other.indexedDB,assertLive:()=>live}),
+      ]);
+      const afterConcurrentClears=await readStored();
+      if(afterConcurrentClears?.format!=="rootark-zk1-protected-revision-index-clear/v1"
+        ||afterConcurrentClears.nonce!==localStorage.getItem(scopedStorageKey)
+        ||afterConcurrentClears.nonce!==other.localStorage.getItem(scopedStorageKey))
+        throw Error("CONCURRENT_CLEARS_LEFT_INCONSISTENT_GENERATION");
+      const opaqueStamp=afterConcurrentClears.nonce;
+      localStorage.setItem(scopedStorageKey,"malformed");
+      const malformedDenied=await deny(()=>index.append({...input(),entries:rows.slice(0,1)}));
+      localStorage.setItem(scopedStorageKey,opaqueStamp);
+      if(!malformedDenied)throw Error("MALFORMED_SHARED_GENERATION_AUTHORIZED_APPEND");
+      frame.remove();
       metadataRaw.fill(0);
       output.textContent="EDGE_REVISION_INDEX_PASS";
     }catch(error){output.textContent="EDGE_REVISION_INDEX_FAIL:"+phase+":"+error.message;}
@@ -222,10 +378,15 @@ test("real Edge IndexedDB protects 128 historical revisions across signed CAS, p
   const server = http.createServer((request, response) => {
     if (request.url === "/") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8",
-        "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'" });
+        "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'; frame-src 'self'" });
       response.end("<!doctype html><meta charset='utf-8'><output id='result'>PENDING</output>"
         + "<script defer src='/client/rootark-zk1-protected-revision-index.js'></script>"
         + "<script defer src='/probe.js'></script>");
+    } else if (request.url === "/frame.html") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "default-src 'none'; script-src 'self'" });
+      response.end("<!doctype html><meta charset='utf-8'>"
+        + "<script defer src='/client/rootark-zk1-protected-revision-index.js'></script>");
     } else if (request.url === "/client/rootark-zk1-protected-revision-index.js") {
       response.writeHead(200, { "content-type": "text/javascript" });
       response.end(fs.readFileSync(path.join(__dirname,
