@@ -140,6 +140,44 @@ test("full 4096-row signed catalog is indexed, returns a bounded 100-hit UI page
   assert.equal(f.opened, 1, "persistent cache covers maximum signed catalog size");
 });
 
+test("signed 4096-revision history pages locally without retaining the metadata key", async () => {
+  const database = indexedDBMemory();
+  const names = Array.from({ length: 4096 }, (_, i) => "history-" + String(i).padStart(4, "0"));
+  const f = fixture(database, names);
+  const key = crypto.randomBytes(32);
+  const first = await search.search(f.input(key, ""));
+  assert.equal(first.totalMatches, 4096);
+  assert.equal(first.entries.length, 100, "unfiltered listing must also be bounded");
+  assert.equal(first.entries[0].name, "history-0000");
+  assert.equal(first.hasNext, true);
+  assert.equal(first.offset, 0);
+  key.fill(0); // The workspace zeroizes the local key immediately after its action.
+
+  const readsBeforePage = f.remoteReads;
+  const second = await first.readPage(100);
+  assert.equal(f.remoteReads, readsBeforePage + 1, "each page rechecks signed CAS");
+  assert.equal(second.entries.length, 100);
+  assert.equal(second.entries[0].name, "history-0100");
+  assert.equal(second.offset, 100);
+  assert.equal(second.totalMatches, 4096);
+  assert.equal(f.opened, 1, "page requests must not re-import the CEK or re-fetch plaintext");
+
+  const last = await first.readPage(4000);
+  assert.equal(last.entries.length, 96);
+  assert.equal(last.entries.at(-1).name, "history-4095");
+  assert.equal(last.hasNext, false);
+  assert.equal(f.opened, 1);
+  await assert.rejects(first.readPage(-100), /ZK_LOCAL_SEARCH_DENIED/);
+  await assert.rejects(first.readPage(4096), /ZK_LOCAL_SEARCH_DENIED/);
+  await assert.rejects(first.readPage(12), /ZK_LOCAL_SEARCH_DENIED/);
+  f.baseline.head.digest = crypto.randomBytes(32).toString("base64url");
+  await assert.rejects(first.readPage(200), /ZK_LOCAL_SEARCH_DENIED/,
+    "a changed signed head invalidates every old in-memory page");
+  f.revoke();
+  await assert.rejects(first.readPage(200), /ZK_LOCAL_SEARCH_DENIED/,
+    "a revoked session must never reveal another cached page");
+});
+
 test("explicit local invalidation deletes only the scoped encrypted index", async () => {
   const database = indexedDBMemory();
   const f = fixture(database);

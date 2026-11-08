@@ -98,6 +98,35 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       list.replaceChildren();
       button.click();
       if(target.value!==""||revision.value!=="")throw Error("DETACHED_RESULT_SELECTED");
+      const pageOne={name:"history-0000",objectId:id,revision:7,epoch:2,
+        logicalTrashCandidate:false};
+      const pageTwo={name:"history-0100",objectId:id,revision:8,epoch:2,
+        logicalTrashCandidate:false};
+      let pageReads=0;
+      const readPage=async(offset)=>{
+        if(offset!==100)throw Error("UNEXPECTED_PAGE_OFFSET");
+        pageReads++;
+        return {entries:[pageTwo],offset,totalMatches:101,pageSize:100,
+          hasNext:false,hasPrevious:true,plaintextSentToServer:false,
+          independentlySignedCatalog:true,authorizesMutation:false};
+      };
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,hasNext:true,hasPrevious:false,readPage});
+      const next=list.querySelector('[data-zk1-page="next"]');
+      if(!next||next.type!=="button")throw Error("MISSING_NEXT_PAGE");
+      next.click();
+      for(let i=0;i<100&&!list.textContent.includes("history-0100");i++)await sleep(10);
+      if(pageReads!==1||!list.textContent.includes("history-0100")
+        ||list.textContent.includes("history-0000"))throw Error("PAGE_NAVIGATION_FAILED");
+      const previous=list.querySelector('[data-zk1-page="previous"]');
+      if(!previous)throw Error("MISSING_PREVIOUS_PAGE");
+      active=false;
+      previous.click();
+      await sleep(40);
+      if(pageReads!==1)throw Error("STALE_PAGE_NAVIGATION");
+      active=true;
+      list.replaceChildren();
       getButton.click();
       for(let i=0;i<100;i++){
         if(dialog.querySelector('[data-zk1-field="status"]').textContent
