@@ -579,3 +579,43 @@ test("P1: both SQLite identity descriptors remain pinned until close without lea
   for (const fd of pins.values()) assert.throws(() => fs.fstatSync(fd), { code: "EBADF" });
   c.close();
 });
+
+test("P2: an owner-authorized floor expiring during signing must never be returned", (t) => {
+  const x = setup(t, "signing-expiry");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const challenge = x.offer({ lease_expires_at_ms: Date.now() + 2200 });
+  const originalSign = crypto.sign;
+  let custodianSignCalls = 0;
+  crypto.sign = (...args) => {
+    const signed = originalSign(...args); // Real Ed25519; only the response is delayed.
+    if (args[2] === x.custodian.privateKey) {
+      custodianSignCalls += 1;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
+    }
+    return signed;
+  };
+  try {
+    assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "no signed response may escape once the owner lease expires inside crypto.sign");
+  } finally { crypto.sign = originalSign; }
+  assert.equal(custodianSignCalls, 1, "real custodian signature was computed");
+  assert.ok(Date.now() >= challenge.request.lease_expires_at_ms,
+    "the lease actually expired before crypto.sign returned");
+  assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "already-committed nonce is not silently retried after a failed signature");
+  for (const file of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(db.prepare("SELECT lease_serial FROM floor WHERE singleton = 1").get().lease_serial, 1);
+    } finally { db.close(); }
+  }
+  c.close();
+  const restarted = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }));
+  const next = x.offer();
+  assert.equal(restarted.attest(next.request, next.ownerLease).floor.sequence, 1);
+  assert.equal(restarted.retainedMinimum().lease_serial, 2,
+    "a fresh owner-signed lease resumes at the next durable journal serial");
+});

@@ -386,6 +386,12 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           // signed bytes without checking both DB inodes once more.
           checkDbPin(anchor);
           checkDbPin(main);
+          // Signing and final DB checks can stall after the pre-sign expiry
+          // check. Never issue a CURRENT attestation whose owner lease has
+          // already expired; its durable nonce is consumed, so fail closed.
+          const completedAt = NOW();
+          if (!Number.isSafeInteger(completedAt) || completedAt < issuedAt
+            || completedAt + 100 >= r.lease_expires_at_ms) deny();
           return { floor: { ...floor, signature } };
         } catch (_) {
           // SQLite fsync/commit ambiguity or unexpected sign failure must not
