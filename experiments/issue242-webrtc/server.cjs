@@ -20,7 +20,8 @@ const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-p
 
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
   authenticateSession = null, sharedWss = null, authorizeRecipient = null,
-  authorizeObject = null, authorizeSignalSnapshot = null } = {}) {
+  authorizeObject = null, authorizeSignalSnapshot = null,
+  authorizeImmutableVersion = null } = {}) {
   const rooms = new Map();
   const pendingRoomCreatesByOwner = new Map();
   let pendingRoomCreates = 0;
@@ -422,7 +423,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
     if (body && Object.hasOwn(body, 'boundObject')) {
       const input = body.boundObject;
+      // This admission gate is intentionally stricter than the legacy hash
+      // preflight. The Root.ark adapter presently has neither an immutable,
+      // owner-authorized version authority nor a single mutation-serialized
+      // all-party ACL snapshot. Do not read 32 MiB or allocate a P2P room
+      // merely to discover later that protected signaling must fail closed.
+      // Only startup-injected trusted callbacks can enable this path; request
+      // JSON, hash results and self-asserted flags are never capabilities.
       if (!authenticated || typeof authorizeObject !== 'function' ||
+        typeof authorizeImmutableVersion !== 'function' ||
+        typeof authorizeSignalSnapshot !== 'function' ||
         !object(input) || Object.keys(input).length !== 2 ||
         typeof input.folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(input.folderId) ||
         typeof input.fileName !== 'string' || input.fileName.length > 100 ||

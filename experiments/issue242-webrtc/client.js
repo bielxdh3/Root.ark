@@ -505,7 +505,15 @@
   async function createRoom(boundObject = null) {
     const intent = ++roomIntent;
     protectedRoomRequired = Boolean(boundObject);
-    if (protectedRoomRequired) retireRoom();
+    if (protectedRoomRequired) {
+      retireRoom();
+      // The server may now deny this entire mode before hashing. Do not
+      // leave a stale manual room identifier or host key visible as if it
+      // authorized ciphertext sharing after a failed bound admission.
+      roomId = null;
+      hostKey = null;
+      $('room').textContent = '';
+    }
     const headers = {};
     if (inRootark) {
       const csrf = document.cookie.split(';').map(value => value.trim())

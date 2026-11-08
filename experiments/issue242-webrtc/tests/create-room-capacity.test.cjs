@@ -10,6 +10,10 @@ function request(owner = 'alice') {
 }
 async function brokerFixture(t, authorizeObject) {
   const broker = makeBroker({ authorizeObject,
+    // Broker capacity tests use synthetic startup-injected authorities; no
+    // production version, real signature or all-writer ACL guarantee implied.
+    authorizeImmutableVersion: () => Object.freeze({ versionId: 'test-immutable-v1' }),
+    authorizeSignalSnapshot: () => null,
     authenticateSession: req => ({ username: req.headers['x-owner'], sessionVersion: 1,
       expiresAt: Date.now() + 60_000 }) });
   await broker.listen();
@@ -95,6 +99,8 @@ test('session revoked while hashing cannot create a stale signed room', async t 
   const broker = makeBroker({
     authenticateSession: req => ({ username: req.headers['x-owner'],
       sessionVersion: currentVersion, expiresAt: Date.now() + 60_000 }),
+    authorizeImmutableVersion: () => Object.freeze({ versionId: 'test-immutable-v1' }),
+    authorizeSignalSnapshot: () => null,
     authorizeObject: async () => { await gate.promise; return grant; },
   });
   await broker.listen();

@@ -24,6 +24,10 @@ async function actualHttpFixture(t, { authorizeObject, beforeRespond = async () 
       username: req.headers['x-owner'], sessionVersion: 1, expiresAt: Date.now() + 60_000,
     }),
     authorizeObject,
+    // Explicit synthetic authorities exercise response-close/finish races.
+    // Root.ark's real adapter deliberately supplies neither capability.
+    authorizeImmutableVersion: () => Object.freeze({ versionId: 'test-immutable-v1' }),
+    authorizeSignalSnapshot: () => null,
   });
   const closed = deferred();
   const processed = deferred();

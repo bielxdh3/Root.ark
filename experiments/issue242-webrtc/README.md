@@ -1,5 +1,11 @@
 # Issue #242: disposable browser WebRTC room
 
+**CURRENT SECURITY STATE (2026-11-08): ACL-bound P2P rooms are disabled at pre-admission.** The real Root.ark adapter supplies neither a trusted immutable owner-authorized version authority nor a mutation-serialized all-party ACL snapshot. A bound POST /p2p/rooms therefore returns HTTP 403 BEFORE reading/hashing ciphertext or reserving a room, even for an otherwise valid legacy owner/recipient ACL. There are no legitimate bound rooms, invites, signaling or 1-second bound sweeper work in the real app. Unbound manually selected file/text sharing continues to work. The browser clears stale room identity after a refused bound request.
+
+This is an **interim fail-closed mitigation, NOT completion of issue #242**. Two trusted factory-only callbacks, authorizeImmutableVersion and authorizeSignalSnapshot, are prerequisites for future bound admission, but their presence alone is NOT proof of crypto custody or atomic filesystem/ACL authority. The standalone broker unit tests inject **synthetic callbacks only for race/capacity tests**, not as production evidence. Do not wire these callbacks in server.js until independently verified owner-signed immutable versions, all-writer serialization, trustworthy all-party ACL snapshots and browser DataChannel revocation/cutoff exist. Existing SHA-256 source reads remain vulnerable to post-final-read mutation; the rejected double-read patch and round-robin sweeper are NOT used.
+
+**Historical note:** descriptions below of successful bound digest/ACL creation and subsequent signaling denial refer to the PRE-2026-11-08 research implementation. The current gate supersedes those descriptions; bound objects are refused before authorization hashing.
+
 **Research-only, loopback-only demo.** The broker has no Root.ark production routes, user data, secrets, persisted rooms or storage. It accepts an optional trusted callback that uses Root.ark's existing signed-session verifier. The experiments now require `ws` and `jsonwebtoken`, which are already declared Root.ark application dependencies; the browser uses native `RTCPeerConnection` and `crypto.subtle`. No GPL or upstream code was copied. See [research](../../docs/roadmap/issue-242-p2p-feasibility-2026-11-06.md).
 
 ## Run
@@ -28,19 +34,19 @@ Set `ROOTARK_P2P_EXPERIMENTAL=true` on a **development or test** Root.ark server
 
 Room admission uses Root.ark's actual HS256 `rootark_session`, TOTP enrollment checks, session version and *authoritative* user store; disabled users, missing `listFiles`, missing origin/CSRF, unknown recipients, old recipient session epochs and login revocation are rejected. The broker revalidates participants before signaling and on a periodic sweep. A 60-second single-use invite is bound to an exact username and its session-version epoch. Other `/ws` events continue using their existing path; P2P frames have their own room `type` protocol and cannot be sent without session and consent.
 
-**Opt-in ACL-bound ciphertext room:** the same authenticated page includes a separate "Criar sala vinculada à ACL" action; provide an exact Root.ark `folderId` and filename. The server requires the **current owner** of an existing locally stored encrypted file (`user-key` or `dual`), its explicit `encrypted-files` authorized-user record, current folder/file read ACL, active object/ACL expiry and a regular retained ciphertext file with size **1–32 MiB**. It computes SHA-256 over only those local encrypted bytes (no decryption, plaintext or keys), pins the encrypted metadata and digest to the temporary room, and rechecks that binding on each room action and a 1-second sweep. Any recipient removal, ACL revocation, folder permission loss, object replacement or ciphertext change closes admission/signaling. Only the exact signed-in recipient may join; both peers must consent. The server supplies trusted expected ciphertext filename, size and SHA-256 in `joined`, and the built-in sender and receiver reject mismatched file offers and prohibit text in bound rooms. The user still selects a **local ciphertext file** explicitly; the server never sends file contents over its signaling connection. Local-only ciphertext hashing is intentionally bounded and fail-closed for cloud-backed objects, aliases and symlinks.
+**ACL-bound ciphertext rooms are currently disabled at pre-admission.** The opt-in interface still shows the experimental bound-action control, but the real Root.ark adapter has no trusted immutable version or all-party mutation-serialized ACL authority. Even a valid explicit legacy owner/recipient ACL cannot create a bound room. The HTTP request returns 403 before reading/hash of stored ciphertext, capacity reservation, invites, or any periodic room work. A browser-selected file is never proof of immutable server storage.
 
-This is a **legacy server-authoritative ACL** integration, **not an independent owner-signed Zero-Knowledge grant**, ZK device identity, or proof that source ciphertext was correctly encrypted. The original manually selected file rooms remain a separate behavior. A modified WebRTC client can transmit arbitrary DataChannel frames after a connection opens; broker revocation closes cooperating browsers but cannot revoke bytes already transferred or enforce every peer-to-peer packet. Production requires independently signed object/version/recipient authorization, security review, cross-device identity/NAT/TURN gates and a unified policy for legacy/manual transfers.
+This retired legacy ciphertext/ACL hash adapter remains research-only, not an active owner-signed Zero-Knowledge grant. No server hash alone proves immutable file version, principal identity or cryptographic custody. The unbound manually selected file rooms remain separate. A modified browser can keep transferring over RTCDataChannel after signaling has ended; no broker operation can recall bytes already transmitted.
 
 For the bound mode, both `encrypted-files` and `file-permissions` must contain explicit current records for the exact folder/filename. The file ACL must be private (`public: false`), owned by the room creator, and explicitly grant read access to the recipient. Missing/failed permission storage and default-public legacy fallback are denied.
 
 To prevent one authenticated account from exhausting the shared signaling capacity by creating rooms without joining, an owner may reserve at most **two** concurrent active rooms across its sessions. Unjoined rooms expire after **15 seconds**, reclaimable immediately on the next room-creation request; a successfully joined host keeps the existing **five-minute** room TTL. The global maximum remains **16** rooms. These limits apply to Root.ark signed-session rooms; the standalone anonymous loopback demo keeps its legacy global-only limit.
 
-`node --test test/issue-242-app-session.test.js test/issue-242-bound-object.test.js` starts disposable instances of **actual Root.ark `server.js`**, signs in through `/auth/login` and exercises sessions, CSRF, recipient isolation, ACL restrictions, ciphertext digests, object replacement and live revocation. `npm run test:app-browser` exercises manual 1:N and bound ciphertext rooms using real Edge and consenting WebRTC peers. CI runs these gates on Ubuntu Node 22 and Windows Node 22/Edge.
+The real Root.ark signed HTTP tests now verify authentication, CSRF, manual P2P, valid legacy ACL bound refusal, 16 concurrent 32 MiB protected attempts with no room entitlement, and preservation of ordinary room capacity. The Edge app browser test verifies manual transfer, refusal of bound creation, and manual recovery. These do not constitute working bound-P2P transfer.
 
-**Security boundary:** unbound rooms are session-scoped manual browser-to-browser sharing: `listFiles` only gates the feature and sender-advertised SHA-256 does not establish stored-object identity. The explicitly bound mode additionally checks the **server-authoritative legacy encrypted-file ACL** and stored local ciphertext SHA-256/size. It does **not** verify an independent owner signature, device identity, file CEK or Zero-Knowledge decryption grant. No stored file is downloaded automatically. No TURN, NAT fallback, real-world cross-network assurance, streaming-to-disk, resume, production credential delegation or cutover. The feature flag is ignored in production.
+**Security boundary:** unbound rooms are manual session-scoped browser transfers, not server-signed stored-object identity. Bound requests are currently refused before hashing or signaling. There is no owner-signed version, device CEK authorization, all-writer snapshot, NAT/TURN readiness or browser DataChannel revocation guarantee. The experimental feature flag remains ignored in production.
 
-## 2026-11-07 critical bound signaling NO-GO (supersedes earlier success descriptions)
+## 2026-11-07 critical bound signaling NO-GO (historical; superseded by the 2026-11-08 pre-admission gate)
 
 The earlier text describes what the owner/recipient ACL checks and client-side
 DataChannel validation could do; it is NOT proof of current safe bound signaling.
@@ -61,15 +67,15 @@ Absent, asynchronous, malformed or denied snapshots close the room before
 any bound SDP/ICE signal. Only the trusted adapter can guarantee the
 consistency contract: shape checks alone cannot prove atomicity.
 
-The existing Root.ark server application reads independently mutable legacy
-ACL metadata and **does not** implement a shared snapshot transaction or
-writer lock. It deliberately supplies no such callback. Therefore its current
-DEV/TEST ACL-bound rooms can be created and invited, but bound SDP/ICE is
+Before the 2026-11-08 gate, the Root.ark server application read independently mutable legacy
+ACL metadata and **did not** implement a shared snapshot transaction or
+writer lock. It supplied no such callback. Therefore its historical
+DEV/TEST ACL-bound rooms could be created and invited, but bound SDP/ICE was
 **fail-closed**: no bound DataChannel transfer is authorized. The separate
 loopback unit fixture demonstrates functioning 1:1 and 1:N with a coherent
 in-memory test authority only; that test does not enable the real app.
 Manual, unbound single-peer and 1:N signed-session rooms continue to work.
-The actual app/Edge tests now prove manual transfers and bound admission/
+Historical app/Edge tests demonstrated manual transfers and bound admission/
 denial, not a functioning bound transfer. Before enabling bound signaling,
 review a real transactional multi-user ACL revision/fence shared with every
 mutation path (including cross-process writers), plus independently signed
