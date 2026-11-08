@@ -49,7 +49,7 @@ test("S3 uses the expected bucket/key and paginates listings", async () => {
 
 test("cloud inventory rejects foreign, malformed, duplicate, and mismatched identities", async () => {
   let contents = [{ Key: "other/uploads/folder/file.txt" }];
-  const s3 = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => ({ Contents: contents }) }) });
+  const s3 = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => ({ IsTruncated: false, Contents: contents }) }) });
   await assert.rejects(s3.inventory(), { code: "foreign_prefix" });
   contents = [{ Key: "rootark/uploads/folder/file/extra.txt" }];
   await assert.rejects(s3.inventory(), { code: "invalid_inventory_key" });
@@ -67,6 +67,28 @@ test("cloud inventory rejects foreign, malformed, duplicate, and mismatched iden
   await assert.rejects(drive.inventory(), { code: "invalid_inventory_metadata" });
   driveFiles = [{ parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/folder/file.txt", rootArkFolderId: "folder", rootArkArea: "uploads" } }];
   await assert.rejects(drive.inventory(), { code: "invalid_inventory_identity" });
+});
+
+test("unbounded S3 inventory requires a real boolean IsTruncated on every page", async () => {
+  for (const invalid of [undefined, null, "true", 1]) {
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => ({
+        IsTruncated: invalid, Contents: [{ Key: "rootark/uploads/root/present.txt" }],
+      }) }) });
+    await assert.rejects(storage.inventory(), { code: "provider_error" });
+  }
+  const complete = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+    createS3Client: async () => ({ send: async () => ({
+      IsTruncated: false, Contents: [{ Key: "rootark/uploads/root/present.txt" }],
+    }) }) });
+  assert.equal((await complete.inventory()).length, 1);
+  let pages = 0;
+  const paginated = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+    createS3Client: async () => ({ send: async () => ++pages === 1
+      ? { IsTruncated: true, NextContinuationToken: "next", Contents: [{ Key: "rootark/uploads/root/first.txt" }] }
+      : { IsTruncated: false, Contents: [{ Key: "rootark/uploads/root/second.txt" }] } }) });
+  assert.equal((await paginated.inventory()).length, 2);
+  assert.equal(pages, 2);
 });
 
 test("Drive inventory filters old parents and prefixes while paginating the configured namespace", async () => {

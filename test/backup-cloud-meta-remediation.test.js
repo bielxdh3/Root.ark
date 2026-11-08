@@ -158,6 +158,25 @@ test("authoritative cloud backup and restore matrix", async (t) => {
     assert.equal(result.history.some((entry) => entry.status === "success"), false);
     assert.equal(result.history.some((entry) => entry.status === "failed"), true);
   });
+  for (const [label, truncated] of [
+    ["missing", undefined], ["null", null], ["string-true", "true"], ["integer-one", 1],
+  ]) {
+    await t.test(`S3 ${label} IsTruncated cannot certify a complete backup ZIP`, async () => {
+      let pages = 0;
+      const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+        createS3Client: async () => ({ send: async () => {
+          pages += 1;
+          return { IsTruncated: truncated, Contents: [{ Key: "rootark/uploads/root/present.txt" }] };
+        } }) });
+      const result = await runBackup([object("present.txt")], { inventory: () => storage.inventory() });
+      assert.equal(pages, 1);
+      assert.equal(result.ok, false, "nonboolean provider response must never certify cloud_complete");
+      assert.equal(result.error.code, "provider_error");
+      assert.deepEqual(result.zips, [], "incomplete inventory must leave no ZIP");
+      assert.equal(result.history.some((entry) => entry.status === "success"), false);
+      assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+    });
+  }
   await t.test("Drive configured-namespace pagination", async () => {
     let page = 0;
     const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" }, createGoogleDriveClient: async () => ({ files: { list: async () => page++ === 0 ? { data: { files: [{ id: "a", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/root/a.txt", rootArkFolderId: "root", rootArkArea: "uploads" } }], nextPageToken: "next" } } : { data: { files: [{ id: "b", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/orphan/b.txt", rootArkFolderId: "orphan", rootArkArea: "uploads" } }] } } } }) });
@@ -178,7 +197,7 @@ test("authoritative cloud backup and restore matrix", async (t) => {
   await t.test("Unicode object", async () => { const result = await runBackup([object("ação-測試.txt")]); assert.ok(result.entries.includes("uploads/ação-測試.txt")); });
   await t.test("traversal key", async () => { const result = await runBackup([object("bad.txt", "x", { folderId: ".." })]); assert.equal(result.ok, false); });
   await t.test("absolute key", async () => { const result = await runBackup([object("bad.txt", "x", { folderId: "/root" })]); assert.equal(result.ok, false); });
-  await t.test("foreign prefix", async () => { const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => ({ Contents: [{ Key: "foreign/uploads/root/a.txt" }] }) }) }); await assert.rejects(storage.inventory(), /outside the configured prefix/); });
+  await t.test("foreign prefix", async () => { const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => ({ IsTruncated: false, Contents: [{ Key: "foreign/uploads/root/a.txt" }] }) }) }); await assert.rejects(storage.inventory(), /outside the configured prefix/); });
   await t.test("malformed Drive appProperties", async () => { const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "root" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [{ id: "x", parents: ["root"], appProperties: { rootArkKey: "rootark/uploads/root/x.txt", rootArkFolderId: "wrong", rootArkArea: "uploads" } }] } }) } }) }); await assert.rejects(storage.inventory(), /does not match/); const normalized = normalizeProviderError(Object.assign(new Error("provider detail"), { code: "invalid_inventory_metadata" })); assert.equal(normalized.code, "invalid_inventory_metadata"); assert.match(normalized.message, /does not match/); });
   await t.test("missing Drive key", async () => { const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "root" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [{ id: "x", parents: ["root"], appProperties: {} }] } }) } }) }); await assert.rejects(storage.inventory()); });
   await t.test("Drive file outside configured parent is ignored", async () => { const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "root" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [{ id: "x", parents: ["foreign"], appProperties: { rootArkKey: "rootark/uploads/root/x.txt", rootArkFolderId: "root", rootArkArea: "uploads" } }] } }) } }) }); assert.deepEqual(await storage.inventory(), []); });

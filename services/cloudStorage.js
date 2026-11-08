@@ -429,9 +429,11 @@ function createCloudStorage(options = {}) {
           ...(bounded ? { MaxKeys: 1000 } : {}) }),
         bounded ? { abortSignal: readOnlyBounds.abortSignal } : undefined);
         fence();
-        if (bounded && (!page || (page.Contents !== undefined && !Array.isArray(page.Contents))
+        if (!page || typeof page.IsTruncated !== "boolean") {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
+        if (bounded && ((page.Contents !== undefined && !Array.isArray(page.Contents))
           || (page.Contents || []).length > 1000
-          || typeof page.IsTruncated !== "boolean"
           || (page.IsTruncated !== Boolean(page.NextContinuationToken)))) {
           throw cloudError("provider_error", "Incomplete S3 inventory page");
         }

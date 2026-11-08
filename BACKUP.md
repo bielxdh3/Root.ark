@@ -52,8 +52,9 @@ Quando `BACKUP_INCLUDE_UPLOADS=false`, a seleção também exclui os objetos
 cloud disponível, o manifesto registra `cloud_complete: false`: esse backup
 parcial não é um baseline completo para reconciliação de uploads no restore.
 
-Se o inventário S3 informar outra página sem fornecer um token de continuação
-válido, ou repetir um token, a criação do backup falha fechada: uma lista parcial
+Se uma página do inventário S3 não informar IsTruncated como booleano real,
+informar outra página sem token de continuação válido ou repetir um token,
+a criação do backup falha fechada: uma lista parcial
 de objetos não pode certificar `cloud_complete: true` nem gerar um ZIP de sucesso.
 
 ## O que não entra
