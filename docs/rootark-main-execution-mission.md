@@ -284,3 +284,43 @@ Os ramos de merge de PR e de cutover são **gates distintos**; nenhum ramo posit
 ## 2026-11-07 23:47 UTC — correção de CI e publicação posterior
 
 A [atualização temporal do ledger](validation/2026-11-07-rootark-wave-execution-status.md#correção-e-atualização-posterior--2026-11-07-2347-utc) corrige o **P2 documental** do checkpoint 23:37: o [CodeQL de #284](https://github.com/bielxdh3/Root.ark/actions/runs/42425618613) já havia concluído **SUCCESS às 23:34:02 UTC**, e JS Analyze às **23:34:08 UTC**; o Security Regression completo segue pendente. Depois do checkpoint, [#299](https://github.com/bielxdh3/Root.ark/pull/299) publicou o merge de dois pais `43a2af02` (reunindo #284 `45a91a6a` e a fonte `d9eeb5fd`, peer33 GO), e [#302](https://github.com/bielxdh3/Root.ark/pull/302) avançou para `0f2000fe` (peer13 GO, ainda **DEV-OFF**). Ambos permanecem OPEN/Draft. Main Windows canonical/syntax continua RED; nenhum merge em Root/main, cutover ou R1 físico foi certificado.
+
+## 2026-11-08 01:01 UTC — publicações Draft, novos NO-GO e dependências
+
+O [ledger posterior](validation/2026-11-07-rootark-wave-execution-status.md#corte-pós-handoff--2026-11-08-0101-utc) documenta resultados **posteriores** aos snapshots de 07/11, sem reescrevê-los. Após revisão independente do SHA exato, [#251](https://github.com/bielxdh3/Root.ark/pull/251) publicou somente documentação em `b51ce11dcf49694475a7ecebbd837670dab2afe6` e [#298](https://github.com/bielxdh3/Root.ark/pull/298) publicou o fixture de ACL de quarentena em `df3dbaef3d0bd1cb8683ded66cada67bdf0dee9e`. Ambos continuam **OPEN/Draft**. O full hosted Security Regression para #298 foi despachado no SHA exato [run 42431780149](https://github.com/bielxdh3/Root.ark/actions/runs/42431780149), ainda em execução neste corte; os três fluxos hospedados focados já concluíram SUCCESS.
+
+O [#293](https://github.com/bielxdh3/Root.ark/pull/293) `eaabb9db` inclui *ancestralmente* o ALL TERMS/Unicode `3b273c32` e os testes de revogação concorrente `673ad3a4`, com Security Regression hospedado SUCCESS; não duplicar esses commits. O [#300](https://github.com/bielxdh3/Root.ark/pull/300) `03cac3a9` concluiu o rerun hospedado attempt 2 SUCCESS, mas CFAPI positivo em Windows 10 permanece **bloqueado**.
+
+Em #284 e #299, os jobs Windows canonical hospedados falharam no **mesmo teste real**, `mutation during pinned hashing cannot inherit signed object fingerprint` (arquivo `test/issue-242-p2p-ciphertext-fd-race.test.js`, `ERR_ASSERTION`); #284 teve ainda falha de teste Edge offline no gate obrigatório. A tentativa local de duplo hashing `f2f24684` recebeu revisão independente **NO-GO P2**: mutação de mesmo tamanho logo após a segunda leitura ainda exporta hash antigo e dobra custo de leitura no sweeper. **Não publicada**. Um Edge offline focado local passou, mas não anula o hosted RED. TURN/cross-NAT real continua ausente.
+
+Em #65, o [#302](https://github.com/bielxdh3/Root.ark/pull/302) publicado `0f2000fe` teve Security Regression hospedado SUCCESS, mas não prova R1 independente. O patch local pós-assinatura `4d0d904a` recebeu **NO-GO P2** independente: edição concorrente de SQLite entre as leituras anchor/main permite atestação `CURRENT` divergente. O candidato local `41d3b6fc` serializa a assinatura sob duas reservas `BEGIN IMMEDIATE` e foi testado em Windows/Ubuntu; aguarda peer do SHA exato. O candidato separado `bf15f7ca` bloqueia assinatura após expiração do lease e também aguarda integração/revisão. Nenhum deles foi publicado neste corte.
+
+~~~mermaid
+flowchart LR
+  MAIN["Root/main d5fbc110: imutável nesta rodada"]
+  READY["#306 Ready, NÃO merged"]
+  DOCS["#251 b51ce11: docs publicado Draft"]
+  BACK["#298 df3dbaef: ACL publicado Draft"]
+  CI{"#298 hosted 42431780149 integralmente GREEN?"}
+  BACKEND["Backup completo, inventário/versionamento e R1 externos ainda bloqueados"]
+  SHARE["#293 eaabb9db: #63/#68 integrado, hosted GREEN"]
+  P2P["#284/#299: canonical Windows FAILED; f2f P2 NO-GO"]
+  ZK["#302 0f2000fe: hosted GREEN, somente DEV-OFF"]
+  ZKPEER{"SQLite atômico + lease final: peer exato GO?"}
+  R1["Custódia independente off-host + owner-signed preupload + prova física"]
+  NO["Sem merge, deploy ou cutover"]
+  MAIN --> READY & DOCS & BACK & SHARE & P2P & ZK
+  BACK --> CI
+  CI -->|Não/pendente| BACKEND
+  CI -->|Sim| BACKEND
+  ZK --> ZKPEER
+  ZKPEER -->|Não/pendente| R1
+  ZKPEER -->|Sim, ainda DEV-OFF| R1
+  BACKEND --> NO
+  R1 --> NO
+  P2P --> NO
+  READY --> NO
+  SHARE --> NO
+~~~
+
+O desenho separa **implementado → integrado → testado → bloqueado → Ready → merged**: nenhum caminho concede automaticamente a última transição. #291 Android e #288 restore seguem sem hardware físico/TOCTOU Windows absoluto; #228 continua CLOSED/UNMERGED e intocado. A proibição atual de merge, deploy e alterações diretas em `Root/main` permanece prevalente mesmo que um check se torne verde.
