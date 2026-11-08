@@ -74,7 +74,9 @@ bool trustedDacl(PSECURITY_DESCRIPTOR descriptor, PACL dacl,
     void* raw = nullptr;
     if (!GetAce(dacl, i, &raw) || !raw) return false;
     const auto* header = static_cast<const ACE_HEADER*>(raw);
-    if ((header->AceFlags & INHERITED_ACE) != 0) return false;
+    // An inherit-only ACE grants no access to this directory itself. Never
+    // count it as an owner grant or silently ignore it on a protected root.
+    if ((header->AceFlags & (INHERITED_ACE | INHERIT_ONLY_ACE)) != 0) return false;
     // Reject unfamiliar/callback/object ACE shapes until they have a
     // well-defined, reviewed authorization and account model.
     if (header->AceType != ACCESS_ALLOWED_ACE_TYPE

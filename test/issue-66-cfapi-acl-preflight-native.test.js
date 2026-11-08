@@ -115,3 +115,79 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     }
     assert.notEqual(run(exe, ["--register", strictRoot], scratch).status, 0);
   });
+
+test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effective Administrators access",
+  { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+    const where = run(vswhere, ["-all", "-products", "*", "-prerelease",
+      "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], undefined, 6000);
+    const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
+    if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
+    try { await fs.access(vcvars); }
+    catch { t.skip("MSVC x64 vcvars missing"); return; }
+
+    // Include the actual production translation unit to call its internal
+    // evaluator with a real SDK DACL, independent of token elevation. A later
+    // native caller could otherwise open via Administrators while a purported
+    // owner-only ACE does not apply to the inspected directory itself.
+    const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-ace-native-"));
+    t.after(() => fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+    const fixture = path.join(scratch, "inherit-only-fixture.cpp");
+    const exe = path.join(scratch, "inherit-only-fixture.exe");
+    const batch = path.join(scratch, "build.cmd");
+    const includePath = source.replaceAll("\\", "/");
+    await fs.writeFile(fixture, [
+      "#define wmain preflight_fixture_only_entry",
+      `#include "${includePath}"`,
+      "#undef wmain",
+      "",
+      "bool evaluate(PSID user, PSID admins, DWORD ownerFlags, DWORD denyFlags, bool& result) {",
+      "  unsigned char aclBytes[1024]{};",
+      "  PACL acl = reinterpret_cast<PACL>(aclBytes);",
+      "  if (!InitializeAcl(acl, sizeof(aclBytes), ACL_REVISION)) return false;",
+      "  const DWORD rights = FILE_READ_ATTRIBUTES | READ_CONTROL;",
+      "  if (denyFlags != 0 && !AddAccessDeniedAceEx(acl, ACL_REVISION, denyFlags, rights, admins))",
+      "    return false;",
+      "  if (!AddAccessAllowedAceEx(acl, ACL_REVISION, ownerFlags, rights, user)",
+      "      || !AddAccessAllowedAceEx(acl, ACL_REVISION, 0, rights, admins)) return false;",
+      "  SECURITY_DESCRIPTOR descriptor{};",
+      "  if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)",
+      "      || !SetSecurityDescriptorOwner(&descriptor, user, FALSE)",
+      "      || !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)",
+      "      || !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)",
+      "      || !IsValidSecurityDescriptor(&descriptor) || !IsValidAcl(acl)) return false;",
+      "  std::vector<unsigned char> identity(GetLengthSid(user));",
+      "  if (!CopySid(static_cast<DWORD>(identity.size()), identity.data(), user)) return false;",
+      "  result = trustedDacl(&descriptor, acl, user, identity);",
+      "  return true;",
+      "}",
+      "",
+      "int wmain() {",
+      "  std::vector<unsigned char> user;",
+      "  std::vector<unsigned char> admins;",
+      "  if (!currentUserSid(user) || !wellKnownSid(WinBuiltinAdministratorsSid, admins)) return 80;",
+      "  bool normal = false, ownerOnlyInherited = false, denyOnlyInherited = false;",
+      "  const DWORD onlyChildren = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE;",
+      "  if (!evaluate(user.data(), admins.data(), 0, 0, normal)",
+      "      || !evaluate(user.data(), admins.data(), onlyChildren, 0, ownerOnlyInherited)",
+      "      || !evaluate(user.data(), admins.data(), 0, onlyChildren, denyOnlyInherited))",
+      "    return 81;",
+      "  std::printf(\"{\\\"normal\\\":%s,\\\"ownerInheritOnly\\\":%s,\\\"denyInheritOnly\\\":%s}\\n\",",
+      "    normal ? \"true\" : \"false\", ownerOnlyInherited ? \"true\" : \"false\",",
+      "    denyOnlyInherited ? \"true\" : \"false\");",
+      "  return 0;",
+      "}",
+      "",
+    ].join("\n"));
+    await fs.writeFile(batch, ["@echo off", `call "${vcvars}" >nul`,
+      "if errorlevel 1 exit /b 1",
+      `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${exe}" "${fixture}" cldapi.lib advapi32.lib`,
+      "exit /b %errorlevel%", ""].join("\r\n"));
+    const build = run("cmd.exe", ["/d", "/c", batch], scratch, 40000);
+    assert.equal(build.status, 0, `native SDK harness build failed: ${build.stdout}\n${build.stderr}`);
+    const result = run(exe, [], scratch);
+    assert.equal(result.status, 0, `native SDK fixture failed: ${result.stdout}\n${result.stderr}`);
+    const acl = JSON.parse(result.stdout.trim());
+    assert.equal(acl.normal, true, "effective owner ACE remains accepted");
+    assert.equal(acl.ownerInheritOnly, false, "owner inheritable-only ACE must not grant root access");
+    assert.equal(acl.denyInheritOnly, false, "strict preflight rejects inherit-only DENY ACE too");
+  });
