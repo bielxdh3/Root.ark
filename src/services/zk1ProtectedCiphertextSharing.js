@@ -110,6 +110,7 @@ class Zk1ProtectedCiphertextSharing {
       activeEgressByStore.set(store, active);
     }
     this.activeEgress = active;
+    this.terminalRecheckTimer = null;
     // Reuse the privately pinned content store, including its durable WAL,
     // scope identity, replay ledger and crash/restart behavior.
     store.db.exec(`CREATE TABLE IF NOT EXISTS zk_content_share (
@@ -313,7 +314,10 @@ class Zk1ProtectedCiphertextSharing {
             Math.min(EGRESS_POLL_MS, remaining)));
         } while (true);
         // Keep terminal proof AND the durable lease. A subsequent owner
-        // revoke will reconcile it only after SQLite becomes writable.
+        // revoke may run in ANOTHER Node process; locally reconcile terminal
+        // proof after SQLite becomes writable without waiting for an owner
+        // request in this process. Never remove unproven/crash-orphan rows.
+        this.scheduleTerminalEgressRecheck();
         deny("ZK_SHARE_UNAVAILABLE");
       },
       (error) => {
@@ -369,6 +373,32 @@ class Zk1ProtectedCiphertextSharing {
       }
       break;
     }
+  }
+
+  scheduleTerminalEgressRecheck() {
+    if (this.terminalRecheckTimer) return;
+    this.terminalRecheckTimer = setTimeout(() => {
+      this.terminalRecheckTimer = null;
+      // At most one SQLite DELETE attempt per tick, independently of how
+      // many HTTP transports terminated during a transient writer outage.
+      // Rotate an unresolved key to avoid starving other finished responses.
+      for (const [key, trackers] of this.activeEgress) {
+        if (![...trackers].some((tracker) => tracker.terminal && !tracker.released)) continue;
+        this.reconcileTerminalEgress(key);
+        if (this.activeEgress.get(key) === trackers) {
+          this.activeEgress.delete(key);
+          this.activeEgress.set(key, trackers);
+        }
+        break;
+      }
+      if ([...this.activeEgress.values()].some((trackers) =>
+        [...trackers].some((tracker) => tracker.terminal && !tracker.released))) {
+        this.scheduleTerminalEgressRecheck();
+      }
+    }, EGRESS_RELEASE_RECHECK_MS);
+    // A completed HTTP response must never keep an otherwise idle process
+    // alive solely because SQLite's durable orphan remains unresolved.
+    this.terminalRecheckTimer.unref?.();
   }
 
   revoke(scope, grantId, ownerUsername) {

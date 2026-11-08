@@ -172,6 +172,37 @@ test("real cross-process HTTP: remote guest finish precedes durable owner revoke
     } finally { await Promise.all([guest.stop(), owner.stop()]); }
   });
 
+test("real cross-process HTTP: live guest reconciles terminal lease after transient WAL writer lock",
+  { timeout: 23000 }, async (t) => {
+    const f = fixture(t);
+    const { guest, owner, keys, guestPort, ownerPort } = await startTwo(t, f);
+    try {
+      const receiving = signedRequest("guest", keys.guest, guestPort);
+      await guest.next("admitted");
+      f.db.exec("BEGIN IMMEDIATE");
+      try {
+        guest.send({ kind: "release" });
+        const settled = await guest.next("settled", 4000);
+        assert.equal(settled.ok, false,
+          "terminal release fails while independent WAL writer holds the lock");
+        assert.equal(settled.code, "ZK_SHARE_UNAVAILABLE");
+        assert.deepEqual(await receiving, { status: 200, body: "ciphertext-only" });
+        assert.equal(f.db.prepare("SELECT count(*) n FROM zk_content_share_egress WHERE grant_id=?")
+          .get(f.grantId).n, 1);
+      } finally { f.db.exec("ROLLBACK"); }
+      // The guest process remains alive but receives no further request or IPC.
+      // Only its observed terminal HTTP event can authorize removing this row.
+      const revoked = await signedRequest("owner", keys.owner, ownerPort);
+      assert.deepEqual(revoked, { status: 200, body: "revoked" },
+        "healthy remote owner must ACK after guest's durable terminal reconciliation");
+      assert.equal(f.db.prepare("SELECT count(*) n FROM zk_content_share_egress WHERE grant_id=?")
+        .get(f.grantId).n, 0);
+    } finally {
+      if (f.db.inTransaction) f.db.exec("ROLLBACK");
+      await Promise.all([guest.stop(), owner.stop()]);
+    }
+  });
+
 test("real cross-process HTTP: SQLITE_BUSY then crashed guest leaves remote orphan 503 even after expiry",
   { timeout: 32000 }, async (t) => {
     const f = fixture(t);
