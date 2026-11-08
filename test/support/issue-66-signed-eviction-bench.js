@@ -115,7 +115,16 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error?.stack || error}\n`);
-  process.exitCode = 1;
-});
+if (process.env.NODE_TEST_CONTEXT) {
+  // Node's default `--test` discovery also executes support/*.js. This is a
+  // benchmark with a required CLI size, not a test, and must never run an
+  // argument-less benchmark (or fail the canonical suite) by discovery.
+  require("node:test")("issue 66 signed eviction benchmark is CLI-only", {
+    skip: "Invoke directly with an explicit disposable fixture count (1..640)",
+  }, () => {});
+} else {
+  main().catch((error) => {
+    process.stderr.write(`${error?.stack || error}\n`);
+    process.exitCode = 1;
+  });
+}
