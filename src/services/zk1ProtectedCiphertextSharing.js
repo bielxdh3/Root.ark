@@ -250,6 +250,14 @@ class Zk1ProtectedCiphertextSharing {
   }
 
   emitTracked(scope, grantId, emit, payload) {
+    // A signed read may outlive its HTTP client while physical admission is
+    // awaiting an independent witness. Reject a response already known closed
+    // BEFORE registering any durable egress lease. There is no await between
+    // this check and the SQLite INSERT, so a normal JS close callback cannot
+    // interleave and turn this admission into a phantom orphaned lease.
+    if (typeof emit.isTerminal === "function" && emit.isTerminal()) {
+      deny("ZK_SHARE_UNAVAILABLE");
+    }
     const key = grantKey(scope, grantId);
     const scopeId = scopeKey(scope);
     const id = canonicalId(grantId);

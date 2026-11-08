@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -48,7 +49,9 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   });
   let now = 1400;
   let allowed = true;
+  let finishedIoAdmissions = 0;
   let pausedReadAdmission = null;
+  let observeNextDisconnectedRead = null;
   let pausedShareResponse = null;
   let partialShareResponse = null;
   let revokeReplies = 0;
@@ -59,6 +62,14 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     const wait = new Promise((resolve) => { release = resolve; });
     pausedReadAdmission = { entered, wait };
     return { started, release };
+  };
+  const observeDisconnectedRead = () => {
+    let onClose;
+    const closed = new Promise((resolve) => { onClose = resolve; });
+    const observation = { closed, onClose, responseClosed: false,
+      ciphertextResponseAttempts: 0 };
+    observeNextDisconnectedRead = observation;
+    return observation;
   };
   const pauseNextShareResponse = () => {
     let arrived;
@@ -98,7 +109,10 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
       }
       return { admissionId: crypto.randomBytes(16), proceed: true };
     },
-    async finishIoAdmission() { return { status: "completed" }; },
+    async finishIoAdmission() {
+      finishedIoAdmissions++;
+      return { status: "completed" };
+    },
   };
   const filename = path.join(dir, "protected.sqlite");
   let store = new Zk1ProtectedObjectStore(filename, {
@@ -117,6 +131,21 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     // Hold the real Express res.end() after a signed GET has passed admission
     // and prepared ciphertext, before the HTTP response reaches 'finish'.
     app.use((req, res, next) => {
+      if (req.path === "/zk-1/v1/share/read" && observeNextDisconnectedRead) {
+        const observation = observeNextDisconnectedRead;
+        observeNextDisconnectedRead = null;
+        res.once("close", () => {
+          observation.responseClosed = true;
+          observation.onClose();
+        });
+        const originalJson = res.json;
+        res.json = function (payload) {
+          if (payload?.ciphertextBase64 !== undefined) {
+            observation.ciphertextResponseAttempts++;
+          }
+          return originalJson.call(this, payload);
+        };
+      }
       if (req.path === "/zk-1/v1/share/read" && partialShareResponse) {
         const gate = partialShareResponse;
         partialShareResponse = null;
@@ -450,6 +479,66 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal((await readAs("recipient", recipient,
     { grantId: secondIssued.body.grantId })).status, 200,
   "failed owner revocation cannot silently block a legitimately signed read");
+
+  // Client disconnects while signed physical admission awaits its witness.
+  // The server already observed response 'close' before share/read reaches
+  // the egress fence; no durable lease or ciphertext send is permitted.
+  const abortGrantId = b64(crypto.randomBytes(32));
+  const abortOwnerProof = await sign(owner, "get", id, 1, digest);
+  const abortFields = { grantId: abortGrantId,
+    recipientUsername: "recipient", recipientDeviceId: recipient.device_id,
+    expiresAt: now + 120 };
+  const abortSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: abortOwnerProof.authorization, ...abortFields,
+  }), abortOwnerProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...abortFields, authorization: wire(abortOwnerProof.authorization),
+    signatureBase64: b64(abortOwnerProof.signature),
+    shareSignatureBase64: b64(abortSignature),
+  })).status, 201);
+  const interruptedAdmission = pauseNextReadAdmission();
+  const beforeAbortedFinish = finishedIoAdmissions;
+  const disconnected = observeDisconnectedRead();
+  const disconnectedProof = await sign(recipient, "get", id, 1, digest);
+  const disconnectedBody = JSON.stringify({
+    grantId: abortGrantId,
+    authorization: wire(disconnectedProof.authorization),
+    signatureBase64: b64(disconnectedProof.signature),
+  });
+  const request = http.request(base + "/zk-1/v1/share/read", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-fixture-account": "recipient" },
+  });
+  request.on("error", () => {});
+  request.on("response", (response) => { response.resume(); });
+  const clientClosed = new Promise((resolve) => request.once("close", resolve));
+  request.end(disconnectedBody);
+  try {
+    await interruptedAdmission.started;
+    request.destroy();
+    await clientClosed;
+    await disconnected.closed;
+    assert.equal(disconnected.responseClosed, true,
+      "real HTTP response closes while witness admission remains pending");
+  } finally { interruptedAdmission.release(); }
+  const leaseCount = store.db.prepare(
+    "SELECT count(*) AS pending FROM zk_content_share_egress WHERE grant_id=?");
+  const leaseDeadline = Date.now() + 3000;
+  while (Date.now() < leaseDeadline
+    && finishedIoAdmissions <= beforeAbortedFinish) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(finishedIoAdmissions > beforeAbortedFinish,
+    "aborted read must finish its physical witness admission without hanging");
+  assert.equal(disconnected.ciphertextResponseAttempts, 0,
+    "no ciphertext can be emitted after the client has disconnected");
+  assert.equal(leaseCount.get(abortGrantId).pending, 0,
+    "preclosed response must not create an orphaned SQLite egress lease");
+  assert.equal((await post("/zk-1/v1/share/revoke", "owner",
+    { grantId: abortGrantId })).status, 200,
+  "owner revoke must ACK after the closed read rather than wait on a phantom lease");
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: abortGrantId })).status, 403);
 
   // Reproduce the second P2 on real Express HTTP, not only a mocked emit:
   // the sender writes part of the ciphertext then throws before finish/close.
