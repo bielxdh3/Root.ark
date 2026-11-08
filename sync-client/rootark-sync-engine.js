@@ -390,6 +390,86 @@ async function uniqueExcludedPhysicalPath(rootDir, trackedPath, directoryCache) 
   return path.relative(root, current).split(path.sep).join("/");
 }
 
+// After a successful, *fully verified* eviction the sync engine itself moved
+// a single cache file out of its parent directory and rewrote its own snapshot
+// in the root. Account for only those known local operations in the in-pass
+// index, rather than rescanning N siblings for each of N safe evictions.
+// All affected directories are independently re-enumerated before a migration
+// is certified complete; unknown additions/aliases never become authorized.
+async function observeVerifiedExcludedEviction(rootDir, physicalPath, directoryCache) {
+  const root = path.resolve(rootDir);
+  const target = path.resolve(root, ...protocol.safeRelativePath(physicalPath, "path").split("/"));
+  const parent = path.dirname(target);
+  const parentCache = directoryCache.get(parent);
+  if (!parentCache) fail("Verified eviction lost its physical directory index", "unsafe_path");
+  const basename = path.basename(target);
+  const casefold = basename.toLowerCase();
+  if (parentCache.names.get(casefold) !== basename || await exists(target)) {
+    fail("Verified eviction left an unexpected physical cache entry", "unsafe_path");
+  }
+  const afterParent = await fsp.lstat(parent, { bigint: true });
+  if (!afterParent.isDirectory() || !sameFileIdentity(parentCache.stats, afterParent)) {
+    fail("Verified eviction changed its parent directory identity", "unsafe_path");
+  }
+  parentCache.names.delete(casefold);
+  parentCache.stats = afterParent;
+  await refreshExcludedInternalRoot(root, directoryCache);
+}
+
+// stageExisting creates the dedicated trash directory *before* a rename. A
+// transient EBUSY can therefore leave that empty, safe internal directory
+// behind even when no eviction succeeded. Keep that one known root entry in
+// the in-pass index, but still compare the entire directory at the end.
+async function refreshExcludedInternalRoot(rootDir, directoryCache) {
+  const root = path.resolve(rootDir);
+  const rootCache = directoryCache.get(root);
+  if (!rootCache) return;
+  const afterRoot = await fsp.lstat(root, { bigint: true });
+  if (!afterRoot.isDirectory() || !sameFileIdentity(rootCache.stats, afterRoot)) {
+    fail("Excluded sync root identity changed", "unsafe_path");
+  }
+  const trash = path.join(root, ".rootark-trash");
+  if (await exists(trash)) {
+    const stats = await fsp.lstat(trash);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe sync trash path", "unsafe_path");
+    if (rootCache.names.has(".rootark-trash") && rootCache.names.get(".rootark-trash") !== ".rootark-trash") {
+      fail("Ambiguous sync trash path", "unsafe_path");
+    }
+    rootCache.names.set(".rootark-trash", ".rootark-trash");
+  }
+  rootCache.stats = afterRoot;
+}
+
+// The engine's own removals were the only names subtracted from the cache.
+// Compare against physical names once per directory after the batch: external
+// concurrent additions, case collisions and unexpected replacements fail
+// closed instead of being recorded as an entirely applied exclusion.
+async function verifyExcludedDirectoryIndexes(directoryCache) {
+  for (const [directory, cached] of directoryCache) {
+    const before = await fsp.lstat(directory, { bigint: true });
+    if (!before.isDirectory() || !sameFileIdentity(cached.stats, before)) {
+      fail("Excluded directory identity changed during batch", "unsafe_path");
+    }
+    const actual = new Map();
+    let count = 0;
+    for await (const entry of await fsp.opendir(directory)) {
+      if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+      const key = entry.name.toLowerCase();
+      if (actual.has(key)) fail("Ambiguous excluded portable case alias", "unsafe_path");
+      actual.set(key, entry.name);
+    }
+    const after = await fsp.lstat(directory, { bigint: true });
+    if (!sameFileVersion(before, after) || actual.size !== cached.names.size) {
+      fail("Excluded directory changed outside verified evictions", "unsafe_path");
+    }
+    for (const [key, name] of actual) {
+      if (cached.names.get(key) !== name) {
+        fail("Excluded directory names changed outside verified evictions", "unsafe_path");
+      }
+    }
+  }
+}
+
 function canonicalMapPath(relativePath, ...maps) {
   if (process.platform !== "win32") return relativePath;
   for (const map of maps) {
@@ -2334,9 +2414,13 @@ class SyncEngine {
     });
   }
 
-  async _evictLocal(relativePath, excludedTrackedPath = null) {
+  async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null) {
     if (!this.opened) await this._open();
-    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
+    // The internal exclusion path was already case-resolved with a bounded
+    // directory index; do not enumerate the same Windows parent 640 times.
+    const safePath = excludedTrackedPath === null
+      ? await canonicalRelativePath(this.rootDir, relativePath)
+      : protocol.safeRelativePath(relativePath, "path");
     const snapshotPath = excludedTrackedPath === null
       ? safePath : protocol.safeRelativePath(excludedTrackedPath, "trackedPath");
     if (!this.isInScope(safePath) || !this.isInScope(snapshotPath)) {
@@ -2345,8 +2429,10 @@ class SyncEngine {
     if (excludedTrackedPath !== null) {
       if (!this.isExcluded(safePath) || !this.isExcluded(snapshotPath)
         || snapshotPath.toLowerCase() !== safePath.toLowerCase()
-        || Object.keys(this.snapshot.files).filter((candidate) =>
-          candidate.toLowerCase() === snapshotPath.toLowerCase()).length !== 1) {
+        || (trustedCasefoldIndex
+          ? trustedCasefoldIndex.get(snapshotPath.toLowerCase()) !== snapshotPath
+          : Object.keys(this.snapshot.files).filter((candidate) =>
+            candidate.toLowerCase() === snapshotPath.toLowerCase()).length !== 1)) {
         fail("Excluded tracked path does not uniquely match the physical alias", "unsafe_path");
       }
     }
@@ -2702,6 +2788,12 @@ class SyncEngine {
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
     const directoryCache = new Map(); // never persist stale filesystem names across syncs
+    const snapshotCasefoldIndex = new Map();
+    for (const relative of Object.keys(this.snapshot.files)) {
+      const folded = relative.toLowerCase();
+      if (snapshotCasefoldIndex.has(folded)) snapshotCasefoldIndex.set(folded, null);
+      else snapshotCasefoldIndex.set(folded, relative);
+    }
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
       if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
       const retry = pendingEvictions[prior.objectId];
@@ -2758,9 +2850,11 @@ class SyncEngine {
         continue;
       }
       try {
-        await this._evictLocal(physicalPath, relative);
+        await this._evictLocal(physicalPath, relative, snapshotCasefoldIndex);
+        await observeVerifiedExcludedEviction(this.rootDir, physicalPath, directoryCache);
         report.evicted += 1;
       } catch (error) {
+        await refreshExcludedInternalRoot(this.rootDir, directoryCache);
         const code = error?.code || "unknown";
         // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
         // Dirty local edits are retained, and rechecked only after an observed
@@ -2798,6 +2892,7 @@ class SyncEngine {
         needsPersistence = true;
       }
     }
+    await verifyExcludedDirectoryIndexes(directoryCache);
     if (!needsPersistence) return report.failed.length || report.kept.length ? report : null;
     if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
     else delete this.snapshot.pendingEvictions;

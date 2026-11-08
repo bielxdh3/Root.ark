@@ -610,6 +610,118 @@ test("issue 66 P2: excluded alias lookup scales with directories, not 160/640 si
   }
 });
 
+test("issue 66 P2: 160/640 sibling unlink batches do not rescan the whole directory per file", async (t) => {
+  // Deliberately synthetic mutation/performance fixture. The real signed
+  // _evictLocal authorization path is covered in the separate bulk fixture.
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-clean-bulk-alias-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  for (const count of [160, 640]) {
+    const root = path.join(dir, `device-${count}`);
+    const parent = path.join(root, "PRIVATE");
+    const instance = await engine(root, adapter, key, {
+      deviceId: `device-b-${count}`, excludedPaths: ["private"],
+    });
+    await fsp.mkdir(parent, { recursive: true });
+    const snapshotFiles = {};
+    for (let i = 0; i < count; i += 1) {
+      const name = `clean-${String(i).padStart(4, "0")}.txt`;
+      const relative = `PRIVATE/${name}`;
+      await fsp.writeFile(path.join(parent, name), `synthetic signed fixture ${i}`);
+      snapshotFiles[relative] = {
+        objectId: `id-${i}`, fileId: `file-${i}`, path: relative,
+        directory: false, deleted: false, hash: "0".repeat(64),
+      };
+    }
+    instance.snapshot.files = snapshotFiles;
+    instance.snapshot.excludedPaths = ["private"];
+    instance.snapshot.excludedPathsCasefoldVersion = 1;
+    instance._evictLocal = async (physical, tracked) => {
+      await fsp.unlink(path.join(root, ...physical.split("/")));
+      delete instance.snapshot.files[tracked];
+      return true;
+    };
+    let opened = 0;
+    const originalOpendir = fsp.opendir;
+    fsp.opendir = async function countedOpenDir(filename, ...args) {
+      if (path.resolve(String(filename)) === path.resolve(parent)) opened += 1;
+      return originalOpendir.call(fsp, filename, ...args);
+    };
+    let report;
+    try {
+      report = await instance._applyExcludedPaths();
+    } finally {
+      fsp.opendir = originalOpendir;
+    }
+    assert.equal(report.evicted, count);
+    assert.ok(opened <= 4, `${count} same-parent clean unlinks required ${opened} full dir scans`);
+    assert.equal((await fsp.readdir(parent)).length, 0);
+  }
+});
+
+test("issue 66 P2: verified signed clean bulk exclusions stay linear and never DELETE remotely", { timeout: 300000 }, async (t) => {
+  // Default CI exercises the real signature/remote/local identity path on a
+  // bounded fixture. Use ROOTARK_ISSUE66_FULL_SIGNED_BULK=1 to extend to
+  // real 160/640 signed objects (several minutes with disposable JSON store).
+  // The independent synthetic 160/640 directory-scaling test always runs.
+  const counts = process.env.ROOTARK_ISSUE66_FULL_SIGNED_BULK === "1" ? [160, 640] : [8];
+  for (const count of counts) {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-issue66-bulk-signed-${count}-`));
+    t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+    const key = crypto.randomBytes(32);
+    const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+    const adapter = await adapterFor(store, "alice", { offline: false });
+    const sourceFiles = {};
+    for (let i = 0; i < count; i += 1) {
+      sourceFiles[`PRIVATE/clean-${String(i).padStart(4, "0")}.txt`] = `signed owner-approved ${count}:${i}`;
+    }
+    await seed(dir, adapter, key, sourceFiles);
+    const root = path.join(dir, "device");
+    const parent = path.join(root, "PRIVATE");
+    const legacy = await engine(root, adapter, key, { deviceId: "device-b" });
+    await legacy.syncOnce();
+    assert.equal(Object.keys(legacy.snapshot.files).filter((p) => p.startsWith("PRIVATE/")).length, count);
+    const recordsBefore = store.list("alice");
+    const idsBefore = new Map(recordsBefore.map((record) => [record.objectId, record.operationId]));
+    assert.equal(idsBefore.size, count);
+    legacy.snapshot.excludedPaths = ["private"];
+    legacy.snapshot.excludedPathsCasefoldVersion = 1;
+    await legacy.persistSnapshot();
+
+    const originalOpendir = fsp.opendir;
+    let parentOpens = 0;
+    fsp.opendir = async function bulkOpen(filename, ...args) {
+      if (path.resolve(String(filename)) === path.resolve(parent)) parentOpens += 1;
+      return originalOpendir.call(fsp, filename, ...args);
+    };
+    let summary;
+    let migrated;
+    try {
+      migrated = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+      summary = await migrated.syncOnce();
+    } finally {
+      fsp.opendir = originalOpendir;
+    }
+    assert.equal(summary.excluded.evicted, count, `all ${count} cached files must be verified and evicted`);
+    assert.equal(summary.excluded.released, 0);
+    assert.equal(summary.excluded.kept.length, 0);
+    assert.equal(summary.excluded.failed.length, 0);
+    assert.equal(summary.pushed, 0);
+    assert.ok(parentOpens <= 4, `real signed ${count}-file eviction scanned its parent ${parentOpens} times`);
+    assert.deepEqual(await fsp.readdir(parent), []);
+    assert.equal(migrated.snapshot.pendingEvictions, undefined);
+    assert.equal(Object.keys(migrated.snapshot.remoteOnly).length, count);
+    const recordsAfter = store.list("alice");
+    assert.equal(recordsAfter.length, count);
+    for (const record of recordsAfter) {
+      assert.equal(record.operationId, idsBefore.get(record.objectId));
+      assert.equal(record.tombstone, false, "a local clean exclusion must never send remote DELETE");
+    }
+  }
+});
+
 test("issue 66 P2 POSIX: cached excluded alias lookup rechecks a changed directory", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX case-collision regression");
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-casefold-cache-mutation-"));
@@ -648,6 +760,46 @@ test("issue 66 P2 POSIX: cached excluded alias lookup rechecks a changed directo
   assert.equal(await fsp.readFile(path.join(parent, "two.txt"), "utf8"), "private two");
   assert.equal(await fsp.readFile(path.join(parent, "TWO.txt"), "utf8"), "a new colliding alias");
   assert.equal(active.snapshot.files["PRIVATE/two.txt"].deleted, false);
+});
+
+test("issue 66 P2 POSIX: an external case alias added during verified bulk is never silently certified", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX portable case-collision regression");
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-clean-bulk-mutation-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const root = path.join(dir, "device");
+  const parent = path.join(root, "PRIVATE");
+  const instance = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  await fsp.mkdir(parent, { recursive: true });
+  const files = {};
+  for (const name of ["one.txt", "two.txt"]) {
+    await fsp.writeFile(path.join(parent, name), `signed fixture ${name}`);
+    files[`PRIVATE/${name}`] = {
+      objectId: `test-${name}`, fileId: `test-${name}`,
+      path: `PRIVATE/${name}`, directory: false, deleted: false, hash: "0".repeat(64),
+    };
+  }
+  instance.snapshot.files = files;
+  instance.snapshot.excludedPaths = ["private"];
+  instance.snapshot.excludedPathsCasefoldVersion = 1;
+  let added = false;
+  instance._evictLocal = async (physical, tracked) => {
+    await fsp.unlink(path.join(root, ...physical.split("/")));
+    delete instance.snapshot.files[tracked];
+    if (!added) {
+      added = true;
+      await fsp.writeFile(path.join(parent, "TWO.txt"), "external private contents");
+    }
+    return true;
+  };
+  await assert.rejects(instance._applyExcludedPaths(), { code: "unsafe_path" },
+    "an external alias must never leave migration marked complete");
+  assert.equal(added, true);
+  assert.equal(instance.snapshot.excludedPathsCasefoldVersion, 1);
+  assert.equal(await fsp.readFile(path.join(parent, "TWO.txt"), "utf8"), "external private contents");
+  assert.equal(store.list("alice").length, 0, "the synthetic local-only fixture never had remote egress");
 });
 
 test("issue 66 P2 POSIX: ambiguous portable case aliases never cause local eviction or false release", async (t) => {
