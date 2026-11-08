@@ -1362,18 +1362,33 @@
             || !Array.isArray(opened.entries)
             || !Number.isSafeInteger(opened.totalMatches)
             || opened.totalMatches < opened.entries.length) fail();
+          const listLive = () => {
+            assertLive();
+            return !busy && verifiedOpaqueDelta === held
+              && field("catalog-delta-query")?.value === term;
+          };
+          const updateListSummary = (page) => {
+            const first = page.entries.length ? page.offset + 1 : 0;
+            field("catalog-delta-summary").textContent = term.trim()
+              ? "Busca local: " + page.totalMatches + " correspondência(s), "
+                + first + "–" + (page.offset + page.entries.length)
+                + " exibidas · CAS #" + page.head.sequence
+              : "Listagem local: " + first + "–"
+                + (page.offset + page.entries.length) + " de "
+                + page.totalMatches + " versão(ões) · CAS #" + page.head.sequence;
+          };
           // Selection only fills the opaque ID used by existing independent
           // authorization gates; it never triggers protected I/O or a mutation.
           window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
-            list, opened.entries, field("catalog-write-id"), () => {
-              assertLive();
-              return !busy && verifiedOpaqueDelta === held;
-            }, field("catalog-delta-read-revision"));
-          field("catalog-delta-summary").textContent = term.trim()
-            ? "Busca local: " + opened.totalMatches + " correspondência(s), "
-              + opened.entries.length + " exibida(s) (máximo 100) · CAS #" + opened.head.sequence
-            : "Listagem local de " + opened.entries.length + " versão(ões) · CAS #"
-              + opened.head.sequence;
+            list, opened.entries, field("catalog-write-id"), listLive,
+            field("catalog-delta-read-revision"), { ...opened,
+              onPage: updateListSummary,
+              onDenied: () => {
+                field("catalog-delta-summary").textContent = "";
+                status("Consulta local interrompida: confira o CAS e o grant atuais.");
+              },
+            });
+          updateListSummary(opened);
           status("CAS/witness revalidados; " + (opened.persistedIndex
             ? opened.reusedIndex ? "índice cifrado reutilizado." : "índice local cifrado atualizado."
             : "listagem local sem armazenamento persistente.")
