@@ -600,10 +600,9 @@ async function collectBackupFiles(options = {}) {
     const staged = path.resolve(stageDir, entryPath);
     if (!staged.startsWith(`${path.resolve(stageDir)}${path.sep}`)) throw new Error("Cloud backup staging escaped its boundary");
     fs.mkdirSync(path.dirname(staged), { recursive: true });
-    // A Drive listing binds an inventoried logical key to one physical ID.
-    // Downloading by a second same-key lookup can silently substitute a
-    // newly created object B for enumerated object A mid-backup. The cloud
-    // adapter must GET the listed ID, or fail closed if it disappeared.
+    // Bind the ZIP download to the same provider object representation that
+    // was enumerated. Drive pins its physical ID; S3 uses conditional ETag
+    // plus the listed byte count because ListObjectsV2 has no version ID.
     let backupInventoryPin;
     if (remote.provider === "gdrive") {
       const physicalId = remote.providerIdentity || remote.id;
@@ -612,6 +611,9 @@ async function collectBackupFiles(options = {}) {
         throw new Error("Cloud backup Drive inventory identity is invalid");
       }
       backupInventoryPin = { providerFileId: physicalId };
+    } else if (remote.provider === "s3"
+      && (remote.providerEtag !== undefined || remote.providerSize !== undefined)) {
+      backupInventoryPin = { etag: remote.providerEtag, size: remote.providerSize };
     }
     if (!await cloudStorage.download(folderId, name, staged, remote.area,
       undefined, undefined, backupInventoryPin)) {
