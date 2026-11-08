@@ -532,7 +532,7 @@ async function collectBackupFiles(options = {}) {
   const remoteIdentities = new Set();
   let stageRootInfo = null;
   if (typeof cloudStorage.inventory !== "function") throw new Error("Authoritative cloud inventory is required");
-  const remotes = await cloudStorage.inventory();
+  const remotes = await cloudStorage.inventory({ backupComplete: true });
   for (const remote of remotes) {
     if (!areas.includes(remote.area)) continue;
     const folderId = String(remote.folderId || "");
