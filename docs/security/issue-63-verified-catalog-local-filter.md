@@ -153,3 +153,13 @@ durable tombstone; no rejected operation resurrects the previous plaintext.
 Old search pages are invalidated by the new snapshot nonce. Ordinary append
 still rejects overflow. This feature does not provide a complete historical
 index or increase the 128-revision resident limit.
+
+The offline-selection confirmation, persistence consent and replacement consent
+are consumed synchronously when each search is submitted, and cleared on both
+success and failure. Editing the query, manifest, manifest SHA-256 pin, CEK
+files, metadata key or other workspace source field also clears these three
+checkboxes. A subsequent selection must be authorized independently; an
+unchecked replacement defaults to ordinary append and preserves the older
+encrypted index when the new selection would exceed its capacity. Real Edge
+same-window tests cover full batch A, batch B denied without fresh replacement
+consent, batch B accepted after fresh opt-in, and invalidation of old pages.

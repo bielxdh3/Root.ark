@@ -67,6 +67,15 @@
     if (batch) batch.textContent = "";
     field("catalog-index-pages")?.replaceChildren();
   }
+  function resetRevisionBatchConsent() {
+    // A new selection must never reuse a destructive replace opt-in. The
+    // offline pin assertion and persistence opt-in are also per operation.
+    for (const name of ["catalog-batch-confirm", "catalog-batch-persist",
+      "catalog-batch-replace"]) {
+      const control = field(name);
+      if (control) control.checked = false;
+    }
+  }
   function from64(value) {
     if (typeof value !== "string" || !base64.test(value)) fail();
     let decoded;
@@ -990,8 +999,14 @@
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
     dialog.addEventListener("close", clearLocalPreview);
-    dialog.addEventListener("input", clearLocalPreview);
-    dialog.addEventListener("change", clearLocalPreview);
+    const invalidateInput = (event) => {
+      clearLocalPreview();
+      const changed = event.target?.getAttribute?.("data-zk1-field");
+      if (changed && !["catalog-batch-confirm", "catalog-batch-persist",
+        "catalog-batch-replace"].includes(changed)) resetRevisionBatchConsent();
+    };
+    dialog.addEventListener("input", invalidateInput);
+    dialog.addEventListener("change", invalidateInput);
     dialog.addEventListener("click", (event) => {
       if (event.target.closest('[data-zk1-field="catalog-delta-private-list"] button'))
         clearLocalPreview();
@@ -1002,6 +1017,7 @@
   }
   async function perform(action) {
     if (action === "catalog-delta-text-cancel") {
+      resetRevisionBatchConsent();
       if (activeTextBatch) {
         activeTextBatch.cancelled = true;
         clearLocalPreview();
@@ -1012,6 +1028,7 @@
     }
     if (busy) return;
     if (action === "close") {
+      resetRevisionBatchConsent();
       clearLocalPreview();
       committedDeviceApproval = null;
       verifiedCatalog = null;
@@ -1039,6 +1056,14 @@
       "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
+    // Capture the owner's checkboxes synchronously at this click, and consume
+    // them before any asynchronous trust, network, file or IndexedDB work.
+    const batchConsent = action === "catalog-delta-text-search" ? {
+      confirmed: field("catalog-batch-confirm")?.checked === true,
+      persist: field("catalog-batch-persist")?.checked === true,
+      replace: field("catalog-batch-replace")?.checked === true,
+    } : null;
+    resetRevisionBatchConsent();
     clearLocalPreview();
     const operationPreviewGeneration = previewGeneration;
     const textBatch = action === "catalog-delta-text-search"
@@ -1609,7 +1634,7 @@
           return;
         }
         if (action === "catalog-delta-text-search") {
-          if (field("catalog-batch-confirm")?.checked !== true
+          if (!batchConsent.confirmed
             || !held.client.readSelectedCiphertext) fail();
           const assertBatchLive = () => {
             assertLive();
@@ -1631,8 +1656,8 @@
           if (manifest.schema !== "rootark-zk1-local-text-batch/v1"
             || !Array.isArray(manifest.entries)
             || manifest.entries.length < 1 || manifest.entries.length > 128) fail();
-          const persistBatch = field("catalog-batch-persist")?.checked === true;
-          const replaceExisting = field("catalog-batch-replace")?.checked === true;
+          const persistBatch = batchConsent.persist;
+          const replaceExisting = batchConsent.replace;
           if (replaceExisting && !persistBatch) fail();
           if (persistBatch) {
             if (field("catalog-write-key")?.files?.length !== 1
@@ -2984,6 +3009,7 @@
         status("Operação recusada: autoridade, permissão, sessão ou ciphertext não verificado.");
       }
     } finally {
+      resetRevisionBatchConsent();
       privateDer?.fill(0);
       data?.fill(0);
       secret?.fill(0);

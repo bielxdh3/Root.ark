@@ -93,6 +93,46 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
       if(batchButton.disabled||!cancel.disabled)
         throw Error("CANCEL_NOT_CLEANED");
+      // Two sequential real Edge UI operations must never reuse consent to
+      // replace the encrypted selection. These attempts deliberately lack
+      // authority, so both must fail closed and consume their opt-ins.
+      const confirmToggle=dialog.querySelector('[data-zk1-field="catalog-batch-confirm"]');
+      const manifestControl=dialog.querySelector('[data-zk1-field="catalog-batch-manifest"]');
+      const cekControl=dialog.querySelector('[data-zk1-field="catalog-batch-ceks"]');
+      const manifestPin=dialog.querySelector('[data-zk1-field="catalog-batch-manifest-pin"]');
+      if(!confirmToggle||!manifestControl||!cekControl||!manifestPin)
+        throw Error("MISSING_SELECTION_CONSENT_CONTROLS");
+      const consent=()=>{persistToggle.click();replaceToggle.click();confirmToggle.click();};
+      const deniedConsent=label=>{
+        if(persistToggle.checked||replaceToggle.checked||confirmToggle.checked)
+          throw Error("REPLACEMENT_CONSENT_REUSED_"+label);
+      };
+      consent();
+      batchButton.click();
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled)throw Error("FIRST_BATCH_NOT_FINISHED");
+      deniedConsent("AFTER_FIRST_BATCH");
+      consent();
+      const manifestFiles=new DataTransfer();
+      manifestFiles.items.add(new File(["disposable-selected-batch-b"],"batch-b.json"));
+      manifestControl.files=manifestFiles.files;
+      manifestControl.dispatchEvent(new Event("change",{bubbles:true}));
+      deniedConsent("AFTER_MANIFEST_CHANGED");
+      consent();
+      const cekFiles=new DataTransfer();
+      cekFiles.items.add(new File(["disposable-second-cek"],"new-key.bin"));
+      cekControl.files=cekFiles.files;
+      cekControl.dispatchEvent(new Event("change",{bubbles:true}));
+      deniedConsent("AFTER_CEKS_CHANGED");
+      consent();
+      manifestPin.value="offline-pin-for-disposable-second-batch";
+      manifestPin.dispatchEvent(new Event("input",{bubbles:true}));
+      deniedConsent("AFTER_PIN_CHANGED");
+      consent();
+      batchButton.click();
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled)throw Error("SECOND_BATCH_NOT_FINISHED");
+      deniedConsent("AFTER_SECOND_BATCH");
       const id="AAAAAAAAAAAAAAAAAAAAAA";
       const malicious="<img src=x onerror=alert(1)> secret-local-only";
       let active=true;
