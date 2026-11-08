@@ -127,8 +127,30 @@ function storedSnapshot(dir) {
       for (const name of fs.readdirSync(folder).sort()) {
         const absolute = path.join(folder, name);
         const relative = path.relative(dir, absolute).replaceAll("\\", "/");
-        if (fs.lstatSync(absolute).isDirectory()) { result[relative] = "DIR"; walk(absolute); }
-        else result[relative] = crypto.createHash("sha256").update(fs.readFileSync(absolute)).digest("hex");
+        const before = fs.lstatSync(absolute, { bigint: true });
+        if (before.isDirectory() && !before.isSymbolicLink()) {
+          result[relative] = "DIR";
+          walk(absolute);
+          continue;
+        }
+        // The snapshot is a security regression assertion, not permission to
+        // follow a server-created link outside the isolated test directory.
+        // Hash the verified file descriptor, never re-open the checked path.
+        assert.ok(before.isFile() && !before.isSymbolicLink() && before.nlink === 1n,
+          `Unexpected nonregular snapshot entry: ${relative}`);
+        const fd = fs.openSync(absolute,
+          fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        try {
+          const opened = fs.fstatSync(fd, { bigint: true });
+          assert.ok(opened.isFile() && opened.nlink === 1n
+            && opened.dev === before.dev && opened.ino === before.ino,
+          `Snapshot file identity changed: ${relative}`);
+          result[relative] = crypto.createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
+          const after = fs.lstatSync(absolute, { bigint: true });
+          assert.ok(after.isFile() && !after.isSymbolicLink()
+            && after.dev === before.dev && after.ino === before.ino,
+          `Snapshot pathname identity changed: ${relative}`);
+        } finally { fs.closeSync(fd); }
       }
     };
     walk(root);
