@@ -15,7 +15,9 @@ const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 const SNAPSHOT_VERSION = 1;
 // A v2 snapshot fences old clients that do not know how to replay the
 // fsynced per-object eviction overlay. Upgrade durably BEFORE first PREPARE,
-// not after staging a file; old v1 binaries must reject version 2.
+// not after staging a file; old v1 binaries must reject version 2. The
+// explicit required flag prevents a vanished *entire* active journal from
+// looking like a successfully compacted empty journal.
 const EVICTION_LEDGER_SNAPSHOT_VERSION = 2;
 // v1 added portable case-folding on POSIX, but marked migration complete even
 // when a dirty legacy alias was retained. Revisit v1 snapshots under v2 so
@@ -972,8 +974,11 @@ class SyncEngine {
         || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
       if ((parsed.version === EVICTION_LEDGER_SNAPSHOT_VERSION
         && (typeof parsed.evictionLedgerEpoch !== "string"
-          || !EVICTION_LEDGER_EPOCH.test(parsed.evictionLedgerEpoch)))
-        || (parsed.version === SNAPSHOT_VERSION && parsed.evictionLedgerEpoch !== undefined)) {
+          || !EVICTION_LEDGER_EPOCH.test(parsed.evictionLedgerEpoch)
+          || typeof parsed.evictionLedgerRequired !== "boolean"))
+        || (parsed.version === SNAPSHOT_VERSION
+          && (parsed.evictionLedgerEpoch !== undefined
+            || parsed.evictionLedgerRequired !== undefined))) {
         fail("Sync snapshot has an invalid eviction replay epoch", "invalid_snapshot");
       }
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
@@ -1055,8 +1060,14 @@ class SyncEngine {
   }
 
   async replayEvictionLedger() {
-    const { entries } = await readEvictionLedger(this.rootDir,
+    const { entries, head } = await readEvictionLedger(this.rootDir,
       this.snapshot.evictionLedgerEpoch || null);
+    if (this.snapshot.evictionLedgerRequired && !head) {
+      // After PREPARE was permitted, absence of the whole ledger (or a
+      // recreated empty directory) is ambiguous. A missing local file must
+      // never be inferred to be a user-signed DELETE.
+      fail("Required active eviction ledger is missing", "invalid_snapshot");
+    }
     if (!entries.size) return;
     if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION) {
       fail("Eviction overlay requires durable snapshot version fence", "invalid_snapshot");
@@ -1142,6 +1153,10 @@ class SyncEngine {
     if (recovered.pendingEvictions && !Object.keys(recovered.pendingEvictions).length) {
       delete recovered.pendingEvictions;
     }
+    // Every committed eviction now has a durable remote-only marker, and
+    // every still-present local file retains its tracked identity/watch.
+    // Retire the guard in that same full durable checkpoint, before cleanup.
+    recovered.evictionLedgerRequired = false;
     const previous = this.snapshot;
     this.snapshot = recovered;
     try { await this.persistSnapshot(); }
@@ -2855,13 +2870,17 @@ class SyncEngine {
         // small PREPARE can protect a destructive local cache-file move.
         const priorVersion = this.snapshot.version;
         const priorEpoch = this.snapshot.evictionLedgerEpoch;
+        const priorRequired = this.snapshot.evictionLedgerRequired;
         this.snapshot.version = EVICTION_LEDGER_SNAPSHOT_VERSION;
         this.snapshot.evictionLedgerEpoch = crypto.randomUUID();
+        this.snapshot.evictionLedgerRequired = true;
         try { await this.persistSnapshot(); }
         catch (error) {
           this.snapshot.version = priorVersion;
           if (priorEpoch === undefined) delete this.snapshot.evictionLedgerEpoch;
           else this.snapshot.evictionLedgerEpoch = priorEpoch;
+          if (priorRequired === undefined) delete this.snapshot.evictionLedgerRequired;
+          else this.snapshot.evictionLedgerRequired = priorRequired;
           throw error;
         }
         this.evictionLedgerHead = {
@@ -2870,7 +2889,8 @@ class SyncEngine {
         };
       }
       if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION
-        || this.snapshot.evictionLedgerEpoch !== this.evictionLedgerHead.epoch) {
+        || this.snapshot.evictionLedgerEpoch !== this.evictionLedgerHead.epoch
+        || this.snapshot.evictionLedgerRequired !== true) {
         fail("Eviction journal is not anchored to its durable snapshot", "invalid_snapshot");
       }
       prepare.epoch = this.evictionLedgerHead.epoch;
@@ -3305,7 +3325,25 @@ class SyncEngine {
       delete this.snapshot.excludedPaths;
       delete this.snapshot.excludedPathsCasefoldVersion;
     }
-    await this.persistSnapshot();
+    const compacting = this.evictionLedgerHead !== null;
+    if (compacting) {
+      // Verify that the on-disk chain still contains every PREPARE produced
+      // in this batch before retiring the active flag. The full checkpoint
+      // is already populated with remote-only markers for staged files.
+      const { head } = await readEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
+      if (!head || this.snapshot.evictionLedgerRequired !== true
+        || head.epoch !== this.evictionLedgerHead.epoch
+        || head.sequence !== this.evictionLedgerHead.sequence
+        || head.digest !== this.evictionLedgerHead.digest) {
+        fail("Active eviction ledger changed before durable checkpoint", "invalid_snapshot");
+      }
+      this.snapshot.evictionLedgerRequired = false;
+    }
+    try { await this.persistSnapshot(); }
+    catch (error) {
+      if (compacting) this.snapshot.evictionLedgerRequired = true;
+      throw error;
+    }
     await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch || null);
     this.evictionLedgerHead = null;
     return report;
