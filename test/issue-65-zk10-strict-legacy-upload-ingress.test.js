@@ -120,17 +120,41 @@ async function fixture(t, strict) {
 
 function storedSnapshot(dir) {
   const result = {};
+  const directory = (folder) => {
+    const stat = fs.lstatSync(folder, { bigint: true });
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink(),
+      `Unsafe snapshot directory: ${path.relative(dir, folder) || "."}`);
+    return stat;
+  };
+  // Only the original disposable root is trusted. All subsequently visited
+  // directories must retain their non-reparse identity at each scan/read stage.
+  // This detects stable junctions and many swaps, but Node's Windows openSync
+  // cannot pin an entire parent chain against an adversarial concurrent rename.
+  const fixtureRoot = { folder: dir, stat: directory(dir) };
+  const assertAncestry = (ancestors) => {
+    for (const { folder, stat } of ancestors) {
+      const now = directory(folder);
+      assert.ok(now.dev === stat.dev && now.ino === stat.ino,
+        `Snapshot directory identity changed: ${path.relative(dir, folder) || "."}`);
+    }
+  };
   for (const area of ["uploads", "temp", "data"]) {
     const root = path.join(dir, area);
-    if (!fs.existsSync(root)) continue;
-    const walk = (folder) => {
+    assertAncestry([fixtureRoot]);
+    let rootStat;
+    try { rootStat = directory(root); }
+    catch (error) { if (error.code === "ENOENT") continue; throw error; }
+    const walk = (folder, ancestors) => {
+      assertAncestry(ancestors);
       for (const name of fs.readdirSync(folder).sort()) {
+        assertAncestry(ancestors);
         const absolute = path.join(folder, name);
         const relative = path.relative(dir, absolute).replaceAll("\\", "/");
         const before = fs.lstatSync(absolute, { bigint: true });
         if (before.isDirectory() && !before.isSymbolicLink()) {
           result[relative] = "DIR";
-          walk(absolute);
+          walk(absolute, [...ancestors, { folder: absolute, stat: before }]);
+          assertAncestry(ancestors);
           continue;
         }
         // The snapshot is a security regression assertion, not permission to
@@ -138,6 +162,7 @@ function storedSnapshot(dir) {
         // Hash the verified file descriptor, never re-open the checked path.
         assert.ok(before.isFile() && !before.isSymbolicLink() && before.nlink === 1n,
           `Unexpected nonregular snapshot entry: ${relative}`);
+        assertAncestry(ancestors);
         const fd = fs.openSync(absolute,
           fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
         try {
@@ -145,18 +170,69 @@ function storedSnapshot(dir) {
           assert.ok(opened.isFile() && opened.nlink === 1n
             && opened.dev === before.dev && opened.ino === before.ino,
           `Snapshot file identity changed: ${relative}`);
+          assertAncestry(ancestors);
           result[relative] = crypto.createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
           const after = fs.lstatSync(absolute, { bigint: true });
           assert.ok(after.isFile() && !after.isSymbolicLink()
             && after.dev === before.dev && after.ino === before.ino,
           `Snapshot pathname identity changed: ${relative}`);
+          assertAncestry(ancestors);
         } finally { fs.closeSync(fd); }
       }
+      assertAncestry(ancestors);
     };
-    walk(root);
+    walk(root, [fixtureRoot, { folder: root, stat: rootStat }]);
   }
+  assertAncestry([fixtureRoot]);
   return result;
 }
+
+test("strict ingress snapshots reject root and nested junctions before reading external data", (t) => {
+  const base = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
+  const scratch = fs.mkdtempSync(path.join(base, "zk10-snapshot-junction-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  const inside = path.join(scratch, "inside");
+  const outside = path.join(scratch, "outside");
+  const externalUploads = path.join(outside, "uploads");
+  fs.mkdirSync(inside);
+  fs.mkdirSync(outside);
+  fs.mkdirSync(externalUploads);
+  const canaries = [path.join(outside, "root-canary.txt"),
+    path.join(externalUploads, "alias-canary.txt")];
+  for (const file of canaries) fs.writeFileSync(file, "DISPOSABLE_EXTERNAL_CANARY_ONLY");
+  const externalIds = new Set(canaries.map((file) => {
+    const stat = fs.statSync(file, { bigint: true });
+    return `${stat.dev}:${stat.ino}`;
+  }));
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  const assertNoExternalRead = (root) => {
+    const read = fs.readFileSync;
+    let externalReads = 0;
+    fs.readFileSync = function (file, ...args) {
+      if (typeof file === "number") {
+        const stat = fs.fstatSync(file, { bigint: true });
+        if (externalIds.has(`${stat.dev}:${stat.ino}`)) externalReads++;
+      }
+      return read.call(this, file, ...args);
+    };
+    try { assert.throws(() => storedSnapshot(root), /snapshot|nonregular|directory|symbolic/i); }
+    finally { fs.readFileSync = read; }
+    assert.equal(externalReads, 0, "snapshot must reject junctions before reading external canaries");
+  };
+
+  fs.symlinkSync(outside, path.join(inside, "uploads"), linkType);
+  assertNoExternalRead(inside);
+  fs.rmSync(path.join(inside, "uploads"));
+
+  const data = path.join(inside, "data");
+  fs.mkdirSync(data);
+  fs.symlinkSync(outside, path.join(data, "nested"), linkType);
+  assertNoExternalRead(inside);
+
+  const rootAlias = path.join(scratch, "alias");
+  fs.symlinkSync(outside, rootAlias, linkType);
+  assertNoExternalRead(rootAlias);
+});
 
 const forged = [
   { field: "ownerSignedOriginalSha256", value: "1".repeat(64) },
