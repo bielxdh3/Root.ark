@@ -35,6 +35,31 @@ test("CFAPI compiler ignores inherited tool selectors and PATH before vcvars ini
   assert.equal(Object.hasOwn(env, "COMSPEC"), false);
 });
 
+test("CFAPI compiler never executes vcvars tools with disposable scratch as its working directory", () => {
+  const code = fs.readFileSync(path.join(__dirname, "support", "issue-66-cfapi-built-artifact.js"), "utf8");
+  assert.ok(code.includes(String.raw`const buildToolCwd = "C:\\Windows\\System32";`),
+    "native compiler command lookup must start in the protected OS directory");
+  assert.ok(code.includes("cwd: buildToolCwd"),
+    "native compiler child process must not start in writable scratch");
+  assert.ok(code.includes('/Fo:"${objectFile}"'),
+    "native compiler must explicitly emit object output inside the fixture directory");
+  assert.ok(code.includes('/Fd:"${pdbFile}"'),
+    "native compiler must explicitly emit debug intermediate output inside the fixture directory");
+});
+
+test("CFAPI compiler rejects existing object and PDB output names before running MSVC", (t) => {
+  for (const extension of [".obj", ".pdb"]) {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cfapi-acl-test-"));
+    t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+    const output = path.join(scratch, `acl-preflight${extension}`);
+    fs.writeFileSync(output, "PRESERVE_DISPOSABLE_CANARY");
+    assert.throws(() => buildCompiledFixture(scratch, "acl-preflight.exe",
+      String.raw`C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat`),
+    /UNTRUSTED_EXECUTABLE/);
+    assert.equal(fs.readFileSync(output, "utf8"), "PRESERVE_DISPOSABLE_CANARY");
+  }
+});
+
 test("CFAPI executable receipts refuse arbitrary TEMP contents even at a permitted name", (t) => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cfapi-acl-test-"));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));

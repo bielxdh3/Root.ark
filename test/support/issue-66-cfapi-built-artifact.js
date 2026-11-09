@@ -103,13 +103,17 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
   // A pre-existing file — even one containing plausible PE headers — is
   // never accepted as the result of the build performed by this helper.
   const executable = path.join(scratch, name);
+  const objectFile = path.join(scratch, name.replace(/\.exe$/, ".obj"));
+  const pdbFile = path.join(scratch, name.replace(/\.exe$/, ".pdb"));
   // existsSync follows a dangling symlink and would incorrectly report false.
   // A native compiler may then follow that alias while writing its output.
-  try {
-    fs.lstatSync(executable);
-    throw new Error(FAIL);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  for (const output of [executable, objectFile, pdbFile]) {
+    try {
+      fs.lstatSync(output);
+      throw new Error(FAIL);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
   }
   assert.equal(typeof vcvars, "string", FAIL);
   assert.match(vcvars,
@@ -122,7 +126,7 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
       : name === "positive-shape.exe"
         ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-positive-shape.cpp")
         : path.join(scratch, "inherit-only-fixture.cpp");
-  for (const filename of [vcvars, source, executable]) {
+  for (const filename of [vcvars, source, executable, objectFile, pdbFile]) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
   }
   for (const filename of [vcvars, source]) {
@@ -138,11 +142,16 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
     ? "cldapi.lib" : "cldapi.lib advapi32.lib";
   const inline = `call "${vcvars}" >nul && if defined VCToolsInstallDir `
     + `"!VCToolsInstallDir!bin\\Hostx64\\x64\\cl.exe" /nologo /std:c++17 /W4 /WX /EHsc `
-    + `/Fe:"${executable}" "${source}" ${libraries}`;
+    + `/Fo:"${objectFile}" /Fd:"${pdbFile}" /Fe:"${executable}" "${source}" ${libraries}`;
   const env = sanitizeBuildEnvironment();
+  // cmd.exe searches its working directory before PATH for unqualified tools
+  // invoked by vcvars64.bat. A writable test scratch directory is not a safe
+  // tool-search directory, even with PATH sanitized. Explicitly locate every
+  // compiler output under scratch so the protected System32 cwd stays clean.
+  const buildToolCwd = "C:\\Windows\\System32";
   const buildResult = spawnSync("C:\\Windows\\System32\\cmd.exe",
     ["/d", "/v:on", "/s", "/c", `"${inline}"`], {
-    cwd: scratch, encoding: "utf8", timeout, windowsHide: true, env,
+    cwd: buildToolCwd, encoding: "utf8", timeout, windowsHide: true, env,
     windowsVerbatimArguments: true,
   });
   // Preserve diagnostic categories; compiler output can reveal local paths.
