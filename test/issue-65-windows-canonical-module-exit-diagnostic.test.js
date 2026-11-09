@@ -48,3 +48,24 @@ test("malformed TAP process status cannot leak secret text or claim a bounded mo
   const output = diagnostics.join("\n");
   assert.doesNotMatch(output, /moduleExitCode=|credential=|password-private|DO-NOT-LOG/);
 });
+
+test("a late exitCode outside the failed module YAML cannot impersonate its process status", () => {
+  const output = [];
+  const tracker = createTapProgressRecorder((line) => output.push(line));
+  for (const line of [
+    "TAP version 13",
+    "not ok 9 - ordinary failed test",
+    "  ---",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_TEST_FAILURE'",
+    "  error: 'test failed'",
+    "  ...",
+    "  exitCode: 137",
+    "ok 10 - unaffected test",
+  ]) tracker.accept(line);
+  tracker.finish();
+  const report = output.join("\n");
+  assert.match(report, /failureType=testCodeFailure code=ERR_TEST_FAILURE category=runtime/);
+  assert.doesNotMatch(report, /moduleExitCode=/);
+  assert.equal(tracker.state.failures, 1);
+});

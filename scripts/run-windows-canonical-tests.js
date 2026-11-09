@@ -107,12 +107,22 @@ function createTapProgressRecorder(write) {
           const nameHash = hash(result[3]);
           write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
           pending = { index: result[2], nameHash, pathHash: "none",
-            failureType: "unknown", code: "unknown", moduleExitCode: null, fileProcessFailed: false };
+            failureType: "unknown", code: "unknown", moduleExitCode: null,
+            fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false };
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
         }
       }
       if (pending) {
+        // The failed test's YAML can end before unrelated output is emitted.
+        // An exitCode after "  ..." is NOT evidence about that test module.
+        // Never reopen an already consumed YAML block for the same result.
+        if (line === "  ---" && !pending.moduleYamlSeen) {
+          pending.moduleYamlSeen = true;
+          pending.moduleYamlOpen = true;
+        } else if (line === "  ...") {
+          pending.moduleYamlOpen = false;
+        }
         const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
         if (location) {
           const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location[1]);
@@ -124,9 +134,11 @@ function createTapProgressRecorder(write) {
         if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
         // Keep only a bounded process status from actual Node TAP YAML. The
         // error marker must match exactly; never print raw YAML or error text.
-        if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
+        if (pending.moduleYamlOpen && line === "  error: 'test failed'") {
+          pending.fileProcessFailed = true;
+        }
         const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
-        if (moduleExit && Number(moduleExit[1]) <= 255)
+        if (pending.moduleYamlOpen && moduleExit && Number(moduleExit[1]) <= 255)
           pending.moduleExitCode = Number(moduleExit[1]);
         const acl = parseAclFailureDiagnostic(line, pending);
         if (acl) pending.acl = acl;
