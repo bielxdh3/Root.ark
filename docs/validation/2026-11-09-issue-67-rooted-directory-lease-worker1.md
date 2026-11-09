@@ -4,7 +4,7 @@
 
 - Published Draft head at investigation: `b412ff378202feb90c70c5a100f7a8f2b683a08e` (parent `b98f0cf1a57a9d7ded16ceb3c0269e898f57d096`).
 - Formal GHAS CodeQL run `129162890153`: **FAILURE, two HIGH** in `sync-client/rootark-sync-engine.js:401` and `:2604`. These are not dismissed or suppressed.
-- Existing read-only native experiments are `scripts/issue-67-native-contained-open.cpp`, `scripts/issue-67-native-contained-read-win.cpp`, and `scripts/issue-67-native-contained-read-posix.cpp`; see `docs/validation/2026-11-09-issue-67-native-read-w35.md` for their prior coverage. None is authorized to mutate restore destinations.
+- Existing native experiments are `scripts/issue-67-native-contained-open.cpp` (**open-only containment probe**, reporting `fileContentRead:false`), and the distinct bounded-content readers `scripts/issue-67-native-contained-read-win.cpp` and `scripts/issue-67-native-contained-read-posix.cpp`; see `docs/validation/2026-11-09-issue-67-native-read-w35.md` for their prior coverage. None is authorized to mutate restore destinations.
 - Existing independent `test/issue-67-w49-concurrent-parent-move.red.test.cjs` in the W49 worktree exposes destructive simultaneous rollback. It remains intentionally RED and untouched.
 
 ## New, narrower experiment
@@ -13,13 +13,13 @@
 
 On WSL2 Ubuntu with ext4 `/home`, a small C helper holds an `O_PATH|O_DIRECTORY|O_NOFOLLOW` directory fd, then waits. A second PID renames that directory **outside the selected root**, and creates a foreign file at the original pathname. The held helper successfully calls `openat2(dirfd, "new.dat", O_CREAT|O_EXCL|O_NOFOLLOW, RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV)` and writes to a **different new file in the relocated directory outside the original root**. The foreign inode at the old pathname is preserved. This proves that `RESOLVE_BENEATH`, `O_EXCL`, and `openat2` are relative to the **held directory object**, not proof of its continuing namespace ancestry.
 
-On actual Windows `E:` NTFS, the existing bounded native `NtCreateFile(RootDirectory, ...)` reader holds the chain of root and ancestor handles without `FILE_SHARE_DELETE`. A separate PID attempting to rename the held `subdir` receives a sharing/permission denial; original bytes remain intact. This is a useful **live handle lease**, but its duration ends with the native process. It has no independent owner-signed physical root authorization or durable rollback transaction.
+On actual Windows `E:` NTFS, the existing **open-only** `scripts/issue-67-native-contained-open.cpp` probe holds a chain of root, ancestor, and leaf handles using `NtCreateFile(RootDirectory, ...)`, without `FILE_SHARE_DELETE`. It does **not** read file content (`fileContentRead:false`); the separate `native-contained-read-win.cpp` is the bounded-content reader, and is **not** exercised by this new test. A separate PID attempting to rename the held `subdir` receives a sharing/permission denial; original bytes remain intact. This is a useful **live handle lease**, but its duration ends with the native process. It has no independent owner-signed physical root authorization or durable rollback transaction.
 
 ## Physical results
 
 | Environment | Focused opt-in lab | Existing native-open gate |
 | --- | --- | --- |
-| Windows Node `v22.23.3`, real `E:` NTFS, MSVC + Windows SDK | **1 PASS, 1 platform SKIP** | **10 PASS** including 8 filesystem subtests, mapped writable section, writer, hardlink, stale root ID, junction and rename |
+| Windows Node `v22.23.3`, real `E:` NTFS, MSVC + Windows SDK | **1 PASS, 1 platform SKIP** | **10 PASS** in `test/issue-67-native-contained-open.test.js`: 1 static source test, 1 parent test, and 8 nested NTFS subtests (including mapped writable section, writer, hardlink, stale root ID, junction and rename); open-only, no file-content read |
 | WSL Ubuntu Node `v22.22.1`, native ext4 `/home`, GCC (`cc`) | **1 PASS, 1 platform SKIP** | Not rerun on WSL in this experiment |
 | Default unconfigured discovery, both OS | 2 deliberate SKIPs; no compilation or filesystem fixtures | Existing coverage unchanged |
 
