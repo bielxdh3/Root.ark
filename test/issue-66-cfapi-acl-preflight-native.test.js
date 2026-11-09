@@ -10,13 +10,21 @@ const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 const { createAclFailureDiagnostic, readCfapiFixtureFailureStage } =
   require("../scripts/acl-test-failure-diagnostic");
+const { buildCompiledFixture, runCompiledFixture } =
+  require("./support/issue-66-cfapi-built-artifact");
 
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp");
 const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
 const aclScript = path.join(__dirname, "support/issue-66-cfapi-acl-fixture.ps1");
+const fixedTools = Object.freeze({
+  vswhere,
+  cmd: "C:\\Windows\\System32\\cmd.exe",
+  powershell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+});
 
-function run(file, args, cwd, timeout = 10000) {
-  return spawnSync(file, args, { cwd, encoding: "utf8", timeout, windowsHide: true });
+function runFixedTool(tool, args, cwd, timeout = 10000) {
+  assert.ok(Object.hasOwn(fixedTools, tool), "UNTRUSTED_EXECUTABLE");
+  return spawnSync(fixedTools[tool], args, { cwd, encoding: "utf8", timeout, windowsHide: true });
 }
 
 test("#66 native ACL preflight has no sync-root registration or file-content operations", async () => {
@@ -37,7 +45,7 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     const diagnostic = createAclFailureDiagnostic(t, "CFAPI_PREFLIGHT");
     return diagnostic.run(async () => {
     diagnostic.stage("TOOLCHAIN_LOOKUP");
-    const where = run(vswhere, ["-all", "-products", "*", "-prerelease",
+    const where = runFixedTool("vswhere", ["-all", "-products", "*", "-prerelease",
       "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], undefined, 6000);
     const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
     if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
@@ -56,7 +64,8 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${exe}" "${source}" cldapi.lib advapi32.lib`,
       "exit /b %errorlevel%", ""].join("\r\n"));
     diagnostic.stage("SDK_BUILD");
-    const build = run("cmd.exe", ["/d", "/c", batch], scratch, 40000);
+    const { receipt, buildResult: build } =
+      buildCompiledFixture(scratch, "acl-preflight.exe", batch);
     assert.equal(build.status, 0, `native SDK build failed: ${build.stdout}\n${build.stderr}`);
 
     diagnostic.stage("ROOT_CREATE");
@@ -74,7 +83,7 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       [inheritedRoot, "2", "ACL_INHERITED_APPLY"],
     ]) {
       diagnostic.stage(stage);
-      const applied = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      const applied = runFixedTool("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", aclScript, dir, expose], scratch, 10000);
       if (applied.status !== 0) {
         const fixedStage = readCfapiFixtureFailureStage(stage, applied.stderr);
@@ -84,7 +93,7 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     }
 
     const inspect = (dir) => {
-      const outcome = run(exe, ["--inspect", dir], scratch);
+      const outcome = runCompiledFixture(receipt, ["--inspect", dir]);
       return { status: outcome.status, output: JSON.parse(outcome.stdout.trim()) };
     };
     diagnostic.stage("OWNER_INSPECT");
@@ -129,13 +138,18 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       t.diagnostic("junction creation unavailable; native reparse-negative test skipped");
     }
     diagnostic.stage("REGISTER_REJECT");
-    assert.notEqual(run(exe, ["--register", strictRoot], scratch).status, 0);
+    assert.notEqual(runCompiledFixture(receipt, ["--register", strictRoot]).status, 0);
+    // An artifact modified after THIS compile receipt must not be relaunched.
+    // This is not atomic Windows executable custody against concurrent swaps.
+    await fs.appendFile(exe, Buffer.from([0x21]));
+    assert.throws(() => runCompiledFixture(receipt, ["--inspect", strictRoot]),
+      /UNTRUSTED_EXECUTABLE/);
     });
   });
 
 test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effective Administrators access",
   { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
-    const where = run(vswhere, ["-all", "-products", "*", "-prerelease",
+    const where = runFixedTool("vswhere", ["-all", "-products", "*", "-prerelease",
       "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], undefined, 6000);
     const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
     if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
@@ -199,9 +213,10 @@ test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effecti
       "if errorlevel 1 exit /b 1",
       `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${exe}" "${fixture}" cldapi.lib advapi32.lib`,
       "exit /b %errorlevel%", ""].join("\r\n"));
-    const build = run("cmd.exe", ["/d", "/c", batch], scratch, 40000);
+    const { receipt, buildResult: build } =
+      buildCompiledFixture(scratch, "inherit-only-fixture.exe", batch);
     assert.equal(build.status, 0, `native SDK harness build failed: ${build.stdout}\n${build.stderr}`);
-    const result = run(exe, [], scratch);
+    const result = runCompiledFixture(receipt, []);
     assert.equal(result.status, 0, `native SDK fixture failed: ${result.stdout}\n${result.stderr}`);
     const acl = JSON.parse(result.stdout.trim());
     assert.equal(acl.normal, true, "effective owner ACE remains accepted");
