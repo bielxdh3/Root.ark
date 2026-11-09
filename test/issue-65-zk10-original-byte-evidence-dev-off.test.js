@@ -154,6 +154,25 @@ test("owner and floor cannot share Ed25519 key material, even via copied or shad
   }
 });
 
+test("native owner and floor SPKI must match pins despite caller-shadowed export methods", () => {
+  for (const role of ["owner", "floor"]) {
+    const f = fixture();
+    const originalOptions = f.options();
+    const actual = role === "owner" ? f.owner.publicKey : f.custodian.publicKey;
+    const foreignDer = f.foreign.publicKey.export({ type: "spki", format: "der" });
+    assert.equal(crypto.KeyObject.prototype.equals.call(actual, f.foreign.publicKey), false);
+    Object.defineProperty(actual, "export", { configurable: true, value: () => foreignDer });
+    const changedPin = role === "owner" ? "pinnedOwnerSpkiSha256" : "pinnedFloorSpkiSha256";
+    assert.throws(() => createDevOffOriginalByteEvidenceGate({
+      ...originalOptions, [changedPin]: hash(foreignDer),
+    }), bad, `${role} must not claim a different pinned public key`);
+    // A shadowed throwing accessor must not replace the native DER source either.
+    Object.defineProperty(actual, "export", { value: () => { throw Error("shadow method"); } });
+    assert.doesNotThrow(() => createDevOffOriginalByteEvidenceGate(originalOptions),
+      `${role} native identity remains valid independently of shadow methods`);
+  }
+});
+
 test("floor signer, nonce, account, immutable head, expiry and revocation fail before body", () => {
   const cases = [
     (f) => ({ revoked: true }),

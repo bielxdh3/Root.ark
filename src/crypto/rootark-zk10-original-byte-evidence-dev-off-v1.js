@@ -41,6 +41,15 @@ const VERIFY = crypto.verify.bind(crypto);
 const HASH = crypto.createHash.bind(crypto);
 const RANDOM = crypto.randomBytes.bind(crypto);
 const KEY_EQUALS = crypto.KeyObject.prototype.equals;
+// Capture the native PublicKeyObject export method from a locally created
+// disposable Ed25519 public key, never from a caller-controlled KeyObject.
+// The 32 zero bytes here are only a fixed prototype-discovery fixture; they
+// are not a trusted identity, signer, custodian, or accepted pin.
+const KEY_EXPORT = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(
+  crypto.createPublicKey({
+    key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+    format: "der", type: "spki",
+  })), "export").value;
 const VIEW_INTRINSICS = Object.getPrototypeOf(Uint8Array.prototype);
 const VIEW_BUFFER = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "buffer").get;
 const VIEW_OFFSET = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "byteOffset").get;
@@ -82,7 +91,7 @@ function publicKey(value, pinnedSpki) {
   if (!(value instanceof crypto.KeyObject) || value.type !== "public"
     || value.asymmetricKeyType !== "ed25519") deny();
   const spkiDigest = HASH("sha256")
-    .update(value.export({ type: "spki", format: "der" })).digest("hex");
+    .update(KEY_EXPORT.call(value, { type: "spki", format: "der" })).digest("hex");
   if (spkiDigest !== hex(pinnedSpki)) deny();
   return value;
 }

@@ -73,3 +73,32 @@ test here proves an independently operated custodian, real owner consent,
 the complete corpus or R1 recovery. Independent SOURCE review of the exact
 frozen SHA is required before any integration or publication, and this
 experiment may not be used as production proof.
+
+## 2026-11-09 — native SPKI identity correction (local follow-on)
+
+Independent W42 SOURCE review found **P2** in W55's original candidate
+`f3e1352064a0fcff893328b6ced4b6018a44de4c`: a valid Ed25519
+`KeyObject` for owner A could override its instance `.export()` to return
+SPKI bytes for unrelated key B. Configuration pinned to B then passed the
+digest check while actual signatures were verified by A. The same flaw
+affected the floor-signer pin. Native `KeyObject.equals` only compared owner
+and floor against each other; it did not bind either to its independently
+specified pinned identity. Therefore W55's 9/9 tests did **not** prove
+trust-pin integrity, and its SHA is **SOURCE NO-GO**.
+
+The follow-on corrects the SPKI extraction to call a captured native
+`PublicKeyObject.prototype.export` function on the actual KeyObject, not a
+caller-shadowable instance method. Its prototype is obtained from a local
+fixed disposable Ed25519 public key that is never an accepted identity.
+New adversarial owner/floor negatives were **RED** on the parent (owner
+accepts unrelated pin), then **GREEN** after the correction. On the isolated
+follow-on worktree, focused verifier tests are 10/10 PASS on Windows
+Node 22.23.3/NTFS, Windows Node 24.14.1, and WSL Ubuntu Node 22.22.1 on
+real ext4 (`/dev/sdd`); syntax and `git diff --check` also pass.
+
+**Scope remains unchanged:** no live route imports the experiment; it
+returns `authorizesIo:false` and `independentCustodyProven:false`. There is
+no off-host floor, historical corpus proof, operating custodian or R1
+authorization. The corrected exact commit still needs a **different**
+independent SOURCE P0/P1/P2 reviewer and an explicit publication decision;
+this local validation cannot itself issue release GO.
