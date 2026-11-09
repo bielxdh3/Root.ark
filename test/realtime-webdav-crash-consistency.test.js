@@ -86,6 +86,7 @@ function childSource(localCrash = false) {
     require.cache[cloudPath]={id:cloudPath,filename:cloudPath,loaded:true,exports:{createCloudStorage:()=>fake}};
     ${localCrash ? `const originalRename=fs.renameSync; fs.renameSync=(from,to)=>{const result=originalRename(from,to); if(process.env.LOCAL_CRASH_TO&&String(from).includes(".rootark-move-")&&String(from).endsWith(".source")&&path.resolve(to)===path.resolve(process.env.LOCAL_CRASH_TO)) process.kill(process.pid,"SIGKILL"); return result;};` : ""}
     if(process.env.CLAIM_SWAP_LOCK_PATH){const lockPath=path.resolve(process.env.CLAIM_SWAP_LOCK_PATH);const evidencePath=path.resolve(process.env.CLAIM_SWAP_EVIDENCE_PATH);const originalRename=fs.renameSync;const originalOpenSync=fs.openSync;const originalReadSync=fs.readSync;let evidenceFd=null;let swapped=false;let completionQueued=false;fs.renameSync=(from,to)=>{if(!swapped&&path.resolve(String(from))===lockPath&&path.resolve(String(to))===evidencePath){swapped=true;fs.writeFileSync(lockPath,process.env.CLAIM_SWAP_CONTENTS);const result=originalRename(from,to);fs.writeFileSync(process.env.CLAIM_SWAP_OBSERVED,"swapped");return result;}return originalRename(from,to);};fs.openSync=(file,...args)=>{const fd=originalOpenSync(file,...args);if(path.resolve(String(file))===evidencePath)evidenceFd=fd;return fd;};fs.readSync=(fd,...args)=>{const result=originalReadSync(fd,...args);if(swapped&&!completionQueued&&fd===evidenceFd&&result>0){completionQueued=true;setImmediate(()=>fs.writeFileSync(process.env.CLAIM_SWAP_COMPLETED,"verified"));}return result;};}
+    if(process.env.CHILD_EXIT_BEFORE_SERVER_REQUIRE==="true") process.exit(77);
     require(${JSON.stringify(SERVER)});
     if(process.env.CLAIM_PAUSE_POST_START) setImmediate(installPause); else if(installPause) installPause();
   `;
@@ -111,9 +112,8 @@ function serverEnv(dir, port, extra = {}) {
   };
 }
 
-function startServer(dir, extra = {}, localCrash = false, { beforeSpawn = null, onSpawn = null } = {}) {
-  return freePort().then(async (port) => {
-    if (beforeSpawn) await beforeSpawn(port);
+function startServer(dir, extra = {}, localCrash = false, { onSpawn = null, occupiedPort = null } = {}) {
+  return (occupiedPort === null ? freePort() : Promise.resolve(occupiedPort)).then(async (port) => {
     const child = spawn(process.execPath, ["-e", childSource(localCrash)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     if (onSpawn) onSpawn(child);
     let stderr = "";
@@ -166,16 +166,27 @@ test("foreign HTTP listener cannot impersonate a freshly spawned WebDAV server",
   let foreign;
   let spawned;
   try {
-    await assert.rejects(startServer(f.dir, {}, false, {
-      beforeSpawn: async (port) => {
-        // `freePort()` deliberately releases its reservation. Occupy the
-        // resulting port with an unrelated listener that answers readiness.
-        // The actual server child must fail to bind this stolen port.
-        foreign = http.createServer((_req, res) => res.writeHead(200).end("foreign"));
-        await new Promise((resolve) => foreign.listen(port, "127.0.0.1", resolve));
-      },
+    // Retain the actual foreign listener's bound port. No freePort close/rebind
+    // gap or assumption about IPv4/IPv6 port exclusivity is involved.
+    foreign = http.createServer((_req, res) => res.writeHead(200).end("foreign"));
+    await new Promise((resolve, reject) => {
+      foreign.once("error", reject);
+      foreign.listen(0, "127.0.0.1", resolve);
+    });
+    const port = foreign.address().port;
+    const foreignResponse = await request(port, "/login.html");
+    assert.equal(foreignResponse.status, 200);
+    assert.equal(foreignResponse.body, "foreign");
+
+    // A genuine spawned child exits before requiring the server. A HTTP-only
+    // readiness check would accept the foreign 200, but child-owned stdout
+    // can never confirm that this process started the WebDAV listener.
+    await assert.rejects(startServer(f.dir, { CHILD_EXIT_BEFORE_SERVER_REQUIRE: "true" }, false, {
+      occupiedPort: port,
       onSpawn: (child) => { spawned = child; },
-    }), /server exited before readiness|server did not start/);
+    }), /server exited before readiness: 77;/);
+    assert.ok(spawned, "the negative case must spawn a real child process");
+    assert.equal(spawned.exitCode, 77, "the child must exit before loading the application");
   } finally {
     if (spawned) await stop(spawned);
     if (foreign) await new Promise((resolve) => foreign.close(resolve));
