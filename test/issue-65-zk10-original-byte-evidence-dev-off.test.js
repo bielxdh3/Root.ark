@@ -173,6 +173,50 @@ test("native owner and floor SPKI must match pins despite caller-shadowed export
   }
 });
 
+test("RSA-512 signatures cannot impersonate Ed25519 owner or floor using shadowed key type", () => {
+  for (const role of ["owner", "floor"]) {
+    const f = fixture();
+    const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 512 });
+    assert.equal(crypto.sign(null, Buffer.from("rsa-probe"), rsa.privateKey).length, 64,
+      "RSA-512 signatures collide with the Ed25519 signature byte length");
+    const opts = f.options();
+    const pin = spki(rsa.publicKey);
+    Object.defineProperty(rsa.publicKey, "asymmetricKeyType", { value: "ed25519" });
+    const override = role === "owner"
+      ? { pinnedOwnerPublicKey: rsa.publicKey, pinnedOwnerSpkiSha256: pin }
+      : { pinnedFloorPublicKey: rsa.publicKey, pinnedFloorSpkiSha256: pin };
+    const readSignedCurrentFloor = (challenge) => sign({
+      type: "rootark-zk10-original-byte-floor-readback/v1",
+      immutable_account_id: f.expected.immutable_account_id,
+      owner_spki_sha256: role === "owner" ? pin : spki(f.owner.publicKey),
+      sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+      nonce: challenge, revoked: false, issued_at_ms: Date.now() - 50,
+      expires_at_ms: Date.now() + 5000,
+    }, FLOOR_FIELDS, FLOOR_DOMAIN, role === "floor" ? rsa.privateKey : f.custodian.privateKey);
+    assert.throws(() => {
+      const gate = createDevOffOriginalByteEvidenceGate({ ...opts, ...override,
+        readSignedCurrentFloor });
+      const evidence = role === "owner" ? f.intent({}, rsa.privateKey) : f.intent();
+      const ticket = gate.beginBeforeBody({ ownerEvidence: evidence, expected: f.expected });
+      gate.verifyOriginalBytes({ ticket, chunks: [f.original] });
+    }, bad, `${role} algorithm identity must be native Ed25519, not RSA-512`);
+  }
+});
+
+test("genuine Ed25519 key identity is read natively despite shadowed type metadata", () => {
+  const f = fixture();
+  const opts = f.options();
+  Object.defineProperties(f.owner.publicKey, {
+    type: { value: "private" },
+    asymmetricKeyType: { value: "rsa" },
+  });
+  Object.defineProperties(f.custodian.publicKey, {
+    type: { value: "private" },
+    asymmetricKeyType: { value: "rsa" },
+  });
+  assert.doesNotThrow(() => createDevOffOriginalByteEvidenceGate(opts));
+});
+
 test("floor signer, nonce, account, immutable head, expiry and revocation fail before body", () => {
   const cases = [
     (f) => ({ revoked: true }),

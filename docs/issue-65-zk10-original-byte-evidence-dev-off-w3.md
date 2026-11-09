@@ -102,3 +102,26 @@ no off-host floor, historical corpus proof, operating custodian or R1
 authorization. The corrected exact commit still needs a **different**
 independent SOURCE P0/P1/P2 reviewer and an explicit publication decision;
 this local validation cannot itself issue release GO.
+
+## 2026-11-09 — second independent P2: signer algorithm confusion
+
+Peer W42 also found that the prior local fix `4e46859bba6c955c2a64638cfa1ffc3a0bfae332`
+still consulted caller-shadowable `KeyObject.asymmetricKeyType`. A genuine
+RSA-512 public key could falsely claim `ed25519`, while its RSA signature
+occupied exactly 64 bytes and verified under Node's polymorphic
+`crypto.verify(null, ...)`. Both owner and floor roles were affected. This
+is a concrete algorithm-confusion **SOURCE NO-GO P2**, not a theoretical
+warning, although no production I/O was authorized.
+
+The subsequent isolated fix captures native `KeyObject.prototype.type` and
+`AsymmetricKeyObject.prototype.asymmetricKeyType` getters from trusted Node
+prototypes and invokes them on the real key object. The already captured
+native `PublicKeyObject.prototype.export` continues to bind actual DER
+to the caller's pinned hash. New RSA-512 owner/floor 64-byte signature
+tests failed on the previous code and passed with the corrected getters;
+genuine Ed25519 keys also pass despite malicious instance metadata shadows.
+Focused verifier tests: **12/12 PASS** on Windows NTFS Node 22.23.3 and
+Node 24.14.1, and **12/12 PASS** on WSL Ubuntu Node 22.22.1 real ext4
+(`/dev/sdd`). This is still a DEV-OFF test-only module with no provider,
+R1 or production authorization. A fresh peer must review the new exact
+commit before any fast-forward of PR #302.

@@ -45,11 +45,14 @@ const KEY_EQUALS = crypto.KeyObject.prototype.equals;
 // disposable Ed25519 public key, never from a caller-controlled KeyObject.
 // The 32 zero bytes here are only a fixed prototype-discovery fixture; they
 // are not a trusted identity, signer, custodian, or accepted pin.
-const KEY_EXPORT = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(
-  crypto.createPublicKey({
+const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
     key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
     format: "der", type: "spki",
-  })), "export").value;
+  }));
+const KEY_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
+const KEY_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
+const KEY_ASYMMETRIC_TYPE = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
 const VIEW_INTRINSICS = Object.getPrototypeOf(Uint8Array.prototype);
 const VIEW_BUFFER = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "buffer").get;
 const VIEW_OFFSET = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "byteOffset").get;
@@ -88,8 +91,8 @@ function integer(value, min, max = Number.MAX_SAFE_INTEGER) {
   return value;
 }
 function publicKey(value, pinnedSpki) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== "public"
-    || value.asymmetricKeyType !== "ed25519") deny();
+  if (!(value instanceof crypto.KeyObject) || KEY_TYPE.call(value) !== "public"
+    || KEY_ASYMMETRIC_TYPE.call(value) !== "ed25519") deny();
   const spkiDigest = HASH("sha256")
     .update(KEY_EXPORT.call(value, { type: "spki", format: "der" })).digest("hex");
   if (spkiDigest !== hex(pinnedSpki)) deny();
