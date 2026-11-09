@@ -1292,7 +1292,12 @@ class SyncEngine {
           || name.toLowerCase().startsWith(EVICTION_LEDGER_ARCHIVE))) {
           fail("An ambiguous or archived eviction ledger remains", "invalid_snapshot");
         }
-        const scanned = await this.scanFiles();
+        // The regular sync scanner obeys the *current* mutable selection and
+        // exclusion policy. A restart with the same excluded path as before
+        // the crash would hide its intact tracked bytes and strand required
+        // genesis forever. Recovery must inspect physical entries regardless
+        // of that policy, without silently ignoring unknown names or links.
+        const scanned = await this.scanPhysicalCacheForEvictionRecovery();
         const trackedKeys = new Set();
         const physicalCache = new Map();
         const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
@@ -2655,6 +2660,93 @@ class SyncEngine {
     await this.persistSnapshot();
     if (summary) summary.applied = (summary.applied || 0) + 1;
     return verifiedFreshDigest;
+  }
+
+  // Only for a required-v2, zero-PREPARE genesis under the exclusive root
+  // mutation lock. Unlike scanFiles(), this walks every physical cache path
+  // without isSelected()/needsTraversal() and rejects untracked entries.
+  // The extra conservative checks never grant a server-side DELETE.
+  async scanPhysicalCacheForEvictionRecovery() {
+    const root = this.rootDir;
+    const expected = new Set();
+    const parents = new Set();
+    for (const [relative, item] of Object.entries(this.snapshot.files)) {
+      if (!item || item.deleted) continue;
+      protocol.safeRelativePath(relative, "path");
+      expected.add(relative);
+      let ancestor = path.posix.dirname(relative);
+      while (ancestor !== ".") {
+        parents.add(ancestor);
+        ancestor = path.posix.dirname(ancestor);
+      }
+    }
+    const scanned = Object.create(null);
+    const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+    let visited = 0;
+    const walk = async (directory, prefix = "") => {
+      const before = await fsp.lstat(directory, { bigint: true });
+      if (!before.isDirectory() || before.isSymbolicLink() || before.ino === 0n) {
+        fail("Unsafe physical cache directory during eviction recovery", "invalid_snapshot");
+      }
+      const names = new Set();
+      let directoryCount = 0;
+      for await (const entry of await fsp.opendir(directory)) {
+        if (++directoryCount > 16384) {
+          fail("Physical recovery directory capacity exceeded", "invalid_snapshot");
+        }
+        if (++visited > EVICTION_LEDGER_MAX * 2) {
+          fail("Physical recovery traversal capacity exceeded", "invalid_snapshot");
+        }
+        const folded = entry.name.toLowerCase();
+        if (names.has(folded)) fail("Ambiguous physical casefold alias in cache", "invalid_snapshot");
+        names.add(folded);
+        if (!prefix) {
+          const internalName = [...INTERNAL_NAMES].find((name) => name.toLowerCase() === folded);
+          if (internalName) {
+            if (entry.name !== internalName) fail("Ambiguous internal cache entry", "invalid_snapshot");
+            continue;
+          }
+          if (INTERNAL_NAME_PREFIXES.some((name) => folded.startsWith(name))) {
+            if (!INTERNAL_NAME_PREFIXES.some((name) => entry.name.startsWith(name))) {
+              fail("Ambiguous internal cache prefix", "invalid_snapshot");
+            }
+            continue;
+          }
+        }
+        const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+        protocol.safeRelativePath(relative, "path");
+        if (!expected.has(relative) && !parents.has(relative)) {
+          fail("Untracked physical path during eviction recovery", "invalid_snapshot");
+        }
+        const target = path.join(directory, entry.name);
+        await containedAbsolute(root, target, false);
+        const stats = await fsp.lstat(target, { bigint: true });
+        if (stats.isSymbolicLink() || stats.ino === 0n) {
+          fail("Unsafe cache link during eviction recovery", "invalid_snapshot");
+        }
+        if (stats.isDirectory()) {
+          await walk(target, relative);
+          if (expected.has(relative)) {
+            scanned[relative] = { directory: true, hash: emptyHash };
+          }
+        } else if (stats.isFile()) {
+          if (!expected.has(relative)) {
+            fail("Untracked physical file during eviction recovery", "invalid_snapshot");
+          }
+          const bytes = await readContainedFile(root, relative, stats);
+          scanned[relative] = { directory: false,
+            hash: crypto.createHash("sha256").update(bytes).digest("hex") };
+        } else {
+          fail("Unsupported physical cache entry during eviction recovery", "invalid_snapshot");
+        }
+      }
+      const after = await fsp.lstat(directory, { bigint: true });
+      if (!sameFileVersion(before, after)) {
+        fail("Physical cache directory changed during recovery", "invalid_snapshot");
+      }
+    };
+    await walk(root);
+    return scanned;
   }
 
   async scanFiles() {

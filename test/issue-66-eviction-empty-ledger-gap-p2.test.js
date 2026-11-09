@@ -25,10 +25,10 @@ async function fixture(t, name, twoFiles = false) {
     },
     async list(objectId = "") { return store.list("alice", objectId || null); },
   };
-  const create = async (root, excludedPaths = []) => new SyncEngine({
+  const create = async (root, excludedPaths = [], extra = {}) => new SyncEngine({
     rootDir: root, adapter, deviceId: root.endsWith("source") ? "device-a" : "device-b",
     keyEpoch: "epoch-1", compartmentId: "private", excludedPaths,
-    fileKeyResolver: () => key,
+    fileKeyResolver: () => key, ...extra,
   }).open();
   const root = path.join(dir, "device");
   const source = path.join(dir, "source");
@@ -173,6 +173,83 @@ test("issue 66 P2: real process crash after durable genesis and required-v2 fsyn
   await restarted.syncOnce();
   verifyNoSignedDelete(f, before);
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
+test("issue 66 P2: post-crash recovery verifies excluded physical bytes with unchanged exclusion policy", async (t) => {
+  const f = await fixture(t, "same-exclusions");
+  await prePrepareCrash(f);
+  const before = f.outbound.length;
+  const restored = await f.create(f.root, ["private"]);
+  assert.equal(restored.snapshot.evictionLedgerRequired, false);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  await restored.syncOnce();
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66 P2: recovery physical proof ignores selectedPaths restrictions and excludes", async (t) => {
+  const f = await fixture(t, "restricted-scope", true);
+  await prePrepareCrash(f);
+  const before = f.outbound.length;
+  const restored = await f.create(f.root, ["private"], { selectedPaths: ["unrelated"] });
+  assert.equal(restored.snapshot.evictionLedgerRequired, false);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  assert.equal(await fsp.readFile(path.join(f.root, "PRIVATE", "second.txt"), "utf8"),
+    "second authenticated server file");
+  await restored.syncOnce();
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66 P2: same exclusions cannot conceal missing, altered or casefold-aliased tracked bytes", async (t) => {
+  for (const mutation of ["missing", "dirty", "casefold"]) {
+    if (mutation === "casefold" && process.platform === "win32") continue;
+    const f = await fixture(t, `policy-negative-${mutation}`);
+    await prePrepareCrash(f);
+    if (mutation === "missing") await fsp.unlink(f.local);
+    if (mutation === "dirty") await fsp.writeFile(f.local, "new unsigned content");
+    if (mutation === "casefold") {
+      await fsp.rename(f.local, path.join(f.root, "PRIVATE", "SECRET.txt"));
+    }
+    const before = f.outbound.length;
+    await assert.rejects(f.create(f.root, ["private"], { selectedPaths: ["other"] }),
+      { code: "invalid_snapshot" });
+    verifyNoSignedDelete(f, before);
+    assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  }
+});
+
+test("issue 66 P2: untracked content within an excluded directory cannot pass recovery proof", async (t) => {
+  const f = await fixture(t, "untracked-inside-excluded");
+  await prePrepareCrash(f);
+  await fsp.writeFile(path.join(f.root, "PRIVATE", "unexpected.txt"), "untracked excluded content");
+  const before = f.outbound.length;
+  await assert.rejects(f.create(f.root, ["private"], { selectedPaths: ["other"] }),
+    { code: "invalid_snapshot" });
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66 P2 POSIX: excluded symlink and duplicate casefold names cannot attest clean recovery", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX symlink and duplicate-case physical paths");
+  for (const mutation of ["tracked-symlink", "untracked-symlink", "duplicate-case"]) {
+    const f = await fixture(t, `unsafe-physical-${mutation}`);
+    await prePrepareCrash(f);
+    if (mutation === "tracked-symlink") {
+      const outside = path.join(f.dir, "outside.txt");
+      await fsp.writeFile(outside, "authenticated server file");
+      await fsp.unlink(f.local);
+      await fsp.symlink(outside, f.local);
+    }
+    if (mutation === "untracked-symlink") {
+      await fsp.symlink(f.local, path.join(f.root, "PRIVATE", "untracked-link.txt"));
+    }
+    if (mutation === "duplicate-case") {
+      await fsp.writeFile(path.join(f.root, "PRIVATE", "SECRET.txt"), "authenticated server file");
+    }
+    const before = f.outbound.length;
+    await assert.rejects(f.create(f.root, ["private"], { selectedPaths: ["unrelated"] }),
+      { code: "invalid_snapshot" });
+    verifyNoSignedDelete(f, before);
+    assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  }
 });
 
 test("issue 66 P2: crash after fsynced genesis but before v2 checkpoint leaves usable v1", async (t) => {
