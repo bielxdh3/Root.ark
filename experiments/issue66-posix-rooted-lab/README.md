@@ -1,8 +1,9 @@
 # Issue #66 — W3 POSIX root-relative I/O laboratory (test-only)
 
 **Status: source/prototype GO within this disposable Linux ext4 experiment;
-system/release NO-GO.** This is an independent milestone branched from
-`c01014735a438bf27bf5e2a346af7930993b5f97`. It makes no changes to
+system/release NO-GO.** This P2 hardening child starts at
+`37b395bd08d2aab384d11ae97ba0b75f4002e86b` (original lab based on
+`c01014735a438bf27bf5e2a346af7930993b5f97`). It makes no changes to
 production Root.ark / CFAPI / SyncEngine / RootSession / Root/main.
 
 ## Physical execution
@@ -22,9 +23,17 @@ filesystem. Fixtures stay in HOME for inspection: **no recursive teardown** and
 no arbitrary filesystem cleanup. Re-running the bulk test creates another
 16,385 disposable entries, so run it only when necessary.
 
-The harness compiles the checked-in **C source** with gcc `-Werror`; its
-executable is placed in a randomized **/tmp** build directory, never inside the
-repository, and is not tracked in Git. There are no changes to application
+The harness compiles the checked-in **C source** with `/usr/bin/gcc`
+(`-Werror`, absolute compiler path). It selects a randomized, `0700`
+`$HOME/.rootark-w3-posix-build-*` directory on ext4 outside the checkout as
+both the compiler's and native runner's explicit `cwd`. The compiler receives
+only `PATH=/usr/bin:/bin`, `LANG=C`, `LC_ALL=C`, and `TMPDIR=<build>`; the
+native executable receives only `HOME`, `LANG`, `LC_ALL` and its opt-in
+flag. The binary is stored in this private build directory and is **not tracked
+in Git**. These restrictions mitigate accidental inherited PATH and compiler
+environment poisoning, but are not executable-image trust attestation.
+The binary and disposable fixtures remain for inspection; there is no
+recursive or pathname-based cleanup. There are no changes to application
 packages or runtime entry points. Normal native outputs are single fixed
 categorical lines, with no source paths, inode IDs, content, credentials or ACLs.
 
@@ -48,10 +57,11 @@ categorical lines, with no source paths, inode IDs, content, credentials or ACLs
    pinned A descriptor reads the original bytes throughout, and B retains its
    independent content. Negative `openat2` checks reject symlink traversal
    (`ELOOP`) and parent escape (`EXDEV`).
-4. Only a newly created, fixed-name `disposable.delete` file is deleted with
-   `unlinkat` relative to pinned A; `fsync` runs for marker files and
-   the affected directory FDs. There is **no recursive deletion**, and neither
-   the original nor replacement fixture trees are removed.
+4. No deletion syscall is exercised. In particular, the earlier
+   close-then-`unlinkat` demonstration was removed because a same-UID
+   adversary could replace the fixed-name entry after close. `fsync` runs
+   for marker files and the affected directory FDs. **All original and
+   replacement fixture entries are retained**, with no automatic cleanup.
 5. A separate 16,385-entry case creates Unicode-suffixed entries with
    `openat2(O_CREAT|O_EXCL)`, enumerates them in streaming fashion through
    `fdopendir` on that same directory fd, rejects unexpected names and counts,
@@ -60,13 +70,16 @@ categorical lines, with no source paths, inode IDs, content, credentials or ACLs
 ## Verification (local, 2026-11-09)
 
 Platform: WSL Ubuntu, Linux 6.18.33.1, **ext4 HOME**, Node **v22.22.1**,
-gcc **15.2.0**. Before the C source existed, the Node tests reported
-**0 PASS / 3 FAIL / 1 SKIP** (intentional TDD RED: gcc build unavailable).
-After compiling the C source, the same opt-in tests reported:
+gcc **15.2.0**. The original lab's pre-implementation TDD RED was
+**0 PASS / 3 FAIL / 1 SKIP** (gcc build unavailable); baseline GREEN was
+3 PASS / 0 FAIL / 1 SKIP. In this P2 child, targeted regressions first
+reproduced inherited compiler state, the `/tmp` build placement, and the
+unsafe `unlinkat` claim (RED). After correcting them, the physical tests
+reported:
 
 ```text
-3 PASS / 0 FAIL / 1 SKIP
-ROOTARK_POSIX_V1 stage=CORE fs=EXT4 parent=INDEPENDENT_FD openat2=STRICT aba=PASS noReplace=PASS marker=PASS unicode=PASS unlink=PASS fsync=PASS
+5 PASS / 0 FAIL / 1 SKIP
+ROOTARK_POSIX_V1 stage=CORE fs=EXT4 parent=INDEPENDENT_FD openat2=STRICT aba=PASS noReplace=PASS marker=PASS unicode=PASS fsync=PASS
 ROOTARK_POSIX_V1 stage=BULK fs=EXT4 entries=16385 enumeration=SAME_FD unicode=PASS fsync=PASS
 ```
 
@@ -86,6 +99,14 @@ not a concurrent malicious-process test or an atomic multi-step transaction.
 
 `RENAME_NOREPLACE` protects one destination from overwrite, not the entire
 namespace against ABA, ancestor replacement, or competing writers.
+The `/usr/bin/gcc` path is a fixed selection, not proof that a trusted
+compiler image actually executed. The compiler, toolchain subprocesses,
+checked-in source file, build-directory pathname, output executable and its
+later path-based launch remain subject to image substitution / same-UID
+TOCTOU. A `0700` private directory and minimal build environment reduce
+exposure but provide no separately attested custody; a hostile same-UID
+process may still mutate user-owned entries. A production launcher would
+need separately proven executable/image authority before admission.
 The lab does not cover independent custody, cold reacquisition after process
 exit, cross-mount/bind-mount adversaries, mount-namespace manipulation,
 system crash/power-cut durability, directory-journal checkpoints, full 16,385

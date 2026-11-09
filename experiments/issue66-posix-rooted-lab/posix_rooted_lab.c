@@ -218,16 +218,11 @@ static void run_core(int scratchfd) {
   require(errno == 0 && count == 3 && foundOwned == 1 &&
           foundUnicode == 1 && foundLink == 1);
 
-  // The only deletion is this just-created, fixed-name disposable file.
-  write_file(pinned, "disposable.delete", "OWNED", 1);
-  require(unlinkat(pinned, "disposable.delete", 0) == 0);
-  struct open_how how = {.flags = O_RDONLY | O_CLOEXEC, .resolve = STRICT_RESOLVE};
-  errno = 0;
-  require(syscall(SYS_openat2, pinned, "disposable.delete", &how, sizeof(how)) == -1 &&
-          errno == ENOENT);
+  // Retain both fixture trees. A same-UID attacker can substitute a filename
+  // between close and deletion, so this lab never deletes directory entries.
   require(fsync(pinned) == 0 && fsync(scratchfd) == 0);
   require(close(restored) == 0 && close(foreign) == 0 && closedir(held) == 0);
-  puts("ROOTARK_POSIX_V1 stage=CORE fs=EXT4 parent=INDEPENDENT_FD openat2=STRICT aba=PASS noReplace=PASS marker=PASS unicode=PASS unlink=PASS fsync=PASS");
+  puts("ROOTARK_POSIX_V1 stage=CORE fs=EXT4 parent=INDEPENDENT_FD openat2=STRICT aba=PASS noReplace=PASS marker=PASS unicode=PASS fsync=PASS");
 }
 
 static void run_bulk(int scratchfd) {
