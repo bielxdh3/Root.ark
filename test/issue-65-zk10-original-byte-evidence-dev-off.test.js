@@ -71,6 +71,12 @@ function fixture() {
     get floorCalls() { return floorCalls; } };
 }
 const bad = /ZK10_ORIGINAL_BYTE_EVIDENCE_UNVERIFIED/;
+// Public, disposable 512-bit RSA negative-test fixture. It is deliberately
+// BREAKABLE and must NEVER be provisioned, generated, or used for a real key.
+// A fixed DER fixture avoids generating insecure cryptographic keys at runtime.
+const REJECT_ONLY_RSA512_PKCS8 = Buffer.from(
+  "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA3JXVfnIi+iWowOBmrotFOWQVdE5lrj+1X+re2poRZETZT24VI6ynYpbQX7QCHuDwOyFtndb3cdOSKgZfW5ap2QIDAQABAkB9LLG4TYC3vwMiYLUkO3gO91KNa6eb2B9OzPOlzWQtJy7q9dUtwSCslf3eGD5f8q7Zry7NCMQtHspcW+Y9h/BhAiEA9WCo5KzfVMvsVDmrmlIE/5+LUIt1UTeAXQVa7bzFNBUCIQDmImtfHCg12D9/VAOqlVQ3yAbHz3ZcTI9RiXUILog7tQIhAO1EkSvFyZJKOXRb64YmZzTyhhjVMRTekR3hjsIxdZLdAiAMYpfSs4o6c5vfN19HI+g3ZE1xHWoqR3iDE9m3igGM7QIhAOHHx9o6lMS8QydfHqFnNuJaWWBXtPefsBGQ8AYi8Cwr",
+  "base64");
 
 test("signed opaque original bytes verify once but NEVER authorize upload, stage or R1", () => {
   const f = fixture(), gate = f.open();
@@ -176,7 +182,10 @@ test("native owner and floor SPKI must match pins despite caller-shadowed export
 test("RSA-512 signatures cannot impersonate Ed25519 owner or floor using shadowed key type", () => {
   for (const role of ["owner", "floor"]) {
     const f = fixture();
-    const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 512 });
+    const rsaPrivate = crypto.createPrivateKey({
+      key: REJECT_ONLY_RSA512_PKCS8, format: "der", type: "pkcs8",
+    });
+    const rsa = { privateKey: rsaPrivate, publicKey: crypto.createPublicKey(rsaPrivate) };
     assert.equal(crypto.sign(null, Buffer.from("rsa-probe"), rsa.privateKey).length, 64,
       "RSA-512 signatures collide with the Ed25519 signature byte length");
     const opts = f.options();
