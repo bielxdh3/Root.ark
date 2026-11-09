@@ -1192,7 +1192,12 @@ class SyncEngine {
     // checkpoint must be recovered BEFORE local reconciliation or outbound
     // sync. Replay never unlinks anything or authorizes a remote operation.
     this.evictionLedgerHead = null;
-    await this.replayEvictionLedger();
+    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired) {
+      denyLegacyNativeRootReplay();
+    }
+    // Run the module-captured implementation, never a caller-replaced
+    // instance or prototype hook which could silently disarm required-v2.
+    await replayEvictionLedgerBuiltIn.call(this);
     this.opened = true;
     return this;
   }
@@ -3766,5 +3771,10 @@ class SyncEngine {
     return summary;
   }
 }
+
+// Captured once while loading the trusted module. A caller or callback may
+// override an engine method, but cannot authorize an unverified native replay
+// by replacing this local binding. This is not OS-level writer custody.
+const replayEvictionLedgerBuiltIn = SyncEngine.prototype.replayEvictionLedger;
 
 module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };

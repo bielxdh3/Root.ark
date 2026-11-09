@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { SyncObjectStore } = require("../src/routes/sync");
 
 function adapter(calls) {
   return {
@@ -112,6 +113,93 @@ test("#66 an overridden engine method or prototype hook cannot waive native-requ
   await assert.rejects(engine.recoverUnstartedEvictionLedger(),
     { code: "root_session_native_unavailable" });
   assert.equal(invoked, 0, "userland override cannot influence a private native trust boundary");
+  assert.deepEqual(await fs.readFile(snapshotPath), exactBytes);
+  assert.equal(await fs.readFile(canary, "utf8"), "RETAIN_SIGNED_LOCAL_BYTES");
+  assert.deepEqual(calls, []);
+});
+
+test("#66 strict native recovery rejects a real nonempty PREPARE ledger even if a stale snapshot says not required", async () => {
+  // Real signed/local adapter fixtures, never a network request or a fake
+  // JSON PREPARE that accidentally fails parser validation before the gate.
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-native-ledger-"));
+  // Preserve disposable directory: recursive pathname teardown is unsafe
+  // under the same-UID ancestor replacement threat this PR investigates.
+  const store = await new SyncObjectStore(path.join(parent, "objects.json")).open();
+  const key = crypto.randomBytes(32);
+  const calls = [];
+  const adapter = {
+    async push(operation) {
+      calls.push({ kind: "push", operation: operation.operation, tombstone: operation.tombstone });
+      return { status: 201, record: (await store.put("alice", operation)).record };
+    },
+    async list(id = "") {
+      calls.push({ kind: "list" });
+      return store.list("alice", id || null);
+    },
+    async listInventory() { throw Error("NETWORK_NOT_AUTHORIZED"); },
+  };
+  const create = async (root, excludedPaths = [], filesOnDemand = false) =>
+    new SyncEngine({ rootDir: root, adapter,
+      deviceId: root.endsWith("source") ? "device-a" : "device-b",
+      keyEpoch: "epoch-1", compartmentId: "private", excludedPaths,
+      filesOnDemand, fileKeyResolver: () => key,
+    }).open();
+  const source = path.join(parent, "source");
+  const root = path.join(parent, "device");
+  await fs.mkdir(path.join(source, "PRIVATE"), { recursive: true });
+  await fs.writeFile(path.join(source, "PRIVATE", "café-中-😀.txt"), "SIGNED_LOCAL_BYTES");
+  await (await create(source)).syncOnce();
+  const imported = await create(root);
+  await imported.syncOnce();
+  imported.snapshot.excludedPaths = ["private"];
+  imported.snapshot.excludedPathsCasefoldVersion = 1;
+  await imported.persistSnapshot();
+  const staging = await create(root, ["private"]);
+  const originalStage = staging.stageExisting.bind(staging);
+  staging.stageExisting = async (target) => {
+    await originalStage(target);
+    throw Object.assign(new Error("INJECTED_AFTER_DURABLE_PREPARE"), { code: "EIO" });
+  };
+  await assert.rejects(staging.syncOnce(), { code: "eviction_restore_failed" });
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const ledgerDir = path.join(root, ".rootark-sync-evictions");
+  const ledger = await fs.readdir(ledgerDir);
+  assert.equal(ledger.filter((name) => name.endsWith(".prepare.json")).length, 1,
+    "regression must exercise a real, validated, nonempty PREPARE ledger");
+  const disk = JSON.parse(await fs.readFile(snapshotPath, "utf8"));
+  assert.equal(disk.evictionLedgerRequired, true);
+  disk.evictionLedgerRequired = false; // hostile/stale snapshot inconsistency
+  const patched = Buffer.from(JSON.stringify(disk));
+  await fs.writeFile(snapshotPath, patched);
+  const callsBefore = calls.length;
+  const strict = new SyncEngine({ rootDir: root, adapter,
+    filesOnDemand: true, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+  });
+  await assert.rejects(strict.open(), { code: "root_session_native_unavailable" });
+  assert.equal(calls.length, callsBefore, "no remote DELETE or LIST after refusing replay");
+  assert.deepEqual(await fs.readFile(snapshotPath), patched,
+    "a blocked strict replay must preserve the exact stale on-disk snapshot");
+  assert.deepEqual(await fs.readdir(ledgerDir), ledger,
+    "a blocked strict replay must not compact or mutate the physical PREPARE");
+  assert.equal(store.list("alice").filter((item) => item.tombstone).length, 0,
+    "server-side signed records must retain zero DELETE tombstones");
+});
+
+test("#66 replacing the entire replay method cannot evade a required-v2 native gate", async (t) => {
+  const { root, snapshotPath, exactBytes, canary } = await makeRoot(t, true);
+  const calls = [];
+  const engine = new SyncEngine({ rootDir: root, adapter: adapter(calls),
+    filesOnDemand: true, fileKeyResolver: () => Buffer.alloc(32),
+  });
+  let forgedReplayCalls = 0;
+  engine.replayEvictionLedger = async () => {
+    forgedReplayCalls++;
+    engine.snapshot.evictionLedgerRequired = false;
+    await engine.persistSnapshot();
+  };
+  await assert.rejects(engine.open(), { code: "root_session_native_unavailable" });
+  assert.equal(forgedReplayCalls, 0, "a caller may not redirect the built-in replay guard");
   assert.deepEqual(await fs.readFile(snapshotPath), exactBytes);
   assert.equal(await fs.readFile(canary, "utf8"), "RETAIN_SIGNED_LOCAL_BYTES");
   assert.deepEqual(calls, []);
