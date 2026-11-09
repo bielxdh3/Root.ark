@@ -46,23 +46,39 @@ test("#66 CFAPI harness never resolves cmd or PowerShell by PATH", () => {
 test("#66 native ACL tool launches use literal paths rather than a dynamic executable dispatcher", () => {
   const code = fs.readFileSync(path.join(__dirname,
     "issue-66-cfapi-acl-preflight-native.test.js"), "utf8");
-  // Check every spawnSync call site, not merely the presence of two expected
-  // strings: another launch through process.env, a new local variable or a
-  // lookup table must fail even if the two literal launches remain in place.
+  // Check every direct spawnSync reference, not only two expected strings.
+  // Unrecognized call syntax (optional chaining, .call, comments between the
+  // identifier and parenthesis) must fail conservatively, even if the two
+  // expected literal calls still exist elsewhere in this source file.
   const launchTargets = (sourceText) => [...sourceText.matchAll(/\bspawnSync\s*\(\s*([^,\r\n]+)\s*,/g)]
     .map((match) => match[1].trim());
   const expected = [
     String.raw`"C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe"`,
     String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`,
   ];
-  assert.deepEqual(launchTargets(code), expected,
-    "the only native ACL spawnSync targets must be two literal absolute Windows tool paths");
+  const assertOnlyFixedSpawns = (sourceText) => {
+    assert.deepEqual(launchTargets(sourceText), expected,
+      "the native ACL spawnSync calls must target two literal absolute Windows tool paths");
+    let remaining = sourceText.replace('const { spawnSync } = require("node:child_process");', "");
+    const permittedCallPrefixes = expected.map((target) => `spawnSync(${target},`);
+    for (const allowed of permittedCallPrefixes) {
+      assert.equal(remaining.split(allowed).length, 2,
+        "each permitted literal executable launch must occur exactly once");
+      remaining = remaining.replace(allowed, "ALLOWLISTED_NATIVE_TEST_LAUNCH");
+    }
+    assert.doesNotMatch(remaining, /\bspawnSync\b/,
+      "all additional spawnSync references, including alternate call syntax, are forbidden");
+  };
+  assertOnlyFixedSpawns(code);
   for (const injected of [
     "spawnSync(process.env.UNTRUSTED_EXE, []);",
     "spawnSync(dynamicExecutable, []);",
     "spawnSync(fixedTools[tool], []);",
+    "spawnSync /* comment */ (process.env.UNTRUSTED_EXE, []);",
+    "spawnSync?.(process.env.UNTRUSTED_EXE, []);",
+    "spawnSync.call(null, process.env.UNTRUSTED_EXE, []);",
   ]) {
-    assert.notDeepEqual(launchTargets(`${code}\n${injected}`), expected,
-      "an added dynamic executable launch must invalidate the static guard");
+    assert.throws(() => assertOnlyFixedSpawns(`${code}\n${injected}`),
+      "every additional launch form must invalidate the static guard");
   }
 });
