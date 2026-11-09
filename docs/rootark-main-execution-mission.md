@@ -533,3 +533,39 @@ flowchart TD
 ~~~
 
 **Regra mantida:** preservar históricos e worktrees; commits locais de documentação exigem novo peer antes de eventual push normal fast-forward. **Não executar push, merge, deploy, cutover, force push nem editar `Root/main`, `README.md`, `docs/plan-tree.md` ou #228.**
+
+## 2026-11-09 04:20 UTC — pós-407497, publicação Draft e gates ainda abertos
+
+**Corte adicional, não retroativo** ao checkpoint de 03:34 UTC. Consultas literais `git ls-remote`, `gh pr view/checks` e `gh api` ao GitHub em **09/11/2026, ~04:20 UTC**, por HEAD exato. O [ledger da mesma coleta](validation/2026-11-07-rootark-wave-execution-status.md#corte-pós-407497--2026-11-09-0420-utc) registra checks e limites de prova. `Root/main` permanece `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`; [#228](https://github.com/bielxdh3/Root.ark/pull/228) **CLOSED/unmerged**.
+
+| PR | HEAD publicado e estado | Checks do SHA na consulta (SUCCESS / FAILURE / SKIPPED / em andamento) |
+| --- | --- | --- |
+| [#251](https://github.com/bielxdh3/Root.ark/pull/251) | **OPEN/Draft** `d75e0cbf7081da061b507697616c87056be29ba3` | **4 / 0 / 1 / 2**. [Security Regression 42558781088](https://github.com/bielxdh3/Root.ark/actions/runs/42558781088) **IN_PROGRESS**: Ubuntu Node22 full **SUCCESS**; Windows canonical e mandatory **IN_PROGRESS**; Analyze JS, CodeQL e Dependency Review **SUCCESS**. |
+| [#293](https://github.com/bielxdh3/Root.ark/pull/293) | **OPEN/Draft** `f9b604047c0634dccedcd99c8ae00f7f3fff075c` | **4 / 0 / 1 / 0** na rollup observada; revisões SOURCE GO reportadas, sem autoridade externa. |
+| [#298](https://github.com/bielxdh3/Root.ark/pull/298) | **OPEN/Draft** `fa18f4f12ec2f5e6e34ad8216c8170d406898962` | **8 / 1 / 1 / 0**. **CodeQL formal FAILURE** com duas anotações HIGH reais; gates verdes não anulam o bloqueio. |
+| [#300](https://github.com/bielxdh3/Root.ark/pull/300) | **OPEN/Draft** `407497b75e1a0316242371f3f33641f042b69d79` | **7 / 0 / 1 / 0** nos checks focados; CodeQL, Dependency Review, PG18 e Provider/Android **SUCCESS**. **Nenhum Security Regression completo desse SHA apareceu na consulta**, portanto não afirmar hosted full GO. |
+| [#302](https://github.com/bielxdh3/Root.ark/pull/302) | **OPEN/Draft** `ce3d7ec4675a32455d844b60166ca32f627d3aca` | **4 / 0 / 1 / 0** na rollup de PR observada; SOURCE GO e checks adicionais anteriores não provam R1 off-host. |
+| [#306](https://github.com/bielxdh3/Root.ark/pull/306) | **OPEN/Ready** `b13b29f9662d5f9036431e53235b9cdc132f0944` | **8 / 0 / 1 / 0**, **não merged**. |
+
+**#300 / #66 — publicação recente com limites explícitos:** quatro commits posteriores a `5c56b93a` estão agora publicados no Draft #300, terminando em `407497b7`. A coordenação registra **duas revisões independentes SOURCE GO do SHA exato** (worker15/worker18), **Windows Node22 62 PASS / 6 SKIP** e **WSL ext4 68 PASS**, além de escopo ampliado **Windows 53 PASS / 4 SKIP** e **WSL 54 PASS / 3 SKIP**. Esses são **relatos locais de validação**, não Security Regression hospedado completo nem prova de durabilidade após power-cut NTFS. Em modo **required-v2**, `.rootark-trash` com mais de **16.384 entradas** ainda retorna **`invalid_snapshot` fail-closed**, exigindo recuperação manual; não declarar disponibilidade/recovery automático universal.
+
+**#298 / #67 — bloqueio real, não um falso alerta:** duas anotações GHAS/CodeQL HIGH no HEAD `fa18f4` (`sync-client/rootark-sync-engine.js:401–402` e `:2604`). A coordenação reporta exploração de troca de ancestrais física NTFS/WSL em testes 3/3 por ambiente e **rollback no-clobber DATA LOSS NO-GO**. Não liberar restauração destrutiva, não suprimir CodeQL para promover #298; exigir prova de contenção nativa de handles e rollback seguro. #65/R1 continua sem digest dos bytes originais assinado pelo owner antes do upload, custodiante independente off-host e piso monotônico; Windows 10 CFAPI positivo, Android físico/Keystore e TURN/cross-NAT seguem sem demonstração.
+
+~~~mermaid
+flowchart TD
+  A["#251 Draft d75e: Windows hosted em progresso"]
+  B["#300 Draft 407497: focused GREEN; required-v2 >16k manual recovery"]
+  C["#298 Draft fa18: CodeQL HIGH + NTFS rollback NO-GO"]
+  D["#293/#302 Draft reviewed; #306 Ready não merged"]
+  E["R1 owner-signed/off-host; Win10 CFAPI; Android/TURN físico ausentes"]
+  G{"CI exato integral, peer, segurança e autoridade externa?"}
+  NO["NÃO: sem merge, deploy nem cutover"]
+  A --> G
+  B --> G
+  C --> G
+  D --> G
+  E --> G
+  G -->|"Bloqueios presentes"| NO
+~~~
+
+**Disciplina de publicação:** este adendo pertence apenas à branch documental #251, preserva todos os snapshots passados e requer **peer independente do novo commit local antes de qualquer push fast-forward pelo prime**. Nenhum merge, deploy, cutover, edição de `Root/main`/#228 ou promoção a READY funcional está autorizado.
