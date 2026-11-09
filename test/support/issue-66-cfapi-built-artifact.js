@@ -126,20 +126,55 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
   return { receipt, buildResult };
 }
 
+// A receipt is not a general-purpose executable launcher. Pin each fixture's
+// allowed operations and local test targets before checking or launching its
+// compiled output. This limits test-harness misuse; it does NOT solve the
+// image-section/byte TOCTOU that remains after the checked FD is closed.
+function validateFixtureArgs(name, scratch, args) {
+  assert.ok(NAMES.has(name) && typeof scratch === "string", FAIL);
+  const values = Array.isArray(args) ? Array.from(args) : null;
+  assert.ok(values && values.length <= 2
+    && values.every(value => typeof value === "string" && value.length <= 1024
+      && !/[\x00-\x1f\x7f]/.test(value)), FAIL);
+  const localTarget = (target, leaf) => comparable(target) === comparable(path.join(scratch, leaf));
+  const scope = () => values.length === 2 && comparable(values[1]) === comparable(scratch);
+  let allowed = false;
+  if (name === "acl-preflight.exe") {
+    allowed = values.length === 2 && (
+      (values[0] === "--inspect"
+        && ["owner-only", "broad-access", "inherited-access", "missing", "junction"]
+          .some(leaf => localTarget(values[1], leaf)))
+      || (values[0] === "--register" && localTarget(values[1], "owner-only"))
+    );
+  } else if (name === "inherit-only-fixture.exe") {
+    allowed = values.length === 0;
+  } else if (name === "deny-fetch.exe") {
+    allowed = (values.length === 1 && values[0] === "--self-test")
+      || (values[0] === "--connect" && scope());
+  } else if (name === "positive-shape.exe") {
+    allowed = values.length === 0
+      || (values.length === 1 && values[0] === "--self-test")
+      || (["--connect", "--register", "--hydrate"].includes(values[0]) && scope());
+  }
+  assert.ok(allowed, FAIL);
+  return values;
+}
+
 function runCompiledFixture(receipt, args, timeout = 10000) {
   const previous = RECEIPTS.get(receipt);
   assert.ok(previous, FAIL);
-  assert.ok(Array.isArray(args) && args.every(v => typeof v === "string"), FAIL);
-  const next = inspect(previous.scratch, path.basename(previous.executable));
+  const name = path.basename(previous.executable);
+  const vettedArgs = validateFixtureArgs(name, previous.scratch, args);
+  const next = inspect(previous.scratch, name);
   assert.ok(next.rootDev === previous.rootDev && next.rootIno === previous.rootIno
     && next.dev === previous.dev && next.ino === previous.ino
     && next.size === previous.size && next.digest === previous.digest, FAIL);
   // Preserve the previously published *test-only* native coverage path.
   // This is still path-based spawn and is NOT secure process-image custody.
   // No production or release authorization may be derived from this runner.
-  return spawnSync(previous.executable, args, {
+  return spawnSync(previous.executable, vettedArgs, {
     cwd: previous.scratch, encoding: "utf8", timeout, windowsHide: true,
   });
 }
 
-module.exports = { buildCompiledFixture, runCompiledFixture };
+module.exports = { buildCompiledFixture, runCompiledFixture, validateFixtureArgs };
