@@ -14,17 +14,20 @@ const { buildCompiledFixture, runCompiledFixture } =
   require("./support/issue-66-cfapi-built-artifact");
 
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp");
-const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
 const aclScript = path.join(__dirname, "support/issue-66-cfapi-acl-fixture.ps1");
-const fixedTools = Object.freeze({
-  vswhere,
-  cmd: "C:\\Windows\\System32\\cmd.exe",
-  powershell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-});
 
-function runFixedTool(tool, args, cwd, timeout = 10000) {
-  assert.ok(Object.hasOwn(fixedTools, tool), "UNTRUSTED_EXECUTABLE");
-  return spawnSync(fixedTools[tool], args, { cwd, encoding: "utf8", timeout, windowsHide: true });
+// Keep a distinct, literal executable at each process creation site. A
+// generic file/lookup dispatcher obscures executable selection to static
+// analysis and expands the set of callers capable of selecting a binary.
+// Fixed paths reduce PATH hijacking; they do not authenticate loaded bytes.
+function runVswhere(args, timeout = 10000) {
+  return spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+    args, { encoding: "utf8", timeout, windowsHide: true });
+}
+
+function runFixturePowershell(args, cwd, timeout = 10000) {
+  return spawnSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    args, { cwd, encoding: "utf8", timeout, windowsHide: true });
 }
 
 test("#66 native ACL preflight has no sync-root registration or file-content operations", async () => {
@@ -45,8 +48,8 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     const diagnostic = createAclFailureDiagnostic(t, "CFAPI_PREFLIGHT");
     return diagnostic.run(async () => {
     diagnostic.stage("TOOLCHAIN_LOOKUP");
-    const where = runFixedTool("vswhere", ["-all", "-products", "*", "-prerelease",
-      "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], undefined, 6000);
+    const where = runVswhere(["-all", "-products", "*", "-prerelease",
+      "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], 6000);
     const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
     if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
     diagnostic.stage("TOOLCHAIN_RESOLVE");
@@ -85,7 +88,7 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       [inheritedRoot, "2", "ACL_INHERITED_APPLY"],
     ]) {
       diagnostic.stage(stage);
-      const applied = runFixedTool("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      const applied = runFixturePowershell(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", aclScript, dir, expose], scratch, 10000);
       if (applied.status !== 0) {
         const fixedStage = readCfapiFixtureFailureStage(stage, applied.stderr);
@@ -151,8 +154,8 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
 
 test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effective Administrators access",
   { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
-    const where = runFixedTool("vswhere", ["-all", "-products", "*", "-prerelease",
-      "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], undefined, 6000);
+    const where = runVswhere(["-all", "-products", "*", "-prerelease",
+      "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], 6000);
     const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
     if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
     try { await fs.access(vcvars); }

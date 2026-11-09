@@ -42,3 +42,14 @@ test("#66 CFAPI harness never resolves cmd or PowerShell by PATH", () => {
     }
   }
 });
+
+test("#66 native ACL tool launches use literal paths rather than a dynamic executable dispatcher", () => {
+  const code = fs.readFileSync(path.join(__dirname,
+    "issue-66-cfapi-acl-preflight-native.test.js"), "utf8");
+  assert.ok(code.includes(String.raw`spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",`),
+    "vswhere launch must pass a fixed executable literal");
+  assert.ok(code.includes(String.raw`spawnSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",`),
+    "ACL setup must pass a fixed executable literal");
+  assert.doesNotMatch(code, /spawnSync\s*\(\s*(?:fixedTools\s*\[|file\b|tool\b)/,
+    "native ACL test must not dispatch executable values through a dynamic lookup");
+});
