@@ -11,6 +11,7 @@ const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owne
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
+const { openNativeRootSession } = require("./rootark-sync-native-root-session-contract");
 
 const SNAPSHOT_VERSION = 1;
 // A v2 snapshot fences old clients that do not know how to replay the
@@ -998,6 +999,14 @@ class SyncEngine {
     this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
     this.excludedPaths = normalizeExcludedPaths(options.excludedPaths);
     this.filesOnDemand = options.filesOnDemand === true;
+    // A future Files On-Demand recovery must use native, independently rooted
+    // custody. The old path-based required-v2 replay is not safe against
+    // same-principal A→B→A. This strict bit cannot be downgraded by callbacks;
+    // non-Files-On-Demand legacy recovery is unchanged unless explicitly opted
+    // into the stricter fail-closed policy.
+    Object.defineProperty(this, "requireNativeRootRecovery", {
+      value: this.filesOnDemand || options.requireNativeRootRecovery === true,
+    });
     if (this.filesOnDemand && typeof this.adapter.listInventory !== "function") {
       fail("Files On-Demand requires a metadata inventory adapter", "inventory_unavailable");
     }
@@ -1181,8 +1190,19 @@ class SyncEngine {
   }
 
   async replayEvictionLedger() {
+    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired) {
+      // The only currently available RootSession contract rejects activation.
+      // Do not read legacy path-based staging/ledger trees, clear the required
+      // marker, emit operations, or accept a caller-supplied fake native object.
+      this.denyUntrustedEvictionReplay();
+    }
     const { entries, head } = await readEvictionLedger(this.rootDir,
       this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
+    if (this.requireNativeRootRecovery && entries.size) {
+      // Even if a future native backend can be opened, legacy JS path replay
+      // must never be selected for an unfinished ledger transaction.
+      this.denyUntrustedEvictionReplay();
+    }
     // A normal v1 snapshot or an already-compacted v2 checkpoint has no
     // active eviction to replay. Do not inspect accumulated .rootark-trash
     // here: its legitimate contents can exceed the strict genesis scan cap,
@@ -1328,7 +1348,17 @@ class SyncEngine {
     await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
   }
 
+  denyUntrustedEvictionReplay() {
+    if (!this.requireNativeRootRecovery) return;
+    // Even if a future native backend returns a handle, it must NOT cause
+    // this JavaScript pathname-based replay to resume. The replacement engine
+    // must instead execute every step inside the verified native session.
+    openNativeRootSession(true);
+    fail("Legacy eviction recovery is not authorized by native custody", "root_session_native_unavailable");
+  }
+
   async recoverUnstartedEvictionLedger(staged = null) {
+    this.denyUntrustedEvictionReplay();
     // Called under the cross-process exclusive root lock, only when required
     // is true and the anchored genesis exists without any PREPARE records.
     // Repeated full-file verification is intentional: this exceptional path

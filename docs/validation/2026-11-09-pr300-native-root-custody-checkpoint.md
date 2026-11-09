@@ -241,3 +241,40 @@ inference from regular Node tests.
 
 Do not merge, deploy, cut over, mark Ready or update `Root/main`. All
 worktree experiments, fixture directories and previous commits are retained.
+
+## New production-boundary change — required-v2 native recovery fail-closed
+
+**Release decision remains NO-GO.** The subsequent isolated candidate
+modifies the actual `sync-client/rootark-sync-engine.js` for the first time
+since `a2e57ba8`. This is a **blocking safety fence**, not a native
+implementation or a successful adversarial recovery.
+
+- A `SyncEngine` constructed with `filesOnDemand: true` sets a non-writable
+  `requireNativeRootRecovery` property; `requireNativeRootRecovery: false`
+  cannot opt out of that requirement. Other callers may explicitly set
+  `requireNativeRootRecovery: true` without enabling Files On-Demand.
+- On cold open, a durable v2 snapshot with `evictionLedgerRequired: true`
+  now fails **before path-based ledger/trash examination** with
+  `root_session_native_unavailable`. A nonempty replay ledger in the strict
+  mode also refuses the legacy path replay; direct calls to
+  `recoverUnstartedEvictionLedger` cannot bypass the fence.
+- The required-v2 snapshot is intentionally **not disarmed**, its tracked
+  cache bytes remain unchanged, no fake JS `nativeRootSession` is read or
+  invoked, and no remote sync adapter operation is issued by the blocked
+  open. A future `openNativeRootSession` implementation returning an object
+  must not silently reenable this legacy replay path.
+- Ordinary v1 Files On-Demand startup and existing non-Files-On-Demand
+  required-v2 behavior are unchanged by this guard. The latter remains
+  **unsafe under the demonstrated hostile A→B→A threat** and must not be
+  interpreted as a secure fallback. The gate does not harden non-recovery
+  eviction/staging, lock acquisition, owner/DLL custody or remote DELETE.
+
+**TDD + physical Windows Node22/NTFS validation, before final commit:**
+the new regression first produced 2 failing assertions (missing strict
+flag and erroneous `invalid_snapshot` fallback); after the change it passed
+3/3. Files On-Demand + RootSession regressions passed 21/21, then combined
+with the new three tests passed **24/24**. The non-Files-On-Demand real
+hard-crash `required-v2` with **16,385** entries still passed **1/1**.
+Ubuntu Node22/ext4 and independent SOURCE review of the final SHA must be
+performed separately before any local integration. This does **not**
+authorize a push of the Draft PR or any release claim.
