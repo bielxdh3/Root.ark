@@ -14,13 +14,17 @@ const localAppData = process.env.LOCALAPPDATA;
 const script = path.join(__dirname, "support", "issue-66-w25-native-rename-identity.ps1");
 const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 
-function invoke(scratch, share, move, enabled = true) {
+function invoke(scratch, share, move, enabled = true, sourceSwap = false) {
   return spawnSync(powershell, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-Scratch", scratch, "-Share", share, "-Move", move,
   ], {
     windowsHide: true, encoding: "utf8", timeout: 15000, maxBuffer: 8192,
-    env: { ...process.env, ROOTARK_ISSUE66_W25_NATIVE_IO_LAB: enabled ? "1" : "0" },
+    env: {
+      ...process.env,
+      ROOTARK_ISSUE66_W25_NATIVE_IO_LAB: enabled ? "1" : "0",
+      ROOTARK_W25_SOURCE_SWAP_TEST: sourceSwap ? "1" : "0",
+    },
   });
 }
 
@@ -62,4 +66,25 @@ test("#66 W25 independent helper rejects nonempty, nested and disabled fixtures 
     assert.deepEqual(fs.readdirSync(scratch).sort(), ["nested", "owner-canary"]);
     assert.deepEqual(fs.readdirSync(nested), []);
     assert.equal(fs.readFileSync(path.join(scratch, "owner-canary"), "utf8"), "DO_NOT_TOUCH");
+  });
+
+test("#66 W25 rejects deterministic same-scratch source replacement before tested rename",
+  { skip: !available, timeout: 90000 }, () => {
+    assert.ok(localAppData && path.win32.isAbsolute(localAppData));
+    for (const share of ["RW", "NONE"]) {
+      for (const mode of ["INFO", "INFO_EX"]) {
+        // The helper owns both directories. It relocates its original child by
+        // a HANDLE, creates a replacement under the pinned scratch root, and
+        // must reject a re-opened source FileIdInfo before the tested rename.
+        const scratch = fs.mkdtempSync(path.join(localAppData, "rootark-w25-rename-identity-"));
+        const result = invoke(scratch, share, mode, true, true);
+        assert.equal(result.status, 42, "substituted source must reject before tested rename");
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, /^ROOTARK_W25_SOURCE_ID_REJECTED\r?\n$/);
+        assert.deepEqual(fs.readdirSync(scratch).sort(),
+          ["held-ancestor", "test-relocated-ancestor"]);
+        assert.deepEqual(fs.readdirSync(path.join(scratch, "held-ancestor")), ["child"]);
+        assert.deepEqual(fs.readdirSync(path.join(scratch, "test-relocated-ancestor")), ["child"]);
+      }
+    }
   });

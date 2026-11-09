@@ -195,14 +195,15 @@ public static class RootarkW25RenameIdentityProof {
   }
 
   private static int RenameByHandle(SafeFileHandle source, SafeFileHandle targetRoot,
-      string mode) {
+      string mode, string leaf = "moved-ancestor") {
     if (mode != "INFO" && mode != "INFO_EX")
       throw new InvalidOperationException("UNTRUSTED_RENAME_MODE");
+    if (leaf != "moved-ancestor" && leaf != "test-relocated-ancestor")
+      throw new InvalidOperationException("UNTRUSTED_RENAME_LEAF");
     // NtSetInformationFile FileRenameInformation (10) / Ex (65), relative to
     // the held scratch root. Win32 SetFileInformationByHandle(FileRenameInfo)
     // returned ERROR_INVALID_PARAMETER (87) for non-null RootDirectory on
     // this machine, and no by-name or full-path fallback is permitted.
-    const string leaf = "moved-ancestor";
     byte[] name = Encoding.Unicode.GetBytes(leaf);
     int rootOffset = IntPtr.Size == 8 ? 8 : 4;
     int nameLengthOffset = rootOffset + IntPtr.Size;
@@ -230,7 +231,8 @@ public static class RootarkW25RenameIdentityProof {
     }
   }
 
-  public static string Probe(string scratch, string shareMode, string moveMode) {
+  public static string Probe(string scratch, string shareMode, string moveMode,
+      bool injectSourceSwap) {
     uint share = shareMode == "NONE" ? 0U : 3U;
     // Retain the actual disposable scratch object and create fixture children
     // by NtCreateFile relative to its HANDLE, never by joined absolute path.
@@ -241,12 +243,36 @@ public static class RootarkW25RenameIdentityProof {
       FILE_ID_INFO scratchId = Id(scratchRoot);
       RequireScratchBinding(scratchRoot, scratch, scratchId);
       int setupStatus;
+      FILE_ID_INFO createdSourceId;
       using (var initial = OpenRelativeDirectory(
-          scratchRoot, "held-ancestor", 7, true, out setupStatus)) {
+          scratchRoot, "held-ancestor", 7, true, out setupStatus,
+          0x00010000 /* DELETE on test-owned source */)) {
         RequirePlainDirectory(initial);
+        createdSourceId = Id(initial);
+        if (createdSourceId.VolumeSerialNumber != scratchId.VolumeSerialNumber)
+          throw new InvalidOperationException("SOURCE_WRONG_VOLUME");
         using (var initialChild = OpenRelativeDirectory(
             initial, "child", 7, true, out setupStatus))
           RequirePlainDirectory(initialChild);
+        if (injectSourceSwap) {
+          // Deterministic owned-fixture ABA: relocate ONLY the just-created
+          // source by HANDLE, then create a separate test-owned same-name
+          // replacement by the retained scratch HANDLE. No arbitrary paths,
+          // deletion, or outside process is involved.
+          RequireScratchBinding(scratchRoot, scratch, scratchId);
+          RenameByHandle(initial, scratchRoot, "INFO", "test-relocated-ancestor");
+          using (var replacement = OpenRelativeDirectory(
+              scratchRoot, "held-ancestor", 7, true, out setupStatus)) {
+            RequirePlainDirectory(replacement);
+            FILE_ID_INFO replacementId = Id(replacement);
+            if (replacementId.VolumeSerialNumber != scratchId.VolumeSerialNumber ||
+                Same(createdSourceId, replacementId))
+              throw new InvalidOperationException("INVALID_SOURCE_SWAP_FIXTURE");
+            using (var replacementChild = OpenRelativeDirectory(
+                replacement, "child", 7, true, out setupStatus))
+              RequirePlainDirectory(replacementChild);
+          }
+        }
       }
       RequireScratchBinding(scratchRoot, scratch, scratchId);
       int rootStatus;
@@ -254,10 +280,16 @@ public static class RootarkW25RenameIdentityProof {
           scratchRoot, "held-ancestor", share, false, out rootStatus,
           0x00010000 /* DELETE on source handle */)) {
       RequirePlainDirectory(root);
+      FILE_ID_INFO before = Id(root);
+      // Closing the initial CREATE handle is required before reopening with
+      // share=0. Its immutable FileIdInfo evidence must bind this new handle
+      // to the original fixture, including the source volume identity.
+      if (before.VolumeSerialNumber != scratchId.VolumeSerialNumber ||
+          !Same(createdSourceId, before))
+        throw new InvalidOperationException("SOURCE_ID_MISMATCH");
       uint handleFlags;
       if (!HandleInfo(root, out handleFlags))
         throw new InvalidOperationException("INVALID_HANDLE");
-      FILE_ID_INFO before = Id(root);
       string beforeName = CanonicalPath(root);
       if (!beforeName.EndsWith("\\held-ancestor", StringComparison.OrdinalIgnoreCase))
         throw new InvalidOperationException("WRONG_INITIAL_HANDLE");
@@ -321,9 +353,17 @@ public static class RootarkW25RenameIdentityProof {
 '@ | Out-Null
 
   [Console]::Out.WriteLine([RootarkW25RenameIdentityProof]::Probe(
-    $directory.FullName, $Share, $Move))
+    $directory.FullName, $Share, $Move, ($env:ROOTARK_W25_SOURCE_SWAP_TEST -eq '1')))
   exit 0
 } catch {
+  $failure = $_.Exception
+  while ($failure.InnerException -ne $null) {
+    $failure = $failure.InnerException
+  }
+  if ($failure.Message -eq 'SOURCE_ID_MISMATCH') {
+    [Console]::Error.WriteLine('ROOTARK_W25_SOURCE_ID_REJECTED')
+    exit 42
+  }
   [Console]::Error.WriteLine('ROOTARK_W25_RENAME_REJECTED')
   exit 41
 }

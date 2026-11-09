@@ -130,6 +130,29 @@ rename primitive and the existing identity comparisons. Windows Node
 four combinations of native rename class and share mask. WSL Ubuntu Node
 **v22.22.1: 4 expected Windows-only SKIP / 0 FAIL**.
 
+**Source CREATE-to-OPEN binding regression (P2, child of 5d5500):**
+`test/support/issue-66-w25-native-rename-identity.ps1` now records the
+original directory's full `FileIdInfo` (volume serial and 16-byte object ID)
+*while the newly created source HANDLE is still open*. It verifies that
+source is a plain non-reparse directory on the same volume as the scratch
+HANDLE. The initial handle is then closed to permit the separate `share=0`
+reopen; the reopened root must also be a plain non-reparse directory and
+have exactly the recorded `FileIdInfo` before any tested rename. An
+identity mismatch fails closed with exit **42**, no success output, and the
+categorical error `ROOTARK_W25_SOURCE_ID_REJECTED`.
+
+The opt-in negative test simulates this gap without an attacker or outside
+path: retaining the original HANDLE, it uses `NtSetInformationFile` to move
+the original fixture to `test-relocated-ancestor`, creates a distinct
+`held-ancestor` beneath the *same pinned scratch HANDLE*, then releases
+the original and reopens by name. It expects the identity rejection in all
+four `INFO / INFO_EX × share 0 / share 3` combinations, verifies that
+both fixture children remain present, and that `moved-ancestor` was
+never created. No delete, cleanup, external directory or arbitrary leaf
+is involved. TDD RED was observed: unpatched code returned successful
+exit **0** against the new test's expected **42**. The source binding fix
+made this deterministic test GREEN.
+
 ## Still NOT established (release NO-GO)
 
 - **W25 P2-A rename primitive now handle-bound:** source and destination
@@ -145,6 +168,12 @@ four combinations of native rename class and share mask. WSL Ubuntu Node
   cannot establish independent ownership of that initial object. No
   adversarial race was executed. Do not claim the whole laboratory
   resistant to malicious same-user filesystem swaps.
+- **W25 P2 internal source substitution is now covered:** source creation
+  and its later reopen are linked by exact `FileIdInfo` and volume identity
+  plus non-reparse checks. The test-injected same-scratch replacement fails
+  before the normal `NtSetInformationFile` rename. This does **not** establish
+  trusted acquisition of the scratch itself, nor prove safety under a
+  concurrent hostile same-user process.
 - **W25 P2-B addressed at source and on real local NTFS:** the independent
   helper checks `GetVolumeInformationByHandleW` against `NTFS` and
   `GetDriveTypeW` against `DRIVE_FIXED` on its retained scratch handle.
