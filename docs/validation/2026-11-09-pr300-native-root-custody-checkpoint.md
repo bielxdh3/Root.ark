@@ -359,3 +359,55 @@ an operational native recovery implementation. Independent SOURCE review
 of the exact final composite SHA remains mandatory before local integration.
 The remote Draft PR has not been pushed; hosted CodeQL has not run on this
 local child and formal CodeQL remains red on the published SHA.
+
+### Third SOURCE NO-GO: mutable cached snapshot and replaceable open dispatcher
+
+Independent SOURCE review of committed `438ca5837d870930699d189908a3b7d4d2d2efff`
+(and its docs child `14d3ed03dd21cfe5e605c1e751cff22484088817`)
+found two more in-process public-engine bypasses:
+
+1. A strict open could first fail on a durable `required-v2` snapshot,
+   leaving `this.snapshot` plus `snapshotDiskRevision` cached. After an
+   in-process caller changed the mutable cached required flag to false, a
+   retry skipped parsing the still-required disk snapshot because file
+   metadata appeared unchanged. With no physical PREPARE, the old code
+   incorrectly completed its open. A real RED regression reproduced this
+   false-positive restart before the fix.
+2. The normal operation lock called the replaceable `this._open()`.
+   A caller controlling the instance could shadow that method to bypass
+   the new lexical native-replay denial entirely. A second real RED
+   regression reproduced this direct public method-dispatch bypass.
+
+Committed child **`b50241ff178da888ba5f13ebbd69ec149c0cd082`**
+(parent `14d3ed03`) forces a durable snapshot reparse on every strict
+native-recovery open and uses the original `_open` implementation captured
+at module initialization for normal mutation and public operation entry
+points. The two regressions turned GREEN while preserving the always
+closed native `RootSession`. This guard cannot defend arbitrary mutation
+of all JavaScript internals by a fully compromised same-process executor;
+that requires genuine native process/authority isolation.
+
+| Exact Git source / workload | Physical host | Result |
+| --- | --- | --- |
+| `b50241ff178da888ba5f13ebbd69ec149c0cd082`: Files On-Demand + strict native gate + RootSession | Windows Node 22 / NTFS | **30 PASS, 0 FAIL** |
+| same exact SHA, archive extracted into native `/dev/sdd` ext4 | Ubuntu WSL Node v22.22.1 / ext4 | **30 PASS, 0 FAIL** |
+| same SHA: non-Files-On-Demand hard-crash before PREPARE, 16,385 legitimate retained trash entries | Windows Node 22 / NTFS | **1 PASS, 0 FAIL** |
+| same SHA from Git archive: same hard-crash scenario | Ubuntu WSL Node v22.22.1 / ext4 | **1 PASS, 0 FAIL** |
+
+The hard-crash positive path is **non-Files-On-Demand legacy behavior**, not
+authorization for the strict Files On-Demand native-recovery branch. The
+strict branch still rejects the documented required-v2 scenario with
+`root_session_native_unavailable`, preserves its ledger/snapshot and
+does not issue a remote signed DELETE. The real nonempty ledger test
+continues to perform JS path-based ledger reads **before** denying replay
+when a stale snapshot falsely says required=false; this does not establish
+any atomic root, owner, ancestor, mounted namespace, or image custody.
+
+The published PR #300 is still **OPEN/Draft at `956b2515`** and formal
+CodeQL remains **FAILURE** on that published SHA. None of the above local
+commits were pushed, and hosted CI has not assessed their exact SHAs.
+Keep production native `RootSession` disabled, no merge/deploy/cutover
+and no ready-for-merge claim until the missing adversarial OS-level
+custody, durability, independent monotonic rollback and CodeQL gates
+are actually closed. Exact-SHA independent SOURCE review is required
+before even the local fast-forward of this candidate.
