@@ -624,7 +624,7 @@ Este checkpoint **não** substitui as evidências históricas nem equivale a aut
 flowchart TD
   A["PRs OPEN/Draft; Root/main e #228 preservados"] --> B{"SOURCE GO SHA exato, testes físicos e CI?"}
   B -->|"#300 fixture e experimentos de revogação testados"| C["CI hosted do SHA 956b em verificação"]
-  B -->|"#251 parser local aguarda peer e nova CI"| D["Sem publicar cadeia não revisada"]
+  B -->|"#251 parser SOURCE GO; CI hospedada pendente"| D["Sem publicar cadeia não revisada"]
   B -->|"#298/#242 native custody e raiz sem prova"| E["Falhar fechado; nada de restore/cutover em produção"]
   C --> F{"Owner-signed original bytes, fase/CAS independente e NTFS power-cut provados?"}
   F -->|"Não"| G["DEV-OFF, sem merge/deploy/R1"]
