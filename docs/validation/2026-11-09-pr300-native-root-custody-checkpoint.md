@@ -12,6 +12,8 @@ Root.ark SyncEngine or a native Windows CFAPI provider is secure for production.
 | Published `Root/main` | `202146bb73ca8577a0a4017c4556cb8b1e9588a6`, unchanged by this work |
 | Previous integrated local candidate | `c01014735a438bf27bf5e2a346af7930993b5f97` |
 | Current integrated test-only contract | `48e881c5bff6e67df2a58847e7963dfd7fb5395d`, parent `c0101473` |
+| Last locally fast-forwarded integrated HEAD | `a2e57ba8f451ec140e0f757f6c5f418b187260f7`, clean at the start of this continuation |
+| New combined candidate with exact physical evidence (not yet fast-forwarded at checkpoint) | `b97328a9749eb7d6e08bb3910564e45faa06da16` — Windows W25, corrected N-API/owner fixtures and LF gate, **local only** |
 | Windows NTFS handle-rename lab | `76cfa21e251382ae12d23d742bb921c84c3dde00`, parent `5d5500da`, **isolated** |
 | POSIX dirfd/openat2 research lab | `8e0ccba222a713e1807cb9ad9f88217b03a3d3a8`, parent `37b395bd`, **isolated** |
 
@@ -109,7 +111,7 @@ flowchart LR
 **Next engineering step:** implement actual native trusted-parent acquisition,
 same-object enumeration/read/rename and durable cold-reopen with a separate
 writer/custody authority, then prove both successful 16,385-entry recovery
-and hostile root replacement without remote signed DELETE. Keep W25 isolated,
+and hostile root replacement without remote signed DELETE. Keep W25 non-operational,
 and prohibit any production call into either experiment until source, image,
 root custody and hostile-physical gates are independently satisfied.
 
@@ -141,3 +143,101 @@ All these commits remain **LOCAL ONLY**. The POSIX experiment being present
 in a test-only source tree does not activate it and does not close any of the
 earlier root/ancestor, same-principal writer, image, code-loading, cold
 reopen, crash or rollback gates. Publication remains **NO-GO**.
+
+## 2026-11-09 continuation — exact test-only combined candidate
+
+**Security decision: NO-GO for operational recovery / release.** The following
+is a bounded local research/testing integration, not a native OS trust chain.
+Neither `sync-client/rootark-sync-engine.js` nor the fail-closed
+`sync-client/rootark-sync-native-root-session-contract.js` was changed after
+`a2e57ba8`. In particular, `openNativeRootSession(true)` still throws
+`root_session_native_unavailable` and no N-API addon is imported by production.
+
+**Combined test-source SHA with physical evidence:**
+`b97328a9749eb7d6e08bb3910564e45faa06da16` (child of `844dee94`,
+which itself is a local cherry-pick composition on top of `a2e57ba8`).
+
+| Scope | Physically executed on exact `b97328a9` | Meaning |
+| --- | --- | --- |
+| Windows **11 Pro build 26300** / Node 22 / NTFS test harness with W25 opt-in, CFAPI tests, ACL fixtures, provenance receipts, contract and platform SKIPs | **45 PASS, 16 SKIP, 0 FAIL** | Tests native handle-relative W25 identity/rename and Unicode read, not independent first acquisition or Windows 10 compatibility |
+| Ubuntu WSL/Node 22/physical ext4, POSIX labs + N-API + owner-read opt-in, Windows skips | **22 PASS, 9 SKIP, 0 FAIL** | Includes 16,385-entry dirfd enumeration, Node22 N-API and non-root writer denials under existing root-owned test fixture |
+| Windows/NTFS `required-v2` process crash before PREPARE with 16,385 retained trash entries | **1 PASS, 0 FAIL** | Legitimate recovery only, NOT hostile A→B→A |
+| Ubuntu WSL/ext4 same `required-v2` hard-crash scenario | **1 PASS, 0 FAIL** | Same limited meaning |
+
+The first composite `844dee94` **failed 1 WSL test**: Windows checkout /
+Git archive had emitted CRLF for the privileged POSIX validation script.
+Commit `b97328a9` adds an exact `.gitattributes` LF constraint and a test
+that fails on carriage returns. An independently extracted, fresh ext4
+archive of `b97328a9` then passed all stated tests. Both the failure and
+subsequent rerun are retained; there is no claim that the first test passed.
+
+### Narrow SOURCE peer gates and actual threat boundaries
+
+- W25 source `77c0b9b3` and its composite `1f659ac3` received independent
+  **SOURCE GO for test-only experiments**, P0/P1/P2 new = 0. The original
+  Windows source and the local cherry-pick have equal W25 file blobs. Initial
+  scratch handle acquisition, same-SID in-place writers, executable image
+  custody, cold power-cycle and persistent root ownership remain unproven.
+- Linux N-API fix `5c6e082c` received independent **SOURCE GO only for the
+  laboratory**, P0/P1/P2 new = 0. It uses private per-callback
+  `napi_property_descriptor.data`, one `napi_add_env_cleanup_hook`, and no
+  replaceable `napi_get/set_instance_data` slot. The physical Node22 test
+  includes two active Workers, cross-token rejection and a second addon in
+  the same Node environment. It still uses a same-UID-writable test parent
+  and nonattested source/compiler/loaded `.node` image.
+- The root-owned ext4 experiment `ada525ba` originally had a **reviewed P1**
+  in its privileged shell's line-oriented `grep` check, allowing a malicious
+  LF/path argument. Its child `8b778d3f` has **SOURCE GO for the narrow
+  validation fix**, with exact 16-char ASCII lowercase hex suffix and
+  no-root `--validate-only` negative tests. The root-owned test directory
+  was created before that fix; later physical tests only read and attempt
+  denied writes, and never re-executed the root script.
+- **Unresolved potentially high-impact privilege/custody risk:** the root
+  setup shell exists in an ordinary user-writable checkout. It must NOT be
+  executed as root under a same-UID malicious-writer threat without a
+  separate root-owned, source-attested acquisition/installation mechanism
+  and pinned/sanitized privileged tool execution. Its fixture is read-only
+  to UID1000, so it proves a narrow owner/read isolation fact, **not a
+  writable Root.ark recovery service or a concurrent malicious mount swap**.
+- The follow-up commit `715c7f19` removes recursive pathname teardown from
+  Windows CFAPI probe tests (RED source regression before / GREEN after,
+  5/5 Windows Node22). Fixtures are retained so a same-SID swap cannot
+  redirect a test cleanup into a foreign tree. The test still passes a
+  pathname to the read-only native CFAPI probe; no full trusted-handle
+  imaging or ancestry proof is claimed.
+
+### Formal CodeQL and independent release gates
+
+On the **published** remote PR #300 head
+`956b2515d3f5262b2bf8c6044be2bfd2db72dc9e`, GitHub still reports
+the **formal CodeQL check as FAILURE** while its separate Analyze
+JavaScript/TypeScript job reports SUCCESS. Three reviewer annotations were
+reconciled: **#493** potential file race and **#496** generated-source
+sanitization are resolved/outdated against prior published source, whereas
+**#497** environment-derived shell command remains unresolved. Local code
+limits executables to fixed absolute locations, removes writable `build.cmd`
+execution, isolates compiler environment and checks build receipts, but
+source-level improvements are **not** an equivalent of hosted CodeQL green
+for `b97328a9`. No hosted check has run on this local SHA; the CLI is not
+installed locally. Do not resolve #497 or mark formal security green by
+inference from regular Node tests.
+
+### Outstanding path to a real GO
+
+1. Independently protected, authenticated root-parent acquisition on both
+   OSes, including a durable root-owner policy and Windows same-SID threat;
+   no user-writable shell/image or namespace may be promoted into authority.
+2. End-to-end native handle/dirfd-relative `SyncEngine` recovery reads,
+   streamed enumeration, journal/ledger stage/promote/commit/unlink and
+   rollback. Remove the active pathname A→B→A gap, do not rely on repeated
+   `lstat` snapshots.
+3. Concurrent writers and malicious mount/reparse swaps in an isolated
+   physical harness; 16,385 entries + Unicode/case aliases; root and
+   writer identity across cold reopen; crash/power-loss ordered durability,
+   anti-rollback floor and zero unauthorized signed remote DELETE.
+4. A final independent P0/P1/P2 source review of the exact production SHA,
+   Windows 10 CFAPI real activation/hydration evidence, and fresh hosted
+   CodeQL/formal/full CI after explicitly authorized publication.
+
+Do not merge, deploy, cut over, mark Ready or update `Root/main`. All
+worktree experiments, fixture directories and previous commits are retained.
