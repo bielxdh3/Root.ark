@@ -16,9 +16,11 @@ function adapter(calls) {
   };
 }
 
-async function makeRoot(t, required) {
+async function makeRoot(_t, required) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-native-gate-"));
-  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  // Keep only newly created disposable fixtures for inspection: a hostile
+  // same-UID process could otherwise replace a TEMP ancestor before a
+  // pathname-based recursive teardown and redirect it into foreign data.
   const root = path.join(parent, "consumer");
   await fs.mkdir(root);
   const canary = path.join(root, "café-中-😀.txt");
@@ -81,6 +83,36 @@ test("#66 an ordinary v1 Files On-Demand open is not incorrectly classified as r
   });
   await engine.open();
   assert.equal(engine.snapshot.version, 1);
+  assert.equal(await fs.readFile(canary, "utf8"), "RETAIN_SIGNED_LOCAL_BYTES");
+  assert.deepEqual(calls, []);
+});
+
+test("#66 a mutable Files On-Demand flag cannot bypass required native recovery on a preexisting engine", async (t) => {
+  const { root, snapshotPath, exactBytes } = await makeRoot(t, true);
+  const calls = [];
+  const engine = new SyncEngine({ rootDir: root, adapter: adapter(calls),
+    filesOnDemand: false, fileKeyResolver: () => Buffer.alloc(32),
+  });
+  assert.throws(() => { engine.filesOnDemand = true; }, TypeError,
+    "runtime mode cannot change after native recovery policy was captured");
+  assert.equal(engine.filesOnDemand, false);
+  assert.deepEqual(await fs.readFile(snapshotPath), exactBytes);
+  assert.deepEqual(calls, []);
+});
+
+test("#66 an overridden engine method or prototype hook cannot waive native-required recovery", async (t) => {
+  const { root, snapshotPath, exactBytes, canary } = await makeRoot(t, true);
+  const calls = [];
+  const engine = new SyncEngine({ rootDir: root, adapter: adapter(calls),
+    filesOnDemand: true, fileKeyResolver: () => Buffer.alloc(32),
+  });
+  let invoked = 0;
+  engine.denyUntrustedEvictionReplay = () => { invoked++; };
+  await assert.rejects(engine.open(), { code: "root_session_native_unavailable" });
+  await assert.rejects(engine.recoverUnstartedEvictionLedger(),
+    { code: "root_session_native_unavailable" });
+  assert.equal(invoked, 0, "userland override cannot influence a private native trust boundary");
+  assert.deepEqual(await fs.readFile(snapshotPath), exactBytes);
   assert.equal(await fs.readFile(canary, "utf8"), "RETAIN_SIGNED_LOCAL_BYTES");
   assert.deepEqual(calls, []);
 });

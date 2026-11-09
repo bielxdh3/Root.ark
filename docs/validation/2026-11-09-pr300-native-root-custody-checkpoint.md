@@ -292,3 +292,34 @@ local integration. There is no proof of adversarial A→B→A safety outside the
 new strict blocking branch, native first-owner authority, durable commit,
 malicious same-SID writers, signed DELETE prevention or production readiness.
 This does **not** authorize a push of the Draft PR or any release claim.
+
+### Independent SOURCE NO-GO and P1 correction of the native-replay fence
+
+The first code commit `dca741770fa71258238857b55813cee207d0fa34`
+was **SOURCE NO-GO, not approved for integration**. Independent review
+identified two concrete, independent P1 bypasses: (a) after constructing
+the engine with `filesOnDemand:false`, JavaScript could change the mutable
+`engine.filesOnDemand` to `true` while the captured strict flag stayed false;
+and (b) an attacker controlling a userland engine object could override
+`engine.denyUntrustedEvictionReplay` and cause the required-v2 replay to
+fall into legacy pathname operations despite a strict constructor.
+
+The next child corrects both defects without enabling native code. The
+`filesOnDemand` instance property is non-writable and non-configurable,
+matching the separately frozen strict native-recovery requirement. The
+recovery deny function is now a **lexically private module function**,
+invoked directly from both replay entrances and the direct zero-PREPARE
+recovery method, not a mutable instance/prototype hook. A future native
+`openNativeRootSession` return still cannot resume the legacy JS path.
+The new RED tests reproduced **2 FAIL** on the reviewed defective code;
+after repair the Windows Node22/NTFS Files On-Demand, native-gate and
+contract suite returned **26 PASS, 0 FAIL**. The new fixture tests also
+retain disposable TEMP files instead of recursively removing a pathname
+that a hostile same-UID actor could swap before cleanup (peer P2 finding).
+
+**Scope caveat:** this change prevents those two specific JavaScript
+configuration/dispatch bypasses. It does not authenticate a hostile
+snapshot, protect arbitrary JS runtime code replacement, establish
+independent native root custody, or make older non-Files-On-Demand recovery
+safe against A→B→A. Independent SOURCE review and exact final-SHA Windows
+and ext4 physical gates remain mandatory before even local integration.
