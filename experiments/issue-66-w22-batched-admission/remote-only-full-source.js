@@ -231,7 +231,7 @@ async function probeStrictRemoteOnlyBatch(engine, trusted, hooks = {}) {
     const ack = prepared.operations.map((operation) => ({ operationId: operation.operationId,
       digest: crypto.createHash("sha256")
         .update(protocol.canonicalJson(operation), "utf8").digest("hex") }));
-    await engine.journal.batchMarkSeenRemoteOnly(ack);
+    await engine.journal.batchMarkSeenRemoteOnly(ack, verifySamePolicy);
     return { observed: prepared.observed, acknowledged: ack.length };
   });
 }

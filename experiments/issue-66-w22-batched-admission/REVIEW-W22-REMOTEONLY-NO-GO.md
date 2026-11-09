@@ -141,3 +141,28 @@ if I/O is stalled, nor is local `Date.now()` an externally trusted monotonic
 authority. A hostile ancestor swap may still redirect pathname-based writes
 after preflight. No production `_pullRemote` hook, automatic recovery, NTFS
 power-cut guarantee, owner-signed completeness witness or cutover is granted.
+
+An independent follow-up also reproduced a revocation gap at the **final
+acknowledgement**: a policy could change while `batchMarkSeenRemoteOnly()`
+waited behind another journal transaction. The previous check happened before
+enqueue, allowing a revoked signer to acquire a newly acknowledged `seen`
+record after revocation. The inert batch ACK now accepts an internal queued
+`beforePersist` callback and repeats the exact pinned epoch/revocation/root
+check after older transactions finish. A signed end-to-end negative test
+reproduces the old ACK race RED and verifies that the new code leaves the
+already-durable observation unacknowledged after revocation. This is a
+last-before-write policy check, not a trusted distributed revocation clock or
+a promise of NTFS metadata durability after power loss.
+
+The next independent review identified a distinct **zero-new-observation
+replay** bug in the exported inert preflight API: when every Ed25519 record
+was already observed or admitted, `batchObserveAdmission([])` previously
+returned before invoking its mandatory `beforeCommit` owner-policy callback.
+Tests reproduced the omitted gate with genuine signed CREATE and DELETE
+records, an observed journal digest and late revocation; already-admitted
+CREATE and a queued journal transaction were also checked. The zero-length
+batch now runs `beforePersist` in the same ordered journal queue, without
+creating an unnecessary journal rename, preserving every prior receipt and
+rejecting revocation. This fixes the **API contract**, not an observed
+production bypass: the wrapper separately rechecks policy before snapshot
+and final ACK, and remains disconnected from production.

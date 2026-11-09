@@ -100,6 +100,10 @@ async function preflightAndPinSignedList(options) {
     await checkPhysicalCollision(rootDir, relative, operation, trackedFiles);
     if (!previouslyPinned) observations.push({ operationId: operation.operationId, digest });
   }
+  // Contract: a supplied beforeCommit owner-policy/revocation callback MUST
+  // execute even on a full replay whose every digest is already pinned and
+  // whose observation batch is empty. The journal serializes that empty-batch
+  // gate behind older transactions without inventing a new receipt.
   // An expiry check only before an awaited policy callback or journal queue
   // can turn a formerly fresh signature into a newly pinned expired receipt.
   // Recheck inside the queued journal mutation, after the last awaited policy

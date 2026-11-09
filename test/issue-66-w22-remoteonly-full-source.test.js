@@ -234,6 +234,26 @@ test("W22 inert source: externally trusted policy epoch rollback/revocation acro
   }
 });
 
+test("W22 inert source: revocation while final ACK is queued cannot mark signed records seen", async (t) => {
+  const f = await fixture(t, 1);
+  let blockingCommit;
+  await assert.rejects(probeStrictRemoteOnlyBatch(f.engine, f.trusted, {
+    afterSnapshot: async () => {
+      blockingCommit = f.engine.journal.commit(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 550));
+        f.state.epoch = 8;
+        f.state.revoked = ["device-signer"];
+      });
+    },
+  }), { code: "authorization_device_revoked" });
+  await blockingCommit;
+  const cold = await f.makeEngine();
+  assert.equal(cold.journal.state.seen.length, 0);
+  assert.equal(Object.keys(cold.journal.state.observed).length, 1);
+  assert.equal(Object.keys(cold.snapshot.remoteOnly).length, 1);
+  assert.deepEqual(f.state.revoked, ["device-signer"]);
+});
+
 test("W22 inert source: physical canary introduced after preflight pins is detected before snapshot", async (t) => {
   const f = await fixture(t, 2);
   const canary = path.join(f.rootDir, "private");

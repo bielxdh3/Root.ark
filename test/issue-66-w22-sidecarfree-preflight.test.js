@@ -139,6 +139,74 @@ test("W22: journal queue delay cannot pin a newly expired signed LIST", async (t
     crypto.createHash("sha256").update(protocol.canonicalJson(fresh)).digest("hex")), false);
 });
 
+test("W22: replay of already observed Ed25519 CREATE or DELETE still checks late revocation", async (t) => {
+  for (const operation of ["create", "delete"]) {
+    const f = await fixture(t);
+    const signed = await f.signed(operation === "create" ? 51 : 52, operation);
+    const digest = crypto.createHash("sha256")
+      .update(protocol.canonicalJson(signed)).digest("hex");
+    let physical = null;
+    if (operation === "delete") {
+      physical = path.join(f.rootDir, signed.metadata.path);
+      await fsp.writeFile(physical, "protected local content");
+      f.trackedFiles[signed.metadata.path] = {
+        objectId: signed.objectId, fileId: signed.fileId,
+        directory: false, deleted: false,
+      };
+    }
+    await f.journal.observeAdmission(signed.operationId, digest);
+    const previous = await fsp.readFile(f.journal.filePath, "utf8");
+    let checked = 0;
+    await assert.rejects(preflightAndPinSignedList({ ...f.expected,
+      records: [signed],
+      beforeCommit: async () => {
+        checked += 1;
+        throw Object.assign(new Error("Signer revoked during replay"),
+          { code: "authorization_device_revoked" });
+      },
+    }), { code: "authorization_device_revoked" });
+    assert.equal(checked, 1, `${operation} replay must check policy even with no new receipts`);
+    assert.equal(await fsp.readFile(f.journal.filePath, "utf8"), previous);
+    if (physical) assert.equal(await fsp.readFile(physical, "utf8"), "protected local content");
+    const cold = await new SyncJournal(f.journal.filePath).open();
+    assert.equal(cold.hasLocalAdmission(signed.operationId, digest), true);
+    assert.equal(cold.hasSeen(signed.operationId), false);
+    checked = 0;
+    const replay = await preflightAndPinSignedList({ ...f.expected,
+      records: [signed], beforeCommit: async () => { checked += 1; },
+    });
+    assert.equal(replay.observed, 0);
+    assert.equal(checked, 1);
+    assert.equal(await fsp.readFile(f.journal.filePath, "utf8"), previous,
+      "already pinned replay is not a second durable journal write");
+  }
+});
+
+test("W22: an admitted Ed25519 CREATE replay cannot skip a queued revocation gate", async (t) => {
+  const f = await fixture(t);
+  const signed = await f.signed(53);
+  const digest = crypto.createHash("sha256").update(protocol.canonicalJson(signed)).digest("hex");
+  await f.journal.markSeen(signed.operationId, digest);
+  const previous = await fsp.readFile(f.journal.filePath, "utf8");
+  let checks = 0;
+  const preceding = f.journal.commit(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  });
+  await assert.rejects(preflightAndPinSignedList({ ...f.expected,
+    records: [signed], beforeCommit: async () => {
+      checks += 1;
+      throw Object.assign(new Error("Revoked after already-admitted replay"),
+        { code: "authorization_device_revoked" });
+    },
+  }), { code: "authorization_device_revoked" });
+  await preceding;
+  assert.equal(checks, 1);
+  assert.equal(await fsp.readFile(f.journal.filePath, "utf8"), previous);
+  const cold = await new SyncJournal(f.journal.filePath).open();
+  assert.equal(cold.hasSeen(signed.operationId), true);
+  assert.equal(cold.hasLocalAdmission(signed.operationId, digest), true);
+});
+
 test("W22: duplicate operationIds and portable case aliases cannot mutate an earlier admission", async (t) => {
   const f = await fixture(t);
   const first = await f.signed(5);

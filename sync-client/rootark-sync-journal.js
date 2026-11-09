@@ -596,7 +596,19 @@ class SyncJournal {
       || (beforePersist !== null && typeof beforePersist !== "function")) {
       throw new Error("Invalid bounded sync admission batch");
     }
-    if (!entries.length) return;
+    if (!entries.length) {
+      // A complete signed LIST replay can consist entirely of previously
+      // observed/admitted digests. Its owner-policy/revocation gate is still
+      // mandatory, even though there is no new journal state to persist.
+      // Serialize the gate behind prior writes without issuing an unnecessary
+      // durable rename or manufacturing a new signed observation.
+      if (beforePersist) {
+        const check = this.queue.then(() => beforePersist());
+        this.queue = check.catch(() => {});
+        await check;
+      }
+      return;
+    }
     const unique = new Set();
     const frozenEntries = [];
     for (const entry of entries) {
@@ -643,11 +655,12 @@ class SyncJournal {
       }
     });
   }
-  async batchMarkSeenRemoteOnly(entries) {
+  async batchMarkSeenRemoteOnly(entries, beforePersist = null) {
     // Inert until an independently reviewed, root-handle-bound remote-only
     // caller exists. This cannot be used for signed WebDAV DELETE/MOVE pairs:
     // each exact digest must already have an observed or admitted journal pin.
-    if (!Array.isArray(entries) || !entries.length || entries.length > 640) {
+    if (!Array.isArray(entries) || !entries.length || entries.length > 640
+      || (beforePersist !== null && typeof beforePersist !== "function")) {
       throw new Error("Invalid bounded remote-only acknowledgement batch");
     }
     const ids = new Set();
@@ -664,7 +677,10 @@ class SyncJournal {
       ids.add(operationId);
       frozen.push({ operationId, digest });
     }
-    await this.commit((next) => {
+    await this.commit(async (next) => {
+      // Recheck the independently pinned current revocation/epoch policy
+      // AFTER older queued journal operations, not only before enqueueing ACK.
+      if (beforePersist) await beforePersist();
       const pending = new Set(next.pending.map((item) => item.operationId));
       const seen = new Set(next.seen);
       const grouped = new Set(Object.values(next.atomicSignedGroups)
