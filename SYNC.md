@@ -11,6 +11,20 @@ nao restaura automaticamente e nao altera a politica de retencao; a recuperacao
 efetiva continua exigindo uma operacao autorizada do cliente. Ela nao concede
 acesso aos objetos protegidos do ZK-1 por outro protocolo nem encerra a issue #67.
 
+O cliente v2 pode listar esse historico sem modificar arquivos, operacoes
+pendentes ou versoes remotas:
+
+```powershell
+node sync-client/rootark-sync-v2.js history --config <config-v2-privado> --object-id <id>
+```
+
+A consulta exige um arquivo de configuracao privado com `serverUrl`, `username`
+e `token`, e permissao `listFiles` no servidor. A saida JSON inclui apenas
+identificadores, caminho, revisao, dispositivo e estado `tombstone`; nao
+imprime ciphertext nem chaves. O campo `signatureVerified: false` informa que
+esses metadados historicos ainda nao possuem verificacao independente de
+assinatura, admissao ou custodia; a consulta **nao** autoriza uma restauracao.
+
 ## Comandos
 
 ```powershell

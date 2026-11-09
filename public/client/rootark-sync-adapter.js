@@ -190,6 +190,20 @@
         if (Array.isArray(payload.objects)) return { ...payload, protocolVersion: PROTOCOL_VERSION, objects: payload.objects.map((record) => assertOpaqueEnvelope(record, false)) };
         return assertOpaqueEnvelope(payload, false);
       },
+      history: async (objectId) => {
+        const requestedId = id(objectId);
+        const payload = await request(`/sync/v1/objects/${encodeURIComponent(requestedId)}/history`);
+        if (payload.protocolVersion !== PROTOCOL_VERSION || !Array.isArray(payload.versions)) {
+          fail("Invalid sync history response");
+        }
+        // History is untrusted read data, never a new device grant or proof
+        // that a version was durably admitted before its signature expired.
+        const versions = payload.versions.map((record) => assertOpaqueEnvelope(record, false));
+        if (versions.some((record) => record.objectId !== requestedId)) {
+          fail("Sync history includes a different object");
+        }
+        return { protocolVersion: PROTOCOL_VERSION, versions };
+      },
       push: (envelope) => {
         const normalized = assertOpaqueEnvelope(envelope);
         const deleteRequest = normalized.operation === "delete";
