@@ -8,6 +8,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { Worker } = require("node:worker_threads");
 const { openNativeRootSession, requireNativeRecoveryAuthority } =
   require("../sync-client/rootark-sync-native-root-session-contract");
 
@@ -15,6 +16,7 @@ const enabled = process.platform === "linux" &&
   process.env.ROOTARK_ISSUE66_W3_NAPI_LAB === "1";
 const source = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/native_bridge.c");
 let addon;
+let addonPath;
 
 function loadLab() {
   if (addon) return addon;
@@ -37,6 +39,7 @@ function loadLab() {
     env: { PATH: "/usr/bin:/bin", LC_ALL: "C", LANG: "C", TMPDIR: build },
   });
   assert.equal(compilation.status, 0, `gcc compilation failed: ${compilation.stderr?.slice(0, 1500)}`);
+  addonPath = target;
   addon = require(target);
   return addon;
 }
@@ -65,8 +68,15 @@ test("#66 W3 token minted in native code rejects JS fd/object/path spoofing",
 test("#66 W3 pinned native fd enumerates and reads exact Unicode across deterministic A-B-A",
   { skip: !enabled }, () => {
     const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
     const token = bridge.openTestSession();
     assert.match(token, /^[0-9a-f]{32}$/);
+    const freshNames = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(freshNames.length, 1, "one native-owned parent fixture was created");
+    assert.equal(freshNames[0].includes(token), false,
+      "directory suffix must be generated independently of the bearer token");
     assert.equal(bridge.authority(), "LAB_ONLY_NO_GO");
     const initial = bridge.enumerate(token);
     assert.deepEqual(initial.sort(), ["alias", "original.bin", "café-中-😀.bin"].sort());
@@ -83,6 +93,52 @@ test("#66 W3 pinned native fd enumerates and reads exact Unicode across determin
     assert.equal(bridge.read(token, "café-中-😀.bin").toString("utf8"), "UNICODE");
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
     assert.throws(() => bridge.read(token, "original.bin"), /NATIVE_TOKEN_REJECTED/);
+  });
+
+test("#66 W3 Node Worker environments own separate native descriptors and session tokens",
+  { skip: !enabled, timeout: 30000 }, async () => {
+    loadLab();
+    const code = `
+      const { parentPort, workerData } = require("node:worker_threads");
+      const native = require(workerData.addonPath);
+      const mine = native.openTestSession();
+      parentPort.postMessage({ type: "ready", token: mine });
+      parentPort.once("message", (other) => {
+        let rejected = false;
+        try { native.read(other.token, "original.bin"); }
+        catch (error) { rejected = error.message === "NATIVE_TOKEN_REJECTED"; }
+        const own = native.read(mine, "original.bin").toString() === "TRUSTED_ORIGINAL";
+        native.closeTestSession(mine);
+        parentPort.postMessage({ type: "result", rejected, own });
+        parentPort.close();
+      });
+    `;
+    function oneMessage(worker) {
+      return new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+        worker.once("exit", (code) => {
+          if (code !== 0) reject(new Error("worker native session failed"));
+        });
+      });
+    }
+    const a = new Worker(code, { eval: true, workerData: { addonPath } });
+    const b = new Worker(code, { eval: true, workerData: { addonPath } });
+    try {
+      const [startA, startB] = await Promise.all([oneMessage(a), oneMessage(b)]);
+      assert.equal(startA.type, "ready");
+      assert.equal(startB.type, "ready");
+      assert.notEqual(startA.token, startB.token);
+      const replies = Promise.all([oneMessage(a), oneMessage(b)]);
+      a.postMessage({ token: startB.token });
+      b.postMessage({ token: startA.token });
+      const [resultA, resultB] = await replies;
+      for (const result of [resultA, resultB]) {
+        assert.deepEqual(result, { type: "result", rejected: true, own: true });
+      }
+    } finally {
+      await Promise.all([a.terminate(), b.terminate()]);
+    }
   });
 
 test("#66 W3 native openat2 denies read-only traversal into a mounted procfs",

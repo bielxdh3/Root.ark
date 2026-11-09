@@ -40,7 +40,14 @@ typedef struct {
   int phase;
   char token[33];
 } lab_session;
-static lab_session state = {.parentfd = -1};
+
+// Each Node environment owns its own native descriptors and token. No
+// process-global session can be consumed or finalized by a worker thread.
+static lab_session *session_for(napi_env env) {
+  lab_session *session = NULL;
+  if (napi_get_instance_data(env, (void **)&session) != napi_ok) return NULL;
+  return session;
+}
 
 static napi_value fail(napi_env env, const char *message) {
   (void)napi_throw_error(env, NULL, message);
@@ -134,8 +141,10 @@ static int rename_no_replace(int parent, const char *from, const char *to) {
 }
 
 static int valid_token(napi_env env, napi_value value) {
+  lab_session *session = session_for(env);
   napi_valuetype t;
-  if (!state.active || napi_typeof(env, value, &t) != napi_ok || t != napi_string)
+  if (!session || !session->active ||
+      napi_typeof(env, value, &t) != napi_ok || t != napi_string)
     return 0;
   size_t size = 0;
   if (napi_get_value_string_utf8(env, value, NULL, 0, &size) != napi_ok ||
@@ -146,7 +155,7 @@ static int valid_token(napi_env env, napi_value value) {
       used != 32 || text[32] != 0) return 0;
   unsigned diff = 0;
   for (size_t i = 0; i < 33; ++i)
-    diff |= (unsigned)(unsigned char)(text[i] ^ state.token[i]);
+    diff |= (unsigned)(unsigned char)(text[i] ^ session->token[i]);
   return diff == 0;
 }
 
@@ -166,23 +175,27 @@ static int leaf_name(napi_env env, napi_value value, char out[256]) {
   return 1;
 }
 
-static void release_handles(void) {
-  if (state.held) {
-    (void)closedir(state.held);
-    state.held = NULL;
+static void release_handles(lab_session *session) {
+  if (!session) return;
+  if (session->held) {
+    (void)closedir(session->held);
+    session->held = NULL;
   }
-  if (state.parentfd >= 0) {
-    (void)close(state.parentfd);
-    state.parentfd = -1;
+  if (session->parentfd >= 0) {
+    (void)close(session->parentfd);
+    session->parentfd = -1;
   }
-  state.active = 0;
-  state.phase = 0;
-  memset(state.token, 0, sizeof(state.token));
+  session->active = 0;
+  session->phase = 0;
+  memset(session->token, 0, sizeof(session->token));
 }
 
-static void cleanup(void *arg) {
-  (void)arg;
-  release_handles(); // handles only; never unlink or recursively clean.
+static void cleanup(napi_env env, void *data, void *hint) {
+  (void)env;
+  (void)hint;
+  lab_session *session = (lab_session *)data;
+  release_handles(session); // handles only; never unlink or recursively clean.
+  free(session);
 }
 
 static napi_value authority(napi_env env, napi_callback_info info) {
@@ -194,7 +207,8 @@ static napi_value authority(napi_env env, napi_callback_info info) {
 static napi_value open_test_session(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 0, argv)) return fail(env, "NATIVE_ARGUMENT_REJECTED");
-  if (state.active || getenv("ROOTARK_ISSUE66_W3_NAPI_LAB") == NULL ||
+  lab_session *session = session_for(env);
+  if (!session || session->active || getenv("ROOTARK_ISSUE66_W3_NAPI_LAB") == NULL ||
       strcmp(getenv("ROOTARK_ISSUE66_W3_NAPI_LAB"), "1") != 0)
     return fail(env, "NATIVE_TEST_DISABLED");
   // POSIX passwd HOME is not independently attested authority. The newly
@@ -210,13 +224,16 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
     if (home >= 0) (void)close(home);
     return fail(env, "NATIVE_PARENT_UNVERIFIED");
   }
-  char id[33];
-  if (!random_hex(id, 16)) {
+  // Two independent CSPRNG draws: a visible HOME directory suffix must not
+  // disclose the native bearer token to another same-UID directory enumerator.
+  char directory_id[33], token[33];
+  if (!random_hex(directory_id, 16) || !random_hex(token, 16) ||
+      strcmp(directory_id, token) == 0) {
     (void)close(home);
     return fail(env, "NATIVE_RANDOM_FAILED");
   }
   char parent_name[80];
-  (void)snprintf(parent_name, sizeof(parent_name), ".rootark-w3-napi-%s", id);
+  (void)snprintf(parent_name, sizeof(parent_name), ".rootark-w3-napi-%s", directory_id);
   if (mkdirat(home, parent_name, 0700) != 0) {
     (void)close(home);
     return fail(env, "NATIVE_PARENT_UNVERIFIED");
@@ -248,26 +265,27 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
     (void)close(parent);
     return fail(env, "NATIVE_FIXTURE_FAILED");
   }
-  state.parentfd = parent;
-  state.held = dir;
-  state.phase = 0;
-  memcpy(state.token, id, sizeof(state.token));
-  state.active = 1;
-  return result_text(env, id);
+  session->parentfd = parent;
+  session->held = dir;
+  session->phase = 0;
+  memcpy(session->token, token, sizeof(session->token));
+  session->active = 1;
+  return result_text(env, token);
 }
 
 static napi_value enumerate(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  int fd = dirfd(state.held);
+  lab_session *session = session_for(env);
+  int fd = dirfd(session->held);
   if (!plain_directory(fd, 1)) return fail(env, "NATIVE_FD_INVALID");
-  rewinddir(state.held);
+  rewinddir(session->held);
   napi_value array;
   if (napi_create_array(env, &array) != napi_ok) return fail(env, "NATIVE_API_FAILED");
   uint32_t count = 0;
   errno = 0;
-  for (struct dirent *entry; (entry = readdir(state.held)) != NULL;) {
+  for (struct dirent *entry; (entry = readdir(session->held)) != NULL;) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
     if (++count > 16) return fail(env, "NATIVE_ENUM_LIMIT"); // no 16,385 claim
@@ -285,10 +303,11 @@ static napi_value native_read(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 2, argv) || !valid_token(env, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
+  lab_session *session = session_for(env);
   char leaf[256];
   if (!leaf_name(env, argv[1], leaf))
     return fail(env, "NATIVE_LEAF_REJECTED");
-  int file = fd_openat2(dirfd(state.held), leaf, O_RDONLY, 0);
+  int file = fd_openat2(dirfd(session->held), leaf, O_RDONLY, 0);
   if (file < 0) return fail(env, "NATIVE_OPEN_DENIED");
   struct stat st;
   if (fstat(file, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
@@ -324,13 +343,14 @@ static napi_value swap_to_foreign(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  if (state.phase != 0) return fail(env, "NATIVE_PHASE_REJECTED");
-  int parent = state.parentfd;
+  lab_session *session = session_for(env);
+  if (session->phase != 0) return fail(env, "NATIVE_PHASE_REJECTED");
+  int parent = session->parentfd;
   if (!rename_no_replace(parent, "held", "parked") ||
       mkdirat(parent, "held", 0700) != 0)
     return fail(env, "NATIVE_RENAME_FAILED");
   int foreign = fd_openat2(parent, "held", O_RDONLY | O_DIRECTORY, 0);
-  int original = dirfd(state.held);
+  int original = dirfd(session->held);
   int okay = plain_directory(foreign, 1) && !object_is(foreign, original) &&
              write_owned(foreign, "original.bin", FOREIGN_BYTES) &&
              marker_equals(original, "original.bin", TRUSTED_BYTES) &&
@@ -338,7 +358,7 @@ static napi_value swap_to_foreign(napi_env env, napi_callback_info info) {
              fsync(foreign) == 0 && fsync(parent) == 0;
   if (foreign >= 0 && close(foreign) != 0) okay = 0;
   if (!okay) return fail(env, "NATIVE_RENAME_FAILED");
-  state.phase = 1;
+  session->phase = 1;
   return result_text(env, "HELD_ORIGINAL_FOREIGN_AT_NAME");
 }
 
@@ -346,21 +366,22 @@ static napi_value restore_original(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  if (state.phase != 1) return fail(env, "NATIVE_PHASE_REJECTED");
-  int parent = state.parentfd;
+  lab_session *session = session_for(env);
+  if (session->phase != 1) return fail(env, "NATIVE_PHASE_REJECTED");
+  int parent = session->parentfd;
   if (!rename_no_replace(parent, "held", "foreign-parked") ||
       !rename_no_replace(parent, "parked", "held"))
     return fail(env, "NATIVE_RENAME_FAILED");
   int restored = fd_openat2(parent, "held", O_RDONLY | O_DIRECTORY, 0);
   int foreign = fd_openat2(parent, "foreign-parked", O_RDONLY | O_DIRECTORY, 0);
-  int okay = object_is(dirfd(state.held), restored) &&
-             !object_is(dirfd(state.held), foreign) &&
+  int okay = object_is(dirfd(session->held), restored) &&
+             !object_is(dirfd(session->held), foreign) &&
              marker_equals(restored, "original.bin", TRUSTED_BYTES) &&
              marker_equals(foreign, "original.bin", FOREIGN_BYTES);
   if (restored >= 0 && close(restored) != 0) okay = 0;
   if (foreign >= 0 && close(foreign) != 0) okay = 0;
   if (!okay) return fail(env, "NATIVE_RENAME_FAILED");
-  state.phase = 2;
+  session->phase = 2;
   return result_text(env, "ORIGINAL_RESTORED_FOREIGN_RETAINED");
 }
 
@@ -382,11 +403,18 @@ static napi_value close_test_session(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  release_handles();
+  release_handles(session_for(env));
   return result_text(env, "CLOSED_NO_AUTHORITY");
 }
 
 static napi_value init(napi_env env, napi_value exports) {
+  lab_session *session = calloc(1, sizeof(*session));
+  if (!session) return fail(env, "NATIVE_API_FAILED");
+  session->parentfd = -1;
+  if (napi_set_instance_data(env, session, cleanup, NULL) != napi_ok) {
+    free(session);
+    return fail(env, "NATIVE_API_FAILED");
+  }
   napi_property_descriptor methods[] = {
     {"authority", NULL, authority, NULL, NULL, NULL, napi_default, NULL},
     {"openTestSession", NULL, open_test_session, NULL, NULL, NULL, napi_default, NULL},
@@ -398,8 +426,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"closeTestSession", NULL, close_test_session, NULL, NULL, NULL, napi_default, NULL},
   };
   if (napi_define_properties(env, exports, sizeof(methods)/sizeof(methods[0]),
-                             methods) != napi_ok ||
-      napi_add_env_cleanup_hook(env, cleanup, NULL) != napi_ok)
+                             methods) != napi_ok)
     return fail(env, "NATIVE_API_FAILED");
   return exports;
 }

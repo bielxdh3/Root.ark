@@ -27,7 +27,11 @@ Only with the explicit lab opt-in, its native code obtains the OS `/` fd,
 opens the passwd HOME dir using `openat2` and creates a private new
 `.rootark-w3-napi-*` parent directory mode `0700`. The native side opens and
 retains that parent dirfd, opens a `held` child, verifies ext4 and ownership,
-then mints a random 128-bit **native-issued opaque test token**. The original
+then mints a random 128-bit **native-issued opaque test token** from a
+**separate** `getrandom` draw: the token is not embedded in, or computed from,
+the directory suffix visible to the same UID. Each Node N-API environment
+holds its own native session via `napi_set_instance_data` with exactly one
+finalizer; no file-static shared session crosses Worker threads. The original
 FD remains under a `DIR*` created by `fdopendir`, and `enumerate(token)`
 uses **that exact same fd** (`rewinddir/readdir/dirfd`). Its present
 enumeration limit is **16 fixture entries**; it does not implement the full
@@ -56,8 +60,18 @@ bind mount under the retained directory.
 Physical TDD on WSL Ubuntu Linux 6.18.33.1, ext4 HOME, Node v22.22.1,
 gcc 15.2.0: initial **0 PASS / 4 FAIL / 1 SKIP** without the C implementation,
 then **4 PASS / 0 FAIL / 1 SKIP** with the addon loaded and called by Node.
+After resolving two source-review concerns (token/directory randomness reuse
+and global state across Node environments), the focused addon suite is
+**5 PASS / 0 FAIL / 1 SKIP** and the combined addon + unchanged RootSession
+contract suite is **12 PASS / 0 FAIL / 1 SKIP**. The new tests physically
+verify a directory suffix distinct from its native token and two concurrent
+Node Workers with separate valid native sessions that reject each other's
+tokens. The environment finalizer closes only its own descriptors.
 The SKIP is a hostile same-UID concurrent bind-mount/parent-trust test:
 `CAP_SYS_ADMIN` and independently protected custody were not available.
+The test-token separation and per-environment state are narrowly scoped
+correctness checks; a hostile same-UID process can still inspect another
+process, mutate the trusted-by-test parent or race native fixture paths.
 
 Even while this addon is loaded, the integrated
 `sync-client/rootark-sync-native-root-session-contract.js`
