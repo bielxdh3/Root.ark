@@ -32,6 +32,9 @@ then mints a random 128-bit **native-issued opaque test token** from a
 the directory suffix visible to the same UID. Each Node N-API environment
 holds its own native session via `napi_set_instance_data` with exactly one
 finalizer; no file-static shared session crosses Worker threads. The original
+passwd HOME lookup uses reentrant `getpwuid_r` with caller-owned storage
+for concurrent Workers; this corrects a race in `getpwuid`, but it does not
+attest to passwd/NSS contents.
 FD remains under a `DIR*` created by `fdopendir`, and `enumerate(token)`
 uses **that exact same fd** (`rewinddir/readdir/dirfd`). Its present
 enumeration limit is **16 fixture entries**; it does not implement the full

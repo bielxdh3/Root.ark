@@ -213,8 +213,13 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
     return fail(env, "NATIVE_TEST_DISABLED");
   // POSIX passwd HOME is not independently attested authority. The newly
   // created 0700 parent and all subsequent handles are strictly test-owned.
-  struct passwd *pw = getpwuid(geteuid());
-  if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/' ||
+  // getpwuid() returns process-shared static storage. Per-worker native
+  // acquisitions must never race while reading the passwd HOME path.
+  struct passwd passwd_entry, *pw = NULL;
+  char passwd_buffer[16384];
+  if (getpwuid_r(geteuid(), &passwd_entry, passwd_buffer,
+                 sizeof(passwd_buffer), &pw) != 0 ||
+      !pw || !pw->pw_dir || pw->pw_dir[0] != '/' ||
       pw->pw_dir[1] == 0) return fail(env, "NATIVE_PARENT_UNVERIFIED");
   int root = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (root < 0) return fail(env, "NATIVE_PARENT_UNVERIFIED");
