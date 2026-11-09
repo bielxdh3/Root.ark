@@ -13,7 +13,33 @@ const enabled = process.platform === "linux" && process.env.ROOTARK_ISSUE66_OWNE
 const source = path.resolve(__dirname, "../experiments/issue66-owner-rooted-read/owner_rooted_read.c");
 const expected = "ROOTARK_OWNER_V1 fs=EXT4 parent=ROOT_STICKY root=ROOT_OWNED marker=READ_ONLY fd=PINNED\n";
 
-test("#66 root-owned ext4 parent rejects concurrent same-UID substitution while native child reads exact root", {
+test("#66 privileged owner-provisioner validates the entire name before any root action", {
+  skip: process.platform !== "linux",
+}, () => {
+  const provisioner = path.resolve(__dirname,
+    "../experiments/issue66-owner-rooted-read/provision-owner-root.sh");
+  const check = (leaf) => spawnSync("/bin/sh", [provisioner, "--validate-only", leaf], {
+    encoding: "utf8", timeout: 5000, maxBuffer: 1024,
+    env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+  });
+  const valid = "rootark-issue66-owner-0123456789abcdef";
+  const accepted = check(valid);
+  assert.equal(accepted.status, 0, "whole-value validator should accept one exact safe leaf");
+  assert.equal(accepted.stdout, "");
+  assert.equal(accepted.stderr, "");
+  for (const dangerous of [
+    `${valid}\n/child`, `${valid}\n../child`, `${valid}/child`,
+    `${valid}\r`, `${valid}\n`, `${valid}extra`,
+    "rootark-issue66-owner-0123456789abcdeg", "../etc/passwd", "",
+  ]) {
+    const result = check(dangerous);
+    assert.equal(result.status, 41, "dangerous or ambiguous leaf must be denied as a whole");
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "");
+  }
+});
+
+test("#66 root-owned ext4 parent denies same-UID substitution across fresh native reads", {
   skip: !enabled, timeout: 60000,
 }, async (t) => {
   assert.match(process.version, /^v22\./);
@@ -73,8 +99,9 @@ test("#66 root-owned ext4 parent rejects concurrent same-UID substitution while 
     ["EPERM", "EACCES"].includes(error.code), "same-UID write must be denied");
 
   // Independent Node processes run as the SAME unprivileged UID and attempt
-  // replacement + in-place mutation WHILE a fresh native process repeatedly
-  // opens/read-verifies the root-owned fixture. Attackers never delete data.
+  // replacement and in-place mutation while fresh native reads are invoked.
+  // This schedules an adversarial window but does NOT establish exact overlap
+  // of syscalls; root/sticky permissions must deny writes regardless of order.
   const attackerCode = [
     "'use strict';",
     "const fs = require('node:fs');",
@@ -120,7 +147,7 @@ test("#66 root-owned ext4 parent rejects concurrent same-UID substitution while 
   for (const attacker of attackers) attacker.child.stdin.write("GO\n");
   for (let i = 0; i < 8; i++) {
     const overlapping = run();
-    assert.equal(overlapping.status, 0, "native open/read must survive active same-UID adversaries");
+    assert.equal(overlapping.status, 0, "native read must survive same-UID writer attempts");
     assert.equal(overlapping.stdout, expected);
     assert.equal(overlapping.stderr, "");
   }

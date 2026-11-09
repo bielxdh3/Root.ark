@@ -4,9 +4,11 @@
 this experiment, and `openNativeRootSession()` remains unconditionally closed.
 This proves a *narrower OS property* than a complete RootSession: a directory
 and marker owned by **root** beneath a root-owned sticky parent cannot be
-renamed or modified by two competing processes running as ordinary UID 1000.
-The test verifies a native held-directory read before, during and after those
-failed mutations. It does not show that Root.ark has obtained an authorized,
+renamed or modified by two processes running as ordinary UID 1000.
+The test verifies native held-directory reads before and after those failed
+mutations, with repeated process launches during attacker attempts. It does
+not synchronize individual syscalls to prove exact temporal overlap, and
+does not show that Root.ark has obtained an authorized,
 writable, durable recovery root from an independent custodian.
 
 ## Scope and safe setup
@@ -29,6 +31,11 @@ writable, durable recovery root from an independent custodian.
 
 The actual setup invocation uses `wsl.exe --user root --exec /bin/sh` with
 the on-disk `provision-owner-root.sh` and a validated, random leaf argument.
+The shell's `--validate-only` mode exercises strict whole-string ASCII/length
+validation **without root privileges**, including malicious newline + slash
+inputs. The root script is in a user-writable checkout: its executable bytes
+are not independently attested, so do not execute it as root in the presence
+of an adversary who can modify the worktree or invoke WSL root.
 The test itself runs from the checked-in worktree with the ordinary WSL user:
 
 ```sh
@@ -46,8 +53,8 @@ program opens `/` then `var/tmp` and the fixed-format leaf using `openat2`
 with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`; verifies ext4,
 root ownership, sticky parent, fixed directory and file modes; enumerates
 the same held directory object, reads the exact Unicode marker through its
-descriptor and rechecks the retained file identity. Both in-process and
-separate same-UID attacker processes attempt rename and in-place write;
+descriptor and rechecks the retained file identity. The test process and
+two separate same-UID attacker processes attempt rename and in-place write;
 every operation must fail `EACCES`/`EPERM`. A new native process repeats the
 read after the attackers, without inheriting a prior file descriptor.
 
@@ -63,7 +70,9 @@ read after the attackers, without inheriting a prior file descriptor.
 - A root-owned sticky `/var/tmp` prevents *this particular* unprivileged
   attacker from replacing this *one root-owned leaf*. It does not stop a
   process with root privileges, a malicious mount namespace, or a kernel
-  attacker. No actual successful A→B→A attack, forced power cut or hostile
+  attacker. A process that can launch WSL as root has that stronger authority.
+  No exact overlap of attacker writes with a native read is established.
+  No actual successful A→B→A attack, forced power cut or hostile
   bind mount is performed.
 - `fsync`/power-loss ordering, monotonic anti-rollback, native write/journal
   phases, Unicode normalization collisions, a `16,385`-entry recovery, cold
