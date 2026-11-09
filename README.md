@@ -30,18 +30,18 @@ Root.ark is a self-hosted Node.js service for managing files, permissions, versi
                      ┌──────────────▼─────────────────┐
                      │ Root.ark server (Express)      │
                      │ auth · ACL · uploads · WebDAV  │
-                     │ sync · opt-in protected routes│
+                     │ sync · opt-in protected routes │
                      └──────────┬───────────┬─────────┘
                                 │           │
                     ┌───────────▼────┐ ┌────▼──────────────────┐
-                    │ SQLite + JSON  │ │ Managed file storage │
-                    │ accounts · ACL │ │ versions · trash     │
-                    │ metadata/audit │ │ quarantine · backups │
+                    │ SQLite + JSON  │ │ Managed file storage  │
+                    │ accounts · ACL │ │ versions · trash      │
+                    │ metadata/audit │ │ quarantine · backups  │
                     └────────────────┘ └────┬──────────────────┘
                                             │ optional adapters
                                   ┌─────────▼─────────────┐
-                                  │ S3 / Google Drive    │
-                                  │ provider boundaries  │
+                                  │ S3 / Google Drive     │
+                                  │ provider boundaries   │
                                   └───────────────────────┘
 
         ZK-1 protected path (opt-in, default-off; separate trust):
@@ -51,8 +51,8 @@ Root.ark is a self-hosted Node.js service for managing files, permissions, versi
              └─────────────┬────────────┘
                            │ signed ciphertext
              ┌─────────────▼────────────┐   ┌──────────────────────┐
-             │ ZK-1 routes in server    │──►│ Independent witness│
-             │ isolated protected API  │   │ and CAS trust gates│
+             │ ZK-1 routes in server    │──►│ Independent witness  │
+             │ isolated protected API   │   │ and CAS trust gates  │
              └──────────────────────────┘   └──────────────────────┘
 ```
 
