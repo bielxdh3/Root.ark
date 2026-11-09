@@ -21,7 +21,9 @@ async function fixture(t, authorizeObject, authorizeSignalSnapshot = null) {
   // construction, never provided by HTTP or claimed to be an owner signature.
   // These unit tests examine broker races, not real immutable storage custody.
   const broker = makeBroker({ authenticateSession, authorizeObject,
-    authorizeImmutableVersion: () => Object.freeze({ versionId: 'test-immutable-v1' }),
+    authorizeImmutableVersion: input => Object.freeze({
+      ...input, boundObject: { ...input.boundObject }, versionId: 'test-immutable-v1',
+    }),
     // A present but unavailable snapshot must still deny protected SDP/ICE;
     // the separate pretrust test covers truly missing startup capabilities.
     authorizeSignalSnapshot: authorizeSignalSnapshot ?? (() => null),

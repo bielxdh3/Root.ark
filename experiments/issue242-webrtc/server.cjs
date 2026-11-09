@@ -18,6 +18,28 @@ const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-peer', 'consent', 'signal']);
 
+function plainDataFields(value, fields) {
+  if (!object(value) || Object.getPrototypeOf(value) !== Object.prototype ||
+    Reflect.ownKeys(value).length !== fields.length) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return fields.every(field => Object.hasOwn(descriptors, field) &&
+    Object.hasOwn(descriptors[field], 'value'));
+}
+
+function immutableVersionMatches(value, expected) {
+  if (!plainDataFields(value, ['owner', 'boundObject', 'pin', 'sha256', 'bytes', 'versionId']) ||
+    !plainDataFields(value.boundObject, ['folderId', 'fileName'])) return false;
+  return value.owner === expected.owner &&
+    value.boundObject.folderId === expected.boundObject.folderId &&
+    value.boundObject.fileName === expected.boundObject.fileName &&
+    value.pin === expected.pin && value.sha256 === expected.sha256 &&
+    value.bytes === expected.bytes &&
+    typeof value.versionId === 'string' &&
+    /^[a-zA-Z0-9_-]{16,128}$/.test(value.versionId) &&
+    !/^\d+$/.test(value.versionId) &&
+    value.versionId !== expected.pin && value.versionId !== expected.sha256;
+}
+
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
   authenticateSession = null, sharedWss = null, authorizeRecipient = null,
   authorizeObject = null, authorizeSignalSnapshot = null,
@@ -298,7 +320,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (role === 'host') room.hostJoined = true;
       send(ws, { type: 'joined', peerId: id, role, username: peer.username,
         ...(room.boundObject ? { boundObject: { ...room.boundObject, sha256: room.objectDigest,
-          size: room.objectSize } } : {}),
+          size: room.objectSize, versionId: room.immutableVersionId } } : {}),
         members: [...room.members.values()].filter(p => p.id !== id).map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
       for (const other of room.members.values()) if (other.id !== id) send(other.ws, { type: 'peer-joined', peerId: id, role, username: peer.username });
       return;
@@ -416,6 +438,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     let objectPin = null;
     let objectDigest = null;
     let objectSize = null;
+    let immutableVersionId = null;
     const body = req.body;
     if (body !== undefined && body !== null && (!object(body) ||
       (Object.keys(body).length > 0 && (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'boundObject'))))) {
@@ -481,6 +504,29 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
           objectPin = grant.fingerprint;
           objectDigest = grant.sha256;
           objectSize = grant.bytes;
+          // A callback's mere presence or a hash of mutable legacy ciphertext
+          // cannot authorize a version. Only a trusted startup-injected
+          // authority may attest the exact owner/path/pin/digest/size tuple;
+          // the adapter MUST independently verify owner-signed immutable
+          // storage and custody before returning this record.
+          const context = Object.freeze({
+            owner, boundObject: Object.freeze({ ...boundObject }),
+            pin: objectPin, sha256: objectDigest, bytes: objectSize,
+          });
+          const version = await authorizeImmutableVersion(context);
+          if (!immutableVersionMatches(version, context)) return { status: 403 };
+          immutableVersionId = version.versionId;
+          // The async authority may overlap a revocation or ciphertext
+          // replacement. Recheck the owner's live ACL and exact bytes after it
+          // resolves; these preflights still cannot replace an atomic custody
+          // and ACL mutation fence.
+          const current = await authorizeObject({
+            owner, recipient: null, boundObject, pin: objectPin,
+          });
+          if (!object(current) || current.fingerprint !== objectPin ||
+            current.sha256 !== objectDigest || current.bytes !== objectSize) {
+            return { status: 403 };
+          }
         } catch { return { status: 403 }; }
       }
       // Hashing may complete after the HTTP request was canceled or the session
@@ -496,12 +542,13 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         hostJoinDeadline: timestamp + (authenticated ? Math.min(roomTtlMs, UNJOINED_ROOM_TTL_MS) : roomTtlMs),
         hostJoined: false,
         owner: user?.username, ownerSessionVersion: user?.sessionVersion,
-        boundObject, objectPin, objectDigest, objectSize,
+        boundObject, objectPin, objectDigest, objectSize, immutableVersionId,
         members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
       rooms.set(room.id, room);
       createdRoom = room;
       return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires,
-        ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest, size: objectSize } } : {}) };
+        ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest,
+          size: objectSize, versionId: immutableVersionId } } : {}) };
     } finally {
       // Retain close/finish listeners for an allocated room until HTTP delivery
       // completes. A disconnect before delivery then reclaims its orphan room.
