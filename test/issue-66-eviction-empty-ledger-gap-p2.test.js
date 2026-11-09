@@ -145,13 +145,106 @@ test("issue 66 P2: retained active zero head cannot migrate over a competing sta
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
 });
 
-test("issue 66 P2: required v2 still refuses oversized ambiguous genesis staging on boot", async (t) => {
+test("issue 66 P2: hard crash with >16384 preexisting trash entries recovers required-v2 before PREPARE", async (t) => {
+  for (const stage of ["staged", "active"]) {
+    const f = await fixture(t, `large-trash-required-recovery-${stage}`);
+    await fillLegitimateTrash(f.root);
+    const before = f.outbound.length;
+    await prePrepareCrash(f, false, stage === "staged");
+    const diskBefore = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+    assert.equal(diskBefore.evictionLedgerRequired, true);
+    const recovered = await f.create(f.root, ["private"]);
+    assert.equal(recovered.snapshot.evictionLedgerRequired, false,
+      "intact required-v2 zero-PREPARE cache must be recoverable despite 16k+ unrelated trash entries");
+    assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+    await recovered.syncOnce();
+    verifyNoSignedDelete(f, before);
+  }
+});
+
+test("issue 66 P2: required v2 refuses a staged case-alias hidden among >16384 trash entries", async (t) => {
   const f = await fixture(t, "large-trash-required");
-  await prePrepareCrash(f);
   await fillLegitimateTrash(f.root);
+  await prePrepareCrash(f, false, true);
+  const stage = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
+  const alias = path.join(f.root, ".rootark-trash", ".ROOTARK-EVICTION-GENESIS-HEAD.JSON");
+  if (process.platform === "win32") {
+    // On ordinary NTFS the alternate spelling is the same physical entry.
+    await fsp.rename(stage, alias);
+  } else {
+    await fsp.writeFile(alias, "forged case alias", { flag: "wx" });
+  }
   const before = f.outbound.length;
   await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
   assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66 P2: large-trash required-v2 recovery still rejects missing tracked bytes", async (t) => {
+  const f = await fixture(t, "large-trash-tracked-missing");
+  await fillLegitimateTrash(f.root);
+  await prePrepareCrash(f);
+  await fsp.unlink(f.local);
+  const before = f.outbound.length;
+  await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66 P2 POSIX: required-v2 rejects a linked stage marker and renamed trash ancestry", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX symlinks and ancestry replacement");
+  const f = await fixture(t, "linked-required-stage");
+  await fillLegitimateTrash(f.root);
+  await prePrepareCrash(f, false, true);
+  const trash = path.join(f.root, ".rootark-trash");
+  const head = path.join(trash, ".rootark-eviction-genesis-head.json");
+  const savedHead = path.join(trash, "untrusted-head-copy.json");
+  await fsp.rename(head, savedHead);
+  await fsp.symlink(savedHead, head);
+  const before = f.outbound.length;
+  await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
+  await fsp.unlink(head);
+  await fsp.rename(savedHead, head);
+  const renamedTrash = path.join(f.dir, "outside-renamed-trash");
+  await fsp.rename(trash, renamedTrash);
+  await fsp.symlink(renamedTrash, trash, "dir");
+  await assert.rejects(f.create(f.root, ["private"]), { code: "unsafe_path" });
+  verifyNoSignedDelete(f, before);
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+});
+
+test("issue 66 P2: replacing staged genesis parent after complete iteration cannot forge anchored recovery", async (t) => {
+  const f = await fixture(t, "renamed-stage-parent-during-proof");
+  await prePrepareCrash(f, false, true);
+  const trash = path.join(f.root, ".rootark-trash");
+  const moved = path.join(f.root, ".rootark-trash-moved-by-host");
+  const marker = ".rootark-eviction-genesis-head.json";
+  const originalOpendir = fsp.opendir;
+  let swapped = false;
+  fsp.opendir = async (...args) => {
+    const dir = await originalOpendir(...args);
+    if (path.resolve(args[0]) !== path.resolve(trash)) return dir;
+    return {
+      async *[Symbol.asyncIterator]() {
+        for await (const entry of dir) yield entry;
+        // Deliberately swap after enumeration but before the reader can open
+        // a byte-identical head at the same path. No symlinks are involved.
+        await fsp.rename(trash, moved);
+        await fsp.mkdir(trash);
+        await fsp.copyFile(path.join(moved, marker), path.join(trash, marker));
+        swapped = true;
+      },
+    };
+  };
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
+  } finally {
+    fsp.opendir = originalOpendir;
+  }
+  assert.equal(swapped, true);
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
   verifyNoSignedDelete(f, before);
 });
 

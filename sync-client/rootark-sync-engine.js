@@ -584,50 +584,74 @@ async function openEvictionLedger(rootDir, create = false) {
   await containedAbsolute(rootDir, directory, false);
   return directory;
 }
-async function stagedEvictionGenesis(rootDir, requireBoundedTrash = false) {
+async function stagedEvictionGenesis(rootDir) {
   const trash = path.join(rootDir, ".rootark-trash");
   if (!(await exists(trash))) return null;
   await containedAbsolute(rootDir, trash, false);
+  const rootStats = await fsp.lstat(rootDir, { bigint: true });
   const trashStats = await fsp.lstat(trash, { bigint: true });
-  if (!trashStats.isDirectory() || trashStats.isSymbolicLink()) {
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || rootStats.ino === 0n
+    || !trashStats.isDirectory() || trashStats.isSymbolicLink() || trashStats.ino === 0n) {
     fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
   }
-  // Old cache trash can legitimately have more than 16k retained files.
-  // Stream names without an unbounded array allocation: only the exact,
-  // reserved genesis entry has any authority. A required-v2 recovery still
-  // enforces its conservative bounded proof, never silently ignoring aliases.
+  // No count bound here: legacy trash can contain arbitrarily many legitimate
+  // retained files when a process crashes after the required-v2 checkpoint.
+  // Scan the *entire* directory in O(1) memory for every portable case alias
+  // of the sole authoritative marker, not just the first 16,384 entries.
+  // Other trash content does not witness an eviction and grants no authority.
+  // POSIX holds the parent's directory FD to detect concurrent path replacement.
+  // Windows cannot portably open a directory FD through fs.promises.open, so
+  // lstat identity/version and contained FD verification remain mandatory.
+  let held = null;
   let candidate = null;
-  let count = 0;
-  for await (const entry of await fsp.opendir(trash)) {
-    if (requireBoundedTrash && ++count > 16384) {
-      fail("Too many staged cache entries", "invalid_snapshot");
+  const assertUnchanged = async () => {
+    await containedAbsolute(rootDir, trash, false);
+    const currentRoot = await fsp.lstat(rootDir, { bigint: true });
+    const currentTrash = await fsp.lstat(trash, { bigint: true });
+    if (!sameFileVersion(rootStats, currentRoot)
+      || !sameFileVersion(trashStats, currentTrash)
+      || (held && !sameFileVersion(trashStats, await held.stat({ bigint: true })))) {
+      fail("Eviction genesis parent changed during streamed proof", "invalid_snapshot");
     }
-    if (entry.name.toLowerCase() !== EVICTION_GENESIS_STAGE) continue;
-    if (candidate !== null || entry.name !== EVICTION_GENESIS_STAGE) {
-      fail("Ambiguous staged eviction genesis", "invalid_snapshot");
-    }
-    candidate = entry.name;
-  }
-  if (candidate === null) return null;
-  const headFile = path.join(trash, EVICTION_GENESIS_STAGE);
-  const headStats = await fsp.lstat(headFile, { bigint: true });
-  if (!headStats.isFile() || headStats.isSymbolicLink()
-    || headStats.nlink !== 1n || headStats.size > 8192n) {
-    fail("Unsafe staged eviction genesis head", "invalid_snapshot");
-  }
-  let head;
+  };
   try {
-    const raw = await readContainedFile(rootDir, `.rootark-trash/${EVICTION_GENESIS_STAGE}`,
-      headStats, true);
-    head = JSON.parse(raw.toString("utf8"));
-  } catch {
-    fail("Unreadable staged eviction genesis head", "invalid_snapshot");
+    if (process.platform !== "win32") {
+      held = await fsp.open(trash, fs.constants.O_RDONLY
+        | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0));
+      await assertUnchanged();
+    }
+    for await (const entry of await fsp.opendir(trash)) {
+      if (entry.name.toLowerCase() !== EVICTION_GENESIS_STAGE) continue;
+      if (candidate !== null || entry.name !== EVICTION_GENESIS_STAGE) {
+        fail("Ambiguous staged eviction genesis", "invalid_snapshot");
+      }
+      candidate = entry.name;
+    }
+    await assertUnchanged();
+    if (candidate === null) return null;
+    const headFile = path.join(trash, EVICTION_GENESIS_STAGE);
+    const headStats = await fsp.lstat(headFile, { bigint: true });
+    if (!headStats.isFile() || headStats.isSymbolicLink()
+      || headStats.nlink !== 1n || headStats.size > 8192n) {
+      fail("Unsafe staged eviction genesis head", "invalid_snapshot");
+    }
+    let head;
+    try {
+      const raw = await readContainedFile(rootDir, `.rootark-trash/${EVICTION_GENESIS_STAGE}`,
+        headStats, true);
+      head = JSON.parse(raw.toString("utf8"));
+    } catch {
+      fail("Unreadable staged eviction genesis head", "invalid_snapshot");
+    }
+    await assertUnchanged();
+    if (!validEvictionLedgerHead(head) || head.sequence !== 0
+      || head.digest !== EVICTION_LEDGER_ZERO) {
+      fail("Invalid staged eviction genesis", "invalid_snapshot");
+    }
+    return { trash, file: headFile, head };
+  } finally {
+    if (held) await held.close();
   }
-  if (!validEvictionLedgerHead(head) || head.sequence !== 0
-    || head.digest !== EVICTION_LEDGER_ZERO) {
-    fail("Invalid staged eviction genesis", "invalid_snapshot");
-  }
-  return { trash, file: headFile, head };
 }
 async function createStagedEvictionGenesis(rootDir) {
   const existing = await stagedEvictionGenesis(rootDir);
@@ -1178,8 +1202,7 @@ class SyncEngine {
         return;
       }
     }
-    const staged = await stagedEvictionGenesis(this.rootDir,
-      this.snapshot.evictionLedgerRequired || Boolean(head) || entries.size > 0);
+    const staged = await stagedEvictionGenesis(this.rootDir);
     if (this.snapshot.evictionLedgerRequired && !head) {
       // A crash after the v2 snapshot but before promoting the genesis can
       // leave the only durable head in v1's already-internal trash namespace.
