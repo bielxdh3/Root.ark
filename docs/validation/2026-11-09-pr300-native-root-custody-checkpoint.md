@@ -411,3 +411,42 @@ and no ready-for-merge claim until the missing adversarial OS-level
 custody, durability, independent monotonic rollback and CodeQL gates
 are actually closed. Exact-SHA independent SOURCE review is required
 before even the local fast-forward of this candidate.
+
+## Follow-up safety fence: destructive Files On-Demand eviction
+
+**Operational/release NO-GO persists.** A follow-up source audit of the
+reviewed local native-recovery gate `496e7582` confirmed a separate
+destructive path **before** any recovery is needed: explicit `evictLocal`
+used `_evictLocal` with `batchDurable=false`; after a remote content check,
+it persisted an `evicted` marker and ran legacy pathname-based
+`stageExisting` (`rename`) followed by `unlink` on the staged name. A hostile
+same-SID/UID writer can replace an ancestor between those calls. The
+auditor did **not** claim a physically reproduced foreign-file deletion.
+
+Until native root ownership and handle-relative mutation are available,
+the new local child rejects **all** `_evictLocal` calls on instances where
+`requireNativeRootRecovery` is true, including explicit user eviction and
+automatic excluded-path/batch eviction. This is a deliberate **loss of
+eviction availability** in Files On-Demand, not a replacement native writer.
+The denial occurs before checking paths, consulting remote records,
+creating `.rootark-trash`, updating `remoteOnly`, or moving/unlinking
+cached bytes. It is a module-private, non-overridable denial, and a future
+successful native opener does **not** fall through to the unsafe JS route.
+
+The previous positive test of explicit eviction was **not silently skipped**:
+it now exercises the same signed remote object and real materialized cache,
+then requires a rejection, unchanged physical Unicode-safe bytes,
+unchanged snapshot/remote operation, no additional remote list, no trash or
+eviction journal, and successful offline/restart preservation. Direct
+`_evictLocal` with a forged `batchDurable=true` also has to reject.
+TDD reproduced a **real RED** (unsafe eviction succeeded) before the
+fence, then Windows Node22/NTFS tests passed **30/30** across Files
+On-Demand, RootSession and native-recovery gate. Independent SOURCE GO
+and exact final-SHA Ubuntu Node22/ext4 tests remain prerequisites before
+merging this child even locally.
+
+**Not yet solved:** other Files On-Demand mutations, hydration/remote
+MOVE/DELETE, pathname-based local reconciliation, same-principal root
+replacement, owner-authorized native writer, cold reopen, crash/rollback,
+mapped image/DLL provenance or fully adversarial A→B→A. Tests that only
+prove legitimate local recovery cannot close these P1 system gates.

@@ -268,23 +268,35 @@ test("issue 66: hydration finds a file on later inventory pages without download
   assert.equal(await exists(path.join(root, "docs", "a.txt")), false);
 });
 
-test("issue 66: verified cache eviction survives offline and hydrates again after reconnect", async (t) => {
+test("issue 66: Files On-Demand refuses destructive cache eviction without native root custody", async (t) => {
   const { root, open, store, state } = await setup(t, { "docs/cache.txt": "cache me" });
   const client = await open();
   await client.materializeRemote("docs/cache.txt");
   const before = store.list("alice")[0];
-  assert.equal(await client.evictLocal("docs/cache.txt"), true);
-  assert.equal(await exists(path.join(root, "docs", "cache.txt")), false);
+  const beforeSnapshot = JSON.stringify(client.snapshot);
+  const beforeFullReads = state.fullReads.length;
+  await assert.rejects(client.evictLocal("docs/cache.txt"),
+    { code: "root_session_native_unavailable" });
+  // A direct internal call, including the batchDurable variant, must never
+  // turn an unavailable native authority into pathname-based deletion.
+  await assert.rejects(client._evictLocal("docs/cache.txt", null, null, true),
+    { code: "root_session_native_unavailable" });
+  assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"), "cache me");
+  assert.equal(JSON.stringify(client.snapshot), beforeSnapshot,
+    "rejected eviction cannot alter tracked or remote-only durable intent");
+  assert.equal(state.fullReads.length, beforeFullReads,
+    "rejected eviction must not query remote state before rejecting unsafe I/O");
+  assert.equal((await fsp.readdir(root)).includes(".rootark-trash"), false);
+  assert.equal((await fsp.readdir(root)).includes(".rootark-sync-evictions"), false);
+  assert.equal(store.list("alice")[0].operationId, before.operationId);
   state.offline = true;
   assert.equal((await client.syncOnce()).offline, true);
-  await assert.rejects(client.materializeRemote("docs/cache.txt"), { code: "offline" });
-  assert.equal(client.snapshot.remoteOnly[before.objectId].reason, "evicted");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"), "cache me");
   assert.equal(store.list("alice")[0].operationId, before.operationId);
   state.offline = false;
   const restarted = await open();
-  assert.equal(await restarted.materializeRemote("docs/cache.txt"), true);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"), "cache me");
   assert.equal(restarted.snapshot.remoteOnly[before.objectId], undefined);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"), "cache me");
 });
 
 test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {

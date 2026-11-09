@@ -36,6 +36,14 @@ function denyLegacyNativeRootReplay() {
   openNativeRootSession(true);
   fail("Legacy eviction recovery is not authorized by native custody", "root_session_native_unavailable");
 }
+function denyUntrustedNativeEviction() {
+  // The recovery fence alone cannot make pathname-based stage/rename/unlink
+  // safe. Reject both explicit and automatic Files On-Demand eviction before
+  // consulting a path or changing remote-only/durable eviction state.
+  // A future native opener returning does not enable this legacy JS route.
+  openNativeRootSession(true);
+  fail("Native rooted cache eviction is not operational", "root_session_native_unavailable");
+}
 function signedEnvelopeDigest(operation) {
   return crypto.createHash("sha256")
     .update(protocol.canonicalJson(operation), "utf8").digest("hex");
@@ -3138,6 +3146,7 @@ class SyncEngine {
   }
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
+    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
     if (!this.opened) await openEngineBuiltIn.call(this);
     // The internal exclusion path was already case-resolved with a bounded
     // directory index; do not enumerate the same Windows parent 640 times.
