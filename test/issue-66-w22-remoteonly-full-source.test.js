@@ -133,6 +133,20 @@ test("W22 inert source: physical negative canaries, directory aliases and staged
   }
 });
 
+test("W22 inert source: a nested physical canary inside the root lock is not empty cache", async (t) => {
+  const f = await fixture(t);
+  const lock = path.join(f.rootDir, ".rootark-sync.lock");
+  await fsp.mkdir(lock);
+  const nested = path.join(lock, "untracked-physical-data");
+  await fsp.mkdir(nested);
+  const canary = path.join(nested, "user-canary.txt");
+  await fsp.writeFile(canary, "untouched physical user bytes");
+  const { assertRootHasNoPhysicalCache } =
+    require("../experiments/issue-66-w22-batched-admission/remote-only-full-source");
+  await assert.rejects(assertRootHasNoPhysicalCache(f.rootDir), { code: "unsafe_path" });
+  assert.equal(await fsp.readFile(canary, "utf8"), "untouched physical user bytes");
+});
+
 test("W22 inert source: physical symlink/junction to an outside canary is refused with no external byte changes", async (t) => {
   const f = await fixture(t);
   const outside = path.join(f.temp, "external-canary");
@@ -309,20 +323,9 @@ test("W22 inert source: real process exit after observation / snapshot reopens a
     const file = path.join(f.temp, "fixture.json");
     await fsp.writeFile(file, JSON.stringify({ rootDir: f.rootDir, records: f.records,
       key: f.fileKey.toString("base64url"), publicKey: f.publicKey }), { mode: 0o600 });
-    const source = `const fs=require('node:fs'); const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));` +
-      `const {SyncEngine}=require(${JSON.stringify(require.resolve("../sync-client/rootark-sync-engine"))});` +
-      `const {verifyAuthorizationProof,verifyHistoricalAuthorizationProof}=require(${JSON.stringify(require.resolve("../sync-client/rootark-sync-authorization"))});` +
-      `const {probeStrictRemoteOnlyBatch}=require(${JSON.stringify(require.resolve("../experiments/issue-66-w22-batched-admission/remote-only-full-source"))});` +
-      `const expected={username:'alice',trustedDevicePublicKeys:{'device-signer':data.publicKey},revokedDeviceIds:[]};` +
-      `const trust={minEpoch:7,keyEpoch:'epoch-1',username:'alice',trustedDevicePublicKeys:expected.trustedDevicePublicKeys,` +
-      `currentPolicyProvider:()=>({epoch:7,keyEpoch:'epoch-1',...expected})};` +
-      `new SyncEngine({rootDir:data.rootDir,adapter:{list:async()=>data.records,push:async()=>{throw Error('push forbidden')}},` +
-      `deviceId:'device-reader',keyEpoch:'epoch-1',compartmentId:'private',excludedPaths:['private'],` +
-      `requireAuthorization:true,fileKeyResolver:()=>Buffer.from(data.key,'base64url'),` +
-      `verifyIncoming:async (op,{locallyAdmitted=false}={})=>(locallyAdmitted?verifyHistoricalAuthorizationProof:verifyAuthorizationProof)` +
-      `(op.authorization,op,expected)}).open().then(e=>probeStrictRemoteOnlyBatch(e,trust,` +
-      `{${phase}:async()=>process.exit(73)})).catch(()=>process.exit(90));`;
-    const child = spawnSync(process.execPath, ["-e", source, file], {
+    const childFile = path.join(__dirname,
+      "../experiments/issue-66-w22-batched-admission/remote-only-hard-exit-child.cjs");
+    const child = spawnSync(process.execPath, [childFile, file, phase], {
       timeout: 20000, encoding: "utf8", windowsHide: true,
     });
     assert.equal(child.status, 73, child.stderr);

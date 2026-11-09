@@ -100,19 +100,26 @@ async function preflightAndPinSignedList(options) {
     await checkPhysicalCollision(rootDir, relative, operation, trackedFiles);
     if (!previouslyPinned) observations.push({ operationId: operation.operationId, digest });
   }
-  // Refresh the expiry deadline immediately before queuing the one durable
-  // transaction. A failure before this point does not pin any prior member.
-  const now = Date.now();
-  for (const item of detached) {
-    const digest = crypto.createHash("sha256")
-      .update(protocol.canonicalJson(item), "utf8").digest("hex");
-    if (!journal.hasLocalAdmission(item.operationId, digest)
-      && item.authorization.expiresAt <= now) {
-      deny("Authorization expired during full LIST preflight", "authorization_expired");
+  // An expiry check only before an awaited policy callback or journal queue
+  // can turn a formerly fresh signature into a newly pinned expired receipt.
+  // Recheck inside the queued journal mutation, after the last awaited policy
+  // gate and before durableWrite. This is NOT an NTFS power-cut/fsync proof.
+  const assertFreshAtCommitStart = () => {
+    const now = Date.now();
+    for (const item of detached) {
+      const digest = crypto.createHash("sha256")
+        .update(protocol.canonicalJson(item), "utf8").digest("hex");
+      if (!journal.hasLocalAdmission(item.operationId, digest)
+        && item.authorization.expiresAt <= now) {
+        deny("Authorization expired before queued journal admission", "authorization_expired");
+      }
     }
-  }
-  if (beforeCommit) await beforeCommit();
-  await journal.batchObserveAdmission(observations);
+  };
+  assertFreshAtCommitStart();
+  await journal.batchObserveAdmission(observations, async () => {
+    if (beforeCommit) await beforeCommit();
+    assertFreshAtCommitStart();
+  });
   return { operations: freezeSignedSnapshot(detached), observed: observations.length };
 }
 

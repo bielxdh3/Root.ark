@@ -116,3 +116,28 @@ The next implementation must first establish descriptor-relative durable
 root-scoped metadata writes and cleanup (or a proven external-writer
 exclusion mechanism), signed complete-inventory/epoch custody and a strict
 production feature gate. Until then this experiment remains inert.
+
+## Independent P2 follow-up — negative tests, not a production clearance
+
+The independent review of the integrated experimental chain reproduced two
+counterexamples to the *inert probe's own* strict preflight claims. A hidden
+regular file nested under the allowed `.rootark-sync.lock` directory passed
+the original root scan. A fresh signed operation could also expire during
+an awaited `beforeCommit` policy check or an earlier queued journal commit,
+yet acquire a new durable admission receipt. Neither counterexample was a
+production call: the experiment is deliberately disconnected.
+
+The follow-up adds native-file negative tests and rejects a lock directory
+containing any child inode, reading at most one entry. It checks expiry both
+after full signed-LIST validation and *inside the queued journal mutation*,
+after the final awaited policy gate and before the durable write begins.
+The crash fixture now runs a static `.cjs` child instead of interpolating
+runtime values into executable `node -e` source. The tests retain their
+original Ed25519, revocation, EIO and no-mutation assertions.
+
+**Remaining limit:** validation at the start of `durableWrite` does not prove
+the filesystem persisted a directory entry before the signed expiry instant
+if I/O is stalled, nor is local `Date.now()` an externally trusted monotonic
+authority. A hostile ancestor swap may still redirect pathname-based writes
+after preflight. No production `_pullRemote` hook, automatic recovery, NTFS
+power-cut guarantee, owner-signed completeness witness or cutover is granted.

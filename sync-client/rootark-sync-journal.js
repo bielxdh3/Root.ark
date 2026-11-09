@@ -587,12 +587,13 @@ class SyncJournal {
       next.observed[operationId] = digest;
     });
   }
-  async batchObserveAdmission(entries) {
+  async batchObserveAdmission(entries, beforePersist = null) {
     // Called ONLY after every envelope in the enclosing remote LIST has been
     // independently authorized and its exact canonical digest frozen. This
     // primitive persists that already verified evidence; it never verifies a
     // signature or turns a remote LIST response into its own authority.
-    if (!Array.isArray(entries) || entries.length > MAX_OBSERVATIONS) {
+    if (!Array.isArray(entries) || entries.length > MAX_OBSERVATIONS
+      || (beforePersist !== null && typeof beforePersist !== "function")) {
       throw new Error("Invalid bounded sync admission batch");
     }
     if (!entries.length) return;
@@ -612,7 +613,10 @@ class SyncJournal {
       unique.add(operationId);
       frozenEntries.push({ operationId, digest });
     }
-    await this.commit((next) => {
+    await this.commit(async (next) => {
+      // Run freshness/owner-policy checks AFTER earlier journal transactions
+      // leave the queue, immediately before mutating this durable batch.
+      if (beforePersist) await beforePersist();
       const pending = new Map(next.pending.map((entry) => [entry.operationId, entry]));
       const seen = new Set(next.seen);
       let count = Object.keys(next.observed).length;

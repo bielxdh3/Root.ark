@@ -114,6 +114,31 @@ test("W22: expired fresh record fails; previously pinned exact historical digest
   { code: "authorization_expired" });
 });
 
+test("W22: a fresh signed batch expires during pre-commit policy wait before any durable pin", async (t) => {
+  const f = await fixture(t);
+  const fresh = await f.signed(41, "create", Date.now() + 650);
+  const before = await fsp.readFile(f.journal.filePath, "utf8");
+  await assert.rejects(preflightAndPinSignedList({ ...f.expected, records: [fresh],
+    beforeCommit: async () => new Promise((resolve) => setTimeout(resolve, 900)),
+  }), { code: "authorization_expired" });
+  assert.equal(await fsp.readFile(f.journal.filePath, "utf8"), before);
+  assert.equal(Object.keys(f.journal.state.observed).length, 0);
+});
+
+test("W22: journal queue delay cannot pin a newly expired signed LIST", async (t) => {
+  const f = await fixture(t);
+  const fresh = await f.signed(42, "create", Date.now() + 650);
+  const busy = f.journal.commit(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 900));
+  });
+  await assert.rejects(preflightAndPinSignedList({ ...f.expected, records: [fresh] }),
+    { code: "authorization_expired" });
+  await busy;
+  assert.equal(Object.keys(f.journal.state.observed).length, 0);
+  assert.equal(f.journal.hasLocalAdmission(fresh.operationId,
+    crypto.createHash("sha256").update(protocol.canonicalJson(fresh)).digest("hex")), false);
+});
+
 test("W22: duplicate operationIds and portable case aliases cannot mutate an earlier admission", async (t) => {
   const f = await fixture(t);
   const first = await f.signed(5);

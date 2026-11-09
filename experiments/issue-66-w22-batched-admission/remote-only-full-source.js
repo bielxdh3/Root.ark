@@ -36,6 +36,16 @@ async function assertRootHasNoPhysicalCache(rootDir) {
       || (kind === "directory" && !stat.isDirectory())) {
       reject("Physical root contains a link or an unexpected inode", "unsafe_path");
     }
+    if (kind === "directory") {
+      // Even the exclusive lock directory must not shelter untracked bytes.
+      // Read just one child so an oversized hostile tree fails in bounded time.
+      const opened = await fsp.opendir(path.join(rootDir, name));
+      try {
+        if (await opened.read()) {
+          reject("Exclusive root lock contains an untracked physical inode", "unsafe_path");
+        }
+      } finally { await opened.close(); }
+    }
   }
   return { dev: root.dev, ino: root.ino };
 }
