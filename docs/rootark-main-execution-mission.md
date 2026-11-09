@@ -726,3 +726,18 @@ flowchart TD
 ~~~
 
 **Decisao do corte:** duas publicacoes fast-forward revisadas, nenhuma aprovacao operacional de ZK10/R1, P2P, CFAPI ou rollback; todos os demais bloqueios mantidos. Sem force push, merge, deploy, cutover, alteracao desta missao em Root/main ou exclusao de worktrees/fixtures.
+
+## 2026-11-09 16:15 UTC — checkpoint pós-retomada (sem release GO)
+
+Este corte apenas acrescenta evidências posteriores ao checkpoint de 15:02 UTC. `Root/main` avançou **externamente** para `2e419e018f396135f8f9f7803e393f1a2ccd240c` (merge do PR #312 Dependabot); esta missão não modificou a branch. PR #228 permanece CLOSED/unmerged; #251/#291/#293/#298/#299/#300/#302 permanecem OPEN/Draft.
+
+| Frente | SHA remoto ou candidato local exato | Resultado observado / gate pendente |
+| --- | --- | --- |
+| #251 | Remoto `a7e482191560d31e1490f496246785498a525230` | Ubuntu full, Windows canonical, CodeQL, PostgreSQL18 e Dependency Review SUCCESS no próprio SHA; Windows mandatory ainda IN_PROGRESS no corte. Antigravity 6743637671 apenas incremental, sem novo P0/P1/P2. Edge físico intermitente sem causa raiz confirmada. |
+| #299 | Remoto `3af2eb20a2be9f58b3ce41acedcbc2ed3f086a63` | W52 workflow apenas acrescenta `--test-concurrency=1` à execução Windows app-edge; peer W12 SOURCE GO limitado e app-edge/Ubuntu/CodeQL hospedados SUCCESS. Windows canonical/mandatory ainda IN_PROGRESS. Antigravity 6744415781 sem P0/P1/P2 no diff. P2P ciphertext mutável W47/W50 continua operacional NO-GO. |
+| #298 | Remoto `b412ff378202feb90c70c5a100f7a8f2b683a08e`; candidato LOCAL `def32801c2880db9d9afe287f656883c63940bf5` | Dois HIGH CodeQL persistem. Novo laboratório Windows NTFS/WSL ext4 demonstra que manter dirfd POSIX e usar openat2 com O_EXCL pode criar fora da raiz após rename por outro processo, enquanto NtCreateFile com root handles no Windows bloqueou rename. É prova negativa/test-only, **não** correção de rollback; peer de def328 pendente. |
+| #300 | Remoto `956b2515d3f5262b2bf8c6044be2bfd2db72dc9e` | CodeQL formal 1 HIGH, candidato 426d >16.384 ainda NO-GO por bind-mount ABA; negar ACE DELETE hostil e não publicar labs sem custódia nativa independente. |
+| #302 | Remoto `5e852c149257588fa3700b32f418ef8efdb38cf6` hosted completo verde; local `f3e1352064a0fcff893328b6ced4b6018a44de4c` SOURCE NO-GO P2; filho LOCAL `4e46859bba6c955c2a64638cfa1ffc3a0bfae332` | Peer W42 reproduziu falsificação de pin SPKI via método KeyObject.export de instância. Filho captura export nativo e vincula material real; novo TDD RED→GREEN, 10/10 Windows Node22 NTFS e WSL Ubuntu Node22 ext4, 10/10 Windows Node24. Peer independente do SHA final pendente; módulo segue DEV-OFF, `authorizesIo:false`, sem custódia off-host nem R1. |
+| #291 Android | Remoto `6d1c3ffff29eba26fd79f293662398b54a0895f0` hosted baseline verde; local `548c91af40c53660d16d2b1c03f66c210be8f8fe` | Peer SOURCE GO limitado à origem HTTPS A→B; Windows JDK17/Gradle8.10.2/SDK35 focused 11/11 e APK PASS, mas full `:core:test` encontrou 18 FAIL de OwnerPinnedOfflineAdmissionTest com fsync de diretório, diagnóstico em andamento; WSL Linux full em execução. Android aparelho/TEE não testados. |
+
+Nenhuma dessas provas libera produção: permanecem sem confirmação owner-signed original bytes pré-upload, monotonic floor de custodiante independente, histórico ZIP/jobs/versões integral, recuperação NTFS após power-cut, CFAPI positivo Windows10, Android físico ou TURN/cross-NAT. Nenhum merge/deploy/cutover/force push realizado; testes e worktrees RED preservados.
