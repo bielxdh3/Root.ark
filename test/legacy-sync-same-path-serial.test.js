@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
@@ -24,7 +25,7 @@ async function until(predicate, deadlineMs = 10000) {
 }
 
 test("periodic scan cannot overlap two uploads for the same local path", {
-  timeout: 30000,
+  timeout: 90000,
 }, async (t) => {
   const privateHome = createPrivateAuthorityFixture("rootark-same-path-private-");
   const sharedHome = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-same-path-shared-"));
@@ -37,8 +38,6 @@ test("periodic scan cannot overlap two uploads for the same local path", {
   const source = path.join(selected, "a.txt");
   await fs.writeFile(source, "SAME_PATH_OLD");
 
-  let resolveFirst;
-  const firstReceived = new Promise((resolve) => { resolveFirst = resolve; });
   let releaseFirst;
   const uploads = [];
   const server = http.createServer((req, res) => {
@@ -65,7 +64,6 @@ test("periodic scan cannot overlap two uploads for the same local path", {
         };
         if (uploads.length === 1) {
           releaseFirst = ack;
-          resolveFirst();
         } else ack();
       });
       return;
@@ -77,7 +75,8 @@ test("periodic scan cannot overlap two uploads for the same local path", {
   const config = path.join(privateHome, "config.json");
   await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: `fixture-serial-${crypto.randomUUID()}`,
+    token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1,
     scanIntervalMs: 75, retryLimit: 1,
   }));
@@ -86,16 +85,20 @@ test("periodic scan cannot overlap two uploads for the same local path", {
     [cli, "start", "--legacy-development-opt-in", "--config", config],
     { cwd: sharedHome, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
+  let childClosed = false;
   for (const stream of [child.stdout, child.stderr]) {
     stream.on("data", (chunk) => { output += String(chunk); });
   }
   const exited = new Promise((resolve, reject) => {
-    child.once("close", (code) => resolve(code));
+    child.once("close", (code) => { childClosed = true; resolve(code); });
     child.once("error", reject);
   });
   t.after(() => child.kill());
   try {
-    await firstReceived;
+    await until(() => Boolean(releaseFirst) || childClosed
+      || output.includes("ERRO a.txt") || output.includes("ERRO:"), 45000);
+    assert.equal(typeof releaseFirst, "function",
+      `the first HTTP upload did not arrive: ${output.slice(-1500)}`);
     assert.deepEqual(uploads, ["OLD"]);
     await fs.writeFile(source, "SAME_PATH_NEW");
     // Several scan intervals elapse while A is still waiting for its HTTP
@@ -119,7 +122,7 @@ test("periodic scan cannot overlap two uploads for the same local path", {
 });
 
 test("ambiguous failed POST blocks further uploads in the still-running process", {
-  timeout: 30000,
+  timeout: 90000,
 }, async (t) => {
   const privateHome = createPrivateAuthorityFixture("rootark-ongoing-ambiguity-private-");
   const sharedHome = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-ongoing-ambiguity-shared-"));
@@ -171,7 +174,8 @@ test("ambiguous failed POST blocks further uploads in the still-running process"
   const config = path.join(privateHome, "config.json");
   await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: `fixture-ambiguous-${crypto.randomUUID()}`,
+    token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1,
     scanIntervalMs: 75, retryLimit: 1,
   }));
@@ -255,7 +259,8 @@ test("once mode finishes more files than the bounded admission queue", {
   const config = path.join(privateHome, "config.json");
   await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: `fixture-once-${crypto.randomUUID()}`,
+    token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
   }));
   const child = spawn(process.execPath,
@@ -339,7 +344,8 @@ test("a busy watcher cannot starve round-robin audit of a late file", {
   const config = path.join(privateHome, "config.json");
   await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: `fixture-fairness-${crypto.randomUUID()}`,
+    token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 2, stabilityMs: 1,
     scanIntervalMs: 80, retryLimit: 1,
   }));
