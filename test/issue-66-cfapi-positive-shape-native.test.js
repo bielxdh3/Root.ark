@@ -8,11 +8,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { buildCompiledFixture, runCompiledFixture } =
+  require("./support/issue-66-cfapi-built-artifact");
 
 const win = process.platform === "win32";
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-positive-shape.cpp");
 const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
-const systemCmd = "C:\\Windows\\System32\\cmd.exe";
 
 function findVcvars() {
   const found = spawnSync(vswhere, ["-all", "-products", "*", "-prerelease",
@@ -40,21 +41,15 @@ test("#66 real Windows SDK validates bounded mock TRANSFER_DATA ranges, not kern
     if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-positive-abi-"));
     t.after(() => fs.rm(temporary, { recursive: true, force: true }));
-    const executable = path.join(temporary, "positive-shape.exe");
-    const script = path.join(temporary, "compile.cmd");
-    await fs.writeFile(script, [
-      "@echo off", `call "${vcvars}" >nul`, "if errorlevel 1 exit /b 1",
-      `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${executable}" "${source}" cldapi.lib`,
-      "exit /b %errorlevel%", "",
-    ].join("\r\n"));
-    const built = spawnSync(systemCmd, ["/d", "/c", script], {
-      cwd: temporary, encoding: "utf8", timeout: 30000, windowsHide: true,
-    });
-    assert.equal(built.status, 0, `SDK compile failed: ${built.stdout}\n${built.stderr}`);
-    const executed = spawnSync(executable, ["--self-test"], {
-      cwd: temporary, encoding: "utf8", timeout: 10000, windowsHide: true,
-    });
-    assert.equal(executed.status, 0, `ABI shape failed: ${executed.stdout}\n${executed.stderr}`);
+    const marker = path.join(temporary, "untrusted-compile-ran.txt");
+    await fs.writeFile(path.join(temporary, "compile.cmd"),
+      `@echo off\r\necho UNTRUSTED > "${marker}"\r\n`);
+    const { receipt, buildResult: built } =
+      buildCompiledFixture(temporary, "positive-shape.exe", vcvars);
+    assert.equal(built.status, 0, "NATIVE_POSITIVE_SHAPE_COMPILE_FAILED");
+    await assert.rejects(fs.access(marker), { code: "ENOENT" });
+    const executed = runCompiledFixture(receipt, ["--self-test"]);
+    assert.equal(executed.status, 0, "NATIVE_POSITIVE_SHAPE_SELF_TEST_FAILED");
     const result = JSON.parse(executed.stdout.trim());
     assert.equal(result.nativeApiPresent, true);
     assert.ok(result.platformBuild >= 16299);
@@ -68,9 +63,7 @@ test("#66 real Windows SDK validates bounded mock TRANSFER_DATA ranges, not kern
     assert.equal(result.cloudDataBytesTransferred, 0);
     for (const args of [["--connect", temporary], ["--register", temporary],
       ["--hydrate", temporary], []]) {
-      const forbidden = spawnSync(executable, args, {
-        cwd: temporary, encoding: "utf8", timeout: 10000, windowsHide: true,
-      });
+      const forbidden = runCompiledFixture(receipt, args);
       assert.notEqual(forbidden.status, 0);
       assert.equal(forbidden.stdout.trim(), "");
     }

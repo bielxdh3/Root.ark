@@ -15,6 +15,8 @@ const RECEIPTS = new WeakMap();
 const NAMES = new Map([
   ["acl-preflight.exe", "rootark-cfapi-acl-test-"],
   ["inherit-only-fixture.exe", "rootark-cfapi-ace-native-"],
+  ["deny-fetch.exe", "rootark-cfapi-abi-"],
+  ["positive-shape.exe", "rootark-cfapi-positive-abi-"],
 ]);
 const FAIL = "UNTRUSTED_EXECUTABLE";
 
@@ -87,7 +89,11 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
     FAIL);
   const source = name === "acl-preflight.exe"
     ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp")
-    : path.join(scratch, "inherit-only-fixture.cpp");
+    : name === "deny-fetch.exe"
+      ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-deny-callback.cpp")
+      : name === "positive-shape.exe"
+        ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-positive-shape.cpp")
+        : path.join(scratch, "inherit-only-fixture.cpp");
   for (const filename of [vcvars, source, executable]) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
   }
@@ -100,9 +106,11 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
   // assembled here from static switches and validated non-shell paths.
   // The separate VS-owned vcvars64.bat and compiler are still a toolchain
   // trust boundary; this does not authenticate their executed bytes.
+  const libraries = name === "deny-fetch.exe" || name === "positive-shape.exe"
+    ? "cldapi.lib" : "cldapi.lib advapi32.lib";
   const inline = `call "${vcvars}" >nul && if defined VCToolsInstallDir `
     + `"!VCToolsInstallDir!bin\\Hostx64\\x64\\cl.exe" /nologo /std:c++17 /W4 /WX /EHsc `
-    + `/Fe:"${executable}" "${source}" cldapi.lib advapi32.lib`;
+    + `/Fe:"${executable}" "${source}" ${libraries}`;
   const env = { ...process.env };
   for (const key of ["CL", "_CL_", "LINK", "_LINK_"]) delete env[key];
   const buildResult = spawnSync("C:\\Windows\\System32\\cmd.exe",
