@@ -275,6 +275,20 @@ flag and erroneous `invalid_snapshot` fallback); after the change it passed
 3/3. Files On-Demand + RootSession regressions passed 21/21, then combined
 with the new three tests passed **24/24**. The non-Files-On-Demand real
 hard-crash `required-v2` with **16,385** entries still passed **1/1**.
-Ubuntu Node22/ext4 and independent SOURCE review of the final SHA must be
-performed separately before any local integration. This does **not**
-authorize a push of the Draft PR or any release claim.
+The committed candidate is
+`dca741770fa71258238857b55813cee207d0fa34` (parent `9b7c3f0f`).
+Its exact Git archive was extracted on native WSL ext4 `/dev/sdd` and run
+with Ubuntu Node **v22.22.1**: **24/24 PASS** for Files On-Demand, the strict
+native recovery gate and RootSession contract, and **1/1 PASS** for the
+non-Files-On-Demand real `required-v2` crash with 16,385 entries (two
+staging variants). All these tests returned exit 0. The matching Windows
+Node22/NTFS results above were on the same committed source.
+
+The published PR #300 still has formal CodeQL **FAILURE** at
+`956b2515d3f5262b2bf8c6044be2bfd2db72dc9e`, and the local native-gate
+code has not been pushed or assessed by hosted CI. Independent SOURCE GO of
+this **product-code delta** is a separate prerequisite for advancing the
+local integration. There is no proof of adversarial A→B→A safety outside the
+new strict blocking branch, native first-owner authority, durable commit,
+malicious same-SID writers, signed DELETE prevention or production readiness.
+This does **not** authorize a push of the Draft PR or any release claim.
