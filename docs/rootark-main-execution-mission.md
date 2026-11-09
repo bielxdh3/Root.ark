@@ -497,3 +497,39 @@ O [checkpoint auditável de 22:42 UTC](validation/2026-11-08-rootark-mission-224
 ## 2026-11-08 23:19 UTC — corte pós-ledger #300 e revisão ZK10
 
 O [checkpoint de execução de 23:19 UTC](validation/2026-11-08-rootark-mission-2319-utc.md) atualiza os cinco HEADs Draft, o fluxograma de dependências, as falhas hospedadas CodeQL/runner, e distingue o P1 do ledger #66 **corrigido e publicado no #300 `3d0f687c`** de **dois P2 ainda abertos**: o travamento de startup após crash pré-PREPARE nesse SHA publicado e o batching de admissões **NO-GO, não publicado**. Nenhum deles autoriza afrouxar o fail-closed anti-DELETE. Documenta também o bloqueio NTFS do #67 e a ausência de owner-signed original-byte e custódia off-host R1. Uma publicação posterior ao corte avançou apenas a branch Draft #302 ao SHA `ce3d7ec4`, com SOURCE GO e Win/WSL Node22 3/3; o CodeQL hospedado desse novo SHA foi confirmado **SUCCESS posteriormente**, não retroativamente no corte 23:19. Root/main, #228, merge, deploy e cutover permanecem intocados.
+
+## 2026-11-09 03:34 UTC — corte de continuidade da missão (checagem posterior 03:43 UTC)
+
+**Novo snapshot, sem reescrever os cortes anteriores.** Consultas de HEADs e checks ao GitHub entre ~03:38 e 03:43 UTC de 09/11/2026. A [matriz de evidências do mesmo corte](validation/2026-11-07-rootark-wave-execution-status.md#corte-de-continuidade--2026-11-09-0334-utc) separa CI publicada, revisão de fonte local, bloqueios e requisitos físicos. `Root/main` permanece literalmente `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`; [#228](https://github.com/bielxdh3/Root.ark/pull/228) **CLOSED / não merged**. Nenhum PR desta missão foi merged ou deployed neste corte.
+
+| PR e estado GitHub | HEAD remoto no corte | Checks concluídos do SHA (SUCCESS / FAILURE / SKIPPED) |
+| --- | --- | --- |
+| [#251](https://github.com/bielxdh3/Root.ark/pull/251) **OPEN/Draft** | `1e2338ac0b5e633c285a12dea74379fa78c5ddef` | **7 / 0 / 1**; Ubuntu Node22 full SUCCESS no [run 42535876790](https://github.com/bielxdh3/Root.ark/actions/runs/42535876790). |
+| [#293](https://github.com/bielxdh3/Root.ark/pull/293) **OPEN/Draft** | `f9b604047c0634dccedcd99c8ae00f7f3fff075c` | **4 / 0 / 1**. |
+| [#298](https://github.com/bielxdh3/Root.ark/pull/298) **OPEN/Draft** | `fa18f4f12ec2f5e6e34ad8216c8170d406898962` | **8 / 1 / 1**: CodeQL formal **FAILURE**, apesar dos outros SUCCESS. |
+| [#300](https://github.com/bielxdh3/Root.ark/pull/300) **OPEN/Draft** | `5c56b93adb6cf1a853550e32d163e3942432c7a6` | **7 / 0 / 1**; CI não prova CFAPI positivo em Windows 10 real. |
+| [#302](https://github.com/bielxdh3/Root.ark/pull/302) **OPEN/Draft** | `ce3d7ec4675a32455d844b60166ca32f627d3aca` | **8 / 0 / 1** em consulta direta dos nove check-runs. |
+| [#306](https://github.com/bielxdh3/Root.ark/pull/306) **OPEN/Ready**, não merged | `b13b29f9662d5f9036431e53235b9cdc132f0944` | **8 / 0 / 1**; Ready não é autorização de merge. |
+
+**CI histórica #251, não repetir sem causa nova:** o job Ubuntu `128889060941` do HEAD antigo `d911e4f5` recebeu sinal de **shutdown do runner** durante testes em 08/11 às 22:53:23 UTC; seu check marcou FAILURE/`The operation was canceled`, e o [workflow 42532338633](https://github.com/bielxdh3/Root.ark/actions/runs/42532338633) terminou CANCELLED. A anotação sobre migração `ubuntu-latest`/Ubuntu 26 é NOTICE, não falha de teste. O HEAD atual `1e2338ac` já concluiu Ubuntu full SUCCESS; **nenhum rerun foi executado**.
+
+**SOURCE não é release:** a correção ACL CFAPI local `adf61187 → ec396ddc → 174d313d` tem **SOURCE GO P1/P2** do conjunto de dois arquivos e MSVC nativo `/W4 /WX` 3/3 Windows; `174d313d` já é ancestral do HEAD #300 `5c56b93a`, com os blobs idênticos. O binário é somente preflight de handle/ACL: **não** registra sync-root, hidrata, conecta ou transfere arquivos, e **não** comprova Windows 10 físico. Revisões independentes reportadas dos fixes #293/#298/#302 não superam CodeQL RED nem pendências de produto.
+
+**Bloqueios ativos:** #66 mantém candidatos locais `d9c66` e `354b` **NO-GO P2** (admissões/fsync e testemunho durável), o caso de startup v1 com mais de **16.384** entradas em `.rootark-trash` (`269f`) e correção local parcial `3b517` ainda dependente de peer; não afrouxar fail-closed anti-DELETE. #67 mantém **NO-GO de perda de dados** em rollback nativo NTFS e recuperação incompleta de ZIP/jobs/versões/conta inteira. #65/R1 ainda carece de digest original pré-upload **assinado pelo owner**, inventário global, custódia **independente off-host** e piso monotônico antirollback. Android físico/Keystore, TURN/cross-NAT real, CFAPI Windows 10 positivo e autorização operacional permanecem ausentes.
+
+~~~mermaid
+flowchart TD
+  D["Draft #251 / #293 / #298 / #300 / #302; #306 Ready não merged"]
+  CI["Checks SHA exato: #298 CodeQL formal RED"]
+  REC["#66/#67: fsync, crash, rollback NTFS e recovery NO-GO"]
+  EXT["R1 off-host owner-signed; Windows10 CFAPI; Android físico; TURN real"]
+  G{"Peer exato + CI integral + autoridade física e aprovação?"}
+  HOLD["BLOQUEADO: sem merge, deploy ou cutover"]
+  D --> G
+  CI --> G
+  REC --> G
+  EXT --> G
+  G -->|"Não: estado atual"| HOLD
+~~~
+
+**Regra mantida:** preservar históricos e worktrees; commits locais de documentação exigem novo peer antes de eventual push normal fast-forward. **Não executar push, merge, deploy, cutover, force push nem editar `Root/main`, `README.md`, `docs/plan-tree.md` ou #228.**
