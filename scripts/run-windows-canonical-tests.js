@@ -65,7 +65,13 @@ function createTapProgressRecorder(write) {
         ? ` aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}` : "";
       const edge = pending.edge
         ? ` edgeStage=${pending.edge.stage} edgeError=${pending.edge.code}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${acl}${edge}`);
+      // Node 22 reports a failed test-file process as an ERR_TEST_FAILURE
+      // under the file's escaped TAP label. Its numeric exit status is the
+      // only safe additional clue about this aggregate failure.
+      const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
+        && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
+        ? ` moduleExitCode=${pending.moduleExitCode}` : "";
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -101,7 +107,7 @@ function createTapProgressRecorder(write) {
           const nameHash = hash(result[3]);
           write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
           pending = { index: result[2], nameHash, pathHash: "none",
-            failureType: "unknown", code: "unknown" };
+            failureType: "unknown", code: "unknown", moduleExitCode: null, fileProcessFailed: false };
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
         }
@@ -116,6 +122,12 @@ function createTapProgressRecorder(write) {
         if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
         const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
         if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+        // Keep only a bounded process status from actual Node TAP YAML. The
+        // error marker must match exactly; never print raw YAML or error text.
+        if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
+        const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
+        if (moduleExit && Number(moduleExit[1]) <= 255)
+          pending.moduleExitCode = Number(moduleExit[1]);
         const acl = parseAclFailureDiagnostic(line, pending);
         if (acl) pending.acl = acl;
         const edge = parseEdgeFailureDiagnostic(line, pending);
