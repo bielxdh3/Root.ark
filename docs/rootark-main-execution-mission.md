@@ -606,3 +606,30 @@ flowchart TD
 ~~~
 
 **Release rule:** isolated source tests or SOURCE GO for a read-only helper are not a full product safety proof. Preserve signed history, the experimental negative tests, all worktrees and the prior roadmap; only new reviewed fast-forward child commits may be published, with no `Root/main` or #228 modifications.
+
+## 2026-11-09 — checkpoint incremental de segurança, CI e bloqueios (após 07:00 UTC)
+
+Este checkpoint **não** substitui as evidências históricas nem equivale a autorização de release. GitHub confirmou `Root/main=d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, todos os PRs prioritários OPEN/Draft e #228 CLOSED/unmerged. Não houve merge, deploy, cutover, force push nem alteração de `Root/main`.
+
+| Frente | SHA publicado confirmado | Evidência atual e fronteira ainda bloqueada |
+| --- | --- | --- |
+| #251 — roadmap/CI | `1a30a69b9c482c8a984fd46e5f58845c3b44abda` | [Full hosted 42565505791](https://github.com/bielxdh3/Root.ark/actions/runs/42565505791) FAILURE: Windows canonical registrou um processo de teste de `backup-restore-transaction-boundary.test.js` com exit 1 (hash de módulo, não nome de asserção); o mesmo arquivo passou 126 PASS/5 SKIP em execução NTFS isolada. A cadeia **LOCAL NÃO PUBLICADA** `e34747f7`→`5bacf646`→`0b66394127689dae2bb5c820265c277515ddb982` melhora somente a telemetria TAP, com RED→GREEN contra mistura de metadados após YAML, 9/9 Win Node22 NTFS e 9/9 WSL Node22/ext4. SOURCE GO independente de `0b663941` foi confirmado para o parser isolado; nova CI e resultado completo do módulo Windows ainda são gates. |
+| #293 — #63/#68 | `f9b604047c0634dccedcd99c8ae00f7f3fff075c` | [Full hosted 42561877204](https://github.com/bielxdh3/Root.ark/actions/runs/42561877204) SUCCESS; os fixes de leases SQLite WAL e Edge one-shot já revisados permanecem intactos. |
+| #298 — #67 | `b586ac3597f06aa1d8f91c62dc45e3a12a3123b7` | Helper de abertura Windows relativa por handles aprovado **somente como laboratório inerte**; CodeQL formal com 2 HIGH permanece vermelho em `sync-client/rootark-sync-engine.js:401-402,2604`. Testes negativos reais E:NTFS e WSL/ext4 reproduzem **OPEN+READ de inode externo** por junction/symlink de ancestral; `services/restorePreimage.js` ainda admite clobber concorrente. Experimentos locais `a9abf89d`, `83cdcb57` e `270dc4d6` mostram que assinatura de estado reconstruído não prova a transição forward original, e `openat2`/dirfd móvel não fixa sozinho raiz física. Não publicar solução de produção sem nativo, owner/phase witness e manual crash recovery íntegros. |
+| #300 — #66 | `956b2515d3f5262b2bf8c6044be2bfd2db72dc9e` | FF sobre `f645438e` preserva replay Ed25519 CREATE/DELETE com `observations=[]`: callback obrigatório de política/revogação roda na fila mesmo sem novo journal write. Peer SOURCE GO **somente ao experimento inerte**; testes 37/37 Win22 E: NTFS e 37/37 WSL/ext4. Novo fix de fixture DACL do proprietário (`.NET Directory.SetAccessControl` sem `Get-Acl`/`Set-Acl`/SACL) recebeu SOURCE GO independente, 12/12 Win22 e 7 PASS/5 SKIP WSL. [Hosted full 42578257642](https://github.com/bielxdh3/Root.ark/actions/runs/42578257642) iniciou; status definitivo ainda pendente. Corridas ABA de root/sidecar, journal requerido com lixo >16.384 e NTFS power-cut **não** foram autorizadas. |
+| #302 — #65 | `ce3d7ec4675a32455d844b60166ca32f627d3aca` | 8 SUCCESS/1 SKIP hosted já verificados; histórico assinado, checks de S3 e provas DEV-OFF preservados. ZK10 segue `authorizesIo:false`, sem digest previamente assinado de bytes originais por proprietário real, inventário completo ZIP/jobs/versões, custódia independente off-host e piso monotônico antirollback; **R1 NO-GO**. |
+| #291/#64 e #299/#242 | `6d1c3ffff29eba26fd79f293662398b54a0895f0` e `95aec7c40855b6d21cd81955bdc7c3ea2409b221` | Android grant-origin `548c91af` é candidato LOCAL SOURCE GO, mas nenhum teste Kotlin/JVM ou aparelho Keystore/TEE comprovado. Em #242 NTFS aceitou digest anterior após modificação mantendo timestamps; o duplo hash `a54018ad` ainda perde corrida após a última leitura. WebRTC cross-NAT/TURN e custódia de bytes seguem NO-GO. |
+
+```mermaid
+flowchart TD
+  A["PRs OPEN/Draft; Root/main e #228 preservados"] --> B{"SOURCE GO SHA exato, testes físicos e CI?"}
+  B -->|"#300 fixture e experimentos de revogação testados"| C["CI hosted do SHA 956b em verificação"]
+  B -->|"#251 parser local aguarda peer e nova CI"| D["Sem publicar cadeia não revisada"]
+  B -->|"#298/#242 native custody e raiz sem prova"| E["Falhar fechado; nada de restore/cutover em produção"]
+  C --> F{"Owner-signed original bytes, fase/CAS independente e NTFS power-cut provados?"}
+  F -->|"Não"| G["DEV-OFF, sem merge/deploy/R1"]
+  D --> G
+  E --> G
+```
+
+**Critério constante:** sucesso de testes e SOURCE GO delimitado de helpers não prova autorização de IO, recuperação diante de power-cut, hardware Windows 10/Android nem release de #63/#65/#66/#67/#68. Preservar worktrees, dados e fixtures RED, sem reinicializações destrutivas.
