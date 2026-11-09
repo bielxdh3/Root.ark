@@ -10,6 +10,7 @@ const test = require("node:test");
 const win = process.platform === "win32";
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-deny-callback.cpp");
 const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+const systemCmd = "C:\\Windows\\System32\\cmd.exe";
 
 function findVcvars() {
   const found = spawnSync(vswhere, ["-all", "-products", "*", "-prerelease", "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], {
@@ -35,7 +36,7 @@ test("issue 66 native CFAPI: real SDK ABI compiles and FETCH_DATA returns failed
     "exit /b %errorlevel%",
     "",
   ].join("\r\n"));
-  const built = spawnSync("cmd.exe", ["/d", "/c", script], {
+  const built = spawnSync(systemCmd, ["/d", "/c", script], {
     cwd: dir, encoding: "utf8", timeout: 30000, windowsHide: true,
   });
   assert.equal(built.status, 0, `SDK compile failed: ${built.stdout}\n${built.stderr}`);

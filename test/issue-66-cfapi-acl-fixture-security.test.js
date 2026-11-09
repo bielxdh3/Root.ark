@@ -9,6 +9,7 @@ const test = require("node:test");
 const { readCfapiFixtureFailureStage } = require("../scripts/acl-test-failure-diagnostic");
 
 const fixtureScript = path.join(__dirname, "support/issue-66-cfapi-acl-fixture.ps1");
+const systemPowerShell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const quote = (text) => `'${text.replace(/'/g, "''")}'`;
 
 test("CFAPI disposable ACL fixtures persist without Get-Acl or Set-Acl under restricted shell command policy",
@@ -30,7 +31,7 @@ test("CFAPI disposable ACL fixtures persist without Get-Acl or Set-Acl under res
         `& ${quote(fixtureScript)} ${quote(target)} ${quote(expose)}`,
         `if (([System.IO.Directory]::GetAccessControl(${quote(target)})).AreAccessRulesProtected -ne $${expectProtected.toString().toLowerCase()}) { exit 71 }`,
       ].join("; ");
-      const child = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive",
+      const child = spawnSync(systemPowerShell, ["-NoProfile", "-NonInteractive",
         "-ExecutionPolicy", "Bypass", "-Command", ps], {
         cwd: scratch, encoding: "utf8", windowsHide: true, timeout: 15000,
       });
@@ -62,7 +63,7 @@ test("CFAPI PowerShell fixture emits only a fixed category on rejected fixture m
     const target = path.join(scratch, "owner-only");
     await fs.mkdir(target);
     const ps = `& ${quote(fixtureScript)} ${quote(target)} 'INVALID_MODE_WITH_PRIVATE_PATH'`;
-    const child = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive",
+    const child = spawnSync(systemPowerShell, ["-NoProfile", "-NonInteractive",
       "-ExecutionPolicy", "Bypass", "-Command", ps], {
       cwd: scratch, encoding: "utf8", windowsHide: true, timeout: 12000,
     });
@@ -85,14 +86,14 @@ test("CFAPI fixture never changes an existing directory outside its disposable s
         "$sha = [System.Security.Cryptography.SHA256]::Create()",
         "[Console]::Out.WriteLine(([BitConverter]::ToString($sha.ComputeHash($acl.GetSecurityDescriptorBinaryForm()))).Replace('-', ''))",
       ].join("; ");
-      const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive",
+      const result = spawnSync(systemPowerShell, ["-NoProfile", "-NonInteractive",
         "-Command", ps], { cwd: foreign, encoding: "utf8", windowsHide: true, timeout: 12000 });
       assert.equal(result.status, 0, "must inspect the disposable DACL");
       assert.match(result.stdout.trim(), /^[A-F0-9]{64}$/);
       return result.stdout.trim();
     };
     const beforeDacl = daclDigest();
-    const child = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive",
+    const child = spawnSync(systemPowerShell, ["-NoProfile", "-NonInteractive",
       "-ExecutionPolicy", "Bypass", "-File", fixtureScript, target, "0"], {
       cwd: foreign, encoding: "utf8", windowsHide: true, timeout: 12000,
     });

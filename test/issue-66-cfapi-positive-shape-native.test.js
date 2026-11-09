@@ -12,6 +12,7 @@ const test = require("node:test");
 const win = process.platform === "win32";
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-positive-shape.cpp");
 const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+const systemCmd = "C:\\Windows\\System32\\cmd.exe";
 
 function findVcvars() {
   const found = spawnSync(vswhere, ["-all", "-products", "*", "-prerelease",
@@ -46,7 +47,7 @@ test("#66 real Windows SDK validates bounded mock TRANSFER_DATA ranges, not kern
       `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${executable}" "${source}" cldapi.lib`,
       "exit /b %errorlevel%", "",
     ].join("\r\n"));
-    const built = spawnSync("cmd.exe", ["/d", "/c", script], {
+    const built = spawnSync(systemCmd, ["/d", "/c", script], {
       cwd: temporary, encoding: "utf8", timeout: 30000, windowsHide: true,
     });
     assert.equal(built.status, 0, `SDK compile failed: ${built.stdout}\n${built.stderr}`);
