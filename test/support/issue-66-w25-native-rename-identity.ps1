@@ -35,6 +35,10 @@ public static class RootarkW25RenameIdentityProof {
     public byte[] FileId;
   }
   [StructLayout(LayoutKind.Sequential)]
+  private struct FILE_ATTRIBUTE_TAG_INFO {
+    public uint Attributes, ReparseTag;
+  }
+  [StructLayout(LayoutKind.Sequential)]
   private struct UNICODE_STRING {
     public ushort Length, MaximumLength;
     public IntPtr Buffer;
@@ -59,6 +63,19 @@ public static class RootarkW25RenameIdentityProof {
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool GetInfo(SafeFileHandle handle, int klass,
     out FILE_ID_INFO info, uint size);
+  [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx",
+    SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetTag(SafeFileHandle handle, int klass,
+    out FILE_ATTRIBUTE_TAG_INFO info, uint size);
+  [DllImport("kernel32.dll", EntryPoint = "GetVolumeInformationByHandleW",
+    CharSet = CharSet.Unicode, SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetVolume(SafeFileHandle handle,
+    StringBuilder volumeName, uint volumeNameCapacity, IntPtr serial,
+    IntPtr maxComponent, IntPtr flags, StringBuilder fileSystem, uint fsCapacity);
+  [DllImport("kernel32.dll", EntryPoint = "GetDriveTypeW", CharSet = CharSet.Unicode)]
+  private static extern uint GetDriveType(string rootPath);
   [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW",
     CharSet = CharSet.Unicode, SetLastError = true)]
   private static extern uint GetName(SafeFileHandle handle, StringBuilder output,
@@ -90,6 +107,28 @@ public static class RootarkW25RenameIdentityProof {
       if (left.FileId[i] != right.FileId[i]) return false;
     return true;
   }
+  private static void RequireLocalNtfs(SafeFileHandle handle) {
+    var fs = new StringBuilder(32);
+    if (!GetVolume(handle, null, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+        fs, (uint)fs.Capacity) ||
+        !string.Equals(fs.ToString(), "NTFS", StringComparison.OrdinalIgnoreCase))
+      throw new InvalidOperationException("NTFS_REQUIRED");
+    string name = CanonicalPath(handle);
+    // Exclude UNC/network volumes and remapped paths; only fixed local drives.
+    if (name.Length < 7 ||
+        !name.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase) ||
+        !char.IsLetter(name[4]) || name[5] != ':' || name[6] != '\\' ||
+        GetDriveType(name.Substring(4, 3)) != 3 /* DRIVE_FIXED */)
+      throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
+  }
+  private static void RequirePlainDirectory(SafeFileHandle handle) {
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    if (!GetTag(handle, 9 /* FileAttributeTagInfo */, out tag,
+        (uint)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO))) ||
+        (tag.Attributes & 0x10 /* DIRECTORY */) == 0 ||
+        (tag.Attributes & 0x400 /* REPARSE_POINT */) != 0)
+      throw new InvalidOperationException("NOT_PLAIN_DIRECTORY");
+  }
   private static string CanonicalPath(SafeFileHandle handle) {
     var output = new StringBuilder(4096);
     uint count = GetName(handle, output, (uint)output.Capacity, 0);
@@ -104,8 +143,23 @@ public static class RootarkW25RenameIdentityProof {
     if (h == null || h.IsInvalid) throw new InvalidOperationException("CREATE_FILE_FAILED");
     return h;
   }
-  private static SafeFileHandle OpenChild(SafeFileHandle parent, out int nativeStatus) {
-    const string leaf = "child"; // NO absolute path and NO caller-supplied leaf
+  private static void RequireScratchBinding(
+      SafeFileHandle retained, string scratch, FILE_ID_INFO originalId) {
+    RequirePlainDirectory(retained);
+    if (!Same(originalId, Id(retained)))
+      throw new InvalidOperationException("SCRATCH_HANDLE_CHANGED");
+    using (var current = OpenDirectory(scratch, 7)) {
+      RequirePlainDirectory(current);
+      if (!Same(originalId, Id(current)))
+        throw new InvalidOperationException("SCRATCH_PATH_CHANGED");
+    }
+  }
+  private static SafeFileHandle OpenRelativeDirectory(
+      SafeFileHandle parent, string leaf, uint share, bool create,
+      out int nativeStatus) {
+    // Only literal names from this test. Never allow user-provided paths.
+    if (leaf != "held-ancestor" && leaf != "moved-ancestor" && leaf != "child")
+      throw new InvalidOperationException("UNTRUSTED_LEAF");
     IntPtr buffer = Marshal.StringToHGlobalUni(leaf);
     IntPtr unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
     try {
@@ -120,8 +174,8 @@ public static class RootarkW25RenameIdentityProof {
       IO_STATUS_BLOCK status;
       SafeFileHandle child;
       nativeStatus = NtCreateFile(out child, 0x00020080,
-        ref attributes, out status, IntPtr.Zero, 0,
-        3 /* SHARE_READ|SHARE_WRITE */, 1 /* FILE_OPEN */,
+        ref attributes, out status, IntPtr.Zero, 0x10 /* DIRECTORY */,
+        share, create ? 2U /* FILE_CREATE */ : 1U /* FILE_OPEN */,
         0x00200001 /* FILE_OPEN_REPARSE_POINT|FILE_DIRECTORY_FILE */,
         IntPtr.Zero, 0);
       if (nativeStatus != 0) {
@@ -134,13 +188,34 @@ public static class RootarkW25RenameIdentityProof {
       Marshal.FreeHGlobal(buffer);
     }
   }
+  private static SafeFileHandle OpenChild(SafeFileHandle parent, out int nativeStatus) {
+    return OpenRelativeDirectory(parent, "child", 3, false, out nativeStatus);
+  }
 
   public static string Probe(string scratch, string shareMode, string moveMode) {
     uint share = shareMode == "NONE" ? 0U : 3U;
     string oldPath = Path.Combine(scratch, "held-ancestor");
     string movedPath = Path.Combine(scratch, "moved-ancestor");
-    Directory.CreateDirectory(Path.Combine(oldPath, "child")); // setup pathname
-    using (var root = OpenDirectory(oldPath, share)) {
+    // Retain the actual disposable scratch object and create fixture children
+    // by NtCreateFile relative to its HANDLE, never by joined absolute path.
+    using (var scratchRoot = OpenDirectory(scratch, 7)) {
+      RequireLocalNtfs(scratchRoot);
+      RequirePlainDirectory(scratchRoot);
+      FILE_ID_INFO scratchId = Id(scratchRoot);
+      RequireScratchBinding(scratchRoot, scratch, scratchId);
+      int setupStatus;
+      using (var initial = OpenRelativeDirectory(
+          scratchRoot, "held-ancestor", 7, true, out setupStatus)) {
+        RequirePlainDirectory(initial);
+        using (var initialChild = OpenRelativeDirectory(
+            initial, "child", 7, true, out setupStatus))
+          RequirePlainDirectory(initialChild);
+      }
+      RequireScratchBinding(scratchRoot, scratch, scratchId);
+      int rootStatus;
+      using (var root = OpenRelativeDirectory(
+          scratchRoot, "held-ancestor", share, false, out rootStatus)) {
+      RequirePlainDirectory(root);
       uint handleFlags;
       if (!HandleInfo(root, out handleFlags))
         throw new InvalidOperationException("INVALID_HANDLE");
@@ -155,6 +230,9 @@ public static class RootarkW25RenameIdentityProof {
       // zero after success is data, not a separate security assurance.
       int win32LastError = 0;
       string win32Status = "NA_DOTNET";
+      // A same-principal actor can still race the following path-based rename.
+      // The identity checks catch many swaps but are NOT an atomic authorization.
+      RequireScratchBinding(scratchRoot, scratch, scratchId);
       if (moveMode == "WIN32") {
         moved = MoveFileEx(oldPath, movedPath, 0);
         win32LastError = Marshal.GetLastWin32Error();
@@ -174,23 +252,37 @@ public static class RootarkW25RenameIdentityProof {
           " ntstatus=NA identity=UNMOVED";
       }
 
-      // Act as a separate untrusted pathname observer. A new directory at the
-      // original name must NOT cause the old root HANDLE to change identity.
-      Directory.CreateDirectory(Path.Combine(oldPath, "child")); // adversarial
+      RequireScratchBinding(scratchRoot, scratch, scratchId);
+      // Replacement is also rooted under the original scratch HANDLE.
+      int replacementStatus;
+      using (var setupReplacement = OpenRelativeDirectory(
+          scratchRoot, "held-ancestor", 7, true, out replacementStatus)) {
+        RequirePlainDirectory(setupReplacement);
+        using (var replacementChild = OpenRelativeDirectory(
+            setupReplacement, "child", 7, true, out replacementStatus))
+          RequirePlainDirectory(replacementChild);
+      }
       FILE_ID_INFO after = Id(root);
       uint afterHandleFlags;
       if (root.IsInvalid || root.IsClosed || !HandleInfo(root, out afterHandleFlags))
         throw new InvalidOperationException("ROOT_HANDLE_NO_LONGER_VALID");
       string afterName = CanonicalPath(root);
-      using (var movedRoot = OpenDirectory(movedPath, 3))
-      using (var replacement = OpenDirectory(oldPath, 3)) {
+      RequireScratchBinding(scratchRoot, scratch, scratchId);
+      int lookupStatus;
+      using (var movedRoot = OpenRelativeDirectory(
+          scratchRoot, "moved-ancestor", 3, false, out lookupStatus))
+      using (var replacement = OpenRelativeDirectory(
+          scratchRoot, "held-ancestor", 3, false, out lookupStatus)) {
+        RequirePlainDirectory(movedRoot);
+        RequirePlainDirectory(replacement);
         FILE_ID_INFO movedId = Id(movedRoot);
         FILE_ID_INFO replacementId = Id(replacement);
         int nativeStatus;
         using (var child = OpenChild(root, out nativeStatus)) {
           FILE_ID_INFO oldChild = Id(child);
           string childName = CanonicalPath(child);
-          using (var replacementChild = OpenDirectory(Path.Combine(oldPath, "child"), 3)) {
+          using (var replacementChild = OpenChild(replacement, out lookupStatus)) {
+            RequirePlainDirectory(replacementChild);
             if (!Same(before, after) || !Same(before, movedId) ||
                 Same(before, replacementId) || Same(oldChild, Id(replacementChild)) ||
                 !afterName.EndsWith("\\moved-ancestor", StringComparison.OrdinalIgnoreCase) ||
@@ -200,11 +292,13 @@ public static class RootarkW25RenameIdentityProof {
           // O1/O2 are mapped object identifiers from actual FileIdInfo bytes.
           // Never reveal filesystem paths, raw file IDs or volume serials.
           return "ROOTARK_W25_RENAME_V2 mode=" + moveMode + " share=" + share +
+            " filesystem=NTFS storage=LOCAL" +
             " handle=VALID move=SUCCESS win32LastError=" + win32Status + " ntstatus=0x" +
             ((uint)nativeStatus).ToString("X8") +
             " rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL";
         }
       }
+    }
     }
   }
 }

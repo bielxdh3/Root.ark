@@ -5,7 +5,6 @@
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
@@ -32,11 +31,10 @@ test("#66 W25 physical NTFS rooted handle IO remains bound through real ancestor
     // The PowerShell helper refuses arbitrary parent paths and aliases.
     assert.ok(localAppData && path.win32.isAbsolute(localAppData));
     const scratch = fs.mkdtempSync(path.join(localAppData, "rootark-w25-native-rooted-io-"));
-    t.after(() => {
-      assert.match(path.basename(scratch), /^rootark-w25-native-rooted-io-[A-Za-z0-9_-]{6,}$/);
-      assert.equal(path.dirname(scratch).toLowerCase(), localAppData.toLowerCase());
-      fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
-    });
+    // Keep the disposable fixture. Recursive deletion by pathname is unsafe
+    // if a same-principal process substitutes the scratch directory.
+    assert.match(path.basename(scratch), /^rootark-w25-native-rooted-io-[A-Za-z0-9_-]{6,}$/);
+    assert.equal(path.dirname(scratch).toLowerCase(), localAppData.toLowerCase());
     const outcome = run(scratch);
     assert.equal(outcome.status, 0, "rooted NTFS test rejected; do not fall back to path-based IO");
     assert.match(outcome.stdout, fixedResult);
@@ -45,26 +43,19 @@ test("#66 W25 physical NTFS rooted handle IO remains bound through real ancestor
     // code. Neither production nor another checkout is changed by the test.
   });
 
-test("#66 W25 native test helper denies arbitrary external scratch and disabled opt-in",
+test("#66 W25 native helper rejects nonempty, nested and disabled scratch",
   { skip: !allowed, timeout: 45000 }, (t) => {
-    const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-w25-native-rooted-io-"));
-    t.after(() => fs.rmSync(foreign, { recursive: true, force: true }));
-    fs.writeFileSync(path.join(foreign, "outside-canary.txt"), "UNCHANGED");
-    for (const optIn of [true, false]) {
-      const result = run(foreign, optIn);
-      assert.equal(result.status, 41);
+    const existing = fs.mkdtempSync(path.join(localAppData, "rootark-w25-native-rooted-io-"));
+    fs.writeFileSync(path.join(existing, "existing-owner-data.txt"), "DO_NOT_TOUCH");
+    const nested = path.join(existing, "nested");
+    fs.mkdirSync(nested);
+    for (const [candidate, enabled] of [[existing, true], [existing, false], [nested, true]]) {
+      const result = run(candidate, enabled);
+      assert.equal(result.status, 41, "ineligible scratch must fail closed");
       assert.equal(result.stdout, "");
       assert.match(result.stderr, /^ROOTARK_W25_ROOTED_IO_REJECTED\r?\n$/);
     }
-    assert.equal(fs.readFileSync(path.join(foreign, "outside-canary.txt"), "utf8"), "UNCHANGED");
-    assert.deepEqual(fs.readdirSync(foreign), ["outside-canary.txt"]);
-    const existing = fs.mkdtempSync(path.join(localAppData, "rootark-w25-native-rooted-io-"));
-    t.after(() => fs.rmSync(existing, { recursive: true, force: true }));
-    fs.writeFileSync(path.join(existing, "existing-owner-data.txt"), "DO_NOT_TOUCH");
-    const rejected = run(existing);
-    assert.equal(rejected.status, 41, "nonempty eligible-looking scratch must fail closed");
-    assert.equal(rejected.stdout, "");
-    assert.match(rejected.stderr, /^ROOTARK_W25_ROOTED_IO_REJECTED\r?\n$/);
-    assert.deepEqual(fs.readdirSync(existing), ["existing-owner-data.txt"]);
+    assert.deepEqual(fs.readdirSync(existing).sort(), ["existing-owner-data.txt", "nested"]);
+    assert.deepEqual(fs.readdirSync(nested), []);
     assert.equal(fs.readFileSync(path.join(existing, "existing-owner-data.txt"), "utf8"), "DO_NOT_TOUCH");
   });

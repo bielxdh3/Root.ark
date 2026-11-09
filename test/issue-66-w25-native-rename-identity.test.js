@@ -5,7 +5,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
@@ -25,42 +24,42 @@ function invoke(scratch, share, move, enabled = true) {
   });
 }
 
-test("#66 W25 native CreateFileW directory sharing and actual rename identity (four modes)",
+test("#66 W25 native NtCreateFile directory sharing and actual rename identity (four modes)",
   { skip: !available, timeout: 90000 }, (t) => {
     assert.ok(localAppData && path.win32.isAbsolute(localAppData));
     for (const share of ["RW", "NONE"]) {
       for (const move of ["DOTNET", "WIN32"]) {
         const scratch = fs.mkdtempSync(path.join(localAppData, "rootark-w25-rename-identity-"));
-        t.after(() => {
-          assert.match(path.basename(scratch), /^rootark-w25-rename-identity-[A-Za-z0-9_-]{6,}$/);
-          assert.equal(path.dirname(scratch).toLowerCase(), localAppData.toLowerCase());
-          fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
-        });
+        // Retain disposable fixtures. A path-only recursive teardown can
+        // delete a foreign subtree if another same-principal process swaps it.
+        assert.match(path.basename(scratch), /^rootark-w25-rename-identity-[A-Za-z0-9_-]{6,}$/);
+        assert.equal(path.dirname(scratch).toLowerCase(), localAppData.toLowerCase());
         const result = invoke(scratch, share, move);
         assert.equal(result.status, 0, "native identity proof rejected");
         assert.equal(result.stderr, "", "native stderr must not disclose paths/IDs/ACLs");
         // A real FileIdInfo comparison must map the held handle AND the moved
         // name to O1, while the replacement has a separate on-disk identity.
-        const expected = new RegExp(`^ROOTARK_W25_RENAME_V2 mode=${move} share=${share === "RW" ? 3 : 0} handle=VALID move=SUCCESS win32LastError=${move === "WIN32" ? "[0-9]+" : "NA_DOTNET"} ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL\\r?\\n$`);
+        const expected = new RegExp(`^ROOTARK_W25_RENAME_V2 mode=${move} share=${share === "RW" ? 3 : 0} filesystem=NTFS storage=LOCAL handle=VALID move=SUCCESS win32LastError=${move === "WIN32" ? "[0-9]+" : "NA_DOTNET"} ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL\\r?\\n$`);
         assert.match(result.stdout, expected,
           "real move must succeed with Win32 status and distinct verified original/replacement IDs");
       }
     }
   });
 
-test("#66 W25 independent rename helper rejects non-empty and external scratch without mutations",
+test("#66 W25 independent helper rejects nonempty, nested and disabled fixtures without mutations",
   { skip: !available, timeout: 45000 }, (t) => {
-    for (const root of [os.tmpdir(), localAppData]) {
-      const scratch = fs.mkdtempSync(path.join(root, "rootark-w25-rename-identity-"));
-      t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
-      fs.writeFileSync(path.join(scratch, "owner-canary"), "DO_NOT_TOUCH");
-      for (const enabled of [true, false]) {
-        const result = invoke(scratch, "RW", "WIN32", enabled);
-        assert.equal(result.status, 41);
-        assert.equal(result.stdout, "");
-        assert.match(result.stderr, /^ROOTARK_W25_RENAME_REJECTED\r?\n$/);
-      }
-      assert.deepEqual(fs.readdirSync(scratch), ["owner-canary"]);
-      assert.equal(fs.readFileSync(path.join(scratch, "owner-canary"), "utf8"), "DO_NOT_TOUCH");
+    // Only create fixtures under our own LocalAppData; no public TEMP scratch.
+    const scratch = fs.mkdtempSync(path.join(localAppData, "rootark-w25-rename-identity-"));
+    fs.writeFileSync(path.join(scratch, "owner-canary"), "DO_NOT_TOUCH");
+    const nested = path.join(scratch, "nested");
+    fs.mkdirSync(nested);
+    for (const [candidate, enabled] of [[scratch, true], [scratch, false], [nested, true]]) {
+      const result = invoke(candidate, "RW", "WIN32", enabled);
+      assert.equal(result.status, 41);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /^ROOTARK_W25_RENAME_REJECTED\r?\n$/);
     }
+    assert.deepEqual(fs.readdirSync(scratch).sort(), ["nested", "owner-canary"]);
+    assert.deepEqual(fs.readdirSync(nested), []);
+    assert.equal(fs.readFileSync(path.join(scratch, "owner-canary"), "utf8"), "DO_NOT_TOUCH");
   });
