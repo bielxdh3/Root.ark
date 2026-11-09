@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { createAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
 
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp");
 const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
@@ -31,24 +32,32 @@ test("#66 native ACL preflight has no sync-root registration or file-content ope
 
 test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and rejects broad access or reparse points",
   { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+    const diagnostic = createAclFailureDiagnostic(t, "CFAPI_PREFLIGHT");
+    return diagnostic.run(async () => {
+    diagnostic.stage("TOOLCHAIN_LOOKUP");
     const where = run(vswhere, ["-all", "-products", "*", "-prerelease",
       "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"], undefined, 6000);
     const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
     if (!vcvars) { t.skip("MSVC x64 toolchain unavailable"); return; }
+    diagnostic.stage("TOOLCHAIN_RESOLVE");
     try { await fs.access(vcvars); }
     catch { t.skip("MSVC x64 vcvars missing"); return; }
 
+    diagnostic.stage("SCRATCH_CREATE");
     const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-acl-test-"));
     t.after(() => fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
     const exe = path.join(scratch, "acl-preflight.exe");
     const batch = path.join(scratch, "build.cmd");
+    diagnostic.stage("BUILD_SCRIPT_WRITE");
     await fs.writeFile(batch, ["@echo off", `call "${vcvars}" >nul`,
       "if errorlevel 1 exit /b 1",
       `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${exe}" "${source}" cldapi.lib advapi32.lib`,
       "exit /b %errorlevel%", ""].join("\r\n"));
+    diagnostic.stage("SDK_BUILD");
     const build = run("cmd.exe", ["/d", "/c", batch], scratch, 40000);
     assert.equal(build.status, 0, `native SDK build failed: ${build.stdout}\n${build.stderr}`);
 
+    diagnostic.stage("ROOT_CREATE");
     const strictRoot = path.join(scratch, "owner-only");
     const exposedRoot = path.join(scratch, "broad-access");
     const inheritedRoot = path.join(scratch, "inherited-access");
@@ -56,6 +65,7 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     await fs.mkdir(exposedRoot);
     await fs.mkdir(inheritedRoot);
     const aclScript = path.join(scratch, "fixture-acl.ps1");
+    diagnostic.stage("ACL_SCRIPT_WRITE");
     await fs.writeFile(aclScript, [
       "param([string]$Target, [string]$Expose)",
       "$ErrorActionPreference = 'Stop'",
@@ -76,7 +86,12 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       "if ($Expose -eq '2') { $acl.SetAccessRuleProtection($false, $true) }",
       "Set-Acl -LiteralPath $Target -AclObject $acl",
     ].join("\r\n"));
-    for (const [dir, expose] of [[strictRoot, "0"], [exposedRoot, "1"], [inheritedRoot, "2"]]) {
+    for (const [dir, expose, stage] of [
+      [strictRoot, "0", "ACL_OWNER_APPLY"],
+      [exposedRoot, "1", "ACL_BROAD_APPLY"],
+      [inheritedRoot, "2", "ACL_INHERITED_APPLY"],
+    ]) {
+      diagnostic.stage(stage);
       const applied = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", aclScript, dir, expose], scratch, 10000);
       assert.equal(applied.status, 0, `disposable ACL setup failed: ${applied.stderr}`);
@@ -86,34 +101,50 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       const outcome = run(exe, ["--inspect", dir], scratch);
       return { status: outcome.status, output: JSON.parse(outcome.stdout.trim()) };
     };
+    diagnostic.stage("OWNER_INSPECT");
     const strong = inspect(strictRoot);
+    diagnostic.stage("OWNER_ACCEPT");
     assert.equal(strong.status, 0);
     assert.equal(strong.output.aclPreflightPassed, true);
+    diagnostic.stage("OWNER_HANDLE");
     assert.equal(strong.output.handleIdentityCaptured, true);
+    diagnostic.stage("OWNER_NO_REGISTER");
     assert.equal(strong.output.syncRootRegistered, false);
+    diagnostic.stage("OWNER_NO_TRANSFER");
     assert.equal(strong.output.cloudDataBytesTransferred, 0);
 
+    diagnostic.stage("BROAD_INSPECT");
     const broad = inspect(exposedRoot);
+    diagnostic.stage("BROAD_REJECT");
     assert.notEqual(broad.status, 0);
     assert.equal(broad.output.aclPreflightPassed, false);
+    diagnostic.stage("INHERITED_INSPECT");
     const inherited = inspect(inheritedRoot);
+    diagnostic.stage("INHERITED_REJECT");
     assert.notEqual(inherited.status, 0);
     assert.equal(inherited.output.aclPreflightPassed, false);
+    diagnostic.stage("MISSING_INSPECT");
     const missing = inspect(path.join(scratch, "missing"));
+    diagnostic.stage("MISSING_REJECT");
     assert.notEqual(missing.status, 0);
     assert.equal(missing.output.aclPreflightPassed, false);
 
+    diagnostic.stage("JUNCTION_CREATE");
     const junction = path.join(scratch, "junction");
     try {
       await fs.symlink(strictRoot, junction, "junction");
+      diagnostic.stage("JUNCTION_INSPECT");
       const reparse = inspect(junction);
+      diagnostic.stage("JUNCTION_REJECT");
       assert.notEqual(reparse.status, 0);
       assert.equal(reparse.output.aclPreflightPassed, false);
     } catch (error) {
       if (!["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) throw error;
       t.diagnostic("junction creation unavailable; native reparse-negative test skipped");
     }
+    diagnostic.stage("REGISTER_REJECT");
     assert.notEqual(run(exe, ["--register", strictRoot], scratch).status, 0);
+    });
   });
 
 test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effective Administrators access",

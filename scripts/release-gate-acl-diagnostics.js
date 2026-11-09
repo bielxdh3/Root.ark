@@ -8,7 +8,7 @@ const { parseAclFailureDiagnostic } = require("./acl-test-failure-diagnostic");
 
 const ANSI = /\x1b\[[\d;]*m/g;
 const FAILURE = /^not ok \d+ - (.+)$/;
-const LOCATION = /^location:\s*['"]?(.+?):\d+:\d+['"]?$/;
+const LOCATION = /^  location:\s*['"]?(.+?):\d+:\d+['"]?$/;
 const CATEGORICAL = /^# ROOTARK_ACL_V1 case=([A-Z_]{1,32}) stage=[A-Z_]{1,32} code=[A-Z_]{1,32} trust=[A-Z_]{1,32}$/;
 // t.diagnostic() is legitimately printed *after* the failed test's YAML
 // terminator, but never after the TAP plan/summary or a following Subtest.
@@ -19,7 +19,9 @@ function extractHostedAclFailureDiagnostics(output) {
   let pending = null;
   const safe = [];
   for (const raw of String(output || "").split(/\r?\n/)) {
-    const line = raw.replace(ANSI, "").trim();
+    // Whitespace is part of the TAP title identity. Trimming it would let
+    // a forged failure title with a trailing space pass exact attribution.
+    const line = raw.replace(ANSI, "").replace(/\r$/, "");
     if (BOUNDARY.test(line)) {
       pending = null;
       continue;

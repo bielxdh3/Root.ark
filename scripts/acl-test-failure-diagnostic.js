@@ -34,6 +34,20 @@ const CASES = Object.freeze({
     title: "Windows native ACL worker initialization leaves the Node event loop responsive",
     stages: ["INSUFFICIENT_TICKS", "EVENT_LOOP_STALL"],
   },
+  CFAPI_PREFLIGHT: {
+    file: "test/issue-66-cfapi-acl-preflight-native.test.js",
+    // Node TAP escapes a leading # in the test title. The hosted reporter
+    // hashes that exact escaped title, not the original test declaration.
+    title: String.raw`\#66 Windows SDK ACL preflight accepts a protected owner-only DACL and rejects broad access or reparse points`,
+    stages: ["TOOLCHAIN_LOOKUP", "TOOLCHAIN_RESOLVE", "SCRATCH_CREATE",
+      "BUILD_SCRIPT_WRITE", "SDK_BUILD", "ROOT_CREATE", "ACL_SCRIPT_WRITE",
+      "ACL_OWNER_APPLY", "ACL_BROAD_APPLY", "ACL_INHERITED_APPLY",
+      "OWNER_INSPECT", "OWNER_ACCEPT", "OWNER_HANDLE", "OWNER_NO_REGISTER",
+      "OWNER_NO_TRANSFER", "BROAD_INSPECT", "BROAD_REJECT",
+      "INHERITED_INSPECT", "INHERITED_REJECT", "MISSING_INSPECT",
+      "MISSING_REJECT", "JUNCTION_CREATE", "JUNCTION_INSPECT",
+      "JUNCTION_REJECT", "REGISTER_REJECT"],
+  },
 });
 const TRUST = new Set(["UNKNOWN", "INHERITED", "PROTECTED", "UNTRUSTED_ADDED", "REJECTED", "ACCEPTED", "QUARANTINED"]);
 const ERRORS = new Set(["UNKNOWN", "ASSERTION", "ATOMIC_UNSAFE", "PERMISSION", "RUNTIME"]);
