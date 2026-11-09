@@ -41,12 +41,15 @@ typedef struct {
   char token[33];
 } lab_session;
 
-// Each Node environment owns its own native descriptors and token. No
-// process-global session can be consumed or finalized by a worker thread.
-static lab_session *session_for(napi_env env) {
-  lab_session *session = NULL;
-  if (napi_get_instance_data(env, (void **)&session) != napi_ok) return NULL;
-  return session;
+// The callback descriptor, rather than the N-API instance-data slot, owns
+// this addon's private per-environment session. The slot can be overwritten
+// by another set_instance_data call and must never carry our authority.
+static lab_session *session_for(napi_env env, napi_callback_info info) {
+  void *private_data = NULL;
+  size_t argc = 0;
+  if (napi_get_cb_info(env, info, &argc, NULL, NULL, &private_data) != napi_ok)
+    return NULL;
+  return (lab_session *)private_data;
 }
 
 static napi_value fail(napi_env env, const char *message) {
@@ -140,8 +143,8 @@ static int rename_no_replace(int parent, const char *from, const char *to) {
          fsync(parent) == 0;
 }
 
-static int valid_token(napi_env env, napi_value value) {
-  lab_session *session = session_for(env);
+static int valid_token(napi_env env, napi_callback_info info, napi_value value) {
+  lab_session *session = session_for(env, info);
   napi_valuetype t;
   if (!session || !session->active ||
       napi_typeof(env, value, &t) != napi_ok || t != napi_string)
@@ -190,9 +193,7 @@ static void release_handles(lab_session *session) {
   memset(session->token, 0, sizeof(session->token));
 }
 
-static void cleanup(napi_env env, void *data, void *hint) {
-  (void)env;
-  (void)hint;
+static void cleanup(void *data) {
   lab_session *session = (lab_session *)data;
   release_handles(session); // handles only; never unlink or recursively clean.
   free(session);
@@ -207,7 +208,7 @@ static napi_value authority(napi_env env, napi_callback_info info) {
 static napi_value open_test_session(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 0, argv)) return fail(env, "NATIVE_ARGUMENT_REJECTED");
-  lab_session *session = session_for(env);
+  lab_session *session = session_for(env, info);
   if (!session || session->active || getenv("ROOTARK_ISSUE66_W3_NAPI_LAB") == NULL ||
       strcmp(getenv("ROOTARK_ISSUE66_W3_NAPI_LAB"), "1") != 0)
     return fail(env, "NATIVE_TEST_DISABLED");
@@ -280,9 +281,9 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
 
 static napi_value enumerate(napi_env env, napi_callback_info info) {
   napi_value argv[3];
-  if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  lab_session *session = session_for(env);
+  lab_session *session = session_for(env, info);
   int fd = dirfd(session->held);
   if (!plain_directory(fd, 1)) return fail(env, "NATIVE_FD_INVALID");
   rewinddir(session->held);
@@ -306,9 +307,9 @@ static napi_value enumerate(napi_env env, napi_callback_info info) {
 
 static napi_value native_read(napi_env env, napi_callback_info info) {
   napi_value argv[3];
-  if (!args_of(env, info, 2, argv) || !valid_token(env, argv[0]))
+  if (!args_of(env, info, 2, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  lab_session *session = session_for(env);
+  lab_session *session = session_for(env, info);
   char leaf[256];
   if (!leaf_name(env, argv[1], leaf))
     return fail(env, "NATIVE_LEAF_REJECTED");
@@ -346,9 +347,9 @@ static napi_value native_read(napi_env env, napi_callback_info info) {
 
 static napi_value swap_to_foreign(napi_env env, napi_callback_info info) {
   napi_value argv[3];
-  if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  lab_session *session = session_for(env);
+  lab_session *session = session_for(env, info);
   if (session->phase != 0) return fail(env, "NATIVE_PHASE_REJECTED");
   int parent = session->parentfd;
   if (!rename_no_replace(parent, "held", "parked") ||
@@ -369,9 +370,9 @@ static napi_value swap_to_foreign(napi_env env, napi_callback_info info) {
 
 static napi_value restore_original(napi_env env, napi_callback_info info) {
   napi_value argv[3];
-  if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  lab_session *session = session_for(env);
+  lab_session *session = session_for(env, info);
   if (session->phase != 1) return fail(env, "NATIVE_PHASE_REJECTED");
   int parent = session->parentfd;
   if (!rename_no_replace(parent, "held", "foreign-parked") ||
@@ -406,9 +407,9 @@ static napi_value probe_existing_mount(napi_env env, napi_callback_info info) {
 
 static napi_value close_test_session(napi_env env, napi_callback_info info) {
   napi_value argv[3];
-  if (!args_of(env, info, 1, argv) || !valid_token(env, argv[0]))
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
-  release_handles(session_for(env));
+  release_handles(session_for(env, info));
   return result_text(env, "CLOSED_NO_AUTHORITY");
 }
 
@@ -416,23 +417,28 @@ static napi_value init(napi_env env, napi_value exports) {
   lab_session *session = calloc(1, sizeof(*session));
   if (!session) return fail(env, "NATIVE_API_FAILED");
   session->parentfd = -1;
-  if (napi_set_instance_data(env, session, cleanup, NULL) != napi_ok) {
+  if (napi_add_env_cleanup_hook(env, cleanup, session) != napi_ok) {
     free(session);
     return fail(env, "NATIVE_API_FAILED");
   }
   napi_property_descriptor methods[] = {
-    {"authority", NULL, authority, NULL, NULL, NULL, napi_default, NULL},
-    {"openTestSession", NULL, open_test_session, NULL, NULL, NULL, napi_default, NULL},
-    {"enumerate", NULL, enumerate, NULL, NULL, NULL, napi_default, NULL},
-    {"read", NULL, native_read, NULL, NULL, NULL, napi_default, NULL},
-    {"swapToForeign", NULL, swap_to_foreign, NULL, NULL, NULL, napi_default, NULL},
-    {"restoreOriginal", NULL, restore_original, NULL, NULL, NULL, napi_default, NULL},
-    {"probeExistingMount", NULL, probe_existing_mount, NULL, NULL, NULL, napi_default, NULL},
-    {"closeTestSession", NULL, close_test_session, NULL, NULL, NULL, napi_default, NULL},
+    {"authority", NULL, authority, NULL, NULL, NULL, napi_default, session},
+    {"openTestSession", NULL, open_test_session, NULL, NULL, NULL, napi_default, session},
+    {"enumerate", NULL, enumerate, NULL, NULL, NULL, napi_default, session},
+    {"read", NULL, native_read, NULL, NULL, NULL, napi_default, session},
+    {"swapToForeign", NULL, swap_to_foreign, NULL, NULL, NULL, napi_default, session},
+    {"restoreOriginal", NULL, restore_original, NULL, NULL, NULL, napi_default, session},
+    {"probeExistingMount", NULL, probe_existing_mount, NULL, NULL, NULL, napi_default, session},
+    {"closeTestSession", NULL, close_test_session, NULL, NULL, NULL, napi_default, session},
   };
   if (napi_define_properties(env, exports, sizeof(methods)/sizeof(methods[0]),
-                             methods) != napi_ok)
+                             methods) != napi_ok) {
+    // If removal unexpectedly fails, the environment still owns the hook:
+    // let it free this state later rather than risk a double free here.
+    if (napi_remove_env_cleanup_hook(env, cleanup, session) == napi_ok)
+      cleanup(session);
     return fail(env, "NATIVE_API_FAILED");
+  }
   return exports;
 }
 

@@ -30,8 +30,11 @@ retains that parent dirfd, opens a `held` child, verifies ext4 and ownership,
 then mints a random 128-bit **native-issued opaque test token** from a
 **separate** `getrandom` draw: the token is not embedded in, or computed from,
 the directory suffix visible to the same UID. Each Node N-API environment
-holds its own native session via `napi_set_instance_data` with exactly one
-finalizer; no file-static shared session crosses Worker threads. The original
+holds its own native session via a private `napi_property_descriptor.data`
+pointer on each callback and a single `napi_add_env_cleanup_hook` for its
+descriptors. The addon no longer uses the replaceable `napi_set_instance_data`
+slot, so no file-static or externally owned instance-data slot is treated as
+session authority across Worker threads. The original
 passwd HOME lookup uses reentrant `getpwuid_r` with caller-owned storage
 for concurrent Workers; this corrects a race in `getpwuid`, but it does not
 attest to passwd/NSS contents.
@@ -70,6 +73,11 @@ contract suite is **12 PASS / 0 FAIL / 1 SKIP**. The new tests physically
 verify a directory suffix distinct from its native token and two concurrent
 Node Workers with separate valid native sessions that reject each other's
 tokens. The environment finalizer closes only its own descriptors.
+The additional same-environment addon coexistence test loads a second native
+module which installs its own instance data, while the first session remains
+readable and closable. A source regression ensures no use of the shared slot.
+On the corrected branch, WSL Node22/ext4 addon + RootSession-contract tests
+yielded **14 PASS / 0 FAIL / 1 SKIP**; this only validates the lab scope.
 The SKIP is a hostile same-UID concurrent bind-mount/parent-trust test:
 `CAP_SYS_ADMIN` and independently protected custody were not available.
 The test-token separation and per-environment state are narrowly scoped

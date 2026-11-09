@@ -149,5 +149,53 @@ test("#66 W3 native openat2 denies read-only traversal into a mounted procfs",
     assert.equal(bridge.probeExistingMount(), "NO_XDEV_DENIED");
   });
 
+test("#66 W3 native bridge survives an unrelated addon taking instance data in the same Node environment",
+  { skip: !enabled, timeout: 30000 }, () => {
+    loadLab();
+    const home = os.homedir();
+    const build = fs.mkdtempSync(path.join(home, ".rootark-w3-napi-slot-"));
+    assert.equal(fs.statSync(build).mode & 0o777, 0o700);
+    assert.equal(fs.statfsSync(build).type, 0xef53);
+    const competitor = path.join(build, "instance-slot-competitor.node");
+    const competitorSource = path.resolve(__dirname,
+      "../experiments/issue66-w3-posix-napi/instance_slot_competitor.c");
+    const compiled = spawnSync("/usr/bin/gcc", [
+      "-std=c11", "-O2", "-fPIC", "-shared", "-Wall", "-Wextra", "-Werror",
+      "-I/usr/include/node", competitorSource, "-o", competitor,
+    ], {
+      cwd: build, timeout: 30000, encoding: "utf8", maxBuffer: 4096,
+      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", TMPDIR: build },
+    });
+    assert.equal(compiled.status, 0, `competitor addon compile failed: ${compiled.stderr}`);
+    const childCode = [
+      "'use strict';",
+      "const bridge = require(process.argv[1]);",
+      "const competitor = require(process.argv[2]);",
+      "const token = bridge.openTestSession();",
+      "if (competitor.install() !== 'COMPETITOR_SLOT_EMPTY') process.exit(71);",
+      "if (bridge.read(token, 'original.bin').toString('utf8') !== 'TRUSTED_ORIGINAL') process.exit(72);",
+      "bridge.closeTestSession(token);",
+      "process.stdout.write('LAB_COEXISTENCE_OK' + String.fromCharCode(10));",
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["-e", childCode, addonPath, competitor], {
+      cwd: build, timeout: 15000, encoding: "utf8", maxBuffer: 4096,
+      env: { ROOTARK_ISSUE66_W3_NAPI_LAB: "1", PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+    });
+    assert.equal(result.status, 0, `native instance data collision broke lab: ${result.stderr}`);
+    assert.equal(result.stdout, "LAB_COEXISTENCE_OK\n");
+    assert.equal(result.stderr, "");
+  });
+
+test("#66 W3 native session cannot be overwritten through the shared N-API instance-data slot",
+  { skip: !enabled }, () => {
+    const nativeSource = fs.readFileSync(source, "utf8");
+    assert.doesNotMatch(nativeSource, /\bnapi_(?:set|get)_instance_data\s*\(/,
+      "native ownership must not depend on a replaceable instance-data slot");
+    assert.match(nativeSource, /\bnapi_get_cb_info\s*\(/,
+      "each method must retrieve its own private callback state");
+    assert.match(nativeSource, /\bnapi_add_env_cleanup_hook\s*\(/,
+      "the private native state must still have one environment cleanup hook");
+  });
+
 test("#66 W3 hostile same-UID bind-mount swap and root authority attestation",
   { skip: "SKIP: requires independently protected parent, CAP_SYS_ADMIN and live competing-writer model" }, () => {});
