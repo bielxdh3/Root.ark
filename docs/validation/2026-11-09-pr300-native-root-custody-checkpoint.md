@@ -317,9 +317,45 @@ contract suite returned **26 PASS, 0 FAIL**. The new fixture tests also
 retain disposable TEMP files instead of recursively removing a pathname
 that a hostile same-UID actor could swap before cleanup (peer P2 finding).
 
-**Scope caveat:** this change prevents those two specific JavaScript
-configuration/dispatch bypasses. It does not authenticate a hostile
-snapshot, protect arbitrary JS runtime code replacement, establish
+### Second SOURCE NO-GO and corrected replay-method bypass
+
+The independent review of `ec781d512bc672bfc4ffdd248afdc5e0c3383881`
+confirmed that the two original P1 bypasses were corrected, but found a
+third P1: `_open()` still called the public, mutable
+`this.replayEvictionLedger()`. Replacing that method on an engine instance
+could bypass all checks even though the strict flag and its denial were
+private. That commit was therefore **SOURCE NO-GO** for integration.
+
+The subsequent code child `438ca5837d870930699d189908a3b7d4d2d2efff`
+blocks the durable required-v2 case **inside `_open()` itself** via the
+lexically private denial and calls the original replay implementation
+captured when the `SyncEngine` module loaded, rather than a replaceable
+instance or prototype method. A RED→GREEN regression explicitly replaces
+the public replay method and tries to disarm the on-disk recovery marker;
+the committed child refuses startup without writing the snapshot.
+
+The same child adds a concrete **nonempty, valid signed PREPARE** regression
+with a stale/inconsistent snapshot flag (`evictionLedgerRequired: false`).
+The strict Files On-Demand replay rejects the ledger with
+`root_session_native_unavailable`; the physical ledger, exact durable
+snapshot bytes, signed store and absence of remote DELETE are checked.
+These fixtures are retained, not removed recursively through untrusted
+TEMP pathnames. The ledger-only case still has a pathname **read before
+denial**, and is **not** an adversarial A→B→A success proof.
+
+| Exact committed source | Physical validation | Result |
+| --- | --- | --- |
+| `438ca5837d870930699d189908a3b7d4d2d2efff` | Windows Node 22 / NTFS: native gate and RootSession contract | 14 PASS, 0 FAIL |
+| same SHA from a clean Git archive on real Ubuntu WSL `/dev/sdd` ext4 | Ubuntu Node v22.22.1: same two suites | 14 PASS, 0 FAIL |
+| same SHA | Windows Node 22 / NTFS: non-Files-On-Demand hard-crash `required-v2` with 16,385 trash entries | 1 PASS, 0 FAIL |
+| same SHA from Git archive on WSL ext4 | Ubuntu Node v22.22.1: same hard-crash scenario | 1 PASS, 0 FAIL |
+
+**Scope caveat:** these corrections address the three identified JavaScript
+configuration/dispatch bypasses; they do not authenticate a hostile
+snapshot, protect an arbitrarily compromised JavaScript runtime, establish
 independent native root custody, or make older non-Files-On-Demand recovery
-safe against A→B→A. Independent SOURCE review and exact final-SHA Windows
-and ext4 physical gates remain mandatory before even local integration.
+safe against A→B→A. This is a narrow **fail-closed production guard**, not
+an operational native recovery implementation. Independent SOURCE review
+of the exact final composite SHA remains mandatory before local integration.
+The remote Draft PR has not been pushed; hosted CodeQL has not run on this
+local child and formal CodeQL remains red on the published SHA.
