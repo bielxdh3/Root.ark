@@ -66,7 +66,7 @@ function inspect(scratch, name) {
   } finally { fs.closeSync(fd); }
 }
 
-function buildCompiledFixture(scratch, name, batch, timeout = 40000) {
+function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
   assert.equal(process.platform, "win32", FAIL);
   assert.ok(NAMES.has(name), FAIL);
   unchangedDirectory(scratch, NAMES.get(name));
@@ -81,16 +81,36 @@ function buildCompiledFixture(scratch, name, batch, timeout = 40000) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  assert.equal(comparable(batch), comparable(path.join(scratch, "build.cmd")), FAIL);
-  assert.equal(comparable(fs.realpathSync.native(batch)), comparable(batch), FAIL);
-  const batchStat = fs.lstatSync(batch, { bigint: true });
-  assert.ok(batchStat.isFile() && !batchStat.isSymbolicLink() && batchStat.nlink === 1n, FAIL);
-  const recipe = fs.readFileSync(batch, "utf8");
-  assert.ok(recipe.includes(`/Fe:"${executable}"`) && recipe.includes("/std:c++17")
-    && recipe.includes("/W4") && recipe.includes("/WX"), FAIL);
-  const buildResult = spawnSync("C:\\Windows\\System32\\cmd.exe", ["/d", "/c", batch], {
-    cwd: scratch, encoding: "utf8", timeout, windowsHide: true,
+  assert.equal(typeof vcvars, "string", FAIL);
+  assert.match(vcvars,
+    /^C:\\Program Files(?: \(x86\))?\\Microsoft Visual Studio\\(?:1\d|20\d{2})\\[\w .-]+\\VC\\Auxiliary\\Build\\vcvars64\.bat$/i,
+    FAIL);
+  const source = name === "acl-preflight.exe"
+    ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp")
+    : path.join(scratch, "inherit-only-fixture.cpp");
+  for (const filename of [vcvars, source, executable]) {
+    assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
+  }
+  for (const filename of [vcvars, source]) {
+    assert.equal(comparable(fs.realpathSync.native(filename)), comparable(filename), FAIL);
+    const stat = fs.lstatSync(filename, { bigint: true });
+    assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n, FAIL);
+  }
+  // No TEMP build.cmd is ever created or interpreted. The sole command is
+  // assembled here from static switches and validated non-shell paths.
+  // The separate VS-owned vcvars64.bat and compiler are still a toolchain
+  // trust boundary; this does not authenticate their executed bytes.
+  const inline = `call "${vcvars}" >nul && if defined VCToolsInstallDir `
+    + `"!VCToolsInstallDir!bin\\Hostx64\\x64\\cl.exe" /nologo /std:c++17 /W4 /WX /EHsc `
+    + `/Fe:"${executable}" "${source}" cldapi.lib advapi32.lib`;
+  const env = { ...process.env };
+  for (const key of ["CL", "_CL_", "LINK", "_LINK_"]) delete env[key];
+  const buildResult = spawnSync("C:\\Windows\\System32\\cmd.exe",
+    ["/d", "/v:on", "/s", "/c", `"${inline}"`], {
+    cwd: scratch, encoding: "utf8", timeout, windowsHide: true, env,
+    windowsVerbatimArguments: true,
   });
+  // Preserve diagnostic categories; compiler output can reveal local paths.
   assert.ok(buildResult.status === 0 && !buildResult.error, FAIL);
   const snapshot = inspect(scratch, name);
   const receipt = Object.freeze({});
@@ -106,9 +126,9 @@ function runCompiledFixture(receipt, args, timeout = 10000) {
   assert.ok(next.rootDev === previous.rootDev && next.rootIno === previous.rootIno
     && next.dev === previous.dev && next.ino === previous.ino
     && next.size === previous.size && next.digest === previous.digest, FAIL);
-  // Path-based spawn remains racy against a writer with the caller's SID.
-  // This API only refuses arbitrary caller-selected names and preexisting
-  // unrelated/stale binaries. It is not an executable-custody guarantee.
+  // Preserve the previously published *test-only* native coverage path.
+  // This is still path-based spawn and is NOT secure process-image custody.
+  // No production or release authorization may be derived from this runner.
   return spawnSync(previous.executable, args, {
     cwd: previous.scratch, encoding: "utf8", timeout, windowsHide: true,
   });

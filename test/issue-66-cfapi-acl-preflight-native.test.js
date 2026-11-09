@@ -57,16 +57,18 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-acl-test-"));
     t.after(() => fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
     const exe = path.join(scratch, "acl-preflight.exe");
-    const batch = path.join(scratch, "build.cmd");
-    diagnostic.stage("BUILD_SCRIPT_WRITE");
-    await fs.writeFile(batch, ["@echo off", `call "${vcvars}" >nul`,
-      "if errorlevel 1 exit /b 1",
-      `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${exe}" "${source}" cldapi.lib advapi32.lib`,
-      "exit /b %errorlevel%", ""].join("\r\n"));
+    // Adversarial proof: a writable TEMP build.cmd may exist, but our build
+    // must never read or invoke it. Its contents are disposable canary bytes.
+    const batchCanary = path.join(scratch, "untrusted-build-script-ran.txt");
+    await fs.writeFile(path.join(scratch, "build.cmd"), [
+      "@echo off", `echo UNTRUSTED > "${batchCanary}"`, "",
+    ].join("\r\n"));
     diagnostic.stage("SDK_BUILD");
     const { receipt, buildResult: build } =
-      buildCompiledFixture(scratch, "acl-preflight.exe", batch);
+      buildCompiledFixture(scratch, "acl-preflight.exe", vcvars);
     assert.equal(build.status, 0, `native SDK build failed: ${build.stdout}\n${build.stderr}`);
+    await assert.rejects(fs.access(batchCanary), { code: "ENOENT" },
+      "no TEMP build.cmd may execute as part of the native test compilation");
 
     diagnostic.stage("ROOT_CREATE");
     const strictRoot = path.join(scratch, "owner-only");
@@ -164,7 +166,6 @@ test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effecti
     t.after(() => fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
     const fixture = path.join(scratch, "inherit-only-fixture.cpp");
     const exe = path.join(scratch, "inherit-only-fixture.exe");
-    const batch = path.join(scratch, "build.cmd");
     const includePath = source.replaceAll("\\", "/");
     await fs.writeFile(fixture, [
       "#define wmain preflight_fixture_only_entry",
@@ -209,12 +210,8 @@ test("#66 native DACL evaluator refuses inherit-only ACEs even alongside effecti
       "}",
       "",
     ].join("\n"));
-    await fs.writeFile(batch, ["@echo off", `call "${vcvars}" >nul`,
-      "if errorlevel 1 exit /b 1",
-      `cl /nologo /std:c++17 /W4 /WX /EHsc /Fe:"${exe}" "${fixture}" cldapi.lib advapi32.lib`,
-      "exit /b %errorlevel%", ""].join("\r\n"));
     const { receipt, buildResult: build } =
-      buildCompiledFixture(scratch, "inherit-only-fixture.exe", batch);
+      buildCompiledFixture(scratch, "inherit-only-fixture.exe", vcvars);
     assert.equal(build.status, 0, `native SDK harness build failed: ${build.stdout}\n${build.stderr}`);
     const result = runCompiledFixture(receipt, []);
     assert.equal(result.status, 0, `native SDK fixture failed: ${result.stdout}\n${result.stderr}`);
