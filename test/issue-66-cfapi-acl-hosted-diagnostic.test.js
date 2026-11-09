@@ -89,7 +89,13 @@ test("real Node TAP escapes the leading # and attributes the CFAPI diagnostic to
   const script = [
     "const test = require('node:test');",
     "const assert = require('node:assert/strict');",
-    `test(${JSON.stringify(title.slice(1))}, (t) => { t.diagnostic(${JSON.stringify(diagnostic.slice(2))}); assert.equal(1, 2); });`,
+    // Keep executable fixture source static: interpolated code risks injection
+    // if a future caller ever supplies a nonliteral test title or diagnostic.
+    'test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and rejects broad access or reparse points", (t) => {',
+    // Node's TAP reporter adds the leading "# " to t.diagnostic() output.
+    '  t.diagnostic("ROOTARK_ACL_V1 case=CFAPI_PREFLIGHT stage=OWNER_ACCEPT code=ASSERTION trust=UNKNOWN");',
+    '  assert.equal(1, 2);',
+    '});',
   ].join("\n");
   await fs.writeFile(fixture, script);
   const env = { ...process.env };
