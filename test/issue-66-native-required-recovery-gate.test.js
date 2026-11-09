@@ -204,3 +204,37 @@ test("#66 replacing the entire replay method cannot evade a required-v2 native g
   assert.equal(await fs.readFile(canary, "utf8"), "RETAIN_SIGNED_LOCAL_BYTES");
   assert.deepEqual(calls, []);
 });
+
+test("#66 strict restart cannot reuse a mutable in-memory snapshot after a denied required-v2 open", async (t) => {
+  const { root, snapshotPath, exactBytes, canary } = await makeRoot(t, true);
+  const calls = [];
+  const engine = new SyncEngine({ rootDir: root, adapter: adapter(calls),
+    filesOnDemand: true, fileKeyResolver: () => Buffer.alloc(32),
+  });
+  await assert.rejects(engine.open(), { code: "root_session_native_unavailable" });
+  engine.snapshot.evictionLedgerRequired = false;
+  // Disk still has true: never trust the cached mutable JS snapshot version.
+  await assert.rejects(engine.open(), { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fs.readFile(snapshotPath), exactBytes);
+  assert.equal(await fs.readFile(canary, "utf8"), "RETAIN_SIGNED_LOCAL_BYTES");
+  assert.deepEqual(calls, []);
+});
+
+test("#66 public _open override cannot suppress native-required replay on open or syncOnce", async (t) => {
+  const { root, snapshotPath, exactBytes } = await makeRoot(t, true);
+  const calls = [];
+  const engine = new SyncEngine({ rootDir: root, adapter: adapter(calls),
+    filesOnDemand: true, fileKeyResolver: () => Buffer.alloc(32),
+  });
+  let hijacked = 0;
+  engine._open = async () => {
+    hijacked++;
+    engine.snapshot.evictionLedgerRequired = false;
+    engine.opened = true;
+  };
+  await assert.rejects(engine.open(), { code: "root_session_native_unavailable" });
+  await assert.rejects(engine.syncOnce(), { code: "root_session_native_unavailable" });
+  assert.equal(hijacked, 0);
+  assert.deepEqual(await fs.readFile(snapshotPath), exactBytes);
+  assert.deepEqual(calls, []);
+});

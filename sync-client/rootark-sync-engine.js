@@ -1041,7 +1041,7 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
       try {
-        await this._open();
+        await openEngineBuiltIn.call(this);
         return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
       } finally {
         // The same exclusive mkdir marker is understood by fresh processes.
@@ -1092,6 +1092,12 @@ class SyncEngine {
     await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
     this.journal = await this.journal.open();
+    // A rejected native-required cold open must never let a later open use
+    // public, mutable this.snapshot as if it were still the disk contents.
+    // Re-parse the durable snapshot on every strict entry, including retries
+    // after a previously failed recovery. This is a JS-state safeguard; it
+    // does not authenticate the disk or protect against hostile root swaps.
+    if (this.requireNativeRootRecovery) this.snapshotDiskRevision = null;
     let snapshotStats;
     try {
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
@@ -1837,7 +1843,7 @@ class SyncEngine {
   }
 
   async _enqueueChange(input) {
-    if (!this.opened) await this._open();
+    if (!this.opened) await openEngineBuiltIn.call(this);
     const remoteOnly = this.snapshot.remoteOnly[input.objectId];
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
@@ -3132,7 +3138,7 @@ class SyncEngine {
   }
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
-    if (!this.opened) await this._open();
+    if (!this.opened) await openEngineBuiltIn.call(this);
     // The internal exclusion path was already case-resolved with a bounded
     // directory index; do not enumerate the same Windows parent 640 times.
     const safePath = excludedTrackedPath === null
@@ -3349,7 +3355,7 @@ class SyncEngine {
   }
 
   async _materializeRemote(relativePath) {
-    if (!this.opened) await this._open();
+    if (!this.opened) await openEngineBuiltIn.call(this);
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     if (!this.isSelected(safePath)) fail("Remote-only path is outside the selected scope", "path_not_selected");
     if (this.filesOnDemand) return this._materializeOnDemand(safePath);
@@ -3742,7 +3748,7 @@ class SyncEngine {
   }
 
   async _syncOnce() {
-    if (!this.opened) await this._open();
+    if (!this.opened) await openEngineBuiltIn.call(this);
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
     let excluded;
     try { excluded = await this._applyExcludedPaths(); }
@@ -3776,5 +3782,6 @@ class SyncEngine {
 // override an engine method, but cannot authorize an unverified native replay
 // by replacing this local binding. This is not OS-level writer custody.
 const replayEvictionLedgerBuiltIn = SyncEngine.prototype.replayEvictionLedger;
+const openEngineBuiltIn = SyncEngine.prototype._open;
 
 module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };
