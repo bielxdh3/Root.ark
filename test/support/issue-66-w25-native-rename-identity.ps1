@@ -92,6 +92,20 @@ public static class RootarkW25RenameIdentityProof {
     ref OBJECT_ATTRIBUTES attributes, out IO_STATUS_BLOCK status,
     IntPtr allocationSize, uint fileAttributes, uint share, uint disposition,
     uint options, IntPtr ea, uint eaSize);
+  [DllImport("ntdll.dll", EntryPoint = "NtQueryDirectoryFile", ExactSpelling = true)]
+  private static extern int NtQueryDirectoryFile(SafeFileHandle directory,
+    IntPtr completionEvent, IntPtr apcRoutine, IntPtr apcContext,
+    out IO_STATUS_BLOCK status, IntPtr buffer, uint length, int informationClass,
+    [MarshalAs(UnmanagedType.U1)] bool singleEntry, IntPtr filter,
+    [MarshalAs(UnmanagedType.U1)] bool restartScan);
+  [DllImport("kernel32.dll", EntryPoint = "WriteFile", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool WriteFile(SafeFileHandle file, byte[] buffer,
+    uint length, out uint written, IntPtr overlapped);
+  [DllImport("kernel32.dll", EntryPoint = "ReadFile", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool ReadFile(SafeFileHandle file, [Out] byte[] buffer,
+    uint length, out uint read, IntPtr overlapped);
 
   private static FILE_ID_INFO Id(SafeFileHandle handle) {
     FILE_ID_INFO result;
@@ -129,6 +143,14 @@ public static class RootarkW25RenameIdentityProof {
         (tag.Attributes & 0x400 /* REPARSE_POINT */) != 0)
       throw new InvalidOperationException("NOT_PLAIN_DIRECTORY");
   }
+  private static void RequirePlainFile(SafeFileHandle handle) {
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    if (!GetTag(handle, 9 /* FileAttributeTagInfo */, out tag,
+        (uint)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO))) ||
+        (tag.Attributes & 0x10 /* DIRECTORY */) != 0 ||
+        (tag.Attributes & 0x400 /* REPARSE_POINT */) != 0)
+      throw new InvalidOperationException("NOT_PLAIN_FILE");
+  }
   private static string CanonicalPath(SafeFileHandle handle) {
     var output = new StringBuilder(4096);
     uint count = GetName(handle, output, (uint)output.Capacity, 0);
@@ -158,9 +180,10 @@ public static class RootarkW25RenameIdentityProof {
   }
   private static SafeFileHandle OpenRelativeDirectory(
       SafeFileHandle parent, string leaf, uint share, bool create,
-      out int nativeStatus, uint extraAccess = 0) {
+      out int nativeStatus, uint extraAccess = 0, bool synchronous = false) {
     // Only literal names from this test. Never allow user-provided paths.
-    if (leaf != "held-ancestor" && leaf != "moved-ancestor" && leaf != "child")
+    if (leaf != "held-ancestor" && leaf != "moved-ancestor" &&
+        leaf != "replacement-ancestor" && leaf != "child")
       throw new InvalidOperationException("UNTRUSTED_LEAF");
     IntPtr buffer = Marshal.StringToHGlobalUni(leaf);
     IntPtr unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
@@ -175,10 +198,12 @@ public static class RootarkW25RenameIdentityProof {
       };
       IO_STATUS_BLOCK status;
       SafeFileHandle child;
-      nativeStatus = NtCreateFile(out child, 0x00020080 | extraAccess,
+      nativeStatus = NtCreateFile(out child,
+        0x00020080 | extraAccess | (synchronous ? 0x00100000U : 0U),
         ref attributes, out status, IntPtr.Zero, 0x10 /* DIRECTORY */,
         share, create ? 2U /* FILE_CREATE */ : 1U /* FILE_OPEN */,
-        0x00200001 /* FILE_OPEN_REPARSE_POINT|FILE_DIRECTORY_FILE */,
+        0x00200001 | (synchronous ? 0x20U : 0U)
+        /* FILE_OPEN_REPARSE_POINT | FILE_DIRECTORY_FILE | optionally SYNCHRONOUS */,
         IntPtr.Zero, 0);
       if (nativeStatus != 0) {
         if (child != null) child.Dispose();
@@ -198,7 +223,8 @@ public static class RootarkW25RenameIdentityProof {
       string mode, string leaf = "moved-ancestor") {
     if (mode != "INFO" && mode != "INFO_EX")
       throw new InvalidOperationException("UNTRUSTED_RENAME_MODE");
-    if (leaf != "moved-ancestor" && leaf != "test-relocated-ancestor")
+    if (leaf != "moved-ancestor" && leaf != "test-relocated-ancestor" &&
+        leaf != "replacement-ancestor" && leaf != "held-ancestor")
       throw new InvalidOperationException("UNTRUSTED_RENAME_LEAF");
     // NtSetInformationFile FileRenameInformation (10) / Ex (65), relative to
     // the held scratch root. Win32 SetFileInformationByHandle(FileRenameInfo)
@@ -229,6 +255,217 @@ public static class RootarkW25RenameIdentityProof {
     } finally {
       Marshal.FreeHGlobal(data);
     }
+  }
+
+  // ASCII-only C# source escapes avoid Windows PowerShell 5.1 ANSI script
+  // decoding while constructing exact UTF-16 surrogate pairs at runtime.
+  private const string MarkerName = "marcador-\u00C1rvore-\uD83E\uDDED.txt";
+  private const string MarkerA = "A | mem\u00F3ria original | a\u00E7\u00E3o \uD83C\uDF3F";
+  private const string MarkerB = "B | substitui\u00E7\u00E3o distinta | \u00F3bice \uD83E\uDDED";
+
+  private static SafeFileHandle OpenMarker(SafeFileHandle parent, bool create,
+      out int statusCode) {
+    // A fixed Unicode leaf, never an absolute path or caller-provided name.
+    IntPtr text = Marshal.StringToHGlobalUni(MarkerName);
+    IntPtr unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+    try {
+      var name = new UNICODE_STRING {
+        Length = (ushort)(MarkerName.Length * 2),
+        MaximumLength = (ushort)((MarkerName.Length + 1) * 2),
+        Buffer = text
+      };
+      Marshal.StructureToPtr(name, unicode, false);
+      var attributes = new OBJECT_ATTRIBUTES {
+        Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+        RootDirectory = parent.DangerousGetHandle(),
+        ObjectName = unicode,
+        Attributes = 0x00001040 /* OBJ_DONT_REPARSE|OBJ_CASE_INSENSITIVE */
+      };
+      IO_STATUS_BLOCK status;
+      SafeFileHandle file;
+      statusCode = NtCreateFile(out file,
+        0x00100081U | (create ? 0x2U : 0U)
+        /* SYNCHRONIZE|READ_DATA|READ_ATTRIBUTES, optionally WRITE_DATA */,
+        ref attributes, out status, IntPtr.Zero,
+        0x80 /* FILE_ATTRIBUTE_NORMAL */, 7 /* share all */,
+        create ? 2U /* FILE_CREATE; never overwrite */ : 1U /* FILE_OPEN */,
+        0x00200060 /* OPEN_REPARSE_POINT|NON_DIRECTORY|SYNCHRONOUS_IO_NONALERT */,
+        IntPtr.Zero, 0);
+      if (statusCode == unchecked((int)0xC0000035) && create) {
+        if (file != null) file.Dispose();
+        return null; // STATUS_OBJECT_NAME_COLLISION; no writes
+      }
+      if (statusCode != 0 || file == null || file.IsInvalid) {
+        if (file != null) file.Dispose();
+        throw new InvalidOperationException("ROOTED_MARKER_OPEN_FAILED");
+      }
+      RequirePlainFile(file);
+      return file;
+    } finally {
+      Marshal.FreeHGlobal(unicode);
+      Marshal.FreeHGlobal(text);
+    }
+  }
+
+  private static void WriteMarker(SafeFileHandle file, string marker) {
+    byte[] expected = Encoding.Unicode.GetBytes(marker);
+    uint written;
+    if (!WriteFile(file, expected, (uint)expected.Length, out written,
+        IntPtr.Zero) || written != expected.Length)
+      throw new InvalidOperationException("ROOTED_WRITE_FAILED");
+  }
+  private static void RequireMarker(SafeFileHandle directory, string expected) {
+    int status;
+    using (var file = OpenMarker(directory, false, out status)) {
+      byte[] expectedUtf16 = Encoding.Unicode.GetBytes(expected);
+      byte[] observed = new byte[expectedUtf16.Length + 2];
+      uint count;
+      if (!ReadFile(file, observed, (uint)observed.Length, out count,
+          IntPtr.Zero) || count != expectedUtf16.Length)
+        throw new InvalidOperationException("ROOTED_READ_LENGTH_FAILED");
+      for (int i = 0; i < expectedUtf16.Length; ++i)
+        if (observed[i] != expectedUtf16[i])
+          throw new InvalidOperationException("ROOTED_READ_BYTES_MISMATCH");
+    }
+  }
+
+  private static void RequireSingleMarkerEntry(SafeFileHandle directory) {
+    const int capacity = 1024;
+    IntPtr buffer = Marshal.AllocHGlobal(capacity);
+    try {
+      Marshal.Copy(new byte[capacity], 0, buffer, capacity);
+      IO_STATUS_BLOCK info;
+      int status = NtQueryDirectoryFile(directory, IntPtr.Zero, IntPtr.Zero,
+        IntPtr.Zero, out info, buffer, capacity,
+        12 /* FileNamesInformation */, false, IntPtr.Zero, true);
+      long length = info.Information.ToInt64();
+      if (status != 0 || length < 12 || length > capacity)
+        throw new InvalidOperationException("NATIVE_ENUM_FAILED");
+      int offset = 0, markers = 0, entries = 0;
+      while (true) {
+        if (++entries > 8 || offset + 12 > length)
+          throw new InvalidOperationException("ENUM_BOUNDS_FAILED");
+        int next = Marshal.ReadInt32(buffer, offset);
+        int nameBytes = Marshal.ReadInt32(buffer, offset + 8);
+        if (nameBytes <= 0 || (nameBytes & 1) != 0 ||
+            nameBytes > 512 || offset + 12 + nameBytes > length)
+          throw new InvalidOperationException("ENUM_NAME_BOUNDS_FAILED");
+        string name = Marshal.PtrToStringUni(
+          IntPtr.Add(buffer, offset + 12), nameBytes / 2);
+        if (string.Equals(name, MarkerName, StringComparison.Ordinal)) ++markers;
+        else if (name != "." && name != "..")
+          throw new InvalidOperationException("UNEXPECTED_ENUM_NAME");
+        if (next == 0) break;
+        if (next % 4 != 0 || next < 12 + nameBytes ||
+            offset + next >= length)
+          throw new InvalidOperationException("ENUM_NEXT_OFFSET_FAILED");
+        offset += next;
+      }
+      if (markers != 1) throw new InvalidOperationException("MARKER_ENUM_COUNT");
+      // A second call must not return further entries after this bounded batch.
+      int last = NtQueryDirectoryFile(directory, IntPtr.Zero, IntPtr.Zero,
+        IntPtr.Zero, out info, buffer, capacity, 12,
+        false, IntPtr.Zero, false);
+      if (last != unchecked((int)0x80000006) /* STATUS_NO_MORE_FILES */)
+        throw new InvalidOperationException("ENUM_NOT_EXHAUSTED");
+    } finally {
+      Marshal.FreeHGlobal(buffer);
+    }
+  }
+
+  public static string ProbeHeldRead(string scratch) {
+    int status;
+    using (var scratchRoot = OpenDirectory(
+        scratch, 7, 0x4 /* FILE_ADD_SUBDIRECTORY */)) {
+      RequireLocalNtfs(scratchRoot);
+      RequirePlainDirectory(scratchRoot);
+      FILE_ID_INFO scratchId = Id(scratchRoot);
+      RequireScratchBinding(scratchRoot, scratch, scratchId);
+      using (var original = OpenRelativeDirectory(
+          scratchRoot, "held-ancestor", 7, true, out status,
+          0x00010001 /* DELETE|FILE_LIST_DIRECTORY */, true)) {
+        RequirePlainDirectory(original);
+        FILE_ID_INFO originalId = Id(original);
+        if (originalId.VolumeSerialNumber != scratchId.VolumeSerialNumber)
+          throw new InvalidOperationException("ORIGINAL_VOLUME_MISMATCH");
+
+        FILE_ID_INFO markerAId;
+        using (var markerA = OpenMarker(original, true, out status)) {
+          if (markerA == null) throw new InvalidOperationException("A_ALREADY_EXISTS");
+          markerAId = Id(markerA);
+          WriteMarker(markerA, MarkerA);
+        }
+        // Negative: FILE_CREATE must never overwrite the existing A marker.
+        using (var collision = OpenMarker(original, true, out status)) {
+          if (collision != null || status != unchecked((int)0xC0000035))
+            throw new InvalidOperationException("COLLISION_NOT_DENIED");
+        }
+        RequireSingleMarkerEntry(original);
+        RequireMarker(original, MarkerA);
+        if (!Same(originalId, Id(original)))
+          throw new InvalidOperationException("ORIGINAL_SOURCE_CHANGED");
+        RequireScratchBinding(scratchRoot, scratch, scratchId);
+        RenameByHandle(original, scratchRoot, "INFO", "moved-ancestor");
+
+        // Phase B owns the old name. A remains open for native enumeration
+        // and read; neither operation opens an absolute pathname.
+        using (var replacement = OpenRelativeDirectory(
+            scratchRoot, "held-ancestor", 7, true, out status,
+            0x00010001 /* DELETE|FILE_LIST_DIRECTORY */, true)) {
+          RequirePlainDirectory(replacement);
+          FILE_ID_INFO replacementId = Id(replacement);
+          if (replacementId.VolumeSerialNumber != scratchId.VolumeSerialNumber ||
+              Same(originalId, replacementId))
+            throw new InvalidOperationException("REPLACEMENT_ID_NOT_DISTINCT");
+          FILE_ID_INFO markerBId;
+          using (var markerB = OpenMarker(replacement, true, out status)) {
+            if (markerB == null) throw new InvalidOperationException("B_ALREADY_EXISTS");
+            markerBId = Id(markerB);
+            WriteMarker(markerB, MarkerB);
+          }
+          if (Same(markerAId, markerBId) ||
+              markerAId.VolumeSerialNumber != scratchId.VolumeSerialNumber ||
+              markerBId.VolumeSerialNumber != scratchId.VolumeSerialNumber)
+            throw new InvalidOperationException("MARKER_IDS_NOT_DISTINCT");
+          RequireScratchBinding(scratchRoot, scratch, scratchId);
+          RequireSingleMarkerEntry(original);
+          RequireSingleMarkerEntry(replacement);
+          RequireMarker(original, MarkerA);
+          RequireMarker(replacement, MarkerB);
+          using (var rereadA = OpenMarker(original, false, out status))
+          using (var rereadB = OpenMarker(replacement, false, out status)) {
+            if (!Same(Id(rereadA), markerAId) ||
+                !Same(Id(rereadB), markerBId))
+              throw new InvalidOperationException("MARKER_ID_CHANGED");
+          }
+          // Phase A returns: relocate B away, restore the *same* A handle
+          // to the old name; no reparse following or replace-if-exists.
+          RenameByHandle(replacement, scratchRoot, "INFO", "replacement-ancestor");
+          RenameByHandle(original, scratchRoot, "INFO", "held-ancestor");
+          RequireScratchBinding(scratchRoot, scratch, scratchId);
+          using (var restored = OpenRelativeDirectory(
+              scratchRoot, "held-ancestor", 3, false, out status))
+          using (var relocated = OpenRelativeDirectory(
+              scratchRoot, "replacement-ancestor", 3, false, out status)) {
+            RequirePlainDirectory(restored);
+            RequirePlainDirectory(relocated);
+            if (!Same(originalId, Id(restored)) ||
+                !Same(replacementId, Id(relocated)) ||
+                !Same(originalId, Id(original)) ||
+                !Same(replacementId, Id(replacement)))
+              throw new InvalidOperationException("ABA_ID_MISMATCH");
+          }
+          RequireSingleMarkerEntry(original);
+          RequireMarker(original, MarkerA);
+          RequireMarker(replacement, MarkerB);
+        }
+      }
+    }
+    // No marker bytes, file IDs, absolute paths or private ACLs in output.
+    return "ROOTARK_W25_HELD_READ_V1 filesystem=NTFS storage=LOCAL" +
+      " rename=HANDLE phases=A_B_A original=READ_A replacement=READ_B" +
+      " rebound=READ_A utf16=EXACT enumeration=EXACT collision=DENIED" +
+      " identity=PINNED reparse=CHECKED";
   }
 
   public static string Probe(string scratch, string shareMode, string moveMode,
@@ -352,8 +589,14 @@ public static class RootarkW25RenameIdentityProof {
 }
 '@ | Out-Null
 
-  [Console]::Out.WriteLine([RootarkW25RenameIdentityProof]::Probe(
-    $directory.FullName, $Share, $Move, ($env:ROOTARK_W25_SOURCE_SWAP_TEST -eq '1')))
+  if ($env:ROOTARK_W25_HELD_UTF16_PROOF -eq '1') {
+    if ($env:ROOTARK_W25_SOURCE_SWAP_TEST -eq '1') { throw 'CONFLICTING_LABS' }
+    [Console]::Out.WriteLine(
+      [RootarkW25RenameIdentityProof]::ProbeHeldRead($directory.FullName))
+  } else {
+    [Console]::Out.WriteLine([RootarkW25RenameIdentityProof]::Probe(
+      $directory.FullName, $Share, $Move, ($env:ROOTARK_W25_SOURCE_SWAP_TEST -eq '1')))
+  }
   exit 0
 } catch {
   $failure = $_.Exception

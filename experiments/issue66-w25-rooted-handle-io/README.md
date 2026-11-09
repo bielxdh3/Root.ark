@@ -155,6 +155,29 @@ made this deterministic test GREEN.
 
 ## Still NOT established (release NO-GO)
 
+**W25 isolated read-only evidence (child of 76cfa21e):** opt-in
+`test/issue-66-w25-native-held-read.test.js` invokes the existing guarded
+PowerShell/C# helper on a fresh, empty test-owned LocalAppData NTFS scratch.
+Via the pinned scratch HANDLE, it creates ancestor A and its Unicode marker
+using `NtCreateFile(RootDirectory)` and `WriteFile` (fixture setup only).
+The original A directory HANDLE stays open. It renames A out by HANDLE,
+creates B under A's former name, and verifies *during B occupancy* that
+`NtQueryDirectoryFile(FileNamesInformation)` enumerates exactly the original
+UTF-16 filename and that `NtCreateFile(RootDirectory=A)` plus `ReadFile`
+returns exactly A's UTF-16 bytes. B is independently enumerated/read and
+verified to have different FileIdInfo and bytes. B is then renamed away
+without replacement, the original A HANDLE is renamed back to its old name,
+and A is enumerated/read again. The helper denies an existing-marker
+`FILE_CREATE` collision, checks non-reparse file/directory attributes and
+FileIdInfo, and returns only categorical proof fields. No filesystem content
+is read via an absolute pathname, and no cleanup/deletion is performed.
+TDD on Windows NTFS Node22: **RED** when the new contract was absent;
+**GREEN 2/2** for the focused test and populated-scratch rejection.
+The test does not execute a hostile same-SID process or establish initial
+scratch custody, independent writer isolation, power-cut durability or
+production CFAPI correctness: **SOURCE NO-GO for those properties** pending
+an independent SOURCE peer review.
+
 - **W25 P2-A rename primitive now handle-bound:** source and destination
   are native HANDLES retained before the rename, so the helper no longer
   resolves mutable source or destination pathnames for this operation.
