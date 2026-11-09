@@ -21,34 +21,42 @@ Root.ark is a self-hosted Node.js service for managing files, permissions, versi
 ## How it fits together
 
 ```text
-          ┌──────────────────────┐   ┌──────────────────────┐
-          │ Browser interface    │   │ Local sync client    │
-          │ files · users · links│   │ watched local files  │
-          └──────────┬───────────┘   └──────────┬───────────┘
-                     │                          │
-                     └────────────┬─────────────┘
-                                  │
-                       ┌──────────▼───────────┐
-                       │   Root.ark server    │
-                       │ auth · permissions   │
-                       │ uploads · WebDAV     │
-                       └──────┬────────┬──────┘
-                              │        │
-                metadata      │        │ files and versions
-                              │        │
-                    ┌─────────▼───┐ ┌──▼──────────────────┐
-                    │   SQLite    │ │ Managed storage     │
-                    │ users · ACL │ │ uploads · trash     │
-                    │ links · jobs│ │ quarantine · backup │
-                    └─────────────┘ └──┬──────────────────┘
-                                      │ optional adapters
-                         ┌────────────▼────────────┐
-                         │ S3 · Google APIs ·      │
-                         │ external storage bounds │
-                         └─────────────────────────┘
+          ┌───────────────────────┐   ┌─────────────────────────┐
+          │ Browser / WebDAV      │   │ Local sync client       │
+          │ ordinary file paths   │   │ signed v2 / legacy-dev  │
+          └───────────┬───────────┘   └────────────┬────────────┘
+                      └─────────────┬──────────────┘
+                                    │
+                     ┌──────────────▼─────────────────┐
+                     │ Root.ark server (Express)      │
+                     │ auth · ACL · uploads · WebDAV  │
+                     │ sync · opt-in protected routes │
+                     └──────────┬───────────┬─────────┘
+                                │           │
+                    ┌───────────▼────┐ ┌────▼──────────────────┐
+                    │ SQLite + JSON  │ │ Managed file storage  │
+                    │ accounts · ACL │ │ versions · trash      │
+                    │ metadata/audit │ │ quarantine · backups  │
+                    └────────────────┘ └────┬──────────────────┘
+                                            │ optional adapters
+                                  ┌─────────▼─────────────┐
+                                  │ S3 / Google Drive     │
+                                  │ provider boundaries   │
+                                  └───────────────────────┘
+
+        ZK-1 protected path (opt-in, default-off; separate trust):
+             ┌──────────────────────────┐
+             │ Authorized ZK-1 client   │
+             │ encrypts + signs locally │
+             └─────────────┬────────────┘
+                           │ signed ciphertext
+             ┌─────────────▼────────────┐   ┌──────────────────────┐
+             │ ZK-1 routes in server    │──►│ Independent witness  │
+             │ isolated protected API   │   │ and CAS trust gates  │
+             └──────────────────────────┘   └──────────────────────┘
 ```
 
-Root.ark combines a browser-facing service, a local synchronization client, and optional integration boundaries. Authentication and authorization decisions stay in the server rather than being delegated to the browser.
+The protected routes are part of the same server but are separately gated and disabled by default. Ordinary file, WebDAV, and legacy sync paths can process server-readable data; the ZK-1 client encrypts and signs before transport. Witness/CAS services require independent provisioning and do **not** imply production authorization. SQLite and JSON store state according to the configured feature/mode; PostgreSQL 18 trust/admission validation is not the default application database.
 
 ## Project status
 
@@ -70,132 +78,14 @@ The repository currently contains working foundations for:
 - [x] automated syntax, test, dependency, and artifact validation.
 - [x] an **opt-in, default-off** Zero-Knowledge v1 (ZK-1) protected-content implementation, with client-held keys and independent trust/fencing requirements.
 
-### Zero-Knowledge v1 — integrated on 2026-11-04 (Issue #65)
+### Zero-Knowledge v1 (opt-in, default-off)
 
-The six reviewed PRs [#231](https://github.com/bielxdh3/Root.ark/pull/231),
-[#232](https://github.com/bielxdh3/Root.ark/pull/232),
-[#233](https://github.com/bielxdh3/Root.ark/pull/233),
-[#234](https://github.com/bielxdh3/Root.ark/pull/234),
-[#235](https://github.com/bielxdh3/Root.ark/pull/235), and
-[#236](https://github.com/bielxdh3/Root.ark/pull/236) were merged into
-`Root/main` at `3f4636331436e3fbc0d6a4076a03662584bea7bc` (the tree matches
-the final #236 head `66d25f1b4f0abd317f262a98210ad88402bc5476`).
-
-The integrated **protected** paths provide client-side AEAD and signed device/
-owner authority, encrypted object and catalog metadata, versioned ciphertext
-transport (including bounded S3/Drive/WebDAV adapters), independently pinned
-CAS/witness and PostgreSQL 18 physical-fencing checks, guarded browser sync,
-and owner-authorized backup/recovery and non-destructive legacy migration.
-Seven concrete P2 regressions in this stack were corrected and independently
-reviewed, including an online recovery GET signing-clock expiry. On their
-exact final PR heads, GitHub reported **38 SUCCESS** checks and **six expected
-SKIPPED** dependency checks, including Windows and Ubuntu Node 22, the complete
-Windows canonical and mandatory release suites, six real Microsoft Edge E2E
-cases, CodeQL, PostgreSQL 18, Kotlin, and WebDAV TLS/Android validations.
-
-**This is integration and test evidence, not authorization to enable protected
-mode globally or deploy it to production.** ZK-1 remains opt-in and default-off.
-The ordinary file, WebDAV, preview, search, sharing, backup and legacy sync
-paths can still handle server-readable information; they do **not** inherit a
-Zero-Knowledge guarantee. Ciphertext sizes, timing, device/operation identity
-and opaque routing identifiers can remain visible. Independent off-host key
-custody, external provider durability, production failover, universal Android
-interoperability and a destructive legacy cutover are not established by CI or
-disposable fixtures. See the [migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md)
-and [residual metadata/trust register](docs/issue-65-zk1-runtime-leakage-register.md).
-
-**Draft-only roadmap continuation (2026-11-06):** protected historical restore and burst-pause resume ([#262](https://github.com/bielxdh3/Root.ark/pull/262), [#271](https://github.com/bielxdh3/Root.ark/pull/271)), verified Files On-Demand hydration/eviction ([#263](https://github.com/bielxdh3/Root.ark/pull/263)), authenticated encrypted local search and browser result selection ([#264](https://github.com/bielxdh3/Root.ark/pull/264), [#274](https://github.com/bielxdh3/Root.ark/pull/274)), scoped owner-signed sharing and recipient ciphertext redemption ([#265](https://github.com/bielxdh3/Root.ark/pull/265), [#270](https://github.com/bielxdh3/Root.ark/pull/270), [#276](https://github.com/bielxdh3/Root.ark/pull/276)), native Android bounded metadata paging and strictly gated verified text preview ([#272](https://github.com/bielxdh3/Root.ark/pull/272), [#273](https://github.com/bielxdh3/Root.ark/pull/273), [#275](https://github.com/bielxdh3/Root.ark/pull/275)), and experimental WebRTC with opt-in authenticated application session integration ([#269](https://github.com/bielxdh3/Root.ark/pull/269), [#277](https://github.com/bielxdh3/Root.ark/pull/277)) remain **unmerged**. The [active mission](docs/rootark-main-execution-mission.md) and [exact-HEAD evidence matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md) distinguish code and tests from unverified security/deployment acceptance. These drafts do **not** supply a native Windows placeholder provider, trusted Android CEK/device provisioning, production P2P/TURN, off-host provider durability, or R1 custody certification.
-
-**Further functional drafts, still unmerged:** [#278](https://github.com/bielxdh3/Root.ark/pull/278) `5e1c79b2` adds safe durable per-device pin/unpin/status (four reproducible P2 classes fixed, independent GO, hosted 4/4); [#279](https://github.com/bielxdh3/Root.ark/pull/279) `d4bd3937` fixes read-only historical preview CLI bootstrap (independent GO, hosted 6/6); [#283](https://github.com/bielxdh3/Root.ark/pull/283) adds a signed-history multi-object advisory recovery plan (independent GO, hosted 6/6); [#280](https://github.com/bielxdh3/Root.ark/pull/280) and [#285](https://github.com/bielxdh3/Root.ark/pull/285) connect protected local search selection to signed ciphertext GET and explicitly owner-pinned offline-key text preview (independent GO, #285 PG18 green, full CI running). [#281](https://github.com/bielxdh3/Root.ark/pull/281) combines Android metadata paging and a safely locked viewer (independent GO, 3/3 hosted). [#282](https://github.com/bielxdh3/Root.ark/pull/282) offers device-local owner-approved HPKE recipient CEK and AEAD read (independent DEV-OFF GO, PG18 green). [#286](https://github.com/bielxdh3/Root.ark/pull/286) adds manual Windows metadata selection and real verified hydration (review/hosted Security Regression pending), **not** native CFAPI placeholders. Experimental bound-object P2P [#284](https://github.com/bielxdh3/Root.ark/pull/284) has 4/4 hosted but independent **NO-GO** for text-channel and synchronous hashing P2 under correction. No operational R1, independent device/CEK provisioning, production P2P/TURN, or authorized merge/deploy is implied. See the [live exact-HEAD matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md).
-
-**Newer draft evidence (2026-11-06):** [#284](https://github.com/bielxdh3/Root.ark/pull/284) `cd14fe9b` repaired both prior P2 with 12/12 signed protocol tests and 4/4 hosted checks, but an independent reviewer reproduced a new **NO-GO P2** where stale old-WebSocket `joined` events can remove a replacement ciphertext room's binding; forward repair is required. [#286](https://github.com/bielxdh3/Root.ark/pull/286) `df87638a` repaired PowerShell relative-path/argument-collision P2 with 10/10 signed Windows tests and independent **code GO**; the first full Ubuntu and Windows canonical runs failed on apparently unrelated intermittent behavior and exact-SHA rerun is pending. [#287](https://github.com/bielxdh3/Root.ark/pull/287) `ac033fa9` adds bounded Android session-only offline metadata inventory (15/15 local HTTP/Node, 3/3 hosted Android/Ubuntu/Windows, independent P1/P2 **GO**); it is not offline encrypted content, CEK provisioning or hardware proof. No protected merge, deployment or native CFAPI implementation is implied.
-
-**Controlled historical restore execution (draft):** [#288](https://github.com/bielxdh3/Root.ark/pull/288) `e4175e20`, stacked on the reviewed advisory plan #283, executes signed per-object restore with fresh independent authority, durable partial progress and safe conservative resume. New 9/9 WSL and 48/48 integrated tests passed locally; **independent final security review and hosted validation are still pending**. No atomic all-or-nothing batch, rollback guarantee, external physical custody or authorized deployment is implied.
-
-**Protected local content search (draft):** [#289](https://github.com/bielxdh3/Root.ark/pull/289) `e9328efc` stacks on #285 and searches text within up to eight owner-selected, independently CEK/manifest-pinned signed revisions. Local AES-GCM and repeated current signed GET checks; no query/CEK/plaintext HTTP, transient read-only results. Signed two-device HTTP, Edge CSP, Node tests, independent P1/P2 **GO**, PG18 and full same-SHA Ubuntu/Windows Security Regression **4/4 SUCCESS**. No automatic key provisioning, off-host provider guarantee or native OS placeholder.
-
-**Superseding draft evidence, 2026-11-07:** [#284](https://github.com/bielxdh3/Root.ark/pull/284) `9c96babe` has independent GO and same-SHA experimental P2P Edge/session 4/4 hosted checks after two async room-race fixes. [#291](https://github.com/bielxdh3/Root.ark/pull/291) `453d5ffb` has independent GO and 3/3 hosted checks for a session-bound Android Keystore ciphertext cache, **not** authorized offline decrypt. [#292](https://github.com/bielxdh3/Root.ark/pull/292) `df59cd1c` has independent GO and focused 4/4 hosted checks for pinned MOVE admission fencing; broader Security Regression was pending at this checkpoint. Earlier provisional NO-GO/local-only statements above describe superseded HEADs. All remain OPEN/DRAFT, without merge, deploy, CFAPI, production TURN, independent R1 custody or device-owner CEK enrollment.
-
-**Recent merged progress (2026-10-18–19; not a release-readiness claim):**
-
-- File-name FTS5 search for non-protected data, Android client scaffolding, selective-sync exclusion/rollback, ransomware-burst detection with device pause, and per-operation sharing permissions were merged in PRs [#211](https://github.com/bielxdh3/Root.ark/pull/211), [#212](https://github.com/bielxdh3/Root.ark/pull/212), [#214](https://github.com/bielxdh3/Root.ark/pull/214), [#215](https://github.com/bielxdh3/Root.ark/pull/215), and [#216](https://github.com/bielxdh3/Root.ark/pull/216).
-- At that historical date, the Zero-Knowledge work consisted of a **keyring library** for device enrollment/revocation and epoch rotation ([#213](https://github.com/bielxdh3/Root.ark/pull/213)) plus a v2 wire-format test fixture ([#221](https://github.com/bielxdh3/Root.ark/pull/221)); the later integrated, still opt-in ZK-1 v1 stack is documented above.
-- Async cryptographic request handling was hardened ([#220](https://github.com/bielxdh3/Root.ark/pull/220)). The Mammoth transitive-dependency advisory has containment tests and documented review controls ([#223](https://github.com/bielxdh3/Root.ark/pull/223)), **not** a patched dependency or a resolved security finding.
-
-### Historical application validation snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`)
-
-PR #179 adds a bounded Windows `EPERM` retry for sync-journal rename; PR #188 adds chunk-upload request limits before body parsing and staging; PR #189 adds disposable crash-recovery coverage for the restore provider-policy pair. The [post-#189 validation snapshot](docs/validation/2026-10-15-rootark-post-189.md) records exact-SHA CI, browser coverage, the live issue/PR query, and remaining acceptance limits for application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`.
-
-This is a historical application-code snapshot, not the latest validation state. PR #175 was open when this snapshot was written and later merged on 2026-10-15 at `2a3fea8b151302de73be755775e4ca8ca54d1c14`. The 2026-10-16 closure work is summarized in [the plan tree](docs/plan-tree.md); the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202) is the durable place to track its final exact `Root/main` SHA and local validation. Checks listed here apply only to application SHA `bde6c54`. Restore remains recoverable rather than globally atomic, and Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime.
-
-### Historical application snapshot after PR #169 — 2026-10-12 (`Root/main` application SHA `b62da94b236c046ae3251b632067072616587342`)
-
-PR #169 added disposable process-interruption restore tests and a bounded provider-convergence test wait, then merged at `b62da94b236c046ae3251b632067072616587342`. On that exact SHA, push-triggered Security Regression [run 38198318484](https://github.com/bielxdh3/Root.ark/actions/runs/38198318484) passed: Ubuntu Node 22 ran 1,172 tests (1,161 passed, 11 skipped, 0 failed); Windows Node 22 ran 1,172 tests (1,157 passed, 15 skipped, 0 failed). CodeQL [38198318488](https://github.com/bielxdh3/Root.ark/actions/runs/38198318488), Dependency Review [38198318447](https://github.com/bielxdh3/Root.ark/actions/runs/38198318447), Pages [38198317998](https://github.com/bielxdh3/Root.ark/actions/runs/38198317998), and the local release gate (21 passed, 0 blocked, 0 failed) also passed. The full npm audit still reports three moderate findings; the open `sprintf-js` Dependabot alert is not cleared by the high-severity gate. See the [post-#169 closure snapshot](docs/validation/2026-10-12-rootark-post-169.md) for browser evidence, issue/PR state, security boundaries, and restore semantics.
-
-This application snapshot is pinned to `b62da94`. A documentation-only publication changes `Root/main` separately and requires its own exact-SHA validation; those checks do not transfer from this application SHA.
-
-### Historical application snapshot after PR #164 — 2026-10-11 (Root/main application SHA 12e511ccc036b00664e0513b872bdabad56aa941)
-
-PR #164, fix(restore): revalidate authorization and preserve cancellation recovery, merged from b1f0b0eb079dfb1badd75183d1bc7cb880e5b070 at 12e511ccc036b00664e0513b872bdabad56aa941. Its PR-head tree and merge tree are identical (3dd893fd8e5f54e86948eac592a8bacc29216079). On that exact merge SHA, push-triggered Security Regression run [38184047635](https://github.com/bielxdh3/Root.ark/actions/runs/38184047635), CodeQL [38184048677](https://github.com/bielxdh3/Root.ark/actions/runs/38184048677), Dependency Review [38184047652](https://github.com/bielxdh3/Root.ark/actions/runs/38184047652), and Pages [38184047362](https://github.com/bielxdh3/Root.ark/actions/runs/38184047362) passed. The local release gate reported 21 passed, 0 blocked, 0 failed. Linux/Windows test counts, browser scope, current-at-query issues and PRs, security corrections, and the restore boundary are recorded in the [post-#164 validation snapshot](docs/validation/2026-10-11-rootark-post-164.md).
-
-This dated record is scoped to application SHA 12e511c. The later documentation-only commit is a separate validation scope; check that commit's exact-SHA results independently. It does not claim production readiness, end-to-end Zero-Knowledge behavior, or global restore atomicity.
-
-### Historical application and default-branch snapshot — 2026-10-11 (prepublication; application code e0cf2f59b5a51594ed5d744d18d2829bb07db51b; Root/main b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8)
-
-PR #161 preserved upload settings during drag-and-drop updates; PR #162 improved anonymous login/TOTP failure audit attribution; PR #160 reconciled the post-#162 documentation. On exact Root/main SHA b3a8aff, push-triggered Security Regression run 38131294264 passed on Ubuntu and Windows, CodeQL run 38131294305 passed, default-branch Dependency Review run 38131294272 passed, and Pages run 38131294251 passed. The local exact-SHA release gate reported 21 passed, 0 blocked, and 0 failed. Test counts, browser evidence, remaining acceptance limits, and the restore boundary are recorded in the [2026-10-11 closure snapshot](docs/validation/2026-10-11-rootark-final-closure.md).
-
-Browser evidence is scoped by application SHA: the broad UI matrix ran on PR #161's app tree matching `c402ec1`; `e0cf2f5` received only a login/workspace/responsive-navigation smoke; this b3-based closure run separately checked valid/invalid TOTP and fake-ClamAV quarantine ingestion. Full restore/restart recovery and expired-session redirect are older `ad470703` evidence, not current-SHA acceptance. The fake scanner proves app/protocol handling, not a real ClamAV engine. Whole restore remains locally rollback/restart recoverable with durable, retryable provider reconciliation, not a global atomic visibility switch. Windows directory-entry power-loss durability, live cloud-provider interoperability, and deployed proxy topology remain unverified. Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime; public shares remain bearer-link based. This prepublication record does not claim that b3 is the resulting documentation merge SHA or that its later SHA has passed validation.
-
-### Historical application-code snapshot — 2026-10-11 (after PR #159; `Root/main` SHA `d2d5f387b52241efc981108c79a21bbf7f27a5c9`)
-
-This dated post-#159 snapshot is superseded by the post-#162 application snapshot above. Its evidence remains scoped to its original SHAs in [the post-#159 validation record](docs/validation/2026-10-11-rootark-post-159.md).
-
-### Historical application-code snapshot — 2026-10-10 (after PR #156; `Root/main` SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`)
-
-PR #153 merged at `4dc8510058718dc5aaab7e2c425b0bf4622b6d4a`, #154 at `5464d050c40c3ff5ea70a67e2314231cef0c9595`, #155 at `2913db3da7708afb46132395e16482907618c158`, and #156 produced the application SHA `c49fee7997580edb7868ecd7cb739aa1f173245f` captured here. On this exact SHA, push-triggered Security Regression [run #38107020584](https://github.com/bielxdh3/Root.ark/actions/runs/38107020584), CodeQL [run #38107020730](https://github.com/bielxdh3/Root.ark/actions/runs/38107020730), default-branch Dependency Review [run #38107020836](https://github.com/bielxdh3/Root.ark/actions/runs/38107020836), and Pages [run #38107019648](https://github.com/bielxdh3/Root.ark/actions/runs/38107019648) passed. PR #156 keeps the restore request barrier active until all configured instances acknowledge restored startup and provider reconciliation succeeds; provider failure retains the durable restore coordinator for restart recovery.
-
-Browser evidence is scoped per SHA. The 738d941 session is historical UI evidence and does not establish later backend behavior. On exact c49fee7, disposable browser runs covered login, files and folders, ordinary and chunk upload, encryption, preview/download, versions, rename/move, permissions and expiry, trash/restore, backup creation and restore confirmation, quarantine behavior, responsive layouts, group creation, user-permission change/restoration, audit CSV export, backup manifest, 2FA status read, logout/session invalidation, realtime refresh preserving an unsaved comment, and visible approval/rejection. A fresh scanner-enabled browser profile approved and rejected uploaded fixtures through `POST`; an earlier session's `GET`/405 was not reproduced and its cause is unconfirmed. A protected share rejected a wrong password with `401`, accepted the correct password, and completed a visible download through `POST`. The 2FA enrollment/verification flow remains untested. Permanent deletion was tested only on an agent-created disposable fixture; the pre-existing closure fixtures were preserved. Whole restore remains rollback/restart recoverable across locally controlled domains, not an atomic visibility switch across filesystem, quarantine, JSON/SQLite, and cloud providers. Windows directory-entry power-loss durability, live cloud interoperability, and deployed proxy topology remain unverified. Root.ark is not production-ready. See [the current closure snapshot](docs/validation/2026-10-10-rootark-post-156.md) and [the issue ledger](docs/issue-ledger.md).
-
-### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #127; source SHA `25e50cbaa26062202d470330e93d7beb4575693a`)
-
-PR #127, `fix(restore): preserve provider inventory baseline`, merged from head `2334bf0cd02125d316b3ff083cf784b3e9f82abb`. The push-triggered Security Regression passed on exact `Root/main` SHA `25e50cbaa26062202d470330e93d7beb4575693a`: Ubuntu Node 22 ran 987 tests (976 passed, 11 skipped, 0 failed), and Windows Node 22 ran 987 tests (983 passed, 4 skipped, 0 failed). Syntax validation passed on both; the Ubuntu job also passed the runtime-artifact guard and configured high-severity dependency audit. CodeQL, default-branch Dependency Review, and Pages passed ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37787160598), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37787160551), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37787160662), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37787159434)). The PR-candidate release gate passed on `2334bf0…` with 21 passed, 0 blocked, and 0 failed; the gate has not yet been run on this merged SHA. Whole restore remains locally rollback-recoverable with durable provider reconciliation, not atomic across storage domains. Provider identity changes, legacy queue rebinding, and ambiguous queues now fail closed or require a validated baseline; live provider interoperability remains unverified. The full browser acceptance matrix remains incomplete.
-
-The issue and PR snapshot for this source SHA was queried after PR #127 and before the documentation-only follow-up; see [the issue ledger](docs/issue-ledger.md). It is time-scoped and does not describe any later merge.
-
-### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #120, source SHA `acbdd721ac49fdd5d01d17817f723168ee53a57b`)
-
-After PR #120 merged, the push-triggered Security Regression workflow passed on exact `Root/main` SHA `acbdd721ac49fdd5d01d17817f723168ee53a57b`: Ubuntu Node 22 ran 939 tests (928 passed, 11 skipped, 0 failed) and Windows Node 22 ran 939 tests (935 passed, 4 skipped, 0 failed). CodeQL, default-branch Dependency Review, Pages, and `node scripts/validate-release-gate.js` on a clean Windows checkout also passed on this SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37737256757), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37737256839), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37737256816), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37737256170)). The release gate reported 21 passed, 0 blocked, and 0 failed. The browser acceptance matrix remains incomplete.
-
-### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #118, source SHA `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`)
-
-After PR #118 merged, the push-triggered Security Regression workflow passed on exact `Root/main` SHA `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL, default-branch Dependency Review, and Pages also passed on that SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37729789854), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37729789865), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37729789780), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37729789584)). This historical snapshot does not validate the later PR #116 merge SHA or complete the browser acceptance matrix.
-
-### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
-
-After PR #117 merged, the push-triggered Security Regression workflow passed on this exact `Root/main` SHA: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL, default-branch dependency review, and Pages also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655)). This snapshot predates the current-base update of PR #116 and any later merge; it is not evidence for any later merge SHA.
-
-### Historical exact-SHA CI snapshot — 2026-10-07
-
-On `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests. CodeQL and the default-branch dependency-review check also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37549800190), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37549800373), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37549800109)). The PR-only dependency-review job was skipped on the push. This is exact-commit CI evidence; it does not establish browser acceptance, provider interoperability, production deployment safety, or release authorization.
-
-### Historical exact-SHA CI snapshot — 2026-10-08 (source SHA `566a3d24591423c624ef3bcb82290a77ff359210`)
-
-At the recorded snapshot, `Root/main` was `566a3d24591423c624ef3bcb82290a77ff359210`. The push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests; CodeQL analysis, default-branch dependency review, and GitHub Pages build and deployment also passed on that exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37712454578), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37712454551), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37712454481), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37712453703)). The PR-only dependency-review job was skipped on the push. This snapshot predates publication of the documentation PR and is not evidence for the later merge SHA.
-
-### Historical exact-SHA CI snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
-
-After PR #115 merged, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests; CodeQL, default-branch dependency review, and GitHub Pages build/deployment also passed on exact `Root/main` SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37715043302), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37715043209), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37715043243), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37715042929)). The PR-only dependency-review job was skipped on the push. This historical evidence does not replace validation of a later final SHA.
-
-### Historical local release-gate evidence
-
-Phase 15 introduced a local release-gate runner and repaired the release-candidate lockfile to the reviewed `brace-expansion` 5.0.9 integrity. Its recorded candidate-local verdict was `RELEASE_GATE_BLOCKED_ENVIRONMENT`: 13 passed, 0 failed, and 1 expected clean-worktree block. That earlier local result is not the current exact-`Root/main` validation result.
-
-Phase 16 evidence is recorded in [the Phase 16 security review](docs/security/phase-16-final-review.md): 66/66 cross-phase tests and 116/116 syntax checks passed, with separate realtime 4/4 and upload 12/12 boundary runs. The review's then-current disposable-install failure to load the `better-sqlite3` native binding, and its pending remote CI evidence, are historical; the exact-SHA CI evidence above supersedes only the remote-CI status. Browser, provider, live-production/TLS, owner, and release authorization remain separate gates, with release authorization `NOT_AUTHORIZED`.
-
-The historical 2026-10-06 GitHub snapshot at `1955eab3d05f72632396eff62ef96d39eedd634b` is retained in [the issue ledger](docs/issue-ledger.md); it is not the current default-branch SHA.
+Root.ark includes protected-content paths for client-side authenticated encryption, signed device/owner authorization, encrypted object/catalog metadata, ciphertext version transport, guarded synchronization, and bounded backup/recovery and legacy-migration workflows. Storage integrations and trust witnesses have additional configuration and verification boundaries.
 
 > [!IMPORTANT]
-> The opt-in ZK-1 v1 implementation is now integrated, but **production deployment, cross-provider durability, independent operator custody, global legacy cutover and whole-application Zero-Knowledge guarantees remain unproven**. Older dated validation snapshots below apply only to their recorded SHAs.
+> **ZK-1 is not a system-wide Zero-Knowledge guarantee and is not approved for unreviewed production use.** Ordinary or legacy file, WebDAV, preview, search, sharing, backup and sync paths may process server-readable data. Protected-content metadata such as size, timing, operation/device identity and opaque routing identifiers may remain observable. Independent off-host key custody, external provider durability, production failover, and an authorized legacy cutover require separate evidence and approval.
+
+See the [migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md), [metadata leakage register](docs/issue-65-zk1-runtime-leakage-register.md), and [historical integration and exact-SHA CI evidence](docs/validation/readme-historical-evidence-through-2026-11-04.md). CI results are not deployment authorization.
 
 ## Requirements
 
@@ -210,8 +100,8 @@ The historical 2026-10-06 GitHub snapshot at `1955eab3d05f72632396eff62ef96d39ee
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/bielxdh3/root.ark.git
-cd root.ark
+git clone https://github.com/bielxdh3/Root.ark.git
+cd Root.ark
 npm ci
 ```
 
@@ -366,22 +256,9 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [Security policy](SECURITY.md)
 - [Zero-Knowledge migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md)
 - [ZK-1 metadata leakage and security boundary register](docs/issue-65-zk1-runtime-leakage-register.md)
+- [Historical integration and exact-SHA CI archive](docs/validation/readme-historical-evidence-through-2026-11-04.md)
 
 ## Roadmap
-
-**Active execution mission:** [priorities, workflow and progress](docs/rootark-main-execution-mission.md). Historical checklists below are not automatically current.
-
-**Current non-production progress:** [exact-PR wave execution matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md), with implemented draft slices, independent reviews and unverified acceptance explicitly separated. None of these drafts are merged into `Root/main` by this roadmap entry.
-
-**New functional drafts (2026-11-06):** historical signed restore [#262](https://github.com/bielxdh3/Root.ark/pull/262), Files On-Demand lazy materialization and atomic same-path CREATE fencing [#263](https://github.com/bielxdh3/Root.ark/pull/263), protected local encrypted search [#264](https://github.com/bielxdh3/Root.ark/pull/264), scoped share capabilities [#265](https://github.com/bielxdh3/Root.ark/pull/265), owner-bound experimental P2P [#266](https://github.com/bielxdh3/Root.ark/pull/266), and Android protected cryptographic core [#267](https://github.com/bielxdh3/Root.ark/pull/267) are under review as **draft** work. They are not deployed, merged, fully interoperable, externally certified or globally enabled. See the [mission ledger](docs/rootark-main-execution-mission.md) for exact HEADs and remaining acceptance.
-
-**Further usable Draft slices (2026-11-07):** [#288](https://github.com/bielxdh3/Root.ark/pull/288) performs verified, resumable 1–32-object historical restoration; [#293](https://github.com/bielxdh3/Root.ark/pull/293) expands owner-pinned, locally decrypted protected text search to 64 exact revisions in bounded windows; [#294](https://github.com/bielxdh3/Root.ark/pull/294) adds an owner-to-recipient portable HPKE offer export/redemption CLI; [#292](https://github.com/bielxdh3/Root.ark/pull/292) rejects pinned out-of-scope MOVE before journal admission; [#284](https://github.com/bielxdh3/Root.ark/pull/284) fences stale WebRTC rooms/transfers on protected intent. The Android ciphertext cache [#291](https://github.com/bielxdh3/Root.ark/pull/291) has a newer forward-only repair at `68a3fc0a` after an independently reproduced duplicate-capture cache wipe; its exact-SHA P1/P2 reviewer gave GO, and [hosted focused CI 42329455067](https://github.com/bielxdh3/Root.ark/actions/runs/42329455067) finished **3/3 SUCCESS** on the new exact SHA; physical Android trust remains unverified. These are isolated **unmerged, non-production** capabilities, not a complete boot or ZK integration: owner-signed SyncV2↔ZK1 mapping, independent R1 custody/durability, physical Windows 10 CFAPI and Android enrollment, and production TURN are not certified.
-
-**Earlier roadmap checkpoint (2026-11-07, superseded):** GitHub then showed **30 OPEN Ready for review, 16 OPEN Draft** (the 28 previously Ready PRs unchanged; #293 and #294 newly Ready). No feature branch was merged into Root/main by that status update. [#293](https://github.com/bielxdh3/Root.ark/pull/293) and [#294](https://github.com/bielxdh3/Root.ark/pull/294) passed full Windows/Ubuntu Security Regression on same-SHA attempt 2. [#295](https://github.com/bielxdh3/Root.ark/pull/295) was a Draft integrating pinned #66 Files On-Demand and manual verified picker, but its earlier full Security Regression **failed** mandatory Windows despite canonical Windows PASS; [#296](https://github.com/bielxdh3/Root.ark/pull/296) was a Draft for DEV-OFF 1–8 pre-issued object-set redemption with Windows CI in progress at that checkpoint. The cross-feature #66+#67 Git tree 677e4d4c had **no verified combined release tests at that checkpoint**. See the [earlier dependency diagram](docs/rootark-main-execution-mission.md#2026-11-07-live-dependency-graph) and [historical CI matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md#2026-11-07-live-github-status).
-
-**Later roadmap checkpoint (2026-11-07 13:02 UTC):** GitHub reported **49 OPEN PRs: 30 Ready for review / 19 Draft**; these counts are a dated snapshot, not a standing claim. [#294](https://github.com/bielxdh3/Root.ark/pull/294) returned to Draft after an independent P2 on its zero-byte CLI. [#295](https://github.com/bielxdh3/Root.ark/pull/295) advanced to `5bac9e8e` (Edge test fix), [#296](https://github.com/bielxdh3/Root.ark/pull/296) to `14f7dc6e`, and the former virtual #66+#67 tree `677e4d4c` became the exact **source tree** of local reviewed commit `c47d2dbb` in new [Draft #298](https://github.com/bielxdh3/Root.ark/pull/298). New [#299](https://github.com/bielxdh3/Root.ark/pull/299) was Ready for review and [#300](https://github.com/bielxdh3/Root.ark/pull/300) Draft; neither status is production certification. [#251](https://github.com/bielxdh3/Root.ark/pull/251)'s previous `a4f327f2` Security Regression [42329893711](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) passed, but does not validate this documentation change. See the [dated dependency update](docs/rootark-main-execution-mission.md#2026-11-07-1302-utc-dependency-update) and [updated status matrix](docs/validation/2026-11-06-rootark-wave-execution-status.md#2026-11-07-1302-utc-follow-up). R1 independent custody, owner-signed cross-protocol mapping, native Windows 10 CFAPI, physical Android enrollment and TURN remain blocked.
-
-**Latest verified review checkpoint (2026-11-07 13:06 UTC):** GitHub moved to **49 OPEN: 26 Ready / 23 Draft**. Newly reported independent review blockers returned [#278](https://github.com/bielxdh3/Root.ark/pull/278) (**P1+3 P2**), [#288](https://github.com/bielxdh3/Root.ark/pull/288) (**P1+2 P2**), [#284](https://github.com/bielxdh3/Root.ark/pull/284) (**3 P2**) and its dependent [#299](https://github.com/bielxdh3/Root.ark/pull/299) to Draft; [#294](https://github.com/bielxdh3/Root.ark/pull/294) was already Draft with one reported P2. These are **reviewer findings awaiting fixes**, not failures independently reproduced by this documentation task. Existing #298 review does not supersede #288's newer P1. Use the [latest review-blocker graph](docs/rootark-main-execution-mission.md#2026-11-07-1306-utc-review-blocker-update) and [latest status update](docs/validation/2026-11-06-rootark-wave-execution-status.md#2026-11-07-1306-utc-review-blockers). None of these branches is merged, deployed or cleared for R1.
 
 - [x] Integrate the approved opt-in client-side Zero-Knowledge v1 architecture (Issue #65; PRs #231–#236)
 - [x] Separate protected cryptographic, storage, and sharing trust boundaries in ZK-1 v1
@@ -391,15 +268,10 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [ ] Strengthen suspicious-file isolation and scanning integrations
 - [ ] Review every external adapter independently
 - [ ] Define any BielOS integration as a separate approved architecture
-- [ ] Reconcile roadmap status and exact-HEAD evidence after each completed mission
-
-**Scoped source-only progress (2026-11-06, not completion of the broad goals above):** the [single-process R2 configuration and fail-closed defaults in Draft #252](https://github.com/bielxdh3/Root.ark/pull/252) underwent bounded review; the [recovery and adapter evidence report](docs/validation/2026-11-06-rootark-recovery-and-adapters.md) records local restore/disaster-recovery tests, existing ClamAV/upload/quarantine source safeguards and independent Local/S3/Google Drive/WebDAV source review using simulated providers. This evidence does **not** certify an actual operator deployment, ingress/TLS, scanner volume, live cloud durability, full-account restore or external R1 custody/cutover. The overall checklist remains **unchecked** until its separate acceptance gates pass.
 
 ## Project direction
 
 Root.ark remains an independent project. Future integration or selective reuse with BielOS requires an explicit architecture, security review, migration plan, and authorization. Similar goals do not make the two systems interchangeable.
-
-Integrations with BielOS or Virki remain outside this execution roadmap.
 
 ## License
 
