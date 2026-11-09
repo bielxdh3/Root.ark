@@ -69,3 +69,25 @@ test("a late exitCode outside the failed module YAML cannot impersonate its proc
   assert.doesNotMatch(report, /moduleExitCode=/);
   assert.equal(tracker.state.failures, 1);
 });
+
+test("post-YAML failure type, code and location cannot combine with a prior process exit", () => {
+  const diagnostic = [];
+  const tracker = createTapProgressRecorder((line) => diagnostic.push(line));
+  for (const line of [
+    "TAP version 13",
+    "not ok 9 - ordinary failed test",
+    "  ---",
+    "  error: 'test failed'",
+    "  exitCode: 137",
+    "  ...",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_TEST_FAILURE'",
+    "  location: '/private/test/backup-restore-transaction-boundary.test.js:1:1'",
+    "ok 10 - unrelated successful test",
+  ]) tracker.accept(line);
+  tracker.finish();
+  const report = diagnostic.join("\n");
+  assert.equal(tracker.state.failures, 1);
+  assert.doesNotMatch(report, /moduleExitCode=137/);
+  assert.doesNotMatch(report, /testCodeFailure|ERR_TEST_FAILURE|backup-restore-transaction|\/private\//);
+});

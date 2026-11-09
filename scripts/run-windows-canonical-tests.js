@@ -123,23 +123,27 @@ function createTapProgressRecorder(write) {
         } else if (line === "  ...") {
           pending.moduleYamlOpen = false;
         }
-        const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
-        if (location) {
-          const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location[1]);
-          if (file) pending.pathHash = hash(`test/${file[1]}`);
+        // Treat module status, failure type, code, and location as ONE YAML
+        // record. Accepting type/code/path outside that record lets later
+        // untrusted TAP output combine with an earlier exitCode, forging an
+        // apparent failed test-file process. Do not reopen a consumed block.
+        if (pending.moduleYamlOpen) {
+          const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
+          if (location) {
+            const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location[1]);
+            if (file) pending.pathHash = hash(`test/${file[1]}`);
+          }
+          const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
+          if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
+          const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
+          if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+          // Keep only bounded, allowlisted process evidence; never print
+          // raw YAML, paths, stack traces, or failure text.
+          if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
+          const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
+          if (moduleExit && Number(moduleExit[1]) <= 255)
+            pending.moduleExitCode = Number(moduleExit[1]);
         }
-        const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
-        if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
-        const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
-        if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
-        // Keep only a bounded process status from actual Node TAP YAML. The
-        // error marker must match exactly; never print raw YAML or error text.
-        if (pending.moduleYamlOpen && line === "  error: 'test failed'") {
-          pending.fileProcessFailed = true;
-        }
-        const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
-        if (pending.moduleYamlOpen && moduleExit && Number(moduleExit[1]) <= 255)
-          pending.moduleExitCode = Number(moduleExit[1]);
         const acl = parseAclFailureDiagnostic(line, pending);
         if (acl) pending.acl = acl;
         const edge = parseEdgeFailureDiagnostic(line, pending);
