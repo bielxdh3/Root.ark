@@ -584,7 +584,7 @@ async function openEvictionLedger(rootDir, create = false) {
   await containedAbsolute(rootDir, directory, false);
   return directory;
 }
-async function stagedEvictionGenesis(rootDir) {
+async function stagedEvictionGenesis(rootDir, requireBoundedTrash = false) {
   const trash = path.join(rootDir, ".rootark-trash");
   if (!(await exists(trash))) return null;
   await containedAbsolute(rootDir, trash, false);
@@ -592,13 +592,23 @@ async function stagedEvictionGenesis(rootDir) {
   if (!trashStats.isDirectory() || trashStats.isSymbolicLink()) {
     fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
   }
-  const names = await fsp.readdir(trash);
-  if (names.length > 16384) fail("Too many staged cache entries", "invalid_snapshot");
-  const candidates = names.filter((name) => name.toLowerCase() === EVICTION_GENESIS_STAGE);
-  if (!candidates.length) return null;
-  if (candidates.length !== 1 || candidates[0] !== EVICTION_GENESIS_STAGE) {
-    fail("Ambiguous staged eviction genesis", "invalid_snapshot");
+  // Old cache trash can legitimately have more than 16k retained files.
+  // Stream names without an unbounded array allocation: only the exact,
+  // reserved genesis entry has any authority. A required-v2 recovery still
+  // enforces its conservative bounded proof, never silently ignoring aliases.
+  let candidate = null;
+  let count = 0;
+  for await (const entry of await fsp.opendir(trash)) {
+    if (requireBoundedTrash && ++count > 16384) {
+      fail("Too many staged cache entries", "invalid_snapshot");
+    }
+    if (entry.name.toLowerCase() !== EVICTION_GENESIS_STAGE) continue;
+    if (candidate !== null || entry.name !== EVICTION_GENESIS_STAGE) {
+      fail("Ambiguous staged eviction genesis", "invalid_snapshot");
+    }
+    candidate = entry.name;
   }
+  if (candidate === null) return null;
   const headFile = path.join(trash, EVICTION_GENESIS_STAGE);
   const headStats = await fsp.lstat(headFile, { bigint: true });
   if (!headStats.isFile() || headStats.isSymbolicLink()
@@ -1155,8 +1165,21 @@ class SyncEngine {
     // and its staged head is only authoritative while a v2 snapshot explicitly
     // requires replay (or an active ledger must be reconciled). A subsequent
     // migration still validates the staged genesis before any PREPARE.
-    if (!this.snapshot.evictionLedgerRequired && !head && !entries.size) return;
-    const staged = await stagedEvictionGenesis(this.rootDir);
+    if (!this.snapshot.evictionLedgerRequired && !entries.size) {
+      if (!head) return;
+      // A successfully recovered zero-PREPARE epoch may retain head.json
+      // after its full durable checkpoint. No cached file was moved by it;
+      // a later ordinary restart must not scan unrelated retained trash.
+      if (head.sequence === 0 && head.digest === EVICTION_LEDGER_ZERO) {
+        if (this.snapshot.version === EVICTION_LEDGER_SNAPSHOT_VERSION
+          && head.epoch !== this.snapshot.evictionLedgerEpoch) {
+          fail("Inactive eviction genesis epoch differs from durable checkpoint", "invalid_snapshot");
+        }
+        return;
+      }
+    }
+    const staged = await stagedEvictionGenesis(this.rootDir,
+      this.snapshot.evictionLedgerRequired || Boolean(head) || entries.size > 0);
     if (this.snapshot.evictionLedgerRequired && !head) {
       // A crash after the v2 snapshot but before promoting the genesis can
       // leave the only durable head in v1's already-internal trash namespace.
@@ -3169,6 +3192,12 @@ class SyncEngine {
         if (pendingEntries.size || (priorHead
           && (priorHead.sequence !== 0 || priorHead.digest !== EVICTION_LEDGER_ZERO))) {
           fail("Unreconciled eviction ledger before snapshot upgrade", "invalid_snapshot");
+        }
+        // A prior zero-head is usable only when its old staged genesis has
+        // actually disappeared. Concurrent/stale copies cannot be silently
+        // combined with a fresh PREPARE: doing so would brick cold replay.
+        if (priorHead && await stagedEvictionGenesis(this.rootDir)) {
+          fail("Conflicting staged and active eviction genesis", "invalid_snapshot");
         }
         const staged = priorHead ? null : await createStagedEvictionGenesis(this.rootDir);
         const genesis = priorHead || staged.head;

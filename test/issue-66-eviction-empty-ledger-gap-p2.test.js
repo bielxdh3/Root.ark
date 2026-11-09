@@ -87,6 +87,64 @@ test("issue 66 P2: ordinary v1 and completed v2 boot with >16384 legitimate tras
   }
 });
 
+test("issue 66 P2: large legitimate trash does not prevent first signed v1 exclusion migration", async (t) => {
+  const f = await fixture(t, "large-trash-first-migration");
+  await fillLegitimateTrash(f.root);
+  const before = f.outbound.length;
+  const sync = await f.create(f.root, ["private"]);
+  const report = await sync.syncOnce();
+  assert.equal(report.excluded.evicted, 1);
+  const disk = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+  assert.equal(disk.version, 2);
+  assert.equal(disk.evictionLedgerRequired, false);
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66 P2: retained zero-genesis head after recovered checkpoint permits later large trash", async (t) => {
+  const f = await fixture(t, "large-trash-after-zero-head-recovery");
+  await prePrepareCrash(f);
+  const recovered = await f.create(f.root, []);
+  assert.equal(recovered.snapshot.evictionLedgerRequired, false);
+  assert.deepEqual(await fsp.readdir(f.ledger), ["head.json"],
+    "regression requires a retained zero-sequence active head after safe recovery");
+  await fillLegitimateTrash(f.root);
+  const before = f.outbound.length;
+  const restarted = await f.create(f.root, []);
+  assert.equal(restarted.snapshot.evictionLedgerRequired, false);
+  await restarted.syncOnce();
+  verifyNoSignedDelete(f, before);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
+test("issue 66 P2: a large trash directory cannot conceal a case-alias genesis marker", async (t) => {
+  const f = await fixture(t, "large-trash-ambiguous-genesis");
+  await fillLegitimateTrash(f.root);
+  const alias = path.join(f.root, ".rootark-trash", ".ROOTARK-EVICTION-GENESIS-HEAD.JSON");
+  await fsp.writeFile(alias, "forged genesis marker", { flag: "wx" });
+  const before = f.outbound.length;
+  const sync = await f.create(f.root, ["private"]);
+  await assert.rejects(sync.syncOnce(), (error) =>
+    error?.code === "invalid_snapshot" && /Ambiguous staged eviction genesis/.test(error.message));
+  verifyNoSignedDelete(f, before);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
+test("issue 66 P2: retained active zero head cannot migrate over a competing staged genesis", async (t) => {
+  const f = await fixture(t, "competing-staged-and-active-zero-head");
+  await prePrepareCrash(f);
+  const recovered = await f.create(f.root, []);
+  assert.equal(recovered.snapshot.evictionLedgerRequired, false);
+  const headFile = path.join(f.ledger, "head.json");
+  assert.deepEqual(await fsp.readdir(f.ledger), ["head.json"]);
+  const stagedFile = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
+  await fsp.copyFile(headFile, stagedFile);
+  const before = f.outbound.length;
+  const migration = await f.create(f.root, ["private"]);
+  await assert.rejects(migration.syncOnce(), { code: "invalid_snapshot" });
+  verifyNoSignedDelete(f, before);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
 test("issue 66 P2: required v2 still refuses oversized ambiguous genesis staging on boot", async (t) => {
   const f = await fixture(t, "large-trash-required");
   await prePrepareCrash(f);
