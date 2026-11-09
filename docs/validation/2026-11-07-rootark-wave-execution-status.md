@@ -395,3 +395,15 @@ Root/main `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, #228 CLOSED/unmerged; todo
 ### 2026-11-09 12:51 UTC — rotina Antigravity incremental (sem release GO)
 
 GitHub PR #299 comentário [6740406813](https://github.com/bielxdh3/Root.ark/pull/299#issuecomment-6740406813) registra revisão Antigravity modelo `gemini-4-argon-medium` do commit `580b39b7094dfd18ba5afc32872251a996b10df1`: nenhum novo P0/P1/P2 **no diff incremental**, sem alterações de código ou merge. Conforme pedido do owner, nos próximos checkpoints consultar revisões periódicas e comparar cada parecer com o SHA correspondente; não substituir peer independente, validações nativas, CodeQL ou CI. Todos os bloqueios R1/NO-GO existentes permanecem.
+
+## 2026-11-09 14:09 UTC — evidência incremental de HEADs e gates (não autoriza produção)
+
+| Frente | HEAD remoto / provas | Gate ainda não cumprido |
+| --- | --- | --- |
+| #251 | `094036e3` OPEN/Draft; Ubuntu full, Windows canonical, Windows mandatory, CodeQL, PostgreSQL18, Dependency Review **SUCCESS** no exato SHA; bot Antigravity 6740797692 | W20 Edge CBOR v2 físico encontrou `EDGE_V2_TIMEOUT_provision`; W48 5 PASS locais, causa não explicada; seguir investigando sem relaxar gate |
+| #298 | `b412ff37` OPEN/Draft; test-discovery Win/WSL peer SOURCE GO limitado | CodeQL formal 2 HIGH reais e rollback que remove arquivo de writer concorrente; W40 RED lab NO-GO |
+| #299 | `f2bc6f8a` OPEN/Draft; W12 peer; WSL ext4 16 PASS isolado/18 PASS combinado; Win22 foreign-listener 1 PASS; hosted Ubuntu+CodeQL SUCCESS; bot 6741614834 | Windows canonical/mandatory em andamento no exato SHA; antigo 580b falhou P2P stale hash; W47 RED pós-lstat físico Win/WSL; RED durante hash usa metadados modelados, falta imutabilidade dos bytes até autorização |
+| #300 | `956b2515` OPEN/Draft; full hosted Windows/Ubuntu SUCCESS; W45 POSIX 0f8 e W46 NTFS 990c held-dirfd/handle labs SOURCE GO apenas inertes, W46 Win22 6 PASS | CodeQL 1 HIGH; 426d required-v2 >16384 RED por bind-mount ABA, root/owner/offhost monotonic inexistentes, NTFS powercut não provado, 609564 ACL DELETE NO-GO |
+| #302 | `5e852c14` OPEN/Draft; HTTP Ed25519/SQLite Win22 NTFS + WSL ext4 17 PASS cada; hosted CodeQL/PG18 SUCCESS; bot 6741822102 | owner-issued protected_enforced, orig-byte signed upload, external monotonic floor, whole-corpus ZIP/jobs/history, Android TEE e cutover físico ainda NO-GO |
+
+`Root/main` preservada em `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`; #228 CLOSED/unmerged. Revisões do Antigravity são incrementais por SHA; não substituem peer SOURCE GO, CodeQL ou CI. Nenhum merge/deploy/force push; worktrees e negativos RED devem permanecer.
