@@ -8,6 +8,16 @@ const { spawn, spawnSync } = require('node:child_process');
 
 const exe = process.env.ROOTARK_NATIVE_READ_EXE;
 const base = process.env.ROOTARK_NATIVE_READ_TESTDIR;
+const unconfiguredDiscovery = Boolean(process.env.NODE_TEST_CONTEXT)
+  && !Object.hasOwn(process.env, 'ROOTARK_NATIVE_READ_EXE')
+  && !Object.hasOwn(process.env, 'ROOTARK_NATIVE_READ_TESTDIR');
+if (unconfiguredDiscovery) {
+  // The lab needs a separately compiled native executable and disposable
+  // fixture directory. Do not hide partial/malformed explicit configuration.
+  test('native contained-read lab requires explicit compiled binary and disposable directory', {
+    skip: 'Run the seven native tests with ROOTARK_NATIVE_READ_EXE and ROOTARK_NATIVE_READ_TESTDIR',
+  }, () => {});
+} else {
 assert.ok(exe && fs.existsSync(exe), 'set compiled ROOTARK_NATIVE_READ_EXE');
 assert.ok(base && fs.statSync(base).isDirectory(), 'set disposable ROOTARK_NATIVE_READ_TESTDIR');
 const isWin = process.platform === 'win32';
@@ -197,3 +207,4 @@ test('hard process crash releases held leases (disposable fixture only)', async 
   fs.renameSync(leaf, path.join(temp, 'post-crash.json'));
   assert.ok(fs.existsSync(path.join(temp, 'post-crash.json')));
 });
+}
