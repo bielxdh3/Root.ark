@@ -299,6 +299,35 @@ test("issue 66: Files On-Demand refuses destructive cache eviction without nativ
   assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"), "cache me");
 });
 
+test("issue 66: automatic excluded cache migration refuses legacy eviction before snapshot mutation", async (t) => {
+  const { root, open, adapter, store, state, key } = await setup(t,
+    { "docs/cache.txt": "retain exact Unicode café-中-😀 bytes" });
+  const original = await open();
+  await original.materializeRemote("docs/cache.txt");
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const oldSnapshot = await fsp.readFile(snapshotPath);
+  const oldFile = await fsp.readFile(path.join(root, "docs", "cache.txt"));
+  const oldRecords = JSON.stringify(store.list("alice"));
+  const oldState = { pushes: state.pushes, fullReads: state.fullReads.length,
+    inventoryReads: state.inventoryReads };
+  const excluded = new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    selectedPaths: ["docs"], excludedPaths: ["docs/cache.txt"],
+    filesOnDemand: true, fileKeyResolver: () => key,
+  });
+  await excluded.open();
+  await assert.rejects(excluded.syncOnce(), { code: "root_session_native_unavailable" },
+    "automatic exclusion must never turn an unsafe native denial into persisted failure or remote-only state");
+  assert.deepEqual(await fsp.readFile(snapshotPath), oldSnapshot);
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "cache.txt")), oldFile);
+  assert.equal(JSON.stringify(store.list("alice")), oldRecords);
+  assert.equal(state.pushes, oldState.pushes);
+  assert.equal(state.fullReads.length, oldState.fullReads);
+  assert.equal(state.inventoryReads, oldState.inventoryReads);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+  assert.equal(await exists(path.join(root, ".rootark-sync-evictions")), false);
+});
+
 test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();

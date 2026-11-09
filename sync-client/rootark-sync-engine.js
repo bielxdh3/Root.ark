@@ -3587,6 +3587,15 @@ class SyncEngine {
     // those entries once even if the configured list has not changed.
     const needsCasefoldMigration = this.excludedPaths.length > 0
       && this.snapshot.excludedPathsCasefoldVersion !== EXCLUDED_PATHS_CASEFOLD_VERSION;
+    // Exclusion-policy changes can cause automatic destructive eviction,
+    // but the old path-based helper cannot establish native root custody.
+    // Deny BEFORE creating retry state, inspecting mutable names, or
+    // persisting exclusion policy / remote-only markers. A harmless no-op
+    // with the same already-applied policy remains permitted.
+    if (this.requireNativeRootRecovery && (listChanged || needsCasefoldMigration
+      || Object.keys(this.snapshot.pendingEvictions || {}).length)) {
+      denyUntrustedNativeEviction();
+    }
     this.snapshot.pendingEvictions = this.snapshot.pendingEvictions || {};
     const pendingEvictions = this.snapshot.pendingEvictions;
     if (!listChanged && !needsCasefoldMigration && !Object.keys(pendingEvictions).length) return null;

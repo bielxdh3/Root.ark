@@ -450,3 +450,58 @@ MOVE/DELETE, pathname-based local reconciliation, same-principal root
 replacement, owner-authorized native writer, cold reopen, crash/rollback,
 mapped image/DLL provenance or fully adversarial A→B→A. Tests that only
 prove legitimate local recovery cannot close these P1 system gates.
+
+### Automatic exclusion preflight — same native custody fence
+
+The first explicit-eviction child `3756cc7ea6dc79dbea33356ada7eeb986ea1c067`
+was physically tested on Windows Node22/NTFS (**30 PASS/0 FAIL**) and a
+fresh exact-SHA archive on Ubuntu WSL Node22/ext4 (**30 PASS/0 FAIL**).
+One uncovered automatic path remained: `_applyExcludedPaths()` could catch
+the `_evictLocal()` native denial and proceed to write an exclusion failure,
+retry state or remote-only intent. A new RED test used a signed remote cache
+entry with Unicode content and a newly configured exclusion; `syncOnce()`
+unexpectedly returned instead of rejecting before a snapshot change.
+
+The corrective child now gates exclusion policy changes, pending evictions
+and case-fold migration **before** building pending retry objects, scanning
+mutable physical paths or persisting snapshot changes when native root
+custody is required. An exclusion policy already applied and requiring no
+work remains a no-op. The new physical Windows Node22/NTFS combined suites
+returned **31 PASS, 0 FAIL**, with the exact cached Unicode bytes, snapshot
+bytes, signed store and remote adapter calls unchanged after denial. This is
+deliberate fail-closed behavior, **not** a native safe eviction backend.
+
+### Mount namespace adversary — physical kernel semantics, not SyncEngine GO
+
+An additional **manual**, explicitly root-privileged experiment was run in
+an **isolated WSL Ubuntu/ext4 mount namespace** using
+`wsl.exe --user root --exec /usr/bin/unshare --mount --propagation private
+/bin/bash -s`. Bash source was piped through standard input instead of
+executing an untrusted shell script from this repository. Preflight checked
+that `/var/tmp` was root-owned (`0:1777`) on ext4 (`ef53`). A single
+root-owned disposable `0700` directory was created by `mktemp -d`; two
+contained directories A and B held different marker bytes.
+
+The kernel was made to bind-mount B over A *only in the child namespace*.
+Pathname `A/marker` then returned B's bytes, while **FD 3**, opened on
+the original `A/marker` before the mount, continued returning A's bytes.
+After unmounting the shadow, pathname A again returned A's exact bytes.
+The original B contents remained untouched, and the fixture was retained.
+
+```text
+ROOTARK_BIND_NS_V1 PASS original=PINNED foreign=VISIBLE restored=ORIGINAL namespace=ISOLATED fs=EXT4 base=/var/tmp/rootark-issue66-bind-CF30mchs
+PRIVATE_BIND_ABA_EXIT=0
+```
+
+**Limit of this evidence:** the mounting actor held root/CAP_SYS_ADMIN; this
+does not demonstrate successful mounting by UID1000, an operational
+RootSession, the `SyncEngine` reading via the original FD, safe concurrent
+writers, crash-safe journal/snapshot promotion, cold reboot, trusted native
+image provenance or monotonic rollback. The unprivileged bind mount test is
+still a truthful SKIP. Nothing was deployed, no host-global mount was
+changed, and `Root/main`/the remote Draft #300 were not modified.
+
+**Source-review gate:** the eviction and exclusion-preflight child is kept
+in its isolated worktree until a peer reviews its **exact committed SHA**;
+passing these Node tests alone must not be reported as SOURCE GO, CodeQL
+success or operational recovery readiness.
