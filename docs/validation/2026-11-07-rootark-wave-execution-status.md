@@ -407,3 +407,17 @@ GitHub PR #299 comentário [6740406813](https://github.com/bielxdh3/Root.ark/pul
 | #302 | `5e852c14` OPEN/Draft; HTTP Ed25519/SQLite Win22 NTFS + WSL ext4 17 PASS cada; hosted CodeQL/PG18 SUCCESS; bot 6741822102 | owner-issued protected_enforced, orig-byte signed upload, external monotonic floor, whole-corpus ZIP/jobs/history, Android TEE e cutover físico ainda NO-GO |
 
 `Root/main` preservada em `d5fbc110944a5437dbd5e9175f39dd97f5e433bc`; #228 CLOSED/unmerged. Revisões do Antigravity são incrementais por SHA; não substituem peer SOURCE GO, CodeQL ou CI. Nenhum merge/deploy/force push; worktrees e negativos RED devem permanecer.
+
+## 2026-11-09 15:02 UTC — FF peer-reviewed, README PR315 preservado e CI nova pendente
+
+| Frente | SHA exato, fonte e prova | Resultado / bloqueio |
+| --- | --- | --- |
+| Root/main / #315 | cca6be46c7bee561922c5ff199e1265405b0d3c0; PR315 merged 14:39:37 UTC por fluxo externo a esta missao | README blob 7339723f32aec09d0493ecdbbb992c7d8cbbde5d preservado. Root/main nao alterada por esta missao; #228 CLOSED/unmerged |
+| #251 | 053ad37ff543bdd7b47c8704be8477fbbe5d8e1a, filho direto de de8cdb08; W30 one-file README, W42 SOURCE GO; merge-tree com main exit0; FF remoto e OPEN/Draft verificados | Novo SHA tem PG18 IN_PROGRESS e CodeQL/Dependency Review QUEUED na consulta 15:02 UTC; sem resultado global hosted ainda; Edge W20 intermitente continua |
+| #299 WebDAV | a1c4d7d8ea0a6ccc536361b648316a1bdc8ee081, filho direto de f2bc6f8a; W51 TDD RED/GREEN e Win11 Node22 NTFS 16 PASS + WSL Node22 ext4 16 PASS; W12 SOURCE GO exato e WSL 16 PASS independentes; FF remoto confirmado OPEN/Draft | Hosted CI NOVO SHA queued; parent f2bc Windows canonical/mandatory falharam em listener estrangeiro e, no mandatory, tambem em mutacao de pinned hashing P2P; nenhuma conclusao GREEN transferida |
+| #299 P2P | W47 escritor fisico RED; W50 laboratorio 104d3b87 Windows LockFileEx/mmap e Linux F_SETLEASE/memfd | SOURCE/OPERATIONAL NO-GO para sala protegida: bytes enviados nao vinculados a snapshot sealed original owner e ACL/epoch; nao eliminar teste negativo para deixar CI verde |
+| #298 | b412ff378202feb90c70c5a100f7a8f2b683a08e permanece HEAD Draft | 2 HIGH CodeQL + RED Win/WSL de rollback delete estrangeiro com parent MOVE; sem solucao nativa revisada |
+| #300 | 956b2515d3f5262b2bf8c6044be2bfd2db72dc9e permanece HEAD Draft | 1 HIGH CodeQL; 426d5e93 >16384 tem P1 bind-mount ABA W39. W45/W46 native held-directory apenas labs NO-GO operacionais; nao relaxar DELETE nos ancestrais |
+| #302 / #291 Android | #302 5e852c14, hosted Ubuntu/PG18/CodeQL SUCCESS, Windows em progresso; #291 6d1c3f hosted baseline Android Win SUCCESS demais queued | R1 DEV-OFF authorizesIo:false; Android local 548c91 nao validado por Kotlin/TEE; offhost monotonic/original-byte custody ausentes |
+
+O bot Antigravity foi consultado nos comentarios por SHA anteriores (#251 de8 6742263447, #299 f2bc 6741614834, #302 5e 6741822102); nao havia novo parecer para 053ad37f nem a1c4d7d8 ate este checkpoint. Sem merge/deploy/cutover/force push. Nenhuma evidência RED nem worktree foi apagada; nenhum teste sintetico foi promovido a prova de dispositivo fisico.
