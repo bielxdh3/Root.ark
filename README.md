@@ -21,34 +21,42 @@ Root.ark is a self-hosted Node.js service for managing files, permissions, versi
 ## How it fits together
 
 ```text
-          ┌──────────────────────┐   ┌──────────────────────┐
-          │ Browser interface    │   │ Local sync client    │
-          │ files · users · links│   │ watched local files  │
-          └──────────┬───────────┘   └──────────┬───────────┘
-                     │                          │
-                     └────────────┬─────────────┘
-                                  │
-                       ┌──────────▼───────────┐
-                       │   Root.ark server    │
-                       │ auth · permissions   │
-                       │ uploads · WebDAV     │
-                       └──────┬────────┬──────┘
-                              │        │
-                metadata      │        │ files and versions
-                              │        │
-                    ┌─────────▼───┐ ┌──▼──────────────────┐
-                    │   SQLite    │ │ Managed storage     │
-                    │ users · ACL │ │ uploads · trash     │
-                    │ links · jobs│ │ quarantine · backup │
-                    └─────────────┘ └──┬──────────────────┘
-                                      │ optional adapters
-                         ┌────────────▼────────────┐
-                         │ S3 · Google APIs ·      │
-                         │ external storage bounds │
-                         └─────────────────────────┘
+          ┌───────────────────────┐   ┌─────────────────────────┐
+          │ Browser / WebDAV      │   │ Local sync client       │
+          │ ordinary file paths   │   │ signed v2 / legacy-dev  │
+          └───────────┬───────────┘   └────────────┬────────────┘
+                      └─────────────┬──────────────┘
+                                    │
+                     ┌──────────────▼─────────────────┐
+                     │ Root.ark server (Express)      │
+                     │ auth · ACL · uploads · WebDAV  │
+                     │ sync · opt-in protected routes│
+                     └──────────┬───────────┬─────────┘
+                                │           │
+                    ┌───────────▼────┐ ┌────▼──────────────────┐
+                    │ SQLite + JSON  │ │ Managed file storage │
+                    │ accounts · ACL │ │ versions · trash     │
+                    │ metadata/audit │ │ quarantine · backups │
+                    └────────────────┘ └────┬──────────────────┘
+                                            │ optional adapters
+                                  ┌─────────▼─────────────┐
+                                  │ S3 / Google Drive    │
+                                  │ provider boundaries  │
+                                  └───────────────────────┘
+
+        ZK-1 protected path (opt-in, default-off; separate trust):
+             ┌──────────────────────────┐
+             │ Authorized ZK-1 client   │
+             │ encrypts + signs locally │
+             └─────────────┬────────────┘
+                           │ signed ciphertext
+             ┌─────────────▼────────────┐   ┌──────────────────────┐
+             │ ZK-1 routes in server    │──►│ Independent witness│
+             │ isolated protected API  │   │ and CAS trust gates│
+             └──────────────────────────┘   └──────────────────────┘
 ```
 
-Root.ark combines a browser-facing service, a local synchronization client, and optional integration boundaries. Authentication and authorization decisions stay in the server rather than being delegated to the browser.
+The protected routes are part of the same server but are separately gated and disabled by default. Ordinary file, WebDAV, and legacy sync paths can process server-readable data; the ZK-1 client encrypts and signs before transport. Witness/CAS services require independent provisioning and do **not** imply production authorization. SQLite and JSON store state according to the configured feature/mode; PostgreSQL 18 trust/admission validation is not the default application database.
 
 ## Project status
 
