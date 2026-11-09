@@ -52,6 +52,51 @@ async function fixture(t, name, twoFiles = false) {
     signed, create, outbound, key };
 }
 
+async function fillLegitimateTrash(root, count = 16385) {
+  const directory = path.join(root, ".rootark-trash");
+  await fsp.mkdir(directory, { recursive: true });
+  // Real, distinct directory entries. 256 concurrent creations keep the
+  // regression practical on both Windows NTFS and native WSL ext4.
+  for (let offset = 0; offset < count; offset += 256) {
+    await Promise.all(Array.from({ length: Math.min(256, count - offset) }, (_, index) =>
+      fsp.writeFile(path.join(directory, `staged-cache-${String(offset + index).padStart(6, "0")}`),
+        "", { flag: "wx" })));
+  }
+  assert.equal((await fsp.readdir(directory)).length, count);
+}
+
+test("issue 66 P2: ordinary v1 and completed v2 boot with >16384 legitimate trash entries", async (t) => {
+  for (const state of ["v1", "v2-completed"]) {
+    const f = await fixture(t, `large-trash-${state}`);
+    if (state === "v2-completed") {
+      const sync = await f.create(f.root, ["private"]);
+      assert.equal((await sync.syncOnce()).excluded.evicted, 1);
+      const disk = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+      assert.equal(disk.version, 2);
+      assert.equal(disk.evictionLedgerRequired, false);
+    } else {
+      assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).version, 1);
+    }
+    await fillLegitimateTrash(f.root);
+    const before = f.outbound.length;
+    const restarted = await f.create(f.root, []);
+    assert.equal(restarted.snapshot.version, state === "v1" ? 1 : 2);
+    assert.equal(restarted.snapshot.evictionLedgerRequired, state === "v1" ? undefined : false);
+    await restarted.syncOnce();
+    verifyNoSignedDelete(f, before);
+  }
+});
+
+test("issue 66 P2: required v2 still refuses oversized ambiguous genesis staging on boot", async (t) => {
+  const f = await fixture(t, "large-trash-required");
+  await prePrepareCrash(f);
+  await fillLegitimateTrash(f.root);
+  const before = f.outbound.length;
+  await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
 function verifyNoSignedDelete(f, from = 0) {
   assert.equal(f.outbound.slice(from).filter((entry) => entry.operation === "delete" || entry.tombstone).length,
     0, "an uncertain ledger must never authorize a signed DELETE");

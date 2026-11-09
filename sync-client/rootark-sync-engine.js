@@ -1149,6 +1149,13 @@ class SyncEngine {
   async replayEvictionLedger() {
     const { entries, head } = await readEvictionLedger(this.rootDir,
       this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
+    // A normal v1 snapshot or an already-compacted v2 checkpoint has no
+    // active eviction to replay. Do not inspect accumulated .rootark-trash
+    // here: its legitimate contents can exceed the strict genesis scan cap,
+    // and its staged head is only authoritative while a v2 snapshot explicitly
+    // requires replay (or an active ledger must be reconciled). A subsequent
+    // migration still validates the staged genesis before any PREPARE.
+    if (!this.snapshot.evictionLedgerRequired && !head && !entries.size) return;
     const staged = await stagedEvictionGenesis(this.rootDir);
     if (this.snapshot.evictionLedgerRequired && !head) {
       // A crash after the v2 snapshot but before promoting the genesis can
