@@ -633,3 +633,31 @@ flowchart TD
 ```
 
 **Critério constante:** sucesso de testes e SOURCE GO delimitado de helpers não prova autorização de IO, recuperação diante de power-cut, hardware Windows 10/Android nem release de #63/#65/#66/#67/#68. Preservar worktrees, dados e fixtures RED, sem reinicializações destrutivas.
+
+## 2026-11-09 — verificação adicional 11:20 UTC (apêndice, sem release)
+
+Este registro é posterior ao snapshot de 07:18 UTC e **preserva os estados históricos anteriores**. GitHub confirmou [Root/main](https://github.com/bielxdh3/Root.ark/tree/Root/main) = **d5fbc110944a5437dbd5e9175f39dd97f5e433bc**; [PR #228](https://github.com/bielxdh3/Root.ark/pull/228) continua CLOSED/unmerged. Os PRs mencionados permanecem OPEN/Draft. Não houve autorização de merge, deploy, R1 ou cutover.
+
+| Frente | HEAD remoto confirmado | CI / parecer e bloqueio |
+| --- | --- | --- |
+| [#251](https://github.com/bielxdh3/Root.ark/pull/251) | **b6a2210300b42c5c1b273a57df7a0a1217371230** | Parser 0b663941 teve SOURCE GO exato e b6 corrigiu Mermaid de peer. [Security Regression 42579917598](https://github.com/bielxdh3/Root.ark/actions/runs/42579917598) e [42579942427](https://github.com/bielxdh3/Root.ark/actions/runs/42579942427) **SUCCESS** no b6, checks 12 SUCCESS/1 SKIP. [Falha anterior 42565505791](https://github.com/bielxdh3/Root.ark/actions/runs/42565505791) pertence ao SHA antigo 1a30, sem implicar falha no b6. |
+| [#293](https://github.com/bielxdh3/Root.ark/pull/293) | **f9b604047c0634dccedcd99c8ae00f7f3fff075c** | [Full hosted 42561877204](https://github.com/bielxdh3/Root.ark/actions/runs/42561877204) **SUCCESS**. |
+| [#300](https://github.com/bielxdh3/Root.ark/pull/300) | **956b2515d3f5262b2bf8c6044be2bfd2db72dc9e** | [Security Regression 42578257642](https://github.com/bielxdh3/Root.ark/actions/runs/42578257642) **SUCCESS**, porém [CodeQL formal 129031320469](https://github.com/bielxdh3/Root.ark/runs/129031320469) **FAILURE**, uncontrolled absolute path na fixture test/issue-66-cfapi-acl-preflight-native.test.js:19. Ancestral f645438e demonstrou replay Ed25519 CREATE/DELETE observations=[] com beforeCommit obrigatório na revogação (37/37 Win22 NTFS e WSL22 ext4), SOURCE GO **apenas inerte**. Filho de fixture 956b teve peer GO delimitado. Candidato local **5edc275 NÃO PUBLICADO** recebeu peer25 SOURCE NO-GO por INTERACTIVE S-1-5-4 ainda gravável em ACL e vcvars multilinha sem sanitização. Sem novo peer do SHA corretivo. |
+| [#298](https://github.com/bielxdh3/Root.ark/pull/298) | **b586ac3597f06aa1d8f91c62dc45e3a12a3123b7** | [Full hosted 42564258448](https://github.com/bielxdh3/Root.ark/actions/runs/42564258448) **SUCCESS**, [CodeQL formal 128986757972](https://github.com/bielxdh3/Root.ark/runs/128986757972) **FAILURE**, dois HIGH. NTFS/ext4 demonstraram OPEN+READ fora da raiz após junction/symlink; services/restorePreimage.js ainda pode remover inode externo. Labs a9abf89d/83cdcb57 sem GO operacional. |
+| [#299](https://github.com/bielxdh3/Root.ark/pull/299) | **95aec7c40855b6d21cd81955bdc7c3ea2409b221** | [Security Regression 42448670330](https://github.com/bielxdh3/Root.ark/actions/runs/42448670330) **FAILURE** em Windows canonical; callbacks, imutabilidade de ciphertext e races aguardam correção/revisão. |
+| [#291 Android](https://github.com/bielxdh3/Root.ark/pull/291) / [#302 ZK10](https://github.com/bielxdh3/Root.ark/pull/302) | **6d1c3ffff29eba26fd79f293662398b54a0895f0** / **ce3d7ec4675a32455d844b60166ca32f627d3aca** | #64 candidato local 548c91af sem prova Kotlin/JVM por toolchain ausente, Android físico/Keystore sem verificação; #302 8 SUCCESS/1 SKIP hosted, mas DEV-OFF authorizesIo:false e R1 NO-GO. |
+
+~~~mermaid
+flowchart TD
+  A["PRs Draft, main protegido e #228 CLOSED"] --> B{"Gates do SHA exato?"}
+  B -->|"#251 e #293 hosted verde"| C["Somente evidência de engenharia"]
+  B -->|"#300 e #298 CodeQL vermelho; #299 Windows vermelho"| D["Corrigir e revisar SHA novo"]
+  B -->|"#64 hardware e #302 R1 pendentes"| E["DEV-OFF, custódia não autorizadora"]
+  C --> F["Sem merge/deploy/cutover"]
+  D --> F
+  E --> F
+~~~
+
+**Fronteiras independentes:** assinatura owner de bytes originais pré-upload, histórico ZIP/jobs/versões integral, custódia off-host com piso monotônico e fase/CAS, Windows10 CFAPI positivo, Android Keystore/TEE, TURN/cross-NAT e prova NTFS power-cut. SOURCE GO ou CI verde não certificam operação. Preservar todas as worktrees e evidências RED.
+
+**Plataforma verificada no host (09/11):** Windows 11 Pro 64-bit, build 26300, E: NTFS fixo saudável e Node 22.23.3. Os jobs hospedados são Windows Server 2022; isto não comprova CFAPI positivo em Windows 10 nem teste NTFS de power-cut.
