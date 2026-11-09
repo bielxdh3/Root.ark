@@ -18,6 +18,8 @@ test("#66 privileged owner-provisioner validates the entire name before any root
 }, () => {
   const provisioner = path.resolve(__dirname,
     "../experiments/issue66-owner-rooted-read/provision-owner-root.sh");
+  assert.equal(fs.readFileSync(provisioner).includes(0x0d), false,
+    "privileged POSIX script must retain LF-only bytes across Windows checkout and archive");
   const check = (leaf) => spawnSync("/bin/sh", [provisioner, "--validate-only", leaf], {
     encoding: "utf8", timeout: 5000, maxBuffer: 1024,
     env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
