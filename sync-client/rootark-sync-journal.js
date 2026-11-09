@@ -587,6 +587,58 @@ class SyncJournal {
       next.observed[operationId] = digest;
     });
   }
+  async batchObserveAdmission(entries) {
+    // Called ONLY after every envelope in the enclosing remote LIST has been
+    // independently authorized and its exact canonical digest frozen. This
+    // primitive persists that already verified evidence; it never verifies a
+    // signature or turns a remote LIST response into its own authority.
+    if (!Array.isArray(entries) || entries.length > MAX_OBSERVATIONS) {
+      throw new Error("Invalid bounded sync admission batch");
+    }
+    if (!entries.length) return;
+    const unique = new Set();
+    const frozenEntries = [];
+    for (const entry of entries) {
+      // A verifier can pass mutable network objects or getters. Read each
+      // field once and detach the primitive identity before the queued fsync.
+      const operationId = entry?.operationId;
+      const digest = entry?.digest;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof operationId !== "string" || !VALID_OPERATION_ID.test(operationId)
+        || typeof digest !== "string" || !VALID_DIGEST.test(digest)
+        || unique.has(operationId)) {
+        throw new Error("Invalid or duplicated sync admission batch identity");
+      }
+      unique.add(operationId);
+      frozenEntries.push({ operationId, digest });
+    }
+    await this.commit((next) => {
+      const pending = new Map(next.pending.map((entry) => [entry.operationId, entry]));
+      const seen = new Set(next.seen);
+      let count = Object.keys(next.observed).length;
+      for (const { operationId, digest } of frozenEntries) {
+        const priorAdmitted = Object.hasOwn(next.admitted, operationId)
+          ? next.admitted[operationId] : null;
+        const priorObserved = Object.hasOwn(next.observed, operationId)
+          ? next.observed[operationId] : null;
+        if ((priorAdmitted !== null && priorAdmitted !== digest)
+          || (priorObserved !== null && priorObserved !== digest)
+          || (pending.has(operationId)
+            && signedEnvelopeDigest(pending.get(operationId)) !== digest)) {
+          throw Object.assign(new Error("Conflicting local sync admission evidence"),
+            { code: "remote_authorization_rejected" });
+        }
+        if (priorObserved !== null || (priorAdmitted !== null
+          && seen.has(operationId))) continue;
+        count += 1;
+        if (count > MAX_OBSERVATIONS) {
+          throw new Error("Sync pre-observation journal capacity exceeded");
+        }
+        // Null-prototype maps also preserve IDs such as "__proto__" exactly.
+        next.observed[operationId] = digest;
+      }
+    });
+  }
   hasLocalAdmission(operationId, digest) {
     return VALID_OPERATION_ID.test(operationId) && VALID_DIGEST.test(digest)
       && ((Object.hasOwn(this.state.admitted, operationId)
