@@ -96,7 +96,7 @@ flowchart LR
   B --> C["Local RootSession contract 48e881c5 (gate OFF)"]
   C --> D["Implement native trusted-root end-to-end I/O"]
   W["W25 NTFS 76cfa21e — isolated"] -. "experiment only" .-> D
-  P["POSIX ext4 8e0ccba2 — isolated"] -. "experiment only" .-> D
+  P["POSIX ext4 34d71021 — test-only local"] -. "experiment only" .-> D
   D --> E["Hostile ABA + cross-principal + power-cut proofs"]
   E --> F["Independent SOURCE GO exact final SHA"]
   F --> G["Fast-forward only after authorized release gates"]
@@ -109,6 +109,35 @@ flowchart LR
 **Next engineering step:** implement actual native trusted-parent acquisition,
 same-object enumeration/read/rename and durable cold-reopen with a separate
 writer/custody authority, then prove both successful 16,385-entry recovery
-and hostile root replacement without remote signed DELETE. Keep W25 and
-POSIX laboratories isolated whenever their own SOURCE review or custody
-claims remain NO-GO.
+and hostile root replacement without remote signed DELETE. Keep W25 isolated,
+and prohibit any production call into either experiment until source, image,
+root custody and hostile-physical gates are independently satisfied.
+
+## Later local test-only integration (after scoped peer GO)
+
+The corrected POSIX laboratory `8e0ccba2` passed independent **SOURCE GO
+strictly for an opt-in research experiment** (zero P0/new P1/P2 for its
+corrected claims; no endorsement of executable-image custody or the
+SyncEngine). The source was cherry-picked unchanged, with owner attribution
+and a single Codex trailer, onto the documentation checkpoint:
+
+- `67b5927632951f6788ca25a4539acec0ad5443c4`: this dated checkpoint
+  on `48e881c5`;
+- `418d9806`: cherry-pick of original POSIX research `37b395bd`;
+- `34d7102187cc115db9222bccee385fdc15551ecd`: cherry-pick of its
+  correction `8e0ccba2`.
+
+The composite was conflict-free by `git merge-tree --write-tree`; the
+exact `34d71021` source archive ran on WSL Ubuntu physical ext4, Node22,
+gcc15: **5 PASS, 1 explicit bind-mount SKIP, 0 FAIL** with the opt-in lab.
+On the Windows Node22/NTFS checkout of that same SHA, the CFAPI and
+`RootSession` contracts ran **28 PASS, 6 Linux-lab SKIP, 0 FAIL**. The
+preceding `48e881c5` integrated candidate ran **28 PASS Windows** and
+**21 PASS / 7 Windows SKIP on WSL ext4** for CFAPI + RootSession. No
+required-v2 engine files, production entry points, host services, cloud
+accounts, or old hostile fixtures were changed by this composition.
+
+All these commits remain **LOCAL ONLY**. The POSIX experiment being present
+in a test-only source tree does not activate it and does not close any of the
+earlier root/ancestor, same-principal writer, image, code-loading, cold
+reopen, crash or rollback gates. Publication remains **NO-GO**.
