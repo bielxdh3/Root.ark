@@ -76,12 +76,15 @@ not reuse the original lab's C# interop and adds **no executable files**. It
 requires **NTFS** from the retained scratch handle through
 `GetVolumeInformationByHandleW` plus a fixed local drive through
 `GetDriveTypeW`. It creates/reopens fixture directories
-through `NtCreateFile` relative to that handle. It performs four bounded
-physical Windows/NTFS cases, with both `.NET
-Directory.Move` and direct native `MoveFileExW`. `NtCreateFile` opens each
-tested root with share mask **3** (`FILE_SHARE_READ | FILE_SHARE_WRITE`,
-**no FILE_SHARE_DELETE**) or **0** (no sharing). `CreateFileW` initially
-opens the scratch anchor with share mask 7. It checks the root's `HANDLE` validity
+through `NtCreateFile` relative to that handle. The new handle-rename
+candidate exercises `NtSetInformationFile` with
+`FileRenameInformation (10)` and `FileRenameInformationEx (65)`,
+using the original source HANDLE, `RootDirectory=scratch HANDLE`
+and fixed relative target `moved-ancestor`. There are four physical
+Windows/NTFS combinations: each information class with source share mask
+**3** (`FILE_SHARE_READ | FILE_SHARE_WRITE`, no FILE_SHARE_DELETE)
+and **0** (no sharing). The source handle has `DELETE` access.
+`CreateFileW` initially opens scratch with share mask 7. It checks root HANDLE validity
 before and after rename and uses real `GetFileInformationByHandleEx(FileIdInfo)`
 volume/file identities. An old handle maps to **O1** before and after rename;
 the moved name also maps to **O1**, whereas a newly created replacement at
@@ -94,21 +97,22 @@ Categorical Windows/NTFS outputs expected by the updated Node 22 test
 ACLs, or user data):
 
 ```
-ROOTARK_W25_RENAME_V2 mode=DOTNET share=3 filesystem=NTFS storage=LOCAL handle=VALID move=SUCCESS win32LastError=NA_DOTNET ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
-ROOTARK_W25_RENAME_V2 mode=WIN32 share=3 filesystem=NTFS storage=LOCAL handle=VALID move=SUCCESS win32LastError=0 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
-ROOTARK_W25_RENAME_V2 mode=DOTNET share=0 filesystem=NTFS storage=LOCAL handle=VALID move=SUCCESS win32LastError=NA_DOTNET ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
-ROOTARK_W25_RENAME_V2 mode=WIN32 share=0 filesystem=NTFS storage=LOCAL handle=VALID move=SUCCESS win32LastError=0 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V3 mode=INFO share=3 filesystem=NTFS storage=LOCAL handle=VALID rename=HANDLE move=SUCCESS renameNtstatus=0x00000000 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V3 mode=INFO_EX share=3 filesystem=NTFS storage=LOCAL handle=VALID rename=HANDLE move=SUCCESS renameNtstatus=0x00000000 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V3 mode=INFO share=0 filesystem=NTFS storage=LOCAL handle=VALID rename=HANDLE move=SUCCESS renameNtstatus=0x00000000 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V3 mode=INFO_EX share=0 filesystem=NTFS storage=LOCAL handle=VALID rename=HANDLE move=SUCCESS renameNtstatus=0x00000000 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
 ```
 
-`win32LastError=0` is the actual `Marshal.GetLastWin32Error` returned following
-`MoveFileExW` on this machine; **GetLastError is not a meaningful independent
-security guarantee when the Win32 call succeeds**. `.NET Directory.Move`
-does not supply a corresponding direct native last-error, so its value is
-`NA_DOTNET`. The `NTSTATUS` is the actual return from rooted `NtCreateFile`.
-These findings prove that omitting `FILE_SHARE_DELETE` **does not by itself
-prevent a rename on the tested Windows host**; existing open handles continue
-referring to their original objects. The four-mode test rejects failure to
-move, same-ID replacement, handle invalidation, and misrouted relative opens.
+`renameNtstatus` is the actual result from `NtSetInformationFile`;
+the separate `ntstatus` belongs to rooted `NtCreateFile` for the child.
+The Win32 `SetFileInformationByHandle(FileRenameInfo)` probe with non-null
+`RootDirectory` returned `ERROR_INVALID_PARAMETER (87)` on this Windows
+host, so the final helper calls the NT service, which accepts the retained
+parent handle and fixed relative filename. It has **no pathname fallback**.
+Both native classes succeeded on the test host. This demonstrates that
+omitting `FILE_SHARE_DELETE` does not alone prohibit renaming **by the
+source handle**, under these narrow conditions. The four-mode test rejects
+failure, same-ID replacement, invalidated handles and wrong relative opens.
 
 **Candidate hardening, locally validated:** after a RED test for the missing
 NTFS marker, Windows NTFS Node **v22.22.1: 4 PASS / 0 FAIL / 0 SKIP** across
@@ -117,17 +121,30 @@ SKIP / 0 FAIL**. No external-path fixture, malicious concurrent process,
 or destructive cleanup was executed. The test suites retain disposable
 LocalAppData directories for later manual review.
 
+**New handle-rename continuation:** the test was RED against pathname-based
+rename code. An attempted Win32 handle rename rejected with error 87
+(no path fallback); the equivalent native NT rename became GREEN on local
+NTFS with both information classes. This evidence covers only the new
+rename primitive and the existing identity comparisons. Windows Node
+**v22.22.1: 4 PASS / 0 FAIL / 0 SKIP** with both W25 test files, including
+four combinations of native rename class and share mask. WSL Ubuntu Node
+**v22.22.1: 4 expected Windows-only SKIP / 0 FAIL**.
+
 ## Still NOT established (release NO-GO)
 
-- **W25 P2-A remains open:** the .NET and Win32 rename operations still
-  accept absolute *pathname* source/target names. A second process under the
-  same user can swap the scratch name after the handle/path identity check
-  but before either rename. This can cause a mutation of an unrelated entry
-  and cannot be ruled out with pre/post pathname checks. The helper now
-  pins the scratch HANDLE, checks its FileIdInfo before and after renames,
-  uses root-relative opens/creation for its children, and **never recursively
-  deletes** any path, reducing impact without an atomic security guarantee.
-  **SOURCE NO-GO for this adversarial safety property.**
+- **W25 P2-A rename primitive now handle-bound:** source and destination
+  are native HANDLES retained before the rename, so the helper no longer
+  resolves mutable source or destination pathnames for this operation.
+  Relative destination is a fixed leaf and the rename refuses replacement.
+  Its fixture creation/readback also uses root-relative native handles.
+  There is no recursive teardown.
+- **W25 initial trust acquisition remains SOURCE NO-GO:** the JS process
+  creates scratch by pathname and PowerShell validates that pathname
+  before obtaining the initial scratch HANDLE. A same-principal actor
+  can swap the entry before acquisition; post-acquisition identity checks
+  cannot establish independent ownership of that initial object. No
+  adversarial race was executed. Do not claim the whole laboratory
+  resistant to malicious same-user filesystem swaps.
 - **W25 P2-B addressed at source and on real local NTFS:** the independent
   helper checks `GetVolumeInformationByHandleW` against `NTFS` and
   `GetDriveTypeW` against `DRIVE_FIXED` on its retained scratch handle.
