@@ -11,6 +11,10 @@ const script = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfap
 const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const win = process.platform === "win32";
 
+// Keep disposable probe fixtures after each run. Recursive pathname cleanup
+// could delete a foreign subtree if a concurrent same-SID process replaced
+// a scratch directory; no native retained-handle delete exists in this lab.
+
 function run(args) {
   return spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-File", script, ...args], {
     encoding: "utf8", timeout: 25000, windowsHide: true,
@@ -19,7 +23,6 @@ function run(args) {
 
 test("issue 66 CFAPI: the native probe requires an explicit opt-in", { skip: !win }, async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-") );
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const file = path.join(directory, "local.txt");
   await fs.writeFile(file, "ordinary local content");
   const result = run(["-LiteralPath", file]);
@@ -30,7 +33,6 @@ test("issue 66 CFAPI: the native probe requires an explicit opt-in", { skip: !wi
 
 test("issue 66 CFAPI: real Windows native inspection identifies an ordinary file without hydrating", { skip: !win }, async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-") );
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const file = path.join(directory, "ordinary.txt");
   const bytes = Buffer.from("preserve ordinary bytes");
   await fs.writeFile(file, bytes);
@@ -60,7 +62,6 @@ test("issue 66 CFAPI: real Windows native inspection identifies an ordinary file
 
 test("issue 66 CFAPI: reparse-point inspection never follows the symlink target", { skip: !win }, async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-"));
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const target = path.join(directory, "target.txt");
   const link = path.join(directory, "link.txt");
   await fs.writeFile(target, "target is protected from modification");
@@ -80,7 +81,6 @@ test("issue 66 CFAPI: reparse-point inspection never follows the symlink target"
 
 test("issue 66 CFAPI: native probe fails closed for missing paths", { skip: !win }, async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-") );
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const result = run(["-AllowNativeProbe", "-LiteralPath", path.join(directory, "missing.txt")]);
   assert.notEqual(result.status, 0);
   assert.equal(result.stdout.trim(), "");
