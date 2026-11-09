@@ -9,16 +9,19 @@ checked-in PowerShell test script that compiles embedded C# interop with
 `Add-Type` and uses `NtCreateFile` with an existing directory `HANDLE` as
 `OBJECT_ATTRIBUTES.RootDirectory`. All **protected** file creation, writing,
 flushing, reading and deletion in the experiment use native root-relative file
-handles. The only pathname writes are the **adversarial simulation** (moving
-the trusted directory and planting a distinct replacement canary) and
-postcondition assertions. There is no fallback from a failed rooted operation
-to a new absolute file path.
+handles. **Pathname-based writes do occur** during the disposable fixture's
+initial setup (`fs.mkdtempSync`, `Directory.CreateDirectory`, owner-only DACL
+`Directory.SetAccessControl`), the adversarial rename/replacement/canary setup,
+postcondition verification and cleanup (`fs.rmSync`). The initial root is
+also opened by `CreateFileW` using an absolute path. These steps are explicitly
+OUTSIDE the protected post-open file-I/O boundary; there is no fallback from
+a failed rooted file operation to a new absolute filename.
 
 Run on a real Windows 10/11 NTFS host with Node 22:
 
 ```powershell
 $env:ROOTARK_ISSUE66_W25_NATIVE_IO_LAB='1'
-node --test --test-reporter=tap test/issue-66-w25-native-rooted-io-lab.test.js
+node --test --test-reporter=tap test/issue-66-w25-native-rooted-io-lab.test.js test/issue-66-w25-native-rename-identity.test.js
 Remove-Item Env:ROOTARK_ISSUE66_W25_NATIVE_IO_LAB
 ```
 
@@ -62,6 +65,41 @@ original #300 native ACL test trio remained 13 PASS / 0 FAIL without opt-in;
 the two new lab tests were correctly SKIP. WSL Ubuntu Node 22: 2 expected
 Windows-only SKIP / 0 FAIL.
 
+## Independent native HANDLE identity / rename reconciliation (W42 P2)
+
+The independent `test/support/issue-66-w25-native-rename-identity.ps1` does
+not reuse the original lab's C# interop and adds **no executable files**. It
+performs four bounded physical Windows/NTFS cases, with both `.NET
+Directory.Move` and direct native `MoveFileExW`, each with `CreateFileW` share
+mask **3** (`FILE_SHARE_READ | FILE_SHARE_WRITE`, **no FILE_SHARE_DELETE**)
+and share mask **0** (no sharing). It checks the root's `HANDLE` validity
+before and after rename and uses real `GetFileInformationByHandleEx(FileIdInfo)`
+volume/file identities. An old handle maps to **O1** before and after rename;
+the moved name also maps to **O1**, whereas a newly created replacement at
+the old absolute pathname maps to a *distinct* **O2**. A native
+`NtCreateFile(RootDirectory=oldHandle, 'child')` returns `NTSTATUS=0x00000000`
+and maps to the original child, not the replacement child.
+
+Actual Windows/NTFS outputs (mapped ephemeral identifiers, no raw file IDs,
+paths, security principals, ACLs, or user data):
+
+```
+ROOTARK_W25_RENAME_V2 mode=DOTNET share=3 handle=VALID move=SUCCESS win32LastError=NA_DOTNET ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V2 mode=WIN32 share=3 handle=VALID move=SUCCESS win32LastError=0 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V2 mode=DOTNET share=0 handle=VALID move=SUCCESS win32LastError=NA_DOTNET ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+ROOTARK_W25_RENAME_V2 mode=WIN32 share=0 handle=VALID move=SUCCESS win32LastError=0 ntstatus=0x00000000 rootBefore=O1 rootAfter=O1 moved=O1 replacement=O2 child=ORIGINAL
+```
+
+`win32LastError=0` is the actual `Marshal.GetLastWin32Error` returned following
+`MoveFileExW` on this machine; **GetLastError is not a meaningful independent
+security guarantee when the Win32 call succeeds**. `.NET Directory.Move`
+does not supply a corresponding direct native last-error, so its value is
+`NA_DOTNET`. The `NTSTATUS` is the actual return from rooted `NtCreateFile`.
+These findings prove that omitting `FILE_SHARE_DELETE` **does not by itself
+prevent a rename on the tested Windows host**; existing open handles continue
+referring to their original objects. The four-mode test rejects failure to
+move, same-ID replacement, handle invalidation, and misrouted relative opens.
+
 ## Still NOT established (release NO-GO)
 
 - Initial, authentic root acquisition: opening the root by pathname could race
@@ -73,7 +111,8 @@ Windows-only SKIP / 0 FAIL.
   handle**, not persistence of the original *name*. A moved root can disappear
   from its discoverable pathname. A cold reopen under the old name can reach
   the replacement. No release ACK should rely on that without additional
-  namespace custody/recovery semantics.
+  namespace custody/recovery semantics. A held handle with share=0 or share=3
+  is NOT itself an anti-rename lock, as independently reproduced above.
 - A `FileStream.Flush(true)` is not proof that directory names, journal
   checkpoint, or directory rename are durable after a Windows power cut.
   Atomic no-replace publication and reboot recovery are unimplemented.
