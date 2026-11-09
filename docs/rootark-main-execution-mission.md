@@ -569,3 +569,40 @@ flowchart TD
 ~~~
 
 **Disciplina de publicação:** este adendo pertence apenas à branch documental #251, preserva todos os snapshots passados e requer **peer independente do novo commit local antes de qualquer push fast-forward pelo prime**. Nenhum merge, deploy, cutover, edição de `Root/main`/#228 ou promoção a READY funcional está autorizado.
+
+## 2026-11-09 05:00 UTC — native containment experiment, admission ABA and open hosted gates
+
+**Incremental snapshot, not a revision of earlier observations.** The exact source and hosted evidence through the 05:00 UTC collection is recorded in [the corresponding validation matrix](validation/2026-11-07-rootark-wave-execution-status.md#checkpoint-native-source-and-hosted-gates--2026-11-09-0500-utc). GitHub still reports all five priority PRs **OPEN/Draft**, literal `Root/main=d5fbc110944a5437dbd5e9175f39dd97f5e433bc`, and #228 **CLOSED/unmerged**. No merge, production deployment, ZK10/R1 cutover, force push or main alteration occurred.
+
+| PR | Published SHA as observed | Verified progress versus remaining gate |
+| --- | --- | --- |
+| [#251](https://github.com/bielxdh3/Root.ark/pull/251) | `a483641e6d2b5fd5ce7604f1c9a65116e606c09b` | Append-only checkpoint, independent scoped document SOURCE GO, FF publication. [Hosted full 42562208232](https://github.com/bielxdh3/Root.ark/actions/runs/42562208232) remains **IN_PROGRESS** with Ubuntu Node22 SUCCESS; Windows canonical/mandatory pending. |
+| [#293](https://github.com/bielxdh3/Root.ark/pull/293) | `f9b604047c0634dccedcd99c8ae00f7f3fff075c` | Reviewed fixes preserved. [Hosted full 42561877204](https://github.com/bielxdh3/Root.ark/actions/runs/42561877204) **IN_PROGRESS** with Ubuntu SUCCESS and both Windows jobs pending; no regression established against this exact source. |
+| [#298](https://github.com/bielxdh3/Root.ark/pull/298) | `b586ac3597f06aa1d8f91c62dc45e3a12a3123b7` | Fast-forward **only two new inert native experiment/test files**, after independent worker20 **SOURCE GO limited to the standalone handle-relative helper** and prime MSVC `/W4 /WX` **Windows Node22 on E: NTFS 10/10 PASS**. Formal CodeQL on this same SHA still **FAILURE**, at engine `:401-402` and `:2604`; production JS restore is **NO-GO**. [Full hosted 42564258448](https://github.com/bielxdh3/Root.ark/actions/runs/42564258448) pending. |
+| [#300](https://github.com/bielxdh3/Root.ark/pull/300) | `407497b75e1a0316242371f3f33641f042b69d79` | Four fixes and two exact-SHA SOURCE GO previously published; focused hosted **7 SUCCESS/1 SKIP**, and [full 42561880440](https://github.com/bielxdh3/Root.ark/actions/runs/42561880440) still **IN_PROGRESS**, Ubuntu SUCCESS, Windows pending. Recovery required-v2 with >16,384 trash entries remains failclosed/manual. |
+| [#302](https://github.com/bielxdh3/Root.ark/pull/302) | `ce3d7ec4675a32455d844b60166ca32f627d3aca` | **8 SUCCESS/1 SKIP** existing exact-SHA checks; approved source unchanged, DEV-OFF `authorizesIo:false`, R1 custody authority not present. |
+
+**#67 / #298 — one narrow native proof, not a restore solution.** The published `b586ac35` experiments with `NtCreateFile` `RootDirectory` one component at a time, no-reparse tags, pinned `FileIdInfo` and share-denied renames/writers. It is not called from production and closes handles before returning. Separately the existing `services/restorePreimage.js:334-344` removed a *foreign concurrent inode* in an actual adversarial Windows NTFS and WSL/ext4 test; both formal HIGH alerts are real path-race blockers. Another **LOCAL ONLY** native WAL transaction prototype `91ae151d114873eefe13977e1cb1a15f390707c4` (parent `b586`, pending exact-SHA peer) passed **27 Windows Node22 real NTFS tests, 5 intentional known-gap skips** in a combined test. It reports manual recovery rather than `COMMITTED`; lacks tree restore, authenticated forward ownership, automatic crash replay and NTFS directory/powercut proof. Never connect it to destructive production rollback without those gates.
+
+**#66 — native adversarial P1/P2 prevents publishing batch admissions.** The experimental `d9c66`→`354b`→`cd29`→`8a448` sidecar admission chain was replayed on top of #300 `407497` in a **separate unpublished worktree**; broad focused tests passed **Windows Node22 57 PASS/3 SKIP** and **WSL Ubuntu Node22 true ext4 60 PASS**. Nevertheless independent worker20 and worker11 demonstrated on real NTFS/ext4 that a concurrent directory **ABA** swap accepts a signed observation that vanishes on cold reopen (**P2**) and path-based witness `unlink` can delete an external canary under temporary symlink/junction substitution (**P1**). Two deterministic negative RED tests were retained in local-only `06e5d1ae3f40c7de3e8f2c7c800a018ed31ac058` (parent `8a448`). This chain has **SOURCE NO-GO**, **was NOT pushed**, and requires rooted handle-relative create/link/unlink or an alternative sidecar-free authenticated admission protocol. Node pathname rechecks and green functional suites cannot remove this evidence.
+
+**#242 and physical limits.** The experimental PR #299 Windows CI failure `test/issue-242-p2p-ciphertext-fd-race.test.js` is now tied to a real stale NTFS `mtimeNs/ctimeNs` after in-place modification: a test returned the pre-write hash. A **LOCAL ONLY** two-pass hashing mitigation `a54018ad7dcf8bff2deb73a0caf1781ebaa0b533` passed focused Win/WSL tests, but an adversarial write **after** its second read still causes false acceptance; no unqualified security GO or push. #65 R1 remains off without genuine pre-upload owner-signed original-byte digests, complete multi-version inventory, independent off-host monotonic custody; native Windows 10 CFAPI positive, Android real Keystore/TEE and TURN/cross-NAT/physical powercut remain unproven.
+
+~~~mermaid
+flowchart TD
+  A["Draft published: #251 a483, #293 f9b, #298 b586, #300 407497, #302 ce3d"]
+  B["#298 CodeQL HIGH + concurrent restore data loss; native WAL research only"]
+  C["#66 sidecar P1 external unlink + P2 lost observation; source NO-GO"]
+  D["#242 NTFS stale timestamp mutation; mitigation incomplete"]
+  E["R1 off-host custody, Win10/Android/TURN and NTFS powercut proof absent"]
+  G{"Exact-SHA peer + hosted full CI + trustworthy custody and physical recovery?"}
+  H["NO: keep Draft, DEV-OFF; no merge/deploy/cutover"]
+  A --> G
+  B --> G
+  C --> G
+  D --> G
+  E --> G
+  G -->|"Gates still open"| H
+~~~
+
+**Release rule:** isolated source tests or SOURCE GO for a read-only helper are not a full product safety proof. Preserve signed history, the experimental negative tests, all worktrees and the prior roadmap; only new reviewed fast-forward child commits may be published, with no `Root/main` or #228 modifications.
