@@ -8,10 +8,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
-const { createAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
+const { createAclFailureDiagnostic, readCfapiFixtureFailureStage } =
+  require("../scripts/acl-test-failure-diagnostic");
 
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp");
 const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+const aclScript = path.join(__dirname, "support/issue-66-cfapi-acl-fixture.ps1");
 
 function run(file, args, cwd, timeout = 10000) {
   return spawnSync(file, args, { cwd, encoding: "utf8", timeout, windowsHide: true });
@@ -64,28 +66,8 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     await fs.mkdir(strictRoot);
     await fs.mkdir(exposedRoot);
     await fs.mkdir(inheritedRoot);
-    const aclScript = path.join(scratch, "fixture-acl.ps1");
-    diagnostic.stage("ACL_SCRIPT_WRITE");
-    await fs.writeFile(aclScript, [
-      "param([string]$Target, [string]$Expose)",
-      "$ErrorActionPreference = 'Stop'",
-      "$owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
-      "$acl = Get-Acl -LiteralPath $Target",
-      "$acl.SetOwner($owner)",
-      "$acl.SetAccessRuleProtection($true, $false)",
-      "foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($rule) | Out-Null }",
-      "$access = [System.Security.AccessControl.FileSystemRights]::FullControl",
-      "$inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
-      "$none = [System.Security.AccessControl.PropagationFlags]::None",
-      "$allow = [System.Security.AccessControl.AccessControlType]::Allow",
-      "$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($owner, $access, $inherit, $none, $allow))",
-      "if ($Expose -eq '1') {",
-      "  $world = [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::WorldSid, $null)",
-      "  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($world, $access, $inherit, $none, $allow))",
-      "}",
-      "if ($Expose -eq '2') { $acl.SetAccessRuleProtection($false, $true) }",
-      "Set-Acl -LiteralPath $Target -AclObject $acl",
-    ].join("\r\n"));
+    diagnostic.stage("ACL_SCRIPT_CHECK");
+    await fs.access(aclScript);
     for (const [dir, expose, stage] of [
       [strictRoot, "0", "ACL_OWNER_APPLY"],
       [exposedRoot, "1", "ACL_BROAD_APPLY"],
@@ -94,7 +76,11 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
       diagnostic.stage(stage);
       const applied = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", aclScript, dir, expose], scratch, 10000);
-      assert.equal(applied.status, 0, `disposable ACL setup failed: ${applied.stderr}`);
+      if (applied.status !== 0) {
+        const fixedStage = readCfapiFixtureFailureStage(stage, applied.stderr);
+        if (fixedStage) diagnostic.stage(fixedStage);
+      }
+      assert.equal(applied.status, 0, "disposable ACL setup failed");
     }
 
     const inspect = (dir) => {
