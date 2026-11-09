@@ -19,6 +19,34 @@ const NAMES = new Map([
   ["positive-shape.exe", "rootark-cfapi-positive-abi-"],
 ]);
 const FAIL = "UNTRUSTED_EXECUTABLE";
+const UNSAFE_BUILD_ENV = new Set([
+  "CL", "_CL_", "LINK", "_LINK_", "INCLUDE", "LIB", "LIBPATH",
+  "VCTOOLSINSTALLDIR", "VCINSTALLDIR", "VSINSTALLDIR", "VCTOOLSVERSION",
+  "VISUALSTUDIOVERSION", "WINDOWSSDKDIR", "WINDOWSSDKVERSION",
+  "UNIVERSALCRTSDKDIR", "UCRTVERSION", "PLATFORM", "PLATFORMTOOLSET",
+  "PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR",
+]);
+
+// The test-runner's inherited environment is not a compiler authority.
+// In particular a preseeded VCToolsInstallDir may redirect the vcvars inline
+// invocation to a caller-writable cl.exe, and inherited PATH can influence
+// compiler subprocess and DLL discovery. Use a minimal OS tools PATH until
+// the explicitly selected vcvars64.bat establishes MSVC/SDK variables.
+// This remains a test-only mitigation, not authentication of the toolchain.
+function sanitizeBuildEnvironment(from = process.env) {
+  const env = {};
+  for (const [key, value] of Object.entries(from)) {
+    const upper = key.toUpperCase();
+    if (UNSAFE_BUILD_ENV.has(upper) || /^_?_?VSCMD_/.test(upper)) continue;
+    env[key] = value;
+  }
+  env.Path = String.raw`C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem`;
+  env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+  env.ComSpec = String.raw`C:\Windows\System32\cmd.exe`;
+  env.SystemRoot = String.raw`C:\Windows`;
+  env.windir = String.raw`C:\Windows`;
+  return env;
+}
 
 function comparable(value) {
   const result = path.normalize(value);
@@ -111,8 +139,7 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
   const inline = `call "${vcvars}" >nul && if defined VCToolsInstallDir `
     + `"!VCToolsInstallDir!bin\\Hostx64\\x64\\cl.exe" /nologo /std:c++17 /W4 /WX /EHsc `
     + `/Fe:"${executable}" "${source}" ${libraries}`;
-  const env = { ...process.env };
-  for (const key of ["CL", "_CL_", "LINK", "_LINK_"]) delete env[key];
+  const env = sanitizeBuildEnvironment();
   const buildResult = spawnSync("C:\\Windows\\System32\\cmd.exe",
     ["/d", "/v:on", "/s", "/c", `"${inline}"`], {
     cwd: scratch, encoding: "utf8", timeout, windowsHide: true, env,
@@ -177,4 +204,5 @@ function runCompiledFixture(receipt, args, timeout = 10000) {
   });
 }
 
-module.exports = { buildCompiledFixture, runCompiledFixture, validateFixtureArgs };
+module.exports = { buildCompiledFixture, runCompiledFixture, validateFixtureArgs,
+  sanitizeBuildEnvironment };

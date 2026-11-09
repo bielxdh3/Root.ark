@@ -46,10 +46,23 @@ test("#66 CFAPI harness never resolves cmd or PowerShell by PATH", () => {
 test("#66 native ACL tool launches use literal paths rather than a dynamic executable dispatcher", () => {
   const code = fs.readFileSync(path.join(__dirname,
     "issue-66-cfapi-acl-preflight-native.test.js"), "utf8");
-  assert.ok(code.includes(String.raw`spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",`),
-    "vswhere launch must pass a fixed executable literal");
-  assert.ok(code.includes(String.raw`spawnSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",`),
-    "ACL setup must pass a fixed executable literal");
-  assert.doesNotMatch(code, /spawnSync\s*\(\s*(?:fixedTools\s*\[|file\b|tool\b)/,
-    "native ACL test must not dispatch executable values through a dynamic lookup");
+  // Check every spawnSync call site, not merely the presence of two expected
+  // strings: another launch through process.env, a new local variable or a
+  // lookup table must fail even if the two literal launches remain in place.
+  const launchTargets = (sourceText) => [...sourceText.matchAll(/\bspawnSync\s*\(\s*([^,\r\n]+)\s*,/g)]
+    .map((match) => match[1].trim());
+  const expected = [
+    String.raw`"C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe"`,
+    String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`,
+  ];
+  assert.deepEqual(launchTargets(code), expected,
+    "the only native ACL spawnSync targets must be two literal absolute Windows tool paths");
+  for (const injected of [
+    "spawnSync(process.env.UNTRUSTED_EXE, []);",
+    "spawnSync(dynamicExecutable, []);",
+    "spawnSync(fixedTools[tool], []);",
+  ]) {
+    assert.notDeepEqual(launchTargets(`${code}\n${injected}`), expected,
+      "an added dynamic executable launch must invalidate the static guard");
+  }
 });

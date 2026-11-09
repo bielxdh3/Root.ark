@@ -6,8 +6,34 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { buildCompiledFixture, runCompiledFixture } =
+const { buildCompiledFixture, runCompiledFixture, sanitizeBuildEnvironment } =
   require("./support/issue-66-cfapi-built-artifact");
+
+test("CFAPI compiler ignores inherited tool selectors and PATH before vcvars initializes", () => {
+  const incoming = {
+    Path: "C:\\untrusted\\bin", PATH: "C:\\other-untrusted\\bin",
+    ComSpec: "C:\\untrusted\\cmd.exe", COMSPEC: "C:\\other\\cmd.exe",
+    SystemRoot: "C:\\untrusted", windir: "C:\\untrusted",
+    VCToolsInstallDir: "C:\\untrusted\\vc", vctoolsinstalldir: "C:\\other\\vc",
+    VCINSTALLDIR: "C:\\untrusted", VSINSTALLDIR: "C:\\untrusted",
+    VSCMD_PREINIT_PATH: "C:\\untrusted\\bin", __VSCMD_PREINIT_PATH: "C:\\untrusted\\bin",
+    CL: "/link C:\\untrusted", _CL_: "/DUNTRUSTED", LINK: "/LIBPATH:C:\\untrusted",
+    _LINK_: "/LIBPATH:C:\\untrusted", INCLUDE: "C:\\untrusted", LIB: "C:\\untrusted",
+    LIBPATH: "C:\\untrusted", CUSTOM_NON_TOOLCHAIN: "expected",
+  };
+  const env = sanitizeBuildEnvironment(incoming);
+  assert.equal(env.CUSTOM_NON_TOOLCHAIN, "expected");
+  for (const key of Object.keys(env)) {
+    assert.ok(!/^(?:CL|_CL_|LINK|_LINK_|VCTOOLSINSTALLDIR|VCINSTALLDIR|VSINSTALLDIR|INCLUDE|LIB|LIBPATH)$/i.test(key));
+    assert.ok(!/^_?_?VSCMD_/i.test(key));
+  }
+  assert.equal(env.Path, String.raw`C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem`);
+  assert.equal(env.ComSpec, String.raw`C:\Windows\System32\cmd.exe`);
+  assert.equal(env.SystemRoot, String.raw`C:\Windows`);
+  assert.equal(env.windir, String.raw`C:\Windows`);
+  assert.equal(Object.hasOwn(env, "PATH"), false);
+  assert.equal(Object.hasOwn(env, "COMSPEC"), false);
+});
 
 test("CFAPI executable receipts refuse arbitrary TEMP contents even at a permitted name", (t) => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cfapi-acl-test-"));
