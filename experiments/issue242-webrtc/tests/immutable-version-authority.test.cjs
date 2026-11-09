@@ -167,3 +167,141 @@ test('session version revoked while async immutable callback awaits prevents roo
   assert.deepEqual(await pending, { status: 401 });
   assert.equal((await f.broker.createRoom({ headers: { owner: 'alice' } })).status, 200);
 });
+
+test('Proxy versionId read changes after validation must not reach a room or overwrite the pinned version', async t => {
+  let reads = 0;
+  const f = fixture(t, input => new Proxy(verified(input), {
+    get(target, field, receiver) {
+      if (field === 'versionId') return ++reads <= 5 ? versionId : null;
+      return Reflect.get(target, field, receiver);
+    },
+  }));
+  const response = await f.broker.createRoom(req());
+  assert.equal(response.status, 200);
+  assert.equal(response.boundObject.versionId, versionId,
+    'read of untrusted live Proxy value after validation must never pollute the room');
+  assert.equal(reads, 0, 'the pinned version must come exclusively from a descriptor snapshot');
+});
+
+test('Proxy get traps for owner, path, pin, hash and size cannot alter a trusted descriptor snapshot', async t => {
+  const fields = ['owner', 'boundObject', 'pin', 'sha256', 'bytes', 'versionId'];
+  for (const field of fields) {
+    await t.test(field, async sub => {
+      let gets = 0;
+      const f = fixture(sub, input => new Proxy(verified(input), {
+        get(target, key, receiver) {
+          if (key === field) {
+            gets++;
+            if (key === 'boundObject') return { folderId: 'elsewhere', fileName: 'wrong.bin' };
+            return key === 'bytes' ? -1 : null;
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      }));
+      const response = await f.broker.createRoom(req());
+      assert.equal(response.status, 200);
+      assert.equal(response.boundObject.versionId, versionId);
+      assert.equal(gets, 0, 'must not invoke an untrusted Proxy getter for ' + field);
+    });
+  }
+  for (const field of ['folderId', 'fileName']) {
+    await t.test('nested ' + field, async sub => {
+      let gets = 0;
+      const f = fixture(sub, input => ({
+        ...verified(input), boundObject: new Proxy({ ...input.boundObject }, {
+          get(target, key, receiver) {
+            if (key === field) { gets++; return 'wrong-name'; }
+            return Reflect.get(target, key, receiver);
+          },
+        }),
+      }));
+      const response = await f.broker.createRoom(req());
+      assert.equal(response.status, 200);
+      assert.equal(response.boundObject.versionId, versionId);
+      assert.equal(gets, 0, 'nested values must be read through own data descriptors');
+    });
+  }
+});
+
+test('invalid Proxy descriptor snapshots deny even when direct property reads look authorized', async t => {
+  const forged = [
+    ['owner', 'intruder'],
+    ['pin', 'c'.repeat(64)],
+    ['sha256', 'd'.repeat(64)],
+    ['bytes', 999],
+    ['versionId', null],
+    ['boundObject', { folderId: 'wrong', fileName: boundObject.fileName }],
+  ];
+  for (const [field, value] of forged) {
+    await t.test(field, async sub => {
+      const f = fixture(sub, input => new Proxy(verified(input), {
+        getOwnPropertyDescriptor(target, key) {
+          const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+          if (key === field) return { ...descriptor, configurable: true, value };
+          return descriptor;
+        },
+      }));
+      denied(await f.broker.createRoom(req()));
+    });
+  }
+});
+
+test('descriptor accessors and throwing Proxy reflection traps are denied without capabilities', async t => {
+  const variants = [
+    ['top accessor', input => Object.defineProperty(verified(input), 'versionId', {
+      configurable: true, get: () => versionId,
+    })],
+    ['nested accessor', input => Object.assign(verified(input), {
+      boundObject: Object.defineProperty({ ...input.boundObject }, 'fileName', {
+        configurable: true, get: () => boundObject.fileName,
+      }),
+    })],
+    ...['getPrototypeOf', 'ownKeys', 'getOwnPropertyDescriptor'].map(trap => [
+      'top trap ' + trap, input => new Proxy(verified(input), {
+        [trap]() { throw new Error('trap denied'); },
+      }),
+    ]),
+    ...['getPrototypeOf', 'ownKeys', 'getOwnPropertyDescriptor'].map(trap => [
+      'nested trap ' + trap, input => ({
+        ...verified(input), boundObject: new Proxy({ ...input.boundObject }, {
+          [trap]() { throw new Error('trap denied'); },
+        }),
+      }),
+    ]),
+  ];
+  for (const [name, factory] of variants) {
+    await t.test(name, async sub => {
+      const f = fixture(sub, factory);
+      denied(await f.broker.createRoom(req()));
+    });
+  }
+});
+
+test('version snapshot is retained unchanged while later asynchronous owner ACL recheck yields', async t => {
+  const entered = deferred();
+  const resume = deferred();
+  let reads = 0;
+  let checks = 0;
+  let target;
+  const f = fixture(t, input => {
+    target = verified(input);
+    return new Proxy(target, {
+      get(_object, key) { if (key === 'versionId') { reads++; return null; } return target[key]; },
+    });
+  }, { authorizeObject: async () => {
+    if (++checks === 2) {
+      entered.release();
+      await resume.promise;
+    }
+    return grant;
+  } });
+  const pending = f.broker.createRoom(req());
+  await entered.promise;
+  target.versionId = null;
+  resume.release();
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.equal(response.boundObject.versionId, versionId,
+    'after await the broker must use detached immutable primitive snapshot');
+  assert.equal(reads, 0, 'no direct Proxy reads after synchronous descriptor snapshot');
+});

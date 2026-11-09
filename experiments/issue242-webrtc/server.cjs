@@ -18,26 +18,38 @@ const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-peer', 'consent', 'signal']);
 
-function plainDataFields(value, fields) {
-  if (!object(value) || Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== fields.length) return false;
+function ownDataSnapshot(value, fields) {
+  if (!object(value) || Object.getPrototypeOf(value) !== Object.prototype) return null;
+  // Read the properties exactly once through own data descriptors, never
+  // through value.field (which can be a changing Proxy get trap).
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  return fields.every(field => Object.hasOwn(descriptors, field) &&
-    Object.hasOwn(descriptors[field], 'value'));
+  if (Reflect.ownKeys(descriptors).length !== fields.length) return null;
+  const snapshot = {};
+  for (const field of fields) {
+    const descriptor = descriptors[field];
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return null;
+    snapshot[field] = descriptor.value;
+  }
+  return snapshot;
 }
 
-function immutableVersionMatches(value, expected) {
-  if (!plainDataFields(value, ['owner', 'boundObject', 'pin', 'sha256', 'bytes', 'versionId']) ||
-    !plainDataFields(value.boundObject, ['folderId', 'fileName'])) return false;
-  return value.owner === expected.owner &&
-    value.boundObject.folderId === expected.boundObject.folderId &&
-    value.boundObject.fileName === expected.boundObject.fileName &&
-    value.pin === expected.pin && value.sha256 === expected.sha256 &&
-    value.bytes === expected.bytes &&
-    typeof value.versionId === 'string' &&
-    /^[a-zA-Z0-9_-]{16,128}$/.test(value.versionId) &&
-    !/^\d+$/.test(value.versionId) &&
-    value.versionId !== expected.pin && value.versionId !== expected.sha256;
+function immutableVersionSnapshot(value, expected) {
+  const snapshot = ownDataSnapshot(value,
+    ['owner', 'boundObject', 'pin', 'sha256', 'bytes', 'versionId']);
+  if (!snapshot) return null;
+  const boundObject = ownDataSnapshot(snapshot.boundObject, ['folderId', 'fileName']);
+  if (!boundObject || snapshot.owner !== expected.owner ||
+    boundObject.folderId !== expected.boundObject.folderId ||
+    boundObject.fileName !== expected.boundObject.fileName ||
+    snapshot.pin !== expected.pin || snapshot.sha256 !== expected.sha256 ||
+    snapshot.bytes !== expected.bytes ||
+    typeof snapshot.versionId !== 'string' ||
+    !/^[a-zA-Z0-9_-]{16,128}$/.test(snapshot.versionId) ||
+    /^\d+$/.test(snapshot.versionId) ||
+    snapshot.versionId === expected.pin || snapshot.versionId === expected.sha256) return null;
+  // All fields crossing awaits and entering the room are now detached
+  // ordinary primitives; no callback-returned Proxy is retained or reread.
+  return Object.freeze({ ...snapshot, boundObject: Object.freeze(boundObject) });
 }
 
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
@@ -514,8 +526,9 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
             pin: objectPin, sha256: objectDigest, bytes: objectSize,
           });
           const version = await authorizeImmutableVersion(context);
-          if (!immutableVersionMatches(version, context)) return { status: 403 };
-          immutableVersionId = version.versionId;
+          const versionSnapshot = immutableVersionSnapshot(version, context);
+          if (!versionSnapshot) return { status: 403 };
+          immutableVersionId = versionSnapshot.versionId;
           // The async authority may overlap a revocation or ciphertext
           // replacement. Recheck the owner's live ACL and exact bytes after it
           // resolves; these preflights still cannot replace an atomic custody
