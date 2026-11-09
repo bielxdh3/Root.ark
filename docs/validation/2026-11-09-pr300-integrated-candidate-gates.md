@@ -85,3 +85,34 @@ cut over, change `Root/main`, reopen #228, or remove adversarial RED
 fixtures and native labs. A later decision requires a new exact-SHA
 independent SOURCE GO, physical Windows Node 22/NTFS and WSL Node 22/ext4
 proofs, fully authorized root/image custody and successful hosted CI/CodeQL.
+
+## Later local test-only hardening (not a release gate)
+
+The integrated chain was extended with the independently reviewed
+`76c6a4cfd1031e124942607152042ad07d0fcf62`, which removes the
+mutable `build.cmd` from the ACL fixture and adds a never-resumed native
+image-section research probe. A further direct local child,
+`06e65b93e54ad679bfe5577b43b94ea75157e7fd`, removes the
+independent mutable `compile.cmd` execution paths in the deny-callback
+and positive-shape native fixtures. Both now produce fresh expected
+binaries through the allowlisted build-receipt helper, and a deliberately
+present malicious `compile.cmd` canary is never executed.
+
+The second child was verified with an exact-file RED before helper
+integration (**2 native tests rejected with `UNTRUSTED_EXECUTABLE`**)
+then GREEN. Windows E: NTFS Node 22 **16 PASS / 0 FAIL** for all seven
+focused CFAPI suites; immutable `git archive` of the new SHA extracted
+on Ubuntu WSL real `/dev/sdd` ext4, Node 22 **9 PASS / 7 Windows SKIP /
+0 FAIL** for the same seven files. The new child has author/committer
+`bielxdh3` and one Codex trailer, with clean worktree and diff.
+
+This mitigates **writable temporary shell-script execution** and
+unmediated fixture-name selection. However the common helper still
+closes the hashed EXE descriptor before pathname-based `spawnSync`.
+The receipts, PE-header validation, SHA-256 and pinned System32 shell
+path do **not** authenticate the Windows image bytes or DLLs loaded
+after process creation, nor exclude same-principal parent/leaf swaps,
+compiler substitution, or a malicious preexisting mapped writer. The
+product required-v2 ABA vulnerability, hostile ACL/owner custody and
+formal CodeQL failure are unchanged. **Operational SOURCE NO-GO and
+NO PUSH** persist; any future peer GO here is limited to test hardening.
