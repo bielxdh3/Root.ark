@@ -111,14 +111,29 @@ function serverEnv(dir, port, extra = {}) {
   };
 }
 
-function startServer(dir, extra = {}, localCrash = false) {
-  return freePort().then((port) => {
-    const child = spawn(process.execPath, ["-e", childSource(localCrash)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+function startServer(dir, extra = {}, localCrash = false, { beforeSpawn = null, onSpawn = null } = {}) {
+  return freePort().then(async (port) => {
+    if (beforeSpawn) await beforeSpawn(port);
+    const child = spawn(process.execPath, ["-e", childSource(localCrash)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    if (onSpawn) onSpawn(child);
     let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    // The free-port probe necessarily closes its socket before child spawn.
+    // Under parallel CI another listener may bind that port and answer the
+    // static /login.html request. Only the spawned child can confirm that it
+    // successfully bound the expected port; a foreign HTTP 200 is not ready.
+    let stdout = "";
+    const childListening = new Promise((resolve) => {
+      child.stdout.on("data", (chunk) => {
+        stdout = (stdout + chunk.toString()).slice(-8192);
+        if (stdout.split(/\r?\n/).some((line) =>
+          line.trim().startsWith("Servidor rodando em http://")
+          && line.trim().endsWith(`:${port}`))) resolve();
+      });
+    });
     const ready = (async () => { for (let i = 0; i < 150; i += 1) { try { await request(port, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 40)); } } throw new Error("server did not start"); })();
     const exited = new Promise((_, reject) => child.once("exit", (code, signal) => reject(new Error(`server exited before readiness: ${code || signal}; stderr=${stderr}`))));
-    return Promise.race([ready, exited]).then(() => ({ child, port, stderr: () => stderr }));
+    return Promise.race([Promise.all([ready, childListening]), exited]).then(() => ({ child, port, stderr: () => stderr }));
   });
 }
 
@@ -144,6 +159,28 @@ test("stop rejects when a process does not close after termination", { timeout: 
   Object.assign(child, { exitCode: null, signalCode: null, stdio: [null, null, null], pid: "not-a-pid" });
   child.kill = () => true;
   await assert.rejects(stop(child, 5), /did not close within 5ms/);
+});
+
+test("foreign HTTP listener cannot impersonate a freshly spawned WebDAV server", { timeout: 25_000 }, async () => {
+  const f = fixture();
+  let foreign;
+  let spawned;
+  try {
+    await assert.rejects(startServer(f.dir, {}, false, {
+      beforeSpawn: async (port) => {
+        // `freePort()` deliberately releases its reservation. Occupy the
+        // resulting port with an unrelated listener that answers readiness.
+        // The actual server child must fail to bind this stolen port.
+        foreign = http.createServer((_req, res) => res.writeHead(200).end("foreign"));
+        await new Promise((resolve) => foreign.listen(port, "127.0.0.1", resolve));
+      },
+      onSpawn: (child) => { spawned = child; },
+    }), /server exited before readiness|server did not start/);
+  } finally {
+    if (spawned) await stop(spawned);
+    if (foreign) await new Promise((resolve) => foreign.close(resolve));
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
 });
 
 function fixture() {
@@ -322,8 +359,22 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
     let second;
     try {
       first = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-delete" });
-      try { await move(f.dir, first.port); } catch {}
-      await waitFor(() => readJournal(f.dir)?.cloud?.state === "source_delete_uncertain");
+      const moveOutcome = await move(f.dir, first.port).then(
+        ({ status }) => ({ status }),
+        (error) => ({ transportCode: String(error?.code || "TRANSPORT_ERROR") }));
+      if (Number.isInteger(moveOutcome.status)) {
+        assert.ok([201, 202, 204].includes(moveOutcome.status),
+          `unexpected MOVE status before durable intent: ${moveOutcome.status}`);
+      }
+      await waitFor(() => readJournal(f.dir)?.cloud?.state === "source_delete_uncertain")
+        .catch((error) => {
+          const journal = readJournal(f.dir);
+          const operationCounts = calls(f.dir).reduce((counts, entry) => {
+            counts[entry.operation] = (counts[entry.operation] || 0) + 1;
+            return counts;
+          }, {});
+          throw new Error(`${error.message}; moveOutcome=${JSON.stringify(moveOutcome)}; childExit=${String(first.child.exitCode ?? first.child.signalCode)}; journalPhase=${String(journal?.phase || "absent")}; journalCloudState=${String(journal?.cloud?.state || "absent")}; providerOperations=${JSON.stringify(operationCounts)}; stderrTail=${first.stderr().slice(-1000)}`);
+        });
       await stop(first.child);
       const journal = readJournal(f.dir);
       assert.equal(journal.cloud.state, "source_delete_uncertain");
