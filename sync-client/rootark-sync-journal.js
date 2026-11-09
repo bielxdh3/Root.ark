@@ -639,6 +639,53 @@ class SyncJournal {
       }
     });
   }
+  async batchMarkSeenRemoteOnly(entries) {
+    // Inert until an independently reviewed, root-handle-bound remote-only
+    // caller exists. This cannot be used for signed WebDAV DELETE/MOVE pairs:
+    // each exact digest must already have an observed or admitted journal pin.
+    if (!Array.isArray(entries) || !entries.length || entries.length > 640) {
+      throw new Error("Invalid bounded remote-only acknowledgement batch");
+    }
+    const ids = new Set();
+    const frozen = [];
+    for (const entry of entries) {
+      const operationId = entry?.operationId;
+      const digest = entry?.digest;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof operationId !== "string" || !VALID_OPERATION_ID.test(operationId)
+        || typeof digest !== "string" || !VALID_DIGEST.test(digest)
+        || ids.has(operationId)) {
+        throw new Error("Invalid or duplicated remote-only admission evidence");
+      }
+      ids.add(operationId);
+      frozen.push({ operationId, digest });
+    }
+    await this.commit((next) => {
+      const pending = new Set(next.pending.map((item) => item.operationId));
+      const seen = new Set(next.seen);
+      const grouped = new Set(Object.values(next.atomicSignedGroups)
+        .flatMap((pair) => [pair.deleteId, pair.moveId]));
+      for (const { operationId, digest } of frozen) {
+        if (pending.has(operationId) || grouped.has(operationId)) {
+          throw new Error("Remote-only acknowledgement overlaps pending atomic work");
+        }
+        if (seen.has(operationId)) {
+          if (!Object.hasOwn(next.admitted, operationId)
+            || next.admitted[operationId] !== digest) {
+            throw new Error("Previously admitted remote-only evidence conflict");
+          }
+        } else if (!Object.hasOwn(next.observed, operationId)
+          || next.observed[operationId] !== digest) {
+          throw new Error("Remote-only acknowledgement requires exact durable observation");
+        }
+      }
+      for (const { operationId, digest } of frozen) {
+        if (!seen.has(operationId)) next.seen.push(operationId);
+        next.admitted[operationId] = digest;
+        delete next.observed[operationId];
+      }
+    });
+  }
   hasLocalAdmission(operationId, digest) {
     return VALID_OPERATION_ID.test(operationId) && VALID_DIGEST.test(digest)
       && ((Object.hasOwn(this.state.admitted, operationId)

@@ -58,7 +58,7 @@ async function checkPhysicalCollision(rootDir, relative, operation, trackedFiles
 async function preflightAndPinSignedList(options) {
   const { records, rootDir, journal, keyEpoch, fileKeyResolver,
     username, trustedDevicePublicKeys, revokedDeviceIds,
-    trackedFiles = Object.create(null) } = options;
+    trackedFiles = Object.create(null), beforeCommit = null } = options;
   if (!Array.isArray(records) || records.length > MAX_BATCH || !rootDir
     || !journal || typeof journal.batchObserveAdmission !== "function"
     || typeof fileKeyResolver !== "function" || typeof username !== "string"
@@ -111,6 +111,7 @@ async function preflightAndPinSignedList(options) {
       deny("Authorization expired during full LIST preflight", "authorization_expired");
     }
   }
+  if (beforeCommit) await beforeCommit();
   await journal.batchObserveAdmission(observations);
   return { operations: freezeSignedSnapshot(detached), observed: observations.length };
 }
