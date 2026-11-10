@@ -1726,3 +1726,101 @@ contract commits have no hosted CodeQL evaluation; the old
 remote #300 formal CodeQL is still red. No new workflows, remote
 push, merge, deploy or `Root/main` changes were performed.
 **RootSession remains fail-closed; RELEASE NO-GO.**
+
+### 2026-11-10 continuation — operational metadata failure-path deletion and historical user-name fence
+
+Baseline local integrated worktree was `4df28c6448eeb41bcf97e2db67cd6d8986d5ad14`;
+remote #300 remains **OPEN/Draft** at `d3a91c921c18e40d23d101958b487725e88e8d95`
+and `Root/main` at `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+Previous native W25 Windows handle-delete and legacy 16,385-entry
+NTFS/ext4 proofs were reused, **not rerun**.
+
+Operational metadata writers exposed **two real destructive error paths**:
+`sync-client/rootark-sync-engine.js` `durableJson()` for snapshot
+and eviction HEAD, and `sync-client/rootark-sync-journal.js`
+`durableWrite()` for the journal. Each created and fsynced an
+exclusive temp, closed its FD, attempted a replaceable rename, then
+deleted `temp` by mutable filename if rename failed. A same-principal
+writer can replace that entry between close and error cleanup.
+Physical Windows/Node22/NTFS and WSL/Node22/ext4 tests moved the
+true temp inode to a parked fixture, planted real foreign bytes at
+its original name, then injected EIO at the actual rename boundary.
+Both old error handlers attempted to destroy the substituted inode;
+the tests intercepted their actual `rm`/`unlink` calls **before**
+data loss: **RED 2 FAIL per OS**.
+
+Child `a36e4ec1f10b73a3f447f68dfd9281a3064c68e5` removes
+those two error-path cleanups. A failed/indeterminate journal or
+snapshot publication preserves the previously committed state
+and leaves the orphan `.tmp` inert, not a replay authority.
+Two default root temp prefixes were added to the internal namespace,
+and a separate observed **RED** showed a former `scanFiles()`
+would include a genuine failed snapshot temp as ordinary user
+content. Both the ordinary scanner and required-v2 physical
+recovery scanner now ignore these internal names; a fresh process
+legitimately completed exclusion while the debris stayed present,
+without emitting a remote signed DELETE. Initial focused code
+tests gave **Windows 5 PASS / WSL 5 PASS** and syntax/diff checks
+passed. **That child alone was SOURCE NO-GO**, however.
+
+An independent peer correctly identified a **P1 backwards-compatibility
+security regression**: these prefixed filenames were valid *user*
+paths in older builds. Silently omitting a previously tracked root
+file from `scanFiles()` made `_reconcileLocal()` prepare an outbound
+signed DELETE while that user file remained. A physical disposable
+historical-root test reproduced the attempted authorization path
+(intercepted before journal admission), **RED 1 FAIL Windows**.
+`ff41222e258206b38e301043f780bd48ac4dc254` adds a
+pre-reconcile and cold-open fail-closed `invalid_snapshot` guard
+for previously tracked files, remote-only objects, pinned and
+pending-eviction paths. It also reserves the new names in shared
+portable path admission for new operations, and handles exact
+root-local custom snapshot and journal names/temps in both
+scanners. Custom metadata nested beneath the user cache root
+is refused rather than silently synchronized; external custom
+metadata paths remain supported. A separate custom-path
+positive test passes without uploading or misclassifying the
+custom metadata.
+
+The shared path validator protects the prefixes at **any path
+segment**. The initial root-only historical guard still missed
+legitimate historical names such as
+`docs/.rootark-sync-index.json.tmp-old-user-file`. The peer
+revised its initial P1 concern after tracing `buildOperation →
+protocol.createOperation`: the new validator would reject this
+nested name **before signing/journal**, so the actual problem
+was a **P2 late invalid_operation / unavailable migration**, not
+a demonstrated signed remote delete. A physical nested-user test
+was RED for that incorrect outcome.
+`ddc8484fddf0b7257bb13ba8c29aa6adeedce973` now inspects
+all path segments for historically newly reserved names and
+returns explicit `invalid_snapshot` before reconciliation,
+on both Windows and WSL. `bcc478285fd0fa66d3b293d158bf1dc0442faa25`
+adds a separate already-open-engine/in-memory nested-path
+regression directly against `_reconcileLocal()`; **Windows and
+WSL Node22 each 1 PASS**, with real physical user-file bytes
+and no signed DELETE.
+
+The latest targeted cross-platform groups each passed
+**4 PASS / 0 FAIL** for failed metadata publication, root and
+nested historical names, and custom control paths; separate
+legitimate FOD custom-external-snapshot, checkpoint replay,
+journal O_EXCL/normal reopen groups each returned
+**4 PASS / 0 FAIL** in Windows and WSL. These were small,
+incremental tests, **not** a re-execution of 16,385 files,
+powercut or NTFS production CFAPI gates.
+
+**Security limitations:** No implementation here atomically
+guarantees a successful rename against an attacker who can
+replace mutable source/destination names. No privileged OS
+parent, independent owner-signed root custody, live native
+RootSession, monotonic rollback floor, real directory powercut
+proof, cold authoritative reacquisition or verified Windows 10
+CFAPI release evidence is available. Orphan cleanup deliberately
+remains pending and may require separately reviewed custody to
+avoid unsafe removal and unbounded disk use. The old hosted
+formal CodeQL job on remote Draft `d3a91c92` continues to
+report **4 HIGH / FAILURE**. Local source changes are **not**
+a new hosted PASS. No GitHub Actions workflow, remote push,
+merge, deploy or `Root/main` mutation was performed.
+**Product RELEASE NO-GO; mission incomplete.**
