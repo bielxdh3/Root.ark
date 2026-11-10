@@ -704,7 +704,8 @@ test("issue 66: Linux genesis promotion cannot overwrite a foreign ledger head",
 });
 
 test("issue 66: crash after exclusive genesis link but before retiring stage fails closed", {
-  skip: process.platform !== "linux" && "Linux held genesis publication and hard crash",
+  skip: !["linux", "win32"].includes(process.platform)
+    && "Windows NTFS or Linux ext4 exclusive genesis publication and hard crash",
 }, async (t) => {
   const f = await fixture(t, "genesis-linked-before-unlink-crash");
   const childSource = String.raw`
@@ -784,6 +785,56 @@ test("issue 66: exclusive Linux genesis publication never overwrites a competing
   } finally { fsp.link = originalLink; }
   assert.equal(injected, true);
   assert.equal(await fsp.readFile(headPath, "utf8"), "FOREIGN_HEAD_NO_REPLACE");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: Windows NTFS genesis publication cannot overwrite a competing head", {
+  skip: process.platform !== "win32" && "Windows NTFS exclusive genesis head publication",
+}, async (t) => {
+  const f = await fixture(t, "windows-competing-genesis-head");
+  const headPath = path.join(f.ledger, "head.json");
+  const originalRename = fsp.rename;
+  const originalLink = fsp.link;
+  let injected = false;
+  let foreignHeadOverwritten = false;
+  const inject = async (source, destination) => {
+    if (!injected && path.basename(String(source)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(destination)) === "head.json") {
+      injected = true;
+      await fsp.writeFile(headPath, "FOREIGN_HEAD_MUST_NOT_CHANGE", { flag: "wx" });
+    }
+  };
+  fsp.rename = async (source, destination, ...args) => {
+    await inject(source, destination);
+    const result = await originalRename(source, destination, ...args);
+    if (path.basename(String(source)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(destination)) === "head.json") {
+      foreignHeadOverwritten = (await fsp.readFile(headPath, "utf8"))
+        !== "FOREIGN_HEAD_MUST_NOT_CHANGE";
+    }
+    return result;
+  };
+  fsp.link = async (source, destination, ...args) => {
+    await inject(source, destination);
+    return originalLink(source, destination, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.rename = originalRename;
+    fsp.link = originalLink;
+  }
+  assert.equal(injected, true, "must reach the real genesis head publication syscall");
+  assert.equal(foreignHeadOverwritten, false,
+    "no publication syscall may overwrite the competing head, even if later cleanup removes it");
+  assert.equal(await fsp.readFile(headPath, "utf8"), "FOREIGN_HEAD_MUST_NOT_CHANGE",
+    "Windows must not overwrite a competing head with an untrusted rename");
+  assert.equal(failure?.code, "invalid_snapshot",
+    "an existing head must deny publication instead of completing the eviction");
+  assert.match(failure.message, /Existing genesis head blocks exclusive publication/);
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
   verifyNoSignedDelete(f, before);
 });

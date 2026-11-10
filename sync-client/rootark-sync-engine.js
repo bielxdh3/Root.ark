@@ -1158,10 +1158,49 @@ async function promoteStagedEvictionGenesis(rootDir, staged) {
       if (trash) await trash.close();
       if (root) await root.close();
     }
+  } else if (process.platform === "win32") {
+    // A Windows RenameFile over a competing head can silently replace it,
+    // even after the earlier existence preflight. NTFS hard-link creation
+    // refuses an existing destination atomically. This is only a legacy
+    // no-overwrite fence; same-SID directory substitution and durability
+    // still require native RootDirectory handles and an external custodian.
+    const source = await fsp.lstat(staged.file, { bigint: true });
+    if (!source.isFile() || source.isSymbolicLink()
+      || source.nlink !== 1n || source.size > 8192n) {
+      fail("Unsafe staged genesis publication source", "invalid_snapshot");
+    }
+    let candidate;
+    try { candidate = JSON.parse(await fsp.readFile(staged.file, "utf8")); }
+    catch { fail("Invalid staged genesis publication bytes", "invalid_snapshot"); }
+    if (!validEvictionLedgerHead(candidate)
+      || candidate.epoch !== staged.head.epoch
+      || candidate.sequence !== 0 || candidate.digest !== EVICTION_LEDGER_ZERO
+      || !sameFileVersion(source, await fsp.lstat(staged.file, { bigint: true }))) {
+      fail("Staged genesis changed before publication", "invalid_snapshot");
+    }
+    try { await fsp.link(staged.file, headFile); }
+    catch (error) {
+      if (error.code === "EEXIST") {
+        fail("Existing genesis head blocks exclusive publication", "invalid_snapshot");
+      }
+      throw error;
+    }
+    // A concurrent writer might still have exchanged pathnames between
+    // checks. On any identity mismatch retain both names for manual review:
+    // do not unlink a potentially foreign staged file.
+    const published = await fsp.lstat(headFile, { bigint: true });
+    const remaining = await fsp.lstat(staged.file, { bigint: true });
+    if (!published.isFile() || published.isSymbolicLink()
+      || !remaining.isFile() || remaining.isSymbolicLink()
+      || !sameFileIdentity(source, published)
+      || !sameFileIdentity(source, remaining)) {
+      fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
+    }
+    await fsp.unlink(staged.file);
   } else {
-  await fsp.rename(staged.file, headFile);
-  await fsyncEvictionDirectory(directory);
-  await fsyncEvictionDirectory(staged.trash);
+    await fsp.rename(staged.file, headFile);
+    await fsyncEvictionDirectory(directory);
+    await fsyncEvictionDirectory(staged.trash);
   }
   const promoted = await readEvictionLedger(rootDir, staged.head.epoch);
   if (promoted.entries.size || !promoted.head
