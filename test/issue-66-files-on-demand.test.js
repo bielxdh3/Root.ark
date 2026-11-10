@@ -861,6 +861,72 @@ test("issue 66: a physically rebound FOD marker never authorizes a foreign inode
   assert.equal(state.pushes, pushesBefore, "a failed root-mode admission must not push a signed operation");
 });
 
+test("issue 66: failed FOD hydration cannot delete a physically substituted inbound temporary", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "authenticated recovery payload",
+  });
+  const client = await open();
+  const target = path.join(root, "docs", "restore.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshot);
+  const storeBefore = JSON.stringify(store.list("alice"));
+  const pushesBefore = state.pushes;
+  const foreignBytes = "foreign temporary must never be removed";
+  const parked = path.join(path.dirname(root), "parked-original-inbound-for-adversarial-test");
+  const originalRename = fsp.rename;
+  const originalRm = fsp.rm;
+  let planted = false;
+  let attemptedForeignRemoval = false;
+  let temporary = null;
+  fsp.rename = async (source, destination, ...rest) => {
+    if (!planted && path.resolve(String(destination)) === path.resolve(target)
+      && String(source).includes(".tmp-")) {
+      await originalRename(source, parked);
+      await fsp.writeFile(source, foreignBytes, { flag: "wx" });
+      planted = true;
+      temporary = String(source);
+      throw Object.assign(new Error("physical inbound publish EIO after temp replacement"), { code: "EIO" });
+    }
+    return originalRename(source, destination, ...rest);
+  };
+  fsp.rm = async (candidate, options) => {
+    if (planted && path.resolve(String(candidate)) === path.resolve(temporary)) {
+      attemptedForeignRemoval = true;
+      // Trap only the destructive syscall, retaining the physical foreign
+      // inode for assertions; the rest of the transaction is real NTFS/ext4.
+      return;
+    }
+    return originalRm(candidate, options);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/restore.txt"), { code: "EIO" });
+  } finally {
+    fsp.rename = originalRename;
+    fsp.rm = originalRm;
+  }
+  assert.equal(planted, true, "real inbound temp must be moved and physically replaced");
+  assert.equal(attemptedForeignRemoval, false,
+    "failed publish must not issue pathname rm against a substituted foreign inode");
+  assert.equal(await fsp.readFile(temporary, "utf8"), foreignBytes);
+  assert.equal(await fsp.readFile(parked, "utf8"), "authenticated recovery payload");
+  assert.equal(await exists(target), false, "failed incoming hydration must not claim a local cache");
+  assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), storeBefore);
+  assert.equal(state.pushes, pushesBefore, "inbound failure may not publish a signed operation");
+  assert.equal(path.basename(temporary).startsWith(".rootark-sync-index.json.tmp-inbound-"), true,
+    "a failed inbound write must leave inert root-control debris, never user-path debris");
+  const cold = await open();
+  const physical = await cold.scanFiles();
+  assert.equal(Object.hasOwn(physical, path.basename(temporary)), false,
+    "a cold FOD scan must not upload an uncertain payload temporary as a user file");
+  assert.equal(await cold.materializeRemote("docs/restore.txt"), true,
+    "legitimate cold hydration must remain available after a failed publish");
+  assert.equal(await fsp.readFile(target, "utf8"), "authenticated recovery payload");
+  assert.equal(await fsp.readFile(temporary, "utf8"), foreignBytes);
+  assert.equal(JSON.stringify(store.list("alice")), storeBefore);
+  assert.equal(state.pushes, pushesBefore, "cold recovery may not sign a foreign temp or delete");
+});
+
 test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root marker", async (t) => {
   const { root, adapter, key } = await setup(t, {});
   await fsp.mkdir(root, { recursive: true });

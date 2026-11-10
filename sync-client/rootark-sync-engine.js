@@ -745,6 +745,27 @@ async function durableJson(filePath, value) {
     throw error;
   }
 }
+// The default snapshot temp prefix is already a reserved, nonauthorizing
+// root-local namespace in BOTH normal scanning and cold required-v2 replay.
+// Keep failed authenticated inbound payloads there, rather than beside a user
+// target where an orphan could later be uploaded as a new user file.
+// There must be no pathname unlink/rm in this helper: a same-SID/UID writer
+// can replace the temp entry after the held handle closes or a rename fails.
+// This only protects cooperative failure cleanup. Successful pathname rename
+// still requires independent root custody before it can authorize native IO.
+async function publishInboundPayload(rootDir, target, bytes, prepareTarget = null) {
+  const temporary = path.join(rootDir,
+    `.rootark-sync-index.json.tmp-inbound-${process.pid}-${crypto.randomUUID()}`);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_SYNC || 0);
+  const handle = await fsp.open(temporary, flags, 0o600);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally { await handle.close(); }
+  if (prepareTarget) await prepareTarget();
+  await fsp.rename(temporary, target);
+}
 
 // A bounded, per-object write-ahead snapshot overlay. Full snapshots remain
 // the authoritative compaction format; small independently synced PREPARE and
@@ -3763,12 +3784,11 @@ class SyncEngine {
         const movedStats = await fsp.lstat(target, { bigint: true });
         if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
       } else {
+        // Preserve the original denial-before-write ordering when a MOVE
+        // would replace existing FOD bytes: native custody must refuse it
+        // without first creating a speculative payload temporary.
         if (await exists(target)) await this.stageExisting(target);
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        try {
-          await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
-          await fsp.rename(temporary, target);
-        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+        await publishInboundPayload(this.rootDir, target, movePayload);
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
@@ -3802,12 +3822,8 @@ class SyncEngine {
           }
         }
       } else {
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
-        try {
-          if (await exists(target)) await this.stageExisting(target);
-          await fsp.rename(temporary, target);
-        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+        await publishInboundPayload(this.rootDir, target, plaintext,
+          async () => { if (await exists(target)) await this.stageExisting(target); });
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
