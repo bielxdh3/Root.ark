@@ -32,6 +32,13 @@
 #define UNICODE_LEAF "caf\303\251-\344\270\255-\360\237\230\200.bin"
 #define TRUSTED_BYTES "TRUSTED_ORIGINAL"
 #define FOREIGN_BYTES "FOREIGN_ORIGINAL"
+#define STAGE_PROOF ".rootark-w3-staged-v1"
+#define JOURNAL_PROOF ".rootark-w3-journal-v1"
+#define PUBLISHED_PROOF ".rootark-w3-committed-v1"
+#define COMMIT_PROOF ".rootark-w3-commit-marker-v1"
+#define STAGE_PAYLOAD "STAGED_ROOT_CANARY_V1"
+#define JOURNAL_PAYLOAD "PREPARED_V1"
+#define COMMIT_PAYLOAD "COMMITTED_V1"
 
 typedef struct {
   int active;
@@ -42,6 +49,7 @@ typedef struct {
   int stream_done;
   int seeded;
   int raw_seeded;
+  int txn_phase; // 0=empty, 1=prepared, 2=published, 3=indeterminate
   char token[33];
 } lab_session;
 
@@ -130,7 +138,9 @@ static int write_owned(int dirfd, const char *name, const char *content) {
 }
 
 static int marker_equals(int dirfd, const char *name, const char *expected) {
-  int fd = fd_openat2(dirfd, name, O_RDONLY, 0);
+  // Never block a helper before fstat if a same-UID fixture writer installs
+  // a FIFO. A non-regular descriptor fails the held-file check below.
+  int fd = fd_openat2(dirfd, name, O_RDONLY | O_NONBLOCK, 0);
   if (fd < 0) return 0;
   struct stat st;
   char bytes[64];
@@ -198,6 +208,7 @@ static void release_handles(lab_session *session) {
   session->stream_done = 0;
   session->seeded = 0;
   session->raw_seeded = 0;
+  session->txn_phase = 0;
   memset(session->token, 0, sizeof(session->token));
 }
 
@@ -286,6 +297,7 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
   session->stream_done = 0;
   session->seeded = 0;
   session->raw_seeded = 0;
+  session->txn_phase = 0;
   memcpy(session->token, token, sizeof(session->token));
   session->active = 1;
   return result_text(env, token);
@@ -432,7 +444,7 @@ static napi_value native_read(napi_env env, napi_callback_info info) {
   char leaf[256];
   if (!leaf_name(env, argv[1], leaf))
     return fail(env, "NATIVE_LEAF_REJECTED");
-  int file = fd_openat2(dirfd(session->held), leaf, O_RDONLY, 0);
+  int file = fd_openat2(dirfd(session->held), leaf, O_RDONLY | O_NONBLOCK, 0);
   if (file < 0) return fail(env, "NATIVE_OPEN_DENIED");
   struct stat st;
   if (fstat(file, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
@@ -462,6 +474,63 @@ static napi_value native_read(napi_env env, napi_callback_info info) {
   if (napi_create_buffer_copy(env, size, content, NULL, &result) != napi_ok)
     return fail(env, "NATIVE_API_FAILED");
   return result;
+}
+
+// Fixed-name transactional rehearsal only. It exercises real fd-relative
+// exclusive stage, fsync, journal and no-overwrite publication, but the lab
+// parent is SAME-UID writable and lacks an independent monotonic custodian.
+// Never export these methods as product RootSession authority.
+static int txn_lab_enabled(void) {
+  const char *flag = getenv("ROOTARK_ISSUE66_W3_TXN_LAB");
+  return flag && strcmp(flag, "1") == 0;
+}
+
+static napi_value stage_proof(napi_env env, napi_callback_info info) {
+  napi_value argv[3];
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
+    return fail(env, "NATIVE_TOKEN_REJECTED");
+  if (!txn_lab_enabled()) return fail(env, "NATIVE_TXN_TEST_DISABLED");
+  lab_session *session = session_for(env, info);
+  int held = dirfd(session->held);
+  if (session->txn_phase != 0 || !plain_directory(held, 1))
+    return fail(env, "NATIVE_TXN_PHASE_REJECTED");
+  // Any uncertain failure permanently blocks this lab session's transaction
+  // rather than permitting a blind second admission after partial writes.
+  session->txn_phase = 3;
+  if (!write_owned(held, STAGE_PROOF, STAGE_PAYLOAD) || fsync(held) != 0 ||
+      !write_owned(held, JOURNAL_PROOF, JOURNAL_PAYLOAD) || fsync(held) != 0)
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  session->txn_phase = 1;
+  return result_text(env, "LAB_TXN_PREPARED");
+}
+
+static napi_value publish_proof(napi_env env, napi_callback_info info) {
+  napi_value argv[3];
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
+    return fail(env, "NATIVE_TOKEN_REJECTED");
+  if (!txn_lab_enabled()) return fail(env, "NATIVE_TXN_TEST_DISABLED");
+  lab_session *session = session_for(env, info);
+  int held = dirfd(session->held);
+  if (session->txn_phase != 1 || !plain_directory(held, 1))
+    return fail(env, "NATIVE_TXN_PHASE_REJECTED");
+  if (!marker_equals(held, STAGE_PROOF, STAGE_PAYLOAD) ||
+      !marker_equals(held, JOURNAL_PROOF, JOURNAL_PAYLOAD)) {
+    session->txn_phase = 3;
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  }
+  errno = 0;
+  if (syscall(SYS_renameat2, held, STAGE_PROOF,
+              held, PUBLISHED_PROOF, RENAME_NOREPLACE) != 0) {
+    if (errno == EEXIST) return fail(env, "NATIVE_TXN_NO_REPLACE_CONFLICT");
+    session->txn_phase = 3;
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  }
+  session->txn_phase = 3;
+  if (fsync(held) != 0 || !write_owned(held, COMMIT_PROOF, COMMIT_PAYLOAD) ||
+      fsync(held) != 0)
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  session->txn_phase = 2;
+  return result_text(env, "LAB_TXN_COMMITTED");
 }
 
 static napi_value swap_to_foreign(napi_env env, napi_callback_info info) {
@@ -549,6 +618,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"beginStream", NULL, begin_stream, NULL, NULL, NULL, napi_default, session},
     {"nextStreamPage", NULL, next_stream_page, NULL, NULL, NULL, napi_default, session},
     {"read", NULL, native_read, NULL, NULL, NULL, napi_default, session},
+    {"stageProof", NULL, stage_proof, NULL, NULL, NULL, napi_default, session},
+    {"publishProof", NULL, publish_proof, NULL, NULL, NULL, napi_default, session},
     {"swapToForeign", NULL, swap_to_foreign, NULL, NULL, NULL, napi_default, session},
     {"restoreOriginal", NULL, restore_original, NULL, NULL, NULL, napi_default, session},
     {"probeExistingMount", NULL, probe_existing_mount, NULL, NULL, NULL, napi_default, session},

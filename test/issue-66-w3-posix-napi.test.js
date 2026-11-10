@@ -18,6 +18,7 @@ const enabled = process.platform === "linux" &&
 // fixture. Require a separate opt-in so normal CI and repeated N-API tests
 // never silently consume that inode/disk budget.
 const stressEnabled = enabled && process.env.ROOTARK_ISSUE66_W3_STREAM_STRESS === "1";
+const txnEnabled = enabled && process.env.ROOTARK_ISSUE66_W3_TXN_LAB === "1";
 const source = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/native_bridge.c");
 let addon;
 let addonPath;
@@ -192,6 +193,98 @@ test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded
     assert.throws(() => bridge.nextStreamPage(token), /NATIVE_TOKEN_REJECTED/);
     assert.throws(() => requireNativeRecoveryAuthority(bridge),
       (e) => e.code === "root_session_unverified_authority");
+  });
+
+test("#66 W3 native fixed stage and durable no-replace publication stay bound to A while B occupies its path",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const beforeNames = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !beforeNames.has(name));
+    assert.equal(created.length, 1);
+    const parent = path.join(home, created[0]);
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    assert.throws(() => bridge.stageProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+    assert.equal(bridge.read(token, ".rootark-w3-staged-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.equal(bridge.read(token, ".rootark-w3-journal-v1").toString(), "PREPARED_V1");
+    assert.equal(bridge.swapToForeign(token), "HELD_ORIGINAL_FOREIGN_AT_NAME");
+    assert.equal(fs.readFileSync(path.join(parent, "held", "original.bin"), "utf8"), "FOREIGN_ORIGINAL");
+    assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false);
+    assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false,
+      "native publication must not write B under the rebound pathname");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+    assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.equal(bridge.read(token, ".rootark-w3-commit-marker-v1").toString(), "COMMITTED_V1");
+    assert.equal(bridge.restoreOriginal(token), "ORIGINAL_RESTORED_FOREIGN_RETAINED");
+    assert.equal(fs.readFileSync(path.join(parent, "held", ".rootark-w3-committed-v1"), "utf8"),
+      "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.existsSync(path.join(parent, "foreign-parked", ".rootark-w3-committed-v1")), false);
+    assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TOKEN_REJECTED/);
+    assert.throws(() => requireNativeRecoveryAuthority(bridge),
+      (error) => error.code === "root_session_unverified_authority");
+  });
+
+test("#66 W3 native publication refuses a same-UID destination collision without replacing foreign bytes",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const held = path.join(home, created[0], "held");
+    const foreignDest = path.join(held, ".rootark-w3-committed-v1");
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    fs.writeFileSync(foreignDest, "FOREIGN_NOT_TO_REPLACE", { flag: "wx", mode: 0o600 });
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_NO_REPLACE_CONFLICT/);
+    assert.equal(fs.readFileSync(foreignDest, "utf8"), "FOREIGN_NOT_TO_REPLACE");
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+    assert.equal(bridge.read(token, ".rootark-w3-staged-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+  });
+
+test("#66 W3 native stage detects a separate same-UID writer's pre-commit in-place corruption",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const held = path.join(home, created[0], "held");
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    const stagePath = path.join(held, ".rootark-w3-staged-v1");
+    const attacker = spawnSync(process.execPath, ["-e",
+      "require('node:fs').writeFileSync(process.argv[1], 'SAME_UID_FOREIGN_BYTES')", stagePath], {
+      cwd: held, timeout: 5000, encoding: "utf8", maxBuffer: 4096,
+      env: { PATH: "/usr/bin:/bin", LANG: "C" },
+    });
+    assert.equal(attacker.status, 0, attacker.stderr);
+    assert.equal(fs.readFileSync(stagePath, "utf8"), "SAME_UID_FOREIGN_BYTES");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_INDETERMINATE/);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-committed-v1")), false);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+  });
+
+test("#66 W3 native stage and publish cannot be enabled by general NAPI lab flag alone",
+  { skip: !enabled || txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    assert.throws(() => bridge.stageProof(token), /NATIVE_TXN_TEST_DISABLED/);
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_TEST_DISABLED/);
+    assert.throws(() => bridge.read(token, ".rootark-w3-staged-v1"), /NATIVE_OPEN_DENIED/);
   });
 
 test("#66 W3 Node Worker environments own separate native descriptors and session tokens",

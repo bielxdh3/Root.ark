@@ -108,6 +108,44 @@ exists. The separate read-only `probeExistingMount` verifies `NO_XDEV`
 rejects existing Linux `/proc` traversal from `/`; it **does not** inject a
 bind mount under the retained directory.
 
+## Experimental held-root stage and no-replace publication
+
+With both `ROOTARK_ISSUE66_W3_NAPI_LAB=1` **and** the separate native
+`ROOTARK_ISSUE66_W3_TXN_LAB=1` opt-in, the **lab-only** functions
+`stageProof(token)` and `publishProof(token)` operate on four **fixed native
+leaf names**; no user-supplied destination, payload, path or fd is accepted:
+
+- `stageProof`: exclusive `openat2` create and `fsync` of an immutable-by-
+  convention staging canary; fsync the pinned directory; exclusive create
+  and fsync a `PREPARED_V1` rehearsal journal; fsync the pinned directory
+  again. Partial failures move this native lab session to an indeterminate
+  phase and do **not** perform unchecked cleanup.
+- `publishProof`: verify the two fixed native canaries by no-follow,
+  nonblocking held fd reads; perform `renameat2(RENAME_NOREPLACE)` from the
+  fixed stage to fixed published name **within the same retained A dirfd**;
+  fsync its directory; exclusively create and fsync the `COMMITTED_V1`
+  marker and its directory. An occupied destination returns
+  `NATIVE_TXN_NO_REPLACE_CONFLICT` without overwriting the foreign file.
+  A failed flush or uncertain transition returns `NATIVE_TXN_INDETERMINATE`.
+
+WSL Node22/ext4 physical tests verify that stage and publication remain
+attached to A while B occupies A's pathname, B has no published file,
+restoration returns the published canary to the original A, and a
+same-UID test writer's colliding destination remains byte-for-byte intact.
+The tests also verify token/session phase rejection and refusal when the
+separate native transaction opt-in is absent. Files are retained for audit.
+
+**Not a crash-safe production transaction:** the journal is a fixed
+disposable plaintext canary, **not signed**, nor held by an independent
+custodian or monotonic counter. The same UID can modify the staging file
+or its parent between native syscalls. There is no `unlinkat`, bounded
+rollback, cold authority reacquisition, reliable durable commit after
+powercut, anti-rollback proof or Windows implementation. A source-level
+test of these two functions cannot authorize arbitrary user writes,
+DELETE/restore, or the native `RootSession` activation. Their contribution
+is limited to real fd-relative syscall ordering and no-replace collision
+rejection on an intentionally disposable isolated ext4 fixture.
+
 ## Evidence and remaining NO-GO
 
 Physical TDD on WSL Ubuntu Linux 6.18.33.1, ext4 HOME, Node v22.22.1,
