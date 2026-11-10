@@ -1676,6 +1676,12 @@ class SyncEngine {
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
       || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return null;
 
+    // The destination is outside the selected scope but a tracked origin is
+    // inside it. Reconciliation can stage/rename/unlink that local origin via
+    // paths without passing through _apply(). Deny BEFORE remote verification
+    // side effects or any local reads, for direct and pull callers alike.
+    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+
     // Reconciliation can stage/rename the origin and then discard its tracked
     // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
     // sidestep the local pin policy merely because _apply() is not called.

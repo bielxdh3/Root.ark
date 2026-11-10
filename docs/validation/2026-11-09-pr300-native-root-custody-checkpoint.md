@@ -650,3 +650,71 @@ same-SID writer exclusion, native image custody, cold power-cut recovery or
 rollback resistance. Do not integrate/push/release until the source-specific
 review, root-wide P1 and published CodeQL gates are resolved. No merge,
 deploy, cutover, or `Root/main` modifications have been made.
+
+#### Exact-code follow-up: real 16,385-entry non-FOD recovery on both filesystems
+
+After committing the code and FOD regressions as
+`5a1b1f2112bc13bcf53eb3ed86e5fab04b23d65e`, the same exact source
+was exercised again against the named physical test
+`issue 66 P2: hard crash with >16384 preexisting trash entries recovers
+required-v2 before PREPARE` in
+`test/issue-66-eviction-empty-ledger-gap-p2.test.js`. That test creates
+**16,385 separate legitimate trash files per fixture** and covers both
+`staged` and `active` zero-PREPARE recovery scenarios. Both test runs
+completed successfully:
+
+- Windows Node v22.23.4 / NTFS, with `TEMP` and `TMP` directed to
+  `E:\servidor\.tmp`: **1 PASS / 0 FAIL**, ~24.9s.
+- Ubuntu WSL Node v22.22.1 / native `/home/bielx` ext4 on `/dev/sdd`:
+  **1 PASS / 0 FAIL**, ~18.1s.
+
+These tests are **non-Files-On-Demand legitimate required-v2 crash
+recovery**; they do not provide a safe A→B→A result or authorize the
+cross-instance downgrade, and they do not attest a native root writer,
+hard-power-loss durability or an external monotonic floor. The deliberately
+failing cross-mode reproducer remains outside the committed passing suite.
+
+### Independent SOURCE P1 follow-up: out-of-scope signed MOVE/DELETE reconciliation
+
+The first bounded inbound application guard was committed as
+`5a1b1f2112bc13bcf53eb3ed86e5fab04b23d65e` and independently
+reviewed. The peer found **another existing P1 inbound route that bypassed
+that guard**: `_pullRemote` dispatches records outside `selectedPaths` to
+`preflightOutOfScopeMove`/`reconcileOutOfScopeMove`, bypassing `_apply`.
+A signed tombstone for an out-of-scope `metadata.path`, while retaining the
+object/file identity of an in-scope materialized cache origin, reached
+pathname staging/rename, or conflict relocation, without native custody.
+This is a real in-process policy bypass; it is not proof of same-SID foreign
+file deletion or owner-root A→B→A resistance.
+
+In the isolated child of `5a1b1f21`, a new RED regression reproduced an
+**actual missing native denial on Windows Node22** with a valid persisted
+remote tombstone, selected tracked original identity, local cached bytes and
+an out-of-scope tombstone pathname. The corrective guard is placed inside
+`preflightOutOfScopeMove` **after** finding a matching tracked selected origin
+and **before** any filesystem read, signature pre-observation or mutation.
+This also protects **direct** `reconcileOutOfScopeMove()` callers, and denies
+tracked-origin remote MOVE and directory reconciliation when the root requires
+native custody. Pure out-of-scope remote-only changes that cannot refer to
+a tracked selected origin retain their previous behavior.
+
+Two physical tests cover an out-of-scope DELETE and an out-of-scope MOVE
+with a Unicode original filename; each attempts both the public remote pull
+and the direct reconciliation route, then checks the exact physical original
+bytes, durable snapshot bytes and the absence of trash staging. The native
+root is still unavailable by design; source provenance and protection
+against hostile concurrent ancestors are **not** established.
+
+| Additional child tests before exact-SHA peer review | Results |
+| --- | --- |
+| Windows Node v22.23.4 / NTFS full Files On-Demand suite | **24 PASS / 0 FAIL / 0 SKIP** |
+| Ubuntu WSL Node v22.22.1 / `/home/bielx` ext4 full Files On-Demand suite | **24 PASS / 0 FAIL / 0 SKIP** |
+| Windows Node22 / Phase16, native recovery gate and RootSession contract | **53 PASS / 0 FAIL / 1 SKIP** |
+| Ubuntu WSL Node22 / same adjacent suites on ext4 | **52 PASS / 0 FAIL / 2 SKIP** |
+
+This change does not repair same-root mode downgrade to a new non-FOD
+`SyncEngine`, pathname-based normal MOVE/UPDATE/hydration, same-UID/SID
+ancestor and native image custody, power-cut/rollback, or hosted CodeQL.
+Independent SOURCE review of the eventual exact child SHA is mandatory;
+these scoped test successes do **not** justify local integration, remote
+push, production operation, merge or deploy.

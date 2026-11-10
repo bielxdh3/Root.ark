@@ -466,6 +466,59 @@ test("issue 66: Files On-Demand WebDAV MOVE translation denies before any local 
   assert.equal(state.fullReads.length, readsBefore);
 });
 
+test("issue 66: out-of-scope remote DELETE cannot stage an in-scope FOD cache origin", async (t) => {
+  const { root, open, store, key } = await setup(t,
+    { "docs/retained.txt": "same cache origin must remain" });
+  const client = await open();
+  await client.materializeRemote("docs/retained.txt");
+  const original = store.list("alice")[0];
+  const bytesBefore = await fsp.readFile(path.join(root, "docs", "retained.txt"));
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const tombstone = protocol.createOperation({
+    operation: "delete", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    baseRevision: original.revision, metadata: { path: "outside/retained.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", tombstone)).kind, "stored");
+
+  await assert.rejects(client.pullRemote({ conflicts: [] }), { code: "root_session_native_unavailable" });
+  await assert.rejects(client.reconcileOutOfScopeMove(tombstone, { conflicts: [] }),
+    { code: "root_session_native_unavailable" }, "direct reconcile must not bypass the pull fence");
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "retained.txt")), bytesBefore);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
+test("issue 66: out-of-scope remote MOVE cannot rename a tracked FOD origin without native custody", async (t) => {
+  const { root, open, store, key } = await setup(t,
+    { "docs/café-中-😀.txt": "origin must survive MOVE outside selected scope" });
+  const client = await open();
+  await client.materializeRemote("docs/café-中-😀.txt");
+  const original = store.list("alice")[0];
+  const filePath = path.join(root, "docs", "café-中-😀.txt");
+  const bytesBefore = await fsp.readFile(filePath);
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const moved = protocol.createOperation({
+    operation: "move", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    baseRevision: original.revision,
+    metadata: { path: "outside/café-中-😀.txt", sourcePath: "docs/café-中-😀.txt" },
+    plaintext: protocol.encodeMovePayload(bytesBefore, key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+
+  await assert.rejects(client.pullRemote({ conflicts: [] }), { code: "root_session_native_unavailable" });
+  await assert.rejects(client.reconcileOutOfScopeMove(moved, { conflicts: [] }),
+    { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fsp.readFile(filePath), bytesBefore);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
 test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();
