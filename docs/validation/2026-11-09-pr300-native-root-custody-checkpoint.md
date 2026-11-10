@@ -1045,3 +1045,47 @@ transaction APIs (`renameNoReplace`, `removeEntry`, journal, rollback,
 commit), native Windows CFAPI acquisition, same-SID hostile substitution,
 monotonic independent floor, power-cut/cold reopen, executable/DLL image
 provenance and formal CodeQL are not proved. Keep RootSession closed.
+
+### Fixed-leaf held-dirfd transaction rehearsal (isolated candidate)
+
+On the reviewed `7ccdad3c` source, candidate
+`f7279cb8660dfd2cd69e2f692bd42a02757cf047` adds **lab-only**
+`stageProof(token)` and `publishProof(token)` to the Linux N-API experiment.
+They require an additional native `ROOTARK_ISSUE66_W3_TXN_LAB=1` opt-in,
+accept no JS path, fd or payload, and use four fixed canary leaf names
+relative to the held A directory descriptor. The stage and fixed
+PREPARED journal are created exclusively with `openat2` and fsynced;
+`renameat2(RENAME_NOREPLACE)` publishes without overwrite, followed by
+directory `fsync` and an exclusive COMMITTED marker. Any uncertain
+flush/transition stays lab-indeterminate, without unsafe recursive cleanup.
+
+On **real WSL Ubuntu Node22/ext4**, focused tests had **3 PASS / 0 FAIL**
+for a staged A renamed under B and restored, a deliberate same-UID
+destination collision preserving the foreign bytes, and a *separate*
+same-UID Node process overwriting a staged canary **before** publication;
+that deterministic pre-commit corruption was rejected without a COMMITTED
+marker. Separate lab opt-in-negative testing passed **1/1**. The combined
+N-API+RootSession contract run had **20 PASS / 0 FAIL / 3 SKIP** under
+transaction opt-in, with the huge inode stress case intentionally skipped.
+Windows Node22 RootSession negative contract ran **7 PASS / 0 FAIL**.
+
+The clean isolated composition
+`42b8d837879dfbce72280c36a0c22c889b4ce09a` cherry-picked the
+transaction code above the reviewed roadmap checkpoint `a39d7409`.
+Exact composition physical validation: **Windows Node22/NTFS FOD +
+RootSession 44 PASS / 1 platform SKIP**, **WSL Node22/ext4 FOD + N-API
+transaction + RootSession 58 PASS / 3 expected SKIP** (large inode stress,
+separate transaction-negative test, hostile bind mount without protected
+parent/CAP_SYS_ADMIN). These tests do **not** simulate a live adversary
+modifying data in the same syscall window, an independent signed journal,
+crash after rename before marker fsync, forced powercut, or cold authority
+reacquisition. `unlinkat`, arbitrary user-path transactions, protected
+owner custody and native Windows publication are *not implemented*.
+
+The source and composite SHAs require independent **SOURCE GO of the
+exact versions** before fast-forward into the local integrated worktree.
+Even with SOURCE GO, this is a test-only syscalls/ordering milestone:
+`openNativeRootSession` and production `requireNativeRecoveryAuthority`
+remain unconditionally denied. **RELEASE NO-GO**. Remote PR #300 stays
+OPEN/Draft at `d3a91c92`, hosted formal CodeQL remains failed and was not
+rerun to conserve GitHub Actions billing; no push/merge/deploy/cutover.
