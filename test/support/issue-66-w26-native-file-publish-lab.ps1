@@ -1,5 +1,6 @@
 param(
-  [ValidateSet('NORMAL', 'COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP')]
+  [ValidateSet('NORMAL', 'COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
+               'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE')]
   [string]$Mode,
   [string]$Scratch
 )
@@ -82,6 +83,11 @@ public static class RootarkW26NativeFilePublishLab {
     IntPtr serial, IntPtr maxComponent, IntPtr flags, StringBuilder filesystem, uint capacity);
   [DllImport("kernel32.dll", EntryPoint = "GetDriveTypeW", CharSet = CharSet.Unicode)]
   private static extern uint DriveType(string rootPath);
+  [DllImport("kernel32.dll", EntryPoint = "GetCurrentProcess")]
+  private static extern IntPtr CurrentProcess();
+  [DllImport("kernel32.dll", EntryPoint = "TerminateProcess", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool Terminate(IntPtr process, uint exitCode);
 
   private static readonly string Trusted = "ORIGINAL_OPENED_STAGE_BYTES";
   private static readonly string Foreign = "FOREIGN_UNTRUSTED_TARGET_BYTES";
@@ -116,7 +122,8 @@ public static class RootarkW26NativeFilePublishLab {
     } catch { root.Dispose(); throw; }
   }
   private static SafeFileHandle File(SafeFileHandle root, string leaf, bool create) {
-    if (leaf != "stage.bin" && leaf != "published.bin" && leaf != "parked-stage.bin")
+    if (leaf != "stage.bin" && leaf != "published.bin" && leaf != "parked-stage.bin"
+      && leaf != "prepared.bin" && leaf != "commit.bin")
       throw new InvalidOperationException("UNTRUSTED_LEAF");
     IntPtr name = Marshal.StringToHGlobalUni(leaf);
     IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
@@ -189,8 +196,21 @@ public static class RootarkW26NativeFilePublishLab {
         10 /* FileRenameInformation */);
     } finally { Marshal.FreeHGlobal(data); }
   }
+  private static void ExitImmediately(uint code) {
+    // The opted-in PowerShell child only. This bypasses managed finally and
+    // represents process termination, never powercut or directory durability.
+    if (!Terminate(CurrentProcess(), code))
+      throw new InvalidOperationException("HARD_EXIT_FAILED");
+    throw new InvalidOperationException("UNEXPECTED_HARD_EXIT_RETURN");
+  }
 
   public static string Run(string scratch, string mode) {
+    bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
+    bool crashAfter = mode == "POST_LINK_HARD_EXIT";
+    bool complete = mode == "TXN_COMPLETE";
+    if ((crashBefore || crashAfter || complete) &&
+        Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_HARD_EXIT_LAB") != "1")
+      throw new InvalidOperationException("HARD_EXIT_TEST_DISABLED");
     if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
       throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
     string parent = Path.Combine(scratch, "held");
@@ -209,6 +229,11 @@ public static class RootarkW26NativeFilePublishLab {
       }
       using (SafeFileHandle source = File(root, "stage.bin", true)) {
         Write(source, Trusted);
+        if (crashBefore || crashAfter || complete) {
+          using (SafeFileHandle prepared = File(root, "prepared.bin", true))
+            Write(prepared, "PREPARED_V1");
+          if (crashBefore) ExitImmediately(74);
+        }
         FILE_ID_INFO original = Id(source);
         string stage = Path.Combine(parent, "stage.bin");
         string target = Path.Combine(parent, "published.bin");
@@ -224,7 +249,7 @@ public static class RootarkW26NativeFilePublishLab {
             if (Same(original, Id(other)))
               throw new InvalidOperationException("SOURCE_SWAP_NOT_PHYSICAL");
           }
-        } else if (mode != "ROOT_SWAP" && mode != "NORMAL") {
+        } else if (mode != "ROOT_SWAP" && mode != "NORMAL" && !crashAfter && !complete) {
           throw new InvalidOperationException("UNTRUSTED_MODE");
         }
         int code = Rename(source, root, "published.bin");
@@ -239,6 +264,7 @@ public static class RootarkW26NativeFilePublishLab {
             unchecked((uint)code).ToString("X8");
         }
         if (code != 0) throw new InvalidOperationException("NATIVE_RENAME_FAILED");
+        if (crashAfter) ExitImmediately(73);
         string published = Path.Combine(visibleParent, "published.bin");
         using (SafeFileHandle actual = File(root, "published.bin", false)) {
           if (!Same(original, Id(source)) || !Same(original, Id(actual)) ||
@@ -255,6 +281,12 @@ public static class RootarkW26NativeFilePublishLab {
         if (mode == "ROOT_SWAP" &&
             ReadFixture(Path.Combine(parent, "published.bin")) != Foreign)
           throw new InvalidOperationException("FOREIGN_ANCESTOR_MUTATED");
+        if (complete) {
+          // Only the fully completed opt-in rehearsal writes this marker.
+          // Windows namespace durability and cold recovery are NOT proven.
+          using (SafeFileHandle marker = File(root, "commit.bin", true))
+            Write(marker, "COMMITTED_V1");
+        }
         return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode +
           " result=ORIGINAL_HANDLE inode=PINNED no_replace=YES";
       }

@@ -24,14 +24,15 @@ function fixture() {
   return directory;
 }
 
-function invoke(scratch, mode, enabled = true) {
+function invoke(scratch, mode, enabled = true, allowHardExit = false) {
   return spawnSync(powershell, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-Scratch", scratch, "-Mode", mode,
   ], {
     windowsHide: true, encoding: "utf8", timeout: 20000, maxBuffer: 8192,
     env: { ...process.env,
-      ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: enabled ? "1" : "0" },
+      ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: enabled ? "1" : "0",
+      ROOTARK_ISSUE66_W26_HARD_EXIT_LAB: allowHardExit ? "1" : "0" },
   });
 }
 
@@ -88,4 +89,59 @@ test("#66 W26 native HANDLE laboratory rejects disabled and populated scratch",
     assert.match(dirty.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
     assert.equal(fs.readFileSync(path.join(dirtyScratch, "DO_NOT_TOUCH"), "utf8"),
       "foreign fixture bytes");
+  });
+
+test("#66 W26 NTFS pre-link abrupt process exit retains only staged bytes and PREPARED",
+  { skip: !available, timeout: 25000 }, () => {
+    const scratch = fixture();
+    const result = invoke(scratch, "PRE_LINK_HARD_EXIT", true, true);
+    assert.equal(result.status, 74, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "");
+    const held = path.join(scratch, "held");
+    assert.equal(fs.readFileSync(path.join(held, "stage.bin"), "utf8"),
+      "ORIGINAL_OPENED_STAGE_BYTES");
+    assert.equal(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"), "PREPARED_V1");
+    assert.equal(fs.existsSync(path.join(held, "published.bin")), false);
+    assert.equal(fs.existsSync(path.join(held, "commit.bin")), false);
+  });
+
+test("#66 W26 NTFS completed native lab sequence writes COMMIT only after opened-HANDLE publish",
+  { skip: !available, timeout: 25000 }, () => {
+    const scratch = fixture();
+    const result = invoke(scratch, "TXN_COMPLETE", true, true);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^ROOTARK_W26_HANDLE_PUBLISH mode=TXN_COMPLETE result=ORIGINAL_HANDLE inode=PINNED no_replace=YES\r?\n$/);
+    const held = path.join(scratch, "held");
+    assert.equal(fs.existsSync(path.join(held, "stage.bin")), false);
+    assert.equal(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"), "PREPARED_V1");
+    assert.equal(fs.readFileSync(path.join(held, "published.bin"), "utf8"),
+      "ORIGINAL_OPENED_STAGE_BYTES");
+    assert.equal(fs.readFileSync(path.join(held, "commit.bin"), "utf8"), "COMMITTED_V1");
+  });
+
+test("#66 W26 NTFS post-rename abrupt process exit retains published inode without COMMIT",
+  { skip: !available, timeout: 25000 }, () => {
+    const scratch = fixture();
+    const result = invoke(scratch, "POST_LINK_HARD_EXIT", true, true);
+    assert.equal(result.status, 73, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "");
+    const held = path.join(scratch, "held");
+    assert.equal(fs.existsSync(path.join(held, "stage.bin")), false);
+    assert.equal(fs.readFileSync(path.join(held, "published.bin"), "utf8"),
+      "ORIGINAL_OPENED_STAGE_BYTES");
+    assert.equal(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"), "PREPARED_V1");
+    assert.equal(fs.existsSync(path.join(held, "commit.bin")), false,
+      "a physical process exit before COMMIT must not be called recovered");
+  });
+
+test("#66 W26 hard-exit mode cannot be enabled by the ordinary native lab flag alone",
+  { skip: !available, timeout: 25000 }, () => {
+    const scratch = fixture();
+    const result = invoke(scratch, "PRE_LINK_HARD_EXIT", true, false);
+    assert.equal(result.status, 41);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+    assert.deepEqual(fs.readdirSync(scratch), []);
   });
