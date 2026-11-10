@@ -23,6 +23,47 @@ const source = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/nat
 let addon;
 let addonPath;
 
+// Assertions must inspect the same opened inode that supplies the bytes.
+// Comparing fs.statSync(path) and later fs.readFileSync(path) would admit a
+// foreign same-UID replacement between those two independent path lookups.
+function observeOpenedFixture(fd) {
+  const before = fs.fstatSync(fd, { bigint: true });
+  assert.equal(before.isFile(), true);
+  assert.equal(before.isSymbolicLink(), false);
+  assert.ok(before.ino > 0n && before.size <= 8192n);
+  const bytes = Buffer.alloc(Number(before.size) + 1);
+  let count = 0;
+  while (count < bytes.length) {
+    const read = fs.readSync(fd, bytes, count, bytes.length - count, count);
+    if (!read) break;
+    count += read;
+  }
+  const after = fs.fstatSync(fd, { bigint: true });
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.size, before.size);
+  assert.equal(after.mtimeNs, before.mtimeNs);
+  assert.equal(BigInt(count), before.size);
+  return { stat: before, bytes: bytes.subarray(0, count).toString("utf8") };
+}
+
+function openFixtureLeaf(dirfd, leaf, flags = fs.constants.O_RDONLY) {
+  assert.match(leaf, /^[a-zA-Z0-9._-]+$/, "native lab leaves are fixed names");
+  return fs.openSync(`/proc/self/fd/${dirfd}/${leaf}`,
+    flags | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK || 0), 0o600);
+}
+
+function withHeldFixtureDirectory(held, action) {
+  const fd = fs.openSync(held, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+    | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    assert.equal(stat.isDirectory(), true);
+    assert.equal(stat.isSymbolicLink(), false);
+    return action(fd);
+  } finally { fs.closeSync(fd); }
+}
+
 test("#66 W3 native stress seeding has an explicit C-level opt-in gate", () => {
   const nativeSource = fs.readFileSync(source, "utf8");
   const seed = nativeSource.split("static napi_value seed_many(")[1]?.split("static napi_value seed_raw_byte_name(")[0];
@@ -275,25 +316,51 @@ test("#66 W3 equal-byte foreign inode cannot be published instead of original st
       name.startsWith(".rootark-w3-napi-") && !before.has(name));
     assert.equal(created.length, 1);
     const held = path.join(home, created[0], "held");
-    const stagePath = path.join(held, ".rootark-w3-staged-v1");
-    const parked = path.join(held, ".rootark-w3-original-stage-parked");
     const destination = path.join(held, ".rootark-w3-committed-v1");
     const commit = path.join(held, ".rootark-w3-commit-marker-v1");
     assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
-    const beforeInode = fs.statSync(stagePath, { bigint: true });
-    fs.renameSync(stagePath, parked);
-    fs.writeFileSync(stagePath, "STAGED_ROOT_CANARY_V1", { flag: "wx", mode: 0o600 });
-    const foreign = fs.statSync(stagePath, { bigint: true });
-    assert.notEqual(foreign.ino, beforeInode.ino, "replacement must be a distinct physical inode");
-    assert.equal(fs.readFileSync(parked, "utf8"), "STAGED_ROOT_CANARY_V1");
-    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_INDETERMINATE/,
-      "equal bytes of an untrusted inode must not authorize the native stage");
-    assert.equal(fs.existsSync(destination), false, "foreign stage must not be published");
-    assert.equal(fs.existsSync(commit), false, "no COMMIT after stage inode replacement");
-    assert.equal(fs.readFileSync(stagePath, "utf8"), "STAGED_ROOT_CANARY_V1");
-    assert.equal(fs.readFileSync(parked, "utf8"), "STAGED_ROOT_CANARY_V1");
-    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
-      "the rejected same-byte substitution must permanently poison the session");
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const originalFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
+      let foreignFd;
+      try {
+        const original = observeOpenedFixture(originalFd);
+        fs.renameSync(`/proc/self/fd/${dirfd}/.rootark-w3-staged-v1`,
+          `/proc/self/fd/${dirfd}/.rootark-w3-original-stage-parked`);
+        // Open EXCLUSIVE under the retained directory, not check(path)->
+        // writeFile(path). Preserve the foreign FD through native rejection.
+        foreignFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1",
+          fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL);
+        fs.writeSync(foreignFd, "STAGED_ROOT_CANARY_V1");
+        fs.fsyncSync(foreignFd);
+        const foreign = observeOpenedFixture(foreignFd);
+        assert.notEqual(foreign.stat.ino, original.stat.ino,
+          "replacement must be a distinct physical inode");
+        assert.equal(original.bytes, "STAGED_ROOT_CANARY_V1");
+        assert.equal(foreign.bytes, original.bytes,
+          "identical bytes alone must not authorize the foreign inode");
+        assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_INDETERMINATE/,
+          "equal bytes of an untrusted inode must not authorize the native stage");
+        assert.equal(fs.existsSync(destination), false, "foreign stage must not be published");
+        assert.equal(fs.existsSync(commit), false, "no COMMIT after stage inode replacement");
+        const visibleFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
+        const parkedFd = openFixtureLeaf(dirfd, ".rootark-w3-original-stage-parked");
+        try {
+          const visible = observeOpenedFixture(visibleFd);
+          const parkedOriginal = observeOpenedFixture(parkedFd);
+          assert.equal(visible.stat.ino, foreign.stat.ino,
+            "current stage name must still refer to the foreign inode");
+          assert.equal(parkedOriginal.stat.ino, original.stat.ino,
+            "parked name must still refer to the original held inode");
+          assert.equal(visible.bytes, "STAGED_ROOT_CANARY_V1");
+          assert.equal(parkedOriginal.bytes, "STAGED_ROOT_CANARY_V1");
+        } finally { fs.closeSync(parkedFd); fs.closeSync(visibleFd); }
+        assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
+          "the rejected same-byte substitution must permanently poison the session");
+      } finally {
+        if (foreignFd !== undefined) fs.closeSync(foreignFd);
+        fs.closeSync(originalFd);
+      }
+    });
   });
 
 test("#66 W3 native publish links original held inode after post-check stage-name replacement",
@@ -308,25 +375,44 @@ test("#66 W3 native publish links original held inode after post-check stage-nam
     assert.equal(created.length, 1);
     const held = path.join(home, created[0], "held");
     assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
-    const stage = path.join(held, ".rootark-w3-staged-v1");
-    const original = fs.statSync(stage, { bigint: true });
-    const saved = process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
-    process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = "1";
-    try { assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED"); }
-    finally {
-      if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
-      else process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = saved;
-    }
-    const parked = path.join(held, ".rootark-w3-postcheck-parked");
-    const published = path.join(held, ".rootark-w3-committed-v1");
-    assert.equal(fs.statSync(parked, { bigint: true }).ino, original.ino,
-      "native adversarial hook must actually park the original staged inode");
-    assert.notEqual(fs.statSync(stage, { bigint: true }).ino, original.ino,
-      "foreign same-byte stage must be a different physical inode");
-    assert.equal(fs.statSync(published, { bigint: true }).ino, original.ino,
-      "publication must link original opened inode, not the late foreign pathname occupant");
-    assert.equal(fs.readFileSync(published, "utf8"), "STAGED_ROOT_CANARY_V1");
-    assert.equal(fs.readFileSync(stage, "utf8"), "STAGED_ROOT_CANARY_V1");
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const originalFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
+      try {
+        const original = observeOpenedFixture(originalFd);
+        const saved = process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
+        process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = "1";
+        try { assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED"); }
+        finally {
+          if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
+          else process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = saved;
+        }
+        const parkedFd = openFixtureLeaf(dirfd, ".rootark-w3-postcheck-parked");
+        const foreignFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
+        const publishedFd = openFixtureLeaf(dirfd, ".rootark-w3-committed-v1");
+        try {
+          const parked = observeOpenedFixture(parkedFd);
+          const foreign = observeOpenedFixture(foreignFd);
+          const published = observeOpenedFixture(publishedFd);
+          assert.equal(parked.stat.dev, original.stat.dev);
+          assert.equal(parked.stat.ino, original.stat.ino,
+            "native adversarial hook must actually park original opened inode");
+          assert.notEqual(foreign.stat.ino, original.stat.ino,
+            "foreign same-byte stage must be a different physical inode");
+          assert.equal(published.stat.dev, original.stat.dev);
+          assert.equal(published.stat.ino, original.stat.ino,
+            "publication must link original opened inode, not the late foreign occupant");
+          assert.equal(published.stat.nlink, 2n,
+            "lab link-publish still has a second name and grants no production custody");
+          assert.equal(parked.bytes, "STAGED_ROOT_CANARY_V1");
+          assert.equal(published.bytes, "STAGED_ROOT_CANARY_V1");
+          assert.equal(foreign.bytes, "STAGED_ROOT_CANARY_V1");
+        } finally {
+          fs.closeSync(publishedFd);
+          fs.closeSync(foreignFd);
+          fs.closeSync(parkedFd);
+        }
+      } finally { fs.closeSync(originalFd); }
+    });
     assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-commit-marker-v1"), "utf8"), "COMMITTED_V1");
     assert.throws(() => bridge.read(token, ".rootark-w3-committed-v1"), /NATIVE_OPEN_DENIED/,
       "remaining hardlink alias cannot be promoted to independently trusted read authority");
@@ -358,10 +444,17 @@ test("#66 W3 anonymous native stage publishes a single-link inode with no unsafe
       else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = saved;
     }
     assert.equal(fs.existsSync(staged), false, "anonymous original must have no abandoned stage pathname");
-    const publishedStat = fs.statSync(published, { bigint: true });
-    assert.equal(publishedStat.nlink, 1n, "single no-replace published inode must be readable after cold open");
-    assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(), "STAGED_ROOT_CANARY_V1");
-    assert.equal(fs.readFileSync(published, "utf8"), "STAGED_ROOT_CANARY_V1");
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const publishedFd = openFixtureLeaf(dirfd, ".rootark-w3-committed-v1");
+      try {
+        const publishedProof = observeOpenedFixture(publishedFd);
+        assert.equal(publishedProof.stat.nlink, 1n,
+          "single no-replace published inode must be readable after cold open");
+        assert.equal(publishedProof.bytes, "STAGED_ROOT_CANARY_V1");
+        assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(),
+          "STAGED_ROOT_CANARY_V1");
+      } finally { fs.closeSync(publishedFd); }
+    });
     assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-commit-marker-v1"), "utf8"), "COMMITTED_V1");
     assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
     assert.throws(() => requireNativeRecoveryAuthority(bridge),
@@ -427,14 +520,20 @@ test("#66 W3 anonymous post-link hard exit retains PREPARED without granting col
     assert.equal(crash.status, 73, crash.stderr || crash.stdout);
     const held = crash.stdout.trim();
     assert.ok(held.startsWith(path.join(os.homedir(), ".rootark-w3-napi-")));
-    assert.equal(fs.statSync(held).isDirectory(), true);
-    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-staged-v1")), false);
-    const published = path.join(held, ".rootark-w3-committed-v1");
-    assert.equal(fs.statSync(published, { bigint: true }).nlink, 1n);
-    assert.equal(fs.readFileSync(published, "utf8"), "STAGED_ROOT_CANARY_V1");
-    assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-journal-v1"), "utf8"), "PREPARED_V1");
-    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false,
-      "a real child-process hard exit before COMMIT cannot be deemed complete");
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const pinnedParent = `/proc/self/fd/${dirfd}`;
+      assert.equal(fs.existsSync(path.join(pinnedParent, ".rootark-w3-staged-v1")), false);
+      const publishedFd = openFixtureLeaf(dirfd, ".rootark-w3-committed-v1");
+      const preparedFd = openFixtureLeaf(dirfd, ".rootark-w3-journal-v1");
+      try {
+        const published = observeOpenedFixture(publishedFd);
+        assert.equal(published.stat.nlink, 1n);
+        assert.equal(published.bytes, "STAGED_ROOT_CANARY_V1");
+        assert.equal(observeOpenedFixture(preparedFd).bytes, "PREPARED_V1");
+        assert.equal(fs.existsSync(path.join(pinnedParent, ".rootark-w3-commit-marker-v1")), false,
+          "a real child-process hard exit before COMMIT cannot be deemed complete");
+      } finally { fs.closeSync(preparedFd); fs.closeSync(publishedFd); }
+    });
     assert.throws(() => openNativeRootSession(true),
       (e) => e.code === "root_session_native_unavailable");
   });

@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -1143,14 +1144,22 @@ test("issue 66 P2: replacing staged genesis parent after complete iteration cann
   const trash = path.join(f.root, ".rootark-trash");
   const moved = path.join(f.root, ".rootark-trash-moved-by-host");
   const marker = ".rootark-eviction-genesis-head.json";
+  // Only the *trash inode* may trigger this post-enumeration mutation. A
+  // ledger scan also uses /proc/self/fd/N on Linux, but its directory FD is
+  // NOT the trash and must not move the trash early (or twice).
+  const trashIdentity = await fsp.lstat(trash, { bigint: true });
   const originalOpendir = fsp.opendir;
   let swapped = false;
   fsp.opendir = async (...args) => {
     const dir = await originalOpendir(...args);
     // Linux now enumerates through the held trash FD; preserve the physical
     // post-iteration swap regression on that route as well as Windows paths.
-    if (path.resolve(args[0]) !== path.resolve(trash)
-      && !/^\/proc\/self\/fd\/\d+$/.test(String(args[0]))) return dir;
+    if (path.resolve(args[0]) !== path.resolve(trash)) {
+      if (!/^\/proc\/self\/fd\/\d+$/.test(String(args[0]))) return dir;
+      const openedDirectory = await fsp.stat(String(args[0]), { bigint: true });
+      if (!openedDirectory.isDirectory() || openedDirectory.dev !== trashIdentity.dev
+        || openedDirectory.ino !== trashIdentity.ino) return dir;
+    }
     return {
       async *[Symbol.asyncIterator]() {
         for await (const entry of dir) yield entry;
@@ -1330,21 +1339,55 @@ fsp.link = async (...args) => {
     name.startsWith(".rootark-eviction-genesis-head.json.tmp-"));
   assert.equal(temps.length, 1, "post-link hard crash must retain a unique temp name");
   const temp = path.join(trash, temps[0]);
-  assert.deepEqual(await fsp.readFile(stage), await fsp.readFile(temp));
-  assert.equal((await fsp.stat(stage)).nlink, 2);
-  assert.equal((await fsp.stat(temp)).nlink, 2);
-  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).version, 1,
-    "a crash during genesis stage must not silently upgrade the durable snapshot");
-  // This lock belongs exclusively to the dead disposable fixture process.
-  await fsp.rmdir(path.join(f.root, ".rootark-sync.lock"));
-  const before = f.outbound.length;
-  const reopened = await f.create(f.root, ["private"]);
-  await assert.rejects(reopened.syncOnce(), (error) =>
-    error?.code === "invalid_snapshot" && /Unreadable staged eviction genesis head/.test(error.message));
-  assert.deepEqual(await fsp.readFile(stage), await fsp.readFile(temp),
-    "a refused restart must preserve both original stage names");
-  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
-  verifyNoSignedDelete(f, before);
+  const openObserved = async (pathname) => {
+    const handle = await fsp.open(pathname, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0));
+    try {
+      const stat = await handle.stat({ bigint: true });
+      assert.equal(stat.isFile(), true);
+      assert.equal(stat.isSymbolicLink(), false);
+      assert.equal(stat.nlink, 2n);
+      return { handle, stat };
+    } catch (error) { await handle.close(); throw error; }
+  };
+  const originalStage = await openObserved(stage);
+  let originalTemp;
+  try {
+    originalTemp = await openObserved(temp);
+    assert.equal(originalStage.stat.dev, originalTemp.stat.dev);
+    assert.equal(originalStage.stat.ino, originalTemp.stat.ino,
+      "the two stage names must refer to the very same original inode");
+    const originalBytes = await originalStage.handle.readFile();
+    assert.deepEqual(originalBytes, await originalTemp.handle.readFile());
+    assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).version, 1,
+      "a crash during genesis stage must not silently upgrade the durable snapshot");
+    // This lock belongs exclusively to the dead disposable fixture process.
+    await fsp.rmdir(path.join(f.root, ".rootark-sync.lock"));
+    const before = f.outbound.length;
+    const reopened = await f.create(f.root, ["private"]);
+    await assert.rejects(reopened.syncOnce(), (error) =>
+      error?.code === "invalid_snapshot" && /Unreadable staged eviction genesis head/.test(error.message));
+    const currentStage = await openObserved(stage);
+    let currentTemp;
+    try {
+      currentTemp = await openObserved(temp);
+      for (const observed of [currentStage, currentTemp]) {
+        assert.equal(observed.stat.dev, originalStage.stat.dev);
+        assert.equal(observed.stat.ino, originalStage.stat.ino,
+          "foreign same-byte replacement after the crash must not pass by pathname");
+        assert.deepEqual(await observed.handle.readFile(), originalBytes,
+          "refused restart must preserve the original inode bytes");
+      }
+    } finally {
+      if (currentTemp) await currentTemp.handle.close();
+      await currentStage.handle.close();
+    }
+    assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+    verifyNoSignedDelete(f, before);
+  } finally {
+    if (originalTemp) await originalTemp.handle.close();
+    await originalStage.handle.close();
+  }
 });
 
 test("issue 66: Linux genesis promotion cannot overwrite a foreign ledger head", {
