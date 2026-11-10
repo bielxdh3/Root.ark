@@ -335,6 +335,90 @@ test("issue 66: ledger name stream rejects excess entries without materializing 
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: Linux PREPARE cannot write into foreign ledger after a real directory substitution", {
+  skip: process.platform !== "linux" && "requires Linux held descriptor and real symlink substitution",
+}, async (t) => {
+  const f = await fixture(t, "foreign-prepare-substitution");
+  const foreign = path.join(f.dir, "foreign-ledger");
+  const parked = path.join(f.root, ".rootark-sync-evictions-parked");
+  await fsp.mkdir(foreign);
+  await fsp.writeFile(path.join(foreign, "FOREIGN_SENTINEL"), "foreign bytes stay intact");
+  const sync = await f.create(f.root, ["private"]);
+  const originalOpen = fsp.open;
+  let substituted = false;
+  fsp.open = async (requested, ...args) => {
+    if (!substituted && /[a-f0-9]{64}\.prepare\.json$/.test(String(requested))) {
+      substituted = true;
+      // Reproduce a real same-UID pathname replacement at the precise
+      // syscall that would create a durable PREPARE; no mock directory data.
+      await fsp.rename(f.ledger, parked);
+      await fsp.symlink(foreign, f.ledger, "dir");
+    }
+    return originalOpen(requested, ...args);
+  };
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(sync.syncOnce(), (error) =>
+      ["invalid_snapshot", "unsafe_path", "root_session_native_unavailable"].includes(error?.code),
+    "a substituted ledger must deny eviction instead of completing");
+  } finally {
+    fsp.open = originalOpen;
+    if (substituted) {
+      await fsp.unlink(f.ledger);
+      await fsp.rename(parked, f.ledger);
+    }
+  }
+  assert.equal(substituted, true, "the test must hit the physical PREPARE creation boundary");
+  assert.deepEqual(await fsp.readdir(foreign), ["FOREIGN_SENTINEL"],
+    "no PREPARE, HEAD or temporary file may be created outside the held ledger");
+  assert.equal(await fsp.readFile(path.join(foreign, "FOREIGN_SENTINEL"), "utf8"),
+    "foreign bytes stay intact");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: Linux COMMIT cannot write into foreign ledger after a real directory substitution", {
+  skip: process.platform !== "linux" && "requires Linux held descriptor and real symlink substitution",
+}, async (t) => {
+  const f = await fixture(t, "foreign-commit-substitution");
+  const foreign = path.join(f.dir, "foreign-ledger");
+  const parked = path.join(f.root, ".rootark-sync-evictions-parked");
+  await fsp.mkdir(foreign);
+  await fsp.writeFile(path.join(foreign, "FOREIGN_SENTINEL"), "foreign bytes stay intact");
+  const sync = await f.create(f.root, ["private"]);
+  const originalOpen = fsp.open;
+  let substituted = false;
+  fsp.open = async (requested, ...args) => {
+    if (!substituted && /[a-f0-9]{64}\.commit\.json$/.test(String(requested))) {
+      substituted = true;
+      await fsp.rename(f.ledger, parked);
+      await fsp.symlink(foreign, f.ledger, "dir");
+    }
+    return originalOpen(requested, ...args);
+  };
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(sync.syncOnce(), (error) =>
+      ["invalid_snapshot", "unsafe_path", "root_session_native_unavailable"].includes(error?.code),
+    "a substituted ledger must not commit eviction through a foreign directory");
+  } finally {
+    fsp.open = originalOpen;
+    if (substituted) {
+      await fsp.unlink(f.ledger);
+      await fsp.rename(parked, f.ledger);
+    }
+  }
+  assert.equal(substituted, true, "test must hit the actual COMMIT creation boundary");
+  assert.deepEqual(await fsp.readdir(foreign), ["FOREIGN_SENTINEL"],
+    "COMMIT must be bound to the original ledger, never the foreign directory");
+  assert.equal(await fsp.readFile(path.join(foreign, "FOREIGN_SENTINEL"), "utf8"),
+    "foreign bytes stay intact");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true,
+    "an uncertain COMMIT must retain the required-v2 recovery marker");
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66 P2: required v2 refuses a staged case-alias hidden among >16384 trash entries", async (t) => {
   const f = await fixture(t, "large-trash-required");
   await fillLegitimateTrash(f.root);

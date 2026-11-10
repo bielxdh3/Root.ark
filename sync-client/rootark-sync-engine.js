@@ -690,7 +690,8 @@ async function fsyncEvictionDirectory(directory) {
 // preflight and rename; a torn exclusive file is deliberately fail-closed.
 async function createDurableEvictionRecord(filePath, value) {
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
-    | (fs.constants.O_SYNC || 0);
+    | (fs.constants.O_SYNC || 0) | (fs.constants.O_NOFOLLOW || 0)
+    | (fs.constants.O_NONBLOCK || 0);
   const handle = await fsp.open(filePath, flags, 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
@@ -766,6 +767,58 @@ async function openEvictionLedger(rootDir, create = false) {
   if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe eviction ledger directory", "invalid_snapshot");
   await containedAbsolute(rootDir, directory, false);
   return directory;
+}
+// The read path above deliberately returns a public pathname only to legacy
+// callers. Linux ledger mutations must instead retain the SAME opened root
+// and child directory across PREPARE/COMMIT and every fsync. A same-UID writer
+// can still alter content or replace the namespace before acquisition: this
+// does NOT authorize native RootSession, malicious-root recovery or rollback.
+async function withHeldEvictionLedgerWrite(rootDir, work) {
+  if (process.platform !== "linux") {
+    // Windows legacy operation remains outside the native root-custody gate.
+    return work(evictionLedgerDirectory(rootDir), async () => {});
+  }
+  if (!Number.isInteger(fs.constants.O_DIRECTORY)
+    || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    fail("Held eviction ledger write is unavailable", "root_session_native_unavailable");
+  }
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+    | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+  const rootPath = path.resolve(rootDir);
+  const ledgerPath = evictionLedgerDirectory(rootPath);
+  let heldRoot;
+  let heldLedger;
+  try {
+    heldRoot = await fsp.open(rootPath, flags);
+    heldLedger = await fsp.open(
+      `/proc/self/fd/${heldRoot.fd}/${EVICTION_LEDGER_DIR}`, flags);
+    const rootBefore = await heldRoot.stat({ bigint: true });
+    const ledgerBefore = await heldLedger.stat({ bigint: true });
+    const verify = async () => {
+      const currentRoot = await fsp.lstat(rootPath, { bigint: true });
+      const currentLedger = await fsp.lstat(ledgerPath, { bigint: true });
+      // Our own O_EXCL PREPARE/COMMIT and atomic HEAD replacement mutate
+      // ledger directory mtime/ctime. Require the SAME inode/volume while
+      // retaining the handles; comparing the old *version* here incorrectly
+      // rejected every legitimate transaction after its first write.
+      if (!rootBefore.isDirectory() || !ledgerBefore.isDirectory()
+        || !currentRoot.isDirectory() || !currentLedger.isDirectory()
+        || !sameFileIdentity(rootBefore, currentRoot)
+        || !sameFileIdentity(ledgerBefore, currentLedger)
+        || !sameFileIdentity(rootBefore, await heldRoot.stat({ bigint: true }))
+        || !sameFileIdentity(ledgerBefore, await heldLedger.stat({ bigint: true }))) {
+        fail("Eviction ledger changed during durable write", "invalid_snapshot");
+      }
+      await containedAbsolute(rootPath, ledgerPath, false);
+    };
+    await verify();
+    const result = await work(`/proc/self/fd/${heldLedger.fd}`, verify);
+    await verify();
+    return result;
+  } finally {
+    if (heldLedger) await heldLedger.close();
+    if (heldRoot) await heldRoot.close();
+  }
 }
 async function stagedEvictionGenesis(rootDir) {
   const trash = path.join(rootDir, ".rootark-trash");
@@ -1128,35 +1181,44 @@ async function writeEvictionPrepare(rootDir, prepare, currentHead) {
     || prepare.previousDigest !== currentHead.digest) {
     fail("Eviction PREPARE lost its monotonic snapshot anchor", "invalid_snapshot");
   }
-  const directory = await openEvictionLedger(rootDir, true);
-  const file = path.join(directory, filename);
-  const headPath = path.join(directory, "head.json");
-  if (!(await exists(headPath))) {
-    fail("Unreconciled eviction journal head", "invalid_snapshot");
-  }
-  if (currentHead.sequence === 0) {
-    const initial = await readEvictionLedger(rootDir, currentHead.epoch);
-    if (initial.entries.size || !initial.head || initial.head.sequence !== 0
-      || initial.head.digest !== EVICTION_LEDGER_ZERO) {
-      fail("Missing or replaced durable eviction genesis", "invalid_snapshot");
+  await openEvictionLedger(rootDir, true);
+  return withHeldEvictionLedgerWrite(rootDir, async (directory, verify) => {
+    const file = path.join(directory, filename);
+    const headPath = path.join(directory, "head.json");
+    if (!(await exists(headPath))) {
+      fail("Unreconciled eviction journal head", "invalid_snapshot");
     }
-  }
-  // One in-flight version per object; never overwrite an earlier PREPARE
-  // whose physical state might still be awaiting replay.
-  if (await exists(file)
-    || await exists(path.join(directory, evictionLedgerName(prepare.objectId, "commit")))) {
-    fail("Unreconciled durable eviction PREPARE/COMMIT", "invalid_snapshot");
-  }
-  await createDurableEvictionRecord(file, prepare);
-  const head = { epoch: prepare.epoch, sequence: prepare.sequence,
-    digest: evictionLedgerDigest(prepare) };
-  await durableJson(headPath, head);
-  return head;
+    if (currentHead.sequence === 0) {
+      const initial = await readEvictionLedger(rootDir, currentHead.epoch);
+      if (initial.entries.size || !initial.head || initial.head.sequence !== 0
+        || initial.head.digest !== EVICTION_LEDGER_ZERO) {
+        fail("Missing or replaced durable eviction genesis", "invalid_snapshot");
+      }
+    }
+    // One in-flight version per object; never overwrite an earlier PREPARE
+    // whose physical state might still be awaiting replay.
+    if (await exists(file)
+      || await exists(path.join(directory, evictionLedgerName(prepare.objectId, "commit")))) {
+      fail("Unreconciled durable eviction PREPARE/COMMIT", "invalid_snapshot");
+    }
+    await verify();
+    await createDurableEvictionRecord(file, prepare);
+    await verify();
+    const head = { epoch: prepare.epoch, sequence: prepare.sequence,
+      digest: evictionLedgerDigest(prepare) };
+    await durableJson(headPath, head);
+    await verify();
+    return head;
+  });
 }
 async function writeEvictionCommit(rootDir, prepare) {
   const digest = crypto.createHash("sha256").update(JSON.stringify(prepare)).digest("hex");
-  await createDurableEvictionRecord(path.join(evictionLedgerDirectory(rootDir), evictionLedgerName(prepare.objectId, "commit")),
+  await withHeldEvictionLedgerWrite(rootDir, async (directory, verify) => {
+    await createDurableEvictionRecord(path.join(directory,
+      evictionLedgerName(prepare.objectId, "commit")),
     { version: EVICTION_LEDGER_VERSION, tx: prepare.tx, digest });
+    await verify();
+  });
 }
 async function clearEvictionLedger(rootDir, expectedEpoch = null) {
   const { directory, entries } = await readEvictionLedger(rootDir, expectedEpoch);
