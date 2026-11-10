@@ -69,6 +69,45 @@ earlier baseline. The original #300 native ACL test trio remained 13 PASS /
 0 FAIL without opt-in; the two new lab tests were correctly SKIP. WSL Ubuntu
 Node 22: 2 expected Windows-only SKIP / 0 FAIL.
 
+## New opt-in physical leaf substitution and handle deletion (V2)
+
+Child `9302e3da` tests a **different race** from the outer-directory
+replacement above: after a file is opened with native
+`NtCreateFile(RootDirectory=retained A HANDLE)`, another same-SID
+operation moves the original child and creates a distinct file at
+its old name *inside A*. The lab also creates a canary under
+replacement B at A's old pathname.
+
+The helper uses a fixed `swap-leaf.bin` and `FILE_SHARE_DELETE`
+to permit this real NTFS move while the original file HANDLE remains
+open. A test-controlled `File.Move` moves that original to a parked
+fixture-only name, then creates both foreign files. The helper calls
+`SetFileInformationByHandle(FileDispositionInfo)` **on the original
+opened file HANDLE**, not on either now-foreign pathname. After closing
+the original handle it requires the parked original to be absent
+and both foreign contents unchanged. A later pathname unlink of the
+original name would instead delete the same-parent foreign file.
+This is a native opened-inode deletion proof only for that schedule.
+
+The categorical V2 requirement was **RED** against the old V1
+helper because V1 did not test this case; the RED is a *missing
+proof*, **not** a destructive exploit of the previous native
+implementation. Physical Windows 11 / NTFS / Node v22.23.4:
+**2 PASS / 0 FAIL** with explicit lab opt-in (including the negative
+empty/nested/disabled scratch gate); Ubuntu WSL Node22:
+**2 expected Windows-only SKIP**. No file outside the test-owned
+LocalAppData fixtures was intentionally opened or deleted. The
+fixtures are retained, never recursively cleaned by the helper.
+
+The test's adversarial steps are **sequential in the same process
+and SID**, not a separately scheduled hostile writer. Initial scratch
+discovery and the adversarial `File.Move`/`WriteAllText` use
+ordinary paths; a hostile same-SID actor could change that ancestry
+before root acquisition. This does **not** establish independent
+root authority, trusted same-SID isolation, cold restart, native
+RootSession, Windows 10/CFAPI, rollback witness, directory powercut
+durability or production secure deletion. **RELEASE NO-GO.**
+
 ## Independent native HANDLE identity / rename reconciliation (W42 P2)
 
 The independent `test/support/issue-66-w25-native-rename-identity.ps1` does

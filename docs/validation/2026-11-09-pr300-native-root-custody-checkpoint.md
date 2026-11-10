@@ -1623,3 +1623,106 @@ reacquisition and genuine powercut/directory durability proof
 remain unavailable. These bounded SOURCE GOs do not authorize
 production, a PR merge, deploy or cutover. No remote push or hosted
 CI rerun occurred. **Product RELEASE NO-GO; mission incomplete.**
+
+### 2026-11-10 continuation — NTFS handle-bound exact-inode deletion lab
+
+Reconciled integrated local `28375772be038acd3715279b92f367ef0d2234da`,
+remote #300 OPEN/Draft `d3a91c921c18e40d23d101958b487725e88e8d95`
+and unchanged `Root/main` `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+The prior Linux ledger record-leaf substitution had already been
+reproduced on real WSL/ext4 and patched in `61669b06`; the Windows
+analogue was integrated in `c2e8e9b4`. Neither was repeated here.
+
+The remaining *post-check, pre-unlink* writer window is structural:
+POSIX `unlinkat(heldDirFd, leaf)` removes whatever inode carries that
+name at the instant of the call, not the previously `fstat`-verified
+inode. Without independently established parent and writer isolation,
+another same-UID actor can switch the name between the syscalls.
+Adding another JS/native stat alone cannot meet the product guarantee.
+
+The opt-in Windows W25 rooted-handle lab has a distinct native primitive:
+child `9302e3da40e2a337abf51e592b2300843777cdbe` uses
+`NtCreateFile(RootDirectory)` to open a fixed original file HANDLE
+with DELETE access. A test-controlled same-SID operation then
+physically moves the original leaf, creates a foreign *same-name*
+leaf inside the retained root A, and creates a different canary
+in the replacement root B at the old A pathname. Native
+`SetFileInformationByHandle(FileDispositionInfo)` deletes only
+the original opened inode, confirmed by the parked original's
+absence and **both** foreign byte strings remaining intact.
+This test is not a pathname check followed by a pathname unlink.
+
+The exact V2 test contract was **RED on V1** because V1 lacked
+the leaf-swap scenario; it was **not** a witnessed vulnerability
+causing foreign-file destruction in the prior native helper.
+The new physical opt-in lab on **Windows 11/NTFS/Node v22.23.4**
+passed **2 PASS / 0 FAIL / 0 SKIP**, including refusal of
+disabled/nested/nonempty fixtures. WSL Node22 gave **2 expected
+Windows-only SKIP / 0 FAIL**. The disposable LocalAppData
+fixtures are intentionally retained and no recursive cleanup
+was invoked. Independent SOURCE reviewed exact `9302e3da`
+and gave **narrow GO**, with no new concrete P1/P2 in the
+two-file lab delta.
+
+**Strict boundary:** The adversarial leaf swap was sequential,
+performed within the same process/SID after opening the HANDLE;
+it was not a separately scheduled hostile-process stress.
+The initial scratch/root discovery remains pathname-based, with
+no independent owner custodian, and even the test's fixed-name
+foreign canaries are not protected against a separate same-SID
+actor changing the surrounding namespace. No production bridge
+invokes the helper. No Windows 10/CFAPI release, file-image
+attestation, independent signed monotonic floor, cold reboot or
+real power-loss durability has been demonstrated. Product
+`RootSession` remains fail-closed.
+
+### CodeQL formal four-HIGH comparison (not a new hosted pass)
+
+The old hosted CodeQL check-run `129597231893` on remote Draft
+`d3a91c92` still returned **FAILURE** with four *Potential file
+system race condition* HIGH annotations. Their original locations
+and corresponding **local source-level** mitigations are:
+
+| Remote annotation | Local mitigation/evidence | Remaining boundary |
+| --- | --- | --- |
+| `sync-client/rootark-sync-engine.js:77` — `lstat` then `readFile(markerPath)` | Local FOD marker holds one descriptor, bounded read with pre/post `fstat` and `lstat`; FIFO, symlink and growth tests previously passed | Initial parent mutable by same SID; no external antirollback |
+| `sync-client/rootark-sync-engine.js:706-707` — held trash opened but directory later enumerated by mutable path | Linux now holds root/trash nofollow FDs and traverses via retained `/proc/self/fd`; physical parent-swap RED→GREEN previously obtained | Windows legacy still uses path checks; parent authority not independent |
+| `test/issue-66-files-on-demand.test.js:625` — separate `stat(marker)` and `readFile(marker)` | Local disposable test now asserts marker bytes directly without a separate vulnerable stat preflight | Test is not a proof of hostile-root isolation |
+| `test/issue-66-independent-owner-posix-root.test.js:167` — check root identity then reopen marker by path | Local opt-in rooted fixture retains marker FD and reads that FD after concurrency probes | Requires external protected root-owned fixture; not a writable recovery test |
+
+These are *source comparisons*, not a formally recomputed CodeQL
+result for the newer integrated SHA. No CodeQL CLI was found on
+the local Windows PATH, and no additional hosted GitHub Actions
+workflow or push was initiated to preserve billing.
+**Release remains NO-GO.**
+
+### 2026-11-10 continuation — native removal admission contract
+
+Child `74ff83b4042d9367469d38a12b0297245fad6cb6` (parent
+`9302e3da`) makes the **nonoperational v1 RootSession contract**
+explicit about destructive operations. A POSIX `unlinkat` on a
+retained dirfd is not identity-bound when the parent can be modified
+by a hostile same-UID writer after an `fstat`; a Windows
+`SetFileInformationByHandle` operation on the retained original
+file HANDLE avoids that specific name-rebinding window, but still
+requires an independently trusted root and ancestor policy.
+The contract now demands native inode-bound removal or protected
+parent writer isolation and adds frozen guards rejecting
+`stat→unlink` as authority.
+
+The additional declarative test was **RED** on the parent (the
+mandatory guard did not exist) then **GREEN**: full contract
+suite `test/issue-66-root-session-contract.test.js` on **Windows
+Node22 8 PASS / 0 FAIL** and **Ubuntu WSL Node22 8 PASS / 0 FAIL**.
+Both `openNativeRootSession(true)` and
+`requireNativeRecoveryAuthority()` still reject callers.
+Independent read-only SOURCE review of the exact `74ff83b4`
+two-file child gave **narrow GO**, zero newly identified P0/P1/P2;
+it was fast-forwarded locally. These checks only establish a
+reviewable native contract, **not** OS security implementation.
+
+The parent/child `9302e3da` W25 opt-in lab and `74ff83b4`
+contract commits have no hosted CodeQL evaluation; the old
+remote #300 formal CodeQL is still red. No new workflows, remote
+push, merge, deploy or `Root/main` changes were performed.
+**RootSession remains fail-closed; RELEASE NO-GO.**
