@@ -458,8 +458,8 @@ test("issue 66: direct incoming DELETE must not stage materialized FOD bytes wit
   });
 
   await assert.rejects(client.apply(remoteDelete), { code: "root_session_native_unavailable" });
-  await assert.rejects(client._apply(remoteDelete), { code: "root_session_native_unavailable" },
-    "private direct apply must not bypass the public method fence");
+  await assert.rejects(client._apply(remoteDelete), { code: "sync_root_busy" },
+    "private direct apply must not bypass the physical mutation lock");
   assert.deepEqual(await fsp.readFile(path.join(root, "docs", "retained.txt")), originalBytes);
   assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), originalSnapshot);
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
@@ -1231,6 +1231,48 @@ test("issue 66: inbound FOD rename completion followed by EIO retains lock befor
   assert.deepEqual(journal.pending, []);
   assert.equal(state.pushes, 0, "there is no evidence of an outbound signed CREATE");
   assert.equal(JSON.stringify(store.list("alice")), oldStore);
+});
+
+test("issue 66: native-required direct inbound _apply cannot bypass an occupied physical root lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "signed remote cache bytes",
+  });
+  const client = await open();
+  const op = store.list("alice").find((entry) => entry.metadata?.path === "docs/restore.txt");
+  assert.ok(op, "fixture must contain a real signed remote operation");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshot);
+  const beforeRemote = JSON.stringify(store.list("alice"));
+  const lock = path.join(root, ".rootark-sync.lock");
+  // A different process's exclusive mkdir is represented by the actual
+  // kernel directory. This test never unlinks someone else's lock.
+  await fsp.mkdir(lock, { mode: 0o700 });
+  await assert.rejects(client._apply(op), { code: "sync_root_busy" });
+  await assert.rejects(client.apply(op), { code: "sync_root_busy" });
+  assert.equal(await exists(path.join(root, "docs", "restore.txt")), false,
+    "no target may be created by bypassing the owner of the physical lock");
+  assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot);
+  assert.deepEqual(await client.journal.recover(), []);
+  assert.equal(state.pushes, 0);
+  assert.equal(JSON.stringify(store.list("alice")), beforeRemote);
+});
+
+test("issue 66: native-required private hydration and reconcile require the physical mutation context", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "signed remote cache bytes",
+  });
+  const client = await open();
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshot);
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client._materializeOnDemand("docs/restore.txt"),
+    { code: "sync_root_busy" });
+  await assert.rejects(client._reconcileLocal(), { code: "sync_root_busy" });
+  assert.equal(await exists(path.join(root, "docs", "restore.txt")), false);
+  assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot);
+  assert.deepEqual(await client.journal.recover(), []);
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 1);
 });
 
 test("issue 66: equal-byte foreign inbound stage cannot authorize a successful FOD publish", async (t) => {

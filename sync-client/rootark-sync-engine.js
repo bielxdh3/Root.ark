@@ -126,6 +126,18 @@ function denyIndeterminateInbound(engine) {
       "sync_inbound_indeterminate");
   }
 }
+// Internal native-required mutation methods may be called by other methods
+// only AFTER withMutationLock has acquired the exclusive physical root lock.
+// The AsyncLocalStorage key is private and cannot be forged by assigning an
+// engine property. It is a cooperative call-graph fence, NOT root custody,
+// and must never become an authorization for hostile same-SID/UID writers.
+function requireNativeRootMutationContext(engine) {
+  if (!engine.requireNativeRootRecovery) return;
+  const queueKey = process.platform === "win32" ? engine.rootDir.toLowerCase() : engine.rootDir;
+  if (ROOT_MUTATION_CONTEXT.getStore() !== queueKey) {
+    fail("Native-required sync mutation lacks its physical root lock", "sync_root_busy");
+  }
+}
 // Module-private and deliberately non-overridable. A future verified native
 // opener returning successfully must NEVER resume the legacy pathname replay.
 function denyLegacyNativeRootReplay() {
@@ -3715,6 +3727,7 @@ class SyncEngine {
 
   async _apply(operation, summary = null, beforeHydrationWrite = null) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     operation = envelopeCopy(operation);
     // Incoming authenticated DELETE/tombstone is not independent authority
@@ -4140,6 +4153,7 @@ class SyncEngine {
 
   async _reconcileLocal() {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     denyHistoricallyTrackedControlTemp(this.snapshot,
       internalRootMetadata(this.rootDir, this.snapshotPath, this.journal?.filePath));
@@ -4631,6 +4645,7 @@ class SyncEngine {
 
   async _materializeOnDemand(safePath) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
       fail("Cannot hydrate while a signed atomic sync batch is pending", "sync_atomic_batch_indeterminate");
     }
