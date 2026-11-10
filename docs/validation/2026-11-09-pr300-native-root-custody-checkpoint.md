@@ -1082,10 +1082,36 @@ crash after rename before marker fsync, forced powercut, or cold authority
 reacquisition. `unlinkat`, arbitrary user-path transactions, protected
 owner custody and native Windows publication are *not implemented*.
 
-The source and composite SHAs require independent **SOURCE GO of the
-exact versions** before fast-forward into the local integrated worktree.
-Even with SOURCE GO, this is a test-only syscalls/ordering milestone:
+Independent reviewers granted **bounded SOURCE GO** to the exact native
+stage child `f7279cb8660dfd2cd69e2f692bd42a02757cf047`, the composed
+SHA `42b8d837879dfbce72280c36a0c22c889b4ce09a`, and this
+docs-only checkpoint `5ef996318c2c119a080983161788f8f16cdc3c60`.
+The integrated local worktree fast-forwarded to `5ef99631` with no
+remote publication. SOURCE GO applies only to this lab and documentation,
+not a complete recovery design. Even with these GO decisions, this is a
+test-only syscalls/ordering milestone:
 `openNativeRootSession` and production `requireNativeRecoveryAuthority`
 remain unconditionally denied. **RELEASE NO-GO**. Remote PR #300 stays
 OPEN/Draft at `d3a91c92`, hosted formal CodeQL remains failed and was not
 rerun to conserve GitHub Actions billing; no push/merge/deploy/cutover.
+
+### Independent legitimate required-v2 crash check on the composed SHA
+
+The exact code SHA `42b8d837879dfbce72280c36a0c22c889b4ce09a`
+was also physically checked for the bounded **non-FOD legitimate**
+`required-v2` recovery scenario with 16,385 distinct trash entries
+already present before the PREPARE transition. Both `staged` and `active`
+subcases are exercised within that Node test; the recovered snapshot
+must clear `evictionLedgerRequired`, preserve authenticated source bytes,
+and issue no signed DELETE. Observed focused Node22 results:
+
+| Filesystem | Test | Observed |
+| --- | --- | --- |
+| Windows / NTFS | `issue-66-eviction-empty-ledger-gap-p2.test.js` `--test-name-pattern='hard crash with'` | 1 PASS / 0 FAIL |
+| Ubuntu WSL / ext4 (`TMPDIR=/home/bielx`) | Same test and exact source SHA | 1 PASS / 0 FAIL |
+
+The physical check uses temporary ordinary-recovery fixtures and does
+**not** establish a hostile writer's ability/inability to replace root
+ancestors, durable journal/rename atomicity under power loss, cold native
+reacquisition, or release-worthy adversarial `required-v2` recovery.
+These are independent proof gates, not extrapolations from green tests.
