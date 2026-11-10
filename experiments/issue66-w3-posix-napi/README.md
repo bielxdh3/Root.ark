@@ -52,6 +52,25 @@ Unicode filename `café-中-😀.bin` is transferred as UTF-8 without
 normalization. This lab does not cover arbitrary invalid UTF-8 raw POSIX
 filenames or casefold collisions.
 
+An additional **test-only** native pagination experiment addresses the old
+16-entry `enumerate(token)` laboratory cap without claiming a production
+RootSession. `seedMany(token)` uses Linux `openat2` with native exclusive
+no-follow creation relative to the same held directory fd to create exactly
+**16,385** extra one-byte records; it fsyncs each opened file and the held
+directory and refuses reseeding. `beginStream(token)` rewinds the native
+`DIR*`; each `nextStreamPage(token)` returns at most 64 raw-name Node
+Buffers, preserving exact `readdir` bytes without UTF-8 normalization, and
+retains the directory cursor across calls until an explicit `done`. Invalid
+tokens, calls after close, and interference from the legacy full-array
+`enumerate` method fail closed. A physical test validates 16,388 unique
+names (including the original Unicode name and alias), reads the last native
+file, and enumerates the **same held A directory** after its pathname is
+deterministically rebound to foreign B. Nothing in this lab reopens a
+trusted root at cold startup, protects its owner-controlled HOME parent
+from another same-UID process, or implements `unlinkat`, a durable recovery
+journal or monotonic rollback protection. The N-API bridge is still
+**LAB_ONLY_NO_GO** and cannot activate the production feature.
+
 Only for deterministic physical validation, native `swapToForeign` and
 `restoreOriginal` perform `renameat2(..., RENAME_NOREPLACE)` on pinned
 parent dirfd. During A→B→A, the old `DIR*` continues listing and reading A,
@@ -80,6 +99,13 @@ On the corrected branch, WSL Node22/ext4 addon + RootSession-contract tests
 yielded **14 PASS / 0 FAIL / 1 SKIP**; this only validates the lab scope.
 The SKIP is a hostile same-UID concurrent bind-mount/parent-trust test:
 `CAP_SYS_ADMIN` and independently protected custody were not available.
+The later isolated `seedMany` + `beginStream` + `nextStreamPage` experiment
+completed physical Ubuntu WSL Node22/ext4 TDD (the new test was RED before
+the native methods existed) and the combined N-API + RootSession contract
+suite with **15 PASS / 0 FAIL / 1 expected SKIP**. That is a bounded
+test-only page-streaming result, not an independent 16,385-entry production
+recovery or crash/power-cut authorization. Its exact commit still requires
+independent SOURCE review before integration.
 The test-token separation and per-environment state are narrowly scoped
 correctness checks; a hostile same-UID process can still inspect another
 process, mutate the trusted-by-test parent or race native fixture paths.

@@ -38,6 +38,9 @@ typedef struct {
   int parentfd;
   DIR *held;
   int phase;
+  int stream_active;
+  int stream_done;
+  int seeded;
   char token[33];
 } lab_session;
 
@@ -190,6 +193,9 @@ static void release_handles(lab_session *session) {
   }
   session->active = 0;
   session->phase = 0;
+  session->stream_active = 0;
+  session->stream_done = 0;
+  session->seeded = 0;
   memset(session->token, 0, sizeof(session->token));
 }
 
@@ -274,6 +280,9 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
   session->parentfd = parent;
   session->held = dir;
   session->phase = 0;
+  session->stream_active = 0;
+  session->stream_done = 0;
+  session->seeded = 0;
   memcpy(session->token, token, sizeof(session->token));
   session->active = 1;
   return result_text(env, token);
@@ -284,6 +293,7 @@ static napi_value enumerate(napi_env env, napi_callback_info info) {
   if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
   lab_session *session = session_for(env, info);
+  if (session->stream_active) return fail(env, "NATIVE_STREAM_BUSY");
   int fd = dirfd(session->held);
   if (!plain_directory(fd, 1)) return fail(env, "NATIVE_FD_INVALID");
   rewinddir(session->held);
@@ -303,6 +313,89 @@ static napi_value enumerate(napi_env env, napi_callback_info info) {
   }
   if (errno != 0) return fail(env, "NATIVE_ENUM_FAILED");
   return array;
+}
+
+// Test-only fixed-count native file creation under the *retained* held dirfd.
+// This is intentionally NOT an independently authorized production writer.
+// A same-UID actor still owns the test parent and can mutate its ancestry.
+static napi_value seed_many(napi_env env, napi_callback_info info) {
+  napi_value argv[3];
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
+    return fail(env, "NATIVE_TOKEN_REJECTED");
+  lab_session *session = session_for(env, info);
+  const int directory = dirfd(session->held);
+  if (session->phase != 0 || session->seeded || !plain_directory(directory, 1))
+    return fail(env, "NATIVE_SEED_DENIED");
+  session->seeded = 1;
+  for (unsigned i = 0; i < 16385; ++i) {
+    char name[32];
+    if (snprintf(name, sizeof(name), "entry-%05u.bin", i) < 0)
+      return fail(env, "NATIVE_SEED_FAILED");
+    int file = fd_openat2(directory, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (file < 0) return fail(env, "NATIVE_SEED_FAILED");
+    int okay = write(file, "x", 1) == 1 && fsync(file) == 0;
+    if (close(file) != 0) okay = 0;
+    if (!okay) return fail(env, "NATIVE_SEED_FAILED");
+  }
+  if (fsync(directory) != 0) return fail(env, "NATIVE_SEED_FAILED");
+  return result_text(env, "LAB_SEEDED_16385");
+}
+
+static napi_value begin_stream(napi_env env, napi_callback_info info) {
+  napi_value argv[3];
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
+    return fail(env, "NATIVE_TOKEN_REJECTED");
+  lab_session *session = session_for(env, info);
+  if (!plain_directory(dirfd(session->held), 1))
+    return fail(env, "NATIVE_FD_INVALID");
+  rewinddir(session->held);
+  session->stream_active = 1;
+  session->stream_done = 0;
+  return result_text(env, "LAB_STREAM_READY");
+}
+
+// The native cursor advances on the same held DIR* across invocations.
+// Names are copied as exact bytes, without lossy UTF-8 normalization.
+// Every page is bounded to 64 names, independent of directory size.
+static napi_value next_stream_page(napi_env env, napi_callback_info info) {
+  napi_value argv[3];
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
+    return fail(env, "NATIVE_TOKEN_REJECTED");
+  lab_session *session = session_for(env, info);
+  if (!session->stream_active || !plain_directory(dirfd(session->held), 1))
+    return fail(env, "NATIVE_STREAM_NOT_READY");
+  napi_value result, array;
+  if (napi_create_object(env, &result) != napi_ok ||
+      napi_create_array(env, &array) != napi_ok)
+    return fail(env, "NATIVE_API_FAILED");
+  uint32_t count = 0;
+  while (count < 64 && !session->stream_done) {
+    errno = 0;
+    struct dirent *entry = readdir(session->held);
+    if (!entry) {
+      if (errno != 0) return fail(env, "NATIVE_ENUM_FAILED");
+      session->stream_done = 1;
+      break;
+    }
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    size_t length = strlen(entry->d_name);
+    if (length == 0 || length > 255)
+      return fail(env, "NATIVE_ENUM_FAILED");
+    napi_value name;
+    if (napi_create_buffer_copy(env, length, entry->d_name, NULL, &name) != napi_ok ||
+        napi_set_element(env, array, count, name) != napi_ok)
+      return fail(env, "NATIVE_API_FAILED");
+    ++count;
+  }
+  if (!plain_directory(dirfd(session->held), 1))
+    return fail(env, "NATIVE_FD_INVALID");
+  napi_value done;
+  if (napi_get_boolean(env, session->stream_done != 0, &done) != napi_ok ||
+      napi_set_named_property(env, result, "names", array) != napi_ok ||
+      napi_set_named_property(env, result, "done", done) != napi_ok)
+    return fail(env, "NATIVE_API_FAILED");
+  return result;
 }
 
 static napi_value native_read(napi_env env, napi_callback_info info) {
@@ -425,6 +518,9 @@ static napi_value init(napi_env env, napi_value exports) {
     {"authority", NULL, authority, NULL, NULL, NULL, napi_default, session},
     {"openTestSession", NULL, open_test_session, NULL, NULL, NULL, napi_default, session},
     {"enumerate", NULL, enumerate, NULL, NULL, NULL, napi_default, session},
+    {"seedMany", NULL, seed_many, NULL, NULL, NULL, napi_default, session},
+    {"beginStream", NULL, begin_stream, NULL, NULL, NULL, napi_default, session},
+    {"nextStreamPage", NULL, next_stream_page, NULL, NULL, NULL, napi_default, session},
     {"read", NULL, native_read, NULL, NULL, NULL, napi_default, session},
     {"swapToForeign", NULL, swap_to_foreign, NULL, NULL, NULL, napi_default, session},
     {"restoreOriginal", NULL, restore_original, NULL, NULL, NULL, napi_default, session},

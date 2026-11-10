@@ -63,6 +63,10 @@ test("#66 W3 token minted in native code rejects JS fd/object/path spoofing",
     assert.throws(() => bridge.read("00000000000000000000000000000000", "original.bin"), /NATIVE_TOKEN_REJECTED/);
     assert.throws(() => bridge.read({ toString() { throw Error("should not invoke"); } }, "original.bin"),
       /NATIVE_TOKEN_REJECTED/);
+    assert.throws(() => bridge.seedMany({ fd: 42, native: true }), /NATIVE_TOKEN_REJECTED/);
+    assert.throws(() => bridge.beginStream(42), /NATIVE_TOKEN_REJECTED/);
+    assert.throws(() => bridge.nextStreamPage("00000000000000000000000000000000"),
+      /NATIVE_TOKEN_REJECTED/);
   });
 
 test("#66 W3 pinned native fd enumerates and reads exact Unicode across deterministic A-B-A",
@@ -93,6 +97,46 @@ test("#66 W3 pinned native fd enumerates and reads exact Unicode across determin
     assert.equal(bridge.read(token, "café-中-😀.bin").toString("utf8"), "UNICODE");
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
     assert.throws(() => bridge.read(token, "original.bin"), /NATIVE_TOKEN_REJECTED/);
+  });
+
+test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded raw-name pages",
+  { skip: !enabled, timeout: 180000 }, () => {
+    const bridge = loadLab();
+    const token = bridge.openTestSession();
+    assert.equal(bridge.seedMany(token), "LAB_SEEDED_16385");
+    assert.throws(() => bridge.seedMany(token), /NATIVE_SEED_DENIED/,
+      "a native session cannot reseed or overwrite its retained fixture");
+    const scan = () => {
+      assert.equal(bridge.beginStream(token), "LAB_STREAM_READY");
+      const decoded = [];
+      let pageCount = 0;
+      while (true) {
+        assert.ok(++pageCount <= 300, "a 64-entry stream must terminate after 258 pages");
+        const page = bridge.nextStreamPage(token);
+        assert.ok(Array.isArray(page.names) && page.names.length <= 64);
+        for (const name of page.names) {
+          assert.ok(Buffer.isBuffer(name), "native returns exact name bytes, not lossy UTF-8 strings");
+          decoded.push(name.toString("utf8"));
+        }
+        if (page.done) break;
+      }
+      assert.equal(decoded.length, 16385 + 3);
+      assert.equal(new Set(decoded).size, decoded.length);
+      assert.ok(decoded.includes("caf\u00e9-\u4e2d-\ud83d\ude00.bin"));
+      assert.ok(decoded.includes("entry-16384.bin"));
+      return decoded.sort();
+    };
+    const before = scan();
+    assert.throws(() => bridge.enumerate(token), /NATIVE_STREAM_BUSY/,
+      "legacy full-array enumerator cannot silently rewind a retained cursor");
+    assert.equal(bridge.read(token, "entry-16384.bin").toString(), "x");
+    assert.equal(bridge.swapToForeign(token), "HELD_ORIGINAL_FOREIGN_AT_NAME");
+    assert.deepEqual(scan(), before, "the same retained directory, not replacement B, is enumerated");
+    assert.equal(bridge.restoreOriginal(token), "ORIGINAL_RESTORED_FOREIGN_RETAINED");
+    assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+    assert.throws(() => bridge.nextStreamPage(token), /NATIVE_TOKEN_REJECTED/);
+    assert.throws(() => requireNativeRecoveryAuthority(bridge),
+      (e) => e.code === "root_session_unverified_authority");
   });
 
 test("#66 W3 Node Worker environments own separate native descriptors and session tokens",
