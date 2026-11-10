@@ -1931,3 +1931,87 @@ Draft `d3a91c92` formal CodeQL is **FAILURE, four HIGH**;
 these local tests do not clear it. No new hosted CI, PR push,
 merge, deploy or `Root/main` update was performed.
 **RootSession remains fail-closed; RELEASE NO-GO.**
+
+### 2026-11-10 continuation — CodeQL cause tracing, marker rebinding, inbound failure cleanup
+
+The GitHub CodeQL check-run `129597231893` on **remote Draft SHA
+`d3a91c921c18e40d23d101958b487725e88e8d95`** still reports
+**four** `Potential file system race condition` failures: old
+`sync-client/rootark-sync-engine.js:77` (marker `lstat` followed by a
+different pathname `readFile`) and `:706-707` (held trash directory
+followed by pathname `opendir`), plus the analogous `stat`/path-read
+patterns in `test/issue-66-files-on-demand.test.js:625` and
+`test/issue-66-independent-owner-posix-root.test.js:167`. These are
+**old remote line numbers**, not findings newly confirmed on the
+unpublished local SHA. The local runtime already used one bounded,
+held marker handle and Linux held-root/held-trash descriptor traversal;
+the POSIX test already read its root-owned canary through a retained FD.
+The FOD-mode regression test now independently checks regular-file,
+single-link, exact marker bytes on the **same** opened FileHandle. No
+CodeQL suppression or bypass was added, and no hosted final-SHA CodeQL
+PASS is claimed.
+
+Marker inode-rebinding regression `9fe36d47718f5a822659aea37faca8315e724f40`
+physically renamed the original marker to a parked name and wrote a
+different inode containing the **same bytes** at the original name
+immediately after real `lstat`. Against old remote `d3a91c92`, the
+marker was incorrectly accepted (**RED: Missing expected rejection**)
+on Windows Node22/NTFS and WSL Node22. Against the held-FD local
+implementation it failed `root_mode_marker_invalid` as required,
+preserving both original and foreign bytes, snapshot and remote store;
+Windows Node22 **3 PASS** and WSL Node22 **4 PASS** in focused tests
+(the latter also included Linux held-trash enumeration). Exact
+`9fe36d47` received narrow independent SOURCE GO. Child
+`23a0746ecbceb9272d42f4155b53f2db5582b440` also reads post-swap
+marker evidence from separately opened and retained file descriptors
+rather than reintroducing `lstat(path)` then `readFile(path)` in the
+test itself; targeted tests reported Windows Node22 **3 PASS** and
+WSL Node22 **3 PASS**. These are deterministic physical-rebinding
+windows, **not** proof against arbitrary concurrent same-SID ABA.
+
+Further inspection found two operational `finally { fsp.rm(temporary) }`
+paths for authenticated inbound hydration and remote MOVE payload
+fallback. The new FOD test physically parked an O_EXCL-created temp,
+placed foreign bytes under its former name, injected EIO at the
+publication `rename` boundary and intercepted the would-be foreign
+removal before destruction. Parent `9fe36d47` was **RED on both
+Windows Node22/NTFS and WSL Node22** (`attemptedForeignRemoval=true`);
+no foreign bytes were actually destroyed. Child
+`a5cab02adcf9ac8ef2c2f8146f1ceeaf1cd89d4d` removed that
+pathname cleanup and kept uncertain payloads under a reserved,
+nonauthorizing internal prefix. Its first independent SOURCE review
+returned **NO-GO/P2**: creating the temp at the root could introduce
+`EXDEV` when the legitimate destination lives in a nested mount.
+Child `da06918abb0af9af9b13384657efc713e6ecc0d6` corrected this
+to use the **same destination directory/volume**, and extended
+required-v2 physical recovery to treat exactly named regular-file
+nested temporary debris as inert, while rejecting a directory or
+case-mismatched impostor. The second independent SOURCE review
+returned **narrow GO for the cumulative `a5cab02a` + `da06918a`**,
+with no new P1/P2 in that scope. This does not certify an actual
+bind-mount matrix: the fix's source ordering and same-parent test
+address that earlier regression, but no cross-device physical mount
+was set up in this round.
+
+On `a5cab02a` before the same-volume child, the entire FOD suite
+reported **Windows Node22 39 PASS / 1 SKIP / 0 FAIL** and **WSL Node22
+40 PASS / 0 FAIL**. On `da06918a`, the new nested-inbound-orphan
+required-v2 test passed **1/1 on Windows Node22** and **1/1 on WSL
+Node22**, including legitimate hard-exit/new-process replay with a
+synthetically inserted orphan and a separate negative forged-directory
+case. The affected FOD marker/hydration/MOVE tests passed **3/3 on each
+platform**, and Phase 16 legitimate authenticated sync/MOVE non-FOD
+regressions passed on both systems. The 16,385-entry stress cases
+were **not repeated**. The orphan was planted after the hard-exit;
+this does not prove an actual crash during an inbound write.
+
+**Remaining security gates are unchanged:** a successful rename and
+other legacy pathname stage/cleanup may still race against a same-UID/
+SID hostile parent or leaf; JS identity checks and source-only
+same-volume reasoning do not furnish independent custody. There is no
+trusted RootSession, production NTFS/CFAPI handle-bound mutation,
+independently signed monotonic rollback floor, true power-cut result,
+Windows 10 CFAPI release result, or hosted CodeQL result for this
+local chain. No push, merge, deploy or `Root/main` mutation was
+performed during the test-and-integration cycle described here.
+**PR #300 is not merge-ready or release-ready: NO-GO.**
