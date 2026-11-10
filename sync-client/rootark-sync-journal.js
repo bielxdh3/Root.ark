@@ -202,7 +202,10 @@ async function durableWrite(filePath, value) {
   try {
     await renameWithRetry(temporary, filePath);
   } catch (error) {
-    await fsp.unlink(temporary).catch(() => {});
+    // Do not unlink a path after a failed publish. Another process with
+    // directory-write access may have replaced the original temporary
+    // inode since close; unlink would remove an unrelated foreign file.
+    // An uncommitted .tmp never becomes replay authority.
     throw error;
   }
   try {

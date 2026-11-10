@@ -29,7 +29,13 @@ const EXCLUDED_PATHS_CASEFOLD_VERSION = 2;
 const EVER_FOD_MARKER_NAME = ".rootark-sync-ever-fod";
 const EVER_FOD_MARKER_BYTES = "rootark-sync-ever-fod-v1\n";
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync-evictions", ".rootark-sync.lock", ".rootark-webdav-owner.lock", EVER_FOD_MARKER_NAME]);
-const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-"];
+const INTERNAL_NAME_PREFIXES = [
+  ".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-",
+  // A failed O_EXCL temp publication must not be cleaned by mutable name.
+  // Its orphan is nonauthorizing transaction debris, never user content to
+  // upload or a physical-cache path to reject during safe cold replay.
+  ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+];
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
@@ -647,7 +653,11 @@ async function durableJson(filePath, value) {
     }
   } catch (error) {
     if (handle) await handle.close().catch(() => {});
-    await fsp.rm(temporary, { force: true }).catch(() => {});
+    // An untrusted same-UID/SID writer can replace the temp filename
+    // after the original FD was closed but before rename() fails. An
+    // unchecked rm(temp) would then delete the FOREIGN replacement.
+    // Do not cleanup by mutable name on failed or indeterminate publish.
+    // The orphan .tmp cannot itself authorize snapshot/ledger recovery.
     throw error;
   }
 }

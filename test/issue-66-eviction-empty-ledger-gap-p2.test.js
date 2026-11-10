@@ -52,6 +52,70 @@ async function fixture(t, name, twoFiles = false) {
     signed, create, outbound, key };
 }
 
+test("issue 66: failed required-v2 snapshot publication must not unlink a swapped temporary inode", async (t) => {
+  const f = await fixture(t, "snapshot-failed-rename-foreign-temp");
+  const sync = await f.create(f.root, ["private"]);
+  const priorDisk = await fsp.readFile(f.snapshot);
+  const foreign = Buffer.from("FOREIGN_SNAPSHOT_TEMP_NEVER_UNLINK");
+  const parked = path.join(f.dir, "original-snapshot-temp-parked");
+  const originalRename = fsp.rename;
+  const originalRm = fsp.rm;
+  let planted = null;
+  let attemptedForeignRemoval = false;
+  const beforeWrites = f.outbound.length;
+  try {
+    fsp.rename = async (source, destination, ...args) => {
+      if (!planted && path.resolve(String(destination)) === path.resolve(f.snapshot)
+        && String(source).startsWith(f.snapshot + ".tmp-")) {
+        planted = String(source);
+        await originalRename(source, parked);
+        await fsp.writeFile(source, foreign, { flag: "wx" });
+        throw Object.assign(new Error("physical snapshot temporary changed before rename"), { code: "EIO" });
+      }
+      return originalRename(source, destination, ...args);
+    };
+    fsp.rm = async (requested, ...args) => {
+      if (planted && path.resolve(String(requested)) === path.resolve(planted)) {
+        attemptedForeignRemoval = true;
+        // Intercept before any foreign bytes are destroyed.
+        throw Object.assign(new Error("foreign snapshot removal intercepted"), { code: "EACCES" });
+      }
+      return originalRm(requested, ...args);
+    };
+    await assert.rejects(sync.persistSnapshot(), { code: "EIO" });
+  } finally {
+    fsp.rename = originalRename;
+    fsp.rm = originalRm;
+  }
+  assert.ok(planted, "must physically substitute a real O_EXCL temporary after close");
+  assert.equal(attemptedForeignRemoval, false,
+    "a failed snapshot rename must never remove a foreign substituted name");
+  assert.deepEqual(await fsp.readFile(planted), foreign);
+  assert.equal((await fsp.lstat(planted)).nlink, 1);
+  assert.ok((await fsp.lstat(parked)).isFile());
+  assert.deepEqual(await fsp.readFile(f.snapshot), priorDisk);
+  // A preserved orphan MUST NOT turn into an ordinary remote sync upload,
+  // nor be mistaken for a previously authenticated cache entry.
+  const journalOrphan = path.join(f.root,
+    ".rootark-sync-journal.json.tmp-123-00000000-0000-4000-8000-000000000066");
+  await fsp.writeFile(journalOrphan, "UNCOMMITTED_JOURNAL_TEMP", { flag: "wx" });
+  const scan = await sync.scanFiles();
+  assert.equal(Object.hasOwn(scan, path.basename(planted)), false,
+    "failed snapshot temporary must remain internal and never sync");
+  assert.equal(Object.hasOwn(scan, path.basename(journalOrphan)), false,
+    "failed journal temporary must remain internal and never sync");
+  const physical = await sync.scanPhysicalCacheForEvictionRecovery();
+  assert.equal(Object.hasOwn(physical, path.basename(planted)), false,
+    "required-v2 physical cache proof must not treat temp debris as local user data");
+  assert.equal(Object.hasOwn(physical, path.basename(journalOrphan)), false,
+    "required-v2 physical recovery must ignore uncommitted journal temp debris");
+  const cold = await f.create(f.root, ["private"]);
+  const recovery = await cold.syncOnce();
+  assert.equal(recovery.excluded.evicted, 1,
+    "legitimate exclusion recovery must still work with inert temp debris");
+  verifyNoSignedDelete(f, beforeWrites);
+});
+
 async function fillLegitimateTrash(root, count = 16385) {
   const directory = path.join(root, ".rootark-trash");
   await fsp.mkdir(directory, { recursive: true });
