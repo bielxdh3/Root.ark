@@ -823,3 +823,55 @@ cooperative-path behavior; absence checking is not atomic under a hostile
 same-SID writer, so native rooted no-replace, authority and rollback
 remain unproven. This child needs exact-SHA physical ext4 tests and
 independent SOURCE review before local integration.
+
+### Composed logical FOD mode and strict MOVE proof: af23a3f0
+
+The exact clean, isolated candidate
+`af23a3f0f9199625678a491596339cfc0ef245e1` contains the first-time
+MOVE compatibility repair (`6c3c1358`), a local ever-FOD marker
+(`e6517538`, rebased from `d8ae58e5`), a real Ed25519 pinned-key
+positive MOVE test (`222eb211`, rebased from `843fc305`), and direct
+helper + shared path namespace corrections (`af23a3f0`, rebased from
+`76a02b86`). The earlier categorical MOVE parent `83e047c9` was
+independently SOURCE **NO-GO** for disabling legitimate absent-source
+hydration; its child preserves authenticated recovery-payload hydration
+when both requested/tracked source and target are absent, while rejecting
+occupied cache and destination before journal admission.
+
+The local fixed-name `.rootark-sync-ever-fod` marker is created with
+exclusive file creation, file fsync and supported parent directory fsync
+before FOD operations, validated on subsequent opens, and checked before
+direct conflict-recovery writes and directory pruning. The shared path
+validator reserves this name against sync and WebDAV user data. Earlier
+independent SOURCE **NO-GO** for the marker's direct helper bypass and
+shared namespace gap was addressed by `af23a3f0`; three TDD regressions
+were RED on its parent and GREEN after the correction. This is a logical
+cooperative-client downgrade fence, NOT a trusted disk-backed monotonic
+custody witness.
+
+| Exact af23a3f0 source validation | Observed result |
+| --- | --- |
+| Windows Node22.23.4 / NTFS FOD full suite | **34 PASS / 0 FAIL / 0 SKIP** |
+| Ubuntu WSL Node22.22.1 / real ext4 FOD full suite, archived exact SHA | **34 PASS / 0 FAIL / 0 SKIP** |
+| Windows Node22 required-v2 hard crash with more than 16,384 legitimate non-FOD trash records | **1 PASS / 0 FAIL** |
+| WSL Node22 ext4 same hard-crash non-FOD recovery | **1 PASS / 0 FAIL** |
+| `git diff --check`, exact Git worktree cleanliness and Codex coauthor metadata | **PASS** |
+
+The strict MOVE fixture proves client-side Ed25519 signed-envelope
+verification using a pinned trusted device key, journal `hasSeen` and
+persisted snapshot identity on reopen. It injects the signed full envelope
+through the adapter while the non-protected disposable store holds the
+encrypted unsigned copy. It does **not** prove protected server-side
+atomic-registry admission, live revocation or production remote signing.
+An independent reviewer issued bounded SOURCE GO for the exact composed
+source, without endorsing native custody, cross-process physical attacker
+exclusion, rollback resistance or release. No force push, merge, deploy,
+Root/main mutation or RootSession enablement is authorized by these runs.
+
+**Release NO-GO persists:** hostile same-SID/UID removal or rollback of
+the local marker cannot be distinguished from a virgin root; pathname
+`lstat`/`readFile` and absent-source MOVE checks are not native held-root
+atomic no-follow operations. Separate process/cold boot, ancestor A→B→A,
+independent monotonic authority, image/DLL provenance, power-cut and
+hosted formal CodeQL remain outstanding. The PR #300 remote remains
+OPEN/Draft and no deployment or cutover was performed.
