@@ -66,8 +66,9 @@ tokens, calls after close, and interference from the legacy full-array
 `enumerate` method fail closed. `seedRawByteName(token)` creates a legal
 POSIX leaf containing byte `0xff` through the held dirfd, and a focused
 test compares exact Buffer bytes without `.toString('utf8')`. The large
-physical stress test validates **16,389** unique raw names (16,385 seeded
-ASCII records, three original entries and the invalid UTF-8 leaf), reads the last native
+physical stress test compares the **entire exact expected byte universe** of
+**16,389** raw names (all 16,385 seeded ASCII records, three original
+entries and the invalid UTF-8 leaf), not just a count or endpoints; it reads the last native
 file, and enumerates the **same held A directory** after its pathname is
 deterministically rebound to foreign B. Nothing in this lab reopens a
 trusted root at cold startup, protects its owner-controlled HOME parent
@@ -149,7 +150,7 @@ Even while this addon is loaded, the integrated
 **Unresolved blockers:** passwd HOME and the underlying namespace/parent are
 not independently attested or isolated from other same-UID actors. No writer
 exclusion, cold reopen, secure anti-rollback custody, crash-safe journal,
-full enumeration of 16,385 entries, hardlink threat closure, signed remote
+full **production** RootSession enumeration of 16,385 entries, hardlink threat closure, signed remote
 DELETE policy, or real application integration is implemented. A `0700`
 directory and random token do not defend against a hostile same-UID process.
 The C source, compiler image and subprocesses, `.node` file, dependencies,

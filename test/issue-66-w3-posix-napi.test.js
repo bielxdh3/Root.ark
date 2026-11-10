@@ -146,6 +146,16 @@ test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded
     assert.equal(bridge.seedRawByteName(token), "LAB_SEEDED_RAW_NAME");
     assert.throws(() => bridge.seedMany(token), /NATIVE_SEED_DENIED/,
       "a native session cannot reseed or overwrite its retained fixture");
+    // A count and unique-name assertion can still pass if an attacker hides
+    // an intermediate seed and supplies a foreign extra name. Compare the
+    // complete 16,389-entry raw byte universe, not just sentinel endpoints.
+    const expectedHex = ["original.bin", "alias", "café-中-😀.bin"]
+      .map((name) => Buffer.from(name, "utf8").toString("hex"));
+    expectedHex.push(Buffer.from([0x72, 0x61, 0x77, 0x2d, 0xff, 0x2e, 0x62, 0x69, 0x6e]).toString("hex"));
+    for (let index = 0; index < 16385; index++) {
+      expectedHex.push(Buffer.from(`entry-${String(index).padStart(5, "0")}.bin`, "ascii").toString("hex"));
+    }
+    expectedHex.sort();
     const scan = () => {
       assert.equal(bridge.beginStream(token), "LAB_STREAM_READY");
       const rawNames = [];
@@ -166,7 +176,10 @@ test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded
       assert.ok(rawNames.includes(Buffer.from("entry-16384.bin", "ascii").toString("hex")));
       assert.ok(rawNames.includes(Buffer.from([0x72, 0x61, 0x77, 0x2d, 0xff, 0x2e, 0x62, 0x69, 0x6e]).toString("hex")),
         "invalid UTF-8 POSIX leaf must be preserved as exact raw bytes without replacement");
-      return rawNames.sort();
+      rawNames.sort();
+      assert.deepEqual(rawNames, expectedHex,
+        "all 16,385 legitimate entries must be present by exact bytes; no foreign substitutions");
+      return rawNames;
     };
     const before = scan();
     assert.throws(() => bridge.enumerate(token), /NATIVE_STREAM_BUSY/,
