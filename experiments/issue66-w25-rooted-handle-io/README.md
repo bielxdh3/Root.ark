@@ -95,9 +95,12 @@ proof*, **not** a destructive exploit of the previous native
 implementation. Physical Windows 11 / NTFS / Node v22.23.4:
 **2 PASS / 0 FAIL** with explicit lab opt-in (including the negative
 empty/nested/disabled scratch gate); Ubuntu WSL Node22:
-**2 expected Windows-only SKIP**. No file outside the test-owned
-LocalAppData fixtures was intentionally opened or deleted. The
-fixtures are retained, never recursively cleaned by the helper.
+**2 expected Windows-only SKIP**. No unrelated user-data file
+outside the test-owned LocalAppData fixtures was intentionally
+targeted for rename, overwrite, or deletion; PowerShell/.NET
+necessarily loads scripts/libraries and may create compiler temp
+files. The fixtures are retained, never recursively cleaned by
+the helper.
 
 The test's adversarial steps are **sequential in the same process
 and SID**, not a separately scheduled hostile writer. Initial scratch
