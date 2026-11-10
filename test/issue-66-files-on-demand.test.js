@@ -824,7 +824,11 @@ test("issue 66: a physically rebound FOD marker never authorizes a foreign inode
   const parked = path.join(root, "parked-original-marker-for-adversarial-test");
   const snapshot = path.join(root, ".rootark-sync-index.json");
   const expectedMarker = "rootark-sync-ever-fod-v1\n";
-  const before = await fsp.lstat(marker, { bigint: true });
+  const markerBefore = await fsp.open(marker, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  let before;
+  try { before = await markerBefore.stat({ bigint: true }); }
+  finally { await markerBefore.close(); }
   const snapshotBefore = await fsp.readFile(snapshot);
   const storeBefore = JSON.stringify(store.list("alice"));
   const pushesBefore = state.pushes;
@@ -850,12 +854,23 @@ test("issue 66: a physically rebound FOD marker never authorizes a foreign inode
     }).open(), { code: "root_mode_marker_invalid" });
   } finally { fsp.lstat = originalLstat; }
   assert.equal(swapped, true, "the physical inode replacement must have happened");
-  const foreign = await fsp.lstat(marker, { bigint: true });
-  const parkedOriginal = await fsp.lstat(parked, { bigint: true });
-  assert.equal(parkedOriginal.ino, before.ino, "original opened inode is retained");
-  assert.notEqual(foreign.ino, before.ino, "foreign equal-byte inode must remain distinct");
-  assert.equal(await fsp.readFile(marker, "utf8"), expectedMarker);
-  assert.equal(await fsp.readFile(parked, "utf8"), expectedMarker);
+  // Read each inode from its own held descriptor, not via another pathname
+  // lookup following a lstat. The proof must not recreate the CodeQL race.
+  const heldEvidence = async (entry) => {
+    const handle = await fsp.open(entry, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    try {
+      const stats = await handle.stat({ bigint: true });
+      const bytes = await handle.readFile("utf8");
+      return { stats, bytes };
+    } finally { await handle.close(); }
+  };
+  const foreign = await heldEvidence(marker);
+  const parkedOriginal = await heldEvidence(parked);
+  assert.equal(parkedOriginal.stats.ino, before.ino, "original opened inode is retained");
+  assert.notEqual(foreign.stats.ino, before.ino, "foreign equal-byte inode must remain distinct");
+  assert.equal(foreign.bytes, expectedMarker);
+  assert.equal(parkedOriginal.bytes, expectedMarker);
   assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
   assert.equal(JSON.stringify(store.list("alice")), storeBefore);
   assert.equal(state.pushes, pushesBefore, "a failed root-mode admission must not push a signed operation");
