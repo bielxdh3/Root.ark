@@ -63,23 +63,48 @@ function denyUntrustedNativeSignedDelete() {
 async function enforceEverFodRootMode(rootDir, filesOnDemand) {
   const markerPath = path.join(rootDir, EVER_FOD_MARKER_NAME);
   const checkExisting = async () => {
-    let stats;
-    try { stats = await fsp.lstat(markerPath); }
-    catch (error) {
-      if (error.code === "ENOENT") return false;
-      throw error;
+    // Open the entry first, then inspect and read the SAME held handle.
+    // Do not authorize a pathname which changed between lstat and readFile.
+    // This does not establish independent parent custody against same-SID ABA.
+    let markerHandle;
+    try {
+      markerHandle = await fsp.open(markerPath,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        // A dangling symlink is NOT a virgin root. Only a genuinely absent
+        // directory entry permits an ordinary never-FOD client to continue.
+        try { await fsp.lstat(markerPath); }
+        catch (probeError) {
+          if (probeError.code === "ENOENT") return false;
+        }
+      }
+      fail("Unreadable Files On-Demand root marker", "root_mode_marker_invalid");
     }
-    if (!stats.isFile() || stats.isSymbolicLink()
-      || stats.size !== Buffer.byteLength(EVER_FOD_MARKER_BYTES)) {
-      fail("Invalid Files On-Demand root marker", "root_mode_marker_invalid");
-    }
-    let bytes;
-    try { bytes = await fsp.readFile(markerPath, "utf8"); }
-    catch { fail("Unreadable Files On-Demand root marker", "root_mode_marker_invalid"); }
-    if (bytes !== EVER_FOD_MARKER_BYTES) {
-      fail("Invalid Files On-Demand root marker", "root_mode_marker_invalid");
-    }
-    return true;
+    try {
+      const heldBefore = await markerHandle.stat({ bigint: true });
+      if (!heldBefore.isFile() || heldBefore.nlink !== 1n
+        || heldBefore.size !== BigInt(Buffer.byteLength(EVER_FOD_MARKER_BYTES))) {
+        fail("Invalid Files On-Demand root marker", "root_mode_marker_invalid");
+      }
+      const pathBefore = await fsp.lstat(markerPath, { bigint: true });
+      if (!pathBefore.isFile() || pathBefore.isSymbolicLink()
+        || !sameFileVersion(heldBefore, pathBefore)) {
+        fail("Replaced Files On-Demand root marker", "root_mode_marker_invalid");
+      }
+      const bytes = await markerHandle.readFile("utf8");
+      const heldAfter = await markerHandle.stat({ bigint: true });
+      const pathAfter = await fsp.lstat(markerPath, { bigint: true });
+      if (bytes !== EVER_FOD_MARKER_BYTES
+        || !sameFileVersion(heldBefore, heldAfter)
+        || !sameFileVersion(heldBefore, pathAfter)) {
+        fail("Changed Files On-Demand root marker", "root_mode_marker_invalid");
+      }
+      return true;
+    } catch (error) {
+      if (error.code === "root_mode_marker_invalid") throw error;
+      fail("Unreadable Files On-Demand root marker", "root_mode_marker_invalid");
+    } finally { await markerHandle.close(); }
   };
   const exists = await checkExisting();
   if (exists) {

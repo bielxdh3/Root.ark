@@ -777,6 +777,38 @@ test("issue 66: malformed ever-FOD root marker fails closed without writing a sn
   }
 });
 
+test("issue 66: a multiply-linked ever-FOD marker cannot authorize a root mode", async (t) => {
+  const { root, open, adapter, key } = await setup(t, {});
+  await open();
+  const marker = path.join(root, ".rootark-sync-ever-fod");
+  const alias = path.join(root, "marker-hardlink-outside-sync");
+  await fsp.link(marker, alias);
+  const original = await fsp.readFile(marker);
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  await assert.rejects(new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key,
+  }).open(), { code: "root_mode_marker_invalid" });
+  assert.deepEqual(await fsp.readFile(marker), original);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+});
+
+test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root marker", async (t) => {
+  const { root, adapter, key } = await setup(t, {});
+  await fsp.mkdir(root, { recursive: true });
+  const marker = path.join(root, ".rootark-sync-ever-fod");
+  try { await fsp.symlink("nonexistent-target", marker, "file"); }
+  catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) { t.skip("symlink creation unavailable"); return; }
+    throw error;
+  }
+  await assert.rejects(new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key,
+  }).open(), { code: "root_mode_marker_invalid" });
+  assert.equal(await exists(path.join(root, ".rootark-sync-index.json")), false);
+});
+
 test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();
