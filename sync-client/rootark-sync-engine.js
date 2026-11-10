@@ -700,15 +700,69 @@ async function createDurableEvictionRecord(filePath, value) {
 }
 async function openEvictionLedger(rootDir, create = false) {
   const directory = evictionLedgerDirectory(rootDir);
-  if (create) {
-    const existed = await exists(directory);
-    await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
-    if (!existed && process.platform !== "win32") {
-      const parent = await fsp.open(rootDir, fs.constants.O_RDONLY);
-      try { await parent.sync(); } finally { await parent.close(); }
+  if (process.platform === "linux") {
+    if (!Number.isInteger(fs.constants.O_DIRECTORY)
+      || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+      fail("Held eviction ledger directories are unavailable", "root_session_native_unavailable");
     }
-  } else if (!(await exists(directory))) return null;
-  const stats = await fsp.lstat(directory, { bigint: true });
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    // Only follow a fixed child name relative to a retained root descriptor.
+    // The root itself still needs independently protected initial custody;
+    // this is NOT a same-UID or same-mount recovery-authority proof.
+    const root = await fsp.open(rootDir, flags);
+    let held;
+    try {
+      const childPath = `/proc/self/fd/${root.fd}/${EVICTION_LEDGER_DIR}`;
+      if (create) {
+        let created = false;
+        try {
+          await fsp.mkdir(childPath, { mode: 0o700 });
+          created = true;
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+        }
+        if (created) await root.sync();
+      }
+      try {
+        held = await fsp.open(childPath, flags);
+      } catch (error) {
+        if (!create && error.code === "ENOENT") return null;
+        fail("Unsafe eviction ledger directory", "invalid_snapshot");
+      }
+      const rootBefore = await root.stat({ bigint: true });
+      const childBefore = await held.stat({ bigint: true });
+      const rootPathStats = await fsp.lstat(rootDir, { bigint: true });
+      const childPathStats = await fsp.lstat(directory, { bigint: true });
+      if (!rootBefore.isDirectory() || !childBefore.isDirectory()
+        || !sameFileVersion(rootBefore, rootPathStats)
+        || !sameFileVersion(childBefore, childPathStats)) {
+        fail("Eviction ledger root or directory changed", "invalid_snapshot");
+      }
+      await containedAbsolute(rootDir, directory, false);
+      if (!sameFileVersion(rootBefore, await root.stat({ bigint: true }))
+        || !sameFileVersion(childBefore, await held.stat({ bigint: true }))) {
+        fail("Eviction ledger root or directory changed", "invalid_snapshot");
+      }
+      return directory;
+    } finally {
+      if (held) await held.close();
+      await root.close();
+    }
+  }
+  if (create) {
+    // Do not walk an existing junction or symlink via recursive mkdir.
+    // This remains a path-based Windows compatibility route; native NTFS
+    // RootDirectory handles are still mandatory for hostile same-SID trust.
+    try { await fsp.mkdir(directory, { mode: 0o700 }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; }
+  }
+  let stats;
+  try { stats = await fsp.lstat(directory, { bigint: true }); }
+  catch (error) {
+    if (!create && error.code === "ENOENT") return null;
+    throw error;
+  }
   if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe eviction ledger directory", "invalid_snapshot");
   await containedAbsolute(rootDir, directory, false);
   return directory;
@@ -903,24 +957,98 @@ function validateEvictionPrepare(item, filename) {
   }
   return item;
 }
+// Linux-only bounded read via the exact retained ledger directory. The
+// pathname is used only for a descriptor-relative child lookup, never as
+// authority to reopen the ledger directory after enumeration.
+async function readHeldEvictionEntry(heldDirectory, filename) {
+  const child = `/proc/self/fd/${heldDirectory.fd}/${filename}`;
+  const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+    | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_CLOEXEC || 0);
+  let handle;
+  try { handle = await fsp.open(child, flags); }
+  catch { fail("Unsafe eviction ledger entry", "invalid_snapshot"); }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.ino === 0n || before.nlink !== 1n
+      || before.size > 8192n) {
+      fail("Unsafe eviction ledger entry", "invalid_snapshot");
+    }
+    const namedBefore = await fsp.lstat(child, { bigint: true });
+    if (!namedBefore.isFile() || namedBefore.isSymbolicLink()
+      || !sameFileVersion(before, namedBefore)) {
+      fail("Eviction ledger entry changed before read", "invalid_snapshot");
+    }
+    const buffer = Buffer.alloc(8193);
+    let count = 0;
+    while (count < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, count, buffer.length - count, count);
+      if (bytesRead === 0) break;
+      count += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(child, { bigint: true });
+    if (count > 8192 || BigInt(count) !== before.size
+      || !after.isFile() || !namedAfter.isFile()
+      || namedAfter.isSymbolicLink() || namedAfter.nlink !== 1n
+      || !sameFileVersion(before, after)
+      || !sameFileVersion(before, namedAfter)) {
+      fail("Eviction ledger entry changed during read", "invalid_snapshot");
+    }
+    return buffer.subarray(0, count);
+  } finally { await handle.close(); }
+}
 async function readEvictionLedger(rootDir, expectedEpoch = null) {
   const directory = await openEvictionLedger(rootDir);
   if (!directory) return { directory: null, entries: new Map(), head: null };
-  const files = await fsp.readdir(directory);
+  const linux = process.platform === "linux";
+  let heldRoot;
+  let heldDirectory;
+  let heldRootStats;
+  let heldDirectoryStats;
+  const verifyHeldLedger = async () => {
+    if (!linux) return;
+    const currentRoot = await fsp.lstat(rootDir, { bigint: true });
+    const currentDirectory = await fsp.lstat(directory, { bigint: true });
+    if (!sameFileVersion(heldRootStats, currentRoot)
+      || !sameFileVersion(heldDirectoryStats, currentDirectory)
+      || !sameFileVersion(heldRootStats, await heldRoot.stat({ bigint: true }))
+      || !sameFileVersion(heldDirectoryStats, await heldDirectory.stat({ bigint: true }))) {
+      fail("Eviction ledger root or directory changed during read", "invalid_snapshot");
+    }
+    await containedAbsolute(rootDir, directory, false);
+  };
+  try {
+    if (linux) {
+      const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+        | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+      heldRoot = await fsp.open(rootDir, flags);
+      heldDirectory = await fsp.open(
+        `/proc/self/fd/${heldRoot.fd}/${EVICTION_LEDGER_DIR}`, flags);
+      heldRootStats = await heldRoot.stat({ bigint: true });
+      heldDirectoryStats = await heldDirectory.stat({ bigint: true });
+      await verifyHeldLedger();
+    }
+  const files = await fsp.readdir(linux ? `/proc/self/fd/${heldDirectory.fd}` : directory);
   if (files.length > EVICTION_LEDGER_MAX * 2 + 1) fail("Eviction ledger capacity exceeded", "invalid_snapshot");
   let head = null;
   const entries = new Map();
   for (const filename of files) {
     const match = /^([a-f0-9]{64})\.(prepare|commit)\.json$/.exec(filename);
     if (!match && filename !== "head.json") fail("Malformed or torn eviction ledger entry", "invalid_snapshot");
-    const file = path.join(directory, filename);
-    const stats = await fsp.lstat(file, { bigint: true });
-    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n || stats.size > 8192n) {
-      fail("Unsafe eviction ledger entry", "invalid_snapshot");
-    }
     let item;
     try {
-      const bytes = await readContainedFile(rootDir, `${EVICTION_LEDGER_DIR}/${filename}`, stats, true);
+      let bytes;
+      if (linux) {
+        bytes = await readHeldEvictionEntry(heldDirectory, filename);
+      } else {
+        const file = path.join(directory, filename);
+        const stats = await fsp.lstat(file, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink()
+          || stats.nlink !== 1n || stats.size > 8192n) {
+          fail("Unsafe eviction ledger entry", "invalid_snapshot");
+        }
+        bytes = await readContainedFile(rootDir, `${EVICTION_LEDGER_DIR}/${filename}`, stats, true);
+      }
       if (bytes.length > 8192) fail("Oversized eviction ledger entry", "invalid_snapshot");
       item = JSON.parse(bytes.toString("utf8"));
     }
@@ -976,7 +1104,12 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
     }
   }
   if (entries.size > EVICTION_LEDGER_MAX) fail("Eviction ledger has too many objects", "invalid_snapshot");
+  await verifyHeldLedger();
   return { directory, entries, head };
+  } finally {
+    if (heldDirectory) await heldDirectory.close();
+    if (heldRoot) await heldRoot.close();
+  }
 }
 async function writeEvictionPrepare(rootDir, prepare, currentHead) {
   const filename = evictionLedgerName(prepare.objectId, "prepare");

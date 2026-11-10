@@ -204,6 +204,49 @@ test("issue 66: staged genesis must enumerate the held trash, not a swapped path
   }
 });
 
+test("issue 66: Linux recovery must not enumerate a ledger directory replaced after validation", {
+  skip: process.platform !== "linux" && "Linux held ledger dirfd required",
+}, async (t) => {
+  const f = await fixture(t, "held-ledger-parent-race");
+  await prePrepareCrash(f);
+  const originalLedger = f.ledger;
+  const displaced = path.join(f.root, ".rootark-sync-evictions-displaced");
+  const attacker = path.join(f.dir, "attacker-ledger");
+  await fsp.mkdir(attacker);
+  await fsp.writeFile(path.join(attacker, "ATTACKER_SENTINEL"), "foreign data, never enumerate");
+  const originalReaddir = fsp.readdir;
+  let injected = false;
+  let attackerEnumerated = false;
+  fsp.readdir = async (requested, ...args) => {
+    const requestedName = String(requested);
+    if (!injected && (requestedName === originalLedger
+      || /^\/proc\/self\/fd\/\d+$/.test(requestedName))) {
+      injected = true;
+      await fsp.rename(originalLedger, displaced);
+      await fsp.symlink(attacker, originalLedger, "dir");
+    }
+    const names = await originalReaddir(requested, ...args);
+    if (injected && names.includes("ATTACKER_SENTINEL")) attackerEnumerated = true;
+    return names;
+  };
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(f.create(f.root, ["private"]),
+      (error) => ["invalid_snapshot", "unsafe_path"].includes(error?.code));
+  } finally {
+    fsp.readdir = originalReaddir;
+    if (injected) {
+      await fsp.unlink(originalLedger);
+      await fsp.rename(displaced, originalLedger);
+    }
+  }
+  assert.equal(injected, true, "the ledger reader must reach a real directory enumeration");
+  assert.equal(attackerEnumerated, false, "the reader must never enumerate the swapped-in directory");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66 P2: required v2 refuses a staged case-alias hidden among >16384 trash entries", async (t) => {
   const f = await fixture(t, "large-trash-required");
   await fillLegitimateTrash(f.root);
