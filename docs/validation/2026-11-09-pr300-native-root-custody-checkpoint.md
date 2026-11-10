@@ -1473,3 +1473,70 @@ active ledger, inconsistent epoch/required markers, failed compaction,
 legitimate restart, archive cold denial and the two Windows swap
 scenarios, but were **not** the separate 16,385-entry stress battery.
 No hosted CI or external custodial provisioning was attempted.
+
+### 2026-11-10 continuation — individually substituted archive record leaves
+
+The prior archive-directory identity hardening did **not** bind the
+individual PREPARE, COMMIT or HEAD filenames used during destructive
+retirement. A same-SID writer could keep the original NTFS ledger
+directory inode and replace just one *child* after its contents were
+read. On exact original parent `c452deaa`, a physical Windows Node22/
+NTFS test substituted a disposable COMMIT file immediately after
+the original archive rename and before cleanup. The old code attempted
+to unlink that new foreign inode: **RED 1 FAIL**. The test intercepted
+the actual `unlink` call and preserved its bytes; no foreign file
+was deleted and no outbound signed DELETE was issued.
+
+Child `c2e8e9b48dcfd8e4ecb13f35af1fe0c40e2e2eff` records the
+Windows BigIntStats of **every** validated PREPARE, COMMIT and HEAD
+while reading the ledger. Windows retirement checks that each
+archive entry is still the same regular, single-link file with the
+same version before its individual unlink. Absent, symlinked,
+hardlinked or changed entries fail closed as `invalid_snapshot`
+without issuing the removal. Focused real NTFS substitution tests
+for COMMIT, PREPARE and HEAD each passed, preserving exact foreign
+Buffer bytes and the signed remote object. The complete
+`test/issue-66-eviction-ledger-sentinel-p1.test.js` on the exact
+child gave **Windows Node22/NTFS 14 PASS, 1 Linux-only SKIP,
+0 FAIL**, and **WSL Node22/ext4 9 PASS, 6 Windows-only SKIP,
+0 FAIL**. Source/test syntax and `git diff --check` passed.
+Independent read-only peer review of exact `c2e8e9b4` gave bounded
+SOURCE GO, no new P0/P1/P2, and the clean code was locally
+fast-forwarded.
+
+Linux had the equivalent **record-leaf**, not parent-directory,
+window even with the old journal directory held via a dirfd.
+On original parent `c2e8e9b4`, a WSL Node22/ext4 test physically
+replaced a COMMIT name after archive rename while the original
+directory descriptor remained pinned. The old code tried to
+`unlink` the new inode via `/proc/self/fd/N/<leaf>`; the test
+intercepted the real operation before destruction: **RED 1 FAIL**.
+Child `61669b0640f01885c30ceac192819d9708a07943` propagates
+the original bounded held-record read's validated BigIntStats to
+the Linux retire stage and checks the held dirfd-relative leaf's
+identity/version and single-link regular-file status before
+each `unlink`. The full WSL Node22/ext4 sentinel module on this
+SHA returned **12 PASS, 6 Windows-only SKIP, 0 FAIL** (three
+physically substituted COMMIT/PREPARE/HEAD leaf cases); Windows
+Node22/NTFS focused smoke gave **4 PASS, 0 FAIL** on the
+existing legitimate compaction and three Windows leaf-swap
+scenarios. Independent exact-SHA SOURCE peer issued bounded GO,
+zero new P0/P1/P2, and the code was integrated locally by safe
+fast-forward. The earlier 16,385-entry physical matrices were
+**not rerun**.
+
+**Critical boundary:** These checks reduce specific legacy
+time-of-check-to-use windows but do **not** make unlink atomic
+with respect to the verified inode. A same-SID/UID attacker can
+still replace or ABA-swap a leaf *after* the final check and
+before the name-based deletion. Production therefore still
+requires independently protected parent/root custody, a
+trusted native identity-bound remove protocol, durable recovery
+commit and independent monotonic rollback floor. Powercut,
+Windows 10/CFAPI, binary attestation and full same-principal
+adversarial matrix are not proven. `RootSession` remains
+fail-closed and the product RELEASE decision remains **NO-GO**.
+The remote Draft PR #300 was last verified at `d3a91c92` with
+four HIGH formal CodeQL alerts in the **old remote check**;
+local SOURCE GO is not a new hosted CodeQL PASS. No PR push,
+GitHub Actions rerun, merge, deploy or cutover was performed.
