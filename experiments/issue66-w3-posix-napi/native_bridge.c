@@ -41,6 +41,7 @@ typedef struct {
   int stream_active;
   int stream_done;
   int seeded;
+  int raw_seeded;
   char token[33];
 } lab_session;
 
@@ -196,6 +197,7 @@ static void release_handles(lab_session *session) {
   session->stream_active = 0;
   session->stream_done = 0;
   session->seeded = 0;
+  session->raw_seeded = 0;
   memset(session->token, 0, sizeof(session->token));
 }
 
@@ -283,6 +285,7 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
   session->stream_active = 0;
   session->stream_done = 0;
   session->seeded = 0;
+  session->raw_seeded = 0;
   memcpy(session->token, token, sizeof(session->token));
   session->active = 1;
   return result_text(env, token);
@@ -339,6 +342,23 @@ static napi_value seed_many(napi_env env, napi_callback_info info) {
   }
   if (fsync(directory) != 0) return fail(env, "NATIVE_SEED_FAILED");
   return result_text(env, "LAB_SEEDED_16385");
+}
+
+// A legal POSIX leaf need not be valid UTF-8. Keep it as raw bytes through
+// native creation and enumeration rather than replacing 0xff with U+FFFD.
+static napi_value seed_raw_byte_name(napi_env env, napi_callback_info info) {
+  napi_value argv[3];
+  if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
+    return fail(env, "NATIVE_TOKEN_REJECTED");
+  lab_session *session = session_for(env, info);
+  int directory = dirfd(session->held);
+  if (session->phase != 0 || session->raw_seeded || !plain_directory(directory, 1))
+    return fail(env, "NATIVE_SEED_DENIED");
+  session->raw_seeded = 1;
+  const char raw_name[] = { 'r', 'a', 'w', '-', (char)0xff, '.', 'b', 'i', 'n', 0 };
+  if (!write_owned(directory, raw_name, "x") || fsync(directory) != 0)
+    return fail(env, "NATIVE_SEED_FAILED");
+  return result_text(env, "LAB_SEEDED_RAW_NAME");
 }
 
 static napi_value begin_stream(napi_env env, napi_callback_info info) {
@@ -519,6 +539,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"openTestSession", NULL, open_test_session, NULL, NULL, NULL, napi_default, session},
     {"enumerate", NULL, enumerate, NULL, NULL, NULL, napi_default, session},
     {"seedMany", NULL, seed_many, NULL, NULL, NULL, napi_default, session},
+    {"seedRawByteName", NULL, seed_raw_byte_name, NULL, NULL, NULL, napi_default, session},
     {"beginStream", NULL, begin_stream, NULL, NULL, NULL, napi_default, session},
     {"nextStreamPage", NULL, next_stream_page, NULL, NULL, NULL, napi_default, session},
     {"read", NULL, native_read, NULL, NULL, NULL, napi_default, session},

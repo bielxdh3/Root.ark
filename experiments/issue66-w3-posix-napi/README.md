@@ -49,8 +49,9 @@ symlinks, non-regular files and hardlinks. It opens exact child bytes via
 `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`, reads
 from that exact fd and returns an independent Node Buffer. The positive
 Unicode filename `café-中-😀.bin` is transferred as UTF-8 without
-normalization. This lab does not cover arbitrary invalid UTF-8 raw POSIX
-filenames or casefold collisions.
+normalization. `read(token, exactLeaf)` still accepts JS string paths and
+cannot open an invalid-UTF-8 leaf; the separate paged enumerator below
+preserves raw POSIX name bytes. Portable casefold collisions remain open.
 
 An additional **test-only** native pagination experiment addresses the old
 16-entry `enumerate(token)` laboratory cap without claiming a production
@@ -62,14 +63,31 @@ directory and refuses reseeding. `beginStream(token)` rewinds the native
 Buffers, preserving exact `readdir` bytes without UTF-8 normalization, and
 retains the directory cursor across calls until an explicit `done`. Invalid
 tokens, calls after close, and interference from the legacy full-array
-`enumerate` method fail closed. A physical test validates 16,388 unique
-names (including the original Unicode name and alias), reads the last native
+`enumerate` method fail closed. `seedRawByteName(token)` creates a legal
+POSIX leaf containing byte `0xff` through the held dirfd, and a focused
+test compares exact Buffer bytes without `.toString('utf8')`. The large
+physical stress test validates **16,389** unique raw names (16,385 seeded
+ASCII records, three original entries and the invalid UTF-8 leaf), reads the last native
 file, and enumerates the **same held A directory** after its pathname is
 deterministically rebound to foreign B. Nothing in this lab reopens a
 trusted root at cold startup, protects its owner-controlled HOME parent
 from another same-UID process, or implements `unlinkat`, a durable recovery
 journal or monotonic rollback protection. The N-API bridge is still
 **LAB_ONLY_NO_GO** and cannot activate the production feature.
+
+The 16,385-file stress test requires a **separate explicit opt-in** in
+addition to the general lab switch:
+
+```sh
+ROOTARK_ISSUE66_W3_NAPI_LAB=1 ROOTARK_ISSUE66_W3_STREAM_STRESS=1 \
+  node --test test/issue-66-w3-posix-napi.test.js
+```
+
+Each authorized stress run deliberately retains its newly created ext4
+HOME fixture for audit and consumes more than 16,385 directory entries
+and inodes. Avoid repeating it during routine CI or development; without
+the explicit stress switch the expensive case is SKIP. No script removes
+prior adversarial fixtures or arbitrary HOME content.
 
 Only for deterministic physical validation, native `swapToForeign` and
 `restoreOriginal` perform `renameat2(..., RENAME_NOREPLACE)` on pinned
@@ -99,13 +117,14 @@ On the corrected branch, WSL Node22/ext4 addon + RootSession-contract tests
 yielded **14 PASS / 0 FAIL / 1 SKIP**; this only validates the lab scope.
 The SKIP is a hostile same-UID concurrent bind-mount/parent-trust test:
 `CAP_SYS_ADMIN` and independently protected custody were not available.
-The later isolated `seedMany` + `beginStream` + `nextStreamPage` experiment
-completed physical Ubuntu WSL Node22/ext4 TDD (the new test was RED before
-the native methods existed) and the combined N-API + RootSession contract
-suite with **15 PASS / 0 FAIL / 1 expected SKIP**. That is a bounded
-test-only page-streaming result, not an independent 16,385-entry production
-recovery or crash/power-cut authorization. Its exact commit still requires
-independent SOURCE review before integration.
+The initial isolated `seedMany` + `beginStream` + `nextStreamPage` candidate
+completed Ubuntu WSL Node22/ext4 TDD (RED before methods existed) and the
+combined N-API + RootSession contract suite with **15 PASS / 0 FAIL /
+1 expected SKIP**. Independent review then required the invalid-UTF-8
+raw-byte test and separate inode-budget opt-in, now included in the next
+child candidate. These are bounded **test-only** results, not an
+independent production recovery or power-cut proof. Exact updated SHA
+still requires peer SOURCE review.
 The test-token separation and per-environment state are narrowly scoped
 correctness checks; a hostile same-UID process can still inspect another
 process, mutate the trusted-by-test parent or race native fixture paths.

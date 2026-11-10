@@ -14,6 +14,10 @@ const { openNativeRootSession, requireNativeRecoveryAuthority } =
 
 const enabled = process.platform === "linux" &&
   process.env.ROOTARK_ISSUE66_W3_NAPI_LAB === "1";
+// Each stress run deliberately leaves >16k files in an auditable ext4 HOME
+// fixture. Require a separate opt-in so normal CI and repeated N-API tests
+// never silently consume that inode/disk budget.
+const stressEnabled = enabled && process.env.ROOTARK_ISSUE66_W3_STREAM_STRESS === "1";
 const source = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/native_bridge.c");
 let addon;
 let addonPath;
@@ -99,16 +103,35 @@ test("#66 W3 pinned native fd enumerates and reads exact Unicode across determin
     assert.throws(() => bridge.read(token, "original.bin"), /NATIVE_TOKEN_REJECTED/);
   });
 
+test("#66 W3 streamed name Buffers preserve invalid POSIX UTF-8 bytes exactly",
+  { skip: !enabled }, () => {
+    const bridge = loadLab();
+    const token = bridge.openTestSession();
+    const raw = Buffer.from([0x72, 0x61, 0x77, 0x2d, 0xff, 0x2e, 0x62, 0x69, 0x6e]);
+    assert.equal(bridge.seedRawByteName(token), "LAB_SEEDED_RAW_NAME");
+    assert.equal(bridge.beginStream(token), "LAB_STREAM_READY");
+    const names = [];
+    for (let i = 0; i < 4; i++) {
+      const page = bridge.nextStreamPage(token);
+      names.push(...page.names);
+      if (page.done) break;
+    }
+    assert.ok(names.every(Buffer.isBuffer));
+    assert.ok(names.some((name) => name.equals(raw)), "exact 0xff must be preserved by native readdir");
+    assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+  });
+
 test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded raw-name pages",
-  { skip: !enabled, timeout: 180000 }, () => {
+  { skip: !stressEnabled, timeout: 180000 }, () => {
     const bridge = loadLab();
     const token = bridge.openTestSession();
     assert.equal(bridge.seedMany(token), "LAB_SEEDED_16385");
+    assert.equal(bridge.seedRawByteName(token), "LAB_SEEDED_RAW_NAME");
     assert.throws(() => bridge.seedMany(token), /NATIVE_SEED_DENIED/,
       "a native session cannot reseed or overwrite its retained fixture");
     const scan = () => {
       assert.equal(bridge.beginStream(token), "LAB_STREAM_READY");
-      const decoded = [];
+      const rawNames = [];
       let pageCount = 0;
       while (true) {
         assert.ok(++pageCount <= 300, "a 64-entry stream must terminate after 258 pages");
@@ -116,15 +139,17 @@ test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded
         assert.ok(Array.isArray(page.names) && page.names.length <= 64);
         for (const name of page.names) {
           assert.ok(Buffer.isBuffer(name), "native returns exact name bytes, not lossy UTF-8 strings");
-          decoded.push(name.toString("utf8"));
+          rawNames.push(name.toString("hex"));
         }
         if (page.done) break;
       }
-      assert.equal(decoded.length, 16385 + 3);
-      assert.equal(new Set(decoded).size, decoded.length);
-      assert.ok(decoded.includes("caf\u00e9-\u4e2d-\ud83d\ude00.bin"));
-      assert.ok(decoded.includes("entry-16384.bin"));
-      return decoded.sort();
+      assert.equal(rawNames.length, 16385 + 4);
+      assert.equal(new Set(rawNames).size, rawNames.length);
+      assert.ok(rawNames.includes(Buffer.from("caf\u00e9-\u4e2d-\ud83d\ude00.bin", "utf8").toString("hex")));
+      assert.ok(rawNames.includes(Buffer.from("entry-16384.bin", "ascii").toString("hex")));
+      assert.ok(rawNames.includes(Buffer.from([0x72, 0x61, 0x77, 0x2d, 0xff, 0x2e, 0x62, 0x69, 0x6e]).toString("hex")),
+        "invalid UTF-8 POSIX leaf must be preserved as exact raw bytes without replacement");
+      return rawNames.sort();
     };
     const before = scan();
     assert.throws(() => bridge.enumerate(token), /NATIVE_STREAM_BUSY/,
