@@ -703,7 +703,9 @@ async function createDurableEvictionRecord(filePath, value) {
 // authority-bearing name: a competing file must NEVER be overwritten after
 // the earlier absence preflight. Sync a unique temporary, publish by atomic
 // no-replace hard link, sync the containing directory on Linux, then retire
-// only our original temp inode. A hard exit after link leaves nlink=2 and
+// the temp name after a fresh identity check. That name-based unlink is NOT
+// race-free under a hostile same-UID/SID writer with directory write access.
+// A hard exit after link leaves nlink=2 and
 // intentionally blocks staged-genesis recovery instead of manufacturing GO.
 // This remains a *legacy cooperative* fence, not trusted same-UID/SID custody.
 async function createDurableExclusiveGenesisStage(filePath, value) {
@@ -757,18 +759,12 @@ async function createDurableExclusiveGenesisStage(filePath, value) {
     await fsyncEvictionDirectory(path.dirname(filePath));
   } catch (error) {
     if (handle) await handle.close().catch(() => {});
-    // Never erase an indeterminate two-name publication. For a pure EEXIST
-    // collision only, remove our own unlinked temporary if it is still the
-    // original unique inode; if identity changed, preserve it for inspection.
-    if (!linked && original) {
-      try {
-        const current = await fsp.lstat(temporary, { bigint: true });
-        if (current.isFile() && !current.isSymbolicLink()
-          && current.nlink === 1n && sameFileIdentity(original, current)) {
-          await fsp.unlink(temporary);
-        }
-      } catch { /* the uncertain temporary must not authorize another write */ }
-    }
+    // Do not delete a temp pathname on a failed/indeterminate transaction:
+    // even an lstat immediately beforehand cannot make this unlink atomic
+    // against an untrusted same-UID writer. An orphan unique .tmp name does
+    // NOT authorize genesis; preserve it for independently reviewed cleanup.
+    // The successful link→unlink path still requires external root custody
+    // before native RootSession may be activated.
     throw error;
   }
 }

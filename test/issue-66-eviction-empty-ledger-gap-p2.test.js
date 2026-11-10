@@ -701,6 +701,11 @@ test("issue 66: staged genesis creation never overwrites a competing reserved he
   assert.match(failure.message, /Existing staged genesis blocks exclusive creation/);
   assert.deepEqual(await fsp.readFile(stage), foreign,
     "the originally competing staged-head bytes must stay untouched");
+  const inertTemps = (await fsp.readdir(path.dirname(stage))).filter((name) =>
+    name.startsWith(".rootark-eviction-genesis-head.json.tmp-"));
+  assert.equal(inertTemps.length, 1,
+    "failure must preserve the unlinked temp for safe independent review, not unlink an uncertain pathname");
+  assert.equal((await fsp.stat(path.join(path.dirname(stage), inertTemps[0]))).nlink, 1);
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
   verifyNoSignedDelete(f, before);
 });
@@ -1096,6 +1101,13 @@ fsp.rename = async (...args) => {
 };
 const originalLink = fsp.link;
 fsp.link = async (...args) => {
+  if (process.argv[6] === "before-genesis"
+    && path.basename(String(args[1])) === ".rootark-eviction-genesis-head.json"
+    && path.basename(String(args[0])).startsWith(".rootark-eviction-genesis-head.json.tmp-")) {
+    // With exclusive stage publication this is the syscall BEFORE the
+    // reserved stage name appears. Crash here must keep the v1 fence.
+    process.exit(76);
+  }
   if (process.argv[6] === "before-promotion"
     && path.basename(String(args[0])) === ".rootark-eviction-genesis-head.json"
     && path.basename(String(args[1])) === "head.json") {
