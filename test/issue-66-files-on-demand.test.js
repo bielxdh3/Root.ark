@@ -422,6 +422,50 @@ test("issue 66: public staging helper must not relocate a sibling file outside s
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
 });
 
+test("issue 66: direct incoming DELETE must not stage materialized FOD bytes without native custody", async (t) => {
+  const { root, open, store, key } = await setup(t,
+    { "docs/retained.txt": "verified cached owner bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/retained.txt");
+  const original = store.list("alice")[0];
+  const originalBytes = await fsp.readFile(path.join(root, "docs", "retained.txt"));
+  const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const remoteDelete = protocol.createOperation({
+    operation: "delete", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    baseRevision: original.revision, metadata: { path: "docs/retained.txt" }, fileKey: key,
+  });
+
+  await assert.rejects(client.apply(remoteDelete), { code: "root_session_native_unavailable" });
+  await assert.rejects(client._apply(remoteDelete), { code: "root_session_native_unavailable" },
+    "private direct apply must not bypass the public method fence");
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "retained.txt")), originalBytes);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), originalSnapshot);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
+test("issue 66: Files On-Demand WebDAV MOVE translation denies before any local scan", async (t) => {
+  const { root, open, store, state } = await setup(t, { "docs/a.txt": "retained signed bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/a.txt");
+  const originalBytes = await fsp.readFile(path.join(root, "docs", "a.txt"));
+  const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const readsBefore = state.fullReads.length;
+
+  await assert.rejects(client.translateWebDavMutation({
+    kind: "move", operationId: crypto.randomUUID(),
+    source: "/docs/a.txt", destination: "/docs/b.txt",
+  }), { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "a.txt")), originalBytes);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), originalSnapshot);
+  assert.equal(await exists(path.join(root, "docs", "b.txt")), false);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.fullReads.length, readsBefore);
+});
+
 test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();

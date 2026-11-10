@@ -2616,6 +2616,12 @@ class SyncEngine {
 
   async _apply(operation, summary = null, beforeHydrationWrite = null) {
     operation = envelopeCopy(operation);
+    // Incoming authenticated DELETE/tombstone is not independent authority
+    // to stage or unlink cached bytes when the native root is unavailable.
+    // This also protects direct _apply() callers, not just public apply().
+    if (this.requireNativeRootRecovery && (operation.operation === "delete" || operation.tombstone)) {
+      denyUntrustedNativeSignedDelete();
+    }
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
     const plaintext = protocol.decryptPayload(operation, key);

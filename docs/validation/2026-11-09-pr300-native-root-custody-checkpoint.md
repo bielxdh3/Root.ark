@@ -611,3 +611,42 @@ code of the committed `32767a66` branch continues to be independently
 reviewed only for its narrower new guards. **No publication/integration
 should treat this branch as native root custody or as a safe root-wide FOD
 mode invariant.**
+
+### Follow-up bounded guard: incoming cached-file DELETE application
+
+The next **isolated** child based on docs-reviewed `2f2644df` responds to an
+independent SOURCE finding of another pathname-based destructive path:
+`SyncEngine.apply()` and direct `_apply()` accepted an incoming protocol
+DELETE/tombstone and called `stageExisting` on locally cached bytes without
+rooted native custody. `stageExisting` source containment is lexical and
+cannot withstand a hostile concurrent ancestor swap.
+
+A new physical FOD regression first produced an explicit **RED** on Windows
+Node22: `Missing expected rejection` when applying a valid encrypted DELETE
+operation to a real hydrated cached file. The child then added an internal
+fail-closed native-required check inside `_apply` *after normalizing the
+envelope and before verify/key/decrypt/journal/staging*. Both public `apply`
+and direct `_apply` now reject this DELETE/tombstone while native custody is
+unavailable. The test verifies exact cached bytes, unchanged local index and
+no `.rootark-trash` staging after denial. The test does **not** assert that
+arbitrary remote operation signatures or disk ancestors have been trusted.
+
+A second test covers an existing denial of `translateWebDavMutation` MOVE
+before path scanning, preserving the cached file and state. A signed remote
+MOVE that **is not** a DELETE still enters legacy `_apply` on hydration and
+may perform unsafe pathname rename/stage; that P1 remains entirely open.
+
+| Additional isolated child regression | Observed |
+| --- | --- |
+| Windows Node v22.23.4 / physical NTFS / FOD suite including 2 new tests | **22 PASS / 0 FAIL** |
+| WSL Ubuntu Node v22.22.1 / `/home/bielx` ext4 / same FOD suite | **22 PASS / 0 FAIL** |
+| Windows Node22 / 3 adjacent native-gate, RootSession, legacy sync suites | **53 PASS / 0 FAIL / 1 SKIP** |
+| WSL Ubuntu Node22 / same 3 adjacent suites with real ext4 fixture | **52 PASS / 0 FAIL / 2 SKIP** |
+
+The earlier **physically reproduced cross-instance FOD-root mode downgrade**
+is not fixed by a per-instance `_apply` check. Neither the new guard nor
+the older signed DELETE fences confer independent owner-root acquisition,
+same-SID writer exclusion, native image custody, cold power-cut recovery or
+rollback resistance. Do not integrate/push/release until the source-specific
+review, root-wide P1 and published CodeQL gates are resolved. No merge,
+deploy, cutover, or `Root/main` modifications have been made.
