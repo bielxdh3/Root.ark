@@ -1233,6 +1233,62 @@ test("issue 66: inbound FOD rename completion followed by EIO retains lock befor
   assert.equal(JSON.stringify(store.list("alice")), oldStore);
 });
 
+test("issue 66: equal-byte foreign inbound stage cannot authorize a successful FOD publish", async (t) => {
+  const payload = "remote source payload with identical foreign bytes";
+  const { root, open, store, state } = await setup(t, { "docs/restore.txt": payload });
+  const client = await open();
+  const parent = path.join(root, "docs");
+  await fsp.mkdir(parent, { recursive: true });
+  const target = path.join(parent, "restore.txt");
+  const parked = path.join(path.dirname(root), "original-inbound-stage-parked");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const oldSnapshot = await fsp.readFile(snapshot);
+  const storeBefore = JSON.stringify(store.list("alice"));
+  const originalRename = fsp.rename;
+  let originalInode;
+  let foreignInode;
+  let physicallyPublished = false;
+  fsp.rename = async (source, destination, ...args) => {
+    if (!physicallyPublished && path.resolve(String(destination)) === path.resolve(target)
+      && String(source).includes(".tmp-inbound-")) {
+      originalInode = await fsp.lstat(source, { bigint: true });
+      await originalRename(source, parked);
+      await fsp.writeFile(source, payload, { flag: "wx" });
+      foreignInode = await fsp.lstat(source, { bigint: true });
+      assert.equal(originalInode.dev === foreignInode.dev
+        && originalInode.ino === foreignInode.ino, false,
+        "physical replacement must be a different inode despite byte equality");
+      await originalRename(source, destination, ...args);
+      physicallyPublished = true;
+      return;
+    }
+    return originalRename(source, destination, ...args);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/restore.txt"),
+      { code: "invalid_snapshot" });
+  } finally { fsp.rename = originalRename; }
+  assert.equal(physicallyPublished, true,
+    "test must cause a REAL kernel rename of foreign source bytes into the target");
+  const originalAfter = await fsp.lstat(parked, { bigint: true });
+  const targetAfter = await fsp.lstat(target, { bigint: true });
+  assert.equal(originalAfter.dev, originalInode.dev);
+  assert.equal(originalAfter.ino, originalInode.ino,
+    "original stage inode remains parked and physically distinct");
+  assert.equal(targetAfter.dev, foreignInode.dev);
+  assert.equal(targetAfter.ino, foreignInode.ino,
+    "foreign inode, not original staged inode, reached the target");
+  assert.equal(await fsp.readFile(target, "utf8"), payload,
+    "identical bytes must not be sufficient for original-inode publication proof");
+  assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot,
+    "the untrusted replacement must not become durably authenticated metadata");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true);
+  await assert.rejects(client._reconcileLocal(), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(state.pushes, 0);
+  assert.equal(JSON.stringify(store.list("alice")), storeBefore);
+});
+
 test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold root locked", async (t) => {
   const { root, adapter, store, state, key } = await setup(t, {});
   const signer = crypto.generateKeyPairSync("ed25519");

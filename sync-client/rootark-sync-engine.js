@@ -763,9 +763,12 @@ async function durableJson(filePath, value) {
 // can still use same-volume atomic rename. Their reserved names cannot become
 // user uploads or authoritative metadata after a failed publication.
 // There must be no pathname unlink/rm in this helper: a same-SID/UID writer
-// can replace the temp entry after the held handle closes or a rename fails.
-// This only protects cooperative failure cleanup. Successful pathname rename
-// still requires independent root custody before it can authorize native IO.
+// can replace a temp entry after an error. Retain the original temporary FD
+// across the entire publication and compare it with the resulting named
+// inode: equal bytes from a substituted foreign inode grant no authority.
+// This is ONLY a fail-closed identity check *after* legacy pathname rename.
+// It cannot stop a hostile late-destination overwrite or same-UID ABA;
+// fully safe publication still requires trusted native RootSession custody.
 async function publishInboundPayload(target, bytes, prepareTarget = null,
   beforeTargetPublication = null) {
   const temporary = path.join(path.dirname(target),
@@ -776,13 +779,29 @@ async function publishInboundPayload(target, bytes, prepareTarget = null,
   try {
     await handle.writeFile(bytes);
     await handle.sync();
+    const original = await handle.stat({ bigint: true });
+    if (!original.isFile() || original.ino === 0n || original.nlink !== 1n
+      || original.size !== BigInt(bytes.length)) {
+      fail("Inbound staged file is not an exclusive original inode", "invalid_snapshot");
+    }
+    if (prepareTarget) await prepareTarget();
+    // The temporary uses a reserved, nonauthorizing name; only this syscall
+    // can place its inode at the user-visible target. Mark a potential target
+    // mutation BEFORE invoking it: EIO can be reported after a real rename.
+    if (beforeTargetPublication) beforeTargetPublication();
+    await fsp.rename(temporary, target);
+    const heldAfter = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(target, { bigint: true });
+    if (!namedAfter.isFile() || namedAfter.isSymbolicLink()
+      || heldAfter.nlink !== 1n || namedAfter.nlink !== 1n
+      || !sameFileIdentity(original, heldAfter)
+      || !sameFileIdentity(original, namedAfter)
+      || heldAfter.size !== original.size || namedAfter.size !== original.size
+      || heldAfter.mtimeNs !== original.mtimeNs
+      || namedAfter.mtimeNs !== original.mtimeNs) {
+      fail("Inbound publish replaced the original staged inode", "invalid_snapshot");
+    }
   } finally { await handle.close(); }
-  if (prepareTarget) await prepareTarget();
-  // The temporary uses a reserved, nonauthorizing name; only this syscall
-  // can place its inode at the user-visible target. Mark a potential target
-  // mutation BEFORE invoking it: EIO can be reported after a real rename.
-  if (beforeTargetPublication) beforeTargetPublication();
-  await fsp.rename(temporary, target);
 }
 
 // A bounded, per-object write-ahead snapshot overlay. Full snapshots remain
