@@ -235,6 +235,7 @@ const { SyncEngine } = require(process.argv[1]);
 const { SyncObjectStore } = require(process.argv[2]);
 (async () => {
   const store = await new SyncObjectStore(process.argv[4]).open();
+  let allowedDirectoryCreates = 0;
   const recovered = await new SyncEngine({
     rootDir: process.argv[3],
     adapter: {
@@ -244,13 +245,16 @@ const { SyncObjectStore } = require(process.argv[2]);
         // parent directory. Never permit a DELETE or a formerly evicted
         // cache file to become a new outbound operation in this cold replay.
         if (operation?.operation !== "create" || operation?.tombstone
-          || operation?.metadata?.path !== "PRIVATE") {
+          || operation?.metadata?.path !== "PRIVATE"
+          || operation?.metadata?.contentType !== "inode/directory"
+          || allowedDirectoryCreates !== 0) {
           process.stderr.write("FORBIDDEN_REPLAY_OUTBOUND_" + JSON.stringify({
             operation: operation?.operation, tombstone: operation?.tombstone,
-            path: operation?.metadata?.path,
+            path: operation?.metadata?.path, contentType: operation?.metadata?.contentType,
           }));
           process.exit(91);
         }
+        allowedDirectoryCreates += 1;
         return { status: 201, record: (await store.put("alice", operation)).record };
       },
     },
@@ -258,6 +262,7 @@ const { SyncObjectStore } = require(process.argv[2]);
     excludedPaths: [], fileKeyResolver: () => Buffer.from(process.argv[5], "base64"),
   }).open();
   await recovered.syncOnce();
+  if (allowedDirectoryCreates !== 1) process.exit(96);
   if (recovered.snapshot.remoteOnly[process.argv[6]]?.reason !== "evicted") process.exit(95);
   process.stdout.write("ROOTARK_REQUIRED_V2_COLD_REPLAY_OK");
 })().catch((error) => {
@@ -278,7 +283,7 @@ const { SyncObjectStore } = require(process.argv[2]);
     const timeout = setTimeout(() => {
       child.kill(); reject(new Error("cold recovery subprocess timed out"));
     }, 30000);
-    child.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
+    child.once("close", (code) => { clearTimeout(timeout); resolve(code); });
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
   });
   assert.equal(exitCode, 0, "cold recovery must succeed with no outbound signed write: " + stderr);
