@@ -13,7 +13,7 @@ const allowed = process.platform === "win32" &&
 const localAppData = process.env.LOCALAPPDATA;
 const script = path.join(__dirname, "support", "issue-66-w25-native-rooted-io-lab.ps1");
 const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-const fixedResult = /^ROOTARK_W25_ROOTED_IO_V1 originalRead=1 originalDelete=1 foreignPreserved=1 postSwapCreate=1 postSwapRead=1 postSwapDelete=1\r?\n$/;
+const fixedResult = /^ROOTARK_W25_ROOTED_IO_V2 originalRead=1 originalDelete=1 foreignPreserved=1 postSwapCreate=1 postSwapRead=1 postSwapDelete=1 pinnedLeafDelete=1 foreignLeafPreserved=1 replacementRootPreserved=1\r?\n$/;
 
 function run(scriptScratch, optIn = true) {
   return spawnSync(powershell, [
@@ -39,8 +39,10 @@ test("#66 W25 physical NTFS rooted handle IO remains bound through real ancestor
     assert.equal(outcome.status, 0, "rooted NTFS test rejected; do not fall back to path-based IO");
     assert.match(outcome.stdout, fixedResult);
     assert.equal(outcome.stderr, "", "native lab must never expose error, path, SID or ACL details");
-    // The replacement's same-name canary is verified as untouched in native
-    // code. Neither production nor another checkout is changed by the test.
+    // V2 additionally requires a genuine file-name swap AFTER a native
+    // RootDirectory-relative open: handle disposition may delete only the
+    // originally opened inode, not the new same-name foreign leaf or a
+    // canary under the replaced ancestor. The helper confirms all three.
   });
 
 test("#66 W25 native helper rejects nonempty, nested and disabled scratch",

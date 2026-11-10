@@ -90,7 +90,7 @@ public static class RootarkW25RootedIoLab {
 
   private const uint GenericRead = 0x80000000, GenericWrite = 0x40000000;
   private const uint AccessDelete = 0x00010000, AccessSync = 0x00100000;
-  private const uint ShareReadWrite = 0x00000003;
+  private const uint ShareReadWrite = 0x00000003, ShareDelete = 0x00000004;
   private const uint OpenExisting = 3, FileCreate = 2, FileOpen = 1;
   private const uint DirectoryFlags = 0x02200000; // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
   private const uint FileOptions = 0x00200060; // OPEN_REPARSE_POINT | SYNCHRONOUS | NON_DIRECTORY
@@ -105,8 +105,9 @@ public static class RootarkW25RootedIoLab {
       throw new InvalidOperationException("INVALID_HANDLE_TARGET");
   }
 
-  private static SafeFileHandle RootedFile(SafeFileHandle root, string leaf, bool create) {
-    if (leaf != "original.bin" && leaf != "after-swap.bin")
+  private static SafeFileHandle RootedFile(SafeFileHandle root, string leaf, bool create,
+      bool allowLeafRename = false) {
+    if (leaf != "original.bin" && leaf != "after-swap.bin" && leaf != "swap-leaf.bin")
       throw new InvalidOperationException("UNTRUSTED_LEAF");
     IntPtr buffer = Marshal.StringToHGlobalUni(leaf);
     IntPtr unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
@@ -125,7 +126,8 @@ public static class RootarkW25RootedIoLab {
       IoStatusBlock result;
       SafeFileHandle file;
       int ntStatus = OpenRelative(out file, GenericRead | GenericWrite | AccessDelete | AccessSync,
-        ref attr, out result, IntPtr.Zero, 0x80, ShareReadWrite,
+        ref attr, out result, IntPtr.Zero, 0x80,
+        ShareReadWrite | (allowLeafRename ? ShareDelete : 0),
         create ? FileCreate : FileOpen, FileOptions, IntPtr.Zero, 0);
       if (ntStatus != 0) {
         if (file != null) file.Dispose();
@@ -167,6 +169,38 @@ public static class RootarkW25RootedIoLab {
     }
   }
 
+  private static bool DeleteOpenedInodeAfterLeafSwap(SafeFileHandle root, string moved,
+      string replacement) {
+    // All names are fixed and belong to the disposable lab fixture.
+    // Protected IO opens swap-leaf.bin through the original pinned native
+    // RootDirectory. Only the adversarial rename/foreign-name creation below
+    // uses ordinary pathnames, deliberately AFTER the opened file HANDLE.
+    Write(root, "swap-leaf.bin", "TRUSTED_OPENED_LEAF");
+    string originalName = Path.Combine(moved, "swap-leaf.bin");
+    string parked = Path.Combine(moved, "opened-leaf-parked.bin");
+    string foreignSameDirectory = originalName;
+    string foreignReplacementRoot = Path.Combine(replacement, "swap-leaf.bin");
+    using (SafeFileHandle opened = RootedFile(root, "swap-leaf.bin", false, true)) {
+      CheckNormal(opened, false);
+      File.Move(originalName, parked);
+      File.WriteAllText(foreignSameDirectory, "FOREIGN_SAME_DIRECTORY_BYTES");
+      File.WriteAllText(foreignReplacementRoot, "FOREIGN_REPLACEMENT_ROOT_BYTES");
+      if (!File.Exists(parked) ||
+          File.ReadAllText(foreignSameDirectory) != "FOREIGN_SAME_DIRECTORY_BYTES" ||
+          File.ReadAllText(foreignReplacementRoot) != "FOREIGN_REPLACEMENT_ROOT_BYTES")
+        throw new InvalidOperationException("LEAF_SWAP_NOT_PHYSICAL");
+      // The HANDLE still identifies the original file even though a
+      // different same-name file now occupies its old name. A path unlink
+      // here would delete that foreign replacement instead.
+      FileDispositionInfo disposition = new FileDispositionInfo { DeleteFile = true };
+      if (!SetInfo(opened, 4, ref disposition, (uint)Marshal.SizeOf(typeof(FileDispositionInfo))))
+        throw new InvalidOperationException("ROOTED_HANDLE_DISPOSITION_FAILED");
+    }
+    return !File.Exists(parked) &&
+      File.ReadAllText(foreignSameDirectory) == "FOREIGN_SAME_DIRECTORY_BYTES" &&
+      File.ReadAllText(foreignReplacementRoot) == "FOREIGN_REPLACEMENT_ROOT_BYTES";
+  }
+
   public static string Run(string scratch) {
     // All *protected* file IO is NtCreateFile RootDirectory-relative. The
     // following pathname operations are the explicitly adversarial actor.
@@ -199,11 +233,13 @@ public static class RootarkW25RootedIoLab {
       bool newReadBound = Read(root, "after-swap.bin") == "TRUSTED_AFTER_SWAP";
       Delete(root, "after-swap.bin");
       bool originalClean = !File.Exists(Path.Combine(moved, "after-swap.bin"));
+      bool pinnedLeafDelete = DeleteOpenedInodeAfterLeafSwap(root, moved, foreign);
 
       if (!heldRootRead || !originalDeleted || !foreignUnchanged ||
-          !originalReceived || !replacementNotWritten || !newReadBound || !originalClean)
+          !originalReceived || !replacementNotWritten || !newReadBound || !originalClean
+          || !pinnedLeafDelete)
         throw new InvalidOperationException("ROOT_ESCAPE_OR_WRONG_OBJECT");
-      return "ROOTARK_W25_ROOTED_IO_V1 originalRead=1 originalDelete=1 foreignPreserved=1 postSwapCreate=1 postSwapRead=1 postSwapDelete=1";
+      return "ROOTARK_W25_ROOTED_IO_V2 originalRead=1 originalDelete=1 foreignPreserved=1 postSwapCreate=1 postSwapRead=1 postSwapDelete=1 pinnedLeafDelete=1 foreignLeafPreserved=1 replacementRootPreserved=1";
     }
   }
 }
