@@ -1180,3 +1180,87 @@ commit, power-loss durability and cold re-acquisition are **not proven**.
 **Release decision: NO-GO.** `openNativeRootSession` stays fail-closed;
 do not infer SOURCE GO for complete recovery or CodeQL clearance from
 these focused local tests. No merge, deploy or cutover.
+
+### 2026-11-10 continuation — physically adversarial ledger writes and retirement
+
+The exact code child `0f80974ad243e772204340f8523d642a3b8f16ca`
+(parent `218ef9ae`) fixes a separate, concrete **legacy Linux ledger
+write redirection**. A physical WSL/Node22/ext4 regression on the parent
+renamed `.rootark-sync-evictions` just before durable PREPARE creation,
+then rebound its public path to an attacker-controlled directory symlink.
+The old code wrote real `.prepare.json`, `.commit.json` and `head.json`
+files to that foreign directory before the test's final rejection. This
+was **RED**, not a hypothetical CodeQL warning. The child holds nofollow
+root/ledger directory descriptors across PREPARE, HEAD update and COMMIT
+and uses procfd-relative file creation, rename and fsync. It rechecks
+directory **identity** (dev/ino), not immutable mtime/ctime, because its
+own committed records legitimately alter directory metadata.
+
+| Physical/local test on code `0f80974a` | Result |
+| --- | --- |
+| WSL Node22/ext4: foreign-path PREPARE and COMMIT substitution (separate real syscall swaps, no foreign write or signed DELETE) | **2 PASS / 0 FAIL** |
+| WSL Node22/ext4: legitimate v1 genesis/crash recovery and post-v2 pre-promotion recovery | **2 PASS / 0 FAIL** |
+| Windows Node22/NTFS: same two narrow legacy recovery paths | **2 PASS / 0 FAIL** |
+| Node22 syntax and Git whitespace/cleanliness checks | **PASS** |
+
+The parent-to-child regression first failed because foreign durable
+records appeared. The independent peer examined the exact committed
+source and issued **bounded SOURCE GO, no new P0/P1/P2**, for this
+Linux-only redirection fix. The code was fast-forwarded locally;
+no remote PR push or hosted workflow was requested.
+
+The subsequent child `5e927dc55644a236b031dd71426bb93af1674755`
+replaces the Linux ledger *retirement/cleanup* pathname flow with a
+retained root and original ledger descriptor. The read phase now returns
+the ledger's device+inode; cleanup verifies the reacquired inode,
+renames relative to the held root, verifies that the archived entry
+is the same original directory, then unlinks the fixed record names
+relative to that original held ledger. Parent `0f80974a` **RED**
+physically attempted to unlink a test-owned foreign file through
+the substituted archived symlink; the regression intercepted the
+deletion before any foreign bytes were destroyed. On `5e927dc5`,
+the hostile case was **GREEN 1 PASS/0 FAIL**, preserving all foreign
+filenames and bytes. A separate *legitimate* ext4 eviction was
+**GREEN 1 PASS/0 FAIL**, with the fresh active ledger empty, no orphan
+archive and no signed DELETE. Focused WSL required-v2/recovery checks
+also gave **2 PASS**, and Windows legacy recovery smoke **1 PASS**.
+The first independent SOURCE review found no new P1/P2 in the Linux
+retirement implementation, but the follow-up test audit issued a
+**P2 SOURCE NO-GO for false-green interception**: the original hook
+recognized a textual archive basename, not the physical parent of a
+`/proc/self/fd/N/<leaf>` unlink. The test-only child
+`c5d5659261089dbf2cf87694b7c0a182196f339c` compares the
+resolved physical parent against the foreign directory before any
+`unlink`, and requires the precise `invalid_snapshot` archive-identity
+error instead of accepting arbitrary failures. Its exact WSL Node22/ext4
+hostile and positive retirement tests both passed **2 PASS/0 FAIL**.
+No changes to production code were needed for this test-coverage fix.
+The exact `c5d56592` test child received **bounded independent
+SOURCE GO** (zero additional P0/P1/P2); the independent review
+checked canonical parent resolution for both procfd and archive
+pathnames, exact error matching, and preservation of foreign
+bytes and signed remote objects. Both `5e927dc5` and `c5d56592`
+were integrated into the clean local worktree by fast-forward.
+The earlier docs-only candidate `94c941cd` was independently
+SOURCE NO-GO for claiming an unqualified test GO on `5e927dc5`
+before its P2 was corrected; that candidate was **not integrated**,
+and this revised child records the accurate approval boundary.
+
+Neither correction supplies a protected parent or independent monotonic
+authority: same-UID/SID A→B→A, replacement of a leaf between checking
+its inode and unlink, and failures of fsync or process power during
+archive retirement are not proved safe for production. An indeterminate
+flush may leave a retained orphan archive requiring verified operator
+recovery, not silent cleanup. The staged genesis writer/promotion,
+generic transaction/rollback, Windows NTFS relative-handle mutations,
+native CFAPI, DLL/executable provenance, powercut/cold reacquisition
+and signed owner custody remain open gates. The product's
+`openNativeRootSession` and `requireNativeRecoveryAuthority` still
+deny activation. The remote PR #300 remains OPEN/Draft at `d3a91c92`
+with **formal CodeQL FAILURE (four HIGH on that remote SHA)**; local
+fixes have not been checked by GitHub Actions, avoiding additional
+metered usage.
+
+**Product RELEASE NO-GO.** These exact-source SOURCE GOs authorize
+only the reviewed local legacy hardening. No merge, deploy,
+force-push, cutover, or Root/main mutation occurred.
