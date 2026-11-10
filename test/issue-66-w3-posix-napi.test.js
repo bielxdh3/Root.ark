@@ -332,6 +332,151 @@ test("#66 W3 native publish links original held inode after post-check stage-nam
       "remaining hardlink alias cannot be promoted to independently trusted read authority");
   });
 
+test("#66 W3 anonymous native stage publishes a single-link inode with no unsafe visible stage retirement",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const held = path.join(home, created[0], "held");
+    const staged = path.join(held, ".rootark-w3-staged-v1");
+    const published = path.join(held, ".rootark-w3-committed-v1");
+    const saved = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+    try {
+      assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+      assert.equal(fs.existsSync(staged), false,
+        "O_TMPFILE PREPARE may not expose a second writable stage name");
+      assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-journal-v1"), "utf8"), "PREPARED_V1");
+      assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    } finally {
+      if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = saved;
+    }
+    assert.equal(fs.existsSync(staged), false, "anonymous original must have no abandoned stage pathname");
+    const publishedStat = fs.statSync(published, { bigint: true });
+    assert.equal(publishedStat.nlink, 1n, "single no-replace published inode must be readable after cold open");
+    assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.readFileSync(published, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-commit-marker-v1"), "utf8"), "COMMITTED_V1");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+    assert.throws(() => requireNativeRecoveryAuthority(bridge),
+      (e) => e.code === "root_session_unverified_authority");
+  });
+
+test("#66 W3 anonymous publication never overwrites a physical foreign destination",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const held = path.join(home, created[0], "held");
+    const saved = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+    try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+    finally {
+      if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = saved;
+    }
+    const published = path.join(held, ".rootark-w3-committed-v1");
+    fs.writeFileSync(published, "FOREIGN_DESTINATION", { flag: "wx", mode: 0o600 });
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_NO_REPLACE_CONFLICT/);
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+    assert.equal(fs.readFileSync(published, "utf8"), "FOREIGN_DESTINATION");
+    assert.equal(fs.statSync(published, { bigint: true }).nlink, 1n);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-staged-v1")), false);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+  });
+
+test("#66 W3 anonymous post-link hard exit retains PREPARED without granting cold COMMIT",
+  { skip: !txnEnabled }, () => {
+    loadLab(); // compile exact current C in a disposable ext4 HOME fixture
+    const child = [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      "const os=require('node:os');",
+      "const bridge=require(process.argv[1]);",
+      "const home=os.homedir();",
+      "const before=new Set(fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')));",
+      "const token=bridge.openTestSession();",
+      "const created=fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')&&!before.has(n));",
+      "if(created.length!==1)process.exit(61);",
+      "const held=path.join(home,created[0],'held');",
+      "if(bridge.stageProof(token)!=='LAB_TXN_PREPARED')process.exit(62);",
+      "fs.writeSync(1,held+'\\n');",
+      "bridge.publishProof(token);",
+      "process.exit(63);",
+    ].join("");
+    const crash = spawnSync(process.execPath, ["-e", child, addonPath], {
+      timeout: 10000, encoding: "utf8", maxBuffer: 4096,
+      env: {
+        PATH: "/usr/bin:/bin", HOME: os.homedir(), LANG: "C", LC_ALL: "C",
+        ROOTARK_ISSUE66_W3_NAPI_LAB: "1", ROOTARK_ISSUE66_W3_TXN_LAB: "1",
+        ROOTARK_ISSUE66_W3_ANON_LAB: "1",
+        ROOTARK_ISSUE66_W3_HARD_EXIT_POST_LINK: "1",
+      },
+    });
+    assert.equal(crash.status, 73, crash.stderr || crash.stdout);
+    const held = crash.stdout.trim();
+    assert.ok(held.startsWith(path.join(os.homedir(), ".rootark-w3-napi-")));
+    assert.equal(fs.statSync(held).isDirectory(), true);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-staged-v1")), false);
+    const published = path.join(held, ".rootark-w3-committed-v1");
+    assert.equal(fs.statSync(published, { bigint: true }).nlink, 1n);
+    assert.equal(fs.readFileSync(published, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-journal-v1"), "utf8"), "PREPARED_V1");
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false,
+      "a real child-process hard exit before COMMIT cannot be deemed complete");
+    assert.throws(() => openNativeRootSession(true),
+      (e) => e.code === "root_session_native_unavailable");
+  });
+
+test("#66 W3 anonymous pre-link hard exit loses unnamed stage but retains only nonauthorizing PREPARED",
+  { skip: !txnEnabled }, () => {
+    loadLab();
+    const child = [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      "const os=require('node:os');",
+      "const bridge=require(process.argv[1]);",
+      "const home=os.homedir();",
+      "const before=new Set(fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')));",
+      "const token=bridge.openTestSession();",
+      "const created=fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')&&!before.has(n));",
+      "if(created.length!==1)process.exit(61);",
+      "const held=path.join(home,created[0],'held');",
+      "if(bridge.stageProof(token)!=='LAB_TXN_PREPARED')process.exit(62);",
+      "fs.writeSync(1,held+'\\n');",
+      "process.exit(74);",
+    ].join("");
+    const crash = spawnSync(process.execPath, ["-e", child, addonPath], {
+      timeout: 10000, encoding: "utf8", maxBuffer: 4096,
+      env: {
+        PATH: "/usr/bin:/bin", HOME: os.homedir(), LANG: "C", LC_ALL: "C",
+        ROOTARK_ISSUE66_W3_NAPI_LAB: "1", ROOTARK_ISSUE66_W3_TXN_LAB: "1",
+        ROOTARK_ISSUE66_W3_ANON_LAB: "1",
+      },
+    });
+    assert.equal(crash.status, 74, crash.stderr || crash.stdout);
+    const held = crash.stdout.trim();
+    assert.ok(held.startsWith(path.join(os.homedir(), ".rootark-w3-napi-")));
+    assert.equal(fs.statSync(held).isDirectory(), true);
+    assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-journal-v1"), "utf8"), "PREPARED_V1");
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-staged-v1")), false);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-committed-v1")), false);
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+    assert.throws(() => requireNativeRecoveryAuthority({ root: held }),
+      (e) => e.code === "root_session_unverified_authority");
+  });
+
 test("#66 W3 native stage detects a separate same-UID writer's pre-commit in-place corruption",
   { skip: !txnEnabled }, (t) => {
     const bridge = loadLab();

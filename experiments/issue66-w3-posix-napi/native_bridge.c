@@ -44,6 +44,7 @@ typedef struct {
   int active;
   int parentfd;
   int staged_fd; // original exclusive inode, retained until session close
+  int txn_anonymous; // opt-in O_TMPFILE stage, never a product recovery mode
   DIR *held;
   int phase;
   int stream_active;
@@ -149,6 +150,31 @@ static int create_open_stage(int dirfd) {
   return fd;
 }
 
+static int create_anonymous_stage(int dirfd) {
+  // ext4 O_TMPFILE has no visible stage pathname. O_EXCL must NOT be set:
+  // Linux otherwise forbids linking this anonymous inode into the directory.
+  int fd = openat(dirfd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  if (fd < 0) return -1;
+  size_t size = strlen(STAGE_PAYLOAD);
+  if (write(fd, STAGE_PAYLOAD, size) != (ssize_t)size || fsync(fd) != 0) {
+    (void)close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int opened_stage_equals(int fd, int anonymous) {
+  if (fd < 0) return 0;
+  struct stat st;
+  char bytes[64];
+  size_t size = strlen(STAGE_PAYLOAD);
+  ssize_t got = pread(fd, bytes, sizeof(bytes), 0);
+  return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+         st.st_size == (off_t)size &&
+         st.st_nlink == (anonymous ? 0 : 1) &&
+         got == (ssize_t)size && memcmp(bytes, STAGE_PAYLOAD, size) == 0;
+}
+
 static int marker_equals(int dirfd, const char *name, const char *expected) {
   // Never block a helper before fstat if a same-UID fixture writer installs
   // a FIFO. A non-regular descriptor fails the held-file check below.
@@ -225,6 +251,7 @@ static void release_handles(lab_session *session) {
   session->seeded = 0;
   session->raw_seeded = 0;
   session->txn_phase = 0;
+  session->txn_anonymous = 0;
   memset(session->token, 0, sizeof(session->token));
 }
 
@@ -315,6 +342,7 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
   session->seeded = 0;
   session->raw_seeded = 0;
   session->txn_phase = 0;
+  session->txn_anonymous = 0;
   memcpy(session->token, token, sizeof(session->token));
   session->active = 1;
   return result_text(env, token);
@@ -514,7 +542,10 @@ static napi_value stage_proof(napi_env env, napi_callback_info info) {
   // Any uncertain failure permanently blocks this lab session's transaction
   // rather than permitting a blind second admission after partial writes.
   session->txn_phase = 3;
-  session->staged_fd = create_open_stage(held);
+  const char *anon = getenv("ROOTARK_ISSUE66_W3_ANON_LAB");
+  session->txn_anonymous = anon && strcmp(anon, "1") == 0;
+  session->staged_fd = session->txn_anonymous
+    ? create_anonymous_stage(held) : create_open_stage(held);
   if (session->staged_fd < 0 || fsync(held) != 0 ||
       !write_owned(held, JOURNAL_PROOF, JOURNAL_PAYLOAD) || fsync(held) != 0)
     return fail(env, "NATIVE_TXN_INDETERMINATE");
@@ -531,11 +562,17 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   int held = dirfd(session->held);
   if (session->txn_phase != 1 || !plain_directory(held, 1))
     return fail(env, "NATIVE_TXN_PHASE_REJECTED");
-  int current = fd_openat2(held, STAGE_PROOF, O_RDONLY | O_NONBLOCK, 0);
-  int stage_identity_matches = current >= 0 && object_is(current, session->staged_fd);
-  if (current >= 0 && close(current) != 0) stage_identity_matches = 0;
+  int stage_identity_matches = opened_stage_equals(session->staged_fd,
+                                                    session->txn_anonymous);
+  if (!session->txn_anonymous) {
+    int current = fd_openat2(held, STAGE_PROOF, O_RDONLY | O_NONBLOCK, 0);
+    stage_identity_matches = stage_identity_matches && current >= 0 &&
+                             object_is(current, session->staged_fd);
+    if (current >= 0 && close(current) != 0) stage_identity_matches = 0;
+    stage_identity_matches = stage_identity_matches &&
+                             marker_equals(held, STAGE_PROOF, STAGE_PAYLOAD);
+  }
   if (!stage_identity_matches ||
-      !marker_equals(held, STAGE_PROOF, STAGE_PAYLOAD) ||
       !marker_equals(held, JOURNAL_PROOF, JOURNAL_PAYLOAD)) {
     session->txn_phase = 3;
     return fail(env, "NATIVE_TXN_INDETERMINATE");
@@ -543,9 +580,10 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   // Publish from the ORIGINAL retained inode, not the mutable stage name.
   // /proc/self/fd is kernel-owned; AT_SYMLINK_FOLLOW dereferences this exact
   // opened descriptor while linkat supplies atomic no-replace destination.
-  // We deliberately leave the original stage hardlink in place: unlinking
-  // a same-UID-writable name would reintroduce foreign-file deletion TOCTOU.
-  // This is a lab-only two-name crash window, NOT a deployable recovery API.
+  // Visible stages keep their second hardlink rather than delete a mutable
+  // name. Anonymous O_TMPFILE stages instead have nlink=0 before publication
+  // and nlink=1 afterwards, with no unsafe cleanup or second visible name.
+  // Neither version authorizes production or cold required-v2 replay.
   char opened_source[64];
   int written = snprintf(opened_source, sizeof(opened_source),
                          "/proc/self/fd/%d", session->staged_fd);
@@ -558,7 +596,7 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   // native link. It must not redirect the source: linkat below resolves only
   // the privately retained opened FD. This is NOT a concurrent writer test.
   const char *rebind = getenv("ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK");
-  if (rebind && strcmp(rebind, "1") == 0) {
+  if (!session->txn_anonymous && rebind && strcmp(rebind, "1") == 0) {
     if (syscall(SYS_renameat2, held, STAGE_PROOF, held,
                 ".rootark-w3-postcheck-parked", RENAME_NOREPLACE) != 0 ||
         !write_owned(held, STAGE_PROOF, STAGE_PAYLOAD)) {
@@ -574,8 +612,15 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   }
   session->txn_phase = 3;
-  if (fsync(held) != 0 || !write_owned(held, COMMIT_PROOF, COMMIT_PAYLOAD) ||
-      fsync(held) != 0)
+  if (fsync(held) != 0)
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  // Physical hard-exit in an explicitly opted-in child process ONLY. The
+  // destination has passed linkat+directory fsync but COMMIT has not been
+  // created. No native cold replay may treat PREPARED as COMMITTED.
+  const char *hard_exit = getenv("ROOTARK_ISSUE66_W3_HARD_EXIT_POST_LINK");
+  if (session->txn_anonymous && hard_exit && strcmp(hard_exit, "1") == 0)
+    _exit(73);
+  if (!write_owned(held, COMMIT_PROOF, COMMIT_PAYLOAD) || fsync(held) != 0)
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   session->txn_phase = 2;
   return result_text(env, "LAB_TXN_COMMITTED");
