@@ -813,6 +813,11 @@ test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root mar
 test("issue 66: held marker inspection uses bounded FD reads under physical concurrent growth", async (t) => {
   const { root, open, adapter, key } = await setup(t, {});
   await open();
+  if (process.platform === "linux" && process.env.ROOTARK_ISSUE66_FIFO_REQUIRE_EXT4 === "1") {
+    assert.match(process.version, /^v22\./);
+    assert.equal((await fsp.statfs(root)).type, 0xef53,
+      "explicit marker growth race must be exercised on physical ext4");
+  }
   const marker = path.join(root, ".rootark-sync-ever-fod");
   const snapshotPath = path.join(root, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotPath);
@@ -822,6 +827,7 @@ test("issue 66: held marker inspection uses bounded FD reads under physical conc
   let mutated = false;
   let reads = 0;
   let maxRequested = 0;
+  let totalReturned = 0;
   fsp.open = async (...args) => {
     const handle = await originalOpen(...args);
     if (args[0] === marker) {
@@ -837,7 +843,9 @@ test("issue 66: held marker inspection uses bounded FD reads under physical conc
           mutated = true;
           await fsp.appendFile(marker, Buffer.alloc(256 * 1024, 0x41));
         }
-        return actualRead(buffer, offset, length, position);
+        const result = await actualRead(buffer, offset, length, position);
+        totalReturned += result.bytesRead;
+        return result;
       };
     }
     return handle;
@@ -852,6 +860,8 @@ test("issue 66: held marker inspection uses bounded FD reads under physical conc
   assert.equal(mutated, true, "the race must modify the physical marker during FD read");
   assert.ok(reads > 0 && maxRequested <= originalSize + 1,
     `untrusted marker read must be capped to expected bytes + 1; observed ${maxRequested}`);
+  assert.ok(totalReturned <= originalSize + 1,
+    `aggregate marker bytes read must be bounded; observed ${totalReturned}`);
   assert.equal((await fsp.stat(marker)).size, originalSize + 256 * 1024);
   assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
 });

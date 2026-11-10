@@ -954,17 +954,21 @@ The independently reviewed FIFO correction still had a concrete P2:
 `.rootark-sync-ever-fod` marker. A same-UID process could enlarge that
 regular file between validation and read, causing an unbounded read and
 allocation before the later identity/version check refused the contents.
-A deterministic physical test appends 256 KiB at the first held-FD read
-and rejects any call to `FileHandle.readFile`. It reproduced **RED** on
-Windows Node22, then **GREEN 1/1** after the code switched to a strict
+A deterministic regression forbids any call to `FileHandle.readFile`
+and instruments individual and aggregate bytes read through the fd.
+The parent code was **RED** on Windows Node22 because it invoked the
+forbidden unbounded API **before** physical growth was triggered. The
+corrected code is **GREEN 1/1** and physically appends 256 KiB during
+its first bounded fd read before rejecting the changed marker. It uses a strict
 buffer of the expected literal byte length plus one sentinel byte,
 using positional reads through the **same** retained handle. The
 corrupted marker and unchanged durable snapshot are checked after denial.
 The focused WSL Node22 test also passed **1/1** with its disposable root
 on ext4. `O_NONBLOCK|O_NOFOLLOW`, descriptor/path identity checks and
 partial/symlink/FIFO fail-closed behavior are retained. The separate
-FIFO test now supports explicit `ROOTARK_ISSUE66_FIFO_REQUIRE_EXT4=1`
-to assert Node22 and the real ext4 superblock for a physical run,
+FIFO and concurrent-growth tests support explicit
+`ROOTARK_ISSUE66_FIFO_REQUIRE_EXT4=1` to assert Node22 and the real ext4
+superblock for a physical run,
 without introducing an ext4 requirement in portable CI.
 
 This is a *bounded memory and marker-admission correction*, not a
