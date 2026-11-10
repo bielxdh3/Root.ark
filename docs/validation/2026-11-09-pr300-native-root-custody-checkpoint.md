@@ -1405,3 +1405,60 @@ remain outside the current same-SID security boundary. `e2297926`,
 `1b4fc52f`, and `88a88b68` were fast-forwarded into the clean
 local integrated worktree. The hosted Draft PR/CodeQL state has
 **not** been updated by any of these local commits.
+
+### 2026-11-10 continuation — Windows archived ledger identity at retirement
+
+The next local code child `76a838de2510c2a1b2c25fd3b0bac3293f72c66d`
+(parent `6f6af91e`) hardens **cooperative Windows NTFS legacy
+ledger retirement**, without activating the native RootSession.
+Previously `readEvictionLedger` returned filenames but no Windows
+directory identity, and `clearEvictionLedger` renamed the public
+ledger path then issued unverified pathname `unlink` for the
+record names. On the original parent, a disposable Windows/Node22
+NTFS adversarial test physically parked the legitimate ledger and
+substituted a different directory at the *real archive rename*.
+The original code attempted to delete a foreign record. The test
+intercepted the syscall **before any foreign bytes were removed**:
+**RED 1 FAIL** (`attemptedForeignUnlink=true`). No external fixture
+or signed server record was destroyed.
+
+The child validates Windows ledger dev+ino both before and after
+the complete read, includes that inode identity in the read
+result, verifies the ledger before retirement, and verifies that
+the renamed archive is the same directory **before mkdir and before
+every subsequent record unlink/rmdir**. A different archive fails
+closed with `invalid_snapshot` and is preserved, without
+attempting deletion. A second NTFS regression substitutes a
+foreign directory **after the legitimate rename**, at the fresh
+active-ledger mkdir boundary; the child again rejects before
+the first unlink. Both tests preserve exact test-owned foreign
+file lists and Buffer bytes and require no signed DELETE.
+
+| Exact local evidence on `76a838de` | Outcome |
+| --- | --- |
+| Windows Node22/NTFS: two distinct physically substituted foreign-archive retirement boundaries | **2 PASS / 0 FAIL** |
+| Windows Node22/NTFS: completed checkpoint and EIO before archive rename | **2 PASS / 0 FAIL** |
+| Windows Node22/NTFS: hard process exit after archive rename and cold open in a different Node22 process | **1 PASS / 0 FAIL** |
+| Ubuntu WSL Node22/ext4: completed checkpoint and orphan archive cold-denial nonregression | **2 PASS / 0 FAIL** |
+| Windows Node22 JS source/test syntax and `git diff --check` | **PASS** |
+
+Independent exact-source, read-only review of `76a838de` reported
+**bounded SOURCE GO with no new P0/P1/P2** in the Windows identity
+delta. The reviewer verified the intercepted RED did not destroy
+foreign bytes and the tests require an actual directory swap,
+precise `invalid_snapshot` identity denial, preserved Buffer
+contents and unchanged signed remote objects. The SHA was
+fast-forwarded locally; no push or hosted CI was performed.
+
+**Release boundary:** A dev+ino check before unlink cannot prevent
+a hostile same-SID actor from replacing its name **after** the
+check; such identity-bound deletion requires an independently
+protected native NTFS RootDirectory/owner service or another
+proven primitive. Root/ancestor custody, signed monotonic floor,
+powercut durability, full native stage/publish/remove and
+Windows 10/CFAPI release proof remain unavailable. The existing
+16,385-entry physical stress tests were not repeated.
+The remote PR remains OPEN/Draft at the last verified `d3a91c92`
+with formal CodeQL **FAILURE (four HIGH on that old remote SHA)**;
+local SOURCE GOs are not hosted CodeQL clearance.
+**RootSession stays fail-closed. Product RELEASE NO-GO.**
