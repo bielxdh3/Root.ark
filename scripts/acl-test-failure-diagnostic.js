@@ -34,10 +34,38 @@ const CASES = Object.freeze({
     title: "Windows native ACL worker initialization leaves the Node event loop responsive",
     stages: ["INSUFFICIENT_TICKS", "EVENT_LOOP_STALL"],
   },
+  CFAPI_PREFLIGHT: {
+    file: "test/issue-66-cfapi-acl-preflight-native.test.js",
+    // Node TAP escapes a leading # in the test title. The hosted reporter
+    // hashes that exact escaped title, not the original test declaration.
+    title: String.raw`\#66 Windows SDK ACL preflight accepts a protected owner-only DACL and rejects broad access or reparse points`,
+    stages: ["TOOLCHAIN_LOOKUP", "TOOLCHAIN_RESOLVE", "SCRATCH_CREATE",
+      "BUILD_SCRIPT_WRITE", "SDK_BUILD", "ROOT_CREATE", "ACL_SCRIPT_CHECK",
+      "ACL_OWNER_APPLY", "ACL_BROAD_APPLY", "ACL_INHERITED_APPLY",
+      "ACL_OWNER_APPLY_INIT", "ACL_OWNER_APPLY_OWNER", "ACL_OWNER_APPLY_PROTECT",
+      "ACL_OWNER_APPLY_RULES", "ACL_OWNER_APPLY_WRITE",
+      "ACL_BROAD_APPLY_INIT", "ACL_BROAD_APPLY_OWNER", "ACL_BROAD_APPLY_PROTECT",
+      "ACL_BROAD_APPLY_RULES", "ACL_BROAD_APPLY_WRITE",
+      "ACL_INHERITED_APPLY_INIT", "ACL_INHERITED_APPLY_OWNER", "ACL_INHERITED_APPLY_PROTECT",
+      "ACL_INHERITED_APPLY_RULES", "ACL_INHERITED_APPLY_WRITE",
+      "OWNER_INSPECT", "OWNER_ACCEPT", "OWNER_HANDLE", "OWNER_NO_REGISTER",
+      "OWNER_NO_TRANSFER", "BROAD_INSPECT", "BROAD_REJECT",
+      "INHERITED_INSPECT", "INHERITED_REJECT", "MISSING_INSPECT",
+      "MISSING_REJECT", "JUNCTION_CREATE", "JUNCTION_INSPECT",
+      "JUNCTION_REJECT", "REGISTER_REJECT"],
+  },
 });
 const TRUST = new Set(["UNKNOWN", "INHERITED", "PROTECTED", "UNTRUSTED_ADDED", "REJECTED", "ACCEPTED", "QUARANTINED"]);
 const ERRORS = new Set(["UNKNOWN", "ASSERTION", "ATOMIC_UNSAFE", "PERMISSION", "RUNTIME"]);
 const LINE = /^# ROOTARK_ACL_V1 case=([A-Z_]{1,32}) stage=([A-Z_]{1,32}) code=([A-Z_]{1,32}) trust=([A-Z_]{1,32})$/;
+const CFAPI_FIXTURE_LINE = /^ROOTARK_CFAPI_FIXTURE_V1 phase=(INIT|OWNER|PROTECT|RULES|WRITE)\r?\n?$/;
+const CFAPI_APPLY = new Set(["ACL_OWNER_APPLY", "ACL_BROAD_APPLY", "ACL_INHERITED_APPLY"]);
+
+function readCfapiFixtureFailureStage(stage, stderr) {
+  if (!CFAPI_APPLY.has(stage) || typeof stderr !== "string" || stderr.length > 80) return null;
+  const matched = CFAPI_FIXTURE_LINE.exec(stderr);
+  return matched ? `${stage}_${matched[1]}` : null;
+}
 
 function classify(error) {
   if (error?.code === "ERR_ASSERTION") return "ASSERTION";
@@ -91,4 +119,4 @@ function parseAclFailureDiagnostic(line, pending) {
   return { stage, code, trust };
 }
 
-module.exports = { createAclFailureDiagnostic, parseAclFailureDiagnostic };
+module.exports = { createAclFailureDiagnostic, parseAclFailureDiagnostic, readCfapiFixtureFailureStage };

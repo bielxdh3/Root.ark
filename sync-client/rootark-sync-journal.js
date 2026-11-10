@@ -587,6 +587,125 @@ class SyncJournal {
       next.observed[operationId] = digest;
     });
   }
+  async batchObserveAdmission(entries, beforePersist = null) {
+    // Called ONLY after every envelope in the enclosing remote LIST has been
+    // independently authorized and its exact canonical digest frozen. This
+    // primitive persists that already verified evidence; it never verifies a
+    // signature or turns a remote LIST response into its own authority.
+    if (!Array.isArray(entries) || entries.length > MAX_OBSERVATIONS
+      || (beforePersist !== null && typeof beforePersist !== "function")) {
+      throw new Error("Invalid bounded sync admission batch");
+    }
+    if (!entries.length) {
+      // A complete signed LIST replay can consist entirely of previously
+      // observed/admitted digests. Its owner-policy/revocation gate is still
+      // mandatory, even though there is no new journal state to persist.
+      // Serialize the gate behind prior writes without issuing an unnecessary
+      // durable rename or manufacturing a new signed observation.
+      if (beforePersist) {
+        const check = this.queue.then(() => beforePersist());
+        this.queue = check.catch(() => {});
+        await check;
+      }
+      return;
+    }
+    const unique = new Set();
+    const frozenEntries = [];
+    for (const entry of entries) {
+      // A verifier can pass mutable network objects or getters. Read each
+      // field once and detach the primitive identity before the queued fsync.
+      const operationId = entry?.operationId;
+      const digest = entry?.digest;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof operationId !== "string" || !VALID_OPERATION_ID.test(operationId)
+        || typeof digest !== "string" || !VALID_DIGEST.test(digest)
+        || unique.has(operationId)) {
+        throw new Error("Invalid or duplicated sync admission batch identity");
+      }
+      unique.add(operationId);
+      frozenEntries.push({ operationId, digest });
+    }
+    await this.commit(async (next) => {
+      // Run freshness/owner-policy checks AFTER earlier journal transactions
+      // leave the queue, immediately before mutating this durable batch.
+      if (beforePersist) await beforePersist();
+      const pending = new Map(next.pending.map((entry) => [entry.operationId, entry]));
+      const seen = new Set(next.seen);
+      let count = Object.keys(next.observed).length;
+      for (const { operationId, digest } of frozenEntries) {
+        const priorAdmitted = Object.hasOwn(next.admitted, operationId)
+          ? next.admitted[operationId] : null;
+        const priorObserved = Object.hasOwn(next.observed, operationId)
+          ? next.observed[operationId] : null;
+        if ((priorAdmitted !== null && priorAdmitted !== digest)
+          || (priorObserved !== null && priorObserved !== digest)
+          || (pending.has(operationId)
+            && signedEnvelopeDigest(pending.get(operationId)) !== digest)) {
+          throw Object.assign(new Error("Conflicting local sync admission evidence"),
+            { code: "remote_authorization_rejected" });
+        }
+        if (priorObserved !== null || (priorAdmitted !== null
+          && seen.has(operationId))) continue;
+        count += 1;
+        if (count > MAX_OBSERVATIONS) {
+          throw new Error("Sync pre-observation journal capacity exceeded");
+        }
+        // Null-prototype maps also preserve IDs such as "__proto__" exactly.
+        next.observed[operationId] = digest;
+      }
+    });
+  }
+  async batchMarkSeenRemoteOnly(entries, beforePersist = null) {
+    // Inert until an independently reviewed, root-handle-bound remote-only
+    // caller exists. This cannot be used for signed WebDAV DELETE/MOVE pairs:
+    // each exact digest must already have an observed or admitted journal pin.
+    if (!Array.isArray(entries) || !entries.length || entries.length > 640
+      || (beforePersist !== null && typeof beforePersist !== "function")) {
+      throw new Error("Invalid bounded remote-only acknowledgement batch");
+    }
+    const ids = new Set();
+    const frozen = [];
+    for (const entry of entries) {
+      const operationId = entry?.operationId;
+      const digest = entry?.digest;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof operationId !== "string" || !VALID_OPERATION_ID.test(operationId)
+        || typeof digest !== "string" || !VALID_DIGEST.test(digest)
+        || ids.has(operationId)) {
+        throw new Error("Invalid or duplicated remote-only admission evidence");
+      }
+      ids.add(operationId);
+      frozen.push({ operationId, digest });
+    }
+    await this.commit(async (next) => {
+      // Recheck the independently pinned current revocation/epoch policy
+      // AFTER older queued journal operations, not only before enqueueing ACK.
+      if (beforePersist) await beforePersist();
+      const pending = new Set(next.pending.map((item) => item.operationId));
+      const seen = new Set(next.seen);
+      const grouped = new Set(Object.values(next.atomicSignedGroups)
+        .flatMap((pair) => [pair.deleteId, pair.moveId]));
+      for (const { operationId, digest } of frozen) {
+        if (pending.has(operationId) || grouped.has(operationId)) {
+          throw new Error("Remote-only acknowledgement overlaps pending atomic work");
+        }
+        if (seen.has(operationId)) {
+          if (!Object.hasOwn(next.admitted, operationId)
+            || next.admitted[operationId] !== digest) {
+            throw new Error("Previously admitted remote-only evidence conflict");
+          }
+        } else if (!Object.hasOwn(next.observed, operationId)
+          || next.observed[operationId] !== digest) {
+          throw new Error("Remote-only acknowledgement requires exact durable observation");
+        }
+      }
+      for (const { operationId, digest } of frozen) {
+        if (!seen.has(operationId)) next.seen.push(operationId);
+        next.admitted[operationId] = digest;
+        delete next.observed[operationId];
+      }
+    });
+  }
   hasLocalAdmission(operationId, digest) {
     return VALID_OPERATION_ID.test(operationId) && VALID_DIGEST.test(digest)
       && ((Object.hasOwn(this.state.admitted, operationId)

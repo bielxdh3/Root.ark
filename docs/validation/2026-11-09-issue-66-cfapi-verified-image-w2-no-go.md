@@ -1,0 +1,25 @@
+# Issue #66 / Draft #300 — W2 verified image custody experiment: NO-GO
+
+This is a **test-only, locally unpublished** successor to `be8d47fa14ceb383b856c8bad93d183166b191b9`. It does **not** enable native CFAPI, grant protected root authority, or establish safe executable custody. Keep PR #300 Draft and do not promote this experiment to a release gate or operational permission.
+
+## What is demonstrated
+
+- The Windows `NtQueryInformationProcess(ProcessImageFileMapping=44)` check compares a held file handle with the actual primary image's **FILE_OBJECT** for a process created with `CREATE_SUSPENDED`. In disposable Windows NTFS physical probes, same-object returns `STATUS_SUCCESS`; a different object, including a leaf name replaced before process creation, returns `0xC0000001`. This is an object-identity result, **not** a cryptographic or complete code-byte measurement. The ancestor-swap case was not demonstrated by this probe.
+- `test/support/issue-66-cfapi-image-section-lab.cpp` is a deliberately non-executing, allowlisted `whoami.exe` / `hostname.exe` research probe. Every started process is terminated while suspended. **There is no `ResumeThread`**, no arbitrary caller-provided executable, no production entry point, and no fallback when class 44 or executable-byte matching fails.
+- Reading all raw bytes of executable PE sections and comparing them to the suspended process mapping is **not** a valid blanket test: a legitimate pinned `whoami.exe` passes class 44 but fails strict byte comparison (section 1 offset 17 observed), even with experimental DIR64 relocation adjustment. Therefore that technique is currently fail-closed, not an authenticated code-byte bridge.
+- The W2 physical Windows22 MSVC `/std:c++17 /W4 /WX /EHsc` probe reported `NTSTATUS:00000000`, `EXECUTABLE_SECTIONS_MATCH:0` (exit `71`) for the same `whoami.exe` handle, `NTSTATUS:c0000001` (exit `68`) for a different pinned `hostname.exe` handle, and exit `64` for an executable outside its allowlist. All started processes were terminated while suspended. The separate W2 ancestor-directory rename attempt failed with Windows `AccessDenied` before a suspended replacement-image check; **ancestor-swap correctness is inconclusive**, not proven.
+- The ACL test compiler no longer **executes** a `build.cmd` under writable TEMP. It assembles a fixed MSVC command itself and uses Windows `System32\cmd.exe` to call an installed `vcvars64.bat` and invoke `cl.exe`. A disposable adversarial `build.cmd` marker placed in the test scratch is not executed; the existing physical native ACL tests still pass. This does not enable any new secure launch path.
+
+## Test-only scope and fail-closed decision
+
+The existing test runner `runCompiledFixture()` is **not** promoted to a secure executable launcher: its preexisting pathname-based `spawnSync` remains an untrusted test-only mechanism. This experiment adds **no OS-backed launch or trusted fallback**; the section probe never resumes a process. To preserve the mandatory existing Windows native regressions, this candidate does **not** deliberately break those tests or silently skip them. Their passing status does not establish executable custody, production authorization, or a security GO.
+
+## Remaining P1/P2 security boundaries
+
+1. **P1 — no authenticated bytes of the actual process image.** Class 44 alone says same file object, not same mapped code bytes. Loader relocations and other legitimate transforms break naive byte matching. A preexisting writable mapping or a same-principal memory injection can modify code across the authorization window unless there is independent OS-enforced isolation. This experiment proves neither.
+2. **P1 — untrusted native launch bootstrap.** A verifier executable or `cl.exe` started from a replaceable path cannot bootstrap its own trust with a preliminary SHA/check. A trusted protected native broker with hardened process creation, byte-identity checks and rigorous threat-model evidence is required; there is none in this commit.
+3. **P1 — DLL and toolchain custody.** The process loader may consult executable-directory DLLs, imports, extension points, IFEO and toolchain search state. The installed VS `vcvars64.bat` and `cl.exe` are treated as tooling inputs, not OS-authenticated at execution; `/MT`, signed-only DLL mitigation and import allowlists are not verified here. A same-principal attacker may manipulate future modules or writable mappings.
+4. **P2 — directory ancestry remains mutable.** Independent NTFS testing found held directory handles alone do not reliably deny ancestor renames. Do not claim `realpath`, `lstat`, handle comparison, or directory-handle share modes guarantee stable path custody.
+5. **P2 — no across-platform or hosted CI proof.** The Windows-only internal class 44 API is not a portable contract. Physical Windows 10, platform variants, CI CodeQL and independent exact-SHA SOURCE review are still outstanding.
+
+This result is intentionally **NO-GO** for a secure launcher. The experimental code never executes an unverified process, and the legacy test-only runner must not be exposed as a secure or production path.
