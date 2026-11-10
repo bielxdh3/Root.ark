@@ -1830,3 +1830,104 @@ report **4 HIGH / FAILURE**. Local source changes are **not**
 a new hosted PASS. No GitHub Actions workflow, remote push,
 merge, deploy or `Root/main` mutation was performed.
 **Product RELEASE NO-GO; mission incomplete.**
+
+### 2026-11-10 continuation — post-rename directory EIO and signed-reconcile abort
+
+The latest integrated local checkpoint preceding this work was
+`bcc478285fd0fa66d3b293d158bf1dc0442faa25` (remote #300
+still OPEN/Draft at `d3a91c92`). The previously peer-reviewed
+docs child `3dc64621` corrected an overclaim: a failure **before**
+rename and a failure **after a successful rename** do not have
+identical disk or rollback semantics. The docs chain was
+fast-forwarded locally without touching `Root/main`.
+
+New Linux Node22 tests in `d1a3e47fdf93aabc9fff3837b2b58095e85ed15d`
+exercise three distinct *post-rename* fault boundaries, using real
+filesystem temporary creation and `rename`, then substituting
+`EIO` for the subsequent **directory FileHandle.sync()** only:
+
+- Snapshot v1→required-v2: a failed parent sync was reported as an
+  EIO; the previous implementation proceeded to write a separate
+  v1 rollback while cache bytes remained local. A new engine
+  object could open with exclusions reset and issued no DELETE.
+  **The final code below intentionally changes this behavior**:
+  it aborts before rollback and leaves the published required-v2
+  snapshot for verified cold replay.
+- PREPARE `head.json`: a real rename under the retained ledger
+  `/proc/self/fd/N` completed, then directory sync returned
+  injected EIO. The published HEAD sequence and durable PREPARE
+  were checked on disk with `required-v2=true`; a new engine
+  object reopened without signing DELETE.
+- Sync journal: a real temp→journal rename succeeded, but the
+  parent sync returned EIO. `journalCommitted=true` prevented
+  reverting memory to the prior phase; the already installed
+  bytes and independently reopened journal object matched.
+
+This **3 PASS WSL Node22** test-only SHA received narrow
+independent SOURCE GO. Separate child `0d969b4bc901e115d11aad6e90a585b77eec60e4`
+added the fourth case: physical full snapshot compaction
+`required-v2=false` after actual cache staging and PREPARE/COMMIT,
+followed by EIO after its successful rename. The cache was
+absent from its old path, journal records remained and a truly
+**separate Node22 operating-system process** opened and synced
+the same Root. The subprocess adapter permitted **exactly one**
+non-tombstone `CREATE` of parent directory `PRIVATE` with
+`contentType=inode/directory`; every other outbound operation
+was fatal, including any DELETE. The durable server retained
+zero tombstones and the original authenticated file operationId.
+Peer review initially returned SOURCE NO-GO on test quality:
+waiting for subprocess `exit` could miss trailing stdout, and
+allowing any CREATE at `PRIVATE` was too broad. Child
+`02600fbe6ceb8de809a531ae6433371721f08ff7` corrected
+both using `close`/drained pipes and a one-only strict directory
+allowlist, receiving narrow SOURCE GO. This is **not** proof
+of actual power loss or independent custodial durability.
+
+A separate security RED surfaced while investigating the first
+scenario: after a successful required-v2 snapshot rename and
+injected parent `sync` EIO, the previous `SyncEngine`
+reported one failed excluded item **but then entered
+`_reconcileLocal()` in the same pass**. The test intercepted that
+method before it could submit any signed operation and was
+**RED 1 FAIL**. Exact code child `f5cc6ea4` (rebased
+without patch changes as `3458a4407825f2435e7cb11639cfb01cd49eede8`)
+now tracks the successful metadata rename. If a subsequent
+parent-directory open/sync/close fails, `durableJson()` raises
+`invalid_snapshot` **with the original EIO as its cause**;
+the existing exclusion and `_syncOnce` fail-closed gates
+abort before `_reconcileLocal`, invalidate the opened engine's
+snapshot revision and require disk re-acquisition. Failed
+**pre-rename** publication preserves its prior error behavior.
+The physical RED turned **GREEN**, with two authenticated local
+files and the remote object intact, no signed DELETE. The
+required-v2 snapshot remains on disk and staged genesis stays
+available for cold recovery rather than rewriting a speculative
+v1 rollback. Original `f5cc6ea4` received narrow independent
+SOURCE GO. The composed exact `3458a440` also received
+independent narrow SOURCE GO: parent `02600fbe`, and stable
+`git patch-id` `3c9e4de4a341d99701e4790af6b4d595374fbd04`
+identical to the original patch.
+
+On the composed exact code, **WSL Ubuntu Node22/ext4 6 PASS /
+0 FAIL** in targeted post-rename, pre-rename collision and
+metadata-recovery cases, plus **Windows Node22/NTFS 5 PASS /
+0 FAIL** for staged genesis and PREPARE/COMMIT/HEAD foreign
+record nonregression. The mount type for WSL's
+`TMPDIR=/home/bielx` was independently checked with
+`findmnt`: `ext4 /`. The tests did **not** rerun any
+16,385-entry stress battery and did **not** simulate a real
+hardware power outage.
+
+**Limits remain decisive:** only exclusion-cycle post-rename
+failclosed behavior and specified cooperative recovery cases
+were proven. Other direct metadata writers still require their
+own independent admission and recovery analysis. No separate
+owner-controlled root/ancestor, stable same-UID/SID writer
+exclusion, truly identity-conditional POSIX unlink, Windows
+native RootSession integration, monotonic independently
+signed rollback floor, powercut durability, Windows 10 CFAPI
+release test or image attestation was provided. The remote
+Draft `d3a91c92` formal CodeQL is **FAILURE, four HIGH**;
+these local tests do not clear it. No new hosted CI, PR push,
+merge, deploy or `Root/main` update was performed.
+**RootSession remains fail-closed; RELEASE NO-GO.**
