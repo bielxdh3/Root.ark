@@ -1028,8 +1028,17 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
       heldDirectoryStats = await heldDirectory.stat({ bigint: true });
       await verifyHeldLedger();
     }
-  const files = await fsp.readdir(linux ? `/proc/self/fd/${heldDirectory.fd}` : directory);
-  if (files.length > EVICTION_LEDGER_MAX * 2 + 1) fail("Eviction ledger capacity exceeded", "invalid_snapshot");
+  // A same-UID writer can place an arbitrary number of junk names here.
+  // readdir() would allocate the ENTIRE name array before checking the cap;
+  // stream via the already pinned Linux dirfd, and stop at the fixed bound.
+  const files = [];
+  const listPath = linux ? `/proc/self/fd/${heldDirectory.fd}` : directory;
+  for await (const entry of await fsp.opendir(listPath)) {
+    if (files.length >= EVICTION_LEDGER_MAX * 2 + 1) {
+      fail("Eviction ledger capacity exceeded", "invalid_snapshot");
+    }
+    files.push(entry.name);
+  }
   let head = null;
   const entries = new Map();
   for (const filename of files) {

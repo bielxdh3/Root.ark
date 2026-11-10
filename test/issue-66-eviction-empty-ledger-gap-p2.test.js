@@ -215,19 +215,42 @@ test("issue 66: Linux recovery must not enumerate a ledger directory replaced af
   await fsp.mkdir(attacker);
   await fsp.writeFile(path.join(attacker, "ATTACKER_SENTINEL"), "foreign data, never enumerate");
   const originalReaddir = fsp.readdir;
+  const originalOpendir = fsp.opendir;
   let injected = false;
   let attackerEnumerated = false;
-  fsp.readdir = async (requested, ...args) => {
+  const ledgerRequest = async (requested) => {
     const requestedName = String(requested);
-    if (!injected && (requestedName === originalLedger
-      || /^\/proc\/self\/fd\/\d+$/.test(requestedName))) {
+    if (requestedName === originalLedger) return true;
+    if (!/^\/proc\/self\/fd\/\d+$/.test(requestedName)) return false;
+    try { return path.resolve(await fsp.realpath(requested)) === path.resolve(originalLedger); }
+    catch { return false; }
+  };
+  const inject = async (requested) => {
+    if (!injected && await ledgerRequest(requested)) {
       injected = true;
       await fsp.rename(originalLedger, displaced);
       await fsp.symlink(attacker, originalLedger, "dir");
     }
+  };
+  fsp.readdir = async (requested, ...args) => {
+    await inject(requested);
     const names = await originalReaddir(requested, ...args);
     if (injected && names.includes("ATTACKER_SENTINEL")) attackerEnumerated = true;
     return names;
+  };
+  fsp.opendir = async (requested, ...args) => {
+    const isLedger = await ledgerRequest(requested);
+    if (isLedger) await inject(requested);
+    const dir = await originalOpendir(requested, ...args);
+    if (!isLedger) return dir;
+    return {
+      async *[Symbol.asyncIterator]() {
+        for await (const entry of dir) {
+          if (entry.name === "ATTACKER_SENTINEL") attackerEnumerated = true;
+          yield entry;
+        }
+      },
+    };
   };
   const before = f.outbound.length;
   try {
@@ -235,6 +258,7 @@ test("issue 66: Linux recovery must not enumerate a ledger directory replaced af
       (error) => ["invalid_snapshot", "unsafe_path"].includes(error?.code));
   } finally {
     fsp.readdir = originalReaddir;
+    fsp.opendir = originalOpendir;
     if (injected) {
       await fsp.unlink(originalLedger);
       await fsp.rename(displaced, originalLedger);
@@ -243,6 +267,70 @@ test("issue 66: Linux recovery must not enumerate a ledger directory replaced af
   assert.equal(injected, true, "the ledger reader must reach a real directory enumeration");
   assert.equal(attackerEnumerated, false, "the reader must never enumerate the swapped-in directory");
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: eviction recovery streams ledger names instead of an unbounded readdir", async (t) => {
+  const f = await fixture(t, "stream-held-ledger-names");
+  await prePrepareCrash(f);
+  const originalReaddir = fsp.readdir;
+  let unboundedLedgerReads = 0;
+  fsp.readdir = async (requested, ...args) => {
+    let ledger = String(requested) === f.ledger;
+    if (!ledger && /^\/proc\/self\/fd\/\d+$/.test(String(requested))) {
+      try { ledger = path.resolve(await fsp.realpath(requested)) === path.resolve(f.ledger); }
+      catch { /* Non-ledger procfd handled normally. */ }
+    }
+    if (ledger) {
+      unboundedLedgerReads += 1;
+      throw new Error("Unbounded ledger enumeration is prohibited");
+    }
+    return originalReaddir(requested, ...args);
+  };
+  const before = f.outbound.length;
+  try {
+    const recovered = await f.create(f.root, ["private"]);
+    assert.equal(recovered.snapshot.evictionLedgerRequired, false);
+  } finally { fsp.readdir = originalReaddir; }
+  assert.equal(unboundedLedgerReads, 0, "ledger names must be streamed with a finite cap");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: ledger name stream rejects excess entries without materializing the tail", async (t) => {
+  const f = await fixture(t, "bounded-ledger-name-stream");
+  await prePrepareCrash(f);
+  const originalOpendir = fsp.opendir;
+  let yielded = 0;
+  let boundedEnumeratorUsed = false;
+  fsp.opendir = async (requested, ...args) => {
+    let ledger = String(requested) === f.ledger;
+    if (!ledger && /^\/proc\/self\/fd\/\d+$/.test(String(requested))) {
+      try { ledger = path.resolve(await fsp.realpath(requested)) === path.resolve(f.ledger); }
+      catch { /* Preserve other procfd reads. */ }
+    }
+    if (!ledger) return originalOpendir(requested, ...args);
+    boundedEnumeratorUsed = true;
+    return {
+      async *[Symbol.asyncIterator]() {
+        // No huge physical fixture needed for this capacity boundary: the
+        // real ledger root/head exist, and only the name source is injected.
+        for (let i = 0; i < 32770; i++) {
+          yielded++;
+          yield { name: `untrusted-name-${i}` };
+        }
+        throw new Error("Name stream illegally consumed beyond the cap");
+      },
+    };
+  };
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(f.create(f.root, ["private"]), (error) =>
+      error?.code === "invalid_snapshot" && /capacity exceeded/.test(error.message));
+  } finally { fsp.opendir = originalOpendir; }
+  assert.equal(boundedEnumeratorUsed, true);
+  assert.equal(yielded, 32770, "must stop at max+1, not consume additional entries");
   assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
   verifyNoSignedDelete(f, before);
 });
