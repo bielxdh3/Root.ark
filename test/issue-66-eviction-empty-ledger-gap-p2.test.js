@@ -1156,7 +1156,9 @@ test("issue 66 P2: replacing staged genesis parent after complete iteration cann
     // post-iteration swap regression on that route as well as Windows paths.
     if (path.resolve(args[0]) !== path.resolve(trash)) {
       if (!/^\/proc\/self\/fd\/\d+$/.test(String(args[0]))) return dir;
-      const openedDirectory = await fsp.stat(String(args[0]), { bigint: true });
+      let openedDirectory;
+      try { openedDirectory = await fsp.stat(String(args[0]), { bigint: true }); }
+      catch (error) { await dir.close(); throw error; }
       if (!openedDirectory.isDirectory() || openedDirectory.dev !== trashIdentity.dev
         || openedDirectory.ino !== trashIdentity.ino) return dir;
     }
@@ -1347,8 +1349,29 @@ fsp.link = async (...args) => {
       assert.equal(stat.isFile(), true);
       assert.equal(stat.isSymbolicLink(), false);
       assert.equal(stat.nlink, 2n);
+      assert.ok(stat.size <= 8192n, "genesis head must remain within its 8 KiB contract");
       return { handle, stat };
     } catch (error) { await handle.close(); throw error; }
+  };
+  const readObserved = async ({ handle, stat }) => {
+    // A hostile same-UID writer can extend an opened file after the size
+    // check. An unbounded FileHandle.readFile() could exhaust test memory.
+    const bytes = Buffer.alloc(8193);
+    let count = 0;
+    while (count < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, count, bytes.length - count, count);
+      if (!bytesRead) break;
+      count += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    assert.equal(after.dev, stat.dev);
+    assert.equal(after.ino, stat.ino);
+    assert.equal(after.nlink, stat.nlink);
+    assert.equal(after.size, stat.size);
+    assert.equal(after.mtimeNs, stat.mtimeNs);
+    assert.equal(after.ctimeNs, stat.ctimeNs);
+    assert.equal(BigInt(count), stat.size);
+    return bytes.subarray(0, count);
   };
   const originalStage = await openObserved(stage);
   let originalTemp;
@@ -1357,8 +1380,8 @@ fsp.link = async (...args) => {
     assert.equal(originalStage.stat.dev, originalTemp.stat.dev);
     assert.equal(originalStage.stat.ino, originalTemp.stat.ino,
       "the two stage names must refer to the very same original inode");
-    const originalBytes = await originalStage.handle.readFile();
-    assert.deepEqual(originalBytes, await originalTemp.handle.readFile());
+    const originalBytes = await readObserved(originalStage);
+    assert.deepEqual(originalBytes, await readObserved(originalTemp));
     assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).version, 1,
       "a crash during genesis stage must not silently upgrade the durable snapshot");
     // This lock belongs exclusively to the dead disposable fixture process.
@@ -1375,7 +1398,7 @@ fsp.link = async (...args) => {
         assert.equal(observed.stat.dev, originalStage.stat.dev);
         assert.equal(observed.stat.ino, originalStage.stat.ino,
           "foreign same-byte replacement after the crash must not pass by pathname");
-        assert.deepEqual(await observed.handle.readFile(), originalBytes,
+        assert.deepEqual(await readObserved(observed), originalBytes,
           "refused restart must preserve the original inode bytes");
       }
     } finally {

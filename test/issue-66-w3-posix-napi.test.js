@@ -64,6 +64,18 @@ function withHeldFixtureDirectory(held, action) {
   } finally { fs.closeSync(fd); }
 }
 
+function withOpenedFixtureLeaves(dirfd, leaves, action) {
+  const opened = [];
+  try {
+    for (const leaf of leaves) opened.push(openFixtureLeaf(dirfd, leaf));
+    return action(...opened);
+  } finally {
+    // If a later leaf open rejects (foreign rename/ENOENT), all earlier
+    // descriptors must still close. The test may not leak a writer HANDLE.
+    for (let i = opened.length - 1; i >= 0; i--) fs.closeSync(opened[i]);
+  }
+}
+
 test("#66 W3 native stress seeding has an explicit C-level opt-in gate", () => {
   const nativeSource = fs.readFileSync(source, "utf8");
   const seed = nativeSource.split("static napi_value seed_many(")[1]?.split("static napi_value seed_raw_byte_name(")[0];
@@ -342,9 +354,9 @@ test("#66 W3 equal-byte foreign inode cannot be published instead of original st
           "equal bytes of an untrusted inode must not authorize the native stage");
         assert.equal(fs.existsSync(destination), false, "foreign stage must not be published");
         assert.equal(fs.existsSync(commit), false, "no COMMIT after stage inode replacement");
-        const visibleFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
-        const parkedFd = openFixtureLeaf(dirfd, ".rootark-w3-original-stage-parked");
-        try {
+        withOpenedFixtureLeaves(dirfd,
+          [".rootark-w3-staged-v1", ".rootark-w3-original-stage-parked"],
+          (visibleFd, parkedFd) => {
           const visible = observeOpenedFixture(visibleFd);
           const parkedOriginal = observeOpenedFixture(parkedFd);
           assert.equal(visible.stat.ino, foreign.stat.ino,
@@ -353,7 +365,7 @@ test("#66 W3 equal-byte foreign inode cannot be published instead of original st
             "parked name must still refer to the original held inode");
           assert.equal(visible.bytes, "STAGED_ROOT_CANARY_V1");
           assert.equal(parkedOriginal.bytes, "STAGED_ROOT_CANARY_V1");
-        } finally { fs.closeSync(parkedFd); fs.closeSync(visibleFd); }
+          });
         assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
           "the rejected same-byte substitution must permanently poison the session");
       } finally {
@@ -386,10 +398,9 @@ test("#66 W3 native publish links original held inode after post-check stage-nam
           if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
           else process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = saved;
         }
-        const parkedFd = openFixtureLeaf(dirfd, ".rootark-w3-postcheck-parked");
-        const foreignFd = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
-        const publishedFd = openFixtureLeaf(dirfd, ".rootark-w3-committed-v1");
-        try {
+        withOpenedFixtureLeaves(dirfd, [".rootark-w3-postcheck-parked",
+          ".rootark-w3-staged-v1", ".rootark-w3-committed-v1"],
+        (parkedFd, foreignFd, publishedFd) => {
           const parked = observeOpenedFixture(parkedFd);
           const foreign = observeOpenedFixture(foreignFd);
           const published = observeOpenedFixture(publishedFd);
@@ -406,11 +417,7 @@ test("#66 W3 native publish links original held inode after post-check stage-nam
           assert.equal(parked.bytes, "STAGED_ROOT_CANARY_V1");
           assert.equal(published.bytes, "STAGED_ROOT_CANARY_V1");
           assert.equal(foreign.bytes, "STAGED_ROOT_CANARY_V1");
-        } finally {
-          fs.closeSync(publishedFd);
-          fs.closeSync(foreignFd);
-          fs.closeSync(parkedFd);
-        }
+        });
       } finally { fs.closeSync(originalFd); }
     });
     assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-commit-marker-v1"), "utf8"), "COMMITTED_V1");
@@ -523,16 +530,16 @@ test("#66 W3 anonymous post-link hard exit retains PREPARED without granting col
     withHeldFixtureDirectory(held, (dirfd) => {
       const pinnedParent = `/proc/self/fd/${dirfd}`;
       assert.equal(fs.existsSync(path.join(pinnedParent, ".rootark-w3-staged-v1")), false);
-      const publishedFd = openFixtureLeaf(dirfd, ".rootark-w3-committed-v1");
-      const preparedFd = openFixtureLeaf(dirfd, ".rootark-w3-journal-v1");
-      try {
+      withOpenedFixtureLeaves(dirfd,
+        [".rootark-w3-committed-v1", ".rootark-w3-journal-v1"],
+        (publishedFd, preparedFd) => {
         const published = observeOpenedFixture(publishedFd);
         assert.equal(published.stat.nlink, 1n);
         assert.equal(published.bytes, "STAGED_ROOT_CANARY_V1");
         assert.equal(observeOpenedFixture(preparedFd).bytes, "PREPARED_V1");
         assert.equal(fs.existsSync(path.join(pinnedParent, ".rootark-w3-commit-marker-v1")), false,
           "a real child-process hard exit before COMMIT cannot be deemed complete");
-      } finally { fs.closeSync(preparedFd); fs.closeSync(publishedFd); }
+        });
     });
     assert.throws(() => openNativeRootSession(true),
       (e) => e.code === "root_session_native_unavailable");
