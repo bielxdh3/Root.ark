@@ -977,3 +977,70 @@ image provenance, native mutation and rollback still prohibit production
 `RootSession`. Exact committed SHA, broad physical validation and new
 independent SOURCE review are required; no new hosted CodeQL success
 or GitHub Actions run is claimed, and no push/merge/deploy is authorized.
+
+### Local integration and paginated native laboratory, 2026-11-10
+
+Execution gates and a literal current-state flowchart are tracked at
+[`docs/roadmap/issue-66-pr300-native-custody-gates.md`](../roadmap/issue-66-pr300-native-custody-gates.md).
+
+The last **locally integrated** HEAD was
+`aed53c54fb0dcc0d93d0d20abdf6a4abeef3b549`, reached by safe
+fast-forward after independent SOURCE GO for the marker FIFO and Linux
+staged-genesis components and the exact source composition. Physical
+exact-SHA checks: **Windows Node22/NTFS 66 PASS / 5 platform SKIP**,
+**WSL Ubuntu Node22/ext4 71 PASS / 0 SKIP**, including cold FIFO denial,
+legitimate 16,385-entry `required-v2` recovery, Unicode and RootSession
+negative activation. None of those proves hostile same-SID root custody.
+
+The next independent marker child `83615c1a96cdb5f9a2a90a71c5fb44675f4adad9`
+fixes an identified test false-green: a concurrent append now verifies
+both *per-call* and *aggregate* bytes returned by the already bounded
+held descriptor, and the explicit Linux physical opt-in checks Node22
+and ext4 for both FIFO and growth fixtures. Independent source review
+issued **bounded SOURCE GO** with no new P0/P1/P2; physical focused
+Node22 Windows/WSL tests each **1 PASS**. The earlier parent `ab91e877`
+was GO only for its code delta while its test evidence still had P2.
+
+The isolated Linux N-API laboratory chain (not imported by the product)
+was `8e5cb4de` (64-name raw Buffer pages and 16,385 native-created files),
+`a75eeb30` (exact invalid UTF-8 POSIX leaf + opt-in), `cc6750c4`
+(native-side mandatory stress opt-in), and `0a4b2c28` (complete raw-byte
+equality across all 16,389 expected names). Independent reviewers flagged
+and later source-closed the P2 cases of (a) stress opt-in enforced only
+in JS and (b) count/unique/endpoints allowing omitted intermediate names.
+The heavy test source at exact `0a4b2c28` obtained **1 PASS** on Ubuntu
+Node22/ext4, using the additional native stress opt-in. Its stable-held
+`DIR*` enumerated all 16,385 generated leaf names plus three fixture
+entries and one byte-`0xff` entry, before and after the deterministic
+A→B→A pathname swap, while the session remained bound to original A.
+The broader native plus contract suite on the preceding source-equivalent
+compose gave **17 PASS / 2 SKIP** (expected separate native-negative and
+hostile bind-mount policy skips under stress). No claim is made that the
+untrusted same-UID parent, mount namespace, cold reacquisition, journal,
+rollback or commit was independently protected.
+
+An isolated composed SHA `7ccdad3cf6fa951a9fa81895730a61fb1a17e78b`
+cherry-picks the native lab chain over the marker correction (the lab
+code and tests match the original reviewed child); the composition
+ran **Windows Node22 FOD+RootSession 44 PASS / 1 SKIP**, **WSL Node22
+FOD+RootSession 45 PASS / 0 SKIP**, and **WSL Node22 native opt-in
+without expensive stress 8 PASS / 2 SKIP**. A SOURCE review of this
+exact composition is required before local fast-forward. An additional
+docs-only child must also pass peer SOURCE review before being integrated.
+
+**Remote and billing:** the PR #300 upstream remains `OPEN/Draft` at
+`d3a91c921c18e40d23d101958b487725e88e8d95`; the protected
+`Root/main` remained `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+The hosted formal CodeQL on the remote SHA failed (four filesystem-race
+annotations), while local source corrections have **not** been formally
+rechecked by hosted CodeQL. No push, GitHub Actions rerun, remote merge,
+deploy, cutover, or privileged root-owned fixture reprovisioning was done
+for this checkpoint. Existing fixtures and worktrees were preserved.
+
+**Product RELEASE NO-GO:** despite substantial native *laboratory*
+read/enumeration/create/fsync and held-root Linux genesis progress,
+independent custody outside the attacker's UID/SID, writable full
+transaction APIs (`renameNoReplace`, `removeEntry`, journal, rollback,
+commit), native Windows CFAPI acquisition, same-SID hostile substitution,
+monotonic independent floor, power-cut/cold reopen, executable/DLL image
+provenance and formal CodeQL are not proved. Keep RootSession closed.
