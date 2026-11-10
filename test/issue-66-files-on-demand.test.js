@@ -878,9 +878,11 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
   let planted = false;
   let attemptedForeignRemoval = false;
   let temporary = null;
+  let sameVolumeParent = false;
   fsp.rename = async (source, destination, ...rest) => {
     if (!planted && path.resolve(String(destination)) === path.resolve(target)
       && String(source).includes(".tmp-")) {
+      sameVolumeParent = path.dirname(path.resolve(String(source))) === path.dirname(path.resolve(target));
       await originalRename(source, parked);
       await fsp.writeFile(source, foreignBytes, { flag: "wx" });
       planted = true;
@@ -905,6 +907,8 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
     fsp.rm = originalRm;
   }
   assert.equal(planted, true, "real inbound temp must be moved and physically replaced");
+  assert.equal(sameVolumeParent, true,
+    "an incoming temp must share its destination directory for nested mount support");
   assert.equal(attemptedForeignRemoval, false,
     "failed publish must not issue pathname rm against a substituted foreign inode");
   assert.equal(await fsp.readFile(temporary, "utf8"), foreignBytes);
@@ -914,10 +918,10 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
   assert.equal(JSON.stringify(store.list("alice")), storeBefore);
   assert.equal(state.pushes, pushesBefore, "inbound failure may not publish a signed operation");
   assert.equal(path.basename(temporary).startsWith(".rootark-sync-index.json.tmp-inbound-"), true,
-    "a failed inbound write must leave inert root-control debris, never user-path debris");
+    "a failed inbound write must leave inert reserved debris, never a user-path temp name");
   const cold = await open();
   const physical = await cold.scanFiles();
-  assert.equal(Object.hasOwn(physical, path.basename(temporary)), false,
+  assert.equal(Object.keys(physical).some((name) => name.endsWith("/" + path.basename(temporary))), false,
     "a cold FOD scan must not upload an uncertain payload temporary as a user file");
   assert.equal(await cold.materializeRemote("docs/restore.txt"), true,
     "legitimate cold hydration must remain available after a failed publish");

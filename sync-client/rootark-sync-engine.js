@@ -39,6 +39,7 @@ const INTERNAL_NAME_PREFIXES = [
 const RESERVED_CONTROL_TEMP_PREFIXES = Object.freeze([
   ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
 ]);
+const INBOUND_PAYLOAD_TEMP_PREFIX = ".rootark-sync-index.json.tmp-inbound-";
 function isReservedHistoricalControlTemp(relative) {
   // The portable path validator reserves these prefixes in EVERY segment,
   // not just at root. Historical legitimate nested names therefore need
@@ -746,16 +747,17 @@ async function durableJson(filePath, value) {
   }
 }
 // The default snapshot temp prefix is already a reserved, nonauthorizing
-// root-local namespace in BOTH normal scanning and cold required-v2 replay.
-// Keep failed authenticated inbound payloads there, rather than beside a user
-// target where an orphan could later be uploaded as a new user file.
+// namespace in normal scanning and cold required-v2 replay. Keep inbound
+// temporaries IN the target directory, so nested mount/bind-mounted subtrees
+// can still use same-volume atomic rename. Their reserved names cannot become
+// user uploads or authoritative metadata after a failed publication.
 // There must be no pathname unlink/rm in this helper: a same-SID/UID writer
 // can replace the temp entry after the held handle closes or a rename fails.
 // This only protects cooperative failure cleanup. Successful pathname rename
 // still requires independent root custody before it can authorize native IO.
-async function publishInboundPayload(rootDir, target, bytes, prepareTarget = null) {
-  const temporary = path.join(rootDir,
-    `.rootark-sync-index.json.tmp-inbound-${process.pid}-${crypto.randomUUID()}`);
+async function publishInboundPayload(target, bytes, prepareTarget = null) {
+  const temporary = path.join(path.dirname(target),
+    `${INBOUND_PAYLOAD_TEMP_PREFIX}${process.pid}-${crypto.randomUUID()}`);
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
     | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_SYNC || 0);
   const handle = await fsp.open(temporary, flags, 0o600);
@@ -3788,7 +3790,7 @@ class SyncEngine {
         // would replace existing FOD bytes: native custody must refuse it
         // without first creating a speculative payload temporary.
         if (await exists(target)) await this.stageExisting(target);
-        await publishInboundPayload(this.rootDir, target, movePayload);
+        await publishInboundPayload(target, movePayload);
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
@@ -3822,7 +3824,7 @@ class SyncEngine {
           }
         }
       } else {
-        await publishInboundPayload(this.rootDir, target, plaintext,
+        await publishInboundPayload(target, plaintext,
           async () => { if (await exists(target)) await this.stageExisting(target); });
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
@@ -3876,6 +3878,22 @@ class SyncEngine {
         const folded = entry.name.toLowerCase();
         if (names.has(folded)) fail("Ambiguous physical casefold alias in cache", "invalid_snapshot");
         names.add(folded);
+        // Failed same-volume inbound publishes may leave a leaf below a
+        // selected directory. This pre-existing reserved control prefix is
+        // not user content or signed recovery authority, but other untracked
+        // entries must still fail closed. Do not follow a link or skip a
+        // directory under the reserved prefix.
+        if (folded.startsWith(INBOUND_PAYLOAD_TEMP_PREFIX)) {
+          if (!entry.name.startsWith(INBOUND_PAYLOAD_TEMP_PREFIX)) {
+            fail("Ambiguous inbound temporary cache prefix", "invalid_snapshot");
+          }
+          const inert = await fsp.lstat(path.join(directory, entry.name), { bigint: true });
+          if (!inert.isFile() || inert.isSymbolicLink() || inert.ino === 0n
+            || inert.nlink !== 1n) {
+            fail("Unsafe inbound temporary during physical recovery", "invalid_snapshot");
+          }
+          continue;
+        }
         if (!prefix) {
           const internalName = internal.names.find((name) => name.toLowerCase() === folded);
           if (internalName) {

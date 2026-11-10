@@ -676,6 +676,37 @@ test("issue 66 P2: retained active zero head cannot migrate over a competing sta
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
 });
 
+test("issue 66: required-v2 cold recovery treats nested inbound orphan as inert, not arbitrary directory", async (t) => {
+  for (const kind of ["file", "directory"]) {
+    const f = await fixture(t, `nested-inbound-orphan-${kind}`);
+    // A genuinely separate process exits after the required-v2 checkpoint,
+    // before PREPARE. The recovery scanner then sees an authentic cache plus
+    // a synthetic failure-path inbound artifact inside the selected subtree.
+    await prePrepareCrash(f, false, true);
+    const orphan = path.join(f.root, "PRIVATE",
+      `.rootark-sync-index.json.tmp-inbound-123-${crypto.randomUUID()}`);
+    if (kind === "file") await fsp.writeFile(orphan, "inert incomplete incoming payload", { flag: "wx" });
+    else await fsp.mkdir(orphan);
+    const before = f.outbound.length;
+    if (kind === "file") {
+      const recovered = await f.create(f.root, ["private"]);
+      assert.equal(recovered.snapshot.evictionLedgerRequired, false,
+        "an inert nested temp must not prevent legitimate required-v2 cold recovery");
+      assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file",
+        "cold recovery must preserve original bytes before voluntary exclusion");
+      await recovered.syncOnce();
+      assert.equal(await fsp.readFile(orphan, "utf8"), "inert incomplete incoming payload");
+      assert.equal(recovered.snapshot.remoteOnly[f.signed.objectId]?.reason, "evicted",
+        "the legitimate selected exclusion must still complete without signing DELETE");
+    } else {
+      await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" },
+        "a directory disguised as an inbound temp is not valid disposable evidence");
+      assert.equal((await fsp.lstat(orphan)).isDirectory(), true);
+    }
+    verifyNoSignedDelete(f, before);
+  }
+});
+
 test("issue 66 P2: hard crash with >16384 preexisting trash entries recovers required-v2 before PREPARE", async (t) => {
   for (const stage of ["staged", "active"]) {
     const f = await fixture(t, `large-trash-required-recovery-${stage}`);
