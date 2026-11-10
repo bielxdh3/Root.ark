@@ -46,8 +46,9 @@ public static class RootarkW26NativeFilePublishLab {
   private struct FILE_STANDARD_INFO {
     public long AllocationSize, EndOfFile;
     public uint NumberOfLinks;
-    [MarshalAs(UnmanagedType.Bool)] public bool DeletePending;
-    [MarshalAs(UnmanagedType.Bool)] public bool Directory;
+    // FILE_STANDARD_INFO uses NT BOOLEAN (one byte), NOT Win32 BOOL (4).
+    [MarshalAs(UnmanagedType.U1)] public bool DeletePending;
+    [MarshalAs(UnmanagedType.U1)] public bool Directory;
   }
   [StructLayout(LayoutKind.Sequential)]
   private struct FILE_BASIC_INFO {
@@ -250,6 +251,15 @@ public static class RootarkW26NativeFilePublishLab {
     }
   }
   private static string InspectCold(string scratch) {
+    // Fail on an incorrect managed ABI before opening any fixture leaf:
+    // LARGE_INTEGER*2 + DWORD + BOOLEAN*2 + padding = 24 bytes on NTFS.
+    if (Marshal.SizeOf(typeof(FILE_STANDARD_INFO)) != 24 ||
+        Marshal.OffsetOf(typeof(FILE_STANDARD_INFO), "NumberOfLinks").ToInt32() != 16 ||
+        Marshal.OffsetOf(typeof(FILE_STANDARD_INFO), "DeletePending").ToInt32() != 20 ||
+        Marshal.OffsetOf(typeof(FILE_STANDARD_INFO), "Directory").ToInt32() != 21 ||
+        Marshal.SizeOf(typeof(FILE_BASIC_INFO)) != 40 ||
+        Marshal.OffsetOf(typeof(FILE_BASIC_INFO), "ChangeTime").ToInt32() != 24)
+      throw new InvalidOperationException("COLD_NATIVE_ABI_UNVERIFIED");
     string parent = Path.Combine(scratch, "held");
     using (SafeFileHandle root = Root(parent, true)) {
       string stage = ColdLeaf(root, "stage.bin");
