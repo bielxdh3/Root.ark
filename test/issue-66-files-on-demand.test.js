@@ -876,14 +876,14 @@ test("issue 66: a physically rebound FOD marker never authorizes a foreign inode
   assert.equal(state.pushes, pushesBefore, "a failed root-mode admission must not push a signed operation");
 });
 
-test("issue 66: failed FOD hydration cannot delete a physically substituted inbound temporary", async (t) => {
+test("issue 66: ambiguous FOD publish retains foreign temporary and quarantines the root", async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "authenticated recovery payload",
   });
   const client = await open();
-  // Keep the parent pre-existing for this retryability/foreign-temp test.
-  // A parent newly created by the failed inbound pass is independently
-  // quarantined: its name is not present in the old durable snapshot.
+  // Keep the parent pre-existing: even then, a failed publication attempt
+  // cannot prove the target was never mutated. Retain the root lock; an
+  // untrusted cold opener cannot authorize a retry from mutable pathnames.
   await fsp.mkdir(path.join(root, "docs"), { recursive: true });
   const target = path.join(root, "docs", "restore.txt");
   const snapshot = path.join(root, ".rootark-sync-index.json");
@@ -938,16 +938,15 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
   assert.equal(state.pushes, pushesBefore, "inbound failure may not publish a signed operation");
   assert.equal(path.basename(temporary).startsWith(".rootark-sync-index.json.tmp-inbound-"), true,
     "a failed inbound write must leave inert reserved debris, never a user-path temp name");
-  const cold = await open();
-  const physical = await cold.scanFiles();
-  assert.equal(Object.keys(physical).some((name) => name.endsWith("/" + path.basename(temporary))), false,
-    "a cold FOD scan must not upload an uncertain payload temporary as a user file");
-  assert.equal(await cold.materializeRemote("docs/restore.txt"), true,
-    "legitimate cold hydration must remain available after a failed publish");
-  assert.equal(await fsp.readFile(target, "utf8"), "authenticated recovery payload");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "ambiguous attempted publish must hold custody even with a pre-existing parent");
+  await assert.rejects(client._reconcileLocal(), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(await exists(target), false,
+    "do not manufacture an authorized target or claim an unsafe cold retry");
   assert.equal(await fsp.readFile(temporary, "utf8"), foreignBytes);
   assert.equal(JSON.stringify(store.list("alice")), storeBefore);
-  assert.equal(state.pushes, pushesBefore, "cold recovery may not sign a foreign temp or delete");
+  assert.equal(state.pushes, pushesBefore, "blocked cold retry may not sign a foreign temp or delete");
 });
 
 test("issue 66: new FOD parent remains locked when inbound payload rename fails", async (t) => {
@@ -1189,6 +1188,49 @@ test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbo
   const diskJournal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
   assert.equal(diskJournal.pending.length, 0);
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
+});
+
+test("issue 66: inbound FOD rename completion followed by EIO retains lock before cold reconcile", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "remote authenticated content after a late native error",
+  });
+  const client = await open();
+  const parent = path.join(root, "docs");
+  await fsp.mkdir(parent, { recursive: true });
+  const target = path.join(parent, "restore.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const oldSnapshot = await fsp.readFile(snapshot);
+  const oldStore = JSON.stringify(store.list("alice"));
+  const originalRename = fsp.rename;
+  let published = false;
+  fsp.rename = async (source, destination, ...args) => {
+    if (!published && path.resolve(String(destination)) === path.resolve(target)
+      && String(source).includes(".tmp-inbound-")) {
+      await originalRename(source, destination, ...args);
+      published = true; // Kernel has physically completed the target rename.
+      throw Object.assign(new Error("injected EIO after real inbound publish"), { code: "EIO" });
+    }
+    return originalRename(source, destination, ...args);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/restore.txt"), { code: "EIO" });
+  } finally {
+    fsp.rename = originalRename;
+  }
+  assert.equal(published, true, "must reach a real successful OS rename before injected EIO");
+  assert.equal(await fsp.readFile(target, "utf8"),
+    "remote authenticated content after a late native error");
+  assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot,
+    "the durable checkpoint must remain older than the physical payload");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "the publisher's uncertain completion must never release the process lock");
+  await assert.rejects(client._reconcileLocal(), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client.syncOnce(), { code: "sync_root_busy" });
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  const journal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
+  assert.deepEqual(journal.pending, []);
+  assert.equal(state.pushes, 0, "there is no evidence of an outbound signed CREATE");
+  assert.equal(JSON.stringify(store.list("alice")), oldStore);
 });
 
 test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold root locked", async (t) => {

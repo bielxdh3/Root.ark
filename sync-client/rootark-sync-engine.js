@@ -766,7 +766,8 @@ async function durableJson(filePath, value) {
 // can replace the temp entry after the held handle closes or a rename fails.
 // This only protects cooperative failure cleanup. Successful pathname rename
 // still requires independent root custody before it can authorize native IO.
-async function publishInboundPayload(target, bytes, prepareTarget = null) {
+async function publishInboundPayload(target, bytes, prepareTarget = null,
+  beforeTargetPublication = null) {
   const temporary = path.join(path.dirname(target),
     `${INBOUND_PAYLOAD_TEMP_PREFIX}${process.pid}-${crypto.randomUUID()}`);
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
@@ -777,6 +778,10 @@ async function publishInboundPayload(target, bytes, prepareTarget = null) {
     await handle.sync();
   } finally { await handle.close(); }
   if (prepareTarget) await prepareTarget();
+  // The temporary uses a reserved, nonauthorizing name; only this syscall
+  // can place its inode at the user-visible target. Mark a potential target
+  // mutation BEFORE invoking it: EIO can be reported after a real rename.
+  if (beforeTargetPublication) beforeTargetPublication();
   await fsp.rename(temporary, target);
 }
 
@@ -3842,9 +3847,14 @@ class SyncEngine {
         if (source !== target) {
           const sameWindowsPath = process.platform === "win32"
             && path.resolve(source).toLowerCase() === path.resolve(target).toLowerCase();
-          if (!sameWindowsPath && await exists(target)) await this.stageExisting(target);
-          await fsp.rename(source, target);
+          if (!sameWindowsPath && await exists(target)) {
+            inboundCacheChanged = true;
+            await this.stageExisting(target);
+          }
+          // The OS rename may succeed and still surface an EIO to the caller.
+          // Once it is attempted, a rejection cannot prove no disk mutation.
           inboundCacheChanged = true;
+          await fsp.rename(source, target);
         }
         const movedStats = await fsp.lstat(target, { bigint: true });
         if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
@@ -3853,8 +3863,8 @@ class SyncEngine {
         // would replace existing FOD bytes: native custody must refuse it
         // without first creating a speculative payload temporary.
         if (await exists(target)) await this.stageExisting(target);
-        await publishInboundPayload(target, movePayload);
-        inboundCacheChanged = true;
+        await publishInboundPayload(target, movePayload, null,
+          () => { inboundCacheChanged = true; });
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
@@ -3870,9 +3880,12 @@ class SyncEngine {
           if (await exists(source)) {
             if (!(await fsp.lstat(source)).isDirectory()) fail("Tracked directory identity points to a non-directory", "unsafe_path");
             if (source !== target) {
-              if (await exists(target)) await this.stageExisting(target);
-              await fsp.rename(source, target);
+              if (await exists(target)) {
+                inboundCacheChanged = true;
+                await this.stageExisting(target);
+              }
               inboundCacheChanged = true;
+              await fsp.rename(source, target);
             }
             relocated = true;
           }
@@ -3889,9 +3902,9 @@ class SyncEngine {
               throw error;
             }
             if (!(await fsp.lstat(target)).isDirectory()) {
+              inboundCacheChanged = true;
               await this.stageExisting(target);
               await fsp.mkdir(target, { recursive: false });
-              inboundCacheChanged = true;
             }
           }
         }
@@ -3900,9 +3913,14 @@ class SyncEngine {
         // A later failed checkpoint leaves ambiguous cache ancestry.
         inboundCacheChanged = true;
       } else {
+        // A failed target preflight must not quarantine a clean existing
+        // parent merely because an inert reserved temporary was created.
+        // Conversely, an actual rename may complete before reporting EIO:
+        // the target-publication callback flips the negative latch BEFORE
+        // entering the potentially mutating syscall, not after its result.
         await publishInboundPayload(target, plaintext,
-          async () => { if (await exists(target)) await this.stageExisting(target); });
-        inboundCacheChanged = true;
+          async () => { if (await exists(target)) await this.stageExisting(target); },
+          () => { inboundCacheChanged = true; });
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
