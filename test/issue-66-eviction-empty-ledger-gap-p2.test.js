@@ -211,6 +211,37 @@ test("issue 66: nested historically tracked control-temp path cannot generate si
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: an already-open engine refuses a newly discovered nested historic control-temp collision", async (t) => {
+  const f = await fixture(t, "in-memory-nested-historical-control-temp");
+  const engine = await f.create(f.root, []);
+  const relative = "docs/.rootark-sync-index.json.tmp-already-open-user-file";
+  await fsp.mkdir(path.join(f.root, "docs"), { recursive: true });
+  const foreign = Buffer.from("OPEN_ENGINE_HISTORICAL_USER_FILE");
+  await fsp.writeFile(path.join(f.root, relative), foreign, { flag: "wx" });
+  const exemplar = engine.snapshot.files["PRIVATE/secret.txt"];
+  assert.ok(exemplar && !exemplar.deleted);
+  engine.snapshot.files[relative] = {
+    ...exemplar,
+    objectId: "object-" + crypto.randomUUID().replace(/-/g, ""),
+    fileId: "file-" + crypto.randomUUID().replace(/-/g, ""),
+  };
+  const original = engine.assertOutgoingAuthorized.bind(engine);
+  let attempted = false;
+  engine.assertOutgoingAuthorized = async (operation, enqueue) => {
+    if (operation.operation === "delete" && operation.metadata?.path === relative) {
+      attempted = true;
+      throw Object.assign(new Error("outgoing nested tombstone blocked by test"), { code: "EACCES" });
+    }
+    return original(operation, enqueue);
+  };
+  const before = f.outbound.length;
+  await assert.rejects(engine._reconcileLocal(), { code: "invalid_snapshot" },
+    "an already-open engine must deny this historical collision before any signed operation");
+  assert.equal(attempted, false);
+  assert.deepEqual(await fsp.readFile(path.join(f.root, relative)), foreign);
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66: configured root-local snapshot and journal filenames and orphans stay internal", async (t) => {
   const f = await fixture(t, "custom-root-control-filenames");
   const snapshotPath = path.join(f.root, "custom-root-index.json");
