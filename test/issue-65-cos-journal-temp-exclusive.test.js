@@ -127,3 +127,56 @@ test("failed journal publication must never unlink a substituted foreign tempora
   assert.deepEqual(await fsp.readFile(filename), originalDisk);
   assert.deepEqual((await new SyncJournal(filename).open()).pending(), [first]);
 });
+
+test("Linux journal post-rename directory fsync EIO marks committed state and reopens exact bytes", {
+  skip: process.platform !== "linux" && "requires a real POSIX directory fsync",
+}, async (t) => {
+  const root = createPrivateAuthorityFixture("cos-journal-post-rename-dir-fsync-");
+  t.after(async () => fsp.rm(root, { recursive: true, force: true, maxRetries: 5 }));
+  const filename = path.join(root, "journal.json");
+  const first = { operationId: "journal-post-rename-prepared", phase: "prepared" };
+  const journal = await new SyncJournal(filename).open();
+  await journal.enqueue(first);
+  const oldBytes = await fsp.readFile(filename);
+  const originalRename = fsp.rename;
+  const originalOpen = fsp.open;
+  let renamed = false;
+  let faulted = false;
+  try {
+    fsp.rename = async (source, destination, ...args) => {
+      const result = await originalRename(source, destination, ...args);
+      if (path.resolve(String(destination)) === path.resolve(filename)
+        && String(source).startsWith(filename + ".tmp-")) renamed = true;
+      return result;
+    };
+    fsp.open = async (requested, ...args) => {
+      const handle = await originalOpen(requested, ...args);
+      if (renamed && !faulted
+        && path.resolve(String(requested)) === path.resolve(root)
+        && args[0] === "r") {
+        handle.sync = async () => {
+          faulted = true;
+          throw Object.assign(new Error("injected post-rename journal directory EIO"), { code: "EIO" });
+        };
+      }
+      return handle;
+    };
+    await assert.rejects(journal.update(first.operationId, { phase: "source-moved" }),
+      (error) => error?.code === "EIO" && error.journalCommitted === true);
+  } finally {
+    fsp.rename = originalRename;
+    fsp.open = originalOpen;
+  }
+  assert.equal(renamed, true, "real filesystem rename must publish journal first");
+  assert.equal(faulted, true, "fault must be injected during parent fsync after rename");
+  const expected = [{ ...first, phase: "source-moved" }];
+  assert.deepEqual(journal.pending(), expected,
+    "in-memory state must track the new installed journal despite indeterminate durability");
+  const diskBytes = await fsp.readFile(filename);
+  assert.notDeepEqual(diskBytes, oldBytes);
+  assert.deepEqual(JSON.parse(diskBytes.toString()).pending, expected);
+  assert.deepEqual((await new SyncJournal(filename).open()).pending(), expected,
+    "a separate instance must replay the physically installed exact journal");
+  assert.deepEqual(await fsp.readdir(root), ["journal.json"],
+    "completed rename must not be misreported as an orphan temporary");
+});

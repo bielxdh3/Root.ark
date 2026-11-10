@@ -53,6 +53,127 @@ async function fixture(t, name, twoFiles = false) {
     signed, create, outbound, key };
 }
 
+test("issue 66: Linux snapshot post-rename fsync EIO recovers without signed deletion", {
+  skip: process.platform !== "linux" && "requires POSIX directory sync after a real rename",
+}, async (t) => {
+  const f = await fixture(t, "snapshot-post-rename-fsync-fault");
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  const originalRename = fsp.rename;
+  const originalOpen = fsp.open;
+  let renamed = false;
+  let failedDirSync = false;
+  let observedError;
+  let observedReport;
+  try {
+    fsp.rename = async (source, destination, ...args) => {
+      let targetIsRequiredV2 = false;
+      if (path.resolve(String(destination)) === path.resolve(f.snapshot)
+        && String(source).startsWith(f.snapshot + ".tmp-")) {
+        const candidate = JSON.parse(await fsp.readFile(String(source), "utf8"));
+        targetIsRequiredV2 = candidate.version === 2 && candidate.evictionLedgerRequired === true;
+      }
+      const result = await originalRename(source, destination, ...args);
+      if (targetIsRequiredV2) renamed = true;
+      return result;
+    };
+    fsp.open = async (requested, ...args) => {
+      const handle = await originalOpen(requested, ...args);
+      if (renamed && !failedDirSync
+        && path.resolve(String(requested)) === path.resolve(f.root)
+        && args[0] === 0 /* Linux fs.constants.O_RDONLY */) {
+        handle.sync = async () => {
+          failedDirSync = true;
+          throw Object.assign(new Error("injected EIO only AFTER real snapshot rename"), { code: "EIO" });
+        };
+      }
+      return handle;
+    };
+    try { observedReport = await sync.syncOnce(); } catch (error) { observedError = error; }
+  } finally {
+    fsp.rename = originalRename;
+    fsp.open = originalOpen;
+  }
+  assert.equal(renamed, true, "real O_EXCL temporary must have been renamed to snapshot");
+  assert.equal(failedDirSync, true, "fault must occur in the post-rename parent fsync");
+  assert.equal(observedError, undefined, "per-file EIO is reported as a failed exclusion");
+  assert.deepEqual(observedReport.excluded.failed.map((row) => row.code), ["EIO"],
+    "post-rename directory fsync must report EIO, not claim eviction success");
+  const newDisk = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+  assert.equal(newDisk.version, 1,
+    "the previous file and in-memory migration state can be rolled back only while the cache is intact");
+  assert.equal(newDisk.evictionLedgerRequired, undefined);
+  const staged = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
+  assert.ok((await fsp.lstat(staged)).isFile(), "genesis must remain staged on disk");
+  assert.equal(newDisk.excludedPathsCasefoldVersion, 2,
+    "a separately persisted rollback may legitimately advance casefold metadata");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  const fresh = await f.create(f.root, []);
+  await fresh.syncOnce();
+  verifyNoSignedDelete(f, before);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
+test("issue 66: Linux PREPARE HEAD post-rename fsync EIO replays without signed deletion", {
+  skip: process.platform !== "linux" && "requires real Linux ledger directory fsync after rename",
+}, async (t) => {
+  const f = await fixture(t, "head-post-rename-fsync-fault");
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  const originalRename = fsp.rename;
+  const originalOpen = fsp.open;
+  let renamedHead = false;
+  let failedHeadSync = false;
+  let report;
+  let thrown;
+  try {
+    fsp.rename = async (source, destination, ...args) => {
+      const result = await originalRename(source, destination, ...args);
+      if (path.basename(String(destination)) === "head.json"
+        && path.basename(String(source)).startsWith("head.json.tmp-")) {
+        const actualParent = await fsp.realpath(path.dirname(String(destination)));
+        if (path.resolve(actualParent) === path.resolve(f.ledger)) renamedHead = true;
+      }
+      return result;
+    };
+    fsp.open = async (requested, ...args) => {
+      const handle = await originalOpen(requested, ...args);
+      if (renamedHead && !failedHeadSync
+        && args[0] === 0 /* O_RDONLY directory flush */) {
+        const actualParent = await fsp.realpath(String(requested));
+        if (path.resolve(actualParent) === path.resolve(f.ledger)) {
+          handle.sync = async () => {
+            failedHeadSync = true;
+            throw Object.assign(new Error("post-HEAD-rename directory sync EIO"), { code: "EIO" });
+          };
+        }
+      }
+      return handle;
+    };
+    try { report = await sync.syncOnce(); } catch (error) { thrown = error; }
+  } finally {
+    fsp.rename = originalRename;
+    fsp.open = originalOpen;
+  }
+  assert.equal(renamedHead, true, "HEAD must first be physically replaced by a real rename");
+  assert.equal(failedHeadSync, true, "the precise HEAD parent fsync must receive injected EIO");
+  assert.ok(thrown || report?.excluded?.failed?.length,
+    "an indeterminate HEAD directory flush cannot report successful exclusion");
+  const persisted = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+  assert.equal(persisted.version, 2);
+  assert.equal(persisted.evictionLedgerRequired, true,
+    "the durable snapshot guard must not be cleared on uncertain PREPARE HEAD");
+  assert.equal((await fsp.readdir(f.ledger)).filter((x) => x.endsWith(".prepare.json")).length, 1);
+  const head = JSON.parse(await fsp.readFile(path.join(f.ledger, "head.json"), "utf8"));
+  assert.equal(head.sequence, 1, "the renamed HEAD may already be physically visible despite EIO");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file",
+    "physical cache remains because stage never started");
+  const fresh = await f.create(f.root, []);
+  await fresh.syncOnce();
+  verifyNoSignedDelete(f, before);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
 test("issue 66: failed required-v2 snapshot publication must not unlink a swapped temporary inode", async (t) => {
   const f = await fixture(t, "snapshot-failed-rename-foreign-temp");
   const sync = await f.create(f.root, ["private"]);
