@@ -222,6 +222,40 @@ test("issue 66 P1: crash after compacted checkpoint but before ledger retirement
   assertRemoteIntact(f, beforeWrites);
 });
 
+test("issue 66: orphan archive after durable compaction refuses unauthenticated cold open", {
+  skip: process.platform !== "linux" && "Linux rootfd archive crash window",
+}, async (t) => {
+  const f = await fixture(t, "post-archive-rename-crash");
+  const sync = await f.create(f.root, ["private"]);
+  const originalRename = fsp.rename;
+  let archived = null;
+  fsp.rename = async (source, destination, ...args) => {
+    if (!archived && path.basename(String(source)) === ".rootark-sync-evictions"
+      && path.basename(String(destination)).startsWith(".rootark-sync-evictions-archive-")) {
+      const actualParent = await fsp.realpath(path.dirname(String(source)));
+      if (path.resolve(actualParent) === path.resolve(await fsp.realpath(f.root))) {
+        await originalRename(source, destination, ...args);
+        archived = path.join(f.root, path.basename(String(destination)));
+        throw Object.assign(new Error("injected hard-crash boundary after archived rename"), { code: "EIO" });
+      }
+    }
+    return originalRename(source, destination, ...args);
+  };
+  try { await assert.rejects(sync.syncOnce(), { code: "EIO" }); }
+  finally { fsp.rename = originalRename; }
+  assert.ok(archived, "must exercise the exact post-rename / pre-fsync archive boundary");
+  assert.ok((await fsp.readdir(archived)).some((name) => name.endsWith(".prepare.json")));
+  await assert.rejects(fsp.lstat(f.ledger), { code: "ENOENT" });
+  const checkpoint = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+  assert.equal(checkpoint.evictionLedgerRequired, false,
+    "the full snapshot must already be durable when archive publication fails");
+  const beforeWrites = f.writes;
+  await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
+  assertRemoteIntact(f, beforeWrites);
+  assert.ok((await fsp.readdir(archived)).some((name) => name.endsWith(".prepare.json")),
+    "fail-closed cold open must not erase an indeterminate archive");
+});
+
 test("issue 66 P1: pre-PREPARE snapshot upgrade EIO does not move bytes or relax old-client fence", async (t) => {
   const f = await fixture(t, "upgrade-EIO");
   const sync = await f.create(f.root, ["private"]);

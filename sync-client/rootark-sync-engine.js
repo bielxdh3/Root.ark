@@ -768,6 +768,35 @@ async function openEvictionLedger(rootDir, create = false) {
   await containedAbsolute(rootDir, directory, false);
   return directory;
 }
+// A crash after the durable full checkpoint can leave an old archive before
+// its records are retired. The snapshot may already say "required: false";
+// absence of an ACTIVE ledger is not proof that the archive was reconciled.
+// Never silently drop that evidence or automatically delete it. A separate
+// independent recovery authority is required for destructive archive repair.
+async function assertNoOrphanedLinuxEvictionArchive(rootDir) {
+  if (process.platform !== "linux") return;
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+    | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+  const root = await fsp.open(rootDir, flags);
+  try {
+    const before = await root.stat({ bigint: true });
+    const directory = `/proc/self/fd/${root.fd}`;
+    // Stream at constant memory: a genuine sync root may contain many valid
+    // physical files, and an attacker can create arbitrarily many names.
+    for await (const entry of await fsp.opendir(directory)) {
+      if (entry.name.toLowerCase().startsWith(EVICTION_LEDGER_ARCHIVE)) {
+        fail("Orphaned eviction archive needs independent recovery", "invalid_snapshot");
+      }
+    }
+    const visible = await fsp.lstat(rootDir, { bigint: true });
+    if (!before.isDirectory() || !visible.isDirectory()
+      || visible.isSymbolicLink()
+      || !sameFileIdentity(before, visible)
+      || !sameFileIdentity(before, await root.stat({ bigint: true }))) {
+      fail("Eviction archive root changed during cold inspection", "invalid_snapshot");
+    }
+  } finally { await root.close(); }
+}
 // The read path above deliberately returns a public pathname only to legacy
 // callers. Linux ledger mutations must instead retain the SAME opened root
 // and child directory across PREPARE/COMMIT and every fsync. A same-UID writer
@@ -1800,6 +1829,7 @@ class SyncEngine {
       // marker, emit operations, or accept a caller-supplied fake native object.
       denyLegacyNativeRootReplay();
     }
+    await assertNoOrphanedLinuxEvictionArchive(this.rootDir);
     const { entries, head } = await readEvictionLedger(this.rootDir,
       this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
     if (this.requireNativeRootRecovery && entries.size) {
