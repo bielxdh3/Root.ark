@@ -1303,6 +1303,53 @@ test("issue 66: an escaped stale AsyncLocalStorage callback cannot reuse a relea
   assert.equal(state.pushes, 0);
 });
 
+test("issue 66: direct native-required outbound retry and conflict recovery cannot bypass a physical lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "authenticated remote bytes",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshot);
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client.retryPush(operation), { code: "sync_root_busy" });
+  await assert.rejects(client.recoverConflict(operation, { conflicts: [] }),
+    { code: "sync_root_busy" });
+  assert.equal(await exists(path.join(root, ".rootark-conflicts")), false);
+  assert.equal(state.pushes, 0, "no outbound signed PUT may bypass the lock owner");
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
+});
+
+test("issue 66: native-required private pull, push, enqueue and prune deny before reading or mutating", async (t) => {
+  const { root, open, state, store } = await setup(t, {
+    "docs/restore.txt": "authenticated remote bytes",
+  });
+  const client = await open();
+  const empty = path.join(root, "docs", "nested-empty");
+  await fsp.mkdir(empty, { recursive: true });
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshot);
+  const readsBefore = state.fullReads.length;
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client._pullRemote({ pulled: 0, offline: false }),
+    { code: "sync_root_busy" });
+  await assert.rejects(client._pushPending({ pushed: 0 }),
+    { code: "sync_root_busy" });
+  await assert.rejects(client._enqueueChange({ operation: "create" }),
+    { code: "sync_root_busy" });
+  await assert.rejects(client.pruneEmptyUntrackedParents(empty),
+    { code: "sync_root_busy" });
+  assert.equal(await exists(empty), true, "a foreign lock must prevent rmdir of an untracked parent");
+  assert.equal(state.fullReads.length, readsBefore,
+    "direct pull must refuse before network inventory or full-content fetch");
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 1);
+  assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
+});
+
 test("issue 66: equal-byte foreign inbound stage cannot authorize a successful FOD publish", async (t) => {
   const payload = "remote source payload with identical foreign bytes";
   const { root, open, store, state } = await setup(t, { "docs/restore.txt": payload });

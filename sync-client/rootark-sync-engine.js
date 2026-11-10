@@ -2962,6 +2962,7 @@ class SyncEngine {
 
   async _enqueueChange(input) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const remoteOnly = this.snapshot.remoteOnly[input.objectId];
@@ -3234,6 +3235,7 @@ class SyncEngine {
 
   async retryPush(operation) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
@@ -3252,6 +3254,7 @@ class SyncEngine {
 
   async recoverConflict(operation, summary) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     // Direct callers must not bypass the persisted root-mode fence by writing
     // conflict recovery payloads outside the ordinary mutation lock.
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
@@ -3477,6 +3480,7 @@ class SyncEngine {
 
   async _pushPending(summary) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const recovered = await this.journal.recover();
     if (this.requireNativeRootRecovery && recovered.some((operation) =>
@@ -4129,6 +4133,7 @@ class SyncEngine {
     // Public/direct callers must not delete an ancestor created by an
     // uncheckpointed inbound FOD operation while the root is quarantined.
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     // A previously opened legacy instance must not prune physical cache paths
     // after another instance has durably marked this root as Files On-Demand.
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
@@ -4296,6 +4301,7 @@ class SyncEngine {
 
   async _pinLocal(relativePath) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
     if (!this.requireAuthorization || typeof this.verifyIncoming !== "function") {
       // Ordinary non-strict sync is allowed to use a caller-supplied AEAD
@@ -4341,6 +4347,7 @@ class SyncEngine {
 
   async _unpinLocal(relativePath) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     const previous = this.snapshot.pinnedFiles || {};
@@ -4738,6 +4745,7 @@ class SyncEngine {
 
   async _pullRemote(summary) {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // A remotely visible single side of a just-committed/lost-ACK pair must
     // NOT consume that local pending ID via _apply, markSeen or the excluded-
@@ -4842,6 +4850,7 @@ class SyncEngine {
   // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
   async _applyExcludedPaths() {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const applied = this.snapshot.excludedPaths || [];
     const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
@@ -5030,6 +5039,7 @@ class SyncEngine {
 
   async _syncOnce() {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
