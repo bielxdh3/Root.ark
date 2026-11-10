@@ -49,7 +49,7 @@ test("#66 W26 Windows NTFS refuses physical foreign destination without clobber"
     const scratch = fixture();
     const result = invoke(scratch, "COLLISION");
     assert.equal(result.status, 0, result.stderr || "HANDLE collision proof failed");
-    assert.match(result.stdout, /^ROOTARK_W26_HANDLE_PUBLISH mode=COLLISION result=DENIED foreign=INTACT stage=INTACT\r?\n$/);
+    assert.match(result.stdout, /^ROOTARK_W26_HANDLE_PUBLISH mode=COLLISION result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0xC0000035\r?\n$/);
     assert.equal(result.stderr, "");
   });
 

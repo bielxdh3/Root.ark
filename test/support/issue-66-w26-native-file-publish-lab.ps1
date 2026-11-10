@@ -80,6 +80,8 @@ public static class RootarkW26NativeFilePublishLab {
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool Volume(SafeFileHandle file, StringBuilder name, uint size,
     IntPtr serial, IntPtr maxComponent, IntPtr flags, StringBuilder filesystem, uint capacity);
+  [DllImport("kernel32.dll", EntryPoint = "GetDriveTypeW", CharSet = CharSet.Unicode)]
+  private static extern uint DriveType(string rootPath);
 
   private static readonly string Trusted = "ORIGINAL_OPENED_STAGE_BYTES";
   private static readonly string Foreign = "FOREIGN_UNTRUSTED_TARGET_BYTES";
@@ -149,6 +151,16 @@ public static class RootarkW26NativeFilePublishLab {
         || written != (uint)data.Length || !Flush(file))
       throw new InvalidOperationException("HELD_STAGE_FLUSH_FAILED");
   }
+  private static void PlantForeign(string filename, string content) {
+    // The deterministic same-SID writer uses pathnames on purpose, but must
+    // never truncate an object which unexpectedly wins this laboratory name.
+    byte[] bytes = Encoding.UTF8.GetBytes(content);
+    using (var stream = new FileStream(filename, FileMode.CreateNew,
+        FileAccess.Write, FileShare.None, 4096, false)) {
+      stream.Write(bytes, 0, bytes.Length);
+      stream.Flush(true);
+    }
+  }
   private static string ReadFixture(string filename) {
     // Diagnostic assertions only: the held writer HANDLE remains open, so
     // File.ReadAllText(FileShare.Read) would spuriously fail with sharing 32.
@@ -179,6 +191,8 @@ public static class RootarkW26NativeFilePublishLab {
   }
 
   public static string Run(string scratch, string mode) {
+    if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
+      throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
     string parent = Path.Combine(scratch, "held");
     Directory.CreateDirectory(parent);
     using (SafeFileHandle root = Root(parent)) {
@@ -191,7 +205,7 @@ public static class RootarkW26NativeFilePublishLab {
         visibleParent = Path.Combine(scratch, "moved-held");
         Directory.Move(parent, visibleParent);
         Directory.CreateDirectory(parent);
-        System.IO.File.WriteAllText(Path.Combine(parent, "published.bin"), Foreign);
+        PlantForeign(Path.Combine(parent, "published.bin"), Foreign);
       }
       using (SafeFileHandle source = File(root, "stage.bin", true)) {
         Write(source, Trusted);
@@ -200,12 +214,12 @@ public static class RootarkW26NativeFilePublishLab {
         string target = Path.Combine(parent, "published.bin");
         if (mode == "COLLISION") {
           // Physical foreign destination inserted before the no-replace syscall.
-          System.IO.File.WriteAllText(target, Foreign);
+          PlantForeign(target, Foreign);
         } else if (mode == "SOURCE_SWAP") {
           // Real rename AFTER holding original stage HANDLE. Equal bytes do
           // not make the newly occupying inode the original FD.
           System.IO.File.Move(stage, Path.Combine(parent, "parked-stage.bin"));
-          System.IO.File.WriteAllText(stage, Trusted);
+          PlantForeign(stage, Trusted);
           using (SafeFileHandle other = File(root, "stage.bin", false)) {
             if (Same(original, Id(other)))
               throw new InvalidOperationException("SOURCE_SWAP_NOT_PHYSICAL");
@@ -215,11 +229,14 @@ public static class RootarkW26NativeFilePublishLab {
         }
         int code = Rename(source, root, "published.bin");
         if (mode == "COLLISION") {
-          if (code == 0 || ReadFixture(target) != Foreign ||
+          // A generic NT failure could otherwise fool the no-clobber proof.
+          // The actual NTFS syscall must report STATUS_OBJECT_NAME_COLLISION.
+          if (code != unchecked((int)0xC0000035) || ReadFixture(target) != Foreign ||
               !System.IO.File.Exists(stage) ||
               ReadFixture(stage) != Trusted)
             throw new InvalidOperationException("DESTINATION_CLOBBERED");
-          return "ROOTARK_W26_HANDLE_PUBLISH mode=COLLISION result=DENIED foreign=INTACT stage=INTACT";
+          return "ROOTARK_W26_HANDLE_PUBLISH mode=COLLISION result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0x" +
+            unchecked((uint)code).ToString("X8");
         }
         if (code != 0) throw new InvalidOperationException("NATIVE_RENAME_FAILED");
         string published = Path.Combine(visibleParent, "published.bin");
