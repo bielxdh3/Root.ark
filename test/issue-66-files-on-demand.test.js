@@ -810,9 +810,62 @@ test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root mar
   assert.equal(await exists(path.join(root, ".rootark-sync-index.json")), false);
 });
 
+test("issue 66: held marker inspection uses bounded FD reads under physical concurrent growth", async (t) => {
+  const { root, open, adapter, key } = await setup(t, {});
+  await open();
+  const marker = path.join(root, ".rootark-sync-ever-fod");
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  const originalSize = (await fsp.stat(marker)).size;
+  const originalOpen = fsp.open;
+  let unboundedRead = false;
+  let mutated = false;
+  let reads = 0;
+  let maxRequested = 0;
+  fsp.open = async (...args) => {
+    const handle = await originalOpen(...args);
+    if (args[0] === marker) {
+      const actualRead = handle.read.bind(handle);
+      handle.readFile = async () => {
+        unboundedRead = true;
+        throw new Error("UNBOUNDED_MARKER_READ_FORBIDDEN");
+      };
+      handle.read = async (buffer, offset, length, position) => {
+        reads++;
+        maxRequested = Math.max(maxRequested, length);
+        if (!mutated) {
+          mutated = true;
+          await fsp.appendFile(marker, Buffer.alloc(256 * 1024, 0x41));
+        }
+        return actualRead(buffer, offset, length, position);
+      };
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(new SyncEngine({ rootDir: root, adapter,
+      deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+      fileKeyResolver: () => key,
+    }).open(), { code: "root_mode_marker_invalid" });
+  } finally { fsp.open = originalOpen; }
+  assert.equal(unboundedRead, false, "marker admission may not call FileHandle.readFile");
+  assert.equal(mutated, true, "the race must modify the physical marker during FD read");
+  assert.ok(reads > 0 && maxRequested <= originalSize + 1,
+    `untrusted marker read must be capped to expected bytes + 1; observed ${maxRequested}`);
+  assert.equal((await fsp.stat(marker)).size, originalSize + 256 * 1024);
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+});
+
 test("issue 66: FIFO root marker fails closed in bounded cold subprocess opens and later legitimate recovery", { skip: process.platform !== "linux" }, async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-ever-fod-fifo-"));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  // CI may use overlayfs/tmpfs: require *physical* ext4 and Node22 only for
+  // an explicit physical-custody run, without making ordinary hosted CI fail.
+  if (process.env.ROOTARK_ISSUE66_FIFO_REQUIRE_EXT4 === "1") {
+    assert.match(process.version, /^v22\./);
+    assert.equal((await fsp.statfs(root)).type, 0xef53,
+      "explicit FIFO physical run must actually use Linux ext4");
+  }
   const marker = path.join(root, ".rootark-sync-ever-fod");
   const made = spawnSync("/usr/bin/mkfifo", [marker], { timeout: 1500, encoding: "utf8" });
   assert.equal(made.status, 0, made.stderr);

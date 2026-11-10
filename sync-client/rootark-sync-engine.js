@@ -96,10 +96,23 @@ async function enforceEverFodRootMode(rootDir, filesOnDemand) {
         || !sameFileVersion(heldBefore, pathBefore)) {
         fail("Replaced Files On-Demand root marker", "root_mode_marker_invalid");
       }
-      const bytes = await markerHandle.readFile("utf8");
+      // The size in the first fstat is only a precondition: another same-UID
+      // writer could enlarge this file before a readFile() consumes EOF.
+      // Read no more than the literal expected length plus one sentinel byte
+      // through this same held descriptor, even under concurrent growth.
+      const expected = Buffer.from(EVER_FOD_MARKER_BYTES, "utf8");
+      const bounded = Buffer.alloc(expected.length + 1);
+      let bytesReadTotal = 0;
+      while (bytesReadTotal < bounded.length) {
+        const { bytesRead } = await markerHandle.read(bounded, bytesReadTotal,
+          bounded.length - bytesReadTotal, bytesReadTotal);
+        if (bytesRead === 0) break;
+        bytesReadTotal += bytesRead;
+      }
       const heldAfter = await markerHandle.stat({ bigint: true });
       const pathAfter = await fsp.lstat(markerPath, { bigint: true });
-      if (bytes !== EVER_FOD_MARKER_BYTES
+      if (bytesReadTotal !== expected.length
+        || !bounded.subarray(0, bytesReadTotal).equals(expected)
         || !sameFileVersion(heldBefore, heldAfter)
         || !sameFileVersion(heldBefore, pathAfter)) {
         fail("Changed Files On-Demand root marker", "root_mode_marker_invalid");

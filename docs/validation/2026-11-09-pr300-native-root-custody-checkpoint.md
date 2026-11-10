@@ -946,3 +946,30 @@ only a bounded ancestry fix for this reader, **not** initial root authority,
 native `openat2` custody, proof against same-UID adversarial pre-acquisition
 swaps or root rollback, or evidence that formal hosted CodeQL is green.
 Release remains **NO-GO**.
+
+### Follow-up same-UID marker growth: bounded held-FD read
+
+The independently reviewed FIFO correction still had a concrete P2:
+`FileHandle.readFile()` was called after a size-only `fstat` of the
+`.rootark-sync-ever-fod` marker. A same-UID process could enlarge that
+regular file between validation and read, causing an unbounded read and
+allocation before the later identity/version check refused the contents.
+A deterministic physical test appends 256 KiB at the first held-FD read
+and rejects any call to `FileHandle.readFile`. It reproduced **RED** on
+Windows Node22, then **GREEN 1/1** after the code switched to a strict
+buffer of the expected literal byte length plus one sentinel byte,
+using positional reads through the **same** retained handle. The
+corrupted marker and unchanged durable snapshot are checked after denial.
+The focused WSL Node22 test also passed **1/1** with its disposable root
+on ext4. `O_NONBLOCK|O_NOFOLLOW`, descriptor/path identity checks and
+partial/symlink/FIFO fail-closed behavior are retained. The separate
+FIFO test now supports explicit `ROOTARK_ISSUE66_FIFO_REQUIRE_EXT4=1`
+to assert Node22 and the real ext4 superblock for a physical run,
+without introducing an ext4 requirement in portable CI.
+
+This is a *bounded memory and marker-admission correction*, not a
+trusted monotonic root mode. Same-SID deletion/replacement, parent ABA,
+image provenance, native mutation and rollback still prohibit production
+`RootSession`. Exact committed SHA, broad physical validation and new
+independent SOURCE review are required; no new hosted CodeQL success
+or GitHub Actions run is claimed, and no push/merge/deploy is authorized.
