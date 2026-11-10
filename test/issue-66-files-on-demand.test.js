@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -621,9 +622,29 @@ test("issue 66: a FOD root retains its mode across non-FOD restart and custom sn
   const snapshotPath = path.join(root, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotPath);
   const markerPath = path.join(root, ".rootark-sync-ever-fod");
-  // Reading the expected exact marker already proves it is present. Avoid a
-  // separate pathname stat/read race in this disposable physical fixture.
-  assert.equal(await fsp.readFile(markerPath, "utf8"), "rootark-sync-ever-fod-v1\n");
+  // Preserve the explicit regular-file assertion without reopening a mutable
+  // pathname after the check (the old stat(path) -> readFile(path) was racy).
+  const markerHandle = await fsp.open(markerPath, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  try {
+    const before = await markerHandle.stat({ bigint: true });
+    assert.equal(before.isFile(), true, "FOD must create a regular-file root marker");
+    assert.equal(before.nlink, 1n, "a marker hardlink cannot be root-mode authority");
+    const expectedMarker = Buffer.from("rootark-sync-ever-fod-v1\n");
+    const bounded = Buffer.alloc(expectedMarker.length + 1);
+    let bytesRead = 0;
+    while (bytesRead < bounded.length) {
+      const result = await markerHandle.read(bounded, bytesRead,
+        bounded.length - bytesRead, bytesRead);
+      if (result.bytesRead === 0) break;
+      bytesRead += result.bytesRead;
+    }
+    assert.equal(bytesRead, expectedMarker.length, "marker must match exact bounded bytes");
+    assert.deepEqual(bounded.subarray(0, bytesRead), expectedMarker);
+    const after = await markerHandle.stat({ bigint: true });
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+  } finally { await markerHandle.close(); }
   const nonFod = new SyncEngine({ rootDir: root, adapter,
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
     selectedPaths: ["docs"], fileKeyResolver: () => key,
@@ -792,6 +813,52 @@ test("issue 66: a multiply-linked ever-FOD marker cannot authorize a root mode",
   }).open(), { code: "root_mode_marker_invalid" });
   assert.deepEqual(await fsp.readFile(marker), original);
   assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+});
+
+test("issue 66: a physically rebound FOD marker never authorizes a foreign inode", async (t) => {
+  const { root, open, adapter, key, state, store } = await setup(t, {
+    "docs/keep.txt": "protected remote content",
+  });
+  await open();
+  const marker = path.join(root, ".rootark-sync-ever-fod");
+  const parked = path.join(root, "parked-original-marker-for-adversarial-test");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const expectedMarker = "rootark-sync-ever-fod-v1\n";
+  const before = await fsp.lstat(marker, { bigint: true });
+  const snapshotBefore = await fsp.readFile(snapshot);
+  const storeBefore = JSON.stringify(store.list("alice"));
+  const pushesBefore = state.pushes;
+  const originalLstat = fsp.lstat;
+  const originalRename = fsp.rename;
+  let swapped = false;
+  // The old implementation used lstat(marker), then a fresh readFile(marker).
+  // Physically rebind that same name immediately after the successful lstat.
+  // A pathname second read would wrongly accept identical foreign bytes.
+  fsp.lstat = async (requested, ...args) => {
+    const result = await originalLstat(requested, ...args);
+    if (!swapped && path.resolve(String(requested)) === path.resolve(marker)) {
+      swapped = true;
+      await originalRename(marker, parked);
+      await fsp.writeFile(marker, expectedMarker, { flag: "wx" });
+    }
+    return result;
+  };
+  try {
+    await assert.rejects(new SyncEngine({ rootDir: root, adapter,
+      deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+      fileKeyResolver: () => key, filesOnDemand: true,
+    }).open(), { code: "root_mode_marker_invalid" });
+  } finally { fsp.lstat = originalLstat; }
+  assert.equal(swapped, true, "the physical inode replacement must have happened");
+  const foreign = await fsp.lstat(marker, { bigint: true });
+  const parkedOriginal = await fsp.lstat(parked, { bigint: true });
+  assert.equal(parkedOriginal.ino, before.ino, "original opened inode is retained");
+  assert.notEqual(foreign.ino, before.ino, "foreign equal-byte inode must remain distinct");
+  assert.equal(await fsp.readFile(marker, "utf8"), expectedMarker);
+  assert.equal(await fsp.readFile(parked, "utf8"), expectedMarker);
+  assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), storeBefore);
+  assert.equal(state.pushes, pushesBefore, "a failed root-mode admission must not push a signed operation");
 });
 
 test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root marker", async (t) => {
