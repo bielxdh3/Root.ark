@@ -1169,34 +1169,62 @@ async function promoteStagedEvictionGenesis(rootDir, staged) {
       || source.nlink !== 1n || source.size > 8192n) {
       fail("Unsafe staged genesis publication source", "invalid_snapshot");
     }
-    let candidate;
-    try { candidate = JSON.parse(await fsp.readFile(staged.file, "utf8")); }
-    catch { fail("Invalid staged genesis publication bytes", "invalid_snapshot"); }
-    if (!validEvictionLedgerHead(candidate)
-      || candidate.epoch !== staged.head.epoch
-      || candidate.sequence !== 0 || candidate.digest !== EVICTION_LEDGER_ZERO
-      || !sameFileVersion(source, await fsp.lstat(staged.file, { bigint: true }))) {
-      fail("Staged genesis changed before publication", "invalid_snapshot");
-    }
-    try { await fsp.link(staged.file, headFile); }
-    catch (error) {
-      if (error.code === "EEXIST") {
-        fail("Existing genesis head blocks exclusive publication", "invalid_snapshot");
+    const heldSource = await fsp.open(staged.file, fs.constants.O_RDONLY
+      | (fs.constants.O_NONBLOCK || 0));
+    try {
+      const beforeRead = await heldSource.stat({ bigint: true });
+      if (!beforeRead.isFile() || !sameFileVersion(source, beforeRead)) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
       }
-      throw error;
-    }
-    // A concurrent writer might still have exchanged pathnames between
-    // checks. On any identity mismatch retain both names for manual review:
-    // do not unlink a potentially foreign staged file.
-    const published = await fsp.lstat(headFile, { bigint: true });
-    const remaining = await fsp.lstat(staged.file, { bigint: true });
-    if (!published.isFile() || published.isSymbolicLink()
-      || !remaining.isFile() || remaining.isSymbolicLink()
-      || !sameFileIdentity(source, published)
-      || !sameFileIdentity(source, remaining)) {
-      fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
-    }
-    await fsp.unlink(staged.file);
+      // The source can grow between lstat and read on NTFS. Never call the
+      // unbounded pathname readFile after a size precheck: read at most one
+      // byte beyond the 8 KiB contract from the retained file handle.
+      const buffer = Buffer.alloc(8193);
+      let count = 0;
+      while (count < buffer.length) {
+        const { bytesRead } = await heldSource.read(buffer, count, buffer.length - count, count);
+        if (!bytesRead) break;
+        count += bytesRead;
+      }
+      const afterRead = await heldSource.stat({ bigint: true });
+      const namedBefore = await fsp.lstat(staged.file, { bigint: true });
+      if (count > 8192 || BigInt(count) !== beforeRead.size
+        || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+        || !sameFileVersion(beforeRead, afterRead)
+        || !sameFileVersion(beforeRead, namedBefore)) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      let candidate;
+      try { candidate = JSON.parse(buffer.subarray(0, count).toString("utf8")); }
+      catch { fail("Invalid staged genesis publication bytes", "invalid_snapshot"); }
+      if (!validEvictionLedgerHead(candidate)
+        || candidate.epoch !== staged.head.epoch
+        || candidate.sequence !== 0 || candidate.digest !== EVICTION_LEDGER_ZERO) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      try { await fsp.link(staged.file, headFile); }
+      catch (error) {
+        if (error.code === "EEXIST") {
+          fail("Existing genesis head blocks exclusive publication", "invalid_snapshot");
+        }
+        throw error;
+      }
+      // A hard link updates ctime/nlink, so only identity + size/mtime can
+      // be compared after publication; never treat this as same-SID custody.
+      const afterLink = await heldSource.stat({ bigint: true });
+      const published = await fsp.lstat(headFile, { bigint: true });
+      const remaining = await fsp.lstat(staged.file, { bigint: true });
+      if (!published.isFile() || published.isSymbolicLink()
+        || !remaining.isFile() || remaining.isSymbolicLink()
+        || !sameFileIdentity(beforeRead, published)
+        || !sameFileIdentity(beforeRead, remaining)
+        || !sameFileIdentity(beforeRead, afterLink)
+        || afterLink.size !== beforeRead.size
+        || afterLink.mtimeNs !== beforeRead.mtimeNs) {
+        fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
+      }
+      await fsp.unlink(staged.file);
+    } finally { await heldSource.close(); }
   } else {
     await fsp.rename(staged.file, headFile);
     await fsyncEvictionDirectory(directory);

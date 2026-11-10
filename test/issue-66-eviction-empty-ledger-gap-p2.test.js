@@ -839,6 +839,59 @@ test("issue 66: Windows NTFS genesis publication cannot overwrite a competing he
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: Windows staged genesis publication reads bounded bytes from a held file, not readFile", {
+  skip: process.platform !== "win32" && "Windows NTFS staged-head held read",
+}, async (t) => {
+  const f = await fixture(t, "windows-held-stage-read");
+  const originalReadFile = fsp.readFile;
+  let unboundedCalls = 0;
+  fsp.readFile = async (filePath, ...args) => {
+    if (path.basename(String(filePath)) === ".rootark-eviction-genesis-head.json") {
+      unboundedCalls++;
+      throw Object.assign(new Error("unbounded staged genesis read forbidden"), { code: "EMSGSIZE" });
+    }
+    return originalReadFile(filePath, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  let report;
+  try { report = await sync.syncOnce(); }
+  finally { fsp.readFile = originalReadFile; }
+  assert.equal(unboundedCalls, 0, "publication must keep and read a bounded file descriptor");
+  assert.equal(report.excluded.evicted, 1, "legitimate Windows genesis still commits");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, false);
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: Windows staged genesis growth before held open denies publication", {
+  skip: process.platform !== "win32" && "Windows NTFS held staged-head growth regression",
+}, async (t) => {
+  const f = await fixture(t, "windows-stage-grows-before-held-open");
+  const originalOpen = fsp.open;
+  let grown = false;
+  fsp.open = async (requested, ...args) => {
+    if (!grown && path.basename(String(requested))
+      === ".rootark-eviction-genesis-head.json") {
+      grown = true;
+      // The actual NTFS staged file changes after the pathname size
+      // precheck but before acquiring the descriptor used for publication.
+      await fsp.appendFile(String(requested), Buffer.alloc(8193));
+    }
+    return originalOpen(requested, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally { fsp.open = originalOpen; }
+  assert.equal(grown, true, "the real staged-head descriptor acquisition must be exercised");
+  assert.equal(failure?.code, "invalid_snapshot");
+  assert.match(failure.message, /Staged genesis changed before publication/);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66: replaced Linux staged genesis leaf cannot become an authorized active head", {
   skip: process.platform !== "linux" && "Linux nofollow staged-head publication",
 }, async (t) => {
