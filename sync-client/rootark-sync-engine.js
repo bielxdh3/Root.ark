@@ -36,6 +36,77 @@ const INTERNAL_NAME_PREFIXES = [
   // upload or a physical-cache path to reject during safe cold replay.
   ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
 ];
+const RESERVED_CONTROL_TEMP_PREFIXES = Object.freeze([
+  ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+]);
+function isReservedHistoricalControlTemp(relative) {
+  return typeof relative === "string" && !relative.includes("/")
+    && !relative.includes("\\")
+    && RESERVED_CONTROL_TEMP_PREFIXES.some((prefix) =>
+      relative.toLowerCase().startsWith(prefix));
+}
+function internalRootMetadata(rootDir, snapshotPath, journalPath) {
+  const names = [...INTERNAL_NAMES];
+  const prefixes = [...INTERNAL_NAME_PREFIXES];
+  const newlyReservedNames = new Set();
+  const newlyReservedPrefixes = new Set(RESERVED_CONTROL_TEMP_PREFIXES);
+  for (const candidate of [snapshotPath, journalPath]) {
+    if (typeof candidate !== "string") continue;
+    const relative = path.relative(rootDir, path.resolve(candidate));
+    if (relative === ".." || relative.startsWith(".." + path.sep)
+      || path.isAbsolute(relative)) continue;
+    // A nested custom control file would require trusted traversal and
+    // reservation of every parent. Fail closed instead of uploading its
+    // metadata or misclassifying it as recovery evidence.
+    if (!relative || relative.includes(path.sep)) {
+      fail("Nested sync control metadata inside cache root is unsupported", "unsafe_path");
+    }
+    if (!names.some((name) => name.toLowerCase() === relative.toLowerCase())) {
+      names.push(relative);
+      newlyReservedNames.add(relative.toLowerCase());
+    }
+    const prefix = relative + ".tmp-";
+    if (!prefixes.some((name) => name.toLowerCase() === prefix.toLowerCase())) {
+      prefixes.push(prefix);
+      newlyReservedPrefixes.add(prefix.toLowerCase());
+    }
+  }
+  return { names, prefixes, newlyReservedNames, newlyReservedPrefixes };
+}
+function isReservedHistoricalControlTempInMetadata(relative, metadata) {
+  if (isReservedHistoricalControlTemp(relative)) return true;
+  if (typeof relative !== "string" || relative.includes("/") || relative.includes("\\")) return false;
+  const lower = relative.toLowerCase();
+  return metadata.newlyReservedNames.has(lower)
+    || [...metadata.newlyReservedPrefixes].some((prefix) => lower.startsWith(prefix));
+}
+function denyHistoricallyTrackedControlTemp(snapshot, metadata) {
+  // These prefixes were user-legal on older clients. Silently skipping a
+  // previously tracked file makes _reconcileLocal synthesize a signed DELETE.
+  // Treat legacy overlap as an explicit migration/availability blocker,
+  // never as physical evidence of user-requested deletion.
+  for (const name of Object.keys(snapshot.files || {})) {
+    if (isReservedHistoricalControlTempInMetadata(name, metadata)) {
+      fail("Legacy tracked file collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+  for (const entry of Object.values(snapshot.remoteOnly || {})) {
+    if (isReservedHistoricalControlTempInMetadata(entry?.path, metadata)) {
+      fail("Legacy remote-only file collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+  for (const entry of Object.values(snapshot.pendingEvictions || {})) {
+    if (isReservedHistoricalControlTempInMetadata(entry?.path, metadata)
+      || isReservedHistoricalControlTempInMetadata(entry?.localPath, metadata)) {
+      fail("Legacy pending eviction collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+  for (const entry of Object.values(snapshot.pinnedFiles || {})) {
+    if (isReservedHistoricalControlTempInMetadata(entry?.path, metadata)) {
+      fail("Legacy pinned file collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+}
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
@@ -2002,6 +2073,8 @@ class SyncEngine {
   }
 
   async _open() {
+    const configuredMetadata = internalRootMetadata(
+      this.rootDir, this.snapshotPath, this.journal?.filePath);
     await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
     // Always recheck, including previously opened non-FOD instances whose
@@ -2043,6 +2116,7 @@ class SyncEngine {
       }
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      denyHistoricallyTrackedControlTemp(parsed, configuredMetadata);
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
       }
@@ -3572,6 +3646,12 @@ class SyncEngine {
       ...(canonicalSourcePath ? { sourcePath: canonicalSourcePath } : {}),
     };
     operation = { ...operation, metadata };
+    const configuredMetadata = internalRootMetadata(
+      this.rootDir, this.snapshotPath, this.journal?.filePath);
+    if (isReservedHistoricalControlTempInMetadata(metadata.path, configuredMetadata)
+      || isReservedHistoricalControlTempInMetadata(metadata.sourcePath, configuredMetadata)) {
+      fail("Remote operation targets reserved local sync metadata", "unsafe_path");
+    }
     const target = await contained(this.rootDir, metadata.path, true);
     // A cached-source MOVE or occupied destination would invoke legacy
     // pathname rename/staging. Deny before journal admission, even when the
@@ -3734,6 +3814,7 @@ class SyncEngine {
   // The extra conservative checks never grant a server-side DELETE.
   async scanPhysicalCacheForEvictionRecovery() {
     const root = this.rootDir;
+    const internal = internalRootMetadata(root, this.snapshotPath, this.journal?.filePath);
     const expected = new Set();
     const parents = new Set();
     for (const [relative, item] of Object.entries(this.snapshot.files)) {
@@ -3767,13 +3848,13 @@ class SyncEngine {
         if (names.has(folded)) fail("Ambiguous physical casefold alias in cache", "invalid_snapshot");
         names.add(folded);
         if (!prefix) {
-          const internalName = [...INTERNAL_NAMES].find((name) => name.toLowerCase() === folded);
+          const internalName = internal.names.find((name) => name.toLowerCase() === folded);
           if (internalName) {
             if (entry.name !== internalName) fail("Ambiguous internal cache entry", "invalid_snapshot");
             continue;
           }
-          if (INTERNAL_NAME_PREFIXES.some((name) => folded.startsWith(name))) {
-            if (!INTERNAL_NAME_PREFIXES.some((name) => entry.name.startsWith(name))) {
+          if (internal.prefixes.some((name) => folded.startsWith(name.toLowerCase()))) {
+            if (!internal.prefixes.some((name) => entry.name.startsWith(name))) {
               fail("Ambiguous internal cache prefix", "invalid_snapshot");
             }
             continue;
@@ -3817,12 +3898,14 @@ class SyncEngine {
 
   async scanFiles() {
     const result = {};
+    const internal = internalRootMetadata(
+      this.rootDir, this.snapshotPath, this.journal?.filePath);
     const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
     const walk = async (directory, prefix = "") => {
       let hasSyncEntries = false;
       for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
-        if (prefix === "" && ([...INTERNAL_NAMES].some((name) => name.toLowerCase() === entry.name.toLowerCase())
-          || INTERNAL_NAME_PREFIXES.some((name) => entry.name.toLowerCase().startsWith(name)))) continue;
+        if (prefix === "" && (internal.names.some((name) => name.toLowerCase() === entry.name.toLowerCase())
+          || internal.prefixes.some((name) => entry.name.toLowerCase().startsWith(name.toLowerCase())))) continue;
         if (entry.name.startsWith(".rootark-put-") || entry.name.startsWith(".rootark-move-")) continue;
         const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
         try { protocol.safeRelativePath(relative, "path"); } catch { continue; }
@@ -3881,6 +3964,8 @@ class SyncEngine {
 
   async _reconcileLocal() {
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    denyHistoricallyTrackedControlTemp(this.snapshot,
+      internalRootMetadata(this.rootDir, this.snapshotPath, this.journal?.filePath));
     const scanned = await this.scanFiles();
     const current = {};
     const snapshotPathByKey = new Map();

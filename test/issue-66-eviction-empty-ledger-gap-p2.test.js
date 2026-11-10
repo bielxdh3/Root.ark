@@ -8,6 +8,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { validatePortableRelativePath } = require("../sync-client/rootark-sync-paths");
 const { SyncObjectStore } = require("../src/routes/sync");
 
 async function fixture(t, name, twoFiles = false) {
@@ -114,6 +115,87 @@ test("issue 66: failed required-v2 snapshot publication must not unlink a swappe
   assert.equal(recovery.excluded.evicted, 1,
     "legitimate exclusion recovery must still work with inert temp debris");
   verifyNoSignedDelete(f, beforeWrites);
+});
+
+test("issue 66: previously tracked control-temp names must never become signed DELETE after namespace reservation", async (t) => {
+  const f = await fixture(t, "historical-control-temp-user-names");
+  const active = await f.create(f.root, []);
+  const names = [
+    ".rootark-sync-index.json.tmp-legacy-user-file",
+    ".rootark-sync-journal.json.tmp-legacy-user-file",
+  ];
+  const foreign = Buffer.from("HISTORICALLY_TRACKED_USER_BYTES_MUST_NOT_BE_REMOTELY_DELETED");
+  const exemplar = active.snapshot.files["PRIVATE/secret.txt"];
+  assert.ok(exemplar && !exemplar.deleted, "test requires a real tracked signed local file");
+  for (const name of names) {
+    await fsp.writeFile(path.join(f.root, name), foreign, { flag: "wx" });
+    active.snapshot.files[name] = {
+      ...exemplar,
+      objectId: "object-" + crypto.randomUUID().replace(/-/g, ""),
+      fileId: "file-" + crypto.randomUUID().replace(/-/g, ""),
+    };
+  }
+  await active.persistSnapshot();
+  const before = f.outbound.length;
+  let attemptedSignedDelete = false;
+  let failure;
+  try {
+    const restarted = await f.create(f.root, []);
+    const original = restarted.assertOutgoingAuthorized.bind(restarted);
+    restarted.assertOutgoingAuthorized = async (operation, enqueue) => {
+      if (operation.operation === "delete" && names.includes(operation.metadata?.path)) {
+        attemptedSignedDelete = true;
+        // The previous code would submit a tombstone for an existing user
+        // inode. Abort BEFORE journal enqueue or outbound push, preserving
+        // the fixture's genuine protected remote content.
+        throw Object.assign(new Error("historical user deletion intercepted"), { code: "EACCES" });
+      }
+      return original(operation, enqueue);
+    };
+    await restarted._reconcileLocal();
+  } catch (error) { failure = error; }
+  assert.equal(attemptedSignedDelete, false,
+    "reserved-name migration must deny rather than queue a signed DELETE");
+  assert.equal(failure?.code, "invalid_snapshot",
+    "a historical tracked collision must fail closed before ordinary sync");
+  for (const name of names) {
+    assert.deepEqual(await fsp.readFile(path.join(f.root, name)), foreign);
+    assert.throws(() => validatePortableRelativePath(name), { code: "unsafe_path" },
+      "new metadata must not allocate a formerly user-legal reserved name");
+  }
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: configured root-local snapshot and journal filenames and orphans stay internal", async (t) => {
+  const f = await fixture(t, "custom-root-control-filenames");
+  const snapshotPath = path.join(f.root, "custom-root-index.json");
+  const journalPath = path.join(f.root, "custom-root-journal.json");
+  // Use a genuine previously persisted snapshot, not a manufactured empty
+  // object that could accidentally conceal a cache reconciliation failure.
+  await fsp.writeFile(snapshotPath, await fsp.readFile(f.snapshot), { flag: "wx" });
+  const sync = await f.create(f.root, [], { snapshotPath, journalPath });
+  const snapshotOrphan = snapshotPath + ".tmp-101-00000000-0000-4000-8000-000000000066";
+  const journalOrphan = journalPath + ".tmp-102-00000000-0000-4000-8000-000000000066";
+  await fsp.writeFile(snapshotOrphan, "CUSTOM_INERT_SNAPSHOT", { flag: "wx" });
+  await fsp.writeFile(journalOrphan, "CUSTOM_INERT_JOURNAL", { flag: "wx" });
+  const internals = [snapshotPath, journalPath, snapshotOrphan, journalOrphan];
+  for (const listing of [await sync.scanFiles(), await sync.scanPhysicalCacheForEvictionRecovery()]) {
+    assert.ok(Object.hasOwn(listing, "PRIVATE/secret.txt"),
+      "the signed legitimate cache still participates in the physical proof");
+    for (const internal of internals) {
+      assert.equal(Object.hasOwn(listing, path.basename(internal)), false,
+        "a custom in-root control name or orphan must never become a synced user object");
+    }
+  }
+  const before = f.outbound.length;
+  const cold = await f.create(f.root, [], { snapshotPath, journalPath });
+  await cold.syncOnce();
+  verifyNoSignedDelete(f, before);
+  for (const internal of internals) assert.ok((await fsp.lstat(internal)).isFile());
+  const unsupportedNested = path.join(f.root, "user-folder", "state.json");
+  await assert.rejects(f.create(f.root, [], { snapshotPath: unsupportedNested, journalPath }),
+    { code: "unsafe_path" }, "nested custom state cannot be treated as user content");
+  await assert.rejects(fsp.lstat(unsupportedNested), { code: "ENOENT" });
 });
 
 async function fillLegitimateTrash(root, count = 16385) {

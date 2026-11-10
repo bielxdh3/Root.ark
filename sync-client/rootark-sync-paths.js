@@ -7,7 +7,10 @@ const INTERNAL = new Set([
   ".rootark-sync-evictions", ".rootark-sync-ever-fod",
   ".rootark-sync.lock", ".rootark-webdav-owner.lock",
 ]);
-const INTERNAL_PREFIXES = [".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-"];
+const INTERNAL_PREFIXES = [
+  ".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-",
+  ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+];
 
 function isInternalSegment(segment) {
   const normalized = segment.toLowerCase();
