@@ -947,6 +947,48 @@ async function createStagedEvictionGenesis(rootDir) {
   const existing = await stagedEvictionGenesis(rootDir);
   if (existing) return existing;
   const trash = path.join(rootDir, ".rootark-trash");
+  if (process.platform === "linux") {
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    let root;
+    let heldTrash;
+    try {
+      root = await fsp.open(rootDir, flags);
+      const relativeTrash = `/proc/self/fd/${root.fd}/.rootark-trash`;
+      let created = false;
+      try {
+        await fsp.mkdir(relativeTrash, { mode: 0o700 });
+        created = true;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+      }
+      if (created) await root.sync();
+      heldTrash = await fsp.open(relativeTrash, flags);
+      const rootBefore = await root.stat({ bigint: true });
+      const trashBefore = await heldTrash.stat({ bigint: true });
+      const verify = async () => {
+        const rootNow = await fsp.lstat(rootDir, { bigint: true });
+        const trashNow = await fsp.lstat(trash, { bigint: true });
+        if (!rootBefore.isDirectory() || !trashBefore.isDirectory()
+          || !rootNow.isDirectory() || !trashNow.isDirectory()
+          || !sameFileIdentity(rootBefore, rootNow)
+          || !sameFileIdentity(trashBefore, trashNow)
+          || !sameFileIdentity(rootBefore, await root.stat({ bigint: true }))
+          || !sameFileIdentity(trashBefore, await heldTrash.stat({ bigint: true }))) {
+          fail("Staged genesis parent changed during creation", "invalid_snapshot");
+        }
+        await containedAbsolute(rootDir, trash, false);
+      };
+      await verify();
+      const head = { epoch: crypto.randomUUID(), sequence: 0, digest: EVICTION_LEDGER_ZERO };
+      await durableJson(`/proc/self/fd/${heldTrash.fd}/${EVICTION_GENESIS_STAGE}`, head);
+      await verify();
+      return { trash, file: path.join(trash, EVICTION_GENESIS_STAGE), head };
+    } finally {
+      if (heldTrash) await heldTrash.close();
+      if (root) await root.close();
+    }
+  }
   if (!(await exists(trash))) {
     await fsp.mkdir(trash, { mode: 0o700 });
     await fsyncEvictionDirectory(rootDir);
@@ -971,9 +1013,102 @@ async function promoteStagedEvictionGenesis(rootDir, staged) {
   const directory = active.directory || await openEvictionLedger(rootDir, true);
   const headFile = path.join(directory, "head.json");
   if (await exists(headFile)) fail("Eviction head appeared during promotion", "invalid_snapshot");
+  if (process.platform === "linux") {
+    // A pathname rename could overwrite head.json in a replaced ledger (or
+    // erase a competing head). Keep both parent directories pinned and
+    // publish via an EXCLUSIVE hard link: unlike rename, link fails EEXIST
+    // without replacing any preexisting destination. This remains a bounded
+    // legacy gate, NOT same-UID root custody or a powercut proof.
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    let root;
+    let trash;
+    let ledger;
+    let heldHead;
+    try {
+      root = await fsp.open(rootDir, flags);
+      const parent = `/proc/self/fd/${root.fd}`;
+      trash = await fsp.open(`${parent}/.rootark-trash`, flags);
+      ledger = await fsp.open(`${parent}/${EVICTION_LEDGER_DIR}`, flags);
+      const rootBefore = await root.stat({ bigint: true });
+      const trashBefore = await trash.stat({ bigint: true });
+      const ledgerBefore = await ledger.stat({ bigint: true });
+      const source = `/proc/self/fd/${trash.fd}/${EVICTION_GENESIS_STAGE}`;
+      const dest = `/proc/self/fd/${ledger.fd}/head.json`;
+      const verifyDirectories = async () => {
+        for (const [name, fd, original] of [
+          [rootDir, root, rootBefore],
+          [path.join(rootDir, ".rootark-trash"), trash, trashBefore],
+          [directory, ledger, ledgerBefore],
+        ]) {
+          const current = await fsp.lstat(name, { bigint: true });
+          if (!current.isDirectory() || current.isSymbolicLink()
+            || !sameFileIdentity(original, current)
+            || !sameFileIdentity(original, await fd.stat({ bigint: true }))) {
+            fail("Genesis publication parent changed", "invalid_snapshot");
+          }
+        }
+      };
+      await verifyDirectories();
+      heldHead = await fsp.open(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+        | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_CLOEXEC || 0));
+      const before = await heldHead.stat({ bigint: true });
+      if (!before.isFile() || before.nlink !== 1n || before.size > 8192n) {
+        fail("Unsafe staged genesis publication source", "invalid_snapshot");
+      }
+      const bytes = Buffer.alloc(8193);
+      let count = 0;
+      while (count < bytes.length) {
+        const { bytesRead } = await heldHead.read(bytes, count, bytes.length - count, count);
+        if (!bytesRead) break;
+        count += bytesRead;
+      }
+      let head;
+      try { head = JSON.parse(bytes.subarray(0, count).toString("utf8")); }
+      catch { fail("Invalid staged genesis publication bytes", "invalid_snapshot"); }
+      const named = await fsp.lstat(source, { bigint: true });
+      if (count > 8192 || BigInt(count) !== before.size
+        || !named.isFile() || named.isSymbolicLink()
+        || !sameFileVersion(before, await heldHead.stat({ bigint: true }))
+        || !sameFileVersion(before, named)
+        || !validEvictionLedgerHead(head)
+        || head.epoch !== staged.head.epoch
+        || head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      await verifyDirectories();
+      try { await fsp.link(source, dest); }
+      catch (error) {
+        if (error.code === "EEXIST") fail("Existing genesis head blocks exclusive publication", "invalid_snapshot");
+        throw error;
+      }
+      // Do not remove the stage unless the new destination is exactly the
+      // retained source inode. If a hostile writer substituted a leaf during
+      // the link, leave the ambiguous state for fail-closed recovery.
+      const published = await fsp.lstat(dest, { bigint: true });
+      const stagedNow = await fsp.lstat(source, { bigint: true });
+      if (!published.isFile() || published.isSymbolicLink()
+        || !stagedNow.isFile() || stagedNow.isSymbolicLink()
+        || !sameFileIdentity(before, published)
+        || !sameFileIdentity(before, stagedNow)) {
+        fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
+      }
+      await ledger.sync();
+      await verifyDirectories();
+      await fsp.unlink(source);
+      await trash.sync();
+      await ledger.sync();
+    } finally {
+      if (heldHead) await heldHead.close();
+      if (ledger) await ledger.close();
+      if (trash) await trash.close();
+      if (root) await root.close();
+    }
+  } else {
   await fsp.rename(staged.file, headFile);
   await fsyncEvictionDirectory(directory);
   await fsyncEvictionDirectory(staged.trash);
+  }
   const promoted = await readEvictionLedger(rootDir, staged.head.epoch);
   if (promoted.entries.size || !promoted.head
     || promoted.head.sequence !== 0 || promoted.head.digest !== EVICTION_LEDGER_ZERO) {

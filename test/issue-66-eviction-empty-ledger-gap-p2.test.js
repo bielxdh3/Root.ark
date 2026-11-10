@@ -613,6 +613,211 @@ test("issue 66 P2: replacing staged genesis parent after complete iteration cann
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: Linux genesis stage must not write through a replaced trash directory", {
+  skip: process.platform !== "linux" && "Linux held trash descriptor required",
+}, async (t) => {
+  const f = await fixture(t, "genesis-stage-foreign-write");
+  const trash = path.join(f.root, ".rootark-trash");
+  const parked = path.join(f.root, ".rootark-trash-parked");
+  const foreign = path.join(f.dir, "foreign-trash");
+  await fsp.mkdir(foreign);
+  await fsp.writeFile(path.join(foreign, "FOREIGN_SENTINEL"), "must stay intact");
+  const originalOpen = fsp.open;
+  let substituted = false;
+  fsp.open = async (requested, ...args) => {
+    if (!substituted && path.basename(String(requested))
+      .startsWith(".rootark-eviction-genesis-head.json.tmp-")) {
+      substituted = true;
+      await fsp.rename(trash, parked);
+      await fsp.symlink(foreign, trash, "dir");
+    }
+    return originalOpen(requested, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.open = originalOpen;
+    if (substituted) {
+      await fsp.unlink(trash);
+      await fsp.rename(parked, trash);
+    }
+  }
+  assert.equal(substituted, true, "the real genesis temporary create must be reached");
+  assert.deepEqual(await fsp.readdir(foreign), ["FOREIGN_SENTINEL"],
+    "no temporary or durable genesis may appear in attacker-controlled trash");
+  assert.equal(failure?.code, "invalid_snapshot", "stage must fail closed on a changed held parent");
+  assert.match(failure.message, /Staged genesis parent changed during creation/);
+  assert.equal(await fsp.readFile(path.join(foreign, "FOREIGN_SENTINEL"), "utf8"), "must stay intact");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: Linux genesis promotion cannot overwrite a foreign ledger head", {
+  skip: process.platform !== "linux" && "Linux held ledger descriptor required",
+}, async (t) => {
+  const f = await fixture(t, "genesis-promotion-foreign-write");
+  const parked = path.join(f.root, ".rootark-sync-evictions-parked");
+  const foreign = path.join(f.dir, "foreign-ledger-promotion");
+  await fsp.mkdir(foreign);
+  await fsp.writeFile(path.join(foreign, "head.json"), "FOREIGN_HEAD_STAYS");
+  const originalRename = fsp.rename;
+  const originalLink = fsp.link;
+  let substituted = false;
+  const inject = async (source, destination) => {
+    if (!substituted && path.basename(String(source)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(destination)) === "head.json") {
+      substituted = true;
+      await originalRename(f.ledger, parked);
+      await fsp.symlink(foreign, f.ledger, "dir");
+    }
+  };
+  fsp.rename = async (source, destination, ...args) => {
+    await inject(source, destination);
+    return originalRename(source, destination, ...args);
+  };
+  fsp.link = async (source, destination, ...args) => {
+    await inject(source, destination);
+    return originalLink(source, destination, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.rename = originalRename;
+    fsp.link = originalLink;
+    if (substituted) {
+      await fsp.unlink(f.ledger);
+      await fsp.rename(parked, f.ledger);
+    }
+  }
+  assert.equal(substituted, true, "the real genesis promotion boundary must be reached");
+  assert.equal(await fsp.readFile(path.join(foreign, "head.json"), "utf8"),
+    "FOREIGN_HEAD_STAYS", "a competing foreign head must never be overwritten");
+  assert.equal(failure?.code, "invalid_snapshot",
+    "an adversarial head publication must fail with an explicit snapshot-denial error");
+  assert.match(failure.message, /Genesis publication parent changed/);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: crash after exclusive genesis link but before retiring stage fails closed", {
+  skip: process.platform !== "linux" && "Linux held genesis publication and hard crash",
+}, async (t) => {
+  const f = await fixture(t, "genesis-linked-before-unlink-crash");
+  const childSource = String.raw`
+"use strict";
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const { SyncEngine } = require(process.argv[1]);
+const { SyncObjectStore } = require(process.argv[2]);
+const originalLink = fsp.link;
+fsp.link = async (...args) => {
+  const result = await originalLink(...args);
+  if (path.basename(String(args[0])) === ".rootark-eviction-genesis-head.json"
+    && path.basename(String(args[1])) === "head.json") process.exit(75);
+  return result;
+};
+(async () => {
+  const store = await new SyncObjectStore(process.argv[4]).open();
+  const sync = await new SyncEngine({
+    rootDir: process.argv[3],
+    adapter: {
+      async list(objectId = "") { return store.list("alice", objectId || null); },
+      async push() { process.exit(94); },
+    },
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    excludedPaths: ["private"], fileKeyResolver: () => Buffer.from(process.argv[5], "base64"),
+  }).open();
+  await sync.syncOnce();
+  process.exit(92);
+})().catch(() => process.exit(93));
+`;
+  const child = spawn(process.execPath, [
+    "-e", childSource, require.resolve("../sync-client/rootark-sync-engine"),
+    require.resolve("../src/routes/sync"), f.root, f.storePath, f.key.toString("base64"),
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+  let err = "";
+  child.stderr.on("data", (bytes) => { err += bytes.toString(); });
+  const exit = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { child.kill(); reject(new Error("genesis link crash child timed out")); }, 30000);
+    child.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
+    child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+  });
+  assert.equal(exit, 75, `must crash after the exact exclusive publication link, got ${exit}: ${err}`);
+  const staged = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
+  const active = path.join(f.ledger, "head.json");
+  assert.deepEqual(await fsp.readFile(active), await fsp.readFile(staged),
+    "a crash leaves identical linked bytes, not an authorized committed recovery");
+  assert.equal((await fsp.stat(active)).nlink, 2, "proof must use the actual same-inode linked stage");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
+  await fsp.rmdir(path.join(f.root, ".rootark-sync.lock"));
+  const before = f.outbound.length;
+  await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: exclusive Linux genesis publication never overwrites a competing head", {
+  skip: process.platform !== "linux" && "Linux exclusive hard-link publication",
+}, async (t) => {
+  const f = await fixture(t, "genesis-competing-head");
+  const headPath = path.join(f.ledger, "head.json");
+  const originalLink = fsp.link;
+  let injected = false;
+  fsp.link = async (source, destination, ...args) => {
+    if (!injected && path.basename(String(source)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(destination)) === "head.json") {
+      injected = true;
+      await fsp.writeFile(headPath, "FOREIGN_HEAD_NO_REPLACE", { flag: "wx" });
+    }
+    return originalLink(source, destination, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(sync.syncOnce(), (error) =>
+      error?.code === "invalid_snapshot"
+        && /Existing genesis head blocks exclusive publication/.test(error.message));
+  } finally { fsp.link = originalLink; }
+  assert.equal(injected, true);
+  assert.equal(await fsp.readFile(headPath, "utf8"), "FOREIGN_HEAD_NO_REPLACE");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: replaced Linux staged genesis leaf cannot become an authorized active head", {
+  skip: process.platform !== "linux" && "Linux nofollow staged-head publication",
+}, async (t) => {
+  const f = await fixture(t, "genesis-stage-leaf-symlink");
+  const foreign = path.join(f.dir, "foreign-genesis-data");
+  await fsp.writeFile(foreign, "FOREIGN_BYTES_MUST_STAY");
+  const originalLink = fsp.link;
+  let injected = false;
+  fsp.link = async (source, destination, ...args) => {
+    if (!injected && path.basename(String(source)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(destination)) === "head.json") {
+      injected = true;
+      await fsp.rename(source, `${source}.parked`);
+      await fsp.symlink(foreign, source);
+    }
+    return originalLink(source, destination, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(sync.syncOnce(), (error) =>
+      error?.code === "invalid_snapshot"
+        && /Indeterminate exclusive genesis publication/.test(error.message));
+  } finally { fsp.link = originalLink; }
+  assert.equal(injected, true);
+  assert.equal(await fsp.readFile(foreign, "utf8"), "FOREIGN_BYTES_MUST_STAY");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
 function verifyNoSignedDelete(f, from = 0) {
   assert.equal(f.outbound.slice(from).filter((entry) => entry.operation === "delete" || entry.tombstone).length,
     0, "an uncertain ledger must never authorize a signed DELETE");
@@ -645,8 +850,8 @@ fsp.open = async (...args) => {
 const originalRename = fsp.rename;
 fsp.rename = async (...args) => {
   if (process.argv[6] === "before-genesis"
-    && path.resolve(args[1]) === path.join(root, ".rootark-trash",
-      ".rootark-eviction-genesis-head.json")) {
+    && path.basename(String(args[1])) === ".rootark-eviction-genesis-head.json"
+    && path.basename(String(args[0])).startsWith(".rootark-eviction-genesis-head.json.tmp-")) {
     process.exit(76);
   }
   if (process.argv[6] === "genesis-only"
@@ -658,6 +863,15 @@ fsp.rename = async (...args) => {
     process.exit(77);
   }
   return originalRename(...args);
+};
+const originalLink = fsp.link;
+fsp.link = async (...args) => {
+  if (process.argv[6] === "before-promotion"
+    && path.basename(String(args[0])) === ".rootark-eviction-genesis-head.json"
+    && path.basename(String(args[1])) === "head.json") {
+    process.exit(77);
+  }
+  return originalLink(...args);
 };
 (async () => {
   const store = await new SyncObjectStore(storePath).open();

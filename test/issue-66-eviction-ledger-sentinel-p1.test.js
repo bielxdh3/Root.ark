@@ -189,7 +189,15 @@ test("issue 66 P1: crash after compacted checkpoint but before ledger retirement
   const originalRename = fsp.rename;
   let blockedArchive = false;
   fsp.rename = async (source, destination) => {
-    if (source === f.ledger && path.basename(destination).startsWith(".rootark-sync-evictions-archive-")) {
+    let exactRootParent = false;
+    if (path.basename(String(source)) === ".rootark-sync-evictions"
+      && path.basename(String(destination)).startsWith(".rootark-sync-evictions-archive-")) {
+      try {
+        exactRootParent = path.resolve(await fsp.realpath(path.dirname(String(source))))
+          === path.resolve(await fsp.realpath(f.root));
+      } catch { /* Unresolved parent must not pretend to exercise a physical rename. */ }
+    }
+    if (exactRootParent) {
       blockedArchive = true;
       throw Object.assign(new Error("simulated post-checkpoint archive EIO"), { code: "EIO" });
     }
