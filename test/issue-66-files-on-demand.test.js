@@ -946,6 +946,81 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
   assert.equal(state.pushes, pushesBefore, "cold recovery may not sign a foreign temp or delete");
 });
 
+test("issue 66: physical post-publish FOD crash retains cold lock and forbids unsigned outbound reconcile", async (t) => {
+  const { root, open, store, state, key } = await setup(t, {
+    "docs/restore.txt": "trusted signed-source recovery bytes",
+  });
+  await open();
+  const target = path.join(root, "docs", "restore.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshot);
+  const beforeStore = JSON.stringify(store.list("alice"));
+  const childProgram = [
+    '"use strict";',
+    'const fs=require("node:fs");',
+    'const fsp=require("node:fs/promises");',
+    'const path=require("node:path");',
+    '(async()=>{',
+    'const input=JSON.parse(process.env.ROOTARK_ISSUE66_CRASH_TEST);',
+    'const {SyncEngine}=require(input.engine);',
+    'const {SyncObjectStore}=require(input.storeModule);',
+    'const store=await new SyncObjectStore(input.storeFile).open();',
+    'const adapter={list:async(id="")=>store.list("alice",id||null),',
+    'listInventory:async()=>({protocolVersion:2,view:"metadata",objects:[],nextCursor:null}),',
+    'push:async()=>{throw Error("unexpected outbound during inbound child")}};',
+    'const client=await new SyncEngine({rootDir:input.root,adapter,deviceId:"device-b",',
+    'keyEpoch:"epoch-1",compartmentId:"private",fileKeyResolver:()=>Buffer.from(input.key,"hex"),',
+    'selectedPaths:["docs"],filesOnDemand:true}).open();',
+    'const operation=store.list("alice").find(x=>x.metadata?.path==="docs/restore.txt");',
+    'if(!operation)throw Error("signed-source record missing");',
+    'const originalRename=fsp.rename;',
+    'fsp.rename=async(source,destination,...args)=>{',
+    'const result=await originalRename(source,destination,...args);',
+    'if(String(source).includes(".tmp-inbound-") &&',
+    'path.resolve(String(destination))===path.resolve(input.target)){',
+    'fs.writeSync(1,"POST_PUBLISH_PHYSICAL_RENAME\\n");',
+    'process.kill(process.pid,"SIGKILL");',
+    'throw Error("native immediate termination unexpectedly returned");',
+    '}',
+    'return result;',
+    '};',
+    'await client.apply(operation);',
+    'process.exit(67);',
+    '})().catch(e=>{fs.writeSync(2,String(e.stack||e));process.exit(68)});',
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["-e", childProgram], {
+    timeout: 15000, encoding: "utf8", maxBuffer: 8192,
+    env: {
+      ...process.env,
+      ROOTARK_ISSUE66_CRASH_TEST: JSON.stringify({
+        engine: path.join(__dirname, "..", "sync-client", "rootark-sync-engine.js"),
+        storeModule: path.join(__dirname, "..", "src", "routes", "sync.js"),
+        storeFile: path.join(path.dirname(root), "objects.json"),
+        root, target, key: key.toString("hex"),
+      }),
+    },
+  });
+  assert.match(child.stdout, /POST_PUBLISH_PHYSICAL_RENAME/,
+    `must reach physical rename before crash, stderr=${child.stderr}`);
+  assert.ok(child.status !== 0 || child.signal,
+    "crash boundary must terminate the separate process without returning");
+  assert.equal(await fsp.readFile(target, "utf8"), "trusted signed-source recovery bytes");
+  assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot,
+    "the original snapshot is physically older than published payload");
+  assert.equal(JSON.stringify(store.list("alice")), beforeStore);
+  // A real abnormal process termination leaves the preexisting root lock.
+  // Cold open MUST stop here; never simulate a custodian or unlink this
+  // security lock from a same-UID/SID writable path to force a fake replay.
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(state.pushes, 0, "cold replay cannot sign an untracked inbound file as a new CREATE");
+  const diskJournal = JSON.parse(await fsp.readFile(
+    path.join(root, ".rootark-sync-journal.json"), "utf8"));
+  assert.equal(diskJournal.pending.length, 0,
+    "failed cold admission cannot enqueue a fresh signed outbound CREATE");
+  assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot);
+  assert.equal(JSON.stringify(store.list("alice")), beforeStore);
+});
+
 test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root marker", async (t) => {
   const { root, adapter, key } = await setup(t, {});
   await fsp.mkdir(root, { recursive: true });
