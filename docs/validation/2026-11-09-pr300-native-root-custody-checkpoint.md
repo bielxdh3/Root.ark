@@ -1750,9 +1750,15 @@ the tests intercepted their actual `rm`/`unlink` calls **before**
 data loss: **RED 2 FAIL per OS**.
 
 Child `a36e4ec1f10b73a3f447f68dfd9281a3064c68e5` removes
-those two error-path cleanups. A failed/indeterminate journal or
-snapshot publication preserves the previously committed state
-and leaves the orphan `.tmp` inert, not a replay authority.
+those two error-path cleanups. **For the injected failure before
+the rename publishes**, the previously committed journal/snapshot
+remains unchanged, while the replaced `.tmp` name stays inert
+and never becomes replay authority. A failure **after** a successful
+rename (for example while syncing a directory) can instead leave
+the newly published target installed with durability indeterminate;
+the journal's `journalCommitted` branch explicitly distinguishes
+that case. Neither scenario authorizes cleaning an uncertain
+temporary by its mutable pathname.
 Two default root temp prefixes were added to the internal namespace,
 and a separate observed **RED** showed a former `scanFiles()`
 would include a genuine failed snapshot temp as ordinary user
