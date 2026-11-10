@@ -2094,3 +2094,58 @@ rollback custody, native identity-bound removal with safe retirement,
 Windows 10 CFAPI and true crash/powercut evidence. PR #228 was found
 already CLOSED without merge since 2026-11-02, and was not touched.
 **Merge NO-GO. Release NO-GO. RootSession fail-closed.**
+
+### 2026-11-10 continuation — unnamed native stage and physical pre/post-link process crashes
+
+The W3 Linux native lab's visible-staged mode at `29ccf0da` used a
+retained source descriptor and native no-replace `linkat`, but left the
+original stage alias with `nlink=2`; its generic native read correctly
+rejects the published alias and cleanup by stage pathname would be
+unsafe under a same-UID writer. This did **not** solve the PR #300
+operational FOD overwrite P2 or enable native `RootSession`.
+
+Isolated code candidate `03b65966f13d29cdf4b0a7e7d91ac2049ca26cb0`
+(parent `8fe2e29d28de32db865b4318246dd68ab2e6e58a`) adds a
+**separately opt-in, test-only** Linux `O_TMPFILE | O_RDWR` stage under
+the retained ext4 directory FD. It deliberately omits `O_EXCL`, which
+would prevent later linking of the anonymous inode. Original bytes
+are written and fsynced on the exact retained descriptor, a visible
+PREPARED journal is written and its directory fsynced, and publication
+uses no-replace `linkat` via `/proc/self/fd/N` with `AT_SYMLINK_FOLLOW`
+relative to the pinned directory. The published inode has **nlink=1**;
+no cleanup of a mutable stage name is necessary. Same-UID in-place
+modification, hostile ancestor substitution and independently
+verified root custody remain unproved. Ordinary public `RootSession`
+activation/authority still throws and never loads this addon.
+
+A new anonymous-stage test was **RED on the parent** (the staged name
+was physically visible), and was **GREEN on `03b65966`**. Additional
+GREEN tests prove native `EEXIST` preserves the foreign destination,
+keeps the transaction terminal, and does not create COMMIT; real
+separate Node22 child processes exit with code 74 after PREPARE/before
+publication and code 73 after link+directory fsync/before COMMIT.
+After the first exit there is only PREPARED, with no named stage or
+destination; after the second there is published nlink1 data and
+PREPARED, but **no COMMIT**. Cold inspection is intentionally
+non-authorizing and does not claim any recovered operation. These are
+hard process exits, **not** physical power loss; no owner-signed
+external antirollback witness is available.
+
+Physical incremental verification for `03b65966`: **Ubuntu WSL
+Node22/ext4, native W3 + RootSession contract: 27 PASS, 3 SKIP,
+0 FAIL** (16,385-entry opt-in stress not rerun). **Windows Node22/NTFS:
+RootSession contract 8 PASS, 0 FAIL**, because the modified C addon is
+Linux-only. Node syntax and diff whitespace checks passed. SOURCE
+review of this exact SHA is separate and required before integration.
+
+The operational FOD late-target `rename(temp,target)` overwrite RED
+remains **unresolved** in an isolated worktree; using JS `link+unlink`
+would reintroduce a foreign deletion race, retaining the alias would
+fail FOD single-link admission, and direct target `wx` exposes partial
+content before durable commit. A production-quality implementation
+needs native HANDLE/FD-bound no-replace publication on both platforms,
+trusted ancestor/writer isolation, ordered durable recovery, and an
+independent cold reacquisition and monotonic rollback authority. The
+CodeQL formal HEAD check is still absent because the current stacked
+PR base is not in the base CodeQL workflow's `pull_request` filter.
+**Merge NO-GO; release NO-GO.**
