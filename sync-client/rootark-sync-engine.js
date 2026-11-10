@@ -2181,10 +2181,15 @@ class SyncEngine {
           await new Promise((resolve) => lease.idleWaiters.push(resolve));
         }
         lease.active = false;
-        // A returned callback is not success when one of the operations it
-        // ABANDONED later rejects. Record identity at callback completion,
-        // retain the OS lock on ambiguous failure and propagate its error.
-        const failedDetached = detachedAtReturn.find((ticket) => lease.failures.has(ticket));
+        // A failed child can settle and leave inFlight BEFORE the owner
+        // callback returns. A snapshot of *active* tickets alone would
+        // silently lose that error and authorize release of the real lock.
+        // When the owner claims success, fail closed on any recorded child
+        // failure (including an already-settled one); otherwise retain the
+        // lock for children that were still detached when the owner failed.
+        const failedDetached = ownerFulfilled
+          ? lease.failures.keys().next().value
+          : detachedAtReturn.find((ticket) => lease.failures.has(ticket));
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.

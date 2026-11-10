@@ -1550,6 +1550,42 @@ test("issue 66: an unawaited outbound adapter failure cannot make the physical l
   assert.equal(state.pushes, 0, "the fixture's real remote writer must not execute");
 });
 
+test("issue 66: an already-settled unawaited private retry failure still blocks the owner's success", async (t) => {
+  const { root, open, store, state, adapter } = await setup(t, {
+    "docs/restore.txt": "signed remote retry failure",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const lock = path.join(root, ".rootark-sync.lock");
+  const originalPush = adapter.push;
+  let entered;
+  const pushEntered = new Promise((resolve) => { entered = resolve; });
+  adapter.push = async () => {
+    entered();
+    throw Object.assign(new Error("remote commit has unknown outcome"), { code: "EIO" });
+  };
+  let unawaited;
+  try {
+    const owner = client.withMutationLock(async () => {
+      unawaited = client.retryPush(operation);
+      await pushEntered;
+      // The rejected private promise FINISHES before the owner callback
+      // returns. Its ticket is no longer in the active inFlight set.
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+    await assert.rejects(owner, { code: "EIO" },
+      "a failed private operation must not vanish when its ticket settled early");
+    await assert.rejects(unawaited, { code: "EIO" });
+  } finally {
+    adapter.push = originalPush;
+  }
+  assert.equal(await exists(lock), true,
+    "a detached failed remote request must keep the real physical lock");
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
 test("issue 66: native-required private pull, push, enqueue and prune deny before reading or mutating", async (t) => {
   const { root, open, state, store } = await setup(t, {
     "docs/restore.txt": "authenticated remote bytes",
