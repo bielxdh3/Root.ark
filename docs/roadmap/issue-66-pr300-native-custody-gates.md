@@ -144,3 +144,24 @@ antirollback witness, Windows 10/CFAPI validation and real powercut.
 Formal CodeQL on the current stacked PR head still lacks a triggering
 base-workflow run. The new W26 candidate requires SOURCE GO of the exact
 SHA before integration or publication. **Merge NO-GO; release NO-GO.**
+
+### W26 follow-up — explicit PREPARE → native rename → COMMIT interruption windows
+
+Local child `caa6eb52` (parent docs `827ba856`) extends the same disposable
+NTFS HANDLE-only lab with a separate opt-in hard-stop flag. The positive
+`TXN_COMPLETE` sequence exclusively writes/flushed `prepared.bin`, publishes
+the original opened stage HANDLE without replacing the target, then
+exclusively writes/flushed `commit.bin`. A PowerShell child process is killed
+with native `TerminateProcess(exit=74)` **before** the rename: staged bytes
+and PREPARED survive, with no published target or COMMIT. Another isolated
+child is killed with `TerminateProcess(exit=73)` **after** native rename,
+but before COMMIT: the original staged name is gone, published bytes and
+PREPARED survive, and COMMIT is absent. The native process exit is not a
+powercut; Windows NTFS directory metadata durability and cold replay remain
+unproved. Physical Windows Node22 W26 **9 PASS**, with **8 PASS** for the
+separate RootSession contract in the preceding regression cycle; no 16,385
+seeding. Windows-only W26 tests skip on WSL. Neither the PREPARED nor the
+COMMIT marker is a trusted owner-signed recovery authority; this lab has
+**no recovery engine**. Exact `caa6eb52` SOURCE approval remains mandatory
+before FF/push. Product FOD late-destination overwrite, external root
+custody, antirollback, hosted CodeQL and Windows 10 CFAPI remain **NO-GO**.

@@ -2209,3 +2209,40 @@ neither native lab is wired to production. The `d221765d` cumulative
 SHA requires exact independent SOURCE GO before FF/push. Hosted CodeQL
 is still absent for the current Draft head due the PR stack-base
 workflow trigger. **Merge NO-GO; release NO-GO.**
+
+### 2026-11-10 continuation — W26 Windows native PREPARE/COMMIT process stop boundary
+
+After the reviewed 5-case W26 original HANDLE identity/no-replace
+fixture, candidate `caa6eb52057f3dd5dd8b0ae92c1b96dd1e9fb0e1`
+(parent `827ba8569a7544486d09d9f51f78c80b8712488c`) adds a
+**separate explicit opt-in** native process-stop mode. The completed
+fixture now writes/flushed a fixed exclusive PREPARED marker, publishes
+an already-flushed file by `NtSetInformationFile` on the **original
+opened file HANDLE**, and only then writes/flushed the exclusive
+COMMIT marker; a fresh `TXN_COMPLETE` test establishes that positive
+ordering. No ordinary FOD SyncEngine mutation was added or authorized.
+
+Two new physical subprocess tests on Windows Node22/NTFS exercise the
+interruption boundaries. `TerminateProcess(GetCurrentProcess(),74)`
+after file and PREPARED flush but **before** the native rename leaves
+`stage.bin` and PREPARED, but no published file or COMMIT. Native
+`TerminateProcess(...,73)` **after** the successful no-replace rename
+but **before** COMMIT leaves the published bytes, no original stage
+name, PREPARED and no COMMIT. Neither test performs a cold authoritative
+recovery; the absence of COMMIT is a physical observation, not a
+signed authorization policy. The child PID belongs to a disposable
+PowerShell lab process, never the user server or parent test process.
+
+Combined W26 Windows Node22/NTFS: **9 PASS / 0 FAIL** (four earlier
+positive/adversarial cases, disabled/populated fixture, two abrupt exits,
+positive completed marker and hard-exit opt-in refusal). The separate
+RootSession contract had **8 PASS** on Windows Node22 in the same
+incremental cycle, and W26 remains Windows-only on WSL. No 16,385
+entry stress was repeated. Windows NTFS crash/powercut namespace
+durability, cold root attestation, CFAPI, safe deletion and signed
+monotonic rollback have **not** been demonstrated. The existing W26
+root comes from user-controlled LocalAppData, not an independently
+trusted custodian. Product FOD overwrite P2 remains RED in an isolated
+worktree; hosted CodeQL on the current stacked PR head is absent.
+Candidate `caa6eb52` requires an independent exact SOURCE GO before
+integration or publication. **Merge NO-GO; release NO-GO.**
