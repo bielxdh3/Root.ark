@@ -68,8 +68,12 @@ async function enforceEverFodRootMode(rootDir, filesOnDemand) {
     // This does not establish independent parent custody against same-SID ABA.
     let markerHandle;
     try {
+      // A hostile same-user writer may substitute a FIFO with no writer.
+      // O_NONBLOCK makes open fail/return immediately for that special file;
+      // the held-descriptor regular-file check below then fails closed.
       markerHandle = await fsp.open(markerPath,
-        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_NONBLOCK || 0));
     } catch (error) {
       if (error.code === "ENOENT") {
         // A dangling symlink is NOT a virgin root. Only a genuinely absent

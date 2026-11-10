@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -620,8 +621,8 @@ test("issue 66: a FOD root retains its mode across non-FOD restart and custom sn
   const snapshotPath = path.join(root, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotPath);
   const markerPath = path.join(root, ".rootark-sync-ever-fod");
-  assert.equal((await fsp.stat(markerPath)).isFile(), true,
-    "FOD opening must durably mark the ROOT before any other sync mutations");
+  // Reading the expected exact marker already proves it is present. Avoid a
+  // separate pathname stat/read race in this disposable physical fixture.
   assert.equal(await fsp.readFile(markerPath, "utf8"), "rootark-sync-ever-fod-v1\n");
   const nonFod = new SyncEngine({ rootDir: root, adapter,
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
@@ -807,6 +808,46 @@ test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root mar
     fileKeyResolver: () => key,
   }).open(), { code: "root_mode_marker_invalid" });
   assert.equal(await exists(path.join(root, ".rootark-sync-index.json")), false);
+});
+
+test("issue 66: FIFO root marker fails closed in bounded cold subprocess opens and later legitimate recovery", { skip: process.platform !== "linux" }, async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-ever-fod-fifo-"));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, ".rootark-sync-ever-fod");
+  const made = spawnSync("/usr/bin/mkfifo", [marker], { timeout: 1500, encoding: "utf8" });
+  assert.equal(made.status, 0, made.stderr);
+  const childSource = [
+    "const { SyncEngine } = require(process.argv[1]);",
+    "const rootDir = process.argv[2];",
+    "const filesOnDemand = process.argv[3] === 'fod';",
+    "new SyncEngine({ rootDir, deviceId: 'fifo-test-device', keyEpoch: 'epoch-1',",
+    "compartmentId: 'private', filesOnDemand, fileKeyResolver: () => Buffer.alloc(32),",
+    "adapter: { list: async () => [], listInventory: async () => ({protocolVersion:2, view:'metadata', objects:[], nextCursor:null}), push: async () => ({status: 201}) } }).open()",
+    ".then(() => { process.stdout.write('OPEN_OK\\n'); process.exit(0); })",
+    ".catch((error) => { process.stdout.write('DENIED:' + error.code + '\\n'); process.exit(2); });",
+  ].join("\n");
+  const reopen = (mode) => spawnSync(process.execPath,
+    ["-e", childSource, require.resolve("../sync-client/rootark-sync-engine"), root, mode],
+    { timeout: 8000, encoding: "utf8" });
+  for (const mode of ["legacy", "fod"]) {
+    const denied = reopen(mode);
+    assert.equal(denied.error?.code, undefined, `FIFO marker must not hang ${mode} cold open`);
+    assert.equal(denied.status, 2, denied.stderr);
+    assert.match(denied.stdout, /DENIED:root_mode_marker_invalid/);
+  }
+  assert.equal(await fsp.stat(marker).then((s) => s.isFIFO()), true);
+  assert.equal(await fsp.stat(path.join(root, ".rootark-sync-index.json")).then(() => true, () => false), false);
+  await fsp.unlink(marker);
+  const recovered = reopen("fod");
+  assert.equal(recovered.error?.code, undefined);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /OPEN_OK/);
+  const coldReopen = reopen("fod");
+  assert.equal(coldReopen.status, 0, coldReopen.stderr);
+  assert.match(coldReopen.stdout, /OPEN_OK/);
+  const downgrade = reopen("legacy");
+  assert.equal(downgrade.status, 2, downgrade.stderr);
+  assert.match(downgrade.stdout, /DENIED:root_mode_fod_required/);
 });
 
 test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes", async (t) => {

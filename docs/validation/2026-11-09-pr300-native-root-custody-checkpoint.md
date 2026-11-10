@@ -875,3 +875,48 @@ atomic no-follow operations. Separate process/cold boot, ancestor A→B→A,
 independent monotonic authority, image/DLL provenance, power-cut and
 hosted formal CodeQL remain outstanding. The PR #300 remote remains
 OPEN/Draft and no deployment or cutover was performed.
+
+### New isolated marker-handle and FIFO hardening (awaiting exact-SHA review)
+
+The published `d3a91c92` hosted CodeQL run reported **four new high alerts**:
+`sync-client/rootark-sync-engine.js` marker `lstat`/read (:77), POSIX
+trash `lstat`/open (:706-707), and two test-only pathname stat/read
+sites (`issue-66-files-on-demand.test.js` :625 and
+`issue-66-independent-owner-posix-root.test.js` :167). Hosted functional
+jobs passed; **formal CodeQL FAILED**. No hosted run of the following
+unpublished fixes exists.
+
+The marker laboratory initially replaced path-based `lstat` and
+`readFile` with a retained file descriptor and `fstat`, rejecting invalid
+type, unexpected link count, changes in descriptor/path identity and
+contents before authorizing cooperative root mode. Independent review
+then found a **P1**: opening a FIFO without a writer with `O_RDONLY`
+and `O_NOFOLLOW` could block forever **before** checking file type.
+Real WSL Node22 subprocess on a physical FIFO reproduced **RED**
+(`ETIMEDOUT`). The correction adds Linux `O_NONBLOCK` during open,
+retains post-open descriptor verification, and denies non-regular files
+with `root_mode_marker_invalid`. A physical FIFO regression launches
+bounded fresh Node22 subprocesses for both non-FOD and FOD paths,
+confirms refusal with no snapshot creation, then exercises controlled
+fixture removal, valid FOD startup, cold reopening, and legacy-mode
+downgrade rejection. The bounded FIFO run on WSL with
+`TMPDIR=/home/bielx` (ext4) finished **1 PASS/0 FAIL**. It does **not**
+prove any protection against an untrusted actor subsequently erasing
+the marker or reverting its parent.
+
+In the same isolated worktree, a no-follow marker hardlink regression
+reproduced **RED** before descriptor hardening; later Windows Node22
+FOD+RootSession tests gave **43 PASS / 1 SKIP**, and the WSL Node22
+counterpart gave **44 PASS / 0 SKIP**. The privileged root-owned ext4
+laboratory was **2 PASS** with its *existing* fixture and unprivileged
+process; no privileged provisioning script was rerun and no fixture was
+deleted. The owner-marker assertion now reads from its previously
+retained no-follow descriptor. These counts were obtained on the
+working tree, not yet from a published/reviewed SHA. Exact final
+commit, independent SOURCE review and composed CI remain required.
+
+**Safety boundary remains:** the local marker is not an independent
+monotonic custody authority, JS file handles do not provide a verified
+rooted create/rename/unlink/rollback transaction, and same-SID
+A→B→A, power-loss durability, independent image provenance and native
+Windows CFAPI custody are still NO-GO. `RootSession` stays closed.

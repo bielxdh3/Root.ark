@@ -60,7 +60,12 @@ test("#66 root-owned ext4 parent denies same-UID substitution across fresh nativ
   assert.equal(rootStats.uid, 0);
   assert.ok(rootStats.isDirectory() && !rootStats.isSymbolicLink());
   assert.equal(rootStats.mode & 0o777, 0o555);
-  const markerStats = fs.lstatSync(unicodeMarker);
+  // Retain the exact no-follow marker descriptor for the entire concurrent
+  // attack. Do not re-open its pathname after the root-identity checks.
+  const markerFd = fs.openSync(unicodeMarker,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  t.after(() => fs.closeSync(markerFd));
+  const markerStats = fs.fstatSync(markerFd);
   assert.equal(markerStats.uid, 0);
   assert.ok(markerStats.isFile() && !markerStats.isSymbolicLink());
   assert.equal(markerStats.mode & 0o777, 0o444);
@@ -161,9 +166,12 @@ test("#66 root-owned ext4 parent denies same-UID substitution across fresh nativ
   assert.equal(second.status, 0, "cold-open native verification failed");
   assert.equal(second.stdout, expected);
   assert.equal(second.stderr, "");
+  // The native child is the independently rooted read authority; the held
+  // canary fd is only a physical continuity assertion, not A→B→A proof.
+  assert.equal(fs.fstatSync(markerFd).isFile(), true);
+  assert.equal(fs.readFileSync(markerFd, "utf8"), "TRUSTED_ROOT_CANARY_V1\n");
   const after = fs.lstatSync(owned);
   assert.equal(after.dev, rootStats.dev);
   assert.equal(after.ino, rootStats.ino);
-  assert.equal(fs.readFileSync(unicodeMarker, "utf8"), "TRUSTED_ROOT_CANARY_V1\n");
   t.diagnostic("Owned fixture and unprivileged build directory deliberately retained; no cleanup performed");
 });
