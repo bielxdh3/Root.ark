@@ -654,6 +654,132 @@ test("issue 66: Linux genesis stage must not write through a replaced trash dire
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: staged genesis creation never overwrites a competing reserved head", async (t) => {
+  const f = await fixture(t, "genesis-stage-atomic-no-replace");
+  const stage = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
+  const foreign = Buffer.from("FOREIGN_STAGED_HEAD_MUST_STAY");
+  const sync = await f.create(f.root, ["private"]);
+  const originalRename = fsp.rename;
+  const originalLink = fsp.link;
+  let injected = false;
+  let attemptedOverwrite = false;
+  const isStagePublish = (source, destination) =>
+    path.basename(String(destination)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(source))
+        .startsWith(".rootark-eviction-genesis-head.json.tmp-");
+  const inject = async (source, destination) => {
+    if (!injected && isStagePublish(source, destination)) {
+      injected = true;
+      await fsp.writeFile(stage, foreign, { flag: "wx" });
+    }
+  };
+  fsp.rename = async (source, destination, ...args) => {
+    await inject(source, destination);
+    if (isStagePublish(source, destination)) {
+      // A normal rename would destroy the competing file. Intercept the
+      // actual original syscall boundary BEFORE any foreign data loss.
+      attemptedOverwrite = true;
+      throw Object.assign(new Error("destructive stage rename intercepted"), { code: "EACCES" });
+    }
+    return originalRename(source, destination, ...args);
+  };
+  fsp.link = async (source, destination, ...args) => {
+    await inject(source, destination);
+    return originalLink(source, destination, ...args);
+  };
+  const before = f.outbound.length;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.rename = originalRename;
+    fsp.link = originalLink;
+  }
+  assert.equal(injected, true, "the real genesis stage publication boundary must be reached");
+  assert.equal(attemptedOverwrite, false, "a staging writer must never attempt a destructive rename");
+  assert.equal(failure?.code, "invalid_snapshot",
+    "an existing staged genesis must fail closed, not be silently replaced");
+  assert.match(failure.message, /Existing staged genesis blocks exclusive creation/);
+  assert.deepEqual(await fsp.readFile(stage), foreign,
+    "the originally competing staged-head bytes must stay untouched");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: hard exit after exclusive genesis stage link leaves ambiguous names fail-closed", {
+  skip: !["linux", "win32"].includes(process.platform)
+    && "requires actual Linux ext4 or Windows NTFS linked staging",
+}, async (t) => {
+  const f = await fixture(t, "genesis-stage-double-link-crash");
+  const childSource = String.raw`
+"use strict";
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const { SyncEngine } = require(process.argv[1]);
+const { SyncObjectStore } = require(process.argv[2]);
+const originalLink = fsp.link;
+fsp.link = async (...args) => {
+  const result = await originalLink(...args);
+  if (path.basename(String(args[0])).startsWith(".rootark-eviction-genesis-head.json.tmp-")
+    && path.basename(String(args[1])) === ".rootark-eviction-genesis-head.json") {
+    process.exit(74); // genuine hard exit after first link, before temp unlink
+  }
+  return result;
+};
+(async () => {
+  const store = await new SyncObjectStore(process.argv[4]).open();
+  const sync = await new SyncEngine({
+    rootDir: process.argv[3],
+    adapter: {
+      async list(objectId = "") { return store.list("alice", objectId || null); },
+      async push() { process.exit(94); },
+    },
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    excludedPaths: ["private"], fileKeyResolver: () => Buffer.from(process.argv[5], "base64"),
+  }).open();
+  await sync.syncOnce();
+  process.exit(92);
+})().catch((error) => {
+  process.stderr.write(String(error?.message ?? error));
+  process.exit(93);
+});
+`;
+  const child = spawn(process.execPath, [
+    "-e", childSource, require.resolve("../sync-client/rootark-sync-engine"),
+    require.resolve("../src/routes/sync"), f.root, f.storePath, f.key.toString("base64"),
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+  let err = "";
+  child.stderr.on("data", (bytes) => { err += bytes.toString(); });
+  const exit = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill(); reject(new Error("stage link hard-exit child timeout"));
+    }, 30000);
+    child.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
+    child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+  });
+  assert.equal(exit, 74, `real child must exit exactly after staging link: ${err}`);
+  const trash = path.join(f.root, ".rootark-trash");
+  const stage = path.join(trash, ".rootark-eviction-genesis-head.json");
+  const temps = (await fsp.readdir(trash)).filter((name) =>
+    name.startsWith(".rootark-eviction-genesis-head.json.tmp-"));
+  assert.equal(temps.length, 1, "post-link hard crash must retain a unique temp name");
+  const temp = path.join(trash, temps[0]);
+  assert.deepEqual(await fsp.readFile(stage), await fsp.readFile(temp));
+  assert.equal((await fsp.stat(stage)).nlink, 2);
+  assert.equal((await fsp.stat(temp)).nlink, 2);
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).version, 1,
+    "a crash during genesis stage must not silently upgrade the durable snapshot");
+  // This lock belongs exclusively to the dead disposable fixture process.
+  await fsp.rmdir(path.join(f.root, ".rootark-sync.lock"));
+  const before = f.outbound.length;
+  const reopened = await f.create(f.root, ["private"]);
+  await assert.rejects(reopened.syncOnce(), (error) =>
+    error?.code === "invalid_snapshot" && /Unreadable staged eviction genesis head/.test(error.message));
+  assert.deepEqual(await fsp.readFile(stage), await fsp.readFile(temp),
+    "a refused restart must preserve both original stage names");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66: Linux genesis promotion cannot overwrite a foreign ledger head", {
   skip: process.platform !== "linux" && "Linux held ledger descriptor required",
 }, async (t) => {

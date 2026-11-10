@@ -699,6 +699,79 @@ async function createDurableEvictionRecord(filePath, value) {
   } finally { await handle.close(); }
   await fsyncEvictionDirectory(path.dirname(filePath));
 }
+// Unlike durableJson's replaceable rename, a staged genesis is a reserved
+// authority-bearing name: a competing file must NEVER be overwritten after
+// the earlier absence preflight. Sync a unique temporary, publish by atomic
+// no-replace hard link, sync the containing directory on Linux, then retire
+// only our original temp inode. A hard exit after link leaves nlink=2 and
+// intentionally blocks staged-genesis recovery instead of manufacturing GO.
+// This remains a *legacy cooperative* fence, not trusted same-UID/SID custody.
+async function createDurableExclusiveGenesisStage(filePath, value) {
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_SYNC || 0);
+  let handle;
+  let original;
+  let linked = false;
+  try {
+    handle = await fsp.open(temporary, flags, 0o600);
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.sync();
+    original = await handle.stat({ bigint: true });
+    if (!original.isFile() || original.isSymbolicLink()
+      || original.ino === 0n || original.nlink !== 1n || original.size > 8192n) {
+      fail("Unsafe staged genesis temporary inode", "invalid_snapshot");
+    }
+    await handle.close();
+    handle = null;
+    const namedTemp = await fsp.lstat(temporary, { bigint: true });
+    if (!namedTemp.isFile() || namedTemp.isSymbolicLink()
+      || !sameFileVersion(original, namedTemp)) {
+      fail("Staged genesis temporary changed before publication", "invalid_snapshot");
+    }
+    try { await fsp.link(temporary, filePath); }
+    catch (error) {
+      if (error.code === "EEXIST") {
+        fail("Existing staged genesis blocks exclusive creation", "invalid_snapshot");
+      }
+      throw error;
+    }
+    linked = true;
+    const verifyLinked = async () => {
+      const stage = await fsp.lstat(filePath, { bigint: true });
+      const temp = await fsp.lstat(temporary, { bigint: true });
+      if (!stage.isFile() || stage.isSymbolicLink()
+        || !temp.isFile() || temp.isSymbolicLink()
+        || !sameFileIdentity(original, stage)
+        || !sameFileIdentity(original, temp)
+        || stage.size !== original.size || temp.size !== original.size
+        || stage.mtimeNs !== original.mtimeNs || temp.mtimeNs !== original.mtimeNs
+        || stage.nlink !== 2n || temp.nlink !== 2n) {
+        fail("Indeterminate exclusive staged genesis publication", "invalid_snapshot");
+      }
+    };
+    await verifyLinked();
+    await fsyncEvictionDirectory(path.dirname(filePath));
+    await verifyLinked();
+    await fsp.unlink(temporary);
+    await fsyncEvictionDirectory(path.dirname(filePath));
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    // Never erase an indeterminate two-name publication. For a pure EEXIST
+    // collision only, remove our own unlinked temporary if it is still the
+    // original unique inode; if identity changed, preserve it for inspection.
+    if (!linked && original) {
+      try {
+        const current = await fsp.lstat(temporary, { bigint: true });
+        if (current.isFile() && !current.isSymbolicLink()
+          && current.nlink === 1n && sameFileIdentity(original, current)) {
+          await fsp.unlink(temporary);
+        }
+      } catch { /* the uncertain temporary must not authorize another write */ }
+    }
+    throw error;
+  }
+}
 async function openEvictionLedger(rootDir, create = false) {
   const directory = evictionLedgerDirectory(rootDir);
   if (process.platform === "linux") {
@@ -1035,7 +1108,8 @@ async function createStagedEvictionGenesis(rootDir) {
       };
       await verify();
       const head = { epoch: crypto.randomUUID(), sequence: 0, digest: EVICTION_LEDGER_ZERO };
-      await durableJson(`/proc/self/fd/${heldTrash.fd}/${EVICTION_GENESIS_STAGE}`, head);
+      await createDurableExclusiveGenesisStage(
+        `/proc/self/fd/${heldTrash.fd}/${EVICTION_GENESIS_STAGE}`, head);
       await verify();
       return { trash, file: path.join(trash, EVICTION_GENESIS_STAGE), head };
     } finally {
@@ -1054,9 +1128,10 @@ async function createStagedEvictionGenesis(rootDir) {
   }
   const head = { epoch: crypto.randomUUID(), sequence: 0, digest: EVICTION_LEDGER_ZERO };
   const file = path.join(trash, EVICTION_GENESIS_STAGE);
-  // durableJson fsyncs temporary bytes then atomically renames and fsyncs
-  // the parent on POSIX. A crash before rename leaves no visible genesis.
-  await durableJson(file, head);
+  // The staged authority name must never replace a concurrently created
+  // head. A hard-link publication with two names is fail-closed if crashed
+  // before temporary-name retirement.
+  await createDurableExclusiveGenesisStage(file, head);
   return { trash, file, head };
 }
 async function promoteStagedEvictionGenesis(rootDir, staged) {
