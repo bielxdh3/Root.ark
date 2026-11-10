@@ -166,6 +166,51 @@ test("issue 66: previously tracked control-temp names must never become signed D
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: nested historically tracked control-temp path cannot generate signed DELETE", async (t) => {
+  const f = await fixture(t, "historical-nested-control-temp-user-names");
+  const active = await f.create(f.root, []);
+  const names = [
+    "docs/.rootark-sync-index.json.tmp-legacy-nested-user-file",
+    "docs/.rootark-sync-journal.json.tmp-legacy-nested-user-file",
+  ];
+  const foreign = Buffer.from("REAL_OLD_NESTED_USER_FILE_MUST_NOT_BECOME_REMOTE_DELETE");
+  await fsp.mkdir(path.join(f.root, "docs"), { recursive: true });
+  const prior = active.snapshot.files["PRIVATE/secret.txt"];
+  assert.ok(prior && !prior.deleted);
+  for (const relative of names) {
+    await fsp.writeFile(path.join(f.root, relative), foreign, { flag: "wx" });
+    active.snapshot.files[relative] = {
+      ...prior,
+      objectId: "object-" + crypto.randomUUID().replace(/-/g, ""),
+      fileId: "file-" + crypto.randomUUID().replace(/-/g, ""),
+    };
+  }
+  await active.persistSnapshot();
+  const before = f.outbound.length;
+  let attempted = false;
+  let error;
+  try {
+    const cold = await f.create(f.root, []);
+    const originallyAuthorized = cold.assertOutgoingAuthorized.bind(cold);
+    cold.assertOutgoingAuthorized = async (operation, enqueue) => {
+      if (operation.operation === "delete" && names.includes(operation.metadata?.path)) {
+        attempted = true;
+        // Stop a would-be tombstone before durable journal admission.
+        throw Object.assign(new Error("nested historical tombstone intercepted"), { code: "EACCES" });
+      }
+      return originallyAuthorized(operation, enqueue);
+    };
+    await cold._reconcileLocal();
+  } catch (cause) { error = cause; }
+  assert.equal(attempted, false, "no nested historical user file may generate signed DELETE");
+  assert.equal(error?.code, "invalid_snapshot", "legacy nested control name must fail closed");
+  for (const relative of names) {
+    assert.deepEqual(await fsp.readFile(path.join(f.root, relative)), foreign);
+    assert.throws(() => validatePortableRelativePath(relative), { code: "unsafe_path" });
+  }
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66: configured root-local snapshot and journal filenames and orphans stay internal", async (t) => {
   const f = await fixture(t, "custom-root-control-filenames");
   const snapshotPath = path.join(f.root, "custom-root-index.json");

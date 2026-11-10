@@ -40,10 +40,13 @@ const RESERVED_CONTROL_TEMP_PREFIXES = Object.freeze([
   ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
 ]);
 function isReservedHistoricalControlTemp(relative) {
-  return typeof relative === "string" && !relative.includes("/")
-    && !relative.includes("\\")
-    && RESERVED_CONTROL_TEMP_PREFIXES.some((prefix) =>
-      relative.toLowerCase().startsWith(prefix));
+  // The portable path validator reserves these prefixes in EVERY segment,
+  // not just at root. Historical legitimate nested names therefore need
+  // the same explicit fail-closed migration fence, never implicit deletion.
+  return typeof relative === "string"
+    && relative.split(/[\\/]/).some((segment) =>
+      RESERVED_CONTROL_TEMP_PREFIXES.some((prefix) =>
+        segment.toLowerCase().startsWith(prefix)));
 }
 function internalRootMetadata(rootDir, snapshotPath, journalPath) {
   const names = [...INTERNAL_NAMES];
