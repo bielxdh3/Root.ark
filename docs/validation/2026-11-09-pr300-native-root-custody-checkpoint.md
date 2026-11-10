@@ -1462,3 +1462,14 @@ The remote PR remains OPEN/Draft at the last verified `d3a91c92`
 with formal CodeQL **FAILURE (four HIGH on that old remote SHA)**;
 local SOURCE GOs are not hosted CodeQL clearance.
 **RootSession stays fail-closed. Product RELEASE NO-GO.**
+
+The combined local code+documentation checkpoint
+`5c47880611af28e46e1adb88fe67c8618040e796` received an additional
+focused full-file regression of
+`test/issue-66-eviction-ledger-sentinel-p1.test.js`: **Windows Node22/
+NTFS 11 PASS, 1 Linux-only SKIP, 0 FAIL**; **Ubuntu WSL Node22/ext4
+9 PASS, 3 Windows-only SKIP, 0 FAIL**. These tests covered missing
+active ledger, inconsistent epoch/required markers, failed compaction,
+legitimate restart, archive cold denial and the two Windows swap
+scenarios, but were **not** the separate 16,385-entry stress battery.
+No hosted CI or external custodial provisioning was attempted.
