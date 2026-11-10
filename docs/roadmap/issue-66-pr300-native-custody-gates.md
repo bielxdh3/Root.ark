@@ -108,3 +108,39 @@ remote merge, deploy, cutover, force-push, `Root/main` mutation, root-owned
 fixture cleanup, or privileged reprovisioning was authorized in this round.
 Use local Windows Node22/NTFS and Ubuntu WSL Node22/ext4 tests before a
 future authorized GitHub Actions run to conserve metered Actions minutes.
+
+## 2026-11-10 W26 — Windows NTFS source-HANDLE no-replace publication (laboratory only)
+
+The Linux W3 `O_TMPFILE`/held-FD lab is **not** a Windows backend. The new
+Windows W26 opt-in laboratory candidate (`0cc48337` + `d221765d`) instead
+uses `NtCreateFile` with `RootDirectory` and `FILE_CREATE` to hold the
+original staged file HANDLE, writes and calls `FlushFileBuffers`, then uses
+`NtSetInformationFile(FileRenameInformation, ReplaceIfExists=FALSE)` relative
+to the same held directory HANDLE. No `stat→rename` admission or source
+pathname unlink is treated as atomic authority. Unlike Linux's original
+two-hardlink lab, successful native rename retires the source name without
+creating another hardlink alias. This is still only a fixed-leaf disposable
+fixture in LocalAppData, not a Windows production RootSession.
+
+Physical Windows Node22/NTFS: **5 PASS** for normal original-inode publish,
+exact `STATUS_OBJECT_NAME_COLLISION (0xC0000035)` with foreign destination
+intact, late equal-byte foreign stage substitution leaving the original
+opened HANDLE as the published inode, and replacement of the original root
+path **before** opening the staged child (retained root A receives the
+publication while replacement B remains intact). Disabled and populated
+scratch cases reject without mutation. Combined Windows RootSession
+contract: **8 PASS**. WSL Node22: **5 expected SKIP** for Windows-only lab.
+No 16,385-record stress was repeated. These experiments were sequential
+physical substitutions in user-owned scratch, not simultaneous hostile
+processes, and `ROOT_SWAP` does not prove renaming a directory while its
+child HANDLE is open. The collision code, original `FileIdInfo` and foreign
+bytes were checked, not merely a generic nonzero native error.
+
+**Outstanding gates:** the normal operational SyncEngine FOD path still
+uses replace-capable pathname rename and has an isolated Windows/WSL RED;
+W26 cannot be connected without independently trusted root/ancestor
+custody, same-SID writer exclusion, safe PREPARE/COMMIT and cold replay,
+antirollback witness, Windows 10/CFAPI validation and real powercut.
+Formal CodeQL on the current stacked PR head still lacks a triggering
+base-workflow run. The new W26 candidate requires SOURCE GO of the exact
+SHA before integration or publication. **Merge NO-GO; release NO-GO.**

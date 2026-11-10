@@ -2150,3 +2150,62 @@ independent cold reacquisition and monotonic rollback authority. The
 CodeQL formal HEAD check is still absent because the current stacked
 PR base is not in the base CodeQL workflow's `pull_request` filter.
 **Merge NO-GO; release NO-GO.**
+
+### 2026-11-10 continuation — W26 physical NTFS HANDLE publication, identity and no-clobber
+
+The previously validated W3 native `O_TMPFILE` publication works on
+Linux/ext4 but does not implement Windows CFAPI custody. An isolated
+opt-in Windows W26 proof was added at child `0cc48337f71d8383db1e780279135c7a47a5d3ab`
+of published `5133d86f995a883b72bb401f0e470f42bfb6d5d6`, with
+follow-up `d221765db844e840e66661d5a8738197d6b73467`. The fixture
+is an empty, fixed-pattern LocalAppData child and requires an explicit
+`ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB=1` flag; it is **never** loaded
+by the product `RootSession`. All protected file opens use a retained
+directory HANDLE with native `NtCreateFile(FILE_CREATE)` on fixed names;
+the original source HANDLE is written and flushed before the target is
+published with `NtSetInformationFile(FileRenameInformation,
+ReplaceIfExists=FALSE, RootDirectory=held-directory-HANDLE)`. The
+published target's `FileIdInfo` is required to match the originally
+opened source, with no `lstat→pathname rename` authority or stage-name
+unlink after publication.
+
+Physical Windows Node22/NTFS **5 PASS, 0 FAIL**: normal publication
+retires the original stage name without a second hardlink alias;
+exclusive insertion of an existing foreign target returns exact native
+`STATUS_OBJECT_NAME_COLLISION = 0xC0000035` and leaves source and
+foreign bytes intact; a physically renamed-away stage plus a separate
+*equal-byte* foreign stage name cannot redirect the original opened
+HANDLE; and a directory root pathname replaced by a foreign B
+**before** opening its child file does not redirect publication from
+the held original directory A. PowerShell5.1/C# source uses the NT
+native API after the previously measured Win32 `FileRenameInfo` nonnull
+RootDirectory failure (ERROR_INVALID_PARAMETER 87), without fallback
+to absolute-path rename. A debug-time file sharing failure was
+resolved by opening diagnostic readers with `FileShare.ReadWrite |
+FileShare.Delete`, not by relaxing the native source HANDLE.
+
+The first source review identified a P2 fixture bug in the uncorrected
+`0cc48337`: ordinary `File.WriteAllText` for adversarial file planting
+could truncate a foreign name winning a test-setup race. Corrective
+child `d221765d` uses `FileMode.CreateNew`/`FileShare.None` and flushes
+the planted inode without overwriting any existing name; it also
+requires a fixed local drive and checks exact NTSTATUS instead of
+accepting any native rename error as a valid collision proof. Focused
+Windows Node22 W26 after child: **5 PASS**; Windows RootSession
+contract separately **8 PASS**; WSL Node22 **5 SKIP** (Windows-only
+lab). All fixtures are retained rather than recursively removed by
+mutable pathname. No 16,385-record evidence was repeated.
+
+**Limits:** the root was initially opened from a user-writable
+LocalAppData pathname, so no independent ancestor custody, same-SID
+writer isolation or production identity attestation is demonstrated.
+The ROOT_SWAP exercise occurs before the staged child HANDLE is opened;
+Windows directory moves with a live child HANDLE were denied and are
+not claimed to succeed. There is no W26 PREPARE/COMMIT journal,
+powercut, native cold recovery, Windows 10 CFAPI or signed monotonic
+rollback proof. The still-published operational FOD `fsp.rename` can
+overwrite a foreign destination and remains a documented P2 RED;
+neither native lab is wired to production. The `d221765d` cumulative
+SHA requires exact independent SOURCE GO before FF/push. Hosted CodeQL
+is still absent for the current Draft head due the PR stack-base
+workflow trigger. **Merge NO-GO; release NO-GO.**
