@@ -1264,3 +1264,75 @@ metered usage.
 **Product RELEASE NO-GO.** These exact-source SOURCE GOs authorize
 only the reviewed local legacy hardening. No merge, deploy,
 force-push, cutover, or Root/main mutation occurred.
+
+### 2026-11-10 continuation — genesis publication and orphan archive cold replay
+
+Local child `cc7daca67e73259baba54637f76cc452756d0775` (parent
+`f67c2436`) hardens **legacy Linux** genesis staging and publication:
+`createStagedEvictionGenesis` holds nofollow root and trash descriptors
+while creating and syncing its head; `promoteStagedEvictionGenesis` holds
+root/trash/ledger descriptors, validates the staged head and publishes
+with an **exclusive hard link** rather than a pathname rename which can
+overwrite a foreign `head.json`. It verifies the original inode and
+both parent identities before removing the staged name. On the old
+parent, physical WSL/Node22 directory replacement at the promotion
+boundary **RED**: a foreign `head.json` was overwritten. The new code
+rejected the substituted directory and preserved that foreign head.
+The trash staging substitution also rejected the swapped path with no
+foreign write. Focused physical WSL Node22/ext4 on the child recorded
+**5 PASS/0 FAIL**, including adversarial staging/promotion and legitimate
+hard-crash boundary regressions; the narrow Windows Node22/NTFS recovery
+checks recorded **2 PASS/0 FAIL**. Previously approved 16,385-entry
+physical tests were **not repeated**. A crash after the exclusive link
+but before removing the staged name leaves two linked names and is
+**fail-closed**, not an automatically proven recovery, because the
+root/owner custody is not yet independently trusted.
+
+The further child `b3b5e5916b54b0521d51fe1f74409e1f2fbc9bee`
+(parent `cc7daca6`) closes a distinct cold-replay gap. In the
+prior implementation, a crash after full checkpoint durability
+(snapshot `evictionLedgerRequired=false`) and after renaming the old
+ledger to `.rootark-sync-evictions-archive-*` could cause a later
+`SyncEngine.open()` to ignore the orphan archive. A physical
+WSL/Node22 test applied to the original parent gave **RED 1 FAIL**
+(`Missing expected rejection`): cold open proceeded despite orphan
+PREPARE evidence. The new Linux-only guard enumerates the held root
+by FD before replay, refuses any reserved archive-name variant,
+and never deletes the uncertain archive. The focused WSL/Node22 tests
+of orphan denial and legitimate empty-ledger restart returned
+**2 PASS/0 FAIL**. An independent SOURCE peer issued bounded GO for
+`b3b5e591`; it was fast-forwarded into the local integrated worktree.
+
+`d5805da88124cb3f380f329b01d614dfefc19c19` adds a separate
+physical Node22/ext4 **real process exit (74)** after the exact archive
+rename before its parent fsync, then a **new Node22 process** which must
+exit 75 only for the expected `invalid_snapshot` orphan-archive denial.
+This physical test returned **1 PASS/0 FAIL**. Initial independent
+test review nevertheless found **P2 false-green**: the post-open check
+only demanded a nonempty archive and would not detect loss of its
+PREPARE record. `7ff6dade263ea9ceb9bfea03bdf671f31a208795`
+corrects the test by capturing *every archived filename and file
+Buffer*, including PREPARE, before the new process opens; it requires
+an exact name-and-byte match afterward. The exact composed real
+process test returned **1 PASS/0 FAIL** on WSL/Node22/ext4 after the
+correction. The test uses disposable ext4 fixtures and explicitly
+removes only the dead test process's local lock. The physical exit is
+not a powercut test. Peer SOURCE review of this corrected child is
+independent of the earlier P2 finding.
+
+**Scope boundary:** Neither local genesis nor archive guard supplies
+independent protected custody of the root or an owner-signed antirollback
+floor. Same-UID A→B→A and same-SID NTFS races, leaf-name substitution
+during unlink, crash windows between atomic filesystem steps, Windows
+CFAPI handle-relative stage/publish/removal, binary/DLL provenance,
+Windows 10 physical release gate, cold hardware reacquisition and
+power-loss directory durability remain unproved. The product
+`RootSession` stays fail-closed; none of these proofs authorize
+production recovery, merge, deploy or cutover. Remote PR #300 was
+last checked **OPEN/Draft at `d3a91c92`** with formal hosted
+**CodeQL FAILURE (four HIGH filesystem-race annotations)**. The
+corresponding local source fixes are not a hosted CodeQL PASS;
+no new hosted workflow or remote push was requested to save billing.
+
+**Product RELEASE NO-GO.** These are bounded implementation and test
+milestones, and the full issue/PR mission remains incomplete.
