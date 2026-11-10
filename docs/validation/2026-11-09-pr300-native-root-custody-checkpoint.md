@@ -2015,3 +2015,82 @@ Windows 10 CFAPI release result, or hosted CodeQL result for this
 local chain. No push, merge, deploy or `Root/main` mutation was
 performed during the test-and-integration cycle described here.
 **PR #300 is not merge-ready or release-ready: NO-GO.**
+
+### 2026-11-10 continuation — stacked PR CodeQL trigger and native stage-inode proof
+
+The single authorized non-force push advanced PR #300's head from
+`d3a91c921c18e40d23d101958b487725e88e8d95` to **published
+`ca1d24e0027ed91280e248312944a38d59a9c86f`**. GitHub confirmed
+OPEN/Draft, with upstream `Root/main` still
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. The prior four
+CodeQL HIGH race annotations belong to old `d3a91c92`, while GitHub
+reported **zero Actions runs / zero check-runs on `ca1d24e0`** when
+checked. Its current PR-base ref is
+`cdx/issue66-picker-pin-integration-prime-20261107` (at
+`5bac9e8e20656634c83cccefbaf7b5450b02a273`). The workflow
+files on that **base** target only `Root/main` and
+`cdx/zk65-split-pr*` for CodeQL and Security Regression PR events.
+The feature-head workflow file's broader allowlist cannot force the
+base workflow to run. Therefore CodeQL is **NOT formally PASS on the
+published SHA**; this is a stack-trigger dependency, not evidence
+that all four old alerts persist. An authorized base workflow or PR
+routing change and exactly one relevant hosted run remain necessary.
+No upstream workflow, base branch or PR routing was modified here.
+
+Security review found a separate, operational **P2** in the published
+FOD inbound path. `sync-client/rootark-sync-engine.js` has a real
+creation/verification interval before an unconditional replacing
+`fsp.rename(temporary, target)`. A root-local same-SID/UID writer can
+create `target` after the last existence check. In a separate, dirty
+RED-only worktree `mission-20261110-pr300-fod-publish-collision-red-prime`,
+the new test `FOD hydration must not rename over a foreign leaf planted
+at publish boundary` physically used an exclusive `wx` insertion at
+the callback boundary, then intercepted the replace-capable rename
+before the planted foreign bytes could be destroyed. Results:
+**Windows Node22/NTFS 1 FAIL** and **WSL Node22/ext4 1 FAIL** on
+`ca1d24e0`, both with `unsafeRenameAttempt=true`; there was no
+foreign data loss, and no modification to the integrated tree. This
+RED has **not** been integrated or advertised as a GREEN. Merely
+adding more JavaScript `stat/exists` checks cannot close this race.
+Using hardlink no-replace in JS without trusted retirement would leave
+orphan aliases or require an unsafe pathname `unlink`, while disabling
+FOD hydration would remove a legitimate recovery capability. Product
+fix remains blocked on a verified native root-relative no-replace
+transaction with independent writer custody and cleanup semantics.
+
+Independently, isolated Linux Node22/ext4 laboratory work advanced the
+*native primitive*, without changing production RootSession. On the
+original native W3 `stageProof/publishProof`, two physical REDs showed
+that a staged filename could be rebound to a different **equal-byte**
+inode and still published, and that `EEXIST` permitted retry rather
+than entering a terminal transaction phase (**2 FAIL** before patch).
+Local child `29ccf0daf6a7484bf63db8bfa26be7f15f1e007c` retains the
+original exclusively created stage FD through publication, checks
+the current stage leaf against that inode, and calls unprivileged
+`linkat` from `/proc/self/fd/N` using `AT_SYMLINK_FOLLOW` to the fixed
+destination on the held dirfd. The kernel creates a hardlink to the
+**opened original inode**, without replacing an existing target. An
+explicit opt-in adversarial hook moved/rebound the stage leaf **after
+the final preflight** and before the native `linkat`; the published
+inode still matched the original source FD. EEXIST now poisons the
+transaction phase, and the original/foreign names are not removed.
+
+W3 opt-in tests, **without** the 16,385 seeding flag, plus the native
+RootSession contract: **WSL Ubuntu Node22/ext4 23 PASS / 3 SKIP /
+0 FAIL**; Windows Node22 native-contract-only **8 PASS / 0 FAIL**.
+The positive lab deliberately leaves two hardlink names with
+`nlink=2` after publication and the generic native read denies them;
+no untrusted name-based cleanup was introduced. It is a bounded
+identity-bound *publication lab*, NOT an operational crash-safe COMMIT,
+cold replay, root authority, owner-signed rollback, concurrent
+same-UID content isolation, production image attestation or powercut
+result. The test hook is opt-in and not a separate external concurrent
+writer. Exact SOURCE review and any later integration/publication of
+`29ccf0da` must remain separately verified.
+
+The external blockers are unchanged: an independently owned trusted
+parent/root, same-principal writer exclusion, monotonic owner-signed
+rollback custody, native identity-bound removal with safe retirement,
+Windows 10 CFAPI and true crash/powercut evidence. PR #228 was found
+already CLOSED without merge since 2026-11-02, and was not touched.
+**Merge NO-GO. Release NO-GO. RootSession fail-closed.**
