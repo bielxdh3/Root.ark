@@ -1220,6 +1220,22 @@ async function promoteStagedEvictionGenesis(rootDir, staged) {
       }
       await ledger.sync();
       await verifyDirectories();
+      // The prior post-link source stat happens before directory fsync and
+      // parent revalidation. A hostile same-UID writer can swap the STAGE
+      // leaf during that gap; never unlink it without a fresh check against
+      // the original held inode. This still cannot make unlink atomic.
+      const finalSource = await fsp.lstat(source, { bigint: true });
+      const finalHeld = await heldHead.stat({ bigint: true });
+      if (!finalSource.isFile() || finalSource.isSymbolicLink()
+        || finalSource.nlink !== 2n
+        || !sameFileIdentity(before, finalSource)
+        || !sameFileIdentity(before, finalHeld)
+        || finalSource.size !== before.size
+        || finalSource.mtimeNs !== before.mtimeNs
+        || finalHeld.size !== before.size
+        || finalHeld.mtimeNs !== before.mtimeNs) {
+        fail("Staged genesis changed before final unlink", "invalid_snapshot");
+      }
       await fsp.unlink(source);
       await trash.sync();
       await ledger.sync();
@@ -1293,6 +1309,14 @@ async function promoteStagedEvictionGenesis(rootDir, staged) {
         || afterLink.size !== beforeRead.size
         || afterLink.mtimeNs !== beforeRead.mtimeNs) {
         fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
+      }
+      const finalStage = await fsp.lstat(staged.file, { bigint: true });
+      if (!finalStage.isFile() || finalStage.isSymbolicLink()
+        || finalStage.nlink !== 2n
+        || !sameFileIdentity(beforeRead, finalStage)
+        || finalStage.size !== beforeRead.size
+        || finalStage.mtimeNs !== beforeRead.mtimeNs) {
+        fail("Staged genesis changed before final unlink", "invalid_snapshot");
       }
       await fsp.unlink(staged.file);
     } finally { await heldSource.close(); }

@@ -1053,6 +1053,80 @@ test("issue 66: replaced Linux staged genesis leaf cannot become an authorized a
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: genesis promotion must not unlink a substituted stage after exclusive link", {
+  skip: !["linux", "win32"].includes(process.platform)
+    && "requires original-byte Linux ext4 or Windows NTFS stage substitution",
+}, async (t) => {
+  const f = await fixture(t, "genesis-post-link-stage-swap");
+  const stage = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
+  const parked = path.join(f.root, ".original-genesis-stage-parked");
+  const foreignSaved = path.join(f.dir, "foreign-genesis-stage-preserved");
+  const foreign = Buffer.from("FOREIGN_POST_LINK_STAGE_MUST_SURVIVE");
+  const originalLink = fsp.link;
+  const originalLstat = fsp.lstat;
+  const originalRename = fsp.rename;
+  const originalUnlink = fsp.unlink;
+  let linked = false;
+  let swapped = false;
+  let attemptedForeignUnlink = false;
+  fsp.link = async (source, destination, ...args) => {
+    const result = await originalLink(source, destination, ...args);
+    if (path.basename(String(source)) === ".rootark-eviction-genesis-head.json"
+      && path.basename(String(destination)) === "head.json") {
+      linked = true;
+    }
+    return result;
+  };
+  fsp.lstat = async (requested, ...args) => {
+    const stat = await originalLstat(requested, ...args);
+    if (linked && !swapped && (
+      process.platform === "linux"
+        ? path.resolve(String(requested)) === path.resolve(f.root)
+        : path.resolve(String(requested)) === path.resolve(stage)
+    )) {
+      // Swap the true staged entry AFTER the previous identity inspection
+      // and AFTER publication, before the real final unlink boundary.
+      await originalRename(stage, parked);
+      await fsp.writeFile(stage, foreign, { flag: "wx" });
+      swapped = true;
+    }
+    return stat;
+  };
+  fsp.unlink = async (requested, ...args) => {
+    if (swapped && path.basename(String(requested)) === path.basename(stage)) {
+      const parent = await fsp.realpath(path.dirname(String(requested)));
+      const expected = await fsp.realpath(path.dirname(stage));
+      if (path.resolve(parent) === path.resolve(expected)) {
+        attemptedForeignUnlink = true;
+        throw Object.assign(new Error("foreign staged unlink intercepted"), { code: "EACCES" });
+      }
+    }
+    return originalUnlink(requested, ...args);
+  };
+  const sync = await f.create(f.root, ["private"]);
+  const before = f.outbound.length;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.link = originalLink;
+    fsp.lstat = originalLstat;
+    fsp.unlink = originalUnlink;
+    if (swapped) {
+      await originalRename(stage, foreignSaved);
+      await originalRename(parked, stage);
+    }
+  }
+  assert.equal(linked, true, "real genesis publication must create the exclusive head link");
+  assert.equal(swapped, true, "real physical stage substitution must run after link");
+  assert.equal(attemptedForeignUnlink, false,
+    "no final stage unlink may target a file substituted after publication");
+  assert.equal(failure?.code, "invalid_snapshot");
+  assert.match(failure.message, /Staged genesis changed before final unlink/);
+  assert.deepEqual(await fsp.readFile(foreignSaved), foreign);
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  verifyNoSignedDelete(f, before);
+});
+
 function verifyNoSignedDelete(f, from = 0) {
   assert.equal(f.outbound.slice(from).filter((entry) => entry.operation === "delete" || entry.tombstone).length,
     0, "an uncertain ledger must never authorize a signed DELETE");
