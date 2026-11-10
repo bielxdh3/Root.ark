@@ -1700,7 +1700,7 @@ class SyncEngine {
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
     // The same side-effect-free check runs BEFORE signature pre-observation.
     // Keep it here too for direct callers and changes during verification.
-    const source = this.preflightOutOfScopeMove(operation);
+    const source = preflightOutOfScopeMoveBuiltIn.call(this, operation);
     // No pull/reconciliation entry point may separately advance a member of
     // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
     // or out-of-scope sweep is not a two-envelope atomic admission receipt.
@@ -2559,7 +2559,7 @@ class SyncEngine {
             }
           }
           if (current && !this.operationDestinationIsSelected(current)) {
-            this.preflightOutOfScopeMove(current);
+            preflightOutOfScopeMoveBuiltIn.call(this, current);
           }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
@@ -3585,7 +3585,7 @@ class SyncEngine {
       if (!this.operationDestinationIsSelected(operation)) {
         // A refused pinned origin must not consume the finite, durable
         // observed[] window before reconciliation rejects its signed MOVE.
-        this.preflightOutOfScopeMove(operation);
+        preflightOutOfScopeMoveBuiltIn.call(this, operation);
         const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
@@ -3842,5 +3842,8 @@ class SyncEngine {
 // by replacing this local binding. This is not OS-level writer custody.
 const replayEvictionLedgerBuiltIn = SyncEngine.prototype.replayEvictionLedger;
 const openEngineBuiltIn = SyncEngine.prototype._open;
+// A caller can shadow public instance methods. Always use this module-captured
+// preflight for out-of-scope origin custody checks, including direct reconcile.
+const preflightOutOfScopeMoveBuiltIn = SyncEngine.prototype.preflightOutOfScopeMove;
 
 module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };

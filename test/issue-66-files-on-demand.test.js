@@ -534,6 +534,79 @@ test("issue 66: out-of-scope remote MOVE cannot rename a tracked FOD origin with
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
 });
 
+test("issue 66: replacing public preflight cannot bypass direct out-of-scope FOD DELETE denial", async (t) => {
+  const { root, open, store, key } = await setup(t,
+    { "docs/retained.txt": "must never be staged by a shadowed method" });
+  const client = await open();
+  await client.materializeRemote("docs/retained.txt");
+  const remote = store.list("alice")[0];
+  const cachePath = path.join(root, "docs", "retained.txt");
+  const originalBytes = await fsp.readFile(cachePath);
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const originalSnapshot = await fsp.readFile(snapshotPath);
+  const tombstone = protocol.createOperation({
+    operation: "delete", objectId: remote.objectId, fileId: remote.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: remote.revision.counter + 1, deviceId: "device-a" },
+    baseRevision: remote.revision, metadata: { path: "outside/retained.txt" }, fileKey: key,
+  });
+  let hijacked = 0;
+  client.preflightOutOfScopeMove = () => {
+    hijacked += 1;
+    return { sourcePath: "docs/retained.txt", prior: client.snapshot.files["docs/retained.txt"],
+      tombstone: true, directoryRecord: false };
+  };
+
+  await assert.rejects(client.reconcileOutOfScopeMove(tombstone, { conflicts: [] }),
+    { code: "root_session_native_unavailable" });
+  assert.equal(hijacked, 0, "a replaced public preflight must never supply destructive authority");
+  assert.deepEqual(await fsp.readFile(cachePath), originalBytes);
+  assert.deepEqual(await fsp.readFile(snapshotPath), originalSnapshot);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
+test("issue 66: Proxy preflight interception cannot bypass FOD remote pull denial", async (t) => {
+  const { root, open, store, key } = await setup(t,
+    { "docs/café-中-😀.txt": "proxy must not stage owner bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/café-中-😀.txt");
+  const remote = store.list("alice")[0];
+  const cachePath = path.join(root, "docs", "café-中-😀.txt");
+  const originalBytes = await fsp.readFile(cachePath);
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const originalSnapshot = await fsp.readFile(snapshotPath);
+  const tombstone = protocol.createOperation({
+    operation: "delete", objectId: remote.objectId, fileId: remote.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: remote.revision.counter + 1, deviceId: "device-a" },
+    baseRevision: remote.revision, metadata: { path: "outside/café-中-😀.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", tombstone)).kind, "stored");
+  let hijacked = 0;
+  const proxied = new Proxy(client, {
+    get(target, property, receiver) {
+      if (property === "preflightOutOfScopeMove") {
+        return () => {
+          hijacked += 1;
+          return { sourcePath: "docs/café-中-😀.txt",
+            prior: target.snapshot.files["docs/café-中-😀.txt"],
+            tombstone: true, directoryRecord: false };
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  await assert.rejects(proxied.pullRemote({ conflicts: [] }),
+    { code: "root_session_native_unavailable" });
+  assert.equal(hijacked, 0, "Proxy method interception must not direct path staging");
+  assert.deepEqual(await fsp.readFile(cachePath), originalBytes);
+  assert.deepEqual(await fsp.readFile(snapshotPath), originalSnapshot);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
 test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();
