@@ -115,6 +115,17 @@ const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+// A successfully published FOD payload with a failed later checkpoint may
+// look like an unrelated local CREATE during the next reconciliation. This
+// module-private negative-only latch retains the existing cross-process lock
+// until independent operator recovery; it grants NO native root authority.
+const INDETERMINATE_FOD_INBOUND = new WeakSet();
+function denyIndeterminateInbound(engine) {
+  if (INDETERMINATE_FOD_INBOUND.has(engine)) {
+    fail("Incoming payload was published without a durable snapshot checkpoint",
+      "sync_inbound_indeterminate");
+  }
+}
 // Module-private and deliberately non-overridable. A future verified native
 // opener returning successfully must NEVER resume the legacy pathname replay.
 function denyLegacyNativeRootReplay() {
@@ -2067,7 +2078,9 @@ class SyncEngine {
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.
-        if (!this.pinnedPolicyIndeterminate) await this.releaseProcessLock(processLock);
+        if (!this.pinnedPolicyIndeterminate && !INDETERMINATE_FOD_INBOUND.has(this)) {
+          await this.releaseProcessLock(processLock);
+        }
       }
     };
     const operation = previous.then(run, run);
@@ -3392,6 +3405,7 @@ class SyncEngine {
   }
 
   async _pushPending(summary) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const recovered = await this.journal.recover();
     if (this.requireNativeRootRecovery && recovered.some((operation) =>
@@ -3647,6 +3661,7 @@ class SyncEngine {
   }
 
   async _apply(operation, summary = null, beforeHydrationWrite = null) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     operation = envelopeCopy(operation);
     // Incoming authenticated DELETE/tombstone is not independent authority
@@ -3740,6 +3755,8 @@ class SyncEngine {
     // must not leave an applied object with no restart-safe observation.
     if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
     let cleanupPath = null;
+    let inboundPayloadPublished = false;
+    try {
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
@@ -3791,6 +3808,7 @@ class SyncEngine {
         // without first creating a speculative payload temporary.
         if (await exists(target)) await this.stageExisting(target);
         await publishInboundPayload(target, movePayload);
+        inboundPayloadPublished = true;
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
@@ -3826,6 +3844,7 @@ class SyncEngine {
       } else {
         await publishInboundPayload(target, plaintext,
           async () => { if (await exists(target)) await this.stageExisting(target); });
+        inboundPayloadPublished = true;
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
@@ -3837,6 +3856,17 @@ class SyncEngine {
     await this.persistSnapshot();
     if (summary) summary.applied = (summary.applied || 0) + 1;
     return verifiedFreshDigest;
+    } catch (error) {
+      // A successful kernel rename followed by any failed local checkpoint
+      // is indeterminate. Retain .rootark-sync.lock: a subsequent sync pass
+      // must not turn the untracked incoming cache file into a signed CREATE.
+      // This does NOT cure the earlier target-overwrite race or allow a cold
+      // operator to trust the same-SID root without native custody.
+      if (this.requireNativeRootRecovery && inboundPayloadPublished) {
+        INDETERMINATE_FOD_INBOUND.add(this);
+      }
+      throw error;
+    }
   }
 
   // Only for a required-v2, zero-PREPARE genesis under the exclusive root
@@ -4010,6 +4040,7 @@ class SyncEngine {
   }
 
   async _reconcileLocal() {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     denyHistoricallyTrackedControlTemp(this.snapshot,
       internalRootMetadata(this.rootDir, this.snapshotPath, this.journal?.filePath));
@@ -4872,6 +4903,7 @@ class SyncEngine {
   }
 
   async _syncOnce() {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };

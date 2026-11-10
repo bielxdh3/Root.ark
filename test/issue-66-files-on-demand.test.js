@@ -1002,8 +1002,12 @@ test("issue 66: physical post-publish FOD crash retains lock and stops cold outb
   });
   assert.match(child.stdout, /POST_PUBLISH_PHYSICAL_RENAME/,
     `must reach physical rename before crash, stderr=${child.stderr}`);
+  assert.equal(child.error, undefined, "subprocess must not time out or fail to spawn");
+  assert.equal(child.stderr, "", "failure/exception path must never pass as a crash");
   if (process.platform === "win32") {
-    assert.notEqual(child.status, 0, "Windows must terminate the separate process");
+    assert.equal(Number.isInteger(child.status), true);
+    assert.equal([0, 67, 68].includes(child.status), false,
+      "Windows must terminate by SIGKILL, not the child normal/failure exits");
   } else {
     assert.equal(child.signal, "SIGKILL", "POSIX must observe a real SIGKILL termination");
   }
@@ -1021,6 +1025,57 @@ test("issue 66: physical post-publish FOD crash retains lock and stops cold outb
   assert.equal(diskJournal.pending.length, 0,
     "failed cold admission cannot enqueue any new outbound CREATE");
   assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot);
+  assert.equal(JSON.stringify(store.list("alice")), beforeStore);
+});
+
+test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbound reconcile", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/recover.txt": "remote file published before a failed checkpoint",
+  });
+  const client = await open();
+  const target = path.join(root, "docs", "recover.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshot);
+  const beforeStore = JSON.stringify(store.list("alice"));
+  const originalRename = fsp.rename;
+  let published = false;
+  let injected = false;
+  fsp.rename = async (source, destination, ...args) => {
+    const dest = path.resolve(String(destination));
+    if (dest === path.resolve(target) && String(source).includes(".tmp-inbound-")) {
+      const result = await originalRename(source, destination, ...args);
+      published = true; // the kernel really renamed the payload inode
+      return result;
+    }
+    if (published && !injected && dest === path.resolve(snapshot)
+      && String(source).includes(".tmp-")) {
+      injected = true;
+      throw Object.assign(new Error("durable snapshot publish injected EIO"), { code: "EIO" });
+    }
+    return originalRename(source, destination, ...args);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/recover.txt"), { code: "EIO" });
+  } finally {
+    fsp.rename = originalRename;
+  }
+  assert.equal(published, true, "the inbound file must have been physically published");
+  assert.equal(injected, true, "EIO must land in the later snapshot rename, not the payload");
+  assert.equal(await fsp.readFile(target, "utf8"),
+    "remote file published before a failed checkpoint");
+  assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot,
+    "the cache content and durable snapshot must disagree at this test boundary");
+  // Public locking is not the only entry point. The module-private negative
+  // latch must also reject direct internal method calls before scanning or
+  // attempting outbound signed mutation, even if a caller overwrites fields.
+  client.inboundPublicationIndeterminate = false;
+  await assert.rejects(client._reconcileLocal(), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client._pushPending({ pushed: 0 }), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client.syncOnce(), { code: "sync_root_busy" });
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(state.pushes, 0, "no direct or cold outbound CREATE may be signed from uncertain cache");
+  const diskJournal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
+  assert.equal(diskJournal.pending.length, 0);
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
 
