@@ -735,3 +735,53 @@ exists, not an implementation of safe native replacement. Internal/public
 method interception, alternate `_apply` rename routes, cross-instance
 non-FOD downgrade, same-SID A→B→A, cold recovery and CodeQL remain
 subject to separate source review and integration gates.
+
+### Exact local composition 5d6d76ee: independent narrow SOURCE GO
+
+The next isolated child `d92566a10891fe0220a00bfd28736068c0b80f69`
+of `42289bdc` denies direct `stageExisting()` for native-required roots
+before any pathname lookup. Windows Node22 reproduced **RED** with a
+materialized FOD file before the change (`Missing expected rejection`),
+then the adjusted entire suite went **GREEN 25/25**. The existing cached
+refresh is now deliberately unavailable pending native custody; the
+physical cache bytes and durable snapshot remain unchanged on denial.
+
+The independent worker's child `7f9fcc409e67d36dae232cc847ce531b11e8cf8d`
+captured the canonical out-of-scope preflight implementation so callers
+cannot shadow the public method in direct reconciliation, remote pull or
+HTTP 409 conflict handling. It reproduced RED for method interception and
+Proxy interception, then GREEN. Cherry-picking this reviewed delta atop
+`d92566a1` required a test-only conflict resolution preserving both
+families of regressions; the resulting exact composition is
+**`5d6d76eed10777d1f521a75ab4be2eb1d98fa3af`**. Both commits have
+author/committer `bielxdh3 <bielxdh3@gmail.com>` and exactly one Codex
+coauthor trailer. No native RootSession implementation was enabled.
+
+| Exact 5d6d76ee physical run | Result |
+| --- | --- |
+| Windows Node v22.23.4 on NTFS: full Files On-Demand suite | **27 PASS / 0 FAIL / 0 SKIP** |
+| Ubuntu WSL Node v22.22.1 on real `/home/bielx` ext4, `git archive` exact SHA with dependencies supplied read-only via `NODE_PATH`: full FOD suite | **27 PASS / 0 FAIL / 0 SKIP** |
+| Windows Node22: `issue-66-eviction-empty-ledger-gap-p2` plus `issue-66-root-session-contract` | **30 PASS / 0 FAIL / 3 SKIP** |
+| Windows Node22: legitimate non-FOD hard crash and recovery with more than 16,384 trash entries, included in preceding run | **PASS** |
+| Git metadata, worktree cleanliness, and `git diff --check` | **PASS** |
+
+The first ext4 test attempt lacked several archived source directories;
+after extending the test-only archive with `public`, `db` and `services`,
+the same exact 5d6d76ee source passed. The source worktrees and this ext4
+fixture were retained; no cleanup of adversarial fixtures was performed.
+Independent **read-only exact-SHA SOURCE GO was restricted to the new
+stageExisting and captured-preflight guards** (new P0/P1/P2: zero).
+The integrated local worktree fast-forwarded from `496e7582` to
+`5d6d76ee` and was clean. These results must not be described as
+adversarial root-custody, cold-reboot, power-cut, image, rollback or
+production recovery proof.
+
+**Still NO-GO:** a different SyncEngine instance may reopen an existing
+FOD root as non-FOD and reach legacy pathname eviction. Physical RED
+exists on Windows Node22/NTFS and WSL Node22/ext4 for a later descendant;
+the logical mode is not yet protected by an independently trusted root
+authority. Existing `_apply` MOVE and replacement paths, same-SID A→B→A,
+monotonic custody, complete native handles/fds, and formally hosted CodeQL
+also remain unresolved. The remote PR #300 remains OPEN/Draft at
+`956b2515`, with CodeQL formally failing in the last check; Root/main
+remains untouched. No push, merge, deploy or cutover was performed.
