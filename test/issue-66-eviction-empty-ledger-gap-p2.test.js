@@ -426,6 +426,7 @@ test("issue 66: Linux ledger retirement cannot delete files through a substitute
   const foreign = path.join(f.dir, "foreign-ledger");
   const parked = path.join(f.root, ".rootark-sync-evictions-parked");
   await fsp.mkdir(foreign);
+  const foreignReal = await fsp.realpath(foreign);
   await fsp.writeFile(path.join(foreign, "FOREIGN_SENTINEL"), "leave foreign bytes intact");
   const sync = await f.create(f.root, ["private"]);
   const originalRename = fsp.rename;
@@ -454,19 +455,27 @@ test("issue 66: Linux ledger retirement cannot delete files through a substitute
     return originalRename(source, destination, ...args);
   };
   fsp.unlink = async (target, ...args) => {
-    if (swapped && archiveVisible && path.basename(path.dirname(String(target)))
-      === path.basename(archiveVisible)) {
-      attemptedForeignUnlink = true;
-      // Observe the dangerous deletion without destroying test-owned foreign
-      // bytes even in the RED parent. No external path cleanup is performed.
-      throw Object.assign(new Error("foreign archive unlink blocked by test"), { code: "EACCES" });
+    if (swapped) {
+      let resolvedParent;
+      try { resolvedParent = await fsp.realpath(path.dirname(String(target))); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      // Works for BOTH pathname archives and /proc/self/fd/<dirfd> children.
+      // Guard the actual physical parent, not its textual basename: a wrong
+      // held descriptor must also be intercepted before it can delete bytes.
+      if (resolvedParent && path.resolve(resolvedParent) === path.resolve(foreignReal)) {
+        attemptedForeignUnlink = true;
+        throw Object.assign(new Error("foreign archive unlink blocked by test"),
+          { code: "EACCES" });
+      }
     }
     return originalUnlink(target, ...args);
   };
   const before = f.outbound.length;
   try {
-    await assert.rejects(sync.syncOnce(),
-      "hostile ledger replacement must not complete retirement");
+    await assert.rejects(sync.syncOnce(), (error) =>
+      error?.code === "invalid_snapshot"
+        && /archive identity is indeterminate/.test(error.message),
+    "a substituted archive must be rejected by exact identity, not incidental errors");
   } finally {
     fsp.rename = originalRename;
     fsp.unlink = originalUnlink;
