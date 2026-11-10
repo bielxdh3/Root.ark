@@ -1303,7 +1303,7 @@ async function readHeldEvictionEntry(heldDirectory, filename) {
       || !sameFileVersion(before, namedAfter)) {
       fail("Eviction ledger entry changed during read", "invalid_snapshot");
     }
-    return buffer.subarray(0, count);
+    return { bytes: buffer.subarray(0, count), identity: before };
   } finally { await handle.close(); }
 }
 async function readEvictionLedger(rootDir, expectedEpoch = null) {
@@ -1368,7 +1368,9 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
     try {
       let bytes;
       if (linux) {
-        bytes = await readHeldEvictionEntry(heldDirectory, filename);
+        const opened = await readHeldEvictionEntry(heldDirectory, filename);
+        bytes = opened.bytes;
+        recordIdentity = opened.identity;
       } else {
         const file = path.join(directory, filename);
         const stats = await fsp.lstat(file, { bigint: true });
@@ -1549,6 +1551,22 @@ async function clearEvictionLedger(rootDir, expectedEpoch = null) {
           fail("Eviction ledger archive identity is indeterminate", "invalid_snapshot");
         }
       };
+      const verifyRecord = async (filename, identity) => {
+        if (!identity || identity.nlink !== 1n) {
+          fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+        }
+        let visible;
+        try {
+          visible = await fsp.lstat(
+            `/proc/self/fd/${heldLedger.fd}/${filename}`, { bigint: true });
+        } catch {
+          fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+        }
+        if (!visible.isFile() || visible.isSymbolicLink()
+          || visible.nlink !== 1n || !sameFileVersion(identity, visible)) {
+          fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+        }
+      };
       await verifyCurrent();
       await fsp.rename(current, archived);
       // If a same-UID process swapped the name just before rename, the moved
@@ -1561,12 +1579,15 @@ async function clearEvictionLedger(rootDir, expectedEpoch = null) {
       for (const row of entries.values()) {
         await verifyArchived();
         if (row.commit) {
+          await verifyRecord(row.commit.filename, row.commit.identity);
           await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/${row.commit.filename}`);
         }
         await verifyArchived();
+        await verifyRecord(row.prepare.filename, row.prepare.identity);
         await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/${row.prepare.filename}`);
       }
       await verifyArchived();
+      await verifyRecord("head.json", headIdentity);
       await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/head.json`);
       await verifyArchived();
       await fsp.rmdir(archived);

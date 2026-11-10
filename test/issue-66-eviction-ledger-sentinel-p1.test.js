@@ -564,3 +564,75 @@ test("issue 66 P1: pre-PREPARE snapshot upgrade EIO does not move bytes or relax
   await restarted.syncOnce();
   assertRemoteIntact(f, beforeWrites);
 });
+
+for (const leafKind of ["commit", "prepare", "head"]) {
+test(`issue 66: Linux retained-ledger cleanup must refuse a substituted ${leafKind} inode`, {
+  skip: process.platform !== "linux" && "requires Linux held ledger dirfd and physical ext4 leaf swap",
+}, async (t) => {
+  const f = await fixture(t, `linux-foreign-archive-${leafKind}`);
+  const sync = await f.create(f.root, ["private"]);
+  const originalMkdir = fsp.mkdir;
+  const originalUnlink = fsp.unlink;
+  const originalRename = fsp.rename;
+  const parked = path.join(f.root, `.original-${leafKind}-parked`);
+  const foreignSaved = path.join(path.dirname(f.root), `foreign-${leafKind}-preserved`);
+  const foreignBytes = Buffer.from(`FOREIGN_LINUX_${leafKind}_MUST_NOT_BE_REMOVED`);
+  let archive = null;
+  let record = null;
+  let substituted = false;
+  let attemptedForeignUnlink = false;
+  fsp.mkdir = async (requested, ...args) => {
+    if (!substituted && path.basename(String(requested)) === ".rootark-sync-evictions") {
+      const archives = (await fsp.readdir(f.root)).filter((name) =>
+        name.startsWith(".rootark-sync-evictions-archive-"));
+      if (archives.length === 1) {
+        archive = path.join(f.root, archives[0]);
+        const names = await fsp.readdir(archive);
+        record = leafKind === "head" ? "head.json"
+          : names.find((name) => name.endsWith(`.${leafKind}.json`));
+        assert.ok(record && names.includes(record),
+          `the original durable ${leafKind} must exist`);
+        await originalRename(path.join(archive, record), parked);
+        await fsp.writeFile(path.join(archive, record), foreignBytes, { flag: "wx" });
+        substituted = true;
+      }
+    }
+    return originalMkdir(requested, ...args);
+  };
+  fsp.unlink = async (requested, ...args) => {
+    if (substituted && path.basename(String(requested)) === record) {
+      const physicalParent = await fsp.realpath(path.dirname(String(requested)));
+      if (path.resolve(physicalParent) === path.resolve(archive)) {
+        attemptedForeignUnlink = true;
+        // Intercept the real /proc/self/fd/N/<leaf> request before any foreign
+        // inode is destroyed by the intentionally vulnerable RED baseline.
+        throw Object.assign(new Error("foreign held-dirfd unlink intercepted"), { code: "EACCES" });
+      }
+    }
+    return originalUnlink(requested, ...args);
+  };
+  const beforeWrites = f.writes;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.mkdir = originalMkdir;
+    fsp.unlink = originalUnlink;
+    if (substituted) {
+      await originalRename(path.join(archive, record), foreignSaved);
+      await originalRename(parked, path.join(archive, record));
+      const active = await fsp.lstat(f.ledger);
+      if (!active.isDirectory() || (await fsp.readdir(f.ledger)).length) {
+        throw new Error("Refusing to clean nonempty disposable active ledger");
+      }
+      await fsp.rmdir(f.ledger);
+      await originalRename(archive, f.ledger);
+    }
+  }
+  assert.equal(substituted, true, "must physically substitute a record in the held original ledger");
+  assert.equal(attemptedForeignUnlink, false, "no held-dirfd unlink may target a substituted inode");
+  assert.equal(failure?.code, "invalid_snapshot");
+  assert.match(failure.message, /Eviction ledger record identity changed before removal/);
+  assert.deepEqual(await fsp.readFile(foreignSaved), foreignBytes);
+  assertRemoteIntact(f, beforeWrites);
+});
+}
