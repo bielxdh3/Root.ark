@@ -803,3 +803,23 @@ unchanged local bytes, durable snapshot, no trash and no destination.
 This narrow guard is not root-wide same-SID custody: first-time hydration
 and non-FOD reopens still have other pathname-based risks, so product
 recovery and release remain **NO-GO** pending exact-SHA SOURCE review.
+
+### Follow-up: preserve first-time signed MOVE hydration without cached rename
+
+Independent exact-SHA SOURCE review rejected `83e047c9` (**NO-GO P1**)
+because its categorical MOVE denial also blocked legitimate first-time
+hydration when both the source and destination were absent, despite an
+authenticated recovery payload. It also identified incomplete assertions
+for journal/remote mutations (**P2**). The original 27/27 GREEN was
+therefore insufficient. A focused Windows Node22 regression reproduced
+**RED** with `root_session_native_unavailable` on a first-time signed
+MOVE whose source had never been materialized. The corrective child
+checks both the canonical destination and potential tracked/requested
+source path existence **before journal admission**, denying occupied
+paths but allowing first-time payload hydration. Windows Node22 full FOD
+suite: **28 PASS / 0 FAIL** with cached-source rejection and first-time
+positive hydration both covered. This only preserves an existing
+cooperative-path behavior; absence checking is not atomic under a hostile
+same-SID writer, so native rooted no-replace, authority and rollback
+remain unproven. This child needs exact-SHA physical ext4 tests and
+independent SOURCE review before local integration.

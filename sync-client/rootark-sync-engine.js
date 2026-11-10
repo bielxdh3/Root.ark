@@ -2626,12 +2626,6 @@ class SyncEngine {
 
   async _apply(operation, summary = null, beforeHydrationWrite = null) {
     operation = envelopeCopy(operation);
-    // An authenticated MOVE is not independent authorization to rename a
-    // cached root by pathname. Even a clean source must wait for native
-    // held-root mutation authority, before admission or any filesystem I/O.
-    if (this.requireNativeRootRecovery && operation.operation === "move") {
-      denyUntrustedNativeEviction();
-    }
     // Incoming authenticated DELETE/tombstone is not independent authority
     // to stage or unlink cached bytes when the native root is unavailable.
     // This also protects direct _apply() callers, not just public apply().
@@ -2666,6 +2660,18 @@ class SyncEngine {
     };
     operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
+    // A cached-source MOVE or occupied destination would invoke legacy
+    // pathname rename/staging. Deny before journal admission, even when the
+    // source bytes are clean. An absent-source signed MOVE can still hydrate
+    // its authenticated recovery payload; this is only a local policy fence,
+    // NOT a same-SID atomic absence or RootSession authority proof.
+    if (this.requireNativeRootRecovery && operation.operation === "move") {
+      if (await exists(target)) denyUntrustedNativeEviction();
+      const trackedSource = activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+      for (const sourcePath of new Set([metadata.sourcePath, trackedSource].filter(Boolean))) {
+        if (await exists(await contained(this.rootDir, sourcePath, true))) denyUntrustedNativeEviction();
+      }
+    }
     // A signed operation may target a directory which contains a device-local
     // pinned file. stageExisting() moves whole directory trees, so check every
     // path it could remove or relocate BEFORE recording admission or touching

@@ -677,10 +677,38 @@ test("issue 66: even a clean cached source cannot be renamed by legacy FOD MOVE 
   assert.equal((await store.put("alice", move)).kind, "stored");
   const originalBytes = await fsp.readFile(path.join(root, "docs", "original.txt"));
   const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const pendingBefore = (await client.journal.recover()).map((item) => item.operationId);
   await assert.rejects(client.apply(move), { code: "root_session_native_unavailable" });
   await assert.rejects(client.materializeRemote("docs/renamed.txt"), { code: "root_session_native_unavailable" });
   assert.deepEqual(await fsp.readFile(path.join(root, "docs", "original.txt")), originalBytes);
   assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
   assert.equal(await exists(path.join(root, "docs", "renamed.txt")), false);
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+  assert.deepEqual((await client.journal.recover()).map((item) => item.operationId), pendingBefore);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+});
+
+test("issue 66: first hydration of signed MOVE with no local source or destination stays available", async (t) => {
+  const { root, open, store, key, state } = await setup(t, { "docs/original.txt": "verified first hydration" });
+  const client = await open();
+  const original = store.list("alice")[0];
+  const move = protocol.createOperation({
+    operation: "move", objectId: original.objectId, fileId: original.fileId,
+    versionId: "first-hydration-move", operationId: "first-hydration-move-op",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: original.revision,
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt", sourcePath: "docs/original.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("verified first hydration"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+  assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
+  assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  assert.equal(await client.materializeRemote("docs/new.txt"), true);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "new.txt"), "utf8"), "verified first hydration");
+  assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, 0);
 });
