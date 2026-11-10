@@ -325,6 +325,12 @@ static napi_value seed_many(napi_env env, napi_callback_info info) {
   napi_value argv[3];
   if (!args_of(env, info, 1, argv) || !valid_token(env, info, argv[0]))
     return fail(env, "NATIVE_TOKEN_REJECTED");
+  // This 16,385-inode stress operation is deliberately retained for audit.
+  // The N-API boundary itself must require explicit opt-in: a JS test skip
+  // alone cannot stop another lab caller from seeding thousands of files.
+  const char *stress = getenv("ROOTARK_ISSUE66_W3_STREAM_STRESS");
+  if (!stress || strcmp(stress, "1") != 0)
+    return fail(env, "NATIVE_STRESS_DISABLED");
   lab_session *session = session_for(env, info);
   const int directory = dirfd(session->held);
   if (session->phase != 0 || session->seeded || !plain_directory(directory, 1))

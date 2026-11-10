@@ -83,6 +83,15 @@ ROOTARK_ISSUE66_W3_NAPI_LAB=1 ROOTARK_ISSUE66_W3_STREAM_STRESS=1 \
   node --test test/issue-66-w3-posix-napi.test.js
 ```
 
+The native `seedMany(token)` method itself checks the literal environment
+variable `ROOTARK_ISSUE66_W3_STREAM_STRESS=1` **before any write**.
+This matters because a different N-API lab consumer can bypass the JS
+test's skip condition. A source-backed test first reproduced **RED** on
+the missing native gate without generating 16,385 files, then a physical
+Node22 native test confirmed the C method refuses a valid session token
+with `NATIVE_STRESS_DISABLED` when the extra switch is absent. This switch
+is only consent for test resource usage, **not independent file authority**.
+
 Each authorized stress run deliberately retains its newly created ext4
 HOME fixture for audit and consumes more than 16,385 directory entries
 and inodes. Avoid repeating it during routine CI or development; without

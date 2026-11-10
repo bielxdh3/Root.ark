@@ -22,6 +22,14 @@ const source = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/nat
 let addon;
 let addonPath;
 
+test("#66 W3 native stress seeding has an explicit C-level opt-in gate", () => {
+  const nativeSource = fs.readFileSync(source, "utf8");
+  const seed = nativeSource.split("static napi_value seed_many(")[1]?.split("static napi_value seed_raw_byte_name(")[0];
+  assert.ok(seed, "native seed function must remain present");
+  assert.match(seed, /getenv\("ROOTARK_ISSUE66_W3_STREAM_STRESS"\)/,
+    "JS test-only skip does not protect another addon caller from expensive seeding");
+});
+
 function loadLab() {
   if (addon) return addon;
   assert.match(process.version, /^v22\./);
@@ -118,6 +126,15 @@ test("#66 W3 streamed name Buffers preserve invalid POSIX UTF-8 bytes exactly",
     }
     assert.ok(names.every(Buffer.isBuffer));
     assert.ok(names.some((name) => name.equals(raw)), "exact 0xff must be preserved by native readdir");
+    assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+  });
+
+test("#66 W3 native seeding refuses missing stress opt-in without writing 16k inodes",
+  { skip: !enabled || stressEnabled }, () => {
+    const bridge = loadLab();
+    const token = bridge.openTestSession();
+    assert.throws(() => bridge.seedMany(token), /NATIVE_STRESS_DISABLED/);
+    assert.equal(bridge.read(token, "original.bin").toString("utf8"), "TRUSTED_ORIGINAL");
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
   });
 
