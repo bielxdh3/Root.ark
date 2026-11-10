@@ -32,7 +32,7 @@ const REQUIRED_OPERATIONS = Object.freeze([
   "readOpenedFile", // FD/HANDLE-bound bytes, no pathname reopen
   "createExclusiveFile", // native no-replace, sealed file ownership
   "renameNoReplace", // both parents owned by the same pinned root session
-  "removeEntry", // exact bound entry, never cleanup through an unchecked path
+  "removeEntry", // delete opened inode or require independently isolated parent
   "syncOpenedFile", // durable bytes, check write/flush errors
   "syncDirectory", // durable namespace transitions, platform-specific proof
   "reacquireRoot", // cold restart from the original trusted parent authority
@@ -48,7 +48,7 @@ const WINDOWS_OPS = Object.freeze({
   readOpenedFile: "read from that exact HANDLE and prevent concurrent same-principal modification",
   createExclusiveFile: "create entry relative to trusted parent HANDLE with native exclusive semantics",
   renameNoReplace: "rename between pinned directory HANDLEs without overwrite or foreign cleanup",
-  removeEntry: "remove only a pinned entry in the pinned parent, with native identity fence",
+  removeEntry: "SetFileInformationByHandle on the originally opened file HANDLE acquired relative to an independently trusted parent; never reopen mutable leaf for deletion",
   syncOpenedFile: "FlushFileBuffers on exact modified file HANDLE, verify errors",
   syncDirectory: "prove durable NTFS namespace update; do not assume Node directory fsync works",
   reacquireRoot: "cold reopen using independently trusted parent, identity and anti-rollback anchor",
@@ -64,7 +64,7 @@ const POSIX_OPS = Object.freeze({
   readOpenedFile: "read from the opened fd; concurrent writer must be excluded or snapshot protected",
   createExclusiveFile: "openat with O_EXCL/O_NOFOLLOW under held directory fd",
   renameNoReplace: "renameat2 RENAME_NOREPLACE between held parent dirfds",
-  removeEntry: "unlinkat relative to held parent dirfd, with race-safe identity fencing",
+  removeEntry: "unlinkat only after independently proven same-UID hostile writer isolation for the pinned parent and its ancestors; an fstat/lstat followed by unlinkat is not atomic identity-conditional deletion",
   syncOpenedFile: "fsync/fdatasync exact opened file descriptor",
   syncDirectory: "fsync held parent dirfds after every namespace transition",
   reacquireRoot: "cold reopen from pinned trusted-parent identity and independent rollback anchor",
@@ -77,6 +77,8 @@ const GUARDS = Object.freeze({
   noPathnameFallback: true,
   rejectCrossMountTraversal: true,
   requireSamePrincipalWriterIsolation: true,
+  noStatThenUnlinkAsIdentityAuthority: true,
+  requireTrustedParentBeforeDestructiveRemove: true,
   requireIndependentTrustedParent: true,
   requireIndependentRollbackAnchor: true,
   requiredMarkerUntilDurableCommit: true,

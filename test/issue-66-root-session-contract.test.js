@@ -95,6 +95,21 @@ test("#66 the native contract covers rooted recovery I/O and cold reopening on b
   assert.equal(ROOT_SESSION_CONTRACT.guards.requiredMarkerUntilDurableCommit, true);
 });
 
+test("#66 native deletion contract forbids stat-to-unlink authority for hostile same-principal writers", () => {
+  const { guards, platforms } = ROOT_SESSION_CONTRACT;
+  assert.equal(guards.noStatThenUnlinkAsIdentityAuthority, true,
+    "pre-unlink stat is never atomic removal of the observed inode");
+  assert.equal(guards.requireTrustedParentBeforeDestructiveRemove, true,
+    "an owner-independent directory writer policy must exist before removal");
+  assert.match(platforms.win32.removeEntry, /SetFileInformationByHandle/i);
+  assert.match(platforms.win32.removeEntry, /opened.*HANDLE/i);
+  assert.match(platforms.linux.removeEntry, /unlinkat/);
+  assert.match(platforms.linux.removeEntry, /same-UID.*writer isolation/i,
+    "dirfd-relative unlink does not protect against same-UID leaf swap");
+  rejects(() => openNativeRootSession(true), ROOT_SESSION_ERROR.NATIVE_UNAVAILABLE);
+  rejects(() => requireNativeRecoveryAuthority(), ROOT_SESSION_ERROR.UNVERIFIED_AUTHORITY);
+});
+
 test("#66 root contract requires streaming 16,385 legitimate trash entries and exact Unicode names", () => {
   const { genesisEnumeration } = ROOT_SESSION_CONTRACT;
   assert.equal(genesisEnumeration.streaming, true);
