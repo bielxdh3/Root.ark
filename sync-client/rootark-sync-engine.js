@@ -1358,11 +1358,13 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
     files.push(entry.name);
   }
   let head = null;
+  let headIdentity = null;
   const entries = new Map();
   for (const filename of files) {
     const match = /^([a-f0-9]{64})\.(prepare|commit)\.json$/.exec(filename);
     if (!match && filename !== "head.json") fail("Malformed or torn eviction ledger entry", "invalid_snapshot");
     let item;
+    let recordIdentity = null;
     try {
       let bytes;
       if (linux) {
@@ -1375,6 +1377,10 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
           fail("Unsafe eviction ledger entry", "invalid_snapshot");
         }
         bytes = await readContainedFile(rootDir, `${EVICTION_LEDGER_DIR}/${filename}`, stats, true);
+        // Carry the identity of the exact validated record into retirement.
+        // A held directory alone does not prevent a same-SID process from
+        // replacing a record leaf under the original directory.
+        recordIdentity = stats;
       }
       if (bytes.length > 8192) fail("Oversized eviction ledger entry", "invalid_snapshot");
       item = JSON.parse(bytes.toString("utf8"));
@@ -1383,11 +1389,12 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
     if (filename === "head.json") {
       if (!validEvictionLedgerHead(item)) fail("Invalid eviction ledger head", "invalid_snapshot");
       head = item;
+      headIdentity = recordIdentity;
       continue;
     }
     const row = entries.get(match[1]) || {};
     if (row[match[2]]) fail("Duplicated eviction ledger entry", "invalid_snapshot");
-    row[match[2]] = { item, filename };
+    row[match[2]] = { item, filename, identity: recordIdentity };
     entries.set(match[1], row);
   }
   // A synced zero-sequence genesis may precede the snapshot's v2 upgrade.
@@ -1439,7 +1446,7 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
       fail("Eviction ledger changed during Windows read", "invalid_snapshot");
     }
   }
-  return { directory, entries, head,
+  return { directory, entries, head, headIdentity,
     directoryIdentity: linux
       ? { dev: heldDirectoryStats.dev, ino: heldDirectoryStats.ino }
       : windowsDirectoryStats
@@ -1498,7 +1505,8 @@ async function writeEvictionCommit(rootDir, prepare) {
   });
 }
 async function clearEvictionLedger(rootDir, expectedEpoch = null) {
-  const { directory, entries, directoryIdentity } = await readEvictionLedger(rootDir, expectedEpoch);
+  const { directory, entries, directoryIdentity, headIdentity } =
+    await readEvictionLedger(rootDir, expectedEpoch);
   if (!directory || !entries.size) return;
   // The full snapshot is durable. Atomically retire the whole old ledger
   // before removing individual files, so a crash during cleanup cannot
@@ -1590,17 +1598,36 @@ async function clearEvictionLedger(rootDir, expectedEpoch = null) {
         fail("Eviction ledger archive identity is indeterminate", "invalid_snapshot");
       }
     };
+    const verifyRecord = async (filename, identity) => {
+      if (!identity || identity.nlink !== 1n) {
+        fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+      }
+      let actual;
+      try { actual = await fsp.lstat(path.join(archived, filename), { bigint: true }); }
+      catch {
+        fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+      }
+      if (!actual.isFile() || actual.isSymbolicLink()
+        || actual.nlink !== 1n || !sameFileVersion(identity, actual)) {
+        fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+      }
+    };
     await verifyArchived();
     await fsyncEvictionDirectory(rootDir);
     await fsp.mkdir(directory, { mode: 0o700 });
     await fsyncEvictionDirectory(rootDir);
     for (const row of entries.values()) {
       await verifyArchived();
-      if (row.commit) await fsp.unlink(path.join(archived, row.commit.filename));
+      if (row.commit) {
+        await verifyRecord(row.commit.filename, row.commit.identity);
+        await fsp.unlink(path.join(archived, row.commit.filename));
+      }
       await verifyArchived();
+      await verifyRecord(row.prepare.filename, row.prepare.identity);
       await fsp.unlink(path.join(archived, row.prepare.filename));
     }
     await verifyArchived();
+    await verifyRecord("head.json", headIdentity);
     await fsp.unlink(path.join(archived, "head.json"));
     await verifyArchived();
     await fsp.rmdir(archived);

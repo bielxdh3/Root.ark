@@ -454,6 +454,81 @@ test("issue 66: Windows retirement rechecks archived identity immediately before
   assertRemoteIntact(f, beforeWrites);
 });
 
+for (const leafKind of ["commit", "prepare", "head"]) {
+test(`issue 66: Windows retirement refuses substituted ${leafKind} leaf inside the original archive`, {
+  skip: process.platform !== "win32" && "requires NTFS record substitution in the retained archive",
+}, async (t) => {
+  const f = await fixture(t, `win-archive-leaf-swap-${leafKind}`);
+  const sync = await f.create(f.root, ["private"]);
+  const originalRename = fsp.rename;
+  const originalMkdir = fsp.mkdir;
+  const originalUnlink = fsp.unlink;
+  const parked = path.join(f.root, `.original-${leafKind}-parked`);
+  const foreignSaved = path.join(path.dirname(f.root), "foreign-record-preserved");
+  const foreignBytes = Buffer.from("FOREIGN_RECORD_BYTES_NOT_AUTHORIZED_FOR_DELETE");
+  let archive = null;
+  let record = null;
+  let substituted = false;
+  let attemptedForeignUnlink = false;
+  fsp.rename = async (source, dest, ...args) => {
+    if (!archive && path.basename(String(source)) === ".rootark-sync-evictions"
+      && path.basename(String(dest)).startsWith(".rootark-sync-evictions-archive-")
+      && path.resolve(path.dirname(String(source))) === path.resolve(f.root)) {
+      archive = String(dest);
+    }
+    return originalRename(source, dest, ...args);
+  };
+  fsp.mkdir = async (requested, ...args) => {
+    if (archive && !substituted && path.resolve(String(requested)) === path.resolve(f.ledger)) {
+      const names = await fsp.readdir(archive);
+      record = leafKind === "head" ? "head.json"
+        : names.find((name) => name.endsWith(`.${leafKind}.json`));
+      assert.ok(record && names.includes(record),
+        `real durable ${leafKind} must exist before retirement`);
+      await originalRename(path.join(archive, record), parked);
+      await fsp.writeFile(path.join(archive, record), foreignBytes, { flag: "wx" });
+      substituted = true;
+    }
+    return originalMkdir(requested, ...args);
+  };
+  fsp.unlink = async (requested, ...args) => {
+    if (substituted && archive && record
+      && path.resolve(String(requested)) === path.resolve(path.join(archive, record))) {
+      attemptedForeignUnlink = true;
+      // Observe the true syscall target, and never actually delete foreign
+      // bytes even when running this test against its vulnerable parent.
+      throw Object.assign(new Error("foreign record unlink intercepted"), { code: "EACCES" });
+    }
+    return originalUnlink(requested, ...args);
+  };
+  const beforeWrites = f.writes;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.rename = originalRename;
+    fsp.mkdir = originalMkdir;
+    fsp.unlink = originalUnlink;
+    if (substituted) {
+      await originalRename(path.join(archive, record), foreignSaved);
+      await originalRename(parked, path.join(archive, record));
+      const active = await fsp.lstat(f.ledger);
+      if (!active.isDirectory() || (await fsp.readdir(f.ledger)).length !== 0) {
+        throw new Error("Refusing to modify nonempty disposable active ledger");
+      }
+      await fsp.rmdir(f.ledger);
+      await originalRename(archive, f.ledger);
+    }
+  }
+  assert.equal(substituted, true, `must substitute a real ${leafKind} after archive rename`);
+  assert.equal(attemptedForeignUnlink, false, "no unlink may target an unverified record inode");
+  assert.equal(failure?.code, "invalid_snapshot");
+  assert.match(failure.message, /Eviction ledger record identity changed before removal/);
+  assert.deepEqual(await fsp.readFile(foreignSaved), foreignBytes,
+    "the substituted foreign record bytes must remain exactly intact");
+  assertRemoteIntact(f, beforeWrites);
+});
+}
+
 test("issue 66 P1: pre-PREPARE snapshot upgrade EIO does not move bytes or relax old-client fence", async (t) => {
   const f = await fixture(t, "upgrade-EIO");
   const sync = await f.create(f.root, ["private"]);
