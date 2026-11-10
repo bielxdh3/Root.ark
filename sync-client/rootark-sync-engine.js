@@ -128,13 +128,16 @@ function denyIndeterminateInbound(engine) {
 }
 // Internal native-required mutation methods may be called by other methods
 // only AFTER withMutationLock has acquired the exclusive physical root lock.
-// The AsyncLocalStorage key is private and cannot be forged by assigning an
-// engine property. It is a cooperative call-graph fence, NOT root custody,
-// and must never become an authorization for hostile same-SID/UID writers.
+// The AsyncLocalStorage lease is private and cannot be forged by assigning an
+// engine property. It becomes INACTIVE BEFORE releasing the kernel lock: an
+// asynchronous callback can otherwise inherit the stale context and mutate
+// after the lock owner returned. This is a cooperative call-graph fence, NOT
+// root custody or authorization against hostile same-SID/UID writers.
 function requireNativeRootMutationContext(engine) {
   if (!engine.requireNativeRootRecovery) return;
   const queueKey = process.platform === "win32" ? engine.rootDir.toLowerCase() : engine.rootDir;
-  if (ROOT_MUTATION_CONTEXT.getStore() !== queueKey) {
+  const lease = ROOT_MUTATION_CONTEXT.getStore();
+  if (!lease || lease.queueKey !== queueKey || lease.active !== true) {
     fail("Native-required sync mutation lacks its physical root lock", "sync_root_busy");
   }
 }
@@ -2116,7 +2119,8 @@ class SyncEngine {
 
   withMutationLock(work) {
     const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
-    if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
+    const inherited = ROOT_MUTATION_CONTEXT.getStore();
+    if (inherited?.queueKey === queueKey && inherited.active === true) {
       fail("Sync mutations cannot re-enter a root operation", "sync_root_busy");
     }
     const previous = ROOT_MUTATION_QUEUES.get(queueKey) || Promise.resolve();
@@ -2127,11 +2131,13 @@ class SyncEngine {
       await fsp.mkdir(this.rootDir, { recursive: true });
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
+      const lease = { queueKey, active: true };
       try {
         denyIndeterminateInbound(this);
         await openEngineBuiltIn.call(this);
-        return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
+        return await ROOT_MUTATION_CONTEXT.run(lease, work);
       } finally {
+        lease.active = false;
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.

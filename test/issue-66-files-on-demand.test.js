@@ -1275,6 +1275,34 @@ test("issue 66: native-required private hydration and reconcile require the phys
   assert.equal(store.list("alice").length, 1);
 });
 
+test("issue 66: an escaped stale AsyncLocalStorage callback cannot reuse a released native-required lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "remote bytes protected by physical lock",
+  });
+  const client = await open();
+  const operation = store.list("alice").find((entry) => entry.metadata?.path === "docs/restore.txt");
+  assert.ok(operation);
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshot);
+  let releaseCallback;
+  const trigger = new Promise((resolve) => { releaseCallback = resolve; });
+  let escaped;
+  await client.withMutationLock(async () => {
+    // Registration happens INSIDE the AsyncLocalStorage context, but the
+    // operation will execute after withMutationLock has already released
+    // the physical lock. An equality-only context guard is a false authority.
+    escaped = trigger.then(() => client._apply(operation));
+  });
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  releaseCallback();
+  await assert.rejects(escaped, { code: "sync_root_busy" });
+  assert.equal(await exists(path.join(root, "docs", "restore.txt")), false);
+  assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot);
+  assert.deepEqual(await client.journal.recover(), []);
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66: equal-byte foreign inbound stage cannot authorize a successful FOD publish", async (t) => {
   const payload = "remote source payload with identical foreign bytes";
   const { root, open, store, state } = await setup(t, { "docs/restore.txt": payload });
