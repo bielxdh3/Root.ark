@@ -581,3 +581,33 @@ No push, merge, deploy, cutover or `Root/main` modifications were made.
 SOURCE peer review of the exact eventual child SHA is required, and a peer
 GO restricted to the new checks cannot override the known **P1 root-mode
 downgrade** or authorize integrating the complete branch.
+
+### Physical cross-instance root-mode downgrade reproduction (intentionally RED)
+
+After committing the bounded guards as
+`32767a66691c95d8224e553574ecf7bebd74cd93` (parent `7f2de23d`),
+a **separate isolated, intentionally dirty** worktree at
+`mission-20261109-pr300-crossmode-repro-prime` was detached at that exact
+source SHA. Its only worktree change is one test case, named
+`issue 66 P1 KNOWN RED: reopening same FOD cache as normal sync must not
+authorize legacy eviction`. The test uses the existing disposable real
+encrypted-object fixture, hydrates a tracked cached file with
+`filesOnDemand:true`, then constructs a new engine over the **same cache
+root** with `filesOnDemand:false` and invokes `evictLocal` on its tracked
+path. It expects native-custody denial and retention of cached bytes.
+
+The expected denial was **not produced** on either OS:
+
+| Exact `32767a66` source plus isolated uncommitted RED test | Observed |
+| --- | --- |
+| Windows Node v22.23.4 / disposable NTFS fixture | **1 FAIL**, `Missing expected rejection: same-root mode downgrade must not grant untrusted pathname eviction` |
+| Ubuntu WSL Node v22.22.1 / `TMPDIR=/home/bielx` real `/dev/sdd` ext4 | **1 FAIL**, same denial failure |
+
+This is a **verified unresolved P1**, not an incidental test infrastructure
+failure, not a GREEN test, and not a proof of a same-SID foreign-file attack.
+The uncommitted reproducer and disposable-test setup are preserved; it is
+deliberately not part of the passing committed regression suite. The source
+code of the committed `32767a66` branch continues to be independently
+reviewed only for its narrower new guards. **No publication/integration
+should treat this branch as native root custody or as a safe root-wide FOD
+mode invariant.**
