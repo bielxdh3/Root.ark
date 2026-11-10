@@ -986,6 +986,52 @@ test("issue 66: new FOD parent remains locked when inbound payload rename fails"
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
 
+test("issue 66: recursive FOD parent mkdir partial EIO cannot free cold lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/sub/restore.txt": "remote bytes after a partial ancestor mkdir",
+  });
+  const client = await open();
+  const firstAncestor = path.join(root, "docs");
+  const requestedParent = path.join(firstAncestor, "sub");
+  const target = path.join(requestedParent, "restore.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const oldSnapshot = await fsp.readFile(snapshot);
+  const oldStore = JSON.stringify(store.list("alice"));
+  const originalMkdir = fsp.mkdir;
+  let createdRealAncestor = false;
+  let injectedPartialError = false;
+  fsp.mkdir = async (candidate, options, ...extra) => {
+    if (!injectedPartialError && path.resolve(String(candidate)) === path.resolve(requestedParent)
+      && options?.recursive === true) {
+      // Real OS mkdir for the first component; the recursive call then
+      // fails at the next segment instead of returning its created path.
+      await originalMkdir(firstAncestor, { recursive: false });
+      createdRealAncestor = true;
+      injectedPartialError = true;
+      throw Object.assign(new Error("physical first ancestor followed by EIO"), { code: "EIO" });
+    }
+    return originalMkdir(candidate, options, ...extra);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/sub/restore.txt"), { code: "EIO" });
+  } finally {
+    fsp.mkdir = originalMkdir;
+  }
+  assert.equal(createdRealAncestor, true, "real ancestor must be created before the recursive EIO");
+  assert.equal(injectedPartialError, true);
+  assert.equal((await fsp.lstat(firstAncestor)).isDirectory(), true);
+  assert.equal(await exists(requestedParent), false);
+  assert.equal(await exists(target), false);
+  assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "partial recursive mkdir must quarantine the root, not authorize a cold local CREATE");
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  const diskJournal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
+  assert.deepEqual(diskJournal.pending, []);
+  assert.equal(state.pushes, 0, "no outbound push is asserted or fabricated by this fixture");
+  assert.equal(JSON.stringify(store.list("alice")), oldStore);
+});
+
 test("issue 66: physical post-publish FOD crash retains lock and stops cold outbound reconcile", async (t) => {
   const { root, open, store, state, key } = await setup(t, {
     "docs/restore.txt": "remote fixture bytes after abrupt exit",

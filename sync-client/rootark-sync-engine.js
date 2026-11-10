@@ -3768,6 +3768,19 @@ class SyncEngine {
     // as a file rename when the later snapshot checkpoint fails. Keep this
     // local to the trusted mutation pass; it cannot grant replay authority.
     let inboundCacheChanged = false;
+    const ensureInboundParent = async () => {
+      try {
+        const created = await fsp.mkdir(path.dirname(target), { recursive: true });
+        if (created !== undefined) inboundCacheChanged = true;
+      } catch (error) {
+        // Recursive mkdir may create one or more intermediate ancestors and
+        // then reject before returning the first created path. We cannot
+        // safely prove non-mutation from that rejection, so quarantine even
+        // when EIO occurs before the final child directory exists.
+        inboundCacheChanged = true;
+        throw error;
+      }
+    };
     try {
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
@@ -3801,8 +3814,7 @@ class SyncEngine {
       const sourceExists = source ? await exists(source) : false;
       const movePayload = protocol.decodeMovePayload(plaintext, key);
       if (!sourceExists && movePayload === null) fail("Moved file is unavailable and the operation has no recovery payload", "move_source_missing");
-      const createdMoveParent = await fsp.mkdir(path.dirname(target), { recursive: true });
-      if (createdMoveParent !== undefined) inboundCacheChanged = true;
+      await ensureInboundParent();
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       let hash;
@@ -3827,8 +3839,7 @@ class SyncEngine {
       }
       this.rememberOperation(operation, hash, sourcePath);
     } else {
-      const createdParent = await fsp.mkdir(path.dirname(target), { recursive: true });
-      if (createdParent !== undefined) inboundCacheChanged = true;
+      await ensureInboundParent();
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
@@ -3851,7 +3862,12 @@ class SyncEngine {
             await fsp.mkdir(target, { recursive: false });
             inboundCacheChanged = true;
           } catch (error) {
-            if (error.code !== "EEXIST") throw error;
+            if (error.code !== "EEXIST") {
+              // An injected/physical I/O failure may follow a successful
+              // mkdir syscall but precede its reported completion.
+              inboundCacheChanged = true;
+              throw error;
+            }
             if (!(await fsp.lstat(target)).isDirectory()) {
               await this.stageExisting(target);
               await fsp.mkdir(target, { recursive: false });
