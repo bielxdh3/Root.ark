@@ -979,6 +979,10 @@ test("issue 66: new FOD parent remains locked when inbound payload rename fails"
   assert.equal((await fsp.lstat(parent)).isDirectory(), true);
   assert.equal(await exists(target), false);
   assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot);
+  await assert.rejects(client.pruneEmptyUntrackedParents(parent),
+    { code: "sync_inbound_indeterminate" });
+  assert.equal((await fsp.lstat(parent)).isDirectory(), true,
+    "a direct cleanup caller must not remove the quarantined ancestor");
   assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
     "new uncheckpointed parent must retain the cross-process root lock");
   await assert.rejects(open(), { code: "sync_root_busy" });

@@ -4050,6 +4050,9 @@ class SyncEngine {
   }
 
   async pruneEmptyUntrackedParents(directory) {
+    // Public/direct callers must not delete an ancestor created by an
+    // uncheckpointed inbound FOD operation while the root is quarantined.
+    denyIndeterminateInbound(this);
     // A previously opened legacy instance must not prune physical cache paths
     // after another instance has durably marked this root as Files On-Demand.
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
