@@ -1430,6 +1430,126 @@ test("issue 66: direct native-required cold open and snapshot persistence cannot
   assert.equal(state.pushes, 0);
 });
 
+test("issue 66: direct cold private _materializeRemote cannot create a root marker before acquiring the physical lock", async (t) => {
+  const { root, adapter, key, state } = await setup(t, {
+    "docs/restore.txt": "remote cold inventory fixture",
+  });
+  const client = new SyncEngine({
+    rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true,
+  });
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client._materializeRemote("docs/restore.txt"),
+    { code: "sync_root_busy" });
+  for (const leaf of [".rootark-sync-ever-fod", ".rootark-sync-index.json",
+    ".rootark-sync-journal.json", "docs"]) {
+    assert.equal(await exists(path.join(root, leaf)), false,
+      `private cold path must not create ${leaf} under an unowned lock`);
+  }
+  assert.equal(state.pushes, 0);
+  assert.equal(state.inventoryReads, 0, "deny before contacting remote inventory");
+});
+
+test("issue 66: an unawaited inbound publish that physically renames then fails cannot make its lock owner succeed", async (t) => {
+  const payload = "published physical bytes before injected EIO";
+  const { root, open, store, state } = await setup(t, { "docs/restore.txt": payload });
+  const client = await open();
+  const operation = store.list("alice").find((entry) => entry.metadata?.path === "docs/restore.txt");
+  assert.ok(operation);
+  const target = path.join(root, "docs", "restore.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshot);
+  const originalKeyFor = client.keyFor.bind(client);
+  const originalRename = fsp.rename;
+  let keyEntered;
+  let releaseKey;
+  const entered = new Promise((resolve) => { keyEntered = resolve; });
+  const gate = new Promise((resolve) => { releaseKey = resolve; });
+  client.keyFor = async (...args) => {
+    keyEntered();
+    await gate;
+    return originalKeyFor(...args);
+  };
+  let physicallyPublished = false;
+  fsp.rename = async (source, destination, ...args) => {
+    if (!physicallyPublished && String(source).includes(".tmp-inbound-")
+      && path.resolve(String(destination)) === path.resolve(target)) {
+      await originalRename(source, destination, ...args);
+      physicallyPublished = true;
+      throw Object.assign(new Error("physical inbound rename completed then EIO"), { code: "EIO" });
+    }
+    return originalRename(source, destination, ...args);
+  };
+  let detached;
+  try {
+    const owner = client.withMutationLock(async () => {
+      detached = client._apply(operation);
+      await entered;
+      // Return without awaiting the started private physical publication.
+    });
+    await entered;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true);
+    releaseKey();
+    await assert.rejects(owner, { code: "EIO" },
+      "outer lock owner must not report SUCCESS after detached publisher EIO");
+    // Attach the caller observer only AFTER the owner has observed the error:
+    // the trusted internal observer must prevent an unhandled Node rejection.
+    await assert.rejects(detached, { code: "EIO" });
+  } finally {
+    releaseKey();
+    fsp.rename = originalRename;
+  }
+  assert.equal(physicallyPublished, true);
+  assert.equal(await fsp.readFile(target, "utf8"), payload);
+  assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "ambiguous physical completion must quarantine the real process lock");
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: an unawaited outbound adapter failure cannot make the physical lock owner succeed", async (t) => {
+  const { root, open, store, state, adapter } = await setup(t, {
+    "docs/restore.txt": "remote owned bytes",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const originalPush = adapter.push;
+  let dispatchEntered;
+  let releaseDispatch;
+  const entered = new Promise((resolve) => { dispatchEntered = resolve; });
+  const gate = new Promise((resolve) => { releaseDispatch = resolve; });
+  adapter.push = async () => {
+    dispatchEntered();
+    await gate;
+    throw Object.assign(new Error("injected unresolved remote acknowledgement"),
+      { code: "authorization_rejected" });
+  };
+  let detached;
+  try {
+    const owner = client.withMutationLock(async () => {
+      detached = client.retryPush(operation);
+      await entered;
+    });
+    await entered;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true);
+    releaseDispatch();
+    await assert.rejects(owner, { code: "authorization_rejected" });
+    await assert.rejects(detached, { code: "authorization_rejected" });
+  } finally {
+    releaseDispatch();
+    adapter.push = originalPush;
+  }
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "detached ambiguous outgoing I/O must not retire its owner's physical lock");
+  assert.equal(state.pushes, 0, "the fixture's real remote writer must not execute");
+});
+
 test("issue 66: native-required private pull, push, enqueue and prune deny before reading or mutating", async (t) => {
   const { root, open, state, store } = await setup(t, {
     "docs/restore.txt": "authenticated remote bytes",

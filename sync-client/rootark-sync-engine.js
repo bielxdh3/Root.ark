@@ -148,16 +148,20 @@ function requireNativeRootMutationContext(engine) {
 // settled. Never treat a scheduled-but-not-started stale callback as active.
 function retainNativeRootMutation(engine) {
   const lease = requireNativeRootMutationContext(engine);
-  if (!lease) return () => {};
-  lease.inFlight += 1;
+  if (!lease) return { finish() {}, fail() {} };
+  const ticket = {};
+  lease.inFlight.add(ticket);
   let retained = true;
-  return () => {
-    if (!retained) return;
-    retained = false;
-    lease.inFlight -= 1;
-    if (lease.inFlight === 0) {
-      for (const notify of lease.idleWaiters.splice(0)) notify();
-    }
+  return {
+    fail(error) { lease.failures.set(ticket, error); },
+    finish() {
+      if (!retained) return;
+      retained = false;
+      lease.inFlight.delete(ticket);
+      if (lease.inFlight.size === 0) {
+        for (const notify of lease.idleWaiters.splice(0)) notify();
+      }
+    },
   };
 }
 // Module-private and deliberately non-overridable. A future verified native
@@ -2150,32 +2154,47 @@ class SyncEngine {
       await fsp.mkdir(this.rootDir, { recursive: true });
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
-      const lease = { queueKey, active: true, inFlight: 0, idleWaiters: [] };
+      const lease = { queueKey, active: true, inFlight: new Set(),
+        failures: new Map(), idleWaiters: [] };
+      let ownerFulfilled = false;
+      let detachedAtReturn = [];
       try {
         denyIndeterminateInbound(this);
-        return await ROOT_MUTATION_CONTEXT.run(lease, async () => {
+        const result = await ROOT_MUTATION_CONTEXT.run(lease, async () => {
           // Cold admission can create the journal/genesis snapshot. It must
           // hold the SAME lease as the following mutation, not run before
           // the AsyncLocalStorage context exists.
           await openEngineBuiltIn.call(this);
           return await work();
         });
+        ownerFulfilled = true;
+        detachedAtReturn = [...lease.inFlight];
+        return result;
       } finally {
+        if (!ownerFulfilled) detachedAtReturn = [...lease.inFlight];
         // A returned callback is not necessarily its last I/O. An unawaited
         // native-required private operation can still hold the original
         // lease; draining it is required BEFORE dropping the process lock.
         // No timeout may silently convert pending writes into authorization
         // to remove the cross-process exclusion marker.
-        while (lease.inFlight !== 0) {
+        while (lease.inFlight.size !== 0) {
           await new Promise((resolve) => lease.idleWaiters.push(resolve));
         }
         lease.active = false;
+        // A returned callback is not success when one of the operations it
+        // ABANDONED later rejects. Record identity at callback completion,
+        // retain the OS lock on ambiguous failure and propagate its error.
+        const failedDetached = detachedAtReturn.find((ticket) => lease.failures.has(ticket));
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.
-        if (!this.pinnedPolicyIndeterminate && !INDETERMINATE_FOD_INBOUND.has(this)) {
+        if (!failedDetached && !this.pinnedPolicyIndeterminate
+          && !INDETERMINATE_FOD_INBOUND.has(this)) {
           await this.releaseProcessLock(processLock);
         }
+        // Preserve an already-throwing owner's original error; its physical
+        // exclusion still remains if another detached child failed too.
+        if (failedDetached && ownerFulfilled) throw lease.failures.get(failedDetached);
       }
     };
     const operation = previous.then(run, run);
@@ -4661,6 +4680,8 @@ class SyncEngine {
   }
 
   async _materializeRemote(relativePath) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
@@ -5119,7 +5140,8 @@ const preflightOutOfScopeMoveBuiltIn = SyncEngine.prototype.preflightOutOfScopeM
 // These are cooperative process-lock leases ONLY; no JS wrapper can grant
 // native RootSession, independent ancestry custody or same-SID isolation.
 for (const name of [
-  "_open", "persistSnapshot", "_apply", "_reconcileLocal", "_materializeOnDemand", "_enqueueChange",
+  "_open", "persistSnapshot", "_apply", "_reconcileLocal", "_materializeOnDemand",
+  "_materializeRemote", "_enqueueChange",
   "retryPush", "recoverConflict", "_pushPending", "pruneEmptyUntrackedParents",
   "_pinLocal", "_unpinLocal", "_pullRemote", "_applyExcludedPaths", "_syncOnce",
 ]) {
@@ -5127,14 +5149,24 @@ for (const name of [
   Object.defineProperty(SyncEngine.prototype, name, {
     configurable: true,
     writable: true,
-    value: async function (...args) {
-      denyIndeterminateInbound(this);
-      const release = retainNativeRootMutation(this);
-      try {
-        return await implementation.apply(this, args);
-      } finally {
-        release();
-      }
+    value: function (...args) {
+      // Attach the non-swallowing error observer to the EXACT promise
+      // returned to the caller. A detached rejection must not terminate
+      // Node before the root lease can record and quarantine its failure.
+      const operation = (async () => {
+        denyIndeterminateInbound(this);
+        const retained = retainNativeRootMutation(this);
+        try {
+          return await implementation.apply(this, args);
+        } catch (error) {
+          retained.fail(error);
+          throw error;
+        } finally {
+          retained.finish();
+        }
+      })();
+      operation.catch(() => {});
+      return operation;
     },
   });
 }
