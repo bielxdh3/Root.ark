@@ -1115,3 +1115,68 @@ The physical check uses temporary ordinary-recovery fixtures and does
 ancestors, durable journal/rename atomicity under power loss, cold native
 reacquisition, or release-worthy adversarial `required-v2` recovery.
 These are independent proof gates, not extrapolations from green tests.
+
+### 2026-11-10 continuation — ledger A→B substitution and bounded enumeration
+
+The last known remote `#300` is still `d3a91c921c18e40d23d101958b487725e88e8d95`,
+OPEN/Draft. The remote formal CodeQL gate is still **FAILURE with four HIGH
+filesystem-race annotations**, despite its separate JavaScript/TypeScript
+analysis and other sampled functional jobs passing. None of the local code
+in this section was pushed or run in hosted CI. `Root/main` stayed at
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+
+The child `54067c2d9c8b0c860e188815a38cb1d5e486cc55` of `3048365a`
+implements **read-only legacy Linux ledger anchoring**, not a native
+RootSession. Its exact-source independent review found zero new P0/P1/P2
+**within this bounded delta** and approved local fast-forward. Linux
+`openEvictionLedger` acquires a nofollow held root/ledger descriptor and
+creates the fixed ledger directory relative to the root FD; recovery
+enumerates the retained ledger via procfd and reads each fixed record through
+a held nofollow FD with an 8 KiB maximum and pre/post identity checks.
+Windows changes only the legacy directory-creation guard to nonrecursive
+`mkdir`, without claiming root-relative NTFS operations.
+
+| Test | Actual outcome |
+| --- | --- |
+| WSL Node22/native ext4 substituted ledger regression on the original `3048365a` | **RED**: foreign `ATTACKER_SENTINEL` was enumerated before eventual invalid-snapshot rejection |
+| WSL Node22/ext4 exact `54067c2d` same regression | **1 PASS, 0 FAIL**, foreign enumeration denied; snapshot, source bytes and signed remote object preserved |
+| WSL Node22/ext4 exact `54067c2d` zero-head/required-v2 focused recovery | **2 PASS, 0 FAIL** |
+| Windows Node22/NTFS exact `54067c2d` focused required-v2 process crash | **1 PASS, 0 FAIL** |
+
+The follow-up `77e1736bf0922bc4de4695c637c48338ac39bed2` replaces
+unbounded `fsp.readdir` of the ledger with bounded incremental
+`fsp.opendir`; it stops after the maximum 32,769 ledger names (16,384
+PREPARE, 16,384 COMMIT, one head) plus one sentinel. A new WSL Node22
+test was **RED** on its parent when `readdir` was forbidden, then
+**GREEN 1/1** after streaming. The earlier physical A→B substitution
+test was adapted to intercept either enumeration API and remained
+**GREEN 1/1**. A synthetic virtual-name boundary (not 32,770 real files)
+proved finite consumption: **WSL Node22/ext4 1 PASS** and **Windows Node22/
+NTFS 1 PASS**; normal bounded streaming also passed **Windows 1/1**.
+An independent read-only SOURCE review of the exact `77e1736b` delta
+reported **bounded GO, no new P0/P1/P2**, confirming the 32,769-entry
+threshold, the replacement-test interception of `opendir`, and finite
+iterator close on failure. This narrow approval does not override the
+known same-UID, Windows pathname or power-loss release blockers. Both
+`54067c2d` and `77e1736b` were fast-forwarded into the **local**
+integrated worktree, now clean at exact
+`77e1736bf0922bc4de4695c637c48338ac39bed2`. The remote Draft
+branch remains unchanged.
+The existing exact `42b8d837` genuine 16,385-file staged+active crash
+evidence was **not rerun**, as neither new commit changes that trash-reader
+contract.
+
+A separate independent read-only examination of native `removeEntry`
+confirmed **NO-GO** for adding fixed-name `unlinkat` to the existing
+same-UID-writable N-API laboratory: the name can be substituted between
+validation and unlink, and a failed post-unlink fsync is indeterminate.
+No unsafe unlink patch, privileged fixture reprovisioning or cleanup was
+performed. Even with the read hardening, production journal writes,
+promotion, stage/rollback and deletion remain pathname-based and cannot
+protect against hostile same-UID/SID swaps. Native owner/root custody,
+independent anti-rollback, image/DLL provenance, Windows CFAPI handle-bound
+commit, power-loss durability and cold re-acquisition are **not proven**.
+
+**Release decision: NO-GO.** `openNativeRootSession` stays fail-closed;
+do not infer SOURCE GO for complete recovery or CodeQL clearance from
+these focused local tests. No merge, deploy or cutover.
