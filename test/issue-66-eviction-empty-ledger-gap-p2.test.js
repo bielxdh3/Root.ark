@@ -174,6 +174,125 @@ test("issue 66: Linux PREPARE HEAD post-rename fsync EIO replays without signed 
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
 });
 
+test("issue 66: Linux completed v2 checkpoint post-rename fsync EIO never signs a deletion", {
+  skip: process.platform !== "linux" && "requires POSIX parent directory fsync after v2 checkpoint rename",
+}, async (t) => {
+  const f = await fixture(t, "v2-compaction-post-rename-fsync");
+  const sync = await f.create(f.root, ["private"]);
+  const originalRename = fsp.rename;
+  const originalOpen = fsp.open;
+  const before = f.outbound.length;
+  let renamedComplete = false;
+  let failedCompleteSync = false;
+  let report;
+  let thrown;
+  try {
+    fsp.rename = async (source, destination, ...args) => {
+      let completed = false;
+      if (path.resolve(String(destination)) === path.resolve(f.snapshot)
+        && String(source).startsWith(f.snapshot + ".tmp-")) {
+        const candidate = JSON.parse(await fsp.readFile(String(source), "utf8"));
+        completed = candidate.version === 2 && candidate.evictionLedgerRequired === false;
+      }
+      const result = await originalRename(source, destination, ...args);
+      if (completed) renamedComplete = true;
+      return result;
+    };
+    fsp.open = async (requested, ...args) => {
+      const handle = await originalOpen(requested, ...args);
+      if (renamedComplete && !failedCompleteSync
+        && path.resolve(String(requested)) === path.resolve(f.root)
+        && args[0] === 0 /* O_RDONLY directory fsync */) {
+        handle.sync = async () => {
+          failedCompleteSync = true;
+          throw Object.assign(new Error("post-v2-full-checkpoint directory EIO"), { code: "EIO" });
+        };
+      }
+      return handle;
+    };
+    try { report = await sync.syncOnce(); } catch (error) { thrown = error; }
+  } finally {
+    fsp.rename = originalRename;
+    fsp.open = originalOpen;
+  }
+  assert.equal(renamedComplete, true, "a real v2 required=false snapshot rename must complete");
+  assert.equal(failedCompleteSync, true, "the subsequent parent directory fsync must receive EIO");
+  assert.ok(thrown || report?.excluded?.failed?.length,
+    "post-rename fsync failure must not report an unqualified successful eviction");
+  const disk = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+  assert.equal(disk.version, 2);
+  assert.equal(disk.evictionLedgerRequired, false,
+    "the freshly installed snapshot may be visible despite durability EIO");
+  await assert.rejects(fsp.lstat(f.local), { code: "ENOENT" });
+  const journalNames = await fsp.readdir(f.ledger);
+  assert.ok(journalNames.some((name) => name.endsWith(".prepare.json")));
+  assert.ok(journalNames.some((name) => name.endsWith(".commit.json")));
+  // Reacquire and reconcile from a truly separate OS process, not merely a
+  // fresh JavaScript SyncEngine instance in the process that injected EIO.
+  const coldSource = String.raw`
+"use strict";
+const { SyncEngine } = require(process.argv[1]);
+const { SyncObjectStore } = require(process.argv[2]);
+(async () => {
+  const store = await new SyncObjectStore(process.argv[4]).open();
+  const recovered = await new SyncEngine({
+    rootDir: process.argv[3],
+    adapter: {
+      async list(objectId = "") { return store.list("alice", objectId || null); },
+      async push(operation) {
+        // Resetting exclusions can legitimately publish the non-sensitive
+        // parent directory. Never permit a DELETE or a formerly evicted
+        // cache file to become a new outbound operation in this cold replay.
+        if (operation?.operation !== "create" || operation?.tombstone
+          || operation?.metadata?.path !== "PRIVATE") {
+          process.stderr.write("FORBIDDEN_REPLAY_OUTBOUND_" + JSON.stringify({
+            operation: operation?.operation, tombstone: operation?.tombstone,
+            path: operation?.metadata?.path,
+          }));
+          process.exit(91);
+        }
+        return { status: 201, record: (await store.put("alice", operation)).record };
+      },
+    },
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    excludedPaths: [], fileKeyResolver: () => Buffer.from(process.argv[5], "base64"),
+  }).open();
+  await recovered.syncOnce();
+  if (recovered.snapshot.remoteOnly[process.argv[6]]?.reason !== "evicted") process.exit(95);
+  process.stdout.write("ROOTARK_REQUIRED_V2_COLD_REPLAY_OK");
+})().catch((error) => {
+  process.stderr.write(String(error?.stack ?? error));
+  process.exit(94);
+});
+`;
+  const child = spawn(process.execPath, [
+    "-e", coldSource, require.resolve("../sync-client/rootark-sync-engine"),
+    require.resolve("../src/routes/sync"), f.root, f.storePath, f.key.toString("base64"),
+    f.signed.objectId,
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (data) => { stdout += data.toString(); });
+  child.stderr.on("data", (data) => { stderr += data.toString(); });
+  const exitCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill(); reject(new Error("cold recovery subprocess timed out"));
+    }, 30000);
+    child.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
+    child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+  });
+  assert.equal(exitCode, 0, "cold recovery must succeed with no outbound signed write: " + stderr);
+  assert.equal(stdout, "ROOTARK_REQUIRED_V2_COLD_REPLAY_OK");
+  const diskStore = await new SyncObjectStore(f.storePath).open();
+  assert.equal(diskStore.list("alice").filter((item) => item.tombstone).length, 0,
+    "a truly fresh process may not create a signed tombstone in the durable server store");
+  const originalRemote = diskStore.list("alice", f.signed.objectId)[0];
+  assert.equal(originalRemote?.operationId, f.signed.operationId,
+    "cold reconciliation must not replace the original protected server object");
+  assert.equal(originalRemote?.tombstone, false);
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66: failed required-v2 snapshot publication must not unlink a swapped temporary inode", async (t) => {
   const f = await fixture(t, "snapshot-failed-rename-foreign-temp");
   const sync = await f.create(f.root, ["private"]);
