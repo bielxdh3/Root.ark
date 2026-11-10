@@ -1540,3 +1540,85 @@ The remote Draft PR #300 was last verified at `d3a91c92` with
 four HIGH formal CodeQL alerts in the **old remote check**;
 local SOURCE GO is not a new hosted CodeQL PASS. No PR push,
 GitHub Actions rerun, merge, deploy or cutover was performed.
+
+### 2026-11-10 continuation — no-replace genesis stage and post-link leaf fence
+
+Reconciled original local integrated HEAD `c9be3dc722b9e38899d6417a9e1db97c292dad56`;
+remote PR #300 was **OPEN/Draft** at `d3a91c921c18e40d23d101958b487725e88e8d95`,
+Root/main `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+The hosted CodeQL formal check `129597231893` was still **FAILURE**:
+four original *Potential file system race condition* annotations,
+in the remote `sync-client/rootark-sync-engine.js` lines 77 and
+706–707, `test/issue-66-files-on-demand.test.js:625`, and
+`test/issue-66-independent-owner-posix-root.test.js:167`.
+No new hosted check has been triggered for these local descendants.
+
+A previously independent failure in `createStagedEvictionGenesis`
+was physically reproduced on **Windows Node22/NTFS** and **WSL
+Node22/ext4**: the old `durableJson(temp,stage)` ultimately called
+replaceable `rename` for the reserved genesis head. An adversarial
+test created a real competing staged head immediately at that syscall
+and intercepted the attempted *destructive* rename before it could
+erase the test-owned foreign bytes: **RED 1 FAIL per platform**.
+`afa4cb5e83af04346b3d2832cd1155c80a9ed46e` introduced a
+separate exclusive stage helper: sync an O_EXCL temporary, link into
+the reserved stage name with atomic no-replace semantics, verify
+the original inode/two-link state, flush the parent on Linux, then
+retire the temporary name. An actual subprocess hard exit immediately
+after stage link, before temporary unlink, left two original links;
+reopen with exclusions failed closed without signed DELETE,
+**Windows 1 PASS and WSL 1 PASS**. The first peer correctly issued
+**SOURCE NO-GO** for `afa4`: the existing pre-stage crash test
+still hooked the old `rename`, and failure-path cleanup could
+attempt pathname unlink on an untrusted temporary leaf.
+
+`022e5c468615e149d9f8807ae1f83a53549d0cf6` corrects both
+review findings without pretending to provide atomic deletion.
+It makes the genuine pre-stage subprocess crash intercept the
+*new* `fsp.link(temp,stage)` **before** publication (exit 76),
+restoring the v1-only temporal proof; and entirely removes
+failure-path temporary unlink, leaving an unlinked single-inode
+`.tmp-` name inert for independent recovery. The competing
+foreign stage and its bytes are preserved on `EEXIST` denial.
+The old pre-stage crash and recovery test, collision test, genuine
+post-link hard-exit, and legitimate post-v2 recovery were rerun
+locally: **Windows focused 4 PASS / 0 FAIL** and **WSL focused
+4 PASS / 0 FAIL**, followed by **1 PASS each platform** verifying
+the original inert temp on denial. A second independent SOURCE review
+of exact `022e5c46` returned **bounded GO, no new P0/P1/P2**.
+
+A distinct post-publication race persisted: after correctly linking
+the original genesis into the active ledger, the old code could
+delete a *new* stage file substituted after its prior inode check.
+Original `afa4` **RED 1 FAIL** physically on Windows/NTFS and
+WSL/ext4; the test intercepted the final real stage `unlink` before
+destroying a foreign disposable file. The original focused child
+`f58b6a9f` received SOURCE GO and was cleanly cherry-picked on
+top of the reviewed `022e5c46` to form exact final
+`a18d2cceabf367ea23e33333cca7a0ca0c234a80`.
+The rebased child makes a fresh final staged-head lstat, bound to
+the held original file identity, link count, size and mtime after
+publication and before deletion; Linux reads the leaf through the
+retained trash dirfd. The independent reviewer verified identical
+Git patch-id between original and rebased deltas and gave **narrow
+SOURCE GO** for exact `a18d2cce`. The composed Windows/Node22
+NTFS and WSL/Node22 ext4 targeted test groups each returned
+**5 PASS / 0 FAIL**, including the competing stage, substituted
+stage, prior-to-stage crash, post-stage-link hard exit and
+legitimate pre-promotion recovery. Original physical 16,385-entry
+stress tests were not repeated.
+
+**Security scope:** Fail-closed after observed collisions and
+substitutions is proved only at those physical test boundaries.
+Success-path `unlink` of a temporary or staged child is still
+by mutable name after its last `lstat`, and a same-UID/SID writer
+can swap or A→B→A that name before the syscall. No JavaScript
+stat check supplies atomic identity-bound removal. **RootSession
+remains unconditionally fail-closed.** A protected OS parent/ACL
+or equivalent external custodian, owner-approved root identity and
+signed independent monotonic rollback floor, native safe stage/
+publish/remove, NTFS/CFAPI on verified Windows 10, cold boot
+reacquisition and genuine powercut/directory durability proof
+remain unavailable. These bounded SOURCE GOs do not authorize
+production, a PR merge, deploy or cutover. No remote push or hosted
+CI rerun occurred. **Product RELEASE NO-GO; mission incomplete.**
