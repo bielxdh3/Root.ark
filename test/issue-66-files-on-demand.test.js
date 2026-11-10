@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
+const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
 
@@ -785,9 +786,20 @@ test("issue 66: even a clean cached source cannot be renamed by legacy FOD MOVE 
   assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
 });
 
-test("issue 66: first hydration of signed MOVE with no local source or destination stays available", async (t) => {
-  const { root, open, store, key, state } = await setup(t, { "docs/original.txt": "verified first hydration" });
-  const client = await open();
+test("issue 66: first hydration of authorized signed MOVE with no local source or destination stays available", async (t) => {
+  const { root, adapter, store, key, state } = await setup(t, { "docs/original.txt": "verified first hydration" });
+  const pair = crypto.generateKeyPairSync("ed25519");
+  const publicKey = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trusted = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
+  let verified = 0;
+  const client = await new SyncEngine({ rootDir: root, adapter, deviceId: "device-b",
+    keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: async (op) => {
+      verified++;
+      return verifyAuthorizationProof(op.authorization, op, trusted);
+    },
+  }).open();
   const original = store.list("alice")[0];
   const move = protocol.createOperation({
     operation: "move", objectId: original.objectId, fileId: original.fileId,
@@ -798,13 +810,35 @@ test("issue 66: first hydration of signed MOVE with no local source or destinati
     metadata: { path: "docs/new.txt", sourcePath: "docs/original.txt" },
     plaintext: protocol.encodeMovePayload(Buffer.from("verified first hydration"), key), fileKey: key,
   });
-  assert.equal((await store.put("alice", move)).kind, "stored");
+  move.authorization = await createAuthorizationProof(move, {
+    username: "alice", privateKey: pair.privateKey, publicKey, expiresAt: Date.now() + 60_000,
+  });
+  // Store the ciphertext in the fixture's non-protected object store; supply
+  // the signed envelope through the inbound adapter so strict verification
+  // is exercised without forging a protected atomic device-registry write.
+  const unsigned = { ...move };
+  delete unsigned.authorization;
+  assert.equal((await store.put("alice", unsigned)).kind, "stored");
+  const listFromStore = adapter.list;
+  adapter.list = async (objectId) => (await listFromStore(objectId))
+    .map((record) => record.operationId === move.operationId ? move : record);
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
   assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
   const remoteBefore = JSON.stringify(store.list("alice"));
   assert.equal(await client.materializeRemote("docs/new.txt"), true);
+  assert.ok(verified > 0, "real Ed25519 pinned-key verifier must run");
+  assert.equal(client.journal.hasSeen(move.operationId), true);
+  assert.deepEqual(await client.journal.recover(), []);
   assert.equal(await fsp.readFile(path.join(root, "docs", "new.txt"), "utf8"), "verified first hydration");
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
   assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
   assert.equal(state.pushes, 0);
+  const reopened = await new SyncEngine({ rootDir: root, adapter, deviceId: "device-b",
+    keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: async (op) => verifyAuthorizationProof(op.authorization, op, trusted),
+  }).open();
+  assert.equal(reopened.snapshot.files["docs/new.txt"].objectId, move.objectId);
+  assert.equal(reopened.snapshot.files["docs/new.txt"].versionId, move.versionId);
+  assert.equal(reopened.journal.hasSeen(move.operationId), true);
 });
