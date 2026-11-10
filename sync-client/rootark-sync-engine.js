@@ -1073,14 +1073,6 @@ async function withHeldEvictionLedgerWrite(rootDir, work) {
 }
 async function stagedEvictionGenesis(rootDir) {
   const trash = path.join(rootDir, ".rootark-trash");
-  if (!(await exists(trash))) return null;
-  await containedAbsolute(rootDir, trash, false);
-  const rootStats = await fsp.lstat(rootDir, { bigint: true });
-  const trashStats = await fsp.lstat(trash, { bigint: true });
-  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || rootStats.ino === 0n
-    || !trashStats.isDirectory() || trashStats.isSymbolicLink() || trashStats.ino === 0n) {
-    fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
-  }
   // No count bound here: legacy trash can contain arbitrarily many legitimate
   // retained files when a process crashes after the required-v2 checkpoint.
   // Scan the *entire* directory in O(1) memory for every portable case alias
@@ -1098,6 +1090,8 @@ async function stagedEvictionGenesis(rootDir) {
   let heldRoot = null;
   let held = null;
   let candidate = null;
+  let rootStats;
+  let trashStats;
   const assertUnchanged = async () => {
     await containedAbsolute(rootDir, trash, false);
     const currentRoot = await fsp.lstat(rootDir, { bigint: true });
@@ -1117,15 +1111,40 @@ async function stagedEvictionGenesis(rootDir) {
       }
       const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
         | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+      // Acquire the parent first; a pathname lstat/containment check BEFORE
+      // open is not an authority for the eventual opened inode. The retained
+      // handle is compared against its pathname only AFTER acquisition.
       heldRoot = await fsp.open(rootDir, flags);
       // The child lookup is relative to the live root handle. POSIX path
       // rebinding after the handle is acquired cannot redirect it elsewhere.
-      held = await fsp.open(`/proc/self/fd/${heldRoot.fd}/.rootark-trash`, flags);
-      await assertUnchanged();
+      try { held = await fsp.open(`/proc/self/fd/${heldRoot.fd}/.rootark-trash`, flags); }
+      catch (error) {
+        if (error.code !== "ENOENT") {
+          fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+        }
+        const currentRoot = await fsp.lstat(rootDir, { bigint: true });
+        const openedRoot = await heldRoot.stat({ bigint: true });
+        if (!currentRoot.isDirectory() || currentRoot.isSymbolicLink()
+          || !sameFileIdentity(currentRoot, openedRoot)
+          || await exists(trash)) {
+          fail("Eviction genesis parent changed during absent-stage check", "invalid_snapshot");
+        }
+        return null;
+      }
     } else if (process.platform !== "win32") {
       fail("Held eviction directories are unavailable on this platform",
         "root_session_native_unavailable");
+    } else if (!(await exists(trash))) {
+      return null;
     }
+    await containedAbsolute(rootDir, trash, false);
+    rootStats = await fsp.lstat(rootDir, { bigint: true });
+    trashStats = await fsp.lstat(trash, { bigint: true });
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || rootStats.ino === 0n
+      || !trashStats.isDirectory() || trashStats.isSymbolicLink() || trashStats.ino === 0n) {
+      fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+    }
+    await assertUnchanged();
     for await (const entry of await fsp.opendir(linux ? `/proc/self/fd/${held.fd}` : trash)) {
       if (entry.name.toLowerCase() !== EVICTION_GENESIS_STAGE) continue;
       if (candidate !== null || entry.name !== EVICTION_GENESIS_STAGE) {
@@ -1379,21 +1398,22 @@ async function promoteStagedEvictionGenesis(rootDir, staged) {
     // refuses an existing destination atomically. This is only a legacy
     // no-overwrite fence; same-SID directory substitution and durability
     // still require native RootDirectory handles and an external custodian.
-    const source = await fsp.lstat(staged.file, { bigint: true });
-    if (!source.isFile() || source.isSymbolicLink()
-      || source.nlink !== 1n || source.size > 8192n) {
-      fail("Unsafe staged genesis publication source", "invalid_snapshot");
-    }
+    // Never precheck a mutable staged pathname and THEN open it. Hold the
+    // actual source inode first, inspect it through the same HANDLE, and
+    // only afterwards confirm the public stage name still points to it.
     const heldSource = await fsp.open(staged.file, fs.constants.O_RDONLY
       | (fs.constants.O_NONBLOCK || 0));
     try {
       const beforeRead = await heldSource.stat({ bigint: true });
-      if (!beforeRead.isFile() || !sameFileVersion(source, beforeRead)) {
+      const namedAtOpen = await fsp.lstat(staged.file, { bigint: true });
+      if (!beforeRead.isFile() || beforeRead.ino === 0n
+        || beforeRead.nlink !== 1n || beforeRead.size > 8192n
+        || !namedAtOpen.isFile() || namedAtOpen.isSymbolicLink()
+        || !sameFileVersion(beforeRead, namedAtOpen)) {
         fail("Staged genesis changed before publication", "invalid_snapshot");
       }
-      // The source can grow between lstat and read on NTFS. Never call the
-      // unbounded pathname readFile after a size precheck: read at most one
-      // byte beyond the 8 KiB contract from the retained file handle.
+      // The source can grow after HANDLE.stat on NTFS. Read at most one
+      // byte beyond the 8 KiB contract from the retained HANDLE.
       const buffer = Buffer.alloc(8193);
       let count = 0;
       while (count < buffer.length) {
