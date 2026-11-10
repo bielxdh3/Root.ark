@@ -1323,6 +1323,113 @@ test("issue 66: direct native-required outbound retry and conflict recovery cann
   assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
 });
 
+test("issue 66: a started but unawaited native-required _apply keeps the physical lock through all awaited I/O", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "remote content behind deferred key resolver",
+  });
+  const client = await open();
+  const operation = store.list("alice").find((entry) => entry.metadata?.path === "docs/restore.txt");
+  assert.ok(operation);
+  const physicalLock = path.join(root, ".rootark-sync.lock");
+  const originalKeyFor = client.keyFor.bind(client);
+  let releaseKey;
+  let enteredKey;
+  const deferredKey = new Promise((resolve) => { releaseKey = resolve; });
+  const keyStarted = new Promise((resolve) => { enteredKey = resolve; });
+  client.keyFor = async (...args) => {
+    enteredKey();
+    await deferredKey;
+    return originalKeyFor(...args);
+  };
+  let pendingApply;
+  let outerSettled = false;
+  const owner = client.withMutationLock(async () => {
+    pendingApply = client._apply(operation);
+    await keyStarted;
+    // Deliberately return without awaiting the started _apply.
+  }).then(() => { outerSettled = true; });
+  await keyStarted;
+  // Give the original owner's async finally a complete event-loop turn. The
+  // lock must be retained even when the callback has already returned.
+  await new Promise((resolve) => setImmediate(resolve));
+  const stillHeld = await exists(physicalLock);
+  const prematurelySettled = outerSettled;
+  releaseKey();
+  await Promise.all([owner, pendingApply]);
+  assert.equal(stillHeld, true,
+    "a live native-required mutation must retain the real process lock across deferred key I/O");
+  assert.equal(prematurelySettled, false,
+    "withMutationLock may not settle before an in-flight private mutation");
+  assert.equal(await exists(physicalLock), false,
+    "the physical lock may be retired only AFTER the complete inbound transaction");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "restore.txt"), "utf8"),
+    "remote content behind deferred key resolver");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66: a started unawaited native-required outbound retry holds its lock until adapter I/O finishes", async (t) => {
+  const { root, open, store, adapter, state } = await setup(t, {
+    "docs/restore.txt": "remote outbound test fixture",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const rootLock = path.join(root, ".rootark-sync.lock");
+  let releaseDispatch;
+  let dispatchStarted;
+  let dispatchCalls = 0;
+  const dispatchGate = new Promise((resolve) => { releaseDispatch = resolve; });
+  const entered = new Promise((resolve) => { dispatchStarted = resolve; });
+  const originalPush = adapter.push;
+  adapter.push = async () => {
+    dispatchCalls += 1;
+    dispatchStarted();
+    await dispatchGate;
+    return { status: 201 };
+  };
+  let pendingRetry;
+  let ownerSettled = false;
+  try {
+    const owner = client.withMutationLock(async () => {
+      pendingRetry = client.retryPush(operation);
+      await entered;
+      // Intentionally return before the private outbound request completes.
+    }).then(() => { ownerSettled = true; });
+    await entered;
+    await new Promise((resolve) => setImmediate(resolve));
+    const heldWhileDispatchPending = await exists(rootLock);
+    const prematureOwnerCompletion = ownerSettled;
+    releaseDispatch();
+    await Promise.all([owner, pendingRetry]);
+    assert.equal(heldWhileDispatchPending, true,
+      "cross-process root exclusion must cover a started outbound request");
+    assert.equal(prematureOwnerCompletion, false);
+    assert.equal(await exists(rootLock), false);
+    assert.equal(dispatchCalls, 1);
+    assert.equal(state.pushes, 0, "fixture's real remote writer must never run");
+  } finally {
+    releaseDispatch();
+    adapter.push = originalPush;
+  }
+});
+
+test("issue 66: direct native-required cold open and snapshot persistence cannot bypass the physical root lock", async (t) => {
+  const { root, open, state, store } = await setup(t, {
+    "docs/restore.txt": "cache fixture never admitted without the physical lock",
+  });
+  const client = await open();
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client._open(), { code: "sync_root_busy" });
+  await assert.rejects(client.persistSnapshot(), { code: "sync_root_busy" });
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(await exists(path.join(root, "docs", "restore.txt")), false);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66: native-required private pull, push, enqueue and prune deny before reading or mutating", async (t) => {
   const { root, open, state, store } = await setup(t, {
     "docs/restore.txt": "authenticated remote bytes",

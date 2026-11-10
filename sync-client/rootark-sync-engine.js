@@ -134,12 +134,31 @@ function denyIndeterminateInbound(engine) {
 // after the lock owner returned. This is a cooperative call-graph fence, NOT
 // root custody or authorization against hostile same-SID/UID writers.
 function requireNativeRootMutationContext(engine) {
-  if (!engine.requireNativeRootRecovery) return;
+  if (!engine.requireNativeRootRecovery) return null;
   const queueKey = process.platform === "win32" ? engine.rootDir.toLowerCase() : engine.rootDir;
   const lease = ROOT_MUTATION_CONTEXT.getStore();
   if (!lease || lease.queueKey !== queueKey || lease.active !== true) {
     fail("Native-required sync mutation lacks its physical root lock", "sync_root_busy");
   }
+  return lease;
+}
+// A private operation may pass an entry guard, await an attacker-controlled
+// adapter/key callback, and continue AFTER the owner's callback returned.
+// Keep the actual OS lock until EVERY started native-required operation has
+// settled. Never treat a scheduled-but-not-started stale callback as active.
+function retainNativeRootMutation(engine) {
+  const lease = requireNativeRootMutationContext(engine);
+  if (!lease) return () => {};
+  lease.inFlight += 1;
+  let retained = true;
+  return () => {
+    if (!retained) return;
+    retained = false;
+    lease.inFlight -= 1;
+    if (lease.inFlight === 0) {
+      for (const notify of lease.idleWaiters.splice(0)) notify();
+    }
+  };
 }
 // Module-private and deliberately non-overridable. A future verified native
 // opener returning successfully must NEVER resume the legacy pathname replay.
@@ -2131,12 +2150,25 @@ class SyncEngine {
       await fsp.mkdir(this.rootDir, { recursive: true });
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
-      const lease = { queueKey, active: true };
+      const lease = { queueKey, active: true, inFlight: 0, idleWaiters: [] };
       try {
         denyIndeterminateInbound(this);
-        await openEngineBuiltIn.call(this);
-        return await ROOT_MUTATION_CONTEXT.run(lease, work);
+        return await ROOT_MUTATION_CONTEXT.run(lease, async () => {
+          // Cold admission can create the journal/genesis snapshot. It must
+          // hold the SAME lease as the following mutation, not run before
+          // the AsyncLocalStorage context exists.
+          await openEngineBuiltIn.call(this);
+          return await work();
+        });
       } finally {
+        // A returned callback is not necessarily its last I/O. An unawaited
+        // native-required private operation can still hold the original
+        // lease; draining it is required BEFORE dropping the process lock.
+        // No timeout may silently convert pending writes into authorization
+        // to remove the cross-process exclusion marker.
+        while (lease.inFlight !== 0) {
+          await new Promise((resolve) => lease.idleWaiters.push(resolve));
+        }
         lease.active = false;
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
@@ -2186,6 +2218,7 @@ class SyncEngine {
 
   async _open() {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     const configuredMetadata = internalRootMetadata(
       this.rootDir, this.snapshotPath, this.journal?.filePath);
     await fsp.mkdir(this.rootDir, { recursive: true });
@@ -2564,6 +2597,7 @@ class SyncEngine {
 
   async persistSnapshot() {
     denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     await durableJson(this.snapshotPath, this.snapshot);
     this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
@@ -5079,5 +5113,30 @@ const openEngineBuiltIn = SyncEngine.prototype._open;
 // A caller can shadow public instance methods. Always use this module-captured
 // preflight for out-of-scope origin custody checks, including direct reconcile.
 const preflightOutOfScopeMoveBuiltIn = SyncEngine.prototype.preflightOutOfScopeMove;
+
+// Capture each trusted implementation once. Track the entire async lifetime,
+// not merely its entry, even if a caller forgets to await a private method.
+// These are cooperative process-lock leases ONLY; no JS wrapper can grant
+// native RootSession, independent ancestry custody or same-SID isolation.
+for (const name of [
+  "_open", "persistSnapshot", "_apply", "_reconcileLocal", "_materializeOnDemand", "_enqueueChange",
+  "retryPush", "recoverConflict", "_pushPending", "pruneEmptyUntrackedParents",
+  "_pinLocal", "_unpinLocal", "_pullRemote", "_applyExcludedPaths", "_syncOnce",
+]) {
+  const implementation = SyncEngine.prototype[name];
+  Object.defineProperty(SyncEngine.prototype, name, {
+    configurable: true,
+    writable: true,
+    value: async function (...args) {
+      denyIndeterminateInbound(this);
+      const release = retainNativeRootMutation(this);
+      try {
+        return await implementation.apply(this, args);
+      } finally {
+        release();
+      }
+    },
+  });
+}
 
 module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };
