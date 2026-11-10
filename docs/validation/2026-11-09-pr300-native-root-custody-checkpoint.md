@@ -505,3 +505,79 @@ changed, and `Root/main`/the remote Draft #300 were not modified.
 in its isolated worktree until a peer reviews its **exact committed SHA**;
 passing these Node tests alone must not be reported as SOURCE GO, CodeQL
 success or operational recovery readiness.
+
+## 2026-11-09 evening continuation — signed DELETE and staging-source guard
+
+**Status: ISOLATED LOCAL CANDIDATE; FULL PRODUCT/RELEASE NO-GO.** The local
+base `7f2de23d7fe621538515109c4fe54021f1dfdae2` (parent `3756cc7e`,
+grandparent integrated `496e7582`) contains the current-instance eviction
+and automatic-exclusion fences. An independent peer reviewed the two fences
+as GO only in that *narrow* sense. A second independent review of the exact
+`7f2de23d` instead confirmed a **P1 source NO-GO for a broader, persistent
+root-wide guarantee**: a cache originally hydrated under `filesOnDemand:true`
+can be reopened by a new engine with `filesOnDemand:false`. The new instance
+has no independently authenticated, immutable root-mode commitment, so its
+public `evictLocal` and ordinary exclusion migration can still invoke legacy
+pathname-based stage/rename/unlink. Freezing properties in the original JS
+instance does not defend a second instance, and a mutable same-UID JSON
+marker would not fix independent root custody. Do not promote this branch
+as safe for adversarial A→B→A, or integrate as an end-to-end security fix.
+
+The further isolated source change in
+`mission-20261109-pr300-fod-delete-guard-prime` adds **bounded fail-closed
+signed DELETE checks only when `requireNativeRootRecovery` is true**:
+
+- `_reconcileLocal` rejects a missing tracked path before signing/enqueuing a
+  remote DELETE; the adversarial input is a materialized Unicode cached file
+  moved to another pathname on the physical filesystem, not a fake scanner.
+- `translateWebDavMutation` rejects DELETE and MOVE (which may synthesize a
+  destination-overwrite tombstone) before scanning and translating.
+- `assertOutgoingAuthorized` rejects DELETE/tombstone both for a direct
+  enqueue and before a signed operation is dispatched. `_pushPending` rejects
+  previously persisted unseen DELETE/tombstone outbox records before remote
+  transmission. A regression writes an old signed DELETE through a non-FOD
+  engine, then reopens in FOD mode and checks it was not pushed. This does
+  **not** block a downgrade to the non-FOD instance: the P1 above remains.
+- Public `stageExisting(target)` now checks static source containment before
+  creating trash or renaming. A real sibling external file was moved by the
+  original source in the RED stage; the corrected source rejects it without
+  modifying that file. This remains a pathname TOCTOU check, **not** a
+  retained native root/ancestor handle or same-SID writer exclusion.
+
+TDD on Windows Node22 observed missing expected rejection for the vanished
+cache, WebDAV DELETE, and external absolute staging source. The old-outbox
+test was also observed RED by temporarily disabling its two new guards in
+the isolated candidate and rerunning, then restoring both guards; there is
+no assertion that these behaviors were safe before the patch.
+
+| Isolated child candidate source / actual workload | Physical result |
+| --- | --- |
+| FOD suite `test/issue-66-files-on-demand.test.js` / Windows Node v22.23.4, NTFS | **20 PASS / 0 FAIL / 0 SKIP** |
+| Same FOD suite / WSL Ubuntu Node v22.22.1, `TMPDIR=/home/bielx` on real `/dev/sdd` ext4 (not `/tmp` tmpfs) | **20 PASS / 0 FAIL / 0 SKIP** |
+| `test/phase16-sync-engine.test.js`, native recovery gate, and native RootSession contract / Windows Node22, NTFS | **53 PASS / 0 FAIL / 1 SKIP** |
+| Same three adjacent suites / WSL Node22, physical ext4 fixtures | **52 PASS / 0 FAIL / 2 SKIP** |
+
+The old durable index can be rewritten by ordinary FOD opening with an
+additional empty `pendingEvictions` field before the stored-outbox denial;
+the new regression compares logical `files` and `remoteOnly` plus retained
+journal rather than asserting byte-identical snapshot for that case. In the
+other rejection paths tests check unchanged cache/remote objects, no adapter
+pushes and no new trash. The test harness uses inherited recursive cleanup
+of its randomly named temporary parent, so it is *not* an adversarial
+same-UID cleanup safety proof. Nothing was executed as root in this change.
+
+**Still blocking any source-wide/production GO:** (1) mode downgrade across
+engines, (2) `SyncEngine._apply` and FOD hydration via `stageExisting` and
+pathname-based MOVEs/DELETEs without native ancestor custody, (3) independent
+owner/root authority and held handles for all I/O, (4) hostile concurrent
+writer/mount/reparse A→B→A and 16,385 entries under real native product
+recovery, (5) crash/power-loss and monotonic rollback protection, (6)
+trusted executable/loader images and Windows 10 CFAPI, and (7) hosted formal
+CodeQL still FAILURE on remote Draft PR #300 head `956b2515`. The separate
+Analyze JavaScript/TypeScript job was SUCCESS, not the formal gate. No hosted
+CI has validated this isolated local SHA. `RootSession` remains disabled.
+
+No push, merge, deploy, cutover or `Root/main` modifications were made.
+SOURCE peer review of the exact eventual child SHA is required, and a peer
+GO restricted to the new checks cannot override the known **P1 root-mode
+downgrade** or authorize integrating the complete branch.

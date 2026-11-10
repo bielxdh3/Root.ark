@@ -328,6 +328,100 @@ test("issue 66: automatic excluded cache migration refuses legacy eviction befor
   assert.equal(await exists(path.join(root, ".rootark-sync-evictions")), false);
 });
 
+test("issue 66: Files On-Demand cannot sign remote DELETE merely because a cached pathname vanishes", async (t) => {
+  const { root, open, store, state } = await setup(t, { "docs/café-中-😀.txt": "trusted cached bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/café-中-😀.txt");
+  const original = await fsp.readFile(path.join(root, "docs", "café-中-😀.txt"));
+  const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const originalRemote = JSON.stringify(store.list("alice"));
+  const originalPushes = state.pushes;
+  await fsp.rename(path.join(root, "docs", "café-中-😀.txt"),
+    path.join(root, "docs", "temporarily-missing.txt"));
+
+  await assert.rejects(client.syncOnce(), { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "temporarily-missing.txt")), original);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), originalSnapshot);
+  assert.equal(JSON.stringify(store.list("alice")), originalRemote);
+  assert.equal(state.pushes, originalPushes);
+  assert.equal((await client.journal.recover()).length, 0, "no signed DELETE or CREATE was queued");
+});
+
+test("issue 66: Files On-Demand WebDAV translation never signs pathname-derived DELETE", async (t) => {
+  const { root, open, store, state } = await setup(t, { "docs/item.txt": "trusted cached bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/item.txt");
+  const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const originalRemote = JSON.stringify(store.list("alice"));
+  await fsp.unlink(path.join(root, "docs", "item.txt"));
+
+  await assert.rejects(client.translateWebDavMutation({
+    kind: "delete", operationId: crypto.randomUUID(), source: "/docs/item.txt",
+  }), { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), originalSnapshot);
+  assert.equal(JSON.stringify(store.list("alice")), originalRemote);
+  assert.equal(state.pushes, 0);
+  assert.equal((await client.journal.recover()).length, 0);
+});
+
+test("issue 66: direct Files On-Demand outbox cannot enqueue a signed DELETE", async (t) => {
+  const { open, store, key, state } = await setup(t, { "docs/remote.txt": "signed original" });
+  const client = await open();
+  const remote = store.list("alice")[0];
+  const originalRemote = JSON.stringify(store.list("alice"));
+  await assert.rejects(client.enqueueChange({
+    operation: "delete", objectId: remote.objectId, fileId: remote.fileId,
+    versionId: crypto.randomUUID(), baseRevision: remote.revision,
+    revision: { counter: 2, deviceId: "device-b" },
+    metadata: { path: "docs/remote.txt" }, fileKey: key,
+  }), { code: "root_session_native_unavailable" });
+  assert.equal((await client.journal.recover()).length, 0);
+  assert.equal(JSON.stringify(store.list("alice")), originalRemote);
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66: a previous non-FOD signed DELETE in a durable journal cannot be pushed by FOD", async (t) => {
+  const { root, open, store, adapter, key, state } = await setup(t,
+    { "docs/retained.txt": "retain remote and local" });
+  const initial = await open();
+  await initial.materializeRemote("docs/retained.txt");
+  const remote = store.list("alice")[0];
+  const legacy = await new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key,
+  }).open();
+  await legacy.enqueueChange({
+    operation: "delete", objectId: remote.objectId, fileId: remote.fileId,
+    versionId: crypto.randomUUID(), baseRevision: remote.revision,
+    revision: { counter: 2, deviceId: "device-b" },
+    metadata: { path: "docs/retained.txt" }, fileKey: key,
+  });
+  const pendingBefore = (await legacy.journal.recover()).map((item) => item.operationId);
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const reopened = await open();
+  const snapshotBefore = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-index.json")));
+  await assert.rejects(reopened.syncOnce(), { code: "root_session_native_unavailable" });
+  assert.deepEqual((await reopened.journal.recover()).map((item) => item.operationId), pendingBefore);
+  const snapshotAfter = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-index.json")));
+  assert.deepEqual(snapshotAfter.files, snapshotBefore.files);
+  assert.deepEqual(snapshotAfter.remoteOnly, snapshotBefore.remoteOnly);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, 0);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "retained.txt"), "utf8"), "retain remote and local");
+});
+
+test("issue 66: public staging helper must not relocate a sibling file outside sync root", async (t) => {
+  const { root, open } = await setup(t, {});
+  const client = await open();
+  const outside = path.join(path.dirname(root), "independent-outside-witness.txt");
+  const bytes = Buffer.from("outside source must remain unchanged");
+  await fsp.writeFile(outside, bytes);
+
+  await assert.rejects(client.stageExisting(outside), { code: "unsafe_path" });
+  assert.deepEqual(await fsp.readFile(outside), bytes);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
 test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();

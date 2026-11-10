@@ -44,6 +44,13 @@ function denyUntrustedNativeEviction() {
   openNativeRootSession(true);
   fail("Native rooted cache eviction is not operational", "root_session_native_unavailable");
 }
+function denyUntrustedNativeSignedDelete() {
+  // A disappearance in a pathname scan (or an old pending signed tombstone)
+  // is not independently verified authority to delete a remote object.
+  // Even a future native opener cannot authorize this old JS write path.
+  openNativeRootSession(true);
+  fail("Native rooted signed DELETE is not operational", "root_session_native_unavailable");
+}
 function signedEnvelopeDigest(operation) {
   return crypto.createHash("sha256")
     .update(protocol.canonicalJson(operation), "utf8").digest("hex");
@@ -1797,6 +1804,9 @@ class SyncEngine {
   }
 
   async assertOutgoingAuthorized(operation, authorizedAction = null) {
+    if (this.requireNativeRootRecovery && (operation.operation === "delete" || operation.tombstone)) {
+      denyUntrustedNativeSignedDelete();
+    }
     let locallyAuthorized;
     try { locallyAuthorized = await this.authorizeOutgoing(operation); } catch {
       fail("Local sync authorization rejected", "authorization_rejected");
@@ -1872,6 +1882,10 @@ class SyncEngine {
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
     const kind = String(event.kind || "");
     if (!["put", "move", "delete"].includes(kind)) fail("Unsupported WebDAV mutation", "invalid_webdav_mutation");
+    if (this.requireNativeRootRecovery && (kind === "delete" || kind === "move")) {
+      // MOVE may also generate a destination tombstone in an overwrite pair.
+      denyUntrustedNativeSignedDelete();
+    }
     const operationPrefixes = [`webdav-${event.operationId}-`,
       `webdavsolo-${event.operationId}-`];
     const pendingForEvent = (await this.journal.recover()).filter((operation) =>
@@ -2353,6 +2367,12 @@ class SyncEngine {
 
   async _pushPending(summary) {
     const recovered = await this.journal.recover();
+    if (this.requireNativeRootRecovery && recovered.some((operation) =>
+      !this.journal.hasSeen(operation.operationId)
+      && (operation.operation === "delete" || operation.tombstone))) {
+      // Pre-existing outboxes must not bypass current native custody rules.
+      denyUntrustedNativeSignedDelete();
+    }
     // The journal's durable group manifest—not adjacency—is the local
     // evidence that the DELETE and MOVE entered the outbox together.
     // enqueueMany can leave unrelated records between two group members.
@@ -2576,13 +2596,17 @@ class SyncEngine {
   }
 
   async stageExisting(target) {
-    if (!(await exists(target))) return null;
+    // A public caller may pass an absolute source. Never stage a file from
+    // outside this root, even when the trash destination itself is contained.
+    // This rejects static escapes, NOT concurrent same-SID ancestor swaps.
+    const safeTarget = await containedAbsolute(this.rootDir, target, true);
+    if (!(await exists(safeTarget))) return null;
     const trashDir = path.join(this.rootDir, ".rootark-trash");
     await fsp.mkdir(trashDir, { recursive: true });
     await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
+    const trashTarget = path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
-    await fsp.rename(target, trashTarget);
+    await fsp.rename(safeTarget, trashTarget);
     return trashTarget;
   }
 
@@ -2962,6 +2986,7 @@ class SyncEngine {
         delete this.snapshot.files[relative];
         continue;
       }
+      if (this.requireNativeRootRecovery) denyUntrustedNativeSignedDelete();
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
       await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
