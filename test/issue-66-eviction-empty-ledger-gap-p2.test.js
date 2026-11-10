@@ -419,6 +419,102 @@ test("issue 66: Linux COMMIT cannot write into foreign ledger after a real direc
   verifyNoSignedDelete(f, before);
 });
 
+test("issue 66: Linux ledger retirement cannot delete files through a substituted archive symlink", {
+  skip: process.platform !== "linux" && "Linux rooted retirement must exclude a foreign symlink",
+}, async (t) => {
+  const f = await fixture(t, "foreign-ledger-retirement");
+  const foreign = path.join(f.dir, "foreign-ledger");
+  const parked = path.join(f.root, ".rootark-sync-evictions-parked");
+  await fsp.mkdir(foreign);
+  await fsp.writeFile(path.join(foreign, "FOREIGN_SENTINEL"), "leave foreign bytes intact");
+  const sync = await f.create(f.root, ["private"]);
+  const originalRename = fsp.rename;
+  const originalUnlink = fsp.unlink;
+  let swapped = false;
+  let attemptedForeignUnlink = false;
+  let archiveVisible = null;
+  let foreignNames = null;
+  fsp.rename = async (source, destination, ...args) => {
+    const sourceName = path.basename(String(source));
+    const destinationName = path.basename(String(destination));
+    if (!swapped && sourceName === ".rootark-sync-evictions"
+      && destinationName.startsWith(".rootark-sync-evictions-archive-")) {
+      swapped = true;
+      archiveVisible = path.join(f.root, destinationName);
+      const names = await fsp.readdir(f.ledger);
+      assert.ok(names.some((name) => name.endsWith(".prepare.json")));
+      assert.ok(names.some((name) => name.endsWith(".commit.json")));
+      for (const name of names) {
+        await fsp.writeFile(path.join(foreign, name), `FOREIGN ${name}`, { flag: "wx" });
+      }
+      foreignNames = (await fsp.readdir(foreign)).sort();
+      await originalRename(f.ledger, parked);
+      await fsp.symlink(foreign, f.ledger, "dir");
+    }
+    return originalRename(source, destination, ...args);
+  };
+  fsp.unlink = async (target, ...args) => {
+    if (swapped && archiveVisible && path.basename(path.dirname(String(target)))
+      === path.basename(archiveVisible)) {
+      attemptedForeignUnlink = true;
+      // Observe the dangerous deletion without destroying test-owned foreign
+      // bytes even in the RED parent. No external path cleanup is performed.
+      throw Object.assign(new Error("foreign archive unlink blocked by test"), { code: "EACCES" });
+    }
+    return originalUnlink(target, ...args);
+  };
+  const before = f.outbound.length;
+  try {
+    await assert.rejects(sync.syncOnce(),
+      "hostile ledger replacement must not complete retirement");
+  } finally {
+    fsp.rename = originalRename;
+    fsp.unlink = originalUnlink;
+    if (swapped) {
+      if (archiveVisible) {
+        try {
+          const stat = await fsp.lstat(archiveVisible);
+          if (stat.isSymbolicLink()) await fsp.unlink(archiveVisible);
+        } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      try {
+        const stat = await fsp.lstat(f.ledger);
+        if (stat.isSymbolicLink()) await fsp.unlink(f.ledger);
+        else if (stat.isDirectory() && !(await fsp.readdir(f.ledger)).length) {
+          await fsp.rmdir(f.ledger);
+        }
+      } catch (error) { if (error.code !== "ENOENT") throw error; }
+      await fsp.rename(parked, f.ledger);
+    }
+  }
+  assert.equal(swapped, true, "the test must reach the actual archive rename");
+  assert.equal(attemptedForeignUnlink, false,
+    "the engine must never attempt to delete a foreign entry through an archive symlink");
+  assert.deepEqual((await fsp.readdir(foreign)).sort(), foreignNames);
+  for (const name of foreignNames) {
+    assert.equal(await fsp.readFile(path.join(foreign, name), "utf8"),
+      name === "FOREIGN_SENTINEL" ? "leave foreign bytes intact" : `FOREIGN ${name}`);
+  }
+  verifyNoSignedDelete(f, before);
+});
+
+test("issue 66: legitimate Linux ledger retirement leaves no orphan archive after a durable eviction", {
+  skip: process.platform !== "linux" && "Linux held-directory retirement",
+}, async (t) => {
+  const f = await fixture(t, "successful-held-ledger-retirement");
+  const before = f.outbound.length;
+  const sync = await f.create(f.root, ["private"]);
+  const report = await sync.syncOnce();
+  assert.equal(report.excluded.evicted, 1);
+  assert.deepEqual(await fsp.readdir(f.ledger), [],
+    "a successful durable compaction must leave a fresh empty active ledger");
+  assert.deepEqual((await fsp.readdir(f.root)).filter((name) =>
+    name.startsWith(".rootark-sync-evictions-archive-")), [],
+  "no archive may remain after successful held-directory cleanup");
+  assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, false);
+  verifyNoSignedDelete(f, before);
+});
+
 test("issue 66 P2: required v2 refuses a staged case-alias hidden among >16384 trash entries", async (t) => {
   const f = await fixture(t, "large-trash-required");
   await fillLegitimateTrash(f.root);

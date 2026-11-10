@@ -1167,7 +1167,8 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
   }
   if (entries.size > EVICTION_LEDGER_MAX) fail("Eviction ledger has too many objects", "invalid_snapshot");
   await verifyHeldLedger();
-  return { directory, entries, head };
+  return { directory, entries, head,
+    directoryIdentity: linux ? { dev: heldDirectoryStats.dev, ino: heldDirectoryStats.ino } : null };
   } finally {
     if (heldDirectory) await heldDirectory.close();
     if (heldRoot) await heldRoot.close();
@@ -1221,12 +1222,78 @@ async function writeEvictionCommit(rootDir, prepare) {
   });
 }
 async function clearEvictionLedger(rootDir, expectedEpoch = null) {
-  const { directory, entries } = await readEvictionLedger(rootDir, expectedEpoch);
+  const { directory, entries, directoryIdentity } = await readEvictionLedger(rootDir, expectedEpoch);
   if (!directory || !entries.size) return;
   // The full snapshot is durable. Atomically retire the whole old ledger
   // before removing individual files, so a crash during cleanup cannot
   // expose a partial active chain to the next process.
-  const archived = path.join(rootDir, `${EVICTION_LEDGER_ARCHIVE}${crypto.randomUUID()}`);
+  const archivedName = `${EVICTION_LEDGER_ARCHIVE}${crypto.randomUUID()}`;
+  if (process.platform === "linux") {
+    // A returned path from the read helper is NOT an authority to rename or
+    // delete. Reacquire the actual inode read above from a held parent, then
+    // retire relative to that parent. Never follow an archive symlink when
+    // removing individual records: all unlinks target the held OLD ledger FD.
+    // Same-UID adversarial A->B->A remains unsolved without protected parent
+    // custody; this is narrow legacy-path containment only, not RootSession.
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    let heldRoot;
+    let heldLedger;
+    try {
+      heldRoot = await fsp.open(rootDir, flags);
+      const rootPath = `/proc/self/fd/${heldRoot.fd}`;
+      const current = `${rootPath}/${EVICTION_LEDGER_DIR}`;
+      const archived = `${rootPath}/${archivedName}`;
+      heldLedger = await fsp.open(current, flags);
+      const ledgerStats = await heldLedger.stat({ bigint: true });
+      if (!directoryIdentity || !sameFileIdentity(directoryIdentity, ledgerStats)) {
+        fail("Eviction ledger changed after authenticated read", "invalid_snapshot");
+      }
+      const verifyCurrent = async () => {
+        const visible = await fsp.lstat(current, { bigint: true });
+        if (!visible.isDirectory() || visible.isSymbolicLink()
+          || !sameFileIdentity(ledgerStats, visible)
+          || !sameFileIdentity(ledgerStats, await heldLedger.stat({ bigint: true }))) {
+          fail("Eviction ledger replaced before retirement", "invalid_snapshot");
+        }
+      };
+      const verifyArchived = async () => {
+        const visible = await fsp.lstat(archived, { bigint: true });
+        if (!visible.isDirectory() || visible.isSymbolicLink()
+          || !sameFileIdentity(ledgerStats, visible)
+          || !sameFileIdentity(ledgerStats, await heldLedger.stat({ bigint: true }))) {
+          fail("Eviction ledger archive identity is indeterminate", "invalid_snapshot");
+        }
+      };
+      await verifyCurrent();
+      await fsp.rename(current, archived);
+      // If a same-UID process swapped the name just before rename, the moved
+      // archive may be a symlink or a different directory. Reject *before*
+      // touching any child name and leave all foreign bytes unchanged.
+      await verifyArchived();
+      await heldRoot.sync();
+      await fsp.mkdir(current, { mode: 0o700 });
+      await heldRoot.sync();
+      for (const row of entries.values()) {
+        await verifyArchived();
+        if (row.commit) {
+          await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/${row.commit.filename}`);
+        }
+        await verifyArchived();
+        await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/${row.prepare.filename}`);
+      }
+      await verifyArchived();
+      await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/head.json`);
+      await verifyArchived();
+      await fsp.rmdir(archived);
+      await heldRoot.sync();
+    } finally {
+      if (heldLedger) await heldLedger.close();
+      if (heldRoot) await heldRoot.close();
+    }
+    return;
+  }
+  const archived = path.join(rootDir, archivedName);
   await fsp.rename(directory, archived);
   await fsyncEvictionDirectory(rootDir);
   await fsp.mkdir(directory, { mode: 0o700 });
