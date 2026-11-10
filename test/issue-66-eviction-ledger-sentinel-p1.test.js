@@ -256,6 +256,46 @@ test("issue 66: orphan archive after durable compaction refuses unauthenticated 
     "fail-closed cold open must not erase an indeterminate archive");
 });
 
+test("issue 66: Windows NTFS cold replay refuses a real orphaned ledger archive", {
+  skip: process.platform !== "win32" && "Windows NTFS legacy archive cold-open regression",
+}, async (t) => {
+  const f = await fixture(t, "windows-post-archive-rename");
+  const sync = await f.create(f.root, ["private"]);
+  const originalRename = fsp.rename;
+  let archived = null;
+  fsp.rename = async (source, destination, ...args) => {
+    if (!archived && path.basename(String(source)) === ".rootark-sync-evictions"
+      && path.basename(String(destination)).startsWith(".rootark-sync-evictions-archive-")
+      && path.resolve(path.dirname(String(source))) === path.resolve(f.root)) {
+      await originalRename(source, destination, ...args);
+      archived = path.join(f.root, path.basename(String(destination)));
+      throw Object.assign(new Error("simulated post-rename NTFS failure"), { code: "EIO" });
+    }
+    return originalRename(source, destination, ...args);
+  };
+  try { await assert.rejects(sync.syncOnce(), { code: "EIO" }); }
+  finally { fsp.rename = originalRename; }
+  assert.ok(archived, "must actually rename the ledger before failure");
+  const entries = (await fsp.readdir(archived)).sort();
+  assert.ok(entries.some((name) => name.endsWith(".prepare.json")));
+  const saved = new Map(await Promise.all(entries.map(async (name) =>
+    [name, await fsp.readFile(path.join(archived, name))])));
+  await assert.rejects(fsp.lstat(f.ledger), { code: "ENOENT" });
+  const checkpoint = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
+  assert.equal(checkpoint.evictionLedgerRequired, false);
+  assert.equal(checkpoint.remoteOnly[f.signed.objectId]?.reason, "evicted");
+  const beforeWrites = f.writes;
+  await assert.rejects(f.create(f.root, []), (error) =>
+    error?.code === "invalid_snapshot"
+      && /Orphaned eviction archive needs independent recovery/.test(error.message));
+  assertRemoteIntact(f, beforeWrites);
+  assert.deepEqual((await fsp.readdir(archived)).sort(), entries);
+  for (const [name, bytes] of saved) {
+    assert.deepEqual(await fsp.readFile(path.join(archived, name)), bytes,
+      `cold rejection must preserve original archived NTFS record ${name}`);
+  }
+});
+
 test("issue 66 P1: pre-PREPARE snapshot upgrade EIO does not move bytes or relax old-client fence", async (t) => {
   const f = await fixture(t, "upgrade-EIO");
   const sync = await f.create(f.root, ["private"]);

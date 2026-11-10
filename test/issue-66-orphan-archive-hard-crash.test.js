@@ -27,7 +27,8 @@ async function physicalChild(script, args) {
 }
 
 test("issue 66: real hard crash after archive rename refuses fresh-process cold replay", {
-  skip: process.platform !== "linux" && "requires Linux rootfd archive hard-crash boundary",
+  skip: !["linux", "win32"].includes(process.platform)
+    && "requires tested Windows NTFS or Linux ext4 archive crash boundary",
 }, async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-orphan-crash-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
@@ -74,7 +75,8 @@ const priorRename = fsp.rename;
 fsp.rename = async (from, to, ...args) => {
   if (path.basename(String(from)) === ".rootark-sync-evictions"
     && path.basename(String(to)).startsWith(".rootark-sync-evictions-archive-")
-    && path.resolve(await fsp.realpath(path.dirname(String(from)))) === path.resolve(root)) {
+    && path.resolve(await fsp.realpath(path.dirname(String(from))))
+      === path.resolve(await fsp.realpath(root))) {
     await priorRename(from, to, ...args);
     process.exit(74); // genuine hard exit before the post-rename directory fsync
   }
