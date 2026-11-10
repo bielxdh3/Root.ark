@@ -946,9 +946,9 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
   assert.equal(state.pushes, pushesBefore, "cold recovery may not sign a foreign temp or delete");
 });
 
-test("issue 66: physical post-publish FOD crash retains cold lock and forbids unsigned outbound reconcile", async (t) => {
+test("issue 66: physical post-publish FOD crash retains lock and stops cold outbound reconcile", async (t) => {
   const { root, open, store, state, key } = await setup(t, {
-    "docs/restore.txt": "trusted signed-source recovery bytes",
+    "docs/restore.txt": "remote fixture bytes after abrupt exit",
   });
   await open();
   const target = path.join(root, "docs", "restore.txt");
@@ -972,7 +972,7 @@ test("issue 66: physical post-publish FOD crash retains cold lock and forbids un
     'keyEpoch:"epoch-1",compartmentId:"private",fileKeyResolver:()=>Buffer.from(input.key,"hex"),',
     'selectedPaths:["docs"],filesOnDemand:true}).open();',
     'const operation=store.list("alice").find(x=>x.metadata?.path==="docs/restore.txt");',
-    'if(!operation)throw Error("signed-source record missing");',
+    'if(!operation)throw Error("remote fixture record missing");',
     'const originalRename=fsp.rename;',
     'fsp.rename=async(source,destination,...args)=>{',
     'const result=await originalRename(source,destination,...args);',
@@ -1002,9 +1002,12 @@ test("issue 66: physical post-publish FOD crash retains cold lock and forbids un
   });
   assert.match(child.stdout, /POST_PUBLISH_PHYSICAL_RENAME/,
     `must reach physical rename before crash, stderr=${child.stderr}`);
-  assert.ok(child.status !== 0 || child.signal,
-    "crash boundary must terminate the separate process without returning");
-  assert.equal(await fsp.readFile(target, "utf8"), "trusted signed-source recovery bytes");
+  if (process.platform === "win32") {
+    assert.notEqual(child.status, 0, "Windows must terminate the separate process");
+  } else {
+    assert.equal(child.signal, "SIGKILL", "POSIX must observe a real SIGKILL termination");
+  }
+  assert.equal(await fsp.readFile(target, "utf8"), "remote fixture bytes after abrupt exit");
   assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot,
     "the original snapshot is physically older than published payload");
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
@@ -1012,11 +1015,11 @@ test("issue 66: physical post-publish FOD crash retains cold lock and forbids un
   // Cold open MUST stop here; never simulate a custodian or unlink this
   // security lock from a same-UID/SID writable path to force a fake replay.
   await assert.rejects(open(), { code: "sync_root_busy" });
-  assert.equal(state.pushes, 0, "cold replay cannot sign an untracked inbound file as a new CREATE");
+  assert.equal(state.pushes, 0, "cold lock prevents an untracked outbound CREATE");
   const diskJournal = JSON.parse(await fsp.readFile(
     path.join(root, ".rootark-sync-journal.json"), "utf8"));
   assert.equal(diskJournal.pending.length, 0,
-    "failed cold admission cannot enqueue a fresh signed outbound CREATE");
+    "failed cold admission cannot enqueue any new outbound CREATE");
   assert.deepEqual(await fsp.readFile(snapshot), beforeSnapshot);
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
