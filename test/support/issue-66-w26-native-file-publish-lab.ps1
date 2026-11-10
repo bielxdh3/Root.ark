@@ -1,6 +1,7 @@
 param(
   [ValidateSet('NORMAL', 'COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
-               'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE')]
+               'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
+               'COLD_INSPECT')]
   [string]$Mode,
   [string]$Scratch
 )
@@ -12,12 +13,18 @@ try {
   $local = [System.IO.Path]::GetFullPath(
     [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)).TrimEnd('\')
   $directory = [System.IO.DirectoryInfo]::new($Scratch)
+  $coldInspect = $Mode -eq 'COLD_INSPECT'
+  $entries = if ($directory.Exists) { @($directory.GetFileSystemInfos()) } else { @() }
   if (-not $directory.Exists -or
       $directory.Name -notmatch '^rootark-w26-native-publish-[A-Za-z0-9_-]{6,}$' -or
       -not [string]::Equals($directory.Parent.FullName.TrimEnd('\'), $local,
         [StringComparison]::OrdinalIgnoreCase) -or
       ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
-      $directory.GetFileSystemInfos().Count -ne 0 -or
+      ($coldInspect -and $env:ROOTARK_ISSUE66_W26_COLD_INSPECT_LAB -ne '1') -or
+      ($coldInspect -and ($entries.Count -ne 1 -or $entries[0].Name -cne 'held' -or
+        -not ($entries[0] -is [System.IO.DirectoryInfo]) -or
+        ($entries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) -or
+      (-not $coldInspect -and $entries.Count -ne 0) -or
       (([System.IO.DirectoryInfo]::new($local)).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
     throw 'UNTRUSTED_LAB_SCRATCH'
   }
@@ -34,6 +41,18 @@ public static class RootarkW26NativeFilePublishLab {
   private struct FILE_ID_INFO {
     public ulong VolumeSerialNumber;
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] FileId;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FILE_STANDARD_INFO {
+    public long AllocationSize, EndOfFile;
+    public uint NumberOfLinks;
+    [MarshalAs(UnmanagedType.Bool)] public bool DeletePending;
+    [MarshalAs(UnmanagedType.Bool)] public bool Directory;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FILE_BASIC_INFO {
+    public long CreationTime, LastAccessTime, LastWriteTime, ChangeTime;
+    public uint FileAttributes;
   }
   [StructLayout(LayoutKind.Sequential)]
   private struct FILE_ATTRIBUTE_TAG_INFO { public uint Attributes, ReparseTag; }
@@ -67,12 +86,24 @@ public static class RootarkW26NativeFilePublishLab {
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool WriteFile(SafeFileHandle file, byte[] data, uint size,
     out uint written, IntPtr overlapped);
+  [DllImport("kernel32.dll", EntryPoint = "ReadFile", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool ReadFile(SafeFileHandle file, byte[] data, uint size,
+    out uint read, IntPtr overlapped);
   [DllImport("kernel32.dll", EntryPoint = "FlushFileBuffers", SetLastError = true)]
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool Flush(SafeFileHandle file);
   [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool GetId(SafeFileHandle file, int klass, out FILE_ID_INFO id, uint size);
+  [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetStandard(SafeFileHandle file, int klass,
+    out FILE_STANDARD_INFO info, uint size);
+  [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetBasic(SafeFileHandle file, int klass,
+    out FILE_BASIC_INFO info, uint size);
   [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool GetTag(SafeFileHandle file, int klass,
@@ -108,8 +139,10 @@ public static class RootarkW26NativeFilePublishLab {
         (tag.Attributes & 0x400) != 0 || ((tag.Attributes & 0x10) != 0) != directory)
       throw new InvalidOperationException("REPARSE_OR_WRONG_TYPE");
   }
-  private static SafeFileHandle Root(string directory) {
-    SafeFileHandle root = OpenDirectory(directory, 0x001F01FF, 7, IntPtr.Zero, 3,
+  private static SafeFileHandle Root(string directory, bool readOnly = false) {
+    SafeFileHandle root = OpenDirectory(directory,
+      readOnly ? 0x00100081U /* SYNC | LIST_DIRECTORY | READ_ATTR */ : 0x001F01FFU,
+      7, IntPtr.Zero, 3,
       0x02200000 /* OPEN_REPARSE_POINT | BACKUP_SEMANTICS */, IntPtr.Zero);
     if (root == null || root.IsInvalid) throw new InvalidOperationException("ROOT_OPEN_FAILED");
     try {
@@ -149,6 +182,95 @@ public static class RootarkW26NativeFilePublishLab {
     } finally {
       Marshal.FreeHGlobal(ptr);
       Marshal.FreeHGlobal(name);
+    }
+  }
+  // New-process, read-only observation of the three unsigned laboratory
+  // phases. No pathname reopen and NO authority to replay, repair or delete.
+  // The same-SID writable parent cannot provide authenticated cold custody.
+  private static string ColdLeaf(SafeFileHandle root, string leaf) {
+    if (leaf != "stage.bin" && leaf != "published.bin" &&
+        leaf != "prepared.bin" && leaf != "commit.bin")
+      throw new InvalidOperationException("COLD_LEAF_REJECTED");
+    IntPtr name = Marshal.StringToHGlobalUni(leaf);
+    IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+    SafeFileHandle file = null;
+    try {
+      var u = new UNICODE_STRING { Length = (ushort)(leaf.Length * 2),
+        MaximumLength = (ushort)((leaf.Length + 1) * 2), Buffer = name };
+      Marshal.StructureToPtr(u, ptr, false);
+      var attr = new OBJECT_ATTRIBUTES { Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+        RootDirectory = root.DangerousGetHandle(), ObjectName = ptr,
+        Attributes = 0x00001040 /* DONT_REPARSE | CASE_INSENSITIVE */ };
+      IO_STATUS_BLOCK status;
+      int code = OpenRelative(out file, 0x00100081 /* SYNC | READ | ATTR */,
+        ref attr, out status, IntPtr.Zero, 0, 7,
+        1U /* FILE_OPEN only */, 0x00200060, IntPtr.Zero, 0);
+      if (code == unchecked((int)0xC0000034) || code == unchecked((int)0xC000003A))
+        return null; // Only a kernel-confirmed missing leaf is absent.
+      if (code != 0 || file == null || file.IsInvalid)
+        throw new InvalidOperationException("COLD_OPEN_UNVERIFIED");
+      Plain(file, false);
+      FILE_ID_INFO id = Id(file);
+      if (id.FileId == null || id.FileId.Length != 16)
+        throw new InvalidOperationException("COLD_ID_UNVERIFIED");
+      FILE_STANDARD_INFO standard;
+      if (!GetStandard(file, 1 /* FileStandardInfo */, out standard,
+            (uint)Marshal.SizeOf(typeof(FILE_STANDARD_INFO))) ||
+          standard.Directory || standard.DeletePending ||
+          standard.NumberOfLinks != 1 || standard.EndOfFile < 0 ||
+          standard.EndOfFile > 128)
+        throw new InvalidOperationException("COLD_INODE_UNVERIFIED");
+      FILE_BASIC_INFO basic;
+      if (!GetBasic(file, 0 /* FileBasicInfo */, out basic,
+            (uint)Marshal.SizeOf(typeof(FILE_BASIC_INFO))))
+        throw new InvalidOperationException("COLD_VERSION_UNVERIFIED");
+      byte[] bytes = new byte[129]; // A bounded native read: no File.ReadAllText(path).
+      uint read;
+      if (!ReadFile(file, bytes, (uint)bytes.Length, out read, IntPtr.Zero)
+          || read > 128 || read != (uint)standard.EndOfFile)
+        throw new InvalidOperationException("COLD_READ_UNVERIFIED");
+      FILE_STANDARD_INFO after;
+      FILE_BASIC_INFO versionAfter;
+      if (!GetStandard(file, 1, out after,
+            (uint)Marshal.SizeOf(typeof(FILE_STANDARD_INFO))) ||
+          !GetBasic(file, 0, out versionAfter,
+            (uint)Marshal.SizeOf(typeof(FILE_BASIC_INFO))) ||
+          !Same(id, Id(file)) || after.EndOfFile != standard.EndOfFile ||
+          after.NumberOfLinks != standard.NumberOfLinks ||
+          after.DeletePending || after.Directory ||
+          basic.CreationTime != versionAfter.CreationTime ||
+          basic.LastWriteTime != versionAfter.LastWriteTime ||
+          basic.ChangeTime != versionAfter.ChangeTime)
+        throw new InvalidOperationException("COLD_READ_CHANGED");
+      return Encoding.UTF8.GetString(bytes, 0, (int)read);
+    } finally {
+      if (file != null) file.Dispose();
+      Marshal.FreeHGlobal(ptr);
+      Marshal.FreeHGlobal(name);
+    }
+  }
+  private static string InspectCold(string scratch) {
+    string parent = Path.Combine(scratch, "held");
+    using (SafeFileHandle root = Root(parent, true)) {
+      string stage = ColdLeaf(root, "stage.bin");
+      string published = ColdLeaf(root, "published.bin");
+      string prepared = ColdLeaf(root, "prepared.bin");
+      string commit = ColdLeaf(root, "commit.bin");
+      if (prepared != "PREPARED_V1" ||
+          (stage != null && stage != Trusted) ||
+          (published != null && published != Trusted) ||
+          (commit != null && commit != "COMMITTED_V1"))
+        throw new InvalidOperationException("COLD_BYTES_UNVERIFIED");
+      string phase;
+      if (stage == Trusted && published == null && commit == null)
+        phase = "PREPARED_ONLY";
+      else if (stage == null && published == Trusted && commit == null)
+        phase = "PUBLISHED_NO_COMMIT";
+      else if (stage == null && published == Trusted && commit == "COMMITTED_V1")
+        phase = "COMMIT_OBSERVED";
+      else throw new InvalidOperationException("COLD_PHASE_UNVERIFIED");
+      return "ROOTARK_W26_COLD_INSPECT phase=" + phase +
+        " authority=LAB_ONLY_NO_GO";
     }
   }
   private static void Write(SafeFileHandle file, string content) {
@@ -205,6 +327,11 @@ public static class RootarkW26NativeFilePublishLab {
   }
 
   public static string Run(string scratch, string mode) {
+    if (mode == "COLD_INSPECT") {
+      if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
+        throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
+      return InspectCold(scratch);
+    }
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";

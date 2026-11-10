@@ -24,7 +24,8 @@ function fixture() {
   return directory;
 }
 
-function invoke(scratch, mode, enabled = true, allowHardExit = false) {
+function invoke(scratch, mode, enabled = true, allowHardExit = false,
+  allowColdInspect = false) {
   return spawnSync(powershell, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-Scratch", scratch, "-Mode", mode,
@@ -32,7 +33,8 @@ function invoke(scratch, mode, enabled = true, allowHardExit = false) {
     windowsHide: true, encoding: "utf8", timeout: 20000, maxBuffer: 8192,
     env: { ...process.env,
       ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: enabled ? "1" : "0",
-      ROOTARK_ISSUE66_W26_HARD_EXIT_LAB: allowHardExit ? "1" : "0" },
+      ROOTARK_ISSUE66_W26_HARD_EXIT_LAB: allowHardExit ? "1" : "0",
+      ROOTARK_ISSUE66_W26_COLD_INSPECT_LAB: allowColdInspect ? "1" : "0" },
   });
 }
 
@@ -144,4 +146,63 @@ test("#66 W26 hard-exit mode cannot be enabled by the ordinary native lab flag a
     assert.equal(result.stdout, "");
     assert.match(result.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
     assert.deepEqual(fs.readdirSync(scratch), []);
+  });
+
+test("#66 W26 new process observes PREPARED-only crash using rooted read-only native HANDLEs",
+  { skip: !available, timeout: 40000 }, () => {
+    const scratch = fixture();
+    const crash = invoke(scratch, "PRE_LINK_HARD_EXIT", true, true);
+    assert.equal(crash.status, 74, crash.stderr);
+    const denied = invoke(scratch, "COLD_INSPECT");
+    assert.equal(denied.status, 41, "cold read requires a separate explicit opt-in");
+    assert.equal(denied.stdout, "");
+    const inspected = invoke(scratch, "COLD_INSPECT", true, false, true);
+    assert.equal(inspected.status, 0, inspected.stderr);
+    assert.equal(inspected.stderr, "");
+    assert.match(inspected.stdout,
+      /^ROOTARK_W26_COLD_INSPECT phase=PREPARED_ONLY authority=LAB_ONLY_NO_GO\r?\n$/);
+    assert.equal(fs.readFileSync(path.join(scratch, "held", "stage.bin"), "utf8"),
+      "ORIGINAL_OPENED_STAGE_BYTES");
+    assert.equal(fs.existsSync(path.join(scratch, "held", "published.bin")), false);
+  });
+
+test("#66 W26 new process observes published-uncommitted inode and never invents COMMIT",
+  { skip: !available, timeout: 40000 }, () => {
+    const scratch = fixture();
+    const crash = invoke(scratch, "POST_LINK_HARD_EXIT", true, true);
+    assert.equal(crash.status, 73, crash.stderr);
+    const inspected = invoke(scratch, "COLD_INSPECT", true, false, true);
+    assert.equal(inspected.status, 0, inspected.stderr);
+    assert.equal(inspected.stderr, "");
+    assert.match(inspected.stdout,
+      /^ROOTARK_W26_COLD_INSPECT phase=PUBLISHED_NO_COMMIT authority=LAB_ONLY_NO_GO\r?\n$/);
+    assert.equal(fs.existsSync(path.join(scratch, "held", "commit.bin")), false);
+  });
+
+test("#66 W26 cold native phase inspector distinguishes COMMIT and denies corrupt foreign bytes",
+  { skip: !available, timeout: 40000 }, () => {
+    const scratch = fixture();
+    const complete = invoke(scratch, "TXN_COMPLETE", true, true);
+    assert.equal(complete.status, 0, complete.stderr);
+    const observed = invoke(scratch, "COLD_INSPECT", true, false, true);
+    assert.equal(observed.status, 0, observed.stderr);
+    assert.match(observed.stdout,
+      /^ROOTARK_W26_COLD_INSPECT phase=COMMIT_OBSERVED authority=LAB_ONLY_NO_GO\r?\n$/);
+    // This is the same-SID *test fixture*, never a trusted custodian. A
+    // tampered unsigned marker must fail rather than becoming a recovery GO.
+    fs.writeFileSync(path.join(scratch, "held", "commit.bin"), "FOREIGN_COMMIT");
+    const corrupted = invoke(scratch, "COLD_INSPECT", true, false, true);
+    assert.equal(corrupted.status, 41);
+    assert.equal(corrupted.stdout, "");
+    assert.match(corrupted.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+    fs.writeFileSync(path.join(scratch, "held", "commit.bin"), "COMMITTED_V1");
+    const published = path.join(scratch, "held", "published.bin");
+    const alias = path.join(scratch, "held", "foreign-hardlink.bin");
+    fs.linkSync(published, alias);
+    const linked = invoke(scratch, "COLD_INSPECT", true, false, true);
+    assert.equal(linked.status, 41,
+      "a second physical hardlink must fail the native opened-inode admission");
+    assert.equal(linked.stdout, "");
+    assert.equal(fs.readFileSync(published, "utf8"), "ORIGINAL_OPENED_STAGE_BYTES");
+    assert.equal(fs.readFileSync(alias, "utf8"), "ORIGINAL_OPENED_STAGE_BYTES");
   });

@@ -165,3 +165,27 @@ COMMIT marker is a trusted owner-signed recovery authority; this lab has
 **no recovery engine**. Exact `caa6eb52` SOURCE approval remains mandatory
 before FF/push. Product FOD late-destination overwrite, external root
 custody, antirollback, hosted CodeQL and Windows 10 CFAPI remain **NO-GO**.
+
+### W26 follow-up — independent-process read-only cold phase inspection (LAB only)
+
+An opt-in `COLD_INSPECT` process now reopens a pre-existing disposable W26
+scratch under LocalAppData without staging, renaming, deleting or granting
+recovery rights. Native `NtCreateFile(RootDirectory)` opens only fixed leaves
+from a newly held NTFS directory HANDLE; reads are bounded to 129 bytes and
+bound to the same opened file identity. `FileIdInfo`, `FileStandardInfo`
+(regular file, nlink=1, size) and `FileBasicInfo` (version) are compared
+before/after each read. It distinguishes PREPARED-only, published-but-NOT-
+committed and COMMIT-observed phases after real child process termination,
+and denies corrupt markers and a foreign hardlink. A separate
+`ROOTARK_ISSUE66_W26_COLD_INSPECT_LAB=1` opt-in is mandatory.
+
+Physical Windows Node22/NTFS: targeted cold cases **3 PASS / 0 FAIL**,
+including same-SID marker corruption and an additional hardlink; the W26
+suite was **12 PASS / 0 FAIL** before the final read-version comparison,
+with all three new cold cases revalidated afterward. RootSession contract
+Windows Node22 **8 PASS**, WSL Node22 **8 PASS**. Earlier November 9 physical
+evidence and 16,385-name stress were reused, not repeated. No cold
+classification authenticates the root: a same-SID writer can replace an
+unsigned, byte-identical fixture; no protected root/ancestors, independent
+floor, binary attestation, Windows 10 or powercut durability is proven.
+**MERGE/RELEASE NO-GO** still applies independently of these results.
