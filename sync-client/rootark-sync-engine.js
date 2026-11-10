@@ -711,6 +711,7 @@ async function durableJson(filePath, value) {
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
     | (fs.constants.O_SYNC || 0);
   let handle;
+  let published = false;
   try {
     handle = await fsp.open(temporary, flags, 0o600);
     await handle.writeFile(`${JSON.stringify(value)}\n`);
@@ -718,6 +719,7 @@ async function durableJson(filePath, value) {
     await handle.close();
     handle = null;
     await renameWithRetry(temporary, filePath);
+    published = true;
     // Node cannot reliably fsync directory handles on Windows. Flush the
     // containing directory where the platform supports it; the file itself
     // is opened with O_SYNC and explicitly synced before the atomic rename.
@@ -732,6 +734,14 @@ async function durableJson(filePath, value) {
     // unchecked rm(temp) would then delete the FOREIGN replacement.
     // Do not cleanup by mutable name on failed or indeterminate publish.
     // The orphan .tmp cannot itself authorize snapshot/ledger recovery.
+    if (published) {
+      // The new metadata inode already replaced the old filename. Any
+      // subsequent parent fsync failure is an indeterminate publication,
+      // not a retryable per-file EIO. Use the existing invalid_snapshot
+      // admission fence to abort the entire pass before signed reconcile.
+      throw evictionError("invalid_snapshot",
+        "Metadata rename completed but parent durability is indeterminate", error);
+    }
     throw error;
   }
 }

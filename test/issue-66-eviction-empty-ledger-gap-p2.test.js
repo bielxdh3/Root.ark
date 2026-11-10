@@ -64,7 +64,6 @@ test("issue 66: Linux snapshot post-rename fsync EIO recovers without signed del
   let renamed = false;
   let failedDirSync = false;
   let observedError;
-  let observedReport;
   try {
     fsp.rename = async (source, destination, ...args) => {
       let targetIsRequiredV2 = false;
@@ -89,29 +88,94 @@ test("issue 66: Linux snapshot post-rename fsync EIO recovers without signed del
       }
       return handle;
     };
-    try { observedReport = await sync.syncOnce(); } catch (error) { observedError = error; }
+    try { await sync.syncOnce(); } catch (error) { observedError = error; }
   } finally {
     fsp.rename = originalRename;
     fsp.open = originalOpen;
   }
   assert.equal(renamed, true, "real O_EXCL temporary must have been renamed to snapshot");
   assert.equal(failedDirSync, true, "fault must occur in the post-rename parent fsync");
-  assert.equal(observedError, undefined, "per-file EIO is reported as a failed exclusion");
-  assert.deepEqual(observedReport.excluded.failed.map((row) => row.code), ["EIO"],
-    "post-rename directory fsync must report EIO, not claim eviction success");
+  assert.equal(observedError?.code, "invalid_snapshot",
+    "a physically published snapshot with uncertain durability must abort the full sync pass");
+  assert.equal(observedError?.cause?.code, "EIO",
+    "the original directory sync fault must remain inspectable as the cause");
+  assert.equal(sync.opened, false, "the old in-memory engine must require a verified cold reopen");
+  assert.equal(sync.snapshotDiskRevision, null);
   const newDisk = JSON.parse(await fsp.readFile(f.snapshot, "utf8"));
-  assert.equal(newDisk.version, 1,
-    "the previous file and in-memory migration state can be rolled back only while the cache is intact");
-  assert.equal(newDisk.evictionLedgerRequired, undefined);
+  assert.equal(newDisk.version, 2);
+  assert.equal(newDisk.evictionLedgerRequired, true,
+    "the installed v2 snapshot cannot be overwritten by an unreviewed v1 rollback");
   const staged = path.join(f.root, ".rootark-trash", ".rootark-eviction-genesis-head.json");
   assert.ok((await fsp.lstat(staged)).isFile(), "genesis must remain staged on disk");
-  assert.equal(newDisk.excludedPathsCasefoldVersion, 2,
-    "a separately persisted rollback may legitimately advance casefold metadata");
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
   const fresh = await f.create(f.root, []);
   await fresh.syncOnce();
   verifyNoSignedDelete(f, before);
   assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+});
+
+test("issue 66: an indeterminate published v2 snapshot aborts before signed reconciliation", {
+  skip: process.platform !== "linux" && "requires POSIX post-rename parent directory fsync",
+}, async (t) => {
+  const f = await fixture(t, "published-snapshot-reconcile-abort", true);
+  const sync = await f.create(f.root, ["private"]);
+  const beforeWrites = f.outbound.length;
+  const originalRename = fsp.rename;
+  const originalOpen = fsp.open;
+  let renamedRequiredV2 = false;
+  let failedDirSync = false;
+  let attemptedReconcile = false;
+  let observed;
+  // On the vulnerable parent a per-object EIO is merely placed in the
+  // exclusion report and the sync moves on to _reconcileLocal(). Intercept
+  // that call before any remote operation is built or signed.
+  sync._reconcileLocal = async () => {
+    attemptedReconcile = true;
+    throw Object.assign(new Error("reconcile after metadata EIO intercepted"), {
+      code: "UNSAFE_RECONCILE_INTERCEPTED",
+    });
+  };
+  try {
+    fsp.rename = async (source, destination, ...args) => {
+      let requiredV2 = false;
+      if (path.resolve(String(destination)) === path.resolve(f.snapshot)
+        && String(source).startsWith(f.snapshot + ".tmp-")) {
+        const candidate = JSON.parse(await fsp.readFile(String(source), "utf8"));
+        requiredV2 = candidate.version === 2 && candidate.evictionLedgerRequired === true;
+      }
+      const result = await originalRename(source, destination, ...args);
+      if (requiredV2) renamedRequiredV2 = true;
+      return result;
+    };
+    fsp.open = async (requested, ...args) => {
+      const handle = await originalOpen(requested, ...args);
+      if (renamedRequiredV2 && !failedDirSync
+        && path.resolve(String(requested)) === path.resolve(f.root)
+        && args[0] === 0 /* O_RDONLY parent directory */) {
+        handle.sync = async () => {
+          failedDirSync = true;
+          throw Object.assign(new Error("real snapshot rename succeeded but parent fsync EIO"), { code: "EIO" });
+        };
+      }
+      return handle;
+    };
+    try { await sync.syncOnce(); } catch (error) { observed = error; }
+  } finally {
+    fsp.rename = originalRename;
+    fsp.open = originalOpen;
+  }
+  assert.equal(renamedRequiredV2, true, "real required-v2 snapshot rename must happen");
+  assert.equal(failedDirSync, true, "fault must occur after published snapshot rename");
+  assert.equal(attemptedReconcile, false,
+    "no signed reconciliation may run until the indeterminate snapshot is reopened");
+  assert.equal(observed?.code, "invalid_snapshot",
+    "durability-indeterminate metadata error must abort the entire pass");
+  assert.equal(observed?.cause?.code, "EIO",
+    "the original physical post-rename directory sync fault must be retained");
+  assert.equal(await fsp.readFile(f.local, "utf8"), "authenticated server file");
+  assert.equal(await fsp.readFile(path.join(f.root, "PRIVATE", "second.txt"), "utf8"),
+    "second authenticated server file");
+  verifyNoSignedDelete(f, beforeWrites);
 });
 
 test("issue 66: Linux PREPARE HEAD post-rename fsync EIO replays without signed deletion", {
