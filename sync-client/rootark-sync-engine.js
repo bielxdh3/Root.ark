@@ -1314,6 +1314,7 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
   let heldDirectory;
   let heldRootStats;
   let heldDirectoryStats;
+  let windowsDirectoryStats;
   const verifyHeldLedger = async () => {
     if (!linux) return;
     const currentRoot = await fsp.lstat(rootDir, { bigint: true });
@@ -1336,6 +1337,14 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
       heldRootStats = await heldRoot.stat({ bigint: true });
       heldDirectoryStats = await heldDirectory.stat({ bigint: true });
       await verifyHeldLedger();
+    } else if (process.platform === "win32") {
+      // The legacy Windows reader cannot pin an NTFS directory across
+      // operations, but it must at least bind its output to a particular
+      // named directory identity before any later destructive retirement.
+      windowsDirectoryStats = await fsp.lstat(directory, { bigint: true });
+      if (!windowsDirectoryStats.isDirectory() || windowsDirectoryStats.isSymbolicLink()) {
+        fail("Unsafe eviction ledger directory", "invalid_snapshot");
+      }
     }
   // A same-UID writer can place an arbitrary number of junk names here.
   // readdir() would allocate the ENTIRE name array before checking the cap;
@@ -1423,8 +1432,19 @@ async function readEvictionLedger(rootDir, expectedEpoch = null) {
   }
   if (entries.size > EVICTION_LEDGER_MAX) fail("Eviction ledger has too many objects", "invalid_snapshot");
   await verifyHeldLedger();
+  if (windowsDirectoryStats) {
+    const after = await fsp.lstat(directory, { bigint: true });
+    if (!after.isDirectory() || after.isSymbolicLink()
+      || !sameFileIdentity(windowsDirectoryStats, after)) {
+      fail("Eviction ledger changed during Windows read", "invalid_snapshot");
+    }
+  }
   return { directory, entries, head,
-    directoryIdentity: linux ? { dev: heldDirectoryStats.dev, ino: heldDirectoryStats.ino } : null };
+    directoryIdentity: linux
+      ? { dev: heldDirectoryStats.dev, ino: heldDirectoryStats.ino }
+      : windowsDirectoryStats
+        ? { dev: windowsDirectoryStats.dev, ino: windowsDirectoryStats.ino }
+        : null };
   } finally {
     if (heldDirectory) await heldDirectory.close();
     if (heldRoot) await heldRoot.close();
@@ -1550,6 +1570,43 @@ async function clearEvictionLedger(rootDir, expectedEpoch = null) {
     return;
   }
   const archived = path.join(rootDir, archivedName);
+  if (process.platform === "win32") {
+    // Never use a successfully parsed journal's filenames as delete
+    // authority against an archive that does not identify the same
+    // directory. Real NTFS tests demonstrated that a same-SID writer can
+    // swap the source name just before rename and redirect legacy cleanup.
+    // This narrow check blocks that substitution; it is NOT a protected
+    // RootDirectory/ACL or ABA guarantee for an actively hostile SID.
+    const current = await fsp.lstat(directory, { bigint: true });
+    if (!directoryIdentity || !current.isDirectory() || current.isSymbolicLink()
+      || !sameFileIdentity(directoryIdentity, current)) {
+      fail("Eviction ledger changed before Windows retirement", "invalid_snapshot");
+    }
+    await fsp.rename(directory, archived);
+    const verifyArchived = async () => {
+      const actual = await fsp.lstat(archived, { bigint: true });
+      if (!actual.isDirectory() || actual.isSymbolicLink()
+        || !sameFileIdentity(directoryIdentity, actual)) {
+        fail("Eviction ledger archive identity is indeterminate", "invalid_snapshot");
+      }
+    };
+    await verifyArchived();
+    await fsyncEvictionDirectory(rootDir);
+    await fsp.mkdir(directory, { mode: 0o700 });
+    await fsyncEvictionDirectory(rootDir);
+    for (const row of entries.values()) {
+      await verifyArchived();
+      if (row.commit) await fsp.unlink(path.join(archived, row.commit.filename));
+      await verifyArchived();
+      await fsp.unlink(path.join(archived, row.prepare.filename));
+    }
+    await verifyArchived();
+    await fsp.unlink(path.join(archived, "head.json"));
+    await verifyArchived();
+    await fsp.rmdir(archived);
+    await fsyncEvictionDirectory(rootDir);
+    return;
+  }
   await fsp.rename(directory, archived);
   await fsyncEvictionDirectory(rootDir);
   await fsp.mkdir(directory, { mode: 0o700 });

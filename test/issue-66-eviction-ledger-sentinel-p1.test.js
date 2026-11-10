@@ -296,6 +296,164 @@ test("issue 66: Windows NTFS cold replay refuses a real orphaned ledger archive"
   }
 });
 
+test("issue 66: Windows retirement must never delete a substituted foreign archive", {
+  skip: process.platform !== "win32" && "requires real NTFS directory swap",
+}, async (t) => {
+  const f = await fixture(t, "win-foreign-archive-retirement");
+  const sync = await f.create(f.root, ["private"]);
+  const foreign = path.join(path.dirname(f.root), "attacker-ledger");
+  const parked = path.join(f.root, ".rootark-sync-evictions-parked");
+  await fsp.mkdir(foreign);
+  const originalRename = fsp.rename;
+  const originalUnlink = fsp.unlink;
+  let injected = false;
+  let archive = null;
+  let attemptedForeignUnlink = false;
+  let foreignBefore;
+  let foreignBytes;
+  fsp.rename = async (source, dest, ...args) => {
+    if (!injected && path.basename(String(source)) === ".rootark-sync-evictions"
+      && path.basename(String(dest)).startsWith(".rootark-sync-evictions-archive-")
+      && path.resolve(path.dirname(String(source))) === path.resolve(f.root)) {
+      injected = true;
+      const names = await fsp.readdir(f.ledger);
+      assert.ok(names.some((name) => name.endsWith(".prepare.json")));
+      assert.ok(names.some((name) => name.endsWith(".commit.json")));
+      for (const name of names) {
+        await fsp.writeFile(path.join(foreign, name), `FOREIGN_${name}`, { flag: "wx" });
+      }
+      await fsp.writeFile(path.join(foreign, "FOREIGN_SENTINEL"), "attacker bytes", { flag: "wx" });
+      foreignBefore = (await fsp.readdir(foreign)).sort();
+      foreignBytes = new Map(await Promise.all(foreignBefore.map(async (name) =>
+        [name, await fsp.readFile(path.join(foreign, name))])));
+      await originalRename(f.ledger, parked);
+      await originalRename(foreign, f.ledger);
+      archive = String(dest);
+    }
+    return originalRename(source, dest, ...args);
+  };
+  fsp.unlink = async (requested, ...args) => {
+    // Prevent even the original vulnerable code from actually deleting the
+    // disposable foreign records. This is an observation of the real target.
+    if (injected && archive
+      && path.resolve(path.dirname(String(requested))) === path.resolve(archive)) {
+      attemptedForeignUnlink = true;
+      throw Object.assign(new Error("foreign deletion intercepted"), { code: "EACCES" });
+    }
+    return originalUnlink(requested, ...args);
+  };
+  const beforeWrites = f.writes;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.rename = originalRename;
+    fsp.unlink = originalUnlink;
+    if (injected && archive) {
+      await originalRename(archive, foreign);
+      // The vulnerable path creates a fresh empty active ledger before it
+      // attempts the unsafe archive unlink. Restore the original only after
+      // removing that *test-owned empty* directory, never any contents.
+      try {
+        const visible = await fsp.lstat(f.ledger);
+        if (!visible.isDirectory() || (await fsp.readdir(f.ledger)).length) {
+          throw new Error("refusing to remove nonempty test ledger during recovery");
+        }
+        await fsp.rmdir(f.ledger);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      await originalRename(parked, f.ledger);
+    }
+  }
+  assert.equal(injected, true, "the real directory retirement boundary must be exercised");
+  assert.equal(attemptedForeignUnlink, false, "no DELETE syscall may target a swapped archive");
+  assert.equal(failure?.code, "invalid_snapshot");
+  assert.match(failure.message, /Eviction ledger archive identity is indeterminate/);
+  assert.deepEqual((await fsp.readdir(foreign)).sort(), foreignBefore);
+  for (const [name, bytes] of foreignBytes) {
+    assert.deepEqual(await fsp.readFile(path.join(foreign, name)), bytes,
+      `no foreign archive bytes may be deleted or changed: ${name}`);
+  }
+  assertRemoteIntact(f, beforeWrites);
+});
+
+test("issue 66: Windows retirement rechecks archived identity immediately before first unlink", {
+  skip: process.platform !== "win32" && "requires Windows NTFS archive rename",
+}, async (t) => {
+  const f = await fixture(t, "win-post-rename-archive-swap");
+  const sync = await f.create(f.root, ["private"]);
+  const foreign = path.join(path.dirname(f.root), "attacker-archive");
+  const parked = path.join(f.root, ".rootark-sync-evictions-parked");
+  await fsp.mkdir(foreign);
+  const originalRename = fsp.rename;
+  const originalMkdir = fsp.mkdir;
+  const originalUnlink = fsp.unlink;
+  let archive = null;
+  let substituted = false;
+  let attemptedForeignUnlink = false;
+  let foreignBefore;
+  let foreignBytes;
+  fsp.rename = async (source, dest, ...args) => {
+    if (!archive && path.basename(String(source)) === ".rootark-sync-evictions"
+      && path.basename(String(dest)).startsWith(".rootark-sync-evictions-archive-")
+      && path.resolve(path.dirname(String(source))) === path.resolve(f.root)) {
+      archive = String(dest);
+    }
+    return originalRename(source, dest, ...args);
+  };
+  fsp.mkdir = async (requested, ...args) => {
+    if (archive && !substituted && path.resolve(String(requested)) === path.resolve(f.ledger)) {
+      substituted = true;
+      const names = await fsp.readdir(archive);
+      assert.ok(names.some((name) => name.endsWith(".prepare.json")));
+      for (const name of names) {
+        await fsp.writeFile(path.join(foreign, name), `FOREIGN_${name}`, { flag: "wx" });
+      }
+      foreignBefore = (await fsp.readdir(foreign)).sort();
+      foreignBytes = new Map(await Promise.all(foreignBefore.map(async (name) =>
+        [name, await fsp.readFile(path.join(foreign, name))])));
+      await originalRename(archive, parked);
+      await originalRename(foreign, archive);
+    }
+    return originalMkdir(requested, ...args);
+  };
+  fsp.unlink = async (requested, ...args) => {
+    if (substituted && archive
+      && path.resolve(path.dirname(String(requested))) === path.resolve(archive)) {
+      attemptedForeignUnlink = true;
+      throw Object.assign(new Error("foreign archive delete intercepted"), { code: "EACCES" });
+    }
+    return originalUnlink(requested, ...args);
+  };
+  const beforeWrites = f.writes;
+  let failure;
+  try { await sync.syncOnce(); } catch (error) { failure = error; }
+  finally {
+    fsp.rename = originalRename;
+    fsp.mkdir = originalMkdir;
+    fsp.unlink = originalUnlink;
+    if (substituted) {
+      await originalRename(archive, foreign);
+      // Only ever remove a verified empty, disposable test ledger.
+      const visible = await fsp.lstat(f.ledger);
+      if (!visible.isDirectory() || (await fsp.readdir(f.ledger)).length) {
+        throw new Error("refusing to remove nonempty test ledger");
+      }
+      await fsp.rmdir(f.ledger);
+      await originalRename(parked, f.ledger);
+    }
+  }
+  assert.equal(substituted, true, "must swap after genuine rename and before cleanup unlink");
+  assert.equal(attemptedForeignUnlink, false, "the original archive inode must be reverified");
+  assert.equal(failure?.code, "invalid_snapshot");
+  assert.match(failure.message, /Eviction ledger archive identity is indeterminate/);
+  assert.deepEqual((await fsp.readdir(foreign)).sort(), foreignBefore);
+  for (const [name, bytes] of foreignBytes) {
+    assert.deepEqual(await fsp.readFile(path.join(foreign, name)), bytes);
+  }
+  assertRemoteIntact(f, beforeWrites);
+});
+
 test("issue 66 P1: pre-PREPARE snapshot upgrade EIO does not move bytes or relax old-client fence", async (t) => {
   const f = await fixture(t, "upgrade-EIO");
   const sync = await f.create(f.root, ["private"]);
