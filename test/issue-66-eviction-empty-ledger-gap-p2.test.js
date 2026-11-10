@@ -162,6 +162,48 @@ test("issue 66 P2: hard crash with >16384 preexisting trash entries recovers req
   }
 });
 
+test("issue 66: staged genesis must enumerate the held trash, not a swapped path", {
+  skip: process.platform !== "linux" && "Linux procfd directory anchors are required",
+}, async (t) => {
+  const f = await fixture(t, "held-trash-parent-race");
+  await prePrepareCrash(f, false, true);
+  const trash = path.join(f.root, ".rootark-trash");
+  const displaced = path.join(f.root, ".rootark-trash-parked");
+  const attacker = path.join(f.dir, "attacker-trash");
+  await fsp.mkdir(attacker);
+  await fsp.writeFile(path.join(attacker, "ATTACKER_SENTINEL"), "never enumerate this");
+  const originalOpendir = fsp.opendir;
+  let injected = false;
+  let attackerEnumerated = false;
+  fsp.opendir = async (directory, ...args) => {
+    const requested = String(directory);
+    if (!injected && (requested === trash || /^\/proc\/self\/fd\/\d+$/.test(requested))) {
+      injected = true;
+      // Real ext4 namespace race: replace the visible trash name immediately
+      // before enumeration; only the previously held inode may be enumerated.
+      await fsp.rename(trash, displaced);
+      await fsp.symlink(attacker, trash, "dir");
+      const opened = await originalOpendir(directory, ...args);
+      const first = await opened.read();
+      attackerEnumerated = first?.name === "ATTACKER_SENTINEL";
+      return opened;
+    }
+    return originalOpendir(directory, ...args);
+  };
+  try {
+    await assert.rejects(f.create(f.root, ["private"]),
+      (error) => error.code === "invalid_snapshot" || error.code === "unsafe_path");
+    assert.equal(injected, true, "recovery must physically enumerate staged trash");
+    assert.equal(attackerEnumerated, false, "a swapped pathname must never be enumerated");
+  } finally {
+    fsp.opendir = originalOpendir;
+    if (injected) {
+      await fsp.unlink(trash);
+      await fsp.rename(displaced, trash);
+    }
+  }
+});
+
 test("issue 66 P2: required v2 refuses a staged case-alias hidden among >16384 trash entries", async (t) => {
   const f = await fixture(t, "large-trash-required");
   await fillLegitimateTrash(f.root);
@@ -223,7 +265,10 @@ test("issue 66 P2: replacing staged genesis parent after complete iteration cann
   let swapped = false;
   fsp.opendir = async (...args) => {
     const dir = await originalOpendir(...args);
-    if (path.resolve(args[0]) !== path.resolve(trash)) return dir;
+    // Linux now enumerates through the held trash FD; preserve the physical
+    // post-iteration swap regression on that route as well as Windows paths.
+    if (path.resolve(args[0]) !== path.resolve(trash)
+      && !/^\/proc\/self\/fd\/\d+$/.test(String(args[0]))) return dir;
     return {
       async *[Symbol.asyncIterator]() {
         for await (const entry of dir) yield entry;

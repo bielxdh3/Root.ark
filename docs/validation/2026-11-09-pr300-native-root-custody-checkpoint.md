@@ -920,3 +920,29 @@ monotonic custody authority, JS file handles do not provide a verified
 rooted create/rename/unlink/rollback transaction, and same-SID
 A→B→A, power-loss durability, independent image provenance and native
 Windows CFAPI custody are still NO-GO. `RootSession` stays closed.
+
+### Isolated Linux staged-genesis read hardening after d3a91c92
+
+The source at `d3a91c92` validates the genesis trash directory and holds a
+POSIX directory FD, but reopens `.rootark-trash` for enumeration and the head
+by pathname. A physical WSL ext4 regression swaps the visible trash name for
+an attacker symlink immediately before `opendir`: the parent code **RED**
+observed enumeration of the attacker directory before eventually failing
+closed. The proposed child instead opens the Linux root and trash with
+`O_DIRECTORY|O_NOFOLLOW`, traverses via `/proc/self/fd` with both FDs
+retained, enumerates all entries there, and reads the genesis marker via
+another held nofollow regular-file FD with a strict 8 KiB bound and pre/post
+`fstat`. There is no Linux pathname fallback if procfs is unavailable;
+non-Linux POSIX staged-genesis inspection fails closed until a native
+equivalent is provided. Windows retains its existing pathname validation.
+
+WSL Ubuntu Node22.22.1 on a physically independent ext4 directory: the new
+swapped-ancestry regression is **GREEN 1/1**, and the full
+`issue-66-eviction-empty-ledger-gap-p2` suite is **27 PASS / 0 FAIL**, including
+the 16,385-entry legitimate trash and required-v2 crash tests. Windows Node
+22.23.3 on NTFS: the 16,385-entry hard-crash test is **PASS 1/1** and the
+full same suite is **23 PASS / 0 FAIL / 4 POSIX SKIP**. This is
+only a bounded ancestry fix for this reader, **not** initial root authority,
+native `openat2` custody, proof against same-UID adversarial pre-acquisition
+swaps or root rollback, or evidence that formal hosted CodeQL is green.
+Release remains **NO-GO**.

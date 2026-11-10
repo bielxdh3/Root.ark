@@ -715,9 +715,16 @@ async function stagedEvictionGenesis(rootDir) {
   // Scan the *entire* directory in O(1) memory for every portable case alias
   // of the sole authoritative marker, not just the first 16,384 entries.
   // Other trash content does not witness an eviction and grants no authority.
-  // POSIX holds the parent's directory FD to detect concurrent path replacement.
-  // Windows cannot portably open a directory FD through fs.promises.open, so
-  // lstat identity/version and contained FD verification remain mandatory.
+  // Linux must traverse root -> trash, enumerate and read the genesis relative
+  // to retained directory FDs. A validated pathname and a held stat alone do
+  // not anchor later opendir/readFile calls across a rename or junction swap.
+  // Node lacks openat2; /proc/self/fd provides a bounded Linux FD-relative
+  // route. Failure to resolve procfd is fatal; never fall back to a pathname.
+  // Neither root acquisition nor the local head is independent same-UID proof.
+  // Windows has no portable directory FD traversal via fs.promises.open and
+  // retains its existing checked pathname behavior.
+  const linux = process.platform === "linux";
+  let heldRoot = null;
   let held = null;
   let candidate = null;
   const assertUnchanged = async () => {
@@ -726,17 +733,29 @@ async function stagedEvictionGenesis(rootDir) {
     const currentTrash = await fsp.lstat(trash, { bigint: true });
     if (!sameFileVersion(rootStats, currentRoot)
       || !sameFileVersion(trashStats, currentTrash)
+      || (heldRoot && !sameFileVersion(rootStats, await heldRoot.stat({ bigint: true })))
       || (held && !sameFileVersion(trashStats, await held.stat({ bigint: true })))) {
       fail("Eviction genesis parent changed during streamed proof", "invalid_snapshot");
     }
   };
   try {
-    if (process.platform !== "win32") {
-      held = await fsp.open(trash, fs.constants.O_RDONLY
-        | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0));
+    if (linux) {
+      if (!Number.isInteger(fs.constants.O_DIRECTORY)
+        || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+        fail("Held eviction directories are unavailable", "root_session_native_unavailable");
+      }
+      const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+        | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+      heldRoot = await fsp.open(rootDir, flags);
+      // The child lookup is relative to the live root handle. POSIX path
+      // rebinding after the handle is acquired cannot redirect it elsewhere.
+      held = await fsp.open(`/proc/self/fd/${heldRoot.fd}/.rootark-trash`, flags);
       await assertUnchanged();
+    } else if (process.platform !== "win32") {
+      fail("Held eviction directories are unavailable on this platform",
+        "root_session_native_unavailable");
     }
-    for await (const entry of await fsp.opendir(trash)) {
+    for await (const entry of await fsp.opendir(linux ? `/proc/self/fd/${held.fd}` : trash)) {
       if (entry.name.toLowerCase() !== EVICTION_GENESIS_STAGE) continue;
       if (candidate !== null || entry.name !== EVICTION_GENESIS_STAGE) {
         fail("Ambiguous staged eviction genesis", "invalid_snapshot");
@@ -746,15 +765,49 @@ async function stagedEvictionGenesis(rootDir) {
     await assertUnchanged();
     if (candidate === null) return null;
     const headFile = path.join(trash, EVICTION_GENESIS_STAGE);
-    const headStats = await fsp.lstat(headFile, { bigint: true });
-    if (!headStats.isFile() || headStats.isSymbolicLink()
-      || headStats.nlink !== 1n || headStats.size > 8192n) {
-      fail("Unsafe staged eviction genesis head", "invalid_snapshot");
-    }
     let head;
     try {
-      const raw = await readContainedFile(rootDir, `.rootark-trash/${EVICTION_GENESIS_STAGE}`,
-        headStats, true);
+      let raw;
+      if (linux) {
+        const heldHeadPath = `/proc/self/fd/${held.fd}/${EVICTION_GENESIS_STAGE}`;
+        const headHandle = await fsp.open(
+          heldHeadPath,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK || 0));
+        try {
+          const before = await headHandle.stat({ bigint: true });
+          if (!before.isFile() || before.ino === 0n || before.nlink !== 1n
+            || before.size > 8192n) {
+            fail("Unsafe staged eviction genesis head", "invalid_snapshot");
+          }
+          // Bounded read: a concurrent writer cannot turn an 8 KiB head into
+          // an unbounded allocation while the directory FD is pinned.
+          const bytes = Buffer.alloc(8193);
+          let count = 0;
+          while (count < bytes.length) {
+            const { bytesRead } = await headHandle.read(bytes, count, bytes.length - count, count);
+            if (bytesRead === 0) break;
+            count += bytesRead;
+          }
+          const after = await headHandle.stat({ bigint: true });
+          const stillNamed = await fsp.lstat(heldHeadPath, { bigint: true });
+          if (count > 8192 || BigInt(count) !== before.size || !after.isFile()
+            || after.nlink !== 1n || !stillNamed.isFile()
+            || stillNamed.isSymbolicLink() || stillNamed.nlink !== 1n
+            || !sameFileIdentity(after, stillNamed)
+            || !sameFileVersion(before, after)) {
+            fail("Staged eviction genesis changed during read", "invalid_snapshot");
+          }
+          raw = bytes.subarray(0, count);
+        } finally { await headHandle.close(); }
+      } else {
+        const headStats = await fsp.lstat(headFile, { bigint: true });
+        if (!headStats.isFile() || headStats.isSymbolicLink()
+          || headStats.nlink !== 1n || headStats.size > 8192n) {
+          fail("Unsafe staged eviction genesis head", "invalid_snapshot");
+        }
+        raw = await readContainedFile(rootDir, `.rootark-trash/${EVICTION_GENESIS_STAGE}`,
+          headStats, true);
+      }
       head = JSON.parse(raw.toString("utf8"));
     } catch {
       fail("Unreadable staged eviction genesis head", "invalid_snapshot");
@@ -767,6 +820,7 @@ async function stagedEvictionGenesis(rootDir) {
     return { trash, file: headFile, head };
   } finally {
     if (held) await held.close();
+    if (heldRoot) await heldRoot.close();
   }
 }
 async function createStagedEvictionGenesis(rootDir) {
