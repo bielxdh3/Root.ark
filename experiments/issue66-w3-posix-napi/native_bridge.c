@@ -43,6 +43,7 @@
 typedef struct {
   int active;
   int parentfd;
+  int staged_fd; // original exclusive inode, retained until session close
   DIR *held;
   int phase;
   int stream_active;
@@ -137,6 +138,17 @@ static int write_owned(int dirfd, const char *name, const char *content) {
   return okay;
 }
 
+static int create_open_stage(int dirfd) {
+  int fd = fd_openat2(dirfd, STAGE_PROOF, O_RDWR | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) return -1;
+  size_t size = strlen(STAGE_PAYLOAD);
+  if (write(fd, STAGE_PAYLOAD, size) != (ssize_t)size || fsync(fd) != 0) {
+    (void)close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 static int marker_equals(int dirfd, const char *name, const char *expected) {
   // Never block a helper before fstat if a same-UID fixture writer installs
   // a FIFO. A non-regular descriptor fails the held-file check below.
@@ -194,6 +206,10 @@ static int leaf_name(napi_env env, napi_value value, char out[256]) {
 
 static void release_handles(lab_session *session) {
   if (!session) return;
+  if (session->staged_fd >= 0) {
+    (void)close(session->staged_fd);
+    session->staged_fd = -1;
+  }
   if (session->held) {
     (void)closedir(session->held);
     session->held = NULL;
@@ -291,6 +307,7 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
     return fail(env, "NATIVE_FIXTURE_FAILED");
   }
   session->parentfd = parent;
+  session->staged_fd = -1;
   session->held = dir;
   session->phase = 0;
   session->stream_active = 0;
@@ -497,7 +514,8 @@ static napi_value stage_proof(napi_env env, napi_callback_info info) {
   // Any uncertain failure permanently blocks this lab session's transaction
   // rather than permitting a blind second admission after partial writes.
   session->txn_phase = 3;
-  if (!write_owned(held, STAGE_PROOF, STAGE_PAYLOAD) || fsync(held) != 0 ||
+  session->staged_fd = create_open_stage(held);
+  if (session->staged_fd < 0 || fsync(held) != 0 ||
       !write_owned(held, JOURNAL_PROOF, JOURNAL_PAYLOAD) || fsync(held) != 0)
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   session->txn_phase = 1;
@@ -513,16 +531,46 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   int held = dirfd(session->held);
   if (session->txn_phase != 1 || !plain_directory(held, 1))
     return fail(env, "NATIVE_TXN_PHASE_REJECTED");
-  if (!marker_equals(held, STAGE_PROOF, STAGE_PAYLOAD) ||
+  int current = fd_openat2(held, STAGE_PROOF, O_RDONLY | O_NONBLOCK, 0);
+  int stage_identity_matches = current >= 0 && object_is(current, session->staged_fd);
+  if (current >= 0 && close(current) != 0) stage_identity_matches = 0;
+  if (!stage_identity_matches ||
+      !marker_equals(held, STAGE_PROOF, STAGE_PAYLOAD) ||
       !marker_equals(held, JOURNAL_PROOF, JOURNAL_PAYLOAD)) {
     session->txn_phase = 3;
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   }
-  errno = 0;
-  if (syscall(SYS_renameat2, held, STAGE_PROOF,
-              held, PUBLISHED_PROOF, RENAME_NOREPLACE) != 0) {
-    if (errno == EEXIST) return fail(env, "NATIVE_TXN_NO_REPLACE_CONFLICT");
+  // Publish from the ORIGINAL retained inode, not the mutable stage name.
+  // /proc/self/fd is kernel-owned; AT_SYMLINK_FOLLOW dereferences this exact
+  // opened descriptor while linkat supplies atomic no-replace destination.
+  // We deliberately leave the original stage hardlink in place: unlinking
+  // a same-UID-writable name would reintroduce foreign-file deletion TOCTOU.
+  // This is a lab-only two-name crash window, NOT a deployable recovery API.
+  char opened_source[64];
+  int written = snprintf(opened_source, sizeof(opened_source),
+                         "/proc/self/fd/%d", session->staged_fd);
+  if (written < 1 || (size_t)written >= sizeof(opened_source)) {
     session->txn_phase = 3;
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  }
+  // An explicitly opted-in deterministic physical adversary changes the
+  // original stage pathname AFTER all source identity checks but BEFORE the
+  // native link. It must not redirect the source: linkat below resolves only
+  // the privately retained opened FD. This is NOT a concurrent writer test.
+  const char *rebind = getenv("ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK");
+  if (rebind && strcmp(rebind, "1") == 0) {
+    if (syscall(SYS_renameat2, held, STAGE_PROOF, held,
+                ".rootark-w3-postcheck-parked", RENAME_NOREPLACE) != 0 ||
+        !write_owned(held, STAGE_PROOF, STAGE_PAYLOAD)) {
+      session->txn_phase = 3;
+      return fail(env, "NATIVE_TXN_INDETERMINATE");
+    }
+  }
+  errno = 0;
+  if (linkat(AT_FDCWD, opened_source,
+             held, PUBLISHED_PROOF, AT_SYMLINK_FOLLOW) != 0) {
+    session->txn_phase = 3;
+    if (errno == EEXIST) return fail(env, "NATIVE_TXN_NO_REPLACE_CONFLICT");
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   }
   session->txn_phase = 3;
@@ -605,6 +653,7 @@ static napi_value init(napi_env env, napi_value exports) {
   lab_session *session = calloc(1, sizeof(*session));
   if (!session) return fail(env, "NATIVE_API_FAILED");
   session->parentfd = -1;
+  session->staged_fd = -1;
   if (napi_add_env_cleanup_hook(env, cleanup, session) != napi_ok) {
     free(session);
     return fail(env, "NATIVE_API_FAILED");

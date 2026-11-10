@@ -218,13 +218,23 @@ test("#66 W3 native fixed stage and durable no-replace publication stay bound to
     assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false,
       "native publication must not write B under the rebound pathname");
     assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
-    assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    // An opened-source hardlink cannot safely retire its same-UID-writable
+    // original name. Both names remain, so the generic native read correctly
+    // rejects nlink=2 rather than promoting a hardlink alias to authority.
+    const stagedPath = path.join(parent, "parked", ".rootark-w3-staged-v1");
+    const publishedPath = path.join(parent, "parked", ".rootark-w3-committed-v1");
+    assert.equal(fs.readFileSync(publishedPath, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.statSync(publishedPath, { bigint: true }).ino,
+      fs.statSync(stagedPath, { bigint: true }).ino, "published bytes belong to original staged inode");
+    assert.equal(fs.statSync(publishedPath, { bigint: true }).nlink, 2n,
+      "source stage name is deliberately retained for later custodian-only cleanup");
+    assert.throws(() => bridge.read(token, ".rootark-w3-committed-v1"), /NATIVE_OPEN_DENIED/);
     assert.equal(bridge.read(token, ".rootark-w3-commit-marker-v1").toString(), "COMMITTED_V1");
     assert.equal(bridge.restoreOriginal(token), "ORIGINAL_RESTORED_FOREIGN_RETAINED");
     assert.equal(fs.readFileSync(path.join(parent, "held", ".rootark-w3-committed-v1"), "utf8"),
       "STAGED_ROOT_CANARY_V1");
     assert.equal(fs.existsSync(path.join(parent, "foreign-parked", ".rootark-w3-committed-v1")), false);
-    assert.equal(bridge.read(token, ".rootark-w3-committed-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.throws(() => bridge.read(token, ".rootark-w3-committed-v1"), /NATIVE_OPEN_DENIED/);
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
     assert.throws(() => bridge.publishProof(token), /NATIVE_TOKEN_REJECTED/);
     assert.throws(() => requireNativeRecoveryAuthority(bridge),
@@ -249,7 +259,77 @@ test("#66 W3 native publication refuses a same-UID destination collision without
     assert.equal(fs.readFileSync(foreignDest, "utf8"), "FOREIGN_NOT_TO_REPLACE");
     assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
     assert.equal(bridge.read(token, ".rootark-w3-staged-v1").toString(), "STAGED_ROOT_CANARY_V1");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
+      "a collided native publication cannot retry after a foreign destination disappears");
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+  });
+
+test("#66 W3 equal-byte foreign inode cannot be published instead of original stage",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const held = path.join(home, created[0], "held");
+    const stagePath = path.join(held, ".rootark-w3-staged-v1");
+    const parked = path.join(held, ".rootark-w3-original-stage-parked");
+    const destination = path.join(held, ".rootark-w3-committed-v1");
+    const commit = path.join(held, ".rootark-w3-commit-marker-v1");
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    const beforeInode = fs.statSync(stagePath, { bigint: true });
+    fs.renameSync(stagePath, parked);
+    fs.writeFileSync(stagePath, "STAGED_ROOT_CANARY_V1", { flag: "wx", mode: 0o600 });
+    const foreign = fs.statSync(stagePath, { bigint: true });
+    assert.notEqual(foreign.ino, beforeInode.ino, "replacement must be a distinct physical inode");
+    assert.equal(fs.readFileSync(parked, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_INDETERMINATE/,
+      "equal bytes of an untrusted inode must not authorize the native stage");
+    assert.equal(fs.existsSync(destination), false, "foreign stage must not be published");
+    assert.equal(fs.existsSync(commit), false, "no COMMIT after stage inode replacement");
+    assert.equal(fs.readFileSync(stagePath, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.readFileSync(parked, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
+      "the rejected same-byte substitution must permanently poison the session");
+  });
+
+test("#66 W3 native publish links original held inode after post-check stage-name replacement",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const held = path.join(home, created[0], "held");
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    const stage = path.join(held, ".rootark-w3-staged-v1");
+    const original = fs.statSync(stage, { bigint: true });
+    const saved = process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
+    process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = "1";
+    try { assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED"); }
+    finally {
+      if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK;
+      else process.env.ROOTARK_ISSUE66_W3_REBIND_AFTER_CHECK = saved;
+    }
+    const parked = path.join(held, ".rootark-w3-postcheck-parked");
+    const published = path.join(held, ".rootark-w3-committed-v1");
+    assert.equal(fs.statSync(parked, { bigint: true }).ino, original.ino,
+      "native adversarial hook must actually park the original staged inode");
+    assert.notEqual(fs.statSync(stage, { bigint: true }).ino, original.ino,
+      "foreign same-byte stage must be a different physical inode");
+    assert.equal(fs.statSync(published, { bigint: true }).ino, original.ino,
+      "publication must link original opened inode, not the late foreign pathname occupant");
+    assert.equal(fs.readFileSync(published, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.readFileSync(stage, "utf8"), "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-commit-marker-v1"), "utf8"), "COMMITTED_V1");
+    assert.throws(() => bridge.read(token, ".rootark-w3-committed-v1"), /NATIVE_OPEN_DENIED/,
+      "remaining hardlink alias cannot be promoted to independently trusted read authority");
   });
 
 test("#66 W3 native stage detects a separate same-UID writer's pre-commit in-place corruption",
