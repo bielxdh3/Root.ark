@@ -1336,3 +1336,72 @@ no new hosted workflow or remote push was requested to save billing.
 
 **Product RELEASE NO-GO.** These are bounded implementation and test
 milestones, and the full issue/PR mission remains incomplete.
+
+### 2026-11-10 continuation — Windows/NTFS orphan archive and exclusive genesis
+
+On the previously integrated parent `56b73665`, a physical Windows
+Node22/NTFS archive rename followed by injected EIO after the complete
+checkpoint left PREPARE evidence in an orphan archive, but the cold open
+silently accepted it: **RED 1 FAIL (Missing expected rejection)**.
+Child `e2297926f181acc23bfe741d845561d8e10acf18` extends the
+Linux-only archive fence to Windows through streaming root enumeration,
+casefolded archive names and before/after root identity checks, without
+deleting the archive. Targeted Windows **3 PASS**, WSL **2 PASS**;
+the separate real process exit immediately after archive rename followed
+by a fresh-process denial passed **1/1 Windows** and **1/1 WSL**.
+Both tests compare archived PREPARE and all other record names and
+bytes before/after denial. Exact-source independent peer review of
+`e2297926` gave bounded GO and it was fast-forwarded locally.
+
+Separately, on exact parent `e2297926`, a Windows NTFS genesis
+promotion test observed that a late competing head was **overwritten
+immediately by the real rename syscall** before later cleanup:
+**RED 1 FAIL**. Child
+`1b4fc52fa390eabc0df16e16891e4460ca3ded87` changes only
+Windows legacy genesis promotion to a validated exclusive hard link
+with same-inode postchecks, then retires the staged name. It refuses
+existing `head.json` without replacement. Tests: **Windows 3 PASS**
+(no-overwrite plus two legitimate required-v2 crash paths),
+**Windows 1 PASS** for process exit after link before stage unlink,
+and **WSL 2 PASS** for unchanged Linux hostile stage/promotion checks.
+No 16,385-entry physical test was repeated.
+
+**This is not product RootSession authority.** Node on Windows
+still uses pathname-based parent lookup and cannot protect against
+same-SID parent A→B→A, staged-leaf replacement or secure destructive
+remove; it does not demonstrate owner-protected NTFS RootDirectory,
+CFAPI image/DLL custody, independent signed monotonic antirollback
+or real power-loss durability. Tests ran on Windows 11 Pro build
+26300, not a Windows 10 release gate. The strict RootSession
+remains fail-closed. The last known remote PR #300 is OPEN/Draft at
+`d3a91c92`; formal CodeQL remains FAILURE with four HIGH on
+that hosted SHA, while local source mitigations are not a hosted PASS.
+No push, CI rerun, merge, deploy or cutover occurred.
+**Product RELEASE NO-GO; mission incomplete.**
+
+The subsequent exact child
+`88a88b685da6fda5245c25ba175bcede8a38c35c` closes a
+bounded-source-read gap identified when reviewing `1b4fc52f`:
+the original Windows staged genesis preflight checked size via
+`lstat`, then performed an **unbounded pathname `readFile`**
+which could observe a larger or swapped file. A focused Windows
+Node22 test forbidding unbounded pathname reads was **RED on
+`1b4fc52f` (1 FAIL)** and **GREEN on `88a88b68`**.
+The new code retains the staged file descriptor through validation
+and exclusive publication, reads at most 8,193 bytes and rejects
+anything above the 8-KiB contract or with mismatched pre/post
+identity/version. A second test physically appended 8,193 bytes
+at the held-file open boundary: Windows **1 PASS**, explicit
+`invalid_snapshot`, no signed DELETE, original local bytes intact.
+Existing Windows competing-head, post-link hard exit and legitimate
+held-read checks passed **3 PASS** on the new child. Source syntax
+and `git diff --check` passed. These checks protect this bounded
+legacy read, but still do not establish same-SID root ownership or
+full native RootSession.
+Independent read-only SOURCE review issued **bounded GO** for exact
+`88a88b68`, with no newly identified P0/P1/P2 in its two-file delta.
+It explicitly confirms that the final `link`/`unlink` name races
+remain outside the current same-SID security boundary. `e2297926`,
+`1b4fc52f`, and `88a88b68` were fast-forwarded into the clean
+local integrated worktree. The hosted Draft PR/CodeQL state has
+**not** been updated by any of these local commits.
