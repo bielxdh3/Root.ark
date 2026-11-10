@@ -383,13 +383,14 @@ test("issue 66: direct Files On-Demand outbox cannot enqueue a signed DELETE", a
 test("issue 66: a previous non-FOD signed DELETE in a durable journal cannot be pushed by FOD", async (t) => {
   const { root, open, store, adapter, key, state } = await setup(t,
     { "docs/retained.txt": "retain remote and local" });
-  const initial = await open();
-  await initial.materializeRemote("docs/retained.txt");
-  const remote = store.list("alice")[0];
+  // A genuine pre-FOD outbox must precede the first FOD open. Opening a
+  // non-FOD writer after FOD activation is now deliberately forbidden.
   const legacy = await new SyncEngine({ rootDir: root, adapter,
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key,
   }).open();
+  await legacy.syncOnce();
+  const remote = store.list("alice")[0];
   await legacy.enqueueChange({
     operation: "delete", objectId: remote.objectId, fileId: remote.fileId,
     versionId: crypto.randomUUID(), baseRevision: remote.revision,
@@ -605,6 +606,101 @@ test("issue 66: Proxy preflight interception cannot bypass FOD remote pull denia
   assert.deepEqual(await fsp.readFile(cachePath), originalBytes);
   assert.deepEqual(await fsp.readFile(snapshotPath), originalSnapshot);
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
+test("issue 66: a FOD root retains its mode across non-FOD restart and custom snapshot paths", async (t) => {
+  const { root, open, adapter, store, key, state } = await setup(t,
+    { "docs/cache.txt": "mode must remain bound to this physical root" });
+  const client = await open();
+  await client.materializeRemote("docs/cache.txt");
+  const cachedPath = path.join(root, "docs", "cache.txt");
+  const original = await fsp.readFile(cachedPath);
+  const originalStore = JSON.stringify(store.list("alice"));
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  const markerPath = path.join(root, ".rootark-sync-ever-fod");
+  assert.equal((await fsp.stat(markerPath)).isFile(), true,
+    "FOD opening must durably mark the ROOT before any other sync mutations");
+  assert.equal(await fsp.readFile(markerPath, "utf8"), "rootark-sync-ever-fod-v1\n");
+  const nonFod = new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    selectedPaths: ["docs"], fileKeyResolver: () => key,
+  });
+  await assert.rejects(nonFod.open(), { code: "root_mode_fod_required" });
+  await assert.rejects(nonFod.evictLocal("docs/cache.txt"), { code: "root_mode_fod_required" });
+  assert.deepEqual(await fsp.readFile(cachedPath), original);
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), originalStore);
+  assert.equal(state.pushes, 0);
+
+  const alternateSnapshot = path.join(path.dirname(root), "alternate-fod-index.json");
+  const otherRoot = path.join(path.dirname(root), "custom-snapshot-root");
+  const customFod = await new SyncEngine({ rootDir: otherRoot, snapshotPath: alternateSnapshot,
+    adapter, deviceId: "device-c", keyEpoch: "epoch-1", compartmentId: "private",
+    filesOnDemand: true, fileKeyResolver: () => key,
+  }).open();
+  assert.equal(customFod.filesOnDemand, true);
+  assert.equal((await fsp.stat(path.join(otherRoot, ".rootark-sync-ever-fod"))).isFile(), true);
+  assert.equal(Object.hasOwn(await customFod.scanFiles(), ".rootark-sync-ever-fod"), false,
+    "the mode marker must never be synchronized as an ordinary file");
+  assert.equal(await exists(path.join(otherRoot, ".rootark-sync-index.json")), false);
+  const differentSnapshot = path.join(path.dirname(root), "other-new-index.json");
+  await assert.rejects(new SyncEngine({ rootDir: otherRoot, snapshotPath: differentSnapshot,
+    adapter, deviceId: "device-c", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key,
+  }).open(), { code: "root_mode_fod_required" });
+  assert.equal(await exists(differentSnapshot), false,
+    "mode denial must precede creating an alternate snapshot");
+});
+
+test("issue 66: an already-open non-FOD engine cannot evict after another instance marks FOD", async (t) => {
+  const { root, open, adapter, store, key, state } = await setup(t,
+    { "docs/retained.txt": "bytes of owner must never be evicted" });
+  const legacy = await new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    selectedPaths: ["docs"], fileKeyResolver: () => key,
+  }).open();
+  assert.equal(await exists(path.join(root, ".rootark-sync-ever-fod")), false,
+    "ordinary non-FOD operations must not set the marker");
+  const fod = await open();
+  await fod.materializeRemote("docs/retained.txt");
+  const cachedPath = path.join(root, "docs", "retained.txt");
+  const original = await fsp.readFile(cachedPath);
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  await assert.rejects(legacy.evictLocal("docs/retained.txt"),
+    { code: "root_mode_fod_required" });
+  await assert.rejects(legacy.syncOnce(), { code: "root_mode_fod_required" });
+  await assert.rejects(legacy.stageExisting(cachedPath), { code: "root_mode_fod_required" },
+    "a direct stage helper must also honor the durable root-mode marker");
+  await assert.rejects(legacy._reconcileLocal(), { code: "root_mode_fod_required" });
+  await assert.rejects(legacy._pushPending({ pushed: 0, conflicts: [], offline: false }),
+    { code: "root_mode_fod_required" });
+  await assert.rejects(legacy._apply({ operation: "delete" }), { code: "root_mode_fod_required" });
+  await assert.rejects(legacy.persistSnapshot(), { code: "root_mode_fod_required" });
+  assert.deepEqual(await fsp.readFile(cachedPath), original);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, 0);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
+test("issue 66: malformed ever-FOD root marker fails closed without writing a snapshot", async (t) => {
+  const { root, adapter, key } = await setup(t, {});
+  await fsp.mkdir(root, { recursive: true });
+  const markerPath = path.join(root, ".rootark-sync-ever-fod");
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  for (const malformed of ["{", "{}", '{"version":999}']) {
+    await fsp.writeFile(markerPath, malformed, "utf8");
+    for (const filesOnDemand of [false, true]) {
+      const engine = new SyncEngine({ rootDir: root, adapter,
+        deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+        fileKeyResolver: () => key, filesOnDemand,
+      });
+      await assert.rejects(engine.open(), { code: "root_mode_marker_invalid" });
+      assert.equal(await exists(snapshotPath), false);
+    }
+  }
 });
 
 test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes", async (t) => {

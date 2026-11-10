@@ -24,7 +24,11 @@ const EVICTION_LEDGER_SNAPSHOT_VERSION = 2;
 // when a dirty legacy alias was retained. Revisit v1 snapshots under v2 so
 // an already-stranded alias gets a durable watch when its bytes become clean.
 const EXCLUDED_PATHS_CASEFOLD_VERSION = 2;
-const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync-evictions", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
+// Root-local availability fence, never an independently trusted ownership or
+// rollback witness. Its location MUST NOT depend on caller snapshotPath.
+const EVER_FOD_MARKER_NAME = ".rootark-sync-ever-fod";
+const EVER_FOD_MARKER_BYTES = "rootark-sync-ever-fod-v1\n";
+const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync-evictions", ".rootark-sync.lock", ".rootark-webdav-owner.lock", EVER_FOD_MARKER_NAME]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-"];
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
@@ -50,6 +54,67 @@ function denyUntrustedNativeSignedDelete() {
   // Even a future native opener cannot authorize this old JS write path.
   openNativeRootSession(true);
   fail("Native rooted signed DELETE is not operational", "root_session_native_unavailable");
+}
+// Called under the ordinary root mutation lock for all public operations.
+// Never accept a mutable snapshot or config flag as proof that a root which
+// has run Files On-Demand can return to legacy pathname mutation. An actor
+// with write access to this same root can remove/replace this marker: it is
+// NOT protection against same-SID tampering, rollback or malicious ancestry.
+async function enforceEverFodRootMode(rootDir, filesOnDemand) {
+  const markerPath = path.join(rootDir, EVER_FOD_MARKER_NAME);
+  const checkExisting = async () => {
+    let stats;
+    try { stats = await fsp.lstat(markerPath); }
+    catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (!stats.isFile() || stats.isSymbolicLink()
+      || stats.size !== Buffer.byteLength(EVER_FOD_MARKER_BYTES)) {
+      fail("Invalid Files On-Demand root marker", "root_mode_marker_invalid");
+    }
+    let bytes;
+    try { bytes = await fsp.readFile(markerPath, "utf8"); }
+    catch { fail("Unreadable Files On-Demand root marker", "root_mode_marker_invalid"); }
+    if (bytes !== EVER_FOD_MARKER_BYTES) {
+      fail("Invalid Files On-Demand root marker", "root_mode_marker_invalid");
+    }
+    return true;
+  };
+  const exists = await checkExisting();
+  if (exists) {
+    if (!filesOnDemand) fail("Files On-Demand root cannot return to legacy sync", "root_mode_fod_required");
+    return;
+  }
+  if (!filesOnDemand) return;
+
+  // Create the marker before opening the journal, initial snapshot, or any
+  // path-based reconciliation. A crash before a complete write leaves an
+  // invalid marker and therefore denies subsequent opens, not a downgrade.
+  let handle;
+  try { handle = await fsp.open(markerPath, "wx", 0o600); }
+  catch (error) {
+    if (error.code === "EEXIST") {
+      if (!(await checkExisting())) fail("Missing Files On-Demand root marker", "root_mode_marker_invalid");
+      return;
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(EVER_FOD_MARKER_BYTES, "utf8");
+    await handle.sync();
+  } finally { await handle.close(); }
+  // Windows may reject opening a directory for fsync; POSIX can fsync the
+  // parent directory to durably publish the O_EXCL entry.
+  let directoryHandle;
+  try {
+    directoryHandle = await fsp.open(rootDir, "r");
+    await directoryHandle.sync();
+  } catch (error) {
+    if (!(process.platform === "win32" && ["EPERM", "EACCES", "EINVAL"].includes(error.code))
+      && !["ENOTSUP", "EINVAL"].includes(error.code)) throw error;
+  } finally { if (directoryHandle) await directoryHandle.close(); }
+  if (!(await checkExisting())) fail("Missing Files On-Demand root marker", "root_mode_marker_invalid");
 }
 function signedEnvelopeDigest(operation) {
   return crypto.createHash("sha256")
@@ -1106,6 +1171,9 @@ class SyncEngine {
   async _open() {
     await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
+    // Always recheck, including previously opened non-FOD instances whose
+    // snapshot cache looks unchanged after another instance marked the root.
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     this.journal = await this.journal.open();
     // A rejected native-required cold open must never let a later open use
     // public, mutable this.snapshot as if it were still the disk contents.
@@ -1474,6 +1542,7 @@ class SyncEngine {
   }
 
   async persistSnapshot() {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     await durableJson(this.snapshotPath, this.snapshot);
     this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
   }
@@ -1698,6 +1767,7 @@ class SyncEngine {
   }
 
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // The same side-effect-free check runs BEFORE signature pre-observation.
     // Keep it here too for direct callers and changes during verification.
     const source = preflightOutOfScopeMoveBuiltIn.call(this, operation);
@@ -1867,6 +1937,7 @@ class SyncEngine {
   }
 
   async _enqueueChange(input) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const remoteOnly = this.snapshot.remoteOnly[input.objectId];
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
@@ -1884,6 +1955,7 @@ class SyncEngine {
   }
 
   async translateWebDavMutation(event) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await this.open();
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
     const kind = String(event.kind || "");
@@ -2135,6 +2207,7 @@ class SyncEngine {
   }
 
   async retryPush(operation) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
       // The journal's prior authorization is not a live device grant. Check
@@ -2372,6 +2445,7 @@ class SyncEngine {
   }
 
   async _pushPending(summary) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const recovered = await this.journal.recover();
     if (this.requireNativeRootRecovery && recovered.some((operation) =>
       !this.journal.hasSeen(operation.operationId)
@@ -2602,6 +2676,7 @@ class SyncEngine {
   }
 
   async stageExisting(target) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // No Files On-Demand caller may move cached bytes into legacy pathname
     // trash until an independently rooted native mutation session exists.
     // Deny before resolving or probing the caller-supplied pathname.
@@ -2625,6 +2700,7 @@ class SyncEngine {
   }
 
   async _apply(operation, summary = null, beforeHydrationWrite = null) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     operation = envelopeCopy(operation);
     // Incoming authenticated DELETE/tombstone is not independent authority
     // to stage or unlink cached bytes when the native root is unavailable.
@@ -2964,6 +3040,7 @@ class SyncEngine {
   }
 
   async _reconcileLocal() {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const scanned = await this.scanFiles();
     const current = {};
     const snapshotPathByKey = new Map();
@@ -3199,6 +3276,7 @@ class SyncEngine {
   }
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
     if (!this.opened) await openEngineBuiltIn.call(this);
     // The internal exclusion path was already case-resolved with a bounded
@@ -3417,6 +3495,7 @@ class SyncEngine {
   }
 
   async _materializeRemote(relativePath) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     if (!this.isSelected(safePath)) fail("Remote-only path is outside the selected scope", "path_not_selected");
@@ -3531,6 +3610,7 @@ class SyncEngine {
   }
 
   async _pullRemote(summary) {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // A remotely visible single side of a just-committed/lost-ACK pair must
     // NOT consume that local pending ID via _apply, markSeen or the excluded-
     // path reconciliation path. Recover the atomic pair through its outbound
@@ -3633,6 +3713,7 @@ class SyncEngine {
   // through the guarded _evictLocal path; excluded files with no local copy become remote-only
   // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
   async _applyExcludedPaths() {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const applied = this.snapshot.excludedPaths || [];
     const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
     // A pre-upgrade snapshot may claim that ["private"] was already applied
@@ -3819,6 +3900,7 @@ class SyncEngine {
   }
 
   async _syncOnce() {
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
     let excluded;
