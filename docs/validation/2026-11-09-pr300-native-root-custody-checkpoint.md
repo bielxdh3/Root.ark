@@ -718,3 +718,20 @@ ancestor and native image custody, power-cut/rollback, or hosted CodeQL.
 Independent SOURCE review of the eventual exact child SHA is mandatory;
 these scoped test successes do **not** justify local integration, remote
 push, production operation, merge or deploy.
+
+### Follow-up laboratory: reject public in-root Files On-Demand staging
+
+A separate child of `42289bdc` found a source-reachable legacy mutation:
+the public `stageExisting()` helper could rename a materialized, contained
+Files On-Demand cache file into `.rootark-trash` without a native RootSession,
+independent authority or durable required-v2 PREPARE. A new Windows Node22
+regression was **RED** (`Missing expected rejection`) before the fix.
+The helper now rejects native-required roots **before pathname inspection**.
+The revised cached-refresh test expects a native-custody denial rather than
+accepting legacy pathname replacement. Windows Node22 FOD suite: **25 PASS,
+0 FAIL** after the fix. This is a bounded fail-closed restriction and a
+user-visible loss of legacy cached-refresh availability until native support
+exists, not an implementation of safe native replacement. Internal/public
+method interception, alternate `_apply` rename routes, cross-instance
+non-FOD downgrade, same-SID A→B→A, cold recovery and CodeQL remain
+subject to separate source review and integration gates.

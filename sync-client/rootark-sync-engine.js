@@ -2602,6 +2602,10 @@ class SyncEngine {
   }
 
   async stageExisting(target) {
+    // No Files On-Demand caller may move cached bytes into legacy pathname
+    // trash until an independently rooted native mutation session exists.
+    // Deny before resolving or probing the caller-supplied pathname.
+    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
     // A public caller may pass an absolute source. Never stage a file from
     // outside this root, even when the trash destination itself is contained.
     // This rejects static escapes, NOT concurrent same-SID ancestor swaps.

@@ -410,15 +410,30 @@ test("issue 66: a previous non-FOD signed DELETE in a durable journal cannot be 
   assert.equal(await fsp.readFile(path.join(root, "docs", "retained.txt"), "utf8"), "retain remote and local");
 });
 
-test("issue 66: public staging helper must not relocate a sibling file outside sync root", async (t) => {
+test("issue 66: FOD public staging denies before probing an outside-root path", async (t) => {
   const { root, open } = await setup(t, {});
   const client = await open();
   const outside = path.join(path.dirname(root), "independent-outside-witness.txt");
   const bytes = Buffer.from("outside source must remain unchanged");
   await fsp.writeFile(outside, bytes);
 
-  await assert.rejects(client.stageExisting(outside), { code: "unsafe_path" });
+  await assert.rejects(client.stageExisting(outside), { code: "root_session_native_unavailable" });
   assert.deepEqual(await fsp.readFile(outside), bytes);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
+test("issue 66: public staging cannot relocate an in-root cached FOD file without native custody", async (t) => {
+  const { root, open, store } = await setup(t, { "docs/retained.txt": "protected FOD cache" });
+  const client = await open();
+  await client.materializeRemote("docs/retained.txt");
+  const target = path.join(root, "docs", "retained.txt");
+  const bytesBefore = await fsp.readFile(target);
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  await assert.rejects(client.stageExisting(target), { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fsp.readFile(target), bytesBefore);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
 });
 
@@ -519,14 +534,16 @@ test("issue 66: out-of-scope remote MOVE cannot rename a tracked FOD origin with
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
 });
 
-test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {
+test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();
   await client.materializeRemote("docs/version.txt");
   await fsp.writeFile(path.join(source, "docs", "version.txt"), "version two");
   await writer.syncOnce();
-  assert.equal(await client.materializeRemote("docs/version.txt"), true);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "version.txt"), "utf8"), "version two");
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  await assert.rejects(client.materializeRemote("docs/version.txt"), { code: "root_session_native_unavailable" });
+  assert.equal(await fsp.readFile(path.join(root, "docs", "version.txt"), "utf8"), "version one");
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
 
   await fsp.writeFile(path.join(root, "docs", "version.txt"), "offline local changes");
   await fsp.writeFile(path.join(source, "docs", "version.txt"), "version three");
