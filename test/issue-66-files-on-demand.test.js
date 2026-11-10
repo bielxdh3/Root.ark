@@ -881,6 +881,10 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
     "docs/restore.txt": "authenticated recovery payload",
   });
   const client = await open();
+  // Keep the parent pre-existing for this retryability/foreign-temp test.
+  // A parent newly created by the failed inbound pass is independently
+  // quarantined: its name is not present in the old durable snapshot.
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
   const target = path.join(root, "docs", "restore.txt");
   const snapshot = path.join(root, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshot);
@@ -944,6 +948,42 @@ test("issue 66: failed FOD hydration cannot delete a physically substituted inbo
   assert.equal(await fsp.readFile(temporary, "utf8"), foreignBytes);
   assert.equal(JSON.stringify(store.list("alice")), storeBefore);
   assert.equal(state.pushes, pushesBefore, "cold recovery may not sign a foreign temp or delete");
+});
+
+test("issue 66: new FOD parent remains locked when inbound payload rename fails", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/restore.txt": "inbound payload denied before final rename",
+  });
+  const client = await open();
+  const parent = path.join(root, "docs");
+  const target = path.join(parent, "restore.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const oldSnapshot = await fsp.readFile(snapshot);
+  const beforeStore = JSON.stringify(store.list("alice"));
+  const originalRename = fsp.rename;
+  let intercepted = false;
+  fsp.rename = async (source, dest, ...args) => {
+    if (!intercepted && path.resolve(String(dest)) === path.resolve(target)
+      && String(source).includes(".tmp-inbound-")) {
+      intercepted = true;
+      throw Object.assign(new Error("injected pre-rename EIO"), { code: "EIO" });
+    }
+    return originalRename(source, dest, ...args);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/restore.txt"), { code: "EIO" });
+  } finally {
+    fsp.rename = originalRename;
+  }
+  assert.equal(intercepted, true, "the parent must be created before final payload rename");
+  assert.equal((await fsp.lstat(parent)).isDirectory(), true);
+  assert.equal(await exists(target), false);
+  assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "new uncheckpointed parent must retain the cross-process root lock");
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(state.pushes, 0);
+  assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
 
 test("issue 66: physical post-publish FOD crash retains lock and stops cold outbound reconcile", async (t) => {
@@ -1029,7 +1069,7 @@ test("issue 66: physical post-publish FOD crash retains lock and stops cold outb
 });
 
 test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbound reconcile", async (t) => {
-  const { root, open, store, state } = await setup(t, {
+  const { root, open, store, state, adapter } = await setup(t, {
     "docs/recover.txt": "remote file published before a failed checkpoint",
   });
   const client = await open();
@@ -1071,12 +1111,99 @@ test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbo
   client.inboundPublicationIndeterminate = false;
   await assert.rejects(client._reconcileLocal(), { code: "sync_inbound_indeterminate" });
   await assert.rejects(client._pushPending({ pushed: 0 }), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client.translateWebDavMutation({
+    kind: "put", path: "/docs/recover.txt", operationId: "post-publish-eio-webdav",
+  }), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client._enqueueChange({ operation: "create" }),
+    { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client._open(), { code: "sync_inbound_indeterminate" });
+  await assert.rejects(client.recoverConflict(store.list("alice")[0], {}),
+    { code: "sync_inbound_indeterminate" });
+  const originalPush = adapter.push;
+  let unsafeDispatchAttempted = false;
+  adapter.push = async () => {
+    unsafeDispatchAttempted = true;
+    throw Object.assign(new Error("unexpected outbound after EIO"), { code: "unsafe_dispatch" });
+  };
+  try {
+    await assert.rejects(client.retryPush(store.list("alice")[0]),
+      { code: "sync_inbound_indeterminate" });
+  } finally {
+    adapter.push = originalPush;
+  }
+  assert.equal(unsafeDispatchAttempted, false,
+    "direct retryPush may not reach HTTP after the root became indeterminate");
   await assert.rejects(client.syncOnce(), { code: "sync_root_busy" });
   await assert.rejects(open(), { code: "sync_root_busy" });
-  assert.equal(state.pushes, 0, "no direct or cold outbound CREATE may be signed from uncertain cache");
+  assert.equal(state.pushes, 0, "no uncertain cache may be enqueued or dispatched as outbound CREATE");
   const diskJournal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
   assert.equal(diskJournal.pending.length, 0);
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
+});
+
+test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold root locked", async (t) => {
+  const { root, adapter, store, state, key } = await setup(t, {});
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trusted = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
+  const engineOptions = {
+    rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: (op) => verifyAuthorizationProof(op.authorization, op, trusted),
+  };
+  const client = await new SyncEngine(engineOptions).open();
+  const directory = path.join(root, "docs");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const oldSnapshot = await fsp.readFile(snapshot);
+  const operation = protocol.createOperation({
+    operation: "create", objectId: `object-${crypto.randomUUID()}`,
+    fileId: `file-${crypto.randomUUID()}`, versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter: 1, deviceId: "device-a" },
+    baseRevision: null, metadata: { path: "docs", name: "docs", size: 0,
+      contentType: "inode/directory" }, plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  operation.authorization = await createAuthorizationProof(operation, {
+    username: "alice", privateKey: signer.privateKey, publicKey,
+    expiresAt: Date.now() + 60_000,
+  });
+  const oldStore = JSON.stringify(store.list("alice"));
+  const originalMkdir = fsp.mkdir;
+  const originalRename = fsp.rename;
+  let physicallyCreated = false;
+  let snapshotEio = false;
+  fsp.mkdir = async (candidate, ...args) => {
+    const result = await originalMkdir(candidate, ...args);
+    if (path.resolve(String(candidate)) === path.resolve(directory)) physicallyCreated = true;
+    return result;
+  };
+  fsp.rename = async (source, target, ...args) => {
+    if (physicallyCreated && !snapshotEio && path.resolve(String(target)) === path.resolve(snapshot)
+      && String(source).includes(".tmp-")) {
+      snapshotEio = true;
+      throw Object.assign(new Error("injected snapshot publish EIO after mkdir"), { code: "EIO" });
+    }
+    return originalRename(source, target, ...args);
+  };
+  try {
+    await assert.rejects(client.apply(operation), { code: "EIO" });
+  } finally {
+    fsp.mkdir = originalMkdir;
+    fsp.rename = originalRename;
+  }
+  assert.equal(physicallyCreated, true, "the physical signed directory CREATE must actually execute");
+  assert.equal(snapshotEio, true, "EIO must happen at the later snapshot, not before mkdir");
+  assert.equal((await fsp.lstat(directory)).isDirectory(), true);
+  assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot,
+    "the durable snapshot must not claim the newly created directory");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "indeterminate physical directory CREATE must retain the process lock");
+  await assert.rejects(new SyncEngine(engineOptions).open(), { code: "sync_root_busy" });
+  assert.equal(state.pushes, 0, "no outbound push is observed; this does not prove an upload attempt");
+  const journal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
+  assert.deepEqual(journal.pending, [], "a fresh local CREATE must not have been enqueued");
+  assert.equal(JSON.stringify(store.list("alice")), oldStore);
 });
 
 test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root marker", async (t) => {

@@ -2072,6 +2072,7 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
       try {
+        denyIndeterminateInbound(this);
         await openEngineBuiltIn.call(this);
         return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
       } finally {
@@ -2122,6 +2123,7 @@ class SyncEngine {
   }
 
   async _open() {
+    denyIndeterminateInbound(this);
     const configuredMetadata = internalRootMetadata(
       this.rootDir, this.snapshotPath, this.journal?.filePath);
     await fsp.mkdir(this.rootDir, { recursive: true });
@@ -2499,6 +2501,7 @@ class SyncEngine {
   }
 
   async persistSnapshot() {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     await durableJson(this.snapshotPath, this.snapshot);
     this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
@@ -2807,6 +2810,7 @@ class SyncEngine {
   }
 
   async buildOperation(input) {
+    denyIndeterminateInbound(this);
     const key = input.fileKey || await this.fileKeyResolver(input);
     let operationInput = input;
     if (input.operation === "move") {
@@ -2837,6 +2841,7 @@ class SyncEngine {
   }
 
   async assertOutgoingAuthorized(operation, authorizedAction = null) {
+    denyIndeterminateInbound(this);
     if (this.requireNativeRootRecovery && (operation.operation === "delete" || operation.tombstone)) {
       denyUntrustedNativeSignedDelete();
     }
@@ -2894,6 +2899,7 @@ class SyncEngine {
   }
 
   async _enqueueChange(input) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     const remoteOnly = this.snapshot.remoteOnly[input.objectId];
@@ -2912,6 +2918,7 @@ class SyncEngine {
   }
 
   async translateWebDavMutation(event) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await this.open();
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
@@ -3164,6 +3171,7 @@ class SyncEngine {
   }
 
   async retryPush(operation) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
@@ -3181,6 +3189,7 @@ class SyncEngine {
   }
 
   async recoverConflict(operation, summary) {
+    denyIndeterminateInbound(this);
     // Direct callers must not bypass the persisted root-mode fence by writing
     // conflict recovery payloads outside the ordinary mutation lock.
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
@@ -3755,7 +3764,10 @@ class SyncEngine {
     // must not leave an applied object with no restart-safe observation.
     if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
     let cleanupPath = null;
-    let inboundPayloadPublished = false;
+    // A directory CREATE (or a newly created parent) can be just as unsafe
+    // as a file rename when the later snapshot checkpoint fails. Keep this
+    // local to the trusted mutation pass; it cannot grant replay authority.
+    let inboundCacheChanged = false;
     try {
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
@@ -3789,7 +3801,8 @@ class SyncEngine {
       const sourceExists = source ? await exists(source) : false;
       const movePayload = protocol.decodeMovePayload(plaintext, key);
       if (!sourceExists && movePayload === null) fail("Moved file is unavailable and the operation has no recovery payload", "move_source_missing");
-      await fsp.mkdir(path.dirname(target), { recursive: true });
+      const createdMoveParent = await fsp.mkdir(path.dirname(target), { recursive: true });
+      if (createdMoveParent !== undefined) inboundCacheChanged = true;
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       let hash;
@@ -3799,6 +3812,7 @@ class SyncEngine {
             && path.resolve(source).toLowerCase() === path.resolve(target).toLowerCase();
           if (!sameWindowsPath && await exists(target)) await this.stageExisting(target);
           await fsp.rename(source, target);
+          inboundCacheChanged = true;
         }
         const movedStats = await fsp.lstat(target, { bigint: true });
         if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
@@ -3808,12 +3822,13 @@ class SyncEngine {
         // without first creating a speculative payload temporary.
         if (await exists(target)) await this.stageExisting(target);
         await publishInboundPayload(target, movePayload);
-        inboundPayloadPublished = true;
+        inboundCacheChanged = true;
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
     } else {
-      await fsp.mkdir(path.dirname(target), { recursive: true });
+      const createdParent = await fsp.mkdir(path.dirname(target), { recursive: true });
+      if (createdParent !== undefined) inboundCacheChanged = true;
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
@@ -3826,6 +3841,7 @@ class SyncEngine {
             if (source !== target) {
               if (await exists(target)) await this.stageExisting(target);
               await fsp.rename(source, target);
+              inboundCacheChanged = true;
             }
             relocated = true;
           }
@@ -3833,18 +3849,24 @@ class SyncEngine {
         if (!relocated) {
           try {
             await fsp.mkdir(target, { recursive: false });
+            inboundCacheChanged = true;
           } catch (error) {
             if (error.code !== "EEXIST") throw error;
             if (!(await fsp.lstat(target)).isDirectory()) {
               await this.stageExisting(target);
               await fsp.mkdir(target, { recursive: false });
+              inboundCacheChanged = true;
             }
           }
         }
+        // Even when an existing directory was legitimately reused, the
+        // durable snapshot must authenticate the new remote identity first.
+        // A later failed checkpoint leaves ambiguous cache ancestry.
+        inboundCacheChanged = true;
       } else {
         await publishInboundPayload(target, plaintext,
           async () => { if (await exists(target)) await this.stageExisting(target); });
-        inboundPayloadPublished = true;
+        inboundCacheChanged = true;
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
@@ -3857,12 +3879,13 @@ class SyncEngine {
     if (summary) summary.applied = (summary.applied || 0) + 1;
     return verifiedFreshDigest;
     } catch (error) {
-      // A successful kernel rename followed by any failed local checkpoint
-      // is indeterminate. Retain .rootark-sync.lock: a subsequent sync pass
-      // must not turn the untracked incoming cache file into a signed CREATE.
+      // A successful rename, directory CREATE or newly created ancestor
+      // followed by any failed local checkpoint is indeterminate. Retain
+      // .rootark-sync.lock: a subsequent sync pass must not mistake incoming
+      // cache bytes or directories for a signed local CREATE.
       // This does NOT cure the earlier target-overwrite race or allow a cold
       // operator to trust the same-SID root without native custody.
-      if (this.requireNativeRootRecovery && inboundPayloadPublished) {
+      if (this.requireNativeRootRecovery && inboundCacheChanged) {
         INDETERMINATE_FOD_INBOUND.add(this);
       }
       throw error;
@@ -4176,6 +4199,7 @@ class SyncEngine {
   }
 
   async _pinLocal(relativePath) {
+    denyIndeterminateInbound(this);
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
     if (!this.requireAuthorization || typeof this.verifyIncoming !== "function") {
       // Ordinary non-strict sync is allowed to use a caller-supplied AEAD
@@ -4220,6 +4244,7 @@ class SyncEngine {
   }
 
   async _unpinLocal(relativePath) {
+    denyIndeterminateInbound(this);
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     const previous = this.snapshot.pinnedFiles || {};
@@ -4279,6 +4304,7 @@ class SyncEngine {
   }
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
     if (!this.opened) await openEngineBuiltIn.call(this);
@@ -4528,6 +4554,7 @@ class SyncEngine {
   }
 
   async _materializeOnDemand(safePath) {
+    denyIndeterminateInbound(this);
     if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
       fail("Cannot hydrate while a signed atomic sync batch is pending", "sync_atomic_batch_indeterminate");
     }
@@ -4613,6 +4640,7 @@ class SyncEngine {
   }
 
   async _pullRemote(summary) {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // A remotely visible single side of a just-committed/lost-ACK pair must
     // NOT consume that local pending ID via _apply, markSeen or the excluded-
@@ -4716,6 +4744,7 @@ class SyncEngine {
   // through the guarded _evictLocal path; excluded files with no local copy become remote-only
   // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
   async _applyExcludedPaths() {
+    denyIndeterminateInbound(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const applied = this.snapshot.excludedPaths || [];
     const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
