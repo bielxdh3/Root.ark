@@ -2127,8 +2127,9 @@ publication and code 73 after link+directory fsync/before COMMIT.
 After the first exit there is only PREPARED, with no named stage or
 destination; after the second there is published nlink1 data and
 PREPARED, but **no COMMIT**. Cold inspection is intentionally
-non-authorizing and does not claim any recovered operation. These are
-hard process exits, **not** physical power loss; no owner-signed
+non-authorizing and does not claim any recovered operation. The pre-link `process.exit(74)` is an orderly child-process exit,
+whereas post-link native `_exit(73)` is an immediate process stop;
+neither is physical power loss; no owner-signed
 external antirollback witness is available.
 
 Physical incremental verification for `03b65966`: **Ubuntu WSL
