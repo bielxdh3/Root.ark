@@ -1555,8 +1555,9 @@ No new hosted check has been triggered for these local descendants.
 
 A previously independent failure in `createStagedEvictionGenesis`
 was physically reproduced on **Windows Node22/NTFS** and **WSL
-Node22/ext4**: the old `durableJson(temp,stage)` ultimately called
-replaceable `rename` for the reserved genesis head. An adversarial
+Node22/ext4**: the old `durableJson(file, head)` created a unique
+temporary internally and then called replaceable `rename(temporary,
+file)` for the reserved genesis head. An adversarial
 test created a real competing staged head immediately at that syscall
 and intercepted the attempted *destructive* rename before it could
 erase the test-owned foreign bytes: **RED 1 FAIL per platform**.
