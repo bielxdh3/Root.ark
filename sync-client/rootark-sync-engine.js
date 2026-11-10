@@ -2224,6 +2224,9 @@ class SyncEngine {
   }
 
   async recoverConflict(operation, summary) {
+    // Direct callers must not bypass the persisted root-mode fence by writing
+    // conflict recovery payloads outside the ordinary mutation lock.
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (operation.operation === "delete" || operation.tombstone) return;
     const key = await this.keyFor(operation);
     const decrypted = protocol.decryptPayload(operation, key);
@@ -3014,6 +3017,9 @@ class SyncEngine {
   }
 
   async pruneEmptyUntrackedParents(directory) {
+    // A previously opened legacy instance must not prune physical cache paths
+    // after another instance has durably marked this root as Files On-Demand.
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const root = path.resolve(this.rootDir);
     let current = path.resolve(directory);
     while (current !== root && current.startsWith(`${root}${path.sep}`)) {

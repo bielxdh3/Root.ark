@@ -686,6 +686,79 @@ test("issue 66: an already-open non-FOD engine cannot evict after another instan
   assert.equal(await exists(path.join(root, ".rootark-trash")), false);
 });
 
+test("issue 66: direct recoverConflict cannot write after another engine marks FOD", async (t) => {
+  const { root, open, adapter, store, key } = await setup(t,
+    { "docs/retained.txt": "protected content" });
+  const legacy = await new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key,
+  }).open();
+  const fod = await open();
+  await fod.materializeRemote("docs/retained.txt");
+  const original = store.list("alice")[0];
+  const cachedPath = path.join(root, "docs", "retained.txt");
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const bytesBefore = await fsp.readFile(cachedPath);
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  const conflict = protocol.createOperation({
+    operation: "update", objectId: original.objectId, fileId: original.fileId,
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    baseRevision: original.revision, metadata: { path: "docs/retained.txt" },
+    plaintext: Buffer.from("should not create a recovery file"), fileKey: key,
+  });
+  const summary = { conflicts: [], conflictRecovery: 0 };
+  await assert.rejects(legacy.recoverConflict(conflict, summary), { code: "root_mode_fod_required" });
+  assert.deepEqual(await fsp.readFile(cachedPath), bytesBefore);
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(summary.conflictRecovery, 0);
+  assert.equal(await exists(path.join(root, ".rootark-conflicts")), false);
+});
+
+test("issue 66: direct prune cannot remove empty tracked-root ancestors after FOD activation", async (t) => {
+  const { root, open, adapter, key } = await setup(t, {});
+  const legacy = await new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key,
+  }).open();
+  const empty = path.join(root, "untracked", "nested");
+  await fsp.mkdir(empty, { recursive: true });
+  const fod = await open();
+  const marker = await fsp.readFile(path.join(root, ".rootark-sync-ever-fod"));
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  await assert.rejects(legacy.pruneEmptyUntrackedParents(empty), { code: "root_mode_fod_required" });
+  assert.equal((await fsp.stat(empty)).isDirectory(), true);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-ever-fod")), marker);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(fod.filesOnDemand, true);
+});
+
+test("issue 66: shared protocol and WebDAV reject ever-FOD marker metadata", async (t) => {
+  const { root, open, store, key, state } = await setup(t, {});
+  const client = await open();
+  const markerPath = path.join(root, ".rootark-sync-ever-fod");
+  const originalMarker = await fsp.readFile(markerPath);
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const readsBefore = state.fullReads.length;
+  for (const name of [".rootark-sync-ever-fod", ".ROOTARK-SYNC-EVER-FOD",
+    "docs/.rootark-sync-ever-fod"]) {
+    assert.throws(() => protocol.safeRelativePath(name, "path"), { code: "invalid_operation" });
+    assert.throws(() => protocol.createOperation({ operation: "create",
+      deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+      revision: { counter: 1, deviceId: "device-b" }, metadata: { path: name },
+      plaintext: Buffer.from("not allowed"), fileKey: key,
+    }), { code: "invalid_operation" });
+  }
+  await assert.rejects(client.translateWebDavMutation({
+    kind: "put", operationId: crypto.randomUUID(), path: "/.rootark-sync-ever-fod",
+  }), { code: "invalid_operation" });
+  assert.deepEqual(await fsp.readFile(markerPath), originalMarker);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.fullReads.length, readsBefore);
+});
+
 test("issue 66: malformed ever-FOD root marker fails closed without writing a snapshot", async (t) => {
   const { root, adapter, key } = await setup(t, {});
   await fsp.mkdir(root, { recursive: true });
