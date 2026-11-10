@@ -130,8 +130,12 @@ const { SyncObjectStore } = require(process.argv[2]);
   const archived = (await fsp.readdir(root)).filter((name) =>
     name.startsWith(".rootark-sync-evictions-archive-"));
   assert.equal(archived.length, 1, "a unique on-disk archive must survive the actual hard exit");
-  assert.ok((await fsp.readdir(path.join(root, archived[0])))
-    .some((name) => name.endsWith(".prepare.json")));
+  const archivedPath = path.join(root, archived[0]);
+  const namesBeforeCold = (await fsp.readdir(archivedPath)).sort();
+  assert.ok(namesBeforeCold.some((name) => name.endsWith(".prepare.json")),
+    "the retained archive must contain the exact durable PREPARE evidence");
+  const bytesBeforeCold = new Map(await Promise.all(namesBeforeCold.map(async (name) =>
+    [name, await fsp.readFile(path.join(archivedPath, name))])));
   await assert.rejects(fsp.lstat(path.join(root, ".rootark-sync-evictions")), { code: "ENOENT" });
   // Remove only the orphaned test process lock inside the disposable fixture,
   // never a foreign or privileged root.
@@ -142,6 +146,10 @@ const { SyncObjectStore } = require(process.argv[2]);
   assert.equal(unexpectedWrites, before);
   assert.equal(store.list("alice").filter((item) => item.tombstone).length, 0);
   assert.equal(store.list("alice", original.objectId)[0].operationId, original.operationId);
-  assert.ok((await fsp.readdir(path.join(root, archived[0]))).length > 0,
-    "the cold-recovery denial must preserve archive bytes for independent custody");
+  assert.deepEqual((await fsp.readdir(archivedPath)).sort(), namesBeforeCold,
+    "cold denial must not silently remove a PREPARE or other archive record");
+  for (const [name, bytes] of bytesBeforeCold) {
+    assert.deepEqual(await fsp.readFile(path.join(archivedPath, name)), bytes,
+      `cold denial must preserve the original bytes of ${name}`);
+  }
 });
