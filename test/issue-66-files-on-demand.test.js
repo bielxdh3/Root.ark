@@ -1244,6 +1244,7 @@ test("issue 66: equal-byte foreign inbound stage cannot authorize a successful F
   const snapshot = path.join(root, ".rootark-sync-index.json");
   const oldSnapshot = await fsp.readFile(snapshot);
   const storeBefore = JSON.stringify(store.list("alice"));
+  const originalOpen = fsp.open;
   const originalRename = fsp.rename;
   const heldFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
   const observeOpened = async (handle) => {
@@ -1265,18 +1266,25 @@ test("issue 66: equal-byte foreign inbound stage cannot authorize a successful F
     assert.equal(BigInt(count), before.size);
     return { stat: before, bytes: bytes.subarray(0, count).toString("utf8") };
   };
-  let originalHandle;
+  let publisherHandle;
   let foreignHandle;
   let parkedHandle;
   let publishedHandle;
   let originalInode;
   let foreignInode;
   let physicallyPublished = false;
+  fsp.open = async (file, flags, ...args) => {
+    const handle = await originalOpen(file, flags, ...args);
+    if (!publisherHandle && typeof flags === "number" && (flags & fs.constants.O_EXCL)
+      && String(file).includes(".tmp-inbound-")) publisherHandle = handle;
+    return handle;
+  };
   fsp.rename = async (source, destination, ...args) => {
     if (!physicallyPublished && path.resolve(String(destination)) === path.resolve(target)
       && String(source).includes(".tmp-inbound-")) {
-      originalHandle = await fsp.open(source, heldFlags);
-      originalInode = (await observeOpened(originalHandle)).stat;
+      assert.ok(publisherHandle, "the producer must retain its exact opened stage handle");
+      originalInode = await publisherHandle.stat({ bigint: true });
+      assert.equal(originalInode.isFile(), true);
       await originalRename(source, parked);
       foreignHandle = await fsp.open(source, fs.constants.O_RDWR | fs.constants.O_CREAT
         | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
@@ -1288,6 +1296,10 @@ test("issue 66: equal-byte foreign inbound stage cannot authorize a successful F
         "physical replacement must be a different inode despite byte equality");
       await originalRename(source, destination, ...args);
       physicallyPublished = true;
+      const stillHeld = await publisherHandle.stat({ bigint: true });
+      assert.equal(stillHeld.dev, originalInode.dev);
+      assert.equal(stillHeld.ino, originalInode.ino,
+        "the same original publisher inode must remain opened after foreign publication");
       return;
     }
     return originalRename(source, destination, ...args);
@@ -1309,7 +1321,7 @@ test("issue 66: equal-byte foreign inbound stage cannot authorize a successful F
       "published name must bind to the actual opened foreign inode");
     assert.equal(publishedProof.bytes, payload,
       "the same opened foreign inode must contain the byte-identical payload");
-    assert.equal((await observeOpened(originalHandle)).bytes, payload);
+    assert.equal(parkedProof.bytes, payload);
     assert.equal((await observeOpened(foreignHandle)).bytes, payload);
     assert.deepEqual(await fsp.readFile(snapshot), oldSnapshot,
       "the untrusted replacement must not become durably authenticated metadata");
@@ -1320,10 +1332,10 @@ test("issue 66: equal-byte foreign inbound stage cannot authorize a successful F
     assert.equal(JSON.stringify(store.list("alice")), storeBefore);
   } finally {
     fsp.rename = originalRename;
+    fsp.open = originalOpen;
     if (publishedHandle) await publishedHandle.close();
     if (parkedHandle) await parkedHandle.close();
     if (foreignHandle) await foreignHandle.close();
-    if (originalHandle) await originalHandle.close();
   }
 });
 
