@@ -2626,6 +2626,12 @@ class SyncEngine {
 
   async _apply(operation, summary = null, beforeHydrationWrite = null) {
     operation = envelopeCopy(operation);
+    // An authenticated MOVE is not independent authorization to rename a
+    // cached root by pathname. Even a clean source must wait for native
+    // held-root mutation authority, before admission or any filesystem I/O.
+    if (this.requireNativeRootRecovery && operation.operation === "move") {
+      denyUntrustedNativeEviction();
+    }
     // Incoming authenticated DELETE/tombstone is not independent authority
     // to stage or unlink cached bytes when the native root is unavailable.
     // This also protects direct _apply() callers, not just public apply().

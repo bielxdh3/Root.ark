@@ -785,3 +785,21 @@ monotonic custody, complete native handles/fds, and formally hosted CodeQL
 also remain unresolved. The remote PR #300 remains OPEN/Draft at
 `956b2515`, with CodeQL formally failing in the last check; Root/main
 remains untouched. No push, merge, deploy or cutover was performed.
+
+### Additional fail-closed FOD MOVE preflight (isolated candidate)
+
+Review of `_apply` found that a signed MOVE with an existing materialized
+source still reached `fsp.rename(source, target)` by pathname, even though
+public `stageExisting` was native-gated. A focused Windows Node22 test
+reproduced **RED** (`Missing expected rejection`) for a legitimate signed
+MOVE of clean cached bytes, including a direct public `apply(move)` call.
+The correction denies **all FOD/native-required incoming MOVE operations**
+before verification admission, journal observation or path I/O, rather than
+attempting to make a pathname rename safe with repeated `lstat` checks.
+It intentionally disables legacy MOVE hydration, even when a signed
+recovery payload exists, until the native held-root operation is proven.
+The full Windows Node22 FOD suite turned **GREEN 27 PASS / 0 FAIL** with
+unchanged local bytes, durable snapshot, no trash and no destination.
+This narrow guard is not root-wide same-SID custody: first-time hydration
+and non-FOD reopens still have other pathname-based risks, so product
+recovery and release remain **NO-GO** pending exact-SHA SOURCE review.

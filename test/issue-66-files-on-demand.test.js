@@ -661,20 +661,26 @@ test("issue 66: a remote MOVE must not relocate unsynced local source bytes", as
   assert.equal(await exists(path.join(root, "docs", "renamed.txt")), false);
 });
 
-test("issue 66: a clean cached source can be hydrated through a verified remote MOVE", async (t) => {
+test("issue 66: even a clean cached source cannot be renamed by legacy FOD MOVE without native custody", async (t) => {
   const { root, open, store, key } = await setup(t, { "docs/original.txt": "signed move bytes" });
   const client = await open();
   await client.materializeRemote("docs/original.txt");
   const before = store.list("alice")[0];
-  assert.equal((await store.put("alice", protocol.createOperation({
+  const move = protocol.createOperation({
     operation: "move", objectId: before.objectId, fileId: before.fileId,
     versionId: "on-demand-good-move", operationId: "on-demand-good-move-op",
     deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
     baseRevision: before.revision, revision: { counter: before.revision.counter + 1, deviceId: "device-a" },
     metadata: { path: "docs/renamed.txt", sourcePath: "docs/original.txt" },
     plaintext: protocol.encodeMovePayload(Buffer.from("signed move bytes"), key), fileKey: key,
-  }))).kind, "stored");
-  assert.equal(await client.materializeRemote("docs/renamed.txt"), true);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "renamed.txt"), "utf8"), "signed move bytes");
-  assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+  const originalBytes = await fsp.readFile(path.join(root, "docs", "original.txt"));
+  const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
+  await assert.rejects(client.apply(move), { code: "root_session_native_unavailable" });
+  await assert.rejects(client.materializeRemote("docs/renamed.txt"), { code: "root_session_native_unavailable" });
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "original.txt")), originalBytes);
+  assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(await exists(path.join(root, "docs", "renamed.txt")), false);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
 });
