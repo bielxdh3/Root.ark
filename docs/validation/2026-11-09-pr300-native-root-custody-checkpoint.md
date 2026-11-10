@@ -1011,8 +1011,9 @@ in JS and (b) count/unique/endpoints allowing omitted intermediate names.
 The heavy test source at exact `0a4b2c28` obtained **1 PASS** on Ubuntu
 Node22/ext4, using the additional native stress opt-in. Its stable-held
 `DIR*` enumerated all 16,385 generated leaf names plus three fixture
-entries and one byte-`0xff` entry, before and after the deterministic
-A→B→A pathname swap, while the session remained bound to original A.
+entries and one byte-`0xff` entry, once before the swap and again while
+foreign B occupied A's pathname; the test then restored A without a
+third enumeration. The session remained bound to original A throughout.
 The broader native plus contract suite on the preceding source-equivalent
 compose gave **17 PASS / 2 SKIP** (expected separate native-negative and
 hostile bind-mount policy skips under stress). No claim is made that the
