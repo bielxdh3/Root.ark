@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const {
   spkiHash, signatureBytes, verifyOwnerRotationKeys,
+  signOwnerCutover, verifyOwnerCutoverHistory,
 } = require("../src/crypto/rootark-zk10-account-cutover-v1");
 
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
@@ -96,4 +97,33 @@ test("P2: inherited kHandle getter cannot replace native Ed25519 verification", 
   } finally {
     crypto.verify = nativeVerify;
   }
+});
+
+test("bounded owner history rejects excessive KeyObjects before invoking native getters", () => {
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const signed = signOwnerCutover({
+    type: "rootark-zk10-owner-account-cutover/v1",
+    immutable_account_id: id(1), zk_account_id: id(2), generation: 1,
+    previous_cutover_digest: null,
+    inventory_head: Buffer.alloc(32, 3).toString("hex"),
+    complete_corpus: true, covered_compartments: [id(3)],
+    legacy_egress_scope: "all", reference_disposition: "fully_accounted",
+    migration_disposition: "closed", grant: "protected_enforced",
+    grants: [], suite: "zk1-v2", nonce: Buffer.alloc(32, 7).toString("base64url"),
+    issued_at: 1800000000,
+  }, owner.privateKey);
+  const sym = Object.getOwnPropertySymbols(owner.publicKey)
+    .find((symbol) => String(symbol) === "Symbol(kHandle)");
+  assert.ok(sym);
+  const attackerOwned = Object.create(owner.publicKey);
+  let reads = 0;
+  Object.defineProperty(attackerOwned, sym, { get() {
+    reads += 1;
+    return owner.publicKey[sym];
+  } });
+  const oversizedOwners = Array(10).fill(attackerOwned);
+  assert.throws(() => verifyOwnerCutoverHistory([signed], oversizedOwners, id(1)),
+    { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" });
+  assert.equal(reads, 0,
+    "the hard upper bound must be enforced before cloning any caller key");
 });
