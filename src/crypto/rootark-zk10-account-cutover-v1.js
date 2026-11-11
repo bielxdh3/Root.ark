@@ -194,7 +194,8 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
   if (!Array.isArray(history) || isProxy(history)
     || history.length < 1 || history.length > 64
     || Reflect.ownKeys(history).length !== history.length + 1
-    || !Array.isArray(ownerKeys) || isProxy(ownerKeys) || !ownerKeys.length
+    || !Array.isArray(ownerKeys) || isProxy(ownerKeys)
+    || !ownerKeys.length || ownerKeys.length > 9
     || Reflect.ownKeys(ownerKeys).length !== ownerKeys.length + 1) deny();
   // Pin every trusted key once, not again after attacker-controlled history
   // processing. Reject accessors, holes and Proxies instead of invoking them.
