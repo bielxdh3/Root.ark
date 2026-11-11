@@ -44,6 +44,65 @@ flowchart TD
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
 
+## 2026-11-11 — current published branches, CI, and mutually independent release gates
+
+This later GitHub snapshot supersedes all earlier **current/as-of** statements
+below, without erasing their original test histories. PR #300 is **OPEN/Draft**
+at exact published HEAD `b774ce13398e2486fd08e3ff7b47d53d66c046c2`;
+PR #301 is OPEN/Draft at `50d76c686f7d47799344ea8994fd0b8adb3293cc`;
+PR #302 is OPEN/Draft at `9096cfa75598f23cd640242febe4118e0df64acd`.
+The untouched `Root/main` ref is
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. No merge, deploy,
+production cutover, forced push or `RootSession` activation occurred in this
+checkpoint.
+
+| Published exact SHA | Hosted checks confirmed | What is **not** proven |
+| --- | --- | --- |
+| PR #300 `b774ce13` | CodeQL run `43058440999` **SUCCESS**. Security Regression run `43058657386` **FAIL** in Ubuntu full, Windows canonical, mandatory release and downstream syntax/tests aggregation. | S0 fail-closed inbound denial is not positive FOD hydration, atomic no-replace publication, original-A native custody or release authorization. |
+| PR #301 `50d76c68` | Security Regression `43058539434`, CodeQL `43058539486`, Dependency Review `43058539491`, PostgreSQL 18 `43058539312` and targeted provider/Android `43058539532` all **SUCCESS**; individual Ubuntu/Windows canonic and mandatory checks also reported SUCCESS for that SHA. | Source-level cryptographic role separation is not an independently operated mapping CURRENT, physical original root enrollment, or cold-replay authorization. |
+| PR #302 `9096cfa7` | CodeQL `43056966865`, Dependency Review `43056966940`, PostgreSQL 18 `43056966851`, Ubuntu full and Windows mandatory release jobs **SUCCESS**. Security Regression `43057146979` **FAIL**: Windows canonical and its syntax/tests aggregator failed; the canonical job logged one `ERR_ASSERTION` in `test/issue-65-zk10-external-floor-custodian-w4.test.js` test *partial wall-clock rollback during signing cannot hide an elapsed owner lease*. | DEV-OFF same-host dual SQLite is not an independent off-host custodian. Passing Ubuntu/mandatory jobs cannot override the failed exact SHA Windows canonical or a separate SOURCE NO-GO. |
+
+The new PR #300 S0 code was published by normal fast-forward (`226652ff`
+source, then documentation HEAD `b774ce13`) after its bounded physical
+RED→GREEN tests and reviews. Native-required inbound CREATE/UPDATE/MOVE
+now reject **before** legacy `publishInboundPayload()` or signed journal
+admission. This closes the observed late foreign-inode overwrite attempt
+**only by denying the positive native-required operation**. It does not
+replace the JavaScript publisher with a native atomic no-replace operation.
+In the hosted full suite, the previously red positive FOD assertions remain
+red and additional positive hydration/picker expectations now reject at the
+new S0 guard. Do not change the positive tests to expect denial or claim
+successful feature delivery. Legacy non-FOD `fsp.rename` remains a separate
+same-principal destination race.
+
+**Four separate trust/evidence planes (all required for release):**
+
+1. **Laboratory:** W3 Linux/ext4 held dirfds and W26 Windows/NTFS retained
+   HANDLEs, native no-replace stage, adversarial inode/ancestor checks and
+   narrow cold witness tests are nonauthorizing. Tests on Windows **11** do
+   not prove Windows **10** CFAPI. A process hard-exit is not a physical
+   powercut, and an opt-in PREPIN rejection is not an original-A enrollment.
+2. **Product:** a real native, independently rooted `RootSession` must hold
+   the original root and every ancestor (FileId/inode, owner, ACL/mode,
+   reparse/mount chain), perform signed inbound/outbound stage, no-replace,
+   PREPARE/COMMIT, cleanup and cold `required-v2` replay through retained
+   native handles, without a legacy JavaScript rename/unlink fallback.
+3. **Independent self-hosted custodian:** a separately administered UID/SID
+   and machine/host must enroll the original-A physical identity **before**
+   any hostile mutable-name preflight, protect independently monotonic owner
+   CURRENT/floor/epoch/lease/revocation, and bind the actual physical origin,
+   owner-signed SyncV2↔ZK mapping and signed ingress/egress. PR #301's
+   mapping proof, PR #302's DEV-OFF floor and PR #300's lab FileId cannot
+   be treated as interchangeable signatures or automatically joined across
+   divergent branch histories.
+4. **Release/merge:** fresh independent SOURCE GO on the **published SHA**,
+   correct author/trailer metadata, hosted CodeQL and all mandatory full CI
+   checks, Windows 10 real CFAPI, hostile-process tests, crash/cold replay,
+   real hardware powercut and explicit operator custody must all be proven.
+   A green check on an ancestor or a narrower DEV-OFF/lab suite is not GO.
+
+**Status: PR #300 MERGE NO-GO · RELEASE NO-GO · RootSession OFF.**
+
 ## 2026-11-11 — verified current publication and independent authority gaps
 
 This entry supersedes earlier *as-of* snapshots below for current branch

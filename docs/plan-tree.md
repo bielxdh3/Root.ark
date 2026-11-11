@@ -9,6 +9,27 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 — **latest verified PR HEADs, authoritative over older
+"current" entries below:** #300 `b774ce13398e2486fd08e3ff7b47d53d66c046c2`
+(OPEN/Draft), #301 `50d76c686f7d47799344ea8994fd0b8adb3293cc`
+(OPEN/Draft), #302 `9096cfa75598f23cd640242febe4118e0df64acd`
+(OPEN/Draft); `Root/main` unchanged at
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. PR #300 exact HEAD
+CodeQL `43058440999` SUCCESS, Security Regression `43058657386`
+FAIL (FOD/native-positive CI remains unimplemented); S0 deny-before-inbound
+is fail-closed **not** functioning native hydration. PR #301 exact HEAD
+CodeQL/Ubuntu22/Windows22 canonical/mandatory/PG18/dependency/provider
+checks SUCCESS, but logical owner CURRENT mapping is not independent
+off-host/physical FileId custody. PR #302 exact HEAD CodeQL/Ubuntu22/
+Windows mandatory/PG18/dependency SUCCESS, but Windows canonical single
+`ERR_ASSERTION` in a partial-clock-rollback owner-lease test and aggregator
+FAIL. DEV-OFF same-host SQLite does not authorize production. Native no-replace
+publication, original-A pre-first-pin enrollment, separate UID/SID custodian,
+PREPARE/COMMIT and signed floor cold replay, real Windows 10 CFAPI and
+physical powercut remain unproven. See
+`docs/roadmap/issue-66-pr300-native-custody-gates.md` for full conjunctive
+gate/CI table. No merge or deploy; **MERGE/RELEASE NO-GO**.
+
 2026-11-11 — **live PR #300 #66 checkpoint, not release authorization:**
 published HEAD `23cc31b69c5efb6f218eb74e556b49e297e79297` remains
 OPEN/Draft; `Root/main` stayed `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
