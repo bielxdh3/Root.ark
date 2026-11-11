@@ -134,6 +134,16 @@ public static class RootarkW26NativeFilePublishLab {
     for (int i = 0; i < 16; i++) if (a.FileId[i] != b.FileId[i]) return false;
     return true;
   }
+  private static string ExactId(FILE_ID_INFO id) {
+    if (id.FileId == null || id.FileId.Length != 16)
+      throw new InvalidOperationException("NATIVE_FILE_ID_INVALID");
+    return id.VolumeSerialNumber.ToString("X16") + "-" +
+      BitConverter.ToString(id.FileId).Replace("-", "");
+  }
+  private sealed class ColdObservation {
+    internal string Bytes;
+    internal string Inode;
+  }
   private static void Plain(SafeFileHandle file, bool directory) {
     FILE_ATTRIBUTE_TAG_INFO tag;
     if (!GetTag(file, 9, out tag, (uint)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO))) ||
@@ -188,7 +198,7 @@ public static class RootarkW26NativeFilePublishLab {
   // New-process, read-only observation of the three unsigned laboratory
   // phases. No pathname reopen and NO authority to replay, repair or delete.
   // The same-SID writable parent cannot provide authenticated cold custody.
-  private static string ColdLeaf(SafeFileHandle root, string leaf) {
+  private static ColdObservation ColdLeaf(SafeFileHandle root, string leaf) {
     if (leaf != "stage.bin" && leaf != "published.bin" &&
         leaf != "prepared.bin" && leaf != "commit.bin")
       throw new InvalidOperationException("COLD_LEAF_REJECTED");
@@ -243,7 +253,8 @@ public static class RootarkW26NativeFilePublishLab {
           basic.LastWriteTime != versionAfter.LastWriteTime ||
           basic.ChangeTime != versionAfter.ChangeTime)
         throw new InvalidOperationException("COLD_READ_CHANGED");
-      return Encoding.UTF8.GetString(bytes, 0, (int)read);
+      return new ColdObservation { Bytes = Encoding.UTF8.GetString(bytes, 0, (int)read),
+        Inode = ExactId(id) };
     } finally {
       if (file != null) file.Dispose();
       Marshal.FreeHGlobal(ptr);
@@ -262,21 +273,28 @@ public static class RootarkW26NativeFilePublishLab {
       throw new InvalidOperationException("COLD_NATIVE_ABI_UNVERIFIED");
     string parent = Path.Combine(scratch, "held");
     using (SafeFileHandle root = Root(parent, true)) {
-      string stage = ColdLeaf(root, "stage.bin");
-      string published = ColdLeaf(root, "published.bin");
-      string prepared = ColdLeaf(root, "prepared.bin");
-      string commit = ColdLeaf(root, "commit.bin");
-      if (prepared != "PREPARED_V1" ||
-          (stage != null && stage != Trusted) ||
-          (published != null && published != Trusted) ||
-          (commit != null && commit != "COMMITTED_V1"))
+      FILE_ID_INFO originalRoot = Id(root);
+      ColdObservation stage = ColdLeaf(root, "stage.bin");
+      ColdObservation published = ColdLeaf(root, "published.bin");
+      ColdObservation prepared = ColdLeaf(root, "prepared.bin");
+      ColdObservation commit = ColdLeaf(root, "commit.bin");
+      string rootPrefix = "PREPARED_V2:" + ExactId(originalRoot) + ":";
+      if (prepared == null || !prepared.Bytes.StartsWith(rootPrefix, StringComparison.Ordinal)
+          || prepared.Bytes.Length != rootPrefix.Length + 49 ||
+          (stage != null && stage.Bytes != Trusted) ||
+          (published != null && published.Bytes != Trusted) ||
+          (stage != null && stage.Inode != prepared.Bytes.Substring(rootPrefix.Length)) ||
+          (published != null && published.Inode != prepared.Bytes.Substring(rootPrefix.Length)) ||
+          (commit != null && commit.Bytes != "COMMITTED_V2:" +
+            prepared.Bytes.Substring("PREPARED_V2:".Length)) ||
+          !Same(originalRoot, Id(root)))
         throw new InvalidOperationException("COLD_BYTES_UNVERIFIED");
       string phase;
-      if (stage == Trusted && published == null && commit == null)
+      if (stage != null && published == null && commit == null)
         phase = "PREPARED_ONLY";
-      else if (stage == null && published == Trusted && commit == null)
+      else if (stage == null && published != null && commit == null)
         phase = "PUBLISHED_NO_COMMIT";
-      else if (stage == null && published == Trusted && commit == "COMMITTED_V1")
+      else if (stage == null && published != null && commit != null)
         phase = "COMMIT_OBSERVED";
       else throw new InvalidOperationException("COLD_PHASE_UNVERIFIED");
       return "ROOTARK_W26_COLD_INSPECT phase=" + phase +
@@ -369,12 +387,14 @@ public static class RootarkW26NativeFilePublishLab {
       }
       using (SafeFileHandle source = File(root, "stage.bin", true)) {
         Write(source, Trusted);
+        FILE_ID_INFO original = Id(source);
+        FILE_ID_INFO initialRoot = Id(root);
+        string originalIdentity = ExactId(initialRoot) + ":" + ExactId(original);
         if (crashBefore || crashAfter || complete) {
           using (SafeFileHandle prepared = File(root, "prepared.bin", true))
-            Write(prepared, "PREPARED_V1");
+            Write(prepared, "PREPARED_V2:" + originalIdentity);
           if (crashBefore) ExitImmediately(74);
         }
-        FILE_ID_INFO original = Id(source);
         string stage = Path.Combine(parent, "stage.bin");
         string target = Path.Combine(parent, "published.bin");
         if (mode == "COLLISION") {
@@ -452,7 +472,7 @@ public static class RootarkW26NativeFilePublishLab {
           // Only the fully completed opt-in rehearsal writes this marker.
           // Windows namespace durability and cold recovery are NOT proven.
           using (SafeFileHandle marker = File(root, "commit.bin", true))
-            Write(marker, "COMMITTED_V1");
+            Write(marker, "COMMITTED_V2:" + originalIdentity);
         }
         return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode +
           " result=ORIGINAL_HANDLE inode=PINNED no_replace=YES";

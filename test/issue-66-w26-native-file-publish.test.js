@@ -190,7 +190,8 @@ test("#66 W26 NTFS pre-link abrupt process exit retains only staged bytes and PR
     const held = path.join(scratch, "held");
     assert.equal(fs.readFileSync(path.join(held, "stage.bin"), "utf8"),
       "ORIGINAL_OPENED_STAGE_BYTES");
-    assert.equal(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"), "PREPARED_V1");
+    assert.match(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"),
+      /^PREPARED_V2:[0-9A-F]{16}-[0-9A-F]{32}:[0-9A-F]{16}-[0-9A-F]{32}$/);
     assert.equal(fs.existsSync(path.join(held, "published.bin")), false);
     assert.equal(fs.existsSync(path.join(held, "commit.bin")), false);
   });
@@ -203,10 +204,13 @@ test("#66 W26 NTFS completed native lab sequence writes COMMIT only after opened
     assert.match(result.stdout, /^ROOTARK_W26_HANDLE_PUBLISH mode=TXN_COMPLETE result=ORIGINAL_HANDLE inode=PINNED no_replace=YES\r?\n$/);
     const held = path.join(scratch, "held");
     assert.equal(fs.existsSync(path.join(held, "stage.bin")), false);
-    assert.equal(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"), "PREPARED_V1");
+    const prepared = fs.readFileSync(path.join(held, "prepared.bin"), "utf8");
+    assert.match(prepared,
+      /^PREPARED_V2:[0-9A-F]{16}-[0-9A-F]{32}:[0-9A-F]{16}-[0-9A-F]{32}$/);
     assert.equal(fs.readFileSync(path.join(held, "published.bin"), "utf8"),
       "ORIGINAL_OPENED_STAGE_BYTES");
-    assert.equal(fs.readFileSync(path.join(held, "commit.bin"), "utf8"), "COMMITTED_V1");
+    assert.equal(fs.readFileSync(path.join(held, "commit.bin"), "utf8"),
+      prepared.replace(/^PREPARED_V2:/, "COMMITTED_V2:"));
   });
 
 test("#66 W26 NTFS post-rename abrupt process exit retains published inode without COMMIT",
@@ -220,7 +224,8 @@ test("#66 W26 NTFS post-rename abrupt process exit retains published inode witho
     assert.equal(fs.existsSync(path.join(held, "stage.bin")), false);
     assert.equal(fs.readFileSync(path.join(held, "published.bin"), "utf8"),
       "ORIGINAL_OPENED_STAGE_BYTES");
-    assert.equal(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"), "PREPARED_V1");
+    assert.match(fs.readFileSync(path.join(held, "prepared.bin"), "utf8"),
+      /^PREPARED_V2:[0-9A-F]{16}-[0-9A-F]{32}:[0-9A-F]{16}-[0-9A-F]{32}$/);
     assert.equal(fs.existsSync(path.join(held, "commit.bin")), false,
       "a physical process exit before COMMIT must not be called recovered");
   });
@@ -282,7 +287,9 @@ test("#66 W26 cold native phase inspector distinguishes COMMIT and denies corrup
     assert.equal(corrupted.status, 41);
     assert.equal(corrupted.stdout, "");
     assert.match(corrupted.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
-    fs.writeFileSync(path.join(scratch, "held", "commit.bin"), "COMMITTED_V1");
+    const prepared = fs.readFileSync(path.join(scratch, "held", "prepared.bin"), "utf8");
+    fs.writeFileSync(path.join(scratch, "held", "commit.bin"),
+      prepared.replace(/^PREPARED_V2:/, "COMMITTED_V2:"));
     const published = path.join(scratch, "held", "published.bin");
     const alias = path.join(scratch, "held", "foreign-hardlink.bin");
     fs.linkSync(published, alias);
@@ -293,3 +300,50 @@ test("#66 W26 cold native phase inspector distinguishes COMMIT and denies corrup
     assert.equal(fs.readFileSync(published, "utf8"), "ORIGINAL_OPENED_STAGE_BYTES");
     assert.equal(fs.readFileSync(alias, "utf8"), "ORIGINAL_OPENED_STAGE_BYTES");
   });
+
+test("#66 W26 cold native inspector rejects same-byte foreign published FileId after real COMMIT", {
+  skip: !available, timeout: 40000,
+}, () => {
+  const scratch = fixture();
+  const complete = invoke(scratch, "TXN_COMPLETE", true, true);
+  assert.equal(complete.status, 0, complete.stderr);
+  const held = path.join(scratch, "held");
+  const published = path.join(held, "published.bin");
+  const parked = path.join(held, "original-published-inode-retained.bin");
+  // Keep the original inode under a harmless new name, and introduce an
+  // equal-byte FOREIGN file at the published name with wx+flush. A validator
+  // checking only marker text would incorrectly report COMMIT_OBSERVED.
+  fs.renameSync(published, parked);
+  const originalFd = fs.openSync(parked, "r");
+  let foreignFd;
+  try {
+    foreignFd = fs.openSync(published, "wx+", 0o600);
+    const readHeld = (fd, size) => {
+      const bytes = Buffer.alloc(size + 1);
+      const length = fs.readSync(fd, bytes, 0, bytes.length, 0);
+      assert.equal(length, size, "the original opened inode must have exactly its checked bytes");
+      return bytes.subarray(0, length);
+    };
+    const originalLength = Number(fs.fstatSync(originalFd, { bigint: true }).size);
+    const originalBytes = readHeld(originalFd, originalLength);
+    fs.writeSync(foreignFd, originalBytes, 0, originalBytes.length, 0);
+    fs.fsyncSync(foreignFd);
+    const originalStat = fs.fstatSync(originalFd, { bigint: true });
+    const foreignStat = fs.fstatSync(foreignFd, { bigint: true });
+    assert.notEqual(originalStat.ino, foreignStat.ino,
+      "the attacker must insert a genuinely distinct NTFS FILE_ID");
+    assert.deepEqual(readHeld(foreignFd, originalLength), originalBytes);
+    const wrong = invoke(scratch, "COLD_INSPECT", true, false, true);
+    assert.equal(wrong.status, 41,
+      "same bytes from an unrelated FILE_ID must not become COMMIT authorization");
+    assert.equal(wrong.stdout, "");
+    assert.match(wrong.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+    assert.deepEqual(readHeld(originalFd, originalLength), originalBytes);
+    assert.deepEqual(readHeld(foreignFd, originalLength), originalBytes);
+    assert.equal(fs.fstatSync(originalFd, { bigint: true }).ino, originalStat.ino);
+    assert.equal(fs.fstatSync(foreignFd, { bigint: true }).ino, foreignStat.ino);
+  } finally {
+    if (foreignFd !== undefined) fs.closeSync(foreignFd);
+    fs.closeSync(originalFd);
+  }
+});
