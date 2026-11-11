@@ -10,6 +10,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } =
@@ -431,6 +432,66 @@ test("issue 66 strict FOD: expired DELETE historical batch cannot release lock a
   await f.assertBothPending();
 });
 
+for (const witnessFailure of ["null-receipt", "transport-error"]) {
+  test("issue 66 strict FOD: JS-overridden authorization cannot dispatch fresh signed batch with "
+    + witnessFailure, { timeout: 120000 }, async (t) => {
+    // A disposable physical file would prove that an untrusted JS override
+    // reached the outbound batch transport. This is never root authority.
+    const remoteRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-batch-server-"));
+    t.after(() => fsp.rm(remoteRoot, { recursive: true, force: true }));
+    const remoteCommit = path.join(remoteRoot, "durable-atomic-commit.bin");
+    let completedPhysicalWrite = false;
+    const f = await fixture(t, {
+      filesOnDemand: true,
+      batchResponse: (pair) => {
+        const data = Buffer.from(protocol.canonicalJson(pair));
+        const fd = fs.openSync(remoteCommit,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+        try {
+          let written = 0;
+          while (written < data.length) {
+            written += fs.writeSync(fd, data, written, data.length - written);
+          }
+          fs.fsyncSync(fd);
+          completedPhysicalWrite = true;
+        } finally {
+          fs.closeSync(fd);
+        }
+        throw Object.assign(new Error("server fsync completed, HTTP ACK lost"),
+          { code: "ETIMEDOUT" });
+      },
+      witnessResponse: () => {
+        if (witnessFailure === "transport-error") {
+          throw Object.assign(new Error("independent witness unavailable"),
+            { code: "offline" });
+        }
+        return null;
+      },
+    });
+    // Adversarial in-process override: a writable JS method is NOT an
+    // independent native RootSession capability or trusted device grant.
+    // The module-owned negative custody fence must remain effective.
+    const originalAuthorization = f.engine.assertOutgoingAuthorized;
+    f.engine.assertOutgoingAuthorized = async (_operation, authorizedAction = null) =>
+      authorizedAction ? authorizedAction() : true;
+    const summary = f.summary();
+    try {
+      await assert.rejects(f.engine.withMutationLock(() =>
+        f.engine.pushAtomicSignedOverwritePair([f.deleted, f.moved], summary)),
+      { code: "sync_atomic_batch_indeterminate" },
+      "JS method replacement must not authorize a signed DELETE/MOVE batch");
+    } finally {
+      f.engine.assertOutgoingAuthorized = originalAuthorization;
+    }
+    assert.equal(completedPhysicalWrite, false,
+      "the forged JS authorization must never reach even a disposable remote writer");
+    assert.equal(fs.existsSync(remoteCommit), false);
+    assert.deepEqual(f.events, [], "no outbound batch transport may run");
+    assert.equal(fs.existsSync(path.join(f.root, ".rootark-sync.lock")), false,
+      "a pre-dispatch rejection without side effects must not poison the root lock");
+    await f.assertBothPending();
+  });
+}
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
   "other-account-witness", "other-immutable-account-id", "other-immutable-store-id",
   "other-username-witness", "other-compartment-witness", "legacy-v1-witness",

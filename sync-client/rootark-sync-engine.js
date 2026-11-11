@@ -3475,6 +3475,13 @@ class SyncEngine {
       // envelopes and the synchronous owner-trusted policy in one no-await
       // window immediately before beginning the single remote batch POST.
       const dispatchIfBothStillFresh = () => {
+        // This call graph is still the legacy JavaScript publisher, NOT an
+        // independently rooted native RootSession. Even a caller that
+        // overrides assertOutgoingAuthorized on this instance must not
+        // turn its JS callback into authority for a destructive signed
+        // DELETE + MOVE. Historical read-only witness verification above
+        // remains permitted without attempting any new remote POST.
+        if (this.requireNativeRootRecovery) denyUntrustedNativeSignedDelete();
         for (const member of [deleted, moved]) {
           try { protocol.validateFreshSignedOperation(member); }
           catch { fail("Atomic batch member expired before dispatch", "authorization_required"); }
