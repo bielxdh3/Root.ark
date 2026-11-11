@@ -493,3 +493,121 @@ test("production NODE_ENV refuses even fully signed disposable evidence", () => 
     else process.env.NODE_ENV = previous;
   }
 });
+
+test("P2: owner A cannot impersonate independently pinned B via own native kKeyType getter and retargeted Hash.prototype.digest", () => {
+  const f = fixture();
+  const opts = f.options();
+  const claimedPinB = spki(f.foreign.publicKey);
+  const actualPinA = spki(f.owner.publicKey);
+  assert.notEqual(claimedPinB, actualPinA);
+  const genuineKey = f.owner.publicKey;
+  const symbols = Object.getOwnPropertySymbols(genuineKey);
+  const handleSymbol = symbols.find((sym) => sym.description === "kHandle");
+  const typeSymbol = symbols.find((sym) => sym.description === "kKeyType");
+  assert.ok(handleSymbol && typeSymbol, "real Node22 native key handle and key type required");
+  const forged = Object.create(Object.getPrototypeOf(genuineKey));
+  Object.defineProperty(forged, handleSymbol, { value: genuineKey[handleSymbol] });
+  const hashPrototype = Object.getPrototypeOf(crypto.createHash("sha256"));
+  const nativeDigest = Object.getOwnPropertyDescriptor(hashPrototype, "digest");
+  let keyTypeGetterCalls = 0;
+  let hashSpoofCalls = 0;
+  Object.defineProperty(forged, typeSymbol, { get() {
+    keyTypeGetterCalls += 1;
+    Object.defineProperty(hashPrototype, "digest", {
+      ...nativeDigest, value: function forgedDigest(encoding) {
+        const result = nativeDigest.value.call(this, encoding);
+        if (encoding === "hex" && result === actualPinA) {
+          hashSpoofCalls += 1;
+          return claimedPinB;
+        }
+        return result;
+      },
+    });
+    return "public";
+  } });
+  opts.pinnedOwnerPublicKey = forged;
+  opts.pinnedOwnerSpkiSha256 = claimedPinB;
+  opts.readSignedCurrentFloor = (challenge) => sign({
+    type: "rootark-zk10-original-byte-floor-readback/v1",
+    immutable_account_id: f.expected.immutable_account_id,
+    owner_spki_sha256: claimedPinB,
+    sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+    nonce: challenge, revoked: false, issued_at_ms: Date.now() - 10,
+    expires_at_ms: Date.now() + 5000,
+  }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+  try {
+    assert.throws(() => {
+      const gate = createDevOffOriginalByteEvidenceGate(opts);
+      const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+      gate.verifyOriginalBytes({ ticket, chunks: [f.original] });
+    }, bad, "owner signed A must never validate as externally pinned owner B");
+    assert.equal(keyTypeGetterCalls, 0,
+      "forged own accessor must be rejected before it can retarget native hashing");
+    assert.equal(hashSpoofCalls, 0);
+  } finally {
+    Object.defineProperty(hashPrototype, "digest", nativeDigest);
+  }
+  const control = f.open();
+  const controlTicket = control.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+  assert.equal(control.verifyOriginalBytes({ ticket: controlTicket,
+    chunks: [f.original] }).originalByteDigestVerified, true,
+  "genuine signed owner A, genuinely pinned as A, must remain accepted");
+});
+
+test("P2: signed CURRENT callback cannot replace native digest/comparison to accept mutated original bytes", () => {
+  for (const attack of ["timingSafeEqual", "hashDigest"]) {
+    const f = fixture();
+    const options = f.options();
+    const realTimingSafeEqual = crypto.timingSafeEqual;
+    const hashPrototype = Object.getPrototypeOf(crypto.createHash("sha256"));
+    const originalDigest = Object.getOwnPropertyDescriptor(hashPrototype, "digest");
+    const ownerPin = spki(f.owner.publicKey);
+    let callbacks = 0;
+    let attackerDispatches = 0;
+    options.readSignedCurrentFloor = (challenge) => {
+      callbacks += 1;
+      const signed = sign({
+        type: "rootark-zk10-original-byte-floor-readback/v1",
+        immutable_account_id: f.expected.immutable_account_id,
+        owner_spki_sha256: ownerPin,
+        sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+        nonce: challenge, revoked: false, issued_at_ms: Date.now() - 20,
+        expires_at_ms: Date.now() + 5000,
+      }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+      if (callbacks === 2 && attack === "timingSafeEqual") {
+        crypto.timingSafeEqual = () => { attackerDispatches += 1; return true; };
+      } else if (callbacks === 2 && attack === "hashDigest") {
+        Object.defineProperty(hashPrototype, "digest", {
+          ...originalDigest,
+          value: function forgedDigest(encoding) {
+            const real = originalDigest.value.call(this, encoding);
+            if (encoding === undefined && Buffer.isBuffer(real)) {
+              attackerDispatches += 1;
+              return Buffer.from(f.body.original_sha256, "hex");
+            }
+            return real;
+          },
+        });
+      }
+      return signed;
+    };
+    try {
+      const gate = createDevOffOriginalByteEvidenceGate(options);
+      const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+      const wrongBytes = Buffer.from(f.original);
+      wrongBytes[0] ^= 0x7f;
+      assert.throws(() => gate.verifyOriginalBytes({ ticket, chunks: [wrongBytes] }), bad,
+        `${attack} callback must not accept bytes different from genuine Ed25519 owner's digest`);
+      assert.ok(callbacks >= 2, "hostile callback must actually run during signed readback");
+      assert.equal(attackerDispatches, 0, "native digest/compare must ignore altered JS methods");
+    } finally {
+      crypto.timingSafeEqual = realTimingSafeEqual;
+      Object.defineProperty(hashPrototype, "digest", originalDigest);
+    }
+    const control = f.open();
+    const controlTicket = control.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+    const positive = control.verifyOriginalBytes({ ticket: controlTicket, chunks: [f.original] });
+    assert.equal(positive.originalByteDigestVerified, true);
+    assert.equal(positive.authorizesIo, false);
+  }
+});

@@ -39,6 +39,11 @@ const FLOOR_TTL_MS = 10000;
 const NOW = Date.now.bind(Date);
 const VERIFY = crypto.verify.bind(crypto);
 const HASH = crypto.createHash.bind(crypto);
+const HASH_PROTOTYPE = Object.getPrototypeOf(HASH("sha256"));
+const HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
+const JSON_STRINGIFY_PRIMITIVE = JSON.stringify.bind(JSON);
 const RANDOM = crypto.randomBytes.bind(crypto);
 const CREATE_PUBLIC = crypto.createPublicKey.bind(crypto);
 const KEY_EQUALS = crypto.KeyObject.prototype.equals;
@@ -53,6 +58,13 @@ const PUBLIC_KEY_FIXTURE = CREATE_PUBLIC({
 const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(PUBLIC_KEY_FIXTURE);
 const KEY_HANDLE_SYMBOL = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
   .find((symbol) => symbol.description === "kHandle");
+const KEY_TYPE_SYMBOL = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kKeyType");
+const NATIVE_HANDLE_PROTOTYPE = Object.getPrototypeOf(PUBLIC_KEY_FIXTURE[KEY_HANDLE_SYMBOL]);
+const NATIVE_HANDLE_ALGORITHM = Object.getOwnPropertyDescriptor(
+  NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType").value;
+const NATIVE_HANDLE_EXPORT = Object.getOwnPropertyDescriptor(
+  NATIVE_HANDLE_PROTOTYPE, "export").value;
 const KEY_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
 const KEY_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
 const KEY_ASYMMETRIC_TYPE = Object.getOwnPropertyDescriptor(
@@ -102,7 +114,27 @@ function publicKey(value, pinnedSpki) {
   // inherited wrappers/accessors are not a stable security principal.
   const handle = KEY_HANDLE_SYMBOL
     && Object.getOwnPropertyDescriptor(value, KEY_HANDLE_SYMBOL);
+  const typeDescriptor = KEY_TYPE_SYMBOL
+    && Object.getOwnPropertyDescriptor(value, KEY_TYPE_SYMBOL);
+  // A forged Object.create(nativePublicPrototype) can own a DATA kHandle
+  // whose value is actually a JavaScript object, or own an accessor kKeyType.
+  // The native key accessors can dispatch through those objects before any
+  // caught exception, poisoning crypto/hash methods for the next verification.
+  // Check BOTH own descriptors and the raw handle's genuine native brand
+  // before calling a single higher-level native KeyObject accessor/export.
   if (!handle || !Object.hasOwn(handle, "value")
+    || !typeDescriptor || !Object.hasOwn(typeDescriptor, "value")
+    || typeDescriptor.value !== "public"
+    || !handle.value || typeof handle.value !== "object"
+    || isProxy(handle.value)
+    || Object.getPrototypeOf(handle.value) !== NATIVE_HANDLE_PROTOTYPE
+    || Object.hasOwn(handle.value, "export")
+    || Object.hasOwn(handle.value, "getAsymmetricKeyType")
+    || Object.getOwnPropertyDescriptor(NATIVE_HANDLE_PROTOTYPE, "export")?.value
+      !== NATIVE_HANDLE_EXPORT
+    || Object.getOwnPropertyDescriptor(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
+      !== NATIVE_HANDLE_ALGORITHM
+    || NATIVE_HANDLE_ALGORITHM.call(handle.value) !== "ed25519"
     || KEY_TYPE.call(value) !== "public"
     || KEY_ASYMMETRIC_TYPE.call(value) !== "ed25519") deny();
   try {
@@ -115,7 +147,9 @@ function publicKey(value, pinnedSpki) {
     if (KEY_TYPE.call(pinned) !== "public"
       || KEY_ASYMMETRIC_TYPE.call(pinned) !== "ed25519"
       || !KEY_EXPORT.call(pinned, { type: "spki", format: "der" }).equals(der)) deny();
-    const spkiDigest = HASH("sha256").update(der).digest("hex");
+    const digest = HASH("sha256");
+    HASH_UPDATE.call(digest, der);
+    const spkiDigest = HASH_DIGEST.call(digest, "hex");
     if (spkiDigest !== hex(pinnedSpki)) deny();
     return pinned;
   } catch (_) { deny(); }
@@ -155,7 +189,17 @@ function signedSnapshot(record, fields, normalize, domain, pinnedKey) {
   const signed = exact(record, [...fields, "signature"]);
   const body = normalize(Object.fromEntries(fields.map((field) => [field, signed[field]])));
   const signature = Buffer.from(bytes(signed.signature, 64), "base64url");
-  const message = Buffer.concat([domain, Buffer.from(JSON.stringify(body), "utf8")]);
+  // All normalized owner/floor records are FLAT scalar schemas. Serialize
+  // each own primitive in the exact signed field order. JSON.stringify(body)
+  // would invoke inherited toJSON hooks after an injected CURRENT callback.
+  const encoded = fields.map((field) => {
+    const descriptor = Object.getOwnPropertyDescriptor(body, field);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")
+      || (descriptor.value !== null && !["string", "boolean", "number"].includes(
+        typeof descriptor.value))) deny();
+    return `${JSON_STRINGIFY_PRIMITIVE(field)}:${JSON_STRINGIFY_PRIMITIVE(descriptor.value)}`;
+  });
+  const message = Buffer.concat([domain, Buffer.from(`{${encoded.join(",")}}`, "utf8")]);
   if (!VERIFY(null, message, pinnedKey, signature)) deny();
   return body;
 }
@@ -268,10 +312,10 @@ function createDevOffOriginalByteEvidenceGate(options) {
           if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
           const copied = immutableBytes(descriptor.value, intent.original_length - size);
           size += copied.length;
-          digest.update(copied);
+          HASH_UPDATE.call(digest, copied);
         }
         if (size !== intent.original_length
-          || !crypto.timingSafeEqual(digest.digest(),
+          || !TIMING_SAFE_EQUAL(HASH_DIGEST.call(digest),
             Buffer.from(intent.original_sha256, "hex"))) deny();
         freshOwner(intent); // check another nonce-signed snapshot after assembly
         return Object.freeze({
