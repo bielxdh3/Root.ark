@@ -1119,7 +1119,8 @@ test("issue 66 P2: large-trash required-v2 recovery still rejects missing tracke
 test("issue 66 P2 POSIX: required-v2 rejects a linked stage marker and renamed trash ancestry", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX symlinks and ancestry replacement");
   const f = await fixture(t, "linked-required-stage");
-  await fillLegitimateTrash(f.root);
+  // Separate >16,384-entry tests exercise streaming enumeration; this test
+  // isolates inode/ancestor rebinding without repeating that large fixture.
   await prePrepareCrash(f, false, true);
   const trash = path.join(f.root, ".rootark-trash");
   const head = path.join(trash, ".rootark-eviction-genesis-head.json");
@@ -1130,10 +1131,21 @@ test("issue 66 P2 POSIX: required-v2 rejects a linked stage marker and renamed t
   await assert.rejects(f.create(f.root, ["private"]), { code: "invalid_snapshot" });
   await fsp.unlink(head);
   await fsp.rename(savedHead, head);
+  const originalHead = await fsp.lstat(head, { bigint: true });
   const renamedTrash = path.join(f.dir, "outside-renamed-trash");
   await fsp.rename(trash, renamedTrash);
   await fsp.symlink(renamedTrash, trash, "dir");
-  await assert.rejects(f.create(f.root, ["private"]), { code: "unsafe_path" });
+  assert.equal((await fsp.lstat(trash)).isSymbolicLink(), true);
+  // The held O_NOFOLLOW directory lookup rejects the rebound parent before
+  // the later generic pathname-containment check. Both are fail-closed; pin
+  // the specific early rejection without weakening the hostile fixture.
+  await assert.rejects(f.create(f.root, ["private"]), {
+    code: "invalid_snapshot", message: "Unsafe pre-upgrade eviction genesis parent",
+  });
+  const preservedHead = await fsp.lstat(path.join(renamedTrash,
+    ".rootark-eviction-genesis-head.json"), { bigint: true });
+  assert.equal(preservedHead.dev, originalHead.dev);
+  assert.equal(preservedHead.ino, originalHead.ino);
   verifyNoSignedDelete(f, before);
   assert.equal((JSON.parse(await fsp.readFile(f.snapshot, "utf8"))).evictionLedgerRequired, true);
 });
