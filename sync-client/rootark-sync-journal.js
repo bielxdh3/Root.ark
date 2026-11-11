@@ -184,6 +184,54 @@ async function renameWithRetry(source, destination) {
   }
 }
 
+function sameJournalInodeVersion(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs);
+}
+
+function invalidJournalIdentity() {
+  return Object.assign(new Error("Sync journal inode changed during cold read"), {
+    code: "invalid_sync_journal",
+  });
+}
+
+async function readHeldJournal(filePath) {
+  // A historical readFile(path) accepted a new, valid-looking foreign journal
+  // after the name was rebound. Acquire an exact inode first, never reopen
+  // the mutable path for bytes, and detect changes around the held read.
+  // This is NOT independently protected root/parent custody or rollback proof.
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    | (fs.constants.O_NONBLOCK || 0);
+  const handle = await fsp.open(filePath, flags);
+  try {
+    const heldBefore = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(filePath, { bigint: true });
+    if (!heldBefore.isFile() || heldBefore.ino === 0n || heldBefore.nlink !== 1n
+      || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+      || !sameJournalInodeVersion(heldBefore, namedBefore)) {
+      throw invalidJournalIdentity();
+    }
+    const bytes = await handle.readFile();
+    const heldAfter = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(filePath, { bigint: true });
+    if (!sameJournalInodeVersion(heldBefore, heldAfter)
+      || !sameJournalInodeVersion(heldBefore, namedAfter)
+      || BigInt(bytes.length) !== heldBefore.size) {
+      throw invalidJournalIdentity();
+    }
+    return JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    // Only a missing file at the ORIGINAL open is a new empty journal.
+    // A disappeared name after opening an inode is foreign interference;
+    // never reinitialize durable pending/seen evidence on that ENOENT.
+    if (error.code === "ENOENT") throw invalidJournalIdentity();
+    throw error;
+  } finally {
+    await handle.close();
+  }
+}
+
 async function durableWrite(filePath, value) {
   const directory = path.dirname(filePath);
   await fsp.mkdir(directory, { recursive: true });
@@ -226,8 +274,9 @@ class SyncJournal {
   }
 
   async open() {
+    const previousState = this.state;
     try {
-      this.state = JSON.parse(await fsp.readFile(this.filePath, "utf8"));
+      this.state = await readHeldJournal(this.filePath);
       if (this.state.version !== JOURNAL_VERSION || !Array.isArray(this.state.pending)
         || this.state.pending.length > MAX_PENDING || !Array.isArray(this.state.seen)
         || this.state.seen.length > MAX_OBSERVATIONS) {
@@ -287,6 +336,9 @@ class SyncJournal {
         throw new Error("Invalid previously observed sync envelope journal");
       }
     } catch (error) {
+      // Invalid cold evidence must not remain usable in memory after a
+      // rejected open or be consumed by a later retry on this same instance.
+      this.state = previousState;
       if (error.code !== "ENOENT") throw error;
       await durableWrite(this.filePath, this.state);
     }

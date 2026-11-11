@@ -879,6 +879,114 @@ test("issue 66: a multiply-linked ever-FOD marker cannot authorize a root mode",
   assert.deepEqual(await fsp.readFile(path.join(root, ".rootark-sync-index.json")), snapshotBefore);
 });
 
+test("issue 66: cold FOD snapshot cannot accept a foreign inode rebound after its initial stat", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/keep.txt": "signed remote content",
+  });
+  await open();
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const parked = path.join(root, "parked-original-index-for-adversarial-test");
+  const originalBytes = await fsp.readFile(snapshot);
+  const injected = JSON.parse(originalBytes);
+  injected.excludedPaths = ["docs"];
+  const foreignBytes = Buffer.from(JSON.stringify(injected));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const pushesBefore = state.pushes;
+  const originalLstat = fsp.lstat;
+  const originalRename = fsp.rename;
+  let physicallySwapped = false;
+  // The vulnerable version lstat()ed the original index and then reopened
+  // its NAME with readFile(). This callback makes that second read follow
+  // a different, valid JSON inode, rather than the original checked file.
+  fsp.lstat = async (requested, ...args) => {
+    const prior = await originalLstat(requested, ...args);
+    if (!physicallySwapped && path.resolve(String(requested)) === snapshot) {
+      physicallySwapped = true;
+      await originalRename(snapshot, parked);
+      const foreign = await fsp.open(snapshot, "wx", 0o600);
+      try {
+        await foreign.writeFile(foreignBytes);
+        await foreign.sync();
+      } finally { await foreign.close(); }
+    }
+    return prior;
+  };
+  try {
+    await assert.rejects(open(), { code: "invalid_snapshot" },
+      "a replacement index must not be accepted as the previously checked inode");
+  } finally {
+    fsp.lstat = originalLstat;
+  }
+  assert.equal(physicallySwapped, true, "the OS must physically change the index inode");
+  assert.deepEqual(await fsp.readFile(parked), originalBytes);
+  assert.deepEqual(await fsp.readFile(snapshot), foreignBytes,
+    "the test must not silently destroy the foreign file");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
+    "a rejected read-only cold snapshot cannot invent a mutating transaction");
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, pushesBefore);
+});
+
+test("issue 66: cold FOD journal read cannot accept a foreign pathname-rebound inode", async (t) => {
+  const { root, open, store, state } = await setup(t, {});
+  await open();
+  const journal = path.join(root, ".rootark-sync-journal.json");
+  const parked = path.join(root, "parked-original-journal-for-adversarial-test");
+  const originalBytes = await fsp.readFile(journal);
+  const injected = JSON.parse(originalBytes);
+  injected.seen.push(`foreign-seen-${crypto.randomUUID()}`);
+  const foreignBytes = Buffer.from(JSON.stringify(injected));
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const pushesBefore = state.pushes;
+  const originalLstat = fsp.lstat;
+  const originalReadFile = fsp.readFile;
+  const originalRename = fsp.rename;
+  let physicallySwapped = false;
+  const swapToForeign = async () => {
+    physicallySwapped = true;
+    await originalRename(journal, parked);
+    const foreign = await fsp.open(journal, "wx", 0o600);
+    try {
+      await foreign.writeFile(foreignBytes);
+      await foreign.sync();
+    } finally { await foreign.close(); }
+  };
+  // Old code opens journal by mutable name through readFile(path). The new
+  // reader acquires a held FD first and must detect a rebound after lstat.
+  // Both branches do a REAL filesystem substitution, not a mock byte return.
+  fsp.readFile = async (requested, ...args) => {
+    if (!physicallySwapped && path.resolve(String(requested)) === journal) {
+      await swapToForeign();
+    }
+    return originalReadFile(requested, ...args);
+  };
+  fsp.lstat = async (requested, ...args) => {
+    const previous = await originalLstat(requested, ...args);
+    if (!physicallySwapped && path.resolve(String(requested)) === journal) {
+      await swapToForeign();
+    }
+    return previous;
+  };
+  try {
+    await assert.rejects(open(), { code: "invalid_sync_journal" },
+      "a different journal inode must not supply signed replay/seen authority");
+  } finally {
+    fsp.lstat = originalLstat;
+    fsp.readFile = originalReadFile;
+  }
+  assert.equal(physicallySwapped, true);
+  assert.deepEqual(await fsp.readFile(parked), originalBytes);
+  assert.deepEqual(await fsp.readFile(journal), foreignBytes);
+  const originalStats = await fsp.lstat(parked, { bigint: true });
+  const foreignStats = await fsp.lstat(journal, { bigint: true });
+  assert.notEqual(originalStats.ino, foreignStats.ino,
+    "the test must distinguish a different physical file, not just changed contents");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "an indeterminate cold journal must retain the physical root lock");
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, pushesBefore);
+});
+
 test("issue 66: a physically rebound FOD marker never authorizes a foreign inode", async (t) => {
   const { root, open, adapter, key, state, store } = await setup(t, {
     "docs/keep.txt": "protected remote content",
@@ -2281,6 +2389,76 @@ test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold 
   const journal = JSON.parse(await fsp.readFile(path.join(root, ".rootark-sync-journal.json"), "utf8"));
   assert.deepEqual(journal.pending, [], "a fresh local CREATE must not have been enqueued");
   assert.equal(JSON.stringify(store.list("alice")), oldStore);
+});
+
+test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree without native custody", async (t) => {
+  const { root, adapter, store, state, key } = await setup(t, {});
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trusted = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
+  const client = await new SyncEngine({
+    rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: (op) => verifyAuthorizationProof(op.authorization, op, trusted),
+  }).open();
+  const objectId = `dir-${crypto.randomUUID()}`;
+  const fileId = `file-${crypto.randomUUID()}`;
+  const signedDirectory = async (verb, relative, revisionCounter, baseRevision = null) => {
+    const operation = protocol.createOperation({
+      operation: verb, objectId, fileId, versionId: crypto.randomUUID(),
+      operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+      compartmentId: "private", revision: { counter: revisionCounter, deviceId: "device-a" },
+      baseRevision, metadata: { path: relative, name: path.posix.basename(relative), size: 0,
+        contentType: "inode/directory" }, plaintext: Buffer.alloc(0), fileKey: key,
+    });
+    operation.authorization = await createAuthorizationProof(operation, {
+      username: "alice", privateKey: signer.privateKey, publicKey,
+      expiresAt: Date.now() + 60_000,
+    });
+    assert.equal(await verifyAuthorizationProof(operation.authorization, operation, trusted), true);
+    return operation;
+  };
+  const created = await signedDirectory("create", "docs/old", 1);
+  await client.apply(created);
+  const oldDirectory = path.join(root, "docs", "old");
+  const newDirectory = path.join(root, "docs", "new");
+  const sentinel = path.join(oldDirectory, "original-cache-sentinel.bin");
+  const sentinelBytes = Buffer.from("ORIGINAL_DIRECTORY_CACHE_INODE");
+  const held = await fsp.open(sentinel, "wx", 0o600);
+  try { await held.writeFile(sentinelBytes); await held.sync(); }
+  finally { await held.close(); }
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const journal = path.join(root, ".rootark-sync-journal.json");
+  const snapshotBefore = await fsp.readFile(snapshot);
+  const journalBefore = await fsp.readFile(journal);
+  const pushesBefore = state.pushes;
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  const updated = await signedDirectory("update", "docs/new", 2, created.revision);
+  const originalRename = fsp.rename;
+  let physicallyRenamedDirectory = false;
+  fsp.rename = async (from, to, ...args) => {
+    const result = await originalRename(from, to, ...args);
+    if (path.resolve(String(from)) === oldDirectory && path.resolve(String(to)) === newDirectory) {
+      physicallyRenamedDirectory = true;
+    }
+    return result;
+  };
+  try {
+    await assert.rejects(client.apply(updated), { code: "root_session_native_unavailable" },
+      "signed UPDATE cannot authorize physical directory rename via legacy pathname code");
+  } finally { fsp.rename = originalRename; }
+  assert.equal(physicallyRenamedDirectory, false,
+    "the kernel must never complete a legacy directory rename in native-required mode");
+  assert.equal((await fsp.lstat(oldDirectory)).isDirectory(), true);
+  assert.deepEqual(await fsp.readFile(sentinel), sentinelBytes);
+  assert.equal(await exists(newDirectory), false);
+  assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
+  assert.deepEqual(await fsp.readFile(journal), journalBefore,
+    "the negative gate must run before durable signed admission");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
+  assert.equal(state.pushes, pushesBefore);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
 });
 
 test("issue 66: a dangling ever-FOD symlink is invalid, never an absent root marker", async (t) => {

@@ -18,7 +18,9 @@ flowchart TD
   H -- No --> N
   H -- Yes --> T{Native create/read/enumerate/rename/unlink, stage, journal, rollback and commit under the same root?}
   T -- No --> N
-  T -- Yes --> D{Flush ordering, cold reopen and independent anti-rollback floor proven?}
+  T -- Yes --> X{No legacy pathname fallback for signed directory relocations or deletes?}
+  X -- No --> N
+  X -- Yes --> D{Flush ordering, cold reopen and independent anti-rollback floor proven?}
   D -- No --> N
   D -- Yes --> F{Real hostile same-SID/UID A-B-A, Unicode, 16385+ entries, power loss and recovery passed on both OSes?}
   F -- No --> N
@@ -251,3 +253,63 @@ CFAPI release evidence (the exercised workstation was Windows 11 build
 26300). Native no-replace and identity-bound deletion must never be
 approximated with stat/exists→pathname rename/unlink. `RootSession` stays
 unconditionally OFF. **MERGE NO-GO and RELEASE NO-GO.**
+
+### 2026-11-11 — cold snapshot/journal inode continuity and signed directory negative gate
+
+The next implementable follow-up hardens **cooperative cold admission** and
+rejects another path-based mutation that bypassed `RootSession` denial. It
+does **not** promote any JavaScript FileHandle into a native custodian.
+
+1. **Snapshot cold read:** `SyncEngine._open()` no longer does
+   `lstat(snapshot)` followed by `readFile(snapshot pathname)`. It opens the
+   index with nofollow/nonblocking flags where supported, keeps the original
+   file handle for its entire read, checks a regular single-link inode with
+   a nonzero file ID, and compares dev/ino/size/mtime/ctime against both the
+   visible name and retained file handle before/after the byte read. An
+   attacker physically swapping the index to a different valid JSON file
+   after the original stat was **RED on Windows Node22/NTFS and WSL
+   Node22/ext4** before the change, then **GREEN** with `invalid_snapshot`.
+   The original and foreign files remained physically distinguishable.
+2. **Signed journal cold read:** `SyncJournal.open()` opens the journal once
+   and reads from the original held handle with analogous version/identity
+   comparisons. An ENOENT **after** opening is invalid rather than consent
+   to create an empty journal. A failed open restores the previous in-memory
+   state. Physical same-name substitution to a different valid JSON journal
+   containing a forged `seen` receipt was **RED on both systems** before
+   the change and **GREEN** afterward with `invalid_sync_journal`, retained
+   root lock and no remote write. This protects a check/read window but
+   cannot authenticate an already-foreign inode at first open or prevent
+   same-UID/SID A→B→A without a protected parent and signed recovery floor.
+3. **Signed directory UPDATE:** required-v2 had denied physically cached
+   signed `MOVE` and `DELETE` but accepted Ed25519-authenticated directory
+   `UPDATE` with a different path. That route renamed an entire cached
+   subtree using legacy `fsp.rename`, despite native custody being OFF.
+   A real directory with an independently fsynced child sentinel was
+   accepted by the vulnerable legacy UPDATE path in RED Windows/WSL runs;
+   that path calls the kernel rename. The new module-owned
+   negative gate rejects **every** native-required directory UPDATE before
+   journal admission, rather than testing source absence and introducing a
+   second `exists → rename` TOCTOU. Both platforms now reject it with
+   `root_session_native_unavailable`, leaving the original subtree, durable
+   journal/snapshot bytes and remote store intact. A normal directory CREATE and
+   standalone signed CREATE continue through their existing bounded paths;
+   non-native legacy operation semantics were not intentionally changed.
+
+Final material regression evidence for the above source changes:
+**FOD Windows Node22/NTFS 75 PASS / 1 FIFO SKIP; WSL Node22/ext4 76 PASS**;
+targeted signed atomic batch **4 PASS** on each; additional cold-journal
+open/receipt/atomic-update regression groups passed together with FOD
+(Windows **99 PASS / 1 SKIP**, WSL **100 PASS** before the separate directory
+UPDATE denial, which does not change journal parsing). Syntax and diff
+whitespace checks passed. These are real filesystem tests with controlled
+same-principal substitutions and verified disk bytes, **not** verified
+independent concurrent-writer exclusion or physical power interruption.
+
+The previous exact published head was `f0d573637952b642c4c34c2f30bb5c27f2ffe6e7`
+with hosted CodeQL SUCCESS. **Never transfer that verdict to this new
+source commit:** independent SOURCE/evidence review and hosted CodeQL must
+both be verified on the exact new published SHA before calling its code
+gate green. All remaining W3/W26 product-integration, native no-replace,
+same-SID/UID writer exclusion, protected ancestors, owner-signed monotonic
+floor, Windows 10 CFAPI, power-cut and mandatory release checks remain
+independent **NO-GO** gates. No release or merge authorization follows.

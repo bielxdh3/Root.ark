@@ -2321,24 +2321,48 @@ class SyncEngine {
     // after a previously failed recovery. This is a JS-state safeguard; it
     // does not authenticate the disk or protect against hostile root swaps.
     if (this.requireNativeRootRecovery) this.snapshotDiskRevision = null;
+    const snapshotOpenFlags = fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+    let snapshotHandle;
     let snapshotStats;
+    let snapshotBytes = null;
     try {
-      snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
+      // Acquire the exact inode BEFORE observing its pathname. lstat followed
+      // by readFile(path) could open a different, attacker-rebound snapshot.
+      snapshotHandle = await fsp.open(this.snapshotPath, snapshotOpenFlags);
     } catch (error) {
       if (error.code !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
       noteColdAdmissionWrite(this.rootDir, true);
       await durableJson(this.snapshotPath, this.snapshot);
       noteColdAdmissionWrite(this.rootDir, false);
-      snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
+      snapshotHandle = await fsp.open(this.snapshotPath, snapshotOpenFlags);
     }
-    if (!snapshotStats.isFile() || snapshotStats.isSymbolicLink()) fail("Sync snapshot is not a regular file", "invalid_snapshot");
-    if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
-      let parsed;
-      try {
-        parsed = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
-      } catch {
-        fail("Invalid sync snapshot", "invalid_snapshot");
+    try {
+      snapshotStats = await snapshotHandle.stat({ bigint: true });
+      const namedBefore = await fsp.lstat(this.snapshotPath, { bigint: true });
+      if (!snapshotStats.isFile() || snapshotStats.ino === 0n
+        || snapshotStats.nlink !== 1n
+        || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+        || !sameSnapshotRevision(snapshotStats, namedBefore)) {
+        fail("Sync snapshot inode differs from the opened file", "invalid_snapshot");
       }
+      if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
+        snapshotBytes = await snapshotHandle.readFile();
+        const heldAfter = await snapshotHandle.stat({ bigint: true });
+        const namedAfter = await fsp.lstat(this.snapshotPath, { bigint: true });
+        if (!sameSnapshotRevision(snapshotStats, heldAfter)
+          || !sameSnapshotRevision(snapshotStats, namedAfter)
+          || BigInt(snapshotBytes.length) !== snapshotStats.size) {
+          fail("Sync snapshot changed during held-inode read", "invalid_snapshot");
+        }
+      }
+    } finally {
+      await snapshotHandle.close();
+    }
+    if (snapshotBytes !== null) {
+      let parsed;
+      try { parsed = JSON.parse(snapshotBytes.toString("utf8")); }
+      catch { fail("Invalid sync snapshot", "invalid_snapshot"); }
       if (![SNAPSHOT_VERSION, EVICTION_LEDGER_SNAPSHOT_VERSION].includes(parsed.version)
         || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
       if ((parsed.version === EVICTION_LEDGER_SNAPSHOT_VERSION
@@ -4025,6 +4049,18 @@ class SyncEngine {
       for (const sourcePath of new Set([metadata.sourcePath, trackedSource].filter(Boolean))) {
         if (await exists(await contained(this.rootDir, sourcePath, true))) denyUntrustedNativeEviction();
       }
+    }
+    // A directory's path may also change through a signed UPDATE, not just a
+    // MOVE. The legacy UPDATE branch may physically rename the entire cached
+    // subtree based on the mutable snapshot AFTER multiple awaits. Checking
+    // source absence now would be a new TOCTOU: a same-SID/UID writer could
+    // create the tracked source later and turn this into a destructive rename.
+    // Deny ALL native-required directory UPDATEs until a real trusted native
+    // RootSession implements this operation. Signed CREATE of an absent
+    // directory remains a separate, narrowly supported cooperative path.
+    if (this.requireNativeRootRecovery && operation.operation === "update"
+      && metadata.contentType === "inode/directory") {
+      denyUntrustedNativeEviction();
     }
     // A signed operation may target a directory which contains a device-local
     // pinned file. stageExisting() moves whole directory trees, so check every
