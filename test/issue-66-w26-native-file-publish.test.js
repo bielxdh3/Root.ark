@@ -246,20 +246,28 @@ for (const mode of ["HELD_REBIND", "HELD_JUNCTION"]) {
     });
 }
 
-test("#66 W26 denies physical same-SID scratch junction before native held creation", {
+for (const mode of ["PRECREATE_SCRATCH_JUNCTION", "PRECREATE_SCRATCH_DIRECTORY",
+  "PRECREATE_SCRATCH_JUNCTION_NO_ACK", "PRECREATE_SCRATCH_DIRECTORY_NO_ACK"]) {
+test(`#66 W26 denies physical same-SID ${mode} before held and signal can mutate B`, {
   skip: !available, timeout: 35000,
 }, async () => {
   const scratch = fixture();
   const parked = `${scratch}-parked`;
-  const foreign = fs.mkdtempSync(path.join(localAppData, "rootark-w26-native-foreign-"));
+  const noAck = mode.endsWith("_NO_ACK");
+  const isJunction = mode.startsWith("PRECREATE_SCRATCH_JUNCTION");
+  const foreign = isJunction
+    ? fs.mkdtempSync(path.join(localAppData, "rootark-w26-native-foreign-")) : scratch;
   const sentinel = path.join(foreign, "FOREIGN_CANARY_DO_NOT_TOUCH");
-  fs.writeFileSync(sentinel, "FOREIGN_UNTOUCHED", { flag: "wx" });
+  if (isJunction)
+    fs.writeFileSync(sentinel, "FOREIGN_UNTOUCHED", { flag: "wx" });
   const attacker = String.raw`
     const fs = require('node:fs');
     const path = require('node:path');
     const scratch = process.argv[1];
     const parked = scratch + '-parked';
     const foreign = process.argv[2];
+    const mode = process.argv[3];
+    const noAck = process.argv[4] === '1';
     const sleep = new Int32Array(new SharedArrayBuffer(4));
     let ready = false;
     for (let i = 0; i < 1000; i++) {
@@ -275,15 +283,28 @@ test("#66 W26 denies physical same-SID scratch junction before native held creat
     }
     if (!ready) throw new Error('PRECREATE_NOT_READY');
     fs.renameSync(scratch, parked);
-    fs.symlinkSync(foreign, scratch, 'junction');
-    if (!fs.lstatSync(scratch).isSymbolicLink()) throw new Error('NOT_A_REAL_JUNCTION');
-    const ack = fs.openSync(path.join(parked, 'precreate-ack.signal'), 'wx');
-    try {
-      fs.writeSync(ack, 'PRECREATE_JUNCTION_PHYSICAL_V1');
-      fs.fsyncSync(ack);
-    } finally { fs.closeSync(ack); }
+    if (mode.startsWith('PRECREATE_SCRATCH_JUNCTION')) {
+      fs.symlinkSync(foreign, scratch, 'junction');
+      if (!fs.lstatSync(scratch).isSymbolicLink()) throw new Error('NOT_A_REAL_JUNCTION');
+    } else {
+      fs.mkdirSync(scratch);
+      const marker = fs.openSync(path.join(scratch, 'FOREIGN_CANARY_DO_NOT_TOUCH'), 'wx');
+      try {
+        fs.writeSync(marker, 'FOREIGN_UNTOUCHED');
+        fs.fsyncSync(marker);
+      } finally { fs.closeSync(marker); }
+      if (!fs.statSync(scratch).isDirectory()) throw new Error('PLAIN_B_NOT_PHYSICAL');
+    }
+    if (!noAck) {
+      const ack = fs.openSync(path.join(parked, 'precreate-ack.signal'), 'wx');
+      try {
+        fs.writeSync(ack, 'PRECREATE_JUNCTION_PHYSICAL_V1');
+        fs.fsyncSync(ack);
+      } finally { fs.closeSync(ack); }
+    }
   `;
-  const child = spawn(process.execPath, ["-e", attacker, scratch, foreign], {
+  const child = spawn(process.execPath, ["-e", attacker, scratch, foreign, mode,
+    noAck ? "1" : "0"], {
     windowsHide: true, stdio: ["ignore", "ignore", "pipe"],
   });
   let childError = "";
@@ -293,24 +314,36 @@ test("#66 W26 denies physical same-SID scratch junction before native held creat
     child.once("error", reject);
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
-  const attempted = invoke(scratch, "PRECREATE_SCRATCH_JUNCTION", true, false, false,
+  const attempted = invoke(scratch, mode, true, false, false,
     false, true);
   assert.deepEqual(await childExit, { code: 0, signal: null }, childError);
-  assert.equal(fs.readFileSync(path.join(parked, "precreate-ack.signal"), "utf8"),
-    "PRECREATE_JUNCTION_PHYSICAL_V1");
-  assert.equal(fs.lstatSync(scratch).isSymbolicLink(), true,
-    "adversary must replace scratch path with a real junction");
+  if (!noAck)
+    assert.equal(fs.readFileSync(path.join(parked, "precreate-ack.signal"), "utf8"),
+      "PRECREATE_JUNCTION_PHYSICAL_V1");
+  assert.equal(fs.lstatSync(scratch).isSymbolicLink(), isJunction,
+    "adversary must replace scratch with the stated physical directory type");
+  assert.notEqual(fs.statSync(parked, { bigint: true }).ino,
+    fs.statSync(scratch, { bigint: true }).ino,
+    "the original scratch and attacker directory must have distinct NTFS identities");
   assert.equal(attempted.status, 41, "scratch junction must fail closed");
   assert.equal(attempted.stdout, "");
   assert.match(attempted.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
-  assert.deepEqual(fs.readdirSync(parked).sort(),
-    ["precreate-ack.signal", "precreate-ready.signal"].sort(),
+  const expectedOriginal = noAck ? ["precreate-ready.signal"] :
+    ["precreate-ack.signal", "precreate-ready.signal", "postattack-ready.signal"];
+  assert.deepEqual(fs.readdirSync(parked).sort(), expectedOriginal.sort(),
     "original preflight scratch must survive without any held creation");
+  if (!noAck) assert.equal(fs.readFileSync(path.join(parked, "postattack-ready.signal"),
+    "utf8"), "POSTATTACK_READY_V1");
   assert.equal(fs.existsSync(path.join(foreign, "held")), false,
-    "NEVER create held under a foreign junction target before custody");
+    "NEVER create held under the substituted foreign directory");
+  assert.equal(fs.existsSync(path.join(foreign, "precreate-ready.signal")), false,
+    "NEVER write a readiness signal through a mutable scratch pathname");
+  assert.equal(fs.existsSync(path.join(foreign, "postattack-ready.signal")), false,
+    "even a post-swap native signal must stay inside original A");
   assert.deepEqual(fs.readdirSync(foreign), ["FOREIGN_CANARY_DO_NOT_TOUCH"]);
   assert.equal(fs.readFileSync(sentinel, "utf8"), "FOREIGN_UNTOUCHED");
 });
+}
 
 test("#66 W26 ancestor-rebind attack requires an independent explicit opt-in", {
   skip: !available, timeout: 25000,

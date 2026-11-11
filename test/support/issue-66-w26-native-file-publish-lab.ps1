@@ -1,6 +1,8 @@
 param(
   [ValidateSet('NORMAL', 'COLLISION', 'EXTERNAL_COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
                'HELD_REBIND', 'HELD_JUNCTION', 'PRECREATE_SCRATCH_JUNCTION',
+               'PRECREATE_SCRATCH_DIRECTORY', 'PRECREATE_SCRATCH_JUNCTION_NO_ACK',
+               'PRECREATE_SCRATCH_DIRECTORY_NO_ACK',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
                'COLD_INSPECT')]
   [string]$Mode,
@@ -210,9 +212,12 @@ public static class RootarkW26NativeFilePublishLab {
     private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
     private readonly List<FILE_ID_INFO> identities = new List<FILE_ID_INFO>();
     private readonly List<string> components = new List<string>();
+    private bool heldReady;
+    internal SafeFileHandle Scratch { get { return handles[handles.Count - (heldReady ? 2 : 1)]; } }
     internal SafeFileHandle Held { get { return handles[handles.Count - 1]; } }
 
-    internal AncestorCustody(string scratch, bool heldReadOnly, bool createHeld = false) {
+    internal AncestorCustody(string scratch, bool heldReadOnly, bool createHeld = false,
+        bool deferHeld = false) {
       string full = Path.GetFullPath(scratch).TrimEnd('\\');
       volumePath = Path.GetPathRoot(full);
       if (string.IsNullOrEmpty(volumePath) || volumePath.Length != 3 ||
@@ -238,12 +243,18 @@ public static class RootarkW26NativeFilePublishLab {
         // NtCreateFile resolves this single leaf against the pinned scratch
         // HANDLE, without any pathname mkdir through a replaceable junction.
         // No other child or ancestor may be created as a side effect.
-        SafeFileHandle held = DirectoryChild(handles[handles.Count - 1], "held",
-          heldReadOnly, createHeld);
-        handles.Add(held);
-        identities.Add(Id(held));
-        components.Add("held");
+        if (!deferHeld) OpenHeld(heldReadOnly, createHeld);
       } catch { Dispose(); throw; }
+    }
+    internal void OpenHeld(bool readOnly, bool create) {
+      if (heldReady) throw new InvalidOperationException("HELD_ALREADY_OPENED");
+      Validate();
+      SafeFileHandle held = DirectoryChild(Scratch, "held", readOnly, create);
+      handles.Add(held);
+      identities.Add(Id(held));
+      components.Add("held");
+      heldReady = true;
+      Validate();
     }
     internal void Validate() {
       // Reacquire only the drive volume root by pathname, then every other
@@ -272,7 +283,9 @@ public static class RootarkW26NativeFilePublishLab {
   }
   private static SafeFileHandle File(SafeFileHandle root, string leaf, bool create) {
     if (leaf != "stage.bin" && leaf != "published.bin" && leaf != "parked-stage.bin"
-      && leaf != "prepared.bin" && leaf != "commit.bin")
+      && leaf != "prepared.bin" && leaf != "commit.bin" &&
+      leaf != "precreate-ready.signal" && leaf != "ancestor-ready.signal" &&
+      leaf != "publisher-ready.signal" && leaf != "postattack-ready.signal")
       throw new InvalidOperationException("UNTRUSTED_LEAF");
     IntPtr name = Marshal.StringToHGlobalUni(leaf);
     IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
@@ -415,6 +428,14 @@ public static class RootarkW26NativeFilePublishLab {
         || written != (uint)data.Length || !Flush(file))
       throw new InvalidOperationException("HELD_STAGE_FLUSH_FAILED");
   }
+  private static void Ready(SafeFileHandle scratch, string name, string content) {
+    if (name != "precreate-ready.signal" && name != "ancestor-ready.signal" &&
+        name != "publisher-ready.signal" && name != "postattack-ready.signal")
+      throw new InvalidOperationException("UNTRUSTED_LAB_SIGNAL");
+    // The signal is created against the original retained scratch HANDLE.
+    // No pathname writer can follow a same-SID junction into a foreign dir.
+    using (SafeFileHandle signal = File(scratch, name, true)) Write(signal, content);
+  }
   private static void PlantForeign(string filename, string content) {
     // The deterministic same-SID writer uses pathnames on purpose, but must
     // never truncate an object which unexpectedly wins this laboratory name.
@@ -470,8 +491,10 @@ public static class RootarkW26NativeFilePublishLab {
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";
+    bool precreateAttack = mode.StartsWith("PRECREATE_SCRATCH_", StringComparison.Ordinal);
+    bool noAck = mode.EndsWith("_NO_ACK", StringComparison.Ordinal);
     bool ancestorAttack = mode == "HELD_REBIND" || mode == "HELD_JUNCTION" ||
-      mode == "PRECREATE_SCRATCH_JUNCTION";
+      precreateAttack;
     if (ancestorAttack &&
         Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_ANCESTOR_ATTACK_LAB") != "1")
       throw new InvalidOperationException("ANCESTOR_ATTACK_LAB_DISABLED");
@@ -483,29 +506,28 @@ public static class RootarkW26NativeFilePublishLab {
       throw new InvalidOperationException("HARD_EXIT_TEST_DISABLED");
     if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
       throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
-    if (mode == "PRECREATE_SCRATCH_JUNCTION") {
-      // An independent same-SID process switches the scratch name AFTER the
-      // PowerShell clean-scratch preflight but BEFORE the former pathname
-      // mkdir. No native custody exists yet, making this the exact P2 gap.
-      string ready = Path.Combine(scratch, "precreate-ready.signal");
-      using (var signal = new FileStream(ready, FileMode.CreateNew,
-          FileAccess.Write, FileShare.Read, 4096, false)) {
-        byte[] bytes = Encoding.UTF8.GetBytes("PRECREATE_READY_V1");
-        signal.Write(bytes, 0, bytes.Length);
-        signal.Flush(true);
-      }
-      string ack = Path.Combine(scratch + "-parked", "precreate-ack.signal");
-      DateTime deadline = DateTime.UtcNow.AddSeconds(10);
-      while (!System.IO.File.Exists(ack)) {
-        if (DateTime.UtcNow > deadline)
-          throw new InvalidOperationException("PRECREATE_ATTACK_TIMEOUT");
-        System.Threading.Thread.Sleep(10);
-      }
-      if (ReadFixture(ack) != "PRECREATE_JUNCTION_PHYSICAL_V1")
-        throw new InvalidOperationException("PRECREATE_ATTACK_NOT_PHYSICAL");
-    }
     string parent = Path.Combine(scratch, "held");
-    using (var custody = new AncestorCustody(scratch, false, true)) {
+    using (var custody = new AncestorCustody(scratch, false, true, precreateAttack)) {
+      if (precreateAttack) {
+        // Real native scratch custody already exists. The external attacker
+        // now attempts the exact early rebind before creating held.
+        custody.Validate();
+        Ready(custody.Scratch, "precreate-ready.signal", "PRECREATE_READY_V1");
+        string ack = Path.Combine(scratch + "-parked", "precreate-ack.signal");
+        DateTime deadline = DateTime.UtcNow.AddSeconds(noAck ? 2 : 10);
+        while (!System.IO.File.Exists(ack)) {
+          if (DateTime.UtcNow > deadline)
+            throw new InvalidOperationException("PRECREATE_ATTACK_TIMEOUT");
+          System.Threading.Thread.Sleep(10);
+        }
+        if (ReadFixture(ack) != "PRECREATE_JUNCTION_PHYSICAL_V1")
+          throw new InvalidOperationException("PRECREATE_ATTACK_NOT_PHYSICAL");
+        // After the attacker rebound scratch to foreign B, this extra probe
+        // must reach only original A via the retained native scratch HANDLE.
+        Ready(custody.Scratch, "postattack-ready.signal", "POSTATTACK_READY_V1");
+        custody.Validate();
+        custody.OpenHeld(false, true);
+      }
       SafeFileHandle root = custody.Held;
       custody.Validate();
       string visibleParent = parent;
@@ -522,13 +544,7 @@ public static class RootarkW26NativeFilePublishLab {
       if (ancestorAttack) {
         // A second same-SID process rebinds held inside disposable scratch
         // while its original native HANDLE is live, before opening stage.
-        string ready = Path.Combine(scratch, "ancestor-ready.signal");
-        using (var signal = new FileStream(ready, FileMode.CreateNew,
-            FileAccess.Write, FileShare.Read, 4096, false)) {
-          byte[] bytes = Encoding.UTF8.GetBytes("ANCESTOR_READY_V1");
-          signal.Write(bytes, 0, bytes.Length);
-          signal.Flush(true);
-        }
+        Ready(custody.Scratch, "ancestor-ready.signal", "ANCESTOR_READY_V1");
         string ack = Path.Combine(scratch, "ancestor-ack.signal");
         DateTime deadline = DateTime.UtcNow.AddSeconds(10);
         while (!System.IO.File.Exists(ack)) {
@@ -564,13 +580,7 @@ public static class RootarkW26NativeFilePublishLab {
           // native no-replace. The disposable rendezvous files grant no root
           // custody, and this test makes no claims about hostile writer
           // exclusion or real power loss.
-          string ready = Path.Combine(scratch, "publisher-ready.signal");
-          using (var signal = new FileStream(ready, FileMode.CreateNew,
-              FileAccess.Write, FileShare.Read, 4096, false)) {
-            byte[] bytes = Encoding.UTF8.GetBytes("PUBLISHER_READY_V1");
-            signal.Write(bytes, 0, bytes.Length);
-            signal.Flush(true);
-          }
+          Ready(custody.Scratch, "publisher-ready.signal", "PUBLISHER_READY_V1");
           string ack = Path.Combine(scratch, "writer-ack.signal");
           DateTime deadline = DateTime.UtcNow.AddSeconds(10);
           while (!System.IO.File.Exists(ack)) {
