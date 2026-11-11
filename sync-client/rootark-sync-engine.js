@@ -3621,7 +3621,10 @@ class SyncEngine {
     const observed = [deleted, moved].map((entry, index) =>
       this.localAdmissionDigestIfFresh(entry) === digests[index] ? digests[index] : null);
     for (let index = 0; index < pending.length; index++) {
-      if (observed[index]) await this.journal.observeAdmission(pending[index].operationId, observed[index]);
+      if (observed[index]) {
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.observeAdmission(pending[index].operationId, observed[index]));
+      }
     }
     this.rememberOperation(deleted);
     this.rememberOperation(moved, moveHash);
@@ -3632,9 +3635,10 @@ class SyncEngine {
       this.snapshot.files[moved.metadata.path].hash = null;
     }
     await this.persistSnapshot();
-    await this.journal.markSeenMany(pending.map((entry, index) => ({
-      operationId: entry.operationId, admittedDigest: observed[index],
-    })));
+    await withNativeDurableMutationIntent(this, () =>
+      this.journal.markSeenMany(pending.map((entry, index) => ({
+        operationId: entry.operationId, admittedDigest: observed[index],
+      }))));
     summary.pushed += 2;
   }
 
