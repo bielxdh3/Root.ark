@@ -115,7 +115,18 @@ const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+const ROOT_MUTATION_OPERATION_CONTEXT = new AsyncLocalStorage();
 const ROOT_MUTATION_PROMISE_TICKETS = new WeakMap();
+// Only the module's cold admission and marker writers may set this latch.
+// A successful and verified step clears it; a rejected potentially mutating
+// syscall keeps the physical lock despite any later wrapper error.
+function noteColdAdmissionWrite(rootDir, uncertain) {
+  const lease = ROOT_MUTATION_CONTEXT.getStore();
+  const key = process.platform === "win32" ? rootDir.toLowerCase() : rootDir;
+  if (lease?.active === true && lease.queueKey === key) {
+    lease.coldAdmissionUncertain = Boolean(uncertain);
+  }
+}
 // A successfully published FOD payload with a failed later checkpoint may
 // look like an unrelated local CREATE during the next reconciliation. This
 // module-private negative-only latch retains the existing cross-process lock
@@ -150,12 +161,19 @@ function requireNativeRootMutationContext(engine) {
 function retainNativeRootMutation(engine) {
   const lease = requireNativeRootMutationContext(engine);
   if (!lease) return { finish() {}, fail() {} };
-  const ticket = {};
+  const ticket = { lease, possibleMutation: false };
   lease.inFlight.add(ticket);
   let retained = true;
   return {
     ticket,
-    fail(error) { lease.failures.set(ticket, error); },
+    fail(error) {
+      // A rejected read-only preflight has not started a root/remote write.
+      // Do NOT poison the process lock for local_changes_pending, invalid
+      // inventory, or a deliberate native-custody denial before publication.
+      // Once a potentially mutating syscall starts, the opposite rule holds.
+      if (ticket.possibleMutation || INDETERMINATE_FOD_INBOUND.has(engine)
+        || engine.pinnedPolicyIndeterminate) lease.failures.set(ticket, error);
+    },
     finish() {
       if (!retained) return;
       retained = false;
@@ -165,6 +183,32 @@ function retainNativeRootMutation(engine) {
       }
     },
   };
+}
+function markNativeRootMutationAttempt(engine) {
+  if (!engine.requireNativeRootRecovery) return;
+  const lease = requireNativeRootMutationContext(engine);
+  const ticket = ROOT_MUTATION_OPERATION_CONTEXT.getStore();
+  if (!ticket || ticket.lease !== lease) {
+    fail("Root mutation has no live private operation context", "sync_root_busy");
+  }
+  ticket.possibleMutation = true;
+}
+function markNativeRootMutationCompleted(engine) {
+  if (!engine.requireNativeRootRecovery) return;
+  const lease = requireNativeRootMutationContext(engine);
+  const ticket = ROOT_MUTATION_OPERATION_CONTEXT.getStore();
+  if (!ticket || ticket.lease !== lease) {
+    fail("Root mutation completion has no private operation context", "sync_root_busy");
+  }
+  ticket.possibleMutation = false;
+}
+async function withNativeDurableMutationIntent(engine, write) {
+  // An I/O API may report EIO after the durable write actually completed.
+  // Keep that specific private ticket unsafe until a successful return.
+  markNativeRootMutationAttempt(engine);
+  const result = await write();
+  markNativeRootMutationCompleted(engine);
+  return result;
 }
 // Only a trusted caller that has durably/completely handled the EXACT child
 // promise can acknowledge its failure. Error-object equality alone is unsafe:
@@ -275,10 +319,12 @@ async function enforceEverFodRootMode(rootDir, filesOnDemand) {
   // path-based reconciliation. A crash before a complete write leaves an
   // invalid marker and therefore denies subsequent opens, not a downgrade.
   let handle;
+  noteColdAdmissionWrite(rootDir, true);
   try { handle = await fsp.open(markerPath, "wx", 0o600); }
   catch (error) {
     if (error.code === "EEXIST") {
       if (!(await checkExisting())) fail("Missing Files On-Demand root marker", "root_mode_marker_invalid");
+      noteColdAdmissionWrite(rootDir, false);
       return;
     }
     throw error;
@@ -298,6 +344,7 @@ async function enforceEverFodRootMode(rootDir, filesOnDemand) {
       && !["ENOTSUP", "EINVAL"].includes(error.code)) throw error;
   } finally { if (directoryHandle) await directoryHandle.close(); }
   if (!(await checkExisting())) fail("Missing Files On-Demand root marker", "root_mode_marker_invalid");
+  noteColdAdmissionWrite(rootDir, false);
 }
 function signedEnvelopeDigest(operation) {
   return crypto.createHash("sha256")
@@ -2166,9 +2213,9 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
       const lease = { queueKey, active: true, inFlight: new Set(),
-        failures: new Map(), handledFailures: new Set(), idleWaiters: [] };
+        failures: new Map(), handledFailures: new Set(), idleWaiters: [],
+        coldAdmissionUncertain: false };
       let ownerFulfilled = false;
-      let ownerError = null;
       try {
         denyIndeterminateInbound(this);
         const result = await ROOT_MUTATION_CONTEXT.run(lease, async () => {
@@ -2176,13 +2223,11 @@ class SyncEngine {
           // hold the SAME lease as the following mutation, not run before
           // the AsyncLocalStorage context exists.
           await openEngineBuiltIn.call(this);
+          lease.coldAdmissionUncertain = false;
           return await work();
         });
         ownerFulfilled = true;
         return result;
-      } catch (error) {
-        ownerError = error;
-        throw error;
       } finally {
         // A returned callback is not necessarily its last I/O. An unawaited
         // native-required private operation can still hold the original
@@ -2196,18 +2241,19 @@ class SyncEngine {
         // A failed child can settle and leave inFlight BEFORE the owner
         // callback returns. A snapshot of *active* tickets alone would
         // silently lose that error and authorize release of the real lock.
-        // A failed owner can propagate the SAME error object from an awaited
-        // child; that is not evidence of a second abandoned operation.
-        // Nevertheless, an earlier detached child may have already settled
-        // with a DIFFERENT failure before the owner itself throws. Inspect
-        // the complete failure ledger, not only active tickets at return.
-        const failedDetached = [...lease.failures].find(([ticket, failure]) =>
-          !lease.handledFailures.has(ticket)
-          && (ownerFulfilled || failure !== ownerError))?.[0];
+        // A failed owner may propagate the same Error object from an awaited
+        // child, but a DIFFERENT detached operation may independently reject
+        // with that identical object. Error identity is not operation proof.
+        // Only a trusted exact-Promise acknowledgement can clear a recorded
+        // failure. Prefer conservative physical-lock custody to a false
+        // release after an unknown remote/local side effect.
+        const failedDetached = [...lease.failures.keys()].find((ticket) =>
+          !lease.handledFailures.has(ticket));
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.
-        if (!failedDetached && !this.pinnedPolicyIndeterminate
+        if (!failedDetached && !lease.coldAdmissionUncertain
+          && !this.pinnedPolicyIndeterminate
           && !INDETERMINATE_FOD_INBOUND.has(this)) {
           await this.releaseProcessLock(processLock);
         }
@@ -2259,12 +2305,16 @@ class SyncEngine {
     requireNativeRootMutationContext(this);
     const configuredMetadata = internalRootMetadata(
       this.rootDir, this.snapshotPath, this.journal?.filePath);
+    noteColdAdmissionWrite(this.rootDir, true);
     await fsp.mkdir(this.rootDir, { recursive: true });
+    noteColdAdmissionWrite(this.rootDir, false);
     await containedAbsolute(this.rootDir, this.rootDir, false);
     // Always recheck, including previously opened non-FOD instances whose
     // snapshot cache looks unchanged after another instance marked the root.
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    noteColdAdmissionWrite(this.rootDir, true);
     this.journal = await this.journal.open();
+    noteColdAdmissionWrite(this.rootDir, false);
     // A rejected native-required cold open must never let a later open use
     // public, mutable this.snapshot as if it were still the disk contents.
     // Re-parse the durable snapshot on every strict entry, including retries
@@ -2276,7 +2326,9 @@ class SyncEngine {
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     } catch (error) {
       if (error.code !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
+      noteColdAdmissionWrite(this.rootDir, true);
       await durableJson(this.snapshotPath, this.snapshot);
+      noteColdAdmissionWrite(this.rootDir, false);
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     }
     if (!snapshotStats.isFile() || snapshotStats.isSymbolicLink()) fail("Sync snapshot is not a regular file", "invalid_snapshot");
@@ -2637,6 +2689,7 @@ class SyncEngine {
   async persistSnapshot() {
     denyIndeterminateInbound(this);
     requireNativeRootMutationContext(this);
+    markNativeRootMutationAttempt(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     await durableJson(this.snapshotPath, this.snapshot);
     this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
@@ -2700,7 +2753,10 @@ class SyncEngine {
       fail("Remote sync envelope changed during authorization", "remote_authorization_rejected");
     }
     this.journal.assertCompatibleAdmission(operation.operationId, digest);
-    if (candidate && preObserve) await this.journal.observeAdmission(operation.operationId, candidate);
+    if (candidate && preObserve) {
+      await withNativeDurableMutationIntent(this,
+        () => this.journal.observeAdmission(operation.operationId, candidate));
+    }
     // The exact historical digest already pinned locally can complete its
     // observed->admitted transition after a crash, even after expiry. Never
     // derive this from operation-ID-only legacy `seen` entries.
@@ -2945,7 +3001,9 @@ class SyncEngine {
       if (pathsEqual(relativePath, sourcePath)) delete this.snapshot.files[relativePath];
     }
     this.rememberRemoteOnly(operation, "excluded", { directory: directoryRecord });
-    for (const item of pending) await this.journal.markSeen(item.operationId);
+    for (const item of pending) {
+      await withNativeDurableMutationIntent(this, () => this.journal.markSeen(item.operationId));
+    }
     await this.pruneEmptyUntrackedParents(path.dirname(target));
     await this.persistSnapshot();
     return true;
@@ -3323,7 +3381,12 @@ class SyncEngine {
       // again on EVERY attempt, after all queue/retry waits, before HTTP PUT.
       // An in-flight request still needs independent server-side revocation
       // fencing in the atomic PUT transaction.
-      try { return await this.assertOutgoingAuthorized(operation, () => this.adapter.push(operation)); } catch (error) {
+      try {
+        return await this.assertOutgoingAuthorized(operation, () => {
+          markNativeRootMutationAttempt(this);
+          return this.adapter.push(operation);
+        });
+      } catch (error) {
         lastError = error;
         if (error?.code === "authorization_rejected" || error?.code === "authorization_required") throw error;
         if (!transient(error) || attempt + 1 === this.maxRetries) throw error;
@@ -3655,8 +3718,9 @@ class SyncEngine {
         if (!this.translateWebDavOperation) continue;
         const translated = await this.translateWebDavOperation(pending);
         if (!translated) continue;
-        if (this.journal.replace) await this.journal.replace(pending.operationId, translated);
-        else await this.journal.update(pending.operationId, translated);
+        await withNativeDurableMutationIntent(this, () => this.journal.replace
+          ? this.journal.replace(pending.operationId, translated)
+          : this.journal.update(pending.operationId, translated));
         pending = translated;
       }
       let operation;
@@ -3703,7 +3767,10 @@ class SyncEngine {
         // impossible to authenticate after authorization expires.
         const acknowledgedDigest = outboundFreshDigest && result?.operationId === operation.operationId
           && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
-        if (acknowledgedDigest) await this.journal.observeAdmission(operation.operationId, acknowledgedDigest);
+        if (acknowledgedDigest) {
+          await withNativeDurableMutationIntent(this,
+            () => this.journal.observeAdmission(operation.operationId, acknowledgedDigest));
+        }
         if (operation.operation === "move" || operation.operation === "delete") {
           const hash = operation.operation === "move" ? await this.hashPendingPayload(operation) : undefined;
           this.rememberOperation(operation, hash);
@@ -3716,7 +3783,8 @@ class SyncEngine {
         // HTTP 2xx is not an independently signed admission receipt. Pin only
         // our locally signed exact envelope if the response echoes every byte.
         // Unknown ACKs and conflict results remain seen-only.
-        await this.journal.markSeen(operation.operationId, acknowledgedDigest);
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.markSeen(operation.operationId, acknowledgedDigest));
         summary.pushed += 1;
       } catch (error) {
         if (error?.code === "remote_path_collision"
@@ -3774,16 +3842,22 @@ class SyncEngine {
             // A verified remote winner is not the local pending operation.
             // Its separately signed envelope needs its own durable admission
             // pin after the remote snapshot/materialization is persisted.
-            await this.journal.markSeen(current.operationId, verifiedFreshDigest);
+            await withNativeDurableMutationIntent(this,
+              () => this.journal.markSeen(current.operationId, verifiedFreshDigest));
           }
-          await this.journal.markSeen(operation.operationId);
+          await withNativeDurableMutationIntent(this,
+            () => this.journal.markSeen(operation.operationId));
           summary.pushed += 1;
           acknowledgeHandledNativeMutationPromise(this, pendingDispatch, error);
           continue;
         }
         if (transient(error)) {
+          // A timeout/offline code from an already-invoked adapter is NOT a
+          // cryptographic no-write receipt. retryPush has recorded an active
+          // outbound write attempt, so an unconfirmed remote COMMIT must
+          // quarantine the physical lock even if the summary says offline.
+          // Trusted pre-dispatch failures never set the per-ticket hazard.
           summary.offline = true;
-          acknowledgeHandledNativeMutationPromise(this, pendingDispatch, error);
           continue;
         }
         throw error;
@@ -3919,7 +3993,11 @@ class SyncEngine {
     // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
     // envelope before the first filesystem or snapshot mutation; failure here
     // must not leave an applied object with no restart-safe observation.
-    if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+    if (verifiedFreshDigest) {
+      markNativeRootMutationAttempt(this);
+      await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+      markNativeRootMutationCompleted(this);
+    }
     let cleanupPath = null;
     // A directory CREATE (or a newly created parent) can be just as unsafe
     // as a file rename when the later snapshot checkpoint fails. Keep this
@@ -4311,7 +4389,11 @@ class SyncEngine {
       if (this.requireNativeRootRecovery) denyUntrustedNativeSignedDelete();
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
-      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
+      await this.assertOutgoingAuthorized(operation, () => {
+        markNativeRootMutationAttempt(this);
+        return this.journal.enqueue(operation);
+      });
+      markNativeRootMutationCompleted(this);
       this.rememberOperation(operation);
     }
     for (const [relative, file] of Object.entries(current)) {
@@ -4343,7 +4425,11 @@ class SyncEngine {
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
-      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
+      await this.assertOutgoingAuthorized(operation, () => {
+        markNativeRootMutationAttempt(this);
+        return this.journal.enqueue(operation);
+      });
+      markNativeRootMutationCompleted(this);
       this.rememberOperation(operation, contentHash);
     }
     await this.persistSnapshot();
@@ -4738,13 +4824,17 @@ class SyncEngine {
     }
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     if (operation.tombstone) {
-      if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+      if (verifiedFreshDigest) {
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.observeAdmission(operation.operationId, verifiedFreshDigest));
+      }
       this.rememberRemoteOnly(operation, entry.reason);
       await this.persistSnapshot();
       return false;
     }
     const appliedDigest = await this._apply(operation);
-    await this.journal.markSeen(operation.operationId, verifiedFreshDigest || appliedDigest);
+    await withNativeDurableMutationIntent(this,
+      () => this.journal.markSeen(operation.operationId, verifiedFreshDigest || appliedDigest));
     return true;
   }
 
@@ -4827,7 +4917,9 @@ class SyncEngine {
     };
     await checkBeforeWrite();
     const verifiedFreshDigest = await this._apply(operation, null, checkBeforeWrite);
+    markNativeRootMutationAttempt(this);
     await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+    markNativeRootMutationCompleted(this);
     return true;
   }
 
@@ -4897,7 +4989,8 @@ class SyncEngine {
       // Fsync the current snapshot before converting any pin to applied.
       await this.persistSnapshot();
       for (const { operation, verifiedFreshDigest } of observedRemoteOnly) {
-        await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.markSeen(operation.operationId, verifiedFreshDigest));
       }
       observedRemoteOnly.length = 0;
     };
@@ -4931,7 +5024,8 @@ class SyncEngine {
         continue;
       }
       const verifiedFreshDigest = await this._apply(operation, summary);
-      await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+      await withNativeDurableMutationIntent(this,
+        () => this.journal.markSeen(operation.operationId, verifiedFreshDigest));
       summary.pulled += 1;
     }
     await flushRemoteOnly();
@@ -5204,7 +5298,17 @@ for (const name of [
         }
         retained = retainNativeRootMutation(this);
         try {
-          return await implementation.apply(this, args);
+          return await ROOT_MUTATION_OPERATION_CONTEXT.run(retained.ticket || null, async () => {
+            // These private paths may perform destructive or remote actions
+            // before they return. Read-only hydration and signed preflight
+            // remain unmarked until their first real mutating syscall.
+            if (this.requireNativeRootRecovery && new Set([
+              "_open", "_enqueueChange", "recoverConflict",
+              "pruneEmptyUntrackedParents", "_pinLocal", "_unpinLocal",
+              "_applyExcludedPaths", "pushAtomicSignedOverwritePair",
+            ]).has(name)) markNativeRootMutationAttempt(this);
+            return await implementation.apply(this, args);
+          });
         } catch (error) {
           retained.fail(error);
           throw error;

@@ -1621,31 +1621,173 @@ test("issue 66: an owner that throws cannot release the lock after a different d
   await assert.rejects(open(), { code: "sync_root_busy" });
 });
 
-test("issue 66: an awaited transient outbound failure handled as offline must not falsely quarantine a native-required root", async (t) => {
+test("issue 66: identical Error objects from two independent outbound attempts cannot release a detached root lock", async (t) => {
+  const { root, open, store, adapter, state } = await setup(t, {
+    "docs/restore.txt": "signed remote operation",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const sharedError = Object.assign(new Error("ambiguous shared adapter error"), { code: "EIO" });
+  const originalPush = adapter.push;
+  let sent = 0;
+  let firstEntered;
+  const firstDispatch = new Promise((resolve) => { firstEntered = resolve; });
+  adapter.push = async () => {
+    sent += 1;
+    if (sent === 1) firstEntered();
+    throw sharedError;
+  };
+  let detached;
+  try {
+    const owner = client.withMutationLock(async () => {
+      detached = client.retryPush(operation);
+      await firstDispatch;
+      // First detached operation settles before a SECOND trusted awaited
+      // operation propagates the EXACT SAME Error object to the owner.
+      await new Promise((resolve) => setImmediate(resolve));
+      await client.retryPush(operation);
+    });
+    await assert.rejects(owner, (error) => error === sharedError);
+    await assert.rejects(detached, (error) => error === sharedError);
+  } finally {
+    adapter.push = originalPush;
+  }
+  assert.equal(sent, 2, "the two physical dispatches must have independent tickets");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "Error object identity cannot authorize releasing a lock after detached I/O");
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: adapter-reported offline after outbound entry cannot prove a safe no-write release", async (t) => {
   const { root, open, adapter, store, state } = await setup(t, {});
   await fsp.mkdir(path.join(root, "docs"), { recursive: true });
   await fsp.writeFile(path.join(root, "docs", "new.txt"), "local queued bytes");
   const originalPush = adapter.push;
   adapter.push = async () => {
-    throw Object.assign(new Error("transient offline before server write"), { code: "offline" });
+    throw Object.assign(new Error("unverified offline after adapter dispatch"), { code: "offline" });
   };
   const client = await open();
   try {
-    const offline = await client.syncOnce();
-    assert.equal(offline.offline, true);
+    await assert.rejects(client.syncOnce(), { code: "offline" });
     assert.equal(state.pushes, 0);
     assert.equal((await client.journal.recover()).length, 1);
-    assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
-      "a caught no-write offline event may release the process lock");
+    assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+      "an adapter's unauthenticated error code cannot prove no remote write");
   } finally {
     adapter.push = originalPush;
   }
-  const resumed = await open();
-  const report = await resumed.syncOnce();
-  assert.equal(report.pushed, 1);
-  assert.equal(state.pushes, 1);
-  assert.equal(store.list("alice").length, 1);
-  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
+  assert.equal(store.list("alice").length, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: remote COMMIT followed by lost ACK keeps native-required lock under ETIMEDOUT", async (t) => {
+  const { root, open, adapter, store, state } = await setup(t, {});
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "lost-ack.txt"), "physical remote commit");
+  const originalPush = adapter.push;
+  let acknowledgedByStore = false;
+  adapter.push = async (operation) => {
+    const result = await originalPush(operation);
+    assert.equal(result.status, 201);
+    acknowledgedByStore = true;
+    throw Object.assign(new Error("network timeout after remote commit"), { code: "ETIMEDOUT" });
+  };
+  const client = await open();
+  try {
+    await assert.rejects(client.syncOnce(), { code: "ETIMEDOUT" });
+  } finally {
+    adapter.push = originalPush;
+  }
+  assert.equal(acknowledgedByStore, true, "real in-memory server must have committed before lost ACK");
+  assert.equal(store.list("alice").filter((entry) =>
+    entry.metadata?.path === "docs/lost-ack.txt").length, 1);
+  assert.ok(state.pushes >= 1, "adapter must have performed real remote writes");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: cold FOD mode marker fsync followed by EIO cannot release the physical lock", async (t) => {
+  const { root, open, state } = await setup(t, {
+    "docs/restore.txt": "signed remote bytes",
+  });
+  const originalOpen = fsp.open;
+  let physicallySynced = false;
+  fsp.open = async (file, flags, ...args) => {
+    const handle = await originalOpen(file, flags, ...args);
+    if (path.basename(String(file)) === ".rootark-sync-ever-fod" && flags === "wx") {
+      const actualSync = handle.sync.bind(handle);
+      handle.sync = async () => {
+        await actualSync();
+        physicallySynced = true;
+        throw Object.assign(new Error("marker fsync completed then EIO"), { code: "EIO" });
+      };
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(open(), { code: "EIO" });
+  } finally {
+    fsp.open = originalOpen;
+  }
+  assert.equal(physicallySynced, true, "the real marker fsync must precede injected failure");
+  assert.equal(await fsp.readFile(path.join(root, ".rootark-sync-ever-fod"), "utf8"),
+    "rootark-sync-ever-fod-v1\n");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "an indeterminate cold admission must leave the physical lock acquired");
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: durable signed inbound seen write followed by EIO keeps the physical root lock", async (t) => {
+  const { root, open, state } = await setup(t, {
+    "docs/restore.txt": "original authenticated remote payload",
+  });
+  const client = await open();
+  const originalMarkSeen = client.journal.markSeen.bind(client.journal);
+  let written = false;
+  client.journal.markSeen = async (...args) => {
+    const result = await originalMarkSeen(...args);
+    written = true;
+    throw Object.assign(new Error("durable markSeen returned EIO after real write"), { code: "EIO" });
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/restore.txt"), { code: "EIO" });
+  } finally {
+    client.journal.markSeen = originalMarkSeen;
+  }
+  assert.equal(written, true, "the real journal I/O must complete before injected EIO");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "restore.txt"), "utf8"),
+    "original authenticated remote payload");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "an uncertain post-journal syscall result cannot release the root");
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: real local enqueue followed by EIO cannot release the native-required root lock", async (t) => {
+  const { root, open, state } = await setup(t, {});
+  const client = await open();
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "new.txt"), "local bytes without a trusted ACK");
+  const originalEnqueue = client.journal.enqueue.bind(client.journal);
+  let enqueued = false;
+  client.journal.enqueue = async (...args) => {
+    const result = await originalEnqueue(...args);
+    enqueued = true;
+    throw Object.assign(new Error("journal enqueue completed then EIO"), { code: "EIO" });
+  };
+  try {
+    await assert.rejects(client.reconcileLocal(), { code: "EIO" });
+  } finally {
+    client.journal.enqueue = originalEnqueue;
+  }
+  assert.equal(enqueued, true);
+  assert.equal((await client.journal.recover()).length, 1);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true);
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
 });
 
 test("issue 66: direct private signed batch and out-of-scope reconciliation must not bypass a foreign lock", async (t) => {
