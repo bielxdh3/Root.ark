@@ -185,6 +185,9 @@ test("alternating Proxy issuer descriptors cannot combine stale signature with c
   }, issuer.privateKey);
   assert.notEqual(digestIssuerProvisioning(stale),
     digestIssuerProvisioning(f.issuerProvisioning));
+  // Keep the switching oracle executable even if the current fail-closed
+  // early Proxy check is accidentally relaxed in a later implementation.
+  const fieldCount = Reflect.ownKeys(f.issuerProvisioning).length;
   let descriptorReads = 0;
   const switchingWire = new Proxy({ ...f.issuerProvisioning }, {
     getOwnPropertyDescriptor(_target, property) {
