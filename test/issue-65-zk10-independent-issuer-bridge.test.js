@@ -185,7 +185,6 @@ test("alternating Proxy issuer descriptors cannot combine stale signature with c
   }, issuer.privateKey);
   assert.notEqual(digestIssuerProvisioning(stale),
     digestIssuerProvisioning(f.issuerProvisioning));
-  const fieldCount = Reflect.ownKeys(f.issuerProvisioning).length;
   let descriptorReads = 0;
   const switchingWire = new Proxy({ ...f.issuerProvisioning }, {
     getOwnPropertyDescriptor(_target, property) {
@@ -196,8 +195,14 @@ test("alternating Proxy issuer descriptors cannot combine stale signature with c
   });
   assert.throws(() => f.verify({ ...f.input, issuerProvisioning: switchingWire }),
     /ZK10_ISSUER_BRIDGE_UNVERIFIED/);
-  assert.equal(descriptorReads, fieldCount,
-    "issuer statement must be captured once and never re-read for digest");
+  // The strengthened exact() boundary now rejects a Proxy BEFORE its first
+  // property/descriptor trap. It must neither evaluate stale signed values
+  // nor accept a forged or alternated digest; zero trap reads is stricter
+  // than the old one-snapshot (fieldCount reads) contract.
+  assert.equal(descriptorReads, 0,
+    "hostile issuer Proxy must be rejected without invoking descriptor traps");
+  assert.equal(f.verify(f.input).issuerProvisioningVerified, true,
+    "the same fail-closed boundary must preserve genuine signed issuer evidence");
 });
 
 test("accessor and throwing Proxy issuer descriptors fail closed", () => {
