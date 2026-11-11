@@ -3,6 +3,7 @@
 // DEV-OFF cryptographic protocol primitives. A signature or Merkle proof never
 // establishes independent off-host custody, freshness, or permission for I/O.
 const crypto = require("node:crypto");
+const { types: { isProxy } } = require("node:util");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
 // Caller-supplied KeyObjects can shadow instance `.type`,
@@ -51,13 +52,29 @@ function decode(value, length) {
 }
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
 function key(value, type) {
-  if (!(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
+  if (isProxy(value) || !(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
     || NATIVE_ALGORITHM.call(value) !== "ed25519") deny();
-  return value;
+  // A forged Object.create(realKey) may provide an own kHandle getter which
+  // returns SPKI B for export and signer A for crypto.verify. Never retain a
+  // caller-owned public KeyObject: snapshot its native DER once, reimport,
+  // and use ONLY the fresh native identity for both SPKI and verification.
+  if (type === "private") return value; // Never export private key material.
+  try {
+    const der = NATIVE_PUBLIC_EXPORT.call(value, { format: "der", type: "spki" });
+    if (!Buffer.isBuffer(der) || der.length !== 44) deny();
+    const pinned = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    if (NATIVE_TYPE.call(pinned) !== "public"
+      || NATIVE_ALGORITHM.call(pinned) !== "ed25519"
+      || !NATIVE_PUBLIC_EXPORT.call(pinned, { format: "der", type: "spki" }).equals(der)) deny();
+    return pinned;
+  } catch (_) { deny(); }
+}
+function pinnedSpkiHash(pinnedPublicKey) {
+  return H(NATIVE_PUBLIC_EXPORT.call(pinnedPublicKey,
+    { format: "der", type: "spki" })).toString("hex");
 }
 function spkiHash(publicKey) {
-  return H(NATIVE_PUBLIC_EXPORT.call(key(publicKey, "public"),
-    { format: "der", type: "spki" })).toString("hex");
+  return pinnedSpkiHash(key(publicKey, "public"));
 }
 function samePublicKey(left, right) {
   return NATIVE_KEY_EQUALS.call(key(left, "public"), key(right, "public"));
@@ -151,7 +168,7 @@ function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
     const { body, next } = rotationPayload(Object.fromEntries(ROTATION_FIELDS.map((f) => [f, signed[f]])));
     if (body.immutable_account_id !== immutableAccountId
       || body.generation !== index + 1 || body.previous_rotation_digest !== previousDigest
-      || body.from_spki_sha256 !== spkiHash(current)) deny();
+      || body.from_spki_sha256 !== pinnedSpkiHash(current)) deny();
     const bytes = signatureBytes(DOMAIN_ROTATION, body);
     if (!crypto.verify(null, bytes, current, decode(signed.signature_from, 64))
       || !crypto.verify(null, bytes, next, decode(signed.signature_next, 64))) deny();
