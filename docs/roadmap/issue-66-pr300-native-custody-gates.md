@@ -44,6 +44,67 @@ flowchart TD
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
 
+## 2026-11-11 — verified current publication and independent authority gaps
+
+This entry supersedes earlier *as-of* snapshots below for current branch
+provenance; historical experiment evidence remains intact. The published
+PR #300 HEAD is `23cc31b69c5efb6f218eb74e556b49e297e79297`
+(`OPEN/Draft`), fast-forwarded from `dceeb9c3179bae28a4065583f754277ee31ba71c`
+after two independent **SOURCE GO** reviews on the exact integrated SHA.
+`Root/main` remained `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+The two new commits fix the *advisory metadata inventory* contract, not
+native storage authority: custom-adapter records are detached as bounded
+JSON-only values, with explicit id/path types, no callable coercion, no
+getter/Proxy execution, and a reconstructed metadata-only output with no
+ciphertext or authorization envelope. Windows Node 22/NTFS and WSL Node
+22/ext4 each completed the exact integrated metadata test file **13/13
+PASS**; Node syntax and Git diff checks passed. A pre-fix hostile
+`toString` callback executed while the corrected path denies with
+`invalid_inventory` and zero callback executions. The DTO's 128 KiB,
+4096-node/key bound does **not** prove constant memory when V8 prepares
+an enumeration of an already enormous custom JavaScript object.
+
+Hosted CodeQL run `43048299591` on exactly `23cc31b6` completed
+**SUCCESS**. Hosted Security Regression run `43048466075` was launched
+for this exact SHA and its Ubuntu Node 22, Windows canonical and Windows
+mandatory jobs were **in progress** at this snapshot; do not claim those
+results before checking completion. At predecessor `dceeb9c3`, the Ubuntu
+full suite reported **3,509 PASS / 18 FAIL / 244 SKIP**. Those failures
+include positive FOD/native-session scenarios: `RootSession` remains OFF
+and old path-based fallback must not be activated to satisfy CI.
+
+The operational inbound publisher, `sync-client/rootark-sync-engine.js`
+`publishInboundPayload()`, still executes replace-capable `fsp.rename`
+after a separate destination-absence check. A new **unpublished,
+non-destructive RED** test in worktree
+`issue66-w14-inbound-collision-red-dce-20261111` planted a foreign inode
+at that exact boundary and intercepted the attempted destructive rename
+on real Windows NTFS and WSL ext4 (**0 PASS / 1 FAIL** each). Both foreign
+inodes, exact canary bytes, local snapshot and signed-operation ACK state
+were preserved. This demonstrates a live P2; it is not a native
+no-replace **GREEN**, and the intentionally RED fixture was not
+committed or published as a fix.
+
+The W26 opt-in `PREPIN_COLD_ORIGIN_REQUIRED` negative lab is already
+published in `dceeb9c3`: owner SID inspection requires native
+`READ_CONTROL`, and separate plain-B/junction-B attacks denied the
+untrusted pre-pin directory (Windows Node22/NTFS **25 PASS**). It still
+cannot attest the physical FileId of original A **before the first native
+pin**; `NORMAL` may pin a hostile same-SID B. The PR #301 logical
+SyncV2/owner-signed ZK mapping and PR #302 DEV-OFF monotonic floor have
+distinct signing domains and divergent branch bases. The PR #302 hosted
+Security Regression on exact `dcd65b6b` finished **SUCCESS** in Ubuntu,
+Windows canonical, mandatory gates and syntax, with CodeQL/PostgreSQL18/
+dependency review green. This neither provisions an off-host custodian
+nor creates a valid cold physical-root authority in PR #300.
+
+**Still blocked:** independent original-root and all-ancestor enrollment
+before hostile namespace access; distinct-principal same-SID/UID writer
+isolation; native HANDLE/dirfd stage/publish/retire with no-replace;
+signed origin/current-floor/PREPARE/COMMIT cold recovery and owner-signed
+ingress/egress; real Windows **10** CFAPI and physical powercut evidence.
+**RootSession OFF; MERGE NO-GO; RELEASE NO-GO.**
+
 ## 2026-11-11 — current live integration and release boundary
 
 The last independently verified published PR #300 HEAD before this W26

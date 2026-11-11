@@ -9,6 +9,23 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 — **live PR #300 #66 checkpoint, not release authorization:**
+published HEAD `23cc31b69c5efb6f218eb74e556b49e297e79297` remains
+OPEN/Draft; `Root/main` stayed `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+Two exact-SHA SOURCE GO reviews approved advisory-inventory boundary
+sanitization; Windows Node22 and WSL Node22 inventory tests each passed
+13/13. CodeQL run `43048299591` succeeded on the published SHA;
+Security Regression `43048466075` was still running and must be checked
+separately. The product FOD inbound `fsp.rename` destination-collision
+P2 remains confirmed physical RED on Windows NTFS and WSL ext4; its
+non-destructive attack fixture is preserved unpublished. `RootSession`
+remains OFF. Independent original-A enrollment, native no-replace
+publication, owner-signed monotonic cold floor, crash/powercut and real
+Windows 10 CFAPI remain unproven. PR #302 exact `dcd65b6b` hosted
+Security Regression is green but its custodian is DEV-OFF, not external
+authority; PR #301 cryptographic signer-role changes require their own
+exact-SHA review/CI, not reuse of PR #300 checks. **MERGE/RELEASE NO-GO.**
+
 2026-11-11 — Issue #66 / PR #300 W26 integration status: current bounded
 native NTFS evidence is recorded in
 `docs/roadmap/issue-66-pr300-native-custody-gates.md`. Four post-native-pin
