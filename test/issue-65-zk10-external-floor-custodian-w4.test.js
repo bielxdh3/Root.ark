@@ -26,6 +26,18 @@ const keyHash = (key) => crypto.createHash("sha256")
 function sign(payload, signer, domain) {
   return { ...payload, signature: b64(crypto.sign(null, signatureBytes(domain, payload), signer)) };
 }
+function isActualCustodianFloorCall(data, key, publicKey, signature) {
+  if (!Buffer.isBuffer(data) || !data.subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)
+    || !(key instanceof crypto.KeyObject)
+    || !crypto.KeyObject.prototype.equals.call(crypto.createPublicKey(key), publicKey)) return false;
+  // Cloned private KeyObjects are a feature. Prove that the real native
+  // signature verifies under the independently expected Ed25519 public key.
+  if (signature !== undefined) {
+    assert.equal(crypto.verify(null, data, publicKey, signature), true,
+      "instrumented floor signature must be real Ed25519 from the expected custodian");
+  }
+  return true;
+}
 function setup(t, suffix = "single") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk10-custodian-w4-"));
   const opened = [];
@@ -102,6 +114,58 @@ test("P2: a shadowed KeyObject export cannot disguise one owner/custodian signin
   "a false reported SPKI must not make the same native signing key independent");
   assert.equal(fs.existsSync(x.paths.databasePath), false);
   assert.equal(fs.existsSync(x.paths.anchorDatabasePath), false);
+});
+
+test("P2 native owner kHandle cannot make the physical custodian signer its own owner", (t) => {
+  const x = setup(t, "owner-handle-role-alias");
+  const actual = x.custodian.publicKey;
+  const other = x.owner.publicKey;
+  const symbol = Object.getOwnPropertySymbols(actual)
+    .find((item) => String(item) === "Symbol(kHandle)");
+  assert.ok(symbol);
+  let reads = 0;
+  const forged = Object.create(actual);
+  Object.defineProperty(forged, symbol, { get() {
+    return (++reads <= 2 ? other : actual)[symbol];
+  } });
+  const { signature: _discard, ...unsigned } = x.genesis;
+  const bootstrap = sign(unsigned, x.custodian.privateKey, DOMAIN_GENESIS);
+  assert.throws(() => x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, ownerPublicKey: forged, bootstrap,
+  })), /ZK10_CUSTODIAN_UNAVAILABLE/,
+  "one actual key A cannot serve owner and custodian despite claimed B");
+  assert.ok(reads >= 1, "native key-handle swap was exercised");
+});
+
+test("P2 mutable private signer cannot sign CURRENT as A while claiming custodian SPKI B", (t) => {
+  const x = setup(t, "private-signer-handle-swap");
+  const actual = x.custodian;
+  const other = crypto.generateKeyPairSync("ed25519");
+  const symbol = Object.getOwnPropertySymbols(actual.privateKey)
+    .find((item) => String(item) === "Symbol(kHandle)");
+  assert.ok(symbol);
+  const forged = Object.create(actual.privateKey);
+  let reads = 0;
+  Object.defineProperty(forged, symbol, { get() {
+    return (++reads === 2 ? other.privateKey : actual.privateKey)[symbol];
+  } });
+  try {
+    const custodian = x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, custodianPrivateKey: forged,
+      custodianSpkiSha256: keyHash(other.publicKey),
+    }));
+    const { request, ownerLease } = x.offer();
+    const { signature, ...floor } = custodian.attest(request, ownerLease).floor;
+    const data = signatureBytes(DOMAIN_FLOOR, floor);
+    const signed = Buffer.from(signature, "base64url");
+    assert.equal(crypto.verify(null, data, other.publicKey, signed), true,
+      "signed CURRENT must verify against the pinned custodian SPKI");
+    assert.equal(crypto.verify(null, data, actual.publicKey, signed), false,
+      "signed CURRENT may not silently use the foreign signer A");
+  } catch (error) {
+    if (error.code !== "ZK10_CUSTODIAN_UNAVAILABLE") throw error;
+  }
+  assert.ok(reads >= 2, "native private key-handle swap was exercised");
 });
 
 test("P2: native Ed25519 identity survives caller-shadowed KeyObject type metadata", (t) => {
@@ -646,8 +710,7 @@ for (const target of ["anchor floor", "primary used-lease journal"]) {
       const signature = sign(algorithm, data, key, ...rest);
       // Only the pinned CUSTODIAN's W170 signature triggers this synchronous
       // adversarial callback; never intercept owner bootstrap/lease signatures.
-      if (key === x.custodian.privateKey
-        && Buffer.isBuffer(data) && data.subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
+      if (isActualCustodianFloorCall(data, key, x.custodian.publicKey, signature)) {
         assert.equal(attempted, false);
         attempted = true;
         const outside = new Database(targetFile, { timeout: 1 });
@@ -700,8 +763,8 @@ test("P2: a real second SQLite writer cannot slip between post-sign anchor and p
   let signed = false, intercepted = false, committed = false, blocked = false;
   crypto.sign = (...args) => {
     const signature = originalSign(...args);
-    if (args[2] === x.custodian.privateKey && Buffer.isBuffer(args[1])
-      && args[1].subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) signed = true;
+    if (isActualCustodianFloorCall(args[1], args[2], x.custodian.publicKey, signature))
+      signed = true;
     return signature;
   };
   Database.prototype.prepare = function (sql, ...args) {
@@ -738,8 +801,7 @@ test("P2: failed signer releases both SQLite reservations and poisons the lease 
   const originalSign = crypto.sign;
   let failedInsideSign = false;
   crypto.sign = (...args) => {
-    if (args[2] === x.custodian.privateKey && Buffer.isBuffer(args[1])
-      && args[1].subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
+    if (isActualCustodianFloorCall(args[1], args[2], x.custodian.publicKey)) {
       failedInsideSign = true;
       throw new Error("injected signer failure");
     }
@@ -881,7 +943,7 @@ test("P2: an owner-authorized floor expiring during signing must never be return
   let custodianSignCalls = 0;
   crypto.sign = (...args) => {
     const signed = originalSign(...args); // Real Ed25519; only the response is delayed.
-    if (args[2] === x.custodian.privateKey) {
+    if (isActualCustodianFloorCall(args[1], args[2], x.custodian.publicKey, signed)) {
       custodianSignCalls += 1;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
     }
@@ -918,7 +980,7 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
   const modulePath = require.resolve("../src/services/zk10DevOffMonotonicFloorCustodian");
   const cached = require.cache[modulePath];
   const genuineNow = Date.now;
-  const startedAt = genuineNow();
+  let startedAt = genuineNow();
   let wallNow = startedAt;
   let createWithClock;
   try {
@@ -933,12 +995,17 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
     if (cached) require.cache[modulePath] = cached;
   }
   const c = x.track(createWithClock(x.config));
-  const challenge = x.offer({ lease_expires_at_ms: startedAt + 2200 });
+  // Begin the lease after module initialization and SQLite bootstrap.
+  // Under runner load, an expiry relative to pre-bootstrap time can
+  // expire before crypto.sign is reached, invalidating this oracle.
+  const challenge = x.offer({ lease_expires_at_ms: genuineNow() + 2200 });
+  startedAt = challenge.ownerLease.issued_at_ms;
+  wallNow = startedAt;
   const originalSign = crypto.sign;
   let custodianSignCalls = 0;
   crypto.sign = (...args) => {
     const signed = originalSign(...args);
-    if (args[2] === x.custodian.privateKey) {
+    if (isActualCustodianFloorCall(args[1], args[2], x.custodian.publicKey, signed)) {
       custodianSignCalls++;
       // Real time passes beyond expiry, but a partial clock rollback leaves
       // the reported time AFTER issuedAt and BEFORE the expiry timestamp.
@@ -983,8 +1050,7 @@ test("P2: reentrant retainedMinimum failure during genuine signing cannot escape
   let signedByCustodian = false, reentrantDenied = false;
   crypto.sign = (algorithm, data, key, ...rest) => {
     const proof = realSign(algorithm, data, key, ...rest);
-    if (key === x.custodian.privateKey && Buffer.isBuffer(data)
-      && data.subarray(0, DOMAIN_FLOOR.length).equals(DOMAIN_FLOOR)) {
+    if (isActualCustodianFloorCall(data, key, x.custodian.publicKey, proof)) {
       signedByCustodian = true;
       // A synchronous instrumented signer reenters the same custodian while
       // BOTH outer BEGIN IMMEDIATE reservations are held. A nested BEGIN on

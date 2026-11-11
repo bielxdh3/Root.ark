@@ -91,12 +91,22 @@ function integer(value, min, max = Number.MAX_SAFE_INTEGER) {
   return value;
 }
 function publicKey(value, pinnedSpki) {
-  if (!(value instanceof crypto.KeyObject) || KEY_TYPE.call(value) !== "public"
+  if (isProxy(value) || !(value instanceof crypto.KeyObject) || KEY_TYPE.call(value) !== "public"
     || KEY_ASYMMETRIC_TYPE.call(value) !== "ed25519") deny();
-  const spkiDigest = HASH("sha256")
-    .update(KEY_EXPORT.call(value, { type: "spki", format: "der" })).digest("hex");
-  if (spkiDigest !== hex(pinnedSpki)) deny();
-  return value;
+  try {
+    // Snapshot the native key material exactly once. An inherited KeyObject
+    // can change its own Symbol(kHandle) between SPKI hashing and VERIFY.
+    // All later checks must use this freshly imported, independent handle.
+    const der = KEY_EXPORT.call(value, { type: "spki", format: "der" });
+    if (!Buffer.isBuffer(der) || der.length !== 44) deny();
+    const pinned = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    if (KEY_TYPE.call(pinned) !== "public"
+      || KEY_ASYMMETRIC_TYPE.call(pinned) !== "ed25519"
+      || !KEY_EXPORT.call(pinned, { type: "spki", format: "der" }).equals(der)) deny();
+    const spkiDigest = HASH("sha256").update(der).digest("hex");
+    if (spkiDigest !== hex(pinnedSpki)) deny();
+    return pinned;
+  } catch (_) { deny(); }
 }
 function normalizedOwner(raw) {
   const o = exact(raw, OWNER_FIELDS);

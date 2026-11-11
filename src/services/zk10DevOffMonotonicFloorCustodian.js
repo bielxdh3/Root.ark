@@ -6,6 +6,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { types: { isProxy } } = require("node:util");
 const Database = require("better-sqlite3");
 const { signatureBytes } = require("../crypto/rootark-zk10-account-cutover-v1");
 
@@ -44,6 +45,12 @@ const nativeType = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "
 const nativeAlgorithm = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(publicKeyPrototype), "asymmetricKeyType").get;
 const nativePublicExport = Object.getOwnPropertyDescriptor(publicKeyPrototype, "export").value;
+// Public and private native exports differ: the private signer must also be
+// detached, otherwise a mutable kHandle can advertise B and later sign as A.
+// This ephemeral native key is discarded after discovering the prototype.
+const privateKeyPrototype = Object.getPrototypeOf(
+  crypto.generateKeyPairSync("ed25519").privateKey);
+const nativePrivateExport = Object.getOwnPropertyDescriptor(privateKeyPrototype, "export").value;
 const nativeKeyEquals = crypto.KeyObject.prototype.equals;
 
 function deny() {
@@ -88,9 +95,31 @@ function unsignedSigned(wire, fields, type, domain, publicKey) {
   return payload;
 }
 function keyObject(value, type) {
-  if (!(value instanceof crypto.KeyObject) || nativeType.call(value) !== type
+  if (isProxy(value) || !(value instanceof crypto.KeyObject) || nativeType.call(value) !== type
     || nativeAlgorithm.call(value) !== "ed25519") deny();
-  return value;
+  let der;
+  try {
+    // A caller may shadow methods, and an inherited instance can replace its
+    // native kHandle between comparison, bootstrap verification and signing.
+    // Import one native DER snapshot into a fresh, exclusively held key.
+    const isPrivate = type === "private";
+    der = (isPrivate ? nativePrivateExport : nativePublicExport).call(value,
+      { format: "der", type: isPrivate ? "pkcs8" : "spki" });
+    if (!Buffer.isBuffer(der) || der.length !== (isPrivate ? 48 : 44)) deny();
+    const pinned = isPrivate
+      ? crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" })
+      : crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    if (nativeType.call(pinned) !== type
+      || nativeAlgorithm.call(pinned) !== "ed25519") deny();
+    if (!isPrivate && !nativePublicExport.call(pinned,
+      { format: "der", type: "spki" }).equals(der)) deny();
+    return pinned;
+  } catch (_) { deny(); }
+  finally {
+    // Do not retain plaintext PKCS8 bytes; only the native private clone is
+    // kept for derivation and signing. Never export it to compare roles.
+    if (type === "private" && Buffer.isBuffer(der)) der.fill(0);
+  }
 }
 function spki(key) {
   return crypto.createHash("sha256")

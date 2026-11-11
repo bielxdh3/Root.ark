@@ -215,6 +215,50 @@ test("native owner and floor SPKI must match pins despite caller-shadowed export
   }
 });
 
+test("P2 inherited native kHandle cannot splice owner or CURRENT signer A onto pinned SPKI B", () => {
+  for (const role of ["owner", "floor"]) {
+    const f = fixture();
+    const actual = role === "owner" ? f.owner.publicKey : f.custodian.publicKey;
+    const alleged = f.foreign.publicKey;
+    const symbol = Object.getOwnPropertySymbols(actual)
+      .find((item) => String(item) === "Symbol(kHandle)");
+    assert.ok(symbol, "exercise real Node KeyObject native handle");
+    // Native property-getter caching differs across Node 22/24, so exercise
+    // each possible export getter index without depending on its call count.
+    for (const swappedRead of [1, 2, 3, 4]) {
+      const forged = Object.create(actual);
+      assert.ok(forged instanceof crypto.KeyObject);
+      let reads = 0;
+      Object.defineProperty(forged, symbol, { get() {
+        // Native metadata sees A, native SPKI export can see B, verification
+        // sees A. A mutable JavaScript wrapper is NOT a pinned signer.
+        return (++reads === swappedRead ? alleged : actual)[symbol];
+      } });
+      const config = f.options();
+      if (role === "owner") {
+        config.pinnedOwnerPublicKey = forged;
+        config.pinnedOwnerSpkiSha256 = spki(alleged);
+        config.readSignedCurrentFloor = (challenge) => sign({
+          type: "rootark-zk10-original-byte-floor-readback/v1",
+          immutable_account_id: f.expected.immutable_account_id,
+          owner_spki_sha256: spki(alleged),
+          sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+          nonce: challenge, revoked: false, issued_at_ms: Date.now() - 50,
+          expires_at_ms: Date.now() + 5000,
+        }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+      } else {
+        config.pinnedFloorPublicKey = forged;
+        config.pinnedFloorSpkiSha256 = spki(alleged);
+      }
+      assert.throws(() => {
+        const gate = createDevOffOriginalByteEvidenceGate(config);
+        const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+        gate.verifyOriginalBytes({ ticket, chunks: [f.original] });
+      }, bad, `${role} real signer A must not authenticate B at read ${swappedRead}`);
+    }
+  }
+});
+
 test("RSA-512 signatures cannot impersonate Ed25519 owner or floor using shadowed key type", () => {
   for (const role of ["owner", "floor"]) {
     const f = fixture();
