@@ -60,6 +60,23 @@ JavaScript cannot preempt that native blockage. Callers may supply an
 `AbortSignal` as the optional `verify(input, { signal })` argument. These
 budgets do not attest an independently operated mapping authority.
 
+### 2026-11-11 — native key identity P2 (isolated, unpublished)
+
+The published verifier used caller-shadowable `KeyObject.export()` when
+comparing a rotated owner's Ed25519 public key to the claimed independent
+CURRENT signer. A physical negative test proved that the **same underlying
+Ed25519 key** passed role separation after its instance `.export()` was
+overridden to return an unrelated SPKI. The isolated correction reads actual
+native key type/algorithm, exports only real public keys using a captured Node
+prototype method, and compares actual Ed25519 key material with captured
+`KeyObject.prototype.equals` against **every** owner generation, provisioner,
+witness and CAS key. Genuine distinct keys survive shadowed instance metadata;
+forged plain objects and shared actual keys fail closed. Focused Windows
+Node 22.22.1 tests passed 26/26 (mapping + adjacent account/object suites);
+WSL Node 22.22.1 mapping tests passed 16/16. This is only a locally tested
+cryptographic role-separation fix, not independent operator provisioning,
+off-host signer custody, a production admission, or a release approval.
+
 **Remaining external blockers:** This module does not implement a trusted
 SyncV2↔ZK account enrollment ceremony, independently operated mapping signer,
 authenticated fresh readback, independently durable monotonic floor/CAS, or
