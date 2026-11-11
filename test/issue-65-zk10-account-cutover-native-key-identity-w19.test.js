@@ -46,7 +46,7 @@ test("P2 rotation must reject forged from-SPKI while signatures use a different 
 });
 
 test("P2 RSA object with shadowed Ed25519 metadata cannot enter owner verification", () => {
-  const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 1024 });
+  const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
   Object.defineProperties(rsa.publicKey, {
     type: { value: "public" }, asymmetricKeyType: { value: "ed25519" },
   });
@@ -60,6 +60,11 @@ test("legitimate native Ed25519 key survives misleading instance metadata", () =
     type: { value: "private" }, asymmetricKeyType: { value: "rsa" },
     export: { value: () => { throw Error("shadow export must never run"); } },
   });
-  assert.equal(key(owner.publicKey, "public"), owner.publicKey);
+  const canonical = key(owner.publicKey, "public");
+  assert.notStrictEqual(canonical, owner.publicKey,
+    "untrusted key instance must not remain in verification path");
+  const bytes = Buffer.from("signed owner challenge");
+  assert.equal(crypto.verify(null, bytes, canonical,
+    crypto.sign(null, bytes, owner.privateKey)), true);
   assert.equal(spkiHash(owner.publicKey), sha(correctDer));
 });

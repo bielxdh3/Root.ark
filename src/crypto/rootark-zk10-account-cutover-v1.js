@@ -6,7 +6,9 @@ const crypto = require("node:crypto");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
 // Read native identity from Node prototypes, not caller-shadowable .type,
-// .asymmetricKeyType or .export properties of the supplied KeyObject.
+// .asymmetricKeyType or .export properties. Public KeyObjects must also be
+// reimported: a prototype-derived wrapper can change its internal kHandle
+// between an SPKI hash and crypto.verify, even with native methods.
 const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
@@ -49,9 +51,21 @@ function decode(value, length) {
 }
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
 function key(value, type) {
-  if (!(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
-    || NATIVE_ALGORITHM.call(value) !== "ed25519") deny();
-  return value;
+  try {
+    if (!(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
+      || NATIVE_ALGORITHM.call(value) !== "ed25519") deny();
+    if (type === "private") return value; // Never export private key material.
+    if (type !== "public") deny();
+    // Take one native SPKI snapshot, then discard the supplied reference.
+    // Subsequent hash and signature checks use only the fresh, native key.
+    const der = NATIVE_PUBLIC_EXPORT.call(value, { format: "der", type: "spki" });
+    if (!Buffer.isBuffer(der) || der.length !== 44) deny();
+    const canonical = crypto.createPublicKey({ key: Buffer.from(der),
+      format: "der", type: "spki" });
+    if (NATIVE_TYPE.call(canonical) !== "public"
+      || NATIVE_ALGORITHM.call(canonical) !== "ed25519") deny();
+    return canonical;
+  } catch (_) { deny(); }
 }
 function spkiHash(publicKey) {
   return H(NATIVE_PUBLIC_EXPORT.call(key(publicKey, "public"),
