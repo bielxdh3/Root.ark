@@ -20,15 +20,38 @@ const sign = (type, statement, key) => ({ statement,
   signature: crypto.sign(null, Buffer.from(DOMAIN + type + "\0" + canonicalJson(statement), "utf8"),
     key.privateKey).toString("base64url") });
 
+// Node's pathname hardlink source may be swapped by a same-principal writer.
+// This is a lab-only post-link check against the exact retained file handles,
+// not a native atomic publish primitive or an authorization for RootSession.
+const assertHeldPublicationIdentity = async (foreign, published) => {
+  const expected = await foreign.stat({ bigint: true });
+  const actual = await published.stat({ bigint: true });
+  if (!expected.isFile() || !actual.isFile()
+    || expected.dev !== actual.dev || expected.ino !== actual.ino) {
+    throw Object.assign(new Error("Published hardlink differs from held foreign inode"),
+      { code: "lab_publication_identity_mismatch" });
+  }
+};
+
 test("#66 signed native cold witness reference rejects stale floors, swapped FileIds and incomplete COMMIT", async (t) => {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-root-witness-"));
-  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  // Keep the disposable test-owned directory for forensic inspection. A
+  // recursive pathname cleanup would be unsafe if a same-principal process
+  // rebound the directory after the test; only an independent custodian may
+  // later retire such evidence.
+  const retainedHandles = [];
+  t.after(async () => {
+    for (const handle of retainedHandles.reverse()) await handle.close();
+  });
   const originalName = path.join(directory, "published.bin");
   const parkedName = path.join(directory, "original-preserved.bin");
+  const stagedForeignName = path.join(directory, "foreign-stage.bin");
   const bytes = Buffer.from("SIGNED_NATIVE_ROOT_COLD_BYTES_V1");
   const original = await fsp.open(originalName, "wx+", 0o600);
-  try { await original.writeFile(bytes); await original.sync(); }
-  finally { await original.close(); }
+  retainedHandles.push(original);
+  await original.writeFile(bytes);
+  await original.sync();
+  let publishedLinkCount = 1n;
   const openedPhysical = async () => {
     // Explicitly NOT a trusted native backend. We only prove that the
     // reference verifier rejects swapped physical evidence; this callback
@@ -38,7 +61,7 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
     try {
       const before = await held.stat({ bigint: true });
       assert.equal(before.isFile(), true);
-      assert.equal(before.nlink, 1n);
+      assert.equal(before.nlink, publishedLinkCount);
       const data = Buffer.alloc(bytes.length + 1);
       const { bytesRead } = await held.read(data, 0, data.length, 0);
       const after = await held.stat({ bigint: true });
@@ -109,16 +132,48 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
   // After a verified COMMIT, a hostile same-user writer preserves the old
   // inode under another name and creates a different inode with EQUAL bytes.
   // The owner-signed root fingerprint and external floor are left intact.
+  // Stage the foreign inode by exclusive creation BEFORE the rename. The
+  // hardlink destination is no-replace, but its source pathname is mutable:
+  // compare the published FD with the retained foreign FD after the link.
+  const foreign = await fsp.open(stagedForeignName, "wx+", 0o600);
+  retainedHandles.push(foreign);
+  await foreign.writeFile(bytes);
+  await foreign.sync();
   await fsp.rename(originalName, parkedName);
-  const foreign = await fsp.open(originalName, "wx+", 0o600);
-  try { await foreign.writeFile(bytes); await foreign.sync(); }
-  finally { await foreign.close(); }
+  await fsp.link(stagedForeignName, originalName);
+  // Retain both hardlinks: unlink(stageName) could delete an attacker's newly
+  // substituted pathname and would itself be an unauthorized filesystem act.
+  publishedLinkCount = 2n;
+  const published = await fsp.open(originalName,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  retainedHandles.push(published);
+  await assertHeldPublicationIdentity(foreign, published);
   const attackerPhysical = await openedPhysical();
   assert.notEqual(attackerPhysical.fileId, originalPhysical.fileId,
     "the test must physically substitute an unrelated opened inode");
   await assert.rejects(inspectSignedColdCommit(args), { code: "root_session_unverified_authority" });
-  assert.deepEqual(await fsp.readFile(originalName), bytes);
-  assert.deepEqual(await fsp.readFile(parkedName), bytes);
+  for (const [label, handle, expectedLinks] of [
+    ["foreign", foreign, 2n], ["published", published, 2n],
+    ["parked-original", original, 1n],
+  ]) {
+    const before = await handle.stat({ bigint: true });
+    assert.equal(before.isFile(), true, `${label} must remain a held regular inode`);
+    assert.equal(before.nlink, expectedLinks, `${label} must preserve its expected link count`);
+    const content = Buffer.alloc(bytes.length + 1);
+    const { bytesRead } = await handle.read(content, 0, content.length, 0);
+    const after = await handle.stat({ bigint: true });
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(bytesRead, bytes.length);
+    assert.deepEqual(content.subarray(0, bytesRead), bytes,
+      `${label} must retain exact original bytes despite hostile name replacement`);
+  }
+  const originalRetainedId = await original.stat({ bigint: true });
+  const foreignRetainedId = await foreign.stat({ bigint: true });
+  assert.notEqual(originalRetainedId.ino, foreignRetainedId.ino,
+    "equal byte strings do not make two distinct retained OS inodes identical");
 
   const forged = { ...args, expectedOwnerDigest: "0".repeat(64) };
   await assert.rejects(inspectSignedColdCommit(forged), { code: "root_session_unverified_authority" });
@@ -165,4 +220,39 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
   floorSequence = 1;
   await assert.rejects(inspectSignedColdCommit(args), { code: "root_session_unverified_authority" },
     "a signed old file identity remains inadmissible after physical replacement");
+});
+
+test("#66 stage-path swap rejects a published hardlink to an unheld foreign inode", async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-stage-swap-"));
+  // Never delete an alias by pathname after a same-principal stage swap.
+  const retained = [];
+  t.after(async () => {
+    for (const handle of retained.reverse()) await handle.close();
+  });
+  const stageName = path.join(directory, "foreign-stage.bin");
+  const preservedName = path.join(directory, "foreign-preserved.bin");
+  const publishedName = path.join(directory, "published.bin");
+  const bytes = Buffer.from("EQUAL_CIPHERTEXT_IS_NOT_FILE_IDENTITY");
+  const expected = await fsp.open(stageName, "wx+", 0o600);
+  retained.push(expected);
+  await expected.writeFile(bytes);
+  await expected.sync();
+
+  // Rebind the stage alias to a different same-user inode with identical bytes.
+  await fsp.rename(stageName, preservedName);
+  const injected = await fsp.open(stageName, "wx+", 0o600);
+  retained.push(injected);
+  await injected.writeFile(bytes);
+  await injected.sync();
+  await fsp.link(stageName, publishedName);
+  const published = await fsp.open(publishedName, "r");
+  retained.push(published);
+  const originalId = await expected.stat({ bigint: true });
+  const injectedId = await injected.stat({ bigint: true });
+  assert.notDeepEqual([originalId.dev, originalId.ino], [injectedId.dev, injectedId.ino],
+    "stage alias must be physically swapped to a distinct inode");
+  await assert.rejects(assertHeldPublicationIdentity(expected, published),
+    { code: "lab_publication_identity_mismatch" });
+  assert.equal((await injected.stat({ bigint: true })).nlink, 2n,
+    "both hostile stage and published hardlinks remain retained; no pathname unlink");
 });

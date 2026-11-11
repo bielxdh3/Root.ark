@@ -668,3 +668,33 @@ could forge the sidecar and other markers. Only a differently owned
 persisted custodian, owner-signed external monotonic floor and sealed
 root/ancestor identities can make this authoritative. **No native
 RootSession activation, no merge/deploy/cutover, RELEASE NO-GO**.
+
+### 2026-11-11 — staged foreign alias witness follow-up (local candidate)
+
+The earlier **local-only** `09465635` fixture retained original and foreign
+FileHandles but still linked a **mutable stage pathname** and subsequently
+unlinked that pathname. A same-UID/SID writer could replace the stage alias
+before either operation: the link could publish a different inode, and the
+unlink could remove the attacker's alias. The companion local `5ee93025`
+roadmap description did not establish a source-safe production publication.
+
+The new candidate is based directly on PR #300's published `18ee8bdb`.
+It keeps the stage and published names as hardlinks (expected `nlink=2`),
+**never unlinks a mutable stage path**, and verifies that the published FD
+has the same `dev` and `ino` as the retained foreign FD. The test also
+reads and `fstat`s the original, foreign and published **same held FDs**
+before/after their exact-byte checks. A separate adversarial case rebinds
+the stage pathname to a different inode containing identical bytes and
+requires the local lab guard to reject with
+`lab_publication_identity_mismatch`.
+
+The unchecked-guard negative control was **RED 1 PASS / 1 FAIL** (`Missing
+expected rejection`) on both **Windows Node 22.23.4 / NTFS** and **WSL
+Node 22.22.1 / ext4**. After the held-inode check, the targeted witness
+suite was **GREEN 2 PASS / 0 FAIL** on both platforms. For WSL, `TMPDIR`
+was set to a verified ext4 path under `/home` (the default `/tmp` was
+tmpfs). These are disposable **nonauthorizing laboratory tests**;
+they do not exclude concurrent same-principal namespace mutation or
+provide atomic native publication. Independent SOURCE review, published
+exact-head CodeQL/CI and production custody remain pending. **RELEASE
+NO-GO**.
