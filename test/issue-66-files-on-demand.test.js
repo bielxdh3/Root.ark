@@ -987,6 +987,75 @@ test("issue 66: cold FOD journal read cannot accept a foreign pathname-rebound i
   assert.equal(state.pushes, pushesBefore);
 });
 
+test("issue 66: cold FOD journal bootstrap never renames over a foreign inode planted after ENOENT", async (t) => {
+  const { root, adapter, key, store, state } = await setup(t, {});
+  await fsp.mkdir(root, { recursive: true });
+  const journal = path.join(root, ".rootark-sync-journal.json");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const foreignBytes = Buffer.from("FOREIGN_JOURNAL_MUST_NOT_BE_OVERWRITTEN");
+  const storeBefore = JSON.stringify(store.list("alice"));
+  const pushesBefore = state.pushes;
+  const originalOpen = fsp.open;
+  const originalRename = fsp.rename;
+  let planted = false;
+  let overwriteAttempted = false;
+  // The first real read-only open yields ENOENT. A concurrent same-principal
+  // writer EXCLUSIVELY creates and syncs a different inode before the caller
+  // handles ENOENT; a subsequent rename(temp, journal) would destroy it.
+  fsp.open = async (candidate, ...args) => {
+    try {
+      return await originalOpen(candidate, ...args);
+    } catch (error) {
+      if (!planted && error.code === "ENOENT"
+        && path.resolve(String(candidate)) === journal) {
+        planted = true;
+        const foreign = await originalOpen(journal, "wx", 0o600);
+        try {
+          await foreign.writeFile(foreignBytes);
+          await foreign.sync();
+        } finally { await foreign.close(); }
+      }
+      throw error;
+    }
+  };
+  fsp.rename = async (source, destination, ...args) => {
+    if (path.resolve(String(destination)) === journal) {
+      overwriteAttempted = true;
+      // Intercept before destruction. The real foreign inode was already
+      // created+fsynced, so this is a physical, non-destructive RED proof.
+      throw Object.assign(new Error("unsafe replace-capable journal bootstrap"), { code: "EIO" });
+    }
+    return originalRename(source, destination, ...args);
+  };
+  const client = new SyncEngine({ rootDir: root, adapter,
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    fileKeyResolver: () => key, filesOnDemand: true,
+  });
+  try {
+    await assert.rejects(client.open(), { code: "invalid_sync_journal" },
+      "late foreign bootstrap ownership must fail closed without attempting replacement");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.rename = originalRename;
+  }
+  assert.equal(planted, true, "a real foreign inode must win the journal name after ENOENT");
+  assert.equal(overwriteAttempted, false, "bootstrap must never call replace-capable rename");
+  const held = await originalOpen(journal, "r");
+  try {
+    const before = await held.stat({ bigint: true });
+    assert.equal(before.isFile(), true);
+    assert.deepEqual(await held.readFile(), foreignBytes);
+    const after = await held.stat({ bigint: true });
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+  } finally { await held.close(); }
+  assert.equal(await exists(snapshot), false, "failed bootstrap must not create authoritative snapshot");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "an uncertain cold journal bootstrap must retain its physical root lock");
+  assert.equal(JSON.stringify(store.list("alice")), storeBefore);
+  assert.equal(state.pushes, pushesBefore);
+});
+
 for (const control of ["snapshot", "journal"]) {
   test(`issue 66: cold ${control} read remains bounded when its opened inode grows concurrently`, async (t) => {
     const { root, open, state, store } = await setup(t, {});

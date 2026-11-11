@@ -402,3 +402,32 @@ Windows 10 CFAPI, power-cut durability or cold independent root reacquisition.
 The actual SyncEngine inbound path still has replace-capable pathname rename.
 The native experiments remain **LAB_ONLY_NO_GO**, RootSession stays OFF,
 and **MERGE/RELEASE remain NO-GO**.
+
+### 2026-11-11 — cold journal bootstrap: no replace-capable publication
+
+A new local required-v2 regression found a separate **first-open journal
+bootstrap** race. The old `readHeldJournal()` correctly rejected a previously
+rebound journal inode, but its `ENOENT` branch called `durableWrite()`: the
+ordinary temp-to-final `rename()` can overwrite a foreign journal created by
+a same-principal writer **after the missing-file observation**. A physical
+fixture created and fsynced a foreign journal inode at that exact point and
+intercepted the would-be replace-capable rename *before destruction*. The
+previous source was **RED on Windows/NTFS and Ubuntu WSL/ext4**.
+
+The replacement cold-only initializer now creates the final journal leaf
+with `O_CREAT | O_EXCL | O_NOFOLLOW`, writes and fsyncs the originally opened
+inode, checks its `fstat` identity/version against the current name, and
+syncs the directory where supported. An occupied name fails
+`invalid_sync_journal` rather than replacing its owner; the root lock remains
+quarantined. If initialization is interrupted, incomplete control-file bytes
+must reject cold reopen rather than invent signed receipt authority. Normal
+subsequent journal updates still use their existing fsynced atomic-update
+path. **GREEN**: focused regression **1 PASS** each on Windows Node22/NTFS
+and WSL Node22/ext4; combined FOD + journal open/temp/update suites
+**Windows 100 PASS / 2 SKIP**, **WSL 102 PASS / 0 SKIP**.
+
+This is a negative single-leaf collision fence, **not** independent custody
+of the root and ancestors, hostile same-SID/UID isolation, antirollback,
+power-cut recovery, a general no-replace implementation or an authorization
+to activate `RootSession`. The precise new SHA requires independent SOURCE
+review and hosted CodeQL after safe publication. **MERGE/RELEASE NO-GO.**

@@ -266,6 +266,45 @@ async function durableWrite(filePath, value) {
   }
 }
 
+async function createInitialJournalExclusive(filePath, value) {
+  // A first cold open may see ENOENT, then a different same-principal writer
+  // can occupy the journal name BEFORE the bootstrap write. The ordinary
+  // temp->rename path is replace-capable and would destroy that foreign inode.
+  // For the initial empty journal only, create the final leaf exclusively.
+  // A crash during this first write can leave a torn journal; subsequent
+  // cold open must fail closed, never silently reset pending/seen authority.
+  const directory = path.dirname(filePath);
+  await fsp.mkdir(directory, { recursive: true });
+  let handle;
+  try {
+    handle = await fsp.open(filePath, fs.constants.O_WRONLY | fs.constants.O_CREAT
+      | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      throw Object.assign(new Error("Foreign journal appeared during cold bootstrap"), {
+        code: "invalid_sync_journal", cause: error,
+      });
+    }
+    throw error;
+  }
+  try {
+    const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.writeFile(bytes);
+    await handle.sync();
+    const original = await handle.stat({ bigint: true });
+    const named = await fsp.lstat(filePath, { bigint: true });
+    if (!original.isFile() || original.ino === 0n || original.nlink !== 1n
+      || original.size !== BigInt(bytes.length)
+      || !named.isFile() || named.isSymbolicLink()
+      || !sameJournalInodeVersion(original, named)) {
+      throw invalidJournalIdentity();
+    }
+  } finally {
+    await handle.close();
+  }
+  await syncDirectory(directory);
+}
+
 class SyncJournal {
   constructor(filePath) {
     this.filePath = path.resolve(filePath);
@@ -342,7 +381,7 @@ class SyncJournal {
       // rejected open or be consumed by a later retry on this same instance.
       this.state = previousState;
       if (error.code !== "ENOENT") throw error;
-      await durableWrite(this.filePath, this.state);
+      await createInitialJournalExclusive(this.filePath, this.state);
     }
     return this;
   }
