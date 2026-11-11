@@ -4,34 +4,24 @@
 // establishes independent off-host custody, freshness, or permission for I/O.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
-// Capture the native factory before a caller-owned KeyObject can execute its
-// inherited kHandle getter and replace crypto.createPublicKey at runtime.
-const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
-const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
-const NATIVE_VERIFY = crypto.verify.bind(crypto);
-const NATIVE_SIGN = crypto.sign.bind(crypto);
-// KeyObject metadata may run caller-owned getters before sparse enrollment
-// verification. Never consult a subsequently rebound JS crypto comparator.
-const NATIVE_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
-// The factory alone is not a pin: hostile KeyObject kHandle getters can
-// replace Hash.prototype.update/digest before a signed digest is computed.
-const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
-const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+// Capture once, BEFORE caller-owned KeyObject getters. Every lazily loaded
+// peer cryptographic module reuses this same pristine snapshot.
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  createHash: NATIVE_CREATE_HASH,
+  verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+  publicExport: NATIVE_PUBLIC_EXPORT,
+  keyType: NATIVE_TYPE,
+  keyAlgorithm: NATIVE_ALGORITHM,
+  keyEquals: NATIVE_KEY_EQUALS,
+} = require("./rootark-zk10-native-intrinsics-v1");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
-// Caller-supplied KeyObjects can shadow instance `.type`,
-// `.asymmetricKeyType` and `.export`. Capture actual native accessors and
-// public export from Node prototypes before examining any caller keys.
-const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
-  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
-  format: "der", type: "spki",
-}));
-const NATIVE_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
-const NATIVE_ALGORITHM = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
-const NATIVE_PUBLIC_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
-const NATIVE_KEY_EQUALS = crypto.KeyObject.prototype.equals;
 const OWNER_FIELDS = Object.freeze(["type", "immutable_account_id", "zk_account_id",
   "generation", "previous_cutover_digest", "inventory_head", "complete_corpus",
   "covered_compartments", "legacy_egress_scope", "reference_disposition",
@@ -130,7 +120,7 @@ function ownerPayload(payload) {
   return { ...p, covered_compartments: names };
 }
 function signatureBytes(domain, payload) {
-  return Buffer.concat([domain, Buffer.from(JSON.stringify(payload), "utf8")]);
+  return Buffer.concat([domain, Buffer.from(NATIVE_JSON_STRINGIFY(payload), "utf8")]);
 }
 function signOwnerCutover(payload, privateKey) {
   const p = ownerPayload(payload);
@@ -239,8 +229,8 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
       || verified.generation !== index + 1 || verified.previous_cutover_digest !== previous
       || (last && (verified.zk_account_id !== last.zk_account_id
         || verified.issued_at < last.issued_at
-        || JSON.stringify(verified.covered_compartments)
-          !== JSON.stringify(last.covered_compartments)))) deny();
+        || NATIVE_JSON_STRINGIFY(verified.covered_compartments)
+          !== NATIVE_JSON_STRINGIFY(last.covered_compartments)))) deny();
     previous = digestOwnerCutover(wire);
     last = verified;
   }

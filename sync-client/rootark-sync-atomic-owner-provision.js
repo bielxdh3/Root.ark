@@ -5,25 +5,21 @@
 // The signing root MUST be pinned by the embedding process, never by sync JSON.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
-const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
-const NATIVE_VERIFY = crypto.verify.bind(crypto);
-const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
-const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
-const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  verify: NATIVE_VERIFY,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  keyType: NATIVE_TYPE,
+  keyAlgorithm: NATIVE_ALGORITHM,
+  publicExport: NATIVE_EXPORT,
+  keyEquals: NATIVE_EQUALS,
+} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const protocol = require("./rootark-sync-protocol");
 
 // Verify native public-key identity, never caller-shadowable instance fields.
 // Reimport each pin so later instance method mutation cannot change readback.
-const PUBLIC_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
-  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
-  format: "der", type: "spki",
-}));
-const NATIVE_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
-const NATIVE_ALGORITHM = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(PUBLIC_PROTOTYPE), "asymmetricKeyType").get;
-const NATIVE_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_PROTOTYPE, "export").value;
-const NATIVE_EQUALS = crypto.KeyObject.prototype.equals;
 
 const DOMAIN = "Root.ark/sync-v2/atomic-owner-provisioning/v1\0";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

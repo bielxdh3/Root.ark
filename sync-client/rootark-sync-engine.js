@@ -1,12 +1,19 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
-const NATIVE_VERIFY = crypto.verify.bind(crypto);
-const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
-const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
-const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  verify: NATIVE_VERIFY,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  keyType: ATOMIC_NATIVE_TYPE,
+  keyAlgorithm: ATOMIC_NATIVE_ALGORITHM,
+  publicExport: ATOMIC_NATIVE_EXPORT,
+  keyEquals: ATOMIC_NATIVE_EQUALS,
+  randomBytes: NATIVE_RANDOM_BYTES,
+  randomUUID: NATIVE_RANDOM_UUID,
+} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -19,15 +26,6 @@ const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
-const ATOMIC_PUBLIC_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
-  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
-  format: "der", type: "spki",
-}));
-const ATOMIC_NATIVE_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
-const ATOMIC_NATIVE_ALGORITHM = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(ATOMIC_PUBLIC_PROTOTYPE), "asymmetricKeyType").get;
-const ATOMIC_NATIVE_EXPORT = Object.getOwnPropertyDescriptor(ATOMIC_PUBLIC_PROTOTYPE, "export").value;
-const ATOMIC_NATIVE_EQUALS = crypto.KeyObject.prototype.equals;
 
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
@@ -364,7 +362,7 @@ function canonicalMapPath(relativePath, ...maps) {
 }
 
 async function durableJson(filePath, value) {
-  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const temporary = `${filePath}.tmp-${process.pid}-${NATIVE_RANDOM_UUID()}`;
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
     | (fs.constants.O_SYNC || 0);
   let handle;
@@ -830,7 +828,7 @@ class SyncEngine {
         await fsp.mkdir(conflictRoot, { recursive: true });
         await containedAbsolute(this.rootDir, conflictRoot, false);
         const operationKey = sha256Hex(operation.operationId).slice(0, 16);
-        const conflictPath = path.join(conflictRoot, `${operationKey}-${crypto.randomUUID()}.local.conflict`);
+        const conflictPath = path.join(conflictRoot, `${operationKey}-${NATIVE_RANDOM_UUID()}.local.conflict`);
         await containedAbsolute(this.rootDir, conflictPath, true);
         await fsp.rename(target, conflictPath);
       }
@@ -878,7 +876,7 @@ class SyncEngine {
       deviceId: input.deviceId || this.deviceId,
       keyEpoch: input.keyEpoch || this.keyEpoch,
       compartmentId: input.compartmentId || this.compartmentId,
-      operationId: input.operationId || crypto.randomUUID(),
+      operationId: input.operationId || NATIVE_RANDOM_UUID(),
       fileKey: key,
     });
     await this.assertOutgoingAuthorized(operation);
@@ -1017,7 +1015,7 @@ class SyncEngine {
     };
     const identityFor = (relativePath, prior) => {
       const deletedPrior = snapshotFiles[relativePath]?.deleted ? snapshotFiles[relativePath] : null;
-      const identitySeed = deletedPrior ? crypto.randomUUID().replace(/-/g, "")
+      const identitySeed = deletedPrior ? NATIVE_RANDOM_UUID().replace(/-/g, "")
         : sha256Hex(relativePath).slice(0, 32);
       return {
         objectId: prior?.objectId || `object-${identitySeed}`,
@@ -1040,7 +1038,7 @@ class SyncEngine {
         operation,
         objectId: identity.objectId,
         fileId: identity.fileId,
-        versionId: crypto.randomUUID(),
+        versionId: NATIVE_RANDOM_UUID(),
         operationId: stableOperationId(`${operation}:${relativePath}`),
         baseRevision,
         revision,
@@ -1343,7 +1341,7 @@ class SyncEngine {
     // can be replayed after the server rolls its physical state backwards.
     // The readback transport must independently attest its current durable
     // head/floor, not fetch unsigned LIST or re-sign the server's JSON.
-    const witnessNonce = crypto.randomBytes(32).toString("base64url");
+    const witnessNonce = NATIVE_RANDOM_BYTES(32).toString("base64url");
     let witnessed;
     try {
       witnessed = await this.atomicBatchWitnessReadback({
@@ -1386,7 +1384,7 @@ class SyncEngine {
     // physical head can authorize a local ACK; never use a journal/PG row or
     // the original sync HTTP response as this readback.
     const verifiedWitnessStatement = detachedWitness.statement;
-    const floorNonce = crypto.randomBytes(32).toString("base64url");
+    const floorNonce = NATIVE_RANDOM_BYTES(32).toString("base64url");
     let floor;
     try {
       floor = await this.atomicBatchCasFloorReadback({
@@ -1639,7 +1637,7 @@ class SyncEngine {
     const trashDir = path.join(this.rootDir, ".rootark-trash");
     await fsp.mkdir(trashDir, { recursive: true });
     await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
+    const trashTarget = path.join(trashDir, `${Date.now()}-${NATIVE_RANDOM_UUID()}-${path.basename(target)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
     await fsp.rename(target, trashTarget);
     return trashTarget;
@@ -1730,7 +1728,7 @@ class SyncEngine {
         if (movedStats.isFile()) hash = sha256Hex(await readContainedFile(this.rootDir, metadata.path, movedStats));
       } else {
         if (await exists(target)) await this.stageExisting(target);
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        const temporary = `${target}.tmp-${process.pid}-${NATIVE_RANDOM_UUID()}`;
         try {
           await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
           await fsp.rename(temporary, target);
@@ -1767,7 +1765,7 @@ class SyncEngine {
           }
         }
       } else {
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        const temporary = `${target}.tmp-${process.pid}-${NATIVE_RANDOM_UUID()}`;
         await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
         try {
           if (await exists(target)) await this.stageExisting(target);
@@ -1896,7 +1894,7 @@ class SyncEngine {
         continue;
       }
       const key = await this.fileKeyResolver(prior);
-      const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
+      const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: NATIVE_RANDOM_UUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
       await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation);
     }
@@ -1920,7 +1918,7 @@ class SyncEngine {
       if (prior && !prior.deleted && prior.hash === file.hash && Boolean(prior.directory) === isDirectory) continue;
       const isUpdate = prior && !prior.deleted;
       const identitySeed = prior?.deleted
-        ? crypto.randomUUID().replace(/-/g, "")
+        ? NATIVE_RANDOM_UUID().replace(/-/g, "")
         : sha256Hex(relative).slice(0, 32);
       const objectId = isUpdate ? prior.objectId : `object-${identitySeed}`;
       const fileId = isUpdate ? prior.fileId : `file-${identitySeed}`;
@@ -1928,7 +1926,7 @@ class SyncEngine {
       const contentHash = sha256Hex(data);
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
-      const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
+      const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: NATIVE_RANDOM_UUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
       await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation, contentHash);
     }
