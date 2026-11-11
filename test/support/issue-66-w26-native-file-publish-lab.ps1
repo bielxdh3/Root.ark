@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('NORMAL', 'COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
+  [ValidateSet('NORMAL', 'COLLISION', 'EXTERNAL_COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
                'COLD_INSPECT')]
   [string]$Mode,
@@ -345,6 +345,9 @@ public static class RootarkW26NativeFilePublishLab {
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";
+    if (mode == "EXTERNAL_COLLISION" &&
+        Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB") != "1")
+      throw new InvalidOperationException("EXTERNAL_WRITER_LAB_DISABLED");
     if ((crashBefore || crashAfter || complete) &&
         Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_HARD_EXIT_LAB") != "1")
       throw new InvalidOperationException("HARD_EXIT_TEST_DISABLED");
@@ -377,6 +380,33 @@ public static class RootarkW26NativeFilePublishLab {
         if (mode == "COLLISION") {
           // Physical foreign destination inserted before the no-replace syscall.
           PlantForeign(target, Foreign);
+        } else if (mode == "EXTERNAL_COLLISION") {
+          // A separately spawned SAME-SID process must create+fsync a foreign
+          // destination AFTER our stage/root HANDLEs are opened, but BEFORE
+          // native no-replace. The disposable rendezvous files grant no root
+          // custody, and this test makes no claims about hostile writer
+          // exclusion or real power loss.
+          string ready = Path.Combine(scratch, "publisher-ready.signal");
+          using (var signal = new FileStream(ready, FileMode.CreateNew,
+              FileAccess.Write, FileShare.Read, 4096, false)) {
+            byte[] bytes = Encoding.UTF8.GetBytes("PUBLISHER_READY_V1");
+            signal.Write(bytes, 0, bytes.Length);
+            signal.Flush(true);
+          }
+          string ack = Path.Combine(scratch, "writer-ack.signal");
+          DateTime deadline = DateTime.UtcNow.AddSeconds(10);
+          while (!System.IO.File.Exists(ack)) {
+            if (DateTime.UtcNow > deadline)
+              throw new InvalidOperationException("EXTERNAL_WRITER_TIMEOUT");
+            System.Threading.Thread.Sleep(10);
+          }
+          if (ReadFixture(ack) != "WRITER_READY_V1" ||
+              ReadFixture(target) != Foreign)
+            throw new InvalidOperationException("EXTERNAL_WRITER_NOT_PHYSICAL");
+          using (SafeFileHandle foreign = File(root, "published.bin", false)) {
+            if (Same(original, Id(foreign)))
+              throw new InvalidOperationException("EXTERNAL_WRITER_SAME_INODE");
+          }
         } else if (mode == "SOURCE_SWAP") {
           // Real rename AFTER holding original stage HANDLE. Equal bytes do
           // not make the newly occupying inode the original FD.
@@ -390,14 +420,14 @@ public static class RootarkW26NativeFilePublishLab {
           throw new InvalidOperationException("UNTRUSTED_MODE");
         }
         int code = Rename(source, root, "published.bin");
-        if (mode == "COLLISION") {
+        if (mode == "COLLISION" || mode == "EXTERNAL_COLLISION") {
           // A generic NT failure could otherwise fool the no-clobber proof.
           // The actual NTFS syscall must report STATUS_OBJECT_NAME_COLLISION.
           if (code != unchecked((int)0xC0000035) || ReadFixture(target) != Foreign ||
               !System.IO.File.Exists(stage) ||
               ReadFixture(stage) != Trusted)
             throw new InvalidOperationException("DESTINATION_CLOBBERED");
-          return "ROOTARK_W26_HANDLE_PUBLISH mode=COLLISION result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0x" +
+          return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode + " result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0x" +
             unchecked((uint)code).ToString("X8");
         }
         if (code != 0) throw new InvalidOperationException("NATIVE_RENAME_FAILED");

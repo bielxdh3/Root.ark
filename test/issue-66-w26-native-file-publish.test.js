@@ -6,7 +6,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const available = process.platform === "win32"
   && process.env.ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB === "1";
@@ -25,7 +25,7 @@ function fixture() {
 }
 
 function invoke(scratch, mode, enabled = true, allowHardExit = false,
-  allowColdInspect = false) {
+  allowColdInspect = false, allowExternalWriter = false) {
   return spawnSync(powershell, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-Scratch", scratch, "-Mode", mode,
@@ -34,7 +34,8 @@ function invoke(scratch, mode, enabled = true, allowHardExit = false,
     env: { ...process.env,
       ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: enabled ? "1" : "0",
       ROOTARK_ISSUE66_W26_HARD_EXIT_LAB: allowHardExit ? "1" : "0",
-      ROOTARK_ISSUE66_W26_COLD_INSPECT_LAB: allowColdInspect ? "1" : "0" },
+      ROOTARK_ISSUE66_W26_COLD_INSPECT_LAB: allowColdInspect ? "1" : "0",
+      ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB: allowExternalWriter ? "1" : "0" },
   });
 }
 
@@ -55,6 +56,92 @@ test("#66 W26 Windows NTFS refuses physical foreign destination without clobber"
     assert.match(result.stdout, /^ROOTARK_W26_HANDLE_PUBLISH mode=COLLISION result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0xC0000035\r?\n$/);
     assert.equal(result.stderr, "");
   });
+
+test("#66 W26 external same-SID writer cannot overwrite the original opened NTFS publication", {
+  skip: !available, timeout: 35000,
+}, async () => {
+  const scratch = fixture();
+  // Unlike COLLISION, the foreign inode here comes from a second REAL OS
+  // process, which runs while the publisher holds both native HANDLEs.
+  // The signal is disposable lab coordination, not trusted root authority.
+  const writerCode = String.raw`
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const scratch = process.argv[1];
+    const ready = path.join(scratch, 'publisher-ready.signal');
+    const target = path.join(scratch, 'held', 'published.bin');
+    const ack = path.join(scratch, 'writer-ack.signal');
+    const sleep = new Int32Array(new SharedArrayBuffer(4));
+    let signaled = false;
+    for (let i = 0; i < 1000; i++) {
+      try {
+        const descriptor = fs.openSync(ready, 'r');
+        try { signaled = fs.readFileSync(descriptor, 'utf8') === 'PUBLISHER_READY_V1'; }
+        finally { fs.closeSync(descriptor); }
+        if (!signaled) throw new Error('INVALID_PUBLISHER_SIGNAL');
+        break;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      Atomics.wait(sleep, 0, 0, 10);
+    }
+    if (!signaled) throw new Error('PUBLISHER_NOT_READY');
+    const publish = (name, body) => {
+      const handle = fs.openSync(name, 'wx', 0o600);
+      try {
+        const bytes = Buffer.from(body);
+        let written = 0;
+        while (written < bytes.length) written += fs.writeSync(handle, bytes, written, bytes.length - written);
+        fs.fsyncSync(handle);
+      } finally { fs.closeSync(handle); }
+    };
+    publish(target, 'FOREIGN_UNTRUSTED_TARGET_BYTES');
+    publish(ack, 'WRITER_READY_V1');
+  `;
+  const writer = spawn(process.execPath, ["-e", writerCode, scratch], {
+    windowsHide: true, stdio: "ignore",
+  });
+  const writerResult = new Promise((resolve, reject) => {
+    writer.once("error", reject);
+    writer.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  const publisher = invoke(scratch, "EXTERNAL_COLLISION", true, false, false, true);
+  const writerExit = await writerResult;
+  assert.deepEqual(writerExit, { code: 0, signal: null },
+    "the independent OS writer must physically create and fsync the foreign inode");
+  assert.equal(publisher.status, 0, publisher.stderr || "external NTFS collision proof failed");
+  assert.match(publisher.stdout,
+    /^ROOTARK_W26_HANDLE_PUBLISH mode=EXTERNAL_COLLISION result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0xC0000035\r?\n$/);
+  assert.equal(publisher.stderr, "");
+  assert.equal(fs.readFileSync(path.join(scratch, "writer-ack.signal"), "utf8"), "WRITER_READY_V1");
+  const stage = fs.openSync(path.join(scratch, "held", "stage.bin"), "r");
+  const foreign = fs.openSync(path.join(scratch, "held", "published.bin"), "r");
+  try {
+    const original = fs.fstatSync(stage, { bigint: true });
+    const planted = fs.fstatSync(foreign, { bigint: true });
+    assert.equal(original.isFile(), true);
+    assert.equal(planted.isFile(), true);
+    assert.notEqual(original.ino, planted.ino, "the foreign name must be a different NTFS inode");
+    assert.equal(fs.readFileSync(stage, "utf8"), "ORIGINAL_OPENED_STAGE_BYTES");
+    assert.equal(fs.readFileSync(foreign, "utf8"), "FOREIGN_UNTRUSTED_TARGET_BYTES");
+    assert.equal(fs.fstatSync(stage, { bigint: true }).ino, original.ino);
+    assert.equal(fs.fstatSync(foreign, { bigint: true }).ino, planted.ino);
+  } finally {
+    fs.closeSync(stage);
+    fs.closeSync(foreign);
+  }
+});
+
+test("#66 W26 external same-SID writer rehearsal requires a separate explicit opt-in", {
+  skip: !available,
+}, () => {
+  const scratch = fixture();
+  const denied = invoke(scratch, "EXTERNAL_COLLISION");
+  assert.equal(denied.status, 41);
+  assert.equal(denied.stdout, "");
+  assert.match(denied.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+  assert.deepEqual(fs.readdirSync(scratch), [], "disabled laboratory must not create a held directory");
+});
 
 test("#66 W26 Windows NTFS cannot publish a late equal-byte foreign stage instead of opened HANDLE",
   { skip: !available, timeout: 25000 }, () => {

@@ -317,6 +317,64 @@ test("#66 W3 native publication refuses a same-UID destination collision without
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
   });
 
+test("#66 W3 external same-UID writer cannot replace the original opened ext4 native stage", {
+  skip: !txnEnabled,
+}, (t) => {
+  const bridge = loadLab();
+  const home = os.homedir();
+  const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+  const token = bridge.openTestSession();
+  t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+  const created = fs.readdirSync(home).filter((name) =>
+    name.startsWith(".rootark-w3-napi-") && !before.has(name));
+  assert.equal(created.length, 1);
+  const held = path.join(home, created[0], "held");
+  assert.equal(fs.statfsSync(held).type, 0xef53, "external writer must exercise ext4");
+  assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+  // A separate process inheriting this UID creates+fsyncs the foreign inode
+  // while the parent continues to retain the native root/stage descriptors.
+  // This proves no-overwrite under an externally planted destination, NOT
+  // independently controlled ancestors, isolation, or powercut recovery.
+  const writer = spawnSync("/usr/bin/node", ["-e", String.raw`
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const held = process.argv[1];
+    const file = path.join(held, '.rootark-w3-committed-v1');
+    const fd = fs.openSync(file, 'wx', 0o600);
+    try {
+      const bytes = Buffer.from('FOREIGN_EXTERNAL_WRITER');
+      let offset = 0;
+      while (offset < bytes.length) offset += fs.writeSync(fd, bytes, offset, bytes.length - offset);
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    process.stdout.write('FOREIGN_DURABLE');
+  `, held], {
+    encoding: "utf8", timeout: 10000, maxBuffer: 1024,
+    env: { ...process.env, ROOTARK_ISSUE66_W3_STREAM_STRESS: "0" },
+  });
+  assert.equal(writer.status, 0, writer.stderr || "external same-UID writer failed");
+  assert.equal(writer.stdout, "FOREIGN_DURABLE");
+  withHeldFixtureDirectory(held, (dirfd) => {
+    withOpenedFixtureLeaves(dirfd, [".rootark-w3-staged-v1", ".rootark-w3-committed-v1"],
+      (stageFd, foreignFd) => {
+        const stage = observeOpenedFixture(stageFd);
+        const foreign = observeOpenedFixture(foreignFd);
+        assert.notEqual(stage.stat.ino, foreign.stat.ino);
+        assert.equal(stage.bytes, "STAGED_ROOT_CANARY_V1");
+        assert.equal(foreign.bytes, "FOREIGN_EXTERNAL_WRITER");
+        assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_NO_REPLACE_CONFLICT/);
+        const stageAfter = observeOpenedFixture(stageFd);
+        const foreignAfter = observeOpenedFixture(foreignFd);
+        assert.equal(stageAfter.stat.ino, stage.stat.ino);
+        assert.equal(foreignAfter.stat.ino, foreign.stat.ino);
+        assert.equal(stageAfter.bytes, stage.bytes);
+        assert.equal(foreignAfter.bytes, foreign.bytes);
+      });
+  });
+  assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
+    "an externally collided publication cannot retry without new authority");
+});
+
 test("#66 W3 equal-byte foreign inode cannot be published instead of original stage",
   { skip: !txnEnabled }, (t) => {
     const bridge = loadLab();

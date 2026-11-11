@@ -360,3 +360,45 @@ inbound pathname rename, grant independent root/ancestor custody, prove
 same-UID/SID writer isolation, monotonic signed rollback protection,
 Windows 10 CFAPI, hardware power-cut durability, or native product
 PREPARE/COMMIT recovery. **MERGE NO-GO; RELEASE NO-GO; RootSession OFF.**
+
+### 2026-11-11 — external-process no-replace collision probes (W26/NTFS and W3/ext4)
+
+The published baseline `63dec688a6218e6b60a19b8b7fe3063d00977fa0`
+passed formal CodeQL (`42958828896`, separate `CodeQL` check
+`130321352433` SUCCESS and Analyze `130320252919` SUCCESS). The additional
+external-writer tests below are a **new unpublished candidate** and must
+receive their own exact-SHA SOURCE review and hosted CodeQL after publication.
+
+The Windows W26 opt-in HANDLE lab now has a strictly separate
+`ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB=1` switch for `EXTERNAL_COLLISION`.
+An actual second Node process, inheriting the same Windows SID, waits until
+the PowerShell/C# native publisher has acquired its directory and original
+stage HANDLEs. The child then **exclusively creates, writes, fsyncs and
+closes** a foreign `published.bin`, and acknowledges the completed physical
+write before the publisher calls native `NtSetInformationFile` with
+`ReplaceIfExists=FALSE`. The syscall returns exact NTFS
+`STATUS_OBJECT_NAME_COLLISION (0xC0000035)`; the retained original stage and
+distinct foreign destination inodes and bytes remain unchanged. The test
+checks both inodes through their own opened file descriptors, and the opt-in
+denial test confirms no held directory is created with the switch off.
+**Windows 11/Node22/NTFS full W26 suite: 14 PASS / 0 FAIL.**
+
+On Ubuntu WSL Node22/ext4, an actual separate **same-UID** Node child creates
+and fsyncs the destination after W3 has staged its original retained inode.
+The native `linkat` from the original opened stage FD returns the expected
+`NATIVE_TXN_NO_REPLACE_CONFLICT`; retained stage and foreign FDs retain
+distinct inode identities, bytes and version after the attempt. This is a
+deterministic separate-process adversarial interleaving: the child finishes
+writing before the native link. **W3 full non-stress suite: 20 PASS / 0 FAIL,
+3 expected SKIP.** The 16,385-record stress and privileged bind-mount
+fixture were not rerun, since neither native primitive was changed.
+
+These are **laboratory no-overwrite proofs, not same-SID/UID exclusion**.
+Each process still shares a writable test principal and the initial ancestor
+lookup is not independently authenticated; the probes neither prove
+unbounded live contention/A→B→A under every syscall nor supply a trusted
+publisher, permanent signed PREPARE/COMMIT, monotonic recovery witness,
+Windows 10 CFAPI, power-cut durability or cold independent root reacquisition.
+The actual SyncEngine inbound path still has replace-capable pathname rename.
+The native experiments remain **LAB_ONLY_NO_GO**, RootSession stays OFF,
+and **MERGE/RELEASE remain NO-GO**.
