@@ -16,7 +16,9 @@ flowchart TD
   A -- No --> N
   A -- Yes --> H{Hold and validate OS handle/fd identity for all I/O?}
   H -- No --> N
-  H -- Yes --> T{Native create/read/enumerate/rename/unlink, stage, journal, rollback and commit under the same root?}
+  H -- Yes --> B{Bound cold metadata reads to opened-inode versions and finite resource budgets?}
+  B -- No --> N
+  B -- Yes --> T{Native create/read/enumerate/rename/unlink, stage, journal, rollback and commit under the same root?}
   T -- No --> N
   T -- Yes --> X{No legacy pathname fallback for signed directory relocations or deletes?}
   X -- No --> N
@@ -313,3 +315,48 @@ gate green. All remaining W3/W26 product-integration, native no-replace,
 same-SID/UID writer exclusion, protected ancestors, owner-signed monotonic
 floor, Windows 10 CFAPI, power-cut and mandatory release checks remain
 independent **NO-GO** gates. No release or merge authorization follows.
+
+### 2026-11-11 — bounded cold metadata reads and directory UPDATE proof
+
+The subsequently published `271a7727` (direct child of `79a0da11`) fixed a
+test-only held-inode canary, but GitHub's **formal** CodeQL check
+`130311529941` on run `42955874978` was **FAILURE** even though the
+`Analyze JavaScript / TypeScript` job `130310716545` completed SUCCESS.
+The branch alert was **#515, `js/file-system-race`** at the physical signed
+directory UPDATE test's later `open(sentinel)`; its original creation had
+already recorded `fstat` of the same path. Do not call this SHA CodeQL-green.
+
+The next isolated code candidate `17eebd8232621644d91bce6be85bbc79b2667af1`
+retains the original exclusive `wx+` sentinel FileHandle across the signed
+negative UPDATE. It reads at an explicit offset on that **same** handle and
+rechecks its original dev/ino/size, plus the name's currently visible inode.
+It also counts attempted directory renames **before the syscall**: a Windows
+sharing or EBUSY failure cannot supply an accidental false-green denial.
+The old post-validation reopen is gone without CodeQL suppression.
+
+The same candidate removes two unlimited `FileHandle.readFile()` calls from
+cold required-v2 snapshot and signed journal admission. The reader now uses
+bounded positional reads from the originally opened inode, with a maximum of
+the `fstat` size plus one extra byte to detect post-check growth and a
+separate **256 MiB per-control-file resource ceiling**. Changed size,
+version, inode or excessive input fails closed; it does not manufacture
+recovery authority. Actual same-inode sparse expansion after the initial
+inspection was **RED on the preceding source** (two tests per platform,
+unbounded method observed) and **GREEN** on the candidate with no unbounded
+read. That ceiling is a deliberate availability boundary: larger historical
+metadata files require a separately reviewed migration/read policy rather
+than bypassing the safety limit.
+
+Physical candidate evidence: Windows Node22/NTFS FOD **77 PASS, 1 FIFO SKIP**;
+Ubuntu WSL Node22/ext4 FOD **78 PASS**; cold growth/negative UPDATE targeted
+**3 PASS each**; Phase16 cold restart/eviction targeted **4 PASS each**.
+No 16,385-record enumeration stress was repeated because the mutation
+concerns control-file consumption, not namespace enumeration or native
+publisher behavior. The candidate requires exact-SHA independent SOURCE
+review before integration and fast-forward, and **formal hosted CodeQL must
+be reevaluated on the subsequently published exact final HEAD**, not borrowed
+from its parent. These changes cannot remove the known replace-capable
+inbound pathname rename, grant independent root/ancestor custody, prove
+same-UID/SID writer isolation, monotonic signed rollback protection,
+Windows 10 CFAPI, hardware power-cut durability, or native product
+PREPARE/COMMIT recovery. **MERGE NO-GO; RELEASE NO-GO; RootSession OFF.**
