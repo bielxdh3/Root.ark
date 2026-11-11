@@ -758,7 +758,11 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   // destination has passed linkat+directory fsync but COMMIT has not been
   // created. No native cold replay may treat PREPARED as COMMITTED.
   const char *hard_exit = getenv("ROOTARK_ISSUE66_W3_HARD_EXIT_POST_LINK");
-  if (session->txn_anonymous && hard_exit && strcmp(hard_exit, "1") == 0)
+  const char *hard_exit_named =
+    getenv("ROOTARK_ISSUE66_W3_HARD_EXIT_POST_LINK_NAMED");
+  if ((session->txn_anonymous && hard_exit && strcmp(hard_exit, "1") == 0) ||
+      (!session->txn_anonymous && hard_exit_named &&
+       strcmp(hard_exit_named, "1") == 0))
     _exit(73);
   if (!write_owned(held, COMMIT_PROOF, COMMIT_PAYLOAD) || fsync(held) != 0)
     return fail(env, "NATIVE_TXN_INDETERMINATE");

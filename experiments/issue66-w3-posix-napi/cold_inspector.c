@@ -163,14 +163,26 @@ static const char *inspect(int home, const char *fixture_name) {
       file_dev != (uintmax_t)root_stat.st_dev || file_ino == 0)
     goto done;
 
+  // Named stages deliberately preserve their original alias after native
+  // linkat: stage and published must BOTH resolve to the exact original
+  // physical inode, each with nlink=2, or cold inspection denies. Anonymous
+  // O_TMPFILE publication has only the published nlink=1 and no stage name.
+  // Never infer identity from matching bytes or permit a third hardlink.
   if (stage.exists &&
       (stage.stat.st_dev != (dev_t)file_dev ||
-       stage.stat.st_ino != (ino_t)file_ino || stage.stat.st_nlink != 1))
+       stage.stat.st_ino != (ino_t)file_ino ||
+       stage.stat.st_nlink != (published.exists ? 2 : 1)))
     goto done;
   if (published.exists &&
       (published.stat.st_dev != (dev_t)file_dev ||
        published.stat.st_ino != (ino_t)file_ino ||
-       published.stat.st_nlink != 1 || stage.exists))
+       published.stat.st_nlink != (stage.exists ? 2 : 1)))
+    goto done;
+  if (stage.exists && published.exists &&
+      (stage.stat.st_dev != published.stat.st_dev ||
+       stage.stat.st_ino != published.stat.st_ino ||
+       stage.stat.st_size != published.stat.st_size ||
+       !bytes_equal(&stage, STAGE_BYTES) || !bytes_equal(&published, STAGE_BYTES)))
     goto done;
 
   if (!published.exists && !commit.exists) phase = "PREPARED_ONLY";
