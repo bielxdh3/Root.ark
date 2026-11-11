@@ -604,3 +604,29 @@ hosted mandatory release matrix has been proven by these lab results.
 `sync-client/rootark-sync-engine.js` still contains the legacy inbound
 replace-capable pathname `rename`; it is **not** made production-safe by
 these experiments. **MERGE NO-GO; RELEASE NO-GO; RootSession OFF**.
+
+**Independent P2 resolved — named-stage cold replay classification.** The
+initial `7da2fd95` inspector correctly classified anonymous `O_TMPFILE`
+publication but conservatively rejected *every* successful **named-stage**
+publication because `linkat` retains the original stage pathname and the
+published name as two hardlinks to one inode. This was a **SOURCE NO-GO**
+from an independent reviewer, despite no false COMMIT. Follow-up source
+`3f26295b` now requires the opened stage and published file to match the
+**same original** dev/ino and PREPARE sidecar, and requires `st_nlink==2`
+on both descriptors. Anonymous stages still require no stage pathname and
+exactly one published hardlink. An extraneous third alias, a same-byte
+foreign stage inode, or a changed FileId fails closed; no unlink/cleanup
+is performed. The native bridge also provides a **separately opted-in
+named-stage post-link `_exit(73)`**, allowing a second process to observe
+`PUBLISHED_NO_COMMIT` through the exact retained original two-link inode.
+The preceding inspector returned status 41 for a real valid named COMMIT
+(physical **RED**); the corrected inspector returned `COMMIT_OBSERVED`
+on the same scenario and denied a byte-identical foreign alias (**GREEN**).
+Three focused named-stage tests **3 PASS** on WSL22/ext4. New combined
+physical W3+signed-witness suite **34 PASS / 3 expected SKIP / 0 FAIL**;
+distinct-principal root-owned ext4 kernel isolation **1 PASS**. The
+isolated RED worktree and its fixtures remain preserved. All classifications
+remain `LAB_ONLY_NO_GO`, including successful named two-link COMMIT, until
+an independent custodian can safely retire the stage and enforce a signed
+monotonic cold floor. Native W3/W26 experiments are **not** imported by
+the operational publisher. **MERGE/RELEASE NO-GO, RootSession OFF.**
