@@ -585,7 +585,17 @@ test("#67 P2: directory fsync failure after no-replace publication retains valid
   const final = (await fsp.readdir(f.local)).find((name) =>
     /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name));
   assert.ok(final);
-  assert.equal((await fsp.lstat(path.join(f.local, final), { bigint: true })).nlink, 1n);
+  const finalStat = await fsp.lstat(path.join(f.local, final), { bigint: true });
+  assert.equal(finalStat.nlink, 2n,
+    "a failed directory fsync must retain the original named temporary, not unlink by a mutable pathname");
+  const aliases = (await fsp.readdir(f.local)).filter((name) =>
+    name.startsWith(`${final}.tmp-`));
+  assert.equal(aliases.length, 1, "exactly one original temporary remains as a retained alias");
+  const aliasStat = await fsp.lstat(path.join(f.local, aliases[0]), { bigint: true });
+  assert.equal(aliasStat.nlink, 2n);
+  assert.equal(aliasStat.dev, finalStat.dev);
+  assert.equal(aliasStat.ino, finalStat.ino,
+    "published final and retained temporary must be the same already-fsynced inode");
   const reopened = await new SyncEngine(f.opts).open();
   const resumed = await reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true });
   assert.equal(resumed.completed, 1);
