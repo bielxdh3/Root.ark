@@ -5,18 +5,16 @@
 // MUST arrive from independent provisioning/custody, never the HTTP caller,
 // owner-controlled corpus, JWT or local database. No route is enabled here.
 const crypto = require("node:crypto");
-const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
-const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
-const NATIVE_VERIFY = crypto.verify.bind(crypto);
-const NATIVE_SIGN = crypto.sign.bind(crypto);
-const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
-const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
-const PUBLIC_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
-  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
-  format: "der", type: "spki",
-}));
-const NATIVE_PUBLIC_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_PROTOTYPE, "export").value;
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  createHash: NATIVE_CREATE_HASH,
+  verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  publicExport: NATIVE_PUBLIC_EXPORT,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+} = require("./rootark-zk10-native-intrinsics-v1");
 const { exact, decode, hex, key } = require("./rootark-zk10-account-cutover-v1");
 const { FIELDS: OBJECT_BINDING_FIELDS, verifyAnonymousObjectBinding } =
   require("./rootark-zk10-anonymous-object-binding-v1");
@@ -64,7 +62,7 @@ function canonical(payload) {
   return p;
 }
 function signedBytes(body) {
-  return Buffer.concat([DOMAIN, Buffer.from(JSON.stringify(body), "utf8")]);
+  return Buffer.concat([DOMAIN, Buffer.from(NATIVE_JSON_STRINGIFY(body), "utf8")]);
 }
 function unpack(wire) {
   const signed = exact(wire, [...FIELDS, "signature"]);

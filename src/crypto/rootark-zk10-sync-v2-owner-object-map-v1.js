@@ -6,13 +6,16 @@
 // or the owner-selected mapping. No current runtime wires these dependencies.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
-const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
-const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
-const NATIVE_VERIFY = crypto.verify.bind(crypto);
-const NATIVE_SIGN = crypto.sign.bind(crypto);
-const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
-const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  createHash: NATIVE_CREATE_HASH,
+  verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  randomBytes: NATIVE_RANDOM_BYTES,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+} = require("./rootark-zk10-native-intrinsics-v1");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
@@ -87,7 +90,7 @@ function sha(bytes) {
   return NATIVE_HASH_DIGEST.call(hash, "hex");
 }
 function signedBytes(domain, payload) {
-  return Buffer.concat([domain, Buffer.from(JSON.stringify(payload), "utf8")]);
+  return Buffer.concat([domain, Buffer.from(NATIVE_JSON_STRINGIFY(payload), "utf8")]);
 }
 function ownPayload(value) {
   const p = exact(value, OWNER_FIELDS);
@@ -356,7 +359,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
 
         // Generate the challenge here. A signed old head with an old nonce is
         // not acceptable after a restart, even if its Ed25519 signature is valid.
-        const challenge = crypto.randomBytes(32).toString("base64url");
+        const challenge = NATIVE_RANDOM_BYTES(32).toString("base64url");
         const wire = exact(await boundedCurrentHead(challenge, signal),
           [...HEAD_FIELDS, "signature"]);
         const head = currentHeadPayload(Object.fromEntries(

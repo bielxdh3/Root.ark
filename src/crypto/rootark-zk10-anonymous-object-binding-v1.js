@@ -5,15 +5,15 @@
 // complete object corpus, or an independently retained owner/corpus head.
 // A valid owner signature therefore NEVER authorizes I/O or proves ownership.
 const crypto = require("node:crypto");
-const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
-const NATIVE_VERIFY = crypto.verify.bind(crypto);
-const NATIVE_SIGN = crypto.sign.bind(crypto);
-// Proof comparison runs after caller-provided owner KeyObjects have been
-// inspected; capture native comparison before any hostile getter executes.
-const NATIVE_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
-const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
-const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const {
+  createHash: NATIVE_CREATE_HASH,
+  verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+} = require("./rootark-zk10-native-intrinsics-v1");
 const {
   exact, decode, hex, key, verifyOwnerRotationKeys, verifyOwnerCutoverHistory,
 } = require("./rootark-zk10-account-cutover-v1");
@@ -170,7 +170,7 @@ function buildSparseObjectInventoryProof(records, accountId, objectId, revision)
     siblings: Object.freeze(siblings) });
 }
 function signatureBytes(body) {
-  return Buffer.concat([DOMAIN, Buffer.from(JSON.stringify(body), "utf8")]);
+  return Buffer.concat([DOMAIN, Buffer.from(NATIVE_JSON_STRINGIFY(body), "utf8")]);
 }
 function signAnonymousObjectBinding(unsigned, privateKey) {
   try {
