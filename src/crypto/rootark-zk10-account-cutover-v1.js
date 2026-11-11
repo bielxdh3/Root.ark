@@ -33,7 +33,7 @@ function deny() {
   throw err;
 }
 function exact(value, fields) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
+  if (!value || typeof value !== "object" || isProxy(value) || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
     || Reflect.ownKeys(value).length !== fields.length) deny();
   const output = {};
@@ -184,16 +184,35 @@ function verifyOwnerRotationChain(rotations, pinnedRoot, immutableAccountId) {
   return keys[keys.length - 1];
 }
 function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
-  if (!Array.isArray(history) || history.length < 1 || history.length > 64
+  if (!Array.isArray(history) || isProxy(history)
+    || history.length < 1 || history.length > 64
     || Reflect.ownKeys(history).length !== history.length + 1
-    || !Array.isArray(ownerKeys) || !ownerKeys.length) deny();
+    || !Array.isArray(ownerKeys) || isProxy(ownerKeys) || !ownerKeys.length
+    || Reflect.ownKeys(ownerKeys).length !== ownerKeys.length + 1) deny();
+  // Pin every trusted key once, not again after attacker-controlled history
+  // processing. Reject accessors, holes and Proxies instead of invoking them.
+  const pinnedKeys = Array.from({ length: ownerKeys.length }, (_, index) => {
+    const entry = Object.getOwnPropertyDescriptor(ownerKeys, String(index));
+    if (!entry || !Object.hasOwn(entry, "value")) deny();
+    return key(entry.value, "public");
+  });
   let previous = null;
   let keyIndex = 0;
   let last;
   for (let index = 0; index < history.length; index += 1) {
+    const entry = Object.getOwnPropertyDescriptor(history, String(index));
+    if (!entry || !Object.hasOwn(entry, "value")) deny();
+    const signed = exact(entry.value, [...OWNER_FIELDS, "signature"]);
+    const payload = ownerPayload(Object.fromEntries(
+      OWNER_FIELDS.map((field) => [field, signed[field]])));
+    // The signature verification and digest must refer to ONE immutable
+    // signed record, not two independently read versions of the same slot.
+    const wire = Object.freeze({ ...payload,
+      covered_compartments: Object.freeze([...payload.covered_compartments]),
+      grants: Object.freeze([]), signature: signed.signature });
     let verified;
-    for (let cursor = keyIndex; cursor < ownerKeys.length; cursor += 1) {
-      try { verified = verifyOwnerCutover(history[index], ownerKeys[cursor]);
+    for (let cursor = keyIndex; cursor < pinnedKeys.length; cursor += 1) {
+      try { verified = verifyOwnerCutover(wire, pinnedKeys[cursor]);
         keyIndex = cursor; break; } catch (_) { /* try later signed owner rotation */ }
     }
     if (!verified || verified.immutable_account_id !== immutableAccountId
@@ -202,10 +221,10 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
         || verified.issued_at < last.issued_at
         || JSON.stringify(verified.covered_compartments)
           !== JSON.stringify(last.covered_compartments)))) deny();
-    previous = digestOwnerCutover(history[index]);
+    previous = digestOwnerCutover(wire);
     last = verified;
   }
-  if (keyIndex !== ownerKeys.length - 1) deny();
+  if (keyIndex !== pinnedKeys.length - 1) deny();
   return Object.freeze({ statement: last, digest: previous });
 }
 
