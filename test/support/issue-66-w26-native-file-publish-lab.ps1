@@ -15,6 +15,11 @@ try {
   if ($env:ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB -ne '1') { throw 'LAB_DISABLED' }
   $local = [System.IO.Path]::GetFullPath(
     [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)).TrimEnd('\')
+  # LAB_ONLY_NO_GO: this managed DirectoryInfo preflight does NOT pin scratch.
+  # Add-Type and the subsequent native first open leave a same-SID swap window.
+  # A plain foreign directory B inserted before that FIRST native pin can pass
+  # this preflight; Run(NORMAL) may then create held/publish into B. There is
+  # no trusted original-A FileId witness across this boundary. RootSession OFF.
   $directory = [System.IO.DirectoryInfo]::new($Scratch)
   $coldInspect = $Mode -eq 'COLD_INSPECT'
   $entries = if ($directory.Exists) { @($directory.GetFileSystemInfos()) } else { @() }
@@ -203,10 +208,13 @@ public static class RootarkW26NativeFilePublishLab {
       Marshal.FreeHGlobal(name);
     }
   }
-  // One process owns all original ancestor HANDLEs until the phase ends.
-  // Each child is acquired and later reopened relative to its held parent.
-  // This is same-SID local LAB identity evidence, never exclusion or cold
-  // off-host custody (a hostile actor may still perform ABA between checks).
+  // LAB_ONLY_NO_GO: these HANDLEs pin the objects first opened NATIVELY, not
+  // necessarily the original A checked by the earlier managed PS preflight.
+  // A same-SID ordinary B installed before this constructor's first native
+  // scratch open is indistinguishable without an independent original FileId
+  // witness; later relative checks cannot repair that missing provenance.
+  // Only AFTER this native pin do tests swap A->B and verify rooted behavior.
+  // No production RootSession authority, cold/off-host custody, ABA exclusion.
   private sealed class AncestorCustody : IDisposable {
     private readonly string volumePath;
     private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
@@ -506,6 +514,10 @@ public static class RootarkW26NativeFilePublishLab {
       throw new InvalidOperationException("HARD_EXIT_TEST_DISABLED");
     if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
       throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
+    // Run(NORMAL) is NOT safe against a plain B already substituted before
+    // the first native pin below: B may receive held and published bytes.
+    // PRECREATE tests start the adversary only AFTER that pin, so their GREEN
+    // proves the narrower post-pin boundary only. RootSession remains OFF.
     string parent = Path.Combine(scratch, "held");
     using (var custody = new AncestorCustody(scratch, false, true, precreateAttack)) {
       if (precreateAttack) {

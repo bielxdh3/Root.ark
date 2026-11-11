@@ -1,7 +1,12 @@
 "use strict";
 
 // Physical Windows/NTFS, opt-in N-API-independent HANDLE identity lab.
-// These fixtures cannot establish production RootSession root custody.
+// LAB_ONLY_NO_GO / RootSession OFF: adversarial swaps happen ONLY after the
+// native scratch HANDLE/FileId pin, and prove post-pin behavior for that A.
+// Managed DirectoryInfo preflight is NOT a retained original-A attestation.
+// A same-SID plain B installed before the FIRST native pin is indistinguishable
+// without an independent trusted original FileId witness: NORMAL may publish
+// into B. These fixtures cannot authorize production RootSession/cold custody.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
