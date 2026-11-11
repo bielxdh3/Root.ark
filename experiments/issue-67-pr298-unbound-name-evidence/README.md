@@ -1,6 +1,10 @@
 # PR #298 / Issue #67 — W21 unbound-pathname publication evidence
 
-**Source**: published PR #298 `ce393b75b676119d7ac6f2e74e17a43421bd6cf9`.
+**Historical RED source**: published PR #298 `ce393b75b676119d7ac6f2e74e17a43421bd6cf9`.
+**Current laboratory integration base**: PR #298 `73c2be30a1fbfd95f346d94337e8d09a972138ec`.
+The earlier baseline identifies the original vulnerable application source,
+not the HEAD of the later lab-only integration. These experiments cannot
+authorize production native I/O or turn the intentionally failing race into GREEN.
 **Verdict**: **SOURCE NO-GO** for same-SID/UID concurrent namespace writers.
 This is a bounded, synthetic **RED reproduction**, not a production patch,
 security regression GREEN, or authority for merge, release or deployment.
