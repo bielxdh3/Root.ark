@@ -183,7 +183,7 @@ public static class RootarkW26NativeFilePublishLab {
     } catch { root.Dispose(); throw; }
   }
   private static SafeFileHandle DirectoryChild(SafeFileHandle parent, string component,
-      bool readOnly, bool create = false) {
+      bool readOnly, bool create = false, bool inspectOwner = false) {
     if (create && readOnly) throw new InvalidOperationException("CREATION_MUST_BE_WRITABLE");
     if (string.IsNullOrEmpty(component) || component == "." || component == ".." ||
         component.IndexOfAny(new char[] { '\\', '/', ':' }) != -1)
@@ -200,7 +200,9 @@ public static class RootarkW26NativeFilePublishLab {
       IO_STATUS_BLOCK status;
       SafeFileHandle opened;
       int code = OpenRelative(out opened,
-        readOnly ? 0x001000A1U /* SYNC | READ_ATTR | TRAVERSE | LIST */ : 0x001F01FFU,
+        readOnly ? (0x001000A1U | (inspectOwner ? 0x00020000U : 0U))
+          /* SYNC | READ_ATTR | TRAVERSE | LIST; optional READ_CONTROL for owner query */
+          : 0x001F01FFU,
         ref attr, out status, IntPtr.Zero, 0x80, 7,
         create ? 2U /* FILE_CREATE exclusive */ : 1U /* FILE_OPEN only */,
         0x00200021U /* OPEN_REPARSE_POINT | DIRECTORY_FILE | SYNCHRONOUS */,
@@ -233,7 +235,7 @@ public static class RootarkW26NativeFilePublishLab {
     internal SafeFileHandle Held { get { return handles[handles.Count - 1]; } }
 
     internal AncestorCustody(string scratch, bool heldReadOnly, bool createHeld = false,
-        bool deferHeld = false) {
+        bool deferHeld = false, bool inspectScratchOwner = false) {
       string full = Path.GetFullPath(scratch).TrimEnd('\\');
       volumePath = Path.GetPathRoot(full);
       if (string.IsNullOrEmpty(volumePath) || volumePath.Length != 3 ||
@@ -251,7 +253,8 @@ public static class RootarkW26NativeFilePublishLab {
           // Only the original scratch directory can create held. All other
           // ancestors need read-only directory traversal rights.
           SafeFileHandle child = DirectoryChild(handles[handles.Count - 1], component,
-            !(createHeld && i == parts.Length - 1));
+            !(createHeld && i == parts.Length - 1), false,
+            inspectScratchOwner && i == parts.Length - 1);
           handles.Add(child);
           identities.Add(Id(child));
           components.Add(component);
@@ -467,8 +470,13 @@ public static class RootarkW26NativeFilePublishLab {
       // A same-principal owned scratch is positively unsuitable as an
       // independently protected original-A anchor. This check is not a
       // sufficient ACL policy for any positive trusted-parent admission.
-      if (new SecurityIdentifier(sid).Equals(WindowsIdentity.GetCurrent().User))
+      if (new SecurityIdentifier(sid).Equals(WindowsIdentity.GetCurrent().User)) {
+        // Emit this laboratory-only oracle ONLY after successfully reading
+        // the owner SID from the original opened native HANDLE. Merely
+        // failing GetSecurityInfo with ACCESS_DENIED must never pass the test.
+        Console.Out.WriteLine("ROOTARK_W26_OWNER_SID_MATCH_DENY_V1");
         throw new InvalidOperationException("SAME_SID_ORIGIN_UNTRUSTED");
+      }
     } finally {
       if (descriptor != IntPtr.Zero) LocalFree(descriptor);
     }
@@ -555,7 +563,7 @@ public static class RootarkW26NativeFilePublishLab {
         throw new InvalidOperationException("PREPIN_ATTACK_NOT_PHYSICAL");
       // Read-only native chain; refuse writes even if the path currently
       // names a perfectly ordinary, empty but DIFFERENT NTFS directory B.
-      using (var original = new AncestorCustody(scratch, true, false, true))
+      using (var original = new AncestorCustody(scratch, true, false, true, true))
         RequireColdOriginalCustody(original);
       throw new InvalidOperationException("COLD_ORIGIN_NOT_AUTHORIZED");
     }

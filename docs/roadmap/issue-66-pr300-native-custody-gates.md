@@ -100,6 +100,35 @@ independently protected custody and cold replay evidence. Windows 10
 signed entry/exit operations remain separate unsatisfied gates.
 **LAB_ONLY_NO_GO · MERGE NO-GO · RELEASE NO-GO · no production activation**.
 
+### Native pre-first-pin denial rehearsal (local post-`a73b4a3` candidate)
+
+An opt-in, negative-only W26 `PREPIN_COLD_ORIGIN_REQUIRED` scenario now
+uses a real same-SID second process to replace the disposable original
+scratch A with either a **plain NTFS directory B** or a **junction B**
+**before** the first native scratch acquisition. The laboratory refuses
+all writes when the independently owner-enrolled original-A FileId and
+signed external floor are missing. Original A remains empty, foreign B
+retains only its exact physical canary, and production `RootSession` stays
+unavailable. This scenario does **not** protect `Run(NORMAL)` from an
+early ordinary-B swap and does **not** compare the originally enrolled
+native A FileId to B: no such trusted original record has been provisioned.
+
+Independent SOURCE review found P2 in the initial version: its read-only
+scratch HANDLE did not request `READ_CONTROL`, so `GetSecurityInfo` could
+fail with ACCESS_DENIED and still produce the generic expected denial.
+The corrected lab requests `READ_CONTROL` **only** for the scratch owner
+read, and a distinct test oracle is emitted only after a successful native
+owner-SID query that confirms the scratch is owned by the **same SID**.
+The plain B test requires that oracle; junction B is rejected earlier by
+native no-reparse opening and must not claim its owner was read. Requiring
+the successful SID oracle on the pre-fix source produced physical **RED
+0 PASS / 2 FAIL**; the corrected source yielded targeted **2 PASS** and
+the complete Windows Node 22.23.4/NTFS opt-in W26 suite **25 PASS /
+0 FAIL / 0 SKIP**, log preserved in `.evidence`. These tests measure
+**zero foreign mutations**, not zero read-only kernel I/O. This is a
+lab-only denial proof, not a release gate promotion; exact-SHA SOURCE
+review and hosted CodeQL/CI are still required before publication.
+
 ## Current bounded milestones
 
 | Milestone | Evidence and what it means | Remaining gap |

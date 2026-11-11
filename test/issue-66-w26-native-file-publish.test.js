@@ -352,7 +352,7 @@ test(`#66 W26 denies physical same-SID ${mode} before held and signal can mutate
 }
 
 for (const replacement of ["PLAIN_B", "JUNCTION_B"]) {
-  test(`#66 W26 cold initial original-A guard denies pre-FIRST-native-pin ${replacement} with zero foreign I/O`,
+  test(`#66 W26 cold original-A-required mode denies pre-FIRST-native-pin ${replacement} with zero foreign writes`,
     { skip: !available, timeout: 30000 }, async () => {
       const scratch = fixture();
       const parked = `${scratch}-parked`;
@@ -407,7 +407,16 @@ for (const replacement of ["PLAIN_B", "JUNCTION_B"]) {
       });
       assert.equal(attackerRan, true, `no early native boundary: ${err}`);
       assert.deepEqual(finished, { code: 41, signal: null }, err);
-      assert.match(out, /^ROOTARK_W26_PREPIN_BOUNDARY_V1\r?\n$/);
+      if (junction) {
+        // OBJ_DONT_REPARSE rejects the junction *before* opening B for an
+        // owner query; that is the correct fail-closed branch, not proof of
+        // the SID inspection performed in the ordinary-directory case.
+        assert.match(out, /^ROOTARK_W26_PREPIN_BOUNDARY_V1\r?\n$/);
+      } else {
+        assert.match(out,
+          /^ROOTARK_W26_PREPIN_BOUNDARY_V1\r?\nROOTARK_W26_OWNER_SID_MATCH_DENY_V1\r?\n$/,
+          "native GetSecurityInfo must confirm same-SID ownership; access-denied cannot count as GREEN");
+      }
       assert.match(err, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
       assert.equal(fs.lstatSync(scratch).isSymbolicLink(), junction);
       assert.notEqual(fs.statSync(parked, { bigint: true }).ino,

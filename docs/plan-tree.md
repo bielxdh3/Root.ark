@@ -23,6 +23,17 @@ pin, independent cold custodian and signed floor, Win10 CFAPI and real
 powercut remain release blockers; the post-pin lab never authorizes
 RootSession, merge or deploy.
 
+2026-11-11 — laboratório W26 de aquisição fria pré-pin, ainda não
+publicado: uma alteração opt-in testa A→B antes do primeiro HANDLE nativo,
+para B comum ou junction, e exige recusa sem escrever no diretório
+estrangeiro enquanto inexiste FileId original atestado por custodiador
+independente. A primeira revisão SOURCE detectou falso verde por ausência
+de `READ_CONTROL` no HANDLE usado por `GetSecurityInfo`; contraprova RED
+0/2, correção exigindo leitura real do SID no B comum, e suíte Windows
+Node22/NTFS 25/25 PASS. O modo NORMAL permanece vulnerável à substituição
+pré-pin: isso não é prova positiva de identidade A, nem autoriza merge,
+RootSession ou release. A nova revisão SOURCE/CI pertence ao novo SHA.
+
 2026-11-11 — Issue #66 / PR #300, W22 inert remote-only source:
 pre-rename `EIO` em checkpoint da snapshot ou ACK do journal deixa
 um `.tmp-<pid>-<uuid>` físico não autorizador. O temporário deve ser
