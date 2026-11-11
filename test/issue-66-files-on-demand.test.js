@@ -1431,6 +1431,78 @@ test("issue 66: a replaced JavaScript authorization method cannot dispatch a nat
   assert.equal(state.pushes, 0);
 });
 
+test("issue 66: native-required retry cannot dispatch a freshly signed DELETE swapped into a signed CREATE during async authorization", async (t) => {
+  const { root, open, adapter, key, state } = await setup(t, {});
+  const client = await open();
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ type: "spki", format: "der" })
+    .toString("base64url");
+  const identity = { objectId: "signed-object-" + crypto.randomUUID(),
+    fileId: "signed-file-" + crypto.randomUUID(), deviceId: "device-a",
+    keyEpoch: "epoch-1", compartmentId: "private" };
+  const signed = async (verb, counter) => {
+    const op = protocol.createOperation({
+      ...identity, operation: verb, versionId: crypto.randomUUID(),
+      operationId: crypto.randomUUID(),
+      revision: { counter, deviceId: "device-a" },
+      baseRevision: counter === 1 ? null : { counter: 1, deviceId: "device-a" },
+      metadata: verb === "create"
+        ? { path: "docs/signed.txt", name: "signed.txt", size: 13 }
+        : { path: "docs/signed.txt" },
+      plaintext: verb === "create" ? Buffer.from("SIGNED_CREATE") : Buffer.from("{}"),
+      fileKey: key,
+    });
+    op.authorization = await createAuthorizationProof(op, {
+      username: "alice", privateKey: signer.privateKey, publicKey,
+      expiresAt: Date.now() + 60000,
+    });
+    assert.equal(await verifyAuthorizationProof(op.authorization, op, {
+      username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+      revokedDeviceIds: [],
+    }), true);
+    return op;
+  };
+  const originalCreate = await signed("create", 1);
+  const actualSignedDelete = await signed("delete", 2);
+  const mutable = JSON.parse(protocol.canonicalJson(originalCreate));
+  const originalAuthorization = client.assertOutgoingAuthorized;
+  const originalPush = adapter.push;
+  const remoteDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-delete-aba-"));
+  t.after(() => fsp.rm(remoteDirectory, { recursive: true, force: true }));
+  const remoteProof = path.join(remoteDirectory, "remote-signed-delete.bin");
+  let dispatched;
+  client.assertOutgoingAuthorized = async (_op, action = null) => {
+    // A caller-owned signed CREATE may be replaced with an independently
+    // valid signed DELETE after the initial guard but before the callback.
+    for (const field of Object.keys(mutable)) delete mutable[field];
+    Object.assign(mutable, JSON.parse(protocol.canonicalJson(actualSignedDelete)));
+    return action ? action() : true;
+  };
+  adapter.push = async (sent) => {
+    dispatched = JSON.parse(protocol.canonicalJson(sent));
+    const handle = await fsp.open(remoteProof, "wx", 0o600);
+    try {
+      await handle.writeFile(protocol.canonicalJson(dispatched));
+      await handle.sync();
+    } finally { await handle.close(); }
+    return { status: 201 };
+  };
+  try {
+    await assert.rejects(client.withMutationLock(() => client.retryPush(mutable)),
+      { code: "invalid_snapshot" },
+      "the caller-owned signed envelope must stay immutable through authorization and dispatch");
+  } finally {
+    client.assertOutgoingAuthorized = originalAuthorization;
+    adapter.push = originalPush;
+  }
+  assert.equal(dispatched, undefined,
+    "even a valid signed DELETE may not reach the adapter after a mutable CREATE preflight");
+  assert.equal(await exists(remoteProof), false);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
+    "an aborted pre-dispatch race must not invent an indeterminate physical write");
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66: a started but unawaited native-required _apply keeps the physical lock through all awaited I/O", async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "remote content behind deferred key resolver",

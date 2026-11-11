@@ -3396,6 +3396,12 @@ class SyncEngine {
       && (operation?.operation === "delete" || operation?.tombstone === true)) {
       denyUntrustedNativeSignedDelete();
     }
+    // Bind the exact stored envelope before any asynchronous authorization.
+    // A caller-owned object may be mutated by a replaceable JavaScript
+    // authorization callback; a one-time operation/tombstone check is NOT a
+    // custody fence against a signed DELETE substituted before dispatch.
+    const nativeRequiredEnvelopeDigest = this.requireNativeRootRecovery
+      ? signedEnvelopeDigest(protocol.validateStoredOperation(operation)) : null;
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
@@ -3405,6 +3411,22 @@ class SyncEngine {
       // fencing in the atomic PUT transaction.
       try {
         return await this.assertOutgoingAuthorized(operation, () => {
+          if (nativeRequiredEnvelopeDigest !== null) {
+            let currentDigest;
+            try {
+              currentDigest = signedEnvelopeDigest(protocol.validateStoredOperation(operation));
+            } catch {
+              fail("Outgoing signed envelope changed before dispatch", "invalid_snapshot");
+            }
+            if (currentDigest !== nativeRequiredEnvelopeDigest) {
+              fail("Outgoing signed envelope changed before dispatch", "invalid_snapshot");
+            }
+            // No await between this immutable-envelope comparison, the
+            // native-required DELETE denial, and physical outbound dispatch.
+            if (operation.operation === "delete" || operation.tombstone === true) {
+              denyUntrustedNativeSignedDelete();
+            }
+          }
           markNativeRootMutationAttempt(this);
           return this.adapter.push(operation);
         });
