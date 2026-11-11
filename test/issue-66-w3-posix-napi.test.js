@@ -367,6 +367,10 @@ test("#66 W3 external same-UID writer cannot replace the original opened ext4 na
         const foreignAfter = observeOpenedFixture(foreignFd);
         assert.equal(stageAfter.stat.ino, stage.stat.ino);
         assert.equal(foreignAfter.stat.ino, foreign.stat.ino);
+        assert.equal(stageAfter.stat.size, stage.stat.size);
+        assert.equal(foreignAfter.stat.size, foreign.stat.size);
+        assert.equal(stageAfter.stat.mtimeNs, stage.stat.mtimeNs);
+        assert.equal(foreignAfter.stat.mtimeNs, foreign.stat.mtimeNs);
         assert.equal(stageAfter.bytes, stage.bytes);
         assert.equal(foreignAfter.bytes, foreign.bytes);
       });
