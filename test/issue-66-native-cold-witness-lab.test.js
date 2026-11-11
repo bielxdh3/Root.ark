@@ -245,7 +245,7 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
     "a signed old file identity remains inadmissible after physical replacement");
 });
 
-test("#66 stage-path swap rejects a published hardlink to an unheld foreign inode", async (t) => {
+test("#66 stage alias rebound to a foreign published inode cannot pass held-source proof", async (t) => {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-stage-swap-"));
   // Never delete an alias by pathname after a same-principal stage swap.
   const retained = [];
@@ -261,19 +261,30 @@ test("#66 stage-path swap rejects a published hardlink to an unheld foreign inod
   await expected.writeFile(bytes);
   await expected.sync();
 
-  // Rebind the stage alias to a different same-user inode with identical bytes.
-  await fsp.rename(stageName, preservedName);
-  const injected = await fsp.open(stageName, "wx+", 0o600);
+  // Create and pin the foreign inode at a distinct EXCLUSIVE published name
+  // BEFORE the stage is moved. Do not open a previously observed/rebound
+  // stage pathname after its rename: that would create a check->open race.
+  // This lab attack models a foreign published inode and an equally forged
+  // stage alias. It is NOT an honest stage->published native publication.
+  const injected = await fsp.open(publishedName, "wx+", 0o600);
   retained.push(injected);
   await injected.writeFile(bytes);
   await injected.sync();
-  await fsp.link(stageName, publishedName);
+  await fsp.rename(stageName, preservedName);
+  // No replace-capable rename or pathname unlink; preserve exact two-link
+  // topology so a guard that only checks nlink cannot falsely pass.
+  await fsp.link(publishedName, stageName);
   const published = await openPublishedLabNoFollow(publishedName);
   retained.push(published);
   const originalId = await expected.stat({ bigint: true });
   const injectedId = await injected.stat({ bigint: true });
   assert.notDeepEqual([originalId.dev, originalId.ino], [injectedId.dev, injectedId.ino],
     "stage alias must be physically swapped to a distinct inode");
+  const stageAlias = await fsp.lstat(stageName, { bigint: true });
+  assert.equal(stageAlias.isFile() && !stageAlias.isSymbolicLink(), true);
+  assert.deepEqual([stageAlias.dev, stageAlias.ino, stageAlias.nlink],
+    [injectedId.dev, injectedId.ino, 2n],
+    "a foreign staged alias and the already pinned published inode have exact two-link topology");
   await assert.rejects(assertHeldPublicationIdentity(expected, published),
     { code: "lab_publication_identity_mismatch" });
   for (const [label, handle, expectedLinks] of [

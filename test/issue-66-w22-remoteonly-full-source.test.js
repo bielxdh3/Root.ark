@@ -116,15 +116,16 @@ async function assertColdFileUntouched(receipt) {
   const { bytesRead } = await receipt.handle.read(bytes, 0, bytes.length, 0);
   assert.equal(bytesRead, receipt.data.length);
   assert.deepEqual(bytes.subarray(0, bytesRead), receipt.data);
-  const namedBefore = await fsp.lstat(receipt.filename, { bigint: true });
-  assert.equal(namedBefore.isFile() && !namedBefore.isSymbolicLink(), true,
-    `${receipt.name} must remain a regular physical leaf, not a reparse link`);
-  assert.equal(namedBefore.nlink, 1n);
+  // Acquire the leaf's actual inode BEFORE any name-based type/version
+  // observation. A pre-open lstat followed by open could follow a rebound
+  // foreign name, including a Windows reparse point where O_NOFOLLOW lacks
+  // native support. Never trust a pathname observation as open authority.
   const reopened = await fsp.open(receipt.filename,
     fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
       | (fs.constants.O_NONBLOCK || 0));
   try {
     const named = await reopened.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(receipt.filename, { bigint: true });
     const namedAfter = await fsp.lstat(receipt.filename, { bigint: true });
     for (const entry of [namedBefore, named, namedAfter]) {
       assert.equal(entry.isFile() && !entry.isSymbolicLink(), true);

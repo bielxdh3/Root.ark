@@ -687,6 +687,15 @@ before/after their exact-byte checks. A separate adversarial case rebinds
 the stage pathname to a different inode containing identical bytes and
 requires the local lab guard to reject with
 `lab_publication_identity_mismatch`.
+After the exact-head hosted CodeQL flagged the test's *open after stage rename*,
+the foreign inode is now first created exclusively at `published.bin` and
+retained there. The original stage is then parked and an atomic **no-replace
+hardlink from this already-published foreign inode back to the empty stage
+name** creates precisely two foreign links. This is an adversarial final-state
+identity test, **not** a reenactment of a legitimate `stage→published` publish
+syscall; that forward direction is covered by a separate positive scenario.
+The guard must still reject two physical aliases with the same bytes and
+the correct `nlink=2` because neither matches the ORIGINAL retained stage.
 
 The unchecked-guard negative control was **RED 1 PASS / 1 FAIL** (`Missing
 expected rejection`) on both **Windows Node 22.23.4 / NTFS** and **WSL
