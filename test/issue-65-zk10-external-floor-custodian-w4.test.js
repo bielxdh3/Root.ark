@@ -14,6 +14,26 @@ const { signatureBytes } = require("../src/crypto/rootark-zk10-account-cutover-v
 const {
   createDevOffZk10MonotonicFloorCustodian,
 } = require("../src/services/zk10DevOffMonotonicFloorCustodian");
+const CUSTODIAN_MODULE = require.resolve("../src/services/zk10DevOffMonotonicFloorCustodian");
+
+// Tests which instrument the genuine crypto.sign/verify syscall boundary must
+// do so BEFORE importing the isolated module: production captures genuine
+// native entrypoints at import to prevent later malicious replacement.
+// This test-only reload preserves the original singleton's require.cache.
+function testFactoryCapturingCurrentCrypto() {
+  const cached = require.cache[CUSTODIAN_MODULE];
+  try {
+    delete require.cache[CUSTODIAN_MODULE];
+    return require(CUSTODIAN_MODULE).createDevOffZk10MonotonicFloorCustodian;
+  } finally {
+    delete require.cache[CUSTODIAN_MODULE];
+    if (cached) require.cache[CUSTODIAN_MODULE] = cached;
+  }
+}
+function isOwnerLeaseVerify(data) {
+  return Buffer.isBuffer(data)
+    && data.subarray(0, DOMAIN_LEASE.length).equals(DOMAIN_LEASE);
+}
 
 const DOMAIN_GENESIS = Buffer.from("Root.ark/zk10/custodian-owner-genesis/v1\0");
 const DOMAIN_LEASE = Buffer.from("Root.ark/zk10/custodian-owner-lease/v1\0");
@@ -274,6 +294,134 @@ test("P2 proxy-verifier forged owner lease cannot install fake crypto verify", (
   }
   assert.equal(descriptorTrapCalls, 0,
     "a Proxy owner lease must be rejected before its descriptor hooks execute");
+});
+
+test("P2 nested lease toJSON cannot poison verifier then authorize foreign-signed CURRENT", (t) => {
+  const x = setup(t, "lease-nested-tojson-second-attempt");
+  const custodian = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const { request, ownerLease } = x.offer();
+  const { signature: _discard, ...unsigned } = ownerLease;
+  const forged = sign(unsigned, foreign.privateKey, DOMAIN_LEASE);
+  const savedVerify = crypto.verify;
+  assert.equal(savedVerify(null, signatureBytes(DOMAIN_LEASE, unsigned),
+    x.owner.publicKey, Buffer.from(forged.signature, "base64url")), false,
+  "a genuine foreign Ed25519 signer is NOT the owner");
+  let toJsonCalls = 0;
+  const poisonedLease = { ...ownerLease, nonce: { toJSON() {
+    toJsonCalls++;
+    crypto.verify = () => true;
+    return unsigned.nonce;
+  } } };
+  let result;
+  try {
+    assert.throws(() => custodian.attest(request, poisonedLease),
+      /ZK10_CUSTODIAN_UNAVAILABLE/, "initial nested lease must fail before journal write");
+    assert.equal(custodian.retainedMinimum().lease_serial, 0,
+      "first invalid lease cannot mutate either SQLite floor");
+    assert.throws(() => { result = custodian.attest(request, forged); },
+      /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "same active instance must not accept foreign owner signature after nested toJSON");
+  } finally { crypto.verify = savedVerify; }
+  assert.equal(toJsonCalls, 0, "nested object toJSON cannot execute before validation");
+  assert.equal(result, undefined, "no owner-unauthorized CURRENT was returned");
+  assert.equal(custodian.retainedMinimum().lease_serial, 0,
+    "both disposable SQLite floors remain at signed genesis");
+});
+
+test("P2 nested bootstrap toJSON cannot poison subsequent forged owner genesis", (t) => {
+  const x = setup(t, "genesis-nested-tojson-second-attempt");
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const { signature: _discard, ...unsigned } = x.genesis;
+  const forged = sign(unsigned, foreign.privateKey, DOMAIN_GENESIS);
+  const nativeVerify = crypto.verify;
+  assert.equal(nativeVerify(null, signatureBytes(DOMAIN_GENESIS, unsigned),
+    x.owner.publicKey, Buffer.from(forged.signature, "base64url")), false);
+  let toJsonCalls = 0;
+  const poisoned = { ...x.genesis, head_digest: { toJSON() {
+    toJsonCalls++;
+    crypto.verify = () => true;
+    return unsigned.head_digest;
+  } } };
+  try {
+    assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, bootstrap: poisoned,
+    }), /ZK10_CUSTODIAN_UNAVAILABLE/);
+    assert.throws(() => x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, bootstrap: forged,
+    })), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "a poisoned crypto singleton cannot enroll an unowned Ed25519 genesis");
+  } finally { crypto.verify = nativeVerify; }
+  assert.equal(toJsonCalls, 0, "no nested bootstrap serialization hook executed");
+  assert.equal(fs.existsSync(x.paths.databasePath), false);
+  assert.equal(fs.existsSync(x.paths.anchorDatabasePath), false);
+});
+
+test("P2 fake-handle own DATA native kHandle cannot mutate verifier through JS export", (t) => {
+  const x = setup(t, "fake-own-data-handle-verify-hook");
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const { signature: _discard, ...unsigned } = x.genesis;
+  const forged = sign(unsigned, foreign.privateKey, DOMAIN_GENESIS);
+  const nativeVerify = crypto.verify;
+  assert.equal(nativeVerify(null, signatureBytes(DOMAIN_GENESIS, unsigned),
+    x.owner.publicKey, Buffer.from(forged.signature, "base64url")), false);
+  const actual = x.owner.publicKey;
+  const fake = Object.create(Object.getPrototypeOf(actual));
+  const symbols = Object.getOwnPropertySymbols(actual);
+  const handleSymbol = symbols.find((sym) => sym.description === "kHandle");
+  const typeSymbol = symbols.find((sym) => sym.description === "kKeyType");
+  assert.ok(handleSymbol && typeSymbol);
+  let hostileExports = 0;
+  Object.defineProperty(fake, typeSymbol, { value: "public" });
+  Object.defineProperty(fake, handleSymbol, { value: {
+    getAsymmetricKeyType() { return "ed25519"; },
+    export() {
+      hostileExports++;
+      crypto.verify = () => true;
+      return actual.export({ format: "der", type: "spki" });
+    },
+  } });
+  try {
+    assert.throws(() => x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, ownerPublicKey: fake, bootstrap: forged,
+    })), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "brand spoof must not forge actual signed owner genesis");
+  } finally { crypto.verify = nativeVerify; }
+  assert.equal(hostileExports, 0, "fake JS handle export must not execute");
+  assert.equal(fs.existsSync(x.paths.databasePath), false);
+  assert.equal(fs.existsSync(x.paths.anchorDatabasePath), false);
+});
+
+test("P2 fake-keytype own accessor cannot poison verifier with genuine raw handle", (t) => {
+  const x = setup(t, "fake-keytype-accessor");
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const { signature: _discard, ...unsigned } = x.genesis;
+  const forgedGenesis = sign(unsigned, foreign.privateKey, DOMAIN_GENESIS);
+  const savedVerify = crypto.verify;
+  assert.equal(savedVerify(null, signatureBytes(DOMAIN_GENESIS, unsigned),
+    x.owner.publicKey, Buffer.from(forgedGenesis.signature, "base64url")), false);
+  const actual = x.owner.publicKey;
+  const symbols = Object.getOwnPropertySymbols(actual);
+  const handleSym = symbols.find((sym) => sym.description === "kHandle");
+  const typeSym = symbols.find((sym) => sym.description === "kKeyType");
+  assert.ok(handleSym && typeSym);
+  const fake = Object.create(Object.getPrototypeOf(actual));
+  Object.defineProperty(fake, handleSym, { value: actual[handleSym] });
+  let typeGetterCalls = 0;
+  Object.defineProperty(fake, typeSym, { get() {
+    typeGetterCalls++;
+    crypto.verify = () => true;
+    return "public";
+  } });
+  try {
+    assert.throws(() => x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, ownerPublicKey: fake, bootstrap: forgedGenesis,
+    })), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "caller-controlled type getter may not authorize foreign Ed25519 genesis");
+  } finally { crypto.verify = savedVerify; }
+  assert.equal(typeGetterCalls, 0, "no caller-owned KeyObject type getter executed");
+  assert.equal(fs.existsSync(x.paths.databasePath), false);
+  assert.equal(fs.existsSync(x.paths.anchorDatabasePath), false);
 });
 
 test("P2: native Ed25519 identity survives caller-shadowed KeyObject type metadata", (t) => {
@@ -700,7 +848,11 @@ for (const store of ["databasePath", "anchorDatabasePath"]) {
   test(`P1: ${store} swapped for another inode during signed lease verification never attests`, (t) => {
     if (process.platform === "win32") return t.skip("POSIX rename of open SQLite inode required");
     const x = setup(t, `swapped-${store}`);
-    const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+    // First enroll genuine disposable SQLite genesis, before importing the
+    // separate module whose native VERIFY captures this hostile timing shim.
+    const seeded = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+    seeded.close();
+    let c;
     const challenge = x.offer();
     const original = x.paths[store];
     const oldInode = path.join(x.root, `orphan-${store}.sqlite`);
@@ -716,7 +868,7 @@ for (const store of ["databasePath", "anchorDatabasePath"]) {
     };
     crypto.verify = (...args) => {
       const valid = verify(...args);
-      if (valid && !swapped) {
+      if (valid && !swapped && isOwnerLeaseVerify(args[1])) {
         swapped = true;
         fs.renameSync(original, oldInode);
         fs.renameSync(substituted, original);
@@ -724,6 +876,8 @@ for (const store of ["databasePath", "anchorDatabasePath"]) {
       return valid;
     };
     try {
+      c = x.track(testFactoryCapturingCurrentCrypto()({
+        ...x.config, bootstrap: undefined }));
       assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
         /ZK10_CUSTODIAN_UNAVAILABLE/);
     } finally {
@@ -745,7 +899,7 @@ for (const store of ["databasePath", "anchorDatabasePath"]) {
 test("P1 POSIX: symlinked primary during lease verification is rejected before signing", (t) => {
   if (process.platform === "win32") return t.skip("POSIX symlink after opened SQLite handle required");
   const x = setup(t, "lease-symlink");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  let c;
   const challenge = x.offer();
   const previous = path.join(x.root, "orphan-primary.sqlite");
   const original = x.paths.databasePath;
@@ -753,7 +907,7 @@ test("P1 POSIX: symlinked primary during lease verification is rejected before s
   let swapped = false;
   crypto.verify = (...args) => {
     const valid = verify(...args);
-    if (valid && !swapped) {
+    if (valid && !swapped && isOwnerLeaseVerify(args[1])) {
       swapped = true;
       fs.renameSync(original, previous);
       fs.symlinkSync(x.paths.anchorDatabasePath, original);
@@ -761,6 +915,7 @@ test("P1 POSIX: symlinked primary during lease verification is rejected before s
     return valid;
   };
   try {
+    c = x.track(testFactoryCapturingCurrentCrypto()(x.config));
     assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/);
   } finally { crypto.verify = verify; }
@@ -772,7 +927,7 @@ test("P1 POSIX: symlinked primary during lease verification is rejected before s
 test("P1 POSIX: anchor switched inside signer callback cannot return a signed attestation", (t) => {
   if (process.platform === "win32") return t.skip("POSIX rename of opened SQLite required");
   const x = setup(t, "sign-time-anchor-swap");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  let c;
   const challenge = x.offer();
   const original = x.paths.anchorDatabasePath;
   const previous = path.join(x.root, "orphan-anchor.sqlite");
@@ -788,6 +943,7 @@ test("P1 POSIX: anchor switched inside signer callback cannot return a signed at
     return signature;
   };
   try {
+    c = x.track(testFactoryCapturingCurrentCrypto()(x.config));
     assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/);
   } finally { crypto.sign = signFloor; }
@@ -800,7 +956,7 @@ test("P1 POSIX: anchor switched inside signer callback cannot return a signed at
 for (const target of ["anchor floor", "primary used-lease journal"]) {
   test(`P2: same-inode ${target} write during signer is blocked by held SQLite reservations`, (t) => {
     const x = setup(t, `signer-inplace-${target.replaceAll(" ", "-")}`);
-    const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+    const seeded = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
     const ownerSigned = x.offer({
       sequence: 2, head_digest: sha(22), enrollment_root: sha(23),
     });
@@ -814,6 +970,7 @@ for (const target of ["anchor floor", "primary used-lease journal"]) {
     const fileBefore = fs.statSync(targetFile, { bigint: true });
     const sign = crypto.sign;
     let attempted = false, blocked = false, committed = false;
+    let c;
     crypto.sign = (algorithm, data, key, ...rest) => {
       const signature = sign(algorithm, data, key, ...rest);
       // Only the pinned CUSTODIAN's W170 signature triggers this synchronous
@@ -842,6 +999,9 @@ for (const target of ["anchor floor", "primary used-lease journal"]) {
     };
     let result;
     try {
+      seeded.close();
+      c = x.track(testFactoryCapturingCurrentCrypto()({
+        ...x.config, bootstrap: undefined }));
       result = c.attest(ownerSigned.request, ownerSigned.ownerLease);
     } finally { crypto.sign = sign; }
     assert.equal(attempted, true, "second connection attempted a real write inside signing");
@@ -862,7 +1022,8 @@ for (const target of ["anchor floor", "primary used-lease journal"]) {
 
 test("P2: a real second SQLite writer cannot slip between post-sign anchor and primary reads", (t) => {
   const x = setup(t, "postsign-cross-store-race");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const seeded = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  let c;
   const lease = x.offer({ sequence: 2, head_digest: sha(52), enrollment_root: sha(53) });
   const outsider = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
   const mutate = outsider.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1");
@@ -888,7 +1049,12 @@ test("P2: a real second SQLite writer cannot slip between post-sign anchor and p
     return originalPrepare.call(this, sql, ...args);
   };
   let result;
-  try { result = c.attest(lease.request, lease.ownerLease); }
+  try {
+    seeded.close();
+    c = x.track(testFactoryCapturingCurrentCrypto()({
+      ...x.config, bootstrap: undefined }));
+    result = c.attest(lease.request, lease.ownerLease);
+  }
   finally {
     Database.prototype.prepare = originalPrepare;
     crypto.sign = originalSign;
@@ -904,7 +1070,7 @@ test("P2: a real second SQLite writer cannot slip between post-sign anchor and p
 
 test("P2: failed signer releases both SQLite reservations and poisons the lease handle", (t) => {
   const x = setup(t, "signer-rollback-locks");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  let c;
   const offer = x.offer({ sequence: 2, head_digest: sha(62), enrollment_root: sha(63) });
   const originalSign = crypto.sign;
   let failedInsideSign = false;
@@ -916,6 +1082,7 @@ test("P2: failed signer releases both SQLite reservations and poisons the lease 
     return originalSign(...args);
   };
   try {
+    c = x.track(testFactoryCapturingCurrentCrypto()(x.config));
     assert.throws(() => c.attest(offer.request, offer.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/);
   } finally { crypto.sign = originalSign; }
@@ -980,7 +1147,7 @@ test("P2: bounded primary lock contention releases the anchor reservation and de
 test("P1 Windows: simulated reparse during signed lease is rejected without another database open", (t) => {
   if (process.platform !== "win32") return t.skip("Windows path-validation regression");
   const x = setup(t, "win-reparse-late");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  let c;
   const challenge = x.offer();
   const lstat = fs.lstatSync;
   const open = fs.openSync;
@@ -1004,10 +1171,12 @@ test("P1 Windows: simulated reparse during signed lease is rejected without anot
   };
   crypto.verify = (...args) => {
     const valid = verify(...args);
-    if (valid) redirected = true;
+    if (valid && isOwnerLeaseVerify(args[1])) redirected = true;
     return valid;
   };
   try {
+    c = x.track(testFactoryCapturingCurrentCrypto()(x.config));
+    openCalls = 0; // Only count openings AFTER the signed lease was received.
     assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/);
   } finally {
@@ -1045,8 +1214,7 @@ test("P1: both SQLite identity descriptors remain pinned until close without lea
 
 test("P2: an owner-authorized floor expiring during signing must never be returned", (t) => {
   const x = setup(t, "signing-expiry");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
-  const challenge = x.offer({ lease_expires_at_ms: Date.now() + 2200 });
+  let c;
   const originalSign = crypto.sign;
   let custodianSignCalls = 0;
   crypto.sign = (...args) => {
@@ -1058,13 +1226,15 @@ test("P2: an owner-authorized floor expiring during signing must never be return
     return signed;
   };
   try {
+    c = x.track(testFactoryCapturingCurrentCrypto()(x.config));
+    const challenge = x.offer({ lease_expires_at_ms: Date.now() + 2200 });
     assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/,
       "no signed response may escape once the owner lease expires inside crypto.sign");
+    assert.ok(Date.now() >= challenge.request.lease_expires_at_ms,
+      "the lease actually expired before the instrumented genuine signing returned");
   } finally { crypto.sign = originalSign; }
   assert.equal(custodianSignCalls, 1, "real custodian signature was computed");
-  assert.ok(Date.now() >= challenge.request.lease_expires_at_ms,
-    "the lease actually expired before crypto.sign returned");
   assert.throws(() => c.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/,
     "already-committed nonce is not silently retried after a failed signature");
   for (const file of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
@@ -1091,13 +1261,20 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
   let startedAt = genuineNow();
   let wallNow = startedAt;
   let createWithClock;
+  const originalSign = crypto.sign;
+  let custodianSignCalls = 0;
+  let signerHook = null;
   try {
     // The module captures Date.now at import, just as a real OS clock can
-    // change after startup. Keep the injection private to this fresh module.
+    // change after startup. Also capture the trusted test-only wrapper of
+    // the REAL Ed25519 signer before importing this isolated module.
     Date.now = () => wallNow;
+    crypto.sign = (...args) => signerHook
+      ? signerHook(...args) : originalSign(...args);
     delete require.cache[modulePath];
     ({ createDevOffZk10MonotonicFloorCustodian: createWithClock } = require(modulePath));
   } finally {
+    crypto.sign = originalSign;
     Date.now = genuineNow;
     delete require.cache[modulePath];
     if (cached) require.cache[modulePath] = cached;
@@ -1109,9 +1286,7 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
   const challenge = x.offer({ lease_expires_at_ms: genuineNow() + 2200 });
   startedAt = challenge.ownerLease.issued_at_ms;
   wallNow = startedAt;
-  const originalSign = crypto.sign;
-  let custodianSignCalls = 0;
-  crypto.sign = (...args) => {
+  signerHook = (...args) => {
     const signed = originalSign(...args);
     if (isActualCustodianFloorCall(args[1], args[2], x.custodian.publicKey, signed)) {
       custodianSignCalls++;
@@ -1126,7 +1301,7 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
     assert.throws(() => c.attest(challenge.request, challenge.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/,
       "a backwards wall-clock step cannot conceal expiry during synchronous Ed25519 signing");
-  } finally { crypto.sign = originalSign; }
+  } finally { signerHook = null; }
   assert.equal(custodianSignCalls, 1, "real custodian Ed25519 signing was delayed");
   assert.ok(genuineNow() >= challenge.request.lease_expires_at_ms,
     "the signed owner lease truly expired during the signing operation");
@@ -1152,7 +1327,7 @@ test("P2: partial wall-clock rollback during signing cannot hide an elapsed owne
 
 test("P2: reentrant retainedMinimum failure during genuine signing cannot escape a poisoned custodian", (t) => {
   const x = setup(t, "reentrant-poison-sign");
-  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  let c;
   const signed = x.offer({ sequence: 2, head_digest: sha(42), enrollment_root: sha(43) });
   const realSign = crypto.sign;
   let signedByCustodian = false, reentrantDenied = false;
@@ -1173,6 +1348,7 @@ test("P2: reentrant retainedMinimum failure during genuine signing cannot escape
     return proof;
   };
   try {
+    c = x.track(testFactoryCapturingCurrentCrypto()(x.config));
     assert.throws(() => c.attest(signed.request, signed.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/,
       "an already-poisoned instance must not return a signed CURRENT");

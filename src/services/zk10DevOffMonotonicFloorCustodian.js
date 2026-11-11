@@ -9,12 +9,25 @@ const path = require("node:path");
 const { types: { isProxy } } = require("node:util");
 const Database = require("better-sqlite3");
 const { signatureBytes } = require("../crypto/rootark-zk10-account-cutover-v1");
+// Capture genuine cryptographic entrypoints before ANY attacker-supplied object
+// is inspected. Hostile toJSON or native-handle hooks must not replace them.
+const VERIFY = crypto.verify.bind(crypto);
+const SIGN = crypto.sign.bind(crypto);
+const CREATE_HASH = crypto.createHash.bind(crypto);
+const hashPrototype = Object.getPrototypeOf(CREATE_HASH("sha256"));
+const HASH_UPDATE = Object.getOwnPropertyDescriptor(hashPrototype, "update").value;
+const HASH_DIGEST = Object.getOwnPropertyDescriptor(hashPrototype, "digest").value;
+function sha256Hex(...parts) {
+  const hash = CREATE_HASH("sha256");
+  for (const part of parts) HASH_UPDATE.call(hash, part);
+  return HASH_DIGEST.call(hash, "hex");
+}
 
 const GENESIS_DOMAIN = Buffer.from("Root.ark/zk10/custodian-owner-genesis/v1\0");
 const LEASE_DOMAIN = Buffer.from("Root.ark/zk10/custodian-owner-lease/v1\0");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk10/external-floor-current/v1\0");
 const JOURNAL_DOMAIN = Buffer.from("Root.ark/zk10/custodian-used-lease-journal/v1\0");
-const EMPTY_JOURNAL_TIP = crypto.createHash("sha256").update(JOURNAL_DOMAIN).digest("hex");
+const EMPTY_JOURNAL_TIP = sha256Hex(JOURNAL_DOMAIN);
 const GENESIS_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
   "immutable_account_id", "identity_digest", "lease_serial"];
 const LEASE_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
@@ -32,6 +45,8 @@ const OPER = /^[a-z][a-z0-9:_-]{0,63}$/;
 const NOW = Date.now.bind(Date);
 const MONOTONIC_NOW_NS = process.hrtime.bigint.bind(process.hrtime);
 const MAX_LEASE_SERIAL = 100_000; // Bounded DEV-OFF journal; no unsafe reset/rotation.
+const INTEGER_WIRE_FIELDS = new Set(["sequence", "lease_serial",
+  "issued_at_ms", "lease_expires_at_ms"]);
 const STORED_FLOOR_FIELDS = [...HEAD_FIELDS, "journal_count", "journal_tip"];
 const dbPins = new WeakMap();
 // Read real crypto.KeyObject internals, not shadowable instance properties.
@@ -46,6 +61,13 @@ const publicKeyFixture = CREATE_PUBLIC({
 const publicKeyPrototype = Object.getPrototypeOf(publicKeyFixture);
 const nativeKeyHandle = Object.getOwnPropertySymbols(publicKeyFixture)
   .find((symbol) => symbol.description === "kHandle");
+const nativeKeyTypeSymbol = Object.getOwnPropertySymbols(publicKeyFixture)
+  .find((symbol) => symbol.description === "kKeyType");
+const nativeHandlePrototype = Object.getPrototypeOf(publicKeyFixture[nativeKeyHandle]);
+const nativeHandleAlgorithm = Object.getOwnPropertyDescriptor(
+  nativeHandlePrototype, "getAsymmetricKeyType").value;
+const nativeHandleExport = Object.getOwnPropertyDescriptor(
+  nativeHandlePrototype, "export").value;
 const nativeType = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
 const nativeAlgorithm = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(publicKeyPrototype), "asymmetricKeyType").get;
@@ -63,7 +85,7 @@ function deny() {
   error.code = error.message;
   throw error;
 }
-function strict(value, fields) {
+function strict(value, fields, allowTrustedConfigObjects = false) {
   // Reject proxies before any ownKeys/getPrototypeOf/descriptor hooks:
   // a malicious hook could replace crypto.verify while inspecting a signed
   // owner lease, falsely authorizing the custodian's genuine Ed25519 signer.
@@ -74,6 +96,12 @@ function strict(value, fields) {
   for (const field of fields) {
     const descriptor = Object.getOwnPropertyDescriptor(value, field);
     if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    // GENESIS, LEASE, REQUEST, and persisted HEAD are FLAT scalar schemas.
+    // Reject every nested object before signatureBytes/JSON.stringify, never
+    // invoke toJSON/getters/Proxy traps during signature authentication.
+    if (!allowTrustedConfigObjects && (INTEGER_WIRE_FIELDS.has(field)
+      ? !Number.isSafeInteger(descriptor.value)
+      : typeof descriptor.value !== "string")) deny();
     result[field] = descriptor.value;
   }
   return result;
@@ -98,7 +126,7 @@ function validateHead(record) {
 function unsignedSigned(wire, fields, type, domain, publicKey) {
   const signed = strict(wire, [...fields, "signature"]);
   const payload = Object.fromEntries(fields.map(field => [field, signed[field]]));
-  if (payload.type !== type || !crypto.verify(null, signatureBytes(domain, payload),
+  if (payload.type !== type || !VERIFY(null, signatureBytes(domain, payload),
     publicKey, bytes(signed.signature, 64))) deny();
   return payload;
 }
@@ -108,9 +136,24 @@ function keyObject(value, type) {
       ? privateKeyPrototype : publicKeyPrototype)) deny();
   const handle = nativeKeyHandle
     && Object.getOwnPropertyDescriptor(value, nativeKeyHandle);
+  const typeDescriptor = nativeKeyTypeSymbol
+    && Object.getOwnPropertyDescriptor(value, nativeKeyTypeSymbol);
   // Reject a caller-inherited or getter-backed native handle *before* calling
-  // intrinsics. Otherwise the getter could replace the crypto import factory.
+  // intrinsics. Also reject accessor-backed kKeyType: nativeType reads it via
+  // ordinary JS property lookup, and an accessor could poison crypto.verify.
   if (!handle || !Object.hasOwn(handle, "value")
+    || !typeDescriptor || !Object.hasOwn(typeDescriptor, "value")
+    || typeDescriptor.value !== type
+    || !handle.value || typeof handle.value !== "object"
+    || isProxy(handle.value)
+    || Object.getPrototypeOf(handle.value) !== nativeHandlePrototype
+    || Object.hasOwn(handle.value, "export")
+    || Object.hasOwn(handle.value, "getAsymmetricKeyType")
+    || Object.getOwnPropertyDescriptor(nativeHandlePrototype, "export")?.value
+      !== nativeHandleExport
+    || Object.getOwnPropertyDescriptor(nativeHandlePrototype, "getAsymmetricKeyType")?.value
+      !== nativeHandleAlgorithm
+    || nativeHandleAlgorithm.call(handle.value) !== "ed25519"
     || nativeType.call(value) !== type
     || nativeAlgorithm.call(value) !== "ed25519") deny();
   let der;
@@ -138,10 +181,8 @@ function keyObject(value, type) {
   }
 }
 function spki(key) {
-  return crypto.createHash("sha256")
-    .update(nativePublicExport.call(keyObject(key, "public"),
-      { format: "der", type: "spki" }))
-    .digest("hex");
+  return sha256Hex(nativePublicExport.call(keyObject(key, "public"),
+    { format: "der", type: "spki" }));
 }
 function safeFileName(value) {
   if (typeof value !== "string" || !path.isAbsolute(value)) deny();
@@ -180,8 +221,7 @@ function nextJournalTip(previousTip, challenge, serial) {
   if (!HEX.test(previousTip) || !Number.isSafeInteger(serial)
     || serial < 1 || serial > MAX_LEASE_SERIAL) deny();
   const entry = { nonce: challenge.nonce, lease_id: challenge.lease_id, lease_serial: serial };
-  return crypto.createHash("sha256").update(Buffer.from(previousTip, "hex"))
-    .update(signatureBytes(JOURNAL_DOMAIN, entry)).digest("hex");
+  return sha256Hex(Buffer.from(previousTip, "hex"), signatureBytes(JOURNAL_DOMAIN, entry));
 }
 function verifyUsedJournal(db, floor) {
   const rows = db.prepare("SELECT nonce, lease_id, lease_serial, chain_tip FROM used_lease ORDER BY lease_serial").all();
@@ -358,7 +398,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
   let main, anchor;
   try {
     const o = strict(options, ["devOff", "databasePath", "anchorDatabasePath",
-      "ownerPublicKey", "custodianPrivateKey", "custodianSpkiSha256", "bootstrap"]);
+      "ownerPublicKey", "custodianPrivateKey", "custodianSpkiSha256", "bootstrap"], true);
     if (o.devOff !== true || process.env.NODE_ENV === "production") deny();
     const owner = keyObject(o.ownerPublicKey, "public");
     const signer = keyObject(o.custodianPrivateKey, "private");
@@ -483,7 +523,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
             if (!same(next, read(anchor, ownerHash, signerHash))
               || !same(next, read(main, ownerHash, signerHash, true))) deny();
             if (NOW() + 100 >= r.lease_expires_at_ms) deny();
-            const signedFloor = crypto.sign(null, signatureBytes(FLOOR_DOMAIN, floor),
+            const signedFloor = SIGN(null, signatureBytes(FLOOR_DOMAIN, floor),
               signer).toString("base64url");
             if (NOW() + 100 >= r.lease_expires_at_ms) deny();
             if (!same(next, read(anchor, ownerHash, signerHash))
