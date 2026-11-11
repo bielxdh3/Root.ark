@@ -13,6 +13,11 @@ const { types: { isProxy } } = require("node:util");
 const BUFFER_FROM = Buffer.from.bind(Buffer);
 const BUFFER_CONCAT = Buffer.concat.bind(Buffer);
 const NATIVE_UINT8ARRAY = Uint8Array;
+// Capturing the native function is not sufficient while dispatch still looks
+// up the mutable Function.prototype.call after a same-realm signed-CURRENT
+// callback. Use a retained Reflect.apply function with its receiver bound
+// BEFORE any hostile callback. This is DEV-OFF, not process isolation.
+const SAFE_APPLY = Reflect.apply.bind(Reflect);
 // An untrusted signed-CURRENT callback runs before both nonce-snapshot
 // signature verification and later byte iteration. Capturing only crypto and
 // Buffer factories does not stop a rebinding of JS property/array intrinsics
@@ -133,13 +138,14 @@ function exact(value, fields) {
   return copy;
 }
 function bytes(value, count) {
-  if (typeof value !== "string" || !REGEX_TEST.call(B64URL, value)) deny();
+  if (typeof value !== "string" || !SAFE_APPLY(REGEX_TEST, B64URL, [value])) deny();
   const decoded = BUFFER_FROM(value, "base64url");
-  if (decoded.length !== count || BUFFER_TO_STRING.call(decoded, "base64url") !== value) deny();
+  if (decoded.length !== count
+    || SAFE_APPLY(BUFFER_TO_STRING, decoded, ["base64url"]) !== value) deny();
   return value;
 }
 function hex(value) {
-  if (typeof value !== "string" || !REGEX_TEST.call(HEX64, value)) deny();
+  if (typeof value !== "string" || !SAFE_APPLY(REGEX_TEST, HEX64, [value])) deny();
   return value;
 }
 function integer(value, min, max = Number.MAX_SAFE_INTEGER) {
@@ -174,22 +180,22 @@ function publicKey(value, pinnedSpki) {
       !== NATIVE_HANDLE_EXPORT
     || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
       !== NATIVE_HANDLE_ALGORITHM
-    || NATIVE_HANDLE_ALGORITHM.call(handle.value) !== "ed25519"
-    || KEY_TYPE.call(value) !== "public"
-    || KEY_ASYMMETRIC_TYPE.call(value) !== "ed25519") deny();
+    || SAFE_APPLY(NATIVE_HANDLE_ALGORITHM, handle.value, []) !== "ed25519"
+    || SAFE_APPLY(KEY_TYPE, value, []) !== "public"
+    || SAFE_APPLY(KEY_ASYMMETRIC_TYPE, value, []) !== "ed25519") deny();
   try {
     // Snapshot the native key material exactly once. An inherited KeyObject
     // can change its own Symbol(kHandle) between SPKI hashing and VERIFY.
     // All later checks must use this freshly imported, independent handle.
-    const der = KEY_EXPORT.call(value, { type: "spki", format: "der" });
+    const der = SAFE_APPLY(KEY_EXPORT, value, [{ type: "spki", format: "der" }]);
     if (!BUFFER_IS_BUFFER(der) || der.length !== 44) deny();
     const pinned = CREATE_PUBLIC({ key: der, format: "der", type: "spki" });
-    if (KEY_TYPE.call(pinned) !== "public"
-      || KEY_ASYMMETRIC_TYPE.call(pinned) !== "ed25519"
-      || !KEY_EXPORT.call(pinned, { type: "spki", format: "der" }).equals(der)) deny();
+    if (SAFE_APPLY(KEY_TYPE, pinned, []) !== "public"
+      || SAFE_APPLY(KEY_ASYMMETRIC_TYPE, pinned, []) !== "ed25519"
+      || !SAFE_APPLY(KEY_EXPORT, pinned, [{ type: "spki", format: "der" }]).equals(der)) deny();
     const digest = HASH("sha256");
-    HASH_UPDATE.call(digest, der);
-    const spkiDigest = HASH_DIGEST.call(digest, "hex");
+    SAFE_APPLY(HASH_UPDATE, digest, [der]);
+    const spkiDigest = SAFE_APPLY(HASH_DIGEST, digest, ["hex"]);
     if (spkiDigest !== hex(pinnedSpki)) deny();
     return pinned;
   } catch (_) { deny(); }
@@ -228,22 +234,22 @@ function normalizedFloor(raw) {
 function signedSnapshot(record, fields, normalize, domain, pinnedKey) {
   const signed = exact(record, fields === OWNER_FIELDS
     ? OWNER_SIGNED_FIELDS : fields === FLOOR_FIELDS ? FLOOR_SIGNED_FIELDS : []);
-  const body = normalize(FROM_ENTRIES(ARRAY_MAP.call(fields,
-    (field) => [field, signed[field]])));
+  const body = normalize(FROM_ENTRIES(SAFE_APPLY(ARRAY_MAP, fields,
+    [(field) => [field, signed[field]]])));
   const signature = BUFFER_FROM(bytes(signed.signature, 64), "base64url");
   // All normalized owner/floor records are FLAT scalar schemas. Serialize
   // each own primitive in the exact signed field order. JSON.stringify(body)
   // would invoke inherited toJSON hooks after an injected CURRENT callback.
-  const encoded = ARRAY_MAP.call(fields, (field) => {
+  const encoded = SAFE_APPLY(ARRAY_MAP, fields, [(field) => {
     const descriptor = OWN_DESCRIPTOR(body, field);
     const type = typeof descriptor?.value;
     if (!descriptor || !HAS_OWN(descriptor, "value")
       || (descriptor.value !== null && type !== "string"
         && type !== "boolean" && type !== "number")) deny();
     return `${JSON_STRINGIFY_PRIMITIVE(field)}:${JSON_STRINGIFY_PRIMITIVE(descriptor.value)}`;
-  });
+  }]);
   const message = BUFFER_CONCAT([domain,
-    BUFFER_FROM(`{${ARRAY_JOIN.call(encoded, ",")}}`, "utf8")]);
+    BUFFER_FROM(`{${SAFE_APPLY(ARRAY_JOIN, encoded, [","])}}`, "utf8")]);
   if (!VERIFY(null, message, pinnedKey, signature)) deny();
   return body;
 }
@@ -259,13 +265,13 @@ function immutableBytes(part, remaining) {
   // No JS-accessed byteLength/length/buffer/byteOffset properties may redefine
   // the real range hashed. Shared backing permits mutation between copies.
   if (isProxy(part) || (!BUFFER_IS_BUFFER(part) && !(part instanceof NATIVE_UINT8ARRAY))) deny();
-  if (ARRAY_SOME.call(["byteLength", "byteOffset", "buffer", "length"], (field) =>
-    HAS_OWN(part, field))) deny();
+  if (SAFE_APPLY(ARRAY_SOME, ["byteLength", "byteOffset", "buffer", "length"],
+    [(field) => HAS_OWN(part, field)])) deny();
   try {
-    const length = VIEW_LENGTH.call(part);
-    const offset = VIEW_OFFSET.call(part);
-    const backing = VIEW_BUFFER.call(part);
-    const total = AB_LENGTH.call(backing); // rejects SharedArrayBuffer and detached backing
+    const length = SAFE_APPLY(VIEW_LENGTH, part, []);
+    const offset = SAFE_APPLY(VIEW_OFFSET, part, []);
+    const backing = SAFE_APPLY(VIEW_BUFFER, part, []);
+    const total = SAFE_APPLY(AB_LENGTH, backing, []); // rejects SharedArrayBuffer and detached backing
     if (!Number.isSafeInteger(length) || length > MAX_CHUNK_BYTES || length > remaining
       || !Number.isSafeInteger(offset) || offset < 0 || offset > total
       || length > total - offset) deny();
@@ -284,7 +290,7 @@ function createDevOffOriginalByteEvidenceGate(options) {
     const floorKey = publicKey(o.pinnedFloorPublicKey, o.pinnedFloorSpkiSha256);
     // A second KeyObject or spoofed .export() digest is not a second custodian.
     // Compare native key material before accepting either signing role.
-    if (KEY_EQUALS.call(ownerKey, floorKey)) deny();
+    if (SAFE_APPLY(KEY_EQUALS, ownerKey, [floorKey])) deny();
     const retained = exact(o.independentlyRetainedMinimum, MINIMUM_FIELDS);
     integer(retained.sequence, 1);
     hex(retained.headDigest);
@@ -295,7 +301,7 @@ function createDevOffOriginalByteEvidenceGate(options) {
       // This callback is a DEVELOPMENT TEST INJECTION, not an off-host network
       // or independently audited monotonic custodian. Require a fresh signed
       // challenge; even its success is insufficient to authorize protected I/O.
-      const challenge = BUFFER_TO_STRING.call(RANDOM(32), "base64url");
+      const challenge = SAFE_APPLY(BUFFER_TO_STRING, RANDOM(32), ["base64url"]);
       const signed = o.readSignedCurrentFloor(challenge);
       const floor = signedSnapshot(signed, FLOOR_FIELDS, normalizedFloor, FLOOR_DOMAIN, floorKey);
       const now = NOW();
@@ -326,23 +332,23 @@ function createDevOffOriginalByteEvidenceGate(options) {
         const scope = exactExpected(expected);
         const intent = signedSnapshot(ownerEvidence, OWNER_FIELDS, normalizedOwner,
           OWNER_DOMAIN, ownerKey);
-        if (ARRAY_SOME.call(EXPECTED_FIELDS,
-          (field) => intent[field] !== scope[field])) deny();
+        if (SAFE_APPLY(ARRAY_SOME, EXPECTED_FIELDS,
+          [(field) => intent[field] !== scope[field]])) deny();
         freshOwner(intent);
         const replayKey = intent.immutable_account_id + ":" + intent.nonce;
-        if (SET_HAS.call(observedNonces, replayKey)
+        if (SAFE_APPLY(SET_HAS, observedNonces, [replayKey])
           || observedNonces.size >= MAX_NONCES) deny();
-        SET_ADD.call(observedNonces, replayKey);
+        SAFE_APPLY(SET_ADD, observedNonces, [replayKey]);
         const ticket = FREEZE({ authorizesIo: false, stagePermitted: false,
           independentCustodyProven: false });
-        WEAK_SET.call(tickets, ticket, { intent, consumed: false });
+        SAFE_APPLY(WEAK_SET, tickets, [ticket, { intent, consumed: false }]);
         return ticket;
       } catch (_) { deny(); }
     }
     function verifyOriginalBytes(input) {
       try {
         const { ticket, chunks } = exact(input, ["ticket", "chunks"]);
-        const saved = ticket && WEAK_GET.call(tickets, ticket);
+        const saved = ticket && SAFE_APPLY(WEAK_GET, tickets, [ticket]);
         if (!saved || saved.consumed) deny();
         saved.consumed = true; // consume before any user-supplied byte access
         const intent = saved.intent;
@@ -358,10 +364,10 @@ function createDevOffOriginalByteEvidenceGate(options) {
           if (!descriptor || !HAS_OWN(descriptor, "value")) deny();
           const copied = immutableBytes(descriptor.value, intent.original_length - size);
           size += copied.length;
-          HASH_UPDATE.call(digest, copied);
+          SAFE_APPLY(HASH_UPDATE, digest, [copied]);
         }
         if (size !== intent.original_length
-          || !TIMING_SAFE_EQUAL(HASH_DIGEST.call(digest),
+          || !TIMING_SAFE_EQUAL(SAFE_APPLY(HASH_DIGEST, digest, []),
             BUFFER_FROM(intent.original_sha256, "hex"))) deny();
         freshOwner(intent); // check another nonce-signed snapshot after assembly
         return FREEZE({

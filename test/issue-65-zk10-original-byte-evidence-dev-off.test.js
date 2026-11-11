@@ -674,6 +674,53 @@ test("P2: signed CURRENT cannot replay stale nonce via rebound Array.prototype.j
   assert.equal(granted, undefined, "no replayed nonce may produce a DEV-OFF ticket");
 });
 
+test("P2: signed CURRENT must resist Function.prototype.call retarget of captured Array.join", () => {
+  const f = fixture();
+  const staleNonce = b64(32);
+  const staleFloor = sign({
+    type: "rootark-zk10-original-byte-floor-readback/v1",
+    immutable_account_id: f.expected.immutable_account_id,
+    owner_spki_sha256: spki(f.owner.publicKey),
+    sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+    nonce: staleNonce, revoked: false, issued_at_ms: Date.now() - 50,
+    expires_at_ms: Date.now() + 5000,
+  }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+  const nativeCall = Function.prototype.call;
+  const nativeJoin = Array.prototype.join;
+  const nativeApply = Reflect.apply;
+  const options = f.options();
+  let floorCallbackCalls = 0, forgedCalls = 0;
+  options.readSignedCurrentFloor = challenge => {
+    assert.notEqual(challenge, staleNonce);
+    floorCallbackCalls++;
+    // The security module captured Array.join itself, but the later `.call`
+    // lookup remains a writable Function.prototype property in the SAME realm.
+    Function.prototype.call = function (receiver, ...args) {
+      const result = nativeApply(nativeCall, this, [receiver, ...args]);
+      if (this === nativeJoin && args[0] === ","
+        && Array.isArray(receiver) && receiver.length === FLOOR_FIELDS.length
+        && typeof result === "string"
+        && result.includes('"nonce":"' + challenge + '"')) {
+        forgedCalls++;
+        return result.replace('"nonce":"' + challenge + '"',
+          '"nonce":"' + staleNonce + '"');
+      }
+      return result;
+    };
+    return { ...staleFloor, nonce: challenge };
+  };
+  let granted;
+  try {
+    const gate = createDevOffOriginalByteEvidenceGate(options);
+    assert.throws(() => { granted = gate.beginBeforeBody({
+      ownerEvidence: f.intent(), expected: f.expected,
+    }); }, bad, "genuine signed B cannot authorize fresh challenge A through rewritten .call");
+  } finally { Function.prototype.call = nativeCall; }
+  assert.ok(floorCallbackCalls > 0, "real external-floor callback must run");
+  assert.equal(forgedCalls, 0, "native signed serializer cannot dispatch via mutable .call");
+  assert.equal(granted, undefined, "no ticket from signature over stale B");
+});
+
 test("P2: wrong physical chunks cannot become signed originals via poisoned array descriptor", () => {
   const f = fixture();
   const wrong = Uint8Array.from(f.original);
