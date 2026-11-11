@@ -144,6 +144,23 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
     ownerProvision: Buffer.from('{"statement":{}, "statement":{}, "signature":"x"}'),
   }), { code: "root_session_unverified_authority" },
   "duplicate keys and noncanonical byte framing cannot supply signed authority");
+  let poisonedMethodCalled = false;
+  const poisoned = Buffer.from(" ".repeat(8193));
+  Object.defineProperty(poisoned, "length", { get() { return 1; } });
+  Object.defineProperty(poisoned, "toString", { value() {
+    poisonedMethodCalled = true;
+    return wire(provision).toString("utf8");
+  } });
+  await assert.rejects(inspectSignedColdCommit({ ...args, ownerProvision: poisoned }),
+    { code: "root_session_unverified_authority" },
+    "intrinsic TypedArray byteLength must defeat a forged Buffer.length");
+  assert.equal(poisonedMethodCalled, false,
+    "the verifier must never invoke a caller-controlled Buffer.toString");
+  const malformedUtf8 = Buffer.from('{"x":"ok"}');
+  malformedUtf8[6] = 0xff;
+  await assert.rejects(inspectSignedColdCommit({ ...args, ownerProvision: malformedUtf8 }),
+    { code: "root_session_unverified_authority" },
+    "invalid UTF-8 must fail, not normalize to a replacement character");
   sequence = 1;
   floorSequence = 1;
   await assert.rejects(inspectSignedColdCommit(args), { code: "root_session_unverified_authority" },

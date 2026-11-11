@@ -6,6 +6,7 @@
 // verifier cannot establish their custody, inspect native root HANDLEs/FDs,
 // prevent local same-UID/SID rollback or authorize a product recovery.
 const crypto = require("node:crypto");
+const { TextDecoder } = require("node:util");
 const { canonicalJson } = require("../../sync-client/rootark-sync-protocol");
 
 const DOMAIN = "Root.ark/issue66/native-cold-proof/v1/";
@@ -17,17 +18,26 @@ const fail = () => Object.assign(new Error("Independent native cold recovery pro
 const exact = (value, keys) => value && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).length === keys.length
   && Object.keys(value).every((name) => keys.includes(name));
+const byteLengthIntrinsic = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype), "byteLength").get;
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 function detach(input, maximum = 8192) {
   // The only accepted ingress is an already length-bounded byte buffer from
   // an external/native readback. No generic JS object, getter or Proxy is
   // recursively enumerated before its cost can be checked. Reject even valid
   // JSON if the supplied bytes are not EXACTLY the canonical signed form.
-  if (!Buffer.isBuffer(input) || input.length > maximum) throw fail();
+  if (!Buffer.isBuffer(input)) throw fail();
   try {
-    const source = input.toString("utf8");
+    const length = Reflect.apply(byteLengthIntrinsic, input, []);
+    if (length > maximum) throw fail();
+    // The native decoder consumes the Buffer's actual bytes, not an
+    // overridable input.toString(). Invalid UTF-8 must not be normalized.
+    const source = strictUtf8.decode(input);
     const parsed = JSON.parse(source);
-    if (canonicalJson(parsed) !== source) throw fail();
+    const canonicalBytes = Buffer.from(canonicalJson(parsed), "utf8");
+    if (canonicalBytes.length !== length
+      || !crypto.timingSafeEqual(canonicalBytes, input)) throw fail();
     return parsed;
   } catch { throw fail(); }
 }
