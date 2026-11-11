@@ -406,20 +406,21 @@ test("#67 P2: failed initial fsynced progress creation cannot permanently brick 
 test("#67 P2: crash after final hardlink publication with two links safely resumes once", async (t) => {
   const f = await fixture(t);
   const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
-  const originalUnlink = fsp.unlink;
+  const originalLink = fsp.link;
   let interrupted = false;
-  fsp.unlink = async (filePath) => {
-    if (!interrupted && String(filePath).includes(".rootark-recovery-execution-")
-      && String(filePath).includes(".tmp-")) {
+  fsp.link = async (source, destination) => {
+    const linked = await originalLink(source, destination);
+    if (!interrupted && String(destination).includes(".rootark-recovery-execution-")
+      && String(destination).endsWith(".json")) {
       interrupted = true;
-      throw Object.assign(new Error("simulated crash before temp unlink"), { code: "EIO" });
+      throw Object.assign(new Error("simulated crash immediately after final link"), { code: "EIO" });
     }
-    return originalUnlink(filePath);
+    return linked;
   };
   try {
     await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
       (error) => error.code === "EIO");
-  } finally { fsp.unlink = originalUnlink; }
+  } finally { fsp.link = originalLink; }
   assert.equal(interrupted, true);
   assert.equal(f.pushes(), 0);
   const names = await fsp.readdir(f.local);
@@ -435,26 +436,29 @@ test("#67 P2: crash after final hardlink publication with two links safely resum
   assert.equal(result.completed, 1);
   assert.equal(f.pushes(), 1);
   assert.equal((await fsp.lstat(path.join(f.local, final), { bigint: true })).nlink, 1n);
-  assert.equal(fs.existsSync(path.join(f.local, temporary)), false);
+  assert.equal(fs.existsSync(path.join(f.local, temporary)), true,
+    "original temporary is retained until identity-bound native retirement exists");
+  assert.equal((await fsp.lstat(path.join(f.local, temporary), { bigint: true })).nlink, 1n);
 });
 
 test("#67 P2: unknown foreign hardlink to valid final progress is never unlinked or trusted", async (t) => {
   const f = await fixture(t);
   const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
-  const originalUnlink = fsp.unlink;
+  const originalLink = fsp.link;
   let interrupted = false;
-  fsp.unlink = async (filePath) => {
-    if (!interrupted && String(filePath).includes(".rootark-recovery-execution-")
-      && String(filePath).includes(".tmp-")) {
+  fsp.link = async (source, destination) => {
+    const linked = await originalLink(source, destination);
+    if (!interrupted && String(destination).includes(".rootark-recovery-execution-")
+      && String(destination).endsWith(".json")) {
       interrupted = true;
       throw Object.assign(new Error("simulated post-link crash"), { code: "EIO" });
     }
-    return originalUnlink(filePath);
+    return linked;
   };
   try {
     await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
       (error) => error.code === "EIO");
-  } finally { fsp.unlink = originalUnlink; }
+  } finally { fsp.link = originalLink; }
   const names = await fsp.readdir(f.local);
   const final = names.find((name) => /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name));
   const temporary = names.find((name) => name.startsWith(`${final}.tmp-`));
@@ -466,6 +470,80 @@ test("#67 P2: unknown foreign hardlink to valid final progress is never unlinked
   assert.equal((await fsp.lstat(path.join(f.local, final), { bigint: true })).nlink, 2n);
   assert.equal(fs.existsSync(foreign), true);
   assert.equal(f.pushes(), 0);
+});
+
+test("#67 P2: a renamed foreign inode never replaces the verified progress temporary at unlink", async (t) => {
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const linkOriginal = fsp.link;
+  let interrupted = false;
+  fsp.link = async (source, destination) => {
+    const linked = await linkOriginal(source, destination);
+    if (!interrupted && String(destination).includes(".rootark-recovery-execution-")
+      && String(destination).endsWith(".json")) {
+      interrupted = true;
+      throw Object.assign(new Error("crash after durable final link"), { code: "EIO" });
+    }
+    return linked;
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
+      (error) => error.code === "EIO");
+  } finally { fsp.link = linkOriginal; }
+  assert.equal(interrupted, true);
+  const names = await fsp.readdir(f.local);
+  const final = names.find((name) => /^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(name));
+  const temporary = path.join(f.local,
+    names.find((name) => name.startsWith(`${final}.tmp-`)));
+  const retained = `${temporary}.retained`;
+  const nativeLstat = fsp.lstat;
+  const unlinkOriginal = fsp.unlink;
+  let swapped = false;
+  let attemptedForeignUnlink = false;
+  let foreignFd;
+  let foreignStats;
+  fsp.lstat = async (name, ...args) => {
+    const stats = await nativeLstat(name, ...args);
+    if (!swapped && name === temporary) {
+      swapped = true;
+      // The original two-link inode survives under retained. The attacker
+      // puts unrelated bytes at the SAME checked name before its unlink.
+      await fsp.rename(temporary, retained);
+      await fsp.writeFile(temporary, "foreign synthetic progress marker");
+      foreignFd = await fsp.open(temporary, "r");
+      foreignStats = await foreignFd.stat({ bigint: true });
+    }
+    return stats;
+  };
+  fsp.unlink = async (name, ...args) => {
+    if (name === temporary) {
+      attemptedForeignUnlink = true;
+      // Intercept at syscall boundary rather than actually deleting foreign.
+      throw Object.assign(new Error("intercepted foreign unlink"), { code: "EACCES" });
+    }
+    return unlinkOriginal(name, ...args);
+  };
+  try {
+    const reopened = await new SyncEngine(f.opts).open();
+    await assert.rejects(reopened.restoreHistoricalPlan(preview,
+      { confirm: true, resume: true }),
+    (error) => error.code === "restore_plan_unavailable");
+  } finally {
+    fsp.lstat = nativeLstat;
+    fsp.unlink = unlinkOriginal;
+  }
+  try {
+    assert.equal(swapped, true, "test must replace the actual previously stat'ed temporary");
+    assert.equal(attemptedForeignUnlink, false,
+      "a checked inode must never authorize unlinking a later foreign pathname");
+    assert.equal((await foreignFd.stat({ bigint: true })).ino, foreignStats.ino);
+    assert.equal((await fsp.lstat(temporary, { bigint: true })).ino, foreignStats.ino);
+    assert.equal((await fsp.readFile(temporary, "utf8")), "foreign synthetic progress marker");
+    assert.equal((await fsp.lstat(retained, { bigint: true })).nlink, 2n);
+    assert.equal(f.pushes(), 0);
+  } finally {
+    if (foreignFd) await foreignFd.close();
+  }
 });
 
 test("#67 P2: directory fsync failure after no-replace publication retains valid resumable final", async (t) => {

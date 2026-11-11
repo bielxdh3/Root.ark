@@ -213,7 +213,7 @@ test("#67: a local write while the signed restore enters its durable outbox cann
     "rejected restore must not remain eligible for retry/push after restart");
 });
 
-test("#67: staging detects an edit after final hash read and restores changed bytes to their path", async (t) => {
+test("#67: staging detects an edit after final hash read and retains changed bytes for manual recovery", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
   const clean = Buffer.from("clean snapshot");
@@ -232,12 +232,16 @@ test("#67: staging detects an edit after final hash read and restores changed by
   };
   await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
     (error) => error.code === "restore_local_conflict");
-  assert.deepEqual(await fsp.readFile(target), edit);
+  assert.equal(fs.existsSync(target), false,
+    "without native identity-scoped rollback, no mutable staged name may be linked back");
+  const trashNames = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  assert.equal(trashNames.length, 1);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trashNames[0])), edit);
   assert.equal(f.pushes(), 0);
   assert.equal((await f.engine.journal.recover()).length, 0);
 });
 
-test("#67: staged content hash rejects same-size edits with restored mtime and stable inode", async (t) => {
+test("#67: staged content hash rejects same-size edits with restored mtime and retains the foreign bytes", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
   const clean = Buffer.from("clean synchronized bytes");
@@ -260,7 +264,10 @@ test("#67: staged content hash rejects same-size edits with restored mtime and s
   };
   await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
     (error) => error.code === "restore_local_conflict");
-  assert.deepEqual(await fsp.readFile(target), altered);
+  assert.equal(fs.existsSync(target), false);
+  const trashNames = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  assert.equal(trashNames.length, 1);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trashNames[0])), altered);
   assert.equal(f.pushes(), 0);
   assert.equal((await f.engine.journal.recover()).length, 0);
 });
@@ -327,7 +334,7 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   assert.equal((await reopened.journal.recover()).length, 0);
 });
 
-test("#67: hardlink permission failure preserves local bytes and blocks remote restore", async (t) => {
+test("#67: hardlink permission failure retains old bytes in trash and blocks remote restore", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
   const old = Buffer.from("newer synchronized local bytes");
@@ -348,7 +355,11 @@ test("#67: hardlink permission failure preserves local bytes and blocks remote r
   try {
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /hardlink permission denial/);
   } finally { fsp.link = originalLink; }
-  assert.deepEqual(await fsp.readFile(target), old);
+  assert.equal(fs.existsSync(target), false,
+    "without native identity-atomic rollback, a staged pathname cannot be safely republished");
+  const staged = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  assert.equal(staged.length, 1);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", staged[0])), old);
   assert.equal(f.pushes(), 0);
   assert.equal((await f.engine.journal.recover()).length, 1);
   await assert.rejects(f.engine.syncOnce(), (error) => error.code === "restore_local_materialization_missing");

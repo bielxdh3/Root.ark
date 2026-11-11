@@ -381,10 +381,10 @@ async function createDurableRestoreProgress(filePath, value) {
   } finally { await handle.close(); }
   await containedAbsolute(path.dirname(filePath), temporary, false);
   await fsp.link(temporary, filePath);
-  // Minimize the nlink=2 crash window. A torn process can still leave both
-  // aliases, so readDurableRestoreProgress validates and repairs that exact
-  // known temporary identity under the exclusive root lock.
-  await fsp.unlink(temporary);
+  // Do not unlink the temporary by its mutable pathname. A same-SID writer
+  // could replace it with a foreign inode after link() and before unlink().
+  // Keep the validated two-link alias inert until native descriptor-bound
+  // namespace retirement is available; neither link grants restore authority.
   if (process.platform !== "win32") {
     const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
     try { await directory.sync(); } finally { await directory.close(); }
@@ -394,19 +394,30 @@ async function createDurableRestoreProgress(filePath, value) {
 async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expectedScope }) {
   let handle;
   try {
-    const before = await fsp.lstat(filePath, { bigint: true });
+    handle = await fsp.open(filePath, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const before = await handle.stat({ bigint: true });
     if (!before.isFile() || before.isSymbolicLink()
       || (before.nlink !== 1n && before.nlink !== 2n)
       || before.size > 65536n) throw Error();
-    handle = await fsp.open(filePath, fs.constants.O_RDONLY
-      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
-    const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || opened.nlink !== before.nlink || !sameFileVersion(before, opened)) throw Error();
-    const contents = await handle.readFile();
+    const pathnameBefore = await fsp.lstat(filePath, { bigint: true });
+    if (!pathnameBefore.isFile() || pathnameBefore.isSymbolicLink()
+      || !sameFileVersion(before, pathnameBefore)) throw Error();
+    // The inode can grow AFTER fstat. Never let a concurrent writer turn a
+    // small progress record into an unbounded readFile() allocation.
+    const contents = Buffer.alloc(65537);
+    let used = 0;
+    while (used < contents.length) {
+      const { bytesRead } = await handle.read(contents, used,
+        contents.length - used, used);
+      if (bytesRead === 0) break;
+      used += bytesRead;
+    }
+    if (used > 65536) throw Error();
     const after = await handle.stat({ bigint: true });
     const pathname = await fsp.lstat(filePath, { bigint: true });
-    if (!sameFileVersion(opened, after) || !sameFileVersion(after, pathname)) throw Error();
-    const parsed = JSON.parse(contents.toString("utf8"));
+    if (!sameFileVersion(before, after) || !sameFileVersion(after, pathname)) throw Error();
+    const parsed = JSON.parse(contents.subarray(0, used).toString("utf8"));
     if (parsed?.version !== 1 || parsed.planDigest !== expectedPlanDigest
       || protocol.canonicalJson(parsed.scope) !== protocol.canonicalJson(expectedScope)
       || !Array.isArray(parsed.items)) throw Error();
@@ -432,16 +443,14 @@ async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expect
       }
       if (matching.length !== 1) throw Error();
       await containedAbsolute(path.dirname(filePath), matching[0], false);
-      await fsp.unlink(matching[0]);
-      if (process.platform !== "win32") {
-        const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
-        try { await directory.sync(); } finally { await directory.close(); }
-      }
-      const restored = await fsp.lstat(filePath, { bigint: true });
-      if (!restored.isFile() || restored.isSymbolicLink() || restored.nlink !== 1n
-        || !sameFileIdentity(restored, before)
-        || restored.size !== before.size || restored.mtimeNs !== before.mtimeNs
-        || restored.birthtimeNs !== before.birthtimeNs || restored.mode !== before.mode) throw Error();
+      // A check followed by pathname unlink is not identity-atomic. Recheck
+      // the expected alias and canonical final, but NEVER remove either name:
+      // an unrelated inode can be substituted by a same-SID writer between
+      // any two filesystem calls, including after this verification.
+      const sibling = await fsp.lstat(matching[0], { bigint: true });
+      const final = await fsp.lstat(filePath, { bigint: true });
+      if (!sibling.isFile() || sibling.isSymbolicLink()
+        || !sameFileVersion(sibling, before) || !sameFileVersion(final, before)) throw Error();
     }
     return parsed;
   } catch {
@@ -2585,55 +2594,41 @@ class SyncEngine {
     if (!staged) fail("Historical restore target disappeared", "restore_local_conflict");
     let unchanged = false;
     try {
-      const after = await fsp.lstat(staged, { bigint: true });
-      // Windows can change ctimeNs on a pathname rename even when no file
-      // content changed. Match the stable inode plus content/mtime/birthtime
-      // identity; comparing ctimeNs here would reject every legitimate restore.
-      unchanged = after.isFile() && !after.isSymbolicLink() && after.nlink === 1n
-        && sameFileIdentity(before, after) && before.size === after.size
-        && before.mtimeNs === after.mtimeNs && before.birthtimeNs === after.birthtimeNs
-        && before.mode === after.mode;
-      if (unchanged) {
-        // Inode/size/mtime alone are insufficient: a concurrent writer can
-        // overwrite bytes in place, then restore the original mtime before
-        // stageExisting renames the file. Validate the actual staged payload
-        // through a no-follow FD before unlinking or materializing anything.
-        await containedAbsolute(this.rootDir, staged, false);
-        const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
-          | (fs.constants.O_NONBLOCK || 0);
-        const handle = await fsp.open(staged, flags);
-        try {
-          const opened = await handle.stat({ bigint: true });
-          if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n
-            || !sameFileIdentity(after, opened)) {
-            unchanged = false;
-          } else {
-            const bytes = await handle.readFile();
-            try {
-              const readEnd = await handle.stat({ bigint: true });
-              const pathEnd = await fsp.lstat(staged, { bigint: true });
-              unchanged = sameFileVersion(opened, readEnd)
-                && sameFileVersion(readEnd, pathEnd)
-                && crypto.createHash("sha256").update(bytes).digest("hex") === expectedHash;
-            } finally { bytes.fill(0); }
-          }
-        } finally { await handle.close(); }
-      }
+      // Pin the opened inode BEFORE checking a mutable pathname. The FD,
+      // subsequent path identity checks and SHA256 must agree on the exact
+      // ciphertext; no same-SID pathname is ever used for rollback cleanup.
+      const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_NONBLOCK || 0);
+      const handle = await fsp.open(staged, flags);
+      try {
+        const opened = await handle.stat({ bigint: true });
+        const after = await fsp.lstat(staged, { bigint: true });
+        // Windows renames can change ctimeNs without changing file bytes.
+        unchanged = opened.isFile() && opened.nlink === 1n
+          && after.isFile() && !after.isSymbolicLink() && after.nlink === 1n
+          && sameFileIdentity(after, opened) && sameFileIdentity(before, opened)
+          && before.size === opened.size && before.mtimeNs === opened.mtimeNs
+          && before.birthtimeNs === opened.birthtimeNs && before.mode === opened.mode;
+        if (unchanged) {
+          await containedAbsolute(this.rootDir, staged, false);
+          const bytes = await handle.readFile();
+          try {
+            const readEnd = await handle.stat({ bigint: true });
+            const pathEnd = await fsp.lstat(staged, { bigint: true });
+            unchanged = sameFileVersion(opened, readEnd)
+              && sameFileVersion(readEnd, pathEnd)
+              && crypto.createHash("sha256").update(bytes).digest("hex") === expectedHash;
+          } finally { bytes.fill(0); }
+        }
+      } finally { await handle.close(); }
     } catch { /* Reject unexpected staging identity and preserve the old bytes. */ }
     if (!unchanged) {
-      await this.replaceStagedIfVacant(staged, target);
+      // No portable Node operation can condition link()/unlink() on a held
+      // FileId/inode. Retain all staged names for manual recovery, even when
+      // restoring the original path would improve availability.
       fail("Historical restore target changed during replacement", "restore_local_conflict");
     }
     return staged;
-  }
-
-  async replaceStagedIfVacant(staged, target) {
-    try {
-      // A hard link claims an absent path atomically; unlike rename, it never
-      // replaces another writer's file. The staged bytes remain if it fails.
-      await fsp.link(staged, target);
-      await fsp.unlink(staged);
-    } catch { /* Retain the staged data for manual recovery when path is occupied. */ }
   }
 
   async apply(operation, summary = null) {
@@ -2833,7 +2828,8 @@ class SyncEngine {
               // created by another process after the last restore preflight.
               await fsp.link(temporary, target);
             } catch (error) {
-              if (staged) await this.replaceStagedIfVacant(staged, target);
+              // Never publish a possibly substituted staged pathname as a
+              // rollback. Preserve its current inode for manual recovery.
               if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
               throw error;
             }
