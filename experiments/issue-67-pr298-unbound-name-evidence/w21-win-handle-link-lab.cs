@@ -17,6 +17,7 @@ class W21WinHandleLinkLab {
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const int FileIdInfo = 18;
+    private const int NtFileRenameInformation = 10;
     private const int NtFileLinkInformation = 11; // FILE_INFORMATION_CLASS, NOT Win32 FILE_INFO_BY_HANDLE_CLASS.
     private const int STATUS_OBJECT_NAME_COLLISION = unchecked((int)0xC0000035);
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
@@ -67,15 +68,16 @@ class W21WinHandleLinkLab {
         Require(handle != new IntPtr(-1) && handle != IntPtr.Zero, "open-parent-directory");
         return handle;
     }
-    private static bool LinkHeld(IntPtr handle, IntPtr parentDirectory, string name, out int status) {
+    private static bool SetHeldName(IntPtr handle, IntPtr parentDirectory,
+        string name, int informationClass, out int status) {
         Require(IntPtr.Size == 8, "x64-mandatory");
         Require(name.IndexOfAny(new char[] { '\\', '/', ':' }) == -1 && name.Length < 128,
             "relative-leaf-only");
         byte[] utf16 = Encoding.Unicode.GetBytes(name);
-        // FILE_LINK_INFO x64: BOOLEAN ReplaceIfExists @0; HANDLE RootDirectory
+        // NT FILE_LINK_INFORMATION/FILE_RENAME_INFORMATION x64:
+        // BOOLEAN ReplaceIfExists @0; HANDLE RootDirectory
         // @8; DWORD FileNameLength (BYTES) @16; WCHAR FileName[] @20.
-        // This is the NT FILE_LINK_INFORMATION used by NtSetInformationFile,
-        // with an already-open destination PARENT handle (not path traversal).
+        // Strictly NO REPLACE and held destination PARENT handle.
         byte[] payload = new byte[20 + utf16.Length + 2];
         Array.Copy(BitConverter.GetBytes(parentDirectory.ToInt64()), 0, payload, 8, 8);
         Array.Copy(BitConverter.GetBytes(utf16.Length), 0, payload, 16, 4);
@@ -85,17 +87,69 @@ class W21WinHandleLinkLab {
             Marshal.Copy(payload, 0, info, payload.Length);
             IO_STATUS_BLOCK io = new IO_STATUS_BLOCK();
             status = NtSetInformationFile(handle, ref io, info,
-                (uint)payload.Length, NtFileLinkInformation);
+                (uint)payload.Length, informationClass);
             return status >= 0;
         } finally { Marshal.FreeHGlobal(info); }
+    }
+    // Test-only PREPARE keeps both OS handles live. Only COMMIT methods may
+    // mutate a namespace; neither accepts a source pathname or replaces an
+    // existing destination. This is NOT a trusted RootSession or owner-A.
+    private sealed class PreparedOperation : IDisposable {
+        private IntPtr source;
+        private IntPtr destinationParent;
+        private readonly string originalSourceId;
+        private readonly string originalParentId;
+        public string OriginalId { get { return originalSourceId; } }
+        public PreparedOperation(string sourceName, string parentName) {
+            source = OpenHeld(sourceName);
+            try {
+                destinationParent = OpenHeldDirectory(parentName);
+                originalSourceId = FileId(source);
+                originalParentId = FileId(destinationParent);
+            } catch { Dispose(); throw; }
+        }
+        private void CheckPrepared() {
+            Require(source != IntPtr.Zero && destinationParent != IntPtr.Zero,
+                "prepared-state-required");
+            Require(FileId(source) == originalSourceId
+                && FileId(destinationParent) == originalParentId,
+                "prepare-physical-identity");
+        }
+        public bool CommitLink(string newLeaf, out int status) {
+            CheckPrepared();
+            return SetHeldName(source, destinationParent, newLeaf,
+                NtFileLinkInformation, out status);
+        }
+        public bool CommitRenameNoReplace(string newLeaf, out int status) {
+            CheckPrepared();
+            return SetHeldName(source, destinationParent, newLeaf,
+                NtFileRenameInformation, out status);
+        }
+        public void Dispose() {
+            if (source != IntPtr.Zero) CloseHandle(source);
+            if (destinationParent != IntPtr.Zero) CloseHandle(destinationParent);
+            source = IntPtr.Zero;
+            destinationParent = IntPtr.Zero;
+        }
     }
     private static string CurrentSid() {
         return WindowsIdentity.GetCurrent().User.Value;
     }
+    private static string ReadWhileNativeHandleRetained(string name) {
+        // The lab's PREPARE source was opened with DELETE access. A normal
+        // File.ReadAllText stream can omit FILE_SHARE_DELETE and fail despite
+        // otherwise sound inode publication under NTFS share-mode rules.
+        using (FileStream stream = new FileStream(name, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete))
+        using (StreamReader reader = new StreamReader(stream, Encoding.UTF8)) {
+            return reader.ReadToEnd();
+        }
+    }
 
-    private static int Attacker(string root) {
-        string source = Path.Combine(root, "source");
-        string retained = Path.Combine(root, "source.retained");
+    private static int Attacker(string root, string sourceLeaf) {
+        Require(sourceLeaf == "source" || sourceLeaf == "rename-source", "attack-leaf");
+        string source = Path.Combine(root, sourceLeaf);
+        string retained = Path.Combine(root, sourceLeaf + ".retained");
         Console.WriteLine("READY|" + CurrentSid() + "|" + Process.GetCurrentProcess().Id);
         if (Console.ReadLine() != "START") return 10;
         File.Move(source, retained);
@@ -116,16 +170,14 @@ class W21WinHandleLinkLab {
         string retained = Path.Combine(root, "source.retained");
         string published = Path.Combine(root, "published");
         Process child = null;
-        IntPtr held = IntPtr.Zero;
-        IntPtr parentDirectory = IntPtr.Zero;
+        PreparedOperation prepared = null;
         try {
             File.WriteAllText(source, "ORIGINAL VERIFIED BYTES", Encoding.UTF8);
-            held = OpenHeld(source);
-            parentDirectory = OpenHeldDirectory(root);
-            string originalId = FileId(held);
+            prepared = new PreparedOperation(source, root);
+            string originalId = prepared.OriginalId;
             ProcessStartInfo start = new ProcessStartInfo();
             start.FileName = System.Reflection.Assembly.GetExecutingAssembly().Location;
-            start.Arguments = "attacker \"" + root.Replace("\"", "\\\"") + "\"";
+            start.Arguments = "attacker \"" + root.Replace("\"", "\\\"") + "\" source";
             start.UseShellExecute = false;
             start.RedirectStandardInput = true;
             start.RedirectStandardOutput = true;
@@ -150,7 +202,7 @@ class W21WinHandleLinkLab {
             finally { CloseHandle(foreignHandle); }
             Require(foreignId != originalId, "distinct-foreign-inode");
             int status;
-            Require(LinkHeld(held, parentDirectory, "published", out status),
+            Require(prepared.CommitLink("published", out status),
                 "native-NtSetInformationFile-link status=" + status.ToString("X8"));
             IntPtr publishedHandle = OpenHeld(published);
             try { Require(FileId(publishedHandle) == originalId, "published-original-FileId"); }
@@ -159,7 +211,7 @@ class W21WinHandleLinkLab {
                 "published-original-bytes");
             Require(File.ReadAllText(source, Encoding.UTF8) == "FOREIGN SECOND-PROCESS BYTES",
                 "foreign-preserved");
-            Require(!LinkHeld(held, parentDirectory, "published", out status)
+            Require(!prepared.CommitLink("published", out status)
                 && status == STATUS_OBJECT_NAME_COLLISION,
                 "no-replace-must-fail-EEXIST");
             child.StandardInput.WriteLine("RELEASE");
@@ -168,8 +220,7 @@ class W21WinHandleLinkLab {
             Console.WriteLine("WINDOWS_NATIVE_HANDLE_LINK_LAB_PASS secondProcess=true sameSid=true originalFileId=true noReplace=true foreignPreserved=true");
             return 0;
         } finally {
-            if (held != IntPtr.Zero) CloseHandle(held);
-            if (parentDirectory != IntPtr.Zero) CloseHandle(parentDirectory);
+            if (prepared != null) prepared.Dispose();
             if (child != null) {
                 if (!child.HasExited) child.Kill();
                 child.Dispose();
@@ -178,9 +229,77 @@ class W21WinHandleLinkLab {
             if (Directory.Exists(root)) Directory.Delete(root, true);
         }
     }
+    private static int ParentRename() {
+        string root = Path.Combine(Path.GetTempPath(),
+            "rootark67-w21-native-rename-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string source = Path.Combine(root, "rename-source");
+        string retained = Path.Combine(root, "rename-source.retained");
+        string renamed = Path.Combine(root, "staged-owner");
+        string occupied = Path.Combine(root, "occupied");
+        Process child = null;
+        PreparedOperation prepared = null;
+        try {
+            File.WriteAllText(source, "ORIGINAL RENAME BYTES", Encoding.UTF8);
+            File.WriteAllText(occupied, "OCCUPIED FOREIGN DESTINATION", Encoding.UTF8);
+            prepared = new PreparedOperation(source, root);
+            string originalId = prepared.OriginalId;
+            ProcessStartInfo start = new ProcessStartInfo();
+            start.FileName = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            start.Arguments = "attacker \"" + root.Replace("\"", "\\\"") + "\" rename-source";
+            start.UseShellExecute = false;
+            start.RedirectStandardInput = true;
+            start.RedirectStandardOutput = true;
+            start.CreateNoWindow = true;
+            child = Process.Start(start);
+            Require(child != null && child.Id != Process.GetCurrentProcess().Id,
+                "rename-distinct-pid");
+            string[] hello = (child.StandardOutput.ReadLine() ?? "").Split('|');
+            Require(hello.Length == 3 && hello[0] == "READY"
+                && hello[1] == CurrentSid() && int.Parse(hello[2]) == child.Id,
+                "rename-same-SID");
+            child.StandardInput.WriteLine("START");
+            child.StandardInput.Flush();
+            Require(child.StandardOutput.ReadLine() == "SWAPPED", "rename-foreign-swapped");
+            IntPtr retainedHandle = OpenHeld(retained);
+            try { Require(FileId(retainedHandle) == originalId, "rename-original-retained"); }
+            finally { CloseHandle(retainedHandle); }
+            IntPtr foreignHandle = OpenHeld(source);
+            try { Require(FileId(foreignHandle) != originalId, "rename-foreign-distinct"); }
+            finally { CloseHandle(foreignHandle); }
+            int status;
+            Require(!prepared.CommitRenameNoReplace("occupied", out status)
+                && status == STATUS_OBJECT_NAME_COLLISION, "rename-no-replace");
+            Require(ReadWhileNativeHandleRetained(occupied)
+                == "OCCUPIED FOREIGN DESTINATION", "collision-foreign-preserved");
+            Require(prepared.CommitRenameNoReplace("staged-owner", out status),
+                "rename-NtSetInformationFile status=" + status.ToString("X8"));
+            IntPtr stagedHandle = OpenHeld(renamed);
+            try { Require(FileId(stagedHandle) == originalId, "rename-staged-original-id"); }
+            finally { CloseHandle(stagedHandle); }
+            Require(!File.Exists(retained), "rename-source-alias-moved");
+            Require(ReadWhileNativeHandleRetained(renamed) == "ORIGINAL RENAME BYTES",
+                "rename-original-bytes");
+            Require(ReadWhileNativeHandleRetained(source) == "FOREIGN SECOND-PROCESS BYTES",
+                "rename-foreign-source-preserved");
+            child.StandardInput.WriteLine("RELEASE");
+            child.StandardInput.Flush();
+            Require(child.WaitForExit(10000) && child.ExitCode == 0, "rename-child-exit");
+            Console.WriteLine("WINDOWS_NATIVE_HANDLE_RENAME_LAB_PASS secondProcess=true sameSid=true originalFileId=true noReplace=true foreignPreserved=true");
+            return 0;
+        } finally {
+            if (prepared != null) prepared.Dispose();
+            if (child != null) {
+                if (!child.HasExited) child.Kill();
+                child.Dispose();
+            }
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
     public static int Main(string[] args) {
         try {
-            if (args.Length == 2 && args[0] == "attacker") return Attacker(args[1]);
+            if (args.Length == 3 && args[0] == "attacker") return Attacker(args[1], args[2]);
+            if (args.Length == 1 && args[0] == "rename") return ParentRename();
             if (args.Length == 0) return Parent();
             throw new Exception("Invalid LAB arguments");
         } catch (Exception error) {
