@@ -131,12 +131,14 @@ leaf names**; no user-supplied destination, payload, path or fd is accepted:
 
 The live W3 session now retains `/`, each literal passwd HOME segment and
 its random fixture parent, plus its original `held` `DIR*`. Each retained
-directory stores its initial `st_dev`/`st_ino`. Before staging, before
+directory stores its initial `st_dev`/`st_ino` **and UID/mode**. Before staging, before
 publication and immediately before writing COMMIT, native code uses
 `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV` to
 reopen each named child **from its original retained parent fd**, comparing
-identities with `fstat` on the original descriptors; it also reopens `held`
-from its original parent. Any missing, renamed, symlinked or rebound segment
+identities and unchanged UID/permission bits with `fstat` on the original
+descriptors, and enforces the originally protected `0700` ext4 fixture parent;
+it also reopens `held` from its original parent. Any missing, renamed,
+symlinked, chmod-weakened or rebound segment
 fails closed with `NATIVE_ANCESTOR_CHANGED` and poisons the transaction phase.
 Unrelated raw enumeration/read experiments continue to exercise their pinned
 `DIR*`; the transaction will refuse to publish while its pathname is rebound.
@@ -148,6 +150,15 @@ native after-link test swaps the parent after the fsynced original publication
 and verifies that the preCOMMIT check refuses the COMMITTED marker. Other tests
 verify collision bytes, staged inode identities and token/session phases.
 All generated ext4 fixtures are retained for audit.
+
+The parent UID/mode follow-up has a separate real same-UID subprocess that
+changes the **original retained directory inode** from `0700` to `0777`
+without renaming it. Previous code physically proceeded with publication
+(RED 1 FAIL); the guarded source rejects before linking or COMMIT
+(GREEN 1 PASS). Full WSL Node22/ext4 W3 suite without the opt-in 16,385-inode
+stress: **38 PASS / 3 expected SKIP / 0 FAIL**. All observations remain
+`LAB_ONLY_NO_GO`; a same-UID writer can still race between checks or later
+restore the same mode (ABA).
 
 **Not a crash-safe production transaction:** the journal is a fixed
 disposable plaintext canary, **not signed**, nor held by an independent

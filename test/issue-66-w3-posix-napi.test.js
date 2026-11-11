@@ -382,6 +382,44 @@ test("#66 W3 retained ancestor chain rejects second-process same-UID parent rena
     } finally { fs.closeSync(originalFd); }
   });
 
+test("#66 W3 native ancestor chain rejects a same-UID parent permission downgrade on the retained inode",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const parent = path.join(home, created[0]);
+    const parentFd = fs.openSync(parent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW);
+    try {
+      const original = fs.fstatSync(parentFd, { bigint: true });
+      assert.equal(original.mode & 0o777n, 0o700n);
+      assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+      const attacker = spawnSync("/usr/bin/node", ["-e", String.raw`
+        const fs = require('node:fs');
+        fs.chmodSync(process.argv[1], 0o777);
+        process.stdout.write('SAME_UID_MODE_CHANGED');
+      `, parent], { timeout: 10000, encoding: "utf8", maxBuffer: 1024 });
+      assert.equal(attacker.status, 0, attacker.stderr);
+      assert.equal(attacker.stdout, "SAME_UID_MODE_CHANGED");
+      const after = fs.fstatSync(parentFd, { bigint: true });
+      assert.equal(after.dev, original.dev);
+      assert.equal(after.ino, original.ino,
+        "the attacker must change permissions on the SAME retained inode");
+      assert.equal(after.mode & 0o777n, 0o777n);
+      assert.throws(() => bridge.publishProof(token), /NATIVE_ANCESTOR_CHANGED/,
+        "a writable-to-others parent must invalidate original protected ancestry");
+      assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false);
+      assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-commit-marker-v1")), false);
+      assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+      assert.equal(bridge.authority(), "LAB_ONLY_NO_GO");
+    } finally { fs.closeSync(parentFd); }
+  });
+
 test("#66 W3 live ancestor recheck blocks COMMIT after a durable link and parent rebind",
   { skip: !txnEnabled }, (t) => {
     const bridge = loadLab();

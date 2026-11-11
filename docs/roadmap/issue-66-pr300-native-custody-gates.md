@@ -12,7 +12,7 @@ is an intentional security boundary, not a test workaround.
 flowchart TD
   S[Draft PR 300: no cutover] --> I{Native executable, DLL and compiler provenance attested?}
   I -- No --> N[Keep RootSession closed; RELEASE NO-GO]
-  I -- Yes --> A{Root and parent acquired from an independent custodian?}
+  I -- Yes --> A{Root and every ancestor acquired and held by an independent custodian?}
   A -- No --> N
   A -- Yes --> P{A distinct untrusted UID/SID fails real reads and writes through every ancestor?}
   P -- No --> N
@@ -727,3 +727,36 @@ Windows `lstat` fallback is only laboratory evidence and cannot provide an
 atomic race-free directory entry guarantee under same-SID mutation.
 This candidate requires fresh independent SOURCE GO and hosted exact-head
 CodeQL/CI if published. **Lab nonauthorizing; RELEASE NO-GO.**
+
+### 2026-11-11 — W3 live native all-ancestor chain and original 0700 permission drift
+
+The W3 POSIX native laboratory now retains the original `/` anchor, every
+literal passwd HOME component and the disposable fixture-parent fd while
+retaining the original `held` DIR*. Each stage, publication and pre-COMMIT
+gate reopens named children from **their originally retained parent fd** with
+`openat2` no-follow/no-cross-mount constraints; it compares the opened inode
+identity to the original descriptor. A physical second same-UID process
+renaming the fixture parent and creating another directory/held was accepted
+by the predecessor (**RED**) and is now rejected without COMMIT. Symlink
+replacement and a deterministic post-link/pre-COMMIT parent rebind also
+reject, without deleting an untrusted pathname.
+
+An independent source review found that checking only `dev/ino` could still
+allow same-inode permission weakening. An additional physical WSL22/ext4
+test changes the retained parent from owner-only `0700` to `0777` from a
+separate same-UID process: prior integrated ancestor source **RED 0 PASS /
+1 FAIL** (it published anyway). The follow-up stores and rechecks the
+original `st_uid` and mode bits of **every ancestor**, plus the private ext4
+parent's strict `0700` contract, before staging, publishing and COMMIT.
+Physical child **GREEN 1 PASS**, and the complete W3 Node22/ext4 suite
+with **no 16,385-inode stress rerun** is **38 PASS / 3 expected SKIP /
+0 FAIL**. These results belong to the local child and await exact-SHA
+independent SOURCE GO and final hosted checks.
+
+This is **live, cooperative LAB_ONLY_NO_GO**, not a persistent independent
+custodian. The cold inspector acquires its own namespace after the original
+descriptors die; a same-UID actor can still do ABA between checks, tamper
+with the source or change the process mount namespace. It cannot attest a
+signed owner floor or authorize `RootSession`. Real Windows 10 CFAPI,
+Windows native all-ancestor custody, separate-principal isolation and
+hardware powercut gates remain open. **MERGE NO-GO; RELEASE NO-GO**.

@@ -47,6 +47,8 @@ typedef struct {
   int fd;
   dev_t dev;
   ino_t ino;
+  uid_t uid;
+  mode_t mode; // initial permissions and special bits, never a grant to write
   char name[256]; // empty only for the retained '/' anchor
 } retained_ancestor;
 
@@ -136,6 +138,8 @@ static int retain_child_directory(lab_session *session, int base, const char *na
   entry->fd = child;
   entry->dev = st.st_dev;
   entry->ino = st.st_ino;
+  entry->uid = st.st_uid;
+  entry->mode = st.st_mode & 07777;
   memcpy(entry->name, name, length + 1);
   return child;
 }
@@ -151,7 +155,8 @@ static int still_original_ancestors(lab_session *session) {
     struct stat st;
     if (current->fd < 0 || fstat(current->fd, &st) != 0 ||
         !S_ISDIR(st.st_mode) || st.st_dev != current->dev ||
-        st.st_ino != current->ino) return 0;
+        st.st_ino != current->ino || st.st_uid != current->uid ||
+        (st.st_mode & 07777) != current->mode) return 0;
     if (i == 0) continue; // '/' is an untrusted process namespace anchor.
     int reopened = fd_openat2(session->ancestors[i - 1].fd,
                               current->name, O_RDONLY | O_DIRECTORY, 0);
@@ -159,6 +164,9 @@ static int still_original_ancestors(lab_session *session) {
     if (reopened >= 0 && close(reopened) != 0) same = 0;
     if (!same) return 0;
   }
+  // Same inode identity alone is insufficient: another same-UID process may
+  // chmod the private 0700 parent to 0777 without renaming any component.
+  if (!plain_directory(session->parentfd, 1)) return 0;
   int held = dirfd(session->held);
   int reopened = fd_openat2(session->parentfd, "held", O_RDONLY | O_DIRECTORY, 0);
   int same = reopened >= 0 && object_is(reopened, held) &&
@@ -426,6 +434,8 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
   session->ancestors[0].fd = root;
   session->ancestors[0].dev = root_stat.st_dev;
   session->ancestors[0].ino = root_stat.st_ino;
+  session->ancestors[0].uid = root_stat.st_uid;
+  session->ancestors[0].mode = root_stat.st_mode & 07777;
   session->ancestors[0].name[0] = 0;
   session->ancestor_count = 1;
   // Walk passwd HOME one literal path segment at a time. A single multi-
