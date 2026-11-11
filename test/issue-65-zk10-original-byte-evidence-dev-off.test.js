@@ -591,6 +591,128 @@ test("P2 hostile signed CURRENT callback cannot replace Buffer.concat to replay 
   assert.equal(accepted, undefined, "no replayed stale CURRENT accepted");
 });
 
+test("P2: signed CURRENT cannot replay stale nonce via poisoned own descriptor after real callback", () => {
+  const f = fixture();
+  const staleNonce = b64(32);
+  const staleFloor = sign({
+    type: "rootark-zk10-original-byte-floor-readback/v1",
+    immutable_account_id: f.expected.immutable_account_id,
+    owner_spki_sha256: spki(f.owner.publicKey),
+    sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+    nonce: staleNonce, revoked: false, issued_at_ms: Date.now() - 40,
+    expires_at_ms: Date.now() + 5000,
+  }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+  const originalDescriptor = Object.getOwnPropertyDescriptor;
+  let getDescriptorCalls = 0, injectedDescriptorCalls = 0;
+  const options = f.options();
+  options.readSignedCurrentFloor = challenge => {
+    assert.notEqual(challenge, staleNonce);
+    getDescriptorCalls++;
+    Object.getOwnPropertyDescriptor = (value, field) => {
+      const found = originalDescriptor.call(Object, value, field);
+      if (field === "nonce" && found?.value === challenge && Object.isFrozen(value)
+        && value?.type === "rootark-zk10-original-byte-floor-readback/v1") {
+        injectedDescriptorCalls++;
+        return { ...found, value: staleNonce };
+      }
+      return found;
+    };
+    return { ...staleFloor, nonce: challenge };
+  };
+  let granted;
+  try {
+    const gate = createDevOffOriginalByteEvidenceGate(options);
+    assert.throws(() => { granted = gate.beginBeforeBody({
+      ownerEvidence: f.intent(), expected: f.expected,
+    }); }, bad, "authentic stale signature for B cannot authorize unowned CURRENT challenge A");
+  } finally { Object.getOwnPropertyDescriptor = originalDescriptor; }
+  assert.ok(getDescriptorCalls > 0, "a separate signed floor callback must run");
+  assert.equal(injectedDescriptorCalls, 0,
+    "signed nonce serialization must not call attacker-rebound Object.getOwnPropertyDescriptor");
+  assert.equal(granted, undefined, "no ticket accepted after stale readback nonce replay");
+});
+
+test("P2: signed CURRENT cannot replay stale nonce via rebound Array.prototype.join", () => {
+  const f = fixture();
+  const staleNonce = b64(32);
+  const staleFloor = sign({
+    type: "rootark-zk10-original-byte-floor-readback/v1",
+    immutable_account_id: f.expected.immutable_account_id,
+    owner_spki_sha256: spki(f.owner.publicKey),
+    sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+    nonce: staleNonce, revoked: false, issued_at_ms: Date.now() - 40,
+    expires_at_ms: Date.now() + 5000,
+  }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+  const nativeJoin = Array.prototype.join;
+  let callbacks = 0, forgedJoins = 0;
+  const options = f.options();
+  options.readSignedCurrentFloor = challenge => {
+    assert.notEqual(challenge, staleNonce);
+    callbacks++;
+    Array.prototype.join = function(separator) {
+      const result = nativeJoin.call(this, separator);
+      if (separator === "," && this.length === FLOOR_FIELDS.length
+        && result.includes('"nonce":"' + challenge + '"')) {
+        forgedJoins++;
+        return result.replace('"nonce":"' + challenge + '"',
+          '"nonce":"' + staleNonce + '"');
+      }
+      return result;
+    };
+    return { ...staleFloor, nonce: challenge };
+  };
+  let granted;
+  try {
+    const gate = createDevOffOriginalByteEvidenceGate(options);
+    assert.throws(() => { granted = gate.beginBeforeBody({
+      ownerEvidence: f.intent(), expected: f.expected,
+    }); }, bad, "native signature for stale B must not validate current challenge A");
+  } finally { Array.prototype.join = nativeJoin; }
+  assert.ok(callbacks > 0, "genuine signed CURRENT readback callback must run");
+  assert.equal(forgedJoins, 0,
+    "canonical signature bytes must never dispatch to attacker-mutated Array.join");
+  assert.equal(granted, undefined, "no replayed nonce may produce a DEV-OFF ticket");
+});
+
+test("P2: wrong physical chunks cannot become signed originals via poisoned array descriptor", () => {
+  const f = fixture();
+  const wrong = Uint8Array.from(f.original);
+  wrong[2] ^= 0x6e;
+  assert.notEqual(hash(Buffer.from(wrong)), f.body.original_sha256,
+    "wrong bytes genuinely differ from owner-signed original SHA");
+  const chunks = [wrong];
+  const nativeDescriptor = Object.getOwnPropertyDescriptor;
+  const options = f.options();
+  const realFloor = options.readSignedCurrentFloor;
+  let floorCalls = 0, injectedDescriptorCalls = 0;
+  options.readSignedCurrentFloor = challenge => {
+    const authentic = realFloor(challenge);
+    floorCalls++;
+    if (floorCalls >= 2) {
+      Object.getOwnPropertyDescriptor = (value, field) => {
+        const found = nativeDescriptor.call(Object, value, field);
+        if (value === chunks && field === "0") {
+          injectedDescriptorCalls++;
+          return { ...found, value: f.original };
+        }
+        return found;
+      };
+    }
+    return authentic;
+  };
+  let accepted;
+  try {
+    const gate = createDevOffOriginalByteEvidenceGate(options);
+    const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+    assert.throws(() => { accepted = gate.verifyOriginalBytes({ ticket, chunks }); }, bad,
+      "the exact Uint8Array physically supplied, not a swapped JS descriptor, must be hashed");
+  } finally { Object.getOwnPropertyDescriptor = nativeDescriptor; }
+  assert.ok(floorCalls >= 2, "verified CURRENT callback executes before body hash");
+  assert.equal(injectedDescriptorCalls, 0,
+    "array elements must be read through an intrinsic captured before external callbacks");
+  assert.equal(accepted, undefined, "no wrong original accepted after signed callback");
+});
+
 test("P2: owner A cannot impersonate independently pinned B via own native kKeyType getter and retargeted Hash.prototype.digest", () => {
   const f = fixture();
   const opts = f.options();

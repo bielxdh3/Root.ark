@@ -13,6 +13,31 @@ const { types: { isProxy } } = require("node:util");
 const BUFFER_FROM = Buffer.from.bind(Buffer);
 const BUFFER_CONCAT = Buffer.concat.bind(Buffer);
 const NATIVE_UINT8ARRAY = Uint8Array;
+// An untrusted signed-CURRENT callback runs before both nonce-snapshot
+// signature verification and later byte iteration. Capturing only crypto and
+// Buffer factories does not stop a rebinding of JS property/array intrinsics
+// from substituting a signed nonce or an original byte-array element.
+const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const HAS_OWN = Object.hasOwn.bind(Object);
+const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const BASE_OBJECT_PROTOTYPE = Object.prototype;
+const BASE_ARRAY_PROTOTYPE = Array.prototype;
+const CREATE_NULL_PROTO = Object.create.bind(Object);
+const FROM_ENTRIES = Object.fromEntries.bind(Object);
+const FREEZE = Object.freeze.bind(Object);
+const OWN_KEYS = Reflect.ownKeys.bind(Reflect);
+const IS_ARRAY = Array.isArray.bind(Array);
+const IS_SAFE_INTEGER = Number.isSafeInteger.bind(Number);
+const ARRAY_MAP = Array.prototype.map;
+const ARRAY_JOIN = Array.prototype.join;
+const ARRAY_SOME = Array.prototype.some;
+const BUFFER_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
+const BUFFER_TO_STRING = Buffer.prototype.toString;
+const REGEX_TEST = RegExp.prototype.test;
+const SET_HAS = Set.prototype.has;
+const SET_ADD = Set.prototype.add;
+const WEAK_GET = WeakMap.prototype.get;
+const WEAK_SET = WeakMap.prototype.set;
 
 const OWNER_DOMAIN = Buffer.from("Root.ark/zk10/owner-original-byte-evidence/v1\0");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk10/original-byte-floor-readback/v1\0");
@@ -25,6 +50,11 @@ const FLOOR_FIELDS = Object.freeze([
   "type", "immutable_account_id", "owner_spki_sha256",
   "sequence", "head_digest", "nonce", "revoked", "issued_at_ms", "expires_at_ms",
 ]);
+// Signature-field order is created before any caller callback can poison the
+// global Array iterator or spread semantics. signedSnapshot accepts only these
+// two immutable schemas and never creates its field list from untrusted JS.
+const OWNER_SIGNED_FIELDS = Object.freeze([...OWNER_FIELDS, "signature"]);
+const FLOOR_SIGNED_FIELDS = Object.freeze([...FLOOR_FIELDS, "signature"]);
 const CONFIG_FIELDS = Object.freeze([
   "devOff", "pinnedOwnerPublicKey", "pinnedOwnerSpkiSha256",
   "pinnedFloorPublicKey", "pinnedFloorSpkiSha256",
@@ -45,9 +75,9 @@ const FLOOR_TTL_MS = 10000;
 const NOW = Date.now.bind(Date);
 const VERIFY = crypto.verify.bind(crypto);
 const HASH = crypto.createHash.bind(crypto);
-const HASH_PROTOTYPE = Object.getPrototypeOf(HASH("sha256"));
-const HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
-const HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const HASH_PROTOTYPE = GET_PROTOTYPE(HASH("sha256"));
+const HASH_UPDATE = OWN_DESCRIPTOR(HASH_PROTOTYPE, "update").value;
+const HASH_DIGEST = OWN_DESCRIPTOR(HASH_PROTOTYPE, "digest").value;
 const TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
 const JSON_STRINGIFY_PRIMITIVE = JSON.stringify.bind(JSON);
 const RANDOM = crypto.randomBytes.bind(crypto);
@@ -61,25 +91,25 @@ const PUBLIC_KEY_FIXTURE = CREATE_PUBLIC({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
 });
-const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(PUBLIC_KEY_FIXTURE);
+const PUBLIC_KEY_PROTOTYPE = GET_PROTOTYPE(PUBLIC_KEY_FIXTURE);
 const KEY_HANDLE_SYMBOL = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
   .find((symbol) => symbol.description === "kHandle");
 const KEY_TYPE_SYMBOL = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
   .find((symbol) => symbol.description === "kKeyType");
-const NATIVE_HANDLE_PROTOTYPE = Object.getPrototypeOf(PUBLIC_KEY_FIXTURE[KEY_HANDLE_SYMBOL]);
-const NATIVE_HANDLE_ALGORITHM = Object.getOwnPropertyDescriptor(
+const NATIVE_HANDLE_PROTOTYPE = GET_PROTOTYPE(PUBLIC_KEY_FIXTURE[KEY_HANDLE_SYMBOL]);
+const NATIVE_HANDLE_ALGORITHM = OWN_DESCRIPTOR(
   NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType").value;
-const NATIVE_HANDLE_EXPORT = Object.getOwnPropertyDescriptor(
+const NATIVE_HANDLE_EXPORT = OWN_DESCRIPTOR(
   NATIVE_HANDLE_PROTOTYPE, "export").value;
-const KEY_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
-const KEY_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
-const KEY_ASYMMETRIC_TYPE = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
-const VIEW_INTRINSICS = Object.getPrototypeOf(Uint8Array.prototype);
-const VIEW_BUFFER = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "buffer").get;
-const VIEW_OFFSET = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "byteOffset").get;
-const VIEW_LENGTH = Object.getOwnPropertyDescriptor(VIEW_INTRINSICS, "byteLength").get;
-const AB_LENGTH = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+const KEY_EXPORT = OWN_DESCRIPTOR(PUBLIC_KEY_PROTOTYPE, "export").value;
+const KEY_TYPE = OWN_DESCRIPTOR(crypto.KeyObject.prototype, "type").get;
+const KEY_ASYMMETRIC_TYPE = OWN_DESCRIPTOR(
+  GET_PROTOTYPE(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
+const VIEW_INTRINSICS = GET_PROTOTYPE(Uint8Array.prototype);
+const VIEW_BUFFER = OWN_DESCRIPTOR(VIEW_INTRINSICS, "buffer").get;
+const VIEW_OFFSET = OWN_DESCRIPTOR(VIEW_INTRINSICS, "byteOffset").get;
+const VIEW_LENGTH = OWN_DESCRIPTOR(VIEW_INTRINSICS, "byteLength").get;
+const AB_LENGTH = OWN_DESCRIPTOR(ArrayBuffer.prototype, "byteLength").get;
 
 function deny() {
   const error = new Error("ZK10_ORIGINAL_BYTE_EVIDENCE_UNVERIFIED");
@@ -87,58 +117,62 @@ function deny() {
   throw error;
 }
 function exact(value, fields) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)
-    || isProxy(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
-    || Reflect.ownKeys(value).length !== fields.length) deny();
-  const copy = {};
-  for (const field of fields) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, field);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+  const candidatePrototype = value !== null && typeof value === "object"
+    ? GET_PROTOTYPE(value) : null;
+  if (value === null || typeof value !== "object" || IS_ARRAY(value)
+    || isProxy(value) || (candidatePrototype !== BASE_OBJECT_PROTOTYPE
+      && candidatePrototype !== null)
+    || OWN_KEYS(value).length !== fields.length) deny();
+  const copy = CREATE_NULL_PROTO(null);
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    const descriptor = OWN_DESCRIPTOR(value, field);
+    if (!descriptor || !HAS_OWN(descriptor, "value")) deny();
     copy[field] = descriptor.value;
   }
   return copy;
 }
 function bytes(value, count) {
-  if (typeof value !== "string" || !B64URL.test(value)) deny();
+  if (typeof value !== "string" || !REGEX_TEST.call(B64URL, value)) deny();
   const decoded = BUFFER_FROM(value, "base64url");
-  if (decoded.length !== count || decoded.toString("base64url") !== value) deny();
+  if (decoded.length !== count || BUFFER_TO_STRING.call(decoded, "base64url") !== value) deny();
   return value;
 }
 function hex(value) {
-  if (typeof value !== "string" || !HEX64.test(value)) deny();
+  if (typeof value !== "string" || !REGEX_TEST.call(HEX64, value)) deny();
   return value;
 }
 function integer(value, min, max = Number.MAX_SAFE_INTEGER) {
-  if (!Number.isSafeInteger(value) || value < min || value > max) deny();
+  if (!IS_SAFE_INTEGER(value) || value < min || value > max) deny();
   return value;
 }
 function publicKey(value, pinnedSpki) {
   if (isProxy(value) || !(value instanceof crypto.KeyObject)
-    || Object.getPrototypeOf(value) !== PUBLIC_KEY_PROTOTYPE) deny();
+    || GET_PROTOTYPE(value) !== PUBLIC_KEY_PROTOTYPE) deny();
   // Never execute a caller-owned Symbol(kHandle) getter while examining a
   // supposedly native key. Native direct KeyObjects own a DATA handle;
   // inherited wrappers/accessors are not a stable security principal.
   const handle = KEY_HANDLE_SYMBOL
-    && Object.getOwnPropertyDescriptor(value, KEY_HANDLE_SYMBOL);
+    && OWN_DESCRIPTOR(value, KEY_HANDLE_SYMBOL);
   const typeDescriptor = KEY_TYPE_SYMBOL
-    && Object.getOwnPropertyDescriptor(value, KEY_TYPE_SYMBOL);
+    && OWN_DESCRIPTOR(value, KEY_TYPE_SYMBOL);
   // A forged Object.create(nativePublicPrototype) can own a DATA kHandle
   // whose value is actually a JavaScript object, or own an accessor kKeyType.
   // The native key accessors can dispatch through those objects before any
   // caught exception, poisoning crypto/hash methods for the next verification.
   // Check BOTH own descriptors and the raw handle's genuine native brand
   // before calling a single higher-level native KeyObject accessor/export.
-  if (!handle || !Object.hasOwn(handle, "value")
-    || !typeDescriptor || !Object.hasOwn(typeDescriptor, "value")
+  if (!handle || !HAS_OWN(handle, "value")
+    || !typeDescriptor || !HAS_OWN(typeDescriptor, "value")
     || typeDescriptor.value !== "public"
     || !handle.value || typeof handle.value !== "object"
     || isProxy(handle.value)
-    || Object.getPrototypeOf(handle.value) !== NATIVE_HANDLE_PROTOTYPE
-    || Object.hasOwn(handle.value, "export")
-    || Object.hasOwn(handle.value, "getAsymmetricKeyType")
-    || Object.getOwnPropertyDescriptor(NATIVE_HANDLE_PROTOTYPE, "export")?.value
+    || GET_PROTOTYPE(handle.value) !== NATIVE_HANDLE_PROTOTYPE
+    || HAS_OWN(handle.value, "export")
+    || HAS_OWN(handle.value, "getAsymmetricKeyType")
+    || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export")?.value
       !== NATIVE_HANDLE_EXPORT
-    || Object.getOwnPropertyDescriptor(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
+    || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
       !== NATIVE_HANDLE_ALGORITHM
     || NATIVE_HANDLE_ALGORITHM.call(handle.value) !== "ed25519"
     || KEY_TYPE.call(value) !== "public"
@@ -148,7 +182,7 @@ function publicKey(value, pinnedSpki) {
     // can change its own Symbol(kHandle) between SPKI hashing and VERIFY.
     // All later checks must use this freshly imported, independent handle.
     const der = KEY_EXPORT.call(value, { type: "spki", format: "der" });
-    if (!Buffer.isBuffer(der) || der.length !== 44) deny();
+    if (!BUFFER_IS_BUFFER(der) || der.length !== 44) deny();
     const pinned = CREATE_PUBLIC({ key: der, format: "der", type: "spki" });
     if (KEY_TYPE.call(pinned) !== "public"
       || KEY_ASYMMETRIC_TYPE.call(pinned) !== "ed25519"
@@ -175,7 +209,7 @@ function normalizedOwner(raw) {
   integer(o.issued_at_ms, 1);
   integer(o.expires_at_ms, o.issued_at_ms + 1);
   if (o.expires_at_ms - o.issued_at_ms > TTL_MS) deny();
-  return Object.freeze(o);
+  return FREEZE(o);
 }
 function normalizedFloor(raw) {
   const f = exact(raw, FLOOR_FIELDS);
@@ -189,23 +223,27 @@ function normalizedFloor(raw) {
   integer(f.issued_at_ms, 1);
   integer(f.expires_at_ms, f.issued_at_ms + 1);
   if (f.expires_at_ms - f.issued_at_ms > FLOOR_TTL_MS) deny();
-  return Object.freeze(f);
+  return FREEZE(f);
 }
 function signedSnapshot(record, fields, normalize, domain, pinnedKey) {
-  const signed = exact(record, [...fields, "signature"]);
-  const body = normalize(Object.fromEntries(fields.map((field) => [field, signed[field]])));
+  const signed = exact(record, fields === OWNER_FIELDS
+    ? OWNER_SIGNED_FIELDS : fields === FLOOR_FIELDS ? FLOOR_SIGNED_FIELDS : []);
+  const body = normalize(FROM_ENTRIES(ARRAY_MAP.call(fields,
+    (field) => [field, signed[field]])));
   const signature = BUFFER_FROM(bytes(signed.signature, 64), "base64url");
   // All normalized owner/floor records are FLAT scalar schemas. Serialize
   // each own primitive in the exact signed field order. JSON.stringify(body)
   // would invoke inherited toJSON hooks after an injected CURRENT callback.
-  const encoded = fields.map((field) => {
-    const descriptor = Object.getOwnPropertyDescriptor(body, field);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")
-      || (descriptor.value !== null && !["string", "boolean", "number"].includes(
-        typeof descriptor.value))) deny();
+  const encoded = ARRAY_MAP.call(fields, (field) => {
+    const descriptor = OWN_DESCRIPTOR(body, field);
+    const type = typeof descriptor?.value;
+    if (!descriptor || !HAS_OWN(descriptor, "value")
+      || (descriptor.value !== null && type !== "string"
+        && type !== "boolean" && type !== "number")) deny();
     return `${JSON_STRINGIFY_PRIMITIVE(field)}:${JSON_STRINGIFY_PRIMITIVE(descriptor.value)}`;
   });
-  const message = BUFFER_CONCAT([domain, BUFFER_FROM(`{${encoded.join(",")}}`, "utf8")]);
+  const message = BUFFER_CONCAT([domain,
+    BUFFER_FROM(`{${ARRAY_JOIN.call(encoded, ",")}}`, "utf8")]);
   if (!VERIFY(null, message, pinnedKey, signature)) deny();
   return body;
 }
@@ -215,14 +253,14 @@ function exactExpected(value) {
   bytes(expected.object_id, 16);
   bytes(expected.version_id, 16);
   integer(expected.key_epoch, 1);
-  return Object.freeze(expected);
+  return FREEZE(expected);
 }
 function immutableBytes(part, remaining) {
   // No JS-accessed byteLength/length/buffer/byteOffset properties may redefine
   // the real range hashed. Shared backing permits mutation between copies.
-  if (isProxy(part) || (!Buffer.isBuffer(part) && !(part instanceof Uint8Array))) deny();
-  if (["byteLength", "byteOffset", "buffer", "length"].some((field) =>
-    Object.hasOwn(part, field))) deny();
+  if (isProxy(part) || (!BUFFER_IS_BUFFER(part) && !(part instanceof NATIVE_UINT8ARRAY))) deny();
+  if (ARRAY_SOME.call(["byteLength", "byteOffset", "buffer", "length"], (field) =>
+    HAS_OWN(part, field))) deny();
   try {
     const length = VIEW_LENGTH.call(part);
     const offset = VIEW_OFFSET.call(part);
@@ -257,7 +295,7 @@ function createDevOffOriginalByteEvidenceGate(options) {
       // This callback is a DEVELOPMENT TEST INJECTION, not an off-host network
       // or independently audited monotonic custodian. Require a fresh signed
       // challenge; even its success is insufficient to authorize protected I/O.
-      const challenge = RANDOM(32).toString("base64url");
+      const challenge = BUFFER_TO_STRING.call(RANDOM(32), "base64url");
       const signed = o.readSignedCurrentFloor(challenge);
       const floor = signedSnapshot(signed, FLOOR_FIELDS, normalizedFloor, FLOOR_DOMAIN, floorKey);
       const now = NOW();
@@ -288,34 +326,36 @@ function createDevOffOriginalByteEvidenceGate(options) {
         const scope = exactExpected(expected);
         const intent = signedSnapshot(ownerEvidence, OWNER_FIELDS, normalizedOwner,
           OWNER_DOMAIN, ownerKey);
-        if (EXPECTED_FIELDS.some((field) => intent[field] !== scope[field])) deny();
+        if (ARRAY_SOME.call(EXPECTED_FIELDS,
+          (field) => intent[field] !== scope[field])) deny();
         freshOwner(intent);
         const replayKey = intent.immutable_account_id + ":" + intent.nonce;
-        if (observedNonces.has(replayKey) || observedNonces.size >= MAX_NONCES) deny();
-        observedNonces.add(replayKey);
-        const ticket = Object.freeze({ authorizesIo: false, stagePermitted: false,
+        if (SET_HAS.call(observedNonces, replayKey)
+          || observedNonces.size >= MAX_NONCES) deny();
+        SET_ADD.call(observedNonces, replayKey);
+        const ticket = FREEZE({ authorizesIo: false, stagePermitted: false,
           independentCustodyProven: false });
-        tickets.set(ticket, { intent, consumed: false });
+        WEAK_SET.call(tickets, ticket, { intent, consumed: false });
         return ticket;
       } catch (_) { deny(); }
     }
     function verifyOriginalBytes(input) {
       try {
         const { ticket, chunks } = exact(input, ["ticket", "chunks"]);
-        const saved = ticket && tickets.get(ticket);
+        const saved = ticket && WEAK_GET.call(tickets, ticket);
         if (!saved || saved.consumed) deny();
         saved.consumed = true; // consume before any user-supplied byte access
         const intent = saved.intent;
         freshOwner(intent);
-        if (!Array.isArray(chunks) || isProxy(chunks)
-          || Object.getPrototypeOf(chunks) !== Array.prototype
+        if (!IS_ARRAY(chunks) || isProxy(chunks)
+          || GET_PROTOTYPE(chunks) !== Array.prototype
           || chunks.length > MAX_CHUNKS
-          || Reflect.ownKeys(chunks).length !== chunks.length + 1) deny();
+          || OWN_KEYS(chunks).length !== chunks.length + 1) deny();
         const digest = HASH("sha256");
         let size = 0;
         for (let index = 0; index < chunks.length; index++) {
-          const descriptor = Object.getOwnPropertyDescriptor(chunks, String(index));
-          if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+          const descriptor = OWN_DESCRIPTOR(chunks, index);
+          if (!descriptor || !HAS_OWN(descriptor, "value")) deny();
           const copied = immutableBytes(descriptor.value, intent.original_length - size);
           size += copied.length;
           HASH_UPDATE.call(digest, copied);
@@ -324,7 +364,7 @@ function createDevOffOriginalByteEvidenceGate(options) {
           || !TIMING_SAFE_EQUAL(HASH_DIGEST.call(digest),
             BUFFER_FROM(intent.original_sha256, "hex"))) deny();
         freshOwner(intent); // check another nonce-signed snapshot after assembly
-        return Object.freeze({
+        return FREEZE({
           status: "SIGNED_ORIGINAL_BYTES_NONAUTHORIZING",
           originalByteDigestVerified: true, originalLength: size,
           authorizesIo: false, stagePermitted: false,
@@ -333,9 +373,9 @@ function createDevOffOriginalByteEvidenceGate(options) {
         });
       } catch (_) { deny(); }
     }
-    return Object.freeze({ beginBeforeBody, verifyOriginalBytes,
+    return FREEZE({ beginBeforeBody, verifyOriginalBytes,
       authorizesIo: false, stagePermitted: false });
   } catch (_) { deny(); }
 }
 
-module.exports = Object.freeze({ createDevOffOriginalByteEvidenceGate });
+module.exports = FREEZE({ createDevOffOriginalByteEvidenceGate });
