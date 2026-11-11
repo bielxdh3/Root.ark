@@ -13,6 +13,8 @@ const {
   keyEquals: ATOMIC_NATIVE_EQUALS,
   randomBytes: NATIVE_RANDOM_BYTES,
   randomUUID: NATIVE_RANDOM_UUID,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
 } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
@@ -74,10 +76,10 @@ function pinnedAtomicWitnessKey(value) {
     if (isProxy(value)) throw new Error("Proxy pin");
     let der;
     if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-      der = Buffer.from(value);
+      der = NATIVE_BUFFER_FROM(value);
     } else if (typeof value === "string" && /^[A-Za-z0-9_-]{40,512}$/.test(value)) {
-      der = Buffer.from(value, "base64url");
-      if (der.toString("base64url") !== value) {
+      der = NATIVE_BUFFER_FROM(value, "base64url");
+      if (NATIVE_BUFFER_TO_STRING.call(der, "base64url") !== value) {
         fail("Atomic batch witness key is not canonical", "authorization_required");
       }
     } else {
@@ -134,10 +136,10 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     fail("Atomic batch lacks an exact independent durable admission receipt",
       "sync_atomic_batch_indeterminate");
   }
-  const signature = Buffer.from(receipt.signature, "base64url");
+  const signature = NATIVE_BUFFER_FROM(receipt.signature, "base64url");
   if (signature.length !== 64
-    || signature.toString("base64url") !== receipt.signature
-    || !NATIVE_VERIFY(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
+    || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== receipt.signature
+    || !NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(ATOMIC_ADMISSION_DOMAIN
       + protocol.canonicalJson(statement), "utf8"), trustedWitnessKey, signature)) {
     fail("Independent atomic batch witness signature invalid",
       "sync_atomic_batch_indeterminate");
@@ -177,9 +179,9 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
     fail("External CAS floor does not attest the same current batch head",
       "sync_atomic_batch_indeterminate");
   }
-  const signature = Buffer.from(detached.signature, "base64url");
-  if (signature.length !== 64 || signature.toString("base64url") !== detached.signature
-    || !NATIVE_VERIFY(null, Buffer.from(ATOMIC_CAS_FLOOR_DOMAIN
+  const signature = NATIVE_BUFFER_FROM(detached.signature, "base64url");
+  if (signature.length !== 64 || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== detached.signature
+    || !NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(ATOMIC_CAS_FLOOR_DOMAIN
       + protocol.canonicalJson(statement), "utf8"), trustedCasKey, signature)) {
     fail("External CAS current floor signature invalid",
       "sync_atomic_batch_indeterminate");

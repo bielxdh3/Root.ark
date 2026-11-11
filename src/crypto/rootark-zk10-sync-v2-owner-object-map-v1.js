@@ -15,6 +15,17 @@ const {
   hashDigest: NATIVE_HASH_DIGEST,
   randomBytes: NATIVE_RANDOM_BYTES,
   jsonStringify: NATIVE_JSON_STRINGIFY,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  bufferByteLength: NATIVE_BUFFER_BYTE_LENGTH,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  ownKeys: NATIVE_OWN_KEYS,
+  ownDescriptor: NATIVE_OWN_DESCRIPTOR,
+  getPrototype: NATIVE_GET_PROTOTYPE,
+  hasOwn: NATIVE_HAS_OWN,
+  objectCreate: NATIVE_OBJECT_CREATE,
+  defineProperty: NATIVE_DEFINE_PROPERTY,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
@@ -90,7 +101,7 @@ function sha(bytes) {
   return NATIVE_HASH_DIGEST.call(hash, "hex");
 }
 function signedBytes(domain, payload) {
-  return Buffer.concat([domain, Buffer.from(NATIVE_JSON_STRINGIFY(payload), "utf8")]);
+  return NATIVE_BUFFER_CONCAT([domain, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(payload), "utf8")]);
 }
 function ownPayload(value) {
   const p = exact(value, OWNER_FIELDS);
@@ -132,7 +143,7 @@ function signOwnerObjectMap(unsigned, privateKey) {
 function digestOwnerObjectMap(signed) {
   try {
     const { payload, signature } = unpackMap(signed);
-    return sha(Buffer.concat([signedBytes(OWNER_DOMAIN, payload), signature]));
+    return sha(NATIVE_BUFFER_CONCAT([signedBytes(OWNER_DOMAIN, payload), signature]));
   } catch (_) { deny(); }
 }
 function currentHeadPayload(value) {
@@ -158,8 +169,8 @@ function signCurrentMappingHead(unsigned, privateKey) {
 function bytes(value, max = 12 * 1024 * 1024) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]*$/.test(value)
     || value.length > Math.ceil(max * 4 / 3) + 4) deny();
-  const out = Buffer.from(value, "base64url");
-  if (out.length > max || out.toString("base64url") !== value) deny();
+  const out = NATIVE_BUFFER_FROM(value, "base64url");
+  if (out.length > max || NATIVE_BUFFER_TO_STRING.call(out, "base64url") !== value) deny();
   return out;
 }
 // Snapshot attacker data before asynchronous signature checks. JSON.stringify
@@ -171,26 +182,29 @@ function copyJson(value, depth = 0, budget = { nodes: 0, bytes: 0 }) {
   // proxies altogether rather than trusting arbitrary synthetic descriptors.
   if (isProxy(value)) deny();
   if (typeof value === "string") {
-    budget.bytes += Buffer.byteLength(value, "utf8");
+    budget.bytes += NATIVE_BUFFER_BYTE_LENGTH(value, "utf8");
     if (budget.bytes > 9 * 1024 * 1024) deny();
   }
   if (value === null || typeof value === "string"
     || typeof value === "number" || typeof value === "boolean") return value;
   if (depth > 8 || !value || typeof value !== "object") deny();
-  const array = Array.isArray(value);
-  if (!array && ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
-  const names = Reflect.ownKeys(value);
+  const array = NATIVE_ARRAY_IS_ARRAY(value);
+  if (!array && ![Object.prototype, null].includes(NATIVE_GET_PROTOTYPE(value))) deny();
+  const names = NATIVE_OWN_KEYS(value);
   if (names.length > 100 || (array && names.length !== value.length + 1)) deny();
-  const result = array ? [] : Object.create(null);
-  for (const name of names) {
+  const result = array ? [] : NATIVE_OBJECT_CREATE(null);
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
     if (array && name === "length") continue;
-    if (typeof name !== "string" || ["__proto__", "constructor", "toJSON"].includes(name)) deny();
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    if (typeof name !== "string" || name === "__proto__"
+      || name === "constructor" || name === "toJSON") deny();
+    const descriptor = NATIVE_OWN_DESCRIPTOR(value, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     if (array && (!/^(0|[1-9][0-9]*)$/.test(name) || Number(name) >= value.length)) deny();
-    budget.bytes += Buffer.byteLength(name, "utf8");
+    budget.bytes += NATIVE_BUFFER_BYTE_LENGTH(name, "utf8");
     if (budget.bytes > 9 * 1024 * 1024) deny();
-    result[name] = copyJson(descriptor.value, depth + 1, budget);
+    NATIVE_DEFINE_PROPERTY(result, name, { value: copyJson(descriptor.value, depth + 1, budget),
+      enumerable: true, configurable: true, writable: true });
   }
   return result;
 }
@@ -308,7 +322,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         if (signal?.aborted) deny();
         const r = exact(input, INPUT_FIELDS);
         const { payload, signature } = unpackMap(r.ownerMapping);
-        const digest = sha(Buffer.concat([signedBytes(OWNER_DOMAIN, payload), signature]));
+        const digest = sha(NATIVE_BUFFER_CONCAT([signedBytes(OWNER_DOMAIN, payload), signature]));
     if (!NATIVE_VERIFY(null, signedBytes(OWNER_DOMAIN, payload),
           ownerKeys[ownerKeys.length - 1], signature)
           || payload.owner_cutover_digest !== cutover.digest
@@ -326,7 +340,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         } else deny();
 
         const operation = copyJson(r.sourceOperation);
-        if (Buffer.byteLength(JSON.stringify(operation)) > 9 * 1024 * 1024) deny();
+        if (NATIVE_BUFFER_BYTE_LENGTH(NATIVE_JSON_STRINGIFY(operation), "utf8") > 9 * 1024 * 1024) deny();
         const normalized = protocol.validateStoredOperation(operation);
         if (!normalized.authorization || normalized.operation === "delete"
           || normalized.tombstone || normalized.revision.counter < 1
@@ -359,7 +373,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
 
         // Generate the challenge here. A signed old head with an old nonce is
         // not acceptable after a restart, even if its Ed25519 signature is valid.
-        const challenge = NATIVE_RANDOM_BYTES(32).toString("base64url");
+        const challenge = NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(32), "base64url");
         const wire = exact(await boundedCurrentHead(challenge, signal),
           [...HEAD_FIELDS, "signature"]);
         const head = currentHeadPayload(Object.fromEntries(
@@ -399,7 +413,7 @@ function nativePublic(value) {
   if (typeof value === "string") {
     der = decode(value, 44);
   } else if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    der = Buffer.from(value);
+    der = NATIVE_BUFFER_FROM(value);
     if (der.length !== 44) deny();
   } else deny();
   const result = key(NATIVE_CREATE_PUBLIC_KEY({ key: der,
