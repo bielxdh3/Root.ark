@@ -138,6 +138,123 @@ test("issue 66 inventory: adapter browses pages and fetches full ciphertext for 
   assert.equal(requests.some((u) => /\/sync\/v1\/objects\?$/.test(u)), false);
 });
 
+test("issue 66 P2: advisory browse rejects full envelopes and unexpected page or metadata fields from custom adapters", async () => {
+  const item = {
+    protocolVersion: 2, operationId: "operation-a", objectId: "object-a",
+    fileId: "file-a", versionId: "version-a", operation: "create",
+    revision: { counter: 1, deviceId: "device-a" }, baseRevision: null,
+    keyEpoch: "epoch-1", compartmentId: "private", deviceId: "device-a",
+    metadata: { path: "docs/a.txt", name: "a.txt", size: 1 }, tombstone: false,
+  };
+  const page = { protocolVersion: 2, view: "metadata", objects: [item], nextCursor: null };
+  let response = page;
+  let inventoryReads = 0;
+  const adapter = {
+    listInventory: async () => { inventoryReads += 1; return response; },
+    list: async () => { throw new Error("Unexpected full ciphertext read during browse"); },
+    push: async () => { throw new Error("Unexpected remote write during browse"); },
+  };
+  // Construct but do not open a root: browsing must never touch a journal or
+  // create on-disk state, nor require the operational Files On-Demand backend.
+  const engine = new SyncEngine({
+    rootDir: path.join(os.tmpdir(), `rootark-advisory-only-${crypto.randomUUID()}`),
+    adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    selectedPaths: ["docs"], fileKeyResolver: () => { throw new Error("Unexpected key read"); },
+  });
+  const good = await engine.browseRemoteInventory({ limit: 2 });
+  assert.deepEqual(good, { ...page, advisory: true,
+    objects: [{ ...item, selectedOnDevice: true }] });
+  for (const malformed of [
+    { ...page, objects: [{ ...item, ciphertext: "NOT_ADVISORY", nonce: "nonce", tag: "tag", aad: "aad" }] },
+    { ...page, objects: [{ ...item, authorization: { synthetic: "NOT_ADVISORY" } }] },
+    { ...page, objects: [{ ...item, metadata: { ...item.metadata, protectedPlaintext: "NOT_ADVISORY" } }] },
+    { ...page, privateAccountState: "NOT_ADVISORY" },
+  ]) {
+    response = malformed;
+    await assert.rejects(engine.browseRemoteInventory({ limit: 2 }), { code: "invalid_inventory" });
+  }
+  assert.equal(inventoryReads, 5, "all rejected pages must come only from the metadata adapter");
+});
+
+test("issue 66 P2: advisory browse cannot publish a changing cursor, getters or Proxy records", async () => {
+  const item = {
+    protocolVersion: 2, operationId: "operation-a", objectId: "object-a",
+    fileId: "file-a", versionId: "version-a", operation: "create",
+    revision: { counter: 1, deviceId: "device-a" }, baseRevision: null,
+    keyEpoch: "epoch-1", compartmentId: "private", deviceId: "device-a",
+    metadata: { path: "docs/a.txt" }, tombstone: false,
+  };
+  const page = { protocolVersion: 2, view: "metadata", objects: [item], nextCursor: null };
+  let response = page;
+  const engine = new SyncEngine({
+    rootDir: path.join(os.tmpdir(), `rootark-advisory-getters-${crypto.randomUUID()}`),
+    adapter: {
+      listInventory: async () => response,
+      list: async () => { throw new Error("Unexpected full read"); },
+      push: async () => { throw new Error("Unexpected push"); },
+    },
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    selectedPaths: ["docs"], fileKeyResolver: () => { throw new Error("Unexpected key read"); },
+  });
+  let cursorReads = 0;
+  const changingCursor = { ...page };
+  Object.defineProperty(changingCursor, "nextCursor", { enumerable: true,
+    get() { return ++cursorReads === 1 ? null : "NOT_ADVISORY"; } });
+  response = changingCursor;
+  await assert.rejects(engine.browseRemoteInventory(), { code: "invalid_inventory" });
+
+  const getterRecord = { ...item };
+  Object.defineProperty(getterRecord, "metadata", { enumerable: true,
+    get() { return { path: "docs/a.txt" }; } });
+  for (const malicious of [
+    { ...page, objects: [getterRecord] },
+    { ...page, objects: [new Proxy(item, {})] },
+    new Proxy(page, {}),
+  ]) {
+    response = malicious;
+    await assert.rejects(engine.browseRemoteInventory(), { code: "invalid_inventory" });
+  }
+});
+
+test("issue 66 P2: advisory browse bounds custom adapter pages, cursor and request inputs before returning UI data", async () => {
+  const item = {
+    protocolVersion: 2, operationId: "operation-a", objectId: "object-a",
+    fileId: "file-a", versionId: "version-a", operation: "create",
+    revision: { counter: 1, deviceId: "device-a" }, baseRevision: null,
+    keyEpoch: "epoch-1", compartmentId: "private", deviceId: "device-a",
+    metadata: { path: "docs/a.txt" }, tombstone: false,
+  };
+  let response = { protocolVersion: 2, view: "metadata", objects: [item], nextCursor: null };
+  let inventoryReads = 0;
+  const engine = new SyncEngine({
+    rootDir: path.join(os.tmpdir(), `rootark-advisory-bounds-${crypto.randomUUID()}`),
+    adapter: {
+      listInventory: async () => { inventoryReads += 1; return response; },
+      list: async () => { throw new Error("Unexpected full read"); },
+      push: async () => { throw new Error("Unexpected push"); },
+    },
+    deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    selectedPaths: ["docs"], fileKeyResolver: () => { throw new Error("Unexpected key read"); },
+  });
+  for (const malformed of [
+    { ...response, objects: [item, item, item] },
+    { ...response, nextCursor: "x".repeat(1025) },
+    { ...response, objects: [], nextCursor: "next" },
+    { ...response, view: "full" },
+    { ...response, protocolVersion: 1 },
+  ]) {
+    response = malformed;
+    await assert.rejects(engine.browseRemoteInventory({ limit: 2 }), { code: "invalid_inventory" });
+  }
+  const readsBeforeInvalidArgs = inventoryReads;
+  for (const options of [{ limit: 0 }, { limit: 65 }, { limit: 1, cursor: "" },
+    { limit: 1, cursor: "x".repeat(1025) }]) {
+    await assert.rejects(engine.browseRemoteInventory(options), { code: "invalid_inventory" });
+  }
+  assert.equal(inventoryReads, readsBeforeInvalidArgs,
+    "invalid requests must be denied before invoking a custom adapter");
+});
+
 test("issue 66 inventory: metadata-heavy library is fully paged within 128 KiB HTTP bodies", async (t) => {
   const { get, seed } = await fixture(t);
   const heavyMetadata = {

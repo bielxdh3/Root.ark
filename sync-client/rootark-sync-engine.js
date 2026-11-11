@@ -5,13 +5,14 @@ const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { types: { isProxy } } = require("node:util");
 
 const protocol = require("./rootark-sync-protocol");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { readExactOpenedControlBytes } = require("./rootark-sync-held-control-read");
-const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
+const { SyncConflictError, assertInventoryEntry } = require("../public/client/rootark-sync-adapter");
 const { openNativeRootSession } = require("./rootark-sync-native-root-session-contract");
 
 const SNAPSHOT_VERSION = 1;
@@ -2048,6 +2049,41 @@ function pathsEqual(left, right) {
   return pathWithin(left, right) && pathWithin(right, left);
 }
 
+// An injected metadata adapter can return mutable objects, accessors or a
+// Proxy instead of a decoded HTTP JSON DTO. Detach only a bounded tree of
+// own DATA properties before validating/returning an advisory page; otherwise
+// nextCursor or a record could change between the guard and picker output.
+function detachedAdvisoryData(value, depth = 0) {
+  if (value === null || typeof value !== "object") return value;
+  if (depth > 4 || isProxy(value)) fail("Invalid metadata inventory DTO", "invalid_inventory");
+  if (Array.isArray(value) && value.length > 64) {
+    fail("Invalid metadata inventory array", "invalid_inventory");
+  }
+  const keys = Reflect.ownKeys(value);
+  if (Array.isArray(value)) {
+    if (keys.length !== value.length + 1) {
+      fail("Invalid metadata inventory array", "invalid_inventory");
+    }
+    return Array.from({ length: value.length }, (_, index) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+        fail("Invalid metadata inventory entry", "invalid_inventory");
+      }
+      return detachedAdvisoryData(descriptor.value, depth + 1);
+    });
+  }
+  if (keys.length > 32) fail("Invalid metadata inventory object", "invalid_inventory");
+  const detached = Object.create(null);
+  for (const key of keys) {
+    const descriptor = typeof key === "string" ? Object.getOwnPropertyDescriptor(value, key) : null;
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+      fail("Invalid metadata inventory accessor", "invalid_inventory");
+    }
+    detached[key] = detachedAdvisoryData(descriptor.value, depth + 1);
+  }
+  return detached;
+}
+
 function evictionError(code, message, cause, rollbackCause) {
   return Object.assign(new Error(message), { code, cause, ...(rollbackCause ? { rollbackCause } : {}) });
 }
@@ -2836,14 +2872,37 @@ class SyncEngine {
     if (typeof this.adapter.listInventory !== "function") {
       fail("Metadata inventory is not supported by this sync adapter", "inventory_unavailable");
     }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64
+      || (cursor !== null && (typeof cursor !== "string" || !cursor
+        || cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(cursor)))) {
+      fail("Invalid metadata inventory request", "invalid_inventory");
+    }
     // Browsing is read-only and advisory. No remote-only pins, journal entries
     // or local files may be created from metadata without fetching and
     // independently verifying the complete signed envelope.
-    const page = await this.adapter.listInventory({ limit, cursor });
-    if (!page || !Array.isArray(page.objects)) fail("Invalid metadata inventory page", "invalid_inventory");
+    const page = detachedAdvisoryData(await this.adapter.listInventory({ limit, cursor }));
+    if (!page || typeof page !== "object" || Array.isArray(page)
+      || Object.keys(page).sort().join(",") !== "nextCursor,objects,protocolVersion,view"
+      || page.protocolVersion !== 2 || page.view !== "metadata"
+      || !Array.isArray(page.objects) || page.objects.length > limit
+      || (page.objects.length === 0 && page.nextCursor !== null)
+      || (page.nextCursor !== null && (typeof page.nextCursor !== "string"
+        || !page.nextCursor || page.nextCursor.length > 1024
+        || !/^[A-Za-z0-9_-]+$/.test(page.nextCursor)))) {
+      fail("Invalid metadata inventory page", "invalid_inventory");
+    }
+    let objects;
+    try {
+      // Custom adapters must not make browser/picker output a full ciphertext
+      // envelope or extra metadata. Reuse the canonical adapter's exact
+      // inventory schema, not the untrusted source object's spread shape.
+      objects = page.objects.map((entry) => assertInventoryEntry(entry));
+    } catch {
+      fail("Invalid metadata inventory entry", "invalid_inventory");
+    }
     return {
-      ...page, advisory: true,
-      objects: page.objects.map((record) => ({
+      protocolVersion: 2, view: "metadata", nextCursor: page.nextCursor, advisory: true,
+      objects: objects.map((record) => ({
         ...record, selectedOnDevice: this.operationDestinationIsSelected(record),
       })),
     };

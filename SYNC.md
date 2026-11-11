@@ -38,6 +38,11 @@ O cliente pode usar `adapter.listInventory({ limit, cursor })` ou
 `engine.browseRemoteInventory({ limit, cursor })` para navegar sem baixar
 conteudo cifrado. `selectedOnDevice` e apenas a politica local dessa
 instancia do engine; o inventario e **informativo, sem verificacao de assinatura**.
+O `browseRemoteInventory` tambem exige o formato metadata-only no limite do
+motor, inclusive para adapters customizados: recusa envelopes completos, campos
+extras, pagina/cursor invalido, objetos com getters ou Proxy e respostas que
+ultrapassem o limite. Essa validacao evita emitir campos nao aprovados ao
+picker/CLI, mas **nao** concede autoridade de materializacao ou RootSession.
 Antes de materializar, reconciliar ou admitir operacoes protegidas, o cliente
 continua usando a leitura completa por `objectId` com validacao independente
 de assinatura, dispositivo e revogacao. O fluxo normal `syncOnce` preserva
