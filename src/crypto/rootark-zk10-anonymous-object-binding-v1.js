@@ -8,6 +8,9 @@ const crypto = require("node:crypto");
 const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
 const NATIVE_VERIFY = crypto.verify.bind(crypto);
 const NATIVE_SIGN = crypto.sign.bind(crypto);
+// Proof comparison runs after caller-provided owner KeyObjects have been
+// inspected; capture native comparison before any hostile getter executes.
+const NATIVE_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
 const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
 const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
 const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
@@ -124,7 +127,7 @@ function verifySparseObjectInventoryProof(accountId, generation, object, sibling
       ? sha(INVENTORY_NODE, bytes, current) : sha(INVENTORY_NODE, current, bytes);
     position >>= 1n;
   }
-  if (!crypto.timingSafeEqual(current, Buffer.from(hex(root), "hex"))) deny();
+  if (!NATIVE_TIMING_SAFE_EQUAL(current, Buffer.from(hex(root), "hex"))) deny();
   return true;
 }
 // Deterministic synthetic-proof helper. It cannot establish external custody,

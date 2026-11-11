@@ -10,6 +10,9 @@ const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
 const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
 const NATIVE_VERIFY = crypto.verify.bind(crypto);
 const NATIVE_SIGN = crypto.sign.bind(crypto);
+// KeyObject metadata may run caller-owned getters before sparse enrollment
+// verification. Never consult a subsequently rebound JS crypto comparator.
+const NATIVE_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
 // The factory alone is not a pin: hostile KeyObject kHandle getters can
 // replace Hash.prototype.update/digest before a signed digest is computed.
 const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
@@ -267,7 +270,7 @@ function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expecte
     current = at & 1n ? H(NODE, siblingHash, current) : H(NODE, current, siblingHash);
     at >>= 1n;
   }
-  if (!crypto.timingSafeEqual(current, Buffer.from(hex(expectedRoot), "hex"))) deny();
+  if (!NATIVE_TIMING_SAFE_EQUAL(current, Buffer.from(hex(expectedRoot), "hex"))) deny();
   return true;
 }
 // Pure deterministic fixture/proof builder. The authority, not an app server,
