@@ -14,7 +14,9 @@ flowchart TD
   I -- No --> N[Keep RootSession closed; RELEASE NO-GO]
   I -- Yes --> A{Root and parent acquired from an independent custodian?}
   A -- No --> N
-  A -- Yes --> H{Hold and validate OS handle/fd identity for all I/O?}
+  A -- Yes --> P{A distinct untrusted UID/SID fails real reads and writes through every ancestor?}
+  P -- No --> N
+  P -- Yes --> H{Hold and validate OS handle/fd identity for all I/O?}
   H -- No --> N
   H -- Yes --> B{Bound cold metadata reads to opened-inode versions and finite resource budgets?}
   B -- No --> N
@@ -485,7 +487,9 @@ Native no-overwrite uses NTFS `NtSetInformationFile` with
 **Owner/witness/floor reference verifier:** isolated candidate
 `2ada620d91f2a4380a59083eb9dc86083ec016ab`, followed by input-budget
 hardening `548fb526192694965da9c7e2bcd29edd638d2670` and
-`cdeeba5c5917410151be12634cde2bf51354bba4`, verifies separately
+`cdeeba5c5917410151be12634cde2bf51354bba4`, with final intrinsic
+Buffer length and strict UTF-8 fix `71b07b2ef0033733327323358f9a4f083ad40a15`
+(rebased `baa9c27c`), verifies separately
 signed Ed25519 owner provisioning, current root-commit witness and
 monotonic floor (distinct keys), a fresh nonce in both independent
 receipts, exact scope/root digest/epoch/sequence/physical file identity,
@@ -509,10 +513,11 @@ ACL bits alone. On Linux this entails a root/independent-UID-owned helper
 with credential-verified AF_UNIX and `openat2`/`renameat2` under retained
 dirfds; on Windows an independently installed service identity, protected
 DACLs over the full ancestor chain and HANDLE-relative NTFS operations
-must exclude the interactive SID. The workstation's WSL account has no
-noninteractive `sudo` privilege and this Windows session is not running as
-SYSTEM: no independently privileged writer service was provisioned or
-exercised here. After provisioning, a separate current owner-signed
+must exclude the interactive SID. This Windows session is not running as
+SYSTEM, and no independently installed Windows service or production Linux
+custodian was provisioned or exercised. An opt-in root-owned WSL **test
+fixture** is now physically exercised below, but is not a deployed,
+independently attested service. After provisioning, a separate current owner-signed
 monotonic witness store and challenge must bind cold PREPARE/COMMIT,
 physical inode/root identity, original bytes, replay floor and exact
 principal to trusted persistence beyond writable sync files. Do not
@@ -527,3 +532,75 @@ Windows/Ubuntu mandatory release gates at the exact published SHA.
 The operational `SyncEngine` inbound publisher still has a replace-capable
 JavaScript pathname `rename`; W3/W26 do **not** make it safe merely by
 existing in the repository. **MERGE NO-GO; RELEASE NO-GO; RootSession OFF.**
+
+### 2026-11-11 — cross-platform native integration, new-process ext4 cold custody, and distinct-UID isolation proof
+
+The previously isolated W3, W26 and witness lines were integrated **after**
+the published `91c4e75c` cold journal bootstrap without resetting or
+replacing their original commits/worktrees. The combined native/witness
+commit chain is `a0b293d1` → `eaf7cb18` → `476b0362` → `8889188c` →
+`a50bfeb1` → `40061a7d` → `baa9c27c` → `50c3b9c3`.
+This preserves the source-to-integrated SHA provenance, the real NTFS
+`NtSetInformationFile` no-replace publisher, and the separately signed
+owner/witness/floor **nonauthorizing** reference. The resulting integrated
+HEAD `50c3b9c32f3e82369427545a9d7860fea1db1549` received two bounded
+independent SOURCE GO reports with zero new P1/P2. Physical exact-tree
+tests: Windows Node22 NTFS W26+signed witness **16 PASS / 0 FAIL**, WSL
+Node22 ext4 W3+signed witness **25 PASS / 3 expected SKIP / 0 FAIL**.
+
+The next source commit `7da2fd9578d97413a15a9b4752a51f12a4882bef`
+implements a further **Linux-only opt-in native laboratory** milestone.
+W3 PREPARE now stores and retains an exclusively created, fsynced native
+`PREPARED_ID_V2` sidecar with the held directory's `st_dev/st_ino` and
+original staged inode `st_dev/st_ino`, and verifies its ORIGINAL held FD,
+namespace occupant and file version both before no-replace `linkat` and
+after publication before COMMIT. `cold_inspector.c` runs in a **new native
+OS process** and walks an explicitly fixed sandbox suffix below passwd
+HOME using `openat2` with `RESOLVE_BENEATH`, `NO_SYMLINKS`, `NO_XDEV`.
+It reads bounded marker bytes from held FDs, compares inode/version and
+current name, checks the original sidecar's exact canonical IDs, and returns
+only `PREPARED_ONLY`, `PUBLISHED_NO_COMMIT`, `COMMIT_OBSERVED` or denial.
+There is **no cold replay** and no native authority emitted by this inspector.
+
+Physical RED→GREEN on WSL/ext4: a parent without the native identity sidecar
+failed the new cold phase proof (missing original inode ID), then the new
+native commit passed; an original cold inspector accepted the same inode's
+`COMMITTED_V1` prefix followed by `\0FOREIGN` (**RED**), then the corrected
+bounded byte comparisons and NUL rejection passed (**GREEN**). A second
+real same-UID process parked the original PREPARE identity sidecar and
+installed a **distinct byte-identical inode**; native publication denied
+before creating COMMIT, and both original and foreign FDs/bytes survived.
+Another physical child exited with code 75 **after fsynced PREPARE but
+before sidecar**; a new inspector denied the torn transaction. A native
+post-link `_exit(73)` produced `PUBLISHED_NO_COMMIT`, never COMMIT. An
+independent same-byte foreign **published** inode with an intact COMMIT also
+caused cold denial. WSL Node22/ext4 complete W3+signed-witness non-stress
+run at `7da2fd95`: **31 PASS / 3 expected SKIP / 0 FAIL**; test-only
+stress 16,385+ entries was not repeated.
+
+Additionally an explicitly gated **privileged WSL test process** created a
+genuine root-owned ext4 fixture under `/root` (`0700` for both protected
+test ancestors and final directory), held the original descriptors,
+published an anonymous `O_TMPFILE` stage no-replace, and verified cold
+COMMIT as root. A separate real OS child dropped to UID/EUID **1000** via
+`runuser` and attempted **read**, **exclusive create**, **overwrite**,
+**rename ancestor**, and **create symlink** at both PREPARE and committed
+phases: **all five operations per phase were denied by the kernel with
+`EACCES`/`EPERM`**. WSL22 root-principal isolated test **1 PASS**. This
+establishes distinct-UID isolation in a disposable root-owned **laboratory
+root**, not a persistent trusted service; it does **not** exclude a host
+administrator, separately privileged process or the same UID as the
+custodian. The Windows same-SID isolation gate is still outstanding.
+
+These are closer physical proofs of a coherent native transaction, but
+**none** independently attests the native executable, protects persistent
+all-ancestor custody through reboot, verifies a current remote monotonic
+operator floor, supplies a production RootSession or eliminates arbitrary
+hostile same-UID TOCTOU while the root is writable by that principal. The
+Linux sidecar contains native inode numbers but is **not signed**; a writer
+with the custodian's privileges can forge it. No real hardware powercut,
+Windows 10 CFAPI callback, native Windows installed service or exact-head
+hosted mandatory release matrix has been proven by these lab results.
+`sync-client/rootark-sync-engine.js` still contains the legacy inbound
+replace-capable pathname `rename`; it is **not** made production-safe by
+these experiments. **MERGE NO-GO; RELEASE NO-GO; RootSession OFF**.
