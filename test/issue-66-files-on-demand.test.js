@@ -987,6 +987,71 @@ test("issue 66: cold FOD journal read cannot accept a foreign pathname-rebound i
   assert.equal(state.pushes, pushesBefore);
 });
 
+for (const control of ["snapshot", "journal"]) {
+  test(`issue 66: cold ${control} read remains bounded when its opened inode grows concurrently`, async (t) => {
+    const { root, open, state, store } = await setup(t, {});
+    await open();
+    const target = path.join(root, control === "snapshot"
+      ? ".rootark-sync-index.json" : ".rootark-sync-journal.json");
+    // The attacker retains its OWN original inode handle; it never relies on
+    // stat(path) then opening the same path after a potential replacement.
+    const nativeOpen = fsp.open;
+    const nativeLstat = fsp.lstat;
+    const adversary = await nativeOpen(target, fs.constants.O_RDWR);
+    const originalLength = (await adversary.readFile()).length;
+    const remoteBefore = JSON.stringify(store.list("alice"));
+    const pushesBefore = state.pushes;
+    let growthInjected = false;
+    let boundedReadCalls = 0;
+    let unboundedReadCalls = 0;
+    let requestedBytes = 0;
+    fsp.open = async (filePath, ...args) => {
+      const handle = await nativeOpen(filePath, ...args);
+      if (path.resolve(String(filePath)) === target) {
+        const nativeRead = handle.read.bind(handle);
+        const nativeReadFile = handle.readFile.bind(handle);
+        handle.read = async (...readArgs) => {
+          boundedReadCalls += 1;
+          requestedBytes += readArgs[2];
+          return nativeRead(...readArgs);
+        };
+        handle.readFile = async (...readArgs) => {
+          unboundedReadCalls += 1;
+          return nativeReadFile(...readArgs);
+        };
+      }
+      return handle;
+    };
+    fsp.lstat = async (filePath, ...args) => {
+      const named = await nativeLstat(filePath, ...args);
+      if (!growthInjected && path.resolve(String(filePath)) === target) {
+        growthInjected = true;
+        // Real sparse growth of the SAME inode, immediately after the victim
+        // has observed its initial version/size and before any payload read.
+        await adversary.truncate(originalLength + (1024 * 1024));
+        await adversary.sync();
+      }
+      return named;
+    };
+    try {
+      await assert.rejects(open(), { code: control === "snapshot"
+        ? "invalid_snapshot" : "invalid_sync_journal" });
+    } finally {
+      fsp.lstat = nativeLstat;
+      fsp.open = nativeOpen;
+      await adversary.close();
+    }
+    assert.equal(growthInjected, true, "a genuine same-inode expansion is required");
+    assert.ok(boundedReadCalls >= 1, "the cold reader must consume held positional reads");
+    assert.equal(unboundedReadCalls, 0,
+      "FileHandle.readFile could read arbitrarily many concurrently appended bytes");
+    assert.ok(requestedBytes <= originalLength + 1,
+      "the original observed size plus one detection byte is the strict read budget");
+    assert.equal(state.pushes, pushesBefore);
+    assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  });
+}
+
 test("issue 66: a physically rebound FOD marker never authorizes a foreign inode", async (t) => {
   const { root, open, adapter, key, state, store } = await setup(t, {
     "docs/keep.txt": "protected remote content",
@@ -2425,14 +2490,15 @@ test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree witho
   const newDirectory = path.join(root, "docs", "new");
   const sentinel = path.join(oldDirectory, "original-cache-sentinel.bin");
   const sentinelBytes = Buffer.from("ORIGINAL_DIRECTORY_CACHE_INODE");
-  const held = await fsp.open(sentinel, "wx", 0o600);
+  // Retain the ORIGINAL exclusive inode through the signed UPDATE. Track
+  // attempted renames before the kernel syscall, so a Windows sharing denial
+  // cannot accidentally make this negative custody test pass.
+  const held = await fsp.open(sentinel, "wx+", 0o600);
+  t.after(() => held.close());
   let originalSentinel;
-  try {
-    await held.writeFile(sentinelBytes);
-    await held.sync();
-    originalSentinel = await held.stat({ bigint: true });
-  }
-  finally { await held.close(); }
+  await held.writeFile(sentinelBytes);
+  await held.sync();
+  originalSentinel = await held.stat({ bigint: true });
   const snapshot = path.join(root, ".rootark-sync-index.json");
   const journal = path.join(root, ".rootark-sync-journal.json");
   const snapshotBefore = await fsp.readFile(snapshot);
@@ -2441,12 +2507,14 @@ test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree witho
   const remoteBefore = JSON.stringify(store.list("alice"));
   const updated = await signedDirectory("update", "docs/new", 2, created.revision);
   const originalRename = fsp.rename;
+  let attemptedDirectoryRename = false;
   let physicallyRenamedDirectory = false;
   fsp.rename = async (from, to, ...args) => {
+    const isDirectoryUpdate = path.resolve(String(from)) === oldDirectory
+      && path.resolve(String(to)) === newDirectory;
+    if (isDirectoryUpdate) attemptedDirectoryRename = true;
     const result = await originalRename(from, to, ...args);
-    if (path.resolve(String(from)) === oldDirectory && path.resolve(String(to)) === newDirectory) {
-      physicallyRenamedDirectory = true;
-    }
+    if (isDirectoryUpdate) physicallyRenamedDirectory = true;
     return result;
   };
   try {
@@ -2455,24 +2523,27 @@ test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree witho
   } finally { fsp.rename = originalRename; }
   assert.equal(physicallyRenamedDirectory, false,
     "the kernel must never complete a legacy directory rename in native-required mode");
-  // Do not stat(parent pathname) then reopen a mutable child pathname to
-  // claim its bytes. Bind this observation to the SAME opened child handle,
-  // and independently match the inode retained from the exclusive creation.
-  const observed = await fsp.open(sentinel, fs.constants.O_RDONLY
-    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
-  try {
-    const before = await observed.stat({ bigint: true });
-    const physicalBytes = await observed.readFile();
-    const after = await observed.stat({ bigint: true });
-    assert.equal(before.isFile(), true);
-    assert.equal(before.dev, originalSentinel.dev);
-    assert.equal(before.ino, originalSentinel.ino);
-    assert.equal(before.size, originalSentinel.size);
-    assert.equal(after.dev, before.dev);
-    assert.equal(after.ino, before.ino);
-    assert.equal(after.size, before.size);
-    assert.deepEqual(physicalBytes, sentinelBytes);
-  } finally { await observed.close(); }
+  assert.equal(attemptedDirectoryRename, false,
+    "even a blocked or EBUSY native rename attempt cannot count as an authorization denial");
+  // An originally opened handle needs NO pathname reopen after its first
+  // fstat. Read the same inode at an explicit offset (the write advanced the
+  // file position) and compare pre/post FD metadata and the visible name.
+  const before = await held.stat({ bigint: true });
+  const buffer = Buffer.alloc(sentinelBytes.length + 1);
+  const { bytesRead } = await held.read(buffer, 0, buffer.length, 0);
+  const after = await held.stat({ bigint: true });
+  const named = await fsp.lstat(sentinel, { bigint: true });
+  assert.equal(before.isFile(), true);
+  assert.equal(before.dev, originalSentinel.dev);
+  assert.equal(before.ino, originalSentinel.ino);
+  assert.equal(before.size, originalSentinel.size);
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.size, before.size);
+  assert.equal(named.dev, originalSentinel.dev);
+  assert.equal(named.ino, originalSentinel.ino);
+  assert.equal(bytesRead, sentinelBytes.length);
+  assert.deepEqual(buffer.subarray(0, bytesRead), sentinelBytes);
   assert.equal((await fsp.lstat(oldDirectory)).isDirectory(), true);
   assert.equal(await exists(newDirectory), false);
   assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);

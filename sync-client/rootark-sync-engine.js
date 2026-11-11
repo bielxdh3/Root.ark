@@ -10,6 +10,7 @@ const protocol = require("./rootark-sync-protocol");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
+const { readExactOpenedControlBytes } = require("./rootark-sync-held-control-read");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 const { openNativeRootSession } = require("./rootark-sync-native-root-session-contract");
 
@@ -2347,7 +2348,9 @@ class SyncEngine {
         fail("Sync snapshot inode differs from the opened file", "invalid_snapshot");
       }
       if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
-        snapshotBytes = await snapshotHandle.readFile();
+        snapshotBytes = await readExactOpenedControlBytes(snapshotHandle,
+          snapshotStats.size, () => evictionError("invalid_snapshot",
+            "Sync snapshot grew beyond its original size or safety budget"));
         const heldAfter = await snapshotHandle.stat({ bigint: true });
         const namedAfter = await fsp.lstat(this.snapshotPath, { bigint: true });
         if (!sameSnapshotRevision(snapshotStats, heldAfter)

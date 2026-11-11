@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { canonicalJson } = require("./rootark-sync-protocol");
+const { readExactOpenedControlBytes } = require("./rootark-sync-held-control-read");
 
 const JOURNAL_VERSION = 1;
 const MAX_PENDING = 10000;
@@ -212,7 +213,8 @@ async function readHeldJournal(filePath) {
       || !sameJournalInodeVersion(heldBefore, namedBefore)) {
       throw invalidJournalIdentity();
     }
-    const bytes = await handle.readFile();
+    const bytes = await readExactOpenedControlBytes(
+      handle, heldBefore.size, invalidJournalIdentity);
     const heldAfter = await handle.stat({ bigint: true });
     const namedAfter = await fsp.lstat(filePath, { bigint: true });
     if (!sameJournalInodeVersion(heldBefore, heldAfter)
