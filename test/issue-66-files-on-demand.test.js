@@ -2426,7 +2426,12 @@ test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree witho
   const sentinel = path.join(oldDirectory, "original-cache-sentinel.bin");
   const sentinelBytes = Buffer.from("ORIGINAL_DIRECTORY_CACHE_INODE");
   const held = await fsp.open(sentinel, "wx", 0o600);
-  try { await held.writeFile(sentinelBytes); await held.sync(); }
+  let originalSentinel;
+  try {
+    await held.writeFile(sentinelBytes);
+    await held.sync();
+    originalSentinel = await held.stat({ bigint: true });
+  }
   finally { await held.close(); }
   const snapshot = path.join(root, ".rootark-sync-index.json");
   const journal = path.join(root, ".rootark-sync-journal.json");
@@ -2450,8 +2455,25 @@ test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree witho
   } finally { fsp.rename = originalRename; }
   assert.equal(physicallyRenamedDirectory, false,
     "the kernel must never complete a legacy directory rename in native-required mode");
+  // Do not stat(parent pathname) then reopen a mutable child pathname to
+  // claim its bytes. Bind this observation to the SAME opened child handle,
+  // and independently match the inode retained from the exclusive creation.
+  const observed = await fsp.open(sentinel, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  try {
+    const before = await observed.stat({ bigint: true });
+    const physicalBytes = await observed.readFile();
+    const after = await observed.stat({ bigint: true });
+    assert.equal(before.isFile(), true);
+    assert.equal(before.dev, originalSentinel.dev);
+    assert.equal(before.ino, originalSentinel.ino);
+    assert.equal(before.size, originalSentinel.size);
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    assert.deepEqual(physicalBytes, sentinelBytes);
+  } finally { await observed.close(); }
   assert.equal((await fsp.lstat(oldDirectory)).isDirectory(), true);
-  assert.deepEqual(await fsp.readFile(sentinel), sentinelBytes);
   assert.equal(await exists(newDirectory), false);
   assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
   assert.deepEqual(await fsp.readFile(journal), journalBefore,
