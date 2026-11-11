@@ -214,6 +214,7 @@ test("protected startup refuses a journal inode hardlinked into the served root"
   }
   const witness = await fsp.lstat(mutationPath, { bigint: true });
   assert.equal(witness.nlink, 2n);
+  const originalBytes = await readPinnedEvidence(mutationPath, witness);
   bridge = new LocalSyncWebDavBridge({
     rootDir: root, token: TOKEN,
     journal: mutation, protocolJournal: outbox,
@@ -222,7 +223,12 @@ test("protected startup refuses a journal inode hardlinked into the served root"
     toProtocolOperation: async () => [],
     resolveProtectedFileKey: async () => Buffer.alloc(32),
   });
-  await assert.rejects(bridge.start(), /Untrusted protected WebDAV journal inode or link count/i);
+  // The held SyncJournal FD now rejects a multi-link inode BEFORE WebDAV's
+  // later namespace check. Require that exact fail-closed admission error.
+  await assert.rejects(bridge.start(), {
+    code: "invalid_sync_journal", message: "Sync journal inode changed during cold read",
+  });
+  assert.deepEqual(await readPinnedEvidence(mutationPath, witness), originalBytes);
   assert.equal((await fsp.lstat(mutationPath, { bigint: true })).ino, witness.ino);
   assert.equal((await fsp.lstat(exposedAlias, { bigint: true })).ino, witness.ino);
   await assert.rejects(fsp.lstat(path.join(root, ".rootark-webdav-owner.lock")),
@@ -318,7 +324,9 @@ test("a legacy bridge also rejects shared journal inodes aliased under separate 
   assert.equal((await fsp.lstat(second, { bigint: true })).ino, before.ino);
   const disk = await readPinnedEvidence(first, before);
   bridge = new LocalSyncWebDavBridge({ rootDir: root, journal, token: TOKEN });
-  await assert.rejects(bridge.start(), /Untrusted WebDAV journal inode or link count/i);
+  await assert.rejects(bridge.start(), {
+    code: "invalid_sync_journal", message: "Sync journal inode changed during cold read",
+  });
   assert.deepEqual(await readPinnedEvidence(first, before), disk);
   assert.deepEqual(await readPinnedEvidence(second, before), disk);
   await assert.rejects(fsp.lstat(first + ".webdav-owner.lock"), { code: "ENOENT" });
