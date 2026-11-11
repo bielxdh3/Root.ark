@@ -98,6 +98,42 @@ test("signed opaque original bytes verify once but NEVER authorize upload, stage
   assert.throws(() => gate.verifyOriginalBytes({ ticket, chunks: [f.original] }), bad);
 });
 
+test("P2: owner statement expiring during final floor callback cannot verify original bytes", () => {
+  const f = fixture();
+  const options = f.options();
+  const realNow = Date.now;
+  const modulePath = require.resolve("../src/crypto/rootark-zk10-original-byte-evidence-dev-off-v1");
+  let virtualNow = realNow();
+  const ownerExpiresAt = virtualNow + 2000;
+  let readbacks = 0;
+  try {
+    // The DEV-OFF verifier deliberately captures Date.now.bind(Date) at
+    // module load. Reload only this module under a deterministic clock.
+    // No sleeping or timing dependence is necessary to prove expiry.
+    Date.now = () => virtualNow;
+    delete require.cache[modulePath];
+    const { createDevOffOriginalByteEvidenceGate: createWithClock } = require(modulePath);
+    const gate = createWithClock({
+      ...options,
+      readSignedCurrentFloor(challenge) {
+        readbacks += 1;
+        if (readbacks === 3) virtualNow = ownerExpiresAt + 1;
+        return options.readSignedCurrentFloor(challenge);
+      },
+    });
+    const ownerEvidence = f.intent({
+      issued_at_ms: virtualNow - 50, expires_at_ms: ownerExpiresAt,
+    });
+    const ticket = gate.beginBeforeBody({ ownerEvidence, expected: f.expected });
+    assert.throws(() => gate.verifyOriginalBytes({ ticket, chunks: [f.original] }), bad,
+      "a fresh signed floor returned after owner expiry cannot revive expired consent");
+    assert.equal(readbacks, 3, "the final post-hash callback must cross owner expiry");
+  } finally {
+    Date.now = realNow;
+    delete require.cache[modulePath];
+  }
+});
+
 test("wrong owner, unsigned intent, changed account/object/version/epoch/nonce and floor fail closed", () => {
   const variations = [
     (f) => ({ ownerEvidence: f.intent({}, f.foreign.privateKey), expected: f.expected }),

@@ -155,3 +155,23 @@ may skip when the local account cannot create symlinks; the POSIX/WSL gate
 must execute it. No test proves an actual independent off-host operator,
 network, physical crash durability, hostile-directory TOCTOU immunity,
 full pair rollback resistance or a production R1.
+
+## 2026-11-11 — reviewer P2: native owner/custodian key separation
+
+At published PR #302 `c32a5e25`, `KeyObject.type`,
+`KeyObject.asymmetricKeyType` and `KeyObject.export()` were read through
+caller-shadowable instance properties. A real shared owner/custodian key
+could report a foreign owner's SPKI, pass the digest inequality, and sign
+both purportedly independent roles. A disposable negative test reproduced
+this acceptance (**RED**) on Windows Node 22.23.4.
+
+The isolated follow-up reads real Node key type/algorithm through captured
+native accessors, exports native SPKI bytes, and compares the owner's
+underlying key material with the custodian's actual public key through
+`KeyObject.prototype.equals`. Shadowing legitimate type metadata no longer
+invalidates a genuine Ed25519 key. Both targeted regressions are GREEN on
+Windows Node 22.23.4/NTFS. The combined floor+original-byte tests are
+**40 PASS / 4 platform SKIP** on Windows and **43 PASS / 1 platform SKIP**
+on Ubuntu WSL Node 22.22.1/ext4. These local outcomes are not hosted CI or
+peer SOURCE approval for a published SHA. Both stores remain local and
+`independentOffServerCustodyProven` remains false; RELEASE NO-GO.

@@ -86,6 +86,34 @@ test("opt-in, separately pinned Ed25519 signer and owner-signed genesis required
   assert.equal(fs.existsSync(x.paths.anchorDatabasePath), false);
 });
 
+test("P2: a shadowed KeyObject export cannot disguise one owner/custodian signing key", (t) => {
+  const x = setup(t, "same-native-key-shadowed-spki");
+  const unrelatedDer = x.owner.publicKey.export({ format: "der", type: "spki" });
+  const actualOwner = x.custodian.publicKey;
+  // The owner genesis and custodian floor would both use the SAME real
+  // private key. Only an instance-shadowed export makes their hashes differ.
+  Object.defineProperty(actualOwner, "export", { value: () => unrelatedDer });
+  const genesis = { ...x.genesis };
+  delete genesis.signature;
+  const bootstrap = sign(genesis, x.custodian.privateKey, DOMAIN_GENESIS);
+  assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, ownerPublicKey: actualOwner, bootstrap,
+  }), /ZK10_CUSTODIAN_UNAVAILABLE/,
+  "a false reported SPKI must not make the same native signing key independent");
+  assert.equal(fs.existsSync(x.paths.databasePath), false);
+  assert.equal(fs.existsSync(x.paths.anchorDatabasePath), false);
+});
+
+test("P2: native Ed25519 identity survives caller-shadowed KeyObject type metadata", (t) => {
+  const x = setup(t, "shadowed-owner-type");
+  Object.defineProperties(x.owner.publicKey, {
+    type: { value: "private" }, asymmetricKeyType: { value: "rsa" },
+  });
+  const custodian = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  assert.equal(custodian.independentOffServerCustodyProven, false);
+  assert.equal(custodian.retainedMinimum().lease_serial, 0);
+});
+
 test("two independent disposable custodians sign W170 exact floor bytes with distinct keys", (t) => {
   const a = setup(t, "first");
   const b = setup(t, "second");

@@ -33,6 +33,18 @@ const MONOTONIC_NOW_NS = process.hrtime.bigint.bind(process.hrtime);
 const MAX_LEASE_SERIAL = 100_000; // Bounded DEV-OFF journal; no unsafe reset/rotation.
 const STORED_FLOOR_FIELDS = [...HEAD_FIELDS, "journal_count", "journal_tip"];
 const dbPins = new WeakMap();
+// Read real crypto.KeyObject internals, not shadowable instance properties.
+// This fixed DER public key only discovers Node's native public-key prototype;
+// it is never an accepted signer, owner pin, or trusted custodian identity.
+const publicKeyPrototype = Object.getPrototypeOf(crypto.createPublicKey({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+}));
+const nativeType = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
+const nativeAlgorithm = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(publicKeyPrototype), "asymmetricKeyType").get;
+const nativePublicExport = Object.getOwnPropertyDescriptor(publicKeyPrototype, "export").value;
+const nativeKeyEquals = crypto.KeyObject.prototype.equals;
 
 function deny() {
   const error = new Error("ZK10_CUSTODIAN_UNAVAILABLE");
@@ -76,13 +88,14 @@ function unsignedSigned(wire, fields, type, domain, publicKey) {
   return payload;
 }
 function keyObject(value, type) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== type
-    || value.asymmetricKeyType !== "ed25519") deny();
+  if (!(value instanceof crypto.KeyObject) || nativeType.call(value) !== type
+    || nativeAlgorithm.call(value) !== "ed25519") deny();
   return value;
 }
 function spki(key) {
   return crypto.createHash("sha256")
-    .update(keyObject(key, "public").export({ format: "der", type: "spki" }))
+    .update(nativePublicExport.call(keyObject(key, "public"),
+      { format: "der", type: "spki" }))
     .digest("hex");
 }
 function safeFileName(value) {
@@ -304,9 +317,11 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
     if (o.devOff !== true || process.env.NODE_ENV === "production") deny();
     const owner = keyObject(o.ownerPublicKey, "public");
     const signer = keyObject(o.custodianPrivateKey, "private");
+    const signerPublic = keyObject(crypto.createPublicKey(signer), "public");
     const ownerHash = spki(owner);
-    const signerHash = spki(crypto.createPublicKey(signer));
-    if (ownerHash === signerHash || o.custodianSpkiSha256 !== signerHash) deny();
+    const signerHash = spki(signerPublic);
+    if (nativeKeyEquals.call(owner, signerPublic) || ownerHash === signerHash
+      || o.custodianSpkiSha256 !== signerHash) deny();
     const mainPath = safeFileName(o.databasePath);
     const anchorPath = safeFileName(o.anchorDatabasePath);
     if (mainPath.toLowerCase() === anchorPath.toLowerCase()) deny();

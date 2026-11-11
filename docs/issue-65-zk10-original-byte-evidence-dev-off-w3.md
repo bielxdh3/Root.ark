@@ -125,3 +125,21 @@ Node 24.14.1, and **12/12 PASS** on WSL Ubuntu Node 22.22.1 real ext4
 (`/dev/sdd`). This is still a DEV-OFF test-only module with no provider,
 R1 or production authorization. A fresh peer must review the new exact
 commit before any fast-forward of PR #302.
+
+## 2026-11-11 — reviewer P2: owner expiry during signed floor readback
+
+The prior `freshOwner()` checked the signed owner's validity only *before*
+invoking the synchronous, externally supplied `readSignedCurrentFloor`
+callback. That callback could advance the wall clock past the owner's
+expiry while returning a newly signed valid floor. The final post-hash
+verification then falsely returned successful, but nonauthorizing,
+original-byte evidence. A deterministic injected clock reproduced this
+exact false success (**RED**) on Windows Node 22.23.4, without sleeps.
+
+The local follow-up now evaluates the owner-issued time window both
+*before and after* the callback at every `freshOwner()` call, including
+the last post-hash readback. The targeted regression is GREEN on Windows
+Node 22.23.4/NTFS and Ubuntu WSL Node 22.22.1/ext4. All outputs remain
+`authorizesIo:false`, `stagePermitted:false`, and without independent
+off-host floor authority. A separately operated, protected floor and
+physical original-root custody remain unproven.

@@ -196,13 +196,19 @@ function createDevOffOriginalByteEvidenceGate(options) {
         || floor.issued_at_ms > now + 1000 || floor.issued_at_ms < now - FLOOR_TTL_MS
         || floor.expires_at_ms <= now || floor.expires_at_ms > now + FLOOR_TTL_MS) deny();
     }
-    function freshOwner(intent) {
+    function validateOwnerWindow(intent) {
       const now = NOW();
       if (intent.issued_at_ms > now + 1000 || intent.issued_at_ms < now - TTL_MS
-        || intent.expires_at_ms <= now
-        || intent.floor_sequence !== retained.sequence
+        || intent.expires_at_ms <= now) deny();
+    }
+    function freshOwner(intent) {
+      validateOwnerWindow(intent);
+      if (intent.floor_sequence !== retained.sequence
         || intent.floor_digest !== retained.headDigest) deny();
       currentFloor(intent.immutable_account_id);
+      // A valid fresh custodian readback cannot extend an owner statement
+      // whose independently signed lifetime expired inside the callback.
+      validateOwnerWindow(intent);
     }
     function beginBeforeBody(input) {
       try {
