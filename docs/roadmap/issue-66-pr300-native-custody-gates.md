@@ -698,3 +698,32 @@ they do not exclude concurrent same-principal namespace mutation or
 provide atomic native publication. Independent SOURCE review, published
 exact-head CodeQL/CI and production custody remain pending. **RELEASE
 NO-GO**.
+
+### 2026-11-11 — independent source P2: staged symlink can falsely pass held-inode test
+
+Independent SOURCE review of local commit `d481a4fd` found another lab
+false-positive: on POSIX, a hostile same-UID writer can rename the retained
+foreign stage to `foreign-preserved.bin`, place a symlink back at the stage
+name, and hardlink the **symlink inode** into `published.bin`. Opening the
+published path with `"r"` **follows** the symlink to the original held foreign
+inode; the old guard accepted matching `dev`/`ino` and equal bytes even
+though no second regular-file hardlink had been published.
+
+The new deterministic disposable physical test confirmed this as **RED**
+on WSL Node 22.22.1 **ext4**: **2 PASS / 1 FAIL** (`Missing expected rejection`),
+with `lstat(published).isSymbolicLink() === true`. The candidate now opens
+published paths with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` (where supported),
+rejects symlink/nonregular publication via a supplementary lab-only `lstat`
+identity check, and demands **exactly two links for both the retained
+source and published file FDs** with equal `dev`/`ino`. All bytes and
+before/after file identities in the attacked fixtures come from retained
+FDs. No hostile stage pathname is unlinked.
+
+Physical targeted WSL/Node22/ext4 is **GREEN 3 PASS / 0 FAIL**. Physical
+Windows/Node22/NTFS hardlink checks are **GREEN 2 PASS / 0 FAIL**; the POSIX
+symlink-inode adversarial scenario is explicitly **SKIPPED on Windows**,
+and no Windows reparse-point or symlink-privilege outcome is claimed. The
+Windows `lstat` fallback is only laboratory evidence and cannot provide an
+atomic race-free directory entry guarantee under same-SID mutation.
+This candidate requires fresh independent SOURCE GO and hosted exact-head
+CodeQL/CI if published. **Lab nonauthorizing; RELEASE NO-GO.**

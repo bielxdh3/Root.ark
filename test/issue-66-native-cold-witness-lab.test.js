@@ -21,16 +21,41 @@ const sign = (type, statement, key) => ({ statement,
     key.privateKey).toString("base64url") });
 
 // Node's pathname hardlink source may be swapped by a same-principal writer.
-// This is a lab-only post-link check against the exact retained file handles,
-// not a native atomic publish primitive or an authorization for RootSession.
+// These lab-only checks cannot provide native atomic publication or RootSession.
+const publicationMismatch = () => Object.assign(
+  new Error("Published inode differs from the retained foreign hardlink"),
+  { code: "lab_publication_identity_mismatch" });
+
+const openPublishedLabNoFollow = async (name) => {
+  let opened;
+  try {
+    opened = await fsp.open(name,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  } catch (error) {
+    // POSIX O_NOFOLLOW rejects an entry hardlinked to a symlink with ELOOP.
+    if (error?.code === "ELOOP") throw publicationMismatch();
+    throw error;
+  }
+  try {
+    // Supplementary lab check for platforms where O_NOFOLLOW is unavailable.
+    // The namespace is not protected against concurrent same-principal writes.
+    const entry = await fsp.lstat(name, { bigint: true });
+    const held = await opened.stat({ bigint: true });
+    if (!entry.isFile() || entry.isSymbolicLink() || !held.isFile()
+      || entry.dev !== held.dev || entry.ino !== held.ino) throw publicationMismatch();
+    return opened;
+  } catch (error) {
+    await opened.close();
+    throw error;
+  }
+};
+
 const assertHeldPublicationIdentity = async (foreign, published) => {
   const expected = await foreign.stat({ bigint: true });
   const actual = await published.stat({ bigint: true });
   if (!expected.isFile() || !actual.isFile()
-    || expected.dev !== actual.dev || expected.ino !== actual.ino) {
-    throw Object.assign(new Error("Published hardlink differs from held foreign inode"),
-      { code: "lab_publication_identity_mismatch" });
-  }
+    || expected.nlink !== 2n || actual.nlink !== 2n
+    || expected.dev !== actual.dev || expected.ino !== actual.ino) throw publicationMismatch();
 };
 
 test("#66 signed native cold witness reference rejects stale floors, swapped FileIds and incomplete COMMIT", async (t) => {
@@ -56,8 +81,7 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
     // Explicitly NOT a trusted native backend. We only prove that the
     // reference verifier rejects swapped physical evidence; this callback
     // cannot authorize RootSession or exclude a same-principal attacker.
-    const held = await fsp.open(originalName,
-      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const held = await openPublishedLabNoFollow(originalName);
     try {
       const before = await held.stat({ bigint: true });
       assert.equal(before.isFile(), true);
@@ -144,8 +168,7 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
   // Retain both hardlinks: unlink(stageName) could delete an attacker's newly
   // substituted pathname and would itself be an unauthorized filesystem act.
   publishedLinkCount = 2n;
-  const published = await fsp.open(originalName,
-    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  const published = await openPublishedLabNoFollow(originalName);
   retainedHandles.push(published);
   await assertHeldPublicationIdentity(foreign, published);
   const attackerPhysical = await openedPhysical();
@@ -245,7 +268,7 @@ test("#66 stage-path swap rejects a published hardlink to an unheld foreign inod
   await injected.writeFile(bytes);
   await injected.sync();
   await fsp.link(stageName, publishedName);
-  const published = await fsp.open(publishedName, "r");
+  const published = await openPublishedLabNoFollow(publishedName);
   retained.push(published);
   const originalId = await expected.stat({ bigint: true });
   const injectedId = await injected.stat({ bigint: true });
@@ -253,6 +276,55 @@ test("#66 stage-path swap rejects a published hardlink to an unheld foreign inod
     "stage alias must be physically swapped to a distinct inode");
   await assert.rejects(assertHeldPublicationIdentity(expected, published),
     { code: "lab_publication_identity_mismatch" });
+  for (const [label, handle, expectedLinks] of [
+    ["retained-foreign", expected, 1n], ["hostile-injected", injected, 2n],
+    ["published", published, 2n],
+  ]) {
+    const before = await handle.stat({ bigint: true });
+    assert.equal(before.isFile(), true, `${label} must be an opened regular inode`);
+    assert.equal(before.nlink, expectedLinks);
+    const content = Buffer.alloc(bytes.length + 1);
+    const { bytesRead } = await handle.read(content, 0, content.length, 0);
+    const after = await handle.stat({ bigint: true });
+    assert.deepEqual([after.dev, after.ino, after.size, after.mtimeNs, after.nlink],
+      [before.dev, before.ino, before.size, before.mtimeNs, before.nlink]);
+    assert.deepEqual(content.subarray(0, bytesRead), bytes,
+      `${label} must have exact held inode bytes despite identical pathname payloads`);
+  }
   assert.equal((await injected.stat({ bigint: true })).nlink, 2n,
     "both hostile stage and published hardlinks remain retained; no pathname unlink");
 });
+
+test("#66 POSIX stage-symlink substitution rejects a published symlink to retained equal bytes",
+  { skip: process.platform === "win32" && "POSIX hardlinks preserve symlink inodes; Windows needs separate reparse validation" },
+  async (t) => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue66-symlink-stage-"));
+    const retained = [];
+    t.after(async () => {
+      for (const handle of retained.reverse()) await handle.close();
+    });
+    const stageName = path.join(directory, "foreign-stage.bin");
+    const preservedName = path.join(directory, "foreign-preserved.bin");
+    const publishedName = path.join(directory, "published.bin");
+    const bytes = Buffer.from("SAME_BYTES_FROM_A_SYMLINK_ARE_NOT_A_HARDLINK");
+    const foreign = await fsp.open(stageName, "wx+", 0o600);
+    retained.push(foreign);
+    await foreign.writeFile(bytes);
+    await foreign.sync();
+    await fsp.rename(stageName, preservedName);
+    await fsp.symlink(preservedName, stageName);
+    await fsp.link(stageName, publishedName);
+    assert.equal((await fsp.lstat(publishedName)).isSymbolicLink(), true,
+      "this physical attack requires the published directory entry to be a symlink");
+    await assert.rejects(openPublishedLabNoFollow(publishedName),
+      { code: "lab_publication_identity_mismatch" });
+    const originalState = await foreign.stat({ bigint: true });
+    assert.equal(originalState.nlink, 1n,
+      "the original foreign inode was not given a second hardlink");
+    const content = Buffer.alloc(bytes.length + 1);
+    const { bytesRead } = await foreign.read(content, 0, content.length, 0);
+    assert.deepEqual(content.subarray(0, bytesRead), bytes);
+    const after = await foreign.stat({ bigint: true });
+    assert.deepEqual([after.dev, after.ino, after.size, after.mtimeNs, after.nlink],
+      [originalState.dev, originalState.ino, originalState.size, originalState.mtimeNs, 1n]);
+  });
