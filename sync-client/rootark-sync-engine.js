@@ -5,12 +5,23 @@ const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { types: { isProxy } } = require("node:util");
 
 const protocol = require("./rootark-sync-protocol");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
+
+const ATOMIC_PUBLIC_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+}));
+const ATOMIC_NATIVE_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
+const ATOMIC_NATIVE_ALGORITHM = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(ATOMIC_PUBLIC_PROTOTYPE), "asymmetricKeyType").get;
+const ATOMIC_NATIVE_EXPORT = Object.getOwnPropertyDescriptor(ATOMIC_PUBLIC_PROTOTYPE, "export").value;
+const ATOMIC_NATIVE_EQUALS = crypto.KeyObject.prototype.equals;
 
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
@@ -51,27 +62,30 @@ function pinnedAtomicOwnerIdentity(value) {
 }
 function pinnedAtomicWitnessKey(value) {
   if (value == null) return null;
-  let key;
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    key = crypto.createPublicKey({ key: Buffer.from(value), format: "der", type: "spki" });
-  } else if (typeof value === "string" && /^[A-Za-z0-9_-]{40,512}$/.test(value)) {
-    const der = Buffer.from(value, "base64url");
-    if (der.toString("base64url") !== value) {
-      fail("Atomic batch witness key is not canonical", "authorization_required");
+  try {
+    if (isProxy(value)) throw new Error("Proxy pin");
+    let der;
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+      der = Buffer.from(value);
+    } else if (typeof value === "string" && /^[A-Za-z0-9_-]{40,512}$/.test(value)) {
+      der = Buffer.from(value, "base64url");
+      if (der.toString("base64url") !== value) {
+        fail("Atomic batch witness key is not canonical", "authorization_required");
+      }
+    } else {
+      const supplied = value instanceof crypto.KeyObject ? value : crypto.createPublicKey(value);
+      if (ATOMIC_NATIVE_TYPE.call(supplied) !== "public"
+        || ATOMIC_NATIVE_ALGORITHM.call(supplied) !== "ed25519") throw new Error("Invalid key");
+      der = ATOMIC_NATIVE_EXPORT.call(supplied, { type: "spki", format: "der" });
     }
-    key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
-  } else if (value instanceof crypto.KeyObject && value.type === "public") {
-    // createPublicKey(publicKeyObject) throws ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE:
-    // an independently supplied public pin is already a parsed KeyObject.
-    key = value;
-  } else {
-    key = crypto.createPublicKey(value);
-  }
-  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+    const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    if (ATOMIC_NATIVE_TYPE.call(key) !== "public"
+      || ATOMIC_NATIVE_ALGORITHM.call(key) !== "ed25519") throw new Error("Invalid key");
+    return key;
+  } catch {
     fail("Atomic batch witness pin must be an Ed25519 public key",
       "authorization_required");
   }
-  return key;
 }
 function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope, identity) {
   // Client-signed envelopes echoed by the server are NOT evidence that the
@@ -447,8 +461,7 @@ class SyncEngine {
         "authorization_required");
     }
     if (witnessPublicKey && casFloorPublicKey
-      && witnessPublicKey.export({ type: "spki", format: "der" })
-        .equals(casFloorPublicKey.export({ type: "spki", format: "der" }))) {
+      && ATOMIC_NATIVE_EQUALS.call(witnessPublicKey, casFloorPublicKey)) {
       fail("External CAS floor and physical witness require distinct pinned keys",
         "authorization_required");
     }
@@ -474,8 +487,7 @@ class SyncEngine {
         witnessPublicKey, casPublicKey: casFloorPublicKey,
       }) : null;
     if (ownerProvision && [witnessPublicKey, casFloorPublicKey].some((key) =>
-      key && key.export({ type: "spki", format: "der" }).equals(
-        ownerProvision.publicKey.export({ type: "spki", format: "der" })))) {
+      key && ATOMIC_NATIVE_EQUALS.call(key, ownerProvision.publicKey))) {
       fail("Owner provisioner, witness and CAS must have distinct pinned keys",
         "authorization_required");
     }
