@@ -15,6 +15,7 @@ const { openNativeRootSession } = require("../sync-client/rootark-sync-native-ro
 const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const kp = () => crypto.generateKeyPairSync("ed25519");
 const pub = (key) => key.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
+const wire = (object) => Buffer.from(canonicalJson(object), "utf8");
 const sign = (type, statement, key) => ({ statement,
   signature: crypto.sign(null, Buffer.from(DOMAIN + type + "\0" + canonicalJson(statement), "utf8"),
     key.privateKey).toString("base64url") });
@@ -68,15 +69,15 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
   let staleChallenge = false;
   let fakePhase = null;
   const args = {
-    scope, expectedOwnerDigest, ownerProvision: provision,
+    scope, expectedOwnerDigest, ownerProvision: wire(provision),
     ownerSignerSpki: pub(owner), witnessSignerSpki: pub(witness), floorSignerSpki: pub(floor),
     async readPhysicalNative() {
       const physical = await openedPhysical();
-      return fakePhase ? { ...physical, phase: fakePhase } : physical;
+      return wire(fakePhase ? { ...physical, phase: fakePhase } : physical);
     },
     async currentSignedReadback(challenge) {
       const receiptNonce = staleChallenge ? "0".repeat(64) : challenge;
-      return {
+      return wire({
         witness: sign("witness", {
           type: "root-commit", version: 1, scope, rootDigest, epoch,
           sequence, phase: "COMMITTED", fileId: originalPhysical.fileId,
@@ -86,7 +87,7 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
           type: "root-floor", version: 1, scope, rootDigest, epoch,
           sequence: floorSequence, commitDigest, challenge: receiptNonce,
         }, floor),
-      };
+      });
     },
   };
   const good = await inspectSignedColdCommit(args);
@@ -130,11 +131,19 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
   await assert.rejects(inspectSignedColdCommit({ ...args, ownerProvision: accessorProvision }),
     { code: "root_session_unverified_authority" });
   assert.equal(unsafeAccessorCalled, false,
-    "a getter must never be invoked while detaching untrusted signed material");
+    "a caller-supplied object must be rejected before any getter or Proxy trap");
   await assert.rejects(inspectSignedColdCommit({ ...args,
-    ownerProvision: { ...provision, enormous: "A".repeat(1024 * 1024) },
+    ownerProvision: wire({ ...provision, enormous: "A".repeat(1024 * 1024) }),
   }), { code: "root_session_unverified_authority" },
-  "bound oversized signed evidence before recursive JSON stringify");
+  "reject oversized serialized bytes before JSON parse or canonicalization");
+  const numerous = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`j${i}`, i]));
+  await assert.rejects(inspectSignedColdCommit({ ...args, ownerProvision: wire(numerous) }),
+    { code: "root_session_unverified_authority" },
+  "a prebounded byte input must not imply that arbitrarily many fields are acceptable");
+  await assert.rejects(inspectSignedColdCommit({ ...args,
+    ownerProvision: Buffer.from('{"statement":{}, "statement":{}, "signature":"x"}'),
+  }), { code: "root_session_unverified_authority" },
+  "duplicate keys and noncanonical byte framing cannot supply signed authority");
   sequence = 1;
   floorSequence = 1;
   await assert.rejects(inspectSignedColdCommit(args), { code: "root_session_unverified_authority" },

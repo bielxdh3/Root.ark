@@ -19,43 +19,16 @@ const exact = (value, keys) => value && typeof value === "object" && !Array.isAr
   && Object.keys(value).every((name) => keys.includes(name));
 
 function detach(input, maximum = 8192) {
-  // Never recursively stringify an unbounded caller object before applying
-  // the budget. Copy only DATA descriptors, with depth/node/byte caps, to a
-  // fresh plain object. Accessors must not change signed bytes mid-verification.
-  let visited = 0;
-  let bytes = 0;
-  const ancestors = new WeakSet();
-  const copy = (value, depth) => {
-    if (++visited > 64 || depth > 7) throw fail();
-    if (value === null || typeof value === "boolean") return value;
-    if (typeof value === "number" && Number.isSafeInteger(value)) return value;
-    if (typeof value === "string") {
-      bytes += Buffer.byteLength(value, "utf8");
-      if (bytes > maximum) throw fail();
-      return value;
-    }
-    if (!value || typeof value !== "object" || Array.isArray(value)
-      || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
-      || ancestors.has(value)) throw fail();
-    ancestors.add(value);
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Reflect.ownKeys(descriptors);
-    if (keys.length > 32) throw fail();
-    const result = Object.create(null);
-    for (const key of keys) {
-      if (typeof key !== "string" || !Object.hasOwn(descriptors[key], "value")) throw fail();
-      bytes += Buffer.byteLength(key, "utf8");
-      if (bytes > maximum) throw fail();
-      Object.defineProperty(result, key, { value: copy(descriptors[key].value, depth + 1),
-        enumerable: true, writable: true, configurable: true });
-    }
-    ancestors.delete(value);
-    return result;
-  };
+  // The only accepted ingress is an already length-bounded byte buffer from
+  // an external/native readback. No generic JS object, getter or Proxy is
+  // recursively enumerated before its cost can be checked. Reject even valid
+  // JSON if the supplied bytes are not EXACTLY the canonical signed form.
+  if (!Buffer.isBuffer(input) || input.length > maximum) throw fail();
   try {
-    const encoded = canonicalJson(copy(input, 0));
-    if (Buffer.byteLength(encoded, "utf8") > maximum) throw fail();
-    return JSON.parse(encoded);
+    const source = input.toString("utf8");
+    const parsed = JSON.parse(source);
+    if (canonicalJson(parsed) !== source) throw fail();
+    return parsed;
   } catch { throw fail(); }
 }
 
