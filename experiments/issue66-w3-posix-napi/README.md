@@ -159,6 +159,9 @@ without renaming it. Previous code physically proceeded with publication
 stress: **38 PASS / 3 expected SKIP / 0 FAIL**. All observations remain
 `LAB_ONLY_NO_GO`; a same-UID writer can still race between checks or later
 restore the same mode (ABA).
+The negative fixture restores `0700` with `fchmod` on the **original opened
+parent fd** in `finally` (even if assertions fail), preserving the inode and
+forensic contents without leaving a world-writable retained directory.
 
 **Not a crash-safe production transaction:** the journal is a fixed
 disposable plaintext canary, **not signed**, nor held by an independent

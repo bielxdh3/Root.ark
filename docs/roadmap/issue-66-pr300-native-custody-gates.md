@@ -750,7 +750,10 @@ original `st_uid` and mode bits of **every ancestor**, plus the private ext4
 parent's strict `0700` contract, before staging, publishing and COMMIT.
 Physical child **GREEN 1 PASS**, and the complete W3 Node22/ext4 suite
 with **no 16,385-inode stress rerun** is **38 PASS / 3 expected SKIP /
-0 FAIL**. These results belong to the local child and await exact-SHA
+0 FAIL**. After proving the hostile `0777` state, the test resecures
+**the same opened parent inode** by `fchmod(fd, 0700)` in `finally` before
+closing the descriptor, leaving the fixture and its original bytes preserved
+without a world-writable directory. These results belong to the local child and await exact-SHA
 independent SOURCE GO and final hosted checks.
 
 This is **live, cooperative LAB_ONLY_NO_GO**, not a persistent independent

@@ -395,8 +395,9 @@ test("#66 W3 native ancestor chain rejects a same-UID parent permission downgrad
     const parent = path.join(home, created[0]);
     const parentFd = fs.openSync(parent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
       | fs.constants.O_NOFOLLOW);
+    let original;
     try {
-      const original = fs.fstatSync(parentFd, { bigint: true });
+      original = fs.fstatSync(parentFd, { bigint: true });
       assert.equal(original.mode & 0o777n, 0o700n);
       assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
       const attacker = spawnSync("/usr/bin/node", ["-e", String.raw`
@@ -417,7 +418,20 @@ test("#66 W3 native ancestor chain rejects a same-UID parent permission downgrad
       assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-commit-marker-v1")), false);
       assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
       assert.equal(bridge.authority(), "LAB_ONLY_NO_GO");
-    } finally { fs.closeSync(parentFd); }
+    } finally {
+      // Restore only the originally retained inode, never the mutable path.
+      // Retain the forensic fixture without leaving an accessible 0777 tree
+      // if any assertion or injected subprocess fails midway through the test.
+      try {
+        fs.fchmodSync(parentFd, 0o700);
+        const restored = fs.fstatSync(parentFd, { bigint: true });
+        assert.equal(restored.mode & 0o777n, 0o700n);
+        if (original) {
+          assert.equal(restored.dev, original.dev);
+          assert.equal(restored.ino, original.ino);
+        }
+      } finally { fs.closeSync(parentFd); }
+    }
   });
 
 test("#66 W3 live ancestor recheck blocks COMMIT after a durable link and parent rebind",
