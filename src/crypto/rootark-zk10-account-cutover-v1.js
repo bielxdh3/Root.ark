@@ -15,6 +15,15 @@ const {
   hashUpdate: NATIVE_HASH_UPDATE,
   hashDigest: NATIVE_HASH_DIGEST,
   jsonStringify: NATIVE_JSON_STRINGIFY,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  arrayPush: NATIVE_ARRAY_PUSH,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  ownKeys: NATIVE_OWN_KEYS,
+  ownDescriptor: NATIVE_OWN_DESCRIPTOR,
+  getPrototype: NATIVE_GET_PROTOTYPE,
+  hasOwn: NATIVE_HAS_OWN,
   publicExport: NATIVE_PUBLIC_EXPORT,
   keyType: NATIVE_TYPE,
   keyAlgorithm: NATIVE_ALGORITHM,
@@ -32,7 +41,7 @@ const HEX = /^[a-f0-9]{64}$/;
 const B64 = /^[A-Za-z0-9_-]+$/;
 const H = (...v) => {
   const hash = NATIVE_CREATE_HASH("sha256");
-  NATIVE_HASH_UPDATE.call(hash, Buffer.concat(v));
+  NATIVE_HASH_UPDATE.call(hash, NATIVE_BUFFER_CONCAT(v));
   return NATIVE_HASH_DIGEST.call(hash);
 };
 function deny() {
@@ -41,21 +50,21 @@ function deny() {
   throw err;
 }
 function exact(value, fields) {
-  if (!value || typeof value !== "object" || isProxy(value) || Array.isArray(value)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
-    || Reflect.ownKeys(value).length !== fields.length) deny();
+  if (!value || typeof value !== "object" || isProxy(value) || NATIVE_ARRAY_IS_ARRAY(value)
+    || ![Object.prototype, null].includes(NATIVE_GET_PROTOTYPE(value))
+    || NATIVE_OWN_KEYS(value).length !== fields.length) deny();
   const output = {};
   for (const field of fields) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, field);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    const descriptor = NATIVE_OWN_DESCRIPTOR(value, field);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     output[field] = descriptor.value;
   }
   return output;
 }
 function decode(value, length) {
   if (typeof value !== "string" || !B64.test(value)) deny();
-  const result = Buffer.from(value, "base64url");
-  if (result.length !== length || result.toString("base64url") !== value) deny();
+  const result = NATIVE_BUFFER_FROM(value, "base64url");
+  if (result.length !== length || NATIVE_BUFFER_TO_STRING.call(result, "base64url") !== value) deny();
   return result;
 }
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
@@ -78,8 +87,8 @@ function key(value, type) {
   } catch (_) { deny(); }
 }
 function pinnedSpkiHash(pinnedPublicKey) {
-  return H(NATIVE_PUBLIC_EXPORT.call(pinnedPublicKey,
-    { format: "der", type: "spki" })).toString("hex");
+  return NATIVE_BUFFER_TO_STRING.call(H(NATIVE_PUBLIC_EXPORT.call(pinnedPublicKey,
+    { format: "der", type: "spki" })), "hex");
 }
 function spkiHash(publicKey) {
   return pinnedSpkiHash(key(publicKey, "public"));
@@ -115,12 +124,12 @@ function ownerPayload(payload) {
     decode(item, 16);
     if (item <= previous) deny();
     previous = item;
-    names.push(item);
+    NATIVE_ARRAY_PUSH.call(names, item);
   }
   return { ...p, covered_compartments: names };
 }
 function signatureBytes(domain, payload) {
-  return Buffer.concat([domain, Buffer.from(NATIVE_JSON_STRINGIFY(payload), "utf8")]);
+  return NATIVE_BUFFER_CONCAT([domain, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(payload), "utf8")]);
 }
 function signOwnerCutover(payload, privateKey) {
   const p = ownerPayload(payload);
@@ -184,7 +193,7 @@ function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
     previousDigest = H(bytes, decode(signed.signature_from, 64),
       decode(signed.signature_next, 64)).toString("hex");
     current = next;
-    accepted.push(current);
+    NATIVE_ARRAY_PUSH.call(accepted, current);
   }
   return Object.freeze(accepted);
 }
@@ -245,7 +254,7 @@ const NODE = Buffer.from("Root.ark/zk10/smt-node/v1\0");
 const LEAF = Buffer.from("Root.ark/zk10/smt-leaf/v1\0");
 function leaf(accountId, cutoverDigest) {
   if (cutoverDigest === null) return EMPTY[0];
-  return H(LEAF, decode(accountId, 16), Buffer.from(hex(cutoverDigest), "hex"));
+  return H(LEAF, decode(accountId, 16), NATIVE_BUFFER_FROM(hex(cutoverDigest), "hex"));
 }
 function pathBits(accountId) {
   return BigInt(`0x${H(Buffer.from("Root.ark/zk10/smt-key/v1\0"),
@@ -256,11 +265,11 @@ function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expecte
     || Reflect.ownKeys(siblings).length !== 257) deny();
   let at = pathBits(accountId), current = leaf(accountId, cutoverDigest);
   for (const sibling of siblings) {
-    const siblingHash = Buffer.from(hex(sibling), "hex");
+    const siblingHash = NATIVE_BUFFER_FROM(hex(sibling), "hex");
     current = at & 1n ? H(NODE, siblingHash, current) : H(NODE, current, siblingHash);
     at >>= 1n;
   }
-  if (!NATIVE_TIMING_SAFE_EQUAL(current, Buffer.from(hex(expectedRoot), "hex"))) deny();
+  if (!NATIVE_TIMING_SAFE_EQUAL(current, NATIVE_BUFFER_FROM(hex(expectedRoot), "hex"))) deny();
   return true;
 }
 // Pure deterministic fixture/proof builder. The authority, not an app server,

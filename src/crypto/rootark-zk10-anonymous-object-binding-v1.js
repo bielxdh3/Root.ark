@@ -13,6 +13,9 @@ const {
   hashUpdate: NATIVE_HASH_UPDATE,
   hashDigest: NATIVE_HASH_DIGEST,
   jsonStringify: NATIVE_JSON_STRINGIFY,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const {
   exact, decode, hex, key, verifyOwnerRotationKeys, verifyOwnerCutoverHistory,
@@ -70,8 +73,8 @@ function canonical(value) {
 function tokenDigest(rawKind, token) {
   kind(rawKind);
   if (typeof token !== "string" || !TOKEN.test(token)) deny();
-  return sha(TOKEN_DOMAIN, Buffer.from(rawKind, "ascii"), Buffer.from([0]),
-    Buffer.from(token, "ascii")).toString("hex");
+  return NATIVE_BUFFER_TO_STRING.call(sha(TOKEN_DOMAIN, NATIVE_BUFFER_FROM(rawKind, "ascii"),
+    NATIVE_BUFFER_FROM([0]), NATIVE_BUFFER_FROM(token, "ascii")), "hex");
 }
 function sha(...parts) {
   const hash = NATIVE_CREATE_HASH("sha256");
@@ -96,7 +99,7 @@ function normalizedInventoryEntry(record) {
     generationBytes: uint64(v.owner_generation, 1),
     objectBytes: decode(v.object_id, 16),
     revisionBytes: uint64(v.revision, 1),
-    ciphertextBytes: Buffer.from(hex(v.ciphertext_sha256), "hex"),
+    ciphertextBytes: NATIVE_BUFFER_FROM(hex(v.ciphertext_sha256), "hex"),
   };
 }
 function inventoryPosition(entry) {
@@ -122,12 +125,12 @@ function verifySparseObjectInventoryProof(accountId, generation, object, sibling
   let position = inventoryPosition(entry);
   let current = inventoryLeaf(entry);
   for (const sibling of siblings) {
-    const bytes = Buffer.from(hex(sibling), "hex");
+    const bytes = NATIVE_BUFFER_FROM(hex(sibling), "hex");
     current = position & 1n
       ? sha(INVENTORY_NODE, bytes, current) : sha(INVENTORY_NODE, current, bytes);
     position >>= 1n;
   }
-  if (!NATIVE_TIMING_SAFE_EQUAL(current, Buffer.from(hex(root), "hex"))) deny();
+  if (!NATIVE_TIMING_SAFE_EQUAL(current, NATIVE_BUFFER_FROM(hex(root), "hex"))) deny();
   return true;
 }
 // Deterministic synthetic-proof helper. It cannot establish external custody,
@@ -170,7 +173,7 @@ function buildSparseObjectInventoryProof(records, accountId, objectId, revision)
     siblings: Object.freeze(siblings) });
 }
 function signatureBytes(body) {
-  return Buffer.concat([DOMAIN, Buffer.from(NATIVE_JSON_STRINGIFY(body), "utf8")]);
+  return NATIVE_BUFFER_CONCAT([DOMAIN, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(body), "utf8")]);
 }
 function signAnonymousObjectBinding(unsigned, privateKey) {
   try {

@@ -14,6 +14,8 @@ const {
   hashDigest: NATIVE_HASH_DIGEST,
   publicExport: NATIVE_PUBLIC_EXPORT,
   jsonStringify: NATIVE_JSON_STRINGIFY,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const { exact, decode, hex, key } = require("./rootark-zk10-account-cutover-v1");
 const { FIELDS: OBJECT_BINDING_FIELDS, verifyAnonymousObjectBinding } =
@@ -62,7 +64,7 @@ function canonical(payload) {
   return p;
 }
 function signedBytes(body) {
-  return Buffer.concat([DOMAIN, Buffer.from(NATIVE_JSON_STRINGIFY(body), "utf8")]);
+  return NATIVE_BUFFER_CONCAT([DOMAIN, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(body), "utf8")]);
 }
 function unpack(wire) {
   const signed = exact(wire, [...FIELDS, "signature"]);

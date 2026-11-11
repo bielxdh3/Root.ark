@@ -15,6 +15,8 @@ const {
   keyAlgorithm: NATIVE_ALGORITHM,
   publicExport: NATIVE_EXPORT,
   keyEquals: NATIVE_EQUALS,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
 } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const protocol = require("./rootark-sync-protocol");
 
@@ -38,11 +40,11 @@ function pinnedProvisionerKey(input) {
     if (isProxy(input)) throw deny();
     let der;
     if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-      der = Buffer.from(input);
+      der = NATIVE_BUFFER_FROM(input);
     } else if (typeof input === "string") {
       if (!/^[A-Za-z0-9_-]{40,512}$/.test(input)) throw deny();
-      der = Buffer.from(input, "base64url");
-      if (der.toString("base64url") !== input) throw deny();
+      der = NATIVE_BUFFER_FROM(input, "base64url");
+      if (NATIVE_BUFFER_TO_STRING.call(der, "base64url") !== input) throw deny();
     } else if (input instanceof crypto.KeyObject) {
       if (NATIVE_TYPE.call(input) !== "public"
         || NATIVE_ALGORITHM.call(input) !== "ed25519") throw deny();
@@ -92,13 +94,13 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
     { type: "spki", format: "der" }).toString("base64url")
     || statement.casSpki !== NATIVE_EXPORT.call(cas,
       { type: "spki", format: "der" }).toString("base64url")) throw deny();
-  const signature = Buffer.from(detached.signature, "base64url");
-  if (signature.length !== 64 || signature.toString("base64url") !== detached.signature) throw deny();
+  const signature = NATIVE_BUFFER_FROM(detached.signature, "base64url");
+  if (signature.length !== 64 || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== detached.signature) throw deny();
   const pin = pinnedProvisionerKey(provisionerPublicKey);
   // All THREE separately administered principals must be physically distinct.
   if (NATIVE_EQUALS.call(witness, cas) || NATIVE_EQUALS.call(witness, pin)
     || NATIVE_EQUALS.call(cas, pin)) throw deny();
-  if (!NATIVE_VERIFY(null, Buffer.from(DOMAIN + protocol.canonicalJson(statement), "utf8"),
+  if (!NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(DOMAIN + protocol.canonicalJson(statement), "utf8"),
     pin, signature)) throw deny();
   // A signature by itself is REPLAYABLE. The trusted embedding must retain
   // the CURRENT certificate digest outside mutable sync config, server and
