@@ -494,6 +494,103 @@ test("production NODE_ENV refuses even fully signed disposable evidence", () => 
   }
 });
 
+test("P2 hostile signed CURRENT callback cannot replace Buffer.from to authenticate wrong Uint8Array original bytes", () => {
+  const f = fixture();
+  const wrong = Uint8Array.from(f.original);
+  wrong[2] ^= 0x7f;
+  assert.equal(wrong.length, f.original.length);
+  assert.notEqual(hash(Buffer.from(wrong)), f.body.original_sha256,
+    "physical wrong bytes do not match the genuine owner-signed SHA256");
+  const options = f.options();
+  const genuineFloorRead = options.readSignedCurrentFloor;
+  const nativeFrom = Buffer.from;
+  let readbacks = 0, forgedCopies = 0;
+  options.readSignedCurrentFloor = (challenge) => {
+    // Return a GENUINELY Ed25519-signed CURRENT first. Only its untrusted
+    // callback then replaces Buffer.from before the body is assembled.
+    const signed = genuineFloorRead(challenge);
+    readbacks++;
+    Buffer.from = function (value, ...args) {
+      if (value instanceof Uint8Array && !Buffer.isBuffer(value)
+        && value.length === wrong.length
+        && value.every((byte, i) => byte === wrong[i])) {
+        forgedCopies++;
+        return nativeFrom(f.original);
+      }
+      return nativeFrom(value, ...args);
+    };
+    return signed;
+  };
+  let accepted;
+  try {
+    const gate = createDevOffOriginalByteEvidenceGate(options);
+    const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+    assert.throws(() => {
+      accepted = gate.verifyOriginalBytes({ ticket, chunks: [wrong] });
+    }, bad, "a malicious callback cannot turn foreign body bytes into genuine owner-signed bytes");
+  } finally { Buffer.from = nativeFrom; }
+  assert.ok(readbacks >= 2, "genuine signed CURRENT was read before wrong body hash");
+  assert.equal(forgedCopies, 0,
+    "untrusted Buffer.from can never be invoked on original-byte typed copy");
+  assert.equal(accepted, undefined, "no false original-byte verification");
+});
+
+test("P2 hostile signed CURRENT callback cannot replace Buffer.concat to replay a stale nonce-signed floor", () => {
+  const f = fixture();
+  const staleNonce = b64(32);
+  const ownerPin = spki(f.owner.publicKey);
+  const staleFloor = sign({
+    type: "rootark-zk10-original-byte-floor-readback/v1",
+    immutable_account_id: f.expected.immutable_account_id,
+    owner_spki_sha256: ownerPin, sequence: f.minimum.sequence,
+    head_digest: f.minimum.headDigest, nonce: staleNonce, revoked: false,
+    issued_at_ms: Date.now() - 50, expires_at_ms: Date.now() + 5000,
+  }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+  // Physically prove this genuine Ed25519 signature authorizes only stale B,
+  // never the fresh challenge A supplied to the callback.
+  const nativeConcat = Buffer.concat;
+  const nativeFrom = Buffer.from;
+  const { signature: staleSignature, ...stalePayload } = staleFloor;
+  assert.equal(crypto.verify(null, nativeConcat([FLOOR_DOMAIN,
+    nativeFrom(JSON.stringify(stalePayload), "utf8")]), f.custodian.publicKey,
+  nativeFrom(staleSignature, "base64url")), true);
+  const options = f.options();
+  let reused = 0, intercepted = 0;
+  options.readSignedCurrentFloor = challenge => {
+    assert.notEqual(challenge, staleNonce);
+    reused++;
+    Buffer.concat = function (parts, ...args) {
+      if (Array.isArray(parts) && Buffer.isBuffer(parts[0])
+        && parts[0].equals(FLOOR_DOMAIN)) {
+        const payload = JSON.parse(parts[1].toString("utf8"));
+        if (payload.nonce === challenge) {
+          // Replace ONLY the verifier's signed message A with the previously
+          // signed B. Returned signed wire still says nonce=A (a false CURRENT).
+          intercepted++;
+          payload.nonce = staleNonce;
+          return nativeConcat([parts[0],
+            nativeFrom(JSON.stringify(payload), "utf8")], ...args);
+        }
+      }
+      return nativeConcat(parts, ...args);
+    };
+    return { ...staleFloor, nonce: challenge };
+  };
+  let accepted;
+  try {
+    const gate = createDevOffOriginalByteEvidenceGate(options);
+    assert.throws(() => {
+      const ticket = gate.beginBeforeBody({
+        ownerEvidence: f.intent(), expected: f.expected,
+      });
+      accepted = gate.verifyOriginalBytes({ ticket, chunks: [f.original] });
+    }, bad, "stale nonce B cannot authorize challenge A even with untrusted Buffer.concat");
+  } finally { Buffer.concat = nativeConcat; }
+  assert.ok(reused >= 1, "untrusted CURRENT callback returned a reused genuine B signature");
+  assert.equal(intercepted, 0, "nonce binding must never call mutable Buffer.concat");
+  assert.equal(accepted, undefined, "no replayed stale CURRENT accepted");
+});
+
 test("P2: owner A cannot impersonate independently pinned B via own native kKeyType getter and retargeted Hash.prototype.digest", () => {
   const f = fixture();
   const opts = f.options();

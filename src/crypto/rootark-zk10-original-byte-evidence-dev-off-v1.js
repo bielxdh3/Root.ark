@@ -7,6 +7,12 @@
 // No HTTP route or production service imports this file.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
+// Pin byte constructors before any caller-supplied KeyObject/nonce-readback
+// callback can retarget Buffer.from/concat. Both native signature-message
+// assembly and original-byte snapshots must use these immutable references.
+const BUFFER_FROM = Buffer.from.bind(Buffer);
+const BUFFER_CONCAT = Buffer.concat.bind(Buffer);
+const NATIVE_UINT8ARRAY = Uint8Array;
 
 const OWNER_DOMAIN = Buffer.from("Root.ark/zk10/owner-original-byte-evidence/v1\0");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk10/original-byte-floor-readback/v1\0");
@@ -94,7 +100,7 @@ function exact(value, fields) {
 }
 function bytes(value, count) {
   if (typeof value !== "string" || !B64URL.test(value)) deny();
-  const decoded = Buffer.from(value, "base64url");
+  const decoded = BUFFER_FROM(value, "base64url");
   if (decoded.length !== count || decoded.toString("base64url") !== value) deny();
   return value;
 }
@@ -188,7 +194,7 @@ function normalizedFloor(raw) {
 function signedSnapshot(record, fields, normalize, domain, pinnedKey) {
   const signed = exact(record, [...fields, "signature"]);
   const body = normalize(Object.fromEntries(fields.map((field) => [field, signed[field]])));
-  const signature = Buffer.from(bytes(signed.signature, 64), "base64url");
+  const signature = BUFFER_FROM(bytes(signed.signature, 64), "base64url");
   // All normalized owner/floor records are FLAT scalar schemas. Serialize
   // each own primitive in the exact signed field order. JSON.stringify(body)
   // would invoke inherited toJSON hooks after an injected CURRENT callback.
@@ -199,7 +205,7 @@ function signedSnapshot(record, fields, normalize, domain, pinnedKey) {
         typeof descriptor.value))) deny();
     return `${JSON_STRINGIFY_PRIMITIVE(field)}:${JSON_STRINGIFY_PRIMITIVE(descriptor.value)}`;
   });
-  const message = Buffer.concat([domain, Buffer.from(`{${encoded.join(",")}}`, "utf8")]);
+  const message = BUFFER_CONCAT([domain, BUFFER_FROM(`{${encoded.join(",")}}`, "utf8")]);
   if (!VERIFY(null, message, pinnedKey, signature)) deny();
   return body;
 }
@@ -225,7 +231,7 @@ function immutableBytes(part, remaining) {
     if (!Number.isSafeInteger(length) || length > MAX_CHUNK_BYTES || length > remaining
       || !Number.isSafeInteger(offset) || offset < 0 || offset > total
       || length > total - offset) deny();
-    const copied = Buffer.from(new Uint8Array(backing, offset, length));
+    const copied = BUFFER_FROM(new NATIVE_UINT8ARRAY(backing, offset, length));
     if (copied.length !== length) deny();
     return copied;
   } catch (_) { deny(); }
@@ -316,7 +322,7 @@ function createDevOffOriginalByteEvidenceGate(options) {
         }
         if (size !== intent.original_length
           || !TIMING_SAFE_EQUAL(HASH_DIGEST.call(digest),
-            Buffer.from(intent.original_sha256, "hex"))) deny();
+            BUFFER_FROM(intent.original_sha256, "hex"))) deny();
         freshOwner(intent); // check another nonce-signed snapshot after assembly
         return Object.freeze({
           status: "SIGNED_ORIGINAL_BYTES_NONAUTHORIZING",
