@@ -268,6 +268,24 @@ node sync-client/rootark-sync-v2.js status --config E:\sync-private\.rootark-syn
 node sync-client/rootark-sync-v2.js unpin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 ```
 
+**Restricao S0 atual:** sem RootSession nativa com custodia independente e
+publicacao atomica sem substituir arquivos estrangeiros, **toda operacao
+remota selecionada que percorra `SyncEngine._apply()` no modo
+`filesOnDemand: true` ou `requireNativeRootRecovery: true`** fica bloqueada
+com `root_session_native_unavailable`, inclusive CREATE/UPDATE/MOVE de arquivos
+ou diretorios e DELETE/tombstone (estes ultimos ja negados antes da verificacao
+de entrada). O bloqueio de CREATE/UPDATE/MOVE ocorre apos a pre-validacao
+criptografica, mas **antes** de `journal.observeAdmission`, criar conteudo
+inbound, diretorios da carga, temporarios de publicacao, `stageExisting` ou
+`rename` JS da carga. O lock cooperativo da raiz e sua admissao podem ter
+feito I/O de controle anteriormente; S0 **nao** promete ausencia total de I/O
+nem protege esse lock contra escritores hostis. Inventario consultivo e
+`browse` continuam disponiveis. `hydrate`, `pin` que exija hidratacao e
+aplicacao de mutacoes remotas selecionadas ficam indisponiveis; a manutencao
+de metadados remotos fora da selecao nao e uma publicacao local de carga.
+Nao existe fallback inseguro nem ativacao automatica de RootSession. O sync
+legado sem exigencia nativa mantem o comportamento anterior.
+
 `hydrate` identifica o objeto pelo inventario e baixa **somente** seu envelope completo; o motor valida identidade, revisao, autorizacao assinada e integridade AEAD antes de materializar os bytes. Se houver modificacao local nao sincronizada, arquivo nao rastreado, ambiguidades ou mudanca entre a consulta de metadados e o download, a hidratacao e recusada sem sobrescrever o arquivo. `evict` preserva a copia remota e exige que o arquivo local esteja limpo e que seus bytes sejam iguais ao objeto remoto verificado. Arquivos evictados continuam remotos, nao viram tombstones; offline, os arquivos ja materializados permanecem acessiveis e novas hidratacoes aguardam conexao.
 
 `pin` hidrata primeiro o envelope completo verificado de um arquivo selecionado e salva uma **preferencia de retencao por dispositivo**, vinculada a identidade `objectId/fileId`, no snapshot local duravel. `evict` e a eviccao automatica por `excludedPaths` nao podem remover arquivos fixados. Mesmo se um arquivo fixado desaparecer localmente, o sync falha com `pinned_file_missing` em vez de emitir um DELETE remoto. `unpin` retira apenas essa preferencia, **sem apagar bytes locais** e sem acessar o servidor; a eviccao existente continua disponivel e, para uma pasta ja excluida, e retomada no proximo sync. Um MOVE remoto autenticado conserva a fixacao pela identidade do objeto. `status` e inteiramente local e funciona offline; sem `--path`, lista as fixacoes. `localPresent` indica somente presenca no disco, nao uma nova verificacao criptografica do conteudo.

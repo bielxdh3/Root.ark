@@ -242,6 +242,14 @@ function denyUntrustedNativeSignedDelete() {
   openNativeRootSession(true);
   fail("Native rooted signed DELETE is not operational", "root_session_native_unavailable");
 }
+function denyUntrustedNativeInboundPublish() {
+  // A verified remote envelope is not authority to replace a physical cache
+  // entry. The legacy inbound path still uses pathname rename(), which can
+  // clobber a foreign same-UID/SID destination planted after its last check.
+  // Even if a future native opener starts returning, never resume that path.
+  openNativeRootSession(true);
+  fail("Native rooted inbound publication is not operational", "root_session_native_unavailable");
+}
 // Called under the ordinary root mutation lock for all public operations.
 // Never accept a mutable snapshot or config flag as proof that a root which
 // has run Files On-Demand can return to legacy pathname mutation. An actor
@@ -4159,9 +4167,9 @@ class SyncEngine {
     const target = await contained(this.rootDir, metadata.path, true);
     // A cached-source MOVE or occupied destination would invoke legacy
     // pathname rename/staging. Deny before journal admission, even when the
-    // source bytes are clean. An absent-source signed MOVE can still hydrate
-    // its authenticated recovery payload; this is only a local policy fence,
-    // NOT a same-SID atomic absence or RootSession authority proof.
+    // source bytes are clean. An absent-source MOVE is also denied by the
+    // unconditional native-required inbound fence below, even if signed;
+    // no branch here authorizes RootSession custody.
     if (this.requireNativeRootRecovery && operation.operation === "move") {
       if (await exists(target)) denyUntrustedNativeEviction();
       const trackedSource = activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
@@ -4175,8 +4183,8 @@ class SyncEngine {
     // source absence now would be a new TOCTOU: a same-SID/UID writer could
     // create the tracked source later and turn this into a destructive rename.
     // Deny ALL native-required directory UPDATEs until a real trusted native
-    // RootSession implements this operation. Signed CREATE of an absent
-    // directory remains a separate, narrowly supported cooperative path.
+    // RootSession implements this operation. Even signed CREATE of an absent
+    // directory is denied by the native-required inbound fence below.
     if (this.requireNativeRootRecovery && operation.operation === "update"
       && metadata.contentType === "inode/directory") {
       denyUntrustedNativeEviction();
@@ -4215,6 +4223,11 @@ class SyncEngine {
       // when Files-On-Demand is disabled on the reopened client.
       fail("A pinned file owns the destination path", "file_pinned");
     }
+    // A native-required inbound mutation must not reach journal admission,
+    // recursive parent creation, stageExisting or replace-capable JS rename.
+    // Browsing and full signed reads remain possible; the positive publish
+    // path requires independent native root custody and no-replace semantics.
+    if (this.requireNativeRootRecovery) denyUntrustedNativeInboundPublish();
     // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
     // envelope before the first filesystem or snapshot mutation; failure here
     // must not leave an applied object with no restart-safe observation.
