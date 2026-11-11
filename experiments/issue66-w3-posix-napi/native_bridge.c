@@ -626,9 +626,10 @@ static napi_value stage_proof(napi_env env, napi_callback_info info) {
   int n = session->staged_fd < 0 ? -1 :
     (fstat(held, &held_stat) == 0 && fstat(session->staged_fd, &original_stage) == 0
       ? snprintf(session->identity_payload, sizeof(session->identity_payload),
-                 "PREPARED_ID_V2:%jx:%jx:%jx:%jx\n",
+                 "PREPARED_ID_V2:%jx:%jx:%jx:%jx:%c\n",
                  (uintmax_t)held_stat.st_dev, (uintmax_t)held_stat.st_ino,
-                 (uintmax_t)original_stage.st_dev, (uintmax_t)original_stage.st_ino)
+                 (uintmax_t)original_stage.st_dev, (uintmax_t)original_stage.st_ino,
+                 session->txn_anonymous ? 'A' : 'N')
       : -1);
   if (n < 1 || (size_t)n >= sizeof(session->identity_payload) ||
       !S_ISDIR(held_stat.st_mode) || !S_ISREG(original_stage.st_mode) ||

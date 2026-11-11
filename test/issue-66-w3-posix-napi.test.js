@@ -703,7 +703,7 @@ test("#66 W3 native cold inspector binds original ext4 inode to PREPARE and COMM
     withHeldFixtureDirectory(held, (dirfd) => {
       withOpenedFixtureLeaves(dirfd, [".rootark-w3-prepared-id-v2"], (idFd) => {
         const id = observeOpenedFixture(idFd);
-        assert.match(id.bytes, /^PREPARED_ID_V2:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+\n$/);
+        assert.match(id.bytes, /^PREPARED_ID_V2:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+:A\n$/);
         assert.equal(id.stat.nlink, 1n);
       });
     });
@@ -746,6 +746,11 @@ test("#66 W3 cold native inspector verifies legitimate named-stage two-link COMM
       "ROOTARK_W3_COLD_INSPECT phase=PREPARED_ONLY authority=LAB_ONLY_NO_GO\n");
     assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
     withHeldFixtureDirectory(held, (dirfd) => {
+      withOpenedFixtureLeaves(dirfd, [".rootark-w3-prepared-id-v2"], (idFd) => {
+        assert.match(observeOpenedFixture(idFd).bytes,
+          /^PREPARED_ID_V2:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+:N\n$/,
+          "cold mode must come from ORIGINAL PREPARE, not a current stage-name guess");
+      });
       withOpenedFixtureLeaves(dirfd,
         [".rootark-w3-staged-v1", ".rootark-w3-committed-v1"],
         (stageFd, publishedFd) => {
@@ -766,6 +771,57 @@ test("#66 W3 cold native inspector verifies legitimate named-stage two-link COMM
       "ROOTARK_W3_COLD_INSPECT phase=COMMIT_OBSERVED authority=LAB_ONLY_NO_GO\n");
     assert.throws(() => requireNativeRecoveryAuthority(bridge),
       (error) => error.code === "root_session_unverified_authority");
+  });
+
+test("#66 W3 named original PREPARE denies cold commit if same-UID writer removes original stage alias",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((n) => n.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const fresh = fs.readdirSync(home).filter((n) =>
+      n.startsWith(".rootark-w3-napi-") && !before.has(n));
+    assert.equal(fresh.length, 1);
+    const held = path.join(home, fresh[0], "held");
+    const originalAnon = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+    finally {
+      if (originalAnon === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = originalAnon;
+    }
+    assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    assert.equal(inspectNativeColdFixture(held).status, 0);
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const originalStage = openFixtureLeaf(dirfd, ".rootark-w3-staged-v1");
+      const published = openFixtureLeaf(dirfd, ".rootark-w3-committed-v1");
+      try {
+        const original = observeOpenedFixture(originalStage);
+        assert.equal(original.stat.nlink, 2n,
+          "named publication is born with two hardlinks to the same inode");
+        assert.equal(observeOpenedFixture(published).stat.ino, original.stat.ino);
+        // Only remove this freshly generated disposable lab leaf. The
+        // ORIGINAL inode and COMMIT remain held; no production cleanup path.
+        fs.unlinkSync(`/proc/self/fd/${dirfd}/.rootark-w3-staged-v1`);
+        const after = observeOpenedFixture(published);
+        assert.equal(after.stat.ino, original.stat.ino);
+        assert.equal(after.stat.nlink, 1n,
+          "physical alias removal must convert named topology to apparent anonymous topology");
+        assert.equal(after.bytes, original.bytes);
+        assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-staged-v1`), false);
+        const cold = inspectNativeColdFixture(held);
+        assert.equal(cold.status, 41,
+          "original PREPARE says named; same-UID alias retirement must never be reclassified anonymous");
+        assert.equal(cold.stdout, "");
+        assert.equal(cold.stderr, "ROOTARK_W3_COLD_INSPECT_REJECTED\n");
+        assert.equal(fs.readFileSync(`/proc/self/fd/${dirfd}/.rootark-w3-commit-marker-v1`, "utf8"),
+          "COMMITTED_V1", "attacker must not alter the original marker to force a denial");
+      } finally {
+        fs.closeSync(published);
+        fs.closeSync(originalStage);
+      }
+    });
   });
 
 test("#66 W3 cold named-stage inspector rejects equal-byte foreign alias after valid COMMIT",

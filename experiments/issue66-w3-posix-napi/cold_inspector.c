@@ -148,14 +148,17 @@ static const char *inspect(int home, const char *fixture_name) {
   // original directory and stage IDs for cold *observations*, not signatures.
   // Reject syntax aliases and trailing bytes by exact re-encoding.
   uintmax_t root_dev, root_ino, file_dev, file_ino;
+  char original_mode = 0;
   char canonical[160];
   int consumed = 0;
-  if (sscanf(identity.bytes, "PREPARED_ID_V2:%jx:%jx:%jx:%jx\n%n",
-             &root_dev, &root_ino, &file_dev, &file_ino, &consumed) != 4 ||
+  if (sscanf(identity.bytes, "PREPARED_ID_V2:%jx:%jx:%jx:%jx:%c\n%n",
+             &root_dev, &root_ino, &file_dev, &file_ino,
+             &original_mode, &consumed) != 5 ||
       consumed == 0 ||
+      (original_mode != 'N' && original_mode != 'A') ||
       snprintf(canonical, sizeof(canonical),
-        "PREPARED_ID_V2:%jx:%jx:%jx:%jx\n",
-        root_dev, root_ino, file_dev, file_ino) < 1 ||
+        "PREPARED_ID_V2:%jx:%jx:%jx:%jx:%c\n",
+        root_dev, root_ino, file_dev, file_ino, original_mode) < 1 ||
       identity.length != strlen(canonical) ||
       memcmp(identity.bytes, canonical, identity.length) != 0 ||
       root_dev != (uintmax_t)root_stat.st_dev ||
@@ -163,6 +166,13 @@ static const char *inspect(int home, const char *fixture_name) {
       file_dev != (uintmax_t)root_stat.st_dev || file_ino == 0)
     goto done;
 
+  // The PREPARE mode byte is a property of the ORIGINAL transaction, not
+  // something inferred from the current pathname. Otherwise a same-UID
+  // attacker could unlink a named stage after COMMIT, dropping nlink 2->1,
+  // and trick us into accepting it as a formerly anonymous O_TMPFILE stage.
+  // N requires the original named stage to exist, even before publication.
+  // A must NEVER have a visible stage name, even with identical bytes.
+  if (original_mode == 'N' ? !stage.exists : stage.exists) goto done;
   // Named stages deliberately preserve their original alias after native
   // linkat: stage and published must BOTH resolve to the exact original
   // physical inode, each with nlink=2, or cold inspection denies. Anonymous

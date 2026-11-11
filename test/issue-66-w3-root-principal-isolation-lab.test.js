@@ -66,7 +66,7 @@ function deniedByRealUnprivilegedProcess(held) {
   }
 }
 
-test("#66 W3 root-owned ext4 native custodian fixture excludes real same-UID client writers",
+test("#66 W3 root-owned ext4 native custodian fixture excludes real distinct-UID client writers",
   { skip: !enabled, timeout: 40000 }, (t) => {
     assert.match(os.release(), /wsl|microsoft/i);
     assert.equal(os.homedir(), "/root");
