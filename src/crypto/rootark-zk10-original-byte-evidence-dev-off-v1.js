@@ -234,22 +234,38 @@ function normalizedFloor(raw) {
 function signedSnapshot(record, fields, normalize, domain, pinnedKey) {
   const signed = exact(record, fields === OWNER_FIELDS
     ? OWNER_SIGNED_FIELDS : fields === FLOOR_FIELDS ? FLOOR_SIGNED_FIELDS : []);
-  const body = normalize(FROM_ENTRIES(SAFE_APPLY(ARRAY_MAP, fields,
-    [(field) => [field, signed[field]]])));
+  // Array.prototype.map performs ArraySpeciesCreate even if its method is
+  // captured. A hostile readSignedCurrentFloor callback can replace the
+  // inherited Array.prototype.constructor[Symbol.species] and return a Proxy
+  // which modifies only serialized field strings while retaining a different
+  // in-memory signed statement. Use fixed indexed writes into a fresh
+  // null-prototype record instead of constructing caller-controlled arrays.
+  const unsigned = CREATE_NULL_PROTO(null);
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    const descriptor = OWN_DESCRIPTOR(signed, field);
+    if (!descriptor || !HAS_OWN(descriptor, "value")) deny();
+    unsigned[field] = descriptor.value;
+  }
+  const body = normalize(unsigned);
   const signature = BUFFER_FROM(bytes(signed.signature, 64), "base64url");
   // All normalized owner/floor records are FLAT scalar schemas. Serialize
   // each own primitive in the exact signed field order. JSON.stringify(body)
   // would invoke inherited toJSON hooks after an injected CURRENT callback.
-  const encoded = SAFE_APPLY(ARRAY_MAP, fields, [(field) => {
+  let encoded = "{";
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
     const descriptor = OWN_DESCRIPTOR(body, field);
     const type = typeof descriptor?.value;
     if (!descriptor || !HAS_OWN(descriptor, "value")
       || (descriptor.value !== null && type !== "string"
         && type !== "boolean" && type !== "number")) deny();
-    return `${JSON_STRINGIFY_PRIMITIVE(field)}:${JSON_STRINGIFY_PRIMITIVE(descriptor.value)}`;
-  }]);
+    if (index !== 0) encoded += ",";
+    encoded += `${JSON_STRINGIFY_PRIMITIVE(field)}:${JSON_STRINGIFY_PRIMITIVE(descriptor.value)}`;
+  }
+  encoded += "}";
   const message = BUFFER_CONCAT([domain,
-    BUFFER_FROM(`{${SAFE_APPLY(ARRAY_JOIN, encoded, [","])}}`, "utf8")]);
+    BUFFER_FROM(encoded, "utf8")]);
   if (!VERIFY(null, message, pinnedKey, signature)) deny();
   return body;
 }

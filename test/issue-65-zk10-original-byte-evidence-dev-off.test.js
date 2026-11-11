@@ -71,6 +71,70 @@ function fixture() {
     get floorCalls() { return floorCalls; } };
 }
 const bad = /ZK10_ORIGINAL_BYTE_EVIDENCE_UNVERIFIED/;
+
+test("P2: Array species cannot transmute fresh signed floor nonce A into stale signed nonce B", () => {
+  const f = fixture();
+  const stolenNonce = b64(32);
+  const oldDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, "constructor");
+  let callbackCalls = 0;
+  let rewrittenNonceFields = 0;
+  let hostileSpeciesCalls = 0;
+  const signedFloorB = sign({
+    type: "rootark-zk10-original-byte-floor-readback/v1",
+    immutable_account_id: f.expected.immutable_account_id,
+    owner_spki_sha256: spki(f.owner.publicKey),
+    sequence: f.minimum.sequence, head_digest: f.minimum.headDigest,
+    nonce: stolenNonce, revoked: false, issued_at_ms: Date.now() - 50,
+    expires_at_ms: Date.now() + 5000,
+  }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+  assert.equal(crypto.verify(null, Buffer.concat([FLOOR_DOMAIN, Buffer.from(JSON.stringify(
+    Object.fromEntries(FLOOR_FIELDS.map((field) => [field, signedFloorB[field]]))
+  ), "utf8")]), f.custodian.publicKey,
+  Buffer.from(signedFloorB.signature, "base64url")), true,
+  "signed B must have a genuine separate custodian Ed25519 signature");
+  try {
+    const gate = f.open({
+      readSignedCurrentFloor(challenge) {
+        callbackCalls += 1;
+        assert.notEqual(challenge, stolenNonce);
+        // Authenticated signature belongs to B, but the wire falsely claims
+        // the unpredictable fresh challenge A. A same-realm callback changes
+        // ONLY the later ArraySpeciesCreate result during serializing A.
+        Object.defineProperty(Array.prototype, "constructor", {
+          ...oldDescriptor, value: { [Symbol.species]: function PollutedArray(size) {
+            hostileSpeciesCalls += 1;
+            return new Proxy(new Array(size), {
+              defineProperty(target, property, descriptor) {
+                if (typeof descriptor.value === "string"
+                  && descriptor.value.includes(`\"nonce\":\"${challenge}\"`)) {
+                  rewrittenNonceFields += 1;
+                  descriptor.value = descriptor.value.replace(
+                    `\"nonce\":\"${challenge}\"`, `\"nonce\":\"${stolenNonce}\"`);
+                }
+                return Reflect.defineProperty(target, property, descriptor);
+              },
+            });
+          } },
+        });
+        return { ...signedFloorB, nonce: challenge };
+      },
+    });
+    assert.throws(() => gate.beginBeforeBody({
+      ownerEvidence: f.intent(), expected: f.expected,
+    }), bad, "signer B must not authorize nonce challenge A via Array species");
+    assert.ok(callbackCalls > 0, "hostile callback must have run after signed owner admission");
+    assert.equal(rewrittenNonceFields, 0,
+      "canonical signed floor must not use hostile Array species for serialization");
+  } finally {
+    Object.defineProperty(Array.prototype, "constructor", oldDescriptor);
+  }
+  assert.equal(hostileSpeciesCalls, 0,
+    "secure field copy and signed serialization must not construct attacker species");
+  const positive = fixture();
+  assert.equal(positive.open().beginBeforeBody({
+    ownerEvidence: positive.intent(), expected: positive.expected,
+  }).authorizesIo, false, "legitimate Ed25519 control stays supported and DEV-OFF");
+});
 // Public, disposable 512-bit RSA negative-test fixture. It is deliberately
 // BREAKABLE and must NEVER be provisioned, generated, or used for a real key.
 // A fixed DER fixture avoids generating insecure cryptographic keys at runtime.
