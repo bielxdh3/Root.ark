@@ -115,6 +115,7 @@ const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+const ROOT_MUTATION_PROMISE_TICKETS = new WeakMap();
 // A successfully published FOD payload with a failed later checkpoint may
 // look like an unrelated local CREATE during the next reconciliation. This
 // module-private negative-only latch retains the existing cross-process lock
@@ -153,6 +154,7 @@ function retainNativeRootMutation(engine) {
   lease.inFlight.add(ticket);
   let retained = true;
   return {
+    ticket,
     fail(error) { lease.failures.set(ticket, error); },
     finish() {
       if (!retained) return;
@@ -163,6 +165,15 @@ function retainNativeRootMutation(engine) {
       }
     },
   };
+}
+// Only a trusted caller that has durably/completely handled the EXACT child
+// promise can acknowledge its failure. Error-object equality alone is unsafe:
+// an adapter could reject two independent operations with one shared Error.
+function acknowledgeHandledNativeMutationPromise(engine, promise, error) {
+  if (!engine.requireNativeRootRecovery || !promise) return;
+  const lease = requireNativeRootMutationContext(engine);
+  const ticket = ROOT_MUTATION_PROMISE_TICKETS.get(promise);
+  if (ticket && lease.failures.get(ticket) === error) lease.handledFailures.add(ticket);
 }
 // Module-private and deliberately non-overridable. A future verified native
 // opener returning successfully must NEVER resume the legacy pathname replay.
@@ -2155,9 +2166,9 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
       const lease = { queueKey, active: true, inFlight: new Set(),
-        failures: new Map(), idleWaiters: [] };
+        failures: new Map(), handledFailures: new Set(), idleWaiters: [] };
       let ownerFulfilled = false;
-      let detachedAtReturn = [];
+      let ownerError = null;
       try {
         denyIndeterminateInbound(this);
         const result = await ROOT_MUTATION_CONTEXT.run(lease, async () => {
@@ -2168,10 +2179,11 @@ class SyncEngine {
           return await work();
         });
         ownerFulfilled = true;
-        detachedAtReturn = [...lease.inFlight];
         return result;
+      } catch (error) {
+        ownerError = error;
+        throw error;
       } finally {
-        if (!ownerFulfilled) detachedAtReturn = [...lease.inFlight];
         // A returned callback is not necessarily its last I/O. An unawaited
         // native-required private operation can still hold the original
         // lease; draining it is required BEFORE dropping the process lock.
@@ -2184,12 +2196,14 @@ class SyncEngine {
         // A failed child can settle and leave inFlight BEFORE the owner
         // callback returns. A snapshot of *active* tickets alone would
         // silently lose that error and authorize release of the real lock.
-        // When the owner claims success, fail closed on any recorded child
-        // failure (including an already-settled one); otherwise retain the
-        // lock for children that were still detached when the owner failed.
-        const failedDetached = ownerFulfilled
-          ? lease.failures.keys().next().value
-          : detachedAtReturn.find((ticket) => lease.failures.has(ticket));
+        // A failed owner can propagate the SAME error object from an awaited
+        // child; that is not evidence of a second abandoned operation.
+        // Nevertheless, an earlier detached child may have already settled
+        // with a DIFFERENT failure before the owner itself throws. Inspect
+        // the complete failure ledger, not only active tickets at return.
+        const failedDetached = [...lease.failures].find(([ticket, failure]) =>
+          !lease.handledFailures.has(ticket)
+          && (ownerFulfilled || failure !== ownerError))?.[0];
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.
@@ -2375,6 +2389,7 @@ class SyncEngine {
       // marker, emit operations, or accept a caller-supplied fake native object.
       denyLegacyNativeRootReplay();
     }
+    requireNativeRootMutationContext(this);
     await assertNoOrphanedEvictionArchive(this.rootDir);
     const { entries, head } = await readEvictionLedger(this.rootDir,
       this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
@@ -2847,6 +2862,13 @@ class SyncEngine {
   }
 
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    denyIndeterminateInbound(this);
+    // The module-captured negative FOD origin fence is purely a snapshot
+    // calculation; it must run BEFORE the lock-context rejection so even
+    // direct callers receive the original native-custody denial rather
+    // than ever attempting a pathname-based cache stage or mode write.
+    if (this.requireNativeRootRecovery) preflightOutOfScopeMoveBuiltIn.call(this, operation);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // The same side-effect-free check runs BEFORE signature pre-observation.
     // Keep it here too for direct callers and changes during verification.
@@ -3334,6 +3356,8 @@ class SyncEngine {
   }
 
   async pushAtomicSignedOverwritePair(pending, summary) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (!this.requireAuthorization || !this.requireCurrentOutgoingAuthorization
       || typeof this.currentDeviceAuthorization !== "function"
       || typeof this.adapter.pushBatch !== "function"
@@ -3636,6 +3660,7 @@ class SyncEngine {
         pending = translated;
       }
       let operation;
+      let pendingDispatch = null;
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
@@ -3663,7 +3688,8 @@ class SyncEngine {
           }
         }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
-        const result = await this.retryPush(operation);
+        pendingDispatch = this.retryPush(operation);
+        const result = await pendingDispatch;
         if (result?.status >= 400) {
           if (result.status === 409 && (result.code === "remote_path_collision"
             || result.payload?.code === "remote_path_collision")) {
@@ -3752,9 +3778,14 @@ class SyncEngine {
           }
           await this.journal.markSeen(operation.operationId);
           summary.pushed += 1;
+          acknowledgeHandledNativeMutationPromise(this, pendingDispatch, error);
           continue;
         }
-        if (transient(error)) { summary.offline = true; continue; }
+        if (transient(error)) {
+          summary.offline = true;
+          acknowledgeHandledNativeMutationPromise(this, pendingDispatch, error);
+          continue;
+        }
         throw error;
       }
     }
@@ -3770,11 +3801,12 @@ class SyncEngine {
   }
 
   async stageExisting(target) {
-    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // No Files On-Demand caller may move cached bytes into legacy pathname
     // trash until an independently rooted native mutation session exists.
-    // Deny before resolving or probing the caller-supplied pathname.
+    // Deny BEFORE the mode-fence helper can itself write an ever-FOD marker
+    // under a foreign process lock. This is a negative fence, not custody.
     if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // A public caller may pass an absolute source. Never stage a file from
     // outside this root, even when the trash destination itself is contained.
     // This rejects static escapes, NOT concurrent same-SID ancestor swaps.
@@ -4466,8 +4498,8 @@ class SyncEngine {
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
     denyIndeterminateInbound(this);
-    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     // The internal exclusion path was already case-resolved with a bounded
     // directory index; do not enumerate the same Windows parent 640 times.
@@ -5145,7 +5177,9 @@ const preflightOutOfScopeMoveBuiltIn = SyncEngine.prototype.preflightOutOfScopeM
 // These are cooperative process-lock leases ONLY; no JS wrapper can grant
 // native RootSession, independent ancestry custody or same-SID isolation.
 for (const name of [
-  "_open", "persistSnapshot", "_apply", "_reconcileLocal", "_materializeOnDemand",
+  "_open", "persistSnapshot", "replayEvictionLedger", "_apply",
+  "reconcileOutOfScopeMove", "pushAtomicSignedOverwritePair",
+  "_reconcileLocal", "_materializeOnDemand",
   "_materializeRemote", "_enqueueChange",
   "retryPush", "recoverConflict", "_pushPending", "pruneEmptyUntrackedParents",
   "_pinLocal", "_unpinLocal", "_pullRemote", "_applyExcludedPaths", "_syncOnce",
@@ -5158,9 +5192,17 @@ for (const name of [
       // Attach the non-swallowing error observer to the EXACT promise
       // returned to the caller. A detached rejection must not terminate
       // Node before the root lease can record and quarantine its failure.
+      let retained;
       const operation = (async () => {
         denyIndeterminateInbound(this);
-        const retained = retainNativeRootMutation(this);
+        // A directly invoked out-of-scope MOVE/DELETE affecting cached FOD
+        // bytes must retain its ORIGINAL negative native-custody error,
+        // even without an acquired root lock. This immutable module-captured
+        // preflight has no filesystem/network I/O or state mutation.
+        if (name === "reconcileOutOfScopeMove" && this.requireNativeRootRecovery) {
+          preflightOutOfScopeMoveBuiltIn.call(this, args[0]);
+        }
+        retained = retainNativeRootMutation(this);
         try {
           return await implementation.apply(this, args);
         } catch (error) {
@@ -5170,7 +5212,10 @@ for (const name of [
           retained.finish();
         }
       })();
-      operation.catch(() => {});
+      if (retained?.ticket) ROOT_MUTATION_PROMISE_TICKETS.set(operation, retained.ticket);
+      // Only a started native-required lease uses this internal rejection
+      // observer. Preserve legacy/non-strict Promise rejection semantics.
+      if (retained?.ticket) operation.catch(() => {});
       return operation;
     },
   });

@@ -1586,6 +1586,108 @@ test("issue 66: an already-settled unawaited private retry failure still blocks 
   await assert.rejects(open(), { code: "sync_root_busy" });
 });
 
+test("issue 66: an owner that throws cannot release the lock after a different detached error has settled", async (t) => {
+  const { root, open, store, adapter, state } = await setup(t, {
+    "docs/restore.txt": "signed remote operation",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const oldPush = adapter.push;
+  let entered;
+  const dispatched = new Promise((resolve) => { entered = resolve; });
+  adapter.push = async () => {
+    entered();
+    throw Object.assign(new Error("ambiguous detached remote I/O"), { code: "EIO" });
+  };
+  let child;
+  try {
+    const owner = client.withMutationLock(async () => {
+      child = client.retryPush(operation);
+      await dispatched;
+      // The detached EIO finishes before the owner's independent rejection.
+      await new Promise((resolve) => setImmediate(resolve));
+      throw Object.assign(new Error("independent owner failure"), { code: "owner_abort" });
+    });
+    await assert.rejects(owner, { code: "owner_abort" },
+      "the primary owner error must remain intact");
+    await assert.rejects(child, { code: "EIO" });
+  } finally {
+    adapter.push = oldPush;
+  }
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), true,
+    "an independently failed owner must still quarantine earlier detached I/O");
+  assert.equal(state.pushes, 0);
+  await assert.rejects(open(), { code: "sync_root_busy" });
+});
+
+test("issue 66: an awaited transient outbound failure handled as offline must not falsely quarantine a native-required root", async (t) => {
+  const { root, open, adapter, store, state } = await setup(t, {});
+  await fsp.mkdir(path.join(root, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(root, "docs", "new.txt"), "local queued bytes");
+  const originalPush = adapter.push;
+  adapter.push = async () => {
+    throw Object.assign(new Error("transient offline before server write"), { code: "offline" });
+  };
+  const client = await open();
+  try {
+    const offline = await client.syncOnce();
+    assert.equal(offline.offline, true);
+    assert.equal(state.pushes, 0);
+    assert.equal((await client.journal.recover()).length, 1);
+    assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
+      "a caught no-write offline event may release the process lock");
+  } finally {
+    adapter.push = originalPush;
+  }
+  const resumed = await open();
+  const report = await resumed.syncOnce();
+  assert.equal(report.pushed, 1);
+  assert.equal(state.pushes, 1);
+  assert.equal(store.list("alice").length, 1);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
+});
+
+test("issue 66: direct private signed batch and out-of-scope reconciliation must not bypass a foreign lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "private/excluded.txt": "signed remote bytes",
+  });
+  const client = await open();
+  const operation = store.list("alice")[0];
+  assert.ok(operation);
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  const remoteBefore = JSON.stringify(store.list("alice"));
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client.reconcileOutOfScopeMove(operation, { conflicts: [] }),
+    { code: "sync_root_busy" });
+  await assert.rejects(client.pushAtomicSignedOverwritePair([operation, operation],
+    { pushed: 0 }), { code: "sync_root_busy" });
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
+  assert.equal(state.pushes, 0);
+  assert.equal(await exists(path.join(root, "private", "excluded.txt")), false);
+});
+
+test("issue 66: direct private eviction, staging and ledger replay cannot probe past a foreign lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/cache.txt": "signed remote cache bytes",
+  });
+  const client = await open();
+  const snapshotPath = path.join(root, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  await fsp.mkdir(path.join(root, ".rootark-sync.lock"), { mode: 0o700 });
+  await assert.rejects(client.stageExisting(path.join(root, "docs", "cache.txt")),
+    { code: "root_session_native_unavailable" });
+  await assert.rejects(client._evictLocal("docs/cache.txt"),
+    { code: "root_session_native_unavailable" });
+  await assert.rejects(client.replayEvictionLedger(), { code: "sync_root_busy" });
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 1);
+  assert.equal(await exists(path.join(root, ".rootark-trash")), false);
+});
+
 test("issue 66: native-required private pull, push, enqueue and prune deny before reading or mutating", async (t) => {
   const { root, open, state, store } = await setup(t, {
     "docs/restore.txt": "authenticated remote bytes",
