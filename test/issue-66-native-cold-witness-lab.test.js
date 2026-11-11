@@ -123,6 +123,18 @@ test("#66 signed native cold witness reference rejects stale floors, swapped Fil
   await assert.rejects(inspectSignedColdCommit(forged), { code: "root_session_unverified_authority" });
   const duplicateSigners = { ...args, floorSignerSpki: pub(witness) };
   await assert.rejects(inspectSignedColdCommit(duplicateSigners), { code: "root_session_unverified_authority" });
+  let unsafeAccessorCalled = false;
+  const accessorProvision = { statement: provision.statement };
+  Object.defineProperty(accessorProvision, "signature", { enumerable: true,
+    get() { unsafeAccessorCalled = true; return provision.signature; } });
+  await assert.rejects(inspectSignedColdCommit({ ...args, ownerProvision: accessorProvision }),
+    { code: "root_session_unverified_authority" });
+  assert.equal(unsafeAccessorCalled, false,
+    "a getter must never be invoked while detaching untrusted signed material");
+  await assert.rejects(inspectSignedColdCommit({ ...args,
+    ownerProvision: { ...provision, enormous: "A".repeat(1024 * 1024) },
+  }), { code: "root_session_unverified_authority" },
+  "bound oversized signed evidence before recursive JSON stringify");
   sequence = 1;
   floorSequence = 1;
   await assert.rejects(inspectSignedColdCommit(args), { code: "root_session_unverified_authority" },

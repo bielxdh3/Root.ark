@@ -19,8 +19,41 @@ const exact = (value, keys) => value && typeof value === "object" && !Array.isAr
   && Object.keys(value).every((name) => keys.includes(name));
 
 function detach(input, maximum = 8192) {
+  // Never recursively stringify an unbounded caller object before applying
+  // the budget. Copy only DATA descriptors, with depth/node/byte caps, to a
+  // fresh plain object. Accessors must not change signed bytes mid-verification.
+  let visited = 0;
+  let bytes = 0;
+  const ancestors = new WeakSet();
+  const copy = (value, depth) => {
+    if (++visited > 64 || depth > 7) throw fail();
+    if (value === null || typeof value === "boolean") return value;
+    if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+    if (typeof value === "string") {
+      bytes += Buffer.byteLength(value, "utf8");
+      if (bytes > maximum) throw fail();
+      return value;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+      || ancestors.has(value)) throw fail();
+    ancestors.add(value);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.length > 32) throw fail();
+    const result = Object.create(null);
+    for (const key of keys) {
+      if (typeof key !== "string" || !Object.hasOwn(descriptors[key], "value")) throw fail();
+      bytes += Buffer.byteLength(key, "utf8");
+      if (bytes > maximum) throw fail();
+      Object.defineProperty(result, key, { value: copy(descriptors[key].value, depth + 1),
+        enumerable: true, writable: true, configurable: true });
+    }
+    ancestors.delete(value);
+    return result;
+  };
   try {
-    const encoded = canonicalJson(input);
+    const encoded = canonicalJson(copy(input, 0));
     if (Buffer.byteLength(encoded, "utf8") > maximum) throw fail();
     return JSON.parse(encoded);
   } catch { throw fail(); }
@@ -33,7 +66,9 @@ function pinnedKey(input) {
     if (!bytes || bytes.toString("base64url") !== input) throw fail();
     const key = crypto.createPublicKey({ key: bytes, format: "der", type: "spki" });
     if (key.asymmetricKeyType !== "ed25519") throw fail();
-    return { key, spki: bytes.toString("base64url") };
+    const canonical = key.export({ format: "der", type: "spki" });
+    if (!canonical.equals(bytes)) throw fail();
+    return { key, spki: canonical.toString("base64url") };
   } catch { throw fail(); }
 }
 
