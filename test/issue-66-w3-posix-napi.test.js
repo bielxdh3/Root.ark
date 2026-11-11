@@ -285,7 +285,7 @@ test("#66 W3 held native fd streams 16,385 extra entries across A-B-A in bounded
       (e) => e.code === "root_session_unverified_authority");
   });
 
-test("#66 W3 native fixed stage and durable no-replace publication stay bound to A while B occupies its path",
+test("#66 W3 native fixed stage refuses publication while B occupies A's held pathname",
   { skip: !txnEnabled }, (t) => {
     const bridge = loadLab();
     const home = os.homedir();
@@ -304,31 +304,144 @@ test("#66 W3 native fixed stage and durable no-replace publication stay bound to
     assert.equal(bridge.swapToForeign(token), "HELD_ORIGINAL_FOREIGN_AT_NAME");
     assert.equal(fs.readFileSync(path.join(parent, "held", "original.bin"), "utf8"), "FOREIGN_ORIGINAL");
     assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false);
-    assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_ANCESTOR_CHANGED/,
+      "retained A must reject publishing while its held pathname resolves to B");
     assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false,
       "native publication must not write B under the rebound pathname");
     assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
     // An opened-source hardlink cannot safely retire its same-UID-writable
     // original name. Both names remain, so the generic native read correctly
     // rejects nlink=2 rather than promoting a hardlink alias to authority.
-    const stagedPath = path.join(parent, "parked", ".rootark-w3-staged-v1");
-    const publishedPath = path.join(parent, "parked", ".rootark-w3-committed-v1");
-    assert.equal(fs.readFileSync(publishedPath, "utf8"), "STAGED_ROOT_CANARY_V1");
-    assert.equal(fs.statSync(publishedPath, { bigint: true }).ino,
-      fs.statSync(stagedPath, { bigint: true }).ino, "published bytes belong to original staged inode");
-    assert.equal(fs.statSync(publishedPath, { bigint: true }).nlink, 2n,
-      "source stage name is deliberately retained for later custodian-only cleanup");
-    assert.throws(() => bridge.read(token, ".rootark-w3-committed-v1"), /NATIVE_OPEN_DENIED/);
-    assert.equal(bridge.read(token, ".rootark-w3-commit-marker-v1").toString(), "COMMITTED_V1");
-    assert.equal(bridge.restoreOriginal(token), "ORIGINAL_RESTORED_FOREIGN_RETAINED");
-    assert.equal(fs.readFileSync(path.join(parent, "held", ".rootark-w3-committed-v1"), "utf8"),
+    assert.equal(fs.existsSync(path.join(parent, "parked", ".rootark-w3-committed-v1")), false,
+      "no publication is allowed to the detached original before ancestry restoration");
+    assert.equal(fs.readFileSync(path.join(parent, "parked", ".rootark-w3-staged-v1"), "utf8"),
       "STAGED_ROOT_CANARY_V1");
+    assert.equal(fs.existsSync(path.join(parent, "parked", ".rootark-w3-commit-marker-v1")), false);
+    assert.equal(bridge.restoreOriginal(token), "ORIGINAL_RESTORED_FOREIGN_RETAINED");
+    assert.equal(fs.existsSync(path.join(parent, "held", ".rootark-w3-committed-v1")), false);
     assert.equal(fs.existsSync(path.join(parent, "foreign-parked", ".rootark-w3-committed-v1")), false);
-    assert.throws(() => bridge.read(token, ".rootark-w3-committed-v1"), /NATIVE_OPEN_DENIED/);
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
+      "a rejected ancestor cannot later retry even after A's pathname is restored");
     assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
     assert.throws(() => bridge.publishProof(token), /NATIVE_TOKEN_REJECTED/);
     assert.throws(() => requireNativeRecoveryAuthority(bridge),
       (error) => error.code === "root_session_unverified_authority");
+  });
+
+test("#66 W3 retained ancestor chain rejects second-process same-UID parent rename and foreign replacement before publish",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const parent = path.join(home, created[0]);
+    const held = path.join(parent, "held");
+    assert.equal(fs.statfsSync(held).type, 0xef53);
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    const originalFd = fs.openSync(path.join(held, "original.bin"),
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const original = observeOpenedFixture(originalFd);
+      const attacker = spawnSync("/usr/bin/node", ["-e", String.raw`
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const [home, suffix] = process.argv.slice(1);
+        if (!/^\.rootark-w3-napi-[0-9a-f]{32}$/.test(suffix)) process.exit(90);
+        const parent = path.join(home, suffix);
+        fs.renameSync(parent, parent + '-parked-ancestor');
+        fs.mkdirSync(parent, { mode: 0o700 });
+        fs.mkdirSync(path.join(parent, 'held'), { mode: 0o700 });
+        const foreign = path.join(parent, 'held', 'original.bin');
+        const fd = fs.openSync(foreign, 'wx', 0o600);
+        try { fs.writeSync(fd, 'FOREIGN_ANCESTOR'); fs.fsyncSync(fd); }
+        finally { fs.closeSync(fd); }
+        process.stdout.write('REBOUND_BY_SECOND_PROCESS');
+      `, home, created[0]], {
+        timeout: 10000, encoding: "utf8", maxBuffer: 1024,
+        env: { ...process.env, ROOTARK_ISSUE66_W3_STREAM_STRESS: "0" },
+      });
+      assert.equal(attacker.status, 0, attacker.stderr);
+      assert.equal(attacker.stdout, "REBOUND_BY_SECOND_PROCESS");
+      const oldHeld = path.join(parent + "-parked-ancestor", "held");
+      assert.equal(observeOpenedFixture(originalFd).stat.ino, original.stat.ino);
+      assert.equal(observeOpenedFixture(originalFd).bytes, "TRUSTED_ORIGINAL");
+      assert.equal(fs.readFileSync(path.join(oldHeld, "original.bin"), "utf8"), "TRUSTED_ORIGINAL");
+      assert.equal(fs.readFileSync(path.join(held, "original.bin"), "utf8"), "FOREIGN_ANCESTOR");
+      assert.throws(() => bridge.publishProof(token), /NATIVE_ANCESTOR_CHANGED/);
+      for (const directory of [oldHeld, held]) {
+        assert.equal(fs.existsSync(path.join(directory, ".rootark-w3-committed-v1")), false);
+        assert.equal(fs.existsSync(path.join(directory, ".rootark-w3-commit-marker-v1")), false);
+      }
+      assert.equal(observeOpenedFixture(originalFd).stat.ino, original.stat.ino);
+      assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+      assert.equal(bridge.authority(), "LAB_ONLY_NO_GO");
+    } finally { fs.closeSync(originalFd); }
+  });
+
+test("#66 W3 live ancestor recheck blocks COMMIT after a durable link and parent rebind",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const parent = path.join(home, created[0]);
+    const held = path.join(parent, "held");
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    const original = fs.openSync(path.join(held, "original.bin"),
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const pinned = observeOpenedFixture(original);
+      const previous = process.env.ROOTARK_ISSUE66_W3_ANCESTOR_REBIND_AFTER_LINK;
+      process.env.ROOTARK_ISSUE66_W3_ANCESTOR_REBIND_AFTER_LINK = "1";
+      try { assert.throws(() => bridge.publishProof(token), /NATIVE_ANCESTOR_CHANGED/); }
+      finally {
+        if (previous === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANCESTOR_REBIND_AFTER_LINK;
+        else process.env.ROOTARK_ISSUE66_W3_ANCESTOR_REBIND_AFTER_LINK = previous;
+      }
+      const parked = path.join(parent + "-afterlink-parked", "held");
+      assert.equal(fs.readFileSync(path.join(parked, ".rootark-w3-committed-v1"), "utf8"),
+        "STAGED_ROOT_CANARY_V1", "a pinned link may exist before detection");
+      assert.equal(fs.existsSync(path.join(parked, ".rootark-w3-commit-marker-v1")), false,
+        "preCOMMIT ancestry check must prevent a durable COMMITTED marker");
+      assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+      assert.equal(fs.readFileSync(path.join(parked, "original.bin"), "utf8"), "TRUSTED_ORIGINAL");
+      assert.equal(observeOpenedFixture(original).stat.ino, pinned.stat.ino);
+      assert.equal(observeOpenedFixture(original).bytes, pinned.bytes);
+      assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
+      assert.equal(bridge.authority(), "LAB_ONLY_NO_GO");
+    } finally { fs.closeSync(original); }
+  });
+
+test("#66 W3 retained ancestor chain rejects a same-UID parent symlink to the original inode",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const created = fs.readdirSync(home).filter((name) =>
+      name.startsWith(".rootark-w3-napi-") && !before.has(name));
+    assert.equal(created.length, 1);
+    const parent = path.join(home, created[0]);
+    const parked = parent + "-symlink-parked";
+    assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED");
+    fs.renameSync(parent, parked);
+    fs.symlinkSync(parked, parent, "dir");
+    assert.equal(fs.lstatSync(parent).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(path.join(parent, "held", "original.bin"), "utf8"),
+      "TRUSTED_ORIGINAL", "the symlink resolves to identical canary bytes");
+    assert.throws(() => bridge.publishProof(token), /NATIVE_ANCESTOR_CHANGED/);
+    assert.equal(fs.existsSync(path.join(parked, "held", ".rootark-w3-committed-v1")), false);
+    assert.equal(fs.existsSync(path.join(parked, "held", ".rootark-w3-commit-marker-v1")), false);
+    assert.equal(bridge.authority(), "LAB_ONLY_NO_GO");
   });
 
 test("#66 W3 native publication refuses a same-UID destination collision without replacing foreign bytes",

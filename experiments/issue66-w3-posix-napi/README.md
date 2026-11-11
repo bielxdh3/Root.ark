@@ -24,7 +24,8 @@ There is no installation or production module import.
 
 The addon accepts **no JS-supplied directory path, fd or authority object**.
 Only with the explicit lab opt-in, its native code obtains the OS `/` fd,
-opens the passwd HOME dir using `openat2` and creates a private new
+retains every `openat2` directory descriptor along the passwd HOME path,
+and creates a private new
 `.rootark-w3-napi-*` parent directory mode `0700`. The native side opens and
 retains that parent dirfd, opens a `held` child, verifies ext4 and ownership,
 then mints a random 128-bit **native-issued opaque test token** from a
@@ -128,12 +129,25 @@ leaf names**; no user-supplied destination, payload, path or fd is accepted:
   `NATIVE_TXN_NO_REPLACE_CONFLICT` without overwriting the foreign file.
   A failed flush or uncertain transition returns `NATIVE_TXN_INDETERMINATE`.
 
-WSL Node22/ext4 physical tests verify that stage and publication remain
-attached to A while B occupies A's pathname, B has no published file,
-restoration returns the published canary to the original A, and a
-same-UID test writer's colliding destination remains byte-for-byte intact.
-The tests also verify token/session phase rejection and refusal when the
-separate native transaction opt-in is absent. Files are retained for audit.
+The live W3 session now retains `/`, each literal passwd HOME segment and
+its random fixture parent, plus its original `held` `DIR*`. Each retained
+directory stores its initial `st_dev`/`st_ino`. Before staging, before
+publication and immediately before writing COMMIT, native code uses
+`openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV` to
+reopen each named child **from its original retained parent fd**, comparing
+identities with `fstat` on the original descriptors; it also reopens `held`
+from its original parent. Any missing, renamed, symlinked or rebound segment
+fails closed with `NATIVE_ANCESTOR_CHANGED` and poisons the transaction phase.
+Unrelated raw enumeration/read experiments continue to exercise their pinned
+`DIR*`; the transaction will refuse to publish while its pathname is rebound.
+
+WSL Node22/ext4 tests physically verify an external second same-UID process
+renaming the fixture parent and installing a foreign parent/held, preserving
+the opened original canary and refusing publication or COMMIT. A deterministic
+native after-link test swaps the parent after the fsynced original publication
+and verifies that the preCOMMIT check refuses the COMMITTED marker. Other tests
+verify collision bytes, staged inode identities and token/session phases.
+All generated ext4 fixtures are retained for audit.
 
 **Not a crash-safe production transaction:** the journal is a fixed
 disposable plaintext canary, **not signed**, nor held by an independent
@@ -145,6 +159,13 @@ test of these two functions cannot authorize arbitrary user writes,
 DELETE/restore, or the native `RootSession` activation. Their contribution
 is limited to real fd-relative syscall ordering and no-replace collision
 rejection on an intentionally disposable isolated ext4 fixture.
+
+**Live-chain limit:** neither the passwd/NSS root nor the process mount
+namespace is independently attested; another same-UID process can race after
+the last comparison, tamper with retained directory contents, or perform
+A→B→A between observations. The standalone `cold_inspector.c` still closes
+its `/`/HOME traversal descriptors and has **no inherited original chain**.
+No cold process can use this lab change as ancestry or product authority.
 
 ## Evidence and remaining NO-GO
 
