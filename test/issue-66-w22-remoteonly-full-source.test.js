@@ -18,7 +18,13 @@ const { probeStrictRemoteOnlyBatch } =
 
 async function fixture(t, count = 2, expiry = Date.now() + 60000) {
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-w22-inert-source-"));
-  t.after(() => fsp.rm(temp, { recursive: true, force: true }));
+  const retainedHandles = [];
+  t.after(async () => {
+    // On Windows the original opened handles must close BEFORE removing the
+    // disposable fixture; separate t.after hooks have no safe cleanup order.
+    for (const handle of retainedHandles.reverse()) await handle.close();
+    await fsp.rm(temp, { recursive: true, force: true });
+  });
   const rootDir = path.join(temp, "cache");
   const fileKey = crypto.randomBytes(32);
   const pair = crypto.generateKeyPairSync("ed25519");
@@ -65,7 +71,8 @@ async function fixture(t, count = 2, expiry = Date.now() + 60000) {
     },
   }).open();
   const engine = await makeEngine();
-  return { temp, rootDir, fileKey, publicKey, records, state, trusted, engine, makeEngine, sign };
+  return { temp, rootDir, fileKey, publicKey, records, state, trusted,
+    engine, makeEngine, sign, retainedHandles };
 }
 
 async function persisted(f) {
@@ -78,11 +85,12 @@ async function persisted(f) {
 // Bind negative-only crash evidence to the SAME opened inode; an lstat(path)
 // followed by readFile(path) could observe unrelated equal-byte replacements.
 // These disposable receipts never grant cold authority or clean up a name.
-async function holdColdFile(t, directory, name) {
+async function holdColdFile(f, directory, name) {
   const filename = path.join(directory, name);
   const handle = await fsp.open(filename,
-    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  t.after(() => handle.close());
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+      | (fs.constants.O_NONBLOCK || 0));
+  f.retainedHandles.push(handle);
   const before = await handle.stat({ bigint: true });
   assert.equal(before.isFile(), true);
   assert.notEqual(before.ino, 0n);
@@ -108,21 +116,31 @@ async function assertColdFileUntouched(receipt) {
   const { bytesRead } = await receipt.handle.read(bytes, 0, bytes.length, 0);
   assert.equal(bytesRead, receipt.data.length);
   assert.deepEqual(bytes.subarray(0, bytesRead), receipt.data);
+  const namedBefore = await fsp.lstat(receipt.filename, { bigint: true });
+  assert.equal(namedBefore.isFile() && !namedBefore.isSymbolicLink(), true,
+    `${receipt.name} must remain a regular physical leaf, not a reparse link`);
+  assert.equal(namedBefore.nlink, 1n);
   const reopened = await fsp.open(receipt.filename,
-    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+      | (fs.constants.O_NONBLOCK || 0));
   try {
     const named = await reopened.stat({ bigint: true });
-    assert.equal(named.dev, receipt.before.dev);
-    assert.equal(named.ino, receipt.before.ino,
-      `${receipt.name} name was rebound to a different inode`);
+    const namedAfter = await fsp.lstat(receipt.filename, { bigint: true });
+    for (const entry of [namedBefore, named, namedAfter]) {
+      assert.equal(entry.isFile() && !entry.isSymbolicLink(), true);
+      assert.equal(entry.nlink, 1n);
+      assert.equal(entry.dev, receipt.before.dev);
+      assert.equal(entry.ino, receipt.before.ino,
+        `${receipt.name} name was rebound to a different inode`);
+    }
   } finally { await reopened.close(); }
 }
 
-async function holdOneUncommittedTemp(t, directory, prefix) {
+async function holdOneUncommittedTemp(f, directory, prefix) {
   const names = (await fsp.readdir(directory)).filter((name) => name.startsWith(prefix));
   assert.equal(names.length, 1, "failed publication must retain one uncommitted temporary");
-  const receipt = await holdColdFile(t, directory, names[0]);
-  return { names: await fsp.readdir(directory), receipt };
+  const receipt = await holdColdFile(f, directory, names[0]);
+  return { names: (await fsp.readdir(directory)).sort(), receipt };
 }
 
 test("W22 inert source: exact 160/640 signed remoteOnly CREATE stays metadata-only and persists 2 journal + 1 snapshot transactions", async (t) => {
@@ -256,10 +274,10 @@ test("W22 inert source: snapshot rename EIO preserves pins and quarantines an un
   assert.equal(intermediate.snapshot, old.snapshot);
   assert.equal(Object.keys(JSON.parse(intermediate.journal).observed).length, 4);
   assert.equal(JSON.parse(intermediate.journal).seen.length, 0);
-  const { names, receipt: orphan } = await holdOneUncommittedTemp(t, f.rootDir,
+  const { names, receipt: orphan } = await holdOneUncommittedTemp(f, f.rootDir,
     ".rootark-sync-index.json.tmp-");
-  const snapshot = await holdColdFile(t, f.rootDir, ".rootark-sync-index.json");
-  const journal = await holdColdFile(t, f.rootDir, ".rootark-sync-journal.json");
+  const snapshot = await holdColdFile(f, f.rootDir, ".rootark-sync-index.json");
+  const journal = await holdColdFile(f, f.rootDir, ".rootark-sync-journal.json");
   const restarted = await f.makeEngine();
   assert.equal(Object.keys(restarted.snapshot.remoteOnly).length, 0);
   await assert.rejects(probeStrictRemoteOnlyBatch(restarted, f.trusted),
@@ -269,7 +287,7 @@ test("W22 inert source: snapshot rename EIO preserves pins and quarantines an un
   assert.equal(restarted.journal.state.seen.length, 0);
   assert.equal(Object.keys(restarted.journal.state.observed).length, 4);
   assert.deepEqual(await persisted(f), intermediate);
-  assert.deepEqual(await fsp.readdir(f.rootDir), names);
+  assert.deepEqual((await fsp.readdir(f.rootDir)).sort(), names);
   for (const witness of [orphan, snapshot, journal]) await assertColdFileUntouched(witness);
 });
 
@@ -361,10 +379,10 @@ test("W22 inert source: markSeen EIO preserves exact pins but cold orphan blocks
   assert.equal(Object.keys(JSON.parse(intermediate.snapshot).remoteOnly).length, 3);
   assert.equal(Object.keys(JSON.parse(intermediate.journal).observed).length, 3);
   assert.equal(JSON.parse(intermediate.journal).seen.length, 0);
-  const { names, receipt: orphan } = await holdOneUncommittedTemp(t, f.rootDir,
+  const { names, receipt: orphan } = await holdOneUncommittedTemp(f, f.rootDir,
     ".rootark-sync-journal.json.tmp-");
-  const snapshot = await holdColdFile(t, f.rootDir, ".rootark-sync-index.json");
-  const journal = await holdColdFile(t, f.rootDir, ".rootark-sync-journal.json");
+  const snapshot = await holdColdFile(f, f.rootDir, ".rootark-sync-index.json");
+  const journal = await holdColdFile(f, f.rootDir, ".rootark-sync-journal.json");
   const restarted = await f.makeEngine();
   assert.equal(Object.keys(restarted.snapshot.remoteOnly).length, 3);
   assert.equal(Object.keys(restarted.journal.state.observed).length, 3);
@@ -374,7 +392,7 @@ test("W22 inert source: markSeen EIO preserves exact pins but cold orphan blocks
   assert.equal(f.state.pushes, 0);
   assert.equal(restarted.journal.state.seen.length, 0);
   assert.deepEqual(await persisted(f), intermediate);
-  assert.deepEqual(await fsp.readdir(f.rootDir), names);
+  assert.deepEqual((await fsp.readdir(f.rootDir)).sort(), names);
   for (const witness of [orphan, snapshot, journal]) await assertColdFileUntouched(witness);
 });
 
