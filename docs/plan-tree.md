@@ -9,6 +9,38 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 late continuation — **newest execution checkpoint**: confirmed
+`Root/main` `202146bb73ca8577a0a4017c4556cb8b1e9588a6` unchanged. PR #298
+was advanced by ordinary FF to `73c2be30` after **two independent SOURCE GO
+limited to 11 LAB experiments**; OPEN/Draft, with held-HANDLE Windows11/NTFS
+and Linux/WSL/ext4 no-replace experiments 7/7 per OS. The *published* #298
+CodeQL is **FAIL**, annotating deliberate pathname race fixtures; issue and
+mandatory jobs remain unreconciled, and **no native product implementation**
+was released. PR #300 remains OPEN/Draft `984a62ef` (prior docs-only FF);
+PR #301 remote remains OPEN/Draft `e1ca644b`; PR #302 remains OPEN/Draft
+`e0af8397`; PR #306 remains OPEN/non-Draft `b13b29f9`, without APPROVED.
+
+PR #301 has **unpublished** local child `7da07252` (parent `25b2649c`):
+two physically RED Windows P2 regressions, fake Hash facade via mutable
+`Object.freeze` and inherited numeric array setter signed A / applied B,
+now Windows targeted 2/2 and related 34/34 GREEN; **exact-SHA WSL and two
+independent SOURCE GO pending**. PR #302 has **unpublished** local child
+`be3170e3` (parent `34b4d39e`): callback-poisoned WeakMap ticket relookup
+unsigned B and Set nonce replay physically RED Windows on parent, patched
+with early native methods; full Windows Node22 70 tests / 66 PASS / 4 SKIP.
+**Exact-child WSL and two independent SOURCE GO pending.** Current WSL
+process launches are stalled; do not silently inherit prior successful WSL
+results. PR #301 published `e1ca` Security Regression 1 old issuer Proxy
+oracle FAIL; PR #300 published earlier `a598` had 49 Windows and 59 Ubuntu
+positive FOD/pin/picker failures. All #298 native file linkage results are
+**LAB ONLY**; writable `RootSession` still unconditionally denies product
+recovery. First-pin original-A independent root+ALL ancestors, real
+same-UID/SID writer isolation, no-replace PREPARE/COMMIT, owner-signed
+off-host CURRENT, CFAPI physical Windows **10** and real powercut remain
+unproven. Four evidence planes in latest
+`docs/roadmap/issue-66-pr300-native-custody-gates.md` are conjunctive.
+**ISSUE #66 INCOMPLETE · MERGE NO-GO · RELEASE NO-GO · RootSession OFF.**
+
 2026-11-11 continuation — **newest live CI checkpoint**: all published HEADs
 remain #298 `ce393b75`, #300 `a598eb47`, #301 `e1ca644b`, #302 `e0af8397`,
 #306 `b13b29f9`, with unchanged `Root/main` `202146bb`. #300 exact Security

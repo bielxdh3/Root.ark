@@ -44,6 +44,47 @@ flowchart TD
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
 
+## 2026-11-11 late continuation — physical lab publication and crypto P2 boundaries
+
+This is the **newest checkpoint**, superseding only the stale "current HEAD"
+claims in historical checkpoints below. It does not supersede their physical
+test evidence or permit release. GitHub was queried after the PR #298 lab-only
+fast-forward; `Root/main` remained `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+
+| PR | Published HEAD / scope | Latest separately bounded evidence and open gate |
+| --- | --- | --- |
+| #298 | `73c2be30a1fbfd95f346d94337e8d09a972138ec`, OPEN/Draft, **normal FF** from `ce393b75` | Two independent exact-SHA SOURCE GO apply **only to 11 experimental lab files**. Physical NTFS/Win11 Node22 and WSL/ext4 Node22 cases each reported 7/7; lab demonstrates actual separate-process same-SID/UID source/ancestor replacement and held HANDLE/dirfd no-replace. Windows 10 CFAPI and production root custody are NOT proven. New SHA CodeQL **FAILED**, with `Potential file system race condition` annotations concentrated in explicitly adversarial lab scripts; investigate and resolve CI honestly, without masking production rules or rewriting intentionally RED tests. Remaining required jobs must be reviewed as they complete. |
+| #300 | `984a62ef8ca2bee00b8bf296086da3e10d5b7761`, OPEN/Draft (documentation only) | Real `RootSession` remains unconditionally disabled. Prior `a598eb47` hosted Security Regression had **49 Windows** and **59 Ubuntu** positive FOD/pin/picker failures; neither lab publisher nor docs cure them. |
+| #301 | `e1ca644b6aaaa48d87534895575d8576cfced077`, OPEN/Draft | Later *unpublished* chain now reaches **local `7da07252eec87ad8a2451bf5f21665ae74e1900d`**. Exact parent `25b2649c` physically failed two new P2 oracles in Windows Node22: dynamic `Object.freeze` fabricated the native Hash facade/SMT root, and inherited `Array.prototype[0]` setter authenticated signed compartment A while applying B. Capturing the early freeze intrinsic and removing array prototype **before first write** gave targeted 2/2 GREEN and related 34/34 Windows tests. WSL tests on this new SHA and two independent exact-SHA SOURCE GO remain pending; prior reviews of `25b` were NO-GO. Published `e1ca` Security Regression failed one old issuer Proxy test expecting descriptor reads, although hardened source correctly rejected Proxy before traps; correct test realism without making real positives negative. |
+| #302 | `e0af83970f2efa3c0798772c001e17f1dd49cade`, OPEN/Draft | Later *unpublished* chain reaches **local `be3170e33b5f8f848c3c917eed9117e21bd75e5d`**. A SOURCE NO-GO on prior `34b4d39e` identified mutable `WeakMap.prototype.get` substituting unsigned byte intent B for real owner-signed A, and mutable `Set.prototype.has` permitting nonce replay after a signed CURRENT callback. Both attacks physically RED on `34b` and GREEN on local child in Windows Node22, along with full **70 total / 66 PASS / 4 SKIP / 0 FAIL** Windows suites. The child pins native Set/WeakMap constructors and methods. Exact-child WSL GREEN and two independent SOURCE GO have NOT been obtained; DEV-OFF dual SQLite remains same-host and NONAUTHORIZING. |
+| #306 | `b13b29f9662d5f9036431e53235b9cdc132f0944`, OPEN/non-Draft | Earlier applicable checks green but no formal APPROVED review and base behind current `Root/main`; not merger-ready. |
+
+**Environment limitation:** New Ubuntu WSL child-test invocations stalled while
+`wsl.exe` was starting, including a trivial process probe; do not report their
+missing exit codes as PASS or FAIL, do not terminate unrelated app processes or
+restart Docker/WSL without diagnosis. Earlier completed WSL tests on prior
+SHAs stay valid **only for their own exact SHAs**.
+
+**Evidence planes remain all-required and distinct:**
+
+1. **Laboratory:** disposable RED and held-inode/HANDLE no-replace demos;
+   independent SOURCE GO for #298 experiments does not authorize runtime I/O.
+2. **Native product:** first-pin independently enrolled original root and ALL
+   ancestors, OS-held identity, writer-isolation, durable no-clobber PREPARE /
+   COMMIT, cold `required-v2`, positive CFAPI FOD hydration/pin/picker and
+   signed ingress/egress. **NOT IMPLEMENTED / NOT PROVEN.**
+3. **Independent self-hosted custodian:** different operator/host retains
+   monotonic owner-signed CURRENT, lease serial, replay/revocation and original
+   physical identity; local test-supplied callbacks and dual SQLite DEV-OFF
+   remain **nonauthorizing**. **NOT PROVISIONED.**
+4. **Release/merge:** Windows **10** CFAPI physical proof, true power-loss /
+   recovery, isolated writers, two SOURCE GO for exact publishable SHA,
+   hosted canonical/mandatory/CodeQL green and owner approval. **NO-GO.**
+
+No merge, deploy, force-push, `Root/main` mutation or production activation
+is authorized by any of the above. **Issue #66 incomplete · RootSession OFF ·
+MERGE NO-GO · RELEASE NO-GO.**
+
 ## 2026-11-11 continuation — completed Windows CI evidence and unpublished fixes
 
 The live GitHub API was rechecked after the 21:00Z checkpoint immediately
