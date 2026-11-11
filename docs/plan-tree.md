@@ -9,6 +9,20 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 — Issue #66 / PR #300 W26 integration status: current bounded
+native NTFS evidence is recorded in
+`docs/roadmap/issue-66-pr300-native-custody-gates.md`. Four post-native-pin
+W26 test/lab commits were integrated without conflicts above published
+`057241e0`; local tree `e1e8b548` received two narrow independent SOURCE
+GO reviews, Windows 11 NTFS/Node22 completed two **22/22** repeat runs
+after one unclassified 21/22 result, and WSL/ext4 W3 remains **38 PASS /
+3 SKIP**. Root/main is untouched; PR300 remains Draft. Formal CodeQL
+**0 alerts** applies to the prior published `057241e0`, **not** to the
+new candidate. The initial original-A identity prior to first native
+pin, independent cold custodian and signed floor, Win10 CFAPI and real
+powercut remain release blockers; the post-pin lab never authorizes
+RootSession, merge or deploy.
+
 2026-11-11 — Issue #66 / PR #300, W22 inert remote-only source:
 pre-rename `EIO` em checkpoint da snapshot ou ACK do journal deixa
 um `.tmp-<pid>-<uuid>` físico não autorizador. O temporário deve ser

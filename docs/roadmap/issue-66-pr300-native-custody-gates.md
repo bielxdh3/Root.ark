@@ -12,7 +12,9 @@ is an intentional security boundary, not a test workaround.
 flowchart TD
   S[Draft PR 300: no cutover] --> I{Native executable, DLL and compiler provenance attested?}
   I -- No --> N[Keep RootSession closed; RELEASE NO-GO]
-  I -- Yes --> A{Root and every ancestor acquired and held by an independent custodian?}
+  I -- Yes --> O{Original root identity pinned by an independent custodian BEFORE any mutable-name preflight?}
+  O -- No --> N
+  O -- Yes --> A{Root and every ancestor acquired and held by an independent custodian?}
   A -- No --> N
   A -- Yes --> P{A distinct untrusted UID/SID fails real reads and writes through every ancestor?}
   P -- No --> N
@@ -41,6 +43,62 @@ flowchart TD
 
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
+
+## 2026-11-11 — current live integration and release boundary
+
+The last independently verified published PR #300 HEAD before this W26
+integration was `057241e030078190147492429782b973746c31d2`; PR #300 was
+**OPEN/Draft**, and `Root/main` remained at
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. Hosted CodeQL on that
+**exact published HEAD** was **SUCCESS / zero annotations** (check
+`130551922365`, run `43028837873`). The hosted Security Regression
+`43028889030` returned **Ubuntu Node 22 FAIL**: 18 failed assertions, all
+in the positive `issue-66-device-pin` suite; errors include missing native
+`RootSession`, an irreversible FOD required-mode fence, and a post-rename
+`fsync` EIO wrapped as an indeterminate snapshot. These cannot be made
+green by authorizing legacy fallback, replacing the native session with a
+mock, or converting positive product tests into expected denials. Windows
+canonical and mandatory release jobs were still running at this snapshot;
+their final outcome must be checked against the exact future published SHA.
+
+The W3 retained-live-ancestry/`0700`-to-`0777` physical RED→GREEN fix was
+independently SOURCE-approved and published in `b6775945`; the complete
+Ubuntu WSL/Node22/ext4 native W3 suite passed **38 / 41**, with three
+expected skips and no failures. A separate duplicate W3 worktree was
+preserved and **not** integrated. The three suspected legacy journal
+hardlink expectations were independently rechecked on `057241e0` and were
+already correct (`invalid_sync_journal`); 16/16 relevant WSL tests passed,
+so no speculative journal change was made.
+
+The W26 NTFS experiment's four reviewed source commits
+`cddceb7e → 5ca10105 → 03fdabaf → cd206fbb` were cherry-picked **without
+conflicts** onto `057241e0` in a new isolated integration worktree, producing
+local experimental head `e1e8b548fcf6aef9e8d73a68b55d89873d05f3e1`
+before this documentation addendum. Two independent source auditors
+confirmed identical W26 test/PowerShell blobs to `cd206fbb`, correct
+author/committer/trailers and no introduced P1/P2 **inside the bounded
+post-first-native-pin lab**. Physical Windows 11/NTFS Node **22.23.4**
+W26 suite passed **22/22** on two captured repeat runs; an earlier first
+integrated run had **21/22**, but its individual failing assertion was not
+retained, so intermittent test instability is **not claimed resolved**.
+The WSL/ext4 W3 regression on the integrated tree was **38 PASS /
+3 expected SKIP / 0 FAIL**. This is local laboratory evidence, not a
+hosted CodeQL/CI result for the future published integration SHA.
+
+The W26 *original-A provenance* gap is unchanged and release-blocking:
+PowerShell's `DirectoryInfo` clean-scratch preflight does **not** retain
+the original directory HANDLE/FileId across `Add-Type`; an ordinary
+same-SID directory **B** installed before the **first native** acquisition
+can be self-pinned and accept `NORMAL` writes. Post-pin native handle/
+FileId validation, parent-relative `NtCreateFile` for held/signals and
+four real A→B attacks (junction/plain × ACK/no ACK) prove only that an
+already pinned A is not redirected. They do **not** attest the initial A,
+exclude same-SID ABA, establish owner custody on cold restart or authorize
+product `RootSession`. The signed owner monotonic floor still needs
+independently protected custody and cold replay evidence. Windows 10
+**real CFAPI**, physical hardware powercut and native product-level
+signed entry/exit operations remain separate unsatisfied gates.
+**LAB_ONLY_NO_GO · MERGE NO-GO · RELEASE NO-GO · no production activation**.
 
 ## Current bounded milestones
 
@@ -776,8 +834,9 @@ with **no 16,385-inode stress rerun** is **38 PASS / 3 expected SKIP /
 0 FAIL**. After proving the hostile `0777` state, the test resecures
 **the same opened parent inode** by `fchmod(fd, 0700)` in `finally` before
 closing the descriptor, leaving the fixture and its original bytes preserved
-without a world-writable directory. These results belong to the local child and await exact-SHA
-independent SOURCE GO and final hosted checks.
+without a world-writable directory. This W3 fix received independent
+SOURCE GO and was published in `b6775945`; hosted checks belong to their
+own exact published SHAs, as reconciled in the live status above.
 
 This is **live, cooperative LAB_ONLY_NO_GO**, not a persistent independent
 custodian. The cold inspector acquires its own namespace after the original
