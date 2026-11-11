@@ -44,6 +44,47 @@ flowchart TD
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
 
+## 2026-11-11 21:00Z — newer cross-PR source/CI checkpoint (supersedes earlier current HEAD snapshots)
+
+This checkpoint records observed **published** refs, not approval to merge,
+deploy, remove Draft, or open `RootSession`. It supersedes older current-HEAD
+tables further down; those earlier test and incident descriptions remain
+historical evidence. `Root/main` is still
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+
+| PR | Published HEAD / draft state | Independent scope and CI evidence at this checkpoint |
+| --- | --- | --- |
+| #298 | `ce393b75b676119d7ac6f2e74e17a43421bd6cf9`, OPEN/Draft | Earlier strict stage restoration fixes passed Win22/NTFS and WSL22/ext4; full PR **NO-GO**. Security Regression run `43097069140` completed `startup_failure` with no execution jobs. CodeQL `43097027050` and PG18 `43097027060` were queued, not green. |
+| #300 | `a598eb470be7b9871fe7e905aa76ea64ab98d60c`, OPEN/Draft | Documentation-only descendant of S0 deny; CodeQL `43094498755` SUCCESS. Security Regression `43094656916` in progress: Ubuntu full TAP **3780 tests, 3473 PASS, 59 FAIL, 248 SKIP**, including 34 positive FOD and 25 pin failures; Windows canonical and mandatory results still running/unconfirmed. The negative S0 physical opt-in tests were SKIP hosted. |
+| #301 | `e1ca644b6aaaa48d87534895575d8576cfced077`, OPEN/Draft | New direct cutover history P2: signature A / digest B split-read reproduced RED on the former `50d76c68`; data-descriptor snapshot and one frozen wire now GREEN. Win22/NTFS **40/40 PASS**, WSL22/ext4 **40/40 PASS**, including real Ed25519 owner rotations and synthetic mapping authority. Two independent SOURCE GO for this *delta*; normal FF published. New exact-SHA hosted checks still in progress/queued (Security Regression `43100369644`, CodeQL `43100369591`, PG18 `43100369434`). |
+| #302 | `e0af83970f2efa3c0798772c001e17f1dd49cade`, OPEN/Draft | Prior native KeyObject clone fix passed local crypto tests, but new same-realm dynamic `crypto.createPublicKey` and `crypto.createPrivateKey` replacement during hostile `Symbol(kHandle)` getters was reproduced as **two DEV-OFF P2 RED** scenarios on Win22 and WSL22. The published source is not cleared. Security Regression `43096175973` completed `startup_failure` with zero execution jobs; CodeQL `43096131770` and PG18 `43096131753` queued. |
+| #306 | `b13b29f9662d5f9036431e53235b9cdc132f0944`, OPEN/non-Draft | Applicable earlier hosted checks succeeded on that SHA, but GitHub contains **zero APPROVED reviews** and its merge base predates the current `Root/main`; no formal merge approval. |
+
+Additional PR #298 *local/unpublished* artifact
+`67c850c11e56b945309aae75973ca0813257c392`
+(parent `ce393b75`) isolates three **expected-security-RED** kernel
+pathname-swap observations in `experiments/issue-67-pr298-unbound-name-evidence/`:
+progress `link` can publish a substituted foreign inode, `stageExisting`
+`rename` can move a foreign inode, and historical `_apply` can hardlink a
+foreign local inode (the subsequent signed SHA gate denied remote push).
+Physical disposable tests reported 5/5 on each Windows Node22/NTFS and WSL
+Node22/ext4 (two legal controls plus three reproductions). These use a
+same-process pre-syscall interposition followed by actual filesystem calls,
+**not** an independently hostile SID/UID or proof of original-root custody.
+The artifact awaits exact-SHA peer review; neither a later `lstat` nor an
+`O_EXCL` name-only fallback resolves these identity races.
+
+**Conjunctive separation:** laboratory FileId/inode probes and same-process
+RED tests; native product authority with first-pin independent original-A,
+held root+ancestor handles and no-replace PREPARE/COMMIT; separately
+administered 100% self-hosted off-host CURRENT/floor/lease/revocation; and
+formal release approvals are **four distinct, all-required evidence planes**.
+No product FOD positive hydration may be claimed while S0 denies it. No
+DEV-OFF SQLite cryptographic correctness grants remote custody or replay
+authority. Real Windows **10** CFAPI and physical **power-loss/recovery**
+remain unperformed; Windows 11 and process hard-exit are not substitutes.
+**MERGE NO-GO · RELEASE NO-GO · RootSession OFF.**
+
 ## 2026-11-11 — current published branches, CI, and mutually independent release gates
 
 This later GitHub snapshot supersedes all earlier **current/as-of** statements

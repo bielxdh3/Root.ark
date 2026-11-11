@@ -9,6 +9,28 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 ~21:00Z — **newer verified cross-PR checkpoint** (supersedes
+subsequent older "current" notes): PR #298 `ce393b75` OPEN/Draft,
+#300 `a598eb47` OPEN/Draft, #301 `e1ca644b` OPEN/Draft (two exact-SHA
+SOURCE GO for narrow crypto split-read fix, 40/40 local Win22 and 40/40
+WSL22 ext4, FF published), #302 `e0af8397` OPEN/Draft, #306 `b13b29f9`
+OPEN/non-Draft with 0 GitHub APPROVED reviews. `Root/main` remains
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. #300 exact CodeQL
+`43094498755` succeeded but Ubuntu canonical still reports 59 positive
+FOD/pin failures on run `43094656916`, Windows result pending. #298
+`43097069140` and #302 `43096175973` Security Regression completed
+`startup_failure` with **no jobs**, not a code-test verdict; their CodeQL
+and PG18 runs still queued. Fresh #301 e1ca hosted checks are pending,
+not inherited from green 50d. Three real pathname-dependent #298 RED
+reproductions were isolated in **unpublished evidence commit** `67c850c`;
+PR #302 also has two local dynamic crypto factory / `Symbol(kHandle)`
+P2 RED scenarios requiring remediation. The four separate laboratory,
+native product, off-host self-hosted custody and release gates remain
+conjunctively unmet. No positive native root-session FOD path, independent
+original-A/ancestor ownership, Windows 10 CFAPI or physical powercut
+proof. **MERGE NO-GO · RELEASE NO-GO · RootSession OFF.** See the
+`docs/roadmap/issue-66-pr300-native-custody-gates.md` top checkpoint.
+
 2026-11-11 — **latest verified PR HEADs, authoritative over older
 "current" entries below:** #300 `b774ce13398e2486fd08e3ff7b47d53d66c046c2`
 (OPEN/Draft), #301 `50d76c686f7d47799344ea8994fd0b8adb3293cc`
