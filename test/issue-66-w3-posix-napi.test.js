@@ -670,6 +670,116 @@ test("#66 W3 native stage detects a separate same-UID writer's pre-commit in-pla
     assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
   });
 
+for (const anonymous of [false, true]) {
+  test(`#66 W3 ${anonymous ? "O_TMPFILE" : "named"} PREPARE rejects an equal-byte foreign journal inode`,
+    { skip: !txnEnabled }, (t) => {
+      const bridge = loadLab();
+      const home = os.homedir();
+      const before = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+      const token = bridge.openTestSession();
+      t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+      const created = fs.readdirSync(home).filter((name) =>
+        name.startsWith(".rootark-w3-napi-") && !before.has(name));
+      assert.equal(created.length, 1);
+      const held = path.join(home, created[0], "held");
+      const saved = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      if (anonymous) process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+      else delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+      finally {
+        if (saved === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+        else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = saved;
+      }
+      withHeldFixtureDirectory(held, (dirfd) => {
+        const originalFd = openFixtureLeaf(dirfd, ".rootark-w3-journal-v1");
+        try {
+          const original = observeOpenedFixture(originalFd);
+          assert.equal(original.bytes, "PREPARED_V1");
+          // A separate same-UID process replaces the PREPARE *inode* while
+          // retaining identical payload bytes. A byte-only comparison at
+          // publish would wrongly admit an unrelated journal's provenance.
+          const writer = spawnSync("/usr/bin/node", ["-e", String.raw`
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const held = process.argv[1];
+            fs.renameSync(path.join(held, '.rootark-w3-journal-v1'),
+              path.join(held, '.rootark-w3-original-journal-parked'));
+            const fd = fs.openSync(path.join(held, '.rootark-w3-journal-v1'), 'wx', 0o600);
+            try {
+              const bytes = Buffer.from('PREPARED_V1');
+              if (fs.writeSync(fd, bytes) !== bytes.length) throw Error('SHORT_WRITE');
+              fs.fsyncSync(fd);
+            } finally { fs.closeSync(fd); }
+            const dirfd = fs.openSync(held, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+            try { fs.fsyncSync(dirfd); } finally { fs.closeSync(dirfd); }
+            process.stdout.write('FOREIGN_PREPARE_FSYNCED');
+          `, held], {
+            cwd: held, timeout: 10000, encoding: "utf8", maxBuffer: 1024,
+            env: { PATH: "/usr/bin:/bin", LANG: "C" },
+          });
+          assert.equal(writer.status, 0, writer.stderr || "independent journal writer failed");
+          assert.equal(writer.stdout, "FOREIGN_PREPARE_FSYNCED");
+          withOpenedFixtureLeaves(dirfd,
+            [".rootark-w3-journal-v1", ".rootark-w3-original-journal-parked"],
+            (foreignFd, parkedFd) => {
+              const foreign = observeOpenedFixture(foreignFd);
+              const parked = observeOpenedFixture(parkedFd);
+              assert.equal(parked.stat.ino, original.stat.ino);
+              assert.equal(parked.stat.dev, original.stat.dev);
+              assert.notEqual(foreign.stat.ino, original.stat.ino);
+              assert.equal(foreign.bytes, original.bytes);
+              assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_INDETERMINATE/,
+                "a distinct PREPARE inode must never authorize native COMMIT");
+              assert.equal(observeOpenedFixture(originalFd).stat.ino, original.stat.ino);
+              assert.equal(observeOpenedFixture(foreignFd).bytes, foreign.bytes);
+              assert.equal(observeOpenedFixture(parkedFd).bytes, parked.bytes);
+              assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-committed-v1`), false);
+              assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-commit-marker-v1`), false);
+            });
+          assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/,
+            "journal inode rebind must permanently poison transaction");
+        } finally { fs.closeSync(originalFd); }
+      });
+      assert.equal(bridge.closeTestSession(token), "CLOSED_NO_AUTHORITY");
+      // Cold separate-process observation after native HANDLE closure:
+      // neither the foreign PREPARE nor the parked original is a COMMIT.
+      // This is inspection only, not trusted independent root reacquisition.
+      const cold = spawnSync("/usr/bin/node", ["-e", String.raw`
+        const fs = require('node:fs');
+        const assert = require('node:assert/strict');
+        const held = process.argv[1];
+        const dir = fs.openSync(held,
+          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+        const readLeaf = (name) => {
+          const fd = fs.openSync('/proc/self/fd/' + dir + '/' + name,
+            fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          try {
+            const st = fs.fstatSync(fd, { bigint: true });
+            assert.ok(st.isFile() && st.ino > 0n && st.size === 11n);
+            const buf = Buffer.alloc(12);
+            assert.equal(fs.readSync(fd, buf, 0, buf.length, 0), 11);
+            return { ino: st.ino, bytes: buf.subarray(0, 11).toString('utf8') };
+          } finally { fs.closeSync(fd); }
+        };
+        try {
+          const foreign = readLeaf('.rootark-w3-journal-v1');
+          const original = readLeaf('.rootark-w3-original-journal-parked');
+          assert.notEqual(foreign.ino, original.ino);
+          assert.equal(foreign.bytes, 'PREPARED_V1');
+          assert.equal(original.bytes, 'PREPARED_V1');
+          assert.equal(fs.existsSync('/proc/self/fd/' + dir +
+            '/.rootark-w3-commit-marker-v1'), false);
+        } finally { fs.closeSync(dir); }
+        process.stdout.write('COLD_PREPARED_ONLY_NO_AUTHORITY');
+      `, held], {
+        cwd: held, timeout: 10000, encoding: "utf8", maxBuffer: 1024,
+        env: { PATH: "/usr/bin:/bin", LANG: "C" },
+      });
+      assert.equal(cold.status, 0, cold.stderr || "cold independent observer failed");
+      assert.equal(cold.stdout, "COLD_PREPARED_ONLY_NO_AUTHORITY");
+    });
+}
+
 test("#66 W3 native stage and publish cannot be enabled by general NAPI lab flag alone",
   { skip: !enabled || txnEnabled }, (t) => {
     const bridge = loadLab();
