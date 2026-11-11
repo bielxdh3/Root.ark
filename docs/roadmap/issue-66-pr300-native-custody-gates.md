@@ -28,7 +28,9 @@ flowchart TD
   D -- No --> N
   D -- Yes --> C{Cold PREPARE and COMMIT bound to original physical identity and signed CURRENT floor?}
   C -- No --> N
-  C -- Yes --> F{Real hostile same-SID/UID A-B-A, Unicode, 16385+ entries, power loss and recovery passed on both OSes?}
+  C -- Yes --> M{Cold PREPARE signs original named/anonymous publication mode and enforces exact stage topology?}
+  M -- No --> N
+  M -- Yes --> F{Real hostile same-SID/UID A-B-A, Unicode, 16385+ entries, power loss and recovery passed on both OSes?}
   F -- No --> N
   F -- Yes --> E{Signed ingress/egress and independent server-side revocation and replay fencing proven?}
   E -- No --> N
@@ -630,3 +632,39 @@ remain `LAB_ONLY_NO_GO`, including successful named two-link COMMIT, until
 an independent custodian can safely retire the stage and enforce a signed
 monotonic cold floor. Native W3/W26 experiments are **not** imported by
 the operational publisher. **MERGE/RELEASE NO-GO, RootSession OFF.**
+
+**Second independent P2 resolved — original publication-mode binding.**
+The follow-up reviewer identified a distinct cold attack on the preceding
+`87f2bd04` state: after a successful named-stage COMMIT, a same-UID writer
+could remove the original stage name. Its published inode then changed
+from `nlink=2` to `nlink=1`, while PREPARE sidecar and COMMIT marker bytes
+remained intact. The old inspector inferred the **anonymous** modality
+from the missing stage name and incorrectly returned `COMMIT_OBSERVED`.
+That was reproduced on real WSL/ext4 with an opened original inode,
+the actual `unlink` of the disposable named stage and the original
+intact COMMIT: previous code **RED** (`status=0`, expected deny 41).
+
+Source `ab4a91a0863140017d95e625c2719e5c979b8cfd` now persists a
+one-byte **`N` (named) or `A` (anonymous)** original publication mode
+alongside the root/stage `st_dev/st_ino` in the exclusively created,
+fsynced PREPARE identity sidecar. The native current-session publisher
+retains and validates the original sidecar inode/bytes/version across
+publication, and the separate cold process compares exact canonical
+sidecar bytes and enforces the **original mode**, never the mode inferred
+from a mutable leaf. Named mode requires the original stage name and
+published inode with the correct `nlink=2` topology; anonymous mode
+requires stage absent and published `nlink=1`. The former false COMMIT
+now returns 41; correct named and anonymous COMMITs remain valid *lab
+classifications only*. The privileged fixture's test name was corrected
+to accurately describe a **different-UID** writer, not same-UID exclusion.
+
+Focused physical regression **GREEN 2 PASS** for named mode and actual
+alias removal; full WSL Node22/ext4 W3+signed witness **35 PASS / 3
+expected SKIP / 0 FAIL**; root-owned distinct-UID adversarial lab
+**1 PASS**. Both original RED worktrees, prior SHAs and all test fixtures
+were kept. The PREPARE `N/A` byte is **not an independent signature**;
+a same-UID writer with access to the entire unprotected test namespace
+could forge the sidecar and other markers. Only a differently owned
+persisted custodian, owner-signed external monotonic floor and sealed
+root/ancestor identities can make this authoritative. **No native
+RootSession activation, no merge/deploy/cutover, RELEASE NO-GO**.
