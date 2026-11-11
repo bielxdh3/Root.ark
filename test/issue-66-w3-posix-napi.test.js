@@ -20,8 +20,10 @@ const enabled = process.platform === "linux" &&
 const stressEnabled = enabled && process.env.ROOTARK_ISSUE66_W3_STREAM_STRESS === "1";
 const txnEnabled = enabled && process.env.ROOTARK_ISSUE66_W3_TXN_LAB === "1";
 const source = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/native_bridge.c");
+const coldSource = path.resolve(__dirname, "../experiments/issue66-w3-posix-napi/cold_inspector.c");
 let addon;
 let addonPath;
+let coldInspectorPath;
 
 // Assertions must inspect the same opened inode that supplies the bytes.
 // Comparing fs.statSync(path) and later fs.readFileSync(path) would admit a
@@ -108,6 +110,41 @@ function loadLab() {
   addonPath = target;
   addon = require(target);
   return addon;
+}
+
+function loadColdInspector() {
+  if (coldInspectorPath) return coldInspectorPath;
+  assert.match(process.version, /^v22\./);
+  assert.match(os.release(), /wsl|microsoft/i);
+  const home = os.homedir();
+  const build = fs.mkdtempSync(path.join(home, ".rootark-w3-cold-build-"));
+  assert.equal(fs.statSync(build).mode & 0o777, 0o700);
+  assert.equal(fs.statfsSync(build).type, 0xef53);
+  const output = path.join(build, "rooted-cold-inspector");
+  const compiled = spawnSync("/usr/bin/gcc", [
+    "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+    "-Wl,-z,relro", "-Wl,-z,now", coldSource, "-o", output,
+  ], {
+    cwd: build, timeout: 30000, encoding: "utf8", maxBuffer: 4096,
+    env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", TMPDIR: build },
+  });
+  assert.equal(compiled.status, 0, `C cold inspection compilation failed: ${compiled.stderr}`);
+  coldInspectorPath = output;
+  return output;
+}
+
+function inspectNativeColdFixture(held, allowed = true) {
+  const home = os.homedir();
+  const fixture = path.basename(path.dirname(held));
+  assert.match(fixture, /^\.rootark-w3-napi-[0-9a-f]{32}$/);
+  assert.equal(path.resolve(held), path.join(home, fixture, "held"));
+  return spawnSync(loadColdInspector(), [fixture.slice(".rootark-w3-napi-".length)], {
+    cwd: home, timeout: 15000, encoding: "utf8", maxBuffer: 4096,
+    env: {
+      PATH: "/usr/bin:/bin", HOME: home, LANG: "C", LC_ALL: "C",
+      ROOTARK_ISSUE66_W3_COLD_INSPECT_LAB: allowed ? "1" : "0",
+    },
+  });
 }
 
 test("#66 W3 native bridge loads in Node22 and cannot activate integrated RootSession",
@@ -643,6 +680,285 @@ test("#66 W3 anonymous pre-link hard exit loses unnamed stage but retains only n
     assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
     assert.throws(() => requireNativeRecoveryAuthority({ root: held }),
       (e) => e.code === "root_session_unverified_authority");
+  });
+
+test("#66 W3 native cold inspector binds original ext4 inode to PREPARE and COMMIT",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((n) => n.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const names = fs.readdirSync(home).filter((n) =>
+      n.startsWith(".rootark-w3-napi-") && !before.has(n));
+    assert.equal(names.length, 1);
+    const held = path.join(home, names[0], "held");
+    const originalAnon = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+    try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+    finally {
+      if (originalAnon === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = originalAnon;
+    }
+    withHeldFixtureDirectory(held, (dirfd) => {
+      withOpenedFixtureLeaves(dirfd, [".rootark-w3-prepared-id-v2"], (idFd) => {
+        const id = observeOpenedFixture(idFd);
+        assert.match(id.bytes, /^PREPARED_ID_V2:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+\n$/);
+        assert.equal(id.stat.nlink, 1n);
+      });
+    });
+    const disabled = inspectNativeColdFixture(held, false);
+    assert.equal(disabled.status, 41);
+    assert.equal(disabled.stdout, "");
+    assert.equal(disabled.stderr, "ROOTARK_W3_COLD_INSPECT_REJECTED\n");
+    const prepared = inspectNativeColdFixture(held);
+    assert.equal(prepared.status, 0, prepared.stderr);
+    assert.equal(prepared.stdout,
+      "ROOTARK_W3_COLD_INSPECT phase=PREPARED_ONLY authority=LAB_ONLY_NO_GO\n");
+    assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    const completed = inspectNativeColdFixture(held);
+    assert.equal(completed.status, 0, completed.stderr);
+    assert.equal(completed.stdout,
+      "ROOTARK_W3_COLD_INSPECT phase=COMMIT_OBSERVED authority=LAB_ONLY_NO_GO\n");
+    assert.throws(() => openNativeRootSession(true),
+      (error) => error.code === "root_session_native_unavailable");
+  });
+
+test("#66 W3 native cold new process observes published-no-COMMIT after hard exit",
+  { skip: !txnEnabled }, () => {
+    loadLab();
+    const code = [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      "const os=require('node:os');",
+      "const bridge=require(process.argv[1]);",
+      "const home=os.homedir();",
+      "const old=new Set(fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')));",
+      "const token=bridge.openTestSession();",
+      "const fresh=fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')&&!old.has(n));",
+      "if(fresh.length!==1)process.exit(61);",
+      "if(bridge.stageProof(token)!=='LAB_TXN_PREPARED')process.exit(62);",
+      "fs.writeSync(1,path.join(home,fresh[0],'held')+'\\n');",
+      "bridge.publishProof(token);",
+      "process.exit(63);",
+    ].join("");
+    const crashed = spawnSync(process.execPath, ["-e", code, addonPath], {
+      timeout: 10000, encoding: "utf8", maxBuffer: 4096,
+      env: {
+        PATH: "/usr/bin:/bin", HOME: os.homedir(), LC_ALL: "C", LANG: "C",
+        ROOTARK_ISSUE66_W3_NAPI_LAB: "1", ROOTARK_ISSUE66_W3_TXN_LAB: "1",
+        ROOTARK_ISSUE66_W3_ANON_LAB: "1",
+        ROOTARK_ISSUE66_W3_HARD_EXIT_POST_LINK: "1",
+      },
+    });
+    assert.equal(crashed.status, 73, crashed.stderr || crashed.stdout);
+    const held = crashed.stdout.trim();
+    const result = inspectNativeColdFixture(held);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout,
+      "ROOTARK_W3_COLD_INSPECT phase=PUBLISHED_NO_COMMIT authority=LAB_ONLY_NO_GO\n");
+    assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+  });
+
+test("#66 W3 cold native inspector rejects equal-byte foreign published ext4 inode with COMMIT intact",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((n) => n.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const fresh = fs.readdirSync(home).filter((n) =>
+      n.startsWith(".rootark-w3-napi-") && !before.has(n));
+    assert.equal(fresh.length, 1);
+    const held = path.join(home, fresh[0], "held");
+    const originalAnon = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+    try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+    finally {
+      if (originalAnon === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = originalAnon;
+    }
+    assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    assert.equal(inspectNativeColdFixture(held).status, 0);
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const leaf = ".rootark-w3-committed-v1";
+      const parked = ".rootark-w3-cold-original-parked";
+      const originalFd = openFixtureLeaf(dirfd, leaf);
+      let foreignFd;
+      try {
+        const original = observeOpenedFixture(originalFd);
+        fs.renameSync(`/proc/self/fd/${dirfd}/${leaf}`,
+          `/proc/self/fd/${dirfd}/${parked}`);
+        foreignFd = openFixtureLeaf(dirfd, leaf,
+          fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL);
+        const bytes = Buffer.from(original.bytes);
+        assert.equal(fs.writeSync(foreignFd, bytes), bytes.length);
+        fs.fsyncSync(foreignFd);
+        const foreign = observeOpenedFixture(foreignFd);
+        assert.notEqual(foreign.stat.ino, original.stat.ino);
+        assert.equal(foreign.bytes, original.bytes);
+        assert.equal(foreign.stat.nlink, 1n);
+        const denied = inspectNativeColdFixture(held);
+        assert.equal(denied.status, 41,
+          "a different inode with byte-identical published content cannot satisfy original PREPARE");
+        assert.equal(denied.stdout, "");
+        assert.equal(denied.stderr, "ROOTARK_W3_COLD_INSPECT_REJECTED\n");
+        assert.equal(observeOpenedFixture(originalFd).stat.ino, original.stat.ino);
+        assert.equal(observeOpenedFixture(foreignFd).stat.ino, foreign.stat.ino);
+        assert.equal(observeOpenedFixture(originalFd).bytes, original.bytes);
+        assert.equal(observeOpenedFixture(foreignFd).bytes, foreign.bytes);
+      } finally {
+        if (foreignFd !== undefined) fs.closeSync(foreignFd);
+        fs.closeSync(originalFd);
+      }
+    });
+    assert.equal(fs.readFileSync(path.join(held, ".rootark-w3-commit-marker-v1"), "utf8"),
+      "COMMITTED_V1", "foreign leaves cannot mutate original COMMIT evidence");
+  });
+
+test("#66 W3 native cold inspector rejects an embedded-NUL COMMIT suffix on the same inode",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((n) => n.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const fresh = fs.readdirSync(home).filter((n) =>
+      n.startsWith(".rootark-w3-napi-") && !before.has(n));
+    assert.equal(fresh.length, 1);
+    const held = path.join(home, fresh[0], "held");
+    const originalAnon = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+    try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+    finally {
+      if (originalAnon === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = originalAnon;
+    }
+    assert.equal(bridge.publishProof(token), "LAB_TXN_COMMITTED");
+    assert.equal(inspectNativeColdFixture(held).status, 0);
+    withHeldFixtureDirectory(held, (dirfd) => {
+      const marker = openFixtureLeaf(dirfd, ".rootark-w3-commit-marker-v1", fs.constants.O_RDWR);
+      try {
+        const original = observeOpenedFixture(marker);
+        assert.equal(original.bytes, "COMMITTED_V1");
+        const injection = Buffer.from([0, 0x46, 0x4f, 0x52, 0x45, 0x49, 0x47, 0x4e]);
+        assert.equal(fs.writeSync(marker, injection, 0, injection.length, Number(original.stat.size)),
+          injection.length);
+        fs.fsyncSync(marker);
+        const changed = fs.fstatSync(marker, { bigint: true });
+        assert.equal(changed.ino, original.stat.ino,
+          "the attack must corrupt the SAME opened inode, not swap a pathname");
+        assert.equal(changed.size, original.stat.size + BigInt(injection.length));
+        const denied = inspectNativeColdFixture(held);
+        assert.equal(denied.status, 41,
+          "C strcmp must not hide bytes after embedded NUL in cold COMMIT marker");
+        assert.equal(denied.stdout, "");
+        assert.equal(denied.stderr, "ROOTARK_W3_COLD_INSPECT_REJECTED\n");
+      } finally { fs.closeSync(marker); }
+    });
+  });
+
+test("#66 W3 native cold new process rejects torn PREPARE before original inode identity proof",
+  { skip: !txnEnabled }, () => {
+    loadLab();
+    const code = [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      "const os=require('node:os');",
+      "const native=require(process.argv[1]);",
+      "const home=os.homedir();",
+      "const before=new Set(fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')));",
+      "const token=native.openTestSession();",
+      "const fresh=fs.readdirSync(home).filter(n=>n.startsWith('.rootark-w3-napi-')&&!before.has(n));",
+      "if(fresh.length!==1)process.exit(61);",
+      "fs.writeSync(1,path.join(home,fresh[0],'held')+'\\n');",
+      "native.stageProof(token);",
+      "process.exit(62);",
+    ].join("");
+    const crashed = spawnSync(process.execPath, ["-e", code, addonPath], {
+      timeout: 10000, encoding: "utf8", maxBuffer: 4096,
+      env: {
+        PATH: "/usr/bin:/bin", HOME: os.homedir(), LANG: "C", LC_ALL: "C",
+        ROOTARK_ISSUE66_W3_NAPI_LAB: "1", ROOTARK_ISSUE66_W3_TXN_LAB: "1",
+        ROOTARK_ISSUE66_W3_ANON_LAB: "1",
+        ROOTARK_ISSUE66_W3_HARD_EXIT_BEFORE_ID_PROOF: "1",
+      },
+    });
+    assert.equal(crashed.status, 75, crashed.stderr || crashed.stdout);
+    const held = crashed.stdout.trim();
+    assert.ok(held.startsWith(path.join(os.homedir(), ".rootark-w3-napi-")));
+    withHeldFixtureDirectory(held, (dirfd) => {
+      withOpenedFixtureLeaves(dirfd, [".rootark-w3-journal-v1"], (preparedFd) => {
+        assert.equal(observeOpenedFixture(preparedFd).bytes, "PREPARED_V1");
+      });
+      assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-prepared-id-v2`), false);
+      assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-committed-v1`), false);
+      assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-commit-marker-v1`), false);
+    });
+    const rejected = inspectNativeColdFixture(held);
+    assert.equal(rejected.status, 41,
+      "durable PREPARE without original inode ID cannot be promoted to a cold transaction");
+    assert.equal(rejected.stdout, "");
+    assert.equal(rejected.stderr, "ROOTARK_W3_COLD_INSPECT_REJECTED\n");
+  });
+
+test("#66 W3 original PREPARE identity sidecar survives separate same-UID equal-byte replacement",
+  { skip: !txnEnabled }, (t) => {
+    const bridge = loadLab();
+    const home = os.homedir();
+    const before = new Set(fs.readdirSync(home).filter((n) => n.startsWith(".rootark-w3-napi-")));
+    const token = bridge.openTestSession();
+    t.after(() => { try { bridge.closeTestSession(token); } catch {} });
+    const fresh = fs.readdirSync(home).filter((n) =>
+      n.startsWith(".rootark-w3-napi-") && !before.has(n));
+    assert.equal(fresh.length, 1);
+    const held = path.join(home, fresh[0], "held");
+    const originalAnon = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+    process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+    try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+    finally {
+      if (originalAnon === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+      else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = originalAnon;
+    }
+    const writer = spawnSync(process.execPath, ["-e", String.raw`
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const held = process.argv[1];
+      const visible = path.join(held, '.rootark-w3-prepared-id-v2');
+      const parked = path.join(held, '.rootark-w3-original-id-parked');
+      const fd = fs.openSync(visible, 'r');
+      let original;
+      try { original = fs.readFileSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(visible, parked);
+      const foreign = fs.openSync(visible, 'wx', 0o600);
+      try {
+        if (fs.writeSync(foreign, original) !== original.length) process.exit(68);
+        fs.fsyncSync(foreign);
+      } finally { fs.closeSync(foreign); }
+      process.stdout.write('EXTERNAL_SAME_UID_ID_REBIND');
+    `, held], {
+      timeout: 10000, encoding: "utf8", maxBuffer: 2048,
+      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+    });
+    assert.equal(writer.status, 0, writer.stderr || "external writer failed");
+    assert.equal(writer.stdout, "EXTERNAL_SAME_UID_ID_REBIND");
+    withHeldFixtureDirectory(held, (dirfd) => {
+      withOpenedFixtureLeaves(dirfd,
+        [".rootark-w3-original-id-parked", ".rootark-w3-prepared-id-v2"],
+        (originalFd, foreignFd) => {
+          const original = observeOpenedFixture(originalFd);
+          const foreign = observeOpenedFixture(foreignFd);
+          assert.notEqual(original.stat.ino, foreign.stat.ino);
+          assert.equal(original.bytes, foreign.bytes,
+            "the collision is a true distinct inode with byte-identical PREPARE identity");
+          assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_INDETERMINATE/);
+          assert.equal(observeOpenedFixture(originalFd).stat.ino, original.stat.ino);
+          assert.equal(observeOpenedFixture(foreignFd).stat.ino, foreign.stat.ino);
+        });
+      assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-committed-v1`), false);
+      assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-commit-marker-v1`), false);
+    });
+    assert.throws(() => bridge.publishProof(token), /NATIVE_TXN_PHASE_REJECTED/);
   });
 
 test("#66 W3 native stage detects a separate same-UID writer's pre-commit in-place corruption",

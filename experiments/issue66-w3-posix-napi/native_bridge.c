@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <linux/magic.h>
 #include <linux/openat2.h>
 #include <pwd.h>
@@ -34,6 +35,7 @@
 #define FOREIGN_BYTES "FOREIGN_ORIGINAL"
 #define STAGE_PROOF ".rootark-w3-staged-v1"
 #define JOURNAL_PROOF ".rootark-w3-journal-v1"
+#define IDENTITY_PROOF ".rootark-w3-prepared-id-v2"
 #define PUBLISHED_PROOF ".rootark-w3-committed-v1"
 #define COMMIT_PROOF ".rootark-w3-commit-marker-v1"
 #define STAGE_PAYLOAD "STAGED_ROOT_CANARY_V1"
@@ -47,6 +49,10 @@ typedef struct {
   int journal_fd; // original exclusive PREPARE inode, retained through COMMIT
   struct stat journal_initial; // version pinned after original PREPARE fsync
   int journal_version_pinned;
+  int identity_fd; // PREPARE binds the native held dirfd and stage inode IDs
+  struct stat identity_initial;
+  char identity_payload[160]; // persisted bytes, NOT an independent signature
+  int identity_version_pinned;
   int txn_anonymous; // opt-in O_TMPFILE stage, never a product recovery mode
   DIR *held;
   int phase;
@@ -203,6 +209,33 @@ static int opened_prepare_equals(int fd, const struct stat *initial) {
          got == (ssize_t)size && memcmp(bytes, JOURNAL_PAYLOAD, size) == 0;
 }
 
+static int opened_identity_equals(int fd, const struct stat *initial,
+                                  const char *expected) {
+  if (fd < 0 || !expected) return 0;
+  struct stat st;
+  char bytes[160];
+  size_t size = strlen(expected);
+  if (size >= sizeof(bytes)) return 0;
+  ssize_t got = pread(fd, bytes, sizeof(bytes), 0);
+  return fstat(fd, &st) == 0 && same_prepare_version(initial, &st) &&
+         S_ISREG(st.st_mode) && st.st_size == (off_t)size &&
+         st.st_nlink == 1 && got == (ssize_t)size &&
+         memcmp(bytes, expected, size) == 0;
+}
+
+static int still_original_identity(lab_session *session, int dirfd) {
+  if (!session->identity_version_pinned ||
+      !opened_identity_equals(session->identity_fd,
+                              &session->identity_initial,
+                              session->identity_payload)) return 0;
+  int current = fd_openat2(dirfd, IDENTITY_PROOF, O_RDONLY | O_NONBLOCK, 0);
+  int okay = current >= 0 && object_is(current, session->identity_fd) &&
+             opened_identity_equals(current, &session->identity_initial,
+                                    session->identity_payload);
+  if (current >= 0 && close(current) != 0) okay = 0;
+  return okay;
+}
+
 static int marker_equals(int dirfd, const char *name, const char *expected) {
   // Never block a helper before fstat if a same-UID fixture writer installs
   // a FIFO. A non-regular descriptor fails the held-file check below.
@@ -268,6 +301,10 @@ static void release_handles(lab_session *session) {
     (void)close(session->journal_fd);
     session->journal_fd = -1;
   }
+  if (session->identity_fd >= 0) {
+    (void)close(session->identity_fd);
+    session->identity_fd = -1;
+  }
   if (session->held) {
     (void)closedir(session->held);
     session->held = NULL;
@@ -285,7 +322,10 @@ static void release_handles(lab_session *session) {
   session->txn_phase = 0;
   session->txn_anonymous = 0;
   session->journal_version_pinned = 0;
+  session->identity_version_pinned = 0;
   memset(&session->journal_initial, 0, sizeof(session->journal_initial));
+  memset(&session->identity_initial, 0, sizeof(session->identity_initial));
+  memset(session->identity_payload, 0, sizeof(session->identity_payload));
   memset(session->token, 0, sizeof(session->token));
 }
 
@@ -370,6 +410,7 @@ static napi_value open_test_session(napi_env env, napi_callback_info info) {
   session->parentfd = parent;
   session->staged_fd = -1;
   session->journal_fd = -1;
+  session->identity_fd = -1;
   session->held = dir;
   session->phase = 0;
   session->stream_active = 0;
@@ -581,13 +622,34 @@ static napi_value stage_proof(napi_env env, napi_callback_info info) {
   session->txn_anonymous = anon && strcmp(anon, "1") == 0;
   session->staged_fd = session->txn_anonymous
     ? create_anonymous_stage(held) : create_open_stage(held);
-  if (session->staged_fd < 0 || fsync(held) != 0 ||
+  struct stat held_stat, original_stage;
+  int n = session->staged_fd < 0 ? -1 :
+    (fstat(held, &held_stat) == 0 && fstat(session->staged_fd, &original_stage) == 0
+      ? snprintf(session->identity_payload, sizeof(session->identity_payload),
+                 "PREPARED_ID_V2:%jx:%jx:%jx:%jx\n",
+                 (uintmax_t)held_stat.st_dev, (uintmax_t)held_stat.st_ino,
+                 (uintmax_t)original_stage.st_dev, (uintmax_t)original_stage.st_ino)
+      : -1);
+  if (n < 1 || (size_t)n >= sizeof(session->identity_payload) ||
+      !S_ISDIR(held_stat.st_mode) || !S_ISREG(original_stage.st_mode) ||
+      original_stage.st_ino == 0 || fsync(held) != 0 ||
       (session->journal_fd =
         create_open_proof(held, JOURNAL_PROOF, JOURNAL_PAYLOAD)) < 0 ||
       fstat(session->journal_fd, &session->journal_initial) != 0 ||
       fsync(held) != 0)
     return fail(env, "NATIVE_TXN_INDETERMINATE");
+  // A deterministic new-process crash can separate an already fsynced
+  // PREPARE from its identity sidecar. On cold admission the native inspector
+  // must reject this torn transaction, never guess the missing FileId.
+  const char *early_exit = getenv("ROOTARK_ISSUE66_W3_HARD_EXIT_BEFORE_ID_PROOF");
+  if (early_exit && strcmp(early_exit, "1") == 0) _exit(75);
+  if ((session->identity_fd = create_open_proof(held, IDENTITY_PROOF,
+                                               session->identity_payload)) < 0 ||
+      fstat(session->identity_fd, &session->identity_initial) != 0 ||
+      fsync(held) != 0)
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
   session->journal_version_pinned = 1;
+  session->identity_version_pinned = 1;
   session->txn_phase = 1;
   return result_text(env, "LAB_TXN_PREPARED");
 }
@@ -626,7 +688,8 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
                                                        &session->journal_initial);
   if (current_journal >= 0 && close(current_journal) != 0)
     journal_identity_matches = 0;
-  if (!stage_identity_matches || !journal_identity_matches) {
+  if (!stage_identity_matches || !journal_identity_matches ||
+      !still_original_identity(session, held)) {
     session->txn_phase = 3;
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   }
@@ -689,7 +752,7 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
                                                    &session->journal_initial);
   if (current_journal >= 0 && close(current_journal) != 0)
     journal_identity_matches = 0;
-  if (!journal_identity_matches)
+  if (!journal_identity_matches || !still_original_identity(session, held))
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   // Physical hard-exit in an explicitly opted-in child process ONLY. The
   // destination has passed linkat+directory fsync but COMMIT has not been
@@ -777,6 +840,7 @@ static napi_value init(napi_env env, napi_value exports) {
   session->parentfd = -1;
   session->staged_fd = -1;
   session->journal_fd = -1;
+  session->identity_fd = -1;
   if (napi_add_env_cleanup_hook(env, cleanup, session) != napi_ok) {
     free(session);
     return fail(env, "NATIVE_API_FAILED");
