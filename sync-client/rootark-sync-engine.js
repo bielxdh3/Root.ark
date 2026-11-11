@@ -4,6 +4,9 @@ const crypto = require("node:crypto");
 const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
 const NATIVE_VERIFY = crypto.verify.bind(crypto);
 const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
+const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
+const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
 const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -33,9 +36,13 @@ const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+function sha256Hex(data, encoding) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, data, encoding);
+  return NATIVE_HASH_DIGEST.call(hash, "hex");
+}
 function signedEnvelopeDigest(operation) {
-  return NATIVE_CREATE_HASH("sha256")
-    .update(protocol.canonicalJson(operation), "utf8").digest("hex");
+  return sha256Hex(protocol.canonicalJson(operation), "utf8");
 }
 
 // v2 is intentionally incompatible with v1: a v1 receipt has no immutable
@@ -198,9 +205,7 @@ function signedWebDavEventId(operation) {
     || typeof operation.metadata?.path !== "string") return null;
   const parts = /^webdav-(.+)-([a-f0-9]{24})$/.exec(operation.operationId);
   if (!parts || parts[1].length > 100) return null;
-  const digest = NATIVE_CREATE_HASH("sha256")
-    .update(`${operation.operation}:${operation.metadata.path}`)
-    .digest("hex").slice(0, 24);
+  const digest = sha256Hex(`${operation.operation}:${operation.metadata.path}`).slice(0, 24);
   return parts[2] === digest ? parts[1] : null;
 }
 
@@ -811,7 +816,7 @@ class SyncEngine {
         }
       } else {
         const bytes = await readContainedFile(this.rootDir, sourcePath, stats);
-        changedLocally = crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash;
+        changedLocally = sha256Hex(bytes) !== prior.hash;
       }
     }
 
@@ -824,7 +829,7 @@ class SyncEngine {
         const conflictRoot = path.join(this.rootDir, ".rootark-conflicts");
         await fsp.mkdir(conflictRoot, { recursive: true });
         await containedAbsolute(this.rootDir, conflictRoot, false);
-        const operationKey = crypto.createHash("sha256").update(operation.operationId).digest("hex").slice(0, 16);
+        const operationKey = sha256Hex(operation.operationId).slice(0, 16);
         const conflictPath = path.join(conflictRoot, `${operationKey}-${crypto.randomUUID()}.local.conflict`);
         await containedAbsolute(this.rootDir, conflictPath, true);
         await fsp.rename(target, conflictPath);
@@ -949,7 +954,7 @@ class SyncEngine {
     let hash;
     if (operation.operation === "move") {
       const plaintext = protocol.decodeMovePayload(protocol.decryptPayload(operation, key), key);
-      if (plaintext !== null) hash = crypto.createHash("sha256").update(plaintext).digest("hex");
+      if (plaintext !== null) hash = sha256Hex(plaintext);
     }
     this.rememberOperation(operation, hash);
     await this.persistSnapshot();
@@ -1008,13 +1013,12 @@ class SyncEngine {
       const soloDelete = kind === "delete" && verbAndPath.startsWith("delete:");
       const soloMove = kind === "move" && !event.previousDestinationIdentity
         && verbAndPath.startsWith("move:");
-      return `${soloDelete || soloMove ? "webdavsolo" : "webdav"}-${event.operationId}-${crypto.createHash("sha256")
-        .update(verbAndPath).digest("hex").slice(0, 24)}`;
+      return `${soloDelete || soloMove ? "webdavsolo" : "webdav"}-${event.operationId}-${sha256Hex(verbAndPath).slice(0, 24)}`;
     };
     const identityFor = (relativePath, prior) => {
       const deletedPrior = snapshotFiles[relativePath]?.deleted ? snapshotFiles[relativePath] : null;
       const identitySeed = deletedPrior ? crypto.randomUUID().replace(/-/g, "")
-        : crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 32);
+        : sha256Hex(relativePath).slice(0, 32);
       return {
         objectId: prior?.objectId || `object-${identitySeed}`,
         fileId: prior?.fileId || `file-${identitySeed}`,
@@ -1627,7 +1631,7 @@ class SyncEngine {
     const content = operation.operation === "move"
       ? protocol.decodeMovePayload(decrypted, key) || decrypted
       : decrypted;
-    return crypto.createHash("sha256").update(content).digest("hex");
+    return sha256Hex(content);
   }
 
   async stageExisting(target) {
@@ -1723,7 +1727,7 @@ class SyncEngine {
           await fsp.rename(source, target);
         }
         const movedStats = await fsp.lstat(target, { bigint: true });
-        if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
+        if (movedStats.isFile()) hash = sha256Hex(await readContainedFile(this.rootDir, metadata.path, movedStats));
       } else {
         if (await exists(target)) await this.stageExisting(target);
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
@@ -1731,7 +1735,7 @@ class SyncEngine {
           await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
           await fsp.rename(temporary, target);
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
-        hash = crypto.createHash("sha256").update(movePayload).digest("hex");
+        hash = sha256Hex(movePayload);
       }
       this.rememberOperation(operation, hash, sourcePath);
     } else {
@@ -1770,7 +1774,7 @@ class SyncEngine {
           await fsp.rename(temporary, target);
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
       }
-      this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
+      this.rememberOperation(operation, sha256Hex(plaintext));
     }
     if (operation.operation === "move" && cleanupPath) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath, true)));
@@ -1784,7 +1788,7 @@ class SyncEngine {
 
   async scanFiles() {
     const result = {};
-    const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+    const emptyHash = sha256Hex(Buffer.alloc(0));
     const walk = async (directory, prefix = "") => {
       let hasSyncEntries = false;
       for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
@@ -1807,7 +1811,7 @@ class SyncEngine {
           if (childHasSyncEntries || this.isSelected(relative) || this.selectedPaths === null) hasSyncEntries = true;
         } else if (entry.isFile() && this.isSelected(relative)) {
           const data = await readContainedFile(this.rootDir, relative);
-          result[relative] = { hash: crypto.createHash("sha256").update(data).digest("hex"), size: data.length, directory: false };
+          result[relative] = { hash: sha256Hex(data), size: data.length, directory: false };
           hasSyncEntries = true;
         }
       }
@@ -1917,11 +1921,11 @@ class SyncEngine {
       const isUpdate = prior && !prior.deleted;
       const identitySeed = prior?.deleted
         ? crypto.randomUUID().replace(/-/g, "")
-        : crypto.createHash("sha256").update(relative).digest("hex").slice(0, 32);
+        : sha256Hex(relative).slice(0, 32);
       const objectId = isUpdate ? prior.objectId : `object-${identitySeed}`;
       const fileId = isUpdate ? prior.fileId : `file-${identitySeed}`;
       const data = isDirectory ? Buffer.alloc(0) : await readContainedFile(this.rootDir, relative);
-      const contentHash = crypto.createHash("sha256").update(data).digest("hex");
+      const contentHash = sha256Hex(data);
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
@@ -1971,7 +1975,7 @@ class SyncEngine {
     const before = await fsp.lstat(target, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink()) fail("Only regular files can be evicted", "unsafe_path");
     const bytes = await readContainedFile(this.rootDir, safePath, before);
-    const hash = crypto.createHash("sha256").update(bytes).digest("hex");
+    const hash = sha256Hex(bytes);
     const afterRead = await fsp.lstat(target, { bigint: true });
     if (hash !== prior.hash || !sameFileVersion(before, afterRead)) fail("Local file changed since its last sync", "local_changes_pending");
 
@@ -1990,7 +1994,7 @@ class SyncEngine {
     const remoteContent = remote.operation === "move"
       ? protocol.decodeMovePayload(remotePlaintext, remoteKey) || remotePlaintext
       : remotePlaintext;
-    if (crypto.createHash("sha256").update(remoteContent).digest("hex") !== hash) {
+    if (sha256Hex(remoteContent) !== hash) {
       fail("Current remote content differs from the local cache", "remote_content_changed");
     }
 
@@ -1998,7 +2002,7 @@ class SyncEngine {
     if (!sameFileVersion(before, beforeStage)) fail("Local file changed during cache verification", "local_changes_pending");
     const confirmedBytes = await readContainedFile(this.rootDir, safePath, beforeStage);
     const afterConfirm = await fsp.lstat(target, { bigint: true });
-    if (crypto.createHash("sha256").update(confirmedBytes).digest("hex") !== hash || !sameFileVersion(beforeStage, afterConfirm)) {
+    if (sha256Hex(confirmedBytes) !== hash || !sameFileVersion(beforeStage, afterConfirm)) {
       fail("Local file changed during cache verification", "local_changes_pending");
     }
 
