@@ -3387,6 +3387,15 @@ class SyncEngine {
   async retryPush(operation) {
     denyIndeterminateInbound(this);
     requireNativeRootMutationContext(this);
+    // The public instance method assertOutgoingAuthorized is replaceable JS.
+    // A direct retryPush caller must NEVER use that override to dispatch a
+    // destructive signed DELETE while required-v2 native root custody is
+    // unavailable. This negative guard is module-owned, runs before mode
+    // I/O or any adapter callback and cannot be waived by an object flag.
+    if (this.requireNativeRootRecovery
+      && (operation?.operation === "delete" || operation?.tombstone === true)) {
+      denyUntrustedNativeSignedDelete();
+    }
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {

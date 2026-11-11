@@ -1387,6 +1387,50 @@ test("issue 66: direct native-required outbound retry and conflict recovery cann
   assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
 });
 
+test("issue 66: a replaced JavaScript authorization method cannot dispatch a native-required signed DELETE retry", async (t) => {
+  const { root, open, store, adapter, state } = await setup(t, {
+    "docs/restore.txt": "signed remote bytes",
+  });
+  const client = await open();
+  const operation = { ...store.list("alice")[0],
+    operation: "delete", tombstone: true };
+  const remoteRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-retry-remote-"));
+  t.after(() => fsp.rm(remoteRoot, { recursive: true, force: true }));
+  const remoteProof = path.join(remoteRoot, "forbidden-signed-delete.bin");
+  const originalAuthorization = client.assertOutgoingAuthorized;
+  const originalPush = adapter.push;
+  let physicallyDispatched = false;
+  // An attacker who controls a writable JS instance method must not become
+  // the independent native-custody or outbound signed-DELETE authority.
+  client.assertOutgoingAuthorized = async (_record, authorizedAction = null) =>
+    authorizedAction ? authorizedAction() : true;
+  adapter.push = async () => {
+    const held = await fsp.open(remoteProof, "wx", 0o600);
+    try {
+      await held.writeFile("UNAUTHORIZED_REMOTE_DELETE_DISPATCHED");
+      await held.sync();
+      physicallyDispatched = true;
+    } finally {
+      await held.close();
+    }
+    return { status: 201 };
+  };
+  try {
+    await assert.rejects(client.withMutationLock(() => client.retryPush(operation)),
+      { code: "root_session_native_unavailable" },
+      "module-private native custody denial must survive a writable JS method override");
+  } finally {
+    client.assertOutgoingAuthorized = originalAuthorization;
+    adapter.push = originalPush;
+  }
+  assert.equal(physicallyDispatched, false);
+  assert.equal(await exists(remoteProof), false,
+    "no outbound adapter may commit even a disposable physical remote record");
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
+    "a pure pre-dispatch negative gate must not poison the real process lock");
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66: a started but unawaited native-required _apply keeps the physical lock through all awaited I/O", async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "remote content behind deferred key resolver",
