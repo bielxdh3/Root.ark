@@ -259,6 +259,74 @@ test("P2 inherited native kHandle cannot splice owner or CURRENT signer A onto p
   }
 });
 
+test("P2 native SPKI factory cannot be replaced by owner or CURRENT KeyObject getter", () => {
+  for (const role of ["owner", "floor"]) {
+    const f = fixture();
+    const actual = role === "owner" ? f.owner.publicKey : f.custodian.publicKey;
+    const alleged = f.foreign.publicKey;
+    const claimedPin = spki(alleged);
+    const handle = Object.getOwnPropertySymbols(actual)
+      .find((key) => String(key) === "Symbol(kHandle)");
+    assert.ok(handle, "real native Ed25519 kHandle required for this physical regression");
+    let exercised = 0;
+    // Some native KeyObject getters read the handle before SPKI export.
+    // Try each documented observed getter position on physical Node 22.
+    for (const swappedRead of [1, 2, 3]) {
+      const savedCreatePublicKey = crypto.createPublicKey;
+      const forgedPinned = Object.create(actual);
+      let pinnedReads = 0;
+      Object.defineProperty(forgedPinned, handle, { get() {
+        // Spoof the DER re-export check with B, then verify A.
+        return (++pinnedReads === 1 ? alleged : actual)[handle];
+      } });
+      const caller = Object.create(actual);
+      let callerReads = 0;
+      Object.defineProperty(caller, handle, { get() {
+        if (++callerReads === swappedRead) {
+          // The untrusted getter executes during a native SPKI operation.
+          // A fresh clone MUST NOT be obtained through this mutable factory.
+          exercised++;
+          crypto.createPublicKey = (options) => {
+            if (options && Buffer.isBuffer(options.key)
+              && hash(options.key) === claimedPin) return forgedPinned;
+            return savedCreatePublicKey(options);
+          };
+          return alleged[handle];
+        }
+        return actual[handle];
+      } });
+      const opts = f.options();
+      if (role === "owner") {
+        opts.pinnedOwnerPublicKey = caller;
+        opts.pinnedOwnerSpkiSha256 = claimedPin;
+        opts.readSignedCurrentFloor = (challenge) => sign({
+          type: "rootark-zk10-original-byte-floor-readback/v1",
+          immutable_account_id: f.expected.immutable_account_id,
+          owner_spki_sha256: claimedPin, sequence: f.minimum.sequence,
+          head_digest: f.minimum.headDigest, nonce: challenge, revoked: false,
+          issued_at_ms: Date.now() - 50, expires_at_ms: Date.now() + 5000,
+        }, FLOOR_FIELDS, FLOOR_DOMAIN, f.custodian.privateKey);
+      } else {
+        opts.pinnedFloorPublicKey = caller;
+        opts.pinnedFloorSpkiSha256 = claimedPin;
+      }
+      try {
+        assert.throws(() => {
+          const gate = createDevOffOriginalByteEvidenceGate(opts);
+          const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+          gate.verifyOriginalBytes({ ticket, chunks: [f.original] });
+        }, bad, `${role} A may not verify as pinned B at getter ${swappedRead}`);
+      } finally {
+        crypto.createPublicKey = savedCreatePublicKey;
+      }
+      assert.equal(callerReads, 0,
+        "the caller-backed native handle getter is rejected before execution");
+    }
+    assert.equal(exercised, 0,
+      "hostile constructor replacement must not execute during key import");
+  }
+});
+
 test("RSA-512 signatures cannot impersonate Ed25519 owner or floor using shadowed key type", () => {
   for (const role of ["owner", "floor"]) {
     const f = fixture();

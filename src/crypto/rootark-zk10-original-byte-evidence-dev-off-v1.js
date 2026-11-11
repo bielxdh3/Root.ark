@@ -40,15 +40,19 @@ const NOW = Date.now.bind(Date);
 const VERIFY = crypto.verify.bind(crypto);
 const HASH = crypto.createHash.bind(crypto);
 const RANDOM = crypto.randomBytes.bind(crypto);
+const CREATE_PUBLIC = crypto.createPublicKey.bind(crypto);
 const KEY_EQUALS = crypto.KeyObject.prototype.equals;
 // Capture the native PublicKeyObject export method from a locally created
 // disposable Ed25519 public key, never from a caller-controlled KeyObject.
 // The 32 zero bytes here are only a fixed prototype-discovery fixture; they
 // are not a trusted identity, signer, custodian, or accepted pin.
-const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
-    key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
-    format: "der", type: "spki",
-  }));
+const PUBLIC_KEY_FIXTURE = CREATE_PUBLIC({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+});
+const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(PUBLIC_KEY_FIXTURE);
+const KEY_HANDLE_SYMBOL = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kHandle");
 const KEY_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
 const KEY_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
 const KEY_ASYMMETRIC_TYPE = Object.getOwnPropertyDescriptor(
@@ -91,7 +95,15 @@ function integer(value, min, max = Number.MAX_SAFE_INTEGER) {
   return value;
 }
 function publicKey(value, pinnedSpki) {
-  if (isProxy(value) || !(value instanceof crypto.KeyObject) || KEY_TYPE.call(value) !== "public"
+  if (isProxy(value) || !(value instanceof crypto.KeyObject)
+    || Object.getPrototypeOf(value) !== PUBLIC_KEY_PROTOTYPE) deny();
+  // Never execute a caller-owned Symbol(kHandle) getter while examining a
+  // supposedly native key. Native direct KeyObjects own a DATA handle;
+  // inherited wrappers/accessors are not a stable security principal.
+  const handle = KEY_HANDLE_SYMBOL
+    && Object.getOwnPropertyDescriptor(value, KEY_HANDLE_SYMBOL);
+  if (!handle || !Object.hasOwn(handle, "value")
+    || KEY_TYPE.call(value) !== "public"
     || KEY_ASYMMETRIC_TYPE.call(value) !== "ed25519") deny();
   try {
     // Snapshot the native key material exactly once. An inherited KeyObject
@@ -99,7 +111,7 @@ function publicKey(value, pinnedSpki) {
     // All later checks must use this freshly imported, independent handle.
     const der = KEY_EXPORT.call(value, { type: "spki", format: "der" });
     if (!Buffer.isBuffer(der) || der.length !== 44) deny();
-    const pinned = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    const pinned = CREATE_PUBLIC({ key: der, format: "der", type: "spki" });
     if (KEY_TYPE.call(pinned) !== "public"
       || KEY_ASYMMETRIC_TYPE.call(pinned) !== "ed25519"
       || !KEY_EXPORT.call(pinned, { type: "spki", format: "der" }).equals(der)) deny();

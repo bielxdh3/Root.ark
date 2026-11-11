@@ -37,10 +37,15 @@ const dbPins = new WeakMap();
 // Read real crypto.KeyObject internals, not shadowable instance properties.
 // This fixed DER public key only discovers Node's native public-key prototype;
 // it is never an accepted signer, owner pin, or trusted custodian identity.
-const publicKeyPrototype = Object.getPrototypeOf(crypto.createPublicKey({
+const CREATE_PUBLIC = crypto.createPublicKey.bind(crypto);
+const CREATE_PRIVATE = crypto.createPrivateKey.bind(crypto);
+const publicKeyFixture = CREATE_PUBLIC({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
-}));
+});
+const publicKeyPrototype = Object.getPrototypeOf(publicKeyFixture);
+const nativeKeyHandle = Object.getOwnPropertySymbols(publicKeyFixture)
+  .find((symbol) => symbol.description === "kHandle");
 const nativeType = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
 const nativeAlgorithm = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(publicKeyPrototype), "asymmetricKeyType").get;
@@ -59,7 +64,10 @@ function deny() {
   throw error;
 }
 function strict(value, fields) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)
+  // Reject proxies before any ownKeys/getPrototypeOf/descriptor hooks:
+  // a malicious hook could replace crypto.verify while inspecting a signed
+  // owner lease, falsely authorizing the custodian's genuine Ed25519 signer.
+  if (value === null || typeof value !== "object" || isProxy(value) || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
     || Reflect.ownKeys(value).length !== fields.length) deny();
   const result = {};
@@ -95,7 +103,15 @@ function unsignedSigned(wire, fields, type, domain, publicKey) {
   return payload;
 }
 function keyObject(value, type) {
-  if (isProxy(value) || !(value instanceof crypto.KeyObject) || nativeType.call(value) !== type
+  if (isProxy(value) || !(value instanceof crypto.KeyObject)
+    || Object.getPrototypeOf(value) !== (type === "private"
+      ? privateKeyPrototype : publicKeyPrototype)) deny();
+  const handle = nativeKeyHandle
+    && Object.getOwnPropertyDescriptor(value, nativeKeyHandle);
+  // Reject a caller-inherited or getter-backed native handle *before* calling
+  // intrinsics. Otherwise the getter could replace the crypto import factory.
+  if (!handle || !Object.hasOwn(handle, "value")
+    || nativeType.call(value) !== type
     || nativeAlgorithm.call(value) !== "ed25519") deny();
   let der;
   try {
@@ -107,8 +123,8 @@ function keyObject(value, type) {
       { format: "der", type: isPrivate ? "pkcs8" : "spki" });
     if (!Buffer.isBuffer(der) || der.length !== (isPrivate ? 48 : 44)) deny();
     const pinned = isPrivate
-      ? crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" })
-      : crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+      ? CREATE_PRIVATE({ key: der, format: "der", type: "pkcs8" })
+      : CREATE_PUBLIC({ key: der, format: "der", type: "spki" });
     if (nativeType.call(pinned) !== type
       || nativeAlgorithm.call(pinned) !== "ed25519") deny();
     if (!isPrivate && !nativePublicExport.call(pinned,
@@ -346,7 +362,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
     if (o.devOff !== true || process.env.NODE_ENV === "production") deny();
     const owner = keyObject(o.ownerPublicKey, "public");
     const signer = keyObject(o.custodianPrivateKey, "private");
-    const signerPublic = keyObject(crypto.createPublicKey(signer), "public");
+    const signerPublic = keyObject(CREATE_PUBLIC(signer), "public");
     const ownerHash = spki(owner);
     const signerHash = spki(signerPublic);
     if (nativeKeyEquals.call(owner, signerPublic) || ownerHash === signerHash

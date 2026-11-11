@@ -134,7 +134,7 @@ test("P2 native owner kHandle cannot make the physical custodian signer its own 
     ...x.config, ownerPublicKey: forged, bootstrap,
   })), /ZK10_CUSTODIAN_UNAVAILABLE/,
   "one actual key A cannot serve owner and custodian despite claimed B");
-  assert.ok(reads >= 1, "native key-handle swap was exercised");
+  assert.equal(reads, 0, "owner key-handle getter is rejected without execution");
 });
 
 test("P2 mutable private signer cannot sign CURRENT as A while claiming custodian SPKI B", (t) => {
@@ -165,7 +165,115 @@ test("P2 mutable private signer cannot sign CURRENT as A while claiming custodia
   } catch (error) {
     if (error.code !== "ZK10_CUSTODIAN_UNAVAILABLE") throw error;
   }
-  assert.ok(reads >= 2, "native private key-handle swap was exercised");
+  assert.equal(reads, 0, "private key-handle getter is rejected without execution");
+});
+
+test("P2 native PKCS8 factory must not be replaceable by a private KeyObject getter", (t) => {
+  const x = setup(t, "private-key-factory-swap");
+  const actual = x.custodian;
+  const alleged = crypto.generateKeyPairSync("ed25519");
+  const handle = Object.getOwnPropertySymbols(actual.privateKey)
+    .find((item) => String(item) === "Symbol(kHandle)");
+  assert.ok(handle, "exercise the native Ed25519 private handle");
+  const savedCreatePrivateKey = crypto.createPrivateKey;
+  const forgedPinned = Object.create(actual.privateKey);
+  let pinnedReads = 0;
+  Object.defineProperty(forgedPinned, handle, { get() {
+    // Native derive sees B; crypto.sign later sees A.
+    return (++pinnedReads === 2 ? alleged.privateKey : actual.privateKey)[handle];
+  } });
+  const caller = Object.create(actual.privateKey);
+  let callerReads = 0;
+  let factoryWasReplaced = false;
+  Object.defineProperty(caller, handle, { get() {
+    if (++callerReads === 2) {
+      factoryWasReplaced = true;
+      crypto.createPrivateKey = () => forgedPinned;
+    }
+    return actual.privateKey[handle];
+  } });
+  try {
+    const custodian = x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, custodianPrivateKey: caller,
+      custodianSpkiSha256: keyHash(alleged.publicKey),
+    }));
+    const { request, ownerLease } = x.offer();
+    const { signature, ...payload } = custodian.attest(request, ownerLease).floor;
+    const message = signatureBytes(DOMAIN_FLOOR, payload);
+    const signed = Buffer.from(signature, "base64url");
+    assert.equal(crypto.verify(null, message, alleged.publicKey, signed), true,
+      "CURRENT must verify under the actual configured custodian SPKI B");
+    assert.equal(crypto.verify(null, message, actual.publicKey, signed), false,
+      "the original private signer A may not impersonate B");
+  } catch (error) {
+    if (error.code !== "ZK10_CUSTODIAN_UNAVAILABLE") throw error;
+  } finally {
+    crypto.createPrivateKey = savedCreatePrivateKey;
+  }
+  assert.equal(callerReads, 0,
+    "native private-key getter cannot run and replace crypto.createPrivateKey");
+  assert.equal(factoryWasReplaced, false, "private native factory remains uncompromised");
+});
+
+test("genuine DER-imported Ed25519 owner and custodian keys remain usable", (t) => {
+  const x = setup(t, "genuine-imported-native-keys");
+  const ownerDer = x.owner.publicKey.export({ format: "der", type: "spki" });
+  const custodianDer = x.custodian.privateKey.export({ format: "der", type: "pkcs8" });
+  let importedPrivate;
+  try {
+    importedPrivate = crypto.createPrivateKey({
+      key: custodianDer, format: "der", type: "pkcs8",
+    });
+  } finally {
+    custodianDer.fill(0);
+  }
+  const importedOwner = crypto.createPublicKey({
+    key: ownerDer, format: "der", type: "spki",
+  });
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, ownerPublicKey: importedOwner, custodianPrivateKey: importedPrivate,
+  }));
+  const { request, ownerLease } = x.offer();
+  const { signature, ...payload } = c.attest(request, ownerLease).floor;
+  assert.equal(crypto.verify(null, signatureBytes(DOMAIN_FLOOR, payload),
+    x.custodian.publicKey, Buffer.from(signature, "base64url")), true);
+  assert.equal(c.independentOffServerCustodyProven, false);
+});
+
+test("P2 proxy-verifier forged owner lease cannot install fake crypto verify", (t) => {
+  const x = setup(t, "owner-lease-proxy-verify-hook");
+  const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const { request, ownerLease } = x.offer();
+  const { signature: _discard, ...unsigned } = ownerLease;
+  const unsignedByOwner = signatureBytes(DOMAIN_LEASE, unsigned);
+  const forged = { ...unsigned, signature: crypto.sign(null,
+    unsignedByOwner, foreign.privateKey).toString("base64url") };
+  assert.equal(crypto.verify(null, unsignedByOwner,
+    x.owner.publicKey, Buffer.from(forged.signature, "base64url")), false,
+  "the owner did not sign this adversarial lease");
+
+  const nativeVerify = crypto.verify;
+  let descriptorTrapCalls = 0;
+  const proxy = new Proxy(forged, {
+    getOwnPropertyDescriptor(target, property) {
+      descriptorTrapCalls++;
+      crypto.verify = (algorithm, message, key, signatureBytesArg) => {
+        if (Buffer.isBuffer(message)
+          && message.subarray(0, DOMAIN_LEASE.length).equals(DOMAIN_LEASE)) return true;
+        return nativeVerify(algorithm, message, key, signatureBytesArg);
+      };
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  try {
+    assert.throws(() => c.attest(request, proxy), /ZK10_CUSTODIAN_UNAVAILABLE/,
+      "an injected verifier cannot turn a foreign signature into owner authorization");
+  } finally {
+    crypto.verify = nativeVerify;
+  }
+  assert.equal(descriptorTrapCalls, 0,
+    "a Proxy owner lease must be rejected before its descriptor hooks execute");
 });
 
 test("P2: native Ed25519 identity survives caller-shadowed KeyObject type metadata", (t) => {
