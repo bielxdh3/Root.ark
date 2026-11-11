@@ -5,6 +5,16 @@
 const crypto = require("node:crypto");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
+// Read native identity from Node prototypes, not caller-shadowable .type,
+// .asymmetricKeyType or .export properties of the supplied KeyObject.
+const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+}));
+const NATIVE_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
+const NATIVE_ALGORITHM = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
+const NATIVE_PUBLIC_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
 const OWNER_FIELDS = Object.freeze(["type", "immutable_account_id", "zk_account_id",
   "generation", "previous_cutover_digest", "inventory_head", "complete_corpus",
   "covered_compartments", "legacy_egress_scope", "reference_disposition",
@@ -39,12 +49,13 @@ function decode(value, length) {
 }
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
 function key(value, type) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== type
-    || value.asymmetricKeyType !== "ed25519") deny();
+  if (!(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
+    || NATIVE_ALGORITHM.call(value) !== "ed25519") deny();
   return value;
 }
 function spkiHash(publicKey) {
-  return H(key(publicKey, "public").export({ format: "der", type: "spki" })).toString("hex");
+  return H(NATIVE_PUBLIC_EXPORT.call(key(publicKey, "public"),
+    { format: "der", type: "spki" })).toString("hex");
 }
 function ownerPayload(payload) {
   const p = exact(payload, OWNER_FIELDS);
