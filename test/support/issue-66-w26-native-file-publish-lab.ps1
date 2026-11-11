@@ -3,6 +3,7 @@ param(
                'HELD_REBIND', 'HELD_JUNCTION', 'PRECREATE_SCRATCH_JUNCTION',
                'PRECREATE_SCRATCH_DIRECTORY', 'PRECREATE_SCRATCH_JUNCTION_NO_ACK',
                'PRECREATE_SCRATCH_DIRECTORY_NO_ACK',
+               'PREPIN_COLD_ORIGIN_REQUIRED',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
                'COLD_INSPECT')]
   [string]$Mode,
@@ -43,6 +44,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using Microsoft.Win32.SafeHandles;
 
 public static class RootarkW26NativeFilePublishLab {
@@ -129,6 +131,12 @@ public static class RootarkW26NativeFilePublishLab {
   [DllImport("kernel32.dll", EntryPoint = "TerminateProcess", SetLastError = true)]
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool Terminate(IntPtr process, uint exitCode);
+  [DllImport("advapi32.dll", EntryPoint = "GetSecurityInfo", SetLastError = true)]
+  private static extern uint GetSecurityInfo(SafeFileHandle handle, uint objectType,
+    uint securityInfo, out IntPtr ownerSid, IntPtr groupSid, IntPtr dacl,
+    IntPtr sacl, out IntPtr securityDescriptor);
+  [DllImport("kernel32.dll", EntryPoint = "LocalFree")]
+  private static extern IntPtr LocalFree(IntPtr ptr);
 
   private static readonly string Trusted = "ORIGINAL_OPENED_STAGE_BYTES";
   private static readonly string Foreign = "FOREIGN_UNTRUSTED_TARGET_BYTES";
@@ -444,6 +452,28 @@ public static class RootarkW26NativeFilePublishLab {
     // No pathname writer can follow a same-SID junction into a foreign dir.
     using (SafeFileHandle signal = File(scratch, name, true)) Write(signal, content);
   }
+  private static void RequireColdOriginalCustody(AncestorCustody custody) {
+    // This is a read-only, negative-only native probe. An independent owner
+    // has NOT enrolled a trusted original-A FileId or signed ancestry floor.
+    // Even an owner different from this process is INSUFFICIENT to authorize.
+    custody.Validate();
+    IntPtr sid = IntPtr.Zero, descriptor = IntPtr.Zero;
+    try {
+      uint status = GetSecurityInfo(custody.Scratch, 1 /* SE_FILE_OBJECT */,
+        1 /* OWNER_SECURITY_INFORMATION */, out sid,
+        IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out descriptor);
+      if (status != 0 || sid == IntPtr.Zero || descriptor == IntPtr.Zero)
+        throw new InvalidOperationException("NATIVE_SCRATCH_OWNER_UNAVAILABLE");
+      // A same-principal owned scratch is positively unsuitable as an
+      // independently protected original-A anchor. This check is not a
+      // sufficient ACL policy for any positive trusted-parent admission.
+      if (new SecurityIdentifier(sid).Equals(WindowsIdentity.GetCurrent().User))
+        throw new InvalidOperationException("SAME_SID_ORIGIN_UNTRUSTED");
+    } finally {
+      if (descriptor != IntPtr.Zero) LocalFree(descriptor);
+    }
+    throw new InvalidOperationException("INDEPENDENT_SIGNED_ORIGINAL_FILEID_NOT_PROVISIONED");
+  }
   private static void PlantForeign(string filename, string content) {
     // The deterministic same-SID writer uses pathnames on purpose, but must
     // never truncate an object which unexpectedly wins this laboratory name.
@@ -514,6 +544,21 @@ public static class RootarkW26NativeFilePublishLab {
       throw new InvalidOperationException("HARD_EXIT_TEST_DISABLED");
     if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
       throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
+    if (mode == "PREPIN_COLD_ORIGIN_REQUIRED") {
+      // Separate-process test coordination uses STDOUT/STDIN, not a mutable
+      // on-disk marker or signature. There is NO native scratch pin yet.
+      if (Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_PREPIN_ATTACK_LAB") != "1")
+        throw new InvalidOperationException("PREPIN_ATTACK_DISABLED");
+      Console.Out.WriteLine("ROOTARK_W26_PREPIN_BOUNDARY_V1");
+      Console.Out.Flush();
+      if (Console.ReadLine() != "ORIGIN_ATTACK_COMPLETE_V1")
+        throw new InvalidOperationException("PREPIN_ATTACK_NOT_PHYSICAL");
+      // Read-only native chain; refuse writes even if the path currently
+      // names a perfectly ordinary, empty but DIFFERENT NTFS directory B.
+      using (var original = new AncestorCustody(scratch, true, false, true))
+        RequireColdOriginalCustody(original);
+      throw new InvalidOperationException("COLD_ORIGIN_NOT_AUTHORIZED");
+    }
     // Run(NORMAL) is NOT safe against a plain B already substituted before
     // the first native pin below: B may receive held and published bytes.
     // PRECREATE tests start the adversary only AFTER that pin, so their GREEN

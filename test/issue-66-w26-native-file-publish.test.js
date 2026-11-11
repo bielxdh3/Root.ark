@@ -12,6 +12,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
+const { openNativeRootSession } = require("../sync-client/rootark-sync-native-root-session-contract");
 
 const available = process.platform === "win32"
   && process.env.ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB === "1";
@@ -349,6 +350,87 @@ test(`#66 W26 denies physical same-SID ${mode} before held and signal can mutate
   assert.equal(fs.readFileSync(sentinel, "utf8"), "FOREIGN_UNTOUCHED");
 });
 }
+
+for (const replacement of ["PLAIN_B", "JUNCTION_B"]) {
+  test(`#66 W26 cold initial original-A guard denies pre-FIRST-native-pin ${replacement} with zero foreign I/O`,
+    { skip: !available, timeout: 30000 }, async () => {
+      const scratch = fixture();
+      const parked = `${scratch}-parked`;
+      const junction = replacement === "JUNCTION_B";
+      const foreign = junction
+        ? fs.mkdtempSync(path.join(localAppData, "rootark-w26-native-foreign-"))
+        : scratch;
+      if (junction) fs.writeFileSync(path.join(foreign, "FOREIGN_CANARY_DO_NOT_TOUCH"),
+        "FOREIGN_UNTOUCHED", { flag: "wx" });
+      const attacker = String.raw`
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const scratch = process.argv[1];
+        const foreign = process.argv[2];
+        const junction = process.argv[3] === 'JUNCTION_B';
+        fs.renameSync(scratch, scratch + '-parked');
+        if (junction) fs.symlinkSync(foreign, scratch, 'junction');
+        else {
+          fs.mkdirSync(scratch);
+          const file = fs.openSync(path.join(scratch, 'FOREIGN_CANARY_DO_NOT_TOUCH'), 'wx');
+          try { fs.writeSync(file, 'FOREIGN_UNTOUCHED'); fs.fsyncSync(file); }
+          finally { fs.closeSync(file); }
+        }
+        if (fs.lstatSync(scratch).isSymbolicLink() !== junction)
+          throw new Error('ATTACK_WRONG_PHYSICAL_TYPE');
+      `;
+      const proc = spawn(powershell, [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", script, "-Scratch", scratch, "-Mode", "PREPIN_COLD_ORIGIN_REQUIRED",
+      ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: {
+        ...process.env, ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: "1",
+        ROOTARK_ISSUE66_W26_PREPIN_ATTACK_LAB: "1",
+      } });
+      let out = "", err = "", attackerRan = false;
+      proc.stdout.setEncoding("utf8");
+      proc.stderr.setEncoding("utf8");
+      proc.stderr.on("data", (part) => { err += part; });
+      proc.stdout.on("data", (part) => {
+        out += part;
+        if (attackerRan || !out.includes("ROOTARK_W26_PREPIN_BOUNDARY_V1")) return;
+        attackerRan = true;
+        const moved = spawnSync(process.execPath, ["-e", attacker, scratch, foreign,
+          replacement], { windowsHide: true, encoding: "utf8", timeout: 10000 });
+        if (moved.status !== 0) {
+          err += `ATTACK_FAILED: ${moved.stderr}`;
+          proc.stdin.end("INVALID_ATTACK\n");
+        } else proc.stdin.end("ORIGIN_ATTACK_COMPLETE_V1\n");
+      });
+      const finished = await new Promise((resolve, reject) => {
+        proc.once("error", reject);
+        proc.once("exit", (code, signal) => resolve({ code, signal }));
+      });
+      assert.equal(attackerRan, true, `no early native boundary: ${err}`);
+      assert.deepEqual(finished, { code: 41, signal: null }, err);
+      assert.match(out, /^ROOTARK_W26_PREPIN_BOUNDARY_V1\r?\n$/);
+      assert.match(err, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+      assert.equal(fs.lstatSync(scratch).isSymbolicLink(), junction);
+      assert.notEqual(fs.statSync(parked, { bigint: true }).ino,
+        fs.statSync(scratch, { bigint: true }).ino,
+        "a second same-SID process must substitute a different physical FileId");
+      assert.deepEqual(fs.readdirSync(parked), [], "original A remains untouched");
+      assert.deepEqual(fs.readdirSync(foreign), ["FOREIGN_CANARY_DO_NOT_TOUCH"],
+        "foreign B must contain only its attacker's original canary");
+      assert.equal(fs.readFileSync(path.join(foreign, "FOREIGN_CANARY_DO_NOT_TOUCH"),
+        "utf8"), "FOREIGN_UNTOUCHED");
+      assert.throws(() => openNativeRootSession(true),
+        { code: "root_session_native_unavailable" }, "production RootSession remains OFF");
+    });
+}
+
+test("#66 W26 native cold original guard never accepts a caller marker without explicit lab opt-in",
+  { skip: !available }, () => {
+    const scratch = fixture();
+    const result = invoke(scratch, "PREPIN_COLD_ORIGIN_REQUIRED");
+    assert.equal(result.status, 41);
+    assert.equal(result.stdout, "");
+    assert.deepEqual(fs.readdirSync(scratch), []);
+  });
 
 test("#66 W26 ancestor-rebind attack requires an independent explicit opt-in", {
   skip: !available, timeout: 25000,
