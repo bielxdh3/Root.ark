@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -72,6 +73,56 @@ async function persisted(f) {
     journal: await fsp.readFile(path.join(f.rootDir, ".rootark-sync-journal.json"), "utf8"),
     snapshot: await fsp.readFile(path.join(f.rootDir, ".rootark-sync-index.json"), "utf8"),
   };
+}
+
+// Bind negative-only crash evidence to the SAME opened inode; an lstat(path)
+// followed by readFile(path) could observe unrelated equal-byte replacements.
+// These disposable receipts never grant cold authority or clean up a name.
+async function holdColdFile(t, directory, name) {
+  const filename = path.join(directory, name);
+  const handle = await fsp.open(filename,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  t.after(() => handle.close());
+  const before = await handle.stat({ bigint: true });
+  assert.equal(before.isFile(), true);
+  assert.notEqual(before.ino, 0n);
+  assert.equal(before.nlink, 1n);
+  assert.ok(before.size > 0n && before.size < 1024n * 1024n,
+    "the disposable cold receipt must be bounded");
+  const data = Buffer.alloc(Number(before.size) + 1);
+  const { bytesRead } = await handle.read(data, 0, data.length, 0);
+  assert.equal(BigInt(bytesRead), before.size);
+  const after = await handle.stat({ bigint: true });
+  for (const key of ["dev", "ino", "size", "mtimeNs", "ctimeNs"]) {
+    assert.equal(after[key], before[key], `opened ${name} changed during read`);
+  }
+  return { filename, name, handle, before, data: data.subarray(0, bytesRead) };
+}
+
+async function assertColdFileUntouched(receipt) {
+  const current = await receipt.handle.stat({ bigint: true });
+  for (const key of ["dev", "ino", "size", "mtimeNs", "ctimeNs"]) {
+    assert.equal(current[key], receipt.before[key], `${receipt.name} original inode changed`);
+  }
+  const bytes = Buffer.alloc(receipt.data.length + 1);
+  const { bytesRead } = await receipt.handle.read(bytes, 0, bytes.length, 0);
+  assert.equal(bytesRead, receipt.data.length);
+  assert.deepEqual(bytes.subarray(0, bytesRead), receipt.data);
+  const reopened = await fsp.open(receipt.filename,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const named = await reopened.stat({ bigint: true });
+    assert.equal(named.dev, receipt.before.dev);
+    assert.equal(named.ino, receipt.before.ino,
+      `${receipt.name} name was rebound to a different inode`);
+  } finally { await reopened.close(); }
+}
+
+async function holdOneUncommittedTemp(t, directory, prefix) {
+  const names = (await fsp.readdir(directory)).filter((name) => name.startsWith(prefix));
+  assert.equal(names.length, 1, "failed publication must retain one uncommitted temporary");
+  const receipt = await holdColdFile(t, directory, names[0]);
+  return { names: await fsp.readdir(directory), receipt };
 }
 
 test("W22 inert source: exact 160/640 signed remoteOnly CREATE stays metadata-only and persists 2 journal + 1 snapshot transactions", async (t) => {
@@ -192,7 +243,7 @@ test("W22 inert source: active eviction or local tracked/pinned state cannot ent
   assert.deepEqual(await persisted(f), before);
 });
 
-test("W22 inert source: EIO before snapshot rename leaves journal pins, no marker; cold retry completes", async (t) => {
+test("W22 inert source: snapshot rename EIO preserves pins and quarantines an untrusted cold orphan", async (t) => {
   const f = await fixture(t, 4);
   const old = await persisted(f);
   const originalRename = fsp.rename;
@@ -204,13 +255,22 @@ test("W22 inert source: EIO before snapshot rename leaves journal pins, no marke
   const intermediate = await persisted(f);
   assert.equal(intermediate.snapshot, old.snapshot);
   assert.equal(Object.keys(JSON.parse(intermediate.journal).observed).length, 4);
+  assert.equal(JSON.parse(intermediate.journal).seen.length, 0);
+  const { names, receipt: orphan } = await holdOneUncommittedTemp(t, f.rootDir,
+    ".rootark-sync-index.json.tmp-");
+  const snapshot = await holdColdFile(t, f.rootDir, ".rootark-sync-index.json");
+  const journal = await holdColdFile(t, f.rootDir, ".rootark-sync-journal.json");
   const restarted = await f.makeEngine();
   assert.equal(Object.keys(restarted.snapshot.remoteOnly).length, 0);
-  assert.deepEqual(await probeStrictRemoteOnlyBatch(restarted, f.trusted),
-    { observed: 0, acknowledged: 4 });
-  const complete = await f.makeEngine();
-  assert.equal(Object.keys(complete.snapshot.remoteOnly).length, 4);
-  assert.equal(complete.journal.state.seen.length, 4);
+  await assert.rejects(probeStrictRemoteOnlyBatch(restarted, f.trusted),
+    { code: "unsafe_path" }, "a preserved untrusted orphan cannot authorize a cold ACK");
+  assert.equal(f.state.pushes, 0);
+  assert.equal((await restarted.journal.recover()).length, 0);
+  assert.equal(restarted.journal.state.seen.length, 0);
+  assert.equal(Object.keys(restarted.journal.state.observed).length, 4);
+  assert.deepEqual(await persisted(f), intermediate);
+  assert.deepEqual(await fsp.readdir(f.rootDir), names);
+  for (const witness of [orphan, snapshot, journal]) await assertColdFileUntouched(witness);
 });
 
 test("W22 inert source: externally trusted policy epoch rollback/revocation across preflight refuses snapshot", async (t) => {
@@ -285,7 +345,7 @@ test("W22 inert source: incomplete LIST, missing prior marker and repeated opera
     { code: "remote_only_batch_ineligible" });
 });
 
-test("W22 inert source: markSeen EIO leaves checkpoint plus exact pins and replays after cold restart", async (t) => {
+test("W22 inert source: markSeen EIO preserves exact pins but cold orphan blocks unsafe replay", async (t) => {
   const f = await fixture(t, 3);
   let journalWrites = 0;
   const originalRename = fsp.rename;
@@ -297,12 +357,25 @@ test("W22 inert source: markSeen EIO leaves checkpoint plus exact pins and repla
   };
   try { await assert.rejects(probeStrictRemoteOnlyBatch(f.engine, f.trusted), { code: "EIO" }); }
   finally { fsp.rename = originalRename; }
+  const intermediate = await persisted(f);
+  assert.equal(Object.keys(JSON.parse(intermediate.snapshot).remoteOnly).length, 3);
+  assert.equal(Object.keys(JSON.parse(intermediate.journal).observed).length, 3);
+  assert.equal(JSON.parse(intermediate.journal).seen.length, 0);
+  const { names, receipt: orphan } = await holdOneUncommittedTemp(t, f.rootDir,
+    ".rootark-sync-journal.json.tmp-");
+  const snapshot = await holdColdFile(t, f.rootDir, ".rootark-sync-index.json");
+  const journal = await holdColdFile(t, f.rootDir, ".rootark-sync-journal.json");
   const restarted = await f.makeEngine();
   assert.equal(Object.keys(restarted.snapshot.remoteOnly).length, 3);
   assert.equal(Object.keys(restarted.journal.state.observed).length, 3);
-  assert.deepEqual(await probeStrictRemoteOnlyBatch(restarted, f.trusted),
-    { observed: 0, acknowledged: 3 });
-  assert.equal((await f.makeEngine()).journal.state.seen.length, 3);
+  assert.equal(restarted.journal.state.seen.length, 0);
+  await assert.rejects(probeStrictRemoteOnlyBatch(restarted, f.trusted),
+    { code: "unsafe_path" }, "a failed ACK's temporary is not a signed admission receipt");
+  assert.equal(f.state.pushes, 0);
+  assert.equal(restarted.journal.state.seen.length, 0);
+  assert.deepEqual(await persisted(f), intermediate);
+  assert.deepEqual(await fsp.readdir(f.rootDir), names);
+  for (const witness of [orphan, snapshot, journal]) await assertColdFileUntouched(witness);
 });
 
 test("W22 inert source: expiry after observation permits same digest restart, but revocation rejects", async (t) => {

@@ -9,6 +9,23 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 — Issue #66 / PR #300, W22 inert remote-only source:
+pre-rename `EIO` em checkpoint da snapshot ou ACK do journal deixa
+um `.tmp-<pid>-<uuid>` físico não autorizador. O temporário deve ser
+preservado: excluir por pathname depois da falha poderia apagar um inode
+estrangeiro substituído por escritor do mesmo UID/SID. O classificador W22
+de raiz vazia **rejeita** esse nome com `unsafe_path` antes de qualquer
+ACK/replay; não existe prova nativa independente que autorize o descarte.
+Os dois testes legados que prometiam retry automático foram alterados para
+provar os mesmos inodes/bytes originais por descritores retidos, journal
+observed/seen, snapshot anterior, nenhum push/DELETE e ausência de
+autorização fria. Testes físicos RED anteriores: 2 falhas no WSL22;
+GREEN WSL22/ext4: **15 PASS / 0 FAIL** no arquivo W22 completo, incluindo
+recuperação legítima sem órfão após saída abrupta de processo. Não é
+recuperação operacional de órfão hostil: requer custódia nativa protegida
+para reconciliação independente. Os testes não ativam `RootSession` nem
+transferem resultado à CI hospedada de outro SHA. **MERGE/RELEASE NO-GO**.
+
 2026-11-06 — Issue #66, etapa parcial em revisao: inventario de metadados
 autenticado, paginado e limitado por resposta, com cursores invalidaveis por
 mudanca na biblioteca e isolamento por conta. Adapter e SyncEngine expõem
