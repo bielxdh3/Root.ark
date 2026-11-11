@@ -253,7 +253,13 @@ test("sync journal retries transient Windows rename EPERM without replacing comm
       assert.ok(failedCalls.every(([source, destination]) => source === failedCalls[0][0] && destination === filePath));
       assert.equal(await fsp.readFile(filePath, "utf8"), committedState);
       assert.deepEqual(journal.pending().map((operation) => operation.operationId), ["journal-retry-ok"]);
-      assert.deepEqual((await fsp.readdir(dir)).filter((name) => name.startsWith("journal.json.tmp-")), []);
+      // A failed rename cannot authorize unlink of a same-SID-replaceable
+      // stage name. Its orphan remains nonauthorizing; cold journal read must
+      // still recover only the previously committed operation.
+      const orphans = (await fsp.readdir(dir)).filter((name) => name.startsWith("journal.json.tmp-"));
+      assert.equal(orphans.length, 1, "failed journal stage is retained for safe recovery");
+      const reopened = await new SyncJournal(filePath).open();
+      assert.deepEqual(reopened.pending().map((operation) => operation.operationId), ["journal-retry-ok"]);
     }
   } finally {
     if (process.platform === "win32") fsp.rename = originalRename;
@@ -297,14 +303,19 @@ test("sync snapshot retries a transient Windows rename EPERM", { skip: process.p
     await assert.rejects(engine.persistSnapshot(), { code: "EPERM" });
     assert.equal(attempts - attemptsBeforeFailure, 3, "persistent Windows EPERM stops after the bounded retry count");
     assert.equal(await fsp.readFile(snapshotPath, "utf8"), committedSnapshot, "exhaustion preserves the previously committed snapshot");
-    assert.deepEqual((await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-")), []);
+    // Do not delete a mutable temporary pathname after failed publication;
+    // it can belong to a different inode by the time a cleanup runs.
+    const afterEperm = (await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-"));
+    assert.equal(afterEperm.length, 1, "failed EPERM stage must be retained");
 
     failureCode = "EIO";
     const attemptsBeforeNonEperm = attempts;
     await assert.rejects(engine.persistSnapshot(), { code: "EIO" });
     assert.equal(attempts - attemptsBeforeNonEperm, 1, "non-EPERM failures are not retried");
     assert.equal(await fsp.readFile(snapshotPath, "utf8"), committedSnapshot);
-    assert.deepEqual((await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-")), []);
+    const afterEio = (await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-"));
+    assert.equal(afterEio.length, 2, "non-EPERM stage must remain alongside the earlier orphan");
+    assert.ok(afterEperm.every((name) => afterEio.includes(name)), "earlier orphan must not be deleted");
   } finally {
     fsp.rename = originalRename;
   }
