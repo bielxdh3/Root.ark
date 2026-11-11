@@ -1,6 +1,6 @@
 param(
   [ValidateSet('NORMAL', 'COLLISION', 'EXTERNAL_COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
-               'HELD_REBIND', 'HELD_JUNCTION',
+               'HELD_REBIND', 'HELD_JUNCTION', 'PRECREATE_SCRATCH_JUNCTION',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
                'COLD_INSPECT')]
   [string]$Mode,
@@ -168,7 +168,8 @@ public static class RootarkW26NativeFilePublishLab {
     } catch { root.Dispose(); throw; }
   }
   private static SafeFileHandle DirectoryChild(SafeFileHandle parent, string component,
-      bool readOnly) {
+      bool readOnly, bool create = false) {
+    if (create && readOnly) throw new InvalidOperationException("CREATION_MUST_BE_WRITABLE");
     if (string.IsNullOrEmpty(component) || component == "." || component == ".." ||
         component.IndexOfAny(new char[] { '\\', '/', ':' }) != -1)
       throw new InvalidOperationException("UNTRUSTED_ANCESTOR_COMPONENT");
@@ -186,7 +187,7 @@ public static class RootarkW26NativeFilePublishLab {
       int code = OpenRelative(out opened,
         readOnly ? 0x001000A1U /* SYNC | READ_ATTR | TRAVERSE | LIST */ : 0x001F01FFU,
         ref attr, out status, IntPtr.Zero, 0x80, 7,
-        1U /* FILE_OPEN only */,
+        create ? 2U /* FILE_CREATE exclusive */ : 1U /* FILE_OPEN only */,
         0x00200021U /* OPEN_REPARSE_POINT | DIRECTORY_FILE | SYNCHRONOUS */,
         IntPtr.Zero, 0);
       if (code != 0 || opened == null || opened.IsInvalid) {
@@ -211,7 +212,7 @@ public static class RootarkW26NativeFilePublishLab {
     private readonly List<string> components = new List<string>();
     internal SafeFileHandle Held { get { return handles[handles.Count - 1]; } }
 
-    internal AncestorCustody(string scratch, bool heldReadOnly) {
+    internal AncestorCustody(string scratch, bool heldReadOnly, bool createHeld = false) {
       string full = Path.GetFullPath(scratch).TrimEnd('\\');
       volumePath = Path.GetPathRoot(full);
       if (string.IsNullOrEmpty(volumePath) || volumePath.Length != 3 ||
@@ -224,14 +225,24 @@ public static class RootarkW26NativeFilePublishLab {
         handles.Add(volume);
         identities.Add(Id(volume));
         components.Add(null);
-        for (int i = 0; i <= parts.Length; i++) {
-          string component = i == parts.Length ? "held" : parts[i];
+        for (int i = 0; i < parts.Length; i++) {
+          string component = parts[i];
+          // Only the original scratch directory can create held. All other
+          // ancestors need read-only directory traversal rights.
           SafeFileHandle child = DirectoryChild(handles[handles.Count - 1], component,
-            i != parts.Length || heldReadOnly);
+            !(createHeld && i == parts.Length - 1));
           handles.Add(child);
           identities.Add(Id(child));
           components.Add(component);
         }
+        // NtCreateFile resolves this single leaf against the pinned scratch
+        // HANDLE, without any pathname mkdir through a replaceable junction.
+        // No other child or ancestor may be created as a side effect.
+        SafeFileHandle held = DirectoryChild(handles[handles.Count - 1], "held",
+          heldReadOnly, createHeld);
+        handles.Add(held);
+        identities.Add(Id(held));
+        components.Add("held");
       } catch { Dispose(); throw; }
     }
     internal void Validate() {
@@ -459,7 +470,8 @@ public static class RootarkW26NativeFilePublishLab {
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";
-    bool ancestorAttack = mode == "HELD_REBIND" || mode == "HELD_JUNCTION";
+    bool ancestorAttack = mode == "HELD_REBIND" || mode == "HELD_JUNCTION" ||
+      mode == "PRECREATE_SCRATCH_JUNCTION";
     if (ancestorAttack &&
         Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_ANCESTOR_ATTACK_LAB") != "1")
       throw new InvalidOperationException("ANCESTOR_ATTACK_LAB_DISABLED");
@@ -471,9 +483,29 @@ public static class RootarkW26NativeFilePublishLab {
       throw new InvalidOperationException("HARD_EXIT_TEST_DISABLED");
     if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
       throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
+    if (mode == "PRECREATE_SCRATCH_JUNCTION") {
+      // An independent same-SID process switches the scratch name AFTER the
+      // PowerShell clean-scratch preflight but BEFORE the former pathname
+      // mkdir. No native custody exists yet, making this the exact P2 gap.
+      string ready = Path.Combine(scratch, "precreate-ready.signal");
+      using (var signal = new FileStream(ready, FileMode.CreateNew,
+          FileAccess.Write, FileShare.Read, 4096, false)) {
+        byte[] bytes = Encoding.UTF8.GetBytes("PRECREATE_READY_V1");
+        signal.Write(bytes, 0, bytes.Length);
+        signal.Flush(true);
+      }
+      string ack = Path.Combine(scratch + "-parked", "precreate-ack.signal");
+      DateTime deadline = DateTime.UtcNow.AddSeconds(10);
+      while (!System.IO.File.Exists(ack)) {
+        if (DateTime.UtcNow > deadline)
+          throw new InvalidOperationException("PRECREATE_ATTACK_TIMEOUT");
+        System.Threading.Thread.Sleep(10);
+      }
+      if (ReadFixture(ack) != "PRECREATE_JUNCTION_PHYSICAL_V1")
+        throw new InvalidOperationException("PRECREATE_ATTACK_NOT_PHYSICAL");
+    }
     string parent = Path.Combine(scratch, "held");
-    Directory.CreateDirectory(parent);
-    using (var custody = new AncestorCustody(scratch, false)) {
+    using (var custody = new AncestorCustody(scratch, false, true)) {
       SafeFileHandle root = custody.Held;
       custody.Validate();
       string visibleParent = parent;
