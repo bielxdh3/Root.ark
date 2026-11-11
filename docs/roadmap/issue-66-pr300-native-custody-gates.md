@@ -22,7 +22,9 @@ flowchart TD
   D -- No --> N
   D -- Yes --> F{Real hostile same-SID/UID A-B-A, Unicode, 16385+ entries, power loss and recovery passed on both OSes?}
   F -- No --> N
-  F -- Yes --> R{Exact SHA independent SOURCE GO and hosted required checks green?}
+  F -- Yes --> E{Signed ingress/egress and independent server-side revocation and replay fencing proven?}
+  E -- No --> N
+  E -- Yes --> R{Exact SHA independent SOURCE GO and hosted required checks green?}
   R -- No --> N
   R -- Yes --> G[Only then request release-policy approval; do not auto-merge]
 ```
@@ -189,3 +191,63 @@ classification authenticates the root: a same-SID writer can replace an
 unsigned, byte-identical fixture; no protected root/ancestors, independent
 floor, binary attestation, Windows 10 or powercut durability is proven.
 **MERGE/RELEASE NO-GO** still applies independently of these results.
+
+### 2026-11-11 — private-lock, journal and signed retry safety chain published
+
+The PR #300 head advanced by **one normal fast-forward push** from
+`e82d88606002f0da943f1fda57a604b203e9c539` to
+`4d9b19bff36a2ab2e19814c6c7b8734da8e58d38` (17 linear commits).
+`Root/main` remains unmodified; PR #300 remains OPEN/Draft. All new commits
+have the required bielxdh3 author/committer and one Codex co-author trailer.
+Two independent SOURCE reviewers found no remaining P1/P2 **within the
+reviewed 17-commit scope**; that is not a production or hosted-CI approval.
+
+The chain tightens the required-v2 private root mutation lock: every private
+mutation path must hold a live physical root lock, stale AsyncLocalStorage
+leases cannot outlive it, and started/unawaited or already-settled failures
+cannot silently release it. Separate explicit write-hazard marks quarantine
+the lock after possible `mkdir`, rename, snapshot or journal side effects,
+including failures reported after a completed syscall. Cold WebDAV
+translation, historical signed atomic-batch journal acknowledgements and
+native-required DELETE retries now obey these negative fences. W26 adds a
+**read-only, native HANDLE-relative cold-phase inspector** for lab-created
+PREPARE, PUBLISHED-without-COMMIT and COMMIT states; no recovery authority is
+granted by the inspector.
+
+The final signed-outbound regression intentionally uses two **genuine Ed25519
+signed** operations. A replaceable `adapter.push` getter used to mutate the
+caller-owned CREATE into a valid DELETE **after** the last envelope check:
+the old `8a3c44f1` failed physically on Windows Node22/NTFS and Ubuntu WSL
+Node22/ext4 (the DELETE reached the disposable adapter). The new
+`4d9b19bf` resolves any getter **before** its final check, validates and
+detaches the exact signed operation, compares its digest to the pre-await
+original, denies DELETE on that same detached object and dispatches only the
+detached copy. A signed legitimate CREATE still writes a disposable fsynced
+record and retains its verified authorization bytes. Physical tests of the
+final code: full FOD **Windows 72 PASS, 1 POSIX-only FIFO SKIP** and **WSL
+73 PASS**; targeted atomic signed batch **4 PASS** on each platform; the
+new attacker/control test **1 PASS** each. W26 cold lab tests **3 PASS**
+after its ABI fix, and the final published W26 implementation was also
+revalidated in its complete Windows Node22/NTFS suite: **12 PASS / 0 FAIL**.
+The November 9 stress proof of 16,385 entries was not rerun: these changes
+did not alter that physical enumeration contract.
+
+Hosted CodeQL on the published **code SHA** `4d9b19bf` completed SUCCESS:
+run `42950460806`, `Analyze JavaScript / TypeScript` check `130293268788`
+SUCCESS and separate formal `CodeQL` check `130294051622` SUCCESS. This is
+exact-head code evidence, not automatically inherited by a subsequent docs
+or code commit. Only these triggered checks were verified; other required
+platform/release gates must be evaluated separately at their exact SHAs.
+
+**Unclosed gates:** the operational inbound publisher still uses a
+replace-capable JavaScript pathname `rename` and has an isolated adversarial
+foreign-destination overwrite RED. W3/ext4 and W26/NTFS remain disposable
+laboratories, not signed or independently acquired RootSession custodians.
+There is no trusted protected root and entire ancestry, no independently
+excluded same-UID/SID hostile writer, no owner-signed monotonic recovery
+floor, no attested native product service with durable PREPARE/COMMIT and
+cold-reopen authority, no real hardware power-cut proof, and no Windows 10
+CFAPI release evidence (the exercised workstation was Windows 11 build
+26300). Native no-replace and identity-bound deletion must never be
+approximated with stat/exists→pathname rename/unlink. `RootSession` stays
+unconditionally OFF. **MERGE NO-GO and RELEASE NO-GO.**
