@@ -1,5 +1,6 @@
 param(
   [ValidateSet('NORMAL', 'COLLISION', 'EXTERNAL_COLLISION', 'SOURCE_SWAP', 'ROOT_SWAP',
+               'HELD_REBIND', 'HELD_JUNCTION',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
                'COLD_INSPECT')]
   [string]$Mode,
@@ -31,6 +32,7 @@ try {
 
   Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
@@ -165,6 +167,98 @@ public static class RootarkW26NativeFilePublishLab {
       return root;
     } catch { root.Dispose(); throw; }
   }
+  private static SafeFileHandle DirectoryChild(SafeFileHandle parent, string component,
+      bool readOnly) {
+    if (string.IsNullOrEmpty(component) || component == "." || component == ".." ||
+        component.IndexOfAny(new char[] { '\\', '/', ':' }) != -1)
+      throw new InvalidOperationException("UNTRUSTED_ANCESTOR_COMPONENT");
+    IntPtr name = Marshal.StringToHGlobalUni(component);
+    IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+    try {
+      var u = new UNICODE_STRING { Length = (ushort)(component.Length * 2),
+        MaximumLength = (ushort)((component.Length + 1) * 2), Buffer = name };
+      Marshal.StructureToPtr(u, ptr, false);
+      var attr = new OBJECT_ATTRIBUTES { Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+        RootDirectory = parent.DangerousGetHandle(), ObjectName = ptr,
+        Attributes = 0x00001040 /* OBJ_DONT_REPARSE | OBJ_CASE_INSENSITIVE */ };
+      IO_STATUS_BLOCK status;
+      SafeFileHandle opened;
+      int code = OpenRelative(out opened,
+        readOnly ? 0x001000A1U /* SYNC | READ_ATTR | TRAVERSE | LIST */ : 0x001F01FFU,
+        ref attr, out status, IntPtr.Zero, 0x80, 7,
+        1U /* FILE_OPEN only */,
+        0x00200021U /* OPEN_REPARSE_POINT | DIRECTORY_FILE | SYNCHRONOUS */,
+        IntPtr.Zero, 0);
+      if (code != 0 || opened == null || opened.IsInvalid) {
+        if (opened != null) opened.Dispose();
+        throw new InvalidOperationException("ANCESTOR_RELATIVE_OPEN_FAILED");
+      }
+      try { Plain(opened, true); return opened; }
+      catch { opened.Dispose(); throw; }
+    } finally {
+      Marshal.FreeHGlobal(ptr);
+      Marshal.FreeHGlobal(name);
+    }
+  }
+  // One process owns all original ancestor HANDLEs until the phase ends.
+  // Each child is acquired and later reopened relative to its held parent.
+  // This is same-SID local LAB identity evidence, never exclusion or cold
+  // off-host custody (a hostile actor may still perform ABA between checks).
+  private sealed class AncestorCustody : IDisposable {
+    private readonly string volumePath;
+    private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+    private readonly List<FILE_ID_INFO> identities = new List<FILE_ID_INFO>();
+    private readonly List<string> components = new List<string>();
+    internal SafeFileHandle Held { get { return handles[handles.Count - 1]; } }
+
+    internal AncestorCustody(string scratch, bool heldReadOnly) {
+      string full = Path.GetFullPath(scratch).TrimEnd('\\');
+      volumePath = Path.GetPathRoot(full);
+      if (string.IsNullOrEmpty(volumePath) || volumePath.Length != 3 ||
+          volumePath[1] != ':' || volumePath[2] != '\\')
+        throw new InvalidOperationException("LOCAL_VOLUME_ROOT_REQUIRED");
+      string relative = full.Substring(volumePath.Length);
+      string[] parts = relative.Split(new char[] { '\\' }, StringSplitOptions.None);
+      try {
+        SafeFileHandle volume = Root(volumePath, true);
+        handles.Add(volume);
+        identities.Add(Id(volume));
+        components.Add(null);
+        for (int i = 0; i <= parts.Length; i++) {
+          string component = i == parts.Length ? "held" : parts[i];
+          SafeFileHandle child = DirectoryChild(handles[handles.Count - 1], component,
+            i != parts.Length || heldReadOnly);
+          handles.Add(child);
+          identities.Add(Id(child));
+          components.Add(component);
+        }
+      } catch { Dispose(); throw; }
+    }
+    internal void Validate() {
+      // Reacquire only the drive volume root by pathname, then every other
+      // component through its original retained parent (no descendant paths).
+      using (SafeFileHandle volume = Root(volumePath, true)) {
+        if (!Same(identities[0], Id(volume)))
+          throw new InvalidOperationException("VOLUME_REBOUND");
+      }
+      for (int i = 1; i < handles.Count; i++) {
+        Plain(handles[i - 1], true);
+        if (!Same(identities[i - 1], Id(handles[i - 1])))
+          throw new InvalidOperationException("RETAINED_ANCESTOR_CHANGED");
+        using (SafeFileHandle current = DirectoryChild(handles[i - 1], components[i], true)) {
+          if (!Same(identities[i], Id(current)))
+            throw new InvalidOperationException("ANCESTOR_REBOUND");
+        }
+      }
+      Plain(Held, true);
+      if (!Same(identities[handles.Count - 1], Id(Held)))
+        throw new InvalidOperationException("HELD_ANCESTOR_CHANGED");
+    }
+    public void Dispose() {
+      for (int i = handles.Count - 1; i >= 0; i--) handles[i].Dispose();
+      handles.Clear();
+    }
+  }
   private static SafeFileHandle File(SafeFileHandle root, string leaf, bool create) {
     if (leaf != "stage.bin" && leaf != "published.bin" && leaf != "parked-stage.bin"
       && leaf != "prepared.bin" && leaf != "commit.bin")
@@ -271,8 +365,9 @@ public static class RootarkW26NativeFilePublishLab {
         Marshal.SizeOf(typeof(FILE_BASIC_INFO)) != 40 ||
         Marshal.OffsetOf(typeof(FILE_BASIC_INFO), "ChangeTime").ToInt32() != 24)
       throw new InvalidOperationException("COLD_NATIVE_ABI_UNVERIFIED");
-    string parent = Path.Combine(scratch, "held");
-    using (SafeFileHandle root = Root(parent, true)) {
+    using (var custody = new AncestorCustody(scratch, true)) {
+      custody.Validate();
+      SafeFileHandle root = custody.Held;
       FILE_ID_INFO originalRoot = Id(root);
       ColdObservation stage = ColdLeaf(root, "stage.bin");
       ColdObservation published = ColdLeaf(root, "published.bin");
@@ -289,6 +384,7 @@ public static class RootarkW26NativeFilePublishLab {
             prepared.Bytes.Substring("PREPARED_V2:".Length)) ||
           !Same(originalRoot, Id(root)))
         throw new InvalidOperationException("COLD_BYTES_UNVERIFIED");
+      custody.Validate();
       string phase;
       if (stage != null && published == null && commit == null)
         phase = "PREPARED_ONLY";
@@ -363,6 +459,10 @@ public static class RootarkW26NativeFilePublishLab {
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";
+    bool ancestorAttack = mode == "HELD_REBIND" || mode == "HELD_JUNCTION";
+    if (ancestorAttack &&
+        Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_ANCESTOR_ATTACK_LAB") != "1")
+      throw new InvalidOperationException("ANCESTOR_ATTACK_LAB_DISABLED");
     if (mode == "EXTERNAL_COLLISION" &&
         Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB") != "1")
       throw new InvalidOperationException("EXTERNAL_WRITER_LAB_DISABLED");
@@ -373,7 +473,9 @@ public static class RootarkW26NativeFilePublishLab {
       throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
     string parent = Path.Combine(scratch, "held");
     Directory.CreateDirectory(parent);
-    using (SafeFileHandle root = Root(parent)) {
+    using (var custody = new AncestorCustody(scratch, false)) {
+      SafeFileHandle root = custody.Held;
+      custody.Validate();
       string visibleParent = parent;
       if (mode == "ROOT_SWAP") {
         // Rebind the root pathname before opening a child file: on Windows,
@@ -385,11 +487,35 @@ public static class RootarkW26NativeFilePublishLab {
         Directory.CreateDirectory(parent);
         PlantForeign(Path.Combine(parent, "published.bin"), Foreign);
       }
+      if (ancestorAttack) {
+        // A second same-SID process rebinds held inside disposable scratch
+        // while its original native HANDLE is live, before opening stage.
+        string ready = Path.Combine(scratch, "ancestor-ready.signal");
+        using (var signal = new FileStream(ready, FileMode.CreateNew,
+            FileAccess.Write, FileShare.Read, 4096, false)) {
+          byte[] bytes = Encoding.UTF8.GetBytes("ANCESTOR_READY_V1");
+          signal.Write(bytes, 0, bytes.Length);
+          signal.Flush(true);
+        }
+        string ack = Path.Combine(scratch, "ancestor-ack.signal");
+        DateTime deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!System.IO.File.Exists(ack)) {
+          if (DateTime.UtcNow > deadline)
+            throw new InvalidOperationException("ANCESTOR_ATTACK_TIMEOUT");
+          System.Threading.Thread.Sleep(10);
+        }
+        if (ReadFixture(ack) != "ANCESTOR_REBOUND_V1")
+          throw new InvalidOperationException("ANCESTOR_ATTACK_NOT_PHYSICAL");
+      }
       using (SafeFileHandle source = File(root, "stage.bin", true)) {
         Write(source, Trusted);
         FILE_ID_INFO original = Id(source);
         FILE_ID_INFO initialRoot = Id(root);
         string originalIdentity = ExactId(initialRoot) + ":" + ExactId(original);
+        // ROOT_SWAP is the older explicit handle-versus-path demonstration:
+        // it intentionally succeeds in detached A. All other modes must
+        // reject a rebounded ancestor before PREPARE or any publication.
+        if (mode != "ROOT_SWAP") custody.Validate();
         if (crashBefore || crashAfter || complete) {
           using (SafeFileHandle prepared = File(root, "prepared.bin", true))
             Write(prepared, "PREPARED_V2:" + originalIdentity);
@@ -436,9 +562,10 @@ public static class RootarkW26NativeFilePublishLab {
             if (Same(original, Id(other)))
               throw new InvalidOperationException("SOURCE_SWAP_NOT_PHYSICAL");
           }
-        } else if (mode != "ROOT_SWAP" && mode != "NORMAL" && !crashAfter && !complete) {
+        } else if (mode != "ROOT_SWAP" && mode != "NORMAL" && !crashAfter && !complete && !ancestorAttack) {
           throw new InvalidOperationException("UNTRUSTED_MODE");
         }
+        if (mode != "ROOT_SWAP") custody.Validate();
         int code = Rename(source, root, "published.bin");
         if (mode == "COLLISION" || mode == "EXTERNAL_COLLISION") {
           // A generic NT failure could otherwise fool the no-clobber proof.
@@ -469,11 +596,13 @@ public static class RootarkW26NativeFilePublishLab {
             ReadFixture(Path.Combine(parent, "published.bin")) != Foreign)
           throw new InvalidOperationException("FOREIGN_ANCESTOR_MUTATED");
         if (complete) {
+          custody.Validate();
           // Only the fully completed opt-in rehearsal writes this marker.
           // Windows namespace durability and cold recovery are NOT proven.
           using (SafeFileHandle marker = File(root, "commit.bin", true))
             Write(marker, "COMMITTED_V2:" + originalIdentity);
         }
+        if (mode != "ROOT_SWAP") custody.Validate();
         return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode +
           " result=ORIGINAL_HANDLE inode=PINNED no_replace=YES";
       }

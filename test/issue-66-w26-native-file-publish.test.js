@@ -25,7 +25,7 @@ function fixture() {
 }
 
 function invoke(scratch, mode, enabled = true, allowHardExit = false,
-  allowColdInspect = false, allowExternalWriter = false) {
+  allowColdInspect = false, allowExternalWriter = false, allowAncestorAttack = false) {
   return spawnSync(powershell, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-Scratch", scratch, "-Mode", mode,
@@ -35,7 +35,8 @@ function invoke(scratch, mode, enabled = true, allowHardExit = false,
       ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: enabled ? "1" : "0",
       ROOTARK_ISSUE66_W26_HARD_EXIT_LAB: allowHardExit ? "1" : "0",
       ROOTARK_ISSUE66_W26_COLD_INSPECT_LAB: allowColdInspect ? "1" : "0",
-      ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB: allowExternalWriter ? "1" : "0" },
+      ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB: allowExternalWriter ? "1" : "0",
+      ROOTARK_ISSUE66_W26_ANCESTOR_ATTACK_LAB: allowAncestorAttack ? "1" : "0" },
   });
 }
 
@@ -160,6 +161,101 @@ test("#66 W26 Windows NTFS pinned directory HANDLE publishes into A while foreig
     assert.match(result.stdout, /^ROOTARK_W26_HANDLE_PUBLISH mode=ROOT_SWAP result=ORIGINAL_HANDLE inode=PINNED no_replace=YES\r?\n$/);
     assert.equal(result.stderr, "");
   });
+
+for (const mode of ["HELD_REBIND", "HELD_JUNCTION"]) {
+  test(`#66 W26 rejects physical same-SID ${mode} under scratch parent before PREPARE`,
+    { skip: !available, timeout: 35000 }, async () => {
+      const scratch = fixture();
+      const parked = path.join(scratch, "held-parked");
+      // Windows denies a rename of scratch itself with a live descendant
+      // directory HANDLE (EPERM). Exercise the movable held entry instead,
+      // still under the unique scratch owned by this test.
+      const attacker = String.raw`
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const scratch = process.argv[1];
+        const mode = process.argv[2];
+        const held = path.join(scratch, 'held');
+        const parked = path.join(scratch, 'held-parked');
+        const sleep = new Int32Array(new SharedArrayBuffer(4));
+        let ready = false;
+        for (let i = 0; i < 1000; i++) {
+          try {
+            ready = fs.readFileSync(path.join(scratch, 'ancestor-ready.signal'), 'utf8')
+              === 'ANCESTOR_READY_V1';
+            if (!ready) throw new Error('INVALID_ANCESTOR_SIGNAL');
+            break;
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+          }
+          Atomics.wait(sleep, 0, 0, 10);
+        }
+        if (!ready) throw new Error('ANCESTOR_NOT_READY');
+        fs.renameSync(held, parked);
+        if (mode === 'HELD_REBIND') {
+          fs.mkdirSync(held);
+          const foreign = fs.openSync(path.join(held, 'published.bin'), 'wx');
+          try {
+            fs.writeSync(foreign, 'FOREIGN_UNTRUSTED_TARGET_BYTES');
+            fs.fsyncSync(foreign);
+          } finally { fs.closeSync(foreign); }
+        } else {
+          // On Windows a junction is created by the real filesystem API.
+          fs.symlinkSync(parked, held, 'junction');
+          if (!fs.lstatSync(held).isSymbolicLink()) throw new Error('JUNCTION_NOT_PHYSICAL');
+        }
+        const ack = fs.openSync(path.join(scratch, 'ancestor-ack.signal'), 'wx');
+        try {
+          fs.writeSync(ack, 'ANCESTOR_REBOUND_V1');
+          fs.fsyncSync(ack);
+        } finally { fs.closeSync(ack); }
+      `;
+      const writer = spawn(process.execPath, ["-e", attacker, scratch, mode], {
+        windowsHide: true, stdio: ["ignore", "ignore", "pipe"],
+      });
+      let writerError = "";
+      writer.stderr.setEncoding("utf8");
+      writer.stderr.on("data", (chunk) => { writerError += chunk; });
+      const writerResult = new Promise((resolve, reject) => {
+        writer.once("error", reject);
+        writer.once("exit", (code, signal) => resolve({ code, signal }));
+      });
+      const publisher = invoke(scratch, mode, true, false, false, false, true);
+      assert.deepEqual(await writerResult, { code: 0, signal: null }, writerError);
+      assert.equal(fs.readFileSync(path.join(scratch, "ancestor-ack.signal"), "utf8"),
+        "ANCESTOR_REBOUND_V1");
+      assert.equal(publisher.status, 41, "rebound ancestor must fail closed");
+      assert.equal(publisher.stdout, "");
+      assert.match(publisher.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+      assert.equal(fs.readFileSync(path.join(parked, "stage.bin"), "utf8"),
+        "ORIGINAL_OPENED_STAGE_BYTES");
+      assert.equal(fs.existsSync(path.join(parked, "prepared.bin")), false,
+        "rebind must be denied before PREPARE");
+      assert.equal(fs.existsSync(path.join(parked, "published.bin")), false,
+        "no publication may occur through the detached original handle");
+      if (mode === "HELD_REBIND") {
+        assert.notEqual(fs.statSync(parked, { bigint: true }).ino,
+          fs.statSync(path.join(scratch, "held"), { bigint: true }).ino,
+          "the same-SID process must substitute a different NTFS directory identity");
+        assert.equal(fs.readFileSync(path.join(scratch, "held", "published.bin"), "utf8"),
+          "FOREIGN_UNTRUSTED_TARGET_BYTES");
+      } else {
+        assert.equal(fs.lstatSync(path.join(scratch, "held")).isSymbolicLink(), true,
+          "the held pathname under scratch must now be a physical junction");
+      }
+    });
+}
+
+test("#66 W26 ancestor-rebind attack requires an independent explicit opt-in", {
+  skip: !available, timeout: 25000,
+}, () => {
+  const scratch = fixture();
+  const denied = invoke(scratch, "HELD_REBIND");
+  assert.equal(denied.status, 41);
+  assert.equal(denied.stdout, "");
+  assert.match(denied.stderr, /^ROOTARK_W26_HANDLE_PUBLISH_REJECTED\r?\n$/);
+  assert.deepEqual(fs.readdirSync(scratch), []);
+});
 
 test("#66 W26 native HANDLE laboratory rejects disabled and populated scratch",
   { skip: !available, timeout: 25000 }, () => {
