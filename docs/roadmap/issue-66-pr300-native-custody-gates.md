@@ -24,7 +24,9 @@ flowchart TD
   X -- No --> N
   X -- Yes --> D{Flush ordering, cold reopen and independent anti-rollback floor proven?}
   D -- No --> N
-  D -- Yes --> F{Real hostile same-SID/UID A-B-A, Unicode, 16385+ entries, power loss and recovery passed on both OSes?}
+  D -- Yes --> C{Cold PREPARE and COMMIT bound to original physical identity and signed CURRENT floor?}
+  C -- No --> N
+  C -- Yes --> F{Real hostile same-SID/UID A-B-A, Unicode, 16385+ entries, power loss and recovery passed on both OSes?}
   F -- No --> N
   F -- Yes --> E{Signed ingress/egress and independent server-side revocation and replay fencing proven?}
   E -- No --> N
@@ -431,3 +433,97 @@ of the root and ancestors, hostile same-SID/UID isolation, antirollback,
 power-cut recovery, a general no-replace implementation or an authorization
 to activate `RootSession`. The precise new SHA requires independent SOURCE
 review and hosted CodeQL after safe publication. **MERGE/RELEASE NO-GO.**
+
+### 2026-11-11 — original PREPARE and COMMIT custody rehearsals, bounded signed floor
+
+This work combines three **non-production** source paths. None connects to
+`SyncEngine` as a trusted `RootSession`; its native recovery activation point
+continues to reject unconditionally. The public branch previously stood at
+`81fe58c2bcaf46856f1e03c6eb2636a67f1a8511`. All new results below
+must be reviewed again at the **exact integrated SHA** and subjected to its
+own hosted CodeQL/mandatory CI, not inherited from baseline `81fe58c2`.
+
+**W3/Linux Node22/ext4:** source commits `a457dd3361038981a163ea07c521c10af53cdae3`
+and `d6594fdf16e4be55aa0c6e4934c77a68291bbab7` retain both the original
+staged inode FD and the exclusive, fsynced PREPARE journal FD. The native
+publisher now checks original-vs-current journal `dev/ino`, regular-file
+type, link count, exact PREPARE bytes and a version pinned **after initial
+fsync** (`mtime/ctime`, including nanoseconds), with an additional native
+fd-relative identity/version check after no-replace publication and before
+writing COMMIT. Physical RED on the parent: a second same-UID process
+substituted a different journal inode with equal bytes and the old code
+committed. The first candidate was SOURCE **NO-GO** for missing same-inode
+version checks and a post-link swap window; both received follow-up code,
+new physical tests and independent **SOURCE GO for the bounded laboratory
+scope** at `d6594fdf`. Windows-style `exists->rename` is not emulated;
+Linux publication remains `linkat` from the original retained inode under
+held ext4 directory FD. WSL Node22 W3 full non-stress suite:
+**24 PASS / 3 expected SKIP / 0 FAIL**. The two additional tests exercise
+named and anonymous `O_TMPFILE`: a separate process changes and restores
+the **same** journal inode (version must still fail), and an opt-in
+kernel-level journal rebind **after** publication must deny COMMIT. A
+published-without-COMMIT inode stays visible and nonauthorizing. These
+rechecks cannot eliminate the last-check-to-COMMIT race for an active writer
+with the same UID: only independent parent custody can do that.
+
+**W26/Windows Node22/NTFS:** source commit
+`77f02bd2327de9275e42da71d3c24f46a934719b` binds the native
+PREPARED_V2 and COMMITTED_V2 marker bytes to the **original** native
+`FILE_ID_INFO` (volume serial and 128-bit FileId) of the held root and
+opened stage. Its new-process cold inspector opens each leaf relative to a
+held native directory HANDLE, verifies bounded bytes and original native
+File IDs, and denies even if a hostile same-SID writer replaces the
+published inode with a **different FileId containing identical bytes**.
+The previous source returned a false `COMMIT_OBSERVED` on that real attack;
+the child denies and retains both original/foreign inodes. Physical full
+W26 suite **15 PASS / 0 FAIL**; independent **SOURCE GO** for this limited
+source. `PREPARED_ONLY`, `PUBLISHED_NO_COMMIT` and `COMMIT_OBSERVED` are
+read-only laboratory classifications, not a signed native replay permit.
+Native no-overwrite uses NTFS `NtSetInformationFile` with
+`ReplaceIfExists=FALSE`, never a JavaScript pathname rename.
+
+**Owner/witness/floor reference verifier:** isolated candidate
+`2ada620d91f2a4380a59083eb9dc86083ec016ab`, followed by input-budget
+hardening `548fb526192694965da9c7e2bcd29edd638d2670` and
+`cdeeba5c5917410151be12634cde2bf51354bba4`, verifies separately
+signed Ed25519 owner provisioning, current root-commit witness and
+monotonic floor (distinct keys), a fresh nonce in both independent
+receipts, exact scope/root digest/epoch/sequence/physical file identity,
+and PREPARE/COMMIT digests. It returns **only a frozen nonauthorizing
+observation** (`authorizesIo:false`, `authorizesReplay:false`). The
+reference accepts **canonical byte buffers of at most 8192 bytes before
+JSON parsing**; no arbitrary JS-object descriptor enumeration is allowed.
+Valid but stale floor, nonce replay, incomplete COMMIT, oversized or
+noncanonical bytes, malformed keys, and a real same-byte foreign inode
+are rejected. Lab verification test **1 PASS on Windows Node22/NTFS and
+1 PASS on WSL Node22/ext4**; signers and physical readback are test-owned,
+not remotely or OS-independently attested. An initial witness implementation
+had SOURCE **NO-GO** for unbounded enumeration before its claimed budget;
+later commits replace that interface. This verifier is NOT wired as a
+product authority and cannot make a local writable journal monotonic.
+
+**Concrete unblock requirements:** provision a separately protected native
+service **and all ancestor directories** under a distinct OS principal;
+prove user-token access denial by a second hostile process, not by checking
+ACL bits alone. On Linux this entails a root/independent-UID-owned helper
+with credential-verified AF_UNIX and `openat2`/`renameat2` under retained
+dirfds; on Windows an independently installed service identity, protected
+DACLs over the full ancestor chain and HANDLE-relative NTFS operations
+must exclude the interactive SID. The workstation's WSL account has no
+noninteractive `sudo` privilege and this Windows session is not running as
+SYSTEM: no independently privileged writer service was provisioned or
+exercised here. After provisioning, a separate current owner-signed
+monotonic witness store and challenge must bind cold PREPARE/COMMIT,
+physical inode/root identity, original bytes, replay floor and exact
+principal to trusted persistence beyond writable sync files. Do not
+equate an in-process N-API addon, 0700 same-UID fixture or test-generated
+signing keys with such an authority.
+
+Additional external release requirements still include genuine Windows 10
+CFAPI hydration/OS callback validation, real hardware power-loss durability
+and recovery, supply-chain attestation, same-SID/UID hostile concurrent
+A-B-A/mount/reparse pressure under an independent service, and all hosted
+Windows/Ubuntu mandatory release gates at the exact published SHA.
+The operational `SyncEngine` inbound publisher still has a replace-capable
+JavaScript pathname `rename`; W3/W26 do **not** make it safe merely by
+existing in the repository. **MERGE NO-GO; RELEASE NO-GO; RootSession OFF.**
