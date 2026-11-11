@@ -13,9 +13,13 @@ Historical sections below preserve their original evidence and claims; they are 
 `Root/main` `202146bb73ca8577a0a4017c4556cb8b1e9588a6` unchanged. PR #298
 was advanced by ordinary FF to `73c2be30` after **two independent SOURCE GO
 limited to 11 LAB experiments**; OPEN/Draft, with held-HANDLE Windows11/NTFS
-and Linux/WSL/ext4 no-replace experiments 7/7 per OS. The *published* #298
-CodeQL is **FAIL**, annotating deliberate pathname race fixtures; issue and
-mandatory jobs remain unreconciled, and **no native product implementation**
+and Linux/WSL/ext4 no-replace experiments 7/7 per OS. On published #298,
+the CodeQL Action workflow `43118997507` and Analyze job `130854325688`
+are **SUCCESS**, but the SEPARATE GitHub Advanced Security `CodeQL` PR
+check-run `130855351016` is **FAILURE** with 20 new high-severity
+`js/file-system-race` alerts (19 in lab experiments, 1 in a historical test).
+The scanner running successfully is not the security-alert gate passing;
+other mandatory jobs must be examined, and **no native product implementation**
 was released. PR #300 remains OPEN/Draft `984a62ef` (prior docs-only FF);
 PR #301 remote remains OPEN/Draft `e1ca644b`; PR #302 remains OPEN/Draft
 `e0af8397`; PR #306 remains OPEN/non-Draft `b13b29f9`, without APPROVED.
