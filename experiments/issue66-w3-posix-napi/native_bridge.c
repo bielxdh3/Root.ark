@@ -45,6 +45,8 @@ typedef struct {
   int parentfd;
   int staged_fd; // original exclusive inode, retained until session close
   int journal_fd; // original exclusive PREPARE inode, retained through COMMIT
+  struct stat journal_initial; // version pinned after original PREPARE fsync
+  int journal_version_pinned;
   int txn_anonymous; // opt-in O_TMPFILE stage, never a product recovery mode
   DIR *held;
   int phase;
@@ -179,13 +181,24 @@ static int opened_stage_equals(int fd, int anonymous) {
          got == (ssize_t)size && memcmp(bytes, STAGE_PAYLOAD, size) == 0;
 }
 
-static int opened_prepare_equals(int fd) {
+static int same_prepare_version(const struct stat *before, const struct stat *after) {
+  return before->st_dev == after->st_dev && before->st_ino == after->st_ino &&
+         before->st_uid == after->st_uid && before->st_mode == after->st_mode &&
+         before->st_nlink == after->st_nlink && before->st_size == after->st_size &&
+         before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+         before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+         before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+         before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+}
+
+static int opened_prepare_equals(int fd, const struct stat *initial) {
   if (fd < 0) return 0;
   struct stat st;
   char bytes[64];
   size_t size = strlen(JOURNAL_PAYLOAD);
   ssize_t got = pread(fd, bytes, sizeof(bytes), 0);
-  return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+  return fstat(fd, &st) == 0 && same_prepare_version(initial, &st) &&
+         S_ISREG(st.st_mode) &&
          st.st_size == (off_t)size && st.st_nlink == 1 &&
          got == (ssize_t)size && memcmp(bytes, JOURNAL_PAYLOAD, size) == 0;
 }
@@ -271,6 +284,8 @@ static void release_handles(lab_session *session) {
   session->raw_seeded = 0;
   session->txn_phase = 0;
   session->txn_anonymous = 0;
+  session->journal_version_pinned = 0;
+  memset(&session->journal_initial, 0, sizeof(session->journal_initial));
   memset(session->token, 0, sizeof(session->token));
 }
 
@@ -569,8 +584,10 @@ static napi_value stage_proof(napi_env env, napi_callback_info info) {
   if (session->staged_fd < 0 || fsync(held) != 0 ||
       (session->journal_fd =
         create_open_proof(held, JOURNAL_PROOF, JOURNAL_PAYLOAD)) < 0 ||
+      fstat(session->journal_fd, &session->journal_initial) != 0 ||
       fsync(held) != 0)
     return fail(env, "NATIVE_TXN_INDETERMINATE");
+  session->journal_version_pinned = 1;
   session->txn_phase = 1;
   return result_text(env, "LAB_TXN_PREPARED");
 }
@@ -600,10 +617,13 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   // remains open until session cleanup. Never promote the new path occupant.
   int current_journal = fd_openat2(held, JOURNAL_PROOF,
                                     O_RDONLY | O_NONBLOCK, 0);
-  int journal_identity_matches = opened_prepare_equals(session->journal_fd) &&
+  int journal_identity_matches = session->journal_version_pinned &&
+                                 opened_prepare_equals(session->journal_fd,
+                                                       &session->journal_initial) &&
                                  current_journal >= 0 &&
                                  object_is(current_journal, session->journal_fd) &&
-                                 opened_prepare_equals(current_journal);
+                                 opened_prepare_equals(current_journal,
+                                                       &session->journal_initial);
   if (current_journal >= 0 && close(current_journal) != 0)
     journal_identity_matches = 0;
   if (!stage_identity_matches || !journal_identity_matches) {
@@ -646,6 +666,30 @@ static napi_value publish_proof(napi_env env, napi_callback_info info) {
   }
   session->txn_phase = 3;
   if (fsync(held) != 0)
+    return fail(env, "NATIVE_TXN_INDETERMINATE");
+  // A checked PREPARE name is mutable under a SAME-UID lab writer. Check the
+  // original inode version and current name again AFTER the publication and
+  // its directory fsync, before emitting COMMIT. This catches deterministic
+  // post-link swaps; only an independently protected parent can eliminate
+  // the remaining last-check -> COMMIT window in a production custodian.
+  const char *late = getenv("ROOTARK_ISSUE66_W3_JOURNAL_REBIND_AFTER_LINK");
+  if (late && strcmp(late, "1") == 0) {
+    if (syscall(SYS_renameat2, held, JOURNAL_PROOF, held,
+                ".rootark-w3-afterlink-original-prepare", RENAME_NOREPLACE) != 0 ||
+        !write_owned(held, JOURNAL_PROOF, JOURNAL_PAYLOAD))
+      return fail(env, "NATIVE_TXN_INDETERMINATE");
+  }
+  current_journal = fd_openat2(held, JOURNAL_PROOF, O_RDONLY | O_NONBLOCK, 0);
+  journal_identity_matches = session->journal_version_pinned &&
+                             opened_prepare_equals(session->journal_fd,
+                                                   &session->journal_initial) &&
+                             current_journal >= 0 &&
+                             object_is(current_journal, session->journal_fd) &&
+                             opened_prepare_equals(current_journal,
+                                                   &session->journal_initial);
+  if (current_journal >= 0 && close(current_journal) != 0)
+    journal_identity_matches = 0;
+  if (!journal_identity_matches)
     return fail(env, "NATIVE_TXN_INDETERMINATE");
   // Physical hard-exit in an explicitly opted-in child process ONLY. The
   // destination has passed linkat+directory fsync but COMMIT has not been

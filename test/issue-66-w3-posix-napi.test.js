@@ -780,6 +780,95 @@ for (const anonymous of [false, true]) {
     });
 }
 
+for (const anonymous of [false, true]) {
+  test(`#66 W3 ${anonymous ? "O_TMPFILE" : "named"} PREPARE denies same-inode byte restoration and post-link journal rebind`,
+    { skip: !txnEnabled }, (t) => {
+      const bridge = loadLab();
+      const home = os.homedir();
+      const previous = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+      const start = (token) => {
+        const prior = process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+        if (anonymous) process.env.ROOTARK_ISSUE66_W3_ANON_LAB = "1";
+        else delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+        try { assert.equal(bridge.stageProof(token), "LAB_TXN_PREPARED"); }
+        finally {
+          if (prior === undefined) delete process.env.ROOTARK_ISSUE66_W3_ANON_LAB;
+          else process.env.ROOTARK_ISSUE66_W3_ANON_LAB = prior;
+        }
+      };
+      const one = bridge.openTestSession();
+      t.after(() => { try { bridge.closeTestSession(one); } catch {} });
+      const first = fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-") && !previous.has(name));
+      assert.equal(first.length, 1);
+      start(one);
+      const held = path.join(home, first[0], "held");
+      const journal = path.join(held, ".rootark-w3-journal-v1");
+      const priorFd = fs.openSync(journal, "r+");
+      try {
+        const before = observeOpenedFixture(priorFd);
+        assert.equal(before.bytes, "PREPARED_V1");
+        const changed = spawnSync("/usr/bin/node", ["-e", String.raw`
+          const fs = require('node:fs');
+          const fd = fs.openSync(process.argv[1], 'r+');
+          try {
+            fs.writeSync(fd, Buffer.from('X'), 0, 1, 0); fs.fsyncSync(fd);
+            fs.writeSync(fd, Buffer.from('PREPARED_V1'), 0, 11, 0);
+            fs.futimesSync(fd, 1, 1); fs.fsyncSync(fd);
+          } finally { fs.closeSync(fd); }
+        `, journal], {
+          cwd: held, timeout: 10000, encoding: "utf8", maxBuffer: 1024,
+          env: { PATH: "/usr/bin:/bin", LANG: "C" },
+        });
+        assert.equal(changed.status, 0, changed.stderr);
+        const after = observeOpenedFixture(priorFd);
+        assert.equal(after.stat.ino, before.stat.ino,
+          "the writer must mutate the very same PREPARE inode");
+        assert.equal(after.bytes, before.bytes,
+          "the writer must restore the original exact bytes");
+        assert.notEqual(after.stat.mtimeNs, before.stat.mtimeNs,
+          "physical inode version must change despite equal final bytes");
+        assert.throws(() => bridge.publishProof(one), /NATIVE_TXN_INDETERMINATE/);
+        assert.equal(fs.existsSync(path.join(held, ".rootark-w3-committed-v1")), false);
+        assert.equal(fs.existsSync(path.join(held, ".rootark-w3-commit-marker-v1")), false);
+        assert.throws(() => bridge.publishProof(one), /NATIVE_TXN_PHASE_REJECTED/);
+      } finally { fs.closeSync(priorFd); }
+      assert.equal(bridge.closeTestSession(one), "CLOSED_NO_AUTHORITY");
+
+      // Separate lab fixture and deterministic kernel swap AFTER the native
+      // no-replace link and its fsync, before COMMIT could be emitted.
+      const existing = new Set(fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-")));
+      const second = bridge.openTestSession();
+      t.after(() => { try { bridge.closeTestSession(second); } catch {} });
+      const created = fs.readdirSync(home).filter((name) => name.startsWith(".rootark-w3-napi-") && !existing.has(name));
+      assert.equal(created.length, 1);
+      start(second);
+      const otherHeld = path.join(home, created[0], "held");
+      const originalLate = process.env.ROOTARK_ISSUE66_W3_JOURNAL_REBIND_AFTER_LINK;
+      process.env.ROOTARK_ISSUE66_W3_JOURNAL_REBIND_AFTER_LINK = "1";
+      try { assert.throws(() => bridge.publishProof(second), /NATIVE_TXN_INDETERMINATE/); }
+      finally {
+        if (originalLate === undefined) delete process.env.ROOTARK_ISSUE66_W3_JOURNAL_REBIND_AFTER_LINK;
+        else process.env.ROOTARK_ISSUE66_W3_JOURNAL_REBIND_AFTER_LINK = originalLate;
+      }
+      withHeldFixtureDirectory(otherHeld, (dirfd) => {
+        withOpenedFixtureLeaves(dirfd,
+          [".rootark-w3-journal-v1", ".rootark-w3-afterlink-original-prepare"],
+          (foreignFd, parkedFd) => {
+            const foreign = observeOpenedFixture(foreignFd);
+            const parked = observeOpenedFixture(parkedFd);
+            assert.equal(foreign.bytes, parked.bytes);
+            assert.equal(foreign.bytes, "PREPARED_V1");
+            assert.notEqual(foreign.stat.ino, parked.stat.ino);
+          });
+        assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-committed-v1`), true,
+          "the no-replace publication may finish before PREPARE rebind is noticed");
+        assert.equal(fs.existsSync(`/proc/self/fd/${dirfd}/.rootark-w3-commit-marker-v1`), false,
+          "after-link journal rebind must block durable COMMIT");
+      });
+      assert.throws(() => bridge.publishProof(second), /NATIVE_TXN_PHASE_REJECTED/);
+    });
+}
+
 test("#66 W3 native stage and publish cannot be enabled by general NAPI lab flag alone",
   { skip: !enabled || txnEnabled }, (t) => {
     const bridge = loadLab();
