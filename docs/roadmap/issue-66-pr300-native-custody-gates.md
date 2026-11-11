@@ -696,6 +696,20 @@ identity test, **not** a reenactment of a legitimate `stage→published` publish
 syscall; that forward direction is covered by a separate positive scenario.
 The guard must still reject two physical aliases with the same bytes and
 the correct `nlink=2` because neither matches the ORIGINAL retained stage.
+The original expected inode also holds **two real links** (`preservedName`
+and `original-held-peer.bin`) before any alias switch: this prevents a false
+GREEN from a guard checking only the link count while omitting inode identity.
+Both candidate source and target must therefore pass nlink checks, with
+**distinct** dev/ino values providing the only rejection reason.
+
+The peer-reviewed false-GREEN was reproduced by removing only the guard's
+`dev/ino` comparison in a disposable copy of the test: **RED 0 PASS /
+1 FAIL** (`Missing expected rejection`) on Windows Node 22.23.4/NTFS
+and WSL Node 22.22.1/ext4. The unmodified identity guard is **GREEN
+1 PASS / 0 FAIL** on each. The temporary mutated test copy was deleted,
+while native evidence fixtures remain retained; none of these results
+authorizes recovery or resolves the current hosted CodeQL until the exact
+corrected commit has been published and scanned.
 
 The unchecked-guard negative control was **RED 1 PASS / 1 FAIL** (`Missing
 expected rejection`) on both **Windows Node 22.23.4 / NTFS** and **WSL

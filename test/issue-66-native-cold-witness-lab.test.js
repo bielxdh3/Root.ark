@@ -254,12 +254,17 @@ test("#66 stage alias rebound to a foreign published inode cannot pass held-sour
   });
   const stageName = path.join(directory, "foreign-stage.bin");
   const preservedName = path.join(directory, "foreign-preserved.bin");
+  const originalPeerName = path.join(directory, "original-held-peer.bin");
   const publishedName = path.join(directory, "published.bin");
   const bytes = Buffer.from("EQUAL_CIPHERTEXT_IS_NOT_FILE_IDENTITY");
   const expected = await fsp.open(stageName, "wx+", 0o600);
   retained.push(expected);
   await expected.writeFile(bytes);
   await expected.sync();
+  // Give the ORIGINAL expected inode an independently held second link too.
+  // Otherwise a guard checking only nlink===2 (without dev/ino) would reject
+  // the negative fixture and the test would falsely claim source-ID security.
+  await fsp.link(stageName, originalPeerName);
 
   // Create and pin the foreign inode at a distinct EXCLUSIVE published name
   // BEFORE the stage is moved. Do not open a previously observed/rebound
@@ -278,6 +283,9 @@ test("#66 stage alias rebound to a foreign published inode cannot pass held-sour
   retained.push(published);
   const originalId = await expected.stat({ bigint: true });
   const injectedId = await injected.stat({ bigint: true });
+  assert.equal(originalId.nlink, 2n,
+    "original expected stage must also have two links: only identity may distinguish the two inodes");
+  assert.equal(injectedId.nlink, 2n);
   assert.notDeepEqual([originalId.dev, originalId.ino], [injectedId.dev, injectedId.ino],
     "stage alias must be physically swapped to a distinct inode");
   const stageAlias = await fsp.lstat(stageName, { bigint: true });
@@ -288,7 +296,7 @@ test("#66 stage alias rebound to a foreign published inode cannot pass held-sour
   await assert.rejects(assertHeldPublicationIdentity(expected, published),
     { code: "lab_publication_identity_mismatch" });
   for (const [label, handle, expectedLinks] of [
-    ["retained-foreign", expected, 1n], ["hostile-injected", injected, 2n],
+    ["retained-foreign", expected, 2n], ["hostile-injected", injected, 2n],
     ["published", published, 2n],
   ]) {
     const before = await handle.stat({ bigint: true });
