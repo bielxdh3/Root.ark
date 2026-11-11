@@ -3107,7 +3107,10 @@ class SyncEngine {
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
-    await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
+    await this.assertOutgoingAuthorized(operation, () => {
+      markNativeRootMutationAttempt(this);
+      return this.journal.enqueue(operation);
+    });
     let hash;
     if (operation.operation === "move") {
       const plaintext = protocol.decodeMovePayload(protocol.decryptPayload(operation, key), key);
@@ -3119,9 +3122,19 @@ class SyncEngine {
   }
 
   async translateWebDavMutation(event) {
+    // Translation can open a cold FOD root, installing its durable mode
+    // marker. It must acquire the kernel-backed root exclusion FIRST, not
+    // call enforceEverFodRootMode outside withMutationLock.
+    // Preserve the module-private negative latch on an already-indeterminate
+    // engine before attempting another physical lock acquisition.
     denyIndeterminateInbound(this);
+    return this.withMutationLock(() => this._translateWebDavMutation(event));
+  }
+
+  async _translateWebDavMutation(event) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
-    if (!this.opened) await this.open();
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
     const kind = String(event.kind || "");
     if (!["put", "move", "delete"].includes(kind)) fail("Unsupported WebDAV mutation", "invalid_webdav_mutation");
@@ -3406,6 +3419,7 @@ class SyncEngine {
     const decrypted = protocol.decryptPayload(operation, key);
     const plaintext = operation.operation === "move" ? (protocol.decodeMovePayload(decrypted, key) || decrypted) : decrypted;
     const conflictRoot = path.join(this.rootDir, ".rootark-conflicts");
+    markNativeRootMutationAttempt(this);
     await fsp.mkdir(conflictRoot, { recursive: true });
     await containedAbsolute(this.rootDir, conflictRoot, false);
     const target = path.join(conflictRoot, `${operation.operationId}.conflict`);
@@ -3476,6 +3490,7 @@ class SyncEngine {
             fail("Atomic batch device grant changed before dispatch", "authorization_rejected");
           }
         }
+        markNativeRootMutationAttempt(this);
         return this.adapter.pushBatch([deleted, moved]);
       };
       // The final synchronous current-policy checks begin ONE network
@@ -4313,6 +4328,7 @@ class SyncEngine {
       const prior = this.snapshot.files[relative];
       if (prior && !prior.deleted && prior.directory) break;
       try {
+        markNativeRootMutationAttempt(this);
         await fsp.rmdir(current);
       } catch (error) {
         if (error.code === "ENOENT") {
@@ -5271,7 +5287,7 @@ const preflightOutOfScopeMoveBuiltIn = SyncEngine.prototype.preflightOutOfScopeM
 // These are cooperative process-lock leases ONLY; no JS wrapper can grant
 // native RootSession, independent ancestry custody or same-SID isolation.
 for (const name of [
-  "_open", "persistSnapshot", "replayEvictionLedger", "_apply",
+  "_open", "persistSnapshot", "replayEvictionLedger", "_translateWebDavMutation", "_apply",
   "reconcileOutOfScopeMove", "pushAtomicSignedOverwritePair",
   "_reconcileLocal", "_materializeOnDemand",
   "_materializeRemote", "_enqueueChange",
@@ -5302,11 +5318,6 @@ for (const name of [
             // These private paths may perform destructive or remote actions
             // before they return. Read-only hydration and signed preflight
             // remain unmarked until their first real mutating syscall.
-            if (this.requireNativeRootRecovery && new Set([
-              "_open", "_enqueueChange", "recoverConflict",
-              "pruneEmptyUntrackedParents", "_pinLocal", "_unpinLocal",
-              "_applyExcludedPaths", "pushAtomicSignedOverwritePair",
-            ]).has(name)) markNativeRootMutationAttempt(this);
             return await implementation.apply(this, args);
           });
         } catch (error) {

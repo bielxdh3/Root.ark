@@ -367,6 +367,70 @@ test("issue 66: Files On-Demand WebDAV translation never signs pathname-derived 
   assert.equal((await client.journal.recover()).length, 0);
 });
 
+test("issue 66: cold WebDAV translation under a foreign root lock cannot create the FOD mode marker", async (t) => {
+  const { root, adapter, key, state } = await setup(t, {
+    "docs/remote.txt": "signed remote source",
+  });
+  await fsp.mkdir(root, { recursive: true });
+  const rootLock = path.join(root, ".rootark-sync.lock");
+  await fsp.mkdir(rootLock, { mode: 0o700 });
+  const cold = new SyncEngine({
+    rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true,
+  });
+  await assert.rejects(cold.translateWebDavMutation({
+    operationId: crypto.randomUUID(), kind: "put", path: "/docs/remote.txt",
+  }), { code: "sync_root_busy" });
+  assert.equal(await exists(path.join(root, ".rootark-sync-ever-fod")), false,
+    "the cold translator must not publish a marker without owning the real root lock");
+  assert.equal(await exists(path.join(root, ".rootark-sync-index.json")), false);
+  assert.equal(await exists(path.join(root, ".rootark-sync-journal.json")), false);
+  assert.equal(await exists(rootLock), true);
+  assert.equal(state.pushes, 0);
+  assert.equal(state.inventoryReads, 0);
+});
+
+test("issue 66: unsupported pin and signed batch preflight cannot leave a false physical root lock", async (t) => {
+  const { root, open, store, state } = await setup(t, {
+    "docs/cache.txt": "authenticated remote content",
+  });
+  const client = await open();
+  await assert.rejects(client.pinLocal("docs/cache.txt"),
+    { code: "authorization_required" });
+  await assert.rejects(client.withMutationLock(() =>
+    client.pushAtomicSignedOverwritePair([], { pushed: 0 })),
+    { code: "sync_atomic_batch_unavailable" });
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
+    "side-effect-free policy denials must not poison future physical ownership");
+  const reopened = await open();
+  assert.equal((await reopened.pinStatus("docs/cache.txt")).pinned, false);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
+  assert.equal(state.pushes, 0);
+  assert.equal(store.list("alice").length, 1);
+});
+
+test("issue 66: rejected native-required excluded-cache migration never leaves a spurious physical lock", async (t) => {
+  const { root, open, state } = await setup(t, {
+    "docs/cache.txt": "verified cached bytes",
+  });
+  const client = await open();
+  await client.materializeRemote("docs/cache.txt");
+  const snapshot = path.join(root, ".rootark-sync-index.json");
+  const before = await fsp.readFile(snapshot);
+  client.excludedPaths = ["docs"];
+  await assert.rejects(client.withMutationLock(() => client._applyExcludedPaths()),
+    { code: "root_session_native_unavailable" });
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
+    "a native-custody refusal before legacy eviction must not poison the root");
+  assert.deepEqual(await fsp.readFile(snapshot), before);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"),
+    "verified cached bytes");
+  const reopened = await open();
+  assert.equal((await reopened.pinStatus("docs/cache.txt")).pinned, false);
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66: direct Files On-Demand outbox cannot enqueue a signed DELETE", async (t) => {
   const { open, store, key, state } = await setup(t, { "docs/remote.txt": "signed original" });
   const client = await open();
