@@ -1,6 +1,9 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
+const NATIVE_VERIFY = crypto.verify.bind(crypto);
+const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
 const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -13,7 +16,7 @@ const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
-const ATOMIC_PUBLIC_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
+const ATOMIC_PUBLIC_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
 }));
@@ -31,7 +34,7 @@ const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
 function signedEnvelopeDigest(operation) {
-  return crypto.createHash("sha256")
+  return NATIVE_CREATE_HASH("sha256")
     .update(protocol.canonicalJson(operation), "utf8").digest("hex");
 }
 
@@ -73,12 +76,12 @@ function pinnedAtomicWitnessKey(value) {
         fail("Atomic batch witness key is not canonical", "authorization_required");
       }
     } else {
-      const supplied = value instanceof crypto.KeyObject ? value : crypto.createPublicKey(value);
+      const supplied = value instanceof crypto.KeyObject ? value : NATIVE_CREATE_PUBLIC_KEY(value);
       if (ATOMIC_NATIVE_TYPE.call(supplied) !== "public"
         || ATOMIC_NATIVE_ALGORITHM.call(supplied) !== "ed25519") throw new Error("Invalid key");
       der = ATOMIC_NATIVE_EXPORT.call(supplied, { type: "spki", format: "der" });
     }
-    const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    const key = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" });
     if (ATOMIC_NATIVE_TYPE.call(key) !== "public"
       || ATOMIC_NATIVE_ALGORITHM.call(key) !== "ed25519") throw new Error("Invalid key");
     return key;
@@ -129,7 +132,7 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
   const signature = Buffer.from(receipt.signature, "base64url");
   if (signature.length !== 64
     || signature.toString("base64url") !== receipt.signature
-    || !crypto.verify(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
+    || !NATIVE_VERIFY(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
       + protocol.canonicalJson(statement), "utf8"), trustedWitnessKey, signature)) {
     fail("Independent atomic batch witness signature invalid",
       "sync_atomic_batch_indeterminate");
@@ -171,7 +174,7 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
   }
   const signature = Buffer.from(detached.signature, "base64url");
   if (signature.length !== 64 || signature.toString("base64url") !== detached.signature
-    || !crypto.verify(null, Buffer.from(ATOMIC_CAS_FLOOR_DOMAIN
+    || !NATIVE_VERIFY(null, Buffer.from(ATOMIC_CAS_FLOOR_DOMAIN
       + protocol.canonicalJson(statement), "utf8"), trustedCasKey, signature)) {
     fail("External CAS current floor signature invalid",
       "sync_atomic_batch_indeterminate");
@@ -195,7 +198,7 @@ function signedWebDavEventId(operation) {
     || typeof operation.metadata?.path !== "string") return null;
   const parts = /^webdav-(.+)-([a-f0-9]{24})$/.exec(operation.operationId);
   if (!parts || parts[1].length > 100) return null;
-  const digest = crypto.createHash("sha256")
+  const digest = NATIVE_CREATE_HASH("sha256")
     .update(`${operation.operation}:${operation.metadata.path}`)
     .digest("hex").slice(0, 24);
   return parts[2] === digest ? parts[1] : null;

@@ -6,6 +6,10 @@
 // or the owner-selected mapping. No current runtime wires these dependencies.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
+const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
+const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
+const NATIVE_VERIFY = crypto.verify.bind(crypto);
+const NATIVE_SIGN = crypto.sign.bind(crypto);
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
@@ -74,7 +78,7 @@ function uuid(value) {
   if (typeof value !== "string" || !UUID.test(value)) deny();
   return value;
 }
-function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
+function sha(bytes) { return NATIVE_CREATE_HASH("sha256").update(bytes).digest("hex"); }
 function signedBytes(domain, payload) {
   return Buffer.concat([domain, Buffer.from(JSON.stringify(payload), "utf8")]);
 }
@@ -111,7 +115,7 @@ function signOwnerObjectMap(unsigned, privateKey) {
   try {
     const payload = ownPayload(unsigned);
     return Object.freeze({ ...payload,
-      signature: crypto.sign(null, signedBytes(OWNER_DOMAIN, payload),
+      signature: NATIVE_SIGN(null, signedBytes(OWNER_DOMAIN, payload),
         key(privateKey, "private")).toString("base64url") });
   } catch (_) { deny(); }
 }
@@ -137,7 +141,7 @@ function signCurrentMappingHead(unsigned, privateKey) {
   try {
     const payload = currentHeadPayload(unsigned);
     return Object.freeze({ ...payload,
-      signature: crypto.sign(null, signedBytes(CURRENT_DOMAIN, payload),
+      signature: NATIVE_SIGN(null, signedBytes(CURRENT_DOMAIN, payload),
         key(privateKey, "private")).toString("base64url") });
   } catch (_) { deny(); }
 }
@@ -295,7 +299,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         const r = exact(input, INPUT_FIELDS);
         const { payload, signature } = unpackMap(r.ownerMapping);
         const digest = sha(Buffer.concat([signedBytes(OWNER_DOMAIN, payload), signature]));
-        if (!crypto.verify(null, signedBytes(OWNER_DOMAIN, payload),
+    if (!NATIVE_VERIFY(null, signedBytes(OWNER_DOMAIN, payload),
           ownerKeys[ownerKeys.length - 1], signature)
           || payload.owner_cutover_digest !== cutover.digest
           || payload.owner_generation !== cutover.statement.generation
@@ -354,7 +358,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           || head.mapping_sequence !== payload.mapping_sequence
           || head.sync_account_id !== identity.accountId
           || head.zk_immutable_account_id !== z.immutableAccountId
-          || !crypto.verify(null, signedBytes(CURRENT_DOMAIN, head),
+      || !NATIVE_VERIFY(null, signedBytes(CURRENT_DOMAIN, head),
             authorityKey, decode(wire.signature, 64))) deny();
         const live = snapshotLocalDevicePolicy(s.currentDevicePolicy());
         const device = normalized.deviceId;
@@ -388,7 +392,7 @@ function nativePublic(value) {
     der = Buffer.from(value);
     if (der.length !== 44) deny();
   } else deny();
-  const result = key(crypto.createPublicKey({ key: der,
+  const result = key(NATIVE_CREATE_PUBLIC_KEY({ key: der,
     format: "der", type: "spki" }), "public");
   if (!result.export({ format: "der", type: "spki" }).equals(der)) deny();
   return result;

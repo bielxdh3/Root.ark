@@ -5,11 +5,14 @@
 // The signing root MUST be pinned by the embedding process, never by sync JSON.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
+const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
+const NATIVE_VERIFY = crypto.verify.bind(crypto);
+const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
 const protocol = require("./rootark-sync-protocol");
 
 // Verify native public-key identity, never caller-shadowable instance fields.
 // Reimport each pin so later instance method mutation cannot change readback.
-const PUBLIC_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
+const PUBLIC_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
 }));
@@ -46,7 +49,7 @@ function pinnedProvisionerKey(input) {
         || NATIVE_ALGORITHM.call(input) !== "ed25519") throw deny();
       der = NATIVE_EXPORT.call(input, { type: "spki", format: "der" });
     } else throw deny();
-    const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    const key = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" });
     if (NATIVE_TYPE.call(key) !== "public"
       || NATIVE_ALGORITHM.call(key) !== "ed25519") throw deny();
     return key;
@@ -96,12 +99,12 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
   // All THREE separately administered principals must be physically distinct.
   if (NATIVE_EQUALS.call(witness, cas) || NATIVE_EQUALS.call(witness, pin)
     || NATIVE_EQUALS.call(cas, pin)) throw deny();
-  if (!crypto.verify(null, Buffer.from(DOMAIN + protocol.canonicalJson(statement), "utf8"),
+  if (!NATIVE_VERIFY(null, Buffer.from(DOMAIN + protocol.canonicalJson(statement), "utf8"),
     pin, signature)) throw deny();
   // A signature by itself is REPLAYABLE. The trusted embedding must retain
   // the CURRENT certificate digest outside mutable sync config, server and
   // journal; an older but correctly signed certificate must fail closed.
-  const digest = crypto.createHash("sha256")
+  const digest = NATIVE_CREATE_HASH("sha256")
     .update(DOMAIN + protocol.canonicalJson(detached), "utf8").digest("hex");
   if (digest !== expectedDigest) throw deny();
   return Object.freeze({ identity: Object.freeze({

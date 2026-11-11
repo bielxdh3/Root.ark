@@ -4,12 +4,18 @@
 // establishes independent off-host custody, freshness, or permission for I/O.
 const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
+// Capture the native factory before a caller-owned KeyObject can execute its
+// inherited kHandle getter and replace crypto.createPublicKey at runtime.
+const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
+const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
+const NATIVE_VERIFY = crypto.verify.bind(crypto);
+const NATIVE_SIGN = crypto.sign.bind(crypto);
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
 // Caller-supplied KeyObjects can shadow instance `.type`,
 // `.asymmetricKeyType` and `.export`. Capture actual native accessors and
 // public export from Node prototypes before examining any caller keys.
-const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
+const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
 }));
@@ -26,7 +32,7 @@ const ROTATION_FIELDS = Object.freeze(["type", "immutable_account_id", "generati
   "from_spki_sha256", "next_public_key", "previous_rotation_digest"]);
 const HEX = /^[a-f0-9]{64}$/;
 const B64 = /^[A-Za-z0-9_-]+$/;
-const H = (...v) => crypto.createHash("sha256").update(Buffer.concat(v)).digest();
+const H = (...v) => NATIVE_CREATE_HASH("sha256").update(Buffer.concat(v)).digest();
 function deny() {
   const err = new Error("ZK10_ACCOUNT_CUTOVER_UNVERIFIED");
   err.code = err.message;
@@ -62,7 +68,7 @@ function key(value, type) {
   try {
     const der = NATIVE_PUBLIC_EXPORT.call(value, { format: "der", type: "spki" });
     if (!Buffer.isBuffer(der) || der.length !== 44) deny();
-    const pinned = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    const pinned = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" });
     if (NATIVE_TYPE.call(pinned) !== "public"
       || NATIVE_ALGORITHM.call(pinned) !== "ed25519"
       || !NATIVE_PUBLIC_EXPORT.call(pinned, { format: "der", type: "spki" }).equals(der)) deny();
@@ -116,13 +122,13 @@ function signatureBytes(domain, payload) {
 }
 function signOwnerCutover(payload, privateKey) {
   const p = ownerPayload(payload);
-  return Object.freeze({ ...p, signature: crypto.sign(null,
+  return Object.freeze({ ...p, signature: NATIVE_SIGN(null,
     signatureBytes(DOMAIN_OWNER, p), key(privateKey, "private")).toString("base64url") });
 }
 function verifyOwnerCutover(wire, publicKey) {
   const signed = exact(wire, [...OWNER_FIELDS, "signature"]);
   const p = ownerPayload(Object.fromEntries(OWNER_FIELDS.map((f) => [f, signed[f]])));
-  if (!crypto.verify(null, signatureBytes(DOMAIN_OWNER, p), key(publicKey, "public"),
+  if (!NATIVE_VERIFY(null, signatureBytes(DOMAIN_OWNER, p), key(publicKey, "public"),
     decode(signed.signature, 64))) deny();
   return Object.freeze(p);
 }
@@ -142,20 +148,21 @@ function rotationPayload(p) {
   if (v.previous_rotation_digest !== null) hex(v.previous_rotation_digest);
   const der = decode(v.next_public_key, 44);
   let next;
-  try { next = crypto.createPublicKey({ key: der, format: "der", type: "spki" }); }
+  try { next = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" }); }
   catch (_) { deny(); }
-  key(next, "public");
+  next = key(next, "public");
+  if (!NATIVE_PUBLIC_EXPORT.call(next, { format: "der", type: "spki" }).equals(der)) deny();
   return { body: v, next };
 }
 function signOwnerRotation(payload, previousPrivateKey, nextPrivateKey) {
   const { body, next } = rotationPayload(payload);
-  if (spkiHash(crypto.createPublicKey(key(previousPrivateKey, "private")))
-    !== body.from_spki_sha256 || spkiHash(crypto.createPublicKey(key(nextPrivateKey, "private")))
+  if (spkiHash(NATIVE_CREATE_PUBLIC_KEY(key(previousPrivateKey, "private")))
+    !== body.from_spki_sha256 || spkiHash(NATIVE_CREATE_PUBLIC_KEY(key(nextPrivateKey, "private")))
     !== spkiHash(next)) deny();
   const data = signatureBytes(DOMAIN_ROTATION, body);
   return Object.freeze({ ...body,
-    signature_from: crypto.sign(null, data, previousPrivateKey).toString("base64url"),
-    signature_next: crypto.sign(null, data, nextPrivateKey).toString("base64url") });
+    signature_from: NATIVE_SIGN(null, data, previousPrivateKey).toString("base64url"),
+    signature_next: NATIVE_SIGN(null, data, nextPrivateKey).toString("base64url") });
 }
 function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
   if (!Array.isArray(rotations) || rotations.length > 8
@@ -170,8 +177,8 @@ function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
       || body.generation !== index + 1 || body.previous_rotation_digest !== previousDigest
       || body.from_spki_sha256 !== pinnedSpkiHash(current)) deny();
     const bytes = signatureBytes(DOMAIN_ROTATION, body);
-    if (!crypto.verify(null, bytes, current, decode(signed.signature_from, 64))
-      || !crypto.verify(null, bytes, next, decode(signed.signature_next, 64))) deny();
+    if (!NATIVE_VERIFY(null, bytes, current, decode(signed.signature_from, 64))
+      || !NATIVE_VERIFY(null, bytes, next, decode(signed.signature_next, 64))) deny();
     previousDigest = H(bytes, decode(signed.signature_from, 64),
       decode(signed.signature_next, 64)).toString("hex");
     current = next;
