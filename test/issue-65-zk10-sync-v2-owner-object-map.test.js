@@ -6,7 +6,8 @@ const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { DOMAIN: SOURCE_DOMAIN } = require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
-const { signOwnerCutover, digestOwnerCutover, signOwnerRotation, spkiHash } =
+const { signOwnerCutover, digestOwnerCutover, signOwnerRotation, spkiHash,
+  verifyOwnerRotationKeys } =
   require("../src/crypto/rootark-zk10-account-cutover-v1");
 const { buildSparseObjectInventoryProof } =
   require("../src/crypto/rootark-zk10-anonymous-object-binding-v1");
@@ -324,6 +325,56 @@ test("native Ed25519 roles use actual key material despite shadowed type and exp
       type: "public", asymmetricKeyType: "ed25519", export: () => Buffer.alloc(44),
     } },
   }), deny, "plain signer objects must never masquerade as native public KeyObjects");
+});
+
+test("P2: inherited KeyObject kHandle cannot splice owner A's signature onto claimed SPKI B", () => {
+  const ownerA = crypto.generateKeyPairSync("ed25519");
+  const claimedB = crypto.generateKeyPairSync("ed25519");
+  const next = crypto.generateKeyPairSync("ed25519");
+  const handle = Object.getOwnPropertySymbols(ownerA.publicKey)
+    .find((symbol) => String(symbol) === "Symbol(kHandle)");
+  assert.ok(handle, "Node 22 must expose a physical kHandle to exercise this exploit");
+  const rogueRoot = Object.create(ownerA.publicKey);
+  assert.ok(rogueRoot instanceof crypto.KeyObject);
+  const seen = [];
+  Object.defineProperty(rogueRoot, handle, { get() {
+    // Native algorithm/type reads A, SPKI export reads B, signature verify
+    // reads A again. Repeated references to the same JS object are NOT a pin.
+    const keyPair = seen.length === 1 ? claimedB : ownerA;
+    seen.push(keyPair === claimedB ? "B" : "A");
+    return keyPair.publicKey[handle];
+  } });
+  const signRotation = (claimedSpki) => {
+    const body = {
+      type: "rootark-zk10-owner-rotation/v1",
+      immutable_account_id: immutableId,
+      generation: 1, from_spki_sha256: claimedSpki,
+      next_public_key: b64(next), previous_rotation_digest: null,
+    };
+    const signedBytes = Buffer.concat([
+      Buffer.from("Root.ark/zk10/owner-rotation/v1\0"),
+      Buffer.from(JSON.stringify(body), "utf8"),
+    ]);
+    return { ...body,
+      signature_from: crypto.sign(null, signedBytes, ownerA.privateKey).toString("base64url"),
+      signature_next: crypto.sign(null, signedBytes, next.privateKey).toString("base64url"),
+    };
+  };
+  // Compute A's genuine SPKI hash without pre-warming its cached asymmetric
+  // metadata, which otherwise changes the exploit's native getter sequence.
+  const ownerAHash = crypto.createHash("sha256")
+    .update(crypto.createPublicKey(ownerA.privateKey)
+      .export({ type: "spki", format: "der" })).digest("hex");
+  const claimedBHash = spkiHash(claimedB.publicKey);
+  assert.notEqual(ownerAHash, claimedBHash);
+  assert.throws(() => verifyOwnerRotationKeys([signRotation(claimedBHash)],
+    rogueRoot, immutableId), /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
+  "signed rotation from real owner A must never authenticate claimed SPKI B");
+  assert.ok(seen.length >= 2, `native kHandle splicing was exercised: ${seen.join(",")}`);
+  const genuine = verifyOwnerRotationKeys(
+    [signRotation(ownerAHash)], ownerA.publicKey, immutableId);
+  assert.equal(genuine.length, 2, "legitimate distinct signed rotation remains valid");
+  assert.equal(crypto.KeyObject.prototype.equals.call(genuine[1], next.publicKey), true);
 });
 
 test("P2 owner cutover is snapshotted: two distinct valid signatures cannot splice a foreign inventory root", async () => {
