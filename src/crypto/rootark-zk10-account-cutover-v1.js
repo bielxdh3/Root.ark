@@ -10,6 +10,11 @@ const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
 const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
 const NATIVE_VERIFY = crypto.verify.bind(crypto);
 const NATIVE_SIGN = crypto.sign.bind(crypto);
+// The factory alone is not a pin: hostile KeyObject kHandle getters can
+// replace Hash.prototype.update/digest before a signed digest is computed.
+const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
+const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
 // Caller-supplied KeyObjects can shadow instance `.type`,
@@ -32,7 +37,11 @@ const ROTATION_FIELDS = Object.freeze(["type", "immutable_account_id", "generati
   "from_spki_sha256", "next_public_key", "previous_rotation_digest"]);
 const HEX = /^[a-f0-9]{64}$/;
 const B64 = /^[A-Za-z0-9_-]+$/;
-const H = (...v) => NATIVE_CREATE_HASH("sha256").update(Buffer.concat(v)).digest();
+const H = (...v) => {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, Buffer.concat(v));
+  return NATIVE_HASH_DIGEST.call(hash);
+};
 function deny() {
   const err = new Error("ZK10_ACCOUNT_CUTOVER_UNVERIFIED");
   err.code = err.message;

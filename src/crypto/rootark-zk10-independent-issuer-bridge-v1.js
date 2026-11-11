@@ -5,6 +5,18 @@
 // MUST arrive from independent provisioning/custody, never the HTTP caller,
 // owner-controlled corpus, JWT or local database. No route is enabled here.
 const crypto = require("node:crypto");
+const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
+const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
+const NATIVE_VERIFY = crypto.verify.bind(crypto);
+const NATIVE_SIGN = crypto.sign.bind(crypto);
+const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
+const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
+const PUBLIC_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_PUBLIC_KEY({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+}));
+const NATIVE_PUBLIC_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_PROTOTYPE, "export").value;
 const { exact, decode, hex, key } = require("./rootark-zk10-account-cutover-v1");
 const { FIELDS: OBJECT_BINDING_FIELDS, verifyAnonymousObjectBinding } =
   require("./rootark-zk10-anonymous-object-binding-v1");
@@ -31,9 +43,8 @@ function deny() {
 }
 function ownerPublicKey(spki) {
   const bytes = decode(spki, 44);
-  const result = crypto.createPublicKey({ key: bytes, format: "der", type: "spki" });
-  key(result, "public");
-  if (!result.export({ type: "spki", format: "der" }).equals(bytes)) deny();
+  const result = key(NATIVE_CREATE_PUBLIC_KEY({ key: bytes, format: "der", type: "spki" }), "public");
+  if (!NATIVE_PUBLIC_EXPORT.call(result, { type: "spki", format: "der" }).equals(bytes)) deny();
   return result;
 }
 function canonical(payload) {
@@ -65,13 +76,15 @@ function unpack(wire) {
   return Object.freeze({ body, signature: decode(signed.signature, 64) });
 }
 function digestSnapshot(bytes, signature) {
-  return crypto.createHash("sha256").update(bytes)
-    .update(signature).digest("hex");
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, bytes);
+  NATIVE_HASH_UPDATE.call(hash, signature);
+  return NATIVE_HASH_DIGEST.call(hash, "hex");
 }
 function signIssuerProvisioning(unsigned, issuerPrivateKey) {
   try {
     const body = canonical(unsigned);
-    const signature = crypto.sign(null, signedBytes(body), key(issuerPrivateKey, "private"));
+    const signature = NATIVE_SIGN(null, signedBytes(body), key(issuerPrivateKey, "private"));
     return Object.freeze({ ...body, signature: signature.toString("base64url") });
   } catch (_) { deny(); }
 }
@@ -98,7 +111,7 @@ function createIssuerProvisionedObjectVerifier(config) {
         const signedMessage = signedBytes(body);
         if (digestSnapshot(signedMessage, signature) !== retainedDigest
           || body.immutable_account_id !== c.immutableAccountId
-          || !crypto.verify(null, signedMessage, issuer, signature)) deny();
+          || !NATIVE_VERIFY(null, signedMessage, issuer, signature)) deny();
         const ownerRoot = ownerPublicKey(body.owner_root_spki);
         // The anonymous owner statement has the same Proxy TOCTOU hazard:
         // downstream verification must see exactly the fields compared here.

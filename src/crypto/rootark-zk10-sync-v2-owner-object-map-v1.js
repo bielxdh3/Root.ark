@@ -10,6 +10,9 @@ const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
 const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
 const NATIVE_VERIFY = crypto.verify.bind(crypto);
 const NATIVE_SIGN = crypto.sign.bind(crypto);
+const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
+const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
@@ -78,7 +81,11 @@ function uuid(value) {
   if (typeof value !== "string" || !UUID.test(value)) deny();
   return value;
 }
-function sha(bytes) { return NATIVE_CREATE_HASH("sha256").update(bytes).digest("hex"); }
+function sha(bytes) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, bytes);
+  return NATIVE_HASH_DIGEST.call(hash, "hex");
+}
 function signedBytes(domain, payload) {
   return Buffer.concat([domain, Buffer.from(JSON.stringify(payload), "utf8")]);
 }

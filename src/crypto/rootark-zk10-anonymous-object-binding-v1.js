@@ -5,6 +5,12 @@
 // complete object corpus, or an independently retained owner/corpus head.
 // A valid owner signature therefore NEVER authorizes I/O or proves ownership.
 const crypto = require("node:crypto");
+const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
+const NATIVE_VERIFY = crypto.verify.bind(crypto);
+const NATIVE_SIGN = crypto.sign.bind(crypto);
+const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
+const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
 const {
   exact, decode, hex, key, verifyOwnerRotationKeys, verifyOwnerCutoverHistory,
 } = require("./rootark-zk10-account-cutover-v1");
@@ -61,14 +67,13 @@ function canonical(value) {
 function tokenDigest(rawKind, token) {
   kind(rawKind);
   if (typeof token !== "string" || !TOKEN.test(token)) deny();
-  return crypto.createHash("sha256").update(TOKEN_DOMAIN)
-    .update(Buffer.from(rawKind, "ascii")).update(Buffer.from([0]))
-    .update(Buffer.from(token, "ascii")).digest("hex");
+  return sha(TOKEN_DOMAIN, Buffer.from(rawKind, "ascii"), Buffer.from([0]),
+    Buffer.from(token, "ascii")).toString("hex");
 }
 function sha(...parts) {
-  const hash = crypto.createHash("sha256");
-  for (const part of parts) hash.update(part);
-  return hash.digest();
+  const hash = NATIVE_CREATE_HASH("sha256");
+  for (const part of parts) NATIVE_HASH_UPDATE.call(hash, part);
+  return NATIVE_HASH_DIGEST.call(hash);
 }
 function uint64(number, minimum) {
   if (!Number.isSafeInteger(number) || number < minimum) deny();
@@ -167,7 +172,7 @@ function signatureBytes(body) {
 function signAnonymousObjectBinding(unsigned, privateKey) {
   try {
     const body = canonical(unsigned);
-    const signature = crypto.sign(null, signatureBytes(body), key(privateKey, "private"));
+    const signature = NATIVE_SIGN(null, signatureBytes(body), key(privateKey, "private"));
     return Object.freeze({ ...body, signature: signature.toString("base64url") });
   } catch (_) { deny(); }
 }
@@ -202,7 +207,7 @@ function verifyAnonymousObjectBinding(input) {
       || body.object_id !== expectedObject.object_id
       || body.object_revision !== expectedObject.revision
       || body.ciphertext_sha256 !== expectedObject.ciphertext_sha256
-      || !crypto.verify(null, signatureBytes(body), keys[keys.length - 1], signature)) deny();
+      || !NATIVE_VERIFY(null, signatureBytes(body), keys[keys.length - 1], signature)) deny();
     // Cryptographically prove this exact owner+object+revision+digest is in the
     // current owner-signed inventory root. The root's complete-corpus claim
     // still requires independently verified external issuance/custody.

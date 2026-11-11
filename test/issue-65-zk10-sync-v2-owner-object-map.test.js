@@ -608,3 +608,60 @@ test("W26: invalid head limits and pre-aborted signal fail before native work", 
   await assert.rejects(verify(f.input, { signal: cancelled.signal }), deny);
   assert.equal(reads, 0);
 });
+
+test("P2: physical owner kHandle cannot redirect signed mapping A digest onto independently retained B", async () => {
+  const f = await fixture();
+  const otherMapping = signOwnerObjectMap({
+    ...f.payload, nonce: Buffer.alloc(32, 77).toString("base64url"),
+  }, keys.owner.privateKey);
+  const otherDigest = digestOwnerObjectMap(otherMapping);
+  assert.notEqual(f.mappingDigest, otherDigest, "both mappings must be genuinely distinct owner signatures");
+  const handle = Object.getOwnPropertySymbols(keys.owner.publicKey)
+    .find((symbol) => String(symbol) === "Symbol(kHandle)");
+  assert.ok(handle, "the native key handle is required for the physical attack");
+  const root = Object.create(keys.owner.publicKey);
+  const hashPrototype = Object.getPrototypeOf(crypto.createHash("sha256"));
+  const original = Object.getOwnPropertyDescriptor(hashPrototype, "digest");
+  let armed = false;
+  let intercepted = 0;
+  let readbacks = 0;
+  Object.defineProperty(root, handle, { get() {
+    if (!armed) {
+      armed = true;
+      Object.defineProperty(hashPrototype, "digest", { ...original, value(encoding) {
+        const digest = original.value.call(this, encoding);
+        if (encoding === "hex" && digest === f.mappingDigest) {
+          intercepted++;
+          return otherDigest;
+        }
+        return digest;
+      } });
+    }
+    return keys.owner.publicKey[handle];
+  } });
+  try {
+    const verifier = createOwnerObjectMapVerifier({
+      sourceAuthority: f.sourceAuthority,
+      zkAuthority: { ...f.zkAuthority, ownerRootPublicKey: root },
+      mappingAuthority: {
+        ...f.authority,
+        independentlyRetainedFloor: { sequence: 5, digest: otherDigest },
+        readCurrentHead: async (challenge) => {
+          readbacks++;
+          return signCurrentMappingHead({
+            type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+            sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+            mapping_sequence: f.payload.mapping_sequence, mapping_digest: otherDigest,
+          }, keys.authority.privateKey);
+        },
+      },
+    });
+    await assert.rejects(verifier(f.input), deny,
+      "signed mapping A must not match retained digest B even if an attacker poisons Hash.digest");
+    assert.equal(armed, true, "owner KeyObject getter must have installed the poison");
+    assert.equal(intercepted, 0, "mapping hashing must bypass a poisoned Hash prototype");
+    assert.equal(readbacks, 0, "mismatched retained digest must fail before an external head read");
+  } finally {
+    Object.defineProperty(hashPrototype, "digest", original);
+  }
+});

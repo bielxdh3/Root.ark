@@ -8,6 +8,9 @@ const { types: { isProxy } } = require("node:util");
 const NATIVE_CREATE_PUBLIC_KEY = crypto.createPublicKey.bind(crypto);
 const NATIVE_VERIFY = crypto.verify.bind(crypto);
 const NATIVE_CREATE_HASH = crypto.createHash.bind(crypto);
+const HASH_PROTOTYPE = Object.getPrototypeOf(NATIVE_CREATE_HASH("sha256"));
+const NATIVE_HASH_UPDATE = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "update").value;
+const NATIVE_HASH_DIGEST = Object.getOwnPropertyDescriptor(HASH_PROTOTYPE, "digest").value;
 const protocol = require("./rootark-sync-protocol");
 
 // Verify native public-key identity, never caller-shadowable instance fields.
@@ -104,8 +107,9 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
   // A signature by itself is REPLAYABLE. The trusted embedding must retain
   // the CURRENT certificate digest outside mutable sync config, server and
   // journal; an older but correctly signed certificate must fail closed.
-  const digest = NATIVE_CREATE_HASH("sha256")
-    .update(DOMAIN + protocol.canonicalJson(detached), "utf8").digest("hex");
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, DOMAIN + protocol.canonicalJson(detached), "utf8");
+  const digest = NATIVE_HASH_DIGEST.call(hash, "hex");
   if (digest !== expectedDigest) throw deny();
   return Object.freeze({ identity: Object.freeze({
     accountId: statement.accountId, storeId: statement.storeId,
