@@ -280,6 +280,50 @@ test("P2 rotated owner signer must NEVER double as independently pinned mapping 
       readCurrentHead: makeHead(rotated.privateKey),
     },
   }), deny);
+  // A caller may override only the JavaScript instance export. The real
+  // Ed25519 key still belongs to the rotated owner, so it cannot also be
+  // the independent CURRENT authority even if the displayed SPKI differs.
+  const unrelatedSpki = keys.attacker.publicKey.export({ format: "der", type: "spki" });
+  Object.defineProperty(rotated.publicKey, "export", { value: () => unrelatedSpki });
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority, mappingAuthority: {
+      ...f.authority, pinnedPublicKey: rotated.publicKey,
+      readCurrentHead: makeHead(rotated.privateKey),
+    },
+  }), deny, "the same real owner key cannot masquerade as a distinct authority via .export");
+});
+
+test("native Ed25519 roles use actual key material despite shadowed type and export metadata", async () => {
+  const f = await fixture();
+  const copy = (publicKey) => crypto.createPublicKey({
+    key: publicKey.export({ format: "der", type: "spki" }),
+    format: "der", type: "spki",
+  });
+  const ownerCopy = copy(keys.owner.publicKey);
+  const authorityCopy = copy(keys.authority.publicKey);
+  for (const candidate of [ownerCopy, authorityCopy]) {
+    Object.defineProperties(candidate, {
+      type: { value: "private" },
+      asymmetricKeyType: { value: "rsa" },
+      export: { value: () => { throw Error("caller-shadowed-export-must-not-run"); } },
+    });
+  }
+  const verifier = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority,
+    zkAuthority: { ...f.zkAuthority, ownerRootPublicKey: ownerCopy },
+    mappingAuthority: { ...f.authority, pinnedPublicKey: authorityCopy },
+  });
+  const result = await verifier(f.input);
+  assert.equal(result.status, "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING");
+  assert.equal(result.authorizesIo, false);
+  assert.equal(result.independentCustodyProven, false);
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority,
+    zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, pinnedPublicKey: {
+      type: "public", asymmetricKeyType: "ed25519", export: () => Buffer.alloc(44),
+    } },
+  }), deny, "plain signer objects must never masquerade as native public KeyObjects");
 });
 
 test("P2 owner cutover is snapshotted: two distinct valid signatures cannot splice a foreign inventory root", async () => {

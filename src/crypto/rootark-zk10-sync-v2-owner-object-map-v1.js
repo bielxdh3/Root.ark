@@ -13,7 +13,7 @@ const { verifyPinnedAtomicOwnerProvision } =
   require("../../sync-client/rootark-sync-atomic-owner-provision");
 const { snapshotLocalDevicePolicy } =
   require("../../sync-client/rootark-sync-zk1-physical-binding");
-const { exact, decode, hex, key, spkiHash,
+const { exact, decode, hex, key, spkiHash, samePublicKey,
   verifyOwnerRotationKeys, verifyOwnerCutoverHistory } =
   require("./rootark-zk10-account-cutover-v1");
 const { verifySparseObjectInventoryProof } =
@@ -224,10 +224,12 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     if (cutover.digest !== hex(z.independentlyRetainedCutoverDigest)) deny();
     const authorityKey = key(a.pinnedPublicKey, "public");
     const authorityHash = spkiHash(authorityKey);
-    if (ownerKeys.some((ownerKey) => authorityHash === spkiHash(ownerKey))
-      || authorityHash === spkiHash(nativePublic(s.provisionerPublicKey))
-      || authorityHash === spkiHash(nativePublic(s.witnessPublicKey))
-      || authorityHash === spkiHash(nativePublic(s.casPublicKey))) deny();
+    const roleKeys = [...ownerKeys, nativePublic(s.provisionerPublicKey),
+      nativePublic(s.witnessPublicKey), nativePublic(s.casPublicKey)];
+    // A forged instance `.export` or `.type` never makes the SAME real
+    // owner/provisioner/witness/CAS signer an independent CURRENT authority.
+    if (roleKeys.some((role) => samePublicKey(authorityKey, role)
+      || authorityHash === spkiHash(role))) deny();
     const floor = exact(a.independentlyRetainedFloor, ["sequence", "digest"]);
     number(floor.sequence);
     hex(floor.digest);
