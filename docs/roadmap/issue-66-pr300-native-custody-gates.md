@@ -105,6 +105,56 @@ signed origin/current-floor/PREPARE/COMMIT cold recovery and owner-signed
 ingress/egress; real Windows **10** CFAPI and physical powercut evidence.
 **RootSession OFF; MERGE NO-GO; RELEASE NO-GO.**
 
+### 2026-11-11 — S0 native-required inbound containment (local integration)
+
+The unpublished integrated candidate `226652ff8504477c2fba2b7d4d2d35de0886528b`
+combines reviewed roadmap checkpoint `a2327a8c` with S0 inbound fence source
+`21c7824e` on the published `23cc31b6` base. The S0 private,
+non-overridable `denyUntrustedNativeInboundPublish()` fence rejects **all**
+native-required signed inbound CREATE/UPDATE/MOVE before `journal.observeAdmission`,
+user-payload parent creation, staged publication or legacy replace-capable
+`fsp.rename`. Signed native-required DELETE is already denied by its own
+earlier fence. Successful signature/AEAD checks and an apparent caller-supplied
+native session **never** authorize JavaScript publication: the current
+`openNativeRootSession(true)` throws, and the new guard still fails if a future
+opener were to return. Metadata-only browsing and legacy non-FOD operations
+retain their separate behavior. Cooperative root-lock bookkeeping may precede
+the fence; there is **no** claim of zero operating-system I/O.
+
+The source parent without S0 was RED on Windows Node22/NTFS and Ubuntu
+WSL Node22/ext4. The physical negative test uses a second **same-principal
+process** to create and `fsync` a foreign inode at signed-ingress time,
+keeps an original file descriptor open, verifies `dev/ino` and original
+bytes **through that descriptor**, and intercepts would-be unsafe JS
+rename/link. With S0 integrated, the four focused tests passed **4/4 on
+Windows 11/NTFS Node22.23.4** and **4/4 on Ubuntu WSL/ext4 Node22.22.1**:
+no inbound temp, no target rename/link, no journal admission or snapshot
+change, no push/ACK, and no foreign canary mutation; authenticated browse
+and legacy non-FOD positive CREATE still work. These are *denial* tests,
+not a positive native FOD hydration implementation or Windows 10 CFAPI gate.
+
+```mermaid
+flowchart LR
+  S[Authenticated inbound envelope] --> Q{Native-required root recovery?}
+  Q -- Yes --> D[Fail closed before inbound journal or payload mutation]
+  Q -- No --> L[Legacy JS path; NOT independent native custody]
+  D --> N[No positive FOD, MERGE or RELEASE GO]
+  L --> N
+```
+
+The legacy non-FOD `fsp.rename` remains replace-capable under a hostile
+same-SID/UID destination race. S0 makes **native-required** ingress inert,
+not the entire engine race-free; it does not enroll original-A FileId before
+the first native pin, construct a product native publisher, fix PREPARE/COMMIT
+or prove physical powercut. This local candidate still requires two
+independent SOURCE reviews of the **final composed SHA**, fast-forward
+publication and hosted CodeQL/Windows/Ubuntu checks of that published SHA.
+The predecessor `23cc31b6` CodeQL succeeded, while its Ubuntu full
+validation completed **3,514 PASS / 18 FAIL / 244 SKIP** (positive FOD
+gates); Windows jobs were not final at this documentary snapshot. Do not
+inherit predecessor results or claim that S0 resolves the 18 functional
+failures. **LAB/DENY ONLY; MERGE NO-GO; RELEASE NO-GO.**
+
 ## 2026-11-11 — current live integration and release boundary
 
 The last independently verified published PR #300 HEAD before this W26

@@ -26,6 +26,23 @@ Security Regression is green but its custodian is DEV-OFF, not external
 authority; PR #301 cryptographic signer-role changes require their own
 exact-SHA review/CI, not reuse of PR #300 checks. **MERGE/RELEASE NO-GO.**
 
+2026-11-11 — **S0 denial is not a native FOD implementation:** local composed
+PR #300 candidate `226652ff8504477c2fba2b7d4d2d35de0886528b` includes
+the private fail-closed `SyncEngine._apply` native-required signed inbound
+guard before journal/payload mutations. A hostile same-principal second
+process inserts an exclusive `fsync`ed foreign inode after authentic Ed25519
+verification; four focused negative tests each passed on Windows Node22/NTFS
+and WSL Node22/ext4 in the composed tree, with retained original FD and no
+rename/link/temp, journal admission, snapshot change or remote push. Browse
+and signed non-FOD legacy CREATE remain operational; other native-required
+operations are intentionally unavailable. Linux/Windows product native
+publisher, independently enrolled original-A and ancestors, owner-signed
+off-host floor, real Windows 10 CFAPI and physical powercut are **still
+missing**. CodeQL/hosted CI on this local SHA have **not** been run;
+predecessor `23cc31b6` had CodeQL SUCCESS but Ubuntu 18 positive FOD FAIL.
+The legacy JS rename remains overwrite-capable outside S0. **No merge,
+deploy, RootSession activation or release authorization.**
+
 2026-11-11 — Issue #66 / PR #300 W26 integration status: current bounded
 native NTFS evidence is recorded in
 `docs/roadmap/issue-66-pr300-native-custody-gates.md`. Four post-native-pin
