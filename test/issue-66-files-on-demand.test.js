@@ -1501,6 +1501,81 @@ test("issue 66: native-required retry cannot dispatch a freshly signed DELETE sw
   assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false,
     "an aborted pre-dispatch race must not invent an indeterminate physical write");
   assert.equal(state.pushes, 0);
+
+  // Stronger synchronous last-use attack: the final signed-envelope check
+  // has already completed when JavaScript resolves adapter.push. A getter can
+  // swap the caller-owned object to a genuinely signed DELETE at that instant
+  // without any await or microtask. The transport must never see that inode
+  // delete and the enclosing root lock must not become a false authority.
+  const getterRebound = JSON.parse(protocol.canonicalJson(originalCreate));
+  const priorPushDescriptor = Object.getOwnPropertyDescriptor(adapter, "push");
+  dispatched = undefined;
+  client.assertOutgoingAuthorized = async (_op, action = null) =>
+    action ? action() : true;
+  Object.defineProperty(adapter, "push", {
+    configurable: true,
+    get() {
+      for (const field of Object.keys(getterRebound)) delete getterRebound[field];
+      Object.assign(getterRebound, JSON.parse(protocol.canonicalJson(actualSignedDelete)));
+      return async (sent) => {
+        dispatched = JSON.parse(protocol.canonicalJson(sent));
+        const handle = await fsp.open(remoteProof, "wx", 0o600);
+        try {
+          await handle.writeFile(protocol.canonicalJson(dispatched));
+          await handle.sync();
+        } finally { await handle.close(); }
+        return { status: 201 };
+      };
+    },
+  });
+  try {
+    await assert.rejects(client.withMutationLock(() => client.retryPush(getterRebound)),
+      { code: "invalid_snapshot" },
+      "synchronous adapter getter substitution must not reach the outbound transport");
+  } finally {
+    client.assertOutgoingAuthorized = originalAuthorization;
+    if (priorPushDescriptor) Object.defineProperty(adapter, "push", priorPushDescriptor);
+    else delete adapter.push;
+  }
+  assert.equal(dispatched, undefined, "the signed foreign DELETE must never reach the adapter");
+  assert.equal(await exists(remoteProof), false);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
+  assert.equal(state.pushes, 0);
+
+  // A correctly authorized CREATE must still reach the adapter with exactly
+  // its signed bytes, but never with the caller's mutable object identity.
+  const legitimateCreate = JSON.parse(protocol.canonicalJson(originalCreate));
+  const createProof = path.join(remoteDirectory, "legitimate-signed-create.bin");
+  const savedPushDescriptor = Object.getOwnPropertyDescriptor(adapter, "push");
+  let receivedCreate;
+  client.assertOutgoingAuthorized = async (_op, action = null) =>
+    action ? action() : true;
+  adapter.push = async (sent) => {
+    assert.notStrictEqual(sent, legitimateCreate);
+    assert.notStrictEqual(sent.metadata, legitimateCreate.metadata);
+    assert.notStrictEqual(sent.authorization, legitimateCreate.authorization);
+    receivedCreate = JSON.parse(protocol.canonicalJson(sent));
+    const handle = await fsp.open(createProof, "wx", 0o600);
+    try {
+      await handle.writeFile(protocol.canonicalJson(receivedCreate));
+      await handle.sync();
+    } finally { await handle.close(); }
+    return { status: 201 };
+  };
+  try {
+    await client.withMutationLock(() => client.retryPush(legitimateCreate));
+  } finally {
+    client.assertOutgoingAuthorized = originalAuthorization;
+    if (savedPushDescriptor) Object.defineProperty(adapter, "push", savedPushDescriptor);
+    else delete adapter.push;
+  }
+  assert.equal(protocol.canonicalJson(receivedCreate), protocol.canonicalJson(originalCreate));
+  assert.equal(await verifyAuthorizationProof(receivedCreate.authorization, receivedCreate, {
+    username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [],
+  }), true);
+  assert.equal(await exists(createProof), true);
+  assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
 });
 
 test("issue 66: a started but unawaited native-required _apply keeps the physical lock through all awaited I/O", async (t) => {

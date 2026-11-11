@@ -3411,24 +3411,37 @@ class SyncEngine {
       // fencing in the atomic PUT transaction.
       try {
         return await this.assertOutgoingAuthorized(operation, () => {
+          let dispatchEnvelope = operation;
+          let nativePush;
+          let nativeAdapter;
           if (nativeRequiredEnvelopeDigest !== null) {
-            let currentDigest;
+            // Resolve a potentially hostile adapter getter BEFORE the final
+            // verification. A getter can synchronously replace the original
+            // caller-owned object without yielding to the event loop.
+            nativeAdapter = this.adapter;
+            nativePush = nativeAdapter.push;
             try {
-              currentDigest = signedEnvelopeDigest(protocol.validateStoredOperation(operation));
+              // validateStoredOperation reconstructs all nested signed fields;
+              // the transport must receive this detached normalized envelope,
+              // never the caller-controlled reference that was checked.
+              dispatchEnvelope = protocol.validateStoredOperation(operation);
             } catch {
               fail("Outgoing signed envelope changed before dispatch", "invalid_snapshot");
             }
-            if (currentDigest !== nativeRequiredEnvelopeDigest) {
+            if (signedEnvelopeDigest(dispatchEnvelope) !== nativeRequiredEnvelopeDigest) {
               fail("Outgoing signed envelope changed before dispatch", "invalid_snapshot");
             }
-            // No await between this immutable-envelope comparison, the
-            // native-required DELETE denial, and physical outbound dispatch.
-            if (operation.operation === "delete" || operation.tombstone === true) {
+            // Check exactly the detached object that will reach the transport.
+            // Neither a late caller getter nor adapter.push lookup can change
+            // the object after this comparison.
+            if (dispatchEnvelope.operation === "delete" || dispatchEnvelope.tombstone === true) {
               denyUntrustedNativeSignedDelete();
             }
           }
           markNativeRootMutationAttempt(this);
-          return this.adapter.push(operation);
+          return nativeRequiredEnvelopeDigest !== null
+            ? Reflect.apply(nativePush, nativeAdapter, [dispatchEnvelope])
+            : this.adapter.push(operation);
         });
       } catch (error) {
         lastError = error;
