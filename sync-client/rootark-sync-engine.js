@@ -2049,39 +2049,93 @@ function pathsEqual(left, right) {
   return pathWithin(left, right) && pathWithin(right, left);
 }
 
-// An injected metadata adapter can return mutable objects, accessors or a
-// Proxy instead of a decoded HTTP JSON DTO. Detach only a bounded tree of
-// own DATA properties before validating/returning an advisory page; otherwise
-// nextCursor or a record could change between the guard and picker output.
-function detachedAdvisoryData(value, depth = 0) {
-  if (value === null || typeof value !== "object") return value;
-  if (depth > 4 || isProxy(value)) fail("Invalid metadata inventory DTO", "invalid_inventory");
-  if (Array.isArray(value) && value.length > 64) {
-    fail("Invalid metadata inventory array", "invalid_inventory");
+// A custom adapter is an untrusted source of advisory UI data. Snapshot only
+// JSON primitives, dense arrays and plain/null-prototype records without
+// invoking getters, toString, valueOf or Proxy traps. Share ONE resource
+// budget across the complete page, not a per-record allocation allowance.
+const ADVISORY_DTO_MAX_BYTES = 128 * 1024;
+const ADVISORY_DTO_MAX_NODES = 4096;
+const ADVISORY_DTO_MAX_KEYS = 4096;
+function detachedAdvisoryData(value, depth = 0, budget = { nodes: 0, keys: 0, bytes: 0 }) {
+  if (++budget.nodes > ADVISORY_DTO_MAX_NODES || depth > 4) {
+    fail("Invalid metadata inventory budget", "invalid_inventory");
   }
-  const keys = Reflect.ownKeys(value);
-  if (Array.isArray(value)) {
-    if (keys.length !== value.length + 1) {
-      fail("Invalid metadata inventory array", "invalid_inventory");
+  const addBytes = (count) => {
+    budget.bytes += count;
+    if (budget.bytes > ADVISORY_DTO_MAX_BYTES) {
+      fail("Invalid metadata inventory size", "invalid_inventory");
     }
-    return Array.from({ length: value.length }, (_, index) => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) {
-        fail("Invalid metadata inventory entry", "invalid_inventory");
-      }
-      return detachedAdvisoryData(descriptor.value, depth + 1);
-    });
+  };
+  if (value === null || typeof value !== "object") {
+    if (value !== null && typeof value !== "string" && typeof value !== "boolean"
+      && (typeof value !== "number" || !Number.isFinite(value))) {
+      fail("Non-JSON metadata inventory value", "invalid_inventory");
+    }
+    // Restrict length before encoding to avoid constructing a huge JSON string.
+    if (typeof value === "string" && value.length > ADVISORY_DTO_MAX_BYTES) {
+      fail("Invalid metadata inventory size", "invalid_inventory");
+    }
+    addBytes(Buffer.byteLength(JSON.stringify(value), "utf8"));
+    return value;
   }
-  if (keys.length > 32) fail("Invalid metadata inventory object", "invalid_inventory");
-  const detached = Object.create(null);
-  for (const key of keys) {
-    const descriptor = typeof key === "string" ? Object.getOwnPropertyDescriptor(value, key) : null;
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+  if (isProxy(value)) fail("Invalid metadata inventory Proxy", "invalid_inventory");
+  const array = Array.isArray(value);
+  const prototype = Object.getPrototypeOf(value);
+  if (array ? prototype !== Array.prototype || value.length > 64
+    : prototype !== Object.prototype && prototype !== null) {
+    fail("Invalid metadata inventory object type", "invalid_inventory");
+  }
+  addBytes(2); // JSON array/object punctuation.
+  const entries = [];
+  // Walk enumerable JSON fields one at a time, stopping at the local/global
+  // cap. Do not enumerate all own keys up front (including thousands of
+  // nonenumerable/symbol keys) and do not evaluate hidden properties: they
+  // are never copied into the returned advisory DTO.
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    if (entries.length >= (array ? 64 : 32) || ++budget.keys > ADVISORY_DTO_MAX_KEYS) {
+      fail("Invalid metadata inventory key budget", "invalid_inventory");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
       fail("Invalid metadata inventory accessor", "invalid_inventory");
     }
-    detached[key] = detachedAdvisoryData(descriptor.value, depth + 1);
+    addBytes(Buffer.byteLength(JSON.stringify(key), "utf8") + (array ? 1 : 2));
+    entries.push([key, descriptor.value]);
+  }
+  if (array) {
+    if (entries.length !== value.length || entries.some(([key], index) => key !== String(index))) {
+      fail("Invalid metadata inventory array", "invalid_inventory");
+    }
+    return entries.map(([, child]) => detachedAdvisoryData(child, depth + 1, budget));
+  }
+  const detached = Object.create(null);
+  for (const [key, child] of entries) {
+    detached[key] = detachedAdvisoryData(child, depth + 1, budget);
   }
   return detached;
+}
+
+function requireAdvisoryInventoryFieldTypes(entry) {
+  for (const key of ["operationId", "objectId", "fileId", "versionId",
+    "operation", "keyEpoch", "compartmentId", "deviceId"]) {
+    if (typeof entry[key] !== "string") fail("Invalid metadata inventory id", "invalid_inventory");
+  }
+  for (const revision of [entry.revision, entry.baseRevision]) {
+    if (revision !== null && (!revision || typeof revision !== "object"
+      || typeof revision.deviceId !== "string")) {
+      fail("Invalid metadata inventory revision", "invalid_inventory");
+    }
+  }
+  if (!entry.metadata || typeof entry.metadata !== "object") {
+    fail("Invalid metadata inventory metadata", "invalid_inventory");
+  }
+  for (const [key, value] of Object.entries(entry.metadata)) {
+    if (key === "size" ? !Number.isSafeInteger(value) || value < 0
+      : typeof value !== "string") {
+      fail("Invalid metadata inventory field type", "invalid_inventory");
+    }
+  }
 }
 
 function evictionError(code, message, cause, rollbackCause) {
@@ -2896,7 +2950,10 @@ class SyncEngine {
       // Custom adapters must not make browser/picker output a full ciphertext
       // envelope or extra metadata. Reuse the canonical adapter's exact
       // inventory schema, not the untrusted source object's spread shape.
-      objects = page.objects.map((entry) => assertInventoryEntry(entry));
+      objects = page.objects.map((entry) => {
+        requireAdvisoryInventoryFieldTypes(entry);
+        return assertInventoryEntry(entry);
+      });
     } catch {
       fail("Invalid metadata inventory entry", "invalid_inventory");
     }

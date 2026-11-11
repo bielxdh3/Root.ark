@@ -42,7 +42,10 @@ O `browseRemoteInventory` tambem exige o formato metadata-only no limite do
 motor, inclusive para adapters customizados: recusa envelopes completos, campos
 extras, pagina/cursor invalido, objetos com getters ou Proxy e respostas que
 ultrapassem o limite. Essa validacao evita emitir campos nao aprovados ao
-picker/CLI, mas **nao** concede autoridade de materializacao ou RootSession.
+picker/CLI: aceita apenas primitivas JSON, arrays densos e objetos planos,
+com teto agregado de 128 KiB e limites para nos/chaves; nao executa metodos
+de conversao enviados por adapters. Ela **nao** concede autoridade de
+materializacao ou RootSession.
 Antes de materializar, reconciliar ou admitir operacoes protegidas, o cliente
 continua usando a leitura completa por `objectId` com validacao independente
 de assinatura, dispositivo e revogacao. O fluxo normal `syncOnce` preserva
