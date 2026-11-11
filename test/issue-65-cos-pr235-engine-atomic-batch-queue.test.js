@@ -89,7 +89,7 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   missingCapability = false, interleaved = false,
   missingWitnessReadback = false, missingCasReadback = false,
   onWitnessChallenge = null,
-  deleteExpiresInMs = 120000 } = {}) {
+  deleteExpiresInMs = 120000, filesOnDemand = false } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
   t.after(async () => {
     await fsp.rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -237,10 +237,18 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   };
   const adapter = { list: async () => ({ objects: [] }), push };
   if (!missingCapability) adapter.pushBatch = pushBatch;
+  if (filesOnDemand) {
+    // This test opens an isolated *real* FOD root but never uses unsigned
+    // inventory as proof of historical batch admission.
+    adapter.listInventory = async () => ({
+      protocolVersion: 2, view: "metadata", objects: [], nextCursor: null,
+    });
+  }
   const journal = await new SyncJournal(journalPath).open();
   let lastWitnessReceipt;
   const engine = new SyncEngine({
     rootDir: root, snapshotPath, journal, adapter,
+    filesOnDemand,
     deviceId: DEVICE, keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: async () => fileKey,
     requireAuthorization: true,
@@ -389,6 +397,38 @@ test("signed pair plus separate pinned synthetic admission witness ACKs both in 
     new Set([f.deleted.operationId, f.moved.operationId]));
   assert.equal(summary.pushed, 2);
   assert.deepEqual(summary.conflicts, []);
+});
+
+test("issue 66 strict FOD: expired DELETE historical batch cannot release lock after real journal observation and EIO", {
+  timeout: 120000,
+}, async (t) => {
+  // The fixture's signed synthetic witness is test-only; it does NOT grant
+  // native RootSession or authenticate production root custody.
+  const f = await fixture(t, { deleteExpiresInMs: 30000, filesOnDemand: true });
+  const originalNow = Date.now;
+  const originalObserve = f.journal.observeAdmission.bind(f.journal);
+  let observed = false;
+  f.journal.observeAdmission = async (...args) => {
+    const result = await originalObserve(...args);
+    observed = true;
+    throw Object.assign(new Error("historical observed journal fsynced, then EIO"), { code: "EIO" });
+  };
+  try {
+    Date.now = () => f.deleted.authorization.expiresAt + 1;
+    assert.ok(Date.now() < f.moved.authorization.expiresAt,
+      "MOVE remains fresh even when the DELETE has expired");
+    await assert.rejects(f.engine.withMutationLock(() =>
+      f.engine.pushAtomicSignedOverwritePair([f.deleted, f.moved], f.summary())),
+    { code: "EIO" });
+  } finally {
+    Date.now = originalNow;
+    f.journal.observeAdmission = originalObserve;
+  }
+  assert.equal(observed, true, "a real local journal commit must precede the injected EIO");
+  assert.deepEqual(f.events, [], "historical admission cannot send a new remote POST");
+  assert.equal(fs.existsSync(path.join(f.root, ".rootark-sync.lock")), true,
+    "an indeterminate durable journal observation must retain the native-required root lock");
+  await f.assertBothPending();
 });
 
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
