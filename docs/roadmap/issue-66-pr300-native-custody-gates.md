@@ -44,6 +44,32 @@ flowchart TD
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
 
+## 2026-11-11 continuation — completed Windows CI evidence and unpublished fixes
+
+The live GitHub API was rechecked after the 21:00Z checkpoint immediately
+below. All five published PR HEADs and the `Root/main` ref remained unchanged;
+the four detached worktrees below were **clean**, not pushed or merged.
+This checkpoint supersedes the still-in-progress Windows #300 CI description
+below, but does not retroactively alter its test evidence.
+
+| Evidence plane | New observed fact | Remaining gate |
+| --- | --- | --- |
+| Hosted #300 `a598eb47` | Security Regression `43094656916` completed **FAILURE**: Ubuntu 3,780 tests / **59 FAIL** (34 FOD, 25 pin); Windows canonical 3,781 tests / **49 FAIL** (34 FOD, 12 pin, 3 picker); Windows mandatory and syntax/test aggregation also FAILED. CodeQL `43094498755` SUCCESS. | These are real *positive* behavior failures under the S0 native-required deny. No tests may be weakened to expect denial; RootSession still throws unconditionally. |
+| Hosted #301 `e1ca644b` | CodeQL `43100369591`, PG18 `43100369434`, dependency review `43100369516` and provider/Android `43100369316` SUCCESS; Security Regression `43100369644` was **in_progress**, not green, at the continuation query. | CI for a later child cannot inherit checks from this SHA. |
+| Hosted #298 `ce393b75` and #302 `e0af8397` | Security Regression `43097069140` and `43096175973` completed `startup_failure`, **0 jobs**, both `workflow_dispatch`; CodeQL and PG18 PR runs remained QUEUED with 0 jobs. Workflow `security-regression.yml` itself was active. | A zero-job infrastructure/dispatch failure is not a source-test failure and is not evidence of success. Do not rerun active jobs or assert a GitHub incident without diagnostics. |
+| #298 local `67c850c11e56b945309aae75973ca0813257c392` | Separate **expected-security-RED** evidence: three actual pathname-resolved `link`/`rename` operations and two legitimate controls per OS; no production code change. | Requires native fd/HANDLE-rooted replacement and own two SOURCE GO for any evidence-only publication. |
+| #301 local `afde24320661902b5bdd2c1cefadbc19229dfe6f` | Two local commits after `e1ca644b`: pin captured native createPublicKey/hash/verify/sign before hostile `Symbol(kHandle)` getters and bound owner-key history. Targeted Win22 and WSL22 suites each **43 PASS** as previously executed. | Await two independent SOURCE GO on the full child delta before any normal fast-forward. No production key authority is established. |
+| #302 local `47c95899a66917b87c8b43d4a23014321d9aa9eb` | Three same-realm DEV-OFF crypto factory/verify mutations reproduced RED on its parent; local fixes reported Win22 **47 PASS/4 SKIP**, WSL22 **50 PASS/1 SKIP**. | Await two independent SOURCE GO before fast-forward; dual SQLite on one host is **not** external independent custody. |
+
+The still-unpublished documentation child `30657c469d20222ccb2e9af126ef44da7236f47f`
+is the immediate parent of this continuation. Neither documentation nor the
+security-RED experiments cure missing native physical custody. **Four separate
+required evidence planes** remain laboratory, native product, independent
+self-hosted off-host operator, and release/merge. Windows **10** CFAPI,
+physical power-loss recovery, separately administered original-A enrollment
+of all ancestors, and a genuine positive FOD hydration path remain unproven.
+**RootSession OFF · MERGE NO-GO · RELEASE NO-GO.**
+
 ## 2026-11-11 21:00Z — newer cross-PR source/CI checkpoint (supersedes earlier current HEAD snapshots)
 
 This checkpoint records observed **published** refs, not approval to merge,

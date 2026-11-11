@@ -9,6 +9,22 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-11 continuation — **newest live CI checkpoint**: all published HEADs
+remain #298 `ce393b75`, #300 `a598eb47`, #301 `e1ca644b`, #302 `e0af8397`,
+#306 `b13b29f9`, with unchanged `Root/main` `202146bb`. #300 exact Security
+Regression `43094656916` is now completed FAILURE: **59 Ubuntu positive
+FOD/pin failures and 49 Windows positive FOD/pin/picker failures**; CodeQL
+SUCCESS is insufficient. #301 new published checks CodeQL, PG18, dependency,
+provider/Android SUCCESS, but Security Regression `43100369644` remained
+in_progress at this check. #298/#302 Security Regression `startup_failure`
+with zero jobs is neither passing nor failing code coverage; other workflows
+are queued. Four isolated unpublished children remain protected: #298
+`67c850c` evidence RED, #300 `30657c46` docs, #301 `afde2432` native crypto
+intrinsics fix, #302 `47c95899` DEV-OFF crypto fix; exact-child SOURCE pairs
+are still required before any FF. **Native positive FOD/root original-A,
+independent custodian, Win10 CFAPI and real powercut remain unproven.**
+**RootSession OFF · MERGE NO-GO · RELEASE NO-GO.** See latest roadmap section.
+
 2026-11-11 ~21:00Z — **newer verified cross-PR checkpoint** (supersedes
 subsequent older "current" notes): PR #298 `ce393b75` OPEN/Draft,
 #300 `a598eb47` OPEN/Draft, #301 `e1ca644b` OPEN/Draft (two exact-SHA
