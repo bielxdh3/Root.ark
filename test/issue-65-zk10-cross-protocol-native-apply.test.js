@@ -6,6 +6,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const z = require("../src/crypto/rootark-zk-1");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const NATIVE_KEY_EQUALS = crypto.KeyObject.prototype.equals;
@@ -24,7 +25,7 @@ test("P2 physical: same Ed25519 inventory and PG signer cannot be disguised by i
   const trustedApply = Reflect.apply;
   let getterReads = 0;
   let equalityBypassAttempts = 0;
-  let scopeTraps = 0;
+  let proofDecodeAttempts = 0;
   Object.defineProperty(inherited, symbol, { get() {
     getterReads++;
     Function.prototype.call = function(receiver, ...args) {
@@ -36,23 +37,27 @@ test("P2 physical: same Ed25519 inventory and PG signer cannot be disguised by i
     };
     return real[symbol];
   } });
-  const dangerousScope = new Proxy({}, {
-    get() { scopeTraps++; throw new Error("scope reached after forged role equality"); },
-    ownKeys() { scopeTraps++; throw new Error("scope reached after forged role equality"); },
-    getOwnPropertyDescriptor() { scopeTraps++; throw new Error("scope reached after forged role equality"); },
-  });
+  // Expected scope/operation must now be safely snapshotted BEFORE the key
+  // callback; valid detached fields keep the native role check reachable.
+  const expectedScope = { account_id: Buffer.alloc(16, 15),
+    compartment_id: Buffer.from("private"), keyring_id: Buffer.alloc(16, 16) };
+  const expectedOperation = { operation_id: Buffer.alloc(16, 17), expected_sequence: 0,
+    expected_root: Buffer.alloc(32, 18), object_id: Buffer.alloc(16, 19),
+    revision: 1, epoch: 1, ciphertext_sha256: Buffer.alloc(32, 20) };
+  const realDecode = z.decodeDeterministic;
+  z.decodeDeterministic = async () => { proofDecodeAttempts++; throw Error("proof reached after role collision"); };
   try {
     await assert.rejects(verifyAttestedInventoryCommit({
       receipt: Buffer.from([1]), physicalAttestation: Buffer.from([1]),
-      scope: dangerousScope, operation: {}, nonce: Buffer.alloc(32, 11),
+      scope: expectedScope, operation: expectedOperation, nonce: Buffer.alloc(32, 11),
       pinnedInventoryPublicKey: inherited,
       pinnedInventorySignerKeyId: Buffer.alloc(16, 12),
       pinnedPhysicalAttestorPublicKey: real, nowSeconds: 1,
     }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
-  } finally { Function.prototype.call = originalCall; }
+  } finally { Function.prototype.call = originalCall; z.decodeDeterministic = realDecode; }
   assert.ok(getterReads > 0, "genuine native getter must have run");
   assert.equal(equalityBypassAttempts, 0, "no mutable .call can suppress native signer equality");
-  assert.equal(scopeTraps, 0, "equal real signers must reject before untrusted proof parsing");
+  assert.equal(proofDecodeAttempts, 0, "equal real signers must reject before untrusted proof parsing");
 });
 
 test("P2: native inventory/PG operator separation cannot use mutable Function.call", async () => {

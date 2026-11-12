@@ -8,7 +8,8 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const z = require("../src/crypto/rootark-zk-1");
 const protocol = require("../sync-client/rootark-sync-protocol");
-const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { createAuthorizationProof, verifyHistoricalAuthorizationProof } =
+  require("../sync-client/rootark-sync-authorization");
 const pg = require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { envelopeBinding, verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
@@ -22,13 +23,16 @@ const domainAdmission = Buffer.from("Root.ark/sync-v2/historical-witness-admissi
 
 async function genuineHistoricalEvidence({
   witnessIsInventory = false, witnessIsDevice = false,
+  issuedAtSeconds = null, admittedAtMs = null, mismatchedDeviceKey = false,
+  forgedDeviceSignature = false, expiredDeviceAuthorization = false,
 } = {}) {
   const device = crypto.generateKeyPairSync("ed25519");
+  const declaredDevice = mismatchedDeviceKey ? crypto.generateKeyPairSync("ed25519") : device;
   const inventory = crypto.generateKeyPairSync("ed25519");
   const attestor = crypto.generateKeyPairSync("ed25519");
   const witness = witnessIsDevice ? device : witnessIsInventory
     ? inventory : crypto.generateKeyPairSync("ed25519");
-  const spki = device.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
+  const spki = declaredDevice.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
   const envelope = protocol.createOperation({ operation: "create", objectId: "object_1",
     fileId: "file_1", versionId: "version_1", deviceId: "device_1",
     compartmentId: "vault", keyEpoch: "epoch-1",
@@ -39,13 +43,27 @@ async function genuineHistoricalEvidence({
     username: "alice", publicKey: spki, privateKey: device.privateKey,
     expiresAt: Date.now() + 120_000,
   });
+  if (expiredDeviceAuthorization) {
+    // Genuine original Ed25519 authorization for an already-expired record;
+    // createAuthorizationProof intentionally permits only newly fresh claims.
+    envelope.authorization.expiresAt = Date.now() - 10_000;
+    const { signature: _old, ...unsigned } = envelope.authorization;
+    const signedBytes = Buffer.concat([Buffer.from(z.ASCII.AUTHORIZATION, "ascii"),
+      Buffer.from([0]), await z.encodeDeterministic(unsigned)]);
+    envelope.authorization.signature = crypto.sign(null, signedBytes,
+      device.privateKey).toString("base64url");
+  }
+  if (forgedDeviceSignature) {
+    const validSignature = envelope.authorization.signature;
+    envelope.authorization.signature = `${validSignature[0] === "A" ? "B" : "A"}${validSignature.slice(1)}`;
+  }
   const scope = { account_id: id(35), compartment_id: Buffer.from("vault"),
     keyring_id: id(36) };
   const bound = envelopeBinding(envelope, scope, 0, hash(37));
   const operation = bound.operation;
   const signerKeyId = id(38);
   const nonce = hash(39);
-  const nowSeconds = Math.floor(Date.now() / 1000);
+  const nowSeconds = issuedAtSeconds ?? Math.floor(Date.now() / 1000);
   const entry = { object_id: operation.object_id, revision: operation.revision,
     epoch: operation.epoch, ciphertext_sha256: operation.ciphertext_sha256 };
   const receiptBody = { type: "rootark-content-inventory-entry/v1", version: 1,
@@ -92,7 +110,8 @@ async function genuineHistoricalEvidence({
     epoch: operation.epoch, checkpointSequence: operation.expected_sequence,
     checkpointRoot: operation.expected_root.toString("base64url"),
     inventoryReceiptSha256: sha(receipt),
-    admittedAtMs: Date.now() - 1000,
+    admittedAtMs: admittedAtMs ?? (expiredDeviceAuthorization
+      ? envelope.authorization.expiresAt - 1000 : Date.now() - 1000),
     witnessSequence: floorBody.sequence, witnessLastHash: floorBody.lastHash,
     witnessPhysicalFenceDigest: floorBody.physicalFenceDigest };
   const admission = { ...admissionBody, signature: crypto.sign(null,
@@ -112,9 +131,286 @@ async function genuineHistoricalEvidence({
     witnessKeyId, statusKeyId,
     trustedMinimumFloor: { sequence: floorBody.sequence,
       lastHash: floorBody.lastHash, physicalFenceDigest: floorBody.physicalFenceDigest } };
-  return { input, allowed, revoked, witness, inventory, attestor, device, spki,
+  return { input, allowed, revoked, witness, inventory, attestor, device, declaredDevice, spki,
     scope, operation };
 }
+
+test("P2 physical: native witness getter cannot rewind verification time for genuinely signed stale PG A", async () => {
+  const realNow = Date.now;
+  const oldSeconds = Math.floor(realNow() / 1000) - 120;
+  const f = await genuineHistoricalEvidence({
+    issuedAtSeconds: oldSeconds, admittedAtMs: oldSeconds * 1000 + 1000,
+  });
+  assert.equal(crypto.verify(null, Buffer.concat([domainFloor, Buffer.from(JSON.stringify((({ signature, ...body }) => body)(f.input.freshFloor)))]),
+    f.witness.publicKey, Buffer.from(f.input.freshFloor.signature, "base64url")), true);
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(f.input),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" }, "signed PG attestation older than 30 s is stale");
+  let rewinds = 0;
+  const old = poisonedNativeKey(f.witness.publicKey, () => {
+    Date.now = () => { rewinds++; return oldSeconds * 1000 + 2000; };
+  });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.input, pinnedWitnessPublicKey: old.publicKey,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
+    "rewinding a JS callback clock cannot revive real signed old PG bytes");
+  } finally { Date.now = realNow; }
+  assert.ok(old.reads > 0, "attacker's native getter must execute");
+  assert.equal(rewinds, 0, "verification must not use callback-rebound Date.now");
+  const good = await genuineHistoricalEvidence();
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission(good.input)).authorizesHistoricalRead, true);
+});
+
+test("P2 physical: native witness getter cannot suppress stale PG detection with mutable Math.abs", async () => {
+  const oldSeconds = Math.floor(Date.now() / 1000) - 120;
+  const f = await genuineHistoricalEvidence({
+    issuedAtSeconds: oldSeconds, admittedAtMs: oldSeconds * 1000 + 1000,
+  });
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(f.input),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  const originalAbs = Math.abs;
+  let bypassCalls = 0;
+  const poison = poisonedNativeKey(f.witness.publicKey, () => {
+    Math.abs = () => { bypassCalls++; return 0; };
+  });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.input, pinnedWitnessPublicKey: poison.publicKey,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
+    "post-getter Math.abs cannot claim a 120-second-old Ed25519 PG is fresh");
+  } finally { Math.abs = originalAbs; }
+  assert.ok(poison.reads > 0);
+  assert.equal(bypassCalls, 0, "signed issue-time delta must use a captured numeric primitive");
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
+});
+
+test("P2 physical: native witness getter cannot retarget Math.floor for real signed PG clock", async () => {
+  const oldSeconds = Math.floor(Date.now() / 1000) - 120;
+  const f = await genuineHistoricalEvidence({
+    issuedAtSeconds: oldSeconds, admittedAtMs: oldSeconds * 1000 + 1000,
+  });
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(f.input),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  const originalFloor = Math.floor;
+  let bypassCalls = 0;
+  const poison = poisonedNativeKey(f.witness.publicKey, () => {
+    Math.floor = (value) => {
+      if (typeof value === "number" && value > 1000000) {
+        bypassCalls++;
+        return oldSeconds + 1;
+      }
+      return originalFloor(value);
+    };
+  });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.input, pinnedWitnessPublicKey: poison.publicKey,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
+    "post-key Math.floor must not shift the trusted now-seconds into stale A's window");
+  } finally { Math.floor = originalFloor; }
+  assert.ok(poison.reads > 0);
+  assert.equal(bypassCalls, 0, "current clock conversion must use captured Math.floor");
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
+});
+
+test("P2 physical: witness getter cannot redirect dynamic device crypto.createPublicKey from declared B to signer A", async () => {
+  const f = await genuineHistoricalEvidence({ mismatchedDeviceKey: true });
+  assert.equal(f.device.publicKey.equals(f.declaredDevice.publicKey), false);
+  await assert.rejects(verifyHistoricalAuthorizationProof(
+    f.input.envelope.authorization, f.input.envelope, f.allowed),
+  "real Ed25519 A signed an authorization declaring unrelated key B");
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(f.input),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  const original = crypto.createPublicKey;
+  const declaredDer = f.declaredDevice.publicKey.export({ format: "der", type: "spki" });
+  let replaced = 0;
+  const poison = poisonedNativeKey(f.witness.publicKey, () => {
+    crypto.createPublicKey = function(input) {
+      if (input?.key?.equals?.(declaredDer)) {
+        replaced++;
+        return f.device.publicKey;
+      }
+      return original(input);
+    };
+  });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.input, pinnedWitnessPublicKey: poison.publicKey,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  } finally { crypto.createPublicKey = original; }
+  assert.ok(poison.reads > 0);
+  assert.equal(replaced, 0, "device Ed25519 verifier must use captured native key decoder");
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
+});
+
+test("P2 physical: witness getter cannot turn invalid device Ed25519 signature B into an authorized read", async () => {
+  const f = await genuineHistoricalEvidence({ forgedDeviceSignature: true });
+  await assert.rejects(verifyHistoricalAuthorizationProof(
+    f.input.envelope.authorization, f.input.envelope, f.allowed));
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(f.input),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  const original = crypto.verify;
+  let faked = 0;
+  const poison = poisonedNativeKey(f.witness.publicKey, () => {
+    crypto.verify = (...args) => { faked++; return true; };
+  });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.input, pinnedWitnessPublicKey: poison.publicKey,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  } finally { crypto.verify = original; }
+  assert.ok(poison.reads > 0);
+  assert.equal(faked, 0, "post-getter mutable crypto.verify must never validate device authorization");
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
+});
+
+test("P2 historical: witness native getter cannot mutate externally retained revoked-device B policy into allowed A", async () => {
+  const f = await genuineHistoricalEvidence();
+  const restricted = { username: f.revoked.username,
+    trustedDevicePublicKeys: { ...f.revoked.trustedDevicePublicKeys },
+    revokedDeviceIds: ["device_1"] };
+  const rejected = { ...f.input, localTrustedDevicePolicy: restricted };
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(rejected),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
+    "a genuine device A was independently revoked");
+  let tampered = 0;
+  const evil = poisonedNativeKey(f.witness.publicKey, () => {
+    tampered++;
+    restricted.revokedDeviceIds = [];
+  });
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+    ...rejected, pinnedWitnessPublicKey: evil.publicKey,
+  }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
+  "operator-pinned local revocation must be snapshotted before native witness getters");
+  assert.ok(evil.reads > 0 && tampered > 0);
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
+    .authorizesHistoricalRead, true, "independently allowed genuine device remains valid");
+});
+
+test("P2 historical: signed witness floor A cannot replace independently retained minimum floor B after key callback", async () => {
+  const f = await genuineHistoricalEvidence();
+  const floorB = { ...f.input.trustedMinimumFloor,
+    sequence: f.input.trustedMinimumFloor.sequence + 1,
+    lastHash: Buffer.alloc(32, 211).toString("hex") };
+  assert.notEqual(floorB.sequence, f.input.freshFloor.sequence);
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+    ...f.input, trustedMinimumFloor: floorB,
+  }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  let mutated = 0;
+  const evil = poisonedNativeKey(f.witness.publicKey, () => {
+    mutated++;
+    floorB.sequence = f.input.trustedMinimumFloor.sequence;
+    floorB.lastHash = f.input.trustedMinimumFloor.lastHash;
+  });
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+    ...f.input, trustedMinimumFloor: floorB, pinnedWitnessPublicKey: evil.publicKey,
+  }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
+  "operator-retained floor B must be captured before hostile witness native key getter");
+  assert.ok(evil.reads > 0 && mutated > 0);
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
+    .authorizesHistoricalRead, true);
+});
+
+test("P2 strict Sync v2: evidence-provider callback cannot replay signed old challenge A by replacing crypto.randomBytes", async () => {
+  const f = await genuineHistoricalEvidence({ expiredDeviceAuthorization: true });
+  assert.ok(f.input.envelope.authorization.expiresAt < Date.now());
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input)).authorizesHistoricalRead,
+    true, "genuinely signed, already-expired device A was historically admitted");
+  const Module = require("node:module");
+  const cache = new Map();
+  const originalRandom = crypto.randomBytes;
+  const oldLog = console.log;
+  const envKeys = ["ROOTARK_SYNC_FILE_KEY", "ROOTARK_SYNC_DEVICE_PRIVATE_KEY",
+    "ROOTARK_SYNC_DEVICE_PUBLIC_KEY"];
+  const previousEnv = Object.fromEntries(envKeys.map((name) => [name, process.env[name]]));
+  const issuedA = Buffer.from(f.input.nonce);
+  let offered = 0, replayed = 0, challenges = 0;
+  class FakeSyncEngine {
+    constructor(options) { this.options = options; this.incomingAllowed = null; }
+    async open() { return this; }
+    async syncOnce() {
+      this.incomingAllowed = await this.options.verifyIncoming(f.input.envelope);
+      return { pushed: 0, pulled: 0, conflicts: [], offline: false };
+    }
+  }
+  const stub = (relative, exports) => {
+    const id = require.resolve(relative);
+    cache.set(id, require.cache[id]);
+    const moduleStub = new Module(id, module);
+    moduleStub.filename = id;
+    moduleStub.loaded = true;
+    moduleStub.exports = exports;
+    require.cache[id] = moduleStub;
+  };
+  const config = { serverUrl: "https://sync.example.test", token: "synthetic",
+    username: "alice", deviceId: "device_1", keyEpoch: "epoch-1",
+    compartmentId: "vault", localFolder: process.cwd(),
+    trustedDevicePublicKeys: { device_1: f.spki }, revokedDeviceIds: [],
+    deviceRevoked: false };
+  const proof = { scope: f.input.scope, expectedSequence: f.input.expectedSequence,
+    expectedRoot: f.input.expectedRoot, receipt: f.input.receipt,
+    physicalAttestation: f.input.physicalAttestation,
+    admission: f.input.admission, freshFloor: f.input.freshFloor };
+  try {
+    process.env.ROOTARK_SYNC_FILE_KEY = Buffer.alloc(32, 52).toString("base64url");
+    process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY = f.device.privateKey.export({
+      format: "der", type: "pkcs8",
+    }).toString("base64url");
+    process.env.ROOTARK_SYNC_DEVICE_PUBLIC_KEY = f.spki;
+    stub("../sync-client/rootark-sync-engine", { SyncEngine: FakeSyncEngine });
+    stub("../sync-client/rootark-sync-v2-private-config", {
+      readPrivateV2Config: () => config,
+    });
+    stub("../public/client/rootark-sync-adapter", { createOpaqueSyncAdapter: () => ({}) });
+    const clientId = require.resolve("../sync-client/rootark-sync-v2");
+    cache.set(clientId, require.cache[clientId]);
+    delete require.cache[clientId];
+    const { start } = require(clientId);
+    console.log = () => {};
+    const engine = await start({ once: true, requireIndependentHistoricalAdmission: true,
+      trustedHistoricalAdmission: {
+        localTrustedDevicePolicy: f.allowed,
+        trustedCurrentDevicePolicyProvider: () => f.allowed,
+        pinnedInventoryPublicKey: f.inventory.publicKey,
+        pinnedInventorySignerKeyId: f.input.pinnedInventorySignerKeyId,
+        pinnedPhysicalAttestorPublicKey: f.attestor.publicKey,
+        pinnedWitnessPublicKey: f.witness.publicKey,
+        witnessKeyId: f.input.witnessKeyId, statusKeyId: f.input.statusKeyId,
+        trustedMinimumFloor: f.input.trustedMinimumFloor,
+      },
+      historicalEvidenceProvider: async (_operation, { nonce }) => {
+        challenges++;
+        if (challenges === 1) {
+          assert.equal(nonce.equals(issuedA), false,
+            "new client challenge is independent of the earlier signed nonce A");
+          crypto.randomBytes = function(size, ...args) {
+            if (size === 32) { replayed++; return Buffer.from(issuedA); }
+            return originalRandom(size, ...args);
+          };
+          return null;
+        }
+        offered++;
+        return proof;
+      },
+    });
+    assert.equal(engine.incomingAllowed, false,
+      "historical signed nonce A must not be replayable by poisoning client crypto.randomBytes");
+    assert.equal(challenges, 3, "fresh challenge must be generated on each recovery/issue attempt");
+    assert.equal(replayed, 0, "post-callback randomBytes replacement must never issue a challenge");
+    assert.equal(offered, 2, "real signed replay was presented twice and denied");
+  } finally {
+    crypto.randomBytes = originalRandom;
+    console.log = oldLog;
+    for (const [id, old] of cache) {
+      if (old) require.cache[id] = old;
+      else delete require.cache[id];
+    }
+    for (const name of envKeys) {
+      if (previousEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = previousEnv[name];
+    }
+  }
+});
 
 function poisonedNativeKey(publicKey, poison) {
   const handle = Object.getOwnPropertySymbols(publicKey)

@@ -6,7 +6,9 @@ const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
   bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM,
   hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST,
-  bufferCompare: NATIVE_BUFFER_COMPARE } =
+  bufferCompare: NATIVE_BUFFER_COMPARE, ownDescriptor: NATIVE_DESCRIPTOR,
+  ownKeys: NATIVE_OWN_KEYS, getPrototype: NATIVE_GET_PROTOTYPE,
+  objectCreate: NATIVE_OBJECT_CREATE, hasOwn: NATIVE_HAS_OWN } =
   require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
@@ -65,16 +67,16 @@ function exactObject(value, names, code = "INVENTORY_FIELDS") {
   let proto;
   let keys;
   try {
-    proto = Object.getPrototypeOf(value);
-    keys = Reflect.ownKeys(value);
+    proto = NATIVE_GET_PROTOTYPE(value);
+    keys = NATIVE_OWN_KEYS(value);
   } catch (_) { fail(code); }
   if ((proto !== Object.prototype && proto !== null)
     || keys.length !== names.length
     || names.some((name) => !keys.includes(name))) fail(code);
-  const result = Object.create(null);
+  const result = NATIVE_OBJECT_CREATE(null);
   for (const name of names) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail(code);
+    const descriptor = NATIVE_DESCRIPTOR(value, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail(code);
     result[name] = descriptor.value;
   }
   return result;
@@ -85,20 +87,20 @@ function objectWithOptional(value, required, optional, code) {
   let proto;
   let keys;
   try {
-    proto = Object.getPrototypeOf(value);
-    keys = Reflect.ownKeys(value);
+    proto = NATIVE_GET_PROTOTYPE(value);
+    keys = NATIVE_OWN_KEYS(value);
   } catch (_) { fail(code); }
   if ((proto !== Object.prototype && proto !== null)
     || required.some((name) => !keys.includes(name))
     || keys.some((name) => !required.includes(name) && !optional.includes(name))) fail(code);
-  const result = Object.create(null);
+  const result = NATIVE_OBJECT_CREATE(null);
   for (const name of [...required, ...optional]) {
     if (!keys.includes(name)) {
       result[name] = undefined;
       continue;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail(code);
+    const descriptor = NATIVE_DESCRIPTOR(value, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail(code);
     result[name] = descriptor.value;
   }
   return result;
@@ -133,13 +135,13 @@ function normalizeEntries(value) {
   const length = value.length;
   if (length > MAX_ENTRIES) fail("INVENTORY_LIMIT");
   let keys;
-  try { keys = Reflect.ownKeys(value); } catch (_) { fail("INVENTORY_ENTRIES"); }
+  try { keys = NATIVE_OWN_KEYS(value); } catch (_) { fail("INVENTORY_ENTRIES"); }
   if (keys.length !== length + 1 || !keys.includes("length")) fail("INVENTORY_ENTRIES");
   const entries = new Array(length);
   let previous = null;
   for (let i = 0; i < length; i += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, String(i));
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail("INVENTORY_ENTRIES");
+    const descriptor = NATIVE_DESCRIPTOR(value, String(i));
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_ENTRIES");
     const entry = normalizeEntry(descriptor.value);
     if (previous) {
       const objectOrder = NATIVE_BUFFER_COMPARE(previous.object_id, entry.object_id);
@@ -264,10 +266,10 @@ async function verifyTerminalProof(input) {
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "operation",
   ], "INVENTORY_TERMINAL_VERIFY_INPUT");
   const serialized = copyBytes(raw.serialized, 1, MAX_TERMINAL_PROOF_BYTES);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const expectedScope = normalizeScope(raw.expectedScope);
   const operation = normalizeTerminalOperation(raw.operation);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); } catch (_) { fail("INVENTORY_ENCODING"); }
   const fields = [
@@ -346,10 +348,12 @@ async function verifyCommittedEntryProof(input) {
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "operation",
   ], "INVENTORY_COMMIT_VERIFY_INPUT");
   const serialized = copyBytes(raw.serialized, 1, MAX_COMMITTED_PROOF_BYTES);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  // Snapshot every externally expected value before the KeyObject's property
+  // getters can rewrite caller-owned trusted scope/operation B into signed A.
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const scope = normalizeScope(raw.expectedScope);
   const operation = normalizeTerminalOperation(raw.operation);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); }
   catch (_) { fail("INVENTORY_ENCODING"); }
@@ -553,13 +557,13 @@ function assertSuperset(currentEntries, previousEntries) {
 
 function normalizeCommittedProofChain(input) {
   if (!Array.isArray(input) || input.length > MAX_ENTRIES) fail("INVENTORY_CHAIN");
-  const keys = Reflect.ownKeys(input);
+  const keys = NATIVE_OWN_KEYS(input);
   if (keys.length !== input.length + 1 || !keys.includes("length")) fail("INVENTORY_CHAIN");
   const result = [];
   let total = 0;
   for (let i = 0; i < input.length; i += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(input, String(i));
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail("INVENTORY_CHAIN");
+    const descriptor = NATIVE_DESCRIPTOR(input, String(i));
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_CHAIN");
     const value = descriptor.value;
     if (!isBytes(value) || (typeof SharedArrayBuffer !== "undefined"
       && value.buffer instanceof SharedArrayBuffer)
@@ -617,7 +621,8 @@ async function verifySnapshot(input) {
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "requested",
     "minimumHead", "nonce",
   ], ["minimumSnapshot", "committedProofChain"], "INVENTORY_VERIFY_INPUT");
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  // These expected bytes belong to the external caller, not the signing key.
+  // Never read them after invoking a caller-owned native KeyObject getter.
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const expectedScope = normalizeScope(raw.expectedScope);
   const requested = normalizeRequested(raw.requested);
@@ -628,6 +633,7 @@ async function verifySnapshot(input) {
     ? null : copyBytes(raw.minimumSnapshot, 1, MAX_SNAPSHOT_BYTES);
   const chain = raw.committedProofChain === undefined || raw.committedProofChain === null
     ? null : normalizeCommittedProofChain(raw.committedProofChain);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
 
   const current = await parseAndVerifySnapshot(serialized, publicKey, pinnedSignerKeyId, expectedScope);
   if (!sameBytes(current.nonce, nonce)) fail("INVENTORY_NONCE");

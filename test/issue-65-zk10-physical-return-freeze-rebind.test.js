@@ -70,6 +70,78 @@ async function authenticEvidence() {
       pinnedPhysicalAttestorPublicKey: physicalSigner.publicKey, nowSeconds: issuedAt } };
 }
 
+test("P2 PG: signed readback scope A cannot be accepted as expected scope B after key getter mutation", async () => {
+  const f = await authenticEvidence();
+  const scopeB = { ...f.input.scope, account_id: Buffer.alloc(16, 201) };
+  assert.equal(scopeB.account_id.equals(f.input.scope.account_id), false);
+  await assert.rejects(pg.verifyCommittedPhysicalReadback(f.physicalAttestation,
+    { ...f.readbackOptions, scope: scopeB }), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+  const pin = Object.create(f.physicalSigner.publicKey);
+  let mutations = 0;
+  Object.defineProperty(pin, "type", { get() {
+    mutations++;
+    scopeB.account_id = f.input.scope.account_id;
+    return "public";
+  } });
+  await assert.rejects(pg.verifyCommittedPhysicalReadback(f.physicalAttestation,
+    { ...f.readbackOptions, scope: scopeB, pinnedPublicKey: pin }),
+  /ZK_PHYSICAL_ATTESTATION_DENIED/,
+  "signed PG A must never authorize an externally expected B scope");
+  assert.ok(mutations > 0, "Ed25519 pin's getter must execute");
+  assert.equal((await pg.verifyCommittedPhysicalReadback(
+    f.physicalAttestation, f.readbackOptions)).verified, true);
+});
+
+test("P2 composite: signed inventory+PG scope A cannot satisfy expected scope B after native kHandle", async () => {
+  const f = await authenticEvidence();
+  const scopeB = { ...f.input.scope, account_id: Buffer.alloc(16, 202) };
+  await assert.rejects(verifyAttestedInventoryCommit({ ...f.input, scope: scopeB }),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
+  const pin = Object.create(f.inventorySigner.publicKey);
+  const handle = Object.getOwnPropertySymbols(f.inventorySigner.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  let reads = 0;
+  Object.defineProperty(pin, handle, { get() {
+    reads++;
+    scopeB.account_id = f.input.scope.account_id;
+    return f.inventorySigner.publicKey[handle];
+  } });
+  await assert.rejects(verifyAttestedInventoryCommit({ ...f.input,
+    scope: scopeB, pinnedInventoryPublicKey: pin,
+  }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+  "expected scope B must be detached before native signer key callback");
+  assert.ok(reads > 0);
+  assert.equal((await verifyAttestedInventoryCommit(f.input)).authorizesIo, false);
+});
+
+test("P2 inventory receipt: genuine Ed25519 scope A cannot be accepted for externally expected B", async () => {
+  const f = await authenticEvidence();
+  const expectedB = { ...f.input.scope, account_id: Buffer.alloc(16, 203) };
+  const verify = (pin) => inventory.verifyCommittedEntryProof({
+    serialized: f.input.receipt, pinnedPublicKey: pin,
+    pinnedSignerKeyId: f.input.pinnedInventorySignerKeyId,
+    expectedScope: expectedB, operation: f.input.operation,
+  });
+  await assert.rejects(verify(f.inventorySigner.publicKey),
+    { code: "INVENTORY_SCOPE" });
+  const pin = Object.create(f.inventorySigner.publicKey);
+  let reads = 0;
+  Object.defineProperty(pin, "type", { get() {
+    reads++;
+    expectedB.account_id = f.input.scope.account_id;
+    return "public";
+  } });
+  await assert.rejects(verify(pin), { code: "INVENTORY_SCOPE" },
+  "PG-linked signed inventory receipt A cannot be rebound to expected B");
+  assert.ok(reads > 0);
+  assert.equal((await inventory.verifyCommittedEntryProof({
+    serialized: f.input.receipt, pinnedPublicKey: f.inventorySigner.publicKey,
+    pinnedSignerKeyId: f.input.pinnedInventorySignerKeyId,
+    expectedScope: f.input.scope, operation: f.input.operation,
+  })).outcome, "COMMITTED_IN_SIGNED_LEDGER");
+});
+
 test("P2: native signer kHandle callback cannot turn authentic nonauthorizing composite into authorizesIo:true", async () => {
   const fixture = await authenticEvidence();
   const baseline = await verifyAttestedInventoryCommit(fixture.input);

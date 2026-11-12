@@ -20,7 +20,6 @@ const {
   bufferByteLength: NATIVE_BUFFER_BYTE_LENGTH,
   bufferToString: NATIVE_BUFFER_TO_STRING,
   arrayIncludes: NATIVE_ARRAY_INCLUDES,
-  arraySome: NATIVE_ARRAY_SOME,
   arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
   ownKeys: NATIVE_OWN_KEYS,
   ownDescriptor: NATIVE_OWN_DESCRIPTOR,
@@ -257,12 +256,20 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     if (cutover.digest !== hex(z.independentlyRetainedCutoverDigest)) deny();
     const authorityKey = key(a.pinnedPublicKey, "public");
     const authorityHash = spkiHash(authorityKey);
-    const roleKeys = [...ownerKeys, nativePublic(s.provisionerPublicKey),
-      nativePublic(s.witnessPublicKey), nativePublic(s.casPublicKey)];
     // A forged instance `.export` or `.type` never makes the SAME real
     // owner/provisioner/witness/CAS signer an independent CURRENT authority.
-    if (NATIVE_ARRAY_SOME.call(roleKeys, (role) => samePublicKey(authorityKey, role)
-      || authorityHash === spkiHash(role))) deny();
+    // A caller-owned KeyObject's kHandle getter ran in key(a.pinnedPublicKey)
+    // above. Do not spread `ownerKeys` now: Array.prototype[Symbol.iterator]
+    // may omit the owner key entirely and silently authorize the SAME signer.
+    const checkIndependent = (role) => {
+      if (samePublicKey(authorityKey, role) || authorityHash === spkiHash(role)) deny();
+    };
+    for (let index = 0; index < ownerKeys.length; index += 1) {
+      checkIndependent(ownerKeys[index]);
+    }
+    checkIndependent(nativePublic(s.provisionerPublicKey));
+    checkIndependent(nativePublic(s.witnessPublicKey));
+    checkIndependent(nativePublic(s.casPublicKey));
     const floor = exact(a.independentlyRetainedFloor, ["sequence", "digest"]);
     number(floor.sequence);
     hex(floor.digest);

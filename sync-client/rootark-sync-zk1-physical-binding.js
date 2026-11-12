@@ -31,6 +31,9 @@ const {
   objectCreate: NATIVE_OBJECT_CREATE,
   defineProperty: NATIVE_DEFINE_PROPERTY,
   freeze: NATIVE_FREEZE,
+  dateNow: NATIVE_DATE_NOW,
+  mathFloor: NATIVE_MATH_FLOOR,
+  mathAbs: NATIVE_MATH_ABS,
 } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const protocol = require("./rootark-sync-protocol");
 const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
@@ -213,7 +216,7 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
     const policy = snapshotLocalDevicePolicy(localTrustedDevicePolicy);
     if (await verifyAuthorizationProof(bound.envelope.authorization,
       bound.envelope, policy) !== true
-      || bound.envelope.authorization.expiresAt <= Date.now()) deny();
+      || bound.envelope.authorization.expiresAt <= NATIVE_DATE_NOW()) deny();
     // This is exactly the API accepted by Zk1PgPhysicalInventoryBridge
     // .putAndAttest(). Never attach a signer-controlled success flag to it.
     // The gate's 32-byte digest comes from the independently trusted current
@@ -256,9 +259,9 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
       pinnedInventoryPublicKey: inventoryKey,
       pinnedInventorySignerKeyId: signerKeyId,
       pinnedPhysicalAttestorPublicKey: physicalKey,
-      nowSeconds: Math.floor(Date.now() / 1000),
+      nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
     });
-    const completedAtSeconds = Math.floor(Date.now() / 1000);
+    const completedAtSeconds = NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000);
     if (result.status !== "VERIFIED_COMPOSITE_NONAUTHORIZING"
       || result.authorizesIo !== false
       // A proof may cross the ±30 s physical freshness window while CBOR and
@@ -266,7 +269,7 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
       // rather than relying only on the pre-await wall-clock sample.
       || !Number.isSafeInteger(result.physicalReadback?.issuedAt)
       || !Number.isSafeInteger(completedAtSeconds) || completedAtSeconds < 1
-      || Math.abs(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
+      || NATIVE_MATH_ABS(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
     return NATIVE_FREEZE({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
       operationId: NATIVE_BUFFER_FROM(bound.operation.operation_id),
       ciphertextSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
@@ -293,6 +296,12 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       "admission", "freshFloor", "pinnedWitnessPublicKey",
       "witnessKeyId", "statusKeyId", "trustedMinimumFloor"]);
     if (typeof v.trustedCurrentDevicePolicyProvider !== "function") deny();
+    // Both values are operator-retained pins. Snapshot them BEFORE the first
+    // caller-owned native witness getter can rewrite B into signed A. A fresh
+    // live policy is independently rechecked after all awaited evidence.
+    const initialTrustedPolicy = snapshotLocalDevicePolicy(v.localTrustedDevicePolicy);
+    const minimum = strict(v.trustedMinimumFloor,
+      ["sequence", "lastHash", "physicalFenceDigest"]);
     const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence, v.expectedRoot);
     const challenge = checkedBytes(v.nonce, 32);
     const committedInventoryReceipt = checkedBytes(v.receipt, 1,
@@ -315,8 +324,6 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     }
     const floorFields = PHYSICAL_FLOOR_WIRE_FIELDS;
     const floor = strict(v.freshFloor, floorFields);
-    const minimum = strict(v.trustedMinimumFloor,
-      ["sequence", "lastHash", "physicalFenceDigest"]);
     const HEX = /^[a-f0-9]{64}$/;
     if (floor.type !== "rootark-zk1-witness-cas-physical-floor/v2"
       || floor.witnessKeyId !== witnessId || floor.statusKeyId !== statusId
@@ -355,7 +362,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
         bound.operation.expected_root, "base64url")
       || !Number.isSafeInteger(admission.admittedAtMs) || admission.admittedAtMs < 1
       || admission.admittedAtMs >= bound.envelope.authorization.expiresAt
-      || admission.admittedAtMs > Date.now()
+      || admission.admittedAtMs > NATIVE_DATE_NOW()
       || admission.witnessSequence !== floor.sequence
       || admission.witnessLastHash !== floor.lastHash
       || admission.witnessPhysicalFenceDigest !== floor.physicalFenceDigest) deny();
@@ -374,7 +381,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       pinnedInventoryPublicKey: v.pinnedInventoryPublicKey,
       pinnedInventorySignerKeyId: checkedBytes(v.pinnedInventorySignerKeyId, 16),
       pinnedPhysicalAttestorPublicKey: v.pinnedPhysicalAttestorPublicKey,
-      localTrustedDevicePolicy: snapshotLocalDevicePolicy(v.localTrustedDevicePolicy),
+      localTrustedDevicePolicy: initialTrustedPolicy,
     });
     // Bind the immutable inventory receipt rather than the fresh PG readback
     // signature: its nonce cannot be known when the *historical* admission is
