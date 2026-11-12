@@ -1702,6 +1702,18 @@ class SyncEngine {
             fail("Unsigned conflict response has no verifiable remote winner",
               "remote_authorization_rejected");
           }
+          // A valid device signature authenticates *an operation*, not the
+          // server's claim that it won THIS object's HTTP 409. A compromised
+          // transport may replay a genuine, unrelated signed object and make
+          // remote-wins discard our still-pending local outbox. Require the
+          // same immutable object, file and compartment before any local
+          // recovery files, summary updates or durable journal ACKs.
+          if (current.objectId !== operation.objectId
+            || current.fileId !== operation.fileId
+            || current.compartmentId !== operation.compartmentId) {
+            fail("Unrelated remote winner cannot acknowledge pending operation",
+              "remote_authorization_rejected");
+          }
           if (current?.operationId === operation?.operationId
             && signedEnvelopeDigest(current) !== signedEnvelopeDigest(operation)) {
             fail("Conflicting local sync admission evidence", "remote_authorization_rejected");

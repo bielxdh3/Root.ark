@@ -546,7 +546,7 @@ test("issue 66 #292 P1: untrusted 409 conflict current cannot probe pinned origi
   const { rootDir, open, remote, adapter, trusted, state } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
   const client = await open([], true, false, ["docs"]);
-  const pending = await remote("create", "object-pending", "docs/pending.txt", "local signed pending", 1);
+  const pending = await remote("create", "object-a", "docs/pending.txt", "local signed pending", 1);
   assert.equal(await verifyAuthorizationProof(pending.authorization, pending, trusted), true);
   await client.journal.enqueue(pending);
   const winnerA = await remote("move", "object-a", "archive/a.txt",
@@ -592,7 +592,7 @@ test("issue 66 #292 P1: forged selected 409 winner cannot write recovery artifac
   const client = await open([], true, false, ["docs"]);
   const localA = await remote("create", "object-local", "docs/local.txt", "signed local outbox", 1);
   await client.journal.enqueue(localA);
-  const winnerA = await remote("create", "object-winner", "docs/winner.txt",
+  const winnerA = await remote("create", "object-local", "docs/winner.txt",
     "authentic signed remote ciphertext", 1);
   assert.equal(await verifyAuthorizationProof(winnerA.authorization, winnerA, trusted), true,
     "positive control: a genuine A recipient/roster authorization verifies");
@@ -650,6 +650,40 @@ test("issue 66 #292 P1: unsigned 409 without current winner keeps signed outbox 
   assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
   assert.equal(client.journal.hasSeen(localA.operationId), false,
     "unsigned 409 cannot consume the only pending copy of a signed operation");
+});
+
+test("issue 66 #292 P1: genuinely trusted but unrelated 409 winner cannot discard pending object", async (t) => {
+  const { rootDir, open, remote, adapter, trusted } = await fixture(t);
+  const client = await open([], true, false, ["docs"]);
+  const pending = await remote("create", "object-local", "docs/local.txt", "signed local pending", 1);
+  const unrelated = await remote("create", "object-foreign", "docs/foreign.txt", "signed foreign object", 1);
+  assert.equal(await verifyAuthorizationProof(pending.authorization, pending, trusted), true);
+  assert.equal(await verifyAuthorizationProof(unrelated.authorization, unrelated, trusted), true,
+    "attacker replays a genuinely trusted A signature rather than forging B");
+  assert.notEqual(unrelated.objectId, pending.objectId);
+  assert.notEqual(unrelated.fileId, pending.fileId);
+  await client.journal.enqueue(pending);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotPath);
+  let sent = 0;
+  adapter.push = async (operation) => {
+    assert.equal(operation.operationId, pending.operationId);
+    sent += 1;
+    return { status: 409, current: unrelated, currentRevision: unrelated.revision };
+  };
+  const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+  await assert.rejects(client.pushPending(summary), { code: "remote_authorization_rejected" },
+    "valid signature for foreign object is not a conflict authorization for local object");
+  assert.equal(sent, 1, "the signed pending operation reached 409 handling");
+  assert.deepEqual(summary.conflicts, []);
+  assert.equal(summary.pushed, 0);
+  assert.equal(fs.existsSync(path.join(rootDir, ".rootark-conflicts")), false,
+    "unrelated winner must not dump local pending plaintext");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
+    "replayed unrelated winner must not acknowledge/drop pending outbox");
+  assert.deepEqual(await fsp.readFile(snapshotPath), snapshotBefore);
+  assert.equal(client.journal.hasSeen(pending.operationId), false);
 });
 
 test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDATE before mutation", async (t) => {
