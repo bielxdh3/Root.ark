@@ -1,7 +1,11 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { types: { isProxy: NATIVE_IS_PROXY } } = require("node:util");
+const { types: {
+  isProxy: NATIVE_IS_PROXY,
+  isUint8Array: NATIVE_IS_UINT8_ARRAY,
+  isSharedArrayBuffer: NATIVE_IS_SHARED_ARRAY_BUFFER,
+} } = require("node:util");
 // Load the shared native snapshot before any caller-owned KeyObject getter.
 const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
@@ -21,6 +25,16 @@ const z = Object.freeze({
   encodeDeterministic: codec.encodeDeterministic,
   decodeDeterministic: codec.decodeDeterministic,
 });
+// Native input predicates and typed-array accessors must be pinned before
+// untrusted KeyObject getters. A late Buffer.isBuffer or Buffer.prototype
+// getter must not rewrite an already owner-hashed raw snapshot B into C
+// during the *nested* inventory verification, after the owner's hash check.
+const NATIVE_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
+const NATIVE_KEY_OBJECT = crypto.KeyObject;
+const NATIVE_PLAIN_PROTO = Object.prototype;
+const NATIVE_TYPED_ARRAY_PROTO = NATIVE_GET_PROTOTYPE(Uint8Array.prototype);
+const NATIVE_VIEW_BUFFER = NATIVE_DESCRIPTOR(NATIVE_TYPED_ARRAY_PROTO, "buffer").get;
+const NATIVE_VIEW_BYTE_LENGTH = NATIVE_DESCRIPTOR(NATIVE_TYPED_ARRAY_PROTO, "byteLength").get;
 // Retain the original sorting implementation before any caller-owned
 // KeyObject getter can replace Array.prototype.sort or Function.call.
 const NATIVE_ARRAY_SORT = Array.prototype.sort;
@@ -62,28 +76,35 @@ function fail(code) {
 }
 
 function isBytes(value) {
-  return Buffer.isBuffer(value) || value instanceof Uint8Array;
+  return !NATIVE_IS_PROXY(value)
+    && (NATIVE_IS_BUFFER(value) || NATIVE_IS_UINT8_ARRAY(value));
 }
 
 function copyBytes(value, min, max = min) {
   if (!isBytes(value)) fail("INVENTORY_INVALID_BYTES");
-  if (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer) {
+  let viewBuffer, length;
+  try {
+    // Do not invoke caller-replaced .buffer/.byteLength getters on a signed
+    // Buffer. The native typed-array accessors read its backing view directly.
+    viewBuffer = NATIVE_APPLY(NATIVE_VIEW_BUFFER, value, []);
+    length = NATIVE_APPLY(NATIVE_VIEW_BYTE_LENGTH, value, []);
+  } catch (_) { fail("INVENTORY_INVALID_BYTES"); }
+  if (NATIVE_IS_SHARED_ARRAY_BUFFER(viewBuffer)) {
     fail("INVENTORY_SHARED_BYTES");
   }
-  const length = value.byteLength;
   if (!Number.isSafeInteger(length) || length < min || length > max) fail("INVENTORY_LIMIT");
   return NATIVE_BUFFER_FROM(value);
 }
 
 function exactObject(value, names, code = "INVENTORY_FIELDS") {
-  if (!value || typeof value !== "object" || Array.isArray(value) || isBytes(value)) fail(code);
+  if (!value || typeof value !== "object" || NATIVE_ARRAY_IS_ARRAY(value) || isBytes(value)) fail(code);
   let proto;
   let keys;
   try {
     proto = NATIVE_GET_PROTOTYPE(value);
     keys = NATIVE_OWN_KEYS(value);
   } catch (_) { fail(code); }
-  if ((proto !== Object.prototype && proto !== null)
+  if ((proto !== NATIVE_PLAIN_PROTO && proto !== null)
     || keys.length !== names.length
     || names.some((name) => !keys.includes(name))) fail(code);
   const result = NATIVE_OBJECT_CREATE(null);
@@ -96,14 +117,14 @@ function exactObject(value, names, code = "INVENTORY_FIELDS") {
 }
 
 function objectWithOptional(value, required, optional, code) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || isBytes(value)) fail(code);
+  if (!value || typeof value !== "object" || NATIVE_ARRAY_IS_ARRAY(value) || isBytes(value)) fail(code);
   let proto;
   let keys;
   try {
     proto = NATIVE_GET_PROTOTYPE(value);
     keys = NATIVE_OWN_KEYS(value);
   } catch (_) { fail(code); }
-  if ((proto !== Object.prototype && proto !== null)
+  if ((proto !== NATIVE_PLAIN_PROTO && proto !== null)
     || required.some((name) => !keys.includes(name))
     || keys.some((name) => !required.includes(name) && !optional.includes(name))) fail(code);
   const result = NATIVE_OBJECT_CREATE(null);
@@ -144,7 +165,7 @@ function normalizeEntry(value) {
 }
 
 function normalizeEntries(value) {
-  if (!Array.isArray(value)) fail("INVENTORY_ENTRIES");
+  if (!NATIVE_ARRAY_IS_ARRAY(value)) fail("INVENTORY_ENTRIES");
   const length = value.length;
   if (length > MAX_ENTRIES) fail("INVENTORY_LIMIT");
   let keys;
@@ -457,8 +478,10 @@ async function readVerifiedCommittedOperation({ serialized, pinnedPublicKey,
 }
 
 function sameBytes(a, b) {
-  return Buffer.isBuffer(a) && Buffer.isBuffer(b)
-    && a.length === b.length && NATIVE_TIMING_SAFE_EQUAL(a, b);
+  return NATIVE_IS_BUFFER(a) && NATIVE_IS_BUFFER(b)
+    && NATIVE_APPLY(NATIVE_VIEW_BYTE_LENGTH, a, [])
+      === NATIVE_APPLY(NATIVE_VIEW_BYTE_LENGTH, b, [])
+    && NATIVE_TIMING_SAFE_EQUAL(a, b);
 }
 
 function hash(value) {
@@ -490,13 +513,13 @@ async function computeRoot(scopeValue, sequenceValue, previousRootValue, entries
 }
 
 function validatePrivateKey(value) {
-  if (!(value instanceof crypto.KeyObject)
+  if (!(value instanceof NATIVE_KEY_OBJECT)
     || value.type !== "private" || value.asymmetricKeyType !== "ed25519") fail("INVENTORY_SIGNER_KEY");
   return value;
 }
 
 function validatePublicKey(value) {
-  if (!(value instanceof crypto.KeyObject)
+  if (!(value instanceof NATIVE_KEY_OBJECT)
     || value.type !== "public" || value.asymmetricKeyType !== "ed25519") fail("INVENTORY_SIGNER_KEY");
   return value;
 }
@@ -616,14 +639,14 @@ function normalizeCommittedProofChain(input) {
   for (let i = 0; i < input.length; i += 1) {
     const descriptor = NATIVE_DESCRIPTOR(input, i);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_CHAIN");
-    const value = descriptor.value;
-    if (!isBytes(value) || (typeof SharedArrayBuffer !== "undefined"
-      && value.buffer instanceof SharedArrayBuffer)
-      || value.byteLength < 1 || value.byteLength > MAX_COMMITTED_PROOF_BYTES
-      || total > MAX_SNAPSHOT_BYTES - value.byteLength) fail("INVENTORY_LIMIT");
-    total += value.byteLength;
+    let copy;
+    try { copy = copyBytes(descriptor.value, 1, MAX_COMMITTED_PROOF_BYTES); }
+    catch (_) { fail("INVENTORY_LIMIT"); } // Preserve the chain's existing error contract.
+    const length = NATIVE_APPLY(NATIVE_VIEW_BYTE_LENGTH, copy, []);
+    if (total > MAX_SNAPSHOT_BYTES - length) fail("INVENTORY_LIMIT");
+    total += length;
     NATIVE_DEFINE_PROPERTY(result, i, {
-      value: NATIVE_BUFFER_FROM(value), enumerable: true,
+      value: copy, enumerable: true,
       configurable: true, writable: true,
     });
   }

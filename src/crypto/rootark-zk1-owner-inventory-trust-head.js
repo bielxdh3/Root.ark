@@ -233,6 +233,10 @@ async function verifyOwnerInventoryEnrollment(input) {
     await NATIVE_VERIFY_INVENTORY_SNAPSHOT({ serialized: snapshot, pinnedPublicKey: inventoryKey,
       pinnedSignerKeyId: keyId, expectedScope: pinnedScopeBytes, requested, minimumHead,
       nonce: decoded.nonce });
+    // No nested callback may change the raw bytes that the offline owner
+    // actually signed. Recheck the private snapshot before returning proof.
+    if (digest(snapshot) !== previous.snapshotHash
+      || NATIVE_BUFFER_COMPARE(snapshot, canonical) !== 0) fail();
     return NATIVE_FREEZE({ minimumHead, minimumSnapshot: NATIVE_BUFFER_FROM(snapshot),
       ownerSignatureVerified: true, externallyPinnedDigestMatched: true,
       signedCounter: previous.counter, ownerCheckpointDigest: previous.digest,
