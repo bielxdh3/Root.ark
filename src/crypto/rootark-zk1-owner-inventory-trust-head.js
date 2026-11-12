@@ -4,6 +4,10 @@
 // outside the storage server. An independently retained digest and SPKI are
 // supplied to the verifier over a separate trusted channel.
 const crypto = require("node:crypto");
+// Loaded before any owner/inventory KeyObject getter supplied by the caller.
+// A same-realm getter must not retarget Ed25519 owner verification to an
+// attacker-controlled crypto.verify implementation.
+const { verify: NATIVE_VERIFY } = require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 const inventory = require("./rootark-zk-content-inventory-v1");
 const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
@@ -118,7 +122,7 @@ async function verifyOwnerInventoryEnrollment(input) {
       const record = exact(descriptor.value, [...FIELDS, "signature"]);
       const current = statement(Object.fromEntries(FIELDS.map((f) => [f, record[f]])));
       const signature = b64(record.signature, 64);
-      if (!crypto.verify(null, bytes(current), ownerKey, signature)) fail();
+      if (!NATIVE_VERIFY(null, bytes(current), ownerKey, signature)) fail();
       compareScope(current, expectedScope);
       if (current.inventory_spki_sha256 !== signerFingerprint
         || current.inventory_signer_key_id !== keyId.toString("base64url")
