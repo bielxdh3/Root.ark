@@ -1397,6 +1397,50 @@ test("multiple inventory revisions require a complete signed operation chain fro
   await assert.rejects(inventory.verifySnapshot({
     ...args, committedProofChain: [receipts[0], tampered, receipts[2]],
   }));
+  // A Proxy(array) passes Array.isArray(). Its ownKeys trap runs in the
+  // signed-proof snapshot path and can replace mutable Array.prototype.push.
+  // That must never replace the ACTUAL caller-supplied corrupted B1 bytes
+  // with the authentic Ed25519-signed A1 receipt in the verifier's copy.
+  const nativePush = Array.prototype.push;
+  let proxyOwnKeys = 0;
+  let forgedCopies = 0;
+  const injectedChain = new Proxy([receipts[0], tampered, receipts[2]], {
+    ownKeys(target) {
+      proxyOwnKeys++;
+      Array.prototype.push = function (...values) {
+        const caller = (new Error().stack || "").split("\n")[2] || "";
+        if (/\bnormalizeCommittedProofChain \(/.test(caller)
+          && values.length === 1 && Buffer.isBuffer(values[0])
+          && values[0].equals(tampered)) {
+          forgedCopies++;
+          return Reflect.apply(nativePush, this, [Buffer.from(receipts[1])]);
+        }
+        return Reflect.apply(nativePush, this, values);
+      };
+      return Reflect.ownKeys(target);
+    },
+  });
+  let observedError = null;
+  let accepted = null;
+  try {
+    try {
+      accepted = await inventory.verifySnapshot({
+        ...args, committedProofChain: injectedChain,
+      });
+    } catch (error) { observedError = error; }
+  } finally {
+    Array.prototype.push = nativePush;
+  }
+  assert.equal(observedError?.code, "INVENTORY_CHAIN",
+    `untrusted Proxy laundered signed A1 over supplied B1: accepted=${accepted?.outcome}` +
+    ` traps=${proxyOwnKeys} substitutedPushes=${forgedCopies}`);
+  assert.equal(proxyOwnKeys, 0, "Proxy trap must be refused before enumeration");
+  assert.equal(forgedCopies, 0, "native proof-chain copying must not use poisoned Array.push");
+  const afterProxyAttack = await inventory.verifySnapshot({
+    ...args, committedProofChain: receipts,
+  });
+  assert.equal(afterProxyAttack.verifiedInterveningReceipts, 3,
+    "genuine signed A0/A1/A2 chain still works");
   // Real signer issued A0/A1/A2, but the caller supplies the DIFFERENT,
   // tampered B1 bytes. A native public-key getter can change this realm's
   // iterator after the B bytes are copied and before proof-chain verification.

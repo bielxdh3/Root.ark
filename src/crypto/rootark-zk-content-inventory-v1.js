@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { types: { isProxy: NATIVE_IS_PROXY } } = require("node:util");
 // Load the shared native snapshot before any caller-owned KeyObject getter.
 const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
@@ -9,7 +10,8 @@ const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   bufferCompare: NATIVE_BUFFER_COMPARE, ownDescriptor: NATIVE_DESCRIPTOR,
   ownKeys: NATIVE_OWN_KEYS, getPrototype: NATIVE_GET_PROTOTYPE,
   objectCreate: NATIVE_OBJECT_CREATE, hasOwn: NATIVE_HAS_OWN,
-  defineProperty: NATIVE_DEFINE_PROPERTY, apply: NATIVE_APPLY } =
+  defineProperty: NATIVE_DEFINE_PROPERTY, arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  apply: NATIVE_APPLY } =
   require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 // Retain the original sorting implementation before any caller-owned
@@ -585,7 +587,12 @@ function assertSuperset(currentEntries, previousEntries) {
 }
 
 function normalizeCommittedProofChain(input) {
-  if (!Array.isArray(input) || input.length > MAX_ENTRIES) fail("INVENTORY_CHAIN");
+  // A Proxy(Array) still satisfies Array.isArray, but its ownKeys/length
+  // traps can retarget Array.prototype.push before the first copied receipt.
+  // Refuse it before consulting any attacker-owned trap, then write only own
+  // DATA slots with the native captured descriptor primitive.
+  if (NATIVE_IS_PROXY(input) || !NATIVE_ARRAY_IS_ARRAY(input)
+    || input.length > MAX_ENTRIES) fail("INVENTORY_CHAIN");
   const keys = NATIVE_OWN_KEYS(input);
   if (keys.length !== input.length + 1 || !keys.includes("length")) fail("INVENTORY_CHAIN");
   const result = [];
@@ -599,7 +606,10 @@ function normalizeCommittedProofChain(input) {
       || value.byteLength < 1 || value.byteLength > MAX_COMMITTED_PROOF_BYTES
       || total > MAX_SNAPSHOT_BYTES - value.byteLength) fail("INVENTORY_LIMIT");
     total += value.byteLength;
-    result.push(NATIVE_BUFFER_FROM(value));
+    NATIVE_DEFINE_PROPERTY(result, i, {
+      value: NATIVE_BUFFER_FROM(value), enumerable: true,
+      configurable: true, writable: true,
+    });
   }
   return result;
 }
