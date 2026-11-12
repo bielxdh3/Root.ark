@@ -332,7 +332,10 @@
             if (!query || (!entry.logicalTrashCandidate
               && entry.name.normalize("NFC").toLowerCase().includes(query))) {
               totalMatches++;
-              if (entries.length < 100) entries.push(entry);
+              // Cap private query hits, not the full workspace listing. The
+              // signed head can contain >100 current objects, all of which
+              // must remain visible when no local filename filter is active.
+              if (!query || entries.length < 100) entries.push(entry);
             }
           }
           // One bad entry/key invalidates the ENTIRE list; no partial results.

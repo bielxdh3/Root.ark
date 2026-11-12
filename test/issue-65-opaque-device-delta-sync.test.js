@@ -68,6 +68,15 @@ test("local filename filter caps display, counts all matches, and rejects a corr
   assert.equal(result.totalMatches, 105);
   assert.equal(result.entries.length, 100);
   assert.equal(decrypted, 105, "the cap must never skip verification of the remaining rows");
+  const unfiltered = await client.readPrivateListing(baseline, key, "");
+  assert.equal(unfiltered.totalMatches, 105,
+    "unfiltered workspace listing must count all current signed object heads");
+  assert.equal(unfiltered.entries.length, 105,
+    "100-hit limit applies to search results, never to unfiltered workspace listing");
+  assert.equal(unfiltered.entries[104].objectId, rows[104].object_id,
+    "the 105th current object must remain visible for browsing");
+  assert.equal(decrypted, 210,
+    "all signed rows are decrypted before display for both query modes");
   const normalized = await client.readPrivateListing(baseline, key, "RELATÓRIO [2026]");
   assert.equal(normalized.totalMatches, 1,
     "casefold and NFC normalization must preserve literal special characters");
