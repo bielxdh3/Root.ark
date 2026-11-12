@@ -1695,6 +1695,13 @@ class SyncEngine {
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
           const current = error.current
             ? envelopeCopy(protocol.validateStoredOperation(error.current)) : null;
+          // A bare HTTP 409 is not a signed remote admission receipt. Without
+          // an authenticated, specific winner, remote-wins would discard our
+          // pending signed operation even if the server never committed it.
+          if (!current) {
+            fail("Unsigned conflict response has no verifiable remote winner",
+              "remote_authorization_rejected");
+          }
           if (current?.operationId === operation?.operationId
             && signedEnvelopeDigest(current) !== signedEnvelopeDigest(operation)) {
             fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
@@ -1717,13 +1724,13 @@ class SyncEngine {
               }
             }
           }
-          if (current && !this.operationDestinationIsSelected(current)) {
-            // The server's 409 `current` is untrusted until its exact device
-            // Ed25519/roster envelope is verified. Never disclose the local
-            // pin state, nor mutate conflict recovery, for an unauthenticated
-            // response. Do not reserve a durable admission for a valid but
-            // pinned-rejected MOVE.
-            await this.verifyIncomingOperation(current, { preObserve: false });
+          // ALL 409 `current` envelopes are attacker-controlled until Ed25519
+          // device/roster verification, including destinations inside selected
+          // paths. In particular, recoverConflict writes decrypted pending
+          // plaintext under .rootark-conflicts and must never run for B.
+          // No durable admission is created until after pin preflight.
+          await this.verifyIncomingOperation(current, { preObserve: false });
+          if (!this.operationDestinationIsSelected(current)) {
             this.preflightOutOfScopeMove(current);
           }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
