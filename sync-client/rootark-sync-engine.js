@@ -2241,7 +2241,7 @@ class SyncEngine {
         this.snapshot.remoteOnly[operation.objectId]];
       for (const previous of known) {
         if (!previous || previous.objectId !== operation.objectId
-          || previous.fileId !== operation.fileId || !previous.revision) continue;
+          || !previous.revision) continue;
         const order = protocol.compareRevisions(operation.revision, previous.revision);
         if (order < 0 || (order === 0 && previous.versionId
           && previous.versionId !== operation.versionId)) {

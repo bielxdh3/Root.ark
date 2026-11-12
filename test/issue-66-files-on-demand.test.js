@@ -359,7 +359,8 @@ test("issue 66: a clean cached source can be hydrated through a verified remote 
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
 });
 
-test("issue 66 #263 P2: authentic signed stale inventory and ciphertext cannot roll back a hydrated revision", async (t) => {
+for (const changedFileId of [false, true]) {
+test(`issue 66 #263 P2: signed old inventory cannot roll back newer object with ${changedFileId ? "changed" : "stable"} fileId`, async (t) => {
   const { root, source, writer, store, key, adapter } = await setup(t,
     { "docs/replay.txt": "authentic revision A" });
   const pair = crypto.generateKeyPairSync("ed25519");
@@ -393,12 +394,33 @@ test("issue 66 #263 P2: authentic signed stale inventory and ciphertext cannot r
   assert.equal(await verifyAuthorizationProof(revisionA.authorization, revisionA, trust), true);
   const firstSnapshot = client.snapshot.files["docs/replay.txt"];
 
-  await fsp.writeFile(path.join(source, "docs", "replay.txt"), "authentic revision B");
-  await writer.syncOnce();
+  if (changedFileId) {
+    assert.equal(await client.evictLocal("docs/replay.txt"), true,
+      "evict authentic A before the signed successor replaces its file identity");
+    const next = protocol.createOperation({
+      operation: "update", objectId: revisionA.objectId,
+      fileId: `new-file-${crypto.randomUUID()}`,
+      versionId: `new-version-${crypto.randomUUID()}`,
+      operationId: `new-operation-${crypto.randomUUID()}`,
+      deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+      baseRevision: revisionA.revision,
+      revision: { counter: revisionA.revision.counter + 1, deviceId: "device-a" },
+      metadata: { path: "docs/replay.txt" },
+      plaintext: Buffer.from("authentic revision B"), fileKey: key,
+    });
+    assert.equal((await store.put("alice", next)).kind, "stored",
+      "real legacy fixture store preserves a newer revision with changed fileId");
+    assert.equal(await verifyAuthorizationProof((await sign(next)).authorization,
+      await sign(next), trust), true,
+    "client admission later receives genuine Ed25519-signed B, not a forged metadata claim");
+  } else {
+    await fsp.writeFile(path.join(source, "docs", "replay.txt"), "authentic revision B");
+    await writer.syncOnce();
+  }
   const revisionB = await sign(store.list("alice")[0]);
   assert.equal(await verifyAuthorizationProof(revisionB.authorization, revisionB, trust), true);
   assert.equal(revisionB.objectId, revisionA.objectId);
-  assert.equal(revisionB.fileId, revisionA.fileId);
+  assert.equal(revisionB.fileId === revisionA.fileId, !changedFileId);
   assert.ok(protocol.compareRevisions(revisionB.revision, revisionA.revision) > 0);
   assert.equal(await client.materializeRemote("docs/replay.txt"), true);
   const before = client.snapshot.files["docs/replay.txt"];
@@ -434,10 +456,11 @@ test("issue 66 #263 P2: authentic signed stale inventory and ciphertext cannot r
     objects: [oldInventory], nextCursor: null });
   strictAdapter.list = async () => [revisionA];
   await assert.rejects(client.materializeRemote("docs/replay.txt"),
-    { code: "remote_rollback_detected" },
-    "historically valid Ed25519 A must not replace already hydrated B");
+    { code: changedFileId ? "local_changes_pending" : "remote_rollback_detected" },
+    "historically valid Ed25519 A must not replace B, even if A's fileId changed");
   assert.equal(await fsp.readFile(path.join(root, "docs", "replay.txt"), "utf8"),
     "authentic revision B");
   assert.deepEqual(client.snapshot.files["docs/replay.txt"], before,
     "replayed old inventory cannot lower the durable local revision");
 });
+}
