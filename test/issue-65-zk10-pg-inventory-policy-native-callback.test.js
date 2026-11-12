@@ -453,3 +453,68 @@ test("P2 PG signed scope A cannot authorize foreign scope B via hostile Array.ev
   assert.ok(evil.reads > 0, "native getter must run");
   assert.equal(attackCalls, 0, "same-realm Array.every must never decide signed scope");
 });
+
+test("P2 PG: decoder input cannot mutate unsigned raw B into genuinely attestor-signed A after KeyObject callback", async () => {
+  const f = fixture();
+  const { signed, nonce, now } = await physicalReceipt(f);
+  const originalA = await z.decodeDeterministic(signed);
+  const forgedB = Buffer.from(await z.encodeDeterministic({
+    ...originalA, generation: 2,
+  }));
+  const nativeFrom = Buffer.from;
+  const nativeIsBuffer = Buffer.isBuffer;
+  const nativeCompare = Buffer.compare;
+  const nativeCopy = Buffer.prototype.copy;
+  assert.equal(forgedB.length, signed.length,
+    "genuine Ed25519 A and unsigned generation B must have equal CBOR length");
+  assert.notEqual(nativeCompare(signed, forgedB), 0,
+    "the provided wire B must differ from genuine signed A");
+  const opts = (pin) => ({ scope: f.scope, operation: f.operation,
+    expected: undefined, nonce, pinnedPublicKey: pin, nowSeconds: now });
+  await assert.rejects(pg.verifyCommittedPhysicalReadback(forgedB,
+    opts(f.signer.publicKey)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+
+  const evilKey = crypto.createPublicKey({
+    key: f.signer.publicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  let keyReads = 0, mutations = 0, mutationsDuringVerification = -1;
+  Object.defineProperty(evilKey, "type", { configurable: true, get() {
+    keyReads++;
+    Buffer.from = function(value, ...args) {
+      // The hostile callback receives the verifier's PRIVATE Buffer holding
+      // raw B only if the codec internally calls mutable Buffer.from(input).
+      if (nativeIsBuffer(value) && value.length === forgedB.length
+        && nativeCompare(value, forgedB) === 0) {
+        nativeCopy.call(signed, value);
+        mutations++;
+      }
+      return nativeFrom(value, ...args);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(pg.verifyCommittedPhysicalReadback(forgedB,
+      opts(evilKey)), /ZK_PHYSICAL_ATTESTATION_DENIED/,
+    "owner-supplied raw B cannot become attestor-signed A during decoding");
+    mutationsDuringVerification = mutations;
+    // The attack is effective, not a zero-hit/disabled callback oracle:
+    // direct invocation with a disposable B changes its bytes to signed A.
+    const canaryB = nativeFrom(forgedB);
+    Buffer.from(canaryB);
+    assert.equal(nativeCompare(canaryB, signed), 0,
+      "adversary can replace equal-length raw B in-place with genuine signed A");
+    assert.equal(mutations, mutationsDuringVerification + 1);
+  } finally {
+    Buffer.from = nativeFrom;
+    delete evilKey.type;
+  }
+  assert.ok(keyReads > 0, "the real KeyObject type getter must run");
+  assert.equal(mutationsDuringVerification, 0,
+    "the decoder must not call poisoned global Buffer.from on raw B");
+  const genuine = await pg.verifyCommittedPhysicalReadback(signed,
+    opts(f.signer.publicKey));
+  assert.equal(genuine.verified, true, "attestor-signed A remains accepted");
+  assert.equal(genuine.generation, 1);
+  assert.equal(genuine.authorizesIo, false);
+});
