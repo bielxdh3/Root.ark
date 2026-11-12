@@ -45,6 +45,91 @@ test("P2 inventory: signed old snapshot A cannot satisfy retained minimum root B
   "signed genuine A remains valid when floor really is A");
 });
 
+test("P2 inventory: inherited numeric Array setter cannot turn owner-signed entry A into requested B", async () => {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 231);
+  const scope = { account_id: Buffer.alloc(16, 232),
+    compartment_id: Buffer.from("protected"), keyring_id: Buffer.alloc(16, 233) };
+  const signedA = { object_id: Buffer.alloc(16, 234), revision: 1, epoch: 1,
+    ciphertext_sha256: Buffer.alloc(32, 235) };
+  const requestedB = { ...signedA, object_id: Buffer.alloc(16, 236) };
+  const nonce = Buffer.alloc(32, 237);
+  const previousRoot = Buffer.alloc(32, 238);
+  const rootA = await inventory.computeRoot(scope, 1, previousRoot, [signedA]);
+  const serialized = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope, sequence: 1,
+    previousRoot, entries: [signedA], nonce,
+  });
+  const args = (pin, requested) => ({ serialized, pinnedPublicKey: pin,
+    pinnedSignerKeyId: signerKeyId, expectedScope: scope, requested,
+    minimumHead: { sequence: 1, root: rootA }, nonce });
+  assert.equal((await inventory.verifySnapshot(args(signer.publicKey, signedA))).outcome,
+    "PRESENT", "real owner-signed A is present");
+  assert.equal((await inventory.verifySnapshot(args(signer.publicKey, requestedB))).outcome,
+    "ABSENT", "unlisted B is absent");
+
+  const priorZero = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+  const z = require("../src/crypto/rootark-zk-1");
+  const nativeDecode = z.decodeDeterministic;
+  const shadowedArrays = new WeakSet();
+  const attackerPin = Object.create(signer.publicKey);
+  let keyGetterReads = 0, interceptedAssignments = 0, returnedForgedB = 0, decodedCopies = 0;
+  const installNumericTrap = () => {
+    Object.defineProperty(Array.prototype, "0", {
+      configurable: true,
+      get() {
+        if (!shadowedArrays.has(this)) return undefined;
+        const immediate = (new Error().stack || "").split("\n")[2] || "";
+        if (/\bat (?:Object\.)?verifySnapshot \(/.test(immediate)) {
+          returnedForgedB++;
+          return requestedB;
+        }
+        return signedA;
+      },
+      set(value) {
+        const stack = new Error().stack || "";
+        if (value && value.object_id && value.object_id.equals(signedA.object_id)
+          && /\bnormalizeEntries \(/.test(stack)) {
+          shadowedArrays.add(this);
+          interceptedAssignments++;
+          return;
+        }
+        Object.defineProperty(this, "0", {
+          value, enumerable: true, configurable: true, writable: true,
+        });
+      },
+    });
+  };
+  Object.defineProperty(attackerPin, "type", { get() {
+    keyGetterReads++;
+    // Keep the original canonical CBOR decode intact. The caller-owned key
+    // callback can replace this mutable module export and install the array
+    // setter exactly after decoding the genuinely signed A bytes.
+    z.decodeDeterministic = async (...arguments_) => {
+      const decoded = await nativeDecode(...arguments_);
+      decodedCopies++;
+      installNumericTrap();
+      return decoded;
+    };
+    return "public";
+  } });
+  try {
+    assert.equal((await inventory.verifySnapshot(args(attackerPin, requestedB))).outcome,
+      "ABSENT", "a signed A row cannot become B through an inherited numeric slot");
+  } finally {
+    z.decodeDeterministic = nativeDecode;
+    if (priorZero) Object.defineProperty(Array.prototype, "0", priorZero);
+    else delete Array.prototype[0];
+  }
+  assert.ok(keyGetterReads > 0, "hostile native KeyObject property callback was reached");
+  assert.ok(decodedCopies > 0, "real signed CBOR A was decoded before the numeric trap");
+  assert.equal(interceptedAssignments, 0,
+    "normalization must define its own indexed slots without inherited setters");
+  assert.equal(returnedForgedB, 0, "signed membership must not consult prototype entries");
+  assert.equal((await inventory.verifySnapshot(args(signer.publicKey, signedA))).outcome,
+    "PRESENT", "signed A remains valid after the attempted attack");
+});
+
 test("P2 inventory: native key getter cannot replace signed member A with requested B through an Array iterator", async () => {
   const signer = crypto.generateKeyPairSync("ed25519");
   const signerKeyId = Buffer.alloc(16, 201);
