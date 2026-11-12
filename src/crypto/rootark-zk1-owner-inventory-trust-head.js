@@ -9,6 +9,7 @@ const crypto = require("node:crypto");
 // attacker-controlled crypto.verify implementation.
 const {
   verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
   createHash: NATIVE_CREATE_HASH, hashUpdate: NATIVE_HASH_UPDATE,
   hashDigest: NATIVE_HASH_DIGEST, bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT, bufferToString: NATIVE_BUFFER_TO_STRING,
@@ -72,7 +73,19 @@ function b64(value, min, max = min) {
 function key(value, kind) {
   if (!(value instanceof crypto.KeyObject) || value.type !== kind
     || value.asymmetricKeyType !== "ed25519") fail();
-  return value;
+  if (kind === "private") return value; // Never export private material.
+  try {
+    // A caller-controlled Symbol(kHandle) getter can return genuine key B
+    // during SPKI export and genuine key A during Ed25519 verification.
+    // Export ONCE with the original native method, reimport the exact 44
+    // bytes, and retain only that fresh stable KeyObject for BOTH operations.
+    const originalSpki = nativeEd25519Spki(value);
+    const pinned = NATIVE_CREATE_PUBLIC_KEY({
+      key: originalSpki, format: "der", type: "spki",
+    });
+    if (NATIVE_BUFFER_COMPARE(nativeEd25519Spki(pinned), originalSpki) !== 0) fail();
+    return pinned;
+  } catch { fail(); }
 }
 function digest(data) {
   const hash = NATIVE_CREATE_HASH("sha256");

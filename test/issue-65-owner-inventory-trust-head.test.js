@@ -290,3 +290,41 @@ test("owner A native PublicKey export cannot be spoofed as foreign pinned B via 
     "genuinely owner-signed A cannot masquerade as independently pinned B");
   assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
 });
+
+test("owner native kHandle cannot export pinned B and then verify genuine A with a different handle", async () => {
+  const f = await fixture();
+  const realA = f.enrollment.ownerPublicKey;
+  const realB = crypto.generateKeyPairSync("ed25519").publicKey;
+  const pinB = crypto.createHash("sha256").update(
+    realB.export({ type: "spki", format: "der" })).digest("hex");
+  assert.notEqual(pinB, f.enrollment.independentOwnerSpkiSha256);
+  const symbol = Object.getOwnPropertySymbols(realA)
+    .find((value) => String(value) === "Symbol(kHandle)");
+  assert.ok(symbol, "physical Node 22 KeyObject must expose its native handle");
+  const handleA = Object.getOwnPropertyDescriptor(realA, symbol).value;
+  const handleB = Object.getOwnPropertyDescriptor(realB, symbol).value;
+  const samples = [];
+  for (let pivot = 1; pivot <= 16; pivot++) {
+    const disguised = Object.create(realA);
+    let reads = 0;
+    Object.defineProperty(disguised, symbol, { configurable: true, get() {
+      reads++;
+      // Stable B for first N native handle reads, then genuine A at verify.
+      return reads <= pivot ? handleB : handleA;
+    } });
+    let accepted = false;
+    try {
+      await verifyOwnerInventoryEnrollment({ ...f.enrollment,
+        ownerPublicKey: disguised, independentOwnerSpkiSha256: pinB });
+      accepted = true;
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+    samples.push({ pivot, reads, accepted });
+  }
+  assert.ok(samples.some((sample) => sample.reads >= 1),
+    "the original caller-owned handle getter must actually execute");
+  assert.equal(samples.some((sample) => sample.accepted), false,
+    `an owner A signature must not verify under independently pinned owner B: ${JSON.stringify(samples)}`);
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
+});
