@@ -92,9 +92,11 @@ async function startFixture(t, mode, extraEnv = {}) {
     }
     : { DB_ENABLED: "false" };
   const pauseMarker = path.join(sandbox, "share-exchange-read-complete.marker");
+  const pauseRelease = path.join(sandbox, "share-exchange-read-release.marker");
   const env = { ...process.env, ...dbEnv, ...extraEnv,
     ...(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT === "exchange-commit"
-      ? { ROOTARK_TEST_SHARE_PAUSE_MARKER: pauseMarker } : {}),
+      ? { ROOTARK_TEST_SHARE_PAUSE_MARKER: pauseMarker,
+        ROOTARK_TEST_SHARE_PAUSE_RELEASE: pauseRelease } : {}),
     NODE_ENV: "test", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   for (const key of Object.keys(env)) if (/^(AWS_|GOOGLE_DRIVE_)/.test(key)) delete env[key];
   delete env.TRUSTED_PROXIES;
@@ -199,7 +201,7 @@ async function startFixture(t, mode, extraEnv = {}) {
     });
   };
 
-  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password, pauseMarker };
+  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password, pauseMarker, pauseRelease };
 }
 
 function viewerCookieFrom(response) {
@@ -263,9 +265,8 @@ for (const mode of ["json", "sqlite"]) {
 }
 
 test("SQLite exchange cannot revoke a new share or lose a parallel alias after its stale read", { timeout: 60_000 }, async (t) => {
-  const { authed, port, origin, dataDir, pauseMarker } = await startFixture(t, "sqlite", {
+  const { authed, port, origin, dataDir, pauseMarker, pauseRelease } = await startFixture(t, "sqlite", {
     ROOTARK_TEST_SHARE_PAUSE_POINT: "exchange-commit",
-    ROOTARK_TEST_SHARE_PAUSE_MS: "2500",
   });
   const settings = { name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
     permissions: ["download"], maxDownloads: 3 };
@@ -288,8 +289,15 @@ test("SQLite exchange cannot revoke a new share or lose a parallel alias after i
   }
   assert.equal(fs.readFileSync(pauseMarker, "utf8"), "snapshot-read-before-admission",
     "real server reached the vulnerable post-snapshot pause before B is created");
-  const independent = await authed("/share/capabilities", settings);
-  assert.equal(independent.status, 201, independent.body);
+  let independent;
+  try {
+    independent = await authed("/share/capabilities", settings);
+    assert.equal(independent.status, 201, independent.body);
+  } finally {
+    // A cannot leave its precommit barrier before B's INSERT has returned.
+    // No scheduler timing assumption can make the unpatched parent pass.
+    fs.writeFileSync(pauseRelease, "B-insert-confirmed");
+  }
   const otherToken = JSON.parse(independent.body).token;
   assert.notEqual(otherToken, token);
   const secondPromise = exchange();
