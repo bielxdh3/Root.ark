@@ -161,6 +161,63 @@ test("P2: authentic owner provision cannot certify one physical Ed25519 witness 
   { code: "authorization_required" });
 });
 
+test("P2: inherited witness key getter cannot retarget canonical owner A bytes to certify identity B", () => {
+  const base = trustedFixture();
+  const original = base.ownerProvisioning;
+  const alteredIdentity = { ...base.ownerIdentity, username: "mallory" };
+  const forged = { ...original, statement: {
+    ...original.statement, username: alteredIdentity.username,
+  } };
+  assert.notEqual(forged.statement.username, original.statement.username);
+  assert.notEqual(protocol.canonicalJson(forged), protocol.canonicalJson(original));
+  assert.equal(crypto.createHash("sha256").update(
+    OWNER_PROVISION_DOMAIN + protocol.canonicalJson(original)).digest("hex"),
+  base.ownerProvisionDigest, "independently pinned digest belongs to signed owner A");
+
+  const witness = crypto.createPublicKey({ key: base.pinnedPublicKey,
+    format: "der", type: "spki" });
+  const nativeHandle = Object.getOwnPropertySymbols(witness)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(nativeHandle, "Node22 native-handle getter required");
+  const inherited = Object.create(witness);
+  const saved = protocol.canonicalJson;
+  let getterReads = 0, retargetedBytes = 0;
+  Object.defineProperty(inherited, nativeHandle, { get() {
+    getterReads++;
+    protocol.canonicalJson = (value) => {
+      if (value?.type === "atomic-owner-provisioning"
+        && value.username === alteredIdentity.username) {
+        retargetedBytes++;
+        return saved(original.statement);
+      }
+      if (value?.statement?.username === alteredIdentity.username
+        && value.signature === original.signature) {
+        retargetedBytes++;
+        return saved(original);
+      }
+      return saved(value);
+    };
+    return witness[nativeHandle];
+  } });
+  try {
+    assert.throws(() => verifyPinnedAtomicOwnerProvision({
+      identity: alteredIdentity, scope: base.scope,
+      provisionerPublicKey: base.ownerProvisionerPublicKey,
+      witnessPublicKey: inherited, casPublicKey: base.casPinnedPublicKey,
+      provisioning: forged, expectedDigest: base.ownerProvisionDigest,
+    }), { code: "authorization_required" },
+    "signed owner A cannot authenticate unowned identity B with retained digest A");
+  } finally { protocol.canonicalJson = saved; }
+  assert.ok(getterReads > 0, "genuine inherited KeyObject handle getter executed");
+  assert.equal(retargetedBytes, 0, "authority does not dispatch to mutable protocol export after getter");
+  assert.ok(verifyPinnedAtomicOwnerProvision({
+    identity: base.ownerIdentity, scope: base.scope,
+    provisionerPublicKey: base.ownerProvisionerPublicKey,
+    witnessPublicKey: base.pinnedPublicKey, casPublicKey: base.casPinnedPublicKey,
+    provisioning: original, expectedDigest: base.ownerProvisionDigest,
+  }), "legitimate signed A still verifies under independent pinned digest A");
+});
+
 test("atomic witness accepts a pinned Ed25519 KeyObject and retains canonical native material", () => {
   // PR236 additionally requires owner-signed provision and a separate CAS
   // floor. Preserve that full authority chain while testing KeyObject input.
