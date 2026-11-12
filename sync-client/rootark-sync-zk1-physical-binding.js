@@ -18,6 +18,7 @@ const {
   hashDigest: NATIVE_HASH_DIGEST,
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
   verify: NATIVE_VERIFY,
   jsonStringify: NATIVE_JSON_STRINGIFY,
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
@@ -296,16 +297,20 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const challenge = checkedBytes(v.nonce, 32);
     const committedInventoryReceipt = checkedBytes(v.receipt, 1,
       inventory.MAX_COMMITTED_PROOF_BYTES);
-    const witnessId = checkedBytes(v.witnessKeyId, 16).toString("base64url");
-    const statusId = checkedBytes(v.statusKeyId, 16).toString("base64url");
+    const witnessId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.witnessKeyId, 16), "base64url");
+    const statusId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.statusKeyId, 16), "base64url");
     const witness = pinnedOwnerPublicKey(v.pinnedWitnessPublicKey, "public");
     const deviceSpki = checkedBytes(Buffer.from(bound.envelope.authorization.publicKey,
       "base64url"), 44);
     const deviceKey = NATIVE_CREATE_PUBLIC_KEY({ key: deviceSpki,
       type: "spki", format: "der" });
     // Witness and all signers must be independently provisioned principals.
-    for (const pin of [v.pinnedInventoryPublicKey, v.pinnedPhysicalAttestorPublicKey,
-      deviceKey]) {
+    // An inherited KeyObject kHandle getter may replace Array.prototype's
+    // iterator; an empty iterator must not skip any signer-separation check.
+    const independentPins = [v.pinnedInventoryPublicKey,
+      v.pinnedPhysicalAttestorPublicKey, deviceKey];
+    for (let index = 0; index < independentPins.length; index += 1) {
+      const pin = independentPins[index];
       if (NATIVE_KEY_EQUALS.call(witness, pinnedOwnerPublicKey(pin, "public"))) deny();
     }
     const floorFields = PHYSICAL_FLOOR_WIRE_FIELDS;
@@ -315,7 +320,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const HEX = /^[a-f0-9]{64}$/;
     if (floor.type !== "rootark-zk1-witness-cas-physical-floor/v2"
       || floor.witnessKeyId !== witnessId || floor.statusKeyId !== statusId
-      || floor.nonce !== challenge.toString("base64url")
+      || floor.nonce !== NATIVE_BUFFER_TO_STRING.call(challenge, "base64url")
       || !Number.isSafeInteger(floor.sequence) || floor.sequence < 1
       || floor.sequence > 100000 || !HEX.test(floor.lastHash)
       || !HEX.test(floor.physicalFenceDigest)
@@ -340,12 +345,14 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     };
     if (admission.type !== "rootark-sync-v2-historical-witness-admission/v1"
       || admission.envelopeSha256 !== digest(bound.canonicalEnvelope)
-      || admission.operationId !== bound.operation.operation_id.toString("base64url")
+      || admission.operationId !== NATIVE_BUFFER_TO_STRING.call(
+        bound.operation.operation_id, "base64url")
       || admission.deviceId !== bound.envelope.deviceId
       || admission.deviceSpkiSha256 !== digest(deviceSpki)
       || admission.epoch !== bound.operation.epoch
       || admission.checkpointSequence !== bound.operation.expected_sequence
-      || admission.checkpointRoot !== bound.operation.expected_root.toString("base64url")
+      || admission.checkpointRoot !== NATIVE_BUFFER_TO_STRING.call(
+        bound.operation.expected_root, "base64url")
       || !Number.isSafeInteger(admission.admittedAtMs) || admission.admittedAtMs < 1
       || admission.admittedAtMs >= bound.envelope.authorization.expiresAt
       || admission.admittedAtMs > Date.now()

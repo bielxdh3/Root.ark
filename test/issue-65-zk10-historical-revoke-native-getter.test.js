@@ -20,11 +20,11 @@ const domainEntry = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
 const domainFloor = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0");
 const domainAdmission = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
 
-async function genuineHistoricalEvidence() {
+async function genuineHistoricalEvidence({ witnessIsInventory = false } = {}) {
   const device = crypto.generateKeyPairSync("ed25519");
   const inventory = crypto.generateKeyPairSync("ed25519");
   const attestor = crypto.generateKeyPairSync("ed25519");
-  const witness = crypto.generateKeyPairSync("ed25519");
+  const witness = witnessIsInventory ? inventory : crypto.generateKeyPairSync("ed25519");
   const spki = device.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
   const envelope = protocol.createOperation({ operation: "create", objectId: "object_1",
     fileId: "file_1", versionId: "version_1", deviceId: "device_1",
@@ -109,7 +109,7 @@ async function genuineHistoricalEvidence() {
     witnessKeyId, statusKeyId,
     trustedMinimumFloor: { sequence: floorBody.sequence,
       lastHash: floorBody.lastHash, physicalFenceDigest: floorBody.physicalFenceDigest } };
-  return { input, allowed, revoked, witness };
+  return { input, allowed, revoked, witness, inventory, attestor, scope, operation };
 }
 
 test("P2 historical: real signed valid read survives, revoked device never becomes authorized after witness getter", async () => {
@@ -153,4 +153,90 @@ test("P2 historical: real signed valid read survives, revoked device never becom
   assert.ok(reads > 0, "physical native witness getter must be exercised");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
     .authorizesHistoricalRead, true, "valid historical signer and device remain accepted");
+});
+
+test("P2 historical: witness cannot impersonate inventory signer via poisoned array iterator", async () => {
+  const f = await genuineHistoricalEvidence({ witnessIsInventory: true });
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(f.input),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  const handle = Object.getOwnPropertySymbols(f.witness.publicKey)
+    .find((value) => value.description === "kHandle");
+  assert.ok(handle);
+  let invoked = 0;
+  let skipped = 0;
+  const oldIterator = Array.prototype[Symbol.iterator];
+  const inherited = Object.create(f.witness.publicKey);
+  Object.defineProperty(inherited, handle, { get() {
+    invoked += 1;
+    Array.prototype[Symbol.iterator] = function*() {
+      if (this.length === 3 && this[0] === f.inventory.publicKey
+        && this[1] === f.attestor.publicKey) {
+        skipped += 1;
+        return;
+      }
+      yield* Reflect.apply(oldIterator, this, []);
+    };
+    return f.witness.publicKey[handle];
+  } });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...f.input, pinnedWitnessPublicKey: inherited,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  } finally {
+    Array.prototype[Symbol.iterator] = oldIterator;
+  }
+  assert.ok(invoked > 0, "real inherited native kHandle was reached");
+  assert.equal(skipped, 0, "the verifier must never consult the poisoned pin iterator");
+});
+
+test("P2 historical: signed witness floor nonce A cannot be replayed for new challenge B", async () => {
+  const f = await genuineHistoricalEvidence();
+  const nonceB = Buffer.alloc(32, 85);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const physicalB = await pg.signCommittedPhysicalReadback({
+    scope: f.scope, operation: f.operation, nonce: nonceB,
+    issuedAt: nowSeconds,
+    readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+      walFlushConfirmed: true, generation: 1, admissionId: id(41),
+      operationId: f.operation.operation_id, revision: f.operation.revision,
+      epoch: f.operation.epoch, digest: hash(42),
+      expectedInventorySequence: f.operation.expected_sequence,
+      expectedInventoryRoot: f.operation.expected_root, chunkCount: 1,
+      root: hash(43), ciphertextSha256: f.operation.ciphertext_sha256,
+      authorizesIo: false, provesIndependentOperator: false },
+  }, f.attestor.privateKey);
+  const replayInput = { ...f.input, nonce: nonceB, physicalAttestation: physicalB };
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission(replayInput),
+    { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  const originalToString = Buffer.prototype.toString;
+  const signedNonceA = f.input.nonce.toString("base64url");
+  const handle = Object.getOwnPropertySymbols(f.witness.publicKey)
+    .find((value) => value.description === "kHandle");
+  assert.ok(handle);
+  let invoked = 0;
+  let altered = 0;
+  const inherited = Object.create(f.witness.publicKey);
+  Object.defineProperty(inherited, handle, { get() {
+    invoked += 1;
+    Buffer.prototype.toString = function(encoding, ...rest) {
+      if (encoding === "base64url" && this.length === 32
+        && crypto.timingSafeEqual(this, nonceB)) {
+        altered += 1;
+        return signedNonceA;
+      }
+      return Reflect.apply(originalToString, this, [encoding, ...rest]);
+    };
+    return f.witness.publicKey[handle];
+  } });
+  try {
+    await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+      ...replayInput, pinnedWitnessPublicKey: inherited,
+    }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
+  } finally {
+    Buffer.prototype.toString = originalToString;
+  }
+  assert.ok(invoked > 0, "real inherited native kHandle was reached");
+  assert.equal(altered, 0, "the verifier must use the captured Buffer serializer");
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
+    .authorizesHistoricalRead, true);
 });
