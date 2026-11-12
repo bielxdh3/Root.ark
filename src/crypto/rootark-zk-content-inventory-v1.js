@@ -295,6 +295,11 @@ async function verifyTerminalProof(input) {
   const publicKey = validatePublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); } catch (_) { fail("INVENTORY_ENCODING"); }
+  // The signed terminal claim must correspond to the original received wire,
+  // not only to bytes potentially substituted during a same-realm callback.
+  if (!sameBytes(serialized, await z.encodeDeterministic(decoded))) {
+    fail("INVENTORY_ENCODING");
+  }
   const fields = [
     "type", "version", "signer_key_id", "scope", "status", "reason", "operation_id",
     "request_digest", "expected_sequence", "expected_root", "observed_sequence", "observed_root",

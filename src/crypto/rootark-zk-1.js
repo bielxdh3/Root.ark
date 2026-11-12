@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 // The canonical codec must not reread these mutable exported helpers after a
 // caller-owned KeyObject getter has already run in the same Node realm.
 const CODEC_BUFFER_FROM = Buffer.from.bind(Buffer);
+const CODEC_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
 const CODEC_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -92,12 +93,14 @@ function fail(code, classification) {
 }
 
 function isBytes(value) {
-  return Buffer.isBuffer(value) || value instanceof Uint8Array;
+  return CODEC_IS_BUFFER(value) || value instanceof Uint8Array;
 }
 
 function bytes(value, code = "INVALID_BYTES", exact, min, max) {
   if (!isBytes(value)) fail(code);
-  const result = Buffer.from(value);
+  // A KeyObject getter may execute before a canonical readback is decoded.
+  // Never copy owner-hashed or signature-bound wire through a mutable global.
+  const result = CODEC_BUFFER_FROM(value);
   if (exact !== undefined && result.length !== exact) fail("INVALID_LENGTH");
   if (min !== undefined && result.length < min) fail("INVALID_LENGTH");
   if (max !== undefined && result.length > max) fail("INVALID_LENGTH");

@@ -123,6 +123,54 @@ test("owner-signed raw B rejects forged nested inventory signature despite post-
     "no post-KeyObject dispatch may reach the shared mutable decoder export");
 });
 
+test("owner-signed raw B must not be mutated in decoder to an unsigned inventory C", async () => {
+  const { good, bytesB, enrollmentB } = await signedOwnerOnInvalidInventoryBytes();
+  // Offline owner signs the SHA256 of B. C is a genuine Ed25519 inventory
+  // snapshot, identical in length but NOT authorized by that owner checkpoint.
+  const signedC = Buffer.from(good.snapshot);
+  assert.notDeepEqual(bytesB, signedC);
+  assert.equal(bytesB.length, signedC.length);
+  const ownerKey = crypto.createPublicKey({
+    key: enrollmentB.ownerPublicKey.export({ type: "spki", format: "der" }),
+    format: "der", type: "spki",
+  });
+  const originalFrom = Buffer.from;
+  const nativeCompare = Buffer.compare.bind(Buffer);
+  let getterReads = 0, mutatedCopies = 0;
+  Object.defineProperty(ownerKey, "type", { configurable: true, get() {
+    getterReads++;
+    Buffer.from = function(input, ...args) {
+      if (Buffer.isBuffer(input) && input.length === bytesB.length
+        && nativeCompare(input, bytesB) === 0) {
+        // Hostile post-owner-hash mutation of the verifier's local B copy:
+        // original owner hash was B, nested Ed25519 inventory is now C.
+        mutatedCopies++;
+        signedC.copy(input);
+      }
+      return Reflect.apply(originalFrom, Buffer, [input, ...args]);
+    };
+    return "public";
+  } });
+  let accepted = false;
+  try {
+    try {
+      await verifyOwnerInventoryEnrollment({ ...enrollmentB, ownerPublicKey: ownerKey });
+      accepted = true;
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+  } finally {
+    Buffer.from = originalFrom;
+    delete ownerKey.type;
+  }
+  assert.ok(getterReads > 0, "native KeyObject.type getter ran");
+  assert.equal(accepted, false, "offline owner signature over B must not attest C");
+  assert.equal(mutatedCopies, 0,
+    "decoder input must use early pinned Buffer.from, never hostile wrapper");
+  assert.equal((await verifyOwnerInventoryEnrollment(good.enrollment)).ownerSignatureVerified,
+    true, "legitimate owner and inventory positive preserved");
+});
+
 test("valid offline owner A and signed inventory C survive post-getter codec export replacement", async () => {
   const f = await fixture();
   const z = require("../src/crypto/rootark-zk-1");
