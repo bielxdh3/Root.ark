@@ -221,7 +221,7 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
     const chunks = [];
     for (let position = 0; position < bound.canonicalEnvelope.length;
       position += PG_CHUNK_BYTES) {
-      chunks.push(Buffer.from(bound.canonicalEnvelope.subarray(position,
+      chunks.push(NATIVE_BUFFER_FROM(bound.canonicalEnvelope.subarray(position,
         position + PG_CHUNK_BYTES)));
     }
     if (!chunks.length || chunks.some((chunk) => chunk.length < 1
@@ -268,9 +268,9 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
       || !Number.isSafeInteger(completedAtSeconds) || completedAtSeconds < 1
       || Math.abs(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
     return NATIVE_FREEZE({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
-      operationId: Buffer.from(bound.operation.operation_id),
-      ciphertextSha256: Buffer.from(bound.operation.ciphertext_sha256),
-      receiptDigest: Buffer.from(result.receiptDigest),
+      operationId: NATIVE_BUFFER_FROM(bound.operation.operation_id),
+      ciphertextSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
+      receiptDigest: NATIVE_BUFFER_FROM(result.receiptDigest),
       localPgReadbackVerified: true,
       historicalServerAdmissionProven: false,
       independentlyAnchoredFloorProven: false,
@@ -300,7 +300,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const witnessId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.witnessKeyId, 16), "base64url");
     const statusId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.statusKeyId, 16), "base64url");
     const witness = pinnedOwnerPublicKey(v.pinnedWitnessPublicKey, "public");
-    const deviceSpki = checkedBytes(Buffer.from(bound.envelope.authorization.publicKey,
+    const deviceSpki = checkedBytes(NATIVE_BUFFER_FROM(bound.envelope.authorization.publicKey,
       "base64url"), 44);
     const deviceKey = NATIVE_CREATE_PUBLIC_KEY({ key: deviceSpki,
       type: "spki", format: "der" });
@@ -329,7 +329,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       || minimum.physicalFenceDigest !== floor.physicalFenceDigest) deny();
     const canonicalSignature = (encoded) => {
       if (typeof encoded !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(encoded)) deny();
-      return checkedBytes(Buffer.from(encoded, "base64url"), 64);
+      return checkedBytes(NATIVE_BUFFER_FROM(encoded, "base64url"), 64);
     };
     const floorUnsigned = NATIVE_PICK_SIGNED_FIELDS(floor, PHYSICAL_FLOOR_SIGNED_FIELDS);
     if (!NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([PHYSICAL_FLOOR_DOMAIN,
@@ -392,7 +392,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
         !== bound.envelope.authorization.publicKey
       || NATIVE_ARRAY_INCLUDES.call(live.revokedDeviceIds, bound.envelope.deviceId)) deny();
     return NATIVE_FREEZE({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
-      envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
+      envelopeSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,
       localPgReadbackVerified: true, externalDurabilityProven: false,
       authorizesHistoricalRead: true, authorizesIo: false });
