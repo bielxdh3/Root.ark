@@ -19,6 +19,7 @@ const CREATE_NULL_PROTO = Object.create.bind(Object);
 const BASE_OBJECT_PROTOTYPE = Object.prototype;
 const GET_PROTO = Object.getPrototypeOf.bind(Object);
 const GET_OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const HAS_OWN = Object.hasOwn.bind(Object);
 const OWN_KEYS = Reflect.ownKeys.bind(Reflect);
 const IS_ARRAY = Array.isArray.bind(Array);
@@ -75,18 +76,18 @@ const LEASE_DOMAIN = FROM_BUFFER("Root.ark/zk10/custodian-owner-lease/v1\0");
 const FLOOR_DOMAIN = FROM_BUFFER("Root.ark/zk10/external-floor-current/v1\0");
 const JOURNAL_DOMAIN = FROM_BUFFER("Root.ark/zk10/custodian-used-lease-journal/v1\0");
 const EMPTY_JOURNAL_TIP = sha256Hex(JOURNAL_DOMAIN);
-const GENESIS_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
-  "immutable_account_id", "identity_digest", "lease_serial"];
-const LEASE_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
+const GENESIS_FIELDS = FREEZE(["type", "sequence", "head_digest", "enrollment_root",
+  "immutable_account_id", "identity_digest", "lease_serial"]);
+const LEASE_FIELDS = FREEZE(["type", "sequence", "head_digest", "enrollment_root",
   "immutable_account_id", "identity_digest", "operation", "nonce", "lease_id",
-  "lease_serial", "issued_at_ms", "lease_expires_at_ms"];
-const REQUEST_FIELDS = ["immutable_account_id", "identity_digest", "operation",
-  "nonce", "lease_id", "lease_expires_at_ms"];
-const FLOOR_FIELDS = ["type", "sequence", "head_digest", "enrollment_root",
+  "lease_serial", "issued_at_ms", "lease_expires_at_ms"]);
+const REQUEST_FIELDS = FREEZE(["immutable_account_id", "identity_digest", "operation",
+  "nonce", "lease_id", "lease_expires_at_ms"]);
+const FLOOR_FIELDS = FREEZE(["type", "sequence", "head_digest", "enrollment_root",
   "immutable_account_id", "identity_digest", "operation", "nonce", "lease_id",
-  "lease_expires_at_ms", "issued_at_ms", "expires_at_ms"];
-const HEAD_FIELDS = ["sequence", "head_digest", "enrollment_root",
-  "immutable_account_id", "identity_digest", "lease_serial"];
+  "lease_expires_at_ms", "issued_at_ms", "expires_at_ms"]);
+const HEAD_FIELDS = FREEZE(["sequence", "head_digest", "enrollment_root",
+  "immutable_account_id", "identity_digest", "lease_serial"]);
 const HEX = /^[a-f0-9]{64}$/;
 const OPER = /^[a-z][a-z0-9:_-]{0,63}$/;
 const NOW = Date.now.bind(Date);
@@ -94,7 +95,7 @@ const MONOTONIC_NOW_NS = process.hrtime.bigint.bind(process.hrtime);
 const MAX_LEASE_SERIAL = 100_000; // Bounded DEV-OFF journal; no unsafe reset/rotation.
 const INTEGER_WIRE_FIELDS = new Set(["sequence", "lease_serial",
   "issued_at_ms", "lease_expires_at_ms"]);
-const STORED_FLOOR_FIELDS = [...HEAD_FIELDS, "journal_count", "journal_tip"];
+const STORED_FLOOR_FIELDS = FREEZE([...HEAD_FIELDS, "journal_count", "journal_tip"]);
 const dbPins = new WeakMap();
 // Read real crypto.KeyObject internals, not shadowable instance properties.
 // This fixed DER public key only discovers Node's native public-key prototype;
@@ -178,7 +179,8 @@ function unsignedSigned(wire, fields, type, domain, publicKey) {
   // Nested objects can define toJSON/toString and execute arbitrary JS while
   // signatureBytes serializes them. Reject EVERY nonprimitive field before
   // any signed serialization or regex coercion, including the lease operation.
-  for (const field of fields) {
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
     const value = payload[field];
     if (field === "sequence" || field === "lease_serial"
       || field === "issued_at_ms" || field === "lease_expires_at_ms") {
@@ -252,7 +254,8 @@ function safeFileName(value) {
   const pieces = SAFE_APPLY(ARRAY_FILTER,
     path.dirname(absolute).slice(root.length).split(path.sep), [Boolean]);
   let currentPath = root;
-  for (const piece of pieces) {
+  for (let index = 0; index < pieces.length; index += 1) {
+    const piece = pieces[index];
     currentPath = path.join(currentPath, piece);
     const stat = fs.lstatSync(currentPath);
     if (!stat.isDirectory() || stat.isSymbolicLink()) deny();
@@ -394,7 +397,11 @@ function floorValues(record) {
   // these rows are the actual durable SQLite values bound to signed heads.
   const values = [];
   for (let index = 0; index < STORED_FLOOR_FIELDS.length; index += 1) {
-    values[index] = record[STORED_FLOOR_FIELDS[index]];
+    // Array.prototype[index] can grow an inherited setter after a hostile
+    // same-realm callback. Defining a fresh own DATA slot prevents a signed
+    // scalar from being silently rewritten during the SQLite parameter copy.
+    DEFINE_PROPERTY(values, String(index), { value: record[STORED_FLOOR_FIELDS[index]],
+      writable: true, enumerable: true, configurable: true });
   }
   return values;
 }
@@ -409,8 +416,10 @@ function insertGenesis(db, head, ownerHash, signerHash) {
       owner_spki, custodian_spki)
       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const values = floorValues(head);
-    values[values.length] = ownerHash;
-    values[values.length] = signerHash;
+    DEFINE_PROPERTY(values, String(values.length), { value: ownerHash,
+      writable: true, enumerable: true, configurable: true });
+    DEFINE_PROPERTY(values, String(values.length), { value: signerHash,
+      writable: true, enumerable: true, configurable: true });
     SAFE_APPLY(statement.run, statement, values);
     checkDbPin(db);
   }).immediate();
@@ -428,7 +437,8 @@ function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge,
       lease_serial = ?, journal_count = ?, journal_tip = ?
       WHERE singleton = 1 AND lease_serial = ?`);
     const values = floorValues(next);
-    values[values.length] = previous.lease_serial;
+    DEFINE_PROPERTY(values, String(values.length), { value: previous.lease_serial,
+      writable: true, enumerable: true, configurable: true });
     const result = SAFE_APPLY(statement.run, statement, values);
     if (result.changes !== 1) deny();
     checkDbPin(db);
@@ -541,7 +551,8 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           const r = strict(request, REQUEST_FIELDS);
           // No attacker-controlled toJSON or coercion is permitted in a
           // request that will be compared, validated or later signed.
-          for (const field of REQUEST_FIELDS) {
+          for (let index = 0; index < REQUEST_FIELDS.length; index += 1) {
+            const field = REQUEST_FIELDS[index];
             const value = r[field];
             if (field === "lease_expires_at_ms") {
               if (!SAFE_INTEGER(value)) deny();
@@ -549,7 +560,14 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           }
           const signed = unsignedSigned(ownerLease, LEASE_FIELDS,
             "rootark-zk10-custodian-owner-lease/v1", LEASE_DOMAIN, owner);
-          for (const field of REQUEST_FIELDS) if (r[field] !== signed[field]) deny();
+          // A hostile same-realm callback may replace Array.prototype's
+          // iterator so a for-of skips every owner-signed request binding.
+          // The fixed schema is an own, bounded array: compare every indexed
+          // field explicitly instead of relying on an inherited iterator.
+          for (let index = 0; index < REQUEST_FIELDS.length; index += 1) {
+            const field = REQUEST_FIELDS[index];
+            if (r[field] !== signed[field]) deny();
+          }
           const nextHead = validateHead(canonicalFields(HEAD_FIELDS, signed));
           // Sample monotonic time before wall time so any intervening delay
           // consumes budget instead of enlarging the owner's signed lease.

@@ -159,6 +159,73 @@ test("P2: malicious same-realm Object.create cannot verify owner Ed25519 A then 
   f.signer.publicKey, Buffer.from(positive.signature, "base64url")));
 });
 
+test("P2: inherited Object.prototype.toJSON cannot authenticate signed owner A while committing B", t => {
+  const f = fixture(t, "inherited-tojson-signed-a-committed-b");
+  const signedA = f.sign(f.base, f.owner.privateKey, LEASE);
+  const forgedB = { ...signedA, sequence: 2,
+    head_digest: sha(98), enrollment_root: sha(99) };
+  assert.equal(crypto.verify(null, signatureBytes(LEASE, f.base),
+    f.owner.publicKey, Buffer.from(signedA.signature, "base64url")), true);
+  assert.equal(crypto.verify(null, signatureBytes(LEASE,
+    Object.fromEntries(Object.entries(forgedB).filter(([key]) => key !== "signature"))),
+  f.owner.publicKey, Buffer.from(forgedB.signature, "base64url")), false,
+  "owner A never Ed25519-signed head B");
+
+  const nativeLstat = fs.lstatSync;
+  const originalToJSON = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
+  let injected = 0;
+  let spoofedSerializations = 0;
+  let issued;
+  fs.lstatSync = function instrumentedLstat(name, ...args) {
+    if (!injected && name === f.config.anchorDatabasePath) {
+      injected += 1;
+      // This hostile same-realm callback happens AFTER the verifier's module
+      // was imported, before it snapshots ownerLease on the current request.
+      Object.defineProperty(Object.prototype, "toJSON", {
+        configurable: true, value: function hostileInheritedSignedSerializer() {
+          if (this.type === "rootark-zk10-custodian-owner-lease/v1"
+            && this.sequence === forgedB.sequence && this.head_digest === forgedB.head_digest) {
+            spoofedSerializations += 1;
+            return { ...this, sequence: f.base.sequence,
+              head_digest: f.base.head_digest, enrollment_root: f.base.enrollment_root };
+          }
+          return this;
+        },
+      });
+    }
+    return nativeLstat(name, ...args);
+  };
+  try { issued = f.custodian.attest(f.request, forgedB); }
+  catch (error) { assert.match(error.message, /ZK10_CUSTODIAN_UNAVAILABLE/); }
+  finally {
+    fs.lstatSync = nativeLstat;
+    if (originalToJSON) Object.defineProperty(Object.prototype, "toJSON", originalToJSON);
+    else delete Object.prototype.toJSON;
+  }
+  let observedRetainedSerial = "unavailable";
+  try { observedRetainedSerial = f.custodian.retainedMinimum().lease_serial; }
+  catch (_) { /* an indeterminate or rejected write must remain fail-closed */ }
+  console.log("PHYSICAL_INHERITED_TOJSON_OWNER_A_FORGED_B",
+    `issued=${issued?.floor.sequence ?? "none"}`,
+    `retainedSerial=${observedRetainedSerial}`,
+    `injections=${injected}`, `spoofedSerializations=${spoofedSerializations}`);
+  assert.equal(injected, 1, "real post-import fs callback must install malicious toJSON");
+  assert.equal(spoofedSerializations, 0,
+    "signed wire must not dispatch to inherited Object.prototype.toJSON");
+  assert.equal(issued, undefined,
+    "signed head A must never produce a custodian-signed CURRENT for B");
+  assert.equal(f.custodian.retainedMinimum().lease_serial, 0,
+    "forged owner head must not advance durable SQLite floors");
+
+  // The same signer still accepts the genuine A lease after the attack is
+  // removed, and its freshly signed CURRENT remains DEV-OFF evidence only.
+  const positive = f.custodian.attest(f.request, signedA).floor;
+  assert.equal(positive.sequence, 1);
+  assert.equal(crypto.verify(null, signatureBytes(FLOOR,
+    Object.fromEntries(Object.entries(positive).filter(([key]) => key !== "signature"))),
+  f.signer.publicKey, Buffer.from(positive.signature, "base64url")), true);
+});
+
 test("P2: malicious own-accessor in strict request cannot compare signed A then issue operation B", t => {
   const f = fixture(t, "request-accessor-a-to-b");
   const signedA = f.sign(f.base, f.owner.privateKey, LEASE);
@@ -217,4 +284,60 @@ test("P2: malicious own-accessor in strict request cannot compare signed A then 
   assert.ok(crypto.verify(null, signatureBytes(FLOOR,
     Object.fromEntries(Object.entries(issued.floor).filter(([name]) => name !== "signature"))),
   f.signer.publicKey, Buffer.from(issued.floor.signature, "base64url")));
+});
+
+test("P2: hostile array iterator cannot omit signed request fields and issue operation B", t => {
+  const f = fixture(t, "request-iterator-skip");
+  const signedA = f.sign(f.base, f.owner.privateKey, LEASE);
+  const unsignedRequestB = { ...f.request, operation: "legacy:write" };
+  assert.equal(crypto.verify(null, signatureBytes(LEASE, f.base),
+    f.owner.publicKey, Buffer.from(signedA.signature, "base64url")), true);
+  assert.equal(unsignedRequestB.operation, "legacy:write");
+  assert.equal(signedA.operation, "legacy:read");
+
+  const nativeLstat = fs.lstatSync;
+  const nativeArrayIterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+  let callbacks = 0, skippedOwnerRequestIterations = 0, issued;
+  fs.lstatSync = function interceptedLstat(name, ...args) {
+    if (!callbacks && name === f.config.anchorDatabasePath) {
+      callbacks += 1;
+      // The custodian has already imported its native crypto functions.
+      // The old `for (const field of REQUEST_FIELDS)` repeatedly dispatched
+      // to this inherited iterator AFTER the attacker-controlled FS callback.
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        configurable: true, writable: true, value: function* poisonedIterator() {
+          if (this.length === 6 && this[0] === "immutable_account_id"
+            && this[1] === "identity_digest" && this[2] === "operation"
+            && this[5] === "lease_expires_at_ms") {
+            skippedOwnerRequestIterations += 1;
+            return;
+          }
+          yield* Reflect.apply(nativeArrayIterator.value, this, []);
+        },
+      });
+    }
+    return nativeLstat(name, ...args);
+  };
+  try { issued = f.custodian.attest(unsignedRequestB, signedA); }
+  catch (error) { assert.match(error.message, /ZK10_CUSTODIAN_UNAVAILABLE/); }
+  finally {
+    fs.lstatSync = nativeLstat;
+    Object.defineProperty(Array.prototype, Symbol.iterator, nativeArrayIterator);
+  }
+  console.log("PHYSICAL_OWNER_REQUEST_ITERATOR_REBIND",
+    `issued=${issued?.floor.operation ?? "none"}`,
+    `retainedSerial=${f.custodian.retainedMinimum().lease_serial}`,
+    `callbacks=${callbacks}`, `skippedIterations=${skippedOwnerRequestIterations}`);
+  assert.equal(callbacks, 1, "the hostile same-realm FS callback must execute");
+  assert.equal(skippedOwnerRequestIterations, 0,
+    "fixed signed schema bindings may not dispatch to a hostile inherited iterator");
+  assert.equal(issued, undefined,
+    "owner's Ed25519-signed READ must never authorize an unsigned WRITE request");
+  assert.equal(f.custodian.retainedMinimum().lease_serial, 0);
+
+  const control = f.custodian.attest(f.request, signedA).floor;
+  assert.equal(control.operation, "legacy:read");
+  assert.equal(crypto.verify(null, signatureBytes(FLOOR,
+    Object.fromEntries(Object.entries(control).filter(([key]) => key !== "signature"))),
+  f.signer.publicKey, Buffer.from(control.signature, "base64url")), true);
 });
