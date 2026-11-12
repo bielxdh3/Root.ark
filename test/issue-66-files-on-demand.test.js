@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
+const { createAuthorizationProof, verifyAuthorizationProof } =
+  require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
 
@@ -355,4 +357,87 @@ test("issue 66: a clean cached source can be hydrated through a verified remote 
   assert.equal(await client.materializeRemote("docs/renamed.txt"), true);
   assert.equal(await fsp.readFile(path.join(root, "docs", "renamed.txt"), "utf8"), "signed move bytes");
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
+});
+
+test("issue 66 #263 P2: authentic signed stale inventory and ciphertext cannot roll back a hydrated revision", async (t) => {
+  const { root, source, writer, store, key, adapter } = await setup(t,
+    { "docs/replay.txt": "authentic revision A" });
+  const pair = crypto.generateKeyPairSync("ed25519");
+  const publicKey = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trust = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [] };
+  const expiry = Date.now() + 60_000;
+  const signed = new Map();
+  const sign = async (operation) => {
+    if (!signed.has(operation.operationId)) {
+      signed.set(operation.operationId, {
+        ...operation, authorization: await createAuthorizationProof(operation,
+          { username: "alice", publicKey, privateKey: pair.privateKey, expiresAt: expiry }),
+      });
+    }
+    return signed.get(operation.operationId);
+  };
+  const liveList = adapter.list.bind(adapter);
+  const strictAdapter = { ...adapter,
+    list: async (objectId) => Promise.all((await liveList(objectId)).map(sign)),
+  };
+  const client = await new SyncEngine({
+    rootDir: root, adapter: strictAdapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: (operation) => verifyAuthorizationProof(
+      operation.authorization, operation, trust),
+  }).open();
+  assert.equal(await client.materializeRemote("docs/replay.txt"), true);
+  const revisionA = await sign(store.list("alice")[0]);
+  assert.equal(await verifyAuthorizationProof(revisionA.authorization, revisionA, trust), true);
+  const firstSnapshot = client.snapshot.files["docs/replay.txt"];
+
+  await fsp.writeFile(path.join(source, "docs", "replay.txt"), "authentic revision B");
+  await writer.syncOnce();
+  const revisionB = await sign(store.list("alice")[0]);
+  assert.equal(await verifyAuthorizationProof(revisionB.authorization, revisionB, trust), true);
+  assert.equal(revisionB.objectId, revisionA.objectId);
+  assert.equal(revisionB.fileId, revisionA.fileId);
+  assert.ok(protocol.compareRevisions(revisionB.revision, revisionA.revision) > 0);
+  assert.equal(await client.materializeRemote("docs/replay.txt"), true);
+  const before = client.snapshot.files["docs/replay.txt"];
+  assert.ok(protocol.compareRevisions(before.revision, firstSnapshot.revision) > 0);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "replay.txt"), "utf8"),
+    "authentic revision B");
+
+  // Replaying A involves a GENUINE owner-enrolled Ed25519 signature over the
+  // old full ciphertext, together with internally consistent old inventory.
+  // It is not a tampered AAD/invalid-signature canary.
+  const { ciphertext, nonce, tag, aad, authorization, ...oldInventory } = revisionA;
+  const liveSignedList = strictAdapter.list;
+  const liveInventory = strictAdapter.listInventory;
+  assert.equal(await client.evictLocal("docs/replay.txt"), true,
+    "positive setup: current B is durably evicted with a pinned revision floor");
+  const evictedB = { ...client.snapshot.remoteOnly[revisionB.objectId] };
+  assert.equal(protocol.compareRevisions(evictedB.revision, revisionB.revision), 0);
+  strictAdapter.listInventory = async () => ({ protocolVersion: 2, view: "metadata",
+    objects: [oldInventory], nextCursor: null });
+  strictAdapter.list = async () => [revisionA];
+  await assert.rejects(client.materializeRemote("docs/replay.txt"),
+    { code: "remote_rollback_detected" },
+    "same genuinely signed replay A must also be rejected against an evicted B marker");
+  assert.deepEqual(client.snapshot.remoteOnly[revisionB.objectId], evictedB);
+  assert.equal(await exists(path.join(root, "docs", "replay.txt")), false);
+
+  strictAdapter.listInventory = liveInventory;
+  strictAdapter.list = liveSignedList;
+  assert.equal(await client.materializeRemote("docs/replay.txt"), true,
+    "positive control: rehydration of exactly the same signed B revision after eviction succeeds");
+  assert.equal(client.snapshot.remoteOnly[revisionB.objectId], undefined);
+  strictAdapter.listInventory = async () => ({ protocolVersion: 2, view: "metadata",
+    objects: [oldInventory], nextCursor: null });
+  strictAdapter.list = async () => [revisionA];
+  await assert.rejects(client.materializeRemote("docs/replay.txt"),
+    { code: "remote_rollback_detected" },
+    "historically valid Ed25519 A must not replace already hydrated B");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "replay.txt"), "utf8"),
+    "authentic revision B");
+  assert.deepEqual(client.snapshot.files["docs/replay.txt"], before,
+    "replayed old inventory cannot lower the durable local revision");
 });

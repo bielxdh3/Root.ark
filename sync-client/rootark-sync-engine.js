@@ -2230,7 +2230,27 @@ class SyncEngine {
     if (moveKey && movePayload === null) {
       fail("Remote MOVE has no verified recovery payload", "move_source_missing");
     }
+    const assertNoSignedInventoryRollback = () => {
+      // A server can replay an internally consistent inventory page and its
+      // ORIGINAL, genuinely signed old ciphertext. Authentication alone does
+      // not prove freshness. Never let that response lower a locally durable
+      // object revision, including when the object was evicted or moved.
+      // This local floor is not independent anti-rollback custody: restoring
+      // the entire snapshot also requires a separate monotonic authority.
+      const known = [...Object.values(this.snapshot.files),
+        this.snapshot.remoteOnly[operation.objectId]];
+      for (const previous of known) {
+        if (!previous || previous.objectId !== operation.objectId
+          || previous.fileId !== operation.fileId || !previous.revision) continue;
+        const order = protocol.compareRevisions(operation.revision, previous.revision);
+        if (order < 0 || (order === 0 && previous.versionId
+          && previous.versionId !== operation.versionId)) {
+          fail("Older signed inventory cannot roll back local cache", "remote_rollback_detected");
+        }
+      }
+    };
     const checkBeforeWrite = async () => {
+      assertNoSignedInventoryRollback();
       await checkLocalCache();
       if (!moveKey) return;
       const sourcePath = activeFileIdentityPath(this.snapshot.files, operation, safePath);
