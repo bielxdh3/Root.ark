@@ -56,6 +56,9 @@ test("rate limits are passed directly to each protected route handler", () => {
       // A /share prefix middleware is allowed ONLY for constant response
       // security headers. A prefix rate limiter would collapse the separate
       // route counters; every sensitive endpoint must retain its own handler.
+      const shareMountDeclarations = [...source.matchAll(/app\.use\(\s*["']\/share["']\s*,/g)];
+      assert.equal(shareMountDeclarations.length, 1,
+        "a second share prefix mount must fail even when formatted differently");
       const shareMounts = [...source.matchAll(/app\.use\("\/share",\s*([\s\S]*?\n\}\);)/g)];
       assert.equal(shareMounts.length, 1,
         "exactly one header-only share prefix middleware is permitted");
