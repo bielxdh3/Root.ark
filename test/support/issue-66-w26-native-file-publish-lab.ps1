@@ -749,6 +749,12 @@ public static class RootarkW26NativeFilePublishLab {
               VerifyOpenedPayload(namedStage, fodPayload, fodSha256);
             }
           }
+          if (mode == "FOD_EXTERNAL_COLLISION") {
+            // The external writer must keep its competing FD open until the
+            // actual NtSetInformationFile attempt has returned and both
+            // source handles have been checked, not just a timed 1s window.
+            Ready(custody.Scratch, "postattack-ready.signal", "COLLISION_COMPLETE_V1");
+          }
           return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode + " result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0x" +
             unchecked((uint)code).ToString("X8");
         }

@@ -104,6 +104,9 @@ test("#66 W37 physical signed FOD: independently fsynced same-SID writer cannot 
       "PUBLISHER_READY_V1");
     assert.equal(fs.readFileSync(path.join(outcome.scratch, "writer-ack.signal"), "utf8"),
       "WRITER_READY_V1");
+    assert.equal(fs.readFileSync(path.join(outcome.scratch, "postattack-ready.signal"), "utf8"),
+      "COLLISION_COMPLETE_V1",
+      "external descriptor must outlive the native collision syscall");
     const stage = fs.openSync(path.join(root, "stage.bin"), "r");
     const foreign = fs.openSync(path.join(root, "published.bin"), "r");
     try {

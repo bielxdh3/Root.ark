@@ -46,7 +46,10 @@ process** before launching the native publisher. Once the publisher's
 retained scratch HANDLE creates its `publisher-ready.signal`, the separate
 actor creates and fsyncs `held/published.bin` using `wx`, retains the
 foreign descriptor during the attempted native rename, and creates a fsynced
-`writer-ack.signal`. The W26 publisher independently checks the signal
+`writer-ack.signal`. The actor releases its descriptor **only after** seeing
+the publisher's `postattack-ready.signal` emitted following the completed
+native collision and source identity check; a fixed-duration sleep is not
+accepted as proof under load. The W26 publisher independently checks the signal
 content, foreign bytes/FileId, and exact NTSTATUS collision. It also
 reopens the surviving stage by its **retained directory HANDLE**, checks its
 FileId equals the original open source, and compares its SHA-256/bytes.
