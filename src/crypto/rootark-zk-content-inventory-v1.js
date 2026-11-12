@@ -3,23 +3,23 @@
 const crypto = require("node:crypto");
 // Load the shared native snapshot before any caller-owned KeyObject getter.
 const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
-  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, createHash: NATIVE_CREATE_HASH,
   hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST } =
   require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
 const SNAPSHOT_TYPE = "rootark-content-inventory-snapshot/v1";
 const VERSION = 1;
-const ROOT_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-root/v1\0", "ascii");
-const SNAPSHOT_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-snapshot/v1\0", "ascii");
+const ROOT_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-root/v1\0", "ascii");
+const SNAPSHOT_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-snapshot/v1\0", "ascii");
 const TERMINAL_TYPE = "rootark-content-inventory-terminal/v1";
-const TERMINAL_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-terminal/v1\0", "ascii");
+const TERMINAL_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-terminal/v1\0", "ascii");
 const MAX_ENTRIES = 4096;
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_TERMINAL_PROOF_BYTES = 4096;
 const MAX_COMMITTED_PROOF_BYTES = 4096;
 const ENTRY_TYPE = "rootark-content-inventory-entry/v1";
-const ENTRY_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0", "ascii");
+const ENTRY_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-entry/v1\0", "ascii");
 const COMMITTED_FIELDS = Object.freeze([
   "type", "version", "signer_key_id", "scope", "sequence", "previous_root", "root",
   "operation_id", "expected_sequence", "expected_root", "request_digest", "entry", "signature",
@@ -55,7 +55,7 @@ function copyBytes(value, min, max = min) {
   }
   const length = value.byteLength;
   if (!Number.isSafeInteger(length) || length < min || length > max) fail("INVENTORY_LIMIT");
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
 
 function exactObject(value, names, code = "INVENTORY_FIELDS") {
@@ -248,7 +248,7 @@ async function createTerminalProof(input) {
     signerKeyId, scope, reason: raw.reason, requestDigest: hash(encodedOperation),
     observedSequence, observedRoot, priorRevision, priorEpoch, blockingOperationId,
   }, operation);
-  const signature = NATIVE_SIGN(null, Buffer.concat([
+  const signature = NATIVE_SIGN(null, NATIVE_BUFFER_CONCAT([
     TERMINAL_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), privateKey);
@@ -317,7 +317,7 @@ async function verifyTerminalProof(input) {
   delete unsigned.signature;
   let valid = false;
   try {
-    valid = NATIVE_VERIFY(null, Buffer.concat([
+    valid = NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([
       TERMINAL_DOMAIN,
       await z.encodeDeterministic(unsigned),
     ]), publicKey, signature);
@@ -328,9 +328,9 @@ async function verifyTerminalProof(input) {
     outcome: "NOT_COMMITTED_FINAL",
     reason: proof.reason,
     operationId,
-    expectedHead: { sequence: operation.expected_sequence, root: Buffer.from(operation.expected_root) },
-    observedHead: { sequence: observedSequence, root: Buffer.from(observedRoot) },
-    blockingOperationId: blockingOperationId === null ? null : Buffer.from(blockingOperationId),
+    expectedHead: { sequence: operation.expected_sequence, root: NATIVE_BUFFER_FROM(operation.expected_root) },
+    observedHead: { sequence: observedSequence, root: NATIVE_BUFFER_FROM(observedRoot) },
+    blockingOperationId: blockingOperationId === null ? null : NATIVE_BUFFER_FROM(blockingOperationId),
   };
 }
 
@@ -387,16 +387,16 @@ async function verifyCommittedEntryProof(input) {
   if (!sameBytes(serialized, await z.encodeDeterministic({ ...unsigned, signature }))) {
     fail("INVENTORY_ENCODING");
   }
-  if (!NATIVE_VERIFY(null, Buffer.concat([ENTRY_DOMAIN,
+  if (!NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([ENTRY_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), publicKey, signature)) fail("INVENTORY_SIGNATURE");
   return {
     status: "VERIFIED_NONAUTHORIZING",
     outcome: "COMMITTED_IN_SIGNED_LEDGER",
-    operationId: Buffer.from(operationId),
-    sequence, root: Buffer.from(root),
-    tuple: { object_id: Buffer.from(entry.object_id), revision: entry.revision,
-      epoch: entry.epoch, ciphertext_sha256: Buffer.from(entry.ciphertext_sha256) },
+    operationId: NATIVE_BUFFER_FROM(operationId),
+    sequence, root: NATIVE_BUFFER_FROM(root),
+    tuple: { object_id: NATIVE_BUFFER_FROM(entry.object_id), revision: entry.revision,
+      epoch: entry.epoch, ciphertext_sha256: NATIVE_BUFFER_FROM(entry.ciphertext_sha256) },
     authorizesIo: false,
   };
 }
@@ -452,7 +452,7 @@ async function computeRoot(scopeValue, sequenceValue, previousRootValue, entries
   if (sequence !== entries.length) fail("INVENTORY_SEQUENCE");
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
   const canonical = await z.encodeDeterministic(rootBody(scope, sequence, previousRoot, entries));
-  return hash(Buffer.concat([ROOT_DOMAIN, canonical]));
+  return hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, canonical]));
 }
 
 function validatePrivateKey(value) {
@@ -482,14 +482,14 @@ async function createSignedSnapshot(input) {
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
 
   const body = rootBody(scope, sequence, previousRoot, entries);
-  const root = hash(Buffer.concat([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
+  const root = hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
   const unsigned = {
     ...body,
     signer_key_id: signerKeyId,
     root,
     nonce,
   };
-  const signature = NATIVE_SIGN(null, Buffer.concat([
+  const signature = NATIVE_SIGN(null, NATIVE_BUFFER_CONCAT([
     SNAPSHOT_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), privateKey);
@@ -520,12 +520,12 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
 
   const body = rootBody(scope, sequence, previousRoot, entries);
-  const calculatedRoot = hash(Buffer.concat([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
+  const calculatedRoot = hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
   if (!sameBytes(root, calculatedRoot)) fail("INVENTORY_ROOT");
   const unsigned = { ...body, signer_key_id: signerKeyId, root, nonce };
   let valid = false;
   try {
-    valid = NATIVE_VERIFY(null, Buffer.concat([
+    valid = NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([
       SNAPSHOT_DOMAIN,
       await z.encodeDeterministic(unsigned),
     ]), publicKey, signature);
@@ -564,7 +564,7 @@ function normalizeCommittedProofChain(input) {
       || value.byteLength < 1 || value.byteLength > MAX_COMMITTED_PROOF_BYTES
       || total > MAX_SNAPSHOT_BYTES - value.byteLength) fail("INVENTORY_LIMIT");
     total += value.byteLength;
-    result.push(Buffer.from(value));
+    result.push(NATIVE_BUFFER_FROM(value));
   }
   return result;
 }
@@ -574,7 +574,7 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
   const delta = current.sequence - previous.sequence;
   if (receipts.length !== delta || delta < 1) fail("INVENTORY_CHAIN");
   let sequence = previous.sequence;
-  let root = Buffer.from(previous.root);
+  let root = NATIVE_BUFFER_FROM(previous.root);
   let entries = previous.entries.slice();
   for (const serialized of receipts) {
     let decoded;
@@ -669,17 +669,17 @@ async function verifySnapshot(input) {
     status: "VERIFIED_NONAUTHORIZING",
     outcome: matched ? "PRESENT" : "ABSENT",
     sequence: current.sequence,
-    root: Buffer.from(current.root),
+    root: NATIVE_BUFFER_FROM(current.root),
     scope: {
-      account_id: Buffer.from(current.scope.account_id),
-      compartment_id: Buffer.from(current.scope.compartment_id),
-      keyring_id: Buffer.from(current.scope.keyring_id),
+      account_id: NATIVE_BUFFER_FROM(current.scope.account_id),
+      compartment_id: NATIVE_BUFFER_FROM(current.scope.compartment_id),
+      keyring_id: NATIVE_BUFFER_FROM(current.scope.keyring_id),
     },
     tuple: matched ? {
-      object_id: Buffer.from(matched.object_id),
+      object_id: NATIVE_BUFFER_FROM(matched.object_id),
       revision: matched.revision,
       epoch: matched.epoch,
-      ciphertext_sha256: Buffer.from(matched.ciphertext_sha256),
+      ciphertext_sha256: NATIVE_BUFFER_FROM(matched.ciphertext_sha256),
     } : null,
     verifiedInterveningReceipts: chain ? chain.length : 0,
   };
