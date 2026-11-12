@@ -233,6 +233,11 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     const s = exact(c.sourceAuthority, SOURCE_FIELDS);
     const z = exact(c.zkAuthority, ZK_FIELDS);
     const a = exact(c.mappingAuthority, AUTHORITY_FIELDS);
+    // Independent rollback authority is supplied by the caller. Capture the
+    // verified scalar boundary BEFORE source/owner/CURRENT public KeyObject
+    // getters can execute attacker-owned same-realm callbacks.
+    const retained = exact(a.independentlyRetainedFloor, ["sequence", "digest"]);
+    const floor = { sequence: number(retained.sequence), digest: hex(retained.digest) };
     const sourceIdentity = exact(s.identity,
       ["accountId", "storeId", "username", "compartmentId"]);
     const identity = verifyPinnedAtomicOwnerProvision({ identity: sourceIdentity,
@@ -270,9 +275,6 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     checkIndependent(nativePublic(s.provisionerPublicKey));
     checkIndependent(nativePublic(s.witnessPublicKey));
     checkIndependent(nativePublic(s.casPublicKey));
-    const floor = exact(a.independentlyRetainedFloor, ["sequence", "digest"]);
-    number(floor.sequence);
-    hex(floor.digest);
     if (typeof a.readCurrentHead !== "function") deny();
     const pendingHeadReads = new Set();
     async function boundedCurrentHead(challenge, signal) {
@@ -356,7 +358,8 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         const normalized = protocol.validateStoredOperation(operation);
         if (!normalized.authorization || normalized.operation === "delete"
           || normalized.tombstone || normalized.revision.counter < 1
-          || normalized.revision.deviceId !== normalized.deviceId) deny();
+          || normalized.revision.deviceId !== normalized.deviceId
+          || normalized.compartmentId !== identity.compartmentId) deny();
         const epochMatch = EPOCH.exec(normalized.keyEpoch);
         if (!epochMatch || !Number.isSafeInteger(Number(epochMatch[1]))) deny();
         await verifyHistoricalAuthorizationProof(normalized.authorization, normalized, localPolicy);
