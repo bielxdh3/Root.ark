@@ -555,7 +555,36 @@ When completing a task:
 7. select the next item based on remaining risk, not novelty;
 8. stop instead of inventing filler phases.
 
-## 10. Issue #65 / PR #302 cryptographic backport — unpublished 2026-11-12
+## 10. Earlier mission dependencies — 2026-11-07 GitHub checkpoint
+
+**Snapshot only; historical phases above remain unchanged.** The current [mission dependency graph](rootark-main-execution-mission.md#2026-11-07-live-dependency-graph) and [exact PR/CI status matrix](validation/2026-11-06-rootark-wave-execution-status.md#2026-11-07-live-github-status) distinguish implemented feature code, reviewed **Ready for review** PRs, Draft integration stacks, and blocked operational gates.
+
+- [IMPLEMENTED / READY] #63 protected 64-revision search (#293 4ea7f7cd); #64 Android ciphertext staging (#291 68a3fc0a); #67 non-atomic signed historical 1–32-object restore (#288 737304bf); #242 experimental session-bound WebRTC (#284 859adf0b); and #68 portable owner-issued offer CLI (#294 d2cc72ec). Ready is GitHub reviewer state, not release certification.
+- [IMPLEMENTED / DRAFT] #66 real manual verified picker combined with prior pin/journal safeguards in #295 0b395611; #68 fixed 1–8 pre-issued object offer redemption in #296 23124120, DEV-OFF only. Previous reviewed #292 df59cd1c pin guard and #294 d2cc72ec remain unchanged.
+- [VIRTUAL / UNVERIFIED] #288 + #295 cross-composition exists only as Git tree 677e4d4c; current combined RED/GREEN/CI and owner-signed SyncV2↔ZK1 account/object/revision/digest/epoch authority mapping are not certified. Never publish the tree as a real merged branch.
+- [CI / INCOMPLETE] #293 [42328562537 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328562537) and #294 [42328729476 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42328729476) passed. #295 [42368335353 attempt 1](https://github.com/bielxdh3/Root.ark/actions/runs/42368335353) completed FAILURE (mandatory Windows FAIL, canonical Windows and Ubuntu PASS); #296 [42370102210](https://github.com/bielxdh3/Root.ark/actions/runs/42370102210) Windows jobs running; #251 [42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) Windows canonical running.
+- [BLOCKED / EXTERNAL] R1 independent custody/TLS/provider durability/cutover; real Windows 10 CFAPI placeholder provider; physical Android owner-pinned device enrollment and CEK; production TURN/cross-NAT. #63/#64/#66/#67/#68/#94/#203/#242 remain OPEN; Root/main baseline remains ea0445df8ccd8f17da2c70572786d298491fd2c2. GitHub refreshed to 30 Ready/16 Draft (original 28 Ready untouched; #293/#294 newly Ready). No Ready PR was modified by this documentation change.
+
+**NEXT:** resolve the exact Windows CI exceptions; obtain verified scratch cross-composition evidence and owner-signed bridge design before claiming integrated release; keep external R1/platform acceptance separate. Do not merge, deploy, activate cutover or close issues based on this checkpoint.
+
+## 11. 2026-11-07 13:02 UTC follow-up — updated, still non-production
+
+The preceding section remains a **historical checkpoint**. The later [dependency graph](rootark-main-execution-mission.md#2026-11-07-1302-utc-dependency-update) and [status matrix](validation/2026-11-06-rootark-wave-execution-status.md#2026-11-07-1302-utc-follow-up) record **49 OPEN, 30 Ready for review, 19 Draft**, according to GitHub at this time; Ready is a review state only. The original 28 Ready were not changed by the documentation task, but #294 reverted to Draft due to a concrete zero-byte CLI P2, while newly opened #299 was Ready.
+
+- [INTEGRATED SOURCE / DRAFT] #66 picker/pin [#295](https://github.com/bielxdh3/Root.ark/pull/295) advanced to `5bac9e8e`; combined #66+#67 [#298](https://github.com/bielxdh3/Root.ark/pull/298) has commit `c47d2dbb` with tree **677e4d4c**. That tree was **virtual in the preceding checkpoint** and is now the real commit tree, but #298 stays Draft, unmerged and uncertified for deployment or external custody.
+- [CURRENT #68 / REVIEW BLOCKER] [#294](https://github.com/bielxdh3/Root.ark/pull/294) at `d2cc72ec` is Draft because of independently identified zero-byte CLI P2; child [#296](https://github.com/bielxdh3/Root.ark/pull/296) is Draft at `14f7dc6e`. A separate #63+#68 scratch composition tree `d327552b` has cross-suite validation **in progress**, not a reviewed merged release.
+- [ADDITIONAL PRS / PLATFORM] [#299](https://github.com/bielxdh3/Root.ark/pull/299) `71784ed0` was Ready for review for experimental P2P; [#300](https://github.com/bielxdh3/Root.ark/pull/300) `9f3e3ffa` was Draft for a read-only CFAPI probe. Physical Windows 10 provider, TURN/cross-NAT production and Android device trust remain unproved; local Android candidate `4a3db203` has two independent P2 findings and is unpublished.
+- [CI / GATES] [#251](https://github.com/bielxdh3/Root.ark/pull/251) exact `a4f327f2` [Security Regression 42329893711 attempt 2](https://github.com/bielxdh3/Root.ark/actions/runs/42329893711) is **SUCCESS**. [#295](https://github.com/bielxdh3/Root.ark/pull/295) exact `5bac9e8e` [42374437851](https://github.com/bielxdh3/Root.ark/actions/runs/42374437851) was **IN PROGRESS** at verification; no all-green claim. Local signed SyncV2↔ZK10 mapping candidate `dddee9b8` has two independent P2 findings, remains unpublished and supplies no R1.
+
+**NEXT:** close the independent P2 findings and verify source/CI on each new exact SHA; separately obtain owner-provisioned external monotonic custody, verified physical Android and Windows 10 CFAPI, and production TURN before any operational acceptance. No merge, deploy, cutover, branch rewrite or issue closure follows from these entries.
+
+## 12. 2026-11-07 13:06 UTC — new upstream review blockers
+
+The 13:02 UTC **30 Ready / 19 Draft** count above remains a dated historical observation. The refreshed [GitHub review state](rootark-main-execution-mission.md#2026-11-07-1306-utc-review-blocker-update) was **49 OPEN / 26 Ready / 23 Draft**. Four changed review states were confirmed: [#278](https://github.com/bielxdh3/Root.ark/pull/278), [#288](https://github.com/bielxdh3/Root.ark/pull/288), [#284](https://github.com/bielxdh3/Root.ark/pull/284), [#299](https://github.com/bielxdh3/Root.ark/pull/299) all **Draft**; #294 was already Draft. Peer-reported findings awaiting remediation: #278 **P1+3 P2**, #288 **P1+2 P2**, #284 **3 P2**, #294 **1 P2** (zero-byte CLI). Dependent #299 returned to Draft on #284's unresolved findings. These counts are neither reproduced exploits nor release certifications.
+
+**REVIEW ORDER:** repair/review #278, #288, #284 and #294 on their own exact SHAs; then re-evaluate dependent #295/#298, #299 and #296 respectively. Existing bounded GO for #298 cannot dismiss its #288 ancestor P1. #251 previous full CI remains scoped to `a4f327f2`; this local documentation update still needs review. Continue the R1, physical Windows 10 CFAPI, Android and TURN NO-GO boundaries.
+
+## 13. Issue #65 / PR #302 cryptographic backport — unpublished 2026-11-12
 
 **DEV-OFF; RootSession OFF; MERGE NO-GO / RELEASE NO-GO.** This checkpoint
 adds a local PR #302 candidate **after** reviewed `7baea943`; the two
