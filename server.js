@@ -12464,15 +12464,35 @@ app.post("/share/c/exchange", shareRateLimit, requireSameOriginPublicShareMutati
     const until = Math.min(Date.now() + CAPABILITY_SESSION_MS, linkExpiry);
     const alias = crypto.randomBytes(16).toString("hex");
     const cookie = crypto.randomBytes(32).toString("hex");
-    const previous = Object.entries(link.capabilitySessions || {})
-      .filter(([id, item]) => /^[a-f0-9]{32}$/.test(id)
-        && /^[a-f0-9]{64}$/.test(item?.hash || "")
-        && new Date(item.expiresAt).getTime() > Date.now())
-      .sort((a, b) => new Date(b[1].expiresAt).getTime() - new Date(a[1].expiresAt).getTime())
-      .slice(0, MAX_CAPABILITY_SESSIONS - 1);
-    link.capabilitySessions = Object.fromEntries([...previous,
-      [alias, { hash: capabilitySessionHash(alias, cookie), expiresAt: new Date(until).toISOString() }]]);
-    savePublicLinks(links);
+    // Deliberately pause AFTER the snapshot read in disposable test mode, so
+    // a second process can create/revoke a link and reproduce stale-snapshot
+    // lost updates against the old savePublicLinks(links) implementation.
+    await pauseShareAccessForTest("exchange-commit");
+    const expiresAt = new Date(until).toISOString();
+    if (shouldUseDatabase()) {
+      const admission = publicLinksRepository.addCapabilitySession(token, {
+        alias, hash: capabilitySessionHash(alias, cookie), expiresAt,
+        expectedResourceBinding: link.resourceBinding,
+        expectedFileName: link.fileName,
+        expectedFolderId: link.folderId || ROOT_FOLDER_ID,
+        maxSessions: MAX_CAPABILITY_SESSIONS,
+      });
+      if (admission.status !== "ok") {
+        return res.status(404).json({ error: "Capacidade indisponivel" });
+      }
+    } else {
+      // Isolated NODE_ENV=test JSON compatibility fixtures only. Production
+      // never uses unversioned whole-map writes for capability sessions.
+      const previous = Object.entries(link.capabilitySessions || {})
+        .filter(([id, item]) => /^[a-f0-9]{32}$/.test(id)
+          && /^[a-f0-9]{64}$/.test(item?.hash || "")
+          && new Date(item.expiresAt).getTime() > Date.now())
+        .sort((a, b) => new Date(b[1].expiresAt).getTime() - new Date(a[1].expiresAt).getTime())
+        .slice(0, MAX_CAPABILITY_SESSIONS - 1);
+      link.capabilitySessions = Object.fromEntries([...previous,
+        [alias, { hash: capabilitySessionHash(alias, cookie), expiresAt }]]);
+      savePublicLinks(links);
+    }
     res.cookie(`rootark_cap_${alias}`, cookie, {
       httpOnly: true, sameSite: "strict", secure: req.secure,
       path: "/share", expires: new Date(until),

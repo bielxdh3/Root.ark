@@ -203,6 +203,53 @@ function incrementPublicLinkViews(token, link) {
   return updated;
 }
 
+// Mutate precisely ONE capability under SQLite's cross-process writer lock.
+// savePublicLinks() intentionally reconciles an entire legacy snapshot and
+// would revoke unrelated shares or overwrite another exchange's sessions if
+// used after awaiting a filesystem/provider read.
+function addCapabilitySession(token, options = {}) {
+  const { alias, hash, expiresAt, expectedResourceBinding, maxSessions = 8 } = options;
+  if (!/^C[a-f0-9]{47}$/.test(token || "") || !/^[a-f0-9]{32}$/.test(alias || "")
+    || !/^[a-f0-9]{64}$/.test(hash || "") || !Number.isSafeInteger(maxSessions)
+    || maxSessions < 1 || maxSessions > 64) return { status: "invalid" };
+
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(`
+      SELECT token, folder_id, file_name, created_by, created_at, expires_at,
+        max_views, views, password_hash, metadata_json, permissions_json
+      FROM public_links WHERE token = ? AND revoked_at IS NULL
+    `).get(token);
+    if (!row) return { status: "missing" };
+    const link = rowToLink(row);
+    const expiry = new Date(row.expires_at).getTime();
+    const sessionExpiry = new Date(expiresAt).getTime();
+    const now = Date.now();
+    if (link.shareKind !== "capability-v1" || link.resourceBinding?.version !== 2
+      || JSON.stringify(link.resourceBinding) !== JSON.stringify(expectedResourceBinding)
+      || (options.expectedFileName !== undefined && link.fileName !== options.expectedFileName)
+      || (options.expectedFolderId !== undefined && link.folderId !== options.expectedFolderId)
+      || !Number.isFinite(expiry) || expiry <= now
+      || !Number.isFinite(sessionExpiry) || sessionExpiry <= now || sessionExpiry > expiry
+      || sessionExpiry > now + 5 * 60_000) return { status: "changed" };
+
+    const sessions = Object.entries(link.capabilitySessions || {})
+      .filter(([id, item]) => /^[a-f0-9]{32}$/.test(id)
+        && /^[a-f0-9]{64}$/.test(item?.hash || "")
+        && Number.isFinite(new Date(item.expiresAt).getTime())
+        && new Date(item.expiresAt).getTime() > now
+        && new Date(item.expiresAt).getTime() <= expiry)
+      .sort((a, b) => new Date(b[1].expiresAt).getTime() - new Date(a[1].expiresAt).getTime())
+      .slice(0, maxSessions - 1);
+    if (sessions.some(([id]) => id === alias)) return { status: "collision" };
+    link.capabilitySessions = Object.fromEntries([...sessions, [alias, { hash, expiresAt }]]);
+    const updated = db.prepare(`UPDATE public_links SET metadata_json = ?
+      WHERE token = ? AND revoked_at IS NULL`).run(jsonStringify(link), token);
+    if (updated.changes !== 1) return { status: "missing" };
+    return { status: "ok", expiresAt };
+  }).immediate();
+}
+
 function consumePublicLinkQuota(token, options = {}) {
   const db = getDb();
   const kind = options.kind;
@@ -316,6 +363,7 @@ function consumePublicLinkQuota(token, options = {}) {
 }
 
 module.exports = {
+  addCapabilitySession,
   consumePublicLinkQuota,
   getRecordedPublicLinkTokens,
   incrementPublicLinkViews,
