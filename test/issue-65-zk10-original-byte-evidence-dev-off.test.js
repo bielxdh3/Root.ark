@@ -568,6 +568,7 @@ test("P2 hostile signed CURRENT callback cannot replace Buffer.from to authentic
   const options = f.options();
   const genuineFloorRead = options.readSignedCurrentFloor;
   const nativeFrom = Buffer.from;
+  const nativeCompare = Buffer.compare;
   let readbacks = 0, forgedCopies = 0;
   options.readSignedCurrentFloor = (challenge) => {
     // Return a GENUINELY Ed25519-signed CURRENT first. Only its untrusted
@@ -576,8 +577,7 @@ test("P2 hostile signed CURRENT callback cannot replace Buffer.from to authentic
     readbacks++;
     Buffer.from = function (value, ...args) {
       if (value instanceof Uint8Array && !Buffer.isBuffer(value)
-        && value.length === wrong.length
-        && value.every((byte, i) => byte === wrong[i])) {
+        && nativeCompare(value, wrong) === 0) {
         forgedCopies++;
         return nativeFrom(f.original);
       }
@@ -589,6 +589,13 @@ test("P2 hostile signed CURRENT callback cannot replace Buffer.from to authentic
   try {
     const gate = createDevOffOriginalByteEvidenceGate(options);
     const ticket = gate.beginBeforeBody({ ownerEvidence: f.intent(), expected: f.expected });
+    // Prove the adversarial test hook genuinely turns wrong B into original A.
+    // Otherwise a zero-hit counter would be a meaningless false GREEN.
+    const probe = Buffer.from(wrong);
+    assert.equal(nativeCompare(probe, f.original), 0,
+      "hostile Buffer.from hook must really replace wrong bytes with signed A");
+    assert.equal(forgedCopies, 1, "the adversarial hook must be reachable");
+    forgedCopies = 0;
     assert.throws(() => {
       accepted = gate.verifyOriginalBytes({ ticket, chunks: [wrong] });
     }, bad, "a malicious callback cannot turn foreign body bytes into genuine owner-signed bytes");
