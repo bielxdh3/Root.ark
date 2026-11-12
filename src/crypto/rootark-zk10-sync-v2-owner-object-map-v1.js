@@ -26,6 +26,8 @@ const {
   hasOwn: NATIVE_HAS_OWN,
   objectCreate: NATIVE_OBJECT_CREATE,
   defineProperty: NATIVE_DEFINE_PROPERTY,
+  freeze: NATIVE_FREEZE,
+  pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyHistoricalAuthorizationProof } =
@@ -45,7 +47,7 @@ const CURRENT_DOMAIN = Buffer.from("Root.ark/zk10/sync-v2-current-map-head/v1\0"
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SYNC_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const EPOCH = /^epoch-([1-9][0-9]*)$/;
-const OWNER_FIELDS = Object.freeze([
+const OWNER_FIELDS = NATIVE_FREEZE([
   "type", "sync_account_id", "sync_store_id", "sync_compartment_id",
   "sync_object_id", "sync_file_id", "sync_version_id", "sync_operation_id",
   "sync_revision_counter", "sync_revision_device_id", "sync_key_epoch",
@@ -54,7 +56,7 @@ const OWNER_FIELDS = Object.freeze([
   "owner_generation", "owner_cutover_digest", "mapping_sequence",
   "previous_mapping_digest", "nonce",
 ]);
-const HEAD_FIELDS = Object.freeze([
+const HEAD_FIELDS = NATIVE_FREEZE([
   "type", "challenge", "sync_account_id", "zk_immutable_account_id",
   "mapping_sequence", "mapping_digest",
 ]);
@@ -64,18 +66,18 @@ const MAX_GLOBAL_PENDING_HEAD_READS = 64;
 // Timeout/cancellation returns control to JS, but a noncooperative external
 // adapter still owns its underlying promise until it actually settles.
 const globalPendingHeadReads = new Set();
-const SOURCE_FIELDS = Object.freeze([
+const SOURCE_FIELDS = NATIVE_FREEZE([
   "identity", "provisioning", "provisionerPublicKey", "provisioningDigest",
   "witnessPublicKey", "casPublicKey", "scope", "pinnedDevicePolicy", "currentDevicePolicy",
 ]);
-const ZK_FIELDS = Object.freeze([
+const ZK_FIELDS = NATIVE_FREEZE([
   "immutableAccountId", "ownerRootPublicKey", "ownerCutoverHistory",
   "ownerRotations", "independentlyRetainedCutoverDigest",
 ]);
-const AUTHORITY_FIELDS = Object.freeze([
+const AUTHORITY_FIELDS = NATIVE_FREEZE([
   "pinnedPublicKey", "independentlyRetainedFloor", "readCurrentHead",
 ]);
-const INPUT_FIELDS = Object.freeze([
+const INPUT_FIELDS = NATIVE_FREEZE([
   "sourceOperation", "zkObject", "zkMembershipProof", "ownerMapping",
 ]);
 
@@ -128,16 +130,16 @@ function ownPayload(value) {
 }
 function unpackMap(value) {
   const signed = exact(value, [...OWNER_FIELDS, "signature"]);
-  const payload = Object.freeze(ownPayload(Object.fromEntries(
-    OWNER_FIELDS.map((field) => [field, signed[field]]))));
+  const payload = NATIVE_FREEZE(ownPayload(NATIVE_PICK_SIGNED_FIELDS(signed, OWNER_FIELDS)));
   return { payload, signature: decode(signed.signature, 64) };
 }
 function signOwnerObjectMap(unsigned, privateKey) {
   try {
     const payload = ownPayload(unsigned);
-    return Object.freeze({ ...payload,
-      signature: NATIVE_SIGN(null, signedBytes(OWNER_DOMAIN, payload),
-        key(privateKey, "private")).toString("base64url") });
+    return NATIVE_FREEZE({ ...payload,
+      signature: NATIVE_BUFFER_TO_STRING.call(
+        NATIVE_SIGN(null, signedBytes(OWNER_DOMAIN, payload), key(privateKey, "private")),
+        "base64url") });
   } catch (_) { deny(); }
 }
 function digestOwnerObjectMap(signed) {
@@ -161,9 +163,10 @@ function currentHeadPayload(value) {
 function signCurrentMappingHead(unsigned, privateKey) {
   try {
     const payload = currentHeadPayload(unsigned);
-    return Object.freeze({ ...payload,
-      signature: NATIVE_SIGN(null, signedBytes(CURRENT_DOMAIN, payload),
-        key(privateKey, "private")).toString("base64url") });
+    return NATIVE_FREEZE({ ...payload,
+      signature: NATIVE_BUFFER_TO_STRING.call(
+        NATIVE_SIGN(null, signedBytes(CURRENT_DOMAIN, payload), key(privateKey, "private")),
+        "base64url") });
   } catch (_) { deny(); }
 }
 function bytes(value, max = 12 * 1024 * 1024) {
@@ -376,8 +379,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         const challenge = NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(32), "base64url");
         const wire = exact(await boundedCurrentHead(challenge, signal),
           [...HEAD_FIELDS, "signature"]);
-        const head = currentHeadPayload(Object.fromEntries(
-          HEAD_FIELDS.map((field) => [field, wire[field]])));
+        const head = currentHeadPayload(NATIVE_PICK_SIGNED_FIELDS(wire, HEAD_FIELDS));
         if (head.challenge !== challenge || head.mapping_digest !== digest
           || head.mapping_sequence !== payload.mapping_sequence
           || head.sync_account_id !== identity.accountId
@@ -394,7 +396,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         // only after the awaited authority verification, on the same JS turn.
         if (signal?.aborted || payload.mapping_sequence <= lastAcceptedSequence) deny();
         lastAcceptedSequence = payload.mapping_sequence;
-        return Object.freeze({
+        return NATIVE_FREEZE({
           status: "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING",
           mappingDigest: digest, mappingSequence: payload.mapping_sequence,
           syncObjectId: payload.sync_object_id, zkObjectId: payload.zk_object_id,

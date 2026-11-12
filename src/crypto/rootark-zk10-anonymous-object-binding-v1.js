@@ -16,6 +16,10 @@ const {
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT,
   bufferToString: NATIVE_BUFFER_TO_STRING,
+  freeze: NATIVE_FREEZE,
+  pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  ownKeys: NATIVE_OWN_KEYS,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const {
   exact, decode, hex, key, verifyOwnerRotationKeys, verifyOwnerCutoverHistory,
@@ -27,18 +31,18 @@ const INVENTORY_KEY = Buffer.from("Root.ark/zk10/anonymous-object-smt-key/v1\0",
 const INVENTORY_LEAF = Buffer.from("Root.ark/zk10/anonymous-object-smt-leaf/v1\0", "ascii");
 const INVENTORY_NODE = Buffer.from("Root.ark/zk10/anonymous-object-smt-node/v1\0", "ascii");
 const INVENTORY_EMPTY = Buffer.from("Root.ark/zk10/anonymous-object-smt-empty/v1\0", "ascii");
-const FIELDS = Object.freeze([
+const FIELDS = NATIVE_FREEZE([
   "type", "kind", "immutable_account_id", "zk_account_id",
   "owner_generation", "owner_cutover_digest", "inventory_head",
   "object_id", "object_revision", "ciphertext_sha256", "token_digest", "nonce",
 ]);
-const INPUT_FIELDS = Object.freeze([
+const INPUT_FIELDS = NATIVE_FREEZE([
   "statement", "ownerCutoverHistory", "ownerRotations", "pinnedOwnerRoot",
   "independentlyRetainedCutoverDigest", "independentlyExpectedAccountId",
   "expectedKind", "expectedToken", "expectedObject", "objectMembershipProof",
 ]);
-const OBJECT_FIELDS = Object.freeze(["object_id", "revision", "ciphertext_sha256"]);
-const INVENTORY_FIELDS = Object.freeze([
+const OBJECT_FIELDS = NATIVE_FREEZE(["object_id", "revision", "ciphertext_sha256"]);
+const INVENTORY_FIELDS = NATIVE_FREEZE([
   "immutable_account_id", "owner_generation", "object_id", "revision", "ciphertext_sha256",
 ]);
 const TOKEN = /^[a-f0-9]{48}$/;
@@ -103,8 +107,8 @@ function normalizedInventoryEntry(record) {
   };
 }
 function inventoryPosition(entry) {
-  return BigInt("0x" + sha(INVENTORY_KEY, entry.accountBytes, entry.objectBytes,
-    entry.revisionBytes).toString("hex"));
+  return BigInt("0x" + NATIVE_BUFFER_TO_STRING.call(
+    sha(INVENTORY_KEY, entry.accountBytes, entry.objectBytes, entry.revisionBytes), "hex"));
 }
 function inventoryLeaf(entry) {
   return sha(INVENTORY_LEAF, entry.accountBytes, entry.generationBytes,
@@ -120,8 +124,8 @@ function verifySparseObjectInventoryProof(accountId, generation, object, sibling
     object_id: object.object_id, revision: object.revision,
     ciphertext_sha256: object.ciphertext_sha256,
   });
-  if (!Array.isArray(siblings) || siblings.length !== 256
-    || Reflect.ownKeys(siblings).length !== 257) deny();
+  if (!NATIVE_ARRAY_IS_ARRAY(siblings) || siblings.length !== 256
+    || NATIVE_OWN_KEYS(siblings).length !== 257) deny();
   let position = inventoryPosition(entry);
   let current = inventoryLeaf(entry);
   for (const sibling of siblings) {
@@ -139,8 +143,8 @@ function buildSparseObjectInventoryProof(records, accountId, objectId, revision)
   decode(accountId, 16);
   decode(objectId, 16);
   uint64(revision, 1);
-  if (!Array.isArray(records) || !records.length || records.length > 1024
-    || Reflect.ownKeys(records).length !== records.length + 1) deny();
+  if (!NATIVE_ARRAY_IS_ARRAY(records) || !records.length || records.length > 1024
+    || NATIVE_OWN_KEYS(records).length !== records.length + 1) deny();
   let level = new Map();
   let target = null;
   for (const record of records) {
@@ -157,7 +161,8 @@ function buildSparseObjectInventoryProof(records, accountId, objectId, revision)
   const siblings = [];
   for (let depth = 0; depth < 256; depth += 1) {
     const position = target >> BigInt(depth);
-    siblings.push((level.get((position ^ 1n).toString()) || EMPTY[depth]).toString("hex"));
+    siblings.push(NATIVE_BUFFER_TO_STRING.call(
+      level.get((position ^ 1n).toString()) || EMPTY[depth], "hex"));
     const parents = new Map();
     for (const [index, digest] of level) {
       const address = BigInt(index);
@@ -169,8 +174,9 @@ function buildSparseObjectInventoryProof(records, accountId, objectId, revision)
     }
     level = parents;
   }
-  return Object.freeze({ root: (level.get("0") || EMPTY[256]).toString("hex"),
-    siblings: Object.freeze(siblings) });
+  return NATIVE_FREEZE({ root: NATIVE_BUFFER_TO_STRING.call(
+    level.get("0") || EMPTY[256], "hex"),
+    siblings: NATIVE_FREEZE(siblings) });
 }
 function signatureBytes(body) {
   return NATIVE_BUFFER_CONCAT([DOMAIN, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(body), "utf8")]);
@@ -179,7 +185,8 @@ function signAnonymousObjectBinding(unsigned, privateKey) {
   try {
     const body = canonical(unsigned);
     const signature = NATIVE_SIGN(null, signatureBytes(body), key(privateKey, "private"));
-    return Object.freeze({ ...body, signature: signature.toString("base64url") });
+    return NATIVE_FREEZE({ ...body,
+      signature: NATIVE_BUFFER_TO_STRING.call(signature, "base64url") });
   } catch (_) { deny(); }
 }
 function verifyAnonymousObjectBinding(input) {
@@ -196,7 +203,7 @@ function verifyAnonymousObjectBinding(input) {
     if (!Number.isSafeInteger(expectedObject.revision) || expectedObject.revision < 1) deny();
 
     const wire = exact(r.statement, [...FIELDS, "signature"]);
-    const body = canonical(Object.fromEntries(FIELDS.map((field) => [field, wire[field]])));
+    const body = canonical(NATIVE_PICK_SIGNED_FIELDS(wire, FIELDS));
     const signature = decode(wire.signature, 64);
     const keys = verifyOwnerRotationKeys(r.ownerRotations, r.pinnedOwnerRoot, expectedAccount);
     const verifiedHead = verifyOwnerCutoverHistory(
@@ -219,7 +226,7 @@ function verifyAnonymousObjectBinding(input) {
     // still requires independently verified external issuance/custody.
     verifySparseObjectInventoryProof(expectedAccount, head.generation,
       expectedObject, r.objectMembershipProof, head.inventory_head);
-    return Object.freeze({
+    return NATIVE_FREEZE({
       status: "VERIFIED_SIGNED_OBJECT_BINDING_NONAUTHORIZING",
       immutableAccountId: expectedAccount,
       ownerGeneration: head.generation,
