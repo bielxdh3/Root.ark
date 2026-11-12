@@ -11,6 +11,37 @@ const Database = require("better-sqlite3");
 // Invoking a captured intrinsic through `.call` is still dynamic: a malicious
 // KeyObject getter can replace Function.prototype.call. Retain native apply.
 const SAFE_APPLY = Reflect.apply.bind(Reflect);
+const NATIVE_SQLITE_PREPARE = Database.prototype.prepare;
+const NATIVE_SQLITE_PRAGMA = Database.prototype.pragma;
+const NATIVE_SQLITE_EXEC = Database.prototype.exec;
+const NATIVE_SQLITE_TRANSACTION = Database.prototype.transaction;
+const NATIVE_SQLITE_CLOSE = Database.prototype.close;
+// Capture a genuine SQLite statement facade BEFORE a caller-owned KeyObject or
+// filesystem callback can mutate better-sqlite3's shared JS prototypes.
+const SQLITE_INTRINSIC_PROBE = new Database(":memory:");
+const SQLITE_STATEMENT_PROBE = SAFE_APPLY(NATIVE_SQLITE_PREPARE, SQLITE_INTRINSIC_PROBE, ["SELECT 1"]);
+const NATIVE_SQLITE_RUN = SQLITE_STATEMENT_PROBE.run;
+const NATIVE_SQLITE_GET = SQLITE_STATEMENT_PROBE.get;
+const NATIVE_SQLITE_ALL = SQLITE_STATEMENT_PROBE.all;
+SQLITE_INTRINSIC_PROBE.close();
+function pinDatabaseMethods(db) {
+  // A hostile native getter may mutate better-sqlite3 prototypes after the
+  // original owner signature is authenticated. Each SQLite instance receives
+  // nonconfigurable own native entrypoints before SQL transaction setup.
+  DEFINE_PROPERTY(db, "prepare", { value: NATIVE_SQLITE_PREPARE });
+  DEFINE_PROPERTY(db, "pragma", { value: NATIVE_SQLITE_PRAGMA });
+  DEFINE_PROPERTY(db, "exec", { value: NATIVE_SQLITE_EXEC });
+  DEFINE_PROPERTY(db, "transaction", { value: NATIVE_SQLITE_TRANSACTION });
+  DEFINE_PROPERTY(db, "close", { value: NATIVE_SQLITE_CLOSE });
+}
+function trustedPrepare(db, statement) {
+  const prepared = SAFE_APPLY(NATIVE_SQLITE_PREPARE, db, [statement]);
+  // Avoid late dynamic dispatch through Statement.prototype.run/get/all.
+  DEFINE_PROPERTY(prepared, "run", { value: NATIVE_SQLITE_RUN });
+  DEFINE_PROPERTY(prepared, "get", { value: NATIVE_SQLITE_GET });
+  DEFINE_PROPERTY(prepared, "all", { value: NATIVE_SQLITE_ALL });
+  return prepared;
+}
 // Capture JSON serialization before any caller-owned options, KeyObjects or
 // SQLite callbacks execute. Every signed record here is primitive-only.
 // A hostile same-realm callback may later replace Object.create with a
@@ -298,7 +329,7 @@ function nextJournalTip(previousTip, challenge, serial) {
     signatureBytes(JOURNAL_DOMAIN, entry, ["nonce", "lease_id", "lease_serial"]));
 }
 function verifyUsedJournal(db, floor) {
-  const rows = db.prepare("SELECT nonce, lease_id, lease_serial, chain_tip FROM used_lease ORDER BY lease_serial").all();
+  const rows = trustedPrepare(db, "SELECT nonce, lease_id, lease_serial, chain_tip FROM used_lease ORDER BY lease_serial").all();
   if (rows.length !== floor.journal_count) deny();
   let tip = EMPTY_JOURNAL_TIP;
   for (let index = 0; index < rows.length; index += 1) {
@@ -353,6 +384,7 @@ function openDb(file) {
     const opened = fs.fstatSync(descriptor, { bigint: true });
     if (!sameFile(opened, fs.lstatSync(file, { bigint: true }))) deny();
     db = new Database(file, { timeout: 2000 });
+    pinDatabaseMethods(db);
     safeFileName(file);
     if (!sameFile(opened, fs.lstatSync(file, { bigint: true }))) deny();
     db.pragma("journal_mode = DELETE");
@@ -391,7 +423,7 @@ function openDb(file) {
 }
 function read(db, ownerHash, signerHash, primary = false) {
   checkDbPin(db);
-  const row = db.prepare("SELECT * FROM floor WHERE singleton = 1").get();
+  const row = trustedPrepare(db, "SELECT * FROM floor WHERE singleton = 1").get();
   if (row && (row.owner_spki !== ownerHash || row.custodian_spki !== signerHash)) deny();
   const floor = mapFloor(row);
   if (primary && floor) verifyUsedJournal(db, floor);
@@ -415,9 +447,9 @@ function insertGenesis(db, head, ownerHash, signerHash) {
   checkDbPin(db);
   db.transaction(() => {
     checkDbPin(db);
-    if (db.prepare("SELECT 1 FROM floor").get()) deny();
+    if (trustedPrepare(db, "SELECT 1 FROM floor").get()) deny();
     checkDbPin(db);
-    const statement = db.prepare(`INSERT INTO floor (singleton, sequence, head_digest, enrollment_root,
+    const statement = trustedPrepare(db, `INSERT INTO floor (singleton, sequence, head_digest, enrollment_root,
       immutable_account_id, identity_digest, lease_serial, journal_count, journal_tip,
       owner_spki, custodian_spki)
       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -438,7 +470,7 @@ function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge,
     const current = read(db, expectedOwner, expectedSigner, primary);
     if (!same(current, previous)) deny();
     checkDbPin(db);
-    const statement = db.prepare(`UPDATE floor SET sequence = ?, head_digest = ?,
+    const statement = trustedPrepare(db, `UPDATE floor SET sequence = ?, head_digest = ?,
       enrollment_root = ?, immutable_account_id = ?, identity_digest = ?,
       lease_serial = ?, journal_count = ?, journal_tip = ?
       WHERE singleton = 1 AND lease_serial = ?`);
@@ -449,7 +481,7 @@ function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge,
     if (result.changes !== 1) deny();
     checkDbPin(db);
     if (primary) {
-      db.prepare(`INSERT INTO used_lease (nonce, lease_id, lease_serial, chain_tip)
+      trustedPrepare(db, `INSERT INTO used_lease (nonce, lease_id, lease_serial, chain_tip)
         VALUES (?, ?, ?, ?)`).run(challenge.nonce, challenge.lease_id,
           next.lease_serial, next.journal_tip);
       checkDbPin(db);
@@ -605,7 +637,7 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
           // process that observes any externally edited state must stop.
           if (!same(minimum, read(anchor, ownerHash, signerHash))
             || !same(minimum, read(main, ownerHash, signerHash, true))
-            || main.prepare("SELECT 1 FROM used_lease WHERE nonce = ? OR lease_id = ?")
+            || trustedPrepare(main, "SELECT 1 FROM used_lease WHERE nonce = ? OR lease_id = ?")
               .get(r.nonce, r.lease_id)) deny();
           // Externally retained minimum is advanced BEFORE the primary.
           // A crash between these two commits blocks all future attestations.

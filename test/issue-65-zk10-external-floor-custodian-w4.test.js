@@ -553,13 +553,13 @@ test("P2: retainedMinimum serializes both floor reads against a real anchor writ
   const x = setup(t, "retained-anchor-interleave");
   const observer = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
   const outside = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
-  const originalPrepare = Database.prototype.prepare;
+  const originalLstat = fs.lstatSync;
   let attempted = false, committed = false, blocked = false;
-  Database.prototype.prepare = function (sql, ...args) {
-    if (!attempted && this.name === x.paths.databasePath
-      && sql === "SELECT * FROM floor WHERE singleton = 1") {
-      // The observer already read old anchor. The second real SQLite handle
-      // attempts to change that same inode before observer reads primary.
+
+  fs.lstatSync = function (name, ...args) {
+    // The primary read() stack is reached AFTER BOTH real BEGIN IMMEDIATE
+    // reservations, whereas prepare() is now a captured native method.
+    if (name === x.paths.databasePath && !attempted && (new Error().stack || "").includes("at read (")) {
       attempted = true;
       try {
         outside.prepare("UPDATE floor SET head_digest = ? WHERE singleton = 1")
@@ -570,15 +570,11 @@ test("P2: retainedMinimum serializes both floor reads against a real anchor writ
         blocked = true;
       }
     }
-    return originalPrepare.call(this, sql, ...args);
+    return originalLstat.call(fs, name, ...args);
   };
   let result;
-  try {
-    result = observer.retainedMinimum();
-  } finally {
-    Database.prototype.prepare = originalPrepare;
-  }
-  assert.equal(attempted, true, "second writer attempted its real SQLite update at read boundary");
+  try { result = observer.retainedMinimum(); }
+  finally { fs.lstatSync = originalLstat; }  assert.equal(attempted, true, "second writer attempted its real SQLite update at read boundary");
   assert.equal(blocked, true, "held anchor reservation must deny the concurrent update");
   assert.equal(committed, false, "anchor must not be changed between the two reads");
   assert.equal(result.head_digest, sha(1), "floor was valid while both reservations were held");
@@ -601,19 +597,22 @@ test("P2: retainedMinimum releases anchor after bounded primary lock failure", (
   const x = setup(t, "retained-primary-busy");
   const observer = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
   const outsideMain = new Database(x.paths.databasePath, { timeout: 1 });
-  const originalExec = Database.prototype.exec;
-  let primaryContested = false;
-  Database.prototype.exec = function (sql, ...args) {
-    if (!primaryContested && this.name === x.paths.databasePath && sql === "BEGIN IMMEDIATE") {
+  const originalLstat = fs.lstatSync;
+  let primaryContested = false, anchorReads = 0;
+  fs.lstatSync = function (name, ...args) {
+    // This second physical anchor pin follows BEGIN IMMEDIATE for anchor and
+    // precedes primary BEGIN IMMEDIATE; race through a real SQLite connection.
+    if (!primaryContested && name === x.paths.anchorDatabasePath
+      && (new Error().stack || "").includes("withBothFloorReservations")
+      && ++anchorReads === 2) {
       primaryContested = true;
-      originalExec.call(outsideMain, "BEGIN IMMEDIATE");
+      outsideMain.exec("BEGIN IMMEDIATE");
     }
-    return originalExec.call(this, sql, ...args);
+    return originalLstat.call(fs, name, ...args);
   };
   try {
     assert.throws(() => observer.retainedMinimum(), /ZK10_CUSTODIAN_UNAVAILABLE/);
-  } finally { Database.prototype.exec = originalExec; }
-  assert.equal(primaryContested, true);
+  } finally { fs.lstatSync = originalLstat; }  assert.equal(primaryContested, true);
   const outsideAnchor = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
   try {
     assert.doesNotThrow(() => outsideAnchor.exec("BEGIN IMMEDIATE"),
@@ -1111,22 +1110,21 @@ test("P2: bounded primary lock contention releases the anchor reservation and de
   const c = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
   const lease = x.offer({ sequence: 2, head_digest: sha(64), enrollment_root: sha(65) });
   const blocker = new Database(x.paths.databasePath, { timeout: 1 });
-  const originalExec = Database.prototype.exec;
-  let blockedSign = false;
-  Database.prototype.exec = function (sql, ...args) {
-    if (!blockedSign && this.name === x.paths.databasePath && sql === "BEGIN IMMEDIATE") {
+  const originalLstat = fs.lstatSync;
+  let blockedSign = false, anchorReads = 0;
+  fs.lstatSync = function (name, ...args) {
+    if (!blockedSign && name === x.paths.anchorDatabasePath
+      && (new Error().stack || "").includes("withBothFloorReservations")
+      && ++anchorReads === 2) {
       blockedSign = true;
-      // The anchor reservation is already held; a second real SQLite handle
-      // acquires primary first, so the custodian's bounded BEGIN must fail.
-      originalExec.call(blocker, "BEGIN IMMEDIATE");
+      blocker.exec("BEGIN IMMEDIATE");
     }
-    return originalExec.call(this, sql, ...args);
+    return originalLstat.call(fs, name, ...args);
   };
   try {
     assert.throws(() => c.attest(lease.request, lease.ownerLease),
       /ZK10_CUSTODIAN_UNAVAILABLE/);
-  } finally { Database.prototype.exec = originalExec; }
-  assert.equal(blockedSign, true, "the primary lock acquisition was contested");
+  } finally { fs.lstatSync = originalLstat; }  assert.equal(blockedSign, true, "the primary lock acquisition was contested");
   const secondAnchor = new Database(x.paths.anchorDatabasePath, { timeout: 1 });
   try {
     assert.doesNotThrow(() => secondAnchor.exec("BEGIN IMMEDIATE"),
@@ -1428,5 +1426,62 @@ test("P2 String-slot hostile callback cannot rebind signed genesis SQLite scalar
       assert.equal(row.head_digest, x.genesis.head_digest);
       assert.equal(row.enrollment_root, x.genesis.enrollment_root);
     } finally { db.close(); }
+  }
+});
+test("P2 post-Ed25519 SQLite prepare retarget cannot persist unsigned B across restart", (t) => {
+  const x = setup(t, "sqlite-prepare-postauth");
+  const nativeLstat = fs.lstatSync;
+  const nativePrepare = Database.prototype.prepare;
+  let hooked = false, swappedInserts = 0, first;
+  try {
+    fs.lstatSync = function (name, ...rest) {
+      // Both DB files exist only after owner Genesis A has been verified.
+      if (!hooked && (name === x.paths.databasePath
+        || name === x.paths.anchorDatabasePath) && fs.existsSync(name)) {
+        hooked = true;
+        Database.prototype.prepare = function (sql) {
+          if (typeof sql === "string" && sql.includes("INSERT INTO floor (singleton, sequence, head_digest, enrollment_root")) {
+            swappedInserts += 1;
+            return nativePrepare.call(this,
+              sql.replace("head_digest, enrollment_root", "enrollment_root, head_digest"));
+          }
+          return nativePrepare.call(this, sql);
+        };
+      }
+      return nativeLstat.call(fs, name, ...rest);
+    };
+    try { first = createDevOffZk10MonotonicFloorCustodian(x.config); }
+    catch (error) { assert.match(error.message, /ZK10_CUSTODIAN_UNAVAILABLE/); }
+  } finally {
+    fs.lstatSync = nativeLstat;
+    Database.prototype.prepare = nativePrepare;
+  }
+  assert.equal(hooked, true, "callback must execute after owner signature validation");
+  assert.equal(swappedInserts, first ? 0 : 2,
+    "native SQLite method should block SQL retarget; legacy path corrupts two stores");
+  if (first) {
+    assert.equal(first.retainedMinimum().head_digest, x.genesis.head_digest);
+    assert.equal(first.retainedMinimum().enrollment_root, x.genesis.enrollment_root);
+    first.close();
+  }
+  for (const filePath of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
+    const db = new Database(filePath, { readonly: true, fileMustExist: true });
+    try {
+      const stored = db.prepare("SELECT head_digest, enrollment_root FROM floor").get();
+      assert.equal(stored.head_digest, first ? x.genesis.head_digest : x.genesis.enrollment_root);
+      assert.equal(stored.enrollment_root, first ? x.genesis.enrollment_root : x.genesis.head_digest);
+    } finally { db.close(); }
+  }
+  if (!first) {
+    assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, bootstrap: undefined,
+    }), /ZK10_CUSTODIAN_UNAVAILABLE/,
+    "failed bootstrap must not promote persistent unsigned B after restart");
+  } else {
+    const reopened = x.track(createDevOffZk10MonotonicFloorCustodian({
+      ...x.config, bootstrap: undefined,
+    }));
+    assert.equal(reopened.retainedMinimum().head_digest, x.genesis.head_digest);
+    assert.equal(reopened.retainedMinimum().enrollment_root, x.genesis.enrollment_root);
   }
 });
