@@ -77,6 +77,48 @@ test("local filename filter caps display, counts all matches, and rejects a corr
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "a corrupt row past the cap must fail the whole listing");
 });
 
+test("P2 review: signed historical names cannot resurrect a trashed object's search hit", async () => {
+  const row = (object_id, revision) => ({ object_id, revision, epoch: 1,
+    ciphertext_digest: new Uint8Array(32).fill(8),
+    metadata_ciphertext: new Uint8Array(284).fill(9) });
+  const rows = [row('deleted-object', 1), row('live-object', 1), row('deleted-object', 2)];
+  const snapshot = { head: { sequence: 3, digest: new Uint8Array(32).fill(7) }, rows };
+  const seen = [];
+  const catalog = { createClient: () => ({ readAll: async () => snapshot }),
+    openMetadata: async ({ objectId, revision }) => {
+      seen.push(`${objectId}:${revision}`);
+      return objectId === 'deleted-object'
+        ? revision === 1 ? 'deleted-report.txt' : '\uE000rootark-zk1-logical-trash/v1'
+        : 'unrelated-current.txt';
+    } };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, 'utf8'), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: {}, pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => 'fixture-csrf', isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey('raw', crypto.randomBytes(32),
+    'AES-GCM', false, ['decrypt']);
+  const match = await client.readPrivateListing(baseline, key, 'report');
+  assert.equal(match.totalMatches, 0,
+    'an earlier append-only name must not resurrect a newer signed trash tombstone');
+  assert.equal(match.entries.length, 0);
+  const full = await client.readPrivateListing(baseline, key, '');
+  assert.equal(full.totalMatches, 2, 'display and total count must use current object heads, not history rows');
+  assert.equal(full.entries.find(x => x.objectId === 'deleted-object')?.logicalTrashCandidate, true);
+  assert.equal(full.entries.find(x => x.objectId === 'deleted-object')?.name, null);
+  assert.equal(seen.length, 6,
+    'all three immutable signed rows are still decrypted and checked on each read');
+});
+
 test("normal workspace routes historical restore through all three existing authorization gates", () => {
   const source = fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
