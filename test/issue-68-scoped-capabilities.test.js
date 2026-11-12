@@ -258,6 +258,62 @@ for (const mode of ["json", "sqlite"]) {
   });
 }
 
+test("SQLite exchange cannot revoke a new share or lose a parallel alias after its stale read", { timeout: 60_000 }, async (t) => {
+  const { authed, port, origin, dataDir } = await startFixture(t, "sqlite", {
+    ROOTARK_TEST_SHARE_PAUSE_POINT: "exchange-commit",
+    ROOTARK_TEST_SHARE_PAUSE_MS: "2500",
+  });
+  const settings = { name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+    permissions: ["download"], maxDownloads: 3 };
+  const created = await authed("/share/capabilities", settings);
+  assert.equal(created.status, 201, created.body);
+  const token = JSON.parse(created.body).token;
+  const exchange = () => {
+    const body = JSON.stringify({ token });
+    return request(port, "/share/c/exchange", {
+      method: "POST", headers: { origin, "content-type": "application/json",
+        "content-length": Buffer.byteLength(body) }, body,
+    });
+  };
+  // The disposable server suspends *after* its second read of the entire
+  // public links map, where the pre-fix savePublicLinks() reused stale data.
+  const firstPromise = exchange();
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const independent = await authed("/share/capabilities", settings);
+  assert.equal(independent.status, 201, independent.body);
+  const otherToken = JSON.parse(independent.body).token;
+  assert.notEqual(otherToken, token);
+  const secondPromise = exchange();
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  assert.equal(first.status, 200, first.body);
+  assert.equal(second.status, 200, second.body);
+  const firstHandle = JSON.parse(first.body).handle;
+  const secondHandle = JSON.parse(second.body).handle;
+  assert.notEqual(firstHandle, secondHandle);
+
+  const Database = require("better-sqlite3");
+  const db = new Database(path.join(dataDir, "rootark.sqlite"), { readonly: true });
+  try {
+    const firstRow = db.prepare("SELECT metadata_json, revoked_at FROM public_links WHERE token = ?").get(token);
+    const otherRow = db.prepare("SELECT revoked_at FROM public_links WHERE token = ?").get(otherToken);
+    assert.equal(otherRow?.revoked_at, null,
+      "an exchange of A may never revoke a concurrently created unrelated B");
+    const sessions = JSON.parse(firstRow.metadata_json).capabilitySessions;
+    assert.ok(sessions?.[firstHandle] && sessions?.[secondHandle],
+      "two overlapping exchanges of A must merge both session aliases atomically");
+  } finally { db.close(); }
+
+  for (const response of [first, second]) {
+    const handle = JSON.parse(response.body).handle;
+    const cookie = response.headers["set-cookie"].find((item) => item.startsWith("rootark_cap_"))
+      .split(";", 1)[0];
+    const view = await request(port, `/share/${handle}/view`, {
+      method: "POST", headers: { origin, cookie },
+    });
+    assert.equal(view.status, 200, "each legitimately issued session remains live");
+  }
+});
+
 for (const mode of ["json", "sqlite"]) {
   test(`scoped capability: authorized creation, per-operation limits and durable revocation (${mode})`,
     { timeout: 60_000 }, async (t) => {

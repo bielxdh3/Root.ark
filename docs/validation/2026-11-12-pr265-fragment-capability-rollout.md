@@ -43,6 +43,11 @@ passing disposable JSON/SQLite tests is not an authorization to enable it.
   repository. JSON mode is deliberately allowed only under `NODE_ENV=test`
   for isolated fixture coverage; it is **not** safe for multiprocess
   revocation because whole-map writes have no cross-process CAS/tombstones.
+- An exchange updates ONLY the matching active capability row under an
+  immediate SQLite writer transaction, merging currently active session
+  aliases from the latest row. Never use the legacy `savePublicLinks()`
+  whole-map reconciliation for exchange: a stale snapshot can otherwise
+  revoke another newly created link or discard concurrent cookie sessions.
 - Revocation is authenticated/CSRF-protected and takes the capability bearer
   in the JSON body, never the request target. Resource generation is bound
   to inode metadata including change time (`ctimeMs`); previously issued
