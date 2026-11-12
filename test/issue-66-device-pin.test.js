@@ -686,6 +686,45 @@ test("issue 66 #292 P1: genuinely trusted but unrelated 409 winner cannot discar
   assert.equal(client.journal.hasSeen(pending.operationId), false);
 });
 
+for (const winnerMode of ["signed pending echo", "signed prior revision replay"]) {
+  test(`issue 66 #292 P1: unwitnessed 409 ${winnerMode} preserves signed outbox`, async (t) => {
+    const { rootDir, open, remote, adapter, trusted } = await fixture(t);
+    const client = await open([], true, false, ["docs"]);
+    const prior = await remote("create", "object-local", "docs/local.txt", "prior signed bytes", 1);
+    const pending = winnerMode === "signed pending echo" ? prior
+      : await remote("update", "object-local", "docs/local.txt", "new signed bytes", 2);
+    const claimedWinner = winnerMode === "signed pending echo" ? pending : prior;
+    assert.equal(await verifyAuthorizationProof(pending.authorization, pending, trusted), true,
+      "pending uses genuine enrolled Ed25519 A");
+    assert.equal(await verifyAuthorizationProof(claimedWinner.authorization, claimedWinner, trusted), true,
+      "server-supplied current has a valid genuine Ed25519 A signature too");
+    assert.equal(claimedWinner.objectId, pending.objectId);
+    assert.equal(claimedWinner.fileId, pending.fileId);
+    assert.equal(claimedWinner.compartmentId, pending.compartmentId);
+    await client.journal.enqueue(pending);
+    const beforeJournal = await fsp.readFile(client.journal.filePath);
+    const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+    const beforeSnapshot = await fsp.readFile(snapshotPath);
+    let outbound = 0;
+    adapter.push = async (operation) => {
+      assert.equal(operation.operationId, pending.operationId);
+      outbound++;
+      return { status: 409, current: claimedWinner, currentRevision: claimedWinner.revision };
+    };
+    const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+    await assert.rejects(client.pushPending(summary), { code: "remote_admission_unproven" },
+      "signed remote ciphertext alone cannot prove the server committed the winner");
+    assert.equal(outbound, 1, "the malicious HTTP 409 is reached through real signed push");
+    assert.deepEqual(summary.conflicts, []);
+    assert.equal(summary.pushed, 0);
+    assert.equal(fs.existsSync(path.join(rootDir, ".rootark-conflicts")), false,
+      "409 cannot create a plaintext recovery artifact before independent commitment evidence");
+    assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal);
+    assert.deepEqual(await fsp.readFile(snapshotPath), beforeSnapshot);
+    assert.equal(client.journal.hasSeen(pending.operationId), false);
+  });
+}
+
 test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDATE before mutation", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");

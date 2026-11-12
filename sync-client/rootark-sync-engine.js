@@ -1745,6 +1745,17 @@ class SyncEngine {
           if (!this.operationDestinationIsSelected(current)) {
             this.preflightOutOfScopeMove(current);
           }
+          // A device signature alone cannot certify that the remote server
+          // actually committed CURRENT. A malicious 409 may echo our OWN
+          // freshly signed pending operation or replay an old same-object
+          // signature. Neither is an independent admission receipt. Until a
+          // separately trusted current-state/CAS witness is available, strict
+          // sync must preserve its pending outbox for explicit reconciliation
+          // instead of writing recovery plaintext or silently marking it seen.
+          if (this.requireAuthorization) {
+            fail("Signed 409 winner lacks independent durable admission evidence",
+              "remote_admission_unproven");
+          }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
           if (current) {
