@@ -166,6 +166,89 @@ async function fixture(overrides = {}) {
       zkMembershipProof: proof.siblings, ownerMapping: mapping } };
 }
 
+test("P2 review: owner map for provisioned compartment A cannot certify device-signed operation B", async () => {
+  const f = await fixture();
+  // Rebuild the whole encrypted operation with real compartment B AAD; only
+  // changing compartmentId on A would fail an unrelated integrity check.
+  const foreign = protocol.createOperation({
+    operation: "create", objectId: f.source.objectId, fileId: f.source.fileId,
+    versionId: f.source.versionId, operationId: f.source.operationId,
+    deviceId: f.source.deviceId, compartmentId: "foreign-compartment",
+    keyEpoch: f.source.keyEpoch, revision: f.source.revision,
+    metadata: { path: "encrypted.fixture" }, fileKey: Buffer.alloc(32, 8),
+    plaintext: Buffer.from("synthetic-sync-v2-data"),
+  });
+  foreign.authorization = await createAuthorizationProof(foreign, {
+    privateKey: keys.device.privateKey, publicKey: b64(keys.device),
+    username: identity.username, expiresAt: Date.now() + 600_000,
+  });
+  const { verifyHistoricalAuthorizationProof } =
+    require("../sync-client/rootark-sync-authorization");
+  await verifyHistoricalAuthorizationProof(foreign.authorization, foreign,
+    f.sourceAuthority.pinnedDevicePolicy);
+  assert.notEqual(foreign.compartmentId, identity.compartmentId);
+  assert.equal(f.payload.sync_compartment_id, identity.compartmentId);
+  // Owner-signed A map and genuine external CURRENT both attest exact
+  // ciphertext B/identifiers. The only invalid pairing is source compartment.
+  const mapB = signOwnerObjectMap({ ...f.payload,
+    sync_ciphertext_sha256: crypto.createHash("sha256")
+      .update(Buffer.from(foreign.ciphertext, "base64url")).digest("hex"),
+  }, keys.owner.privateKey);
+  const mapBDigest = digestOwnerObjectMap(mapB);
+  const authorityB = { ...f.authority, readCurrentHead: (challenge) =>
+    signCurrentMappingHead({
+      type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+      sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+      mapping_sequence: f.payload.mapping_sequence, mapping_digest: mapBDigest,
+    }, keys.authority.privateKey),
+  };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: authorityB,
+  });
+  await assert.rejects(verify({ ...f.input, sourceOperation: foreign, ownerMapping: mapB }), deny,
+    "genuine device-signed B may not be mapped into owner-provisioned compartment A");
+  const positive = await createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  })(f.input);
+  assert.equal(positive.authorizesIo, false, "valid compartment A remains nonauthorizing");
+});
+
+test("P2 review: native authority KeyObject getter cannot rewind independently retained mapping floor", async () => {
+  const f = await fixture();
+  const floor = { sequence: 6, digest: hex(99) };
+  const initialFloor = { ...floor };
+  const handle = Object.getOwnPropertySymbols(keys.authority.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "physical native Ed25519 KeyObject handle required");
+  const keyWithGetter = Object.create(keys.authority.publicKey);
+  let callbacks = 0;
+  Object.defineProperty(keyWithGetter, handle, { get() {
+    callbacks++;
+    floor.sequence = 4;
+    floor.digest = hex(77);
+    return keys.authority.publicKey[handle];
+  } });
+  const verifier = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, independentlyRetainedFloor: floor,
+      pinnedPublicKey: keyWithGetter },
+  });
+  assert.ok(callbacks > 0, "attacker-controlled native getter ran");
+  assert.deepEqual(initialFloor, { sequence: 6, digest: hex(99) },
+    "the original trusted minimum must be strictly higher than mapping sequence 5");
+  await assert.rejects(verifier(f.input), deny,
+    "a valid sequence-5 Ed25519 mapping cannot rewind original floor sequence 6");
+  assert.deepEqual(floor, { sequence: 4, digest: hex(77) },
+    "the callback really altered the caller-owned floor; only the detached snapshot denied rollback");
+  const valid = await createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  })(f.input);
+  assert.equal(valid.authorizesIo, false, "genuine floor-4 mapping-5 still works");
+});
+
 test("owner/SyncV2 device signatures + independent current challenged head bind exact ciphertext identities", async () => {
   const f = await fixture();
   const verify = createOwnerObjectMapVerifier({ sourceAuthority: f.sourceAuthority,
