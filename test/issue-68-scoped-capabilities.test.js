@@ -593,7 +593,6 @@ for (const mode of ["json", "sqlite"]) {
       const filePath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
       const stamp = new Date(Math.floor((Date.now() - 30_000) / 1000) * 1000);
       fs.utimesSync(filePath, stamp, stamp);
-      const before = fs.statSync(filePath);
       const created = await authed("/share/capabilities", {
         name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
         permissions: ["download"], maxDownloads: 1,
@@ -602,12 +601,20 @@ for (const mode of ["json", "sqlite"]) {
       const { token } = JSON.parse(created.body);
       const initial = await publicPost(token, "view");
       assert.equal(initial.status, 200, initial.body);
-      await new Promise((resolve) => setTimeout(resolve, 40));
+      // Bind the hostile rewrite and both stat probes to the SAME opened
+      // descriptor, rather than checking a pathname and writing it later.
+      const fd = fs.openSync(filePath, fs.constants.O_RDWR
+        | (fs.constants.O_NOFOLLOW || 0));
+      let before, after;
       const changed = "R".repeat(Buffer.byteLength(FILE_CONTENT) - 1) + "\n";
-      assert.notEqual(changed, FILE_CONTENT);
-      fs.writeFileSync(filePath, changed);
-      fs.utimesSync(filePath, stamp, stamp);
-      const after = fs.statSync(filePath);
+      try {
+        before = fs.fstatSync(fd);
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.notEqual(changed, FILE_CONTENT);
+        assert.equal(fs.writeSync(fd, changed, 0, "utf8"), Buffer.byteLength(changed));
+        fs.futimesSync(fd, stamp, stamp);
+        after = fs.fstatSync(fd);
+      } finally { fs.closeSync(fd); }
       assert.equal(after.ino, before.ino, "negative oracle must keep the identical inode");
       assert.equal(after.size, before.size, "negative oracle must preserve file length");
       assert.equal(after.birthtimeMs, before.birthtimeMs,
