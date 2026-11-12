@@ -10,16 +10,22 @@ const { SCHEMA, FIELDS, checkpointDigest, verifyOwnerInventoryEnrollment } =
   require("../src/crypto/rootark-zk1-owner-inventory-trust-head");
 const portable = require("../public/client/rootark-zk1-owner-inventory-trust-head");
 
-async function fixture() {
+async function fixture({ forgedInventorySignature = false } = {}) {
   const keys = crypto.generateKeyPairSync("ed25519");
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: Buffer.from("owner-client"), keyring_id: crypto.randomBytes(16) };
   const signerKeyId = crypto.randomBytes(16);
   const nonce = crypto.randomBytes(32);
-  const snapshot = await inventory.createSignedSnapshot({
+  let snapshot = await inventory.createSignedSnapshot({
     signerKeyId, privateKey: keys.privateKey, scope,
     sequence: 0, previousRoot: null, entries: [], nonce,
   });
+  if (forgedInventorySignature) {
+    const z = require("../src/crypto/rootark-zk-1");
+    const original = await z.decodeDeterministic(snapshot);
+    snapshot = await z.encodeDeterministic({ ...original,
+      signature: crypto.randomBytes(64) });
+  }
   const decoded = await require("../src/crypto/rootark-zk-1").decodeDeterministic(snapshot);
   const now = Math.floor(Date.now() / 1000);
   const signed = await runOfflineSigner({
@@ -206,6 +212,37 @@ test("owner KeyObject callback cannot rewrite independently expected account B t
   assert.equal(accepted, false,
     "initial operator-expected B must not be replaced by owner-signed A");
   assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
+});
+
+test("genuine Ed25519 owner A does not delegate inventory signature B to a swapped verifier export", async () => {
+  // Owner A signs a real checkpoint and its independent digest pins the
+  // exact serialized inventory snapshot. Its INNER inventory signer is
+  // deliberately forged (B). A caller KeyObject may not change the verifier
+  // implementation after valid owner authorization.
+  const f = await fixture({ forgedInventorySignature: true });
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der",
+  }), type: "spki", format: "der" });
+  const original = inventory.verifySnapshot;
+  let attacks = 0;
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    attacks++;
+    inventory.verifySnapshot = async () => ({ status: "FORGED_ACCEPT" });
+    return "public";
+  } });
+  try {
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...f.enrollment, ownerPublicKey: owner,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "owner-signed checkpoint cannot waive the independent inventory signature");
+    assert.ok(attacks > 0, "test must run the KeyObject callback");
+  } finally {
+    inventory.verifySnapshot = original;
+    delete owner.type;
+  }
+  const good = await fixture();
+  assert.equal((await verifyOwnerInventoryEnrollment(good.enrollment))
+    .ownerSignatureVerified, true);
 });
 
 test("genuine signed checkpoint A cannot authorize unsigned B by post-getter Buffer.concat retarget", async () => {
