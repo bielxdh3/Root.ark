@@ -36,6 +36,54 @@ const target = Object.freeze({ object_id: zkObjectId, revision: 2,
 const targetHash = crypto.createHash("sha256").update(zkCiphertext).digest("hex");
 const deny = /ZK10_SYNC_V2_MAP_UNVERIFIED/;
 
+test("P2 mapping: callback iterator must not hide genuine owner Ed25519 A when CURRENT key is also A", async () => {
+  const f = await fixture();
+  const ownHead = (challenge) => signCurrentMappingHead({
+    type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+    sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+    mapping_sequence: f.payload.mapping_sequence, mapping_digest: f.mappingDigest,
+  }, keys.owner.privateKey);
+  const sameSignerAuthority = { ...f.authority,
+    pinnedPublicKey: keys.owner.publicKey, readCurrentHead: ownHead };
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: sameSignerAuthority,
+  }), deny, "owner Ed25519 A cannot issue purported independent CURRENT Ed25519 A");
+  const handle = Object.getOwnPropertySymbols(keys.owner.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  const poisoned = Object.create(keys.owner.publicKey);
+  const actualIterator = Array.prototype[Symbol.iterator];
+  const nativeEquals = crypto.KeyObject.prototype.equals;
+  let reads = 0, skipped = 0;
+  Object.defineProperty(poisoned, handle, { get() {
+    reads++;
+    Array.prototype[Symbol.iterator] = function*() {
+      if (this.length === 1 && this[0] instanceof crypto.KeyObject
+        && Reflect.apply(nativeEquals, this[0], [keys.owner.publicKey])) {
+        skipped++;
+        return;
+      }
+      yield* Reflect.apply(actualIterator, this, []);
+    };
+    return keys.owner.publicKey[handle];
+  } });
+  try {
+    assert.throws(() => createOwnerObjectMapVerifier({
+      sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...sameSignerAuthority, pinnedPublicKey: poisoned },
+    }), deny, "inherited KeyObject getter cannot omit owner from separation check");
+  } finally { Array.prototype[Symbol.iterator] = actualIterator; }
+  assert.ok(reads > 0, "native owner key callback executed");
+  assert.equal(skipped, 0, "native iteration or indexed role checks must ignore forged iterator");
+  const good = await fixture();
+  const valid = createOwnerObjectMapVerifier({
+    sourceAuthority: good.sourceAuthority, zkAuthority: good.zkAuthority,
+    mappingAuthority: good.authority,
+  });
+  assert.equal((await valid(good.input)).authorizesIo, false);
+});
+
 function sourceProvisioning() {
   const statement = { type: "atomic-owner-provisioning", version: 1,
     scope: "synthetic-owner", ...identity, witnessSpki: b64(keys.witness),

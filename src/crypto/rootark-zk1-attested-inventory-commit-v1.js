@@ -90,23 +90,26 @@ async function verifyAttestedInventoryCommit(input) {
     // to this comparison then replace the attestor with the writer key.
     // Pin real native Ed25519 key material once. Caller-supplied metadata and
     // KeyObject.export can lie, and the two signer roles must be distinct.
+    // The operator's expected scope/operation/nonce must be detached before
+    // any untrusted native KeyObject can change the corresponding input object.
+    const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
+    const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
+    const nonce = rawBytes(input.nonce, 32, 32);
+    const scope = inventory.normalizeScope(input.scope);
+    const operation = snapshotOperation(input.operation);
+    const signerId = rawBytes(input.pinnedInventorySignerKeyId, 16, 16);
+    const nowSeconds = input.nowSeconds;
+    if (!Number.isSafeInteger(nowSeconds) || nowSeconds < 1) deny();
     const inventoryKey = pinnedOwnerPublicKey(input.pinnedInventoryPublicKey, "public");
     const attestorKey = pinnedOwnerPublicKey(input.pinnedPhysicalAttestorPublicKey, "public");
-    const nowSeconds = input.nowSeconds;
     // The public KeyObject's .export() is an overridable own property.
     // Compare native cryptographic key identities with the intrinsic method,
     // not caller-supplied DER from an attacker-controlled export override.
     if (NATIVE_KEY_EQUALS.call(inventoryKey, attestorKey)) deny();
-    const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
-    const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
-    const nonce = rawBytes(input.nonce, 32, 32);
     // Both signature parsers have asynchronous CBOR boundaries. If they read
     // the caller's mutable operation/scope independently, a hostile Proxy can
     // present a valid ledger operation A and a valid physical readback B.
     // Detach exactly ONCE before either parser awaits any promise.
-    const scope = inventory.normalizeScope(input.scope);
-    const operation = snapshotOperation(input.operation);
-    const signerId = rawBytes(input.pinnedInventorySignerKeyId, 16, 16);
     const [signedReceipt, physical] = await Promise.all([
       inventory.verifyCommittedEntryProof({ serialized: receipt,
         pinnedPublicKey: inventoryKey,

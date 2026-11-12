@@ -18,6 +18,11 @@ const BUFFER_CONCAT = Buffer.concat.bind(Buffer);
 const BUFFER_COMPARE = Buffer.compare.bind(Buffer);
 const BUFFER_TO_STRING = Buffer.prototype.toString;
 const BUFFER_BYTE_LENGTH = Buffer.byteLength.bind(Buffer);
+// This only pins the original JS clock method against same-realm rebinding;
+// OS wall-clock changes still require independent trusted-time/floor evidence.
+const DATE_NOW = Date.now.bind(Date);
+const MATH_FLOOR = Math.floor.bind(Math);
+const MATH_ABS = Math.abs.bind(Math);
 const ARRAY_JOIN = Array.prototype.join;
 const ARRAY_PUSH = Array.prototype.push;
 const ARRAY_INCLUDES = Array.prototype.includes;
@@ -152,6 +157,9 @@ module.exports = Object.freeze({
   bufferCompare: BUFFER_COMPARE,
   bufferToString: withSafeCall(BUFFER_TO_STRING),
   bufferByteLength: BUFFER_BYTE_LENGTH,
+  dateNow: DATE_NOW,
+  mathFloor: MATH_FLOOR,
+  mathAbs: MATH_ABS,
   arrayJoin: withSafeCall(ARRAY_JOIN),
   arrayPush: withSafeCall(ARRAY_PUSH),
   arrayIncludes: withSafeCall(ARRAY_INCLUDES),

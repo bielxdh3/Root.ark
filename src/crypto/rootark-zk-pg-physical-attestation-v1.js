@@ -4,7 +4,7 @@
 // PostgreSQL attestor AFTER it has verified bytes and a WAL flush barrier.
 // Neither this signature nor an mTLS ACK proves external/cloud durability.
 const crypto = require("node:crypto");
-const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY,
+const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY, mathAbs: NATIVE_MATH_ABS,
   sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
   getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY } =
   require("./rootark-zk10-native-intrinsics-v1");
@@ -117,9 +117,18 @@ async function signCommittedPhysicalReadback(request, attestorPrivateKey) {
 async function verifyCommittedPhysicalReadback(raw, options = {}) {
   try {
     exact(options, ["scope", "operation", "expected", "nonce", "pinnedPublicKey", "nowSeconds"]);
-    const pin = key(options.pinnedPublicKey, "public");
     const expected = options.expected;
     if (expected !== undefined) exact(expected, ["digest", "root", "chunks"]);
+    // Snapshot every operator-supplied expected byte/clock before the native
+    // KeyObject can execute an inherited kHandle or other property getter.
+    const op = operationOf(options.operation);
+    const scope = scopeOf(options.scope);
+    const challenge = bytes(options.nonce, 32);
+    const nowSeconds = count(options.nowSeconds, 1);
+    const expectedSnapshot = expected === undefined ? undefined : {
+      digest: bytes(expected.digest, 32), root: bytes(expected.root, 32),
+      chunks: count(expected.chunks, 1),
+    };
     // Validate the untrusted transport value *before* any Buffer.from coercion.
     // A foreign object may have an attacker-supplied iterator/valueOf; an
     // enormous typed array must never be copied merely to measure its size.
@@ -128,6 +137,7 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
       || (typeof SharedArrayBuffer !== "undefined"
         && raw.buffer instanceof SharedArrayBuffer)) deny();
     const serialized = NATIVE_BUFFER_FROM(raw);
+    const pin = key(options.pinnedPublicKey, "public");
     const proof = await z.decodeDeterministic(serialized);
     exact(proof, ALL_FIELDS);
     const { signature, ...unsigned } = proof;
@@ -135,21 +145,19 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     if (!same(canonical, serialized)) deny();
     const encoded = NATIVE_BUFFER_FROM(await z.encodeDeterministic(unsigned));
     if (!NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([DOMAIN, encoded]), pin, bytes(signature, 64))) deny();
-    const op = operationOf(options.operation);
-    const scope = scopeOf(options.scope);
     if (unsigned.type !== TYPE || !hasSignedFields(unsigned)
       || !matchSignedBytes(unsigned, scope, ["account_id", "compartment_id", "keyring_id"])
       || !matchSignedBytes(unsigned, op,
         ["operation_id", "object_id", "expected_inventory_root", "ciphertext_sha256"])
       || unsigned.revision !== op.revision || unsigned.epoch !== op.epoch
       || unsigned.expected_inventory_sequence !== op.expected_inventory_sequence
-      || !same(bytes(unsigned.nonce, 32), bytes(options.nonce, 32))
-      || (expected !== undefined
-        && (!same(bytes(unsigned.physical_digest, 32), bytes(expected.digest, 32))
-          || !same(bytes(unsigned.chunk_root, 32), bytes(expected.root, 32))
-          || unsigned.chunk_count !== count(expected.chunks, 1)))
+      || !same(bytes(unsigned.nonce, 32), challenge)
+      || (expectedSnapshot !== undefined
+        && (!same(bytes(unsigned.physical_digest, 32), expectedSnapshot.digest)
+          || !same(bytes(unsigned.chunk_root, 32), expectedSnapshot.root)
+          || unsigned.chunk_count !== expectedSnapshot.chunks))
       || !Number.isSafeInteger(unsigned.issued_at)
-      || Math.abs(count(options.nowSeconds, 1) - unsigned.issued_at) > 30) deny();
+      || NATIVE_MATH_ABS(nowSeconds - unsigned.issued_at) > 30) deny();
     const generation = count(unsigned.generation, 1);
     const physicalDigest = bytes(unsigned.physical_digest, 32);
     const chunkRoot = bytes(unsigned.chunk_root, 32);
