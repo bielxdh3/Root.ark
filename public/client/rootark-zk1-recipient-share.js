@@ -169,11 +169,11 @@
         || entry.revokedAtEpoch !== null) deny();
       return bytes(entry.authorizationPublicKey, 32);
     };
-    active(recipientDeviceId);
+    const recipientKey = active(recipientDeviceId);
     // Never carry a mutable provider object across crypto/network awaits.
     const stableScope = Object.fromEntries(
       Object.entries(scope).map(([key, value]) => [key, b64(value)]));
-    return { scope: stableScope, issuerKey: active(s.issuer_device_id) };
+    return { scope: stableScope, issuerKey: active(s.issuer_device_id), recipientKey };
   }
   function endpoint(origin) {
     if (typeof origin !== "string") deny();
@@ -227,6 +227,9 @@
         || input.signerKey.algorithm?.name !== "Ed25519"
         || input.signerKey.extractable !== false
         || !input.signerKey.usages?.includes("sign")) deny();
+      // An untrusted key provider must not replace the signer after its local
+      // recipient-roster binding has been verified.
+      const signerKey = input.signerKey;
       const fetchImpl = input.fetchImpl ?? fetch;
       const nowSeconds = input.nowSeconds ?? (() => Math.floor(Date.now() / 1000));
       if (typeof fetchImpl !== "function" || typeof nowSeconds !== "function") deny();
@@ -251,8 +254,17 @@
         "Ed25519", false, ["verify"]);
       if (!await crypto.subtle.verify("Ed25519", issuer, signature,
         Uint8Array.from([...DOMAIN, ...raw]))) deny();
+      // A server can replay authentic owner-signed ciphertext while ignoring
+      // the client's GET signature. Check possession of the independently
+      // enrolled recipient key LOCALLY before any network request. The
+      // nonextractable private CryptoKey is reused for the actual GET.
+      const recipient = await crypto.subtle.importKey("raw", first.recipientKey,
+        "Ed25519", false, ["verify"]);
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const localSignature = await crypto.subtle.sign("Ed25519", signerKey, challenge);
+      if (!await crypto.subtle.verify("Ed25519", recipient, localSignature, challenge)) deny();
       const signed = await protectedHttp.signProtectedContentOperation({
-        signerKey: input.signerKey, scope: first.scope, deviceId: recipientDeviceId,
+        signerKey, scope: first.scope, deviceId: recipientDeviceId,
         operation: "get", objectId: statement.object_id,
         expectedObjectRevision: statement.object_revision,
         expectedCiphertextDigest: statement.ciphertext_digest,
@@ -290,7 +302,8 @@
         if (!equals(digest, statement.ciphertext_digest)) deny();
         const final = trustedSnapshot(await input.readIndependentAuthority(),
           statement, recipientDeviceId);
-        if (!equals(final.issuerKey, first.issuerKey)) deny();
+        if (!equals(final.issuerKey, first.issuerKey)
+          || !equals(final.recipientKey, first.recipientKey)) deny();
         // No await after this final authority/expiry fence and before release.
         currentTime();
         return Object.freeze({
