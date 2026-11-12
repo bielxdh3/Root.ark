@@ -289,6 +289,55 @@ test("issue 66: verified cache eviction survives offline and hydrates again afte
   assert.equal(restarted.snapshot.remoteOnly[before.objectId], undefined);
 });
 
+test("issue 66 P2: verified evicted A can hydrate a later remote MOVE at B", async (t) => {
+  const { root, open, store, key, adapter } = await setup(t,
+    { "docs/a.txt": "original verified bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/a.txt"), true);
+  const earlier = store.list("alice")[0];
+  assert.equal(await client.evictLocal("docs/a.txt"), true);
+  assert.equal(await exists(path.join(root, "docs", "a.txt")), false);
+  const moved = protocol.createOperation({
+    operation: "move", objectId: earlier.objectId, fileId: earlier.fileId,
+    versionId: `moved-${crypto.randomUUID()}`, operationId: `moved-${crypto.randomUUID()}`,
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: earlier.revision,
+    revision: { counter: earlier.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/b.txt", sourcePath: "docs/a.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("original verified bytes"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const inventory = await client.syncOnce();
+  assert.equal(inventory.available, 1);
+  assert.equal(store.list("alice").find((item) => item.objectId === earlier.objectId).operationId,
+    moved.operationId, "local reconciliation may publish a directory, never replace the remote moved file");
+  const originalInventory = adapter.listInventory;
+  adapter.listInventory = async (options) => {
+    const page = await originalInventory(options);
+    return { ...page, objects: page.objects.map((row) => row.objectId === earlier.objectId
+      ? { ...row, fileId: "unrelated-file" } : row) };
+  };
+  await assert.rejects(client.materializeRemote("docs/b.txt"),
+    { code: "remote_object_changed" },
+    "an advisory MOVE that changes the evicted file identity cannot rebind the cache");
+  adapter.listInventory = originalInventory;
+  await fsp.writeFile(path.join(root, "docs", "b.txt"), "offline independent local bytes");
+  await assert.rejects(client.materializeRemote("docs/b.txt"),
+    { code: "local_changes_pending" },
+    "hydrating a verified remote MOVE must never overwrite an untracked destination");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "b.txt"), "utf8"),
+    "offline independent local bytes");
+  await fsp.unlink(path.join(root, "docs", "b.txt"));
+  assert.equal(await client.materializeRemote("docs/b.txt"), true,
+    "new destination must recover from the AEAD MOVE payload after A was evicted");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "b.txt"), "utf8"),
+    "original verified bytes");
+  assert.equal(await exists(path.join(root, "docs", "a.txt")), false);
+  assert.equal(client.snapshot.files["docs/b.txt"].objectId, earlier.objectId);
+  assert.equal(client.snapshot.remoteOnly[earlier.objectId], undefined);
+  assert.equal((await client.journal.recover()).length, 0);
+});
+
 test("issue 66: refreshes clean cached bytes, preserves dirty cached bytes", async (t) => {
   const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
   const client = await open();

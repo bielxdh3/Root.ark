@@ -2196,8 +2196,19 @@ class SyncEngine {
         if (crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash) {
           fail("Local file changed since its last sync", "local_changes_pending");
         }
-      } else if (evicted && (!pathsEqual(evicted.path, safePath) || evicted.deleted)) {
-        fail("Evicted file no longer matches this path", "remote_object_changed");
+      } else if (evicted) {
+        // Eviction pins an object identity/revision, not an immutable pathname.
+        // A later authenticated MOVE can rename that evicted object before the
+        // device reconnects. Do not deny the new path merely because the
+        // marker still records the old one. The full envelope must still
+        // match inventory and pass normal verification before any write.
+        const relocated = !pathsEqual(evicted.path, safePath);
+        if (evicted.deleted || (relocated && (
+          matching.operation !== "move" || matching.fileId !== evicted.fileId
+          || !matching.metadata?.sourcePath
+          || protocol.compareRevisions(matching.revision, evicted.revision) <= 0))) {
+          fail("Evicted file no longer matches this path", "remote_object_changed");
+        }
       }
     };
     await checkLocalCache();
