@@ -1247,3 +1247,43 @@ cold recovery tests. Windows 11 NTFS does NOT demonstrate Windows 10 CFAPI;
 process exits do NOT demonstrate physical powercut. No merge, deploy, release,
 production activation, Draft removal, or Root/main change is authorized.
 **PRODUCT NO-GO; INDEPENDENT CUSTODY NO-GO; MERGE NO-GO; RELEASE NO-GO.**
+
+### Exact-SHA post-handoff clarification (not a production acceptance)
+
+The earlier #301 `1b608915` checkpoint is historical. The later local chain
+reaches `bba41b9f1c8f094b72d5e0f6de1d9520df4ea035` after `d922ddbf`;
+the alternative child `72d65e4b9e2015cbfb2b3da9c7e75d01e34011fc` has
+the same Git tree, not an additional integrated security fix. Independent
+reviewers returned **SOURCE NO-GO** for the newer `bba` tree: dynamically
+rebinding the clock/nonce/authorization functions after hostile KeyObject
+getters; iterating owner keys with a replaceable Array iterator after such a
+getter; and reading expected account scope, operation, inventory minimum floor
+or nonce too late (including signed old-A snapshot replay against B). A
+source finding without a physical RED must not be reported as a physically
+reproduced exploit. Final implementation, two new reviews of its exact SHA,
+and Windows/WSL evidence remain outstanding.
+
+The #302 local `7baea943b655785d782c93ec000d21dc3271fc03` is a test-only
+child of `cadf27899e092e6136cbcb1b894da95a0aec8473` that strengthens a
+genuine owner-Ed25519-A SQLite retarget oracle: it requires successful A
+bootstrap, zero prototype-retarget INSERTs, independently opened A rows in
+both real SQLite databases, and cold reopen retaining A. In a newly isolated
+Windows Node22 worktree, its two focused files completed **62 PASS, 0 FAIL,
+4 SKIP**. This is DEV-OFF regression coverage, not external custody. A first
+independent SOURCE GO was received; Linux/ext4 and final publication gates
+are still outstanding as of this evidence checkpoint.
+
+The #298 child `5eca8be765c232973f39e03ca89f14fc518a0484` received two
+independent narrow SOURCE GO and passed Windows Node22 controlled-restore
+**18 PASS, 0 FAIL, 1 SKIP**, plus a separate 1 PASS foreign-FD test. Its
+CodeQL configuration excludes only deliberately vulnerable Issue #67
+experimental lab files, never production or security tests. The published
+`e209a6ee` GHAS CodeQL check remains failed; no hosted CI result for the
+child may be inferred. WSL/ext4 testing is still unverified.
+
+No one of these results opens the native `RootSession`. Root A and every
+ancestor need independently enrolled and held OS identities before mutable
+name lookup, an isolated self-hosted operator, native atomic no-replace,
+durable cold PREPARE/COMMIT, replay/revocation fencing and genuine positive
+CFAPI hydration/pin/unpin/eviction/picker. Windows 10 physical CFAPI and real
+powercut remain independent external gates. **MERGE NO-GO / RELEASE NO-GO.**
