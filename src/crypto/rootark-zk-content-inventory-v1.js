@@ -138,10 +138,13 @@ function normalizeEntries(value) {
   let keys;
   try { keys = NATIVE_OWN_KEYS(value); } catch (_) { fail("INVENTORY_ENTRIES"); }
   if (keys.length !== length + 1 || !keys.includes("length")) fail("INVENTORY_ENTRIES");
-  const entries = new Array(length);
+  // The global Array constructor is mutable after an inherited native
+  // KeyObject getter. A literal cannot be redirected into an attacker Proxy.
+  const entries = [];
+  entries.length = length;
   let previous = null;
   for (let i = 0; i < length; i += 1) {
-    const descriptor = NATIVE_DESCRIPTOR(value, String(i));
+    const descriptor = NATIVE_DESCRIPTOR(value, i);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_ENTRIES");
     const entry = normalizeEntry(descriptor.value);
     if (previous) {
@@ -160,7 +163,7 @@ function normalizeEntries(value) {
     // setters before decoding. Normalized signed entries must own their DATA
     // slots, not inherit a getter that changes from A at signature time to B
     // at requested-item lookup.
-    NATIVE_DEFINE_PROPERTY(entries, String(i), {
+    NATIVE_DEFINE_PROPERTY(entries, i, {
       value: entry, enumerable: true, configurable: true, writable: true,
     });
     previous = entry;
@@ -584,7 +587,7 @@ function normalizeCommittedProofChain(input) {
   const result = [];
   let total = 0;
   for (let i = 0; i < input.length; i += 1) {
-    const descriptor = NATIVE_DESCRIPTOR(input, String(i));
+    const descriptor = NATIVE_DESCRIPTOR(input, i);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_CHAIN");
     const value = descriptor.value;
     if (!isBytes(value) || (typeof SharedArrayBuffer !== "undefined"
