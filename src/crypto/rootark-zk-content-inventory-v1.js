@@ -9,9 +9,11 @@ const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   bufferCompare: NATIVE_BUFFER_COMPARE, ownDescriptor: NATIVE_DESCRIPTOR,
   ownKeys: NATIVE_OWN_KEYS, getPrototype: NATIVE_GET_PROTOTYPE,
   objectCreate: NATIVE_OBJECT_CREATE, hasOwn: NATIVE_HAS_OWN,
-  defineProperty: NATIVE_DEFINE_PROPERTY } =
+  defineProperty: NATIVE_DEFINE_PROPERTY, apply: NATIVE_APPLY } =
   require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
+// Capture sorting before a caller-owned native KeyObject getter can rebind it.
+const NATIVE_ARRAY_SORT = Array.prototype.sort;
 
 const SNAPSHOT_TYPE = "rootark-content-inventory-snapshot/v1";
 const VERSION = 1;
@@ -606,8 +608,15 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
   if (receipts.length !== delta || delta < 1) fail("INVENTORY_CHAIN");
   let sequence = previous.sequence;
   let root = NATIVE_BUFFER_FROM(previous.root);
-  let entries = previous.entries.slice();
-  for (const serialized of receipts) {
+  // The signed bytes were copied before the caller-owned key getter ran.
+  // Never revisit a mutable iterator/slice/spread/sort after that callback.
+  let entries = [];
+  for (let i = 0; i < previous.entries.length; i += 1) {
+    NATIVE_DEFINE_PROPERTY(entries, i, { value: previous.entries[i],
+      enumerable: true, configurable: true, writable: true });
+  }
+  for (let receiptIndex = 0; receiptIndex < receipts.length; receiptIndex += 1) {
+    const serialized = receipts[receiptIndex];
     let decoded;
     try { decoded = await z.decodeDeterministic(serialized); }
     catch (_) { fail("INVENTORY_ENCODING"); }
@@ -628,8 +637,16 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
     if (verified.sequence !== sequence + 1
       || row.expected_sequence !== sequence
       || !sameBytes(copyBytes(row.expected_root, 32), root)) fail("INVENTORY_CHAIN");
-    entries = normalizeEntries([...entries, verified.tuple].sort((a, b) =>
-      NATIVE_BUFFER_COMPARE(a.object_id, b.object_id) || a.revision - b.revision));
+    const nextEntries = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      NATIVE_DEFINE_PROPERTY(nextEntries, index, { value: entries[index],
+        enumerable: true, configurable: true, writable: true });
+    }
+    NATIVE_DEFINE_PROPERTY(nextEntries, entries.length, { value: verified.tuple,
+      enumerable: true, configurable: true, writable: true });
+    NATIVE_APPLY(NATIVE_ARRAY_SORT, nextEntries, [(a, b) =>
+      NATIVE_BUFFER_COMPARE(a.object_id, b.object_id) || a.revision - b.revision]);
+    entries = normalizeEntries(nextEntries);
     const calculated = await computeRoot(scope, verified.sequence, root, entries);
     if (!sameBytes(calculated, verified.root)) fail("INVENTORY_CHAIN");
     sequence = verified.sequence;

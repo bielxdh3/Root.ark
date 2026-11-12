@@ -1397,6 +1397,79 @@ test("multiple inventory revisions require a complete signed operation chain fro
   await assert.rejects(inventory.verifySnapshot({
     ...args, committedProofChain: [receipts[0], tampered, receipts[2]],
   }));
+  // Real signer issued A0/A1/A2, but the caller supplies the DIFFERENT,
+  // tampered B1 bytes. A native public-key getter can change this realm's
+  // iterator after the B bytes are copied and before proof-chain verification.
+  // A forged iterator may yield valid A1 instead of the supplied B1.
+  const inherited = Object.create(f.keys.publicKey);
+  const originalIterator = Array.prototype[Symbol.iterator];
+  let getterReads = 0;
+  let replacedReceipts = 0;
+  Object.defineProperty(inherited, "type", { get() {
+    getterReads++;
+    Array.prototype[Symbol.iterator] = function*() {
+      if (this.length === 3 && Buffer.isBuffer(this[1])
+        && this[1].equals(tampered)
+        && /\bverifyInterveningProofChain\b/.test(new Error().stack)) {
+        replacedReceipts++;
+        yield receipts[0]; yield receipts[1]; yield receipts[2];
+        return;
+      }
+      yield* Reflect.apply(originalIterator, this, []);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(inventory.verifySnapshot({
+      ...args, pinnedPublicKey: inherited,
+      committedProofChain: [receipts[0], tampered, receipts[2]],
+    }), /INVENTORY_/,
+    "signed genuine A1 must not replace physically supplied corrupt B1 via a post-key iterator");
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+  }
+  assert.ok(getterReads > 0, "real native pinned KeyObject getter must execute");
+  assert.equal(replacedReceipts, 0,
+    "proof-chain verifier must not consult an iterator replaced after the key callback");
+  const afterAttack = await inventory.verifySnapshot({
+    ...args, committedProofChain: receipts,
+  });
+  assert.equal(afterAttack.verifiedInterveningReceipts, 3,
+    "actual authentic A0/A1/A2 chain remains accepted");
+  // An attacker callback must not be allowed to poison the array-copy or
+  // sorting primitive and deny a genuine three-receipt Ed25519 history.
+  for (const method of ["slice", "sort"]) {
+    const native = Array.prototype[method];
+    const pinned = Object.create(f.keys.publicKey);
+    let keyReads = 0;
+    let intercepted = 0;
+    Object.defineProperty(pinned, "type", { get() {
+      keyReads++;
+      Array.prototype[method] = function(...arguments_) {
+        // Target only the verifier's DIRECT late array operation, not
+        // unrelated internals in the canonical CBOR library's call stack.
+        const directCaller = (new Error().stack || "").split("\n")[2] || "";
+        if (/\bverifyInterveningProofChain\b/.test(directCaller)) {
+          intercepted++;
+          throw new Error("HOSTILE_ARRAY_" + method.toUpperCase());
+        }
+        return Reflect.apply(native, this, arguments_);
+      };
+      return "public";
+    } });
+    try {
+      const valid = await inventory.verifySnapshot({
+        ...args, pinnedPublicKey: pinned, committedProofChain: receipts,
+      });
+      assert.equal(valid.verifiedInterveningReceipts, 3,
+        `signed A chain remains valid when late Array.${method} is poisoned`);
+    } finally {
+      Array.prototype[method] = native;
+    }
+    assert.ok(keyReads > 0, `native getter exercised in ${method} attack`);
+    assert.equal(intercepted, 0,
+      `proof-chain reconstruction must not use late Array.${method}`);
+  }
   await assert.rejects(inventory.verifySnapshot({
     ...args, committedProofChain: [Buffer.alloc(inventory.MAX_COMMITTED_PROOF_BYTES + 1)],
   }), /INVENTORY_LIMIT/);
