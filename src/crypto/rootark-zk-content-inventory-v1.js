@@ -159,7 +159,13 @@ function normalizeEntries(value) {
     } else if (entry.revision !== 1) {
       fail("INVENTORY_ORDER");
     }
-    entries[i] = entry;
+    // A caller-owned KeyObject getter may have installed inherited numeric
+    // Array setters before this signed snapshot is decoded. Assignment can
+    // leave a hole whose inherited getter later returns different A/B rows
+    // between signature verification and membership. Define own DATA slots.
+    NATIVE_DEFINE_PROPERTY(entries, String(i), {
+      value: entry, enumerable: true, configurable: true, writable: true,
+    });
     previous = entry;
   }
   return entries;
