@@ -143,7 +143,9 @@ function ownerPayload(payload) {
     NATIVE_DEFINE_PROPERTY(names, String(index), { value: item,
       enumerable: true, writable: true, configurable: true });
   }
-  return { ...p, covered_compartments: names };
+  // The verified statement is retained by the history caller alongside its
+  // digest. Neither coverage nor grants may be rewritten after verification.
+  return { ...p, covered_compartments: NATIVE_FREEZE(names), grants: NATIVE_FREEZE([]) };
 }
 function signatureBytes(domain, payload) {
   return NATIVE_BUFFER_CONCAT([domain, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(payload), "utf8")]);

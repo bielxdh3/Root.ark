@@ -1,6 +1,11 @@
 "use strict";
 
 const crypto = require("node:crypto");
+// Load the shared native snapshot before any caller-owned KeyObject getter.
+const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST } =
+  require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
 const SNAPSHOT_TYPE = "rootark-content-inventory-snapshot/v1";
@@ -243,7 +248,7 @@ async function createTerminalProof(input) {
     signerKeyId, scope, reason: raw.reason, requestDigest: hash(encodedOperation),
     observedSequence, observedRoot, priorRevision, priorEpoch, blockingOperationId,
   }, operation);
-  const signature = crypto.sign(null, Buffer.concat([
+  const signature = NATIVE_SIGN(null, Buffer.concat([
     TERMINAL_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), privateKey);
@@ -312,7 +317,7 @@ async function verifyTerminalProof(input) {
   delete unsigned.signature;
   let valid = false;
   try {
-    valid = crypto.verify(null, Buffer.concat([
+    valid = NATIVE_VERIFY(null, Buffer.concat([
       TERMINAL_DOMAIN,
       await z.encodeDeterministic(unsigned),
     ]), publicKey, signature);
@@ -382,7 +387,7 @@ async function verifyCommittedEntryProof(input) {
   if (!sameBytes(serialized, await z.encodeDeterministic({ ...unsigned, signature }))) {
     fail("INVENTORY_ENCODING");
   }
-  if (!crypto.verify(null, Buffer.concat([ENTRY_DOMAIN,
+  if (!NATIVE_VERIFY(null, Buffer.concat([ENTRY_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), publicKey, signature)) fail("INVENTORY_SIGNATURE");
   return {
@@ -419,11 +424,13 @@ async function readVerifiedCommittedOperation({ serialized, pinnedPublicKey,
 
 function sameBytes(a, b) {
   return Buffer.isBuffer(a) && Buffer.isBuffer(b)
-    && a.length === b.length && crypto.timingSafeEqual(a, b);
+    && a.length === b.length && NATIVE_TIMING_SAFE_EQUAL(a, b);
 }
 
 function hash(value) {
-  return crypto.createHash("sha256").update(value).digest();
+  const digest = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(digest, value);
+  return NATIVE_HASH_DIGEST.call(digest);
 }
 
 function rootBody(scope, sequence, previousRoot, entries) {
@@ -482,7 +489,7 @@ async function createSignedSnapshot(input) {
     root,
     nonce,
   };
-  const signature = crypto.sign(null, Buffer.concat([
+  const signature = NATIVE_SIGN(null, Buffer.concat([
     SNAPSHOT_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), privateKey);
@@ -518,7 +525,7 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
   const unsigned = { ...body, signer_key_id: signerKeyId, root, nonce };
   let valid = false;
   try {
-    valid = crypto.verify(null, Buffer.concat([
+    valid = NATIVE_VERIFY(null, Buffer.concat([
       SNAPSHOT_DOMAIN,
       await z.encodeDeterministic(unsigned),
     ]), publicKey, signature);
