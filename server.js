@@ -2801,6 +2801,15 @@ async function pauseShareAccessForTest(point) {
   if (process.env.NODE_ENV !== "test" || process.env.ROOTARK_TEST_SHARE_PAUSE_POINT !== point) return;
   if (point === "exchange-commit" && process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER) {
     fs.writeFileSync(process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER, "snapshot-read-before-admission");
+    if (process.env.ROOTARK_TEST_SHARE_PAUSE_RELEASE) {
+      const release = process.env.ROOTARK_TEST_SHARE_PAUSE_RELEASE;
+      const deadline = Date.now() + 15_000;
+      while (!fs.existsSync(release)) {
+        if (Date.now() >= deadline) throw new Error("Test exchange-commit release barrier expired");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return;
+    }
   }
   await new Promise((resolve) => setTimeout(resolve, Number(process.env.ROOTARK_TEST_SHARE_PAUSE_MS) || 0));
 }
