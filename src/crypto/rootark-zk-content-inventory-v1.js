@@ -8,7 +8,8 @@ const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST,
   bufferCompare: NATIVE_BUFFER_COMPARE, ownDescriptor: NATIVE_DESCRIPTOR,
   ownKeys: NATIVE_OWN_KEYS, getPrototype: NATIVE_GET_PROTOTYPE,
-  objectCreate: NATIVE_OBJECT_CREATE, hasOwn: NATIVE_HAS_OWN } =
+  objectCreate: NATIVE_OBJECT_CREATE, hasOwn: NATIVE_HAS_OWN,
+  defineProperty: NATIVE_DEFINE_PROPERTY } =
   require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
@@ -155,7 +156,13 @@ function normalizeEntries(value) {
     } else if (entry.revision !== 1) {
       fail("INVENTORY_ORDER");
     }
-    entries[i] = entry;
+    // A caller-owned KeyObject callback may install inherited numeric Array
+    // setters before decoding. Normalized signed entries must own their DATA
+    // slots, not inherit a getter that changes from A at signature time to B
+    // at requested-item lookup.
+    NATIVE_DEFINE_PROPERTY(entries, String(i), {
+      value: entry, enumerable: true, configurable: true, writable: true,
+    });
     previous = entry;
   }
   return entries;
