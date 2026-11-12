@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const { runOfflineSigner } =
   require("./support/issue-65-owner-inventory-offline-runner");
 const inventory = require("../src/crypto/rootark-zk-content-inventory-v1");
-const { SCHEMA, checkpointDigest, verifyOwnerInventoryEnrollment } =
+const { SCHEMA, FIELDS, checkpointDigest, verifyOwnerInventoryEnrollment } =
   require("../src/crypto/rootark-zk1-owner-inventory-trust-head");
 const portable = require("../public/client/rootark-zk1-owner-inventory-trust-head");
 
@@ -178,4 +178,115 @@ test("owner-signed A never authorizes forged checkpoint B when owner KeyObject g
   const positive = await verifyOwnerInventoryEnrollment(f.enrollment);
   assert.equal(positive.ownerSignatureVerified, true,
     "genuinely signed A stays accepted after the negative");
+});
+
+test("owner KeyObject callback cannot rewrite independently expected account B to owner-signed A", async () => {
+  const f = await fixture();
+  const expectedB = { ...f.scope, account_id: crypto.randomBytes(16) };
+  assert.notDeepEqual(expectedB.account_id, f.scope.account_id);
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der" }), type: "spki", format: "der" });
+  let called = 0;
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    called++;
+    expectedB.account_id = Buffer.from(f.scope.account_id);
+    return "public";
+  } });
+  let accepted = false;
+  try {
+    try {
+      await verifyOwnerInventoryEnrollment({ ...f.enrollment,
+        ownerPublicKey: owner, expectedScope: expectedB });
+      accepted = true;
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+  } finally { delete owner.type; }
+  assert.ok(called > 0, "attacker-owned KeyObject getter must execute");
+  assert.equal(accepted, false,
+    "initial operator-expected B must not be replaced by owner-signed A");
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
+});
+
+test("genuine signed checkpoint A cannot authorize unsigned B by post-getter Buffer.concat retarget", async () => {
+  const f = await fixture();
+  const authentic = f.signed.checkpoints[0];
+  const forgedB = { ...authentic, issued_at: authentic.issued_at - 1 };
+  const digestB = checkpointDigest(forgedB);
+  const originalConcat = Buffer.concat;
+  const domain = Buffer.from("Root.ark/zk-1/owner-inventory-trust-head/v1\0", "ascii");
+  const unsignedA = Object.fromEntries(FIELDS.map((name) => [name, authentic[name]]));
+  const signatureBytesA = originalConcat([domain,
+    Buffer.from(JSON.stringify(unsignedA), "utf8")]);
+  let substituted = 0;
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der" }), type: "spki", format: "der" });
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    Buffer.concat = function(parts, ...args) {
+      if (substituted === 0 && Array.isArray(parts) && parts.length === 2
+          && Buffer.isBuffer(parts[0]) && parts[0].equals(domain)) {
+        substituted++;
+        return Buffer.from(signatureBytesA);
+      }
+      return originalConcat.call(Buffer, parts, ...args);
+    };
+    return "public";
+  } });
+  let accepted = false;
+  try {
+    try {
+      await verifyOwnerInventoryEnrollment({ ...f.enrollment,
+        ownerPublicKey: owner, checkpoints: [forgedB],
+        independentRetainedCheckpointDigest: digestB });
+      accepted = true;
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+  } finally {
+    Buffer.concat = originalConcat;
+    delete owner.type;
+  }
+  assert.equal(accepted, false, "genuine signature A cannot attest to B");
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
+});
+
+test("owner A native PublicKey export cannot be spoofed as foreign pinned B via Function.prototype.call", async () => {
+  const f = await fixture();
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der" }), type: "spki", format: "der" });
+  const foreignKey = crypto.generateKeyPairSync("ed25519").publicKey;
+  const foreignDer = foreignKey.export({ type: "spki", format: "der" });
+  const foreignDigest = crypto.createHash("sha256").update(foreignDer).digest("hex");
+  assert.notEqual(foreignDigest, f.enrollment.independentOwnerSpkiSha256);
+  const oldCall = Function.prototype.call;
+  const safeApply = Reflect.apply.bind(Reflect);
+  let keyCallbacks = 0;
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    keyCallbacks++;
+    Function.prototype.call = function(receiver, ...args) {
+      if (receiver === owner && args[0]?.type === "spki" &&
+          args[0]?.format === "der") return Buffer.from(foreignDer);
+      return safeApply(oldCall, this, [receiver, ...args]);
+    };
+    return "public";
+  } });
+  let accepted = false;
+  try {
+    try {
+      await verifyOwnerInventoryEnrollment({
+        ...f.enrollment, ownerPublicKey: owner,
+        independentOwnerSpkiSha256: foreignDigest,
+      });
+      accepted = true;
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+  } finally {
+    Function.prototype.call = oldCall;
+    delete owner.type;
+  }
+  assert.ok(keyCallbacks > 0, "real owner KeyObject getter must be invoked");
+  assert.equal(accepted, false,
+    "genuinely owner-signed A cannot masquerade as independently pinned B");
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
 });
