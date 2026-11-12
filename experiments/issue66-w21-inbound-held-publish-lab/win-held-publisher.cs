@@ -21,6 +21,36 @@ class W21WinHandleLinkLab {
     private const int NtFileLinkInformation = 11; // FILE_INFORMATION_CLASS, NOT Win32 FILE_INFO_BY_HANDLE_CLASS.
     private const int STATUS_OBJECT_NAME_COLLISION = unchecked((int)0xC0000035);
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    // A narrowly scoped, nonauthorizing original-A enrollment experiment.
+    // The Node harness verifies a separately issued *test* Ed25519 receipt;
+    // this helper receives already-verified physical IDs, never a private key.
+    private const uint SYNCHRONIZE = 0x00100000;
+    private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+    private const uint FILE_TRAVERSE = 0x00000020;
+    private const uint FILE_LIST_DIRECTORY = 0x00000001;
+    private const uint OBJ_CASE_INSENSITIVE = 0x40;
+    private const uint OBJ_DONT_REPARSE = 0x1000;
+    private const uint FILE_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_DIRECTORY_FILE = 0x1;
+    private const uint FILE_NON_DIRECTORY_FILE = 0x40;
+    private const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x20;
+    private const int FileAttributeTagInfo = 9;
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING {
+        public ushort Length, MaximumLength;
+        public IntPtr Buffer;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OBJECT_ATTRIBUTES {
+        public int Length;
+        public IntPtr RootDirectory, ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor, SecurityQualityOfService;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_ATTRIBUTE_TAG_INFO {
+        public uint Attributes, ReparseTag;
+    }
     [StructLayout(LayoutKind.Sequential)]
     private struct IO_STATUS_BLOCK {
         public IntPtr Status;
@@ -40,6 +70,22 @@ class W21WinHandleLinkLab {
     [DllImport("ntdll.dll")]
     private static extern int NtSetInformationFile(IntPtr handle, ref IO_STATUS_BLOCK io,
         IntPtr buffer, uint length, int informationClass);
+    [DllImport("ntdll.dll", EntryPoint = "NtCreateFile", ExactSpelling = true)]
+    private static extern int NtCreateFile(out IntPtr handle, uint access,
+        ref OBJECT_ATTRIBUTES attr, out IO_STATUS_BLOCK status, IntPtr allocation,
+        uint attributes, uint share, uint disposition, uint options,
+        IntPtr ea, uint eaLength);
+    [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetAttributeTag(IntPtr handle, int cls,
+        out FILE_ATTRIBUTE_TAG_INFO data, uint length);
+    [DllImport("kernel32.dll", EntryPoint = "GetVolumeInformationByHandleW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeInformationByHandleW(IntPtr handle,
+        StringBuilder volumeName, uint volumeLength, IntPtr serial,
+        IntPtr maxComponent, IntPtr flags, StringBuilder filesystem, uint filesystemLength);
+    [DllImport("kernel32.dll", EntryPoint = "GetDriveTypeW", CharSet = CharSet.Unicode)]
+    private static extern uint GetDriveTypeW(string driveRoot);
 
     private static void Require(bool condition, string stage) {
         if (!condition) throw new Exception("WINDOWS_NATIVE_HANDLE_LAB_FAIL " + stage
@@ -134,6 +180,168 @@ class W21WinHandleLinkLab {
     }
     private static string CurrentSid() {
         return WindowsIdentity.GetCurrent().User.Value;
+    }
+    private static void AssertNativeType(IntPtr handle, bool directory) {
+        FILE_ATTRIBUTE_TAG_INFO tag;
+        Require(GetAttributeTag(handle, FileAttributeTagInfo, out tag,
+            (uint)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO)))
+            && (tag.Attributes & 0x400) == 0
+            && ((tag.Attributes & 0x10) != 0) == directory,
+            "held-native-plain-type");
+    }
+    private static IntPtr OpenNativeRelative(IntPtr parent, string leaf,
+        bool directory, uint share, bool commitSource = false) {
+        Require(!string.IsNullOrEmpty(leaf) && leaf != "." && leaf != ".."
+            && leaf.Length < 256 && leaf.IndexOfAny(new char[] { '\\', '/', ':', '\0' }) == -1,
+            "native-leaf-validation");
+        IntPtr unicode = Marshal.StringToHGlobalUni(leaf);
+        IntPtr nameStruct = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+        try {
+            UNICODE_STRING name = new UNICODE_STRING {
+                Length = (ushort)(leaf.Length * 2),
+                MaximumLength = (ushort)((leaf.Length + 1) * 2), Buffer = unicode,
+            };
+            Marshal.StructureToPtr(name, nameStruct, false);
+            OBJECT_ATTRIBUTES attributes = new OBJECT_ATTRIBUTES {
+                Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+                RootDirectory = parent, ObjectName = nameStruct,
+                Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            };
+            IO_STATUS_BLOCK status;
+            IntPtr opened;
+            uint access = SYNCHRONIZE | FILE_READ_ATTRIBUTES
+                | (directory ? FILE_TRAVERSE | FILE_LIST_DIRECTORY
+                    : (commitSource ? GENERIC_READ | DELETE : 0U));
+            int code = NtCreateFile(out opened, access, ref attributes, out status,
+                IntPtr.Zero, 0x80, share, 1, FILE_OPEN_REPARSE_POINT
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE),
+                IntPtr.Zero, 0);
+            Require(code == 0 && opened != IntPtr.Zero && opened != new IntPtr(-1),
+                "native-relative-open-ntstatus=" + code.ToString("X8"));
+            try { AssertNativeType(opened, directory); return opened; }
+            catch { CloseHandle(opened); throw; }
+        } finally {
+            Marshal.FreeHGlobal(nameStruct);
+            Marshal.FreeHGlobal(unicode);
+        }
+    }
+    // All path parts are lexical only. The OS object walk opens *every*
+    // component via NtCreateFile(RootDirectory=the previously retained HANDLE).
+    // Once pinned, native code never uses that pathname for publication.
+    private sealed class EnrolledOriginal : IDisposable {
+        private readonly System.Collections.Generic.List<IntPtr> held =
+            new System.Collections.Generic.List<IntPtr>();
+        private readonly System.Collections.Generic.List<string> names =
+            new System.Collections.Generic.List<string>();
+        private readonly System.Collections.Generic.List<string> ids =
+            new System.Collections.Generic.List<string>();
+        private readonly uint share;
+        public string EnrolledIds { get { return string.Join(",", ids.ToArray()); } }
+        public EnrolledOriginal(string targetDirectory, bool lockNames) {
+            share = lockNames ? 3U : FILE_SHARE_ALL;
+            string full = Path.GetFullPath(targetDirectory);
+            string drive = Path.GetPathRoot(full);
+            Require(drive != null && drive.Length == 3 && drive[1] == ':'
+                && drive[2] == '\\', "absolute-local-drive-required");
+            Require(GetDriveTypeW(drive) == 3U, "local-fixed-drive-required");
+            // This native drive-root anchor is checked against the enrolled
+            // original FileId too. Independent volume/mount trust is absent.
+            IntPtr root = CreateFileW(drive, SYNCHRONIZE | FILE_READ_ATTRIBUTES
+                | FILE_TRAVERSE | FILE_LIST_DIRECTORY, share, IntPtr.Zero,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                IntPtr.Zero);
+            Require(root != IntPtr.Zero && root != new IntPtr(-1), "drive-root-open");
+            held.Add(root);
+            try {
+                AssertNativeType(root, true);
+                StringBuilder filesystem = new StringBuilder(32);
+                Require(GetVolumeInformationByHandleW(root, null, 0, IntPtr.Zero,
+                    IntPtr.Zero, IntPtr.Zero, filesystem, 32)
+                    && string.Equals(filesystem.ToString(), "NTFS", StringComparison.OrdinalIgnoreCase),
+                    "physical-NTFS-required");
+                ids.Add(FileId(root));
+                string[] parts = full.Substring(drive.Length).TrimEnd('\\')
+                    .Split(new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                Require(parts.Length > 1 && parts.Length <= 32, "bounded-directory-depth");
+                foreach (string part in parts) {
+                    IntPtr child = OpenNativeRelative(held[held.Count - 1], part, true, share);
+                    held.Add(child);
+                    names.Add(part);
+                    ids.Add(FileId(child));
+                }
+                // Keep source DELETE-capable for the real held-HANDLE link.
+                // In locked mode its own share=3 prevents hostile source
+                // renames; read-only reopens below must permit original
+                // DELETE access via share=7, while requesting no DELETE.
+                IntPtr source = OpenNativeRelative(held[held.Count - 1], "source", false,
+                    share, true);
+                held.Add(source);
+                ids.Add(FileId(source));
+            } catch { Dispose(); throw; }
+        }
+        public bool Matches(string expected) {
+            string[] enrolled = expected.Split(',');
+            if (enrolled.Length != ids.Count) return false;
+            for (int i = 0; i < enrolled.Length; i++) {
+                if (!string.Equals(enrolled[i], ids[i], StringComparison.Ordinal)) return false;
+            }
+            return true;
+        }
+        public bool StillNamedOriginal() {
+            for (int i = 0; i < held.Count; i++) {
+                if (!string.Equals(FileId(held[i]), ids[i], StringComparison.Ordinal)) return false;
+                if (i == 0) continue;
+                IntPtr reopened = IntPtr.Zero;
+                try {
+                    reopened = OpenNativeRelative(held[i - 1],
+                        i == held.Count - 1 ? "source" : names[i - 1],
+                        i != held.Count - 1,
+                        i == held.Count - 1 ? FILE_SHARE_ALL : share);
+                    if (!string.Equals(FileId(reopened), ids[i], StringComparison.Ordinal)) return false;
+                } catch { return false; }
+                finally { if (reopened != IntPtr.Zero) CloseHandle(reopened); }
+            }
+            return true;
+        }
+        public bool CommitLink(out int status) {
+            return SetHeldName(held[held.Count - 1], held[held.Count - 2],
+                "published", NtFileLinkInformation, out status);
+        }
+        public void Dispose() {
+            for (int i = held.Count - 1; i >= 0; i--) CloseHandle(held[i]);
+            held.Clear();
+        }
+    }
+    private static int EnrolledMode(string[] args) {
+        Require(args.Length >= 3, "enrolled-args");
+        bool lockNames = args[1] == "locked";
+        Require(args[1] == "locked" || args[1] == "movable", "enrollment-mode");
+        using (EnrolledOriginal original = new EnrolledOriginal(args[2], lockNames)) {
+            if (args[0] == "enroll") {
+                Console.WriteLine("ENROLLED|" + original.EnrolledIds);
+                return 0;
+            }
+            Require(args[0] == "publish" && args.Length == 4, "publication-args");
+            if (!original.Matches(args[3])) {
+                Console.WriteLine("REJECTED|ENROLLED_ORIGINAL_MISMATCH");
+                return 21;
+            }
+            Console.WriteLine("PINNED|" + CurrentSid() + "|" + Process.GetCurrentProcess().Id);
+            Console.Out.Flush();
+            Require(Console.ReadLine() == "COMMIT", "commit-signal");
+            if (!original.StillNamedOriginal()) {
+                Console.WriteLine("REJECTED|ORIGINAL_ANCESTRY_REBOUND");
+                return 22;
+            }
+            int status;
+            if (!original.CommitLink(out status)) {
+                Console.WriteLine("REJECTED|NO_REPLACE_" + status.ToString("X8"));
+                return 23;
+            }
+            Console.WriteLine("PUBLISHED|HELD_SOURCE|NO_REPLACE|" + CurrentSid());
+            return 0;
+        }
     }
     private static string ReadWhileNativeHandleRetained(string name) {
         // The lab's PREPARE source was opened with DELETE access. A normal
@@ -321,6 +529,8 @@ class W21WinHandleLinkLab {
     }
     public static int Main(string[] args) {
         try {
+            if (args.Length > 0 && (args[0] == "enroll" || args[0] == "publish"))
+                return EnrolledMode(args);
             if (args.Length == 3 && args[0] == "attacker") return Attacker(args[1], args[2]);
             if (args.Length == 1 && args[0] == "rename") return ParentRename();
             if (args.Length == 0) return Parent();
