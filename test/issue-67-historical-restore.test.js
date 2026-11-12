@@ -132,6 +132,52 @@ test("#67: historical MOVE restores authenticated file bytes, not the encrypted 
   assert.equal(f.current().revision.counter, 4);
 });
 
+test("#67 P2: stale tracked source cannot restore after an authenticated remote MOVE", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.local, "document.txt");
+  const destination = path.join(f.local, "moved.txt");
+  const originalBytes = Buffer.from("original authenticated bytes");
+  await fsp.writeFile(source, originalBytes);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(originalBytes).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const moved = await f.sign({ operation: "move", operationId: "trusted-move-op",
+    versionId: "trusted-move-version", revision: { counter: 2, deviceId: "device-a" },
+    baseRevision: f.original.revision,
+    metadata: { path: "moved.txt", sourcePath: "document.txt" },
+    plaintext: protocol.encodeMovePayload(originalBytes, f.privateFileKey),
+  });
+  assert.equal(await verifyAuthorizationProof(moved.authorization, moved, f.trusted), true);
+  f.versions.splice(1, 1, moved);
+  f.setCurrent(moved);
+
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict",
+    "restore must not duplicate a signed identity at stale and current paths");
+  assert.deepEqual(await fsp.readFile(source), originalBytes);
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+
+  // The fixture's historical `list(objectId)` returns a single record;
+  // the ordinary sync pull uses `list()` and expects a record collection.
+  const historyList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? historyList(objectId) : [await historyList()];
+  const synced = await f.engine.syncOnce();
+  assert.equal(synced.offline, false);
+  assert.equal(fs.existsSync(source), false, "verified MOVE reconciles the old name");
+  assert.deepEqual(await fsp.readFile(destination), originalBytes);
+  const result = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(result.pushed, true, "normal restore succeeds after reconciling the signed MOVE");
+  assert.equal(f.current().revision.counter, 3);
+  assert.equal(fs.existsSync(source), false);
+  assert.deepEqual(await fsp.readFile(destination), originalBytes);
+});
+
 test("#67: restore never overwrites untracked local data or accepts a cross-object current head", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
