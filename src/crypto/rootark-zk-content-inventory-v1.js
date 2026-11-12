@@ -3,8 +3,10 @@
 const crypto = require("node:crypto");
 // Load the shared native snapshot before any caller-owned KeyObject getter.
 const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
-  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, createHash: NATIVE_CREATE_HASH,
-  hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST } =
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
+  bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM,
+  hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST,
+  bufferCompare: NATIVE_BUFFER_COMPARE } =
   require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
@@ -140,7 +142,7 @@ function normalizeEntries(value) {
     if (!descriptor || !Object.hasOwn(descriptor, "value")) fail("INVENTORY_ENTRIES");
     const entry = normalizeEntry(descriptor.value);
     if (previous) {
-      const objectOrder = Buffer.compare(previous.object_id, entry.object_id);
+      const objectOrder = NATIVE_BUFFER_COMPARE(previous.object_id, entry.object_id);
       if (objectOrder > 0) fail("INVENTORY_ORDER");
       if (objectOrder === 0) {
         if (entry.revision === previous.revision) fail("INVENTORY_DUPLICATE");
@@ -598,7 +600,7 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
       || row.expected_sequence !== sequence
       || !sameBytes(copyBytes(row.expected_root, 32), root)) fail("INVENTORY_CHAIN");
     entries = normalizeEntries([...entries, verified.tuple].sort((a, b) =>
-      Buffer.compare(a.object_id, b.object_id) || a.revision - b.revision));
+      NATIVE_BUFFER_COMPARE(a.object_id, b.object_id) || a.revision - b.revision));
     const calculated = await computeRoot(scope, verified.sequence, root, entries);
     if (!sameBytes(calculated, verified.root)) fail("INVENTORY_CHAIN");
     sequence = verified.sequence;
@@ -656,7 +658,7 @@ async function verifySnapshot(input) {
 
   let matched = null;
   for (const entry of current.entries) {
-    const order = Buffer.compare(entry.object_id, requested.object_id);
+    const order = NATIVE_BUFFER_COMPARE(entry.object_id, requested.object_id);
     if (order > 0) break;
     if (order === 0 && entry.revision === requested.revision) {
       if (entry.epoch !== requested.epoch

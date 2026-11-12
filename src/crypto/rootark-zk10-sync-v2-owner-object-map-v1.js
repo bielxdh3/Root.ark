@@ -19,6 +19,8 @@ const {
   bufferConcat: NATIVE_BUFFER_CONCAT,
   bufferByteLength: NATIVE_BUFFER_BYTE_LENGTH,
   bufferToString: NATIVE_BUFFER_TO_STRING,
+  arrayIncludes: NATIVE_ARRAY_INCLUDES,
+  arraySome: NATIVE_ARRAY_SOME,
   arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
   ownKeys: NATIVE_OWN_KEYS,
   ownDescriptor: NATIVE_OWN_DESCRIPTOR,
@@ -192,7 +194,7 @@ function copyJson(value, depth = 0, budget = { nodes: 0, bytes: 0 }) {
     || typeof value === "number" || typeof value === "boolean") return value;
   if (depth > 8 || !value || typeof value !== "object") deny();
   const array = NATIVE_ARRAY_IS_ARRAY(value);
-  if (!array && ![Object.prototype, null].includes(NATIVE_GET_PROTOTYPE(value))) deny();
+  if (!array && !NATIVE_ARRAY_INCLUDES.call([Object.prototype, null], NATIVE_GET_PROTOTYPE(value))) deny();
   const names = NATIVE_OWN_KEYS(value);
   if (names.length > 100 || (array && names.length !== value.length + 1)) deny();
   const result = array ? [] : NATIVE_OBJECT_CREATE(null);
@@ -259,7 +261,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       nativePublic(s.witnessPublicKey), nativePublic(s.casPublicKey)];
     // A forged instance `.export` or `.type` never makes the SAME real
     // owner/provisioner/witness/CAS signer an independent CURRENT authority.
-    if (roleKeys.some((role) => samePublicKey(authorityKey, role)
+    if (NATIVE_ARRAY_SOME.call(roleKeys, (role) => samePublicKey(authorityKey, role)
       || authorityHash === spkiHash(role))) deny();
     const floor = exact(a.independentlyRetainedFloor, ["sequence", "digest"]);
     number(floor.sequence);
@@ -390,8 +392,8 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         const device = normalized.deviceId;
         if (live.username !== localPolicy.username
           || live.trustedDevicePublicKeys[device] !== localPolicy.trustedDevicePublicKeys[device]
-          || live.revokedDeviceIds.includes(device)
-          || localPolicy.revokedDeviceIds.includes(device)) deny();
+          || NATIVE_ARRAY_INCLUDES.call(live.revokedDeviceIds, device)
+          || NATIVE_ARRAY_INCLUDES.call(localPolicy.revokedDeviceIds, device)) deny();
         // Two concurrent readbacks may both be valid. The sequence is consumed
         // only after the awaited authority verification, on the same JS turn.
         if (signal?.aborted || payload.mapping_sequence <= lastAcceptedSequence) deny();
