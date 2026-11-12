@@ -91,7 +91,11 @@ async function startFixture(t, mode, extraEnv = {}) {
       DB_AUTO_BACKUP_ON_START: "false",
     }
     : { DB_ENABLED: "false" };
-  const env = { ...process.env, ...dbEnv, ...extraEnv, NODE_ENV: "test", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  const pauseMarker = path.join(sandbox, "share-exchange-read-complete.marker");
+  const env = { ...process.env, ...dbEnv, ...extraEnv,
+    ...(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT === "exchange-commit"
+      ? { ROOTARK_TEST_SHARE_PAUSE_MARKER: pauseMarker } : {}),
+    NODE_ENV: "test", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   for (const key of Object.keys(env)) if (/^(AWS_|GOOGLE_DRIVE_)/.test(key)) delete env[key];
   delete env.TRUSTED_PROXIES;
   const port = await getUnusedPort();
@@ -195,7 +199,7 @@ async function startFixture(t, mode, extraEnv = {}) {
     });
   };
 
-  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password };
+  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password, pauseMarker };
 }
 
 function viewerCookieFrom(response) {
@@ -259,7 +263,7 @@ for (const mode of ["json", "sqlite"]) {
 }
 
 test("SQLite exchange cannot revoke a new share or lose a parallel alias after its stale read", { timeout: 60_000 }, async (t) => {
-  const { authed, port, origin, dataDir } = await startFixture(t, "sqlite", {
+  const { authed, port, origin, dataDir, pauseMarker } = await startFixture(t, "sqlite", {
     ROOTARK_TEST_SHARE_PAUSE_POINT: "exchange-commit",
     ROOTARK_TEST_SHARE_PAUSE_MS: "2500",
   });
@@ -278,7 +282,12 @@ test("SQLite exchange cannot revoke a new share or lose a parallel alias after i
   // The disposable server suspends *after* its second read of the entire
   // public links map, where the pre-fix savePublicLinks() reused stale data.
   const firstPromise = exchange();
-  await new Promise((resolve) => setTimeout(resolve, 350));
+  const deadline = Date.now() + 10_000;
+  while (!fs.existsSync(pauseMarker) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(fs.readFileSync(pauseMarker, "utf8"), "snapshot-read-before-admission",
+    "real server reached the vulnerable post-snapshot pause before B is created");
   const independent = await authed("/share/capabilities", settings);
   assert.equal(independent.status, 201, independent.body);
   const otherToken = JSON.parse(independent.body).token;
