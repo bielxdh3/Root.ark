@@ -15,11 +15,13 @@ const { types: { isProxy } } = require("node:util");
 const APPLY = Reflect.apply.bind(Reflect);
 const BUFFER_FROM = Buffer.from.bind(Buffer);
 const BUFFER_CONCAT = Buffer.concat.bind(Buffer);
+const BUFFER_COMPARE = Buffer.compare.bind(Buffer);
 const BUFFER_TO_STRING = Buffer.prototype.toString;
 const BUFFER_BYTE_LENGTH = Buffer.byteLength.bind(Buffer);
 const ARRAY_JOIN = Array.prototype.join;
 const ARRAY_PUSH = Array.prototype.push;
 const ARRAY_INCLUDES = Array.prototype.includes;
+const ARRAY_SOME = Array.prototype.some;
 const ARRAY_SORT = Array.prototype.sort;
 const ARRAY_IS_ARRAY = Array.isArray.bind(Array);
 const OWN_KEYS = Reflect.ownKeys.bind(Reflect);
@@ -147,11 +149,13 @@ module.exports = Object.freeze({
   jsonParse: JSON_PARSE,
   bufferFrom: BUFFER_FROM,
   bufferConcat: BUFFER_CONCAT,
+  bufferCompare: BUFFER_COMPARE,
   bufferToString: withSafeCall(BUFFER_TO_STRING),
   bufferByteLength: BUFFER_BYTE_LENGTH,
   arrayJoin: withSafeCall(ARRAY_JOIN),
   arrayPush: withSafeCall(ARRAY_PUSH),
   arrayIncludes: withSafeCall(ARRAY_INCLUDES),
+  arraySome: withSafeCall(ARRAY_SOME),
   arrayIsArray: ARRAY_IS_ARRAY,
   ownKeys: OWN_KEYS,
   ownDescriptor: OWN_DESCRIPTOR,

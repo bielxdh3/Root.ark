@@ -244,6 +244,36 @@ test("wrong source owner provisioning, signer pin or current revocation fail", a
       revokedDeviceIds: ["source-device-4"] }) })(f.input), deny);
 });
 
+test("P2 real Ed25519 owner map and live revoked device cannot bypass post-await Array.includes", async () => {
+  const f = await fixture();
+  const revoked = { username: identity.username,
+    trustedDevicePublicKeys: { "source-device-4": b64(keys.device) },
+    revokedDeviceIds: ["source-device-4"] };
+  const originalIncludes = Array.prototype.includes;
+  let callbackRan = false;
+  const authority = { ...f.authority, readCurrentHead: async (...args) => {
+    const signedHead = await f.authority.readCurrentHead(...args);
+    Array.prototype.includes = function(value, ...rest) {
+      if (value === "source-device-4" && this.length === 1
+        && this[0] === "source-device-4") return false;
+      return Reflect.apply(originalIncludes, this, [value, ...rest]);
+    };
+    callbackRan = true;
+    return signedHead;
+  } };
+  const verifier = createOwnerObjectMapVerifier({
+    sourceAuthority: { ...f.sourceAuthority, currentDevicePolicy: () => revoked },
+    zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  });
+  try {
+    await assert.rejects(verifier(f.input), deny);
+  } finally { Array.prototype.includes = originalIncludes; }
+  assert.equal(callbackRan, true, "poison happens inside async signed head callback");
+  const valid = await createOwnerObjectMapVerifier({ sourceAuthority: f.sourceAuthority,
+    zkAuthority: f.zkAuthority, mappingAuthority: f.authority })(f.input);
+  assert.equal(valid.status, "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING");
+});
+
 test("P2 rotated owner signer must NEVER double as independently pinned mapping head signer", async () => {
   const f = await fixture();
   const rotated = crypto.generateKeyPairSync("ed25519");
