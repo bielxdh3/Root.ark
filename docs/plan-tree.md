@@ -798,3 +798,11 @@ When completing a task:
 6. link the PR, issue, validation report, or architecture decision;
 7. select the next item based on remaining risk, not novelty;
 8. stop instead of inventing filler phases.
+
+## 2026-11-11 late Issue #66 four-plane execution checkpoint
+
+1. `[LAB PARTIAL]` PR #300 W31 unpublished `16ea2e919b1b` retains Windows volume-root, every ancestor, and source HANDLEs; NTFS lab 18 PASS/1 expected SKIP reported. Separate same-SID lab issuer is not an independently operated self-hosted custodian; WSL unavailable for this SHA.
+2. `[LAB REVIEWED / NOT PUBLISHED]` PR #298 `5eca8be765c2` (parent published `e209a6ee`) received two independent narrow SOURCE GO for CodeQL lab-only scope and foreign-FD test. Windows targeted 1 PASS; full suite and WSL evidence remain outstanding; exact-child hosted CodeQL/GHAS unavailable.
+3. `[SECURITY BLOCKED]` PR #301 child `1b608915` has worker-reported RED-to-GREEN repairs but still requires two exact-SHA SOURCE GO and Windows/WSL full gates; PR #302 cryptographic/DEV-OFF candidates still require closure of remaining P2 findings and same-SHA independent review; no DEV-OFF result authorizes production IO.
+4. `[PRODUCT BLOCKED]` Implement real protected original-A/all-ancestor native `RootSession`, signed durable PREPARE/COMMIT and positive CFAPI/FOD pin/picker without changing success tests into expected denials.
+5. `[EXTERNAL GATES]` Provision distinct self-hosted operator/monotonic custody, prove Windows 10 CFAPI and physical powercut, then rerun both-platform tests and hosted CI before considering Draft change/merge/release. Current decision: NO-GO.

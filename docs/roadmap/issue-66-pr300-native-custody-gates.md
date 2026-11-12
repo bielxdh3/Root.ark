@@ -1189,3 +1189,57 @@ with the source or change the process mount namespace. It cannot attest a
 signed owner floor or authorize `RootSession`. Real Windows 10 CFAPI,
 Windows native all-ancestor custody, separate-principal isolation and
 hardware powercut gates remain open. **MERGE NO-GO; RELEASE NO-GO**.
+
+## 2026-11-11 late checkpoint: held all-ancestor NTFS evidence and remaining product gates
+
+This checkpoint is newer than earlier dated statements above; it does not rewrite
+historical CI, SOURCE reviews, or previously published SHAs. Published PR #300
+is `c928d894939014767f1a8669946eeca72b29a97e` (OPEN/DRAFT); `Root/main`
+remains `202146bb73ca8577a0a4017c4556cb8b1e9588a6` at last reconciliation.
+
+**LAB (not product):** W31's unpublished child
+`16ea2e919b1bbe443877bae2650f877854c205a1` of `1689985269` adds a
+Windows NTFS native laboratory retaining a volume-root HANDLE, every ancestor
+HANDLE and source HANDLE/FileId. An opt-in enrolled original-A FileId chain is
+signed by a separate Node/Ed25519 laboratory process (same SID), checked in JS
+before the native publisher; native relative opens compare the retained chain,
+then perform held-parent no-replace publication. The implementer reported
+Windows Node22/NTFS **18 PASS / 1 expected Linux SKIP**: positive original-A
+link, before/after-pin B substitutions, no-replace collision, and ordinary
+same-SID ancestor/source rename blocked under strict share mode. This is not
+native signature verification, separately administered custody, completed
+ABA/powercut evidence, or a production `RootSession`. WSL ext4 for this exact
+candidate was unavailable; independent exact-SHA review remains required.
+
+**PR #298:** published `e209a6ee3cb26931d33152f1022218242c32abb2`
+remains OPEN/DRAFT with hosted GHAS CodeQL check failing at the last check.
+Local detached child `5eca8be765c232973f39e03ca89f14fc518a0484`
+scopes CodeQL exclusion ONLY to the intentionally vulnerable
+`experiments/issue-67-pr298-unbound-name-evidence/**` laboratory and changes
+a test read to its retained foreign FD; `security-extended` and product/source
+scans remain enabled. Two independent SOURCE GO opinions cover only this
+limited delta. Windows Node22 targeted restored-inode case **1 PASS / 0 FAIL**;
+full controlled-restore suite remains in progress at this checkpoint and WSL
+probe unresponsive. The child is **not published** and its exact hosted CodeQL
+and GHAS results are unknown.
+
+**PR #301/#302:** #301 remote `e1ca644b` remains DRAFT and hosted Security
+Regression has failed; a NEW unpublished child `1b608915478ed8f6bab651178c476de87c6ae742` of
+`218bfcef` now addresses inherited Array numeric setters/iterators and mutable
+`Object.freeze` terminal flags with genuine Ed25519 A/B RED-to-GREEN evidence.
+Worker-reported Windows22 validation: 6/6 adversarial+positive, 125 PASS /
+1 expected SKIP broad suite, and 37/37 PG/inventory; no WSL or two exact
+independent SOURCE GO yet, therefore publication remains blocked. #302 remote `e0af8397`
+remains DRAFT, with later DEV-OFF custodian/SQLite candidates not equivalent
+to independent authority or verified production IO. Candidate SHAs, reviewers,
+and both-platform tests must be reconciled anew before any fast-forward push.
+
+**PRODUCT, INDEPENDENT CUSTODY, RELEASE:** `RootSession` remains unimplemented/
+disabled for product FOD hydration/pin/picker. Required positive product path
+needs original physical A and every ancestor enrolled and held before the
+first mutable lookup, independent self-hosted operator and monotonic signed
+floor, native no-replace and durable PREPARE/COMMIT, hostile same-SID/UID
+cold recovery tests. Windows 11 NTFS does NOT demonstrate Windows 10 CFAPI;
+process exits do NOT demonstrate physical powercut. No merge, deploy, release,
+production activation, Draft removal, or Root/main change is authorized.
+**PRODUCT NO-GO; INDEPENDENT CUSTODY NO-GO; MERGE NO-GO; RELEASE NO-GO.**
