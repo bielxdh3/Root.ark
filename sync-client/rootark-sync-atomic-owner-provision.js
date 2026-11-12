@@ -17,8 +17,12 @@ const {
   keyEquals: NATIVE_EQUALS,
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferToString: NATIVE_BUFFER_TO_STRING,
+  canonicalSortedJson: NATIVE_CANONICAL_SORTED_JSON,
+  freeze: NATIVE_FREEZE,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  ownKeys: NATIVE_OWN_KEYS,
+  jsonParse: NATIVE_JSON_PARSE,
 } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
-const protocol = require("./rootark-sync-protocol");
 
 // Verify native public-key identity, never caller-shadowable instance fields.
 // Reimport each pin so later instance method mutation cannot change readback.
@@ -29,8 +33,8 @@ const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
 const deny = () => Object.assign(new Error("Atomic batch owner provision is not independently authenticated"),
   { code: "authorization_required" });
 const exactKeys = (value, keys) => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const actual = Reflect.ownKeys(value);
+  if (!value || typeof value !== "object" || NATIVE_ARRAY_IS_ARRAY(value)) return false;
+  const actual = NATIVE_OWN_KEYS(value);
   return actual.length === keys.length && actual.every((key) =>
     typeof key === "string" && keys.includes(key));
 };
@@ -62,7 +66,7 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
   // Detach all callback-owned certificate data exactly once; comparison and
   // Ed25519 verification must see identical canonical bytes, never getters.
   let detached;
-  try { detached = JSON.parse(protocol.canonicalJson(provisioning)); }
+  try { detached = NATIVE_JSON_PARSE(NATIVE_CANONICAL_SORTED_JSON(provisioning)); }
   catch { throw deny(); }
   if (!exactKeys(identity, ["accountId", "storeId", "username", "compartmentId"])
     || !exactKeys(detached, ["statement", "signature"])
@@ -90,30 +94,30 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
     witness = pinnedProvisionerKey(witnessPublicKey);
     cas = pinnedProvisionerKey(casPublicKey);
   } catch { throw deny(); }
-  if (statement.witnessSpki !== NATIVE_EXPORT.call(witness,
-    { type: "spki", format: "der" }).toString("base64url")
-    || statement.casSpki !== NATIVE_EXPORT.call(cas,
-      { type: "spki", format: "der" }).toString("base64url")) throw deny();
+  if (statement.witnessSpki !== NATIVE_BUFFER_TO_STRING.call(
+    NATIVE_EXPORT.call(witness, { type: "spki", format: "der" }), "base64url")
+    || statement.casSpki !== NATIVE_BUFFER_TO_STRING.call(
+      NATIVE_EXPORT.call(cas, { type: "spki", format: "der" }), "base64url")) throw deny();
   const signature = NATIVE_BUFFER_FROM(detached.signature, "base64url");
   if (signature.length !== 64 || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== detached.signature) throw deny();
   const pin = pinnedProvisionerKey(provisionerPublicKey);
   // All THREE separately administered principals must be physically distinct.
   if (NATIVE_EQUALS.call(witness, cas) || NATIVE_EQUALS.call(witness, pin)
     || NATIVE_EQUALS.call(cas, pin)) throw deny();
-  if (!NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(DOMAIN + protocol.canonicalJson(statement), "utf8"),
+  if (!NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(DOMAIN + NATIVE_CANONICAL_SORTED_JSON(statement), "utf8"),
     pin, signature)) throw deny();
   // A signature by itself is REPLAYABLE. The trusted embedding must retain
   // the CURRENT certificate digest outside mutable sync config, server and
   // journal; an older but correctly signed certificate must fail closed.
   const hash = NATIVE_CREATE_HASH("sha256");
-  NATIVE_HASH_UPDATE.call(hash, DOMAIN + protocol.canonicalJson(detached), "utf8");
+  NATIVE_HASH_UPDATE.call(hash, DOMAIN + NATIVE_CANONICAL_SORTED_JSON(detached), "utf8");
   const digest = NATIVE_HASH_DIGEST.call(hash, "hex");
   if (digest !== expectedDigest) throw deny();
-  return Object.freeze({ identity: Object.freeze({
+  return NATIVE_FREEZE({ identity: NATIVE_FREEZE({
     accountId: statement.accountId, storeId: statement.storeId,
     username: statement.username, compartmentId: statement.compartmentId,
-  }), publicKey: pin, provisioning: Object.freeze({
-    statement: Object.freeze(statement), signature: detached.signature,
+  }), publicKey: pin, provisioning: NATIVE_FREEZE({
+    statement: NATIVE_FREEZE(statement), signature: detached.signature,
   }) });
 }
 

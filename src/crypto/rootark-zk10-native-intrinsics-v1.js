@@ -10,12 +10,16 @@ const crypto = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
 // Capture these before the first caller-owned KeyObject getter too. Even an
 // immutable JSON encoder can be retargeted via Array.join or Buffer.from.
+// Calling a captured function through .call is insufficient: the dispatch
+// itself re-reads Function.prototype.call after an untrusted native getter.
+const APPLY = Reflect.apply.bind(Reflect);
 const BUFFER_FROM = Buffer.from.bind(Buffer);
 const BUFFER_CONCAT = Buffer.concat.bind(Buffer);
 const BUFFER_TO_STRING = Buffer.prototype.toString;
 const BUFFER_BYTE_LENGTH = Buffer.byteLength.bind(Buffer);
 const ARRAY_JOIN = Array.prototype.join;
 const ARRAY_PUSH = Array.prototype.push;
+const ARRAY_SORT = Array.prototype.sort;
 const ARRAY_IS_ARRAY = Array.isArray.bind(Array);
 const OWN_KEYS = Reflect.ownKeys.bind(Reflect);
 const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
@@ -23,6 +27,7 @@ const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
 const HAS_OWN = Object.hasOwn.bind(Object);
 const OBJECT_CREATE = Object.create.bind(Object);
 const DEFINE_PROPERTY = Object.defineProperty.bind(Object);
+const OBJECT_FREEZE = Object.freeze.bind(Object);
 
 const createPublicKey = crypto.createPublicKey.bind(crypto);
 const createHash = crypto.createHash.bind(crypto);
@@ -32,6 +37,38 @@ const publicPrototype = Object.getPrototypeOf(createPublicKey({
   format: "der", type: "spki",
 }));
 const PRIMITIVE_STRINGIFY = JSON.stringify.bind(JSON);
+const JSON_PARSE = JSON.parse.bind(JSON);
+
+// Keep the familiar intrinsic.call(receiver, ...) interface for existing
+// native key/hash call sites, but give each reference its own immutable call
+// implementation. The attacker can reassign Function.prototype.call later.
+function withSafeCall(method) {
+  const boundNative = function(...args) { return APPLY(method, this, args); };
+  DEFINE_PROPERTY(boundNative, "call", { value(receiver, ...args) {
+    return APPLY(method, receiver, args);
+  }, enumerable: false, configurable: false, writable: false });
+  return OBJECT_FREEZE(boundNative);
+}
+
+// The decoded signed record is already an own-DATA snapshot. Pick only the
+// protocol's signed fields without consulting Array.prototype.map, its
+// mutable iterator or Object.fromEntries after an untrusted key callback.
+function pickSignedFields(snapshot, names) {
+  if (!snapshot || typeof snapshot !== "object" || isProxy(snapshot)) {
+    throw new TypeError("noncanonical signed record");
+  }
+  const picked = OBJECT_CREATE(null);
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
+    const descriptor = OWN_DESCRIPTOR(snapshot, name);
+    if (typeof name !== "string" || !descriptor || !HAS_OWN(descriptor, "value")) {
+      throw new TypeError("invalid signed field");
+    }
+    DEFINE_PROPERTY(picked, name, { value: descriptor.value,
+      enumerable: true, configurable: true, writable: true });
+  }
+  return picked;
+}
 
 // Ordinary JSON.stringify invokes inherited Object/Array.prototype.toJSON;
 // capturing the function alone cannot bind a signature to the object actually
@@ -39,7 +76,7 @@ const PRIMITIVE_STRINGIFY = JSON.stringify.bind(JSON);
 // consulting prototype methods or triggering caller-owned getters/Proxy traps.
 // Primitive escaping/number formatting still comes from the original native
 // JSON serializer, preserving the signed wire layout and insertion order.
-function canonicalStringify(value, depth = 0) {
+function canonicalStringify(value, depth = 0, sortKeys = false) {
   if (depth > 8) throw new TypeError("nested signed wire");
   if (value === null || typeof value === "string" || typeof value === "boolean"
     || (typeof value === "number" && Number.isFinite(value))) {
@@ -58,9 +95,9 @@ function canonicalStringify(value, depth = 0) {
       if (!descriptor || !HAS_OWN(descriptor, "value")) {
         throw new TypeError("noncanonical signed array element");
       }
-      ARRAY_PUSH.call(fields, canonicalStringify(descriptor.value, depth + 1));
+      APPLY(ARRAY_PUSH, fields, [canonicalStringify(descriptor.value, depth + 1, sortKeys)]);
     }
-    return `[${ARRAY_JOIN.call(fields, ",")}]`;
+    return `[${APPLY(ARRAY_JOIN, fields, [","])}]`;
   }
   const prototype = GET_PROTOTYPE(value);
   if (prototype !== Object.prototype && prototype !== null) {
@@ -68,6 +105,9 @@ function canonicalStringify(value, depth = 0) {
   }
   const names = OWN_KEYS(value);
   if (names.length > 128) throw new TypeError("oversized signed object");
+  // Atomic SyncV2 wire uses lexicographically sorted object fields. Sort
+  // with the initial native comparator, without a post-getter .sort() lookup.
+  if (sortKeys) APPLY(ARRAY_SORT, names, []);
   const fields = [];
   for (const name of names) {
     if (typeof name !== "string") throw new TypeError("symbol in signed object");
@@ -75,10 +115,13 @@ function canonicalStringify(value, depth = 0) {
     if (!descriptor || !HAS_OWN(descriptor, "value") || !descriptor.enumerable) {
       throw new TypeError("noncanonical signed field");
     }
-    ARRAY_PUSH.call(fields, `${PRIMITIVE_STRINGIFY(name)}:${canonicalStringify(descriptor.value, depth + 1)}`);
+    APPLY(ARRAY_PUSH, fields, [
+      `${PRIMITIVE_STRINGIFY(name)}:${canonicalStringify(descriptor.value, depth + 1, sortKeys)}`,
+    ]);
   }
-  return `{${ARRAY_JOIN.call(fields, ",")}}`;
+  return `{${APPLY(ARRAY_JOIN, fields, [","])}}`;
 }
+const canonicalSortedJson = (value) => canonicalStringify(value, 0, true);
 
 module.exports = Object.freeze({
   createPublicKey,
@@ -88,13 +131,18 @@ module.exports = Object.freeze({
   timingSafeEqual: crypto.timingSafeEqual.bind(crypto),
   randomBytes: crypto.randomBytes.bind(crypto),
   randomUUID: crypto.randomUUID.bind(crypto),
+  apply: APPLY,
+  freeze: OBJECT_FREEZE,
+  pickSignedFields,
   jsonStringify: canonicalStringify,
+  canonicalSortedJson,
+  jsonParse: JSON_PARSE,
   bufferFrom: BUFFER_FROM,
   bufferConcat: BUFFER_CONCAT,
-  bufferToString: BUFFER_TO_STRING,
+  bufferToString: withSafeCall(BUFFER_TO_STRING),
   bufferByteLength: BUFFER_BYTE_LENGTH,
-  arrayJoin: ARRAY_JOIN,
-  arrayPush: ARRAY_PUSH,
+  arrayJoin: withSafeCall(ARRAY_JOIN),
+  arrayPush: withSafeCall(ARRAY_PUSH),
   arrayIsArray: ARRAY_IS_ARRAY,
   ownKeys: OWN_KEYS,
   ownDescriptor: OWN_DESCRIPTOR,
@@ -102,11 +150,11 @@ module.exports = Object.freeze({
   hasOwn: HAS_OWN,
   objectCreate: OBJECT_CREATE,
   defineProperty: DEFINE_PROPERTY,
-  hashUpdate: Object.getOwnPropertyDescriptor(prototype, "update").value,
-  hashDigest: Object.getOwnPropertyDescriptor(prototype, "digest").value,
-  publicExport: Object.getOwnPropertyDescriptor(publicPrototype, "export").value,
-  keyType: Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get,
-  keyAlgorithm: Object.getOwnPropertyDescriptor(
-    Object.getPrototypeOf(publicPrototype), "asymmetricKeyType").get,
-  keyEquals: crypto.KeyObject.prototype.equals,
+  hashUpdate: withSafeCall(OWN_DESCRIPTOR(prototype, "update").value),
+  hashDigest: withSafeCall(OWN_DESCRIPTOR(prototype, "digest").value),
+  publicExport: withSafeCall(OWN_DESCRIPTOR(publicPrototype, "export").value),
+  keyType: withSafeCall(OWN_DESCRIPTOR(crypto.KeyObject.prototype, "type").get),
+  keyAlgorithm: withSafeCall(OWN_DESCRIPTOR(
+    GET_PROTOTYPE(publicPrototype), "asymmetricKeyType").get),
+  keyEquals: withSafeCall(crypto.KeyObject.prototype.equals),
 });
