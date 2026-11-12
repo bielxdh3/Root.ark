@@ -38,12 +38,6 @@ function snapshot(value, names) {
   }
   return Object.freeze(copy);
 }
-function ownedData(value, name) {
-  if (!value || typeof value !== "object") deny();
-  const descriptor = Object.getOwnPropertyDescriptor(value, name);
-  if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
-  return descriptor.value;
-}
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
   const d = Object.getOwnPropertyDescriptors(value);
@@ -97,13 +91,6 @@ async function openProtectedRecipientShareFile(input) {
       deviceHpkePrivateKey, nowSeconds } = input;
     if (typeof redeemInput?.readIndependentAuthority !== "function"
       || !Number.isSafeInteger(nowSeconds) || nowSeconds < 1) deny();
-    // Take primitive expirations before HPKE/file-AEAD awaits; a caller-owned
-    // approval or witness record must not move its expiration while decoding.
-    const ownerEnvelopeExpiry = envelope.core.expires_at;
-    const approvalExpiry = ownedData(ownedData(authority, "approval"), "expires_at");
-    const witnessExpiry = ownedData(ownedData(authority, "committedReceipt"), "expires_at");
-    if (![ownerEnvelopeExpiry, approvalExpiry, witnessExpiry]
-      .every((time) => Number.isSafeInteger(time) && time > 0)) deny();
     const receipt = await redeemProtectedCiphertextShare(redeemInput);
     if (receipt.ownerGrantSignatureVerified !== true
       || receipt.serverRevocationProofVerified !== false
@@ -149,8 +136,13 @@ async function openProtectedRecipientShareFile(input) {
     // again immediately before releasing the decrypted file to this process.
     currentAuthority(await redeemInput.readIndependentAuthority(),
       statement, shareSignature, statementBytes);
+    // Only the owner CEK opener can attest which owner approval and witness
+    // it ACTUALLY verified after the preceding asynchronous share redemption.
+    const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
+    if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
+      || verifiedReleaseExpiresAt < 1) deny();
     const releaseSeconds = Math.floor(Date.now() / 1000);
-    if ([statement.expires_at, ownerEnvelopeExpiry, approvalExpiry, witnessExpiry]
+    if ([statement.expires_at, verifiedReleaseExpiresAt]
       .some((expiresAt) => releaseSeconds >= expiresAt || nowSeconds >= expiresAt)) deny();
     const result = Object.freeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
