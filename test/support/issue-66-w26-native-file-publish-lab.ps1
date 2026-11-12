@@ -5,9 +5,10 @@ param(
                'PRECREATE_SCRATCH_DIRECTORY_NO_ACK',
                'PREPIN_COLD_ORIGIN_REQUIRED',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
-               'COLD_INSPECT')]
+               'COLD_INSPECT', 'FOD_POSITIVE', 'FOD_COLLISION')]
   [string]$Mode,
-  [string]$Scratch
+  [string]$Scratch,
+  [string]$PayloadSha256
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,6 +46,7 @@ using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
 
 public static class RootarkW26NativeFilePublishLab {
@@ -102,6 +104,10 @@ public static class RootarkW26NativeFilePublishLab {
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool ReadFile(SafeFileHandle file, byte[] data, uint size,
     out uint read, IntPtr overlapped);
+  [DllImport("kernel32.dll", EntryPoint = "SetFilePointerEx", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool Seek(SafeFileHandle file, long distance,
+    out long newOffset, uint method);
   [DllImport("kernel32.dll", EntryPoint = "FlushFileBuffers", SetLastError = true)]
   [return: MarshalAs(UnmanagedType.Bool)]
   private static extern bool Flush(SafeFileHandle file);
@@ -440,12 +446,51 @@ public static class RootarkW26NativeFilePublishLab {
         " authority=LAB_ONLY_NO_GO";
     }
   }
-  private static void Write(SafeFileHandle file, string content) {
-    byte[] data = Encoding.UTF8.GetBytes(content);
+  private static void WriteBytes(SafeFileHandle file, byte[] data) {
     uint written;
     if (!WriteFile(file, data, (uint)data.Length, out written, IntPtr.Zero)
         || written != (uint)data.Length || !Flush(file))
       throw new InvalidOperationException("HELD_STAGE_FLUSH_FAILED");
+  }
+  private static void Write(SafeFileHandle file, string content) {
+    WriteBytes(file, Encoding.UTF8.GetBytes(content));
+  }
+  private static string Sha256(byte[] value) {
+    using (SHA256 hash = SHA256.Create())
+      return BitConverter.ToString(hash.ComputeHash(value)).Replace("-", "").ToLowerInvariant();
+  }
+  private static void VerifyOpenedPayload(SafeFileHandle file, byte[] expected,
+      string expectedSha256) {
+    // Exact HANDLE-bound physical bytes, including the 4096+1 EOF case.
+    FILE_STANDARD_INFO standard;
+    if (!GetStandard(file, 1, out standard, (uint)Marshal.SizeOf(typeof(FILE_STANDARD_INFO)))
+        || standard.Directory || standard.DeletePending || standard.NumberOfLinks != 1
+        || standard.EndOfFile != expected.Length)
+      throw new InvalidOperationException("FOD_NATIVE_OPENED_LENGTH_CHANGED");
+    long offset;
+    if (!Seek(file, 0, out offset, 0) || offset != 0)
+      throw new InvalidOperationException("FOD_NATIVE_READ_SEEK_FAILED");
+    byte[] bytes = new byte[expected.Length];
+    int position = 0;
+    while (position < bytes.Length) {
+      byte[] chunk = new byte[Math.Min(4096, bytes.Length - position)];
+      uint read;
+      if (!ReadFile(file, chunk, (uint)chunk.Length, out read, IntPtr.Zero) || read == 0
+          || read > chunk.Length)
+        throw new InvalidOperationException("FOD_NATIVE_READ_FAILED");
+      Buffer.BlockCopy(chunk, 0, bytes, position, (int)read);
+      position += (int)read;
+    }
+    if (Sha256(bytes) != expectedSha256 ||
+        !CryptographicOperationsFixedEquals(bytes, expected))
+      throw new InvalidOperationException("FOD_NATIVE_BYTES_CHANGED");
+    Array.Clear(bytes, 0, bytes.Length);
+  }
+  private static bool CryptographicOperationsFixedEquals(byte[] a, byte[] b) {
+    if (a.Length != b.Length) return false;
+    int mismatch = 0;
+    for (int i = 0; i < a.Length; i++) mismatch |= a[i] ^ b[i];
+    return mismatch == 0;
   }
   private static void Ready(SafeFileHandle scratch, string name, string content) {
     if (name != "precreate-ready.signal" && name != "ancestor-ready.signal" &&
@@ -528,7 +573,7 @@ public static class RootarkW26NativeFilePublishLab {
     throw new InvalidOperationException("UNEXPECTED_HARD_EXIT_RETURN");
   }
 
-  public static string Run(string scratch, string mode) {
+  public static string Run(string scratch, string mode, byte[] fodPayload, string fodSha256) {
     if (mode == "COLD_INSPECT") {
       if (DriveType(Path.GetPathRoot(scratch)) != 3 /* DRIVE_FIXED */)
         throw new InvalidOperationException("LOCAL_FIXED_NTFS_REQUIRED");
@@ -537,6 +582,12 @@ public static class RootarkW26NativeFilePublishLab {
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";
+    bool fod = mode == "FOD_POSITIVE" || mode == "FOD_COLLISION";
+    if (fod && (Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W37_FOD_LAB") != "1"
+      || fodPayload == null || fodPayload.Length < 1 || fodPayload.Length > 8192
+      || fodSha256 == null || fodSha256.Length != 64
+      || Sha256(fodPayload) != fodSha256))
+      throw new InvalidOperationException("FOD_LAB_INPUT_UNVERIFIED");
     bool precreateAttack = mode.StartsWith("PRECREATE_SCRATCH_", StringComparison.Ordinal);
     bool noAck = mode.EndsWith("_NO_ACK", StringComparison.Ordinal);
     bool ancestorAttack = mode == "HELD_REBIND" || mode == "HELD_JUNCTION" ||
@@ -621,7 +672,9 @@ public static class RootarkW26NativeFilePublishLab {
           throw new InvalidOperationException("ANCESTOR_ATTACK_NOT_PHYSICAL");
       }
       using (SafeFileHandle source = File(root, "stage.bin", true)) {
-        Write(source, Trusted);
+        if (fod) WriteBytes(source, fodPayload);
+        else Write(source, Trusted);
+        if (fod) VerifyOpenedPayload(source, fodPayload, fodSha256);
         FILE_ID_INFO original = Id(source);
         FILE_ID_INFO initialRoot = Id(root);
         string originalIdentity = ExactId(initialRoot) + ":" + ExactId(original);
@@ -636,7 +689,7 @@ public static class RootarkW26NativeFilePublishLab {
         }
         string stage = Path.Combine(parent, "stage.bin");
         string target = Path.Combine(parent, "published.bin");
-        if (mode == "COLLISION") {
+        if (mode == "COLLISION" || mode == "FOD_COLLISION") {
           // Physical foreign destination inserted before the no-replace syscall.
           PlantForeign(target, Foreign);
         } else if (mode == "EXTERNAL_COLLISION") {
@@ -669,17 +722,18 @@ public static class RootarkW26NativeFilePublishLab {
             if (Same(original, Id(other)))
               throw new InvalidOperationException("SOURCE_SWAP_NOT_PHYSICAL");
           }
-        } else if (mode != "ROOT_SWAP" && mode != "NORMAL" && !crashAfter && !complete && !ancestorAttack) {
+        } else if (mode != "ROOT_SWAP" && mode != "NORMAL" && !fod
+            && !crashAfter && !complete && !ancestorAttack) {
           throw new InvalidOperationException("UNTRUSTED_MODE");
         }
         if (mode != "ROOT_SWAP") custody.Validate();
         int code = Rename(source, root, "published.bin");
-        if (mode == "COLLISION" || mode == "EXTERNAL_COLLISION") {
+        if (mode == "COLLISION" || mode == "EXTERNAL_COLLISION" || mode == "FOD_COLLISION") {
           // A generic NT failure could otherwise fool the no-clobber proof.
           // The actual NTFS syscall must report STATUS_OBJECT_NAME_COLLISION.
           if (code != unchecked((int)0xC0000035) || ReadFixture(target) != Foreign ||
               !System.IO.File.Exists(stage) ||
-              ReadFixture(stage) != Trusted)
+              (fod ? !System.IO.File.Exists(stage) : ReadFixture(stage) != Trusted))
             throw new InvalidOperationException("DESTINATION_CLOBBERED");
           return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode + " result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0x" +
             unchecked((uint)code).ToString("X8");
@@ -689,15 +743,19 @@ public static class RootarkW26NativeFilePublishLab {
         string published = Path.Combine(visibleParent, "published.bin");
         using (SafeFileHandle actual = File(root, "published.bin", false)) {
           if (!Same(original, Id(source)) || !Same(original, Id(actual)) ||
-              ReadFixture(published) != Trusted)
+              (!fod && ReadFixture(published) != Trusted))
             throw new InvalidOperationException("OPENED_INODE_NOT_PUBLISHED");
+          if (fod) {
+            VerifyOpenedPayload(source, fodPayload, fodSha256);
+            VerifyOpenedPayload(actual, fodPayload, fodSha256);
+          }
         }
         if (mode == "SOURCE_SWAP" &&
             (!System.IO.File.Exists(stage) ||
               ReadFixture(stage) != Trusted ||
               System.IO.File.Exists(Path.Combine(visibleParent, "parked-stage.bin"))))
           throw new InvalidOperationException("FOREIGN_SOURCE_NOT_PRESERVED");
-        if (mode == "NORMAL" && System.IO.File.Exists(stage))
+        if ((mode == "NORMAL" || fod) && System.IO.File.Exists(stage))
           throw new InvalidOperationException("STAGE_NAME_NOT_RETIRED");
         if (mode == "ROOT_SWAP" &&
             ReadFixture(Path.Combine(parent, "published.bin")) != Foreign)
@@ -711,14 +769,41 @@ public static class RootarkW26NativeFilePublishLab {
         }
         if (mode != "ROOT_SWAP") custody.Validate();
         return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode +
-          " result=ORIGINAL_HANDLE inode=PINNED no_replace=YES";
+          " result=ORIGINAL_HANDLE inode=PINNED no_replace=YES" +
+          (fod ? " bytes=" + fodPayload.Length + " sha256=" + fodSha256 +
+            " cfapi=NOT_REGISTERED authority=LAB_ONLY_NO_GO" : "");
       }
     }
   }
 }
 '@ | Out-Null
 
-  [Console]::Out.WriteLine([RootarkW26NativeFilePublishLab]::Run($directory.FullName, $Mode))
+  $payloadBytes = $null
+  $payloadDigest = $null
+  if ($Mode -eq 'FOD_POSITIVE' -or $Mode -eq 'FOD_COLLISION') {
+    if ($env:ROOTARK_ISSUE66_W37_FOD_LAB -ne '1' -or
+        $PayloadSha256 -notmatch '^[0-9a-f]{64}$') { throw 'FOD_LAB_INPUT_UNVERIFIED' }
+    # Plaintext never enters a command line, environment variable or error
+    # message. The disposable child receives bounded binary stdin, then opens
+    # and flushes the stage through a retained NTFS directory HANDLE.
+    $pipe = [Console]::OpenStandardInput()
+    $bounded = New-Object byte[] 8193
+    $readTotal = 0
+    while ($readTotal -lt $bounded.Length) {
+      $read = $pipe.Read($bounded, $readTotal, $bounded.Length - $readTotal)
+      if ($read -eq 0) { break }
+      $readTotal += $read
+    }
+    if ($readTotal -lt 1 -or $readTotal -gt 8192) { throw 'FOD_LAB_LENGTH_DENIED' }
+    $payloadBytes = New-Object byte[] $readTotal
+    [Array]::Copy($bounded, $payloadBytes, $readTotal)
+    [Array]::Clear($bounded, 0, $bounded.Length)
+    $payloadDigest = $PayloadSha256
+  } elseif ($PSBoundParameters.ContainsKey('PayloadSha256')) {
+    throw 'FOD_LAB_UNEXPECTED_INPUT'
+  }
+  [Console]::Out.WriteLine([RootarkW26NativeFilePublishLab]::Run(
+    $directory.FullName, $Mode, $payloadBytes, $payloadDigest))
   exit 0
 } catch {
   # Keep paths, ACLs and identifiers out of the public test signal.
