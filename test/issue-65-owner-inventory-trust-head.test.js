@@ -159,6 +159,35 @@ test("P2 native inventory handle cannot pin signer B while verifying genuine sig
   assert.ok(spkiBReads > 0, "fingerprint path exercised the foreign inventory handle");
   assert.equal(checkedAReads, 0,
     "nested inventory signature verifier must never use caller-owned A handle");
+  // The caller's public key getter can also retarget the mutable Node
+  // crypto.verify export after native SPKI export but before the nested
+  // inventory snapshot verifies its Ed25519 signature. The independently
+  // owner-signed inventory B fingerprint MUST still reject snapshot A.
+  const originalVerify = crypto.verify;
+  const poisoned = Object.create(realA);
+  let exportBRuns = 0;
+  let injectedVerifyRuns = 0;
+  Object.defineProperty(poisoned, handle, { get() {
+    if (new Error().stack.includes("nativeEd25519Spki")) {
+      exportBRuns++;
+      crypto.verify = (...args) => {
+        injectedVerifyRuns++;
+        return true;
+      };
+      return otherInventory.publicKey[handle];
+    }
+    return realA[handle];
+  } });
+  try {
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...claimedB, inventoryPublicKey: poisoned,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "owner-signed B must not accept inventory-signed A via retargeted dynamic crypto.verify");
+    assert.ok(exportBRuns > 0, "attack must execute inside a real native inventory getter");
+    assert.equal(injectedVerifyRuns, 0, "nested verification must retain the native crypto.verify");
+  } finally {
+    crypto.verify = originalVerify;
+  }
   assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true,
     "unmodified legitimate A snapshot continues to verify with its signed A key");
 });
