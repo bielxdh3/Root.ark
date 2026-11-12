@@ -178,6 +178,43 @@ test("#67 P2: stale tracked source cannot restore after an authenticated remote 
   assert.deepEqual(await fsp.readFile(destination), originalBytes);
 });
 
+test("#67 P2: a signed fileId rotation cannot hide the old tracked objectId during MOVE restore", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.local, "document.txt");
+  const destination = path.join(f.local, "moved.txt");
+  const originalBytes = Buffer.from("original authenticated bytes");
+  await fsp.writeFile(source, originalBytes);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(originalBytes).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const rotated = await f.sign({ operation: "update", fileId: "rotated-file-id",
+    operationId: "signed-id-rotation", versionId: "rotated-version",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: f.original.revision,
+    metadata: { path: "document.txt" }, plaintext: originalBytes,
+  });
+  const moved = await f.sign({ operation: "move", fileId: "rotated-file-id",
+    operationId: "signed-rotated-move", versionId: "moved-rotated-version",
+    revision: { counter: 3, deviceId: "device-a" }, baseRevision: rotated.revision,
+    metadata: { path: "moved.txt", sourcePath: "document.txt" },
+    plaintext: protocol.encodeMovePayload(originalBytes, f.privateFileKey),
+  });
+  assert.equal(await verifyAuthorizationProof(rotated.authorization, rotated, f.trusted), true);
+  assert.equal(await verifyAuthorizationProof(moved.authorization, moved, f.trusted), true);
+  f.versions.splice(1, 1, rotated, moved);
+  f.setCurrent(moved);
+
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", rotated.versionId),
+    (error) => error.code === "restore_local_conflict",
+    "the old tracked object cannot be hidden by a newly signed fileId");
+  assert.deepEqual(await fsp.readFile(source), originalBytes);
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+});
+
 test("#67: restore never overwrites untracked local data or accepts a cross-object current head", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");

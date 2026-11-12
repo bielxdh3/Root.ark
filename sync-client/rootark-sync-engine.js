@@ -675,7 +675,11 @@ class SyncEngine {
       // A remote MOVE may be signed and current while our local snapshot still
       // tracks the same file at its old path. Restoring directly to the new
       // path would duplicate that identity instead of reconciling the MOVE.
-      if (activeFileIdentityPath(this.snapshot.files, current, relative)) {
+      // fileId is not immutable across signed updates, so an old tracked
+      // revision can retain the same objectId with a DIFFERENT fileId.
+      if (Object.entries(this.snapshot.files).some(([trackedPath, prior]) =>
+        trackedPath !== relative && prior && !prior.deleted
+          && prior.objectId === objectId)) {
         fail("Historical restore requires local MOVE reconciliation", "restore_local_conflict");
       }
     };
