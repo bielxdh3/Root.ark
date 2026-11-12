@@ -22,6 +22,7 @@ const {
   jsonStringify: NATIVE_JSON_STRINGIFY,
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
   arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  arrayIncludes: NATIVE_ARRAY_INCLUDES,
   getPrototype: NATIVE_GET_PROTOTYPE,
   ownKeys: NATIVE_OWN_KEYS,
   ownDescriptor: NATIVE_OWN_DESCRIPTOR,
@@ -71,8 +72,10 @@ function deny() {
   throw error;
 }
 function strict(raw, fields) {
+  const prototype = raw && typeof raw === "object" && !isProxy(raw)
+    ? NATIVE_GET_PROTOTYPE(raw) : undefined;
   if (!raw || typeof raw !== "object" || isProxy(raw) || NATIVE_ARRAY_IS_ARRAY(raw)
-    || ![Object.prototype, null].includes(NATIVE_GET_PROTOTYPE(raw))
+    || (prototype !== Object.prototype && prototype !== null)
     || NATIVE_OWN_KEYS(raw).length !== fields.length) deny();
   const result = NATIVE_OBJECT_CREATE(null);
   for (let index = 0; index < fields.length; index += 1) {
@@ -99,38 +102,51 @@ function lengthPrefixed(bytes) {
 }
 function snapshotLocalDevicePolicy(input) {
   const raw = strict(input, ["username", "trustedDevicePublicKeys", "revokedDeviceIds"]);
+  const pinsPrototype = raw.trustedDevicePublicKeys
+    && typeof raw.trustedDevicePublicKeys === "object"
+    && !isProxy(raw.trustedDevicePublicKeys)
+    ? NATIVE_GET_PROTOTYPE(raw.trustedDevicePublicKeys) : undefined;
   if (typeof raw.username !== "string" || !raw.username || raw.username.length > 512
     || !raw.trustedDevicePublicKeys || typeof raw.trustedDevicePublicKeys !== "object"
-    || Array.isArray(raw.trustedDevicePublicKeys)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(raw.trustedDevicePublicKeys))
-    || !Array.isArray(raw.revokedDeviceIds)
+    || NATIVE_ARRAY_IS_ARRAY(raw.trustedDevicePublicKeys)
+    || (pinsPrototype !== Object.prototype && pinsPrototype !== null)
+    || !NATIVE_ARRAY_IS_ARRAY(raw.revokedDeviceIds)
     || raw.revokedDeviceIds.length > 10000) deny();
-  const pins = Object.create(null);
-  const pinKeys = Reflect.ownKeys(raw.trustedDevicePublicKeys);
+  const pins = NATIVE_OBJECT_CREATE(null);
+  const pinKeys = NATIVE_OWN_KEYS(raw.trustedDevicePublicKeys);
   if (pinKeys.length < 1 || pinKeys.length > 10000) deny();
-  for (const deviceId of pinKeys) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw.trustedDevicePublicKeys, deviceId);
+  for (let index = 0; index < pinKeys.length; index += 1) {
+    const deviceId = pinKeys[index];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(raw.trustedDevicePublicKeys, deviceId);
     if (typeof deviceId !== "string" || !descriptor || !descriptor.enumerable
-      || !Object.hasOwn(descriptor, "value")) deny();
+      || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const spki = descriptor.value;
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)
       || typeof spki !== "string" || spki.length > 160
       || !/^[A-Za-z0-9_-]+$/.test(spki)) deny();
-    pins[deviceId] = spki;
+    NATIVE_DEFINE_PROPERTY(pins, deviceId, {
+      value: spki, enumerable: true, writable: true, configurable: true,
+    });
   }
   // Never call an untrusted Array's overridable `.map`. A forged own `map`
   // function can silently discard revocations while leaving Array.isArray true.
-  if (Reflect.ownKeys(raw.revokedDeviceIds).length !== raw.revokedDeviceIds.length + 1) deny();
+  if (NATIVE_OWN_KEYS(raw.revokedDeviceIds).length !== raw.revokedDeviceIds.length + 1) deny();
   const revoked = [];
+  const seen = NATIVE_OBJECT_CREATE(null);
   for (let index = 0; index < raw.revokedDeviceIds.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw.revokedDeviceIds, String(index));
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    const descriptor = NATIVE_OWN_DESCRIPTOR(raw.revokedDeviceIds, String(index));
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const deviceId = descriptor.value;
     if (typeof deviceId !== "string"
-      || !/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)) deny();
-    revoked.push(deviceId);
+      || !/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)
+      || NATIVE_HAS_OWN(seen, deviceId)) deny();
+    NATIVE_DEFINE_PROPERTY(seen, deviceId, { value: true });
+    // Defining own DATA slots avoids a hostile Array.push and inherited numeric
+    // setters installed by a signed native KeyObject's kHandle callback.
+    NATIVE_DEFINE_PROPERTY(revoked, String(index), {
+      value: deviceId, enumerable: true, writable: true, configurable: true,
+    });
   }
-  if (new Set(revoked).size !== revoked.length) deny();
   return { username: raw.username, trustedDevicePublicKeys: pins,
     revokedDeviceIds: revoked };
 }
@@ -367,7 +383,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     if (live.username !== bound.envelope.authorization.username
       || live.trustedDevicePublicKeys[bound.envelope.deviceId]
         !== bound.envelope.authorization.publicKey
-      || live.revokedDeviceIds.includes(bound.envelope.deviceId)) deny();
+      || NATIVE_ARRAY_INCLUDES.call(live.revokedDeviceIds, bound.envelope.deviceId)) deny();
     return NATIVE_FREEZE({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
       envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,

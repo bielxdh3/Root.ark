@@ -19,6 +19,7 @@ const BUFFER_TO_STRING = Buffer.prototype.toString;
 const BUFFER_BYTE_LENGTH = Buffer.byteLength.bind(Buffer);
 const ARRAY_JOIN = Array.prototype.join;
 const ARRAY_PUSH = Array.prototype.push;
+const ARRAY_INCLUDES = Array.prototype.includes;
 const ARRAY_SORT = Array.prototype.sort;
 const ARRAY_IS_ARRAY = Array.isArray.bind(Array);
 const OWN_KEYS = Reflect.ownKeys.bind(Reflect);
@@ -150,6 +151,7 @@ module.exports = Object.freeze({
   bufferByteLength: BUFFER_BYTE_LENGTH,
   arrayJoin: withSafeCall(ARRAY_JOIN),
   arrayPush: withSafeCall(ARRAY_PUSH),
+  arrayIncludes: withSafeCall(ARRAY_INCLUDES),
   arrayIsArray: ARRAY_IS_ARRAY,
   ownKeys: OWN_KEYS,
   ownDescriptor: OWN_DESCRIPTOR,

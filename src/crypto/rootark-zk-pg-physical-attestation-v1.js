@@ -4,7 +4,9 @@
 // PostgreSQL attestor AFTER it has verified bytes and a WAL flush barrier.
 // Neither this signature nor an mTLS ACK proves external/cloud durability.
 const crypto = require("node:crypto");
-const { freeze: NATIVE_FREEZE } = require("./rootark-zk10-native-intrinsics-v1");
+const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL } =
+  require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/physical-pg-readback-attestation/v1\0");
@@ -36,7 +38,7 @@ function count(n, minimum) {
   return n;
 }
 function same(a, b) {
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return a.length === b.length && NATIVE_TIMING_SAFE_EQUAL(a, b);
 }
 function key(value, kind) {
   if (!(value instanceof crypto.KeyObject) || value.type !== kind
@@ -90,7 +92,7 @@ async function signCommittedPhysicalReadback(request, attestorPrivateKey) {
     exact(request, ["scope", "operation", "readback", "nonce", "issuedAt"]);
     const unsigned = claimsOf(request);
     const encoded = Buffer.from(await z.encodeDeterministic(unsigned));
-    const signature = crypto.sign(null, Buffer.concat([DOMAIN, encoded]), attestorPrivateKey);
+    const signature = NATIVE_SIGN(null, Buffer.concat([DOMAIN, encoded]), attestorPrivateKey);
     return Buffer.from(await z.encodeDeterministic({ ...unsigned, signature }));
   } catch (_) { deny(); }
 }
@@ -115,7 +117,7 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     const canonical = Buffer.from(await z.encodeDeterministic({ ...unsigned, signature }));
     if (!same(canonical, serialized)) deny();
     const encoded = Buffer.from(await z.encodeDeterministic(unsigned));
-    if (!crypto.verify(null, Buffer.concat([DOMAIN, encoded]), pin, bytes(signature, 64))) deny();
+    if (!NATIVE_VERIFY(null, Buffer.concat([DOMAIN, encoded]), pin, bytes(signature, 64))) deny();
     const op = operationOf(options.operation);
     const scope = scopeOf(options.scope);
     if (unsigned.type !== TYPE || !FIELDS.every((f) => Object.hasOwn(unsigned, f))
