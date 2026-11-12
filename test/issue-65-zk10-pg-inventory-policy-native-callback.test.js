@@ -574,3 +574,63 @@ test("P2 PG: hostile CBOR Object.keys cannot transiently sign A while returning 
     "genuine signed A cannot authenticate the unsigned generation B");
   assert.equal((await verify(f.signer.publicKey, signed)).generation, 1);
 });
+
+test("P2 PG: Set.prototype.has after native KeyObject getter cannot sign A but return forged B", async () => {
+  const f = fixture();
+  const { signed, now, nonce } = await physicalReceipt(f);
+  const originalA = await z.decodeDeterministic(signed);
+  assert.equal(originalA.generation, 1);
+  const forgedB = Buffer.from(await z.encodeDeterministic({ ...originalA, generation: 2 }));
+  const verify = (pin, serialized = forgedB) => pg.verifyCommittedPhysicalReadback(serialized, {
+    scope: f.scope, operation: f.operation, nonce,
+    pinnedPublicKey: pin, nowSeconds: now, expected: undefined,
+  });
+  assert.equal((await verify(f.signer.publicKey, signed)).generation, 1);
+  await assert.rejects(verify(f.signer.publicKey), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+
+  const nativeSetHas = Set.prototype.has;
+  const maliciousPin = crypto.createPublicKey({
+    key: f.signer.publicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  let getterReads = 0, replacements = 0, restorations = 0;
+  Object.defineProperty(maliciousPin, "type", { configurable: true, get() {
+    getterReads++;
+    Set.prototype.has = function (value) {
+      if (value && value.type === pg.TYPE && value.generation === 2
+        && !Object.hasOwn(value, "signature")) {
+        replacements++;
+        value.generation = 1;
+        queueMicrotask(() => { value.generation = 2; restorations++; });
+      }
+      return Reflect.apply(nativeSetHas, this, [value]);
+    };
+    return "public";
+  } });
+  let accepted, rejected, replacementsDuringVerification = -1;
+  try {
+    try { accepted = await verify(maliciousPin); }
+    catch (error) { rejected = error; }
+    replacementsDuringVerification = replacements;
+    const positive = await verify(maliciousPin, signed);
+    assert.equal(positive.generation, 1, "a real Ed25519 signed A stays accepted under poison");
+    assert.equal(positive.authorizesIo, false);
+    // The same malicious hook demonstrably mutates a matching unsigned map,
+    // even though the guarded codec must never invoke it during verification.
+    const probe = { type: pg.TYPE, generation: 2 };
+    assert.equal(new Set().has(probe), false);
+    await Promise.resolve();
+    assert.equal(probe.generation, 2, "the probe's queued restoration ran");
+  } finally {
+    Set.prototype.has = nativeSetHas;
+    delete maliciousPin.type;
+  }
+  assert.equal(accepted, undefined, "a signature for A must never attest forged B");
+  assert.match(rejected?.message || "", /ZK_PHYSICAL_ATTESTATION_DENIED/);
+  assert.ok(getterReads > 0, "the real native KeyObject.type getter executed");
+  assert.equal(replacementsDuringVerification, 0,
+    "codec must use captured native Set.has, not the post-key hostile method");
+  assert.equal(replacements, 1, "the hostile hook is live on an independent positive canary");
+  assert.equal(restorations, replacements, "all transient A mutations were restored to B");
+  assert.equal((await verify(f.signer.publicKey, signed)).generation, 1);
+});

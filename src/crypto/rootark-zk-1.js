@@ -14,6 +14,14 @@ const CODEC_OBJECT_CREATE = Object.create.bind(Object);
 const CODEC_OBJECT_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const CODEC_ARRAY_IS_ARRAY = Array.isArray.bind(Array);
 const CODEC_PLAIN_OBJECT_PROTOTYPE = Object.prototype;
+// The cycle guard executes before the signed-map copy: KeyObject.type can
+// replace Set.prototype.has and temporarily turn unsigned B into signed A.
+// Keep this guard on load-time native references, without a late .call lookup.
+const CODEC_SET = Set;
+const CODEC_SET_HAS = Set.prototype.has;
+const CODEC_SET_ADD = Set.prototype.add;
+const CODEC_SET_DELETE = Set.prototype.delete;
+const CODEC_APPLY = Reflect.apply.bind(Reflect);
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { CipherSuite, HkdfSha256, Aes256Gcm } = require("@hpke/core");
@@ -154,7 +162,7 @@ function safeMap(value, required, exact) {
 // Third-party cborg may consult a poisoned global Object.keys after an
 // attacker-owned native KeyObject getter. Take two separate descriptor-only
 // snapshots so its encoder never receives the protected expected values.
-function snapshotCborValue(value, seen = new Set()) {
+function snapshotCborValue(value, seen = new CODEC_SET()) {
   if (value === null || typeof value === "boolean" || typeof value === "string") return value;
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
@@ -165,8 +173,10 @@ function snapshotCborValue(value, seen = new Set()) {
     return value;
   }
   if (isBytes(value)) return CODEC_BUFFER_FROM(value);
-  if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
-  seen.add(value);
+  if (typeof value !== "object" || CODEC_APPLY(CODEC_SET_HAS, seen, [value])) {
+    fail("UNSUPPORTED_CBOR_VALUE");
+  }
+  CODEC_APPLY(CODEC_SET_ADD, seen, [value]);
   let result;
   if (CODEC_ARRAY_IS_ARRAY(value)) {
     const length = value.length;
@@ -195,7 +205,7 @@ function snapshotCborValue(value, seen = new Set()) {
       });
     }
   }
-  seen.delete(value);
+  CODEC_APPLY(CODEC_SET_DELETE, seen, [value]);
   return result;
 }
 
@@ -259,7 +269,7 @@ async function encodeDeterministic(value) {
   }
 }
 
-function inspectDecoded(value, seen = new Set()) {
+function inspectDecoded(value, seen = new CODEC_SET()) {
   if (value === null || typeof value === "boolean" || typeof value === "string") return;
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
@@ -270,8 +280,10 @@ function inspectDecoded(value, seen = new Set()) {
     return;
   }
   if (isBytes(value)) return;
-  if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
-  seen.add(value);
+  if (typeof value !== "object" || CODEC_APPLY(CODEC_SET_HAS, seen, [value])) {
+    fail("UNSUPPORTED_CBOR_VALUE");
+  }
+  CODEC_APPLY(CODEC_SET_ADD, seen, [value]);
   if (Array.isArray(value)) value.forEach((entry) => inspectDecoded(entry, seen));
   else {
     const map = plainObject(value);
@@ -280,7 +292,7 @@ function inspectDecoded(value, seen = new Set()) {
       inspectDecoded(map[key], seen);
     }
   }
-  seen.delete(value);
+  CODEC_APPLY(CODEC_SET_DELETE, seen, [value]);
 }
 
 async function decodeDeterministic(input) {

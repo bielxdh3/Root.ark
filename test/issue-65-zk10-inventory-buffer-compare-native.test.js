@@ -445,3 +445,75 @@ test("P2 inventory: poisoned CBOR Object.keys cannot restore unsigned nonce B af
   assert.equal(authenticated, undefined, "signed nonce A cannot authenticate unsigned nonce B");
   assert.equal((await verify(signer.publicKey, genuineSignedA, originalNonceA)).outcome, "ABSENT");
 });
+
+test("P2 inventory: Set.prototype.has cannot turn signed nonce A into unsigned nonce B", async () => {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 141);
+  const scope = { account_id: Buffer.alloc(16, 142),
+    compartment_id: Buffer.from("set-cbor"), keyring_id: Buffer.alloc(16, 143) };
+  const signedNonceA = Buffer.alloc(32, 144);
+  const unsignedNonceB = Buffer.from(signedNonceA);
+  unsignedNonceB[0] ^= 1;
+  const root = await inventory.computeRoot(scope, 0, null, []);
+  const signedA = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope, sequence: 0,
+    previousRoot: null, entries: [], nonce: signedNonceA,
+  });
+  const z = require("../src/crypto/rootark-zk-1");
+  const decoded = await z.decodeDeterministic(signedA);
+  const forgedB = Buffer.from(await z.encodeDeterministic({ ...decoded, nonce: unsignedNonceB }));
+  assert.notDeepEqual(forgedB, signedA);
+  const requested = { object_id: Buffer.alloc(16, 145), revision: 1,
+    epoch: 1, ciphertext_sha256: Buffer.alloc(32, 146) };
+  const verify = (pin, serialized = forgedB, nonce = unsignedNonceB) =>
+    inventory.verifySnapshot({ serialized, pinnedPublicKey: pin,
+      pinnedSignerKeyId: signerKeyId, expectedScope: scope,
+      requested, minimumHead: { sequence: 0, root }, nonce });
+  assert.equal((await verify(signer.publicKey, signedA, signedNonceA)).outcome, "ABSENT");
+  await assert.rejects(verify(signer.publicKey), { code: "INVENTORY_SIGNATURE" });
+
+  const nativeSetHas = Set.prototype.has;
+  const maliciousPin = crypto.createPublicKey({
+    key: signer.publicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  let getterReads = 0, replacements = 0, restorations = 0;
+  Object.defineProperty(maliciousPin, "type", { configurable: true, get() {
+    getterReads++;
+    Set.prototype.has = function (value) {
+      if (value && value.type === inventory.SNAPSHOT_TYPE
+        && value.nonce?.length === 32 && !Object.hasOwn(value, "signature")
+        && value.nonce[0] === unsignedNonceB[0]) {
+        replacements++;
+        value.nonce[0] = signedNonceA[0];
+        queueMicrotask(() => { value.nonce[0] = unsignedNonceB[0]; restorations++; });
+      }
+      return Reflect.apply(nativeSetHas, this, [value]);
+    };
+    return "public";
+  } });
+  let accepted, rejected, replacementsDuringVerification = -1;
+  try {
+    try { accepted = await verify(maliciousPin); }
+    catch (error) { rejected = error; }
+    replacementsDuringVerification = replacements;
+    assert.equal((await verify(maliciousPin, signedA, signedNonceA)).outcome,
+      "ABSENT", "genuine Ed25519 owner A remains accepted under hostile callback");
+    const canaryNonce = Buffer.from(unsignedNonceB);
+    const probe = { type: inventory.SNAPSHOT_TYPE, nonce: canaryNonce };
+    assert.equal(new Set().has(probe), false);
+    await Promise.resolve();
+    assert.equal(probe.nonce[0], unsignedNonceB[0], "the probe restores unsigned nonce B");
+  } finally {
+    Set.prototype.has = nativeSetHas;
+    delete maliciousPin.type;
+  }
+  assert.equal(accepted, undefined, "signed nonce A must not authenticate forged nonce B");
+  assert.ok(["INVENTORY_SIGNATURE", "INVENTORY_ENCODING"].includes(rejected?.code));
+  assert.ok(getterReads > 0, "native KeyObject.type callback executes");
+  assert.equal(replacementsDuringVerification, 0,
+    "the inventory codec must use its pinned Set.has before private CBOR copies");
+  assert.equal(replacements, 1, "independent positive canary demonstrates live hostile Set.has");
+  assert.equal(restorations, replacements, "nonce B is restored after each transient replacement");
+  assert.equal((await verify(signer.publicKey, signedA, signedNonceA)).outcome, "ABSENT");
+});
