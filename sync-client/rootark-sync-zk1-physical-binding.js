@@ -7,6 +7,9 @@
 // success flag is never evidence of such a write. An admission timestamp,
 // witness/CAS floor, and external cloud durability are NOT proven here.
 const crypto = require("node:crypto");
+// A native Ed25519 KeyObject getter runs before later local policy snapshots.
+// Define own array data slots instead of consulting mutable Array.push.
+const NATIVE_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const protocol = require("./rootark-sync-protocol");
 const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
   require("./rootark-sync-authorization");
@@ -84,7 +87,9 @@ function snapshotLocalDevicePolicy(input) {
     const deviceId = descriptor.value;
     if (typeof deviceId !== "string"
       || !/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)) deny();
-    revoked.push(deviceId);
+    NATIVE_DEFINE_PROPERTY(revoked, String(index), {
+      value: deviceId, enumerable: true, writable: true, configurable: true,
+    });
   }
   if (new Set(revoked).size !== revoked.length) deny();
   return { username: raw.username, trustedDevicePublicKeys: pins,
