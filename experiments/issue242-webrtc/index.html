@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="pt-BR">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#242 | Disposable WebRTC Room</title>
+<style>
+  body{font:16px system-ui,Arial;max-width:750px;margin:2rem auto;padding:0 1rem;color:#171717;background:#fafafa}
+  button,input{font:inherit;padding:.5rem;margin:.2rem;max-width:95%}
+  fieldset{border:1px solid #aaa;border-radius:8px;margin:1rem 0;padding:1rem}
+  .entry{padding:.5rem;background:#eee;border-radius:5px;margin:.5rem 0;overflow-wrap:anywhere}
+  #events{white-space:pre-wrap;overflow-wrap:anywhere;min-height:80px}
+  small{color:#555}
+</style>
+<h1>WebRTC room experiment #242</h1>
+<p>Somente loopback, dados de teste selecionados pelo navegador, sem Root.ark storage. Credenciais nunca entram no link.</p>
+<fieldset>
+  <legend>Sala temporária</legend>
+  <button id="create">Criar sala (host)</button>
+  <div>Room ID: <strong id="room"></strong></div>
+  <button id="invite" disabled>Gerar convite único (60 s)</button>
+  <div id="invites"></div>
+</fieldset>
+<fieldset>
+  <legend>Entrar em sala existente</legend>
+  <input id="roomInput" placeholder="Room ID" autocomplete="off">
+  <input id="inviteInput" type="password" placeholder="Convite (uso único)" autocomplete="off">
+  <button id="join">Entrar</button>
+</fieldset>
+<fieldset>
+  <legend>Pares e consentimento</legend>
+  <div id="peers"></div>
+</fieldset>
+<fieldset>
+  <legend>Enviar aos pares autorizados</legend>
+  <input id="textInput" maxlength="1000" placeholder="Texto de teste">
+  <button id="sendText">Enviar texto</button>
+  <input type="file" id="fileInput">
+  <button id="sendFile">Enviar arquivo de teste (até 1 MiB)</button>
+  <div id="incoming"></div>
+</fieldset>
+<p id="state">Sem conexão</p>
+<pre id="events" aria-live="polite"></pre>
+<small>Não testa TURN, NAT externo, persistência, retomada, streaming maior que RAM ou autenticação Root.ark.</small>
+<script src="/client.js"></script>
+</html>
