@@ -36,6 +36,9 @@ jobs:
         with:
           languages: javascript-typescript
           queries: security-extended
+          # Scope out intentionally vulnerable RED-only lab scripts, not the
+          # production source or the security regression test tree.
+          config-file: ./.github/codeql/issue67-lab-scope.yml
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4

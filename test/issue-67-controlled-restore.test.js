@@ -538,7 +538,10 @@ test("#67 P2: a renamed foreign inode never replaces the verified progress tempo
       "a checked inode must never authorize unlinking a later foreign pathname");
     assert.equal((await foreignFd.stat({ bigint: true })).ino, foreignStats.ino);
     assert.equal((await fsp.lstat(temporary, { bigint: true })).ino, foreignStats.ino);
-    assert.equal((await fsp.readFile(temporary, "utf8")), "foreign synthetic progress marker");
+    // The foreign descriptor was opened at the actual swap. Read THAT held
+    // inode, not the independently mutable pathname checked by lstat above.
+    assert.equal(await foreignFd.readFile({ encoding: "utf8" }),
+      "foreign synthetic progress marker");
     assert.equal((await fsp.lstat(retained, { bigint: true })).nlink, 2n);
     assert.equal(f.pushes(), 0);
   } finally {
