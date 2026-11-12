@@ -137,3 +137,45 @@ test("fork, orphan successor, self-claimed previous digest and rollback counter 
     independentRetainedCheckpointDigest: checkpointDigest(fork),
   }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
 });
+
+test("owner-signed A never authorizes forged checkpoint B when owner KeyObject getter retargets crypto.verify", async () => {
+  // Genuine external-owner Ed25519 signature A and valid signed inventory.
+  // B changes ONLY the Ed25519 signature while remaining structurally valid;
+  // the independently supplied B digest is real, not a fake unsigned marker.
+  const f = await fixture();
+  const forged = { ...f.signed.checkpoints[0],
+    signature: crypto.randomBytes(64).toString("base64url") };
+  const forgedDigest = checkpointDigest(forged);
+  let getterCalls = 0;
+  const owner = crypto.createPublicKey({
+    key: f.enrollment.ownerPublicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  const originalVerify = crypto.verify;
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    getterCalls += 1;
+    crypto.verify = () => true;
+    return "public";
+  } });
+  let verified;
+  try {
+    try {
+      verified = await verifyOwnerInventoryEnrollment({
+        ...f.enrollment, ownerPublicKey: owner,
+        checkpoints: [forged],
+        independentRetainedCheckpointDigest: forgedDigest,
+      });
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+  } finally {
+    crypto.verify = originalVerify;
+    delete owner.type;
+  }
+  assert.ok(getterCalls > 0, "the genuine key's hostile getter must execute");
+  assert.equal(verified, undefined,
+    "a retargeted same-realm crypto.verify may not validate a forged owner signature");
+  const positive = await verifyOwnerInventoryEnrollment(f.enrollment);
+  assert.equal(positive.ownerSignatureVerified, true,
+    "genuinely signed A stays accepted after the negative");
+});
