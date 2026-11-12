@@ -1219,8 +1219,8 @@ scopes CodeQL exclusion ONLY to the intentionally vulnerable
 a test read to its retained foreign FD; `security-extended` and product/source
 scans remain enabled. Two independent SOURCE GO opinions cover only this
 limited delta. Windows Node22 targeted restored-inode case **1 PASS / 0 FAIL**;
-full controlled-restore suite remains in progress at this checkpoint and WSL
-probe unresponsive. The child is **not published** and its exact hosted CodeQL
+the subsequent full Windows Node22 controlled-restore suite completed **18 PASS,
+1 expected SKIP, 0 FAIL**. WSL probe remains unresponsive. The child is **not published** and its exact hosted CodeQL
 and GHAS results are unknown.
 
 **PR #301/#302:** #301 remote `e1ca644b` remains DRAFT and hosted Security
@@ -1229,7 +1229,11 @@ Regression has failed; a NEW unpublished child `1b608915478ed8f6bab651178c476de8
 `Object.freeze` terminal flags with genuine Ed25519 A/B RED-to-GREEN evidence.
 Worker-reported Windows22 validation: 6/6 adversarial+positive, 125 PASS /
 1 expected SKIP broad suite, and 37/37 PG/inventory; no WSL or two exact
-independent SOURCE GO yet, therefore publication remains blocked. #302 remote `e0af8397`
+independent SOURCE GO yet. Two later SOURCE reviews of `1b608915` explicitly
+returned **NO-GO** on additional dynamically rebound crypto.verify /
+crypto.timingSafeEqual in PG/inventory, revocation snapshot mutable push/includes,
+and mutable covered-compartments return. A new isolated descendant is needed;
+therefore publication remains blocked. #302 remote `e0af8397`
 remains DRAFT, with later DEV-OFF custodian/SQLite candidates not equivalent
 to independent authority or verified production IO. Candidate SHAs, reviewers,
 and both-platform tests must be reconciled anew before any fast-forward push.
