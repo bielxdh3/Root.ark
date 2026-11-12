@@ -42,6 +42,11 @@ const BUFFER_TO_STRING = Buffer.prototype.toString;
 const BUFFER_FILL = Buffer.prototype.fill;
 const BUFFER_EQUALS = Buffer.prototype.equals;
 const IS_BUFFER = Buffer.isBuffer.bind(Buffer);
+// A failed physical SQLite pin must stay poisoned even if caller-controlled
+// JS mutates WeakMap.prototype.get after a native filesystem failure.
+const NATIVE_WEAK_GET = WeakMap.prototype.get;
+const NATIVE_WEAK_SET = WeakMap.prototype.set;
+const NATIVE_WEAK_DELETE = WeakMap.prototype.delete;
 function canonicalFields(fields, source) {
   const wire = CREATE_NULL_PROTO(null);
   // Enumerate only these trusted canonical field names in fixed order. A
@@ -312,7 +317,7 @@ function sameFile(stat, candidate) {
     && stat.ino !== zero && stat.dev === candidate.dev && stat.ino === candidate.ino;
 }
 function checkDbPin(db) {
-  const pin = dbPins.get(db);
+  const pin = SAFE_APPLY(NATIVE_WEAK_GET, dbPins, [db]);
   if (!pin || pin.failed) deny();
   try {
     // SQLite has a separate native handle. Keep our file descriptor pinned
@@ -331,8 +336,8 @@ function checkDbPin(db) {
 }
 function closeDb(db) {
   if (!db) return;
-  const pin = dbPins.get(db);
-  dbPins.delete(db);
+  const pin = SAFE_APPLY(NATIVE_WEAK_GET, dbPins, [db]);
+  SAFE_APPLY(NATIVE_WEAK_DELETE, dbPins, [db]);
   try { db.close(); }
   finally { if (pin) fs.closeSync(pin.fd); }
 }
@@ -371,7 +376,8 @@ function openDb(file) {
     const after = fs.fstatSync(descriptor, { bigint: true });
     if (!sameFile(opened, after)
       || !sameFile(after, fs.lstatSync(file, { bigint: true }))) deny();
-    dbPins.set(db, { file, fd: descriptor, identity: opened, failed: false });
+    SAFE_APPLY(NATIVE_WEAK_SET, dbPins,
+      [db, { file, fd: descriptor, identity: opened, failed: false }]);
     descriptor = undefined; // Keep the pin until closeDb, not just startup.
     return db;
   } catch (_) {
