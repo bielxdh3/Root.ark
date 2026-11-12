@@ -68,6 +68,36 @@ async function exists(filePath) {
   return fsp.stat(filePath).then(() => true, () => false);
 }
 
+// Construct a disposable *preexisting* cache, rather than asking the current
+// FOD engine to publish bytes without the required native RootSession. The
+// writer has already created the remote operation and its local tracked
+// identity in setup(); this fixture only copies those known bytes and fields
+// into the consumer's isolated temp root. It is not a production hydration.
+async function seedLegacyCachedFodFixture({ root, source, writer, open }, relativePaths) {
+  const initial = await open();
+  for (const relative of relativePaths) {
+    const tracked = writer.snapshot.files[relative];
+    assert.ok(tracked && !tracked.deleted, `writer must track ${relative}`);
+    const target = path.join(root, relative);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.copyFile(path.join(source, relative), target);
+    initial.snapshot.files[relative] = structuredClone(tracked);
+  }
+  // This is deliberately a direct disk fixture write, not persistSnapshot():
+  // that production API must continue to require native mutation authority.
+  await fsp.writeFile(path.join(root, ".rootark-sync-index.json"),
+    JSON.stringify(initial.snapshot));
+  const reopened = await open();
+  for (const relative of relativePaths) {
+    assert.deepEqual(reopened.snapshot.files[relative], writer.snapshot.files[relative],
+      "disposable legacy cache must retain exact tracked object, version and hash");
+    assert.deepEqual(await fsp.readFile(path.join(root, relative)),
+      await fsp.readFile(path.join(source, relative)),
+      "disposable legacy cache must retain exact source bytes");
+  }
+  return reopened;
+}
+
 async function seedRemote(store, key, relative, objectId = `external-${crypto.randomUUID()}`) {
   const operation = protocol.createOperation({
     operation: "create", objectId, fileId: `file-${crypto.randomUUID()}`,
@@ -272,9 +302,8 @@ test("issue 66: hydration finds a file on later inventory pages without download
 });
 
 test("issue 66: Files On-Demand refuses destructive cache eviction without native root custody", async (t) => {
-  const { root, open, store, state } = await setup(t, { "docs/cache.txt": "cache me" });
-  const client = await open();
-  await client.materializeRemote("docs/cache.txt");
+  const { root, source, writer, open, store, state } = await setup(t, { "docs/cache.txt": "cache me" });
+  const client = await seedLegacyCachedFodFixture({ root, source, writer, open }, ["docs/cache.txt"]);
   const before = store.list("alice")[0];
   const beforeSnapshot = JSON.stringify(client.snapshot);
   const beforeFullReads = state.fullReads.length;
@@ -303,10 +332,9 @@ test("issue 66: Files On-Demand refuses destructive cache eviction without nativ
 });
 
 test("issue 66: automatic excluded cache migration refuses legacy eviction before snapshot mutation", async (t) => {
-  const { root, open, adapter, store, state, key } = await setup(t,
+  const { root, source, writer, open, adapter, store, state, key } = await setup(t,
     { "docs/cache.txt": "retain exact Unicode café-中-😀 bytes" });
-  const original = await open();
-  await original.materializeRemote("docs/cache.txt");
+  await seedLegacyCachedFodFixture({ root, source, writer, open }, ["docs/cache.txt"]);
   const snapshotPath = path.join(root, ".rootark-sync-index.json");
   const oldSnapshot = await fsp.readFile(snapshotPath);
   const oldFile = await fsp.readFile(path.join(root, "docs", "cache.txt"));
