@@ -102,6 +102,66 @@ test("P2 inventory: native key getter cannot replace signed member A with reques
     "PRESENT", "genuine A remains accepted");
 });
 
+test("P2 inventory: native key callback cannot hide an older signed object from monotonic superset comparison", async () => {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 211);
+  const scope = { account_id: Buffer.alloc(16, 212),
+    compartment_id: Buffer.from("protected"), keyring_id: Buffer.alloc(16, 213) };
+  const oldA = { object_id: Buffer.alloc(16, 214), revision: 1,
+    epoch: 1, ciphertext_sha256: Buffer.alloc(32, 215) };
+  const newB = { object_id: Buffer.alloc(16, 216), revision: 1,
+    epoch: 1, ciphertext_sha256: Buffer.alloc(32, 217) };
+  const newC = { object_id: Buffer.alloc(16, 218), revision: 1,
+    epoch: 1, ciphertext_sha256: Buffer.alloc(32, 219) };
+  const genesisRoot = Buffer.alloc(32, 220);
+  const oldRoot = await inventory.computeRoot(scope, 1, genesisRoot, [oldA]);
+  const oldSnapshot = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope,
+    sequence: 1, previousRoot: genesisRoot, entries: [oldA], nonce: Buffer.alloc(32, 221),
+  });
+  const nowNonce = Buffer.alloc(32, 222);
+  const unsignedNewRoot = await inventory.computeRoot(scope, 2, oldRoot, [newB, newC]);
+  const newSnapshot = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope,
+    sequence: 2, previousRoot: oldRoot, entries: [newB, newC], nonce: nowNonce,
+  });
+  assert.equal(unsignedNewRoot.length, 32);
+  const input = (pin) => ({
+    serialized: newSnapshot, pinnedPublicKey: pin, pinnedSignerKeyId: signerKeyId,
+    expectedScope: scope, requested: newB,
+    minimumHead: { sequence: 1, root: oldRoot }, minimumSnapshot: oldSnapshot,
+    nonce: nowNonce,
+  });
+  await assert.rejects(inventory.verifySnapshot(input(signer.publicKey)),
+    { code: "INVENTORY_REMOVED" }, "signed snapshot B/C omits historical signed A");
+
+  const hostile = Object.create(signer.publicKey);
+  const oldIterator = Array.prototype[Symbol.iterator];
+  let keyGetterReads = 0;
+  let omissions = 0;
+  Object.defineProperty(hostile, "type", { get() {
+    keyGetterReads++;
+    Array.prototype[Symbol.iterator] = function*() {
+      if (this.length === 1 && this[0]?.object_id?.equals?.(oldA.object_id)
+        && /\bat assertSuperset \(/.test(new Error().stack)) {
+        omissions++;
+        return;
+      }
+      yield* Reflect.apply(oldIterator, this, []);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(inventory.verifySnapshot(input(hostile)),
+      { code: "INVENTORY_REMOVED" },
+      "a native public-key getter cannot hide previously signed historical object A");
+  } finally {
+    Array.prototype[Symbol.iterator] = oldIterator;
+  }
+  assert.ok(keyGetterReads > 0);
+  assert.equal(omissions, 0, "monotonic history cannot invoke an attacker iterator");
+});
+
 test("P2 inventory: signed object A must not make requested B PRESENT via post-key Buffer.compare", async () => {
   const signer = crypto.generateKeyPairSync("ed25519");
   const signerKeyId = Buffer.alloc(16, 71);

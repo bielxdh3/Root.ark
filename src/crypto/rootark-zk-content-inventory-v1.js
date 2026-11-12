@@ -541,15 +541,30 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
 }
 
 function assertSuperset(currentEntries, previousEntries) {
-  const current = new Map(currentEntries.map((entry) => [
-    `${entry.object_id.toString("hex")}:${entry.revision}`,
-    entry,
-  ]));
-  for (const previous of previousEntries) {
-    const key = `${previous.object_id.toString("hex")}:${previous.revision}`;
-    const entry = current.get(key);
-    if (!entry) fail("INVENTORY_REMOVED");
-    if (entry.epoch !== previous.epoch || !sameBytes(entry.ciphertext_sha256, previous.ciphertext_sha256)) {
+  // Both arrays were normalized in canonical (object_id, revision) order.
+  // A public KeyObject getter may replace Array.prototype[Symbol.iterator],
+  // Array.prototype.map or Map.prototype.get after verification. Compare the
+  // own indexed entries directly so it cannot hide a previously signed row.
+  let cursor = 0;
+  for (let index = 0; index < previousEntries.length; index += 1) {
+    const previous = previousEntries[index];
+    let match = null;
+    while (cursor < currentEntries.length) {
+      const candidate = currentEntries[cursor];
+      const order = NATIVE_BUFFER_COMPARE(candidate.object_id, previous.object_id)
+        || candidate.revision - previous.revision;
+      if (order < 0) {
+        cursor += 1;
+        continue;
+      }
+      if (order > 0) fail("INVENTORY_REMOVED");
+      match = candidate;
+      cursor += 1;
+      break;
+    }
+    if (!match) fail("INVENTORY_REMOVED");
+    if (match.epoch !== previous.epoch
+      || !sameBytes(match.ciphertext_sha256, previous.ciphertext_sha256)) {
       fail("INVENTORY_MUTATED");
     }
   }
