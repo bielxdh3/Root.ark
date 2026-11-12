@@ -52,7 +52,8 @@ function canonicalWindowsTestEnvironment(environment = process.env,
 }
 
 function createTapProgressRecorder(write) {
-  const state = { results: 0, failures: 0, plan: false, tests: null, reportedFailures: null,
+  const state = { results: 0, failures: 0, plan: false, tests: null,
+    reportedFailures: null, reportedPasses: null,
     lastResultHash: "none", lastSubtestHash: "none", subtests: 0,
     observedFailures: 0, topLevelTodos: 0, topLevelSkips: 0,
     nestedResults: 0, nestedObservedFailures: 0, nestedFailures: 0,
@@ -203,6 +204,8 @@ function createTapProgressRecorder(write) {
       if (tests) state.tests = Number(tests[1]);
       const failures = /^# fail (\d+)$/.exec(line);
       if (failures) state.reportedFailures = Number(failures[1]);
+      const passes = /^# pass (\d+)$/.exec(line);
+      if (passes) state.reportedPasses = Number(passes[1]);
     },
   };
 }
@@ -354,11 +357,14 @@ function run() {
     childProgress.finished(code, signal);
     clearInterval(heartbeat);
     tracker.finish();
-    const { results, failures, plan, tests, reportedFailures } = tracker.state;
-    const passed = !timedOut && !spawnFailed && code === 0 && !signal && plan && tests !== null
+    const { results, failures, plan, tests, reportedFailures, reportedPasses } = tracker.state;
+    // A child that exits 0 with TAP "1..0 / # tests 0 / # fail 0", or only
+    // TODO/SKIP, has NOT run a positive canonical test. Never certify it.
+    const passed = !timedOut && !spawnFailed && code === 0 && !signal && plan
+      && tests > 0 && results > 0 && reportedPasses > 0
       && reportedFailures === 0 && failures === 0 && tracker.state.nestedFailures === 0
       && childProgress.state.childExit && childProgress.state.stdoutEof && childProgress.state.stderrEof;
-    const summary = `${passed ? "PASS" : "FAIL"} Windows canonical suite: exit=${code ?? "unknown"} signal=${signal ? "present" : "none"} TAPresults=${results} tests=${tests ?? "unknown"} failures=${failures} ${tracker.safeSummary()} ${childProgress.safeSummary()}`;
+    const summary = `${passed ? "PASS" : "FAIL"} Windows canonical suite: exit=${code ?? "unknown"} signal=${signal ? "present" : "none"} TAPresults=${results} tests=${tests ?? "unknown"} passed=${reportedPasses ?? "unknown"} failures=${failures} ${tracker.safeSummary()} ${childProgress.safeSummary()}`;
     reportedSuite = true;
     if (passed) console.log(summary);
     else writeFailureDiagnostic(summary);
