@@ -105,6 +105,17 @@ function savePublicLinks(entries = {}, options = {}) {
       ensureFolderId(db, link.folderId || "root");
       const existing = existingByToken.get(token);
       const existingLink = existing ? rowToLink(existing) : null;
+      // The stored capability policy is immutable under legacy whole-map
+      // reconciliation. A stale or malformed JSON snapshot cannot replace
+      // the binding or silently downgrade an active C-prefixed grant.
+      if (existingLink?.shareKind === "capability-v1"
+        && (link.shareKind !== "capability-v1"
+          || JSON.stringify(existingLink.resourceBinding) !== JSON.stringify(link.resourceBinding)
+          || existingLink.fileName !== fileName
+          || existingLink.folderId !== (link.folderId || "root"))) {
+        activeTokens.add(token);
+        continue;
+      }
       const views = Math.max(Number(link.views) || 0, Number(existing?.views) || 0);
       const downloads = Math.max(Number(link.downloads) || 0, Number(existingLink?.downloads) || 0);
       const activeViewers = {};
@@ -134,6 +145,13 @@ function savePublicLinks(entries = {}, options = {}) {
         ...(existingLink?.lastDownloadedAt && (!link.lastDownloadedAt || existingLink.lastDownloadedAt > link.lastDownloadedAt)
           ? { lastDownloadedAt: existingLink.lastDownloadedAt }
           : {}),
+        // Capability aliases are managed by addCapabilitySession under a
+        // dedicated IMMEDIATE transaction. Always preserve the newest DB
+        // session set rather than replacing it with a stale legacy snapshot.
+        ...(link.shareKind === "capability-v1"
+          ? { capabilitySessions: existingLink?.shareKind === "capability-v1"
+            ? (existingLink.capabilitySessions || {}) : {} }
+          : {}),
       };
       activeTokens.add(token);
       insert.run(
@@ -154,6 +172,12 @@ function savePublicLinks(entries = {}, options = {}) {
     const revoke = db.prepare("UPDATE public_links SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL");
     for (const row of existingRows) {
       if (activeTokens.has(row.token)) continue;
+      // Only the explicit single-token revokeCapability operation can revoke
+      // an UNEXPIRED C-prefixed capability. Absence from a legacy snapshot
+      // may mean another process created it after our read. Expired rows can
+      // still be tombstoned by routine cleanup to bound metadata retention.
+      if (/^C[a-f0-9]{47}$/.test(row.token)
+        && new Date(row.expires_at).getTime() > Date.now()) continue;
       revoke.run(now, row.token);
     }
 
@@ -180,6 +204,49 @@ function savePublicLinks(entries = {}, options = {}) {
         now
       );
     }
+  }).immediate();
+}
+
+function createCapability(token, link) {
+  if (!/^C[a-f0-9]{47}$/.test(token || "") || link?.shareKind !== "capability-v1"
+    || link?.resourceBinding?.version !== 2
+    || !/^[a-f0-9]{64}$/.test(link.resourceBinding.identity || "")
+    || !basename(link.fileName) || basename(link.fileName) !== link.fileName
+    || !link.createdBy || new Date(link.expiresAt).getTime() <= Date.now()) {
+    return { status: "invalid" };
+  }
+  const db = getDb();
+  return db.transaction(() => {
+    ensureRootFolder(db);
+    ensureFolderId(db, link.folderId || "root");
+    const result = db.prepare(`INSERT OR IGNORE INTO public_links
+      (token, folder_id, file_name, created_by, created_at, expires_at,
+       max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`).run(
+      token, link.folderId || "root", link.fileName, link.createdBy,
+      link.createdAt || nowIso(), link.expiresAt, Number(link.maxViews) || 0,
+      0, link.passwordHash || null,
+      jsonStringify({ ...link, capabilitySessions: {} }), permissionsToColumn(link.permissions));
+    return { status: result.changes === 1 ? "ok" : "collision" };
+  }).immediate();
+}
+
+function revokeCapability(token, username) {
+  if (!/^C[a-f0-9]{47}$/.test(token || "")) return { status: "missing" };
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT created_by, metadata_json FROM public_links
+      WHERE token = ? AND revoked_at IS NULL`).get(token);
+    if (!row) return { status: "missing" };
+    const metadata = safeJsonParse(row.metadata_json, {});
+    if (metadata.shareKind !== "capability-v1") return { status: "missing" };
+    const owner = String(row.created_by || metadata.createdBy || "").trim().toLowerCase();
+    if (!owner || owner !== String(username || "").trim().toLowerCase()) {
+      return { status: "forbidden" };
+    }
+    const outcome = db.prepare(`UPDATE public_links SET revoked_at = ?
+      WHERE token = ? AND revoked_at IS NULL`).run(nowIso(), token);
+    return { status: outcome.changes === 1 ? "ok" : "missing" };
   }).immediate();
 }
 
@@ -364,9 +431,11 @@ function consumePublicLinkQuota(token, options = {}) {
 
 module.exports = {
   addCapabilitySession,
+  createCapability,
   consumePublicLinkQuota,
   getRecordedPublicLinkTokens,
   incrementPublicLinkViews,
   loadPublicLinks,
+  revokeCapability,
   savePublicLinks,
 };

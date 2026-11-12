@@ -48,6 +48,12 @@ passing disposable JSON/SQLite tests is not an authorization to enable it.
   aliases from the latest row. Never use the legacy `savePublicLinks()`
   whole-map reconciliation for exchange: a stale snapshot can otherwise
   revoke another newly created link or discard concurrent cookie sessions.
+- Creation and owner revocation likewise use per-token SQLite transactions.
+  Legacy whole-map reconciliation preserves the latest capability sessions
+  already committed in SQLite and cannot revoke an unexpired capability merely
+  because an old snapshot lacks it. Expired rows remain eligible for cleanup.
+  Tests include a confirmed stale-writer RED and an explicit post-read barrier,
+  not merely assumed delays between concurrent HTTP calls.
 - Revocation is authenticated/CSRF-protected and takes the capability bearer
   in the JSON body, never the request target. Resource generation is bound
   to inode metadata including change time (`ctimeMs`); previously issued

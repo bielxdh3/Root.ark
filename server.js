@@ -2799,6 +2799,9 @@ function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) 
 // Test-only pause points (NODE_ENV=test) used to race a permission change against an in-flight request.
 async function pauseShareAccessForTest(point) {
   if (process.env.NODE_ENV !== "test" || process.env.ROOTARK_TEST_SHARE_PAUSE_POINT !== point) return;
+  if (point === "exchange-commit" && process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER) {
+    fs.writeFileSync(process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER, "snapshot-read-before-admission");
+  }
   await new Promise((resolve) => setTimeout(resolve, Number(process.env.ROOTARK_TEST_SHARE_PAUSE_MS) || 0));
 }
 
@@ -12331,12 +12334,12 @@ const createPublicShare = async (req, res) => {
     return identity ? { version: 2, folderId: finalFolder.id, fileName: name, identity } : null;
   })() : null;
   if (isCapability && !resourceBinding) return res.status(404).json({ error: "Arquivo nao encontrado" });
-  const links = cleanupExpiredPublicLinks();
+  const links = isCapability && shouldUseDatabase() ? null : cleanupExpiredPublicLinks();
   const shareToken = isCapability
     ? `C${crypto.randomBytes(24).toString("hex").slice(1)}`
     : crypto.randomBytes(24).toString("hex");
   const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
-  links[shareToken] = {
+  const newLink = {
     fileName: name,
     folderId: finalFolder.id,
     createdAt: new Date().toISOString(),
@@ -12351,7 +12354,18 @@ const createPublicShare = async (req, res) => {
     ...(isCapability ? { shareKind: "capability-v1", resourceBinding } : {}),
     activeViewers: {},
   };
-  savePublicLinks(links);
+  if (isCapability && shouldUseDatabase()) {
+    // Capability creation is one INSERT under SQLite's writer transaction.
+    // Do not reconcile (and inadvertently revoke) other processes' links.
+    const inserted = publicLinksRepository.createCapability(shareToken, newLink);
+    if (inserted.status !== "ok") {
+      return res.status(503).json({ error: "Criacao de capacidade indisponivel" });
+    }
+    broadcastDataChanged("shares");
+  } else {
+    links[shareToken] = newLink;
+    savePublicLinks(links);
+  }
   addActionHistory(isCapability ? "share_capability_created" : "share_created",
     isCapability ? "" : name, req.user.username, {
     expiresAt,
@@ -12536,6 +12550,18 @@ app.delete("/share/capabilities/revoke", shareRateLimit, authenticate, requirePe
   const token = typeof req.body?.token === "string" && /^C[a-f0-9]{47}$/.test(req.body.token)
     && Object.keys(req.body).length === 1 ? req.body.token : "";
   if (!token) return res.status(404).json({ error: "Capacidade indisponivel" });
+  if (shouldUseDatabase()) {
+    // A transaction checks ownership and tombstones this ONE token. Neither
+    // its read nor its write may revoke another concurrently inserted grant.
+    const revoked = publicLinksRepository.revokeCapability(token, req.user.username);
+    if (revoked.status === "forbidden") return res.status(403).json({ error: "Acesso negado" });
+    if (revoked.status !== "ok") return res.status(404).json({ error: "Capacidade indisponivel" });
+    broadcastDataChanged("shares");
+    auditLog("share.capability_revoked", getAuditActor(req),
+      { type: "public_link", id: crypto.createHash("sha256").update(token).digest("hex") },
+      "revoked", "success", { scope: "file" });
+    return res.status(204).end();
+  }
   const links = loadPublicLinks();
   const link = links[token];
   if (!link || link.shareKind !== "capability-v1") {
