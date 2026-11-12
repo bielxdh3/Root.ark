@@ -9,6 +9,43 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-12 UTC — **newest execution checkpoint (source/local tests, not release):**
+`Root/main` remains `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+Published OPEN/Draft HEADs: #298 `e209a6ee`, #300 `c928d894`,
+#301 `e1ca644b`, #302 `e0af8397`; #306 is OPEN/non-Draft
+`b13b29f9` without formal APPROVED review. #298 CodeQL workflow
+`43126620790` succeeded while distinct GitHub CodeQL check-run
+`130881048062` FAILED; #300 CodeQL workflow/check-run on `c928` succeeded.
+These are not all-platform product or release validations.
+
+Unpublished #300 native lab child `7a4fdc1b` from `c928` has two independent
+SOURCE GO **only for experimental C#/C++ held-HANDLE/dirfd no-replace**;
+Windows NTFS/Node22 2 PASS, 1 Linux-only SKIP, 0 FAIL. Parent already PASS:
+the two FileShare.Delete read updates are defensive, not RED→GREEN. No exact
+child WSL, product RootSession, independent root-A custody or positive FOD.
+#301 has divergent local native-crypto candidates `a4220c4f` and `91ef9b81`,
+still requiring reconciliation; #301 published `e1ca` Security Regression
+failed its stale issuer Proxy oracle. #302 local DEV-OFF integrated
+`67b3d5dc` (parent `72211129`) reproduced **two genuine physical Windows
+signed-A/SQLite-B RED**: GENESIS sequence 1 persisted 2 and UPDATE sequence
+2 persisted 3 under mutated iterator; patched explicit SQL scalar binding,
+83 total Windows tests / 79 PASS / 4 POSIX SKIP / 0 FAIL. Exact-child WSL
+and independent SOURCE pair were not yet complete at this checkpoint.
+`3c68d325` is a separate preserved
+lineage, not proof that all cumulative patches were merged.
+
+**Four distinct all-required gates** remain LAB, NATIVE PRODUCT, independent
+self-hosted off-process/operator custody, and MERGE/RELEASE. Product still
+lacks original physical A and **all ancestor** independent pre-first-pin
+enrollment, protected UID/SID writer isolation, native rooted transactional
+no-replace stage/cleanup, signed durable cold PREPARE/COMMIT and `required-v2`
+reopen, positive CFAPI hydration/pin/picker, and signed ingress/egress fences.
+External gates require Windows **10** CFAPI physical tests, off-host operator
+and real powercut; WSL currently unavailable. Prior #300 positive FOD/pin/
+picker hosted failures (**49 Windows / 59 Ubuntu** on older `a598eb47`) remain
+unresolved by S0 refusal. Do not turn them into expected-denial positives.
+**ISSUE #66 INCOMPLETE · RootSession OFF · MERGE NO-GO · RELEASE NO-GO.**
+
 2026-11-11 late continuation — **newest execution checkpoint**: confirmed
 `Root/main` `202146bb73ca8577a0a4017c4556cb8b1e9588a6` unchanged. PR #298
 was advanced by ordinary FF to `73c2be30` after **two independent SOURCE GO

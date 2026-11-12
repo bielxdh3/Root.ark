@@ -44,6 +44,43 @@ flowchart TD
 The arrows are **conjunctive gates**, not alternative tests. A positive lab
 proof does not unlock the next gate without its own source-backed evidence.
 
+## 2026-11-12 UTC continuation — latest reconciled code, physical tests and independent gates
+
+This checkpoint supersedes **only the current-head/status assertions** in
+older dated sections. It neither reclassifies earlier evidence nor authorizes
+publication, merge, deployment, FOD activation or product RootSession. Latest
+queried `Root/main` was unchanged at
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+
+| PR | Live published GitHub HEAD and checks | New local-only evidence and outstanding review gate |
+| --- | --- | --- |
+| #298 | `e209a6ee3cb26931d33152f1022218242c32abb2`, OPEN/Draft. CodeQL Action workflow `43126620790` / Analyze job **SUCCESS**, but the **separate GitHub CodeQL check-run `130881048062` is FAILURE**. PostgreSQL, provider/Android, historical restore preview and dependency review workflows passed. | Published LAB-only no-replace/held-inode findings do not remediate product pathname mutations or prove native root custody. Scanner execution is not GHAS security-alert clearance. |
+| #300 | `c928d894939014767f1a8669946eeca72b29a97e`, OPEN/Draft; CodeQL Action `43121898978` and independent CodeQL check-run `130865225523` both **SUCCESS** on that SHA. | **Unpublished LAB-only chain** `c928d894 → c8949a9e → 7a4fdc1b`: real second-PID same-SID Windows/NTFS retained native source+destination HANDLE, native no-replace link/rename and foreign late-destination collision. Exact `7a4` Windows/Node22 2 PASS / 1 Linux SKIP / 0 FAIL, two independent SOURCE GO strictly for the experimental four-file delta. Parent `c894` was also 2 PASS / 1 SKIP; sharing-compatible reads are preventive, **not** physical RED→GREEN. POSIX code reused earlier verified lab, but WSL/ext4 tests on exact `7a4` are **not** available. Not published; no production source changed. |
+| #301 | `e1ca644b6aaaa48d87534895575d8576cfced077`, OPEN/Draft; prior hosted Security Regression `43100369644` FAILED the issuer Proxy test, other named hosted checks passed. | **Separate unpublished/divergent** native-crypto branches `a4220c4f` and `91ef9b81` must be reconciled; a local GO, green test or exact SHA on one is not inherited by the other. Ed25519 role separation, signed-body serialisation and post-callback intrinsic authority still need a common independently reviewed result. |
+| #302 | `e0af83970f2efa3c0798772c001e17f1dd49cade`, OPEN/Draft. Earlier Security Regression `43096175973` was `startup_failure` / **zero jobs**, not a code verdict. | **Unpublished** alternative `3c68d325` fixes unsigned SQL iterator on `4b30` lineage. **New isolated integration `67b3d5dc`** ports that fix atop `72211129` SQLite descriptor-pinning lineage, keeping originals intact. Exact parent `72211129` real Windows/Node22 attack persisted unsigned SQLite `sequence=2` under owner-signed GENESIS `1`, and `sequence=3` under signed UPDATE `2`: **0 PASS / 2 security RED** by physical database read. Exact child combined 83 tests / **79 PASS / 4 POSIX SKIP / 0 FAIL**, syntax and diff PASS. The exact-SHA independent SOURCE review pair was not yet complete at this checkpoint, and WSL/ext4 remains unavailable. Dual SQLite remains **DEV-OFF, nonauthorizing**. |
+| #306 | `b13b29f9662d5f9036431e53235b9cdc132f0944`, OPEN/non-Draft, no GitHub APPROVED review in last query. | Merge not permitted by mission, and prior mechanically clean mergeability is not formal security approval. |
+
+WSL service process invocations are currently unresponsive: no new Linux
+Node22/ext4 PASS is inferred from an earlier SHA or from a Windows Linux-SKIP.
+Do not restart unrelated services, rewrite tests as expected product denial or
+reclassify GitHub `startup_failure` as a source-test failure. No current
+publication of `7a4fdc1b` / `67b3d5dc` / `a4220c4f` / `91ef9b81` is
+authorized without their own independent SOURCE evidence and platform gates.
+
+**Four conjunctive planes, unchanged:** LAB primitive and attack reproductions
+are not a native product; product requires enrolled original physical root A
+and every ancestor **before the first mutable pathname preflight**, separately
+administered SID/UID writer isolation, native held-handle no-replace and durable
+signed PREPARE/COMMIT/cold `required-v2` recovery. Independent 100% self-hosted
+operator must attest identities, owner-signed monotonic CURRENT and real
+revocation/replay fencing outside the application. Release additionally needs
+real **Windows 10 CFAPI FOD hydration/pin/picker positives**, actual physical
+powercut/recovery, required hosted checks and review of the **exact** final SHA.
+Prior #300 `a598eb47` hosted Security Regression reported **49 Windows and 59
+Ubuntu positive FOD/pin/picker failures**: subsequent fail-closed S0 gates and
+LAB positives do not cure those product requirements. **RootSession OFF ·
+ISSUE #66 INCOMPLETE · MERGE NO-GO · RELEASE NO-GO.**
+
 ## 2026-11-11 late continuation — physical lab publication and crypto P2 boundaries
 
 This is the **newest checkpoint**, superseding only the stale "current HEAD"
