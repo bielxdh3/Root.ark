@@ -1372,3 +1372,59 @@ test("P2: reentrant retainedMinimum failure during genuine signing cannot escape
   assert.ok(refreshed.attest(next.request, next.ownerLease).floor.signature);
   assert.equal(refreshed.retainedMinimum().lease_serial, 2);
 });
+
+test("P2 String-slot hostile callback cannot rebind signed genesis SQLite scalar positions", (t) => {
+  const clean = setup(t, "string-slot-positive");
+  const ordinary = clean.track(createDevOffZk10MonotonicFloorCustodian(clean.config));
+  assert.equal(ordinary.retainedMinimum().head_digest, clean.genesis.head_digest);
+  assert.equal(ordinary.retainedMinimum().enrollment_root, clean.genesis.enrollment_root);
+
+  const x = setup(t, "string-slot-hostile");
+  assert.notEqual(x.genesis.head_digest, x.genesis.enrollment_root,
+    "genuine Ed25519 Genesis A must distinguish its signed scalar positions");
+  assert.equal(crypto.verify(null, signatureBytes(DOMAIN_GENESIS,
+    (({ signature, ...payload }) => payload)(x.genesis)), x.owner.publicKey,
+    Buffer.from(x.genesis.signature, "base64url")), true);
+  const nativeString = global.String;
+  const nativeLstat = fs.lstatSync;
+  let hooked = false, swaps = 0;
+  let instance;
+  try {
+    fs.lstatSync = function (name, ...rest) {
+      if (!hooked && (name === x.paths.databasePath
+        || name === x.paths.anchorDatabasePath)) {
+        hooked = true;
+        global.String = function (value) {
+          const stack = new Error().stack || "";
+          if (stack.includes("floorValues") && (value === 1 || value === 2)) {
+            swaps += 1;
+            return nativeString(value === 1 ? 2 : 1);
+          }
+          return nativeString(value);
+        };
+      }
+      return nativeLstat.call(fs, name, ...rest);
+    };
+    instance = createDevOffZk10MonotonicFloorCustodian(x.config);
+  } finally {
+    fs.lstatSync = nativeLstat;
+    global.String = nativeString;
+  }
+  if (instance) x.track(instance);
+  assert.equal(hooked, true, "a post-owner-authentication filesystem callback must execute");
+  assert.ok(swaps === 0 || swaps >= 4,
+    "hardened native numeric keys never invoke the injected String wrapper; legacy path must hit both stores");
+  assert.ok(instance, "signed A positive should remain functional rather than denying bootstrap");
+  assert.equal(instance.retainedMinimum().head_digest, x.genesis.head_digest,
+    "a genuine owner-signed head A must never persist as unsigned swapped B");
+  assert.equal(instance.retainedMinimum().enrollment_root, x.genesis.enrollment_root,
+    "the owner-signed enrollment A must not be swapped into head B");
+  for (const filePath of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
+    const db = new Database(filePath, { readonly: true, fileMustExist: true });
+    try {
+      const row = db.prepare("SELECT head_digest, enrollment_root FROM floor").get();
+      assert.equal(row.head_digest, x.genesis.head_digest);
+      assert.equal(row.enrollment_root, x.genesis.enrollment_root);
+    } finally { db.close(); }
+  }
+});

@@ -406,7 +406,7 @@ function floorValues(record) {
     // Array.prototype[index] can grow an inherited setter after a hostile
     // same-realm callback. Defining a fresh own DATA slot prevents a signed
     // scalar from being silently rewritten during the SQLite parameter copy.
-    DEFINE_PROPERTY(values, String(index), { value: record[STORED_FLOOR_FIELDS[index]],
+    DEFINE_PROPERTY(values, index, { value: record[STORED_FLOOR_FIELDS[index]],
       writable: true, enumerable: true, configurable: true });
   }
   return values;
@@ -422,9 +422,9 @@ function insertGenesis(db, head, ownerHash, signerHash) {
       owner_spki, custodian_spki)
       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const values = floorValues(head);
-    DEFINE_PROPERTY(values, String(values.length), { value: ownerHash,
+    DEFINE_PROPERTY(values, values.length, { value: ownerHash,
       writable: true, enumerable: true, configurable: true });
-    DEFINE_PROPERTY(values, String(values.length), { value: signerHash,
+    DEFINE_PROPERTY(values, values.length, { value: signerHash,
       writable: true, enumerable: true, configurable: true });
     SAFE_APPLY(statement.run, statement, values);
     checkDbPin(db);
@@ -443,7 +443,7 @@ function advanceDb(db, previous, next, expectedOwner, expectedSigner, challenge,
       lease_serial = ?, journal_count = ?, journal_tip = ?
       WHERE singleton = 1 AND lease_serial = ?`);
     const values = floorValues(next);
-    DEFINE_PROPERTY(values, String(values.length), { value: previous.lease_serial,
+    DEFINE_PROPERTY(values, values.length, { value: previous.lease_serial,
       writable: true, enumerable: true, configurable: true });
     const result = SAFE_APPLY(statement.run, statement, values);
     if (result.changes !== 1) deny();
@@ -525,7 +525,8 @@ function createDevOffZk10MonotonicFloorCustodian(options) {
       insertGenesis(main, genesis, ownerHash, signerHash);
     }
     let minimum = read(anchor, ownerHash, signerHash);
-    if (!minimum || !same(minimum, read(main, ownerHash, signerHash, true))) deny();
+    if (!minimum || !same(minimum, read(main, ownerHash, signerHash, true))
+      || (!mainExists && !same(minimum, genesis))) deny();
     let closed = false, poisoned = false;
     const api = {
       independentOffServerCustodyProven: false,
