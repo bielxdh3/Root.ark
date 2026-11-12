@@ -7,6 +7,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const vm = require("node:vm");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -152,12 +153,49 @@ async function startFixture(t, mode, extraEnv = {}) {
       body: payload,
     });
   };
-  const publicPost = (token, operationPath, viewerCookie = "") => request(port, `/share/${token}/${operationPath}`, {
-    method: "POST",
-    headers: viewerCookie ? { origin, cookie: viewerCookie } : { origin },
-  });
+  const exchangedCapabilities = new Map();
+  const exchangeCapability = async (token) => {
+    if (exchangedCapabilities.has(token)) return exchangedCapabilities.get(token);
+    const body = JSON.stringify({ token });
+    const response = await request(port, "/share/c/exchange", {
+      method: "POST",
+      headers: { origin, "content-type": "application/json",
+        "content-length": Buffer.byteLength(body) }, body,
+    });
+    assert.equal(response.status, 200, response.body);
+    const { handle } = JSON.parse(response.body);
+    assert.match(handle, /^[a-f0-9]{32}$/,
+      "a non-bearer public handle selects the isolated HTTP cookie session");
+    const cookies = (response.headers["set-cookie"] || [])
+      .filter((value) => value.startsWith("rootark_cap_")).map((value) => value.split(";", 1)[0]);
+    assert.equal(cookies.length, 1, "the exchange must issue exactly one opaque HttpOnly session cookie");
+    assert.equal(cookies[0].includes(token), false,
+      "the original bearer secret must never appear in a cookie name or value");
+    assert.ok((response.headers["set-cookie"] || []).some((value) =>
+      value.includes("HttpOnly") && value.includes("SameSite=Strict")),
+    "the capability session is HttpOnly and Strict SameSite");
+    const session = { handle, cookie: cookies.join("; ") };
+    exchangedCapabilities.set(token, session);
+    return session;
+  };
+  const publicPost = async (token, operationPath, viewerCookie = "") => {
+    const capability = /^C[a-f0-9]{47}$/.test(token)
+      ? await exchangeCapability(token) : null;
+    const requestPath = capability
+      ? `/share/${capability.handle}/${operationPath}`
+      : `/share/${token}/${operationPath}`;
+    if (capability) {
+      assert.equal(requestPath.includes(token), false,
+        "capability bearer may never appear in the HTTP request target");
+    }
+    return request(port, requestPath, {
+      method: "POST",
+      headers: { origin, ...((capability || viewerCookie)
+        ? { cookie: [capability?.cookie, viewerCookie].filter(Boolean).join("; ") } : {}) },
+    });
+  };
 
-  return { port, origin, authed, publicPost, legacyToken, dataDir, password };
+  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password };
 }
 
 function viewerCookieFrom(response) {
@@ -200,15 +238,30 @@ for (const mode of ["json", "sqlite"]) {
     assert.equal(response.status, 404, "never stream bytes from a descriptor outside the capability generation");
     assert.equal(response.body.includes("FORBIDDEN_AFTER_OPEN_BYTES"), false);
     const authorizedRetry = await publicPost(token, "download", viewerCookieFrom(viewer));
-    assert.equal(authorizedRetry.status, 200, "rejected foreign descriptor must not spend the download quota");
-    assert.equal(authorizedRetry.body, FILE_CONTENT);
+    assert.equal(authorizedRetry.status, 404,
+      "restoring a pathname after a foreign-descriptor swap changes kernel ctime; the old capability generation stays revoked");
+    // A failed opener did not consume a quota; the security failure above is
+    // due to generation drift, not artificially exhausted download allowance.
+    let downloads;
+    if (mode === "sqlite") {
+      const Database = require("better-sqlite3");
+      const db = new Database(path.join(dataDir, "rootark.sqlite"), { readonly: true });
+      try {
+        const row = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(token);
+        downloads = JSON.parse(row.metadata_json).downloads;
+      } finally { db.close(); }
+    } else {
+      downloads = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))[token].downloads;
+    }
+    assert.equal(downloads || 0, 0,
+      "foreign descriptor refusal must preserve download quota despite generation revocation");
   });
 }
 
 for (const mode of ["json", "sqlite"]) {
   test(`scoped capability: authorized creation, per-operation limits and durable revocation (${mode})`,
     { timeout: 60_000 }, async (t) => {
-      const { authed, port, origin, publicPost, dataDir, password } = await startFixture(t, mode);
+      const { authed, port, origin, publicPost, exchangeCapability, dataDir, password } = await startFixture(t, mode);
       const input = { name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
         permissions: ["download"], maxDownloads: 1 };
 
@@ -238,11 +291,77 @@ for (const mode of ["json", "sqlite"]) {
       assert.equal(capability.scope?.folderId, "root");
       assert.equal(capability.scope?.fileName, FILE_NAME);
       assert.match(capability.token, /^C[a-f0-9]{47}$/);
-      assert.ok(capability.url.endsWith(`/share/${capability.token}`));
+      assert.ok(capability.url.endsWith(`/share/c#${capability.token}`),
+        "secret must be a browser fragment, absent from the HTTP request target");
+      const landing = await request(port, "/share/c");
+      assert.equal(landing.status, 200, "fragment-only capability landing is public");
+      assert.equal(landing.body.includes(capability.token), false,
+        "the landing HTML must never embed a bearer secret");
+      const inlineScript = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(landing.body)?.[1];
+      assert.ok(inlineScript, "fragment landing must ship the browser controller");
+      assert.doesNotThrow(() => new vm.Script(inlineScript),
+        "nonce-protected fragment controller must parse as browser JavaScript");
+      assert.match(inlineScript, /window\.history\.replaceState\(null, "", "\/share\/c"\)/,
+        "landing JS must remove the bearer fragment before contacting the server");
+      assert.equal(landing.headers["cache-control"], "no-store");
+      assert.equal(landing.headers["referrer-policy"], "no-referrer");
+      const oldCookiePage = await request(port, "/share/c", {
+        headers: { cookie: `rootark_share_pwd_${capability.token}=legacyPwd; rootark_share_${capability.token}=legacyViewer` },
+      });
+      assert.equal(oldCookiePage.status, 200);
+      for (const prefix of [`rootark_share_pwd_${capability.token}=`,
+        `rootark_share_${capability.token}=`]) {
+        assert.ok((oldCookiePage.headers["set-cookie"] || []).some((value) =>
+          value.startsWith(prefix) && value.includes("Expires=Thu, 01 Jan 1970")),
+        "one-time response must clear pre-upgrade token-bearing cookie names");
+      }
+      const crossOriginExchange = await request(port, "/share/c/exchange", {
+        method: "POST", headers: { origin: "https://cross-origin.invalid",
+          "content-type": "application/json" },
+        body: JSON.stringify({ token: capability.token }),
+      });
+      assert.equal(crossOriginExchange.status, 403,
+        "cross-origin requests cannot create bearer-derived cookie sessions");
+      const oldLeakingPath = await request(port, `/share/${capability.token}`);
+      assert.equal(oldLeakingPath.status, 404,
+        "old capability bearer-in-path routes fail closed, not silently aliased");
+      const oldLeakingView = await request(port, `/share/${capability.token}/view`, {
+        method: "POST", headers: { origin },
+      });
+      assert.equal(oldLeakingView.status, 404,
+        "client cannot bypass the opaque capability session using a URL bearer");
+
+      const session = await exchangeCapability(capability.token);
+      const unauthenticatedAlias = await request(port, `/share/${session.handle}/view`, {
+        method: "POST", headers: { origin },
+      });
+      assert.equal(unauthenticatedAlias.status, 404,
+        "public alias alone is never sufficient without the opaque cookie");
+      const duplicateCookie = await request(port, `/share/${session.handle}/view`, {
+        method: "POST", headers: { origin,
+          cookie: `${session.cookie}; ${session.cookie}` },
+      });
+      assert.equal(duplicateCookie.status, 404,
+        "ambiguous duplicate capability cookies must fail closed");
+      const secondCreated = await authed("/share/capabilities", input);
+      assert.equal(secondCreated.status, 201);
+      const secondToken = JSON.parse(secondCreated.body).token;
+      const secondSession = await exchangeCapability(secondToken);
+      assert.notEqual(secondSession.handle, session.handle);
+      const crossAliasCookie = await request(port, `/share/${session.handle}/view`, {
+        method: "POST", headers: { origin, cookie: secondSession.cookie },
+      });
+      assert.equal(crossAliasCookie.status, 404,
+        "a valid cookie for another alias cannot authorize this capability");
 
       const view = await publicPost(capability.token, "view");
       assert.equal(view.status, 200, view.body);
       assert.equal("fileName" in JSON.parse(view.body), false, "download-only is metadata-blind");
+      assert.equal(view.headers["cache-control"], "no-store");
+      assert.equal(view.body.includes(capability.token), false);
+      assert.equal((view.headers["set-cookie"] || []).some((value) =>
+        value.includes(capability.token)), false,
+      "viewer cookies and session headers may not contain the original capability bearer");
       const cookie = viewerCookieFrom(view);
       const deniedPreview = await publicPost(capability.token, "preview", cookie);
       assert.equal(deniedPreview.status, 403, "download token cannot preview");
@@ -257,10 +376,20 @@ for (const mode of ["json", "sqlite"]) {
       const first = results.find((response) => response.status === 200);
       const exhausted = results.find((response) => response.status === 410);
       assert.equal(first.body, FILE_CONTENT);
+      assert.equal(first.headers["cache-control"], "no-store",
+        "streaming responses must override the old share cache policy");
+      assert.equal((first.headers["set-cookie"] || []).some((value) =>
+        value.includes(capability.token)), false,
+      "download receipt cookies must not contain the original bearer");
+      assert.ok((first.headers["set-cookie"] || []).some((value) =>
+        value.startsWith(`rootark_share_dl_${session.handle}=`)
+          && value.includes("Path=/share/c")),
+      "fragment landing page /share/c must be able to read its alias-only receipt cookie");
       assert.equal(exhausted.body.includes(FILE_CONTENT), false);
 
-      const unauthorizedRevoke = await request(port, `/share/capabilities/${capability.token}`, {
-        method: "DELETE", headers: { origin },
+      const revokeBody = JSON.stringify({ token: capability.token });
+      const unauthorizedRevoke = await request(port, "/share/capabilities/revoke", {
+        method: "DELETE", headers: { origin, "content-type": "application/json" }, body: revokeBody,
       });
       assert.notEqual(unauthorizedRevoke.status, 204, "anonymous client cannot revoke");
       if (mode === "json") {
@@ -271,19 +400,29 @@ for (const mode of ["json", "sqlite"]) {
         const otherCookies = loginOther.headers["set-cookie"].map((cookie) => cookie.split(";", 1)[0]);
         const otherCookie = otherCookies.join("; ");
         const csrf = otherCookies.find((cookie) => cookie.startsWith("rootark_csrf=")).split("=", 2)[1];
-        const wrongOwner = await request(port, `/share/capabilities/${capability.token}`, {
+        const wrongOwner = await request(port, "/share/capabilities/revoke", {
           method: "DELETE", headers: { origin, cookie: otherCookie, "x-csrf-token": csrf,
-            "content-type": "application/json", "content-length": 2 }, body: "{}",
+            "content-type": "application/json", "content-length": Buffer.byteLength(revokeBody) }, body: revokeBody,
         });
         assert.equal(wrongOwner.status, 403, "another authenticated admin cannot revoke someone else's capability");
       }
-      const revoked = await authed(`/share/capabilities/${capability.token}`, {}, "DELETE");
+      const revoked = await authed("/share/capabilities/revoke", { token: capability.token }, "DELETE");
       assert.equal(revoked.status, 204, revoked.body);
       const afterRevoke = await publicPost(capability.token, "view");
       assert.equal(afterRevoke.status, 404, "revocation prevents future bearer sessions");
-      const again = await authed(`/share/capabilities/${capability.token}`, {}, "DELETE");
+      const freshRevokedExchangeBody = JSON.stringify({ token: capability.token });
+      const freshRevokedExchange = await request(port, "/share/c/exchange", {
+        method: "POST", headers: { origin, "content-type": "application/json",
+          "content-length": Buffer.byteLength(freshRevokedExchangeBody) },
+        body: freshRevokedExchangeBody,
+      });
+      assert.equal(freshRevokedExchange.status, 404,
+        "a revoked original bearer must not create a NEW alias session (bypass memoized fixture)");
+      const again = await authed("/share/capabilities/revoke", { token: capability.token }, "DELETE");
       assert.equal(again.status, 404, "revocation cannot resurrect a token");
-      const unknown = await authed(`/share/capabilities/${crypto.randomBytes(24).toString("hex")}`, {}, "DELETE");
+      const unknown = await authed("/share/capabilities/revoke", {
+        token: `C${crypto.randomBytes(24).toString("hex").slice(1)}`,
+      }, "DELETE");
       assert.equal(unknown.status, 404);
 
       if (mode === "sqlite") {
@@ -302,7 +441,7 @@ for (const mode of ["json", "sqlite"]) {
 
   test(`scoped capability cannot follow file replacement and does not alter legacy shares (${mode})`,
     { timeout: 60_000 }, async (t) => {
-      const { authed, publicPost, port, dataDir, legacyToken } = await startFixture(t, mode);
+      const { authed, publicPost, exchangeCapability, port, origin, dataDir, legacyToken } = await startFixture(t, mode);
       const created = await authed("/share/capabilities", {
         name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"], maxDownloads: 2,
       });
@@ -310,6 +449,21 @@ for (const mode of ["json", "sqlite"]) {
       const { token } = JSON.parse(created.body);
       const initial = await publicPost(token, "view");
       assert.equal(initial.status, 200, initial.body);
+      const { handle, cookie: sessionCookie } = await exchangeCapability(token);
+      const aliasOnlyQr = await request(port, `/share/${handle}/qr`, {
+        headers: { cookie: sessionCookie },
+      });
+      assert.equal(aliasOnlyQr.status, 404,
+        "a short-lived alias+cookie cannot recover the long-lived original bearer via QR");
+      const qrBody = JSON.stringify({ token });
+      const qrBefore = await request(port, "/share/c/qr", {
+        method: "POST", headers: { origin, "content-type": "application/json",
+          "content-length": Buffer.byteLength(qrBody) }, body: qrBody,
+      });
+      assert.equal(qrBefore.status, 200,
+        "only explicit possession of the original volatile fragment can render the QR");
+      assert.equal(qrBefore.headers["content-type"], "image/png");
+      assert.equal(qrBefore.headers["cache-control"], "no-store");
 
       const filePath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
       fs.renameSync(filePath, `${filePath}.old`);
@@ -343,8 +497,14 @@ for (const mode of ["json", "sqlite"]) {
       const missingBinding = await publicPost(token, "download", viewerCookieFrom(initial));
       assert.equal(missingBinding.status, 404, "missing policy marker must not downgrade an issued capability");
       assert.equal(missingBinding.body.includes("REPLACEMENT_PRIVATE_FILE"), false);
-      const missingBindingPage = await request(port, `/share/${token}`);
-      assert.equal(missingBindingPage.status, 404, "HTML capability entry must fail closed on missing metadata");
+      // The prior opaque session still names the invalidated capability; it
+      // must not display the swapped/corrupt resource after a policy change.
+      const missingBindingQr = await request(port, "/share/c/qr", {
+        method: "POST", headers: { origin, "content-type": "application/json",
+          "content-length": Buffer.byteLength(qrBody) }, body: qrBody,
+      });
+      assert.equal(missingBindingQr.status, 404,
+        "an already-exchanged cookie session cannot bypass revoked file-generation binding");
 
       const legacy = await publicPost(legacyToken, "view");
       assert.equal(legacy.status, 200, "legacy share access remains compatible after a file change");
@@ -352,5 +512,76 @@ for (const mode of ["json", "sqlite"]) {
       assert.equal(forged.status, 404, "a forged capability cannot access other paths");
       const originalLegacy = await request(port, "/login.html");
       assert.equal(originalLegacy.status, 200, "legacy application remains reachable");
+    });
+
+  test(`scoped capability rejects same-inode same-size rewrite after mtime reset (${mode})`,
+    { timeout: 60_000 }, async (t) => {
+      const { authed, publicPost, dataDir } = await startFixture(t, mode);
+      const filePath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
+      const stamp = new Date(Math.floor((Date.now() - 30_000) / 1000) * 1000);
+      fs.utimesSync(filePath, stamp, stamp);
+      const before = fs.statSync(filePath);
+      const created = await authed("/share/capabilities", {
+        name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+        permissions: ["download"], maxDownloads: 1,
+      });
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      const initial = await publicPost(token, "view");
+      assert.equal(initial.status, 200, initial.body);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const changed = "R".repeat(Buffer.byteLength(FILE_CONTENT) - 1) + "\n";
+      assert.notEqual(changed, FILE_CONTENT);
+      fs.writeFileSync(filePath, changed);
+      fs.utimesSync(filePath, stamp, stamp);
+      const after = fs.statSync(filePath);
+      assert.equal(after.ino, before.ino, "negative oracle must keep the identical inode");
+      assert.equal(after.size, before.size, "negative oracle must preserve file length");
+      assert.equal(after.birthtimeMs, before.birthtimeMs,
+        "negative oracle must preserve inode creation identity");
+      assert.equal(after.mtimeMs, before.mtimeMs,
+        "attacker demonstrably restored the mtime that the old binding trusted");
+      assert.notEqual(after.ctimeMs, before.ctimeMs,
+        "positive tamper canary: kernel-owned change time must prove the in-place rewrite");
+      const denied = await publicPost(token, "download", viewerCookieFrom(initial));
+      assert.equal(denied.status, 404,
+        "an old capability may not serve rewritten bytes after same-inode same-size mtime forgery");
+      assert.equal(denied.body.includes(changed), false);
+    });
+
+  test(`scoped capability expires an opaque session independently of the original grant (${mode})`,
+    { timeout: 60_000 }, async (t) => {
+      const { authed, publicPost, exchangeCapability, dataDir } = await startFixture(t, mode);
+      const created = await authed("/share/capabilities", {
+        name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+        permissions: ["download"], maxDownloads: 2,
+      });
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      const activated = await publicPost(token, "view");
+      assert.equal(activated.status, 200);
+      const { handle } = await exchangeCapability(token);
+      const expired = new Date(Date.now() - 60_000).toISOString();
+      if (mode === "sqlite") {
+        const Database = require("better-sqlite3");
+        const db = new Database(path.join(dataDir, "rootark.sqlite"));
+        try {
+          const row = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(token);
+          const metadata = JSON.parse(row.metadata_json);
+          assert.ok(metadata.capabilitySessions?.[handle]);
+          metadata.capabilitySessions[handle].expiresAt = expired;
+          db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?").run(JSON.stringify(metadata), token);
+        } finally { db.close(); }
+      } else {
+        const file = path.join(dataDir, "public-links.json");
+        const links = JSON.parse(fs.readFileSync(file, "utf8"));
+        assert.ok(links[token].capabilitySessions?.[handle]);
+        links[token].capabilitySessions[handle].expiresAt = expired;
+        fs.writeFileSync(file, JSON.stringify(links));
+      }
+      const oldSession = await publicPost(token, "download", viewerCookieFrom(activated));
+      assert.equal(oldSession.status, 404,
+        "expired alias+cookie cannot download even if the underlying grant has an hour remaining");
+      assert.equal(oldSession.body.includes(FILE_CONTENT), false);
     });
 }
