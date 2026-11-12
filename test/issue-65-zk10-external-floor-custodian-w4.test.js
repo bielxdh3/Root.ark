@@ -1430,6 +1430,10 @@ test("P2 String-slot hostile callback cannot rebind signed genesis SQLite scalar
 });
 test("P2 post-Ed25519 SQLite prepare retarget cannot persist unsigned B across restart", (t) => {
   const x = setup(t, "sqlite-prepare-postauth");
+  const { signature, ...signedGenesisA } = x.genesis;
+  assert.equal(crypto.verify(null, signatureBytes(DOMAIN_GENESIS, signedGenesisA),
+    x.owner.publicKey, Buffer.from(signature, "base64url")), true,
+  "genesis A must carry a genuine owner Ed25519 signature before the hostile callback");
   const nativeLstat = fs.lstatSync;
   const nativePrepare = Database.prototype.prepare;
   let hooked = false, swappedInserts = 0, first;
@@ -1450,38 +1454,33 @@ test("P2 post-Ed25519 SQLite prepare retarget cannot persist unsigned B across r
       }
       return nativeLstat.call(fs, name, ...rest);
     };
-    try { first = createDevOffZk10MonotonicFloorCustodian(x.config); }
-    catch (error) { assert.match(error.message, /ZK10_CUSTODIAN_UNAVAILABLE/); }
+    first = x.track(createDevOffZk10MonotonicFloorCustodian(x.config));
   } finally {
     fs.lstatSync = nativeLstat;
     Database.prototype.prepare = nativePrepare;
   }
   assert.equal(hooked, true, "callback must execute after owner signature validation");
-  assert.equal(swappedInserts, first ? 0 : 2,
-    "native SQLite method should block SQL retarget; legacy path corrupts two stores");
-  if (first) {
-    assert.equal(first.retainedMinimum().head_digest, x.genesis.head_digest);
-    assert.equal(first.retainedMinimum().enrollment_root, x.genesis.enrollment_root);
-    first.close();
-  }
+  assert.ok(first, "owner-signed genesis A must bootstrap under hostile SQLite prototype mutation");
+  assert.equal(swappedInserts, 0,
+    "no owner-signed SQLite INSERT may dispatch through the replaced prototype");
+  assert.equal(first.retainedMinimum().head_digest, x.genesis.head_digest);
+  assert.equal(first.retainedMinimum().enrollment_root, x.genesis.enrollment_root);
+  first.close();
   for (const filePath of [x.paths.databasePath, x.paths.anchorDatabasePath]) {
     const db = new Database(filePath, { readonly: true, fileMustExist: true });
     try {
       const stored = db.prepare("SELECT head_digest, enrollment_root FROM floor").get();
-      assert.equal(stored.head_digest, first ? x.genesis.head_digest : x.genesis.enrollment_root);
-      assert.equal(stored.enrollment_root, first ? x.genesis.enrollment_root : x.genesis.head_digest);
+      assert.equal(stored.head_digest, x.genesis.head_digest,
+        "both physical SQLite stores must retain the owner-signed head A");
+      assert.equal(stored.enrollment_root, x.genesis.enrollment_root,
+        "both physical SQLite stores must retain the owner-signed enrollment A");
     } finally { db.close(); }
   }
-  if (!first) {
-    assert.throws(() => createDevOffZk10MonotonicFloorCustodian({
-      ...x.config, bootstrap: undefined,
-    }), /ZK10_CUSTODIAN_UNAVAILABLE/,
-    "failed bootstrap must not promote persistent unsigned B after restart");
-  } else {
-    const reopened = x.track(createDevOffZk10MonotonicFloorCustodian({
-      ...x.config, bootstrap: undefined,
-    }));
-    assert.equal(reopened.retainedMinimum().head_digest, x.genesis.head_digest);
-    assert.equal(reopened.retainedMinimum().enrollment_root, x.genesis.enrollment_root);
-  }
+  const reopened = x.track(createDevOffZk10MonotonicFloorCustodian({
+    ...x.config, bootstrap: undefined,
+  }));
+  assert.equal(reopened.retainedMinimum().head_digest, x.genesis.head_digest,
+    "restart must recover only the originally owner-signed head A");
+  assert.equal(reopened.retainedMinimum().enrollment_root, x.genesis.enrollment_root,
+    "restart must recover only the originally owner-signed enrollment A");
 });
