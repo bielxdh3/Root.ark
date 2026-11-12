@@ -6,6 +6,16 @@
 // Require BOTH independently pinned identities on the exact operation and a
 // fresh, caller-owned nonce. Non-authorizing and not a cloud fsync receipt.
 const crypto = require("node:crypto");
+const { key: pinnedOwnerPublicKey } = require("./rootark-zk10-account-cutover-v1");
+const {
+  keyEquals: NATIVE_KEY_EQUALS,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+} = require("./rootark-zk10-native-intrinsics-v1");
 const inventory = require("./rootark-zk-content-inventory-v1");
 const { verifyCommittedPhysicalReadback } =
   require("./rootark-zk-pg-physical-attestation-v1");
@@ -32,20 +42,20 @@ function rawBytes(value, min, max) {
     || value.length < min || value.length > max
     || (typeof SharedArrayBuffer !== "undefined"
       && value.buffer instanceof SharedArrayBuffer)) deny();
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
-function publicKey(value) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== "public"
-    || value.asymmetricKeyType !== "ed25519") deny();
+function sha(bytes) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, bytes);
+  return NATIVE_HASH_DIGEST.call(hash);
 }
-function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest(); }
 function derivePhysicalChainPageNonce(chainNonce, afterSequence) {
   const nonce = rawBytes(chainNonce, 32, 32);
   if (!Number.isSafeInteger(afterSequence) || afterSequence < 0
     || afterSequence > inventory.MAX_ENTRIES) deny();
   const seq = Buffer.alloc(8);
   seq.writeBigUInt64BE(BigInt(afterSequence));
-  return sha(Buffer.concat([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
+  return sha(NATIVE_BUFFER_CONCAT([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
 }
 function derivePhysicalChainNonce(pageNonce, sequence, operationId) {
   const nonce = rawBytes(pageNonce, 32, 32);
@@ -53,7 +63,7 @@ function derivePhysicalChainNonce(pageNonce, sequence, operationId) {
   if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > inventory.MAX_ENTRIES) deny();
   const seq = Buffer.alloc(8);
   seq.writeBigUInt64BE(BigInt(sequence));
-  return sha(Buffer.concat([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
+  return sha(NATIVE_BUFFER_CONCAT([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
 }
 function snapshotOperation(value) {
   exact(value, ["operation_id", "expected_sequence", "expected_root", "object_id",
@@ -77,15 +87,15 @@ async function verifyAttestedInventoryCommit(input) {
     // The exact KeyObject references used for separation MUST also verify
     // both signatures. A top-level Proxy can otherwise serve separate keys
     // to this comparison then replace the attestor with the writer key.
-    const inventoryKey = input.pinnedInventoryPublicKey;
-    const attestorKey = input.pinnedPhysicalAttestorPublicKey;
+    // Pin real native Ed25519 key material once. Caller-supplied metadata and
+    // KeyObject.export can lie, and the two signer roles must be distinct.
+    const inventoryKey = pinnedOwnerPublicKey(input.pinnedInventoryPublicKey, "public");
+    const attestorKey = pinnedOwnerPublicKey(input.pinnedPhysicalAttestorPublicKey, "public");
     const nowSeconds = input.nowSeconds;
-    publicKey(inventoryKey);
-    publicKey(attestorKey);
     // The public KeyObject's .export() is an overridable own property.
     // Compare native cryptographic key identities with the intrinsic method,
     // not caller-supplied DER from an attacker-controlled export override.
-    if (crypto.KeyObject.prototype.equals.call(inventoryKey, attestorKey)) deny();
+    if (NATIVE_KEY_EQUALS.call(inventoryKey, attestorKey)) deny();
     const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
     const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
     const nonce = rawBytes(input.nonce, 32, 32);
@@ -109,16 +119,16 @@ async function verifyAttestedInventoryCommit(input) {
     if (signedReceipt.outcome !== "COMMITTED_IN_SIGNED_LEDGER"
       || physical.status !== "PHYSICALLY_REREAD_PG_COMMITTED"
       || physical.verified !== true || physical.walFlushConfirmed !== true
-      || !crypto.timingSafeEqual(signedReceipt.operationId, physical.operationId)
+      || !NATIVE_TIMING_SAFE_EQUAL(signedReceipt.operationId, physical.operationId)
       || physical.authorizesIo !== false || signedReceipt.authorizesIo !== false) deny();
     // Digest is an explicitly NON-DURABLE evidence-bundle fingerprint, not a
     // replacement for an externally anchored CAS/FLOOR or a recovery ticket.
-    const receiptDigest = sha(Buffer.concat([DOMAIN, sha(receipt), sha(physicalBytes)]));
+    const receiptDigest = sha(NATIVE_BUFFER_CONCAT([DOMAIN, sha(receipt), sha(physicalBytes)]));
     return Object.freeze({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
       inventoryReceipt: signedReceipt,
       physicalReadback: physical,
       receiptDigest,
-      nonce: Buffer.from(nonce),
+      nonce: NATIVE_BUFFER_FROM(nonce),
       authorizesIo: false, externalDurabilityProven: false,
       independentlyAnchoredFloorProven: false });
   } catch (_) { deny(); }
