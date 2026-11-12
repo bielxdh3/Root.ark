@@ -1324,3 +1324,43 @@ targeted **62 PASS / 0 FAIL / 4 SKIP** does not prove independently
 administered off-host self-hosted custody, original-A, cross-store antirollback
 or production authorization. Linux/ext4 is still unverified. The release
 gates above remain conjunctive; no push, Draft change, merge or deploy.
+
+### Latest local external-writer and hosted-alert evidence (unpublished)
+
+**#300 signed native post-pin lab:** child
+`fbc503a70a2f907984c89ef05be35d86e42c8434` (parent `fc837826`)
+adds `FOD_EXTERNAL_COLLISION`. A separate physical same-SID Node process
+waits until the W26 parent has retained the native scratch directory, then
+uses `wx` plus `fsync` to plant a colliding foreign leaf and acknowledges
+publication while keeping its FD open. W26 checks the actual kernel
+`STATUS_OBJECT_NAME_COLLISION`, target bytes and a freshly opened stage
+FileId under its original retained parent HANDLE, as well as the signed A
+source HANDLE's SHA-256 and exact bytes. The identical new test on the
+parent failed because the external mode did not exist; the child passed the
+targeted case **1/1** and the complete signed-FOD suite **7/7** on Windows
+Node22/NTFS. That RED is a *missing capability*, not proof of an unsafe
+overwrite exploit in `fc837826`. A combined FOD+W26 run had **31 PASS /
+1 FAIL** (precreate rendezvous timeout/invalid signal); isolated precreate
+then passed **1/1**. Earlier W26 24/1 followed by 25/0 twice is retained.
+No original-A independent pre-first-lookup enrollment, continuous
+same-SID writer exclusion, operational CFAPI hydration, durable authenticated
+PREPARE/COMMIT or physical powercut proof is supplied. This LAB must never
+be wired into product RootSession on the strength of these tests.
+
+**#298 published GHAS:** check-run `130881048062` on published `e209a6ee`
+reported **25 high severity** annotations: 24 inside four deliberately
+vulnerable Issue #67 experiment scripts, and one in the controlled-restore
+test at prior line 541. This count comes from the exact published check;
+the global Code Scanning API reported no currently open alerts, a separate
+view that does not turn the historical failed check green. Local `5eca8be`
+limits CodeQL exclusions to the lab path and changes the foreign inode
+oracle to a retained-FD read, with two bounded SOURCE GO and Windows focused
+tests, but **no exact-child GHAS or WSL result**. Never exclude production
+source to manufacture a passing security gate.
+
+**Overall:** #300 native LAB SOURCE reviews and WSL evidence remain
+outstanding for the new composed SHA; #301 `f5b666e` has only one
+independent bounded SOURCE GO and no final hosted CI; #302 `7baea943`
+has two bounded SOURCE GO and Windows regressions but no self-hosted
+external custodian or Linux proof. #306 checks do not authorize its merge.
+RootSession remains OFF. **MERGE NO-GO / RELEASE NO-GO.**
