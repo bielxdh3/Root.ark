@@ -26,6 +26,7 @@ const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
 const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
 const HAS_OWN = Object.hasOwn.bind(Object);
 const OBJECT_CREATE = Object.create.bind(Object);
+const SET_PROTOTYPE = Object.setPrototypeOf.bind(Object);
 const DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const OBJECT_FREEZE = Object.freeze.bind(Object);
 
@@ -89,7 +90,10 @@ function canonicalStringify(value, depth = 0, sortKeys = false) {
     if (value.length > 1024 || OWN_KEYS(value).length !== value.length + 1) {
       throw new TypeError("noncanonical signed array");
     }
-    const fields = [];
+    // Detach the scratch array BEFORE the first push. Native Array.push still
+    // consults inherited numeric setters on default-prototype arrays; a key
+    // getter could replace signed field 5 while leaving the statement at B.
+    const fields = SET_PROTOTYPE([], null);
     for (let index = 0; index < value.length; index += 1) {
       const descriptor = OWN_DESCRIPTOR(value, String(index));
       if (!descriptor || !HAS_OWN(descriptor, "value")) {
@@ -108,8 +112,11 @@ function canonicalStringify(value, depth = 0, sortKeys = false) {
   // Atomic SyncV2 wire uses lexicographically sorted object fields. Sort
   // with the initial native comparator, without a post-getter .sort() lookup.
   if (sortKeys) APPLY(ARRAY_SORT, names, []);
-  const fields = [];
-  for (const name of names) {
+  // Iterators and inherited numeric setters are same-realm mutable after an
+  // untrusted KeyObject getter. Iterate the own keys by index only.
+  const fields = SET_PROTOTYPE([], null);
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
     if (typeof name !== "string") throw new TypeError("symbol in signed object");
     const descriptor = OWN_DESCRIPTOR(value, name);
     if (!descriptor || !HAS_OWN(descriptor, "value") || !descriptor.enumerable) {

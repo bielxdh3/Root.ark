@@ -28,6 +28,7 @@ const {
   hasOwn: NATIVE_HAS_OWN,
   objectCreate: NATIVE_OBJECT_CREATE,
   defineProperty: NATIVE_DEFINE_PROPERTY,
+  freeze: NATIVE_FREEZE,
 } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const protocol = require("./rootark-sync-protocol");
 const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
@@ -249,7 +250,7 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
       || !Number.isSafeInteger(result.physicalReadback?.issuedAt)
       || !Number.isSafeInteger(completedAtSeconds) || completedAtSeconds < 1
       || Math.abs(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
-    return Object.freeze({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
+    return NATIVE_FREEZE({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
       operationId: Buffer.from(bound.operation.operation_id),
       ciphertextSha256: Buffer.from(bound.operation.ciphertext_sha256),
       receiptDigest: Buffer.from(result.receiptDigest),
@@ -367,7 +368,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       || live.trustedDevicePublicKeys[bound.envelope.deviceId]
         !== bound.envelope.authorization.publicKey
       || live.revokedDeviceIds.includes(bound.envelope.deviceId)) deny();
-    return Object.freeze({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
+    return NATIVE_FREEZE({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
       envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,
       localPgReadbackVerified: true, externalDurabilityProven: false,
