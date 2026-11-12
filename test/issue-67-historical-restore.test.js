@@ -14,6 +14,18 @@ const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
+async function restoreRecoveredBytesOnlyIfVacant(target, bytes) {
+  // This helper is deliberately test-only. Recovery must never overwrite a
+  // path another writer creates after the earlier existence assertion.
+  const file = await fsp.open(target, "wx", 0o600);
+  try {
+    await file.writeFile(bytes);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
+
 test("#67: restore CLI rejects an incomplete request before reading private credentials", () => {
   const command = spawnSync(process.execPath, [path.join(__dirname, "../sync-client/rootark-sync-v2.js"),
     "restore", "--config", "missing-private-config", "--object-id", "file-1"], { encoding: "utf8", windowsHide: true });
@@ -384,7 +396,20 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), old);
   // Explicit recovery is possible without a new signature: materialize the
   // exact authenticated pending bytes, then let the existing CAS path resume.
-  await fsp.writeFile(target, protocol.decryptPayload(f.original, f.privateFileKey));
+  const recoveredBytes = protocol.decryptPayload(f.original, f.privateFileKey);
+  try {
+    // Simulate a competing writer recreating the missing path after the
+    // absence check. Recovery must refuse and preserve those exact bytes.
+    const competingBytes = Buffer.from("rival local edit before explicit recovery");
+    await fsp.writeFile(target, competingBytes, { flag: "wx" });
+    await assert.rejects(() => restoreRecoveredBytesOnlyIfVacant(target, recoveredBytes),
+      (error) => error.code === "EEXIST");
+    assert.deepEqual(await fsp.readFile(target), competingBytes);
+    await fsp.unlink(target);
+    await restoreRecoveredBytesOnlyIfVacant(target, recoveredBytes);
+  } finally {
+    recoveredBytes.fill(0);
+  }
   const resumed = await reopened.syncOnce();
   assert.equal(resumed.pushed, 1);
   assert.equal(f.pushes(), 1);
