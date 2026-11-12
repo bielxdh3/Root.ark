@@ -6,7 +6,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const protocol = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 
@@ -19,7 +19,8 @@ function deny(code) {
 }
 
 async function materializeSelectedLab({ signedOperation, fileKey,
-  localTrustedDevicePolicy, selectedPath, collision = false } = {}) {
+  localTrustedDevicePolicy, selectedPath, collision = false,
+  externalCollision = false } = {}) {
   if (process.platform !== "win32" ||
     process.env.ROOTARK_ISSUE66_W37_FOD_LAB !== "1") deny("fod_lab_disabled");
   // Selection is a laboratory input, not an independent signed inventory or
@@ -55,7 +56,15 @@ async function materializeSelectedLab({ signedOperation, fileKey,
   // A unique test-owned scratch is allocated only after every signature,
   // selection and AEAD check. Uncertain outcomes are deliberately retained.
   const scratch = fs.mkdtempSync(path.join(local, "rootark-w26-native-publish-w37-"));
-  const mode = collision ? "FOD_COLLISION" : "FOD_POSITIVE";
+  if (collision && externalCollision) deny("fod_lab_invalid_mode");
+  const mode = externalCollision ? "FOD_EXTERNAL_COLLISION" :
+    collision ? "FOD_COLLISION" : "FOD_POSITIVE";
+  // Separate same-SID actor: its own fsynced foreign destination and an ACK
+  // are observed by the native publisher before the no-replace syscall.
+  const actor = externalCollision ? spawn(process.execPath,
+    [path.join(__dirname, "foreign-writer.lab.cjs"), scratch], {
+      windowsHide: true, stdio: "ignore",
+    }) : null;
   const outcome = spawnSync(powershell, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-Scratch", scratch, "-Mode", mode,
@@ -63,13 +72,22 @@ async function materializeSelectedLab({ signedOperation, fileKey,
   ], { windowsHide: true, encoding: "utf8", timeout: 25000, maxBuffer: 8192,
     input: plaintext,
     env: { ...process.env, ROOTARK_ISSUE66_W26_NATIVE_PUBLISH_LAB: "1",
-      ROOTARK_ISSUE66_W37_FOD_LAB: "1" } });
+      ROOTARK_ISSUE66_W37_FOD_LAB: "1",
+      ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB: externalCollision ? "1" : "0" } });
+  if (actor) {
+    const exitCode = await new Promise((resolve) => {
+      if (actor.exitCode !== null) return resolve(actor.exitCode);
+      actor.once("exit", resolve);
+      actor.once("error", () => resolve(-1));
+    });
+    if (exitCode !== 0) deny("fod_lab_external_writer_denied");
+  }
   if (outcome.status !== 0 || outcome.error || outcome.stderr !== "") {
     deny("fod_lab_native_denied");
   }
   const evidence = (outcome.stdout || "").trim();
-  if (collision) {
-    if (evidence !== "ROOTARK_W26_HANDLE_PUBLISH mode=FOD_COLLISION result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0xC0000035") {
+  if (collision || externalCollision) {
+    if (evidence !== `ROOTARK_W26_HANDLE_PUBLISH mode=${mode} result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0xC0000035`) {
       deny("fod_lab_native_unverified");
     }
     return { mode, scratch, status: "collision_preserved", authorizesIo: false };

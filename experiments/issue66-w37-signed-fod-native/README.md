@@ -39,3 +39,20 @@ custodian. This experiment proves native FILE_CREATE/no-replace only after a
 test-owned native pin, and must never make `RootSession` available.
 
 **LAB ONLY · ROOTSESSION OFF · PRODUCT/RELEASE NO-GO.**
+# Additional same-SID concurrent-writer laboratory
+
+The opt-in `FOD_EXTERNAL_COLLISION` mode starts a **separate Node 22
+process** before launching the native publisher. Once the publisher's
+retained scratch HANDLE creates its `publisher-ready.signal`, the separate
+actor creates and fsyncs `held/published.bin` using `wx`, retains the
+foreign descriptor during the attempted native rename, and creates a fsynced
+`writer-ack.signal`. The W26 publisher independently checks the signal
+content, foreign bytes/FileId, and exact NTSTATUS collision. It also
+reopens the surviving stage by its **retained directory HANDLE**, checks its
+FileId equals the original open source, and compares its SHA-256/bytes.
+
+The actor is not an independent custodian, and the parent directory is still
+writable by the same SID. This proves a bounded *post-pin, late-destination*
+no-replace race on disposable NTFS, **not** original-A provenance, exclusion
+of a persistent adversarial writer, CFAPI callbacks, durable PREPARE/COMMIT,
+powercut recovery or permission to enable production FOD.

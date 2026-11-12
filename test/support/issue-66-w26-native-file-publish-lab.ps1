@@ -5,7 +5,8 @@ param(
                'PRECREATE_SCRATCH_DIRECTORY_NO_ACK',
                'PREPIN_COLD_ORIGIN_REQUIRED',
                'PRE_LINK_HARD_EXIT', 'POST_LINK_HARD_EXIT', 'TXN_COMPLETE',
-               'COLD_INSPECT', 'FOD_POSITIVE', 'FOD_COLLISION')]
+               'COLD_INSPECT', 'FOD_POSITIVE', 'FOD_COLLISION',
+               'FOD_EXTERNAL_COLLISION')]
   [string]$Mode,
   [string]$Scratch,
   [string]$PayloadSha256
@@ -582,7 +583,8 @@ public static class RootarkW26NativeFilePublishLab {
     bool crashBefore = mode == "PRE_LINK_HARD_EXIT";
     bool crashAfter = mode == "POST_LINK_HARD_EXIT";
     bool complete = mode == "TXN_COMPLETE";
-    bool fod = mode == "FOD_POSITIVE" || mode == "FOD_COLLISION";
+    bool fod = mode == "FOD_POSITIVE" || mode == "FOD_COLLISION" ||
+      mode == "FOD_EXTERNAL_COLLISION";
     if (fod && (Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W37_FOD_LAB") != "1"
       || fodPayload == null || fodPayload.Length < 1 || fodPayload.Length > 8192
       || fodSha256 == null || fodSha256.Length != 64
@@ -595,7 +597,7 @@ public static class RootarkW26NativeFilePublishLab {
     if (ancestorAttack &&
         Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_ANCESTOR_ATTACK_LAB") != "1")
       throw new InvalidOperationException("ANCESTOR_ATTACK_LAB_DISABLED");
-    if (mode == "EXTERNAL_COLLISION" &&
+    if ((mode == "EXTERNAL_COLLISION" || mode == "FOD_EXTERNAL_COLLISION") &&
         Environment.GetEnvironmentVariable("ROOTARK_ISSUE66_W26_EXTERNAL_WRITER_LAB") != "1")
       throw new InvalidOperationException("EXTERNAL_WRITER_LAB_DISABLED");
     if ((crashBefore || crashAfter || complete) &&
@@ -692,7 +694,7 @@ public static class RootarkW26NativeFilePublishLab {
         if (mode == "COLLISION" || mode == "FOD_COLLISION") {
           // Physical foreign destination inserted before the no-replace syscall.
           PlantForeign(target, Foreign);
-        } else if (mode == "EXTERNAL_COLLISION") {
+        } else if (mode == "EXTERNAL_COLLISION" || mode == "FOD_EXTERNAL_COLLISION") {
           // A separately spawned SAME-SID process must create+fsync a foreign
           // destination AFTER our stage/root HANDLEs are opened, but BEFORE
           // native no-replace. The disposable rendezvous files grant no root
@@ -728,13 +730,25 @@ public static class RootarkW26NativeFilePublishLab {
         }
         if (mode != "ROOT_SWAP") custody.Validate();
         int code = Rename(source, root, "published.bin");
-        if (mode == "COLLISION" || mode == "EXTERNAL_COLLISION" || mode == "FOD_COLLISION") {
+        if (mode == "COLLISION" || mode == "EXTERNAL_COLLISION" ||
+            mode == "FOD_COLLISION" || mode == "FOD_EXTERNAL_COLLISION") {
           // A generic NT failure could otherwise fool the no-clobber proof.
           // The actual NTFS syscall must report STATUS_OBJECT_NAME_COLLISION.
           if (code != unchecked((int)0xC0000035) || ReadFixture(target) != Foreign ||
               !System.IO.File.Exists(stage) ||
               (fod ? !System.IO.File.Exists(stage) : ReadFixture(stage) != Trusted))
             throw new InvalidOperationException("DESTINATION_CLOBBERED");
+          if (fod) {
+            // A same-SID writer cannot turn a surviving *name* into proof that
+            // the original selected signed source HANDLE survived. Verify
+            // both retained and currently named inodes and their exact bytes.
+            using (SafeFileHandle namedStage = File(root, "stage.bin", false)) {
+              if (!Same(original, Id(source)) || !Same(original, Id(namedStage)))
+                throw new InvalidOperationException("FOD_COLLISION_SOURCE_REBOUND");
+              VerifyOpenedPayload(source, fodPayload, fodSha256);
+              VerifyOpenedPayload(namedStage, fodPayload, fodSha256);
+            }
+          }
           return "ROOTARK_W26_HANDLE_PUBLISH mode=" + mode + " result=DENIED foreign=INTACT stage=INTACT collisionNtstatus=0x" +
             unchecked((uint)code).ToString("X8");
         }
@@ -780,7 +794,8 @@ public static class RootarkW26NativeFilePublishLab {
 
   $payloadBytes = $null
   $payloadDigest = $null
-  if ($Mode -eq 'FOD_POSITIVE' -or $Mode -eq 'FOD_COLLISION') {
+  if ($Mode -eq 'FOD_POSITIVE' -or $Mode -eq 'FOD_COLLISION' -or
+      $Mode -eq 'FOD_EXTERNAL_COLLISION') {
     if ($env:ROOTARK_ISSUE66_W37_FOD_LAB -ne '1' -or
         $PayloadSha256 -notmatch '^[0-9a-f]{64}$') { throw 'FOD_LAB_INPUT_UNVERIFIED' }
     # Plaintext never enters a command line, environment variable or error

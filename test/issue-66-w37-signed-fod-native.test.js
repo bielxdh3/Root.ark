@@ -86,6 +86,38 @@ test("#66 W37 physical signed FOD: later foreign NTFS destination is not replace
       fs.statSync(path.join(held, "published.bin"), { bigint: true }).ino);
   });
 
+test("#66 W37 physical signed FOD: independently fsynced same-SID writer cannot replace native target",
+  { skip: !available, timeout: 30000 }, async () => {
+    const bytes = Buffer.alloc(4097);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 13 + 29) % 251;
+    const f = await signedFixture(bytes);
+    const outcome = await materializeSelectedLab({
+      signedOperation: f.operation, fileKey: f.fileKey,
+      localTrustedDevicePolicy: f.localTrustedDevicePolicy,
+      selectedPath: f.selectedPath, externalCollision: true,
+    });
+    assert.equal(outcome.mode, "FOD_EXTERNAL_COLLISION");
+    assert.equal(outcome.status, "collision_preserved");
+    assert.equal(outcome.authorizesIo, false);
+    const root = path.join(outcome.scratch, "held");
+    assert.equal(fs.readFileSync(path.join(outcome.scratch, "publisher-ready.signal"), "utf8"),
+      "PUBLISHER_READY_V1");
+    assert.equal(fs.readFileSync(path.join(outcome.scratch, "writer-ack.signal"), "utf8"),
+      "WRITER_READY_V1");
+    const stage = fs.openSync(path.join(root, "stage.bin"), "r");
+    const foreign = fs.openSync(path.join(root, "published.bin"), "r");
+    try {
+      assert.deepEqual(fs.readFileSync(stage), bytes);
+      assert.equal(fs.readFileSync(foreign, "utf8"), "FOREIGN_UNTRUSTED_TARGET_BYTES");
+      assert.notEqual(fs.fstatSync(stage, { bigint: true }).ino,
+        fs.fstatSync(foreign, { bigint: true }).ino);
+      assert.equal(fs.fstatSync(stage, { bigint: true }).nlink, 1n);
+    } finally {
+      fs.closeSync(stage);
+      fs.closeSync(foreign);
+    }
+  });
+
 test("#66 W37 signed FOD: forged B, revoked pin, wrong key and unselected path never reach the native writer",
   { skip: !available }, async () => {
     const f = await signedFixture(Buffer.from("authentic selected user bytes"));
