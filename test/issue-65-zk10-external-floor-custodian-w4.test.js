@@ -1391,8 +1391,10 @@ test("P2 String-slot hostile callback cannot rebind signed genesis SQLite scalar
   let instance;
   try {
     fs.lstatSync = function (name, ...rest) {
+      // Existing SQLite file is first visible only inside openDb(), which
+      // runs AFTER unsignedSigned() has verified genuine owner Genesis A.
       if (!hooked && (name === x.paths.databasePath
-        || name === x.paths.anchorDatabasePath)) {
+        || name === x.paths.anchorDatabasePath) && fs.existsSync(name)) {
         hooked = true;
         global.String = function (value) {
           const stack = new Error().stack || "";
