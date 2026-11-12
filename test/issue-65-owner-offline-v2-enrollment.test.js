@@ -762,6 +762,10 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "test must reach actual HPKE decrypt before the clock changes");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
+    assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
+      envelope.core.expires_at, issued.approval.expires_at,
+      signedCommittedHead.expires_at),
+    "release expiry must be computed from signed owner-approved trust material");
     const decrypted = await content.decryptFile({
       cek: await content.importFileCek(bCek.cek), metadata,
       envelopeBytes: recoveredCiphertext,
@@ -1277,6 +1281,55 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(shared.data), bytes);
     assert.equal(shared.authorizesProductionIo, false);
     shared.data.fill(0);
+    {
+    // P2 regression: a genuinely signed share grant can outlive the owner
+    // HPKE approval and witness. Expiration during real file AEAD must deny.
+    const longGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      expiresAt: Math.max(envelope.core.expires_at,
+        issued.approval.expires_at, signedCommittedHead.expires_at) + 120 };
+    const longMessage = await shareGrantMessageV1(longGrantInput);
+    const longGrant = { grantId: longGrantInput.grantId,
+      expiresAt: longGrantInput.expiresAt,
+      shareStatementBase64: b64(longMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, longMessage, originalActor)) };
+    const longShareInput = { ...recipientShareInput, grant: longGrant,
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: metadata.object_id, revision: 1, epoch: metadata.epoch,
+        ciphertextBase64: b64(recoveredCiphertext),
+        shareStatementBase64: longGrant.shareStatementBase64,
+        shareSignatureBase64: longGrant.shareSignatureBase64,
+      }), { status: 200, headers: { "content-type": "application/json" } }) };
+    const firstExpiry = Math.min(envelope.core.expires_at,
+      issued.approval.expires_at, signedCommittedHead.expires_at);
+    assert.ok(longGrant.expiresAt > firstExpiry + 2,
+      "genuine signed share remains live after owner approval/witness expiration");
+    const encodedFile = JSON.parse(recoveredCiphertext.toString("utf8"));
+    const fileAeadCipherLength = Buffer.from(encodedFile.ciphertext, "base64url").length;
+    assert.notEqual(fileAeadCipherLength, 48, "genuine file AEAD differs from HPKE CEK");
+    const originalFinalDecrypt = subtle.decrypt;
+    const originalFinalNow = Date.now;
+    let finalAeadCompleted = false;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await originalFinalDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) {
+        finalAeadCompleted = true;
+        Date.now = () => (firstExpiry + 2) * 1000;
+      }
+      return openedFile;
+    };
+    try {
+      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: longShareInput }), /ZK_SHARE_FILE_OPEN_DENIED/,
+      "do not release plaintext after owner approval/witness expires during file AEAD");
+    } finally {
+      delete subtle.decrypt;
+      Date.now = originalFinalNow;
+    }
+    assert.equal(finalAeadCompleted, true,
+      "oracle must complete genuine file AEAD before expiring owner authority");
+    }
     await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
       redeemInput: { ...recipientShareInput, grant: { ...grant,
         shareSignatureBase64: b64(crypto.randomBytes(64)) } },
