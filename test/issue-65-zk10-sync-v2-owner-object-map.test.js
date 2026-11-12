@@ -178,6 +178,62 @@ test("owner/SyncV2 device signatures + independent current challenged head bind 
   await assert.rejects(verify(f.input), deny, "accepted mapping cannot replay in one verifier");
 });
 
+test("P2 device Ed25519 ciphertext A must not authorize independently owner-signed ciphertext B after a native key callback", async () => {
+  const f = await fixture();
+  const ciphertextB = Buffer.from("different ciphertext B").toString("base64url");
+  const envelopeB = { ...f.source, ciphertext: ciphertextB };
+  const signedB = signOwnerObjectMap({
+    ...f.payload,
+    sync_ciphertext_sha256: crypto.createHash("sha256")
+      .update(Buffer.from(ciphertextB, "base64url")).digest("hex"),
+  }, keys.owner.privateKey);
+  const digestB = digestOwnerObjectMap(signedB);
+  const authorityB = { ...f.authority,
+    readCurrentHead: (challenge) => signCurrentMappingHead({
+      type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+      sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+      mapping_sequence: f.payload.mapping_sequence, mapping_digest: digestB,
+    }, keys.authority.privateKey),
+  };
+  const candidate = { ...f.input, sourceOperation: envelopeB, ownerMapping: signedB };
+  const create = (authority) => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: authority,
+  });
+  await assert.rejects(create(authorityB)(candidate), deny,
+    "without a hostile iterator the genuine device signature for A rejects ciphertext B");
+
+  const nativeHandle = Object.getOwnPropertySymbols(keys.authority.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(nativeHandle, "Node 22 native Ed25519 handle is required");
+  const hostileAuthorityKey = Object.create(keys.authority.publicKey);
+  const originalIterator = Array.prototype[Symbol.iterator];
+  let getterReads = 0;
+  let skippedChecks = 0;
+  Object.defineProperty(hostileAuthorityKey, nativeHandle, { get() {
+    getterReads += 1;
+    Array.prototype[Symbol.iterator] = function*() {
+      if (this.length === 16 && this[0] === "protocolVersion"
+        && this[13] === "ciphertextDigest") {
+        skippedChecks += 1;
+        return;
+      }
+      yield* Reflect.apply(originalIterator, this, []);
+    };
+    return keys.authority.publicKey[nativeHandle];
+  } });
+  try {
+    await assert.rejects(create({ ...authorityB, pinnedPublicKey: hostileAuthorityKey })(candidate),
+      deny, "native owner-map key callback cannot suppress ciphertext A/B device binding");
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+  }
+  assert.ok(getterReads > 0, "genuine KeyObject callback was exercised");
+  assert.equal(skippedChecks, 0, "authorization comparison must not use poisoned Array iterator");
+  assert.equal((await create(f.authority)(f.input)).authorizesIo, false,
+    "genuine owner and device Ed25519 authorization still passes");
+});
+
 test("tampered map identity, revisions, ciphertext digests, and epochs fail closed", async () => {
   const f = await fixture();
   for (const [field, value] of Object.entries({
