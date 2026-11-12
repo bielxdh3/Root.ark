@@ -130,6 +130,81 @@ test("P2 inventory: inherited numeric Array setter cannot turn owner-signed entr
     "PRESENT", "signed A remains valid after the attempted attack");
 });
 
+test("P2 inventory: hostile late Array constructor cannot proxy a signed A row into requested B", async () => {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 241);
+  const scope = { account_id: Buffer.alloc(16, 242),
+    compartment_id: Buffer.from("protected"), keyring_id: Buffer.alloc(16, 243) };
+  const signedA = { object_id: Buffer.alloc(16, 244), revision: 1, epoch: 1,
+    ciphertext_sha256: Buffer.alloc(32, 245) };
+  const requestedB = { ...signedA, object_id: Buffer.alloc(16, 246) };
+  const nonce = Buffer.alloc(32, 247);
+  const previousRoot = Buffer.alloc(32, 248);
+  const rootA = await inventory.computeRoot(scope, 1, previousRoot, [signedA]);
+  const serialized = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope, sequence: 1,
+    previousRoot, entries: [signedA], nonce,
+  });
+  const args = (pin, requested) => ({ serialized, pinnedPublicKey: pin,
+    pinnedSignerKeyId: signerKeyId, expectedScope: scope, requested,
+    minimumHead: { sequence: 1, root: rootA }, nonce });
+  assert.equal((await inventory.verifySnapshot(args(signer.publicKey, signedA))).outcome,
+    "PRESENT", "genuine owner Ed25519 A remains present");
+  assert.equal((await inventory.verifySnapshot(args(signer.publicKey, requestedB))).outcome,
+    "ABSENT", "unsigned B cannot be found in a signed A-only snapshot");
+
+  const z = require("../src/crypto/rootark-zk-1");
+  const originalDecode = z.decodeDeterministic;
+  const originalArray = global.Array;
+  const pin = Object.create(signer.publicKey);
+  let keyReads = 0, validDecodes = 0, maliciousConstructs = 0, substitutedReads = 0;
+  Object.defineProperty(pin, "type", { get() {
+    keyReads++;
+    z.decodeDeterministic = async (...arguments_) => {
+      const decoded = await originalDecode(...arguments_);
+      validDecodes++;
+      // An untrusted native key getter may rewrite this global AFTER genuine
+      // CBOR decoding while normalizeEntries still uses the global Array.
+      global.Array = new Proxy(originalArray, {
+        construct(target, arguments_) {
+          const direct = (new Error().stack || "").split("\n")[2] || "";
+          const actual = Reflect.construct(target, arguments_, target);
+          if (!/\bnormalizeEntries \(/.test(direct)) return actual;
+          maliciousConstructs++;
+          return new Proxy(actual, {
+            get(array, property, receiver) {
+              if (property === "0") {
+                const caller = (new Error().stack || "").split("\n")[2] || "";
+                if (/\bat (?:Object\.)?verifySnapshot \(/.test(caller)) {
+                  substitutedReads++;
+                  return requestedB;
+                }
+              }
+              return Reflect.get(array, property, receiver);
+            },
+          });
+        },
+      });
+      return decoded;
+    };
+    return "public";
+  } });
+  try {
+    assert.equal((await inventory.verifySnapshot(args(pin, requestedB))).outcome,
+      "ABSENT", "a caller-owned constructor cannot replace signed A with unsigned B");
+  } finally {
+    z.decodeDeterministic = originalDecode;
+    global.Array = originalArray;
+  }
+  assert.ok(keyReads > 0, "hostile native key callback executed");
+  assert.ok(validDecodes > 0, "original Ed25519-signed snapshot was actually decoded");
+  assert.equal(maliciousConstructs, 0,
+    "normalized rows must use an intrinsic Array literal, not the late global constructor");
+  assert.equal(substitutedReads, 0, "membership cannot read a hostile Proxy array");
+  assert.equal((await inventory.verifySnapshot(args(signer.publicKey, signedA))).outcome,
+    "PRESENT", "owner-signed A stays accepted after the hostile callback");
+});
+
 test("P2 inventory: native key getter cannot replace signed member A with requested B through an Array iterator", async () => {
   const signer = crypto.generateKeyPairSync("ed25519");
   const signerKeyId = Buffer.alloc(16, 201);
