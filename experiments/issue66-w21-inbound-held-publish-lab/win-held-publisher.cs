@@ -225,9 +225,9 @@ class W21WinHandleLinkLab {
             IntPtr publishedHandle = OpenHeld(published);
             try { Require(FileId(publishedHandle) == originalId, "published-original-FileId"); }
             finally { CloseHandle(publishedHandle); }
-            Require(File.ReadAllText(published, Encoding.UTF8) == "ORIGINAL VERIFIED BYTES",
+            Require(ReadWhileNativeHandleRetained(published) == "ORIGINAL VERIFIED BYTES",
                 "published-original-bytes");
-            Require(File.ReadAllText(source, Encoding.UTF8) == "FOREIGN SECOND-PROCESS BYTES",
+            Require(ReadWhileNativeHandleRetained(source) == "FOREIGN SECOND-PROCESS BYTES",
                 "foreign-preserved");
             Require(!prepared.CommitLink("published", out status)
                 && status == STATUS_OBJECT_NAME_COLLISION,
