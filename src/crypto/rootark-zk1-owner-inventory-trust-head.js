@@ -9,6 +9,7 @@ const crypto = require("node:crypto");
 // attacker-controlled crypto.verify implementation.
 const {
   verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
   createHash: NATIVE_CREATE_HASH, hashUpdate: NATIVE_HASH_UPDATE,
   hashDigest: NATIVE_HASH_DIGEST, bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT, bufferToString: NATIVE_BUFFER_TO_STRING,
@@ -171,10 +172,20 @@ async function verifyOwnerInventoryEnrollment(input) {
       const signature = b64(record.signature, 64);
       checked[index] = { current, signature, recordDigest: checkpointDigest(record) };
     }
-    const ownerKey = key(r.ownerPublicKey, "public");
-    const inventoryKey = key(r.inventoryPublicKey, "public");
-    if (spkiHash(ownerKey) !== pinnedOwnerSpki) fail();
-    const signerFingerprint = spkiHash(inventoryKey);
+    // A caller-owned KeyObject can swap its native kHandle after exporting
+    // SPKI B and before Ed25519 verification. Reimport the exact detached
+    // DER bytes and use only those new native keys for signatures and nested
+    // inventory verification; the fingerprint and verifier must be identical.
+    const ownerSpki = nativeEd25519Spki(key(r.ownerPublicKey, "public"));
+    const inventorySpki = nativeEd25519Spki(key(r.inventoryPublicKey, "public"));
+    const ownerKey = NATIVE_CREATE_PUBLIC_KEY({
+      key: ownerSpki, format: "der", type: "spki",
+    });
+    const inventoryKey = NATIVE_CREATE_PUBLIC_KEY({
+      key: inventorySpki, format: "der", type: "spki",
+    });
+    if (digest(ownerSpki) !== pinnedOwnerSpki) fail();
+    const signerFingerprint = digest(inventorySpki);
     let previous = null;
     for (let index = 0; index < checked.length; index += 1) {
       const { current, signature, recordDigest } = checked[index];

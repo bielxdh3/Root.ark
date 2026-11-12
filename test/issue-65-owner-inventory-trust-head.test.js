@@ -72,6 +72,97 @@ test("signed owner inventory ancestry cannot be verified under a spoofed indepen
   "an owner signature is not proof of the independently pinned owner identity");
 });
 
+test("P2 native owner handle cannot pin SPKI B while verifying genuine owner Ed25519 A", async () => {
+  const f = await fixture();
+  const nativeA = f.enrollment.ownerPublicKey;
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const foreignSpki = foreign.publicKey.export({ type: "spki", format: "der" });
+  const foreignPin = crypto.createHash("sha256").update(foreignSpki).digest("hex");
+  await assert.rejects(verifyOwnerInventoryEnrollment({
+    ...f.enrollment, independentOwnerSpkiSha256: foreignPin,
+  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+  "genuine signed owner A must reject independent pin B");
+
+  const handle = Object.getOwnPropertySymbols(nativeA)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "Node22 real owner Ed25519 KeyObject handle required");
+  const hybrid = Object.create(nativeA);
+  let returnedForeignDuringSpki = 0;
+  let returnedGenuineDuringVerification = 0;
+  Object.defineProperty(hybrid, handle, { get() {
+    if (new Error().stack.includes("nativeEd25519Spki")) {
+      returnedForeignDuringSpki++;
+      return foreign.publicKey[handle];
+    }
+    returnedGenuineDuringVerification++;
+    return nativeA[handle];
+  } });
+  await assert.rejects(verifyOwnerInventoryEnrollment({
+    ...f.enrollment, ownerPublicKey: hybrid,
+    independentOwnerSpkiSha256: foreignPin,
+  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+  "caller-controlled native kHandle must never mix B identity with A signature");
+  assert.ok(returnedForeignDuringSpki > 0, "native export must have observed attacker B handle");
+  assert.equal(returnedGenuineDuringVerification, 0,
+    "the verifier must not return to the caller-owned A handle after pinning B");
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true,
+    "genuine owner A remains accepted for the true A pin");
+});
+
+test("P2 native inventory handle cannot pin signer B while verifying genuine signed snapshot A", async () => {
+  const f = await fixture();
+  const otherInventory = crypto.generateKeyPairSync("ed25519");
+  const spkiB = otherInventory.publicKey.export({ type: "spki", format: "der" });
+  const decoded = await require("../src/crypto/rootark-zk-1").decodeDeterministic(f.snapshot);
+  const freshOwner = await runOfflineSigner({
+    scope: Object.fromEntries(Object.entries(f.scope).map(([name, bytes]) =>
+      [name, bytes.toString("base64url")])),
+    inventorySignerKeyId: f.enrollment.inventorySignerKeyId.toString("base64url"),
+    inventorySpkiSha256: crypto.createHash("sha256").update(spkiB).digest("hex"),
+    heads: [{ sequence: 0, root: Buffer.from(decoded.root).toString("hex"),
+      snapshotSha256: crypto.createHash("sha256").update(f.snapshot).digest("hex"),
+      issuedAt: f.now - 5, expiresAt: f.now + 120 }],
+  });
+  const claimedB = {
+    ...f.enrollment, checkpoints: freshOwner.checkpoints,
+    ownerPublicKey: crypto.createPublicKey({
+      key: Buffer.from(freshOwner.ownerSpki, "base64url"),
+      format: "der", type: "spki",
+    }),
+    independentOwnerSpkiSha256: freshOwner.independentOwnerSpkiSha256,
+    independentRetainedCheckpointDigest: freshOwner.independentRetainedCheckpointDigest,
+    inventoryPublicKey: otherInventory.publicKey,
+  };
+  await assert.rejects(verifyOwnerInventoryEnrollment(claimedB),
+    /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "genuine owner-signed declaration of inventory B cannot verify snapshot signed by A");
+
+  const realA = f.keys.publicKey;
+  const handle = Object.getOwnPropertySymbols(realA)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "real Ed25519 inventory native handle required");
+  const hybrid = Object.create(realA);
+  let spkiBReads = 0;
+  let checkedAReads = 0;
+  Object.defineProperty(hybrid, handle, { get() {
+    if (new Error().stack.includes("nativeEd25519Spki")) {
+      spkiBReads++;
+      return otherInventory.publicKey[handle];
+    }
+    checkedAReads++;
+    return realA[handle];
+  } });
+  await assert.rejects(verifyOwnerInventoryEnrollment({
+    ...claimedB, inventoryPublicKey: hybrid,
+  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+  "signed B inventory identity cannot validate genuine A snapshot through mutable kHandle");
+  assert.ok(spkiBReads > 0, "fingerprint path exercised the foreign inventory handle");
+  assert.equal(checkedAReads, 0,
+    "nested inventory signature verifier must never use caller-owned A handle");
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true,
+    "unmodified legitimate A snapshot continues to verify with its signed A key");
+});
+
 test("browser/WebCrypto imports offline owner checkpoint with independent pins; export roundtrip is portable", async () => {
   const f = await fixture();
   const wire = portable.exportPortableEnrollment({
