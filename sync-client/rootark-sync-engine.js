@@ -1718,6 +1718,12 @@ class SyncEngine {
             }
           }
           if (current && !this.operationDestinationIsSelected(current)) {
+            // The server's 409 `current` is untrusted until its exact device
+            // Ed25519/roster envelope is verified. Never disclose the local
+            // pin state, nor mutate conflict recovery, for an unauthenticated
+            // response. Do not reserve a durable admission for a valid but
+            // pinned-rejected MOVE.
+            await this.verifyIncomingOperation(current, { preObserve: false });
             this.preflightOutOfScopeMove(current);
           }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
@@ -1727,7 +1733,15 @@ class SyncEngine {
             if (this.operationDestinationIsSelected(current)) {
               verifiedFreshDigest = await this._apply(current, summary);
             } else {
-              verifiedFreshDigest = await this.verifyIncomingOperation(current);
+              // Recheck current revocation/identity after asynchronous local
+              // conflict recovery. Only now may a successfully preflighted
+              // exact signed envelope reserve a durable journal observation.
+              verifiedFreshDigest = await this.verifyIncomingOperation(current,
+                { preObserve: false });
+              this.preflightOutOfScopeMove(current);
+              if (verifiedFreshDigest) {
+                await this.journal.observeAdmission(current.operationId, verifiedFreshDigest);
+              }
               const reconciled = await this.reconcileOutOfScopeMove(current, summary, {
                 preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
               });

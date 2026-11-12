@@ -542,6 +542,51 @@ test("issue 66 #292 P1: untrusted Ed25519 B out-of-scope MOVE must fail authenti
   assert.equal(state.pushes, 0);
 });
 
+test("issue 66 #292 P1: untrusted 409 conflict current cannot probe pinned origin before Ed25519 authentication", async (t) => {
+  const { rootDir, open, remote, adapter, trusted, state } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false, ["docs"]);
+  const pending = await remote("create", "object-pending", "docs/pending.txt", "local signed pending", 1);
+  assert.equal(await verifyAuthorizationProof(pending.authorization, pending, trusted), true);
+  await client.journal.enqueue(pending);
+  const winnerA = await remote("move", "object-a", "archive/a.txt",
+    "authenticated remote bytes", 2, "docs/a.txt");
+  assert.equal(await verifyAuthorizationProof(winnerA.authorization, winnerA, trusted), true);
+  const rogue = crypto.generateKeyPairSync("ed25519");
+  const rogueKey = rogue.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const winnerB = { ...winnerA, authorization: await createAuthorizationProof(winnerA, {
+    username: "alice", privateKey: rogue.privateKey, publicKey: rogueKey,
+    expiresAt: Date.now() + 60_000,
+  }) };
+  await assert.rejects(verifyAuthorizationProof(winnerB.authorization, winnerB, trusted),
+    { code: "authorization_device_untrusted" });
+  let outboundRequests = 0;
+  adapter.push = async (operation) => {
+    assert.equal(operation.operationId, pending.operationId);
+    outboundRequests++;
+    return { status: 409, current: winnerB, currentRevision: winnerB.revision };
+  };
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  const indexFile = path.join(rootDir, ".rootark-sync-index.json");
+  const indexBefore = await fsp.readFile(indexFile);
+  const summary = () => ({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
+  await assert.rejects(client.pushPending(summary()), { code: "authorization_device_untrusted" },
+    "a forged B in a 409 reply must not reach file_pinned or remote-wins recovery");
+  assert.equal(outboundRequests, 1, "the signed A pending operation was really dispatched once");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
+    "untrusted conflict reply cannot consume signed pending or admission");
+  assert.deepEqual(await fsp.readFile(indexFile), indexBefore);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  assert.equal(fs.existsSync(path.join(rootDir, ".rootark-conflicts")), false,
+    "untrusted conflict reply must not write recovery artifacts");
+  adapter.push = async () => ({ status: 409, current: winnerA, currentRevision: winnerA.revision });
+  await assert.rejects(client.pushPending(summary()), { code: "file_pinned" },
+    "genuinely owner/device-signed A must retain physical pin protection");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDATE before mutation", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
