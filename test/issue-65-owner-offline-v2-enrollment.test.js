@@ -731,6 +731,10 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "test must reach actual HPKE decrypt before the clock changes");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
+    assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
+      envelope.core.expires_at, issued.approval.expires_at,
+      signedCommittedHead.expires_at),
+    "owner CEK opener returns the signed owner/approval/witness expiration actually verified");
     const decrypted = await content.decryptFile({
       cek: await content.importFileCek(bCek.cek), metadata,
       envelopeBytes: recoveredCiphertext,
