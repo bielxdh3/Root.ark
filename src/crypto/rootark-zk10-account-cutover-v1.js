@@ -24,6 +24,7 @@ const {
   arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
   ownKeys: NATIVE_OWN_KEYS,
   ownDescriptor: NATIVE_OWN_DESCRIPTOR,
+  defineProperty: NATIVE_DEFINE_PROPERTY,
   getPrototype: NATIVE_GET_PROTOTYPE,
   hasOwn: NATIVE_HAS_OWN,
   publicExport: NATIVE_PUBLIC_EXPORT,
@@ -39,6 +40,11 @@ const OWNER_FIELDS = NATIVE_FREEZE(["type", "immutable_account_id", "zk_account_
   "migration_disposition", "grant", "grants", "suite", "nonce", "issued_at"]);
 const ROTATION_FIELDS = NATIVE_FREEZE(["type", "immutable_account_id", "generation",
   "from_spki_sha256", "next_public_key", "previous_rotation_digest"]);
+// Construct each wire field list before any caller-owned native getter runs.
+// Late array spread would consult attacker-replaceable Symbol.iterator.
+const OWNER_WIRE_FIELDS = NATIVE_FREEZE([...OWNER_FIELDS, "signature"]);
+const ROTATION_WIRE_FIELDS = NATIVE_FREEZE([...ROTATION_FIELDS,
+  "signature_from", "signature_next"]);
 const HEX = /^[a-f0-9]{64}$/;
 const B64 = /^[A-Za-z0-9_-]+$/;
 const H = (...v) => {
@@ -57,10 +63,12 @@ function exact(value, fields) {
   if ((proto !== Object.prototype && proto !== null)
     || NATIVE_OWN_KEYS(value).length !== fields.length) deny();
   const output = {};
-  for (const field of fields) {
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
     const descriptor = NATIVE_OWN_DESCRIPTOR(value, field);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
-    output[field] = descriptor.value;
+    NATIVE_DEFINE_PROPERTY(output, field, { value: descriptor.value,
+      writable: true, enumerable: true, configurable: true });
   }
   return output;
 }
@@ -123,11 +131,17 @@ function ownerPayload(payload) {
     || NATIVE_OWN_KEYS(p.covered_compartments).length !== p.covered_compartments.length + 1) deny();
   let previous = "";
   const names = [];
-  for (const item of p.covered_compartments) {
+  for (let index = 0; index < p.covered_compartments.length; index += 1) {
+    const descriptor = NATIVE_OWN_DESCRIPTOR(p.covered_compartments, String(index));
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    const item = descriptor.value;
     decode(item, 16);
     if (item <= previous) deny();
     previous = item;
-    NATIVE_ARRAY_PUSH.call(names, item);
+    // Define an own DATA property directly: even a captured native Array.push
+    // would invoke Array.prototype[7] installed by a hostile KeyObject getter.
+    NATIVE_DEFINE_PROPERTY(names, String(index), { value: item,
+      enumerable: true, writable: true, configurable: true });
   }
   return { ...p, covered_compartments: names };
 }
@@ -140,14 +154,14 @@ function signOwnerCutover(payload, privateKey) {
     signatureBytes(DOMAIN_OWNER, p), key(privateKey, "private")), "base64url") });
 }
 function verifyOwnerCutover(wire, publicKey) {
-  const signed = exact(wire, [...OWNER_FIELDS, "signature"]);
+  const signed = exact(wire, OWNER_WIRE_FIELDS);
   const p = ownerPayload(NATIVE_PICK_SIGNED_FIELDS(signed, OWNER_FIELDS));
   if (!NATIVE_VERIFY(null, signatureBytes(DOMAIN_OWNER, p), key(publicKey, "public"),
     decode(signed.signature, 64))) deny();
   return NATIVE_FREEZE(p);
 }
 function digestOwnerCutover(wire) {
-  const record = exact(wire, [...OWNER_FIELDS, "signature"]);
+  const record = exact(wire, OWNER_WIRE_FIELDS);
   const p = ownerPayload(NATIVE_PICK_SIGNED_FIELDS(record, OWNER_FIELDS));
   decode(record.signature, 64);
   return NATIVE_BUFFER_TO_STRING.call(H(
@@ -188,7 +202,7 @@ function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
   const accepted = [current];
   let previousDigest = null;
   for (let index = 0; index < rotations.length; index += 1) {
-    const signed = exact(rotations[index], [...ROTATION_FIELDS, "signature_from", "signature_next"]);
+    const signed = exact(rotations[index], ROTATION_WIRE_FIELDS);
     const { body, next } = rotationPayload(NATIVE_PICK_SIGNED_FIELDS(
       signed, ROTATION_FIELDS));
     if (body.immutable_account_id !== immutableAccountId
@@ -200,7 +214,8 @@ function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
     previousDigest = NATIVE_BUFFER_TO_STRING.call(H(bytes, decode(signed.signature_from, 64),
       decode(signed.signature_next, 64)), "hex");
     current = next;
-    NATIVE_ARRAY_PUSH.call(accepted, current);
+    NATIVE_DEFINE_PROPERTY(accepted, String(accepted.length), { value: current,
+      enumerable: true, writable: true, configurable: true });
   }
   return NATIVE_FREEZE(accepted);
 }
@@ -217,23 +232,32 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
     || NATIVE_OWN_KEYS(ownerKeys).length !== ownerKeys.length + 1) deny();
   // Pin every trusted key once, not again after attacker-controlled history
   // processing. Reject accessors, holes and Proxies instead of invoking them.
-  const pinnedKeys = Array.from({ length: ownerKeys.length }, (_, index) => {
+  const pinnedKeys = [];
+  for (let index = 0; index < ownerKeys.length; index += 1) {
     const entry = NATIVE_OWN_DESCRIPTOR(ownerKeys, String(index));
     if (!entry || !NATIVE_HAS_OWN(entry, "value")) deny();
-    return key(entry.value, "public");
-  });
+    NATIVE_DEFINE_PROPERTY(pinnedKeys, String(index), { value: key(entry.value, "public"),
+      enumerable: true, writable: true, configurable: true });
+  }
   let previous = null;
   let keyIndex = 0;
   let last;
   for (let index = 0; index < history.length; index += 1) {
     const entry = NATIVE_OWN_DESCRIPTOR(history, String(index));
     if (!entry || !NATIVE_HAS_OWN(entry, "value")) deny();
-    const signed = exact(entry.value, [...OWNER_FIELDS, "signature"]);
+    const signed = exact(entry.value, OWNER_WIRE_FIELDS);
     const payload = ownerPayload(NATIVE_PICK_SIGNED_FIELDS(signed, OWNER_FIELDS));
     // The signature verification and digest must refer to ONE immutable
     // signed record, not two independently read versions of the same slot.
+    const compartments = [];
+    for (let offset = 0; offset < payload.covered_compartments.length; offset += 1) {
+      const part = NATIVE_OWN_DESCRIPTOR(payload.covered_compartments, String(offset));
+      if (!part || !NATIVE_HAS_OWN(part, "value")) deny();
+      NATIVE_DEFINE_PROPERTY(compartments, String(offset), { value: part.value,
+        enumerable: true, writable: true, configurable: true });
+    }
     const wire = NATIVE_FREEZE({ ...payload,
-      covered_compartments: NATIVE_FREEZE([...payload.covered_compartments]),
+      covered_compartments: NATIVE_FREEZE(compartments),
       grants: NATIVE_FREEZE([]), signature: signed.signature });
     let verified;
     for (let cursor = keyIndex; cursor < pinnedKeys.length; cursor += 1) {

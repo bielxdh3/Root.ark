@@ -4,6 +4,7 @@
 // PostgreSQL attestor AFTER it has verified bytes and a WAL flush barrier.
 // Neither this signature nor an mTLS ACK proves external/cloud durability.
 const crypto = require("node:crypto");
+const { freeze: NATIVE_FREEZE } = require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/physical-pg-readback-attestation/v1\0");
@@ -136,7 +137,7 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     const chunkRoot = bytes(unsigned.chunk_root, 32);
     const chunkCount = count(unsigned.chunk_count, 1);
     bytes(unsigned.admission_id, 16);
-    return Object.freeze({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+    return NATIVE_FREEZE({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
       walFlushConfirmed: true, generation, admissionId: Buffer.from(unsigned.admission_id),
       physicalDigest, chunkRoot, chunkCount,
       // Return the already-verified, signed issuance time so callers that

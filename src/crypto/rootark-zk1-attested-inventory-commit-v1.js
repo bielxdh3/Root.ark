@@ -15,6 +15,7 @@ const {
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT,
   timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+  freeze: NATIVE_FREEZE,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const inventory = require("./rootark-zk-content-inventory-v1");
 const { verifyCommittedPhysicalReadback } =
@@ -124,7 +125,7 @@ async function verifyAttestedInventoryCommit(input) {
     // Digest is an explicitly NON-DURABLE evidence-bundle fingerprint, not a
     // replacement for an externally anchored CAS/FLOOR or a recovery ticket.
     const receiptDigest = sha(NATIVE_BUFFER_CONCAT([DOMAIN, sha(receipt), sha(physicalBytes)]));
-    return Object.freeze({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
+    return NATIVE_FREEZE({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
       inventoryReceipt: signedReceipt,
       physicalReadback: physical,
       receiptDigest,
