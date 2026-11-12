@@ -141,10 +141,14 @@ function normalizeEntries(value) {
   let keys;
   try { keys = NATIVE_OWN_KEYS(value); } catch (_) { fail("INVENTORY_ENTRIES"); }
   if (keys.length !== length + 1 || !keys.includes("length")) fail("INVENTORY_ENTRIES");
-  const entries = new Array(length);
+  // A KeyObject getter may replace the global Array constructor with a Proxy
+  // between canonical decode and this normalization. An array literal uses
+  // the intrinsic constructor and cannot be redirected to a forged Proxy.
+  const entries = [];
+  entries.length = length;
   let previous = null;
   for (let i = 0; i < length; i += 1) {
-    const descriptor = NATIVE_DESCRIPTOR(value, String(i));
+    const descriptor = NATIVE_DESCRIPTOR(value, i);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_ENTRIES");
     const entry = normalizeEntry(descriptor.value);
     if (previous) {
@@ -163,7 +167,7 @@ function normalizeEntries(value) {
     // Array setters before this signed snapshot is decoded. Assignment can
     // leave a hole whose inherited getter later returns different A/B rows
     // between signature verification and membership. Define own DATA slots.
-    NATIVE_DEFINE_PROPERTY(entries, String(i), {
+    NATIVE_DEFINE_PROPERTY(entries, i, {
       value: entry, enumerable: true, configurable: true, writable: true,
     });
     previous = entry;
@@ -587,7 +591,7 @@ function normalizeCommittedProofChain(input) {
   const result = [];
   let total = 0;
   for (let i = 0; i < input.length; i += 1) {
-    const descriptor = NATIVE_DESCRIPTOR(input, String(i));
+    const descriptor = NATIVE_DESCRIPTOR(input, i);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_CHAIN");
     const value = descriptor.value;
     if (!isBytes(value) || (typeof SharedArrayBuffer !== "undefined"
@@ -612,7 +616,7 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
   // byte strings already copied and bounded before invoking the key getter.
   let entries = [];
   for (let i = 0; i < previous.entries.length; i += 1) {
-    NATIVE_DEFINE_PROPERTY(entries, String(i), { value: previous.entries[i],
+    NATIVE_DEFINE_PROPERTY(entries, i, { value: previous.entries[i],
       enumerable: true, configurable: true, writable: true });
   }
   for (let receiptIndex = 0; receiptIndex < receipts.length; receiptIndex += 1) {
@@ -639,10 +643,10 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
       || !sameBytes(copyBytes(row.expected_root, 32), root)) fail("INVENTORY_CHAIN");
     const nextEntries = [];
     for (let index = 0; index < entries.length; index += 1) {
-      NATIVE_DEFINE_PROPERTY(nextEntries, String(index), { value: entries[index],
+      NATIVE_DEFINE_PROPERTY(nextEntries, index, { value: entries[index],
         enumerable: true, configurable: true, writable: true });
     }
-    NATIVE_DEFINE_PROPERTY(nextEntries, String(entries.length), { value: verified.tuple,
+    NATIVE_DEFINE_PROPERTY(nextEntries, entries.length, { value: verified.tuple,
       enumerable: true, configurable: true, writable: true });
     NATIVE_APPLY(NATIVE_ARRAY_SORT, nextEntries, [(a, b) =>
       NATIVE_BUFFER_COMPARE(a.object_id, b.object_id) || a.revision - b.revision]);
