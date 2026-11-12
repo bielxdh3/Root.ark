@@ -663,7 +663,11 @@ async function verifySnapshot(input) {
   }
 
   let matched = null;
-  for (const entry of current.entries) {
+  // The signed snapshot has already been verified, but a public KeyObject
+  // getter may have replaced Array.prototype[Symbol.iterator]. Index the
+  // verified own entries; never accept an iterator-supplied unsigned member.
+  for (let index = 0; index < current.entries.length; index += 1) {
+    const entry = current.entries[index];
     const order = NATIVE_BUFFER_COMPARE(entry.object_id, requested.object_id);
     if (order > 0) break;
     if (order === 0 && entry.revision === requested.revision) {

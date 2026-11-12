@@ -24,6 +24,14 @@ const PROOF_FIELDS = Object.freeze([
   "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest",
   "expiresAt", "replayId", "idempotencyKey", "publicKey", "signature",
 ]);
+// This comparison runs after caller-owned native KeyObject callbacks in some
+// historical proof paths. Array.prototype[Symbol.iterator] can be replaced by
+// those callbacks; keep the exact binding field order and iterate own slots.
+const ENVELOPE_BINDING_FIELDS = Object.freeze([
+  "protocolVersion", "deviceId", "operationId", "objectId", "fileId",
+  "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
+  "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest",
+]);
 
 function fail(message, code = "invalid_device_authorization") {
   throw Object.assign(new Error(message), { code });
@@ -134,9 +142,8 @@ function assertAuthorizationEnvelopeBinding(proof, operation) {
     expiresAt: proof.expiresAt, replayId: proof.replayId,
     idempotencyKey: proof.idempotencyKey,
   }, false);
-  for (const field of ["protocolVersion", "deviceId", "operationId", "objectId", "fileId",
-    "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
-    "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
+  for (let index = 0; index < ENVELOPE_BINDING_FIELDS.length; index += 1) {
+    const field = ENVELOPE_BINDING_FIELDS[index];
     if (NATIVE_JSON_STRINGIFY(proof[field]) !== NATIVE_JSON_STRINGIFY(expectedCore[field])) {
       fail("Authorization envelope binding mismatch", "authorization_scope");
     }

@@ -45,6 +45,63 @@ test("P2 inventory: signed old snapshot A cannot satisfy retained minimum root B
   "signed genuine A remains valid when floor really is A");
 });
 
+test("P2 inventory: native key getter cannot replace signed member A with requested B through an Array iterator", async () => {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 201);
+  const scope = { account_id: Buffer.alloc(16, 202),
+    compartment_id: Buffer.from("protected"), keyring_id: Buffer.alloc(16, 203) };
+  const memberA = { object_id: Buffer.alloc(16, 204), revision: 1, epoch: 1,
+    ciphertext_sha256: Buffer.alloc(32, 205) };
+  const memberB = { ...memberA, object_id: Buffer.alloc(16, 206) };
+  const nonce = Buffer.alloc(32, 207);
+  const previousRoot = Buffer.alloc(32, 208);
+  const rootA = await inventory.computeRoot(scope, 1, previousRoot, [memberA]);
+  const serialized = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope,
+    sequence: 1, previousRoot, entries: [memberA], nonce,
+  });
+  const input = (pin, requested) => ({ serialized, pinnedPublicKey: pin,
+    pinnedSignerKeyId: signerKeyId, expectedScope: scope, requested,
+    minimumHead: { sequence: 1, root: rootA }, nonce });
+  assert.equal((await inventory.verifySnapshot(input(signer.publicKey, memberA))).outcome,
+    "PRESENT", "genuinely signed Ed25519 member A is present");
+  assert.equal((await inventory.verifySnapshot(input(signer.publicKey, memberB))).outcome,
+    "ABSENT", "unsigned member B is absent");
+
+  const handle = Object.getOwnPropertySymbols(signer.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "native Ed25519 handle must be reachable");
+  const poisoned = Object.create(signer.publicKey);
+  const originalIterator = Array.prototype[Symbol.iterator];
+  let keyGetterReads = 0;
+  let substituted = 0;
+  Object.defineProperty(poisoned, handle, { get() {
+    keyGetterReads++;
+    Array.prototype[Symbol.iterator] = function*() {
+      // Only the post-signature membership loop can be substituted. CBOR
+      // canonicalization and Ed25519 verification keep checking signed A.
+      if (this.length === 1 && this[0]?.object_id?.equals?.(memberA.object_id)
+        && /\bat (?:Object\.)?verifySnapshot \(/.test(new Error().stack)) {
+        substituted++;
+        yield memberB;
+        return;
+      }
+      yield* Reflect.apply(originalIterator, this, []);
+    };
+    return signer.publicKey[handle];
+  } });
+  try {
+    assert.equal((await inventory.verifySnapshot(input(poisoned, memberB))).outcome,
+      "ABSENT", "signed member A cannot be presented as unsigned B");
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+  }
+  assert.ok(keyGetterReads > 0, "real native KeyObject getter executed");
+  assert.equal(substituted, 0, "membership search must not use a post-key iterator");
+  assert.equal((await inventory.verifySnapshot(input(signer.publicKey, memberA))).outcome,
+    "PRESENT", "genuine A remains accepted");
+});
+
 test("P2 inventory: signed object A must not make requested B PRESENT via post-key Buffer.compare", async () => {
   const signer = crypto.generateKeyPairSync("ed25519");
   const signerKeyId = Buffer.alloc(16, 71);
