@@ -6254,9 +6254,40 @@ function registerExperimentalP2p() {
       || fileName.length < 1 || fileName.length > 100
       || path.basename(fileName) !== fileName
       || /[/\\\x00-\x1f\x7f]/.test(fileName) || isCloudStorageEnabled()) return null;
-    // Read bytes asynchronously before the final fresh ACL/metadata check.
-    // No path/mtime cache can substitute for the current ciphertext SHA-256.
+    // Cheap, synchronous deny BEFORE touching up to 32 MiB of ciphertext.
+    // A non-owner or unlisted recipient must never induce a disk hash; the
+    // complete fresh ACL/metadata check below still runs AFTER the awaited
+    // ciphertext read, so revocation during hashing remains fail closed.
     const prior = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const earlyOwner = p2pUser(owner);
+    const earlyRecipient = recipient === null ? null : p2pUser(recipient);
+    const earlyFolder = getFolderById(folderId);
+    const earlyAcl = prior?.accessControl;
+    const earlyFileEntry = getFilePermissionEntry(folderId, fileName, loadFilePermissions());
+    const earlyFileAcl = earlyFileEntry && normalizeFilePermissionEntry(earlyFileEntry);
+    if (!earlyOwner || earlyOwner.disabled || normalizeUserPermissions(earlyOwner).listFiles !== true
+      || (recipient !== null && (!earlyRecipient || earlyRecipient.disabled
+        || normalizeUserPermissions(earlyRecipient).listFiles !== true))
+      || !earlyFolder || !isFolderAvailable(folderId)
+      || isFileExpired(folderId, fileName) || isFileInTrash(folderId, fileName)
+      || isStoredVersionFile(folderId, fileName)
+      || restoreProviderOrphans.isSuppressed(folderId, fileName, "uploads")
+      || !prior || prior.folderId !== folderId || prior.fileName !== fileName
+      || !["user-key", "dual"].includes(prior.encryptionLevel)
+      || prior.algorithm !== "aes-256-gcm"
+      || !Number.isSafeInteger(prior.encryptedSize) || prior.encryptedSize < 1
+      || !earlyAcl || earlyAcl.owner !== owner || !Array.isArray(earlyAcl.authorizedUsers)
+      || !earlyAcl.authorizedUsers.includes(owner)
+      || (recipient !== null && !earlyAcl.authorizedUsers.includes(recipient))
+      || (earlyAcl.expiresAt !== null && earlyAcl.expiresAt !== undefined
+        && (!Number.isFinite(Date.parse(earlyAcl.expiresAt)) || Date.parse(earlyAcl.expiresAt) <= Date.now()))
+      || !earlyFileEntry || earlyFileEntry.public !== false || earlyFileAcl?.owner !== owner
+      || (recipient !== null && !earlyFileAcl.users?.[recipient]?.read)
+      || !hasFolderAccess({ user: earlyOwner }, earlyFolder)
+      || !hasFileAccess({ user: earlyOwner }, earlyFolder, fileName)
+      || (recipient !== null && (!hasFolderAccess({ user: earlyRecipient }, earlyFolder)
+        || !hasFileAccess({ user: earlyRecipient }, earlyFolder, fileName)))) return null;
+    // No path/mtime cache can substitute for the current ciphertext SHA-256.
     const ciphertext = await currentP2pCiphertext(folderId, fileName, prior?.encryptedSize);
     if (!ciphertext) return null;
     const ownerUser = p2pUser(owner);

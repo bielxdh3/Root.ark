@@ -160,8 +160,14 @@ async function run() {
     await refreshedBob.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
     // No shared mutation-serialized ACL authority exists in this legacy app.
     // The broker must close the bound room rather than relay the WebRTC offer.
-    await until(() => refreshedBob.evaluate('window.__poc.snapshot().peers.length===0'),
-      'bound signaling bypassed the missing all-party authority fence', 20_000);
+    // peers.length===0 can be TRUE before any signaling is processed. Require
+    // BOTH affirmative server ROOM_CLOSED and the socket-close side effect,
+    // which clears the pinned object on the real browser client.
+    await until(() => refreshedBob.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("ROOM_CLOSED")' +
+      ' && window.__poc.snapshot().boundObject===null' +
+      ' && window.__poc.snapshot().peers.length===0'),
+    'broker did not affirmatively close bound signaling without all-party authority', 20_000);
     assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 0,
       'no bound ciphertext transfer can be received without snapshot authority');
     console.log('PASS real Root.ark Edge: signed-cookie manual 1:N transfer, bound owner ACL/digest admission, and bound signaling fail-closed without atomic authority');
