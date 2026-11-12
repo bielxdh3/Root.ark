@@ -23,6 +23,10 @@ const { types: { isProxy } } = require("node:util");
 const NATIVE_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
 const z = require("./rootark-zk-1");
 const inventory = require("./rootark-zk-content-inventory-v1");
+// Resolve the nested inventory signature verifier once, before any
+// caller-controlled owner KeyObject property can replace this export.
+// A valid owner checkpoint NEVER authorizes an unsigned inventory snapshot.
+const NATIVE_VERIFY_INVENTORY_SNAPSHOT = inventory.verifySnapshot.bind(inventory);
 const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 
 const DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/owner-inventory-trust-head/v1\0", "ascii");
@@ -219,7 +223,7 @@ async function verifyOwnerInventoryEnrollment(input) {
         ciphertext_sha256: NATIVE_BUFFER_FROM(new Uint8Array(32)) };
     const minimumHead = { sequence: previous.inventorySequence,
       root: NATIVE_BUFFER_FROM(previous.root, "hex") };
-    await inventory.verifySnapshot({ serialized: snapshot, pinnedPublicKey: inventoryKey,
+    await NATIVE_VERIFY_INVENTORY_SNAPSHOT({ serialized: snapshot, pinnedPublicKey: inventoryKey,
       pinnedSignerKeyId: keyId, expectedScope: pinnedScopeBytes, requested, minimumHead,
       nonce: decoded.nonce });
     return NATIVE_FREEZE({ minimumHead, minimumSnapshot: NATIVE_BUFFER_FROM(snapshot),
