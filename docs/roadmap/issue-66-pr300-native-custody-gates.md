@@ -1364,3 +1364,17 @@ independent bounded SOURCE GO and no final hosted CI; #302 `7baea943`
 has two bounded SOURCE GO and Windows regressions but no self-hosted
 external custodian or Linux proof. #306 checks do not authorize its merge.
 RootSession remains OFF. **MERGE NO-GO / RELEASE NO-GO.**
+
+### Composite native LAB and verified second-process lifetime fence
+
+The new unpublished local composite head `f5cd2e63` is an ordinary
+cherry-picked integration on the documentation/W21/W31 line, not a
+publication or a PR merge. Its source lineage preserves the W37 original
+`fc837826`, external-writer `fbc503a7` and handshake `db8b6352`
+changes in equivalent cherry-picked commits. The external same-SID actor
+now holds the foreign FD **until** the native parent signals completion
+after `NtSetInformationFile` and checks both retained/reopened original
+source identities; a fixed 1-second hold no longer serves as proof.
+Windows Node22 newly tested W21/W31/FOD combined **17 PASS / 1 SKIP /
+0 FAIL**, including the 7 signed FOD cases. No original-A operator or
+product CFAPI authority was introduced.
