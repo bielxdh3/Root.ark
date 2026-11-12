@@ -505,6 +505,43 @@ test("issue 66 #278 P1: FOD-off signed out-of-scope MOVE cannot discard offline 
   assert.equal(state.pushes, 0);
 });
 
+test("issue 66 #292 P1: untrusted Ed25519 B out-of-scope MOVE must fail authentication before pin preflight", async (t) => {
+  const { rootDir, open, remote, state, adapter, trusted } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false, ["docs/a.txt"]);
+  const valid = await remote("move", "object-a", "archive/a.txt",
+    "authenticated remote bytes", 2, "docs/a.txt");
+  assert.equal(await verifyAuthorizationProof(valid.authorization, valid, trusted), true,
+    "positive control: the pin conflict on a genuinely signed A MOVE remains enforced");
+  const rogue = crypto.generateKeyPairSync("ed25519");
+  const rogueKey = rogue.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const forged = { ...valid, authorization: await createAuthorizationProof(valid, {
+    username: "alice", privateKey: rogue.privateKey, publicKey: rogueKey,
+    expiresAt: Date.now() + 60_000,
+  }) };
+  await assert.rejects(verifyAuthorizationProof(forged.authorization, forged, trusted),
+    { code: "authorization_device_untrusted" },
+    "negative control: valid Ed25519 B must not authenticate as pinned A");
+  const originalList = adapter.list;
+  adapter.list = async (objectId) => objectId === undefined ? [forged] : originalList(objectId);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  const snapshotBefore = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  await assert.rejects(client.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+    conflicts: [], offline: false }), { code: "authorization_device_untrusted" },
+  "unsigned/untrusted remote ciphertext must never invoke the local pin-denial oracle");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
+    "rejected B signature cannot consume admission slots");
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), snapshotBefore);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  adapter.list = async (objectId) => objectId === undefined ? [valid] : originalList(objectId);
+  await assert.rejects(client.pullRemote({ pushed: 0, pulled: 0, applied: 0,
+    conflicts: [], offline: false }), { code: "file_pinned" },
+  "a genuinely signed A MOVE is still denied by the physical pinned-origin guard");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
+    "valid but pin-blocked MOVE must not consume admission slots either");
+  assert.equal(state.pushes, 0);
+});
+
 test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDATE before mutation", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");

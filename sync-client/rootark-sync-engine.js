@@ -2581,10 +2581,17 @@ class SyncEngine {
     };
     for (const operation of inspected) {
       if (!this.operationDestinationIsSelected(operation)) {
-        // A refused pinned origin must not consume the finite, durable
-        // observed[] window before reconciliation rejects its signed MOVE.
+        // Authenticity must precede even a side-effect-free local pin oracle:
+        // an untrusted LIST entry cannot force file_pinned before its Ed25519
+        // device/roster proof is checked. Defer durable observation until the
+        // pin preflight accepts this exact verified envelope, so a genuine
+        // refused MOVE cannot exhaust the finite observed[] window either.
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation,
+          { preObserve: false });
         this.preflightOutOfScopeMove(operation);
-        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
+        if (verifiedFreshDigest) {
+          await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+        }
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
         observedRemoteOnly.push({ operation, verifiedFreshDigest });
