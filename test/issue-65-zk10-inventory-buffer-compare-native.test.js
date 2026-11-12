@@ -102,27 +102,32 @@ test("P2 inventory: inherited numeric Array setter cannot turn owner-signed entr
   };
   Object.defineProperty(attackerPin, "type", { get() {
     keyGetterReads++;
-    // Keep the original canonical CBOR decode intact. The caller-owned key
-    // callback can replace this mutable module export and install the array
-    // setter exactly after decoding the genuinely signed A bytes.
+    // The verifier now captures the native decoder before this callback.
+    // Install the numeric setter directly at the getter boundary so it is
+    // still a REAL hostile post-key mutation, not a dead decoder hook.
+    installNumericTrap();
     z.decodeDeterministic = async (...arguments_) => {
-      const decoded = await nativeDecode(...arguments_);
       decodedCopies++;
-      installNumericTrap();
-      return decoded;
+      return nativeDecode(...arguments_);
     };
     return "public";
   } });
   try {
-    assert.equal((await inventory.verifySnapshot(args(attackerPin, requestedB))).outcome,
-      "ABSENT", "a signed A row cannot become B through an inherited numeric slot");
+    // The trap is now installed BEFORE the detached canonical decode instead
+    // of through a poisoned codec export. If it affects CBOR reconstruction,
+    // strict canonical-byte rejection is an acceptable *specific* fail-closed
+    // outcome; accepting unsigned B as PRESENT never is.
+    await assert.rejects(inventory.verifySnapshot(args(attackerPin, requestedB)),
+      { code: "INVENTORY_ENCODING" },
+      "hostile pre-decode numeric setters must fail closed at canonical bytes");
   } finally {
     z.decodeDeterministic = nativeDecode;
     if (priorZero) Object.defineProperty(Array.prototype, "0", priorZero);
     else delete Array.prototype[0];
   }
   assert.ok(keyGetterReads > 0, "hostile native KeyObject property callback was reached");
-  assert.ok(decodedCopies > 0, "real signed CBOR A was decoded before the numeric trap");
+  assert.equal(decodedCopies, 0,
+    "native signed A must be decoded without dispatching to a poisoned codec export");
   assert.equal(interceptedAssignments, 0,
     "normalization must define its own indexed slots without inherited setters");
   assert.equal(returnedForgedB, 0, "signed membership must not consult prototype entries");
@@ -160,32 +165,31 @@ test("P2 inventory: hostile late Array constructor cannot proxy a signed A row i
   let keyReads = 0, validDecodes = 0, maliciousConstructs = 0, substitutedReads = 0;
   Object.defineProperty(pin, "type", { get() {
     keyReads++;
-    z.decodeDeterministic = async (...arguments_) => {
-      const decoded = await originalDecode(...arguments_);
-      validDecodes++;
-      // An untrusted native key getter may rewrite this global AFTER genuine
-      // CBOR decoding while normalizeEntries still uses the global Array.
-      global.Array = new Proxy(originalArray, {
-        construct(target, arguments_) {
-          const direct = (new Error().stack || "").split("\n")[2] || "";
-          const actual = Reflect.construct(target, arguments_, target);
-          if (!/\bnormalizeEntries \(/.test(direct)) return actual;
-          maliciousConstructs++;
-          return new Proxy(actual, {
-            get(array, property, receiver) {
-              if (property === "0") {
-                const caller = (new Error().stack || "").split("\n")[2] || "";
-                if (/\bat (?:Object\.)?verifySnapshot \(/.test(caller)) {
-                  substitutedReads++;
-                  return requestedB;
-                }
+    // Install the constructor trap immediately after the genuine native key
+    // callback. The old decoder-export hook is no longer an execution point.
+    global.Array = new Proxy(originalArray, {
+      construct(target, arguments_) {
+        const direct = (new Error().stack || "").split("\n")[2] || "";
+        const actual = Reflect.construct(target, arguments_, target);
+        if (!/\bnormalizeEntries \(/.test(direct)) return actual;
+        maliciousConstructs++;
+        return new Proxy(actual, {
+          get(array, property, receiver) {
+            if (property === "0") {
+              const caller = (new Error().stack || "").split("\n")[2] || "";
+              if (/\bat (?:Object\.)?verifySnapshot \(/.test(caller)) {
+                substitutedReads++;
+                return requestedB;
               }
-              return Reflect.get(array, property, receiver);
-            },
-          });
-        },
-      });
-      return decoded;
+            }
+            return Reflect.get(array, property, receiver);
+          },
+        });
+      },
+    });
+    z.decodeDeterministic = async (...arguments_) => {
+      validDecodes++;
+      return originalDecode(...arguments_);
     };
     return "public";
   } });
@@ -197,7 +201,8 @@ test("P2 inventory: hostile late Array constructor cannot proxy a signed A row i
     global.Array = originalArray;
   }
   assert.ok(keyReads > 0, "hostile native key callback executed");
-  assert.ok(validDecodes > 0, "original Ed25519-signed snapshot was actually decoded");
+  assert.equal(validDecodes, 0,
+    "valid signed snapshot must not dispatch through the hostile decoder export");
   assert.equal(maliciousConstructs, 0,
     "normalized rows must use an intrinsic Array literal, not the late global constructor");
   assert.equal(substitutedReads, 0, "membership cannot read a hostile Proxy array");

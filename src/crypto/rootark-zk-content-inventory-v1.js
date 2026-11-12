@@ -13,7 +13,14 @@ const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
   defineProperty: NATIVE_DEFINE_PROPERTY, arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
   apply: NATIVE_APPLY } =
   require("./rootark-zk10-native-intrinsics-v1");
-const z = require("./rootark-zk-1");
+// A signer KeyObject getter can replace this module's shared codec exports
+// after the original signed bytes have already been independently pinned.
+// Retain our own immutable codec facade before consulting any such getter.
+const codec = require("./rootark-zk-1");
+const z = Object.freeze({
+  encodeDeterministic: codec.encodeDeterministic,
+  decodeDeterministic: codec.decodeDeterministic,
+});
 // Retain the original sorting implementation before any caller-owned
 // KeyObject getter can replace Array.prototype.sort or Function.call.
 const NATIVE_ARRAY_SORT = Array.prototype.sort;
@@ -524,6 +531,10 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
   const serialized = copyBytes(serializedValue, 1, MAX_SNAPSHOT_BYTES);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); } catch (_) { fail("INVENTORY_ENCODING"); }
+  // The signature below must cover THIS wire snapshot, never a substituted
+  // decoded object returned by a late codec or same-realm callback.
+  const canonical = await z.encodeDeterministic(decoded);
+  if (!sameBytes(serialized, canonical)) fail("INVENTORY_ENCODING");
   const raw = exactObject(decoded, SNAPSHOT_FIELDS, "INVENTORY_FIELDS");
   if (raw.type !== SNAPSHOT_TYPE || raw.version !== VERSION) fail("INVENTORY_VERSION");
   const signerKeyId = copyBytes(raw.signer_key_id, 16);

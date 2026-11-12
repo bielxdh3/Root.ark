@@ -1,6 +1,10 @@
 "use strict";
 
 const crypto = require("node:crypto");
+// The canonical codec must not reread these mutable exported helpers after a
+// caller-owned KeyObject getter has already run in the same Node realm.
+const CODEC_BUFFER_FROM = Buffer.from.bind(Buffer);
+const CODEC_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { CipherSuite, HkdfSha256, Aes256Gcm } = require("@hpke/core");
@@ -175,7 +179,7 @@ async function encodeDeterministic(value) {
   validateCborValue(value);
   try {
     const api = await cborg();
-    return Buffer.from(api.encode(value, {
+    return CODEC_BUFFER_FROM(api.encode(value, {
       ...api.rfc8949EncodeOptions,
       ignoreUndefinedProperties: false,
     }));
@@ -223,7 +227,8 @@ async function decodeDeterministic(input) {
     });
     inspectDecoded(value);
     const canonical = await encodeDeterministic(value);
-    if (!crypto.timingSafeEqual(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
+    if (encoded.length !== canonical.length ||
+        !CODEC_TIMING_SAFE_EQUAL(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
     return value;
   } catch (error) {
     if (error instanceof RootarkZkError) throw error;
