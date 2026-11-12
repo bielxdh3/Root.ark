@@ -518,3 +518,59 @@ test("P2 PG: decoder input cannot mutate unsigned raw B into genuinely attestor-
   assert.equal(genuine.generation, 1);
   assert.equal(genuine.authorizesIo, false);
 });
+
+test("P2 PG: hostile CBOR Object.keys cannot transiently sign A while returning unsigned generation B", async () => {
+  const f = fixture();
+  const { signed, now, nonce } = await physicalReceipt(f);
+  const genuineA = await z.decodeDeterministic(signed);
+  assert.deepEqual(await z.encodeDeterministic(genuineA), signed,
+    "the genuine Ed25519 signed CBOR A bytes must remain canonical and unchanged");
+  const forgedB = Buffer.from(await z.encodeDeterministic({
+    ...genuineA, generation: 2,
+  }));
+  assert.notDeepEqual(forgedB, signed);
+  const verify = (pin, serialized = forgedB) => pg.verifyCommittedPhysicalReadback(serialized, {
+    scope: f.scope, operation: f.operation, nonce,
+    pinnedPublicKey: pin, nowSeconds: now, expected: undefined,
+  });
+  assert.equal((await verify(f.signer.publicKey, signed)).generation, 1);
+  await assert.rejects(verify(f.signer.publicKey), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+
+  const originalKeys = Object.keys;
+  let getterReads = 0, substitutions = 0, restored = 0;
+  const maliciousPin = crypto.createPublicKey({
+    key: f.signer.publicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  Object.defineProperty(maliciousPin, "type", { configurable: true, get() {
+    getterReads++;
+    Object.keys = function (value) {
+      if (value && value.type === pg.TYPE && value.generation === 2
+        && !Object.hasOwn(value, "signature")) {
+        substitutions++;
+        value.generation = 1;
+        queueMicrotask(() => { value.generation = 2; restored++; });
+      }
+      return originalKeys(value);
+    };
+    return "public";
+  } });
+  let accepted;
+  try {
+    try { accepted = await verify(maliciousPin); }
+    catch (error) { assert.match(error.message, /ZK_PHYSICAL_ATTESTATION_DENIED/); }
+    const positiveUnderPoison = await verify(maliciousPin, signed);
+    assert.equal(positiveUnderPoison.generation, 1,
+      "a genuine Ed25519 attestation A must still verify while the hostile callback is installed");
+    assert.equal(positiveUnderPoison.authorizesIo, false);
+  } finally {
+    Object.keys = originalKeys;
+    delete maliciousPin.type;
+  }
+  assert.ok(getterReads > 0, "the real Ed25519 KeyObject callback ran");
+  assert.ok(substitutions > 0, "the CBOR unsigned-map poison was actually invoked");
+  assert.equal(restored, substitutions, "every transient mutation was restored");
+  assert.equal(accepted, undefined,
+    "genuine signed A cannot authenticate the unsigned generation B");
+  assert.equal((await verify(f.signer.publicKey, signed)).generation, 1);
+});

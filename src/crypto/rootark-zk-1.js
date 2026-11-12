@@ -6,6 +6,14 @@ const crypto = require("node:crypto");
 const CODEC_BUFFER_FROM = Buffer.from.bind(Buffer);
 const CODEC_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
 const CODEC_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
+const CODEC_OBJECT_KEYS = Object.keys.bind(Object);
+const CODEC_OBJECT_HAS_OWN = Object.hasOwn.bind(Object);
+const CODEC_OBJECT_GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const CODEC_OBJECT_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const CODEC_OBJECT_CREATE = Object.create.bind(Object);
+const CODEC_OBJECT_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
+const CODEC_ARRAY_IS_ARRAY = Array.isArray.bind(Array);
+const CODEC_PLAIN_OBJECT_PROTOTYPE = Object.prototype;
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { CipherSuite, HkdfSha256, Aes256Gcm } = require("@hpke/core");
@@ -143,29 +151,81 @@ function safeMap(value, required, exact) {
   return map;
 }
 
-function validateCborValue(value, seen = new Set()) {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return;
+// Third-party cborg may consult a poisoned global Object.keys after an
+// attacker-owned native KeyObject getter. Take two separate descriptor-only
+// snapshots so its encoder never receives the protected expected values.
+function snapshotCborValue(value, seen = new Set()) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
-    return;
+    return value;
   }
   if (typeof value === "bigint") {
     if (value < 0n || value > MAX_U64) fail("UNSUPPORTED_CBOR_VALUE");
-    return;
+    return value;
   }
-  if (isBytes(value)) return;
+  if (isBytes(value)) return CODEC_BUFFER_FROM(value);
   if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
   seen.add(value);
-  if (Array.isArray(value)) {
-    value.forEach((entry) => validateCborValue(entry, seen));
+  let result;
+  if (CODEC_ARRAY_IS_ARRAY(value)) {
+    const length = value.length;
+    if (!Number.isSafeInteger(length) || length < 0
+      || CODEC_OBJECT_KEYS(value).length !== length) fail("UNSUPPORTED_CBOR_VALUE");
+    result = [];
+    for (let i = 0; i < length; i += 1) {
+      const descriptor = CODEC_OBJECT_DESCRIPTOR(value, i);
+      if (!descriptor || !CODEC_OBJECT_HAS_OWN(descriptor, "value")) fail("UNSUPPORTED_CBOR_VALUE");
+      CODEC_OBJECT_DEFINE_PROPERTY(result, i, { value: snapshotCborValue(descriptor.value, seen),
+        enumerable: true, configurable: true, writable: true });
+    }
   } else {
-    const map = plainObject(value);
-    for (const key of Object.keys(map)) {
+    const prototype = CODEC_OBJECT_GET_PROTOTYPE(value);
+    if (prototype !== CODEC_PLAIN_OBJECT_PROTOTYPE && prototype !== null) fail("AMBIGUOUS_MAP");
+    result = CODEC_OBJECT_CREATE(null);
+    const keys = CODEC_OBJECT_KEYS(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
       if (key === "__proto__" || key === "constructor" || key === "prototype") fail("INVALID_MAP_KEY");
-      validateCborValue(map[key], seen);
+      const descriptor = CODEC_OBJECT_DESCRIPTOR(value, key);
+      if (!descriptor || !CODEC_OBJECT_HAS_OWN(descriptor, "value")) fail("UNSUPPORTED_CBOR_VALUE");
+      CODEC_OBJECT_DEFINE_PROPERTY(result, key, {
+        value: snapshotCborValue(descriptor.value, seen),
+        enumerable: true, configurable: true, writable: true,
+      });
     }
   }
   seen.delete(value);
+  return result;
+}
+
+function sameCborValue(a, b) {
+  if (isBytes(a)) return isBytes(b) && a.length === b.length
+    && CODEC_TIMING_SAFE_EQUAL(a, b);
+  if (typeof a === "bigint" && typeof b === "number") {
+    return Number.isSafeInteger(b) && BigInt(b) === a;
+  }
+  if (typeof b === "bigint" && typeof a === "number") {
+    return Number.isSafeInteger(a) && a === Number(b);
+  }
+  if (a === null || typeof a !== "object") return a === b;
+  if (b === null || typeof b !== "object" || CODEC_ARRAY_IS_ARRAY(a) !== CODEC_ARRAY_IS_ARRAY(b)) {
+    return false;
+  }
+  if (CODEC_ARRAY_IS_ARRAY(a) && a.length !== b.length) return false;
+  const keysA = CODEC_OBJECT_KEYS(a);
+  const keysB = CODEC_OBJECT_KEYS(b);
+  if (keysA.length !== keysB.length) return false;
+  for (let index = 0; index < keysA.length; index += 1) {
+    const key = keysA[index];
+    // Canonical CBOR reorders map keys, so compare by own key and value.
+    if (!CODEC_OBJECT_HAS_OWN(b, key)) return false;
+    const left = CODEC_OBJECT_DESCRIPTOR(a, key);
+    const right = CODEC_OBJECT_DESCRIPTOR(b, key);
+    if (!left || !right || !CODEC_OBJECT_HAS_OWN(left, "value")
+      || !CODEC_OBJECT_HAS_OWN(right, "value") || !sameCborValue(left.value, right.value)) return false;
+  }
+  return true;
 }
 
 let cborgPromise;
@@ -179,13 +239,21 @@ function cborg() {
 }
 
 async function encodeDeterministic(value) {
-  validateCborValue(value);
+  const expected = snapshotCborValue(value);
+  const isolated = snapshotCborValue(expected);
   try {
     const api = await cborg();
-    return CODEC_BUFFER_FROM(api.encode(value, {
+    const encoded = CODEC_BUFFER_FROM(api.encode(isolated, {
       ...api.rfc8949EncodeOptions,
       ignoreUndefinedProperties: false,
     }));
+    // Compare synchronously: queueMicrotask can restore malicious mutations
+    // only after this frame returns.
+    const roundtrip = api.decode(encoded, { strict: true, allowIndefinite: false,
+      allowUndefined: false, allowInfinity: false, allowNaN: false,
+      allowBigInt: true, rejectDuplicateMapKeys: true });
+    if (!sameCborValue(expected, roundtrip)) fail("CBOR_ENCODE_FAILED");
+    return encoded;
   } catch (_) {
     fail("CBOR_ENCODE_FAILED");
   }

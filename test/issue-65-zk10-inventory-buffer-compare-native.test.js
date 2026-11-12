@@ -381,3 +381,67 @@ test("P2 inventory: signed object A must not make requested B PRESENT via post-k
   assert.equal((await inventory.verifySnapshot(args(signer.publicKey, requestedA))).outcome,
     "PRESENT", "valid real Ed25519 owner remains accepted after the attack");
 });
+
+test("P2 inventory: poisoned CBOR Object.keys cannot restore unsigned nonce B after encoding signed nonce A", async () => {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 131);
+  const scope = { account_id: Buffer.alloc(16, 132),
+    compartment_id: Buffer.from("nonce-cbor"), keyring_id: Buffer.alloc(16, 133) };
+  const originalNonceA = Buffer.alloc(32, 134);
+  const forgedNonceB = Buffer.from(originalNonceA);
+  forgedNonceB[0] ^= 1;
+  const root = await inventory.computeRoot(scope, 0, null, []);
+  const genuineSignedA = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signer.privateKey, scope,
+    sequence: 0, previousRoot: null, entries: [], nonce: originalNonceA,
+  });
+  const z = require("../src/crypto/rootark-zk-1");
+  const genuine = await z.decodeDeterministic(genuineSignedA);
+  assert.deepEqual(await z.encodeDeterministic(genuine), genuineSignedA,
+    "the genuine owner-signed CBOR A bytes must remain canonical and unchanged");
+  const forgedB = Buffer.from(await z.encodeDeterministic({
+    ...genuine, nonce: forgedNonceB,
+  }));
+  assert.notDeepEqual(forgedB, genuineSignedA);
+  const requested = { object_id: Buffer.alloc(16, 135), revision: 1,
+    epoch: 1, ciphertext_sha256: Buffer.alloc(32, 136) };
+  const verify = (key, serialized = forgedB, nonce = forgedNonceB) =>
+    inventory.verifySnapshot({ serialized, pinnedPublicKey: key,
+      pinnedSignerKeyId: signerKeyId, expectedScope: scope,
+      requested, minimumHead: { sequence: 0, root }, nonce });
+  assert.equal((await verify(signer.publicKey, genuineSignedA, originalNonceA)).outcome, "ABSENT");
+  await assert.rejects(verify(signer.publicKey), { code: "INVENTORY_SIGNATURE" });
+
+  const originalKeys = Object.keys;
+  let getterReads = 0, substitutions = 0, restorations = 0;
+  const maliciousKey = crypto.createPublicKey({
+    key: signer.publicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  Object.defineProperty(maliciousKey, "type", { configurable: true, get() {
+    getterReads++;
+    Object.keys = function (value) {
+      if (value && value.type === inventory.SNAPSHOT_TYPE
+        && value.nonce?.length === 32 && !Object.hasOwn(value, "signature")
+        && value.nonce[0] === forgedNonceB[0]) {
+        substitutions++;
+        value.nonce[0] = originalNonceA[0];
+        queueMicrotask(() => { value.nonce[0] = forgedNonceB[0]; restorations++; });
+      }
+      return originalKeys(value);
+    };
+    return "public";
+  } });
+  let authenticated;
+  try {
+    try { authenticated = await verify(maliciousKey); }
+    catch (error) { assert.ok(["INVENTORY_SIGNATURE", "INVENTORY_ENCODING"].includes(error.code)); }
+    assert.equal((await verify(maliciousKey, genuineSignedA, originalNonceA)).outcome,
+      "ABSENT", "genuine Ed25519 nonce A must verify with the hostile callback installed");
+  } finally { Object.keys = originalKeys; delete maliciousKey.type; }
+  assert.ok(getterReads > 0, "native Ed25519 KeyObject getter actually ran");
+  assert.ok(substitutions > 0, "attacker mutated the unsigned nonce during CBOR encoding");
+  assert.equal(restorations, substitutions, "the unsigned B nonce was restored");
+  assert.equal(authenticated, undefined, "signed nonce A cannot authenticate unsigned nonce B");
+  assert.equal((await verify(signer.publicKey, genuineSignedA, originalNonceA)).outcome, "ABSENT");
+});
