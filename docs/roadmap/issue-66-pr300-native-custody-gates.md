@@ -1287,3 +1287,40 @@ name lookup, an isolated self-hosted operator, native atomic no-replace,
 durable cold PREPARE/COMMIT, replay/revocation fencing and genuine positive
 CFAPI hydration/pin/unpin/eviction/picker. Windows 10 physical CFAPI and real
 powercut remain independent external gates. **MERGE NO-GO / RELEASE NO-GO.**
+
+### Subsequent physically exercised local candidates (unpublished)
+
+**PR #300 native positive LAB:** exact child
+`fc837826998f7fb9ac93d9b4a43df94a79d7fae9` has parent published
+`c928d894939014767f1a8669946eeca72b29a97e`. Its Windows NTFS laboratory
+uses actual Sync v2 Ed25519 device authorization, local revocation policy,
+AES-GCM selected plaintext and W26 NtCreateFile RootDirectory / opened-HANDLE
+SHA-256 readback / NtSetInformationFile no-replace. The previously unavailable
+4,097-byte FOD LAB mode was RED on the parent; the exact child passed **6/6**
+in a separate Windows Node22 worktree. A full existing W26 test run first
+returned **24 PASS / 1 FAIL** and a complete rerun returned **25 PASS /
+0 FAIL**; repeatability is not established by this evidence alone. No native
+RootSession product adapter, CFAPI callbacks, owner-enrolled independently
+trusted original A, Windows 10 or powercut proof is implied. This is positive
+native LAB execution, not release-safe product hydration.
+
+**PR #301 cryptographic candidate:**
+`f5b666e292f3f23c9efd0a9b7038333af1e93ab4` is a direct unpublished child
+of `bba41b9f1c8f094b72d5e0f6de1d9520df4ea035`. It addresses hostile
+KeyObject callbacks poisoning Date.now/Math, crypto nonce, device verification,
+owner-role key iteration and late expected scope, operation, nonce and inventory
+minimumHead snapshots. Implementer reports **13 real Ed25519 A/B attacks RED
+on parent and GREEN on child**, plus 122 ZK selected GREEN; prime separately
+reran **44 focused and 9 issuer bridge** Windows Node22 tests successfully on
+the exact child. Broader HTTP/WS tests had three Windows ACL-bootstrap failures
+also present on the parent; these remain failures, not masked test successes.
+Exact-SHA independent SOURCE reviews, Linux/ext4 and hosted CI are still
+outstanding at this checkpoint. Captured Date.now is not an independent
+monotonic clock or off-host operator custody.
+
+**PR #302 DEV-OFF:** two independent SOURCE GO were subsequently reported for
+exact local `7baea943b655785d782c93ec000d21dc3271fc03`. Windows Node22
+targeted **62 PASS / 0 FAIL / 4 SKIP** does not prove independently
+administered off-host self-hosted custody, original-A, cross-store antirollback
+or production authorization. Linux/ext4 is still unverified. The release
+gates above remain conjunctive; no push, Draft change, merge or deploy.
