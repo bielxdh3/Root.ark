@@ -1587,6 +1587,17 @@ class SyncEngine {
             throw error;
           }
           if (inventory.matching) {
+            // A server can echo the exact genuine Ed25519 CREATE without ever
+            // committing it. A signed request is proof of authorship, NOT
+            // independent physical admission. Preserve the pending outbox
+            // until a non-colluding durable admission receipt is available.
+            const candidate = inventory.matching;
+            if (candidate.objectId === operation.objectId
+              && candidate.fileId === operation.fileId
+              && candidate.operationId === operation.operationId) {
+              fail("Exact signed CREATE echo does not prove physical admission",
+                "remote_admission_unproven");
+            }
             fail("A remote object already owns the Files On-Demand CREATE path",
               "remote_path_collision");
           }
