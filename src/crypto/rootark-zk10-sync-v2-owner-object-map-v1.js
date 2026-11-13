@@ -195,7 +195,11 @@ function copyJson(value, depth = 0, budget = { nodes: 0, bytes: 0 }) {
   const array = NATIVE_ARRAY_IS_ARRAY(value);
   if (!array && !NATIVE_ARRAY_INCLUDES.call([Object.prototype, null], NATIVE_GET_PROTOTYPE(value))) deny();
   const names = NATIVE_OWN_KEYS(value);
-  if (names.length > 100 || (array && names.length !== value.length + 1)) deny();
+  // Arrays own a non-element "length" key. The signed cutover protocol permits
+  // 128 covered compartments, not 99. Retain the stricter 100-own-key ceiling
+  // for arbitrary objects; arrays may have at most 128 indexed elements.
+  if (names.length > (array ? 129 : 100)
+    || (array && names.length !== value.length + 1)) deny();
   const result = array ? [] : NATIVE_OBJECT_CREATE(null);
   for (let index = 0; index < names.length; index += 1) {
     const name = names[index];
@@ -240,11 +244,18 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     const floor = { sequence: number(retained.sequence), digest: hex(retained.digest) };
     const sourceIdentity = exact(s.identity,
       ["accountId", "storeId", "username", "compartmentId"]);
+    // KeyObjects supplied by the caller may have an inherited Symbol(kHandle)
+    // getter. Reimport every source role ONCE, then pass those pinned native
+    // identities both to provisioning verification and separation checks.
+    // Never export the original caller-owned role again after verification.
+    const sourceProvisioner = nativePublic(s.provisionerPublicKey);
+    const sourceWitness = nativePublic(s.witnessPublicKey);
+    const sourceCas = nativePublic(s.casPublicKey);
     const identity = verifyPinnedAtomicOwnerProvision({ identity: sourceIdentity,
       scope: s.scope, provisioning: s.provisioning,
-      provisionerPublicKey: s.provisionerPublicKey,
+      provisionerPublicKey: sourceProvisioner,
       expectedDigest: s.provisioningDigest,
-      witnessPublicKey: s.witnessPublicKey, casPublicKey: s.casPublicKey }).identity;
+      witnessPublicKey: sourceWitness, casPublicKey: sourceCas }).identity;
     const localPolicy = snapshotLocalDevicePolicy(s.pinnedDevicePolicy);
     if (typeof s.currentDevicePolicy !== "function" || localPolicy.username !== identity.username
       || identity.compartmentId !== id(identity.compartmentId)) deny();
@@ -272,9 +283,9 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     for (let index = 0; index < ownerKeys.length; index += 1) {
       checkIndependent(ownerKeys[index]);
     }
-    checkIndependent(nativePublic(s.provisionerPublicKey));
-    checkIndependent(nativePublic(s.witnessPublicKey));
-    checkIndependent(nativePublic(s.casPublicKey));
+    checkIndependent(sourceProvisioner);
+    checkIndependent(sourceWitness);
+    checkIndependent(sourceCas);
     if (typeof a.readCurrentHead !== "function") deny();
     const pendingHeadReads = new Set();
     async function boundedCurrentHead(challenge, signal) {
