@@ -320,8 +320,14 @@ async function openProtectedRecipientShareFile(input) {
     // again immediately before releasing the decrypted file to this process.
     currentAuthority(await redeemInput.readIndependentAuthority(),
       statement, shareSignature, statementBytes);
-    if (Math.floor(Date.now() / 1000) >= statement.expires_at
-      || nowSeconds >= statement.expires_at) deny();
+    // Only the owner CEK opener can attest which owner approval and witness
+    // it ACTUALLY verified after the preceding asynchronous share redemption.
+    const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
+    if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
+      || verifiedReleaseExpiresAt < 1) deny();
+    const releaseSeconds = Math.floor(Date.now() / 1000);
+    if ([statement.expires_at, verifiedReleaseExpiresAt]
+      .some((expiresAt) => releaseSeconds >= expiresAt || nowSeconds >= expiresAt)) deny();
     const result = Object.freeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
       grantId: receipt.grantId, objectId: receipt.objectId,

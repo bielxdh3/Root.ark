@@ -276,6 +276,34 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(redeemed.durableCopyProven, false);
   assert.equal(redeemed.authorizesPlaintextRelease, false);
   assert.equal(redeemed.serverRevocationProofVerified, false);
+  // P2 review: a hostile ciphertext transport can replay an authentic owner
+  // grant and bytes while ignoring the recipient's unrelated GET signature.
+  // The client itself must bind its nonexportable Ed25519 signer to the
+  // independently pinned recipient device, before any HTTP request.
+  const rogueRecipient = await crypto.webcrypto.subtle.generateKey("Ed25519", false,
+    ["sign", "verify"]);
+  assert.equal(rogueRecipient.privateKey.extractable, false);
+  const sameAuthenticResponse = {
+    id: redeemed.objectId, revision: redeemed.revision, epoch: redeemed.epoch,
+    ciphertextBase64: redeemed.ciphertextBase64,
+    shareStatementBase64: redeemed.shareStatementBase64,
+    shareSignatureBase64: redeemed.shareSignatureBase64,
+  };
+  let untrustedHttpCalls = 0;
+  const forgedServer = async () => {
+    untrustedHttpCalls++;
+    return new Response(JSON.stringify(sameAuthenticResponse), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  const forgedInput = { signerKey: rogueRecipient.privateKey, fetchImpl: forgedServer };
+  await assert.rejects(redeem(forgedInput), /ZK_SHARE_REDEMPTION_DENIED/,
+    "a genuine owner grant must not certify an unrelated recipient Ed25519 signer");
+  assert.equal(untrustedHttpCalls, 0,
+    "recipient pin check must fail locally, before calling an untrusted server");
+  const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
+  assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
+    "positive control: the same authenticated bytes with the pinned device signer remain valid");
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
   await assert.rejects(redeem({ readIndependentAuthority: null }),
