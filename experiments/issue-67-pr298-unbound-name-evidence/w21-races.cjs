@@ -197,7 +197,7 @@ test("positive: historical signed restore materializes original authenticated by
     "AUTHENTICATED RESTORE BYTES");
 });
 
-test("RED: _apply history materializes foreign temporary using a real hardlink", async (t) => {
+test("GREEN: _apply history rejects substituted foreign temporary and never publishes foreign bytes", async (t) => {
   const f = await signedRestoreFixture(t);
   const target = path.join(f.local, "document.txt");
   const originalLink = fsp.link;
@@ -215,27 +215,16 @@ test("RED: _apply history materializes foreign temporary using a real hardlink",
       foreignFd = await fsp.open(from, "r");
       return originalLink(from, to, ...rest);
     };
-    // An existing _pushPending SHA gate rejects the wrong materialized bytes
-    // BEFORE remote dispatch. The local pathname publication is nevertheless
-    // already wrong. Prove both facts without erasing the existing protection.
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
-      (error) => error.code === "restore_local_materialization_missing");
+      (error) => error.code === "restore_local_conflict");
   } finally {
     fsp.link = originalLink;
   }
   try {
     assert.equal(triggered, true, "the original historical publication path was exercised");
-    const published = await fsp.lstat(target, { bigint: true });
-    const foreign = await foreignFd.stat({ bigint: true });
-    const real = await originalFd.stat({ bigint: true });
-    assert.deepEqual([published.dev, published.ino], [foreign.dev, foreign.ino],
-      "RED: final local target contains foreign inode");
-    assert.notDeepEqual([published.dev, published.ino], [real.dev, real.ino],
-      "authenticated bytes remain only in retained temp");
-    assert.equal(await fsp.readFile(target, "utf8"), "FOREIGN SYNTHETIC RESTORE BYTES");
+    assert.equal(fs.existsSync(target), false, "target must not exist with foreign bytes");
     assert.equal(await fsp.readFile(retained, "utf8"), "AUTHENTICATED RESTORE BYTES");
     assert.equal(f.getPushed(), 0, "the existing signed outbound digest gate MUST stay effective");
-    console.log("EXPECTED_SECURITY_RED W21_APPLY_FOREIGN_BYTES_PUBLISHED pushed=" + f.getPushed());
   } finally {
     if (originalFd) await originalFd.close();
     if (foreignFd) await foreignFd.close();

@@ -2863,7 +2863,15 @@ class SyncEngine {
         }
       } else {
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
+        const tempHandle = await fsp.open(temporary, "wx", 0o600);
+        let tempStat;
+        try {
+          await tempHandle.writeFile(plaintext);
+          await tempHandle.sync();
+          tempStat = await tempHandle.stat({ bigint: true });
+        } finally {
+          await tempHandle.close();
+        }
         try {
           if (historicalRestoreHash !== undefined) {
             const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
@@ -2876,6 +2884,17 @@ class SyncEngine {
               // rollback. Preserve its current inode for manual recovery.
               if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
               throw error;
+            }
+            let targetStat;
+            try {
+              targetStat = await fsp.lstat(target, { bigint: true });
+            } catch (statError) {
+              await fsp.unlink(target).catch(() => {});
+              throw statError;
+            }
+            if (!sameFileIdentity(tempStat, targetStat) || targetStat.nlink < 2n) {
+              await fsp.unlink(target).catch(() => {});
+              fail("Historical restore materialization identity mismatch", "restore_local_conflict");
             }
           } else {
             if (await exists(target)) await this.stageExisting(target);
