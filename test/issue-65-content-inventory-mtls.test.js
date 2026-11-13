@@ -939,6 +939,345 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(status.externalDurabilityProven, false);
   });
 
+  for (const method of ["status", "append"]) {
+    await t.test(`P2 hostile native key getter cannot forge HTTPS ${method} proof through Promise.then`, async (child) => {
+      const h = await harness(child, { strictPhysical: true });
+      const floor = await h.ledger.readLocalHead();
+      const operation = newOperation({ root: floor.root });
+      const minimum = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+      assert.equal((await h.ledger.append(operation)).status, "committed");
+      const committedHead = await h.ledger.readLocalHead();
+      const authentic = await h.ledger.getOperationStatus(operation.operation_id);
+      const tampered = Buffer.from(authentic.proof);
+      tampered[tampered.length - 1] ^= 1;
+      h.ledger.getOperationStatus = async () => ({ ...authentic, proof: tampered });
+
+      const signer = h.signer.publicKey;
+      const handle = Object.getOwnPropertySymbols(signer)
+        .find((symbol) => symbol.description === "kHandle");
+      assert.ok(handle, "real native Ed25519 getter is required");
+      const poisonedPin = Object.create(signer);
+      let armed = false, getterReads = 0, forgedCalls = 0, forgedStack;
+      let reachedGetter;
+      const actualGetterRan = new Promise((resolve) => { reachedGetter = resolve; });
+      const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+      const originalThen = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
+      const fakeReceipt = { sequence: committedHead.sequence,
+        root: Buffer.from(committedHead.root), authorizesIo: false };
+      const fakeChecked = { inventoryReceipt: fakeReceipt,
+        receiptDigest: Buffer.alloc(32, 0x71), authorizesIo: false };
+      const fakeSnapshot = { sequence: committedHead.sequence,
+        root: Buffer.from(committedHead.root), outcome: "PRESENT" };
+      Object.defineProperty(poisonedPin, handle, { get() {
+        getterReads++;
+        if (armed) {
+          reachedGetter();
+          Object.defineProperty(Promise.prototype, "constructor", { configurable: true,
+            writable: true, value: function ForgedPromise() {} });
+          Object.defineProperty(Promise.prototype, "then", { configurable: true,
+            writable: true, value(resolve) {
+              forgedCalls++;
+              forgedStack ||= new Error("hostile then reached").stack;
+              resolve(method === "append" ? [fakeSnapshot, fakeChecked] : fakeChecked);
+            } });
+        }
+        return signer[handle];
+      } });
+      const client = h.makeClient(method === "append" ? "writer" : "status-reader",
+        { inventoryPublicKey: poisonedPin });
+      armed = true;
+      let pending;
+      try {
+        pending = method === "append"
+          ? client.append({ scope: h.scope, operation, nonce: crypto.randomBytes(32),
+            minimumHead: floor, minimumSnapshot: minimum.bytes })
+          : client.getOperationStatus({ scope: h.scope, operation });
+        // Await the actual HTTP callback's hostile native key getter FIRST.
+        // No test-side pin is allowed on the public Promise under test.
+        await actualGetterRan;
+        let rejected = false;
+        try { await pending; }
+        catch (error) {
+          rejected = true;
+          assert.equal(error.code, "INVENTORY_HTTP_UNAVAILABLE");
+        }
+        assert.equal(rejected, true,
+          "an unsigned inventory receipt plus real signed PG evidence cannot commit");
+        assert.equal(forgedCalls, 0, `HTTPS client must not consult inherited hostile then: ${forgedStack}`);
+      } finally {
+        Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+        Object.defineProperty(Promise.prototype, "then", originalThen);
+      }
+      assert.ok(getterReads > 0, "hostile KeyObject getter executed");
+    });
+  }
+
+  await t.test("P2 hostile native key getter cannot turn invalid HTTPS snapshot into success via inherited catch", async (child) => {
+    const h = await harness(child);
+    const genesis = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: genesis.root });
+    const query = { scope: h.scope, nonce: crypto.randomBytes(32),
+      requested: requested(operation), minimumHead: { sequence: 0, root: genesis.root } };
+    const realSnapshot = h.ledger.getSnapshot.bind(h.ledger);
+    const legitimate = await h.makeClient("reader").getSnapshot(query);
+    assert.equal(legitimate.outcome, "ABSENT");
+    h.ledger.getSnapshot = async (...args) => {
+      const snapshot = await realSnapshot(...args);
+      const tampered = Buffer.from(snapshot.bytes);
+      tampered[tampered.length - 1] ^= 1;
+      return { ...snapshot, bytes: tampered };
+    };
+    const originalCatch = Object.getOwnPropertyDescriptor(Promise.prototype, "catch");
+    const signer = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(signer)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle);
+    const poisoned = Object.create(signer);
+    let reads = 0, forgedCatch = 0, armed = false, getterReached;
+    const getterRan = new Promise((resolve) => { getterReached = resolve; });
+    Object.defineProperty(poisoned, handle, { get() {
+      reads++;
+      if (armed) {
+        getterReached();
+        Object.defineProperty(Promise.prototype, "catch", { configurable: true,
+          writable: true, value() {
+            forgedCatch++;
+            return Promise.resolve({ status: "VERIFIED_NONAUTHORIZING", outcome: "PRESENT",
+              root: Buffer.from(genesis.root), authorizesIo: false });
+          } });
+      }
+      return signer[handle];
+    } });
+    const client = h.makeClient("reader", { inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      const pending = client.getSnapshot({ ...query, nonce: crypto.randomBytes(32) });
+      await getterRan;
+      let rejected = false;
+      try { await pending; } catch (error) {
+        rejected = true;
+        assert.equal(error.code, "INVENTORY_HTTP_UNAVAILABLE");
+      }
+      assert.equal(rejected, true, "unsigned snapshot cannot satisfy signed PRESENT");
+      assert.equal(forgedCatch, 0, "security verification cannot consult inherited catch");
+    } finally {
+      Object.defineProperty(Promise.prototype, "catch", originalCatch);
+    }
+    assert.ok(reads > 0, "a native Ed25519 KeyObject callback must trigger the poison");
+  });
+
+  await t.test("P2 hostile native key getter cannot forge HTTPS status via Promise species capability", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const genesis = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: genesis.root });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const authentic = await h.ledger.getOperationStatus(operation.operation_id);
+    const corrupt = Buffer.from(authentic.proof);
+    corrupt[corrupt.length - 1] ^= 1;
+    h.ledger.getOperationStatus = async () => ({ ...authentic, proof: corrupt });
+    const publicKey = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(publicKey)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle);
+    const hostile = Object.create(publicKey);
+    const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+    let armed = false, keyReads = 0, speciesReads = 0, reachedGetter;
+    const getterRan = new Promise((resolve) => { reachedGetter = resolve; });
+    Object.defineProperty(hostile, handle, { get() {
+      keyReads++;
+      if (armed) {
+        reachedGetter();
+        Object.defineProperty(Promise, Symbol.species, { configurable: true, get() {
+          speciesReads++;
+          return function ForgedSpecies(executor) {
+            const spoof = new Promise((resolve) => resolve({
+              status: "committed", signedLedgerOperationCommitted: true,
+              independentPhysicalAttestationVerified: true, authorizesIo: false }));
+            executor(() => {}, () => {});
+            return spoof;
+          };
+        } });
+      }
+      return publicKey[handle];
+    } });
+    const client = h.makeClient("status-reader", { inventoryPublicKey: hostile });
+    armed = true;
+    try {
+      const pending = client.getOperationStatus({ scope: h.scope, operation });
+      await getterRan;
+      let rejected = false;
+      try { await pending; } catch (error) {
+        rejected = true;
+        assert.equal(error.code, "INVENTORY_HTTP_UNAVAILABLE");
+      }
+      assert.equal(rejected, true, "forged species capability cannot certify unsigned receipt");
+      assert.equal(speciesReads, 0, "post-key HTTPS verification cannot consult hostile species");
+    } finally {
+      Object.defineProperty(Promise, Symbol.species, originalSpecies);
+    }
+    assert.ok(keyReads > 0, "native Ed25519 getter must actually execute");
+  });
+
+  await t.test("P2 inherited Object.then cannot turn real signed ABSENT inventory into forged PRESENT", async (child) => {
+    const h = await harness(child);
+    const genesis = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: genesis.root });
+    const request = { scope: h.scope, nonce: crypto.randomBytes(32),
+      requested: requested(operation), minimumHead: { sequence: 0, root: genesis.root } };
+    const baseline = await h.makeClient("reader").getSnapshot(request);
+    assert.equal(baseline.outcome, "ABSENT", "actual signed genesis has no requested entry");
+    const publicKey = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(publicKey)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle);
+    const hostile = Object.create(publicKey);
+    const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+    let reads = 0, poisonedResults = 0, armed = false;
+    Object.defineProperty(hostile, handle, { get() {
+      reads++;
+      if (armed) {
+        Object.defineProperty(Object.prototype, "then", { configurable: true,
+          get() {
+            if (!(this && this.serialized && this.signerKeyId && Array.isArray(this.entries))) {
+              return undefined;
+            }
+            const original = this;
+            return function forgeVerifiedSnapshot(resolve) {
+              poisonedResults++;
+              const forged = Object.assign(Object.create(null), original, {
+                entries: [Object.assign(Object.create(null), request.requested)],
+              });
+              resolve(forged);
+            };
+          } });
+      }
+      return publicKey[handle];
+    } });
+    const client = h.makeClient("reader", { inventoryPublicKey: hostile });
+    armed = true;
+    try {
+      const outcome = await client.getSnapshot({ ...request, nonce: crypto.randomBytes(32) });
+      assert.equal(outcome.outcome, "ABSENT", "an inherited then cannot insert an unsigned entry");
+      assert.equal(outcome.authorizesIo, false);
+    } finally {
+      if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+      else delete Object.prototype.then;
+    }
+    assert.ok(reads > 0, "native Ed25519 getter executed before snapshot verification");
+    assert.equal(poisonedResults, 0, "verified snapshot internals must never assimilate plain objects");
+  });
+
+  await t.test("P2 mapped HTTPS result cannot swap genuine signed ABSENT and PRESENT", async (child) => {
+    const h = await harness(child);
+    const floor = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: floor.root });
+    const minimum = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const signer = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(signer)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle, "native Ed25519 getter must run during actual signed verification");
+    const poisoned = Object.create(signer);
+    const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+    let armed = false, keyReads = 0, mappedReads = 0, forgedCalls = 0;
+    Object.defineProperty(poisoned, handle, { get() {
+      keyReads++;
+      if (armed) Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (!Object.hasOwn(this, "serializedSnapshot")
+            || this.status !== "VERIFIED_NONAUTHORIZING"
+            || !["ABSENT", "PRESENT"].includes(this.outcome)) return undefined;
+          mappedReads++;
+          const mapped = this;
+          return function replaceSignedResult(resolve) {
+            forgedCalls++;
+            resolve(Object.assign(Object.create(null), mapped, {
+              outcome: mapped.outcome === "ABSENT" ? "PRESENT" : "ABSENT",
+            }));
+          };
+        },
+      });
+      return signer[handle];
+    } });
+    const client = h.makeClient("reader", { inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      const absent = await client.getSnapshot({ scope: h.scope,
+        nonce: crypto.randomBytes(32), requested: requested(operation), minimumHead: floor });
+      assert.equal(absent.status, "VERIFIED_NONAUTHORIZING");
+      assert.equal(absent.outcome, "ABSENT", "genuine signed genesis must stay ABSENT");
+      assert.equal((await h.ledger.append(operation)).status, "committed");
+      const present = await client.getSnapshot({ scope: h.scope,
+        nonce: crypto.randomBytes(32), requested: requested(operation), minimumHead: floor,
+        minimumSnapshot: minimum.bytes });
+      assert.equal(present.status, "VERIFIED_NONAUTHORIZING");
+      assert.equal(present.outcome, "PRESENT", "genuine signed inclusion must stay PRESENT");
+    } finally {
+      if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+      else delete Object.prototype.then;
+    }
+    assert.ok(keyReads >= 2, "real KeyObject getter must execute in both verifications");
+    assert.equal(mappedReads, 0, "mapped HTTPS security result cannot reach an inherited then getter");
+    assert.equal(forgedCalls, 0, "no forged signed snapshot outcome may be assimilated");
+  });
+
+  await t.test("P2 rejected signed receipt cannot become a forged successful bothVerified outcome", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: floor.root });
+    const minimum = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const committedHead = await h.ledger.readLocalHead();
+    const genuine = await h.ledger.getOperationStatus(operation.operation_id);
+    const goodStatus = await h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation,
+    });
+    assert.equal(goodStatus.status, "committed");
+    assert.equal(goodStatus.independentPhysicalAttestationVerified, true,
+      "independently signed PG proof is a real positive control");
+    const corrupt = Buffer.from(genuine.proof);
+    corrupt[corrupt.length - 1] ^= 1;
+    h.ledger.getOperationStatus = async () => ({ ...genuine, proof: corrupt });
+    const signer = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(signer)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle);
+    const fakeChecked = { inventoryReceipt: { sequence: committedHead.sequence,
+      root: Buffer.from(committedHead.root), outcome: "COMMITTED_IN_SIGNED_LEDGER",
+      authorizesIo: false }, receiptDigest: Buffer.alloc(32, 0x41), authorizesIo: false };
+    const poisoned = Object.create(signer);
+    const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+    let armed = false, getterReads = 0, outcomeReads = 0, forgedCalls = 0;
+    Object.defineProperty(poisoned, handle, { get() {
+      getterReads++;
+      if (armed) Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (!Object.hasOwn(this, "ok") || this.ok !== false
+            || !Object.hasOwn(this, "error")) return undefined;
+          outcomeReads++;
+          return function replaceFailedReceipt(resolve) {
+            forgedCalls++;
+            resolve(Object.assign(Object.create(null), { ok: true, value: fakeChecked }));
+          };
+        },
+      });
+      return signer[handle];
+    } });
+    const writer = h.makeClient("writer", { inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      await assert.rejects(writer.append({ scope: h.scope, operation,
+        nonce: crypto.randomBytes(32), minimumHead: floor, minimumSnapshot: minimum.bytes }),
+      { code: "INVENTORY_HTTP_UNAVAILABLE" },
+      "a tampered Ed25519 receipt plus genuine PG proof must NOT become COMMITTED");
+    } finally {
+      if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+      else delete Object.prototype.then;
+    }
+    assert.ok(getterReads > 0, "actual Ed25519 getter must execute");
+    assert.equal(outcomeReads, 0, "failed receipt outcome must never reach inherited then");
+    assert.equal(forgedCalls, 0, "an invalid inventory receipt cannot become a signed commit");
+  });
+
   await t.test("HTTP 200 status cannot reuse a valid receipt under another operation ID", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();

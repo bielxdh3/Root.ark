@@ -78,7 +78,12 @@ test("deterministic CBOR has a stable fixture and strict rejection", async () =>
   const second = await z.encodeDeterministic({ a: Buffer.from([1, 2]), b: 1 });
   assert.equal(first.toString("hex"), "a26161420102616201");
   assert.deepEqual(first, second);
-  assert.deepEqual(await z.decodeDeterministic(first), { a: Uint8Array.from([1, 2]), b: 1 });
+  const decoded = await z.decodeDeterministic(first);
+  assert.equal(Object.getPrototypeOf(decoded), null,
+    "decoded signed CBOR maps must not inherit a poisoned Object.prototype.then");
+  assert.deepEqual(Reflect.ownKeys(decoded), ["a", "b"],
+    "decoding cannot append a synthetic then or change canonical own fields");
+  assert.deepEqual({ ...decoded }, { a: Uint8Array.from([1, 2]), b: 1 });
   const invalid = [
     Buffer.from("a2616101616101", "hex"),
     Buffer.from("bf616101ff", "hex"),
