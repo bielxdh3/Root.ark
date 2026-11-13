@@ -119,6 +119,47 @@ function deny() {
   throw Object.assign(new Error("ZK10_SYNC_V2_MAP_UNVERIFIED"),
     { code: "ZK10_SYNC_V2_MAP_UNVERIFIED" });
 }
+function frozenNonThenableResult(data) {
+  // Async return itself performs PromiseResolve and can assimilate an
+  // inherited Object.prototype.then installed by the CURRENT head callback.
+  // Copy only own DATA descriptors into a null-prototype immutable result.
+  const safe = NATIVE_OBJECT_CREATE(null);
+  const names = NATIVE_OWN_KEYS(data);
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(data, name);
+    if (typeof name !== "string" || !descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(safe, name, { value: descriptor.value,
+      enumerable: true, configurable: false, writable: false });
+  }
+  return NATIVE_FREEZE(safe);
+}
+function safeMappingPromiseThen(onFulfilled, onRejected) {
+  const pending = this;
+  async function settle() {
+    let value, fulfilled = false;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+    if (typeof onRejected !== "function") throw value;
+    return onRejected(value);
+  }
+  return safeMappingPromise(settle());
+}
+function safeMappingPromise(pending) {
+  // Never call inherited .then/.catch after a CURRENT authority callback.
+  // Native await reads this genuine Promise's own constructor fast path.
+  NATIVE_DEFINE_PROPERTY(pending, "constructor", {
+    value: NATIVE_PUBLIC_PROMISE, configurable: false, writable: false,
+  });
+  NATIVE_DEFINE_PROPERTY(pending, "then", {
+    value: safeMappingPromiseThen, configurable: false, writable: false,
+  });
+  NATIVE_DEFINE_PROPERTY(pending, "catch", { value(onRejected) {
+    return NATIVE_APPLY(safeMappingPromiseThen, this, [undefined, onRejected]);
+  }, configurable: false, writable: false });
+  return pending;
+}
 function number(value) {
   if (!Number.isSafeInteger(value) || value < 1) deny();
   return value;
@@ -477,7 +518,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         // only after the awaited authority verification, on the same JS turn.
         if (nativeAborted(signal) || payload.mapping_sequence <= lastAcceptedSequence) deny();
         lastAcceptedSequence = payload.mapping_sequence;
-        return NATIVE_FREEZE({
+        return frozenNonThenableResult({
           status: "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING",
           mappingDigest: digest, mappingSequence: payload.mapping_sequence,
           syncObjectId: payload.sync_object_id, zkObjectId: payload.zk_object_id,
@@ -490,13 +531,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     }
     return function verifyOwnerSignedMapping(input, control) {
       const pending = verifyOwnerSignedMappingInternal(input, control);
-      // A hostile CURRENT callback can replace Promise.prototype.constructor
-      // before consumers await this exported verifier. Bind the real native
-      // constructor to the actual rejected or fulfilled Promise instance.
-      NATIVE_DEFINE_PROPERTY(pending, "constructor", {
-        value: NATIVE_PUBLIC_PROMISE, configurable: false, writable: false,
-      });
-      return pending;
+      return safeMappingPromise(pending);
     };
   } catch (_) { deny(); }
 }

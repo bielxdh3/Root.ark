@@ -408,6 +408,77 @@ test("P2: exported CURRENT verifier cannot become a forged success through its o
   }
 });
 
+test("P2: caller .then on exported CURRENT verifier cannot forge failed signature", async () => {
+  const f = await fixture();
+  const nativeThen = Promise.prototype.then;
+  let pending, getterReached;
+  const getterRan = new Promise((resolve) => { getterReached = resolve; });
+  let poisonedCalls = 0;
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: () => {
+      Promise.prototype.then = function forgedThen(accept, reject) {
+        if (this === pending) {
+          poisonedCalls++;
+          return Promise.resolve("accepted");
+        }
+        return Reflect.apply(nativeThen, this, [accept, reject]);
+      };
+      getterReached();
+      return Promise.resolve({ invalid: "not signed" });
+    } },
+  });
+  try {
+    pending = verify(f.input);
+    Reflect.apply(nativeThen, pending, [undefined, () => {}]);
+    await getterRan;
+    const verdict = await pending.then(() => "accepted", () => "denied");
+    assert.equal(verdict, "denied", "inherited .then must not manufacture signed acceptance");
+    assert.equal(poisonedCalls, 0, "external .then cannot invoke a poisoned prototype");
+  } finally {
+    Promise.prototype.then = nativeThen;
+  }
+});
+
+test("P2: signed CURRENT result must never assimilate an inherited forged success", async () => {
+  const f = await fixture();
+  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  let readCount = 0, forgedReturnReads = 0;
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: (challenge) => {
+      readCount++;
+      const signed = signedHead(f, challenge);
+      Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (this && this.status === "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING") {
+            forgedReturnReads++;
+            return (resolve) => resolve(Object.assign(Object.create(null), {
+              status: "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING",
+              ownerMappingVerified: true, authorizesIo: true,
+            }));
+          }
+          return undefined;
+        },
+      });
+      return Promise.resolve(signed);
+    } },
+  });
+  try {
+    const result = await verify(f.input);
+    assert.equal(readCount, 1, "real signed CURRENT head must reach the callback");
+    assert.equal(result.ownerMappingVerified, true);
+    assert.equal(result.authorizesIo, false,
+      "forged inherited then must never convert a nonauthorizing return into authority");
+    assert.equal(Object.getPrototypeOf(result), null,
+      "signed outcome must be a null-prototype non-thenable value");
+    assert.equal(forgedReturnReads, 0, "no inherited then may be consulted on final outcome");
+  } finally {
+    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+    else delete Object.prototype.then;
+  }
+});
+
 test("P2: cross-realm native Promise keeps its true outstanding read slot until settlement", async () => {
   const f = await fixture();
   const ForeignPromise = vm.runInNewContext("Promise");
