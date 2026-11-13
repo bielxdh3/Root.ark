@@ -582,7 +582,13 @@ async function computeRoot(scopeValue, sequenceValue, previousRootValue, entries
   if (sequence !== entries.length) fail("INVENTORY_SEQUENCE");
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
   const canonical = await z.encodeDeterministic(rootBody(scope, sequence, previousRoot, entries));
-  return hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, canonical]));
+  const root = hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, canonical]));
+  // PromiseResolve assimilates an inherited Object.prototype.then even on a
+  // native Buffer. A hostile Ed25519 KeyObject getter may install that trap
+  // before a later inventory chain recomputation returns its SHA-256 root.
+  NATIVE_DEFINE_PROPERTY(root, "then", { value: undefined,
+    enumerable: false, configurable: false, writable: false });
+  return root;
 }
 
 function validatePrivateKey(value) {
