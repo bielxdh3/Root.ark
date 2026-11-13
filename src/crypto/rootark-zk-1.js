@@ -9,6 +9,7 @@ const CODEC_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
 const CODEC_OBJECT_KEYS = Object.keys.bind(Object);
 const CODEC_OBJECT_HAS_OWN = Object.hasOwn.bind(Object);
 const CODEC_OBJECT_GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const CODEC_OBJECT_SET_PROTOTYPE = Object.setPrototypeOf.bind(Object);
 const CODEC_OBJECT_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
 const CODEC_OBJECT_CREATE = Object.create.bind(Object);
 const CODEC_OBJECT_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
@@ -31,6 +32,40 @@ function codecNativePromise(value) {
   CODEC_OBJECT_DEFINE_PROPERTY(value, "constructor", {
     value: CODEC_PROMISE, configurable: false, writable: false,
   });
+  return value;
+}
+
+function codecNonThenableResult(value) {
+  // Node's async PromiseResolve assimilates returned Buffers, arrays and maps
+  // through inherited Object.prototype.then BEFORE the caller can pin its
+  // Promise. An untrusted native KeyObject getter may install that inherited
+  // method after real signature validation. Prevent this at the codec result.
+  if (value !== null && typeof value === "object") {
+    if (!CODEC_ARRAY_IS_ARRAY(value) && !isBytes(value)) {
+      // Canonical decoded maps are consumed by exact() validators that count
+      // Reflect.ownKeys. Adding even a nonenumerable own "then" here corrupts
+      // the signed field set and makes genuine persisted ledgers unreadable.
+      // A null prototype preserves *all* signed DATA fields while excluding
+      // any hostile Object.prototype.then from async PromiseResolve.
+      const prototype = CODEC_OBJECT_GET_PROTOTYPE(value);
+      if (prototype !== null && prototype !== CODEC_PLAIN_OBJECT_PROTOTYPE) {
+        fail("UNSUPPORTED_CBOR_VALUE");
+      }
+      const present = CODEC_OBJECT_DESCRIPTOR(value, "then");
+      if (present && (!CODEC_OBJECT_HAS_OWN(present, "value")
+        || typeof present.value === "function")) fail("UNSUPPORTED_CBOR_VALUE");
+      if (prototype !== null) CODEC_OBJECT_SET_PROTOTYPE(value, null);
+      return value;
+    }
+    const ownThen = CODEC_OBJECT_DESCRIPTOR(value, "then");
+    if (ownThen) {
+      if (!CODEC_OBJECT_HAS_OWN(ownThen, "value")
+        || typeof ownThen.value === "function") fail("UNSUPPORTED_CBOR_VALUE");
+    } else {
+      CODEC_OBJECT_DEFINE_PROPERTY(value, "then", { value: undefined,
+        enumerable: false, writable: false, configurable: false });
+    }
+  }
   return value;
 }
 const path = require("node:path");
@@ -279,7 +314,7 @@ async function encodeDeterministicInternal(value) {
       allowUndefined: false, allowInfinity: false, allowNaN: false,
       allowBigInt: true, rejectDuplicateMapKeys: true });
     if (!sameCborValue(expected, roundtrip)) fail("CBOR_ENCODE_FAILED");
-    return encoded;
+    return codecNonThenableResult(encoded);
   } catch (_) {
     fail("CBOR_ENCODE_FAILED");
   }
@@ -328,7 +363,7 @@ async function decodeDeterministicInternal(input) {
     const canonical = await codecNativePromise(encodeDeterministic(value));
     if (encoded.length !== canonical.length ||
         !CODEC_TIMING_SAFE_EQUAL(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
-    return value;
+    return codecNonThenableResult(value);
   } catch (error) {
     if (error instanceof RootarkZkError) throw error;
     fail("CBOR_DECODE_FAILED");

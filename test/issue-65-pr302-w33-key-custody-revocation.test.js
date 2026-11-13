@@ -26,6 +26,18 @@ function fixture() {
     nonce: crypto.randomBytes(32), now: Math.floor(Date.now() / 1000) };
 }
 
+test("P2 canonical decoded CBOR must preserve exact signed field names without synthetic then", async () => {
+  const wire = { operation_id: crypto.randomBytes(16), expected_sequence: 0,
+    expected_root: crypto.randomBytes(32), revision: 1 };
+  const bytes = await z.encodeDeterministic(wire);
+  const decoded = await z.decodeDeterministic(bytes);
+  assert.equal(Object.hasOwn(decoded, "then"), false,
+    "a Promise boundary guard must not add a synthetic field that breaks exact signed ledgers");
+  assert.deepEqual(new Set(Reflect.ownKeys(decoded)), new Set(Object.keys(wire)));
+  assert.deepEqual(Buffer.from(decoded.expected_root), wire.expected_root);
+  assert.equal(decoded.revision, 1);
+});
+
 async function committed(f) {
   const op = f.operation;
   const unsigned = { type: "rootark-content-inventory-entry/v1", version: 1,
@@ -111,6 +123,214 @@ function immediateKeySwap(publicB, publicA) {
   } });
   return { pin, get changed() { return changed; } };
 }
+
+test("P2 public composite Promise cannot forge committed inventory after hostile KeyObject getter", async () => {
+  const f = fixture();
+  const validReceipt = await committed(f);
+  const validPhysical = await physical(f);
+  const invalidReceipt = Buffer.from(validReceipt);
+  invalidReceipt[invalidReceipt.length - 1] ^= 1;
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
+  const originalPin = f.signer.publicKey;
+  const handle = Object.getOwnPropertySymbols(originalPin)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "real native Ed25519 KeyObject required");
+  let getterReads = 0, forgedCalls = 0;
+  const hostilePin = Object.create(originalPin);
+  Object.defineProperty(hostilePin, handle, { get() {
+    getterReads += 1;
+    Object.defineProperty(Promise.prototype, "constructor", { configurable: true,
+      writable: true, value: function ForgedPromise() {} });
+    Object.defineProperty(Promise.prototype, "then", { configurable: true,
+      writable: true, value(resolve) {
+        forgedCalls += 1;
+        resolve({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
+          inventoryReceipt: { outcome: "COMMITTED_IN_SIGNED_LEDGER" },
+          physicalReadback: { status: "PHYSICALLY_REREAD_PG_COMMITTED" },
+          authorizesIo: false });
+      } });
+    return originalPin[handle];
+  } });
+  try {
+    let rejected = false;
+    try {
+      await verifyAttestedInventoryCommit(compositeOptions(f,
+        invalidReceipt, validPhysical, hostilePin));
+    } catch (error) {
+      rejected = true;
+      assert.equal(error.code, "ZK_ATTESTED_INVENTORY_COMMIT_DENIED");
+    }
+    assert.equal(rejected, true, "tampered inventory must never produce a composite success");
+    assert.equal(forgedCalls, 0, "public await must not invoke inherited attacker then");
+  } finally {
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+    Object.defineProperty(Promise.prototype, "then", originalThen);
+  }
+  assert.ok(getterReads > 0, "attacker actually poisoned the native key boundary");
+  const genuine = await verifyAttestedInventoryCommit(compositeOptions(f,
+    validReceipt, validPhysical));
+  assert.equal(genuine.status, "VERIFIED_COMPOSITE_NONAUTHORIZING");
+  assert.equal(genuine.authorizesIo, false);
+});
+
+test("P2 public composite then/catch cannot accept forged success after native key callback", async () => {
+  const f = fixture();
+  const receipt = await committed(f);
+  const badReceipt = Buffer.from(receipt);
+  badReceipt[badReceipt.length - 1] ^= 1;
+  const physicalBytes = await physical(f);
+  const signer = f.signer.publicKey;
+  const handle = Object.getOwnPropertySymbols(signer)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  const poisoned = Object.create(signer);
+  const originalThen = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
+  const originalCatch = Object.getOwnPropertyDescriptor(Promise.prototype, "catch");
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  let poisonedReads = 0, forgedThen = 0, forgedCatch = 0;
+  Object.defineProperty(poisoned, handle, { get() {
+    poisonedReads++;
+    Object.defineProperty(Promise.prototype, "constructor", { configurable: true,
+      writable: true, value: function ForgedPromise() {} });
+    Object.defineProperty(Promise.prototype, "then", { configurable: true,
+      writable: true, value(resolve) {
+        forgedThen++;
+        resolve({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING", authorizesIo: false });
+      } });
+    Object.defineProperty(Promise.prototype, "catch", { configurable: true,
+      writable: true, value() {
+        forgedCatch++;
+        return Promise.resolve({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING" });
+      } });
+    return signer[handle];
+  } });
+  try {
+    const invalid = compositeOptions(f, badReceipt, physicalBytes, poisoned);
+    const chained = verifyAttestedInventoryCommit(invalid).then(value => value);
+    let rejectedThen = false;
+    try { await chained; } catch (error) {
+      rejectedThen = true;
+      assert.equal(error.code, "ZK_ATTESTED_INVENTORY_COMMIT_DENIED");
+    }
+    assert.equal(rejectedThen, true);
+    const caught = verifyAttestedInventoryCommit(invalid).catch(error => { throw error; });
+    let rejectedCatch = false;
+    try { await caught; } catch (error) {
+      rejectedCatch = true;
+      assert.equal(error.code, "ZK_ATTESTED_INVENTORY_COMMIT_DENIED");
+    }
+    assert.equal(rejectedCatch, true);
+    assert.equal(forgedThen, 0, "never use inherited hostile then()");
+    assert.equal(forgedCatch, 0, "never use inherited hostile catch()");
+  } finally {
+    Object.defineProperty(Promise.prototype, "then", originalThen);
+    Object.defineProperty(Promise.prototype, "catch", originalCatch);
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+  }
+  assert.ok(poisonedReads >= 2, "both calls must execute the actual native getter");
+  assert.equal((await verifyAttestedInventoryCommit(compositeOptions(f,
+    receipt, physicalBytes))).status, "VERIFIED_COMPOSITE_NONAUTHORIZING");
+});
+
+test("P2 native Promise species cannot substitute composite rejection with forged signed success", async () => {
+  const f = fixture();
+  const receipt = await committed(f);
+  const bad = Buffer.from(receipt);
+  bad[bad.length - 1] ^= 1;
+  const pg = await physical(f);
+  const signer = f.signer.publicKey;
+  const handle = Object.getOwnPropertySymbols(signer)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  const malicious = Object.create(signer);
+  let getterReads = 0, speciesCalls = 0;
+  const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+  Object.defineProperty(malicious, handle, { get() {
+    getterReads++;
+    Object.defineProperty(Promise, Symbol.species, { configurable: true, get() {
+      speciesCalls++;
+      return function ForgedSpecies(executor) {
+        const spoof = new Promise((resolve) => resolve({
+          status: "VERIFIED_COMPOSITE_NONAUTHORIZING", authorizesIo: false }));
+        executor(() => {}, () => {});
+        return spoof;
+      };
+    } });
+    return signer[handle];
+  } });
+  try {
+    const checked = verifyAttestedInventoryCommit(compositeOptions(f, bad, pg, malicious));
+    const chained = checked.then(value => value);
+    let rejected = false;
+    try { await chained; } catch (error) {
+      rejected = true;
+      assert.equal(error.code, "ZK_ATTESTED_INVENTORY_COMMIT_DENIED");
+    }
+    assert.equal(rejected, true, "a forged species promise cannot hide a real signed denial");
+    assert.equal(speciesCalls, 0, "must not consult globally mutable Promise species");
+  } finally {
+    Object.defineProperty(Promise, Symbol.species, originalSpecies);
+  }
+  assert.ok(getterReads > 0, "actual native KeyObject getter must poison species");
+});
+
+test("P2 codec async result cannot replace signed A with unsigned B after real KeyObject getter", async () => {
+  const f = fixture();
+  const signedReceipt = await committed(f);
+  const signedA = { signed: "A" };
+  const unsignedB = { signed: "B" };
+  const rawA = await z.encodeDeterministic(signedA);
+  const rawB = await z.encodeDeterministic(unsignedB);
+  const publicKey = f.signer.publicKey;
+  const handle = Object.getOwnPropertySymbols(publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "native Ed25519 getter required");
+  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  let reads = 0, forgedBytes = 0, forgedMaps = 0, getterReached;
+  const getterRan = new Promise((resolve) => { getterReached = resolve; });
+  const hostile = Object.create(publicKey);
+  Object.defineProperty(hostile, handle, { get() {
+    reads++;
+    Object.defineProperty(Object.prototype, "then", { configurable: true,
+      get() {
+        const current = this;
+        if (Buffer.isBuffer(current) && current.equals(rawA)) {
+          return function forgeCodecBytes(resolve) {
+            forgedBytes++;
+            resolve(Buffer.from(rawB));
+          };
+        }
+        if (current?.signed === "A") {
+          return function forgeCodecMap(resolve) {
+            forgedMaps++;
+            resolve(Object.assign(Object.create(null), unsignedB));
+          };
+        }
+        return undefined;
+      } });
+    getterReached();
+    return publicKey[handle];
+  } });
+  try {
+    const verification = inventory.verifyCommittedEntryProof(
+      commitOptions(f, signedReceipt, hostile));
+    const observedVerification = verification.then(() => undefined, () => undefined);
+    await getterRan;
+    const actualEncoded = await z.encodeDeterministic(signedA);
+    assert.deepEqual(Buffer.from(actualEncoded), Buffer.from(rawA),
+      "signed A codec bytes cannot become unsigned B during async resolution");
+    const actualDecoded = await z.decodeDeterministic(rawA);
+    assert.equal(actualDecoded.signed, "A", "decoded signed A cannot become an unsigned map B");
+    assert.equal(forgedBytes, 0, "no inherited then may resolve codec byte outputs");
+    assert.equal(forgedMaps, 0, "no inherited then may resolve decoded maps");
+    await observedVerification;
+  } finally {
+    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+    else delete Object.prototype.then;
+  }
+  assert.ok(reads > 0, "real signer KeyObject callback installed the poison");
+});
 
 test("P2 native receipt pin B cannot become signer A synchronously during KeyObject.type", async () => {
   const f = fixture();

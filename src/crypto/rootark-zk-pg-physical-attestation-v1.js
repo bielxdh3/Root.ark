@@ -6,7 +6,8 @@
 const crypto = require("node:crypto");
 const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY, mathAbs: NATIVE_MATH_ABS,
   sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
-  getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY } =
+  getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY,
+  objectCreate: NATIVE_OBJECT_CREATE, defineProperty: NATIVE_DEFINE_PROPERTY } =
   require("./rootark-zk10-native-intrinsics-v1");
 const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const z = require("./rootark-zk-1");
@@ -14,6 +15,21 @@ const z = require("./rootark-zk-1");
 // Keep the real codec entry points used for the signed bytes fixed from load.
 const NATIVE_ENCODE_DETERMINISTIC = z.encodeDeterministic.bind(z);
 const NATIVE_DECODE_DETERMINISTIC = z.decodeDeterministic.bind(z);
+
+function signedResult(fields) {
+  // A hostile signer KeyObject getter may install Object.prototype.then;
+  // resolving an async verifier with ordinary `{}` would then assimilate a
+  // forged proof AFTER genuine Ed25519 verification completed.
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let i = 0; i < keys.length; i += 1) {
+    const descriptor = NATIVE_DESCRIPTOR(fields, keys[i]);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, keys[i], { value: descriptor.value,
+      writable: false, enumerable: true, configurable: false });
+  }
+  return NATIVE_FREEZE(result);
+}
 
 const DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/physical-pg-readback-attestation/v1\0");
 const TYPE = "rootark-zk1-physical-pg-readback-attestation/v1";
@@ -171,7 +187,7 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     const chunkRoot = bytes(unsigned.chunk_root, 32);
     const chunkCount = count(unsigned.chunk_count, 1);
     bytes(unsigned.admission_id, 16);
-    return NATIVE_FREEZE({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+    return signedResult({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
       walFlushConfirmed: true, generation, admissionId: NATIVE_BUFFER_FROM(unsigned.admission_id),
       physicalDigest, chunkRoot, chunkCount,
       // Return the already-verified, signed issuance time so callers that

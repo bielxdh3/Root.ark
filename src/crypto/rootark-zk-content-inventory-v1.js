@@ -5,6 +5,7 @@ const { types: {
   isProxy: NATIVE_IS_PROXY,
   isUint8Array: NATIVE_IS_UINT8_ARRAY,
   isSharedArrayBuffer: NATIVE_IS_SHARED_ARRAY_BUFFER,
+  isPromise: NATIVE_IS_PROMISE,
 } } = require("node:util");
 // Load the shared native snapshot before any caller-owned KeyObject getter.
 const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
@@ -39,6 +40,77 @@ const NATIVE_VIEW_BYTE_LENGTH = NATIVE_DESCRIPTOR(NATIVE_TYPED_ARRAY_PROTO, "byt
 // Retain the original sorting implementation before any caller-owned
 // KeyObject getter can replace Array.prototype.sort or Function.call.
 const NATIVE_ARRAY_SORT = Array.prototype.sort;
+const NATIVE_PROMISE = Promise;
+
+function inventoryNativeThen(onFulfilled, onRejected) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+    if (typeof onRejected !== "function") throw value;
+    return onRejected(value);
+  }
+  return inventoryNativePromise(settle());
+}
+
+function inventoryNativeCatch(onRejected) {
+  return NATIVE_APPLY(inventoryNativeThen, this, [undefined, onRejected]);
+}
+
+function inventoryNativeFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (NATIVE_IS_PROXY(cleanup)) fail("INVENTORY_PROMISE");
+      await (NATIVE_IS_PROMISE(cleanup) ? inventoryNativePromise(cleanup) : cleanup);
+    }
+    if (!fulfilled) throw value;
+    return value;
+  }
+  return inventoryNativePromise(settle());
+}
+
+function inertVerifiedResult(fields) {
+  // An untrusted Ed25519 KeyObject getter may install Object.prototype.then.
+  // Resolving an async function with a plain object then assimilates attacker
+  // code AFTER the actual signature was verified. Return only own DATA fields
+  // on a native null-prototype result, never an inherited thenable.
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let i = 0; i < keys.length; i += 1) {
+    const key = keys[i];
+    const descriptor = NATIVE_DESCRIPTOR(fields, key);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_FIELDS");
+    NATIVE_DEFINE_PROPERTY(result, key, { value: descriptor.value,
+      writable: false, enumerable: true, configurable: false });
+  }
+  return result;
+}
+
+function inventoryNativePromise(pending) {
+  if (NATIVE_IS_PROXY(pending) || !NATIVE_IS_PROMISE(pending)) fail("INVENTORY_PROMISE");
+  NATIVE_DEFINE_PROPERTY(pending, "constructor", { value: NATIVE_PROMISE,
+    configurable: false, writable: false });
+  const previousThen = NATIVE_DESCRIPTOR(pending, "then");
+  if (previousThen) {
+    if (previousThen.value !== inventoryNativeThen || previousThen.configurable !== false
+      || previousThen.writable !== false) fail("INVENTORY_PROMISE");
+    return pending;
+  }
+  NATIVE_DEFINE_PROPERTY(pending, "then", { value: inventoryNativeThen,
+    configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "catch", { value: inventoryNativeCatch,
+    configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "finally", { value: inventoryNativeFinally,
+    configurable: false, writable: false });
+  return pending;
+}
 
 const SNAPSHOT_TYPE = "rootark-content-inventory-snapshot/v1";
 const VERSION = 1;
@@ -377,7 +449,7 @@ async function verifyTerminalProof(input) {
     ]), publicKey, signature);
   } catch (_) { fail("INVENTORY_SIGNATURE"); }
   if (!valid) fail("INVENTORY_SIGNATURE");
-  return {
+  return inertVerifiedResult({
     status: "VERIFIED_NONAUTHORIZING",
     outcome: "NOT_COMMITTED_FINAL",
     reason: proof.reason,
@@ -385,7 +457,7 @@ async function verifyTerminalProof(input) {
     expectedHead: { sequence: operation.expected_sequence, root: NATIVE_BUFFER_FROM(operation.expected_root) },
     observedHead: { sequence: observedSequence, root: NATIVE_BUFFER_FROM(observedRoot) },
     blockingOperationId: blockingOperationId === null ? null : NATIVE_BUFFER_FROM(blockingOperationId),
-  };
+  });
 }
 
 function normalizeMinimumHead(value) {
@@ -446,7 +518,7 @@ async function verifyCommittedEntryProof(input) {
   if (!NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([ENTRY_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), publicKey, signature)) fail("INVENTORY_SIGNATURE");
-  return {
+  return inertVerifiedResult({
     status: "VERIFIED_NONAUTHORIZING",
     outcome: "COMMITTED_IN_SIGNED_LEDGER",
     operationId: NATIVE_BUFFER_FROM(operationId),
@@ -454,7 +526,7 @@ async function verifyCommittedEntryProof(input) {
     tuple: { object_id: NATIVE_BUFFER_FROM(entry.object_id), revision: entry.revision,
       epoch: entry.epoch, ciphertext_sha256: NATIVE_BUFFER_FROM(entry.ciphertext_sha256) },
     authorizesIo: false,
-  };
+  });
 }
 
 async function readVerifiedCommittedOperation({ serialized, pinnedPublicKey,
@@ -473,9 +545,9 @@ async function readVerifiedCommittedOperation({ serialized, pinnedPublicKey,
     epoch: row.entry?.epoch,
     ciphertext_sha256: row.entry?.ciphertext_sha256,
   });
-  await verifyCommittedEntryProof({ serialized: bytes, pinnedPublicKey,
-    pinnedSignerKeyId, expectedScope, operation });
-  return operation;
+  await inventoryNativePromise(verifyCommittedEntryProof({ serialized: bytes, pinnedPublicKey,
+    pinnedSignerKeyId, expectedScope, operation }));
+  return inertVerifiedResult(operation);
 }
 
 function sameBytes(a, b) {
@@ -596,7 +668,7 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
     ]), publicKey, signature);
   } catch (_) { fail("INVENTORY_SIGNATURE"); }
   if (!valid) fail("INVENTORY_SIGNATURE");
-  return { sequence, previousRoot, root, nonce, entries, scope, signerKeyId, serialized };
+  return inertVerifiedResult({ sequence, previousRoot, root, nonce, entries, scope, signerKeyId, serialized });
 }
 
 function assertSuperset(currentEntries, previousEntries) {
@@ -687,10 +759,10 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
       epoch: row.entry?.epoch,
       ciphertext_sha256: row.entry?.ciphertext_sha256,
     };
-    const verified = await verifyCommittedEntryProof({
+    const verified = await inventoryNativePromise(verifyCommittedEntryProof({
       serialized, pinnedPublicKey: publicKey, pinnedSignerKeyId: signerKeyId,
       expectedScope: scope, operation,
-    });
+    }));
     if (verified.sequence !== sequence + 1
       || row.expected_sequence !== sequence
       || !sameBytes(copyBytes(row.expected_root, 32), root)) fail("INVENTORY_CHAIN");
@@ -704,7 +776,7 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
     NATIVE_APPLY(NATIVE_ARRAY_SORT, nextEntries, [(a, b) =>
       NATIVE_BUFFER_COMPARE(a.object_id, b.object_id) || a.revision - b.revision]);
     entries = normalizeEntries(nextEntries);
-    const calculated = await computeRoot(scope, verified.sequence, root, entries);
+    const calculated = await inventoryNativePromise(computeRoot(scope, verified.sequence, root, entries));
     if (!sameBytes(calculated, verified.root)) fail("INVENTORY_CHAIN");
     sequence = verified.sequence;
     root = verified.root;
@@ -734,7 +806,8 @@ async function verifySnapshot(input) {
     ? null : normalizeCommittedProofChain(raw.committedProofChain);
   const publicKey = detachedPublicKey(raw.pinnedPublicKey);
 
-  const current = await parseAndVerifySnapshot(serialized, publicKey, pinnedSignerKeyId, expectedScope);
+  const current = await inventoryNativePromise(parseAndVerifySnapshot(
+    serialized, publicKey, pinnedSignerKeyId, expectedScope));
   if (!sameBytes(current.nonce, nonce)) fail("INVENTORY_NONCE");
   if (current.sequence < minimumHead.sequence) fail("INVENTORY_STALE");
 
@@ -748,16 +821,17 @@ async function verifySnapshot(input) {
       fail("INVENTORY_CHAIN");
     }
     if (!minimumSnapshot) fail("INVENTORY_HISTORY_REQUIRED");
-    previous = await parseAndVerifySnapshot(minimumSnapshot, publicKey, pinnedSignerKeyId, expectedScope);
+    previous = await inventoryNativePromise(parseAndVerifySnapshot(
+      minimumSnapshot, publicKey, pinnedSignerKeyId, expectedScope));
     if (previous.sequence !== minimumHead.sequence || !sameBytes(previous.root, minimumHead.root)) {
       fail("INVENTORY_FLOOR_PROOF");
     }
     assertSuperset(current.entries, previous.entries);
     if (chain) {
-      await verifyInterveningProofChain({
+      await inventoryNativePromise(verifyInterveningProofChain({
         receipts: chain, previous, current, scope: expectedScope, publicKey,
         signerKeyId: pinnedSignerKeyId,
-      });
+      }));
     }
   }
 
@@ -776,7 +850,7 @@ async function verifySnapshot(input) {
       break;
     }
   }
-  return {
+  return inertVerifiedResult({
     status: "VERIFIED_NONAUTHORIZING",
     outcome: matched ? "PRESENT" : "ABSENT",
     sequence: current.sequence,
@@ -793,7 +867,7 @@ async function verifySnapshot(input) {
       ciphertext_sha256: NATIVE_BUFFER_FROM(matched.ciphertext_sha256),
     } : null,
     verifiedInterveningReceipts: chain ? chain.length : 0,
-  };
+  });
 }
 
 module.exports = {
@@ -814,9 +888,9 @@ module.exports = {
   computeRoot,
   createSignedSnapshot,
   createTerminalProof,
-  verifyTerminalProof,
-  verifyCommittedEntryProof,
-  readVerifiedCommittedOperation,
+  verifyTerminalProof: (...args) => inventoryNativePromise(verifyTerminalProof(...args)),
+  verifyCommittedEntryProof: (...args) => inventoryNativePromise(verifyCommittedEntryProof(...args)),
+  readVerifiedCommittedOperation: (...args) => inventoryNativePromise(readVerifiedCommittedOperation(...args)),
   normalizeCommittedProofChain,
-  verifySnapshot,
+  verifySnapshot: (...args) => inventoryNativePromise(verifySnapshot(...args)),
 };

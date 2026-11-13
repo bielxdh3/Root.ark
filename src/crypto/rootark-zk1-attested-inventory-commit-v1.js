@@ -15,7 +15,9 @@ const { keyEquals: NATIVE_KEY_EQUALS,
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT,
   freeze: NATIVE_FREEZE,
-  defineProperty: NATIVE_DEFINE_PROPERTY } =
+  defineProperty: NATIVE_DEFINE_PROPERTY, objectCreate: NATIVE_OBJECT_CREATE,
+  ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
+  hasOwn: NATIVE_HAS_OWN } =
   require("./rootark-zk10-native-intrinsics-v1");
 const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const inventory = require("./rootark-zk-content-inventory-v1");
@@ -28,6 +30,18 @@ const VERIFY_COMMITTED_ENTRY = inventory.verifyCommittedEntryProof;
 const VERIFY_PHYSICAL_READBACK = verifyCommittedPhysicalReadback;
 const NATIVE_PROMISE_CONSTRUCTOR = Promise;
 
+function inertComposite(fields) {
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let i = 0; i < keys.length; i += 1) {
+    const descriptor = NATIVE_DESCRIPTOR(fields, keys[i]);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, keys[i], { value: descriptor.value,
+      writable: false, enumerable: true, configurable: false });
+  }
+  return NATIVE_FREEZE(result);
+}
+
 function verifiedNativePromise(promise) {
   if (isProxy(promise) || !isPromise(promise)) deny();
   // Async functions return native Promises. Their inherited constructor can be
@@ -35,6 +49,31 @@ function verifiedNativePromise(promise) {
   // so await reads the true internal state without consulting a forged .then.
   NATIVE_DEFINE_PROPERTY(promise, "constructor", { value: NATIVE_PROMISE_CONSTRUCTOR,
     enumerable: false, configurable: false, writable: false });
+  const existingThen = NATIVE_DESCRIPTOR(promise, "then");
+  if (existingThen) {
+    const existingCatch = NATIVE_DESCRIPTOR(promise, "catch");
+    if (existingThen.configurable !== false || existingThen.writable !== false
+      || typeof existingThen.value !== "function" || !existingCatch
+      || existingCatch.configurable !== false || existingCatch.writable !== false
+      || typeof existingCatch.value !== "function") deny();
+    // The captured inventory verifier already supplies a fully pinned native
+    // Promise. Never redefine its nonconfigurable own methods.
+    return promise;
+  }
+  NATIVE_DEFINE_PROPERTY(promise, "then", { value(onFulfilled, onRejected) {
+    async function settle() {
+      let fulfilled = false, value;
+      try { value = await promise; fulfilled = true; }
+      catch (error) { value = error; }
+      if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+      if (typeof onRejected !== "function") throw value;
+      return onRejected(value);
+    }
+    return verifiedNativePromise(settle());
+  }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(promise, "catch", { value(onRejected) {
+    return promise.then(undefined, onRejected);
+  }, configurable: false, writable: false });
   return promise;
 }
 
@@ -102,7 +141,7 @@ function snapshotOperation(value) {
     ciphertext_sha256: rawBytes(value.ciphertext_sha256, 32, 32) };
 }
 
-async function verifyAttestedInventoryCommit(input) {
+async function verifyAttestedInventoryCommitInternal(input) {
   try {
     exact(input, ["receipt", "physicalAttestation", "scope", "operation", "nonce",
       "pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
@@ -151,7 +190,7 @@ async function verifyAttestedInventoryCommit(input) {
     // Digest is an explicitly NON-DURABLE evidence-bundle fingerprint, not a
     // replacement for an externally anchored CAS/FLOOR or a recovery ticket.
     const receiptDigest = sha(NATIVE_BUFFER_CONCAT([DOMAIN, sha(receipt), sha(physicalBytes)]));
-    return NATIVE_FREEZE({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
+    return inertComposite({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
       inventoryReceipt: signedReceipt,
       physicalReadback: physical,
       receiptDigest,
@@ -159,6 +198,13 @@ async function verifyAttestedInventoryCommit(input) {
       authorizesIo: false, externalDurabilityProven: false,
       independentlyAnchoredFloorProven: false });
   } catch (_) { deny(); }
+}
+
+function verifyAttestedInventoryCommit(input) {
+  // The two caller-owned KeyObjects may poison Promise.prototype while the
+  // internal verifier runs. Never expose its mutable inherited constructor to
+  // an external await that treats the composite as a security admission gate.
+  return verifiedNativePromise(verifyAttestedInventoryCommitInternal(input));
 }
 
 module.exports = { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
