@@ -197,12 +197,12 @@ function copyBytes(value, min, max = min) {
   if ((!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
     || (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer)
     || value.byteLength < min || value.byteLength > max) fail();
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
 
 function decode(value, min, max) {
   if (typeof value !== "string" || !B64U.test(value) || value.length > max * 2 + 4) fail();
-  const bytes = Buffer.from(value, "base64url");
+  const bytes = NATIVE_BUFFER_FROM(value, "base64url");
   if (bytes.length < min || bytes.length > max || bytes.toString("base64url") !== value) fail();
   return bytes;
 }
@@ -221,10 +221,10 @@ function encodeOperation(operation) {
 
 function operationEntry(operation) {
   return {
-    object_id: Buffer.from(operation.object_id),
+    object_id: NATIVE_BUFFER_FROM(operation.object_id),
     revision: operation.revision,
     epoch: operation.epoch,
-    ciphertext_sha256: Buffer.from(operation.ciphertext_sha256),
+    ciphertext_sha256: NATIVE_BUFFER_FROM(operation.ciphertext_sha256),
   };
 }
 
@@ -398,7 +398,9 @@ function createZk1ContentInventoryHttpsClient({
       nonce,
     }), (verification) => ({
       ...verification,
-      serializedSnapshot: Buffer.from(serialized),
+      // The actual signed wire must survive a malicious Ed25519 KeyObject
+      // getter rewriting Buffer.from after signature verification.
+      serializedSnapshot: NATIVE_BUFFER_FROM(serialized),
       authorizesIo: false,
     }));
   }
@@ -420,14 +422,14 @@ function createZk1ContentInventoryHttpsClient({
         status: "not_committed_final",
         reason: verification.reason,
         verified: true,
-        proof: Buffer.from(proof),
+        proof: NATIVE_BUFFER_FROM(proof),
         authorizesIo: false,
       };
     });
   }
 
   function call(route, requestBody, requestLimit, responseLimit) {
-    const body = Buffer.from(JSON.stringify(requestBody), "utf8");
+    const body = NATIVE_BUFFER_FROM(JSON.stringify(requestBody), "utf8");
     if (body.length < 1 || body.length > requestLimit) fail();
     const request = requestJson({
       url,

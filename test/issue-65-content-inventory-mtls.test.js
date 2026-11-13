@@ -1419,6 +1419,53 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(forgedCalls, 0, "an invalid inventory receipt cannot become a signed commit");
   });
 
+  await t.test("P2 signed HTTPS snapshot bytes cannot be replaced by a post-key Buffer.from", async (child) => {
+    const h = await harness(child);
+    const head = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: head.root });
+    const nonce = crypto.randomBytes(32);
+    const signed = await h.ledger.getSnapshot({ nonce });
+    assert.equal(signed.status, "snapshot");
+    const query = {
+      scope: h.scope, nonce, requested: requested(operation),
+      minimumHead: { sequence: head.sequence, root: head.root },
+    };
+    const genuine = await h.makeClient("reader").getSnapshot(query);
+    assert.equal(genuine.status, "VERIFIED_NONAUTHORIZING");
+    assert.equal(genuine.outcome, "ABSENT");
+    assert.deepEqual(genuine.serializedSnapshot, signed.bytes,
+      "fresh Ed25519-signed snapshot is returned without altering bytes");
+
+    const originalFrom = Buffer.from;
+    const hostile = Object.create(h.signer.publicKey);
+    let armed = false, keyReads = 0, swapped = 0;
+    Object.defineProperty(hostile, "type", { get() {
+      keyReads++;
+      if (armed) Buffer.from = function hostileBufferFrom(value, ...options) {
+        if (Buffer.isBuffer(value) && value.equals(signed.bytes)) {
+          swapped++;
+          return originalFrom(Buffer.alloc(signed.bytes.length, 0x5b));
+        }
+        return originalFrom(value, ...options);
+      };
+      return "public";
+    } });
+    const attacked = h.makeClient("reader", { inventoryPublicKey: hostile });
+    armed = true;
+    try {
+      const verified = await attacked.getSnapshot(query);
+      assert.equal(verified.status, "VERIFIED_NONAUTHORIZING");
+      assert.equal(verified.outcome, "ABSENT");
+      assert.deepEqual(verified.serializedSnapshot, signed.bytes,
+        "the externally returned verified snapshot must be the actual signed bytes");
+      assert.equal(swapped, 0,
+        "a post-KeyObject mutable Buffer.from cannot substitute the verified wire");
+    } finally {
+      Buffer.from = originalFrom;
+    }
+    assert.ok(keyReads > 0, "the hostile native Ed25519 key getter must execute");
+  });
+
   await t.test("P2 signed operation status cannot trust spoofed post-key timingSafeEqual", async (child) => {
     const h = await harness(child);
     const head = await h.ledger.readLocalHead();
