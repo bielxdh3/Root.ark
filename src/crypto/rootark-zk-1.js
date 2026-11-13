@@ -22,6 +22,17 @@ const CODEC_SET_HAS = Set.prototype.has;
 const CODEC_SET_ADD = Set.prototype.add;
 const CODEC_SET_DELETE = Set.prototype.delete;
 const CODEC_APPLY = Reflect.apply.bind(Reflect);
+const CODEC_PROMISE = Promise;
+const { types: { isProxy: CODEC_IS_PROXY, isPromise: CODEC_IS_PROMISE } } = require("node:util");
+function codecNativePromise(value) {
+  if (CODEC_IS_PROXY(value) || !CODEC_IS_PROMISE(value)) {
+    throw new TypeError("non-native codec Promise");
+  }
+  CODEC_OBJECT_DEFINE_PROPERTY(value, "constructor", {
+    value: CODEC_PROMISE, configurable: false, writable: false,
+  });
+  return value;
+}
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { CipherSuite, HkdfSha256, Aes256Gcm } = require("@hpke/core");
@@ -239,20 +250,25 @@ function sameCborValue(a, b) {
 }
 
 let cborgPromise;
-function cborg() {
-  if (!cborgPromise) cborgPromise = import("cborg").catch((error) => {
+async function loadCborg() {
+  try {
+    return await codecNativePromise(import("cborg"));
+  } catch (error) {
     const searchPath = process.env.NODE_PATH?.split(path.delimiter).find((entry) => entry);
     if (!searchPath) throw error;
-    return import(pathToFileURL(path.join(searchPath, "cborg", "cborg.js")).href);
-  });
+    return await codecNativePromise(import(pathToFileURL(path.join(searchPath, "cborg", "cborg.js")).href));
+  }
+}
+function cborg() {
+  if (!cborgPromise) cborgPromise = codecNativePromise(loadCborg());
   return cborgPromise;
 }
 
-async function encodeDeterministic(value) {
+async function encodeDeterministicInternal(value) {
   const expected = snapshotCborValue(value);
   const isolated = snapshotCborValue(expected);
   try {
-    const api = await cborg();
+    const api = await codecNativePromise(cborg());
     const encoded = CODEC_BUFFER_FROM(api.encode(isolated, {
       ...api.rfc8949EncodeOptions,
       ignoreUndefinedProperties: false,
@@ -295,10 +311,10 @@ function inspectDecoded(value, seen = new CODEC_SET()) {
   CODEC_APPLY(CODEC_SET_DELETE, seen, [value]);
 }
 
-async function decodeDeterministic(input) {
+async function decodeDeterministicInternal(input) {
   const encoded = bytes(input);
   try {
-    const api = await cborg();
+    const api = await codecNativePromise(cborg());
     const value = api.decode(encoded, {
       strict: true,
       allowIndefinite: false,
@@ -309,7 +325,7 @@ async function decodeDeterministic(input) {
       rejectDuplicateMapKeys: true,
     });
     inspectDecoded(value);
-    const canonical = await encodeDeterministic(value);
+    const canonical = await codecNativePromise(encodeDeterministic(value));
     if (encoded.length !== canonical.length ||
         !CODEC_TIMING_SAFE_EQUAL(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
     return value;
@@ -319,6 +335,14 @@ async function decodeDeterministic(input) {
   }
 }
 
+// The caller's await is also a trust boundary: never expose an async return
+// whose inherited Promise constructor/then can be replaced after a key getter.
+function encodeDeterministic(value) {
+  return codecNativePromise(encodeDeterministicInternal(value));
+}
+function decodeDeterministic(input) {
+  return codecNativePromise(decodeDeterministicInternal(input));
+}
 function resolveSuite(suite = SUITE_ID, version = SUITE_VERSION) {
   if (suite !== SUITE_ID) fail("UNKNOWN_SUITE");
   if (version !== SUITE_VERSION) fail("UNSUPPORTED_SUITE_VERSION");

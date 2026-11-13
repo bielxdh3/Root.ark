@@ -2,6 +2,18 @@
 
 const crypto = require("node:crypto");
 const zk = require("../src/crypto/rootark-zk-1");
+const { types: { isProxy, isPromise } } = require("node:util");
+const { createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  verify: NATIVE_VERIFY, defineProperty: NATIVE_DEFINE_PROPERTY } =
+  require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+const NATIVE_PROMISE = Promise;
+function verifiedPromise(value) {
+  if (isProxy(value) || !isPromise(value)) fail("Non-native authorization Promise");
+  NATIVE_DEFINE_PROPERTY(value, "constructor", {
+    value: NATIVE_PROMISE, configurable: false, writable: false,
+  });
+  return value;
+}
 
 const PROOF_FIELDS = Object.freeze([
   "schemaVersion", "type", "suite", "protocolVersion", "username", "deviceId", "operationId",
@@ -86,13 +98,13 @@ function proofCore(operation, options, requireFresh = true) {
 
 async function signedBytes(core) {
   const { signature: _signature, ...unsigned } = core;
-  return Buffer.concat([Buffer.from(zk.ASCII.AUTHORIZATION, "ascii"), Buffer.from([0]), await zk.encodeDeterministic(unsigned)]);
+  return Buffer.concat([Buffer.from(zk.ASCII.AUTHORIZATION, "ascii"), Buffer.from([0]), await verifiedPromise(zk.encodeDeterministic(unsigned))]);
 }
 
 async function createAuthorizationProof(operation, options = {}) {
   if (!options.privateKey || !options.publicKey) fail("Authorization key material is required");
   const core = proofCore(operation, options);
-  core.signature = crypto.sign(null, await signedBytes(core), options.privateKey).toString("base64url");
+  core.signature = crypto.sign(null, await verifiedPromise(signedBytes(core)), options.privateKey).toString("base64url");
   return core;
 }
 
@@ -142,8 +154,8 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
     fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
   }
   assertAuthorizationEnvelopeBinding(normalized, operation);
-  const key = crypto.createPublicKey({ key: Buffer.from(normalized.publicKey, "base64url"), format: "der", type: "spki" });
-  if (!crypto.verify(null, await signedBytes(normalized), key, Buffer.from(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
+  const key = NATIVE_CREATE_PUBLIC_KEY({ key: Buffer.from(normalized.publicKey, "base64url"), format: "der", type: "spki" });
+  if (!NATIVE_VERIFY(null, await verifiedPromise(signedBytes(normalized)), key, Buffer.from(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
   return true;
 }
 

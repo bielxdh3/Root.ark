@@ -241,7 +241,7 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
   } catch (_) { deny(); }
 }
 
-async function verifySyncV2PhysicalEnvelopeEvidence(input) {
+async function verifySyncV2PhysicalEnvelopeEvidenceInternal(input) {
   try {
     const v = strict(input, ["envelope", "scope", "expectedSequence", "expectedRoot",
       "receipt", "physicalAttestation", "nonce", "pinnedInventoryPublicKey",
@@ -292,7 +292,7 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
 // AND answer a fresh challenge with the exact externally pinned physical
 // witness head. The equality rule deliberately rejects advancing histories
 // until an authenticated ancestry protocol is available.
-async function verifySyncV2HistoricalWitnessAdmission(input) {
+async function verifySyncV2HistoricalWitnessAdmissionInternal(input) {
   try {
     const v = strict(input, ["envelope", "scope", "expectedSequence", "expectedRoot",
       "receipt", "physicalAttestation", "nonce", "pinnedInventoryPublicKey",
@@ -406,6 +406,14 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
   }
 }
 
+// Pin the OUTER returned native Promise too. The consumer's own await must not
+// assimilate an attacker-installed Promise.prototype.then after a KeyObject getter.
+function verifySyncV2PhysicalEnvelopeEvidence(input) {
+  return pinnedNativeAwait(verifySyncV2PhysicalEnvelopeEvidenceInternal(input));
+}
+function verifySyncV2HistoricalWitnessAdmission(input) {
+  return pinnedNativeAwait(verifySyncV2HistoricalWitnessAdmissionInternal(input));
+}
 module.exports = { envelopeBinding, physicalWriteRequest,
   snapshotLocalDevicePolicy, verifySyncV2PhysicalEnvelopeEvidence,
   verifySyncV2HistoricalWitnessAdmission };

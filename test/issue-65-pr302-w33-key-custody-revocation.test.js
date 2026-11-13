@@ -861,3 +861,171 @@ test("P2 historical signed witness cannot admit invalid PG after hostile Promise
   assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesIo,
     false, "normal nonauthorizing positive continues to work after restored globals");
 });
+
+test("P2 historical witness cannot bypass invalid device Ed25519 signature via poisoned crypto.verify", async () => {
+  const { f, witness, args } = await historicalFixture();
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesHistoricalRead,
+    true, "real signed device + witness + PG + inventory positive");
+  const invalidEnvelope = { ...args.envelope, authorization: {
+    ...args.envelope.authorization, signature: crypto.randomBytes(64).toString("base64url"),
+  } };
+  const bound = binding.envelopeBinding(invalidEnvelope, f.scope,
+    args.expectedSequence, args.expectedRoot);
+  f.operation = bound.operation;
+  const receipt = await committed(f);
+  const pgAttestation = await physical(f);
+  const unsignedAdmission = { ...args.admission, envelopeSha256: hash64(bound.canonicalEnvelope),
+    operationId: bound.operation.operation_id.toString("base64url"),
+    inventoryReceiptSha256: hash64(receipt) };
+  delete unsignedAdmission.signature;
+  const admission = { ...unsignedAdmission, signature: crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0"),
+    Buffer.from(JSON.stringify(unsignedAdmission)),
+  ]), witness.privateKey).toString("base64url") };
+  const invalid = { ...args, envelope: invalidEnvelope,
+    receipt, physicalAttestation: pgAttestation, admission };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(invalid),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "the only invalid signature is device authorization, all other Ed25519 proofs are genuine");
+  const originalVerify = crypto.verify;
+  const hostile = Object.create(witness.publicKey);
+  let witnessGetterReads = 0, forgedVerificationCalls = 0;
+  Object.defineProperty(hostile, "type", { get() {
+    witnessGetterReads++;
+    crypto.verify = (...params) => {
+      forgedVerificationCalls++;
+      return true;
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission({
+      ...invalid, pinnedWitnessPublicKey: hostile,
+    }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "witness getter cannot replace independent device verification after its own signature");
+  } finally { crypto.verify = originalVerify; }
+  assert.ok(witnessGetterReads > 0, "native Ed25519 witness getter executed");
+  assert.equal(forgedVerificationCalls, 0,
+    "the device verifier must not consult overwritten crypto.verify after hostile getter");
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesIo,
+    false, "untampered signed control is preserved");
+});
+
+test("P2 public historical read API must not expose a Promise whose rejection can be forged", async () => {
+  const { witness, args } = await historicalFixture();
+  const invalid = { ...args, physicalAttestation: Buffer.from([0x01, 0x02, 0x03]) };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(invalid),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/);
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Promise.prototype.then;
+  const hostile = Object.create(witness.publicKey);
+  let getters = 0, diverted = 0, verdict = "not-awaited";
+  Object.defineProperty(hostile, "type", { get() {
+    getters++;
+    Object.defineProperty(Promise.prototype, "constructor", {
+      configurable: true, writable: true, value: function HostilePromise() {},
+    });
+    Promise.prototype.then = function forgedResult(onFulfilled, onRejected) {
+      if (typeof onFulfilled === "function" && typeof onRejected === "function") {
+        return Reflect.apply(originalThen, this, [onFulfilled, () => {
+          diverted++;
+          return onFulfilled({ authorizesHistoricalRead: true, authorizesIo: false });
+        }]);
+      }
+      return Reflect.apply(originalThen, this, [onFulfilled, onRejected]);
+    };
+    return "public";
+  } });
+  try {
+    const pending = binding.verifySyncV2HistoricalWitnessAdmission({
+      ...invalid, pinnedWitnessPublicKey: hostile,
+    });
+    // Deliberately DO NOT pin pending.constructor here: this is the exact
+    // caller-facing async boundary used by rootark-sync-v2.js.
+    try { await pending; verdict = "accepted"; } catch { verdict = "denied"; }
+  } finally {
+    Promise.prototype.then = originalThen;
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+  }
+  assert.ok(getters > 0, "witness getter poisoned global Promise reactions");
+  assert.equal(verdict, "denied", "the real caller cannot accept an invalid signed PG via fake Promise.then");
+  // Nested promises can still encounter the hostile reaction and fail closed;
+  // the externally visible read decision must always remain denied.
+});
+
+test("P2 public physical read API must not return an unpinned hostile-await Promise", async () => {
+  const { f, args } = await historicalFixture();
+  const invalid = { envelope: args.envelope, scope: args.scope,
+    expectedSequence: args.expectedSequence, expectedRoot: args.expectedRoot,
+    receipt: args.receipt, physicalAttestation: Buffer.from([0x01, 0x02, 0x03]),
+    nonce: args.nonce, pinnedInventoryPublicKey: args.pinnedInventoryPublicKey,
+    pinnedInventorySignerKeyId: args.pinnedInventorySignerKeyId,
+    pinnedPhysicalAttestorPublicKey: args.pinnedPhysicalAttestorPublicKey,
+    localTrustedDevicePolicy: args.localTrustedDevicePolicy };
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Promise.prototype.then;
+  const hostile = Object.create(f.signer.publicKey);
+  let getters = 0, diverted = 0, verdict = "not-awaited";
+  Object.defineProperty(hostile, "type", { get() {
+    getters++;
+    Object.defineProperty(Promise.prototype, "constructor", {
+      configurable: true, writable: true, value: function HostilePromise() {},
+    });
+    Promise.prototype.then = function forgedResult(onFulfilled, onRejected) {
+      if (typeof onFulfilled === "function" && typeof onRejected === "function") {
+        return Reflect.apply(originalThen, this, [onFulfilled, () => {
+          diverted++;
+          return onFulfilled({ localPgReadbackVerified: true, authorizesIo: false });
+        }]);
+      }
+      return Reflect.apply(originalThen, this, [onFulfilled, onRejected]);
+    };
+    return "public";
+  } });
+  try {
+    const pending = binding.verifySyncV2PhysicalEnvelopeEvidence({
+      ...invalid, pinnedInventoryPublicKey: hostile,
+    });
+    try { await pending; verdict = "accepted"; } catch { verdict = "denied"; }
+  } finally {
+    Promise.prototype.then = originalThen;
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+  }
+  assert.ok(getters > 0);
+  assert.equal(verdict, "denied", "physical binding must never expose a forger-controlled rejection");
+});
+
+test("P2 CBOR codec must never substitute signed A bytes while claiming to encode B after Promise poisoning", async () => {
+  const signedA = { type: "proof", identity: "signed-A", revision: 1 };
+  const unsignedB = { type: "proof", identity: "untrusted-B", revision: 2 };
+  const bytesA = await z.encodeDeterministic(signedA);
+  const bytesB = await z.encodeDeterministic(unsignedB);
+  assert.notDeepEqual(bytesA, bytesB, "A and B are distinct canonical CBOR records");
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Promise.prototype.then;
+  let hijacks = 0, result;
+  const forgedCodec = {
+    rfc8949EncodeOptions: {},
+    encode() { return bytesA; },
+    decode() { return unsignedB; },
+  };
+  try {
+    Object.defineProperty(Promise.prototype, "constructor", {
+      configurable: true, writable: true, value: function HostilePromise() {},
+    });
+    Promise.prototype.then = function forgedCodecAwait(onFulfilled, onRejected) {
+      if (typeof onFulfilled === "function" && typeof onRejected === "function") {
+        hijacks++;
+        return Reflect.apply(originalThen, this, [() => onFulfilled(forgedCodec), onRejected]);
+      }
+      return Reflect.apply(originalThen, this, [onFulfilled, onRejected]);
+    };
+    result = await z.encodeDeterministic(unsignedB);
+  } finally {
+    Promise.prototype.then = originalThen;
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+  }
+  assert.deepEqual(result, bytesB,
+    "the codec must bind canonical bytes B even when ambient Promise reactions are poisoned");
+  assert.equal(hijacks, 0, "no external forged codec API can enter the native await");
+});
