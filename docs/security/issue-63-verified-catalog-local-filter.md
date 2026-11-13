@@ -13,3 +13,35 @@ The existing protected-index AES-GCM primitive is not fed by the production UI. 
 **Acceptance and regression:** (1) matching names visible in the authenticated dialog, unrelated names and trash excluded from nonempty results; (2) Unicode normalization and literal special-character filtering; (3) query longer than 120 UTF-16 units denied; (4) full decryption even when a match is absent, so corruption/wrong keys cannot yield a partial list; (5) no plaintext query in outbound requests or serialized opaque snapshots; (6) old unfiltered behavior, signed readback, revocation and logout checks unchanged. Validate with the existing signed-catalog/real AES-GCM browser fixture, focused Node tests and Edge UI probe.
 
 This is partial functionality. Issue #63 remains open: secure population/lifecycle of a general protected search index, cross-device/offline semantics, richer search and wider acceptance are unresolved.
+
+## Follow-up: persistent encrypted on-device filename index (stacked draft)
+
+After the existing manual `catalog-delta-anchor` authenticates a device grant,
+externally pinned owner head, CAS/witness head and signed opaque catalog,
+`catalog-delta-list` can populate an encrypted local filename index. The first
+search still decrypts **every** current AES-GCM metadata row in the browser,
+including logical-trash rows and results past the 100-hit display limit.
+The stored record contains only an AES-256-GCM ciphertext, random 96-bit IV,
+format tag and nonsecret scope/owner/CAS pins. Its encryption key derives
+locally using HKDF-SHA-256 from the freshly imported 32-byte metadata key,
+with domain separation and account/compartment/keyring scoping. IndexedDB
+storage never receives a plaintext name or query. No raw key is persisted.
+
+On later searches (including after a page reload and a *new* authorized device
+anchor), `verifyPrivateListingHead` **re-fetches** and verifies the complete
+signed current catalog against external CAS/witness/owner pins and checks
+every opaque row before cached plaintext can be decrypted. A changed head or
+scope reindexes after a fresh full signed listing; a wrong key, tampered cache,
+revoked grant, account mismatch, rollback, unavailable trust or invalid row
+fails closed. The owner epoch/digest and exact catalog head are AEAD associated
+data. Successful browser publish, trash or restore clears that scope's local
+index; independently signed head checks protect against stale records even
+if local cache deletion fails. Search and results remain in DOM/memory after
+decryption; no filename or search term reaches an HTTP request.
+
+This is **not offline search**: the fresh independent signed check remains
+mandatory on every search. Site-data clearing removes the local cache;
+users reimport their offline 32-byte metadata key. Corpus remains filenames
+of current catalog versions only: no content full-text, cross-device transfer
+of index artifacts, search ranking or historical backup search. Issue #63
+continues beyond this bounded filename index.

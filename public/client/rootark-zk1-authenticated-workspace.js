@@ -643,6 +643,20 @@
       document.head.append(script);
     });
   }
+  async function invalidateProtectedLocalSearch(grant, assertLive) {
+    // A failed local cache delete is never authority: every subsequent read
+    // still requires the newly pinned, independently signed catalog head.
+    try {
+      if (!window.RootarkZk1ProtectedLocalSearch?.clear)
+        await loadScript("rootark-zk1-protected-local-search");
+      assertLive();
+      await window.RootarkZk1ProtectedLocalSearch.clear({
+        grant, indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+        assertLive,
+      });
+    } catch (_) { /* signed head fencing still excludes stale records */ }
+    assertLive();
+  }
   async function ensureScripts() {
     if (!loadingScripts) loadingScripts = (async () => {
       for (const name of dependencyNames) await loadScript(name);
@@ -821,7 +835,8 @@
       + '<label>Chave historica de metadados do arquivo ANTES da rotacao (raw 32 bytes; importada somente para leitura local)<input type="file" data-zk1-field="catalog-restore-source-metadata-key"></label>'
       + '<label>CEK NOVA do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-cek"></label>'
       + '<label>Chave NOVA de metadados do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-metadata"></label>'
-      + '<label>Busca por nome (somente neste navegador; vazio lista todos)<input type="search" data-zk1-field="catalog-delta-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
+      + '<label>Busca por nome (índice local AES-GCM; vazio lista todos)<input type="search" data-zk1-field="catalog-delta-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
+      + '<p class="muted">O catálogo assinado é revalidado a cada busca. O índice cifrado fica no armazenamento deste navegador, até uma mudança do catálogo ou limpeza dos dados do site. Nome e consulta não são enviados ao servidor.</p>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Buscar / listar nomes localmente (AES-GCM)</button>'
@@ -1226,6 +1241,7 @@
               || result.serverPlaintextExposed !== false
               || result.physicalDeletionAuthorized !== false
               || result.journalClearedAfterSignedProof !== true) fail();
+            await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
             field("catalog-delta-summary").textContent = "Restore cifrado · CAS #"
               + result.sequence + " · revisão " + result.revision;
             status("Restore lógico" + (rekeySelected ? " com rekey do proprietário" : "")
@@ -1253,6 +1269,7 @@
             || result.originalHistoryPreserved !== true
             || result.serverPlaintextExposed !== false
             || result.journalClearedAfterSignedProof !== true) fail();
+          await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
           field("catalog-delta-summary").textContent = "Trash lógico · CAS #"
             + result.sequence + " · revisão " + result.revision;
           status("Tombstone AES-GCM/Ed25519 publicado em nova revisão: PUT uma vez, "
@@ -1260,17 +1277,28 @@
           return;
         }
         if (action === "catalog-delta-list") {
-          // The metadata key is imported for DECRYPT only and never exported
-          // or sent to the server. Render via textContent, never HTML.
+          // Raw key material is used only locally to decrypt catalog metadata
+          // and derive the nonextractable HKDF-separated cached index key.
+          if (!window.RootarkZk1ProtectedLocalSearch?.search)
+            await loadScript("rootark-zk1-protected-local-search");
+          assertLive();
+          if (!window.RootarkZk1ProtectedLocalSearch?.search) fail();
           const raw = await fileBytes("catalog-write-key", 32, 32);
-          let metadataKey;
-          try { metadataKey = await crypto.subtle.importKey("raw", raw,
-            { name: "AES-GCM", length: 256 }, false, ["decrypt"]); }
-          finally { raw.fill(0); }
           const list = field("catalog-delta-private-list");
           list.replaceChildren();
           const term = field("catalog-delta-query")?.value || "";
-          const opened = await held.client.readPrivateListing(held.baseline, metadataKey, term);
+          let opened;
+          try {
+            opened = await window.RootarkZk1ProtectedLocalSearch.search({
+              client: held.client, baseline: held.baseline,
+              grant: trust.signedDeviceGrant,
+              ownerRevision: trust.pinnedCurrentHead.revision,
+              ownerEpoch: trust.pinnedCurrentHead.epoch,
+              ownerDigest: to64(trust.pinnedCurrentHead.digest),
+              metadataRaw: raw, term, indexedDBImpl:
+                typeof indexedDB === "object" ? indexedDB : null, assertLive,
+            });
+          } finally { raw.fill(0); }
           assertLive();
           if (opened.independentlySignedCatalog !== true
             || opened.plaintextSentToServer !== false
@@ -1297,8 +1325,10 @@
               + opened.entries.length + " exibida(s) (máximo 100) · CAS #" + opened.head.sequence
             : "Listagem local de " + opened.entries.length + " versão(ões) · CAS #"
               + opened.head.sequence;
-          status("Metadados autenticados via CAS/witness e abertos só neste navegador. "
-            + "Nenhum nome ou chave enviado ao servidor.");
+          status("CAS/witness revalidados; " + (opened.persistedIndex
+            ? opened.reusedIndex ? "índice cifrado reutilizado." : "índice local cifrado atualizado."
+            : "listagem local sem armazenamento persistente.")
+            + " Nenhum nome, chave ou consulta enviado ao servidor.");
           return;
         }
         if (action === "catalog-delta-publish") {
@@ -1341,6 +1371,7 @@
           if (result.journalClearedAfterSignedProof !== true
             || result.plaintextMetadataExposed !== false
             || result.productionDurabilityProven !== false) fail();
+          await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
           field("catalog-delta-summary").textContent = "CAS assinado #" + result.sequence;
           status("Versão cifrada enviada uma única vez, GET exato e catálogo CAS assinados. "
             + "Fixe o novo head externamente e ancore novamente em ambos os dispositivos. "
@@ -1713,6 +1744,7 @@
         assertLive();
         verifiedCatalog = null;
         if (result.verifiedSignedReadback !== true || result.productionDurabilityProven !== false) fail();
+        await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
         status("Catálogo completo #" + result.sequence + " confirmado por GET assinado + CAS: "
           + result.digest + ". " + result.totalCount + " versão(ões). Object ID: " + objectId
           + (uncertainPut ? ". ACK do PUT incerto, GET conferido." : ".")
