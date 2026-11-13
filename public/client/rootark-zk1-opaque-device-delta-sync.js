@@ -318,8 +318,10 @@
             || metadataKey.extractable !== false
             || !metadataKey.usages?.includes("decrypt")) deny();
           const { current, head, scope } = await freshPrivateListing(previous);
-          const entries = [];
-          let totalMatches = 0;
+          // The catalog is append-only history. Decrypt and validate EVERY
+          // signed row first, but search/display only the highest revision
+          // per object: an old name must not resurrect a trashed/renamed file.
+          const latestByObject = new Map();
           for (const row of current.rows) {
             assertLive();
             const name = await catalog.openMetadata({
@@ -328,20 +330,31 @@
               ciphertext: bytes(row.metadata_ciphertext, 284),
             });
             assertLive();
-            // Validate/decrypt EVERY signed row, including nonmatches and
-            // after the display cap; a bad row must fail the entire search.
-            if (!query || (name !== TRASH_NAME
-              && name.normalize("NFC").toLowerCase().includes(query))) {
-              totalMatches++;
-              if (!query || entries.length < 100) {
-                entries.push(Object.freeze({ objectId: row.object_id,
-                  revision: row.revision, epoch: row.epoch,
-                  name: name === TRASH_NAME ? null : name,
-                  logicalTrashCandidate: name === TRASH_NAME }));
-              }
+            // Preserve the max signed revision regardless of global row order.
+            // Never skip historical decryption/verification for convenience.
+            const previous = latestByObject.get(row.object_id);
+            if (!previous || row.revision > previous.revision) {
+              latestByObject.delete(row.object_id);
+              latestByObject.set(row.object_id, Object.freeze({
+                objectId: row.object_id, revision: row.revision, epoch: row.epoch,
+                name: name === TRASH_NAME ? null : name,
+                logicalTrashCandidate: name === TRASH_NAME,
+              }));
             }
           }
           assertLive();
+          const entries = [];
+          let totalMatches = 0;
+          for (const entry of latestByObject.values()) {
+            if (!query || (!entry.logicalTrashCandidate
+              && entry.name.normalize("NFC").toLowerCase().includes(query))) {
+              totalMatches++;
+              // Cap private query hits, not the full workspace listing. The
+              // signed head can contain >100 current objects, all of which
+              // must remain visible when no local filename filter is active.
+              if (!query || entries.length < 100) entries.push(entry);
+            }
+          }
           // One bad entry/key invalidates the ENTIRE list; no partial results.
           return Object.freeze({ head, scope,
             entries: Object.freeze(entries), totalMatches,
