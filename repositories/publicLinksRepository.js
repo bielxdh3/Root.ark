@@ -72,6 +72,17 @@ function getRecordedPublicLinkTokens(tokens = []) {
 function savePublicLinks(entries = {}, options = {}) {
   const db = getDb();
   const now = nowIso();
+  // A stale legacy snapshot is never evidence of capability revocation. An
+  // explicit trash lifecycle supplies the affected resource separately; the
+  // SQLite transaction revokes ALL matching C-tokens, including grants added
+  // after the caller loaded its snapshot.
+  const revocation = options.capabilityRevocation;
+  if (revocation !== undefined && (!revocation || typeof revocation !== "object"
+    || !/^[A-Za-z0-9._:-]{1,160}$/.test(revocation.folderId || "")
+    || (revocation.fileName !== undefined
+      && (!basename(revocation.fileName) || basename(revocation.fileName) !== revocation.fileName)))) {
+    throw new Error("Invalid explicit capability trash revocation scope");
+  }
   db.transaction(() => {
     ensureRootFolder(db);
     const existingRows = db.prepare(`
@@ -179,6 +190,14 @@ function savePublicLinks(entries = {}, options = {}) {
       if (/^C[a-f0-9]{47}$/.test(row.token)
         && new Date(row.expires_at).getTime() > Date.now()) continue;
       revoke.run(now, row.token);
+    }
+
+    if (revocation) {
+      db.prepare(`UPDATE public_links SET revoked_at = ?
+        WHERE revoked_at IS NULL AND folder_id = ?
+          AND token GLOB 'C*' AND LENGTH(token) = 48
+          AND (? IS NULL OR file_name = ?)`).run(now, revocation.folderId,
+        revocation.fileName ?? null, revocation.fileName ?? null);
     }
 
     const insertRevoked = db.prepare(`

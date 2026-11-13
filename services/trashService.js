@@ -411,14 +411,17 @@ function removeFileMetadata(context) {
   }
 
   const publicLinks = loaders.loadPublicLinks();
-  let linksChanged = false;
   for (const [token, link] of Object.entries(publicLinks)) {
     if ((link.folderId || "root") === folder.id && link.fileName === fileName) {
       delete publicLinks[token];
-      linksChanged = true;
     }
   }
-  if (linksChanged) loaders.savePublicLinks(publicLinks);
+  // The absence of a C-token from a legacy snapshot cannot revoke it: a
+  // concurrent exchange may have minted it after the read. Explicit trash
+  // revocation must name the resource, even when the snapshot was empty.
+  loaders.savePublicLinks(publicLinks, {
+    capabilityRevocation: { folderId: folder.id, fileName },
+  });
 }
 
 function removeFolderMetadata({ folderId, loaders }) {
@@ -521,14 +524,14 @@ function moveFolderToTrash({ folder, deletedBy, loaders }) {
 
   loaders.saveFolders(loaders.loadFolders().filter((item) => item.id !== folder.id));
   const publicLinks = loaders.loadPublicLinks();
-  let linksChanged = false;
   for (const [token, link] of Object.entries(publicLinks)) {
     if ((link.folderId || "root") === folder.id) {
       delete publicLinks[token];
-      linksChanged = true;
     }
   }
-  if (linksChanged) loaders.savePublicLinks(publicLinks);
+  loaders.savePublicLinks(publicLinks, {
+    capabilityRevocation: { folderId: folder.id },
+  });
   removeFolderMetadata({ folderId: folder.id, loaders });
 
   return trashRepository.saveTrashItem({
