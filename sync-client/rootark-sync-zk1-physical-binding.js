@@ -83,6 +83,25 @@ function pinnedNativeAwait(value) {
   });
   return value;
 }
+function ownNonThenableResult(fields, frozen = false) {
+  // Async PromiseResolve reads an *inherited* Object.prototype.then on a
+  // returned ordinary object. A native Ed25519 getter can install that
+  // property after a genuine signed check, replacing the entire result and
+  // even its hardcoded authorizesIo:false. Snapshot our own data properties
+  // into a null-prototype object BEFORE returning from any async boundary.
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let index = 0; index < keys.length; index += 1) {
+    const name = keys[index];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(fields, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, name, {
+      value: descriptor.value, enumerable: true,
+      configurable: !frozen, writable: !frozen,
+    });
+  }
+  return frozen ? NATIVE_FREEZE(result) : result;
+}
 function strict(raw, fields) {
   if (!raw || typeof raw !== "object" || isProxy(raw) || NATIVE_ARRAY_IS_ARRAY(raw)) deny();
   const prototype = NATIVE_GET_PROTOTYPE(raw);
@@ -234,10 +253,10 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
     }
     if (!chunks.length || chunks.some((chunk) => chunk.length < 1
       || chunk.length > PG_CHUNK_BYTES)) deny();
-    return { scope: bound.scope, operation: bound.operation,
+    return ownNonThenableResult({ scope: bound.scope, operation: bound.operation,
       digest: gateDigest,
       expectedRootHash: computeZk1CiphertextRoot(chunks),
-      expectedChunkCount: chunks.length, chunks };
+      expectedChunkCount: chunks.length, chunks });
   } catch (_) { deny(); }
 }
 
@@ -275,14 +294,14 @@ async function verifySyncV2PhysicalEnvelopeEvidenceInternal(input) {
       || !NATIVE_IS_SAFE_INTEGER(result.physicalReadback?.issuedAt)
       || !NATIVE_IS_SAFE_INTEGER(completedAtSeconds) || completedAtSeconds < 1
       || NATIVE_MATH_ABS(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
-    return NATIVE_FREEZE({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
+    return ownNonThenableResult({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
       operationId: NATIVE_BUFFER_FROM(bound.operation.operation_id),
       ciphertextSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
       receiptDigest: NATIVE_BUFFER_FROM(result.receiptDigest),
       localPgReadbackVerified: true,
       historicalServerAdmissionProven: false,
       independentlyAnchoredFloorProven: false,
-      externalDurabilityProven: false, authorizesIo: false });
+      externalDurabilityProven: false, authorizesIo: false }, true);
   } catch (_) { deny(); }
 }
 
@@ -394,11 +413,11 @@ async function verifySyncV2HistoricalWitnessAdmissionInternal(input) {
       || live.trustedDevicePublicKeys[bound.envelope.deviceId]
         !== bound.envelope.authorization.publicKey
       || NATIVE_ARRAY_INCLUDES.call(live.revokedDeviceIds, bound.envelope.deviceId)) deny();
-    return NATIVE_FREEZE({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
+    return ownNonThenableResult({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
       envelopeSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,
       localPgReadbackVerified: true, externalDurabilityProven: false,
-      authorizesHistoricalRead: true, authorizesIo: false });
+      authorizesHistoricalRead: true, authorizesIo: false }, true);
   } catch (_) {
     const error = new Error("SYNC_ZK1_HISTORICAL_ADMISSION_DENIED");
     error.code = error.message;

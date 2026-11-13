@@ -859,6 +859,109 @@ async function historicalFixture() {
   return { f, witness, args, initialPolicy };
 }
 
+test("P2 real signed physical and historical verifiers reject inherited then result substitution", async (t) => {
+  const { f, witness, args } = await historicalFixture();
+  const physicalArgs = {
+    envelope: args.envelope, scope: args.scope,
+    expectedSequence: args.expectedSequence, expectedRoot: args.expectedRoot,
+    receipt: args.receipt, physicalAttestation: args.physicalAttestation,
+    nonce: args.nonce, pinnedInventoryPublicKey: args.pinnedInventoryPublicKey,
+    pinnedInventorySignerKeyId: args.pinnedInventorySignerKeyId,
+    pinnedPhysicalAttestorPublicKey: args.pinnedPhysicalAttestorPublicKey,
+    localTrustedDevicePolicy: args.localTrustedDevicePolicy,
+  };
+  const cases = [
+    { label: "physical", key: f.attestor.publicKey,
+      status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
+      verify: (pin) => binding.verifySyncV2PhysicalEnvelopeEvidence({
+        ...physicalArgs, pinnedPhysicalAttestorPublicKey: pin }),
+      readFlag: "localPgReadbackVerified" },
+    { label: "historical", key: witness.publicKey,
+      status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
+      verify: (pin) => binding.verifySyncV2HistoricalWitnessAdmission({
+        ...args, pinnedWitnessPublicKey: pin }),
+      readFlag: "authorizesHistoricalRead" },
+  ];
+  for (const item of cases) {
+    await t.test(item.label, async () => {
+      const genuine = await item.verify(item.key);
+      assert.equal(genuine.status, item.status);
+      assert.equal(genuine[item.readFlag], true,
+        "real signatures and independently pinned witness/PG proof must pass");
+      assert.equal(genuine.authorizesIo, false);
+      assert.equal(genuine.externalDurabilityProven, false);
+
+      const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+      const hostile = Object.create(item.key);
+      let getterReads = 0, resultAssimilations = 0;
+      Object.defineProperty(hostile, "type", { get() {
+        getterReads++;
+        Object.defineProperty(Object.prototype, "then", {
+          configurable: true, get() {
+            const descriptor = Object.getOwnPropertyDescriptor(this, "status");
+            if (descriptor?.value !== item.status) return undefined;
+            resultAssimilations++;
+            return (resolve) => resolve(Object.assign(Object.create(null), {
+              status: item.status, [item.readFlag]: true,
+              authorizesIo: true, externalDurabilityProven: true,
+            }));
+          },
+        });
+        return "public";
+      } });
+      let result;
+      try { result = await item.verify(hostile); }
+      finally {
+        if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+        else delete Object.prototype.then;
+      }
+      assert.ok(getterReads > 0, "native Ed25519 KeyObject getter was exercised");
+      assert.equal(resultAssimilations, 0,
+        "async PromiseResolve must never consult inherited then on the verified output");
+      assert.equal(result[item.readFlag], true);
+      assert.equal(result.authorizesIo, false);
+      assert.equal(result.externalDurabilityProven, false);
+    });
+  }
+});
+
+test("P2 valid physical write request cannot assimilate a forged inherited then result", async () => {
+  const { args } = await historicalFixture();
+  const gate = crypto.randomBytes(32);
+  const invoke = () => binding.physicalWriteRequest(args.envelope, args.scope,
+    args.expectedSequence, args.expectedRoot, gate, args.localTrustedDevicePolicy);
+  const positive = await invoke();
+  assert.deepEqual(positive.digest, gate);
+  assert.ok(positive.chunks.length > 0);
+  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  let assimilated = 0, result;
+  try {
+    Object.defineProperty(Object.prototype, "then", {
+      configurable: true, get() {
+        const chunks = Object.getOwnPropertyDescriptor(this, "chunks");
+        const count = Object.getOwnPropertyDescriptor(this, "expectedChunkCount");
+        if (!chunks || !count || !Array.isArray(chunks.value)) return undefined;
+        assimilated++;
+        return (resolve) => resolve(Object.assign(Object.create(null), {
+          scope: args.scope, operation: positive.operation,
+          digest: Buffer.alloc(32, 0x6e),
+          expectedRootHash: Buffer.alloc(32, 0x7a),
+          expectedChunkCount: 0, chunks: [],
+        }));
+      },
+    });
+    result = await invoke();
+  } finally {
+    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+    else delete Object.prototype.then;
+  }
+  assert.equal(assimilated, 0,
+    "a valid device authorization must not expose a thenable write descriptor");
+  assert.deepEqual(result.digest, gate, "externally pinned CAS gate digest must be preserved");
+  assert.deepEqual(result.expectedRootHash, positive.expectedRootHash);
+  assert.equal(result.expectedChunkCount, positive.expectedChunkCount);
+});
+
 test("P2 historical signed READ denies live revoked device after witness getter changes Array.includes", async () => {
   const { witness, args, initialPolicy } = await historicalFixture();
   assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args))
