@@ -361,3 +361,150 @@ test("issue 66: failed local pin journal commit never claims pin; a verified MOV
   assert.equal(state.pushes, 0);
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/moved.txt"), "utf8"), "authenticated remote bytes");
 });
+
+test("issue 66 #278 P1: FOD-off signed out-of-scope MOVE cannot discard offline pinned bytes or consume admission", async (t) => {
+  const { rootDir, open, remote, state, adapter } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false, ["docs/a.txt"]);
+  const move = await remote("move", "object-a", "archive/a.txt", "authenticated remote bytes", 2, "docs/a.txt");
+  // The FOD fixture normally exposes full envelopes only by object ID;
+  // a legacy FOD-disabled pull lists every signed envelope.
+  const originalList = adapter.list;
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()] : originalList(objectId);
+  assert.equal(client.operationDestinationIsSelected(move), false);
+  assert.ok(client.snapshot.files["docs/a.txt"]);
+  assert.throws(() => client.preflightOutOfScopeMove(move), { code: "file_pinned" });
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  await assert.rejects(client.syncOnce(), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
+    "reject before signed admission pre-observation");
+  const afterSnapshot = JSON.parse(await fsp.readFile(snapshotFile, "utf8"));
+  const beforeParsed = JSON.parse(snapshotBefore.toString("utf8"));
+  assert.deepEqual(afterSnapshot.files, beforeParsed.files,
+    "reject before untracking the pinned source");
+  assert.deepEqual(afterSnapshot.pinnedFiles, beforeParsed.pinnedFiles);
+  assert.deepEqual(afterSnapshot.remoteOnly, beforeParsed.remoteOnly);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(fs.existsSync(path.join(rootDir, "archive/a.txt")), false);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDATE before mutation", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false);
+  const signed = await remote("update", "object-a", "docs/a.txt", "", 2,
+    undefined, "inode/directory");
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeSnapshot = await fsp.readFile(snapshotFile);
+  await assert.rejects(client.apply(signed), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal);
+  assert.deepEqual(await fsp.readFile(snapshotFile), beforeSnapshot);
+  assert.equal((await fsp.stat(path.join(rootDir, "docs/a.txt"))).isFile(), true);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
+test("issue 66 #278 P2: local regular-to-directory replacement cannot corrupt pinned snapshot", async (t) => {
+  const { rootDir, open } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false);
+  const original = await fsp.readFile(path.join(rootDir, "docs/a.txt"));
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  await fsp.unlink(path.join(rootDir, "docs/a.txt"));
+  await fsp.mkdir(path.join(rootDir, "docs/a.txt"));
+  await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+  await fsp.rmdir(path.join(rootDir, "docs/a.txt"));
+  await fsp.writeFile(path.join(rootDir, "docs/a.txt"), original);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true,
+    "durable index remains valid after safe local repair and restart");
+});
+
+test("issue 66 #278 P2: signed CREATE of existing matching ancestor directory preserves pinned child", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false);
+  const signed = await remote("create", "directory-docs", "docs", "", 1,
+    undefined, "inode/directory");
+  await client.apply(signed);
+  assert.equal((await fsp.stat(path.join(rootDir, "docs"))).isDirectory(), true);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  const restarted = await open();
+  assert.equal((await restarted.pinStatus("docs/a.txt")).pinned, true);
+  assert.equal(restarted.snapshot.files.docs.directory, true);
+  assert.equal(restarted.snapshot.files.docs.objectId, "directory-docs");
+});
+
+test("issue 66 #278 P2: ancestor CREATE cannot replace tracked directory identity of pinned child", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false);
+  await client.apply(await remote("create", "directory-docs", "docs", "", 1,
+    undefined, "inode/directory"));
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  await assert.rejects(client.apply(await remote("create", "impostor-directory",
+    "docs", "", 1, undefined, "inode/directory")), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
+test("issue 66 #278 POSIX: case-distinct existing ancestor cannot launder a pinned directory CREATE", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX case-distinct directory invariant");
+  const { rootDir, open, remote } = await fixture(t);
+  await (await open()).pinLocal("docs/a.txt");
+  const client = await open([], true, false);
+  await fsp.mkdir(path.join(rootDir, "Docs"));
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  await assert.rejects(client.apply(await remote("create", "alias-directory",
+    "Docs", "", 1, undefined, "inode/directory")), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+});
+
+test("issue 66 #278 P2: pinStatus listing passes known pins without quadratic rescan", async (t) => {
+  const { rootDir, open } = await fixture(t);
+  const client = await open();
+  const count = 128;
+  await fsp.mkdir(path.join(rootDir, "docs"), { recursive: true });
+  client.snapshot.pinnedFiles ||= {};
+  for (let i = 0; i < count; i++) {
+    const relative = `docs/pin-${i}.txt`;
+    await fsp.writeFile(path.join(rootDir, relative), "");
+    client.snapshot.pinnedFiles[`object-list-${i}`] = {
+      objectId: `object-list-${i}`, fileId: `file-list-${i}`, path: relative,
+    };
+  }
+  const pinnedObject = client.snapshot.pinnedFiles;
+  const realValues = Object.values;
+  let scans = 0;
+  Object.values = function (obj) {
+    if (obj === pinnedObject) scans++;
+    return realValues(obj);
+  };
+  try {
+    const result = await client.pinStatus();
+    assert.equal(result.files.length, count);
+    assert.equal(result.files.every((item) => item.pinned && item.localPresent), true);
+    assert.ok(scans <= 2, `pinStatus made ${scans} full pinnedFiles scans for ${count} entries`);
+  } finally {
+    Object.values = realValues;
+  }
+});
