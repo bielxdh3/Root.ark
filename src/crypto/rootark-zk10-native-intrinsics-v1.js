@@ -7,7 +7,7 @@
 // It does not defend against an untrusted script running BEFORE initial load
 // or supply independent custody, a protected process, or production I/O.
 const crypto = require("node:crypto");
-const { types: { isProxy } } = require("node:util");
+const { types: { isProxy, isPromise } } = require("node:util");
 // Capture these before the first caller-owned KeyObject getter too. Even an
 // immutable JSON encoder can be retargeted via Array.join or Buffer.from.
 // Calling a captured function through .call is insufficient: the dispatch
@@ -45,41 +45,74 @@ const SET_ADD = SET_CONSTRUCTOR.prototype.add;
 const SET_DELETE = SET_CONSTRUCTOR.prototype.delete;
 const SET_SIZE = OWN_DESCRIPTOR(SET_CONSTRUCTOR.prototype, "size").get;
 function newNativeSet() { return new SET_CONSTRUCTOR(); }
-// Native Promise reactions MUST NOT be looked up from the mutable prototype
-// after a caller-controlled KeyObject callback. Promise.race also assimilates
-// inputs through their dynamic `.then`, so install the race reactions directly
-// on real native Promises instead of using that combinator.
+// Native Promise reactions MUST NOT look up .then, constructor[Symbol.species]
+// or Promise.race after a hostile KeyObject getter. Await on a truly native
+// Promise uses its internal state only when constructor is the realm's pinned
+// intrinsic; pin that own DATA property before crossing any async boundary.
 const PROMISE_CONSTRUCTOR = Promise;
-const PROMISE_THEN = PROMISE_CONSTRUCTOR.prototype.then;
-const PROMISE_RESOLVE = PROMISE_CONSTRUCTOR.resolve.bind(PROMISE_CONSTRUCTOR);
-function newNativePromise(executor) { return new PROMISE_CONSTRUCTOR(executor); }
+function pinNativePromise(promise) {
+  if (isProxy(promise) || !isPromise(promise)) throw new TypeError("not a native Promise");
+  DEFINE_PROPERTY(promise, "constructor", { value: PROMISE_CONSTRUCTOR,
+    enumerable: false, configurable: false, writable: false });
+  return promise;
+}
+function newNativePromise(executor) {
+  return pinNativePromise(new PROMISE_CONSTRUCTOR(executor));
+}
+function nativePromiseThen(onFulfilled, onRejected) {
+  const source = this;
+  return pinNativePromise((async () => {
+    try {
+      const value = await source;
+      return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+    } catch (error) {
+      if (typeof onRejected === "function") return onRejected(error);
+      throw error;
+    }
+  })());
+}
 function nativePromiseRace(first, second, third) {
-  return new PROMISE_CONSTRUCTOR((resolve, reject) => {
-    APPLY(PROMISE_THEN, first, [resolve, reject]);
-    APPLY(PROMISE_THEN, second, [resolve, reject]);
-    APPLY(PROMISE_THEN, third, [resolve, reject]);
+  return newNativePromise((resolve, reject) => {
+    const observe = (candidate) => {
+      void (async () => {
+        try { resolve(await candidate); } catch (error) { reject(error); }
+      })();
+    };
+    observe(first);
+    observe(second);
+    observe(third);
   });
 }
 function invokeNativeRead(callback) {
-  return new PROMISE_CONSTRUCTOR((resolve, reject) => {
+  return newNativePromise((resolve, reject) => {
     // Wait one genuine microtask before entering the external adapter; caller
     // must reserve its slot synchronously before the adapter gets control.
-    APPLY(PROMISE_THEN, PROMISE_RESOLVE(), [() => {
+    void (async () => {
+      await newNativePromise((ready) => ready());
+      let outcome;
       try {
-        const outcome = callback();
-        const accept = (value) => resolve({ settled: true, value });
-        if (outcome instanceof PROMISE_CONSTRUCTOR) {
-          // The native internal promise slot, not a replaced `.then` getter,
-          // determines when the external authority's work really completes.
-          APPLY(PROMISE_THEN, outcome, [accept, reject]);
-        } else if (outcome !== null && (typeof outcome === "object" || typeof outcome === "function")
-          && typeof outcome.then === "function") {
-          reject(new TypeError("CURRENT authority must return a native Promise"));
-        } else {
-          accept(outcome);
+        outcome = callback();
+      } catch (_) {
+        // A caller may start external work and then throw. There is no proof
+        // the read stopped; retain the occupied slot fail-closed.
+        return;
+      }
+      if (outcome !== null && (typeof outcome === "object" || typeof outcome === "function")) {
+        if (isPromise(outcome) && !isProxy(outcome)) {
+          try { pinNativePromise(outcome); } catch (_) { return; }
+          try { resolve({ settled: true, value: await outcome }); }
+          catch (error) { reject(error); }
+          return;
         }
-      } catch (error) { reject(error); }
-    }, reject]);
+        // Never adopt a foreign/custom thenable: it can settle its callback
+        // while real I/O still runs. Nor may rejection release this read slot.
+        // An unsupported asynchronous return keeps the quota until restart.
+        let then;
+        try { then = outcome.then; } catch (_) { return; }
+        if (typeof then === "function") return;
+      }
+      resolve({ settled: true, value: outcome });
+    })();
   });
 }
 
@@ -221,7 +254,7 @@ module.exports = Object.freeze({
   setDelete: withSafeCall(SET_DELETE),
   setSize: withSafeCall(SET_SIZE),
   newNativePromise,
-  nativePromiseThen: withSafeCall(PROMISE_THEN),
+  nativePromiseThen: withSafeCall(nativePromiseThen),
   nativePromiseRace,
   invokeNativeRead,
   hashUpdate: withSafeCall(OWN_DESCRIPTOR(prototype, "update").value),

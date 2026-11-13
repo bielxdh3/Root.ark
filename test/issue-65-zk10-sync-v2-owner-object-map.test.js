@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const vm = require("node:vm");
 const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { DOMAIN: SOURCE_DOMAIN, verifyPinnedAtomicOwnerProvision } =
@@ -360,6 +361,79 @@ test("P2: native key callback cannot invoke Promise.then cleanup before CURRENT 
     for (const call of outstanding) call.resolve(signedHead(f, call.challenge));
     for (let i = 0; i < 5; i += 1) await Promise.resolve();
   }
+});
+
+test("P2: cross-realm native Promise keeps its true outstanding read slot until settlement", async () => {
+  const f = await fixture();
+  const ForeignPromise = vm.runInNewContext("Promise");
+  const calls = [];
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority,
+      readCurrentHead: (challenge, { signal }) => new ForeignPromise((resolve) => {
+        calls.push({ challenge, signal, resolve });
+      }),
+    },
+  }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(calls.length, 1, "a cross-realm native Promise must reach the real adapter");
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(calls.length, 1,
+    "a foreign unresolved native Promise cannot free its physical pending slot early");
+  calls[0].resolve(signedHead(f, calls[0].challenge));
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  const fresh = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: (challenge) =>
+      new ForeignPromise((resolve) => resolve(signedHead(f, challenge))) },
+  });
+  assert.equal((await fresh(f.input)).authorizesIo, false,
+    "settled genuine foreign-realm Ed25519 authority response remains supported");
+});
+
+test("P2: unsupported async thenable cannot free a still-running adapter read slot", async () => {
+  const f = await fixture();
+  let externalReads = 0;
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: () => {
+      externalReads += 1;
+      const trulyRunningRead = new Promise(() => {});
+      return { then(resolve) { void trulyRunningRead; void resolve; } };
+    } },
+  }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(externalReads, 1);
+  await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  assert.equal(externalReads, 1,
+    "a rejected unsupported thenable cannot manufacture a completed physical read");
+});
+
+test("P2: hostile Promise species cannot redirect native reactions or disable genuine signed head", async () => {
+  const f = await fixture();
+  const { newNativePromise, nativePromiseThen, nativePromiseRace } =
+    require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+  const real = newNativePromise((resolve) => resolve(12));
+  const original = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+  assert.ok(original && original.configurable, "native Promise species must be poisonable");
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  });
+  let next, race, signed;
+  try {
+    Object.defineProperty(Promise, Symbol.species, { configurable: true,
+      get() { throw new Error("hostile Promise species getter"); } });
+    next = nativePromiseThen.call(real, (value) => value);
+    race = nativePromiseRace(real, next, newNativePromise(() => {}));
+    signed = verify(f.input);
+  } finally {
+    Object.defineProperty(Promise, Symbol.species, original);
+  }
+  assert.equal(await next, 12);
+  assert.equal(await race, 12);
+  assert.equal((await signed).ownerMappingVerified, true,
+    "real signed authority does not depend on poisoned global species");
 });
 
 test("P2: pinned native Set add/delete/size ignore later same-realm prototype changes", () => {
