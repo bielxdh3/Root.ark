@@ -80,7 +80,10 @@ function savePublicLinks(entries = {}, options = {}) {
   if (revocation !== undefined && (!revocation || typeof revocation !== "object"
     || !/^[A-Za-z0-9._:-]{1,160}$/.test(revocation.folderId || "")
     || (revocation.fileName !== undefined
-      && (!basename(revocation.fileName) || basename(revocation.fileName) !== revocation.fileName)))) {
+      && (!basename(revocation.fileName) || basename(revocation.fileName) !== revocation.fileName))
+    || (revocation.aliases !== undefined
+      && (revocation.fileName === undefined || !Array.isArray(revocation.aliases)
+        || revocation.aliases.some((name) => !basename(name) || basename(name) !== name))))) {
     throw new Error("Invalid explicit capability trash revocation scope");
   }
   db.transaction(() => {
@@ -193,28 +196,19 @@ function savePublicLinks(entries = {}, options = {}) {
     }
 
     if (revocation) {
-      if (process.platform === "win32" && revocation.fileName !== undefined) {
-        // The same physical NTFS file can have old C-token grants recorded
-        // under multiple case aliases. SQLite NOCASE only folds ASCII, so
-        // compare Unicode spellings under the same IMMEDIATE transaction.
-        const rows = db.prepare(`SELECT token, file_name FROM public_links
+      if (revocation.fileName !== undefined) {
+        // Aliases are explicit directory-entry identities verified against the
+        // live file BEFORE trash rename, never guessed using Unicode casefold.
+        const revokeNamed = db.prepare(`UPDATE public_links SET revoked_at = ?
           WHERE revoked_at IS NULL AND folder_id = ?
-            AND token GLOB 'C*' AND LENGTH(token) = 48`).all(revocation.folderId);
-        const canonicalFold = revocation.fileName.toLowerCase();
-        for (const row of rows) {
-          if (/^C[a-f0-9]{47}$/.test(row.token)
-            && typeof row.file_name === "string"
-            && row.file_name.toLowerCase() === canonicalFold) {
-            revoke.run(now, row.token);
-          }
+            AND token GLOB 'C*' AND LENGTH(token) = 48 AND file_name = ?`);
+        for (const fileName of new Set([revocation.fileName, ...(revocation.aliases || [])])) {
+          revokeNamed.run(now, revocation.folderId, fileName);
         }
       } else {
-        // POSIX files named A.txt and a.txt are distinct physical objects.
         db.prepare(`UPDATE public_links SET revoked_at = ?
           WHERE revoked_at IS NULL AND folder_id = ?
-            AND token GLOB 'C*' AND LENGTH(token) = 48
-            AND (? IS NULL OR file_name = ?)`).run(now, revocation.folderId,
-          revocation.fileName ?? null, revocation.fileName ?? null);
+            AND token GLOB 'C*' AND LENGTH(token) = 48`).run(now, revocation.folderId);
       }
     }
 

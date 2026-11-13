@@ -13116,6 +13116,10 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   } catch (_error) {
     return res.status(409).json({ error: "Nome fisico ambiguo para exclusao" });
   }
+  const physicalNameIsStable = (directory) => {
+    try { return trashService.resolvePhysicalFileName(directory, name) === name; }
+    catch (_error) { return false; }
+  };
 
   if (!hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
@@ -13130,7 +13134,7 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!hasFileEditAccess(req, currentFolderRecord, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (isFileInTrash(currentFolderRecord.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
-    if (trashService.resolvePhysicalFileName(currentFolder.uploadDir, name) !== name) {
+    if (!physicalNameIsStable(currentFolder.uploadDir)) {
       return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
     }
     const filePath = path.join(currentFolder.uploadDir, name);
@@ -13140,7 +13144,7 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
     if (!hasFolderAccess(req, publishFolder) || !canMoveToTrash(req) || !hasFileEditAccess(req, publishFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (isFileInTrash(publishFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
-    if (trashService.resolvePhysicalFileName(currentFolder.uploadDir, name) !== name) {
+    if (!physicalNameIsStable(currentFolder.uploadDir)) {
       return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
     }
     const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;

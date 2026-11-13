@@ -193,3 +193,144 @@ test("issue 68 P1: real folder trash and restore never reactivate a revoked SQLi
   });
   assert.match(result, /LIFECYCLE_PASS/);
 });
+
+test("issue 68 Windows Unicode alias cannot select a different physical directory entry", (t) => {
+  if (process.platform !== "win32") return t.skip("NTFS-specific name equivalence");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-physical-case-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const physicalName = "\u0130.txt";
+  const unboundAlias = "i\u0307.txt";
+  fs.writeFileSync(path.join(dir, physicalName), "real file must survive");
+  if (fs.existsSync(path.join(dir, unboundAlias))) {
+    return t.skip("this filesystem actually resolves the Unicode alias");
+  }
+  const { resolvePhysicalFileName } = require("../services/trashService");
+  assert.equal(resolvePhysicalFileName(dir, physicalName), physicalName);
+  assert.equal(resolvePhysicalFileName(dir, unboundAlias), unboundAlias,
+    "JS lowercase equivalence is not proof that the requested path exists on NTFS");
+  assert.equal(fs.readFileSync(path.join(dir, physicalName), "utf8"),
+    "real file must survive");
+});
+
+test("issue 68 Windows non-exact hardlink alias is ambiguous and cannot select a victim", (t) => {
+  if (process.platform !== "win32") return t.skip("NTFS-specific hardlink names");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-physical-hardlink-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const physical = path.join(dir, "Documento.txt");
+  const hardlink = path.join(dir, "Outro.txt");
+  fs.writeFileSync(physical, "retain both directory names");
+  try { fs.linkSync(physical, hardlink); }
+  catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+      return t.skip("Hardlinks unavailable in this disposable filesystem");
+    }
+    throw error;
+  }
+  const { resolvePhysicalFileName } = require("../services/trashService");
+  assert.throws(() => resolvePhysicalFileName(dir, "documento.txt"), /ambiguo/);
+  assert.equal(fs.readFileSync(physical, "utf8"), "retain both directory names");
+  assert.equal(fs.readFileSync(hardlink, "utf8"), "retain both directory names");
+});
+
+test("issue 68 Windows Unicode capability revocation cannot tombstone unproven aliases", (t) => {
+  if (process.platform !== "win32") return t.skip("NTFS-specific name equivalence");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-unicode-capability-"));
+  const previous = { DB_ENABLED: process.env.DB_ENABLED, DATABASE_URL: process.env.DATABASE_URL };
+  process.env.DB_ENABLED = "true";
+  process.env.DATABASE_URL = path.join(dir, "rootark.sqlite");
+  const { closeDb } = require("../db");
+  const { runMigrations } = require("../db/migrations");
+  const repository = require("../repositories/publicLinksRepository");
+  t.after(() => {
+    closeDb();
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
+  const physicalName = "\u0130.txt";
+  const unboundAlias = "i\u0307.txt";
+  fs.writeFileSync(path.join(dir, physicalName), "real");
+  if (fs.existsSync(path.join(dir, unboundAlias))) {
+    return t.skip("this filesystem actually resolves the Unicode alias");
+  }
+  const physicalToken = `C${"a".repeat(47)}`;
+  const unrelatedToken = `C${"b".repeat(47)}`;
+  const entry = (name) => ({
+    folderId: "root", fileName: name, shareKind: "capability-v1",
+    resourceBinding: { version: 2, folderId: "root", fileName: name,
+      identity: "e".repeat(64) }, createdBy: "tester",
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    permissions: ["download"],
+  });
+  assert.equal(repository.createCapability(physicalToken, entry(physicalName)).status, "ok");
+  assert.equal(repository.createCapability(unrelatedToken, entry(unboundAlias)).status, "ok");
+  repository.savePublicLinks(repository.loadPublicLinks(), {
+    capabilityRevocation: { folderId: "root", fileName: physicalName },
+  });
+  assert.equal(repository.loadPublicLinks()[physicalToken], undefined);
+  assert.ok(repository.loadPublicLinks()[unrelatedToken],
+    "different nonexistent Unicode spelling is not proven to be the same file");
+});
+
+test("issue 68 Windows trash does not rescan the directory per legacy capability alias", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows capability alias enumeration");
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-alias-linear-"));
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const script = `
+    "use strict";
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const root = ${JSON.stringify(path.resolve(__dirname, ".."))};
+    const repository = require(path.join(root, "repositories/publicLinksRepository"));
+    const trash = require(path.join(root, "services/trashService"));
+    require(path.join(root, "db/migrations")).runMigrations({ backup: false });
+    const dir = path.join(process.cwd(), "uploads");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "Arquivo.txt"), "known physical bytes");
+    const folder = { id: "root", name: "Root", uploadDir: dir };
+    const tokens = Array.from({ length: 48 }, (_, i) =>
+      "C" + (i + 1).toString(16).padStart(47, "0"));
+    const entry = () => ({ folderId: "root", fileName: "arquivo.txt",
+      shareKind: "capability-v1", createdBy: "tester",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 600000).toISOString(),
+      resourceBinding: { version: 2, folderId: "root",
+        fileName: "arquivo.txt", identity: "e".repeat(64) },
+      permissions: ["download"] });
+    for (const token of tokens) {
+      assert.equal(repository.createCapability(token, entry()).status, "ok");
+    }
+    const empty = () => ({});
+    const loaders = {
+      loadFilePermissions: empty, saveFilePermissions: () => {},
+      loadFileExpirations: empty, saveFileExpirations: () => {},
+      loadFileVersions: empty, saveFileVersions: () => {},
+      loadEncryptedFiles: empty, saveEncryptedFiles: () => {},
+      loadPublicLinks: () => repository.loadPublicLinks(),
+      savePublicLinks: (entries, options) => repository.savePublicLinks(entries, options),
+    };
+    let scans = 0;
+    const original = fs.readdirSync;
+    fs.readdirSync = function (...args) { scans++; return original.apply(this, args); };
+    try {
+      trash.moveFileToTrash({ folder, fileName: "Arquivo.txt",
+        deletedBy: "tester", loaders });
+    } finally { fs.readdirSync = original; }
+    assert.ok(scans <= 10, "must not reread directory once per token: " + scans);
+    assert.equal(fs.existsSync(path.join(dir, "Arquivo.txt")), false);
+    for (const token of tokens) assert.equal(repository.loadPublicLinks()[token], undefined);
+    console.log("LINEAR_ALIAS_SCAN_PASS");
+  `;
+  const result = execFileSync(process.execPath, ["-e", script], {
+    cwd: sandbox,
+    env: { ...process.env, DB_ENABLED: "true",
+      DATABASE_URL: path.join(sandbox, "rootark.sqlite") },
+    timeout: 30_000, windowsHide: true, encoding: "utf8",
+  });
+  assert.match(result, /LINEAR_ALIAS_SCAN_PASS/);
+});
