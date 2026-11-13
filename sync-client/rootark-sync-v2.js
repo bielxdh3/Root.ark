@@ -49,13 +49,26 @@ function normalizeTrustedDevicePolicy(config) {
 
 function args(argv) {
   const result = {};
+  const valuedOptions = new Set(["config", "path", "limit", "cursor"]);
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
-    if (!item.startsWith("--")) continue;
-    const key = item.slice(2);
-    const value = argv[index + 1];
-    result[key] = value && !value.startsWith("--") ? value : true;
-    if (result[key] !== true) index += 1;
+    if (!item.startsWith("--")) throw new Error("Invalid Sync v2 option");
+    const separator = item.indexOf("=");
+    const key = item.slice(2, separator < 0 ? undefined : separator);
+    if (Object.hasOwn(result, key)) throw new Error(`Invalid Sync v2 duplicate --${key}`);
+    if (key === "once" && separator < 0) {
+      const next = argv[index + 1];
+      result.once = next === "true" || next === "false" ? (index++, next === "true") : true;
+    } else if (valuedOptions.has(key)) {
+      const value = separator < 0 ? argv[index + 1] : item.slice(separator + 1);
+      if (!value || (separator < 0 && value.startsWith("--"))) {
+        throw new Error(`Invalid Sync v2 --${key} value`);
+      }
+      result[key] = value;
+      if (separator < 0) index += 1;
+    } else {
+      throw new Error(`Invalid Sync v2 option --${key}`);
+    }
   }
   return result;
 }
@@ -409,5 +422,5 @@ if (require.main === module) {
     + "Files On-Demand: node sync-client/rootark-sync-v2.js browse|hydrate|evict|pin|unpin|status --config <private-config> [--path relative/file]");
 }
 
-module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
+module.exports = { args, fileKeyResolver, normalizeTrustedDevicePolicy,
   trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity, start };
