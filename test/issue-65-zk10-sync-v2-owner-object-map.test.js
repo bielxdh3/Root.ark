@@ -512,6 +512,95 @@ test("P2: hostile Ed25519 getter cannot rewind the CURRENT head monotonic deadli
   assert.ok(Date.now() - startedAt >= 20, "external callback blocked longer than expiry");
 });
 
+test("P2: hostile Ed25519 getter cannot suppress actual caller AbortSignal cancellation", async () => {
+  const f = await fixture();
+  const caller = new AbortController();
+  const nativeAbort = AbortController.prototype.abort;
+  const nativeAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted");
+  const originalAdd = EventTarget.prototype.addEventListener;
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle && nativeAborted?.get);
+  const injected = Object.create(keys.source.publicKey);
+  let getterReads = 0, forgedEventAdds = 0;
+  Object.defineProperty(injected, handle, { get() {
+    getterReads++;
+    Object.defineProperty(AbortSignal.prototype, "aborted", {
+      configurable: true, get() { return false; },
+    });
+    EventTarget.prototype.addEventListener = function ignoredAbort() {
+      forgedEventAdds++;
+    };
+    return keys.source.publicKey[handle];
+  } });
+  const calls = [];
+  let reached;
+  const dispatched = new Promise((resolve) => { reached = resolve; });
+  let pending;
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...f.authority,
+        readCurrentHead: (challenge, { signal }) => new Promise((resolve) => {
+          calls.push({ challenge, signal, resolve });
+          reached();
+        }) },
+    }, { headTimeoutMs: 1000, maxPendingHeadReads: 1 });
+    assert.ok(getterReads > 0, "genuine native Ed25519 handle getter executed");
+    pending = verify(f.input, { signal: caller.signal });
+    await withinHeadDeadline(dispatched);
+    Reflect.apply(nativeAbort, caller, []);
+    assert.equal(Reflect.apply(nativeAborted.get, caller.signal, []), true,
+      "actual caller AbortSignal is cancelled despite poisoned prototype getter");
+    calls[0].resolve(signedHead(f, calls[0].challenge));
+    await withinHeadDeadline(assert.rejects(pending, deny), 500);
+    assert.equal(forgedEventAdds, 0, "native abort listener is never intercepted");
+  } finally {
+    EventTarget.prototype.addEventListener = originalAdd;
+    Object.defineProperty(AbortSignal.prototype, "aborted", nativeAborted);
+    for (const call of calls) call.resolve(signedHead(f, call.challenge));
+    if (pending) await Promise.race([pending.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 100))]);
+  }
+});
+
+test("P2: hostile Ed25519 getter cannot prevent native timeout abort on external read", async () => {
+  const f = await fixture();
+  const nativeAbort = AbortController.prototype.abort;
+  const nativeAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  const injected = Object.create(keys.source.publicKey);
+  let getterReads = 0, forgedAbortCalls = 0;
+  Object.defineProperty(injected, handle, { get() {
+    getterReads++;
+    AbortController.prototype.abort = function ignoredAbort() { forgedAbortCalls++; };
+    return keys.source.publicKey[handle];
+  } });
+  const calls = [];
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...f.authority,
+        readCurrentHead: (challenge, { signal }) =>
+          new Promise((resolve) => calls.push({ resolve, challenge, signal })) },
+    }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+    assert.ok(getterReads > 0);
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+    assert.equal(calls.length, 1, "external adapter must actually be reached");
+    assert.equal(Reflect.apply(nativeAborted, calls[0].signal, []), true,
+      "the real native AbortController must abort after timeout");
+    assert.equal(forgedAbortCalls, 0, "native abort cannot dispatch to poisoned prototype method");
+  } finally {
+    AbortController.prototype.abort = nativeAbort;
+    for (const call of calls) call.resolve(signedHead(f, call.challenge));
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  }
+});
+
 test("P2: pinned native Set add/delete/size ignore later same-realm prototype changes", () => {
   const { newNativeSet, setAdd, setDelete, setSize } =
     require("../src/crypto/rootark-zk10-native-intrinsics-v1");

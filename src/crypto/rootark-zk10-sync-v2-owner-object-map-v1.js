@@ -27,6 +27,7 @@ const {
   hasOwn: NATIVE_HAS_OWN,
   objectCreate: NATIVE_OBJECT_CREATE,
   defineProperty: NATIVE_DEFINE_PROPERTY,
+  apply: NATIVE_APPLY,
   newNativeSet: NATIVE_SET_CREATE,
   setAdd: NATIVE_SET_ADD,
   setDelete: NATIVE_SET_DELETE,
@@ -80,6 +81,20 @@ const NATIVE_CLEAR_TIMEOUT = clearTimeout;
 const NATIVE_HRTIME_BIGINT = process.hrtime.bigint.bind(process.hrtime);
 const NATIVE_ABORT_CONTROLLER = AbortController;
 const NATIVE_ABORT_SIGNAL = AbortSignal;
+const NATIVE_ABORT = NATIVE_ABORT_CONTROLLER.prototype.abort;
+const NATIVE_CONTROLLER_SIGNAL = Object.getOwnPropertyDescriptor(
+  NATIVE_ABORT_CONTROLLER.prototype, "signal").get;
+const NATIVE_SIGNAL_ABORTED = Object.getOwnPropertyDescriptor(
+  NATIVE_ABORT_SIGNAL.prototype, "aborted").get;
+const NATIVE_EVENT_ADD = EventTarget.prototype.addEventListener;
+const NATIVE_EVENT_REMOVE = EventTarget.prototype.removeEventListener;
+function nativeAborted(signal) {
+  return signal !== undefined && NATIVE_APPLY(NATIVE_SIGNAL_ABORTED, signal, []) === true;
+}
+function nativeAbort(controller) {
+  try { NATIVE_APPLY(NATIVE_ABORT, controller, []); }
+  catch (_) { /* Deadline/cancellation still settles fail-closed. */ }
+}
 // Timeout/cancellation returns control to JS, but a noncooperative external
 // adapter still owns its underlying promise until it actually settles.
 const globalPendingHeadReads = NATIVE_SET_CREATE();
@@ -324,33 +339,34 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     if (typeof a.readCurrentHead !== "function") deny();
     const pendingHeadReads = NATIVE_SET_CREATE();
     async function boundedCurrentHead(challenge, signal) {
-      if (signal?.aborted || NATIVE_SET_SIZE.call(pendingHeadReads) >= maxPendingHeadReads
+      if (nativeAborted(signal) || NATIVE_SET_SIZE.call(pendingHeadReads) >= maxPendingHeadReads
         || NATIVE_SET_SIZE.call(globalPendingHeadReads) >= MAX_GLOBAL_PENDING_HEAD_READS) deny();
       const controller = new NATIVE_ABORT_CONTROLLER();
+      const controllerSignal = NATIVE_APPLY(NATIVE_CONTROLLER_SIGNAL, controller, []);
       // Timers can run late if an adapter blocks the JS event loop. Reject a
       // result even if its microtask beats an overdue timeout callback.
       const expiresAt = NATIVE_HRTIME_BIGINT() + BigInt(headTimeoutMs) * 1000000n;
       let timer, onCancel;
       const deadline = NATIVE_PROMISE_CREATE((resolve) => {
         timer = NATIVE_SET_TIMEOUT(() => {
-          controller.abort();
+          nativeAbort(controller);
           resolve({ settled: false });
         }, headTimeoutMs);
       });
       const cancelled = NATIVE_PROMISE_CREATE((resolve) => {
         if (signal) {
           onCancel = () => {
-            controller.abort();
+            nativeAbort(controller);
             resolve({ settled: false });
           };
-          signal.addEventListener("abort", onCancel, { once: true });
+          NATIVE_APPLY(NATIVE_EVENT_ADD, signal, ["abort", onCancel, { once: true }]);
         }
       });
       // Reserve capacity BEFORE invoking an untrusted async adapter. A late
       // result never re-enters verification and never frees its slot early.
       const pending = NATIVE_PROMISE_READ(() => {
-        if (controller.signal.aborted) deny();
-        return a.readCurrentHead(challenge, { signal: controller.signal });
+        if (nativeAborted(controllerSignal)) deny();
+        return a.readCurrentHead(challenge, { signal: controllerSignal });
       });
       NATIVE_SET_ADD.call(pendingHeadReads, pending);
       NATIVE_SET_ADD.call(globalPendingHeadReads, pending);
@@ -361,15 +377,15 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         const result = await NATIVE_PROMISE_RACE(
           NATIVE_PROMISE_THEN.call(pending, (value) => value,
             () => ({ settled: false })), deadline, cancelled);
-        if (!result.settled || controller.signal.aborted || signal?.aborted
+        if (!result.settled || nativeAborted(controllerSignal) || nativeAborted(signal)
           || NATIVE_HRTIME_BIGINT() >= expiresAt) {
-          controller.abort();
+          nativeAbort(controller);
           deny();
         }
         return result.value;
       } finally {
         NATIVE_CLEAR_TIMEOUT(timer);
-        if (onCancel) signal.removeEventListener("abort", onCancel);
+        if (onCancel) NATIVE_APPLY(NATIVE_EVENT_REMOVE, signal, ["abort", onCancel]);
       }
     }
     let lastAcceptedSequence = 0;
@@ -377,7 +393,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       try {
         const signal = control === undefined ? undefined : exact(control, ["signal"]).signal;
         if (signal !== undefined && !(signal instanceof NATIVE_ABORT_SIGNAL)) deny();
-        if (signal?.aborted) deny();
+        if (nativeAborted(signal)) deny();
         const r = exact(input, INPUT_FIELDS);
         const { payload, signature } = unpackMap(r.ownerMapping);
         const digest = sha(NATIVE_BUFFER_CONCAT([signedBytes(OWNER_DOMAIN, payload), signature]));
@@ -454,7 +470,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           || NATIVE_ARRAY_INCLUDES.call(localPolicy.revokedDeviceIds, device)) deny();
         // Two concurrent readbacks may both be valid. The sequence is consumed
         // only after the awaited authority verification, on the same JS turn.
-        if (signal?.aborted || payload.mapping_sequence <= lastAcceptedSequence) deny();
+        if (nativeAborted(signal) || payload.mapping_sequence <= lastAcceptedSequence) deny();
         lastAcceptedSequence = payload.mapping_sequence;
         return NATIVE_FREEZE({
           status: "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING",
