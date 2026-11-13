@@ -1205,7 +1205,7 @@ function loadPublicLinks() {
   return JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
 }
 
-function savePublicLinks(entries = {}) {
+function savePublicLinks(entries = {}, options = {}) {
   const nextEntries = entries && typeof entries === "object" ? entries : {};
   let removedFallbackEntries = {};
   if (shouldUseDatabase() && shouldReadJsonFallback() && fs.existsSync(PUBLIC_LINKS_FILE)) {
@@ -1215,7 +1215,11 @@ function savePublicLinks(entries = {}) {
     );
   }
   if (shouldUseDatabase()) {
-    publicLinksRepository.savePublicLinks(nextEntries, { removedEntries: removedFallbackEntries });
+    publicLinksRepository.savePublicLinks(nextEntries, {
+      removedEntries: removedFallbackEntries,
+      ...(options.capabilityRevocation
+        ? { capabilityRevocation: options.capabilityRevocation } : {}),
+    });
   }
   if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(nextEntries, null, 2));
   broadcastDataChanged("shares");
@@ -12515,16 +12519,13 @@ app.post("/share/c/exchange", shareRateLimit, requireSameOriginPublicShareMutati
       // Construct an own-property-only, prototype-less session dictionary.
       // Even legacy JSON with hostile keys must never turn a dynamic key into
       // a prototype setter; persisted session IDs are independently checked.
-      const sessions = Object.create(null);
-      for (const [id, item] of previous) {
-        Object.defineProperty(sessions, id, {
-          value: item, enumerable: true, writable: true, configurable: true,
-        });
-      }
-      Object.defineProperty(sessions, alias, {
-        value: { hash: capabilitySessionHash(alias, cookie), expiresAt },
-        enumerable: true, writable: true, configurable: true,
-      });
+      // Object.fromEntries defines own data properties without interpreting
+      // "__proto__" as a setter. Detach the resulting dictionary prototype
+      // before persistence; no untrusted key is ever dynamically assigned.
+      const sessions = Object.fromEntries([...previous, [
+        alias, { hash: capabilitySessionHash(alias, cookie), expiresAt },
+      ]]);
+      Object.setPrototypeOf(sessions, null);
       link.capabilitySessions = sessions;
       savePublicLinks(links);
     }
