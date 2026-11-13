@@ -128,8 +128,10 @@ function verifySparseObjectInventoryProof(accountId, generation, object, sibling
     || NATIVE_OWN_KEYS(siblings).length !== 257) deny();
   let position = inventoryPosition(entry);
   let current = inventoryLeaf(entry);
-  for (const sibling of siblings) {
-    const bytes = NATIVE_BUFFER_FROM(hex(sibling), "hex");
+  // Caller callbacks may poison Array.prototype[Symbol.iterator] before this
+  // read. Use the indexed 256 DATA slots, never an ambient iterator.
+  for (let depth = 0; depth < 256; depth += 1) {
+    const bytes = NATIVE_BUFFER_FROM(hex(siblings[depth]), "hex");
     current = position & 1n
       ? sha(INVENTORY_NODE, bytes, current) : sha(INVENTORY_NODE, current, bytes);
     position >>= 1n;

@@ -225,6 +225,23 @@ function copyJson(value, depth = 0, budget = { nodes: 0, bytes: 0 }) {
   return result;
 }
 
+function snapshotSparseProof(proof) {
+  // The signed Merkle protocol requires 256 siblings; generic copyJson caps
+  // arrays at 128. Capture every own DATA slot before any async authorization.
+  // Never invoke caller getters, proxies or user-supplied iterators.
+  if (isProxy(proof) || !NATIVE_ARRAY_IS_ARRAY(proof) || proof.length !== 256
+    || NATIVE_OWN_KEYS(proof).length !== 257) deny();
+  const result = [];
+  for (let index = 0; index < 256; index += 1) {
+    const descriptor = NATIVE_OWN_DESCRIPTOR(proof, String(index));
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    const sibling = hex(descriptor.value);
+    NATIVE_DEFINE_PROPERTY(result, String(index), { value: sibling,
+      enumerable: true, configurable: false, writable: false });
+  }
+  return NATIVE_FREEZE(result);
+}
+
 function headLimits(value) {
   const limits = value === undefined
     ? { headTimeoutMs: DEFAULT_HEAD_TIMEOUT_MS,
@@ -381,6 +398,11 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           || normalized.compartmentId !== identity.compartmentId) deny();
         const epochMatch = EPOCH.exec(normalized.keyEpoch);
         if (!epochMatch || !Number.isSafeInteger(Number(epochMatch[1]))) deny();
+        // Bind both caller-owned ZK inputs BEFORE the first await. Neither
+        // ciphertext nor the sparse proof may change during authorization.
+        const target = exact(copyJson(r.zkObject),
+          ["object_id", "revision", "epoch", "ciphertext"]);
+        const membershipProof = snapshotSparseProof(r.zkMembershipProof);
         await verifyHistoricalAuthorizationProof(normalized.authorization, normalized, localPolicy);
         if (payload.sync_object_id !== normalized.objectId
           || payload.sync_file_id !== normalized.fileId
@@ -391,7 +413,6 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           || payload.sync_key_epoch !== Number(epochMatch[1])
           || payload.sync_ciphertext_sha256 !== sha(bytes(normalized.ciphertext))) deny();
 
-        const target = exact(r.zkObject, ["object_id", "revision", "epoch", "ciphertext"]);
         decode(target.object_id, 16);
         number(target.revision);
         number(target.epoch);
@@ -403,7 +424,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         verifySparseObjectInventoryProof(z.immutableAccountId, cutover.statement.generation,
           { object_id: target.object_id, revision: target.revision,
             ciphertext_sha256: targetDigest },
-          r.zkMembershipProof, cutover.statement.inventory_head);
+          membershipProof, cutover.statement.inventory_head);
 
         // Generate the challenge here. A signed old head with an old nonce is
         // not acceptable after a restart, even if its Ed25519 signature is valid.
