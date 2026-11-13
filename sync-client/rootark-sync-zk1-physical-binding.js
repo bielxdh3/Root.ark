@@ -10,6 +10,7 @@ const crypto = require("node:crypto");
 // A native Ed25519 KeyObject getter runs before later local policy snapshots.
 // Define own array data slots instead of consulting mutable Array.push.
 const NATIVE_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
+const NATIVE_GET_OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
 const { arrayIncludes: NATIVE_ARRAY_INCLUDES } =
   require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const protocol = require("./rootark-sync-protocol");
@@ -40,7 +41,7 @@ function strict(raw, fields) {
     || fields.some((field) => !Object.hasOwn(raw, field))) deny();
   const result = Object.create(null);
   for (const field of fields) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw, field);
+    const descriptor = NATIVE_GET_OWN_DESCRIPTOR(raw, field);
     if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
     result[field] = descriptor.value;
   }
@@ -70,7 +71,7 @@ function snapshotLocalDevicePolicy(input) {
   const pinKeys = Reflect.ownKeys(raw.trustedDevicePublicKeys);
   if (pinKeys.length < 1 || pinKeys.length > 10000) deny();
   for (const deviceId of pinKeys) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw.trustedDevicePublicKeys, deviceId);
+    const descriptor = NATIVE_GET_OWN_DESCRIPTOR(raw.trustedDevicePublicKeys, deviceId);
     if (typeof deviceId !== "string" || !descriptor || !descriptor.enumerable
       || !Object.hasOwn(descriptor, "value")) deny();
     const spki = descriptor.value;
@@ -84,7 +85,7 @@ function snapshotLocalDevicePolicy(input) {
   if (Reflect.ownKeys(raw.revokedDeviceIds).length !== raw.revokedDeviceIds.length + 1) deny();
   const revoked = [];
   for (let index = 0; index < raw.revokedDeviceIds.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw.revokedDeviceIds, String(index));
+    const descriptor = NATIVE_GET_OWN_DESCRIPTOR(raw.revokedDeviceIds, String(index));
     if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
     const deviceId = descriptor.value;
     if (typeof deviceId !== "string"

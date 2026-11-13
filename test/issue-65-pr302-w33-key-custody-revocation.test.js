@@ -258,6 +258,29 @@ test("P2 composite rejects same native signer despite KeyObject getter rewriting
   assert.equal(substitutedCalls, 0, "only original native key equality may decide role separation");
 });
 
+test("P2 composite pins physical attestor reference before inventory key getter replaces it", async () => {
+  const f = fixture();
+  const receipt = await committed(f);
+  const signedPg = await physical(f);
+  const trustedB = crypto.generateKeyPairSync("ed25519");
+  const original = compositeOptions(f, receipt, signedPg);
+  assert.equal((await verifyAttestedInventoryCommit(original)).status,
+    "VERIFIED_COMPOSITE_NONAUTHORIZING", "signed A inventory + signed C PG positive");
+  const input = { ...original, pinnedPhysicalAttestorPublicKey: trustedB.publicKey };
+  let replaced = 0;
+  const poisonedInventory = Object.create(f.signer.publicKey);
+  Object.defineProperty(poisonedInventory, "type", { get() {
+    replaced += 1;
+    input.pinnedPhysicalAttestorPublicKey = f.attestor.publicKey;
+    return "public";
+  } });
+  input.pinnedInventoryPublicKey = poisonedInventory;
+  await assert.rejects(verifyAttestedInventoryCommit(input),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "original trusted attestor B never signed PG C despite a hostile getter swap");
+  assert.ok(replaced > 0, "real inventory KeyObject callback executed");
+});
+
 const hash64 = (value) => crypto.createHash("sha256").update(value).digest("base64url");
 
 async function historicalFixture() {
@@ -350,4 +373,32 @@ test("P2 historical signed READ denies live revoked device after witness getter 
   assert.equal(bypasses, 0, "live revocation must use captured native includes");
   assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args))
     .authorizesHistoricalRead, true, "signed historical positive is preserved");
+});
+
+test("P2 historical signed READ cannot replace a revoked device via poisoned descriptor", async () => {
+  const { witness, args, initialPolicy } = await historicalFixture();
+  const revokedPolicy = { ...initialPolicy, revokedDeviceIds: ["device-revoke"] };
+  const originalDescriptor = Object.getOwnPropertyDescriptor;
+  const hostile = Object.create(witness.publicKey);
+  let getterCalls = 0, spoofedDescriptors = 0;
+  Object.defineProperty(hostile, "type", { get() {
+    getterCalls += 1;
+    Object.getOwnPropertyDescriptor = function poisonedDescriptor(value, key) {
+      if (value === revokedPolicy.revokedDeviceIds && key === "0") {
+        spoofedDescriptors += 1;
+        return { value: "device-other", enumerable: true, writable: true, configurable: true };
+      }
+      return Reflect.apply(originalDescriptor, Object, [value, key]);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission({ ...args,
+      trustedCurrentDevicePolicyProvider: () => revokedPolicy,
+      pinnedWitnessPublicKey: hostile }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/);
+  } finally { Object.getOwnPropertyDescriptor = originalDescriptor; }
+  assert.ok(getterCalls > 0, "witness getter must execute");
+  assert.equal(spoofedDescriptors, 0, "revocation slots must be read via pinned native descriptor");
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args))
+    .authorizesHistoricalRead, true, "genuine signed historical READ remains allowed");
 });

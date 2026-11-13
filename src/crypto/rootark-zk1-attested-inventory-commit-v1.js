@@ -88,10 +88,15 @@ async function verifyAttestedInventoryCommit(input) {
     const scope = inventory.normalizeScope(input.scope);
     const operation = snapshotOperation(input.operation);
     const signerId = rawBytes(input.pinnedInventorySignerKeyId, 16, 16);
+    // Capture BOTH externally provisioned signer references before invoking
+    // either KeyObject's caller-controlled getters. Otherwise the first key
+    // can substitute the expected physical signer before we even read it.
+    const inventoryPin = input.pinnedInventoryPublicKey;
+    const physicalPin = input.pinnedPhysicalAttestorPublicKey;
     // Reimport immutable native SPKI while each caller-controlled key is
     // observed, then test independence on those same verifier identities.
-    const inventoryKey = publicKey(input.pinnedInventoryPublicKey);
-    const attestorKey = publicKey(input.pinnedPhysicalAttestorPublicKey);
+    const inventoryKey = publicKey(inventoryPin);
+    const attestorKey = publicKey(physicalPin);
     // The public KeyObject's .export() is an overridable own property.
     // Compare native cryptographic key identities with the intrinsic method,
     // not caller-supplied DER from an attacker-controlled export override.
