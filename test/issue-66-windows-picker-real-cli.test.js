@@ -17,6 +17,14 @@ const ps = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const picker = path.resolve(__dirname, "../sync-client/rootark-sync-windows-picker.ps1");
 const cli = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 
+const { args } = require("../sync-client/rootark-sync-v2");
+
+test("issue 66: Sync v2 CLI --once parses boolean values instead of truthy strings", () => {
+  assert.strictEqual(args(["--once"]).once, true);
+  assert.strictEqual(args(["--once", "true"]).once, true);
+  assert.strictEqual(args(["--once", "false"]).once, false);
+});
+
 test("issue 66: malformed or ambiguous --path fails before reading config", () => {
   for (const flags of [
     ["--config", "dummy", "--path"],
@@ -135,9 +143,8 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
   assert.equal(requests.filter((request) => request === `/sync/v1/objects/${objectId}`).length, 1);
   const reveal = JSON.parse((await fsp.readFile(launch, "utf8")).replace(/^\uFEFF/, ""));
   assert.match(reveal.executable, /explorer\.exe$/i);
-  assert.ok(reveal.args.join(" ").includes(filename));
-  assert.ok(reveal.args.join(" ").includes(path.join(localFolder, remotePath)),
-    "Explorer must reveal exactly the signed hydrated file under Node's resolved root");
+  assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
+    "Explorer must receive /select,\"<target>\" without a space after the comma under Node's resolved root");
   if (relativeRoot) {
     assert.equal((await fsp.readFile(path.join(staleCwd, "sync-data", remotePath), "utf8")), "UNVERIFIED STALE FILE");
   }
