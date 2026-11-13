@@ -598,8 +598,12 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   currentDigest = realHeadDigest;
   const listingAfterTrash = await freshTrashReader.readPrivateListing(
     latestTrash, ownerMetadataKey);
-  assert.equal(listingAfterTrash.entries[2].name, null);
-  assert.equal(listingAfterTrash.entries[2].logicalTrashCandidate, true);
+  assert.equal(listingAfterTrash.totalMatches, 1,
+    "one object with three signed revisions remains one current listing entry");
+  assert.equal(listingAfterTrash.entries.length, 1,
+    "older version names are verified but not displayed as separate live files");
+  assert.equal(listingAfterTrash.entries[0].name, null);
+  assert.equal(listingAfterTrash.entries[0].logicalTrashCandidate, true);
   const searchedAfterTrash = await freshTrashReader.readPrivateListing(
     latestTrash, ownerMetadataKey, "Lixeira lógica");
   assert.equal(searchedAfterTrash.totalMatches, 0,
