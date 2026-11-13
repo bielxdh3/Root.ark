@@ -854,26 +854,35 @@ class SyncEngine {
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
       || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return null;
 
-    // This path bypasses _apply and can move an offline pinned source into
-    // trash. Refuse before signed pre-observation or snapshot/journal changes.
-    const sourceKey = sourcePath.toLowerCase();
+    // Reconciliation can stage/rename the origin and then discard its tracked
+    // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
+    // sidestep the local pin policy merely because _apply() is not called.
+    // Fold case on every OS so a POSIX path remains safe after Windows replay.
+    const originKey = sourcePath.toLowerCase();
     if (Object.values(this.snapshot.pinnedFiles || {}).some((pin) => {
       const pinnedPath = pin.path.toLowerCase();
-      return pinnedPath === sourceKey || pinnedPath.startsWith(`${sourceKey}/`);
-    })) fail("Pinned local origin cannot be reconciled outside selected paths", "file_pinned");
+      return pinnedPath === originKey || pinnedPath.startsWith(`${originKey}/`);
+    })) {
+      fail("Pinned local origin cannot be reconciled outside selected paths", "file_pinned");
+    }
 
     return { sourcePath, prior, tombstone, directoryRecord };
   }
 
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    // The same side-effect-free check runs BEFORE signature pre-observation.
+    // Keep it here too for direct callers and changes during verification.
     const source = this.preflightOutOfScopeMove(operation);
-    // A signed DELETE+MOVE remote transaction cannot be separately admitted.
+    // No pull/reconciliation entry point may separately advance a member of
+    // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
+    // or out-of-scope sweep is not a two-envelope atomic admission receipt.
     if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
       fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
         "sync_atomic_batch_indeterminate");
     }
     if (!source) return false;
     const { sourcePath, prior, tombstone, directoryRecord } = source;
+
     const pending = (await this.journal.recover()).filter((item) => item.protocolVersion && item.objectId === operation.objectId);
     const target = await contained(this.rootDir, sourcePath, true);
     const sourceExists = await exists(target);
@@ -1697,6 +1706,25 @@ class SyncEngine {
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
           const current = error.current
             ? envelopeCopy(protocol.validateStoredOperation(error.current)) : null;
+          // A bare HTTP 409 is not a signed remote admission receipt. Without
+          // an authenticated, specific winner, remote-wins would discard our
+          // pending signed operation even if the server never committed it.
+          if (!current) {
+            fail("Unsigned conflict response has no verifiable remote winner",
+              "remote_authorization_rejected");
+          }
+          // A valid device signature authenticates *an operation*, not the
+          // server's claim that it won THIS object's HTTP 409. A compromised
+          // transport may replay a genuine, unrelated signed object and make
+          // remote-wins discard our still-pending local outbox. Require the
+          // same immutable object, file and compartment before any local
+          // recovery files, summary updates or durable journal ACKs.
+          if (current.objectId !== operation.objectId
+            || current.fileId !== operation.fileId
+            || current.compartmentId !== operation.compartmentId) {
+            fail("Unrelated remote winner cannot acknowledge pending operation",
+              "remote_authorization_rejected");
+          }
           if (current?.operationId === operation?.operationId
             && signedEnvelopeDigest(current) !== signedEnvelopeDigest(operation)) {
             fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
@@ -1719,8 +1747,25 @@ class SyncEngine {
               }
             }
           }
-          if (current && !this.operationDestinationIsSelected(current)) {
+          // ALL 409 `current` envelopes are attacker-controlled until Ed25519
+          // device/roster verification, including destinations inside selected
+          // paths. In particular, recoverConflict writes decrypted pending
+          // plaintext under .rootark-conflicts and must never run for B.
+          // No durable admission is created until after pin preflight.
+          await this.verifyIncomingOperation(current, { preObserve: false });
+          if (!this.operationDestinationIsSelected(current)) {
             this.preflightOutOfScopeMove(current);
+          }
+          // A device signature alone cannot certify that the remote server
+          // actually committed CURRENT. A malicious 409 may echo our OWN
+          // freshly signed pending operation or replay an old same-object
+          // signature. Neither is an independent admission receipt. Until a
+          // separately trusted current-state/CAS witness is available, strict
+          // sync must preserve its pending outbox for explicit reconciliation
+          // instead of writing recovery plaintext or silently marking it seen.
+          if (this.requireAuthorization) {
+            fail("Signed 409 winner lacks independent durable admission evidence",
+              "remote_admission_unproven");
           }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
@@ -1729,7 +1774,15 @@ class SyncEngine {
             if (this.operationDestinationIsSelected(current)) {
               verifiedFreshDigest = await this._apply(current, summary);
             } else {
-              verifiedFreshDigest = await this.verifyIncomingOperation(current);
+              // Recheck current revocation/identity after asynchronous local
+              // conflict recovery. Only now may a successfully preflighted
+              // exact signed envelope reserve a durable journal observation.
+              verifiedFreshDigest = await this.verifyIncomingOperation(current,
+                { preObserve: false });
+              this.preflightOutOfScopeMove(current);
+              if (verifiedFreshDigest) {
+                await this.journal.observeAdmission(current.operationId, verifiedFreshDigest);
+              }
               const reconciled = await this.reconcileOutOfScopeMove(current, summary, {
                 preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
               });
@@ -1825,20 +1878,18 @@ class SyncEngine {
     }
     const pinnedDescendant = protectedPaths.some((pin) => affectedPaths.some((candidate) =>
       pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)));
-    // A signed CREATE can record the identity of an existing directory
-    // without touching that directory or its pinned descendants. This is
-    // common after hydration of a child while the parent CREATE was unseen.
+    // A signed CREATE can register an existing directory after child hydration
+    // without replacing it. Never allow a case-distinct alias, conflicting
+    // tracked identity or non-directory target to bypass pin protection.
     let existingAncestorCreate = false;
     if (pinnedDescendant && operation.operation === "create"
+      && !operation.tombstone && !metadata.sourcePath
       && metadata.contentType === "inode/directory") {
       const ancestorPrefix = `${metadata.path}/`;
-      // A second case-distinct POSIX directory can be replayed as an alias on
-      // Windows. It is not the pinned child's actual ancestor, even if both
-      // physical directories happen to exist on the originating device.
       const sameSpelling = protectedPaths.every((pin) =>
         !pin.path.toLowerCase().startsWith(ancestorPrefix.toLowerCase())
         || pin.path.startsWith(ancestorPrefix));
-      const existing = Object.entries(this.snapshot.files).find(([relative, entry]) =>
+      const existing = Object.entries(this.snapshot.files).find(([relative]) =>
         relative.toLowerCase() === metadata.path.toLowerCase());
       if (sameSpelling && (!existing || (!existing[1].deleted && existing[1].directory
         && existing[1].objectId === operation.objectId && existing[1].fileId === operation.fileId))) {
@@ -2058,9 +2109,8 @@ class SyncEngine {
       const canonical = process.platform === "win32" ? snapshotPathByKey.get(pathKey(relative)) || relative : relative;
       current[canonical] = file;
     }
-    // A local inode/directory at the path of a pinned regular file is not an
-    // authorized edit to that identity. Block before enqueuing any operations
-    // or persisting a restart-invalid tracked directory beside the pin.
+    // A local directory at the path of a pinned regular file is not an
+    // authorized edit to its identity. Fail before journal/snapshot mutation.
     const currentByPortablePath = new Map(Object.entries(current)
       .map(([relative, entry]) => [relative.toLowerCase(), entry]));
     for (const pin of Object.values(this.snapshot.pinnedFiles || {})) {
@@ -2626,8 +2676,17 @@ class SyncEngine {
     };
     for (const operation of inspected) {
       if (!this.operationDestinationIsSelected(operation)) {
+        // Authenticity must precede even a side-effect-free local pin oracle:
+        // an untrusted LIST entry cannot force file_pinned before its Ed25519
+        // device/roster proof is checked. Defer durable observation until the
+        // pin preflight accepts this exact verified envelope, so a genuine
+        // refused MOVE cannot exhaust the finite observed[] window either.
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation,
+          { preObserve: false });
         this.preflightOutOfScopeMove(operation);
-        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
+        if (verifiedFreshDigest) {
+          await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+        }
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
         observedRemoteOnly.push({ operation, verifiedFreshDigest });
