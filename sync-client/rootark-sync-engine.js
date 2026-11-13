@@ -761,13 +761,13 @@ class SyncEngine {
     if (records.length !== 1) fail("Current sync version unavailable", "history_version_unavailable");
     const current = protocol.validateStoredOperation(records[0]);
     const historical = selected[0];
-    if (current.objectId !== objectId || current.fileId !== historical.fileId
+    if (current.objectId !== objectId
       || current.compartmentId !== historical.compartmentId
       || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
       fail("Current signed version does not match history", "invalid_history");
     }
     if (verifyRetained) {
-      if (versions.some((record) => record.fileId !== historical.fileId
+      if (versions.some((record) => record.objectId !== objectId
         || record.compartmentId !== historical.compartmentId)) {
         fail("Retained history mixes file or compartment identities", "invalid_history");
       }
@@ -820,11 +820,11 @@ class SyncEngine {
       }
     };
     await assertCleanDestination();
-    return { historical, current, relative, existing, versions, assertCleanDestination };
+    return { historical, current, relative, existing, versions, assertCleanDestination, assertNoStaleLocalIdentity };
   }
 
   async _restoreHistoricalVersion(objectId, versionId) {
-    const { historical, current, relative, existing, assertCleanDestination } =
+    const { historical, current, relative, existing, assertCleanDestination, assertNoStaleLocalIdentity } =
       await this._inspectHistoricalRestore(objectId, versionId);
     const key = await this.keyFor(historical);
     const decrypted = protocol.decryptPayload(historical, key);

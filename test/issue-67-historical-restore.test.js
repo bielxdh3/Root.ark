@@ -486,3 +486,27 @@ test("#67: real atomic device registry durably admits a newly signed historical 
   const reopened = await new SyncObjectStore(storagePath, { atomicDeviceRegistry: true }).open();
   assert.equal(reopened.list("alice", "file-1")[0].versionId, restored.versionId);
 });
+
+test("#67 P2: restore succeeds across signed fileId rotation create(oldId) -> update(newId) -> delete(newId)", async (t) => {
+  const f = await fixture(t);
+  const oldId = "old-file-id";
+  const newId = "rotated-file-id";
+  const originalBytes = Buffer.from("original authenticated bytes");
+  const updatedBytes = Buffer.from("updated authenticated bytes");
+  const created = await f.sign({ operation: "create", fileId: oldId, versionId: "v1-created", operationId: "op1",
+    revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "document.txt", name: "document.txt" },
+    plaintext: originalBytes });
+  const updated = await f.sign({ operation: "update", fileId: newId, versionId: "v2-updated", operationId: "op2",
+    baseRevision: created.revision, revision: { counter: 2, deviceId: "device-a" },
+    metadata: { path: "document.txt", name: "document.txt" }, plaintext: updatedBytes });
+  const deleted = await f.sign({ operation: "delete", fileId: newId, versionId: "v3-deleted", operationId: "op3",
+    baseRevision: updated.revision, revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "document.txt" } });
+  f.versions.splice(0, f.versions.length, created, updated, deleted);
+  f.setCurrent(deleted);
+  const restored = await f.engine.restoreHistoricalVersion("file-1", "v1-created");
+  assert.equal(restored.pushed, true);
+  assert.equal(restored.sourceVersionId, "v1-created");
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"), "original authenticated bytes");
+  assert.equal(f.current().fileId, newId, "restored revision inherits current rotated fileId");
+});

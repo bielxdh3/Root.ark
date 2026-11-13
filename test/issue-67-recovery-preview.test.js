@@ -312,3 +312,26 @@ test("#67: preview refuses untracked and unsent local bytes but accepts clean tr
   assert.deepEqual(await fsp.readFile(target), synchronized);
   assert.equal(f.pushes(), 0);
 });
+
+test("#67 P2: preview succeeds across signed fileId rotation create(oldId) -> update(newId) -> delete(newId)", async (t) => {
+  const f = await fixture(t);
+  const oldId = "file-old";
+  const newId = "file-rotated";
+  const original = await f.sign({ operation: "create", fileId: oldId, versionId: "v1", operationId: "op1",
+    revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "note.txt" },
+    plaintext: Buffer.from("authenticated historical bytes") });
+  const updated = await f.sign({ operation: "update", fileId: newId, versionId: "v2", operationId: "op2",
+    baseRevision: original.revision, revision: { counter: 2, deviceId: "device-a" },
+    metadata: { path: "note.txt" }, plaintext: Buffer.from("authenticated updated bytes") });
+  const deleted = await f.sign({ operation: "delete", fileId: newId, versionId: "v3", operationId: "op3",
+    baseRevision: updated.revision, revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "note.txt" } });
+  f.versions.splice(0, f.versions.length, original, updated, deleted);
+  f.setHead(deleted);
+  const outcome = await f.engine.previewHistoricalRestore("object-1", "v1");
+  assert.equal(outcome.ready, true);
+  assert.equal(outcome.sourceVersionId, "v1");
+  assert.equal(outcome.currentVersionId, "v3");
+  assert.equal(outcome.verifiedRetainedVersions, 3);
+  assert.equal(f.pushes(), 0);
+});
