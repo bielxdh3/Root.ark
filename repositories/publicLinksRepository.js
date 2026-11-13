@@ -193,11 +193,29 @@ function savePublicLinks(entries = {}, options = {}) {
     }
 
     if (revocation) {
-      db.prepare(`UPDATE public_links SET revoked_at = ?
-        WHERE revoked_at IS NULL AND folder_id = ?
-          AND token GLOB 'C*' AND LENGTH(token) = 48
-          AND (? IS NULL OR file_name = ?)`).run(now, revocation.folderId,
-        revocation.fileName ?? null, revocation.fileName ?? null);
+      if (process.platform === "win32" && revocation.fileName !== undefined) {
+        // The same physical NTFS file can have old C-token grants recorded
+        // under multiple case aliases. SQLite NOCASE only folds ASCII, so
+        // compare Unicode spellings under the same IMMEDIATE transaction.
+        const rows = db.prepare(`SELECT token, file_name FROM public_links
+          WHERE revoked_at IS NULL AND folder_id = ?
+            AND token GLOB 'C*' AND LENGTH(token) = 48`).all(revocation.folderId);
+        const canonicalFold = revocation.fileName.toLowerCase();
+        for (const row of rows) {
+          if (/^C[a-f0-9]{47}$/.test(row.token)
+            && typeof row.file_name === "string"
+            && row.file_name.toLowerCase() === canonicalFold) {
+            revoke.run(now, row.token);
+          }
+        }
+      } else {
+        // POSIX files named A.txt and a.txt are distinct physical objects.
+        db.prepare(`UPDATE public_links SET revoked_at = ?
+          WHERE revoked_at IS NULL AND folder_id = ?
+            AND token GLOB 'C*' AND LENGTH(token) = 48
+            AND (? IS NULL OR file_name = ?)`).run(now, revocation.folderId,
+          revocation.fileName ?? null, revocation.fileName ?? null);
+      }
     }
 
     const insertRevoked = db.prepare(`

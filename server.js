@@ -13099,12 +13099,20 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
 app.get("/delete/:name", deleteRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
 app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
-  const name = path.basename(req.params.name);
+  const requestedName = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
-
   if (!canMoveToTrash(req)) {
     return res.status(403).json({ error: "Permissao negada: delete" });
+  }
+  // Resolve the physical case before file-permission checks and lifecycle
+  // locking: an NTFS URL alias must not bypass the protected metadata key.
+  let name;
+  try {
+    name = trashService.resolvePhysicalFileName(
+      ensureFolderDirectories(folder.id).uploadDir, requestedName);
+  } catch (_error) {
+    return res.status(409).json({ error: "Nome fisico ambiguo para exclusao" });
   }
 
   if (!hasFileEditAccess(req, folder, name)) {
@@ -13120,6 +13128,9 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!hasFileEditAccess(req, currentFolderRecord, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (isFileInTrash(currentFolderRecord.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+    if (trashService.resolvePhysicalFileName(currentFolder.uploadDir, name) !== name) {
+      return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
+    }
     const filePath = path.join(currentFolder.uploadDir, name);
     await ensureCloudFileCached(folder.id, name, filePath, "uploads");
     if (!refreshAuthenticatedUser(req, res)) return;
@@ -13127,12 +13138,16 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
     if (!hasFolderAccess(req, publishFolder) || !canMoveToTrash(req) || !hasFileEditAccess(req, publishFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (isFileInTrash(publishFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (trashService.resolvePhysicalFileName(currentFolder.uploadDir, name) !== name) {
+      return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
+    }
     const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
 
     try {
     const trashItem = trashService.moveFileToTrash({
       folder: currentFolder,
       fileName: name,
+      expectedCanonicalName: name,
       deletedBy: req.user.username,
       loaders: getTrashLoaders(),
     });
