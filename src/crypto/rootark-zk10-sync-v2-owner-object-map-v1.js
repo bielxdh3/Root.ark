@@ -31,6 +31,10 @@ const {
   setAdd: NATIVE_SET_ADD,
   setDelete: NATIVE_SET_DELETE,
   setSize: NATIVE_SET_SIZE,
+  newNativePromise: NATIVE_PROMISE_CREATE,
+  nativePromiseThen: NATIVE_PROMISE_THEN,
+  nativePromiseRace: NATIVE_PROMISE_RACE,
+  invokeNativeRead: NATIVE_PROMISE_READ,
   freeze: NATIVE_FREEZE,
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
 } = require("./rootark-zk10-native-intrinsics-v1");
@@ -302,13 +306,13 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       // result even if its microtask beats an overdue timeout callback.
       const expiresAt = process.hrtime.bigint() + BigInt(headTimeoutMs) * 1000000n;
       let timer, onCancel;
-      const deadline = new Promise((resolve) => {
+      const deadline = NATIVE_PROMISE_CREATE((resolve) => {
         timer = setTimeout(() => {
           controller.abort();
           resolve({ settled: false });
         }, headTimeoutMs);
       });
-      const cancelled = new Promise((resolve) => {
+      const cancelled = NATIVE_PROMISE_CREATE((resolve) => {
         if (signal) {
           onCancel = () => {
             controller.abort();
@@ -319,21 +323,19 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       });
       // Reserve capacity BEFORE invoking an untrusted async adapter. A late
       // result never re-enters verification and never frees its slot early.
-      const pending = Promise.resolve().then(() => {
+      const pending = NATIVE_PROMISE_READ(() => {
         if (controller.signal.aborted) deny();
         return a.readCurrentHead(challenge, { signal: controller.signal });
       });
       NATIVE_SET_ADD.call(pendingHeadReads, pending);
       NATIVE_SET_ADD.call(globalPendingHeadReads, pending);
-      void pending.then(
+      void NATIVE_PROMISE_THEN.call(pending,
         () => { NATIVE_SET_DELETE.call(pendingHeadReads, pending); NATIVE_SET_DELETE.call(globalPendingHeadReads, pending); },
         () => { NATIVE_SET_DELETE.call(pendingHeadReads, pending); NATIVE_SET_DELETE.call(globalPendingHeadReads, pending); });
       try {
-        const result = await Promise.race([
-          pending.then((value) => ({ settled: true, value }),
-            () => ({ settled: false })),
-          deadline, cancelled,
-        ]);
+        const result = await NATIVE_PROMISE_RACE(
+          NATIVE_PROMISE_THEN.call(pending, (value) => value,
+            () => ({ settled: false })), deadline, cancelled);
         if (!result.settled || controller.signal.aborted || signal?.aborted
           || process.hrtime.bigint() >= expiresAt) {
           controller.abort();

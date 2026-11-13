@@ -45,6 +45,43 @@ const SET_ADD = SET_CONSTRUCTOR.prototype.add;
 const SET_DELETE = SET_CONSTRUCTOR.prototype.delete;
 const SET_SIZE = OWN_DESCRIPTOR(SET_CONSTRUCTOR.prototype, "size").get;
 function newNativeSet() { return new SET_CONSTRUCTOR(); }
+// Native Promise reactions MUST NOT be looked up from the mutable prototype
+// after a caller-controlled KeyObject callback. Promise.race also assimilates
+// inputs through their dynamic `.then`, so install the race reactions directly
+// on real native Promises instead of using that combinator.
+const PROMISE_CONSTRUCTOR = Promise;
+const PROMISE_THEN = PROMISE_CONSTRUCTOR.prototype.then;
+const PROMISE_RESOLVE = PROMISE_CONSTRUCTOR.resolve.bind(PROMISE_CONSTRUCTOR);
+function newNativePromise(executor) { return new PROMISE_CONSTRUCTOR(executor); }
+function nativePromiseRace(first, second, third) {
+  return new PROMISE_CONSTRUCTOR((resolve, reject) => {
+    APPLY(PROMISE_THEN, first, [resolve, reject]);
+    APPLY(PROMISE_THEN, second, [resolve, reject]);
+    APPLY(PROMISE_THEN, third, [resolve, reject]);
+  });
+}
+function invokeNativeRead(callback) {
+  return new PROMISE_CONSTRUCTOR((resolve, reject) => {
+    // Wait one genuine microtask before entering the external adapter; caller
+    // must reserve its slot synchronously before the adapter gets control.
+    APPLY(PROMISE_THEN, PROMISE_RESOLVE(), [() => {
+      try {
+        const outcome = callback();
+        const accept = (value) => resolve({ settled: true, value });
+        if (outcome instanceof PROMISE_CONSTRUCTOR) {
+          // The native internal promise slot, not a replaced `.then` getter,
+          // determines when the external authority's work really completes.
+          APPLY(PROMISE_THEN, outcome, [accept, reject]);
+        } else if (outcome !== null && (typeof outcome === "object" || typeof outcome === "function")
+          && typeof outcome.then === "function") {
+          reject(new TypeError("CURRENT authority must return a native Promise"));
+        } else {
+          accept(outcome);
+        }
+      } catch (error) { reject(error); }
+    }, reject]);
+  });
+}
 
 const createPublicKey = crypto.createPublicKey.bind(crypto);
 const createHash = crypto.createHash.bind(crypto);
@@ -183,6 +220,10 @@ module.exports = Object.freeze({
   setAdd: withSafeCall(SET_ADD),
   setDelete: withSafeCall(SET_DELETE),
   setSize: withSafeCall(SET_SIZE),
+  newNativePromise,
+  nativePromiseThen: withSafeCall(PROMISE_THEN),
+  nativePromiseRace,
+  invokeNativeRead,
   hashUpdate: withSafeCall(OWN_DESCRIPTOR(prototype, "update").value),
   hashDigest: withSafeCall(OWN_DESCRIPTOR(prototype, "digest").value),
   publicExport: withSafeCall(OWN_DESCRIPTOR(publicPrototype, "export").value),

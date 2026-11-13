@@ -317,6 +317,51 @@ test("P2: hostile CURRENT authority cannot erase noncooperative Set readback quo
   }
 });
 
+test("P2: native key callback cannot invoke Promise.then cleanup before CURRENT read resolves", async () => {
+  const f = await fixture();
+  const originalThen = Promise.prototype.then;
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "real Ed25519 KeyObject native handle required");
+  const injected = Object.create(keys.source.publicKey);
+  let nativeReads = 0;
+  Object.defineProperty(injected, handle, { get() {
+    nativeReads += 1;
+    Promise.prototype.then = function forgedThen(onFulfilled, onRejected) {
+      // Parent attaches the accounting cleanup to a still-unsettled Promise
+      // using a mutable .then lookup after this genuine KeyObject callback.
+      if (typeof onFulfilled === "function"
+        && Function.prototype.toString.call(onFulfilled).includes("NATIVE_SET_DELETE")) {
+        onFulfilled();
+      }
+      return Reflect.apply(originalThen, this, [onFulfilled, onRejected]);
+    };
+    return keys.source.publicKey[handle];
+  } });
+  const outstanding = [];
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...f.authority, readCurrentHead: (challenge, { signal }) =>
+        new Promise((resolve) => outstanding.push({ resolve, challenge, signal })) },
+    }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+    assert.ok(nativeReads > 0, "native source key getter must install the mutation");
+    assert.notEqual(Promise.prototype.then, originalThen,
+      "the untrusted native getter must actually replace Promise.prototype.then");
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+    assert.equal(outstanding.length, 1, "first genuinely signed mapping reached real head adapter");
+    assert.equal(outstanding[0].signal.aborted, true);
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+    assert.equal(outstanding.length, 1,
+      "a malicious premature Promise.then callback cannot release unsettled read capacity");
+  } finally {
+    Promise.prototype.then = originalThen;
+    for (const call of outstanding) call.resolve(signedHead(f, call.challenge));
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  }
+});
+
 test("P2: pinned native Set add/delete/size ignore later same-realm prototype changes", () => {
   const { newNativeSet, setAdd, setDelete, setSize } =
     require("../src/crypto/rootark-zk10-native-intrinsics-v1");
