@@ -26,6 +26,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     + "<script defer src='/client/rootark-zk1-file-content.js'></script>"
     + "<script defer src='/client/rootark-zk1-selected-local-preview.js'></script>"
     + "<script defer src='/client/rootark-zk1-protected-text-batch.js'></script>"
+    + "<script defer src='/client/rootark-zk1-protected-revision-index.js'></script>"
     + "<script defer src='/probe.js'></script>";
   const bootstrap = "window.RootarkApi={get:async()=>({enabled:true,"
     + "securityVersion:2,signedHistoryRequired:true,opaqueCatalogV1:true})};";
@@ -54,9 +55,84 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const revision=dialog.querySelector('[data-zk1-field="catalog-delta-read-revision"]');
       const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
       const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
+      const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
+      const persistToggle=dialog.querySelector('[data-zk1-field="catalog-batch-persist"]');
+      const replaceToggle=dialog.querySelector('[data-zk1-field="catalog-batch-replace"]');
+      const storedIndexButton=dialog.querySelector('[data-zk1-action="catalog-delta-index-search"]');
+      const indexPages=dialog.querySelector('[data-zk1-field="catalog-index-pages"]');
       if(!list||!target||!revision||!getButton||getButton.type!=="button"
-        ||!batchButton||batchButton.type!=="button")
+        ||!batchButton||batchButton.type!=="button"
+        ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked
+        ||!persistToggle||persistToggle.type!=="checkbox"||persistToggle.checked
+        ||!replaceToggle||replaceToggle.type!=="checkbox"||replaceToggle.checked
+        ||!storedIndexButton||storedIndexButton.type!=="button"
+        ||storedIndexButton.disabled||!indexPages
+        ||indexPages.getAttribute("role")!=="navigation"
+        ||indexPages.children.length!==0)
         throw Error("MISSING_EXPLICIT_PROTECTED_GET");
+      persistToggle.click();
+      if(!persistToggle.checked)throw Error("EXPLICIT_REVISION_INDEX_OPT_IN_DENIED");
+      persistToggle.click();
+      if(persistToggle.checked)throw Error("REVISION_INDEX_OPT_IN_STUCK");
+      replaceToggle.click();
+      if(!replaceToggle.checked)throw Error("EXPLICIT_REPLACEMENT_OPT_IN_DENIED");
+      replaceToggle.click();
+      if(replaceToggle.checked)throw Error("EXPLICIT_REPLACEMENT_OPT_IN_STUCK");
+      const progress=dialog.querySelector('[data-zk1-field="catalog-batch-progress"]');
+      const cancel=dialog.querySelector('[data-zk1-action="catalog-delta-text-cancel"]');
+      if(!progress||progress.getAttribute("role")!=="status"
+        ||!cancel||cancel.textContent!=="Cancelar busca"||!cancel.disabled)
+        throw Error("MISSING_ACCESSIBLE_CANCEL_PROGRESS");
+      document.cookie="rootark_csrf=disposable-browser-session; SameSite=Strict";
+      if(batchButton.disabled)throw Error("BATCH_BUTTON_INITIAL_DISABLED");
+      batchButton.click();
+      if(cancel.disabled)throw Error("CANCEL_NOT_AVAILABLE_DURING_BUSY");
+      cancel.click();
+      if(!progress.textContent.includes("Cancelando"))
+        throw Error("CANCEL_NOT_ACKNOWLEDGED");
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled||!cancel.disabled)
+        throw Error("CANCEL_NOT_CLEANED");
+      // Two sequential real Edge UI operations must never reuse consent to
+      // replace the encrypted selection. These attempts deliberately lack
+      // authority, so both must fail closed and consume their opt-ins.
+      const confirmToggle=dialog.querySelector('[data-zk1-field="catalog-batch-confirm"]');
+      const manifestControl=dialog.querySelector('[data-zk1-field="catalog-batch-manifest"]');
+      const cekControl=dialog.querySelector('[data-zk1-field="catalog-batch-ceks"]');
+      const manifestPin=dialog.querySelector('[data-zk1-field="catalog-batch-manifest-pin"]');
+      if(!confirmToggle||!manifestControl||!cekControl||!manifestPin)
+        throw Error("MISSING_SELECTION_CONSENT_CONTROLS");
+      const consent=()=>{persistToggle.click();replaceToggle.click();confirmToggle.click();};
+      const deniedConsent=label=>{
+        if(persistToggle.checked||replaceToggle.checked||confirmToggle.checked)
+          throw Error("REPLACEMENT_CONSENT_REUSED_"+label);
+      };
+      consent();
+      batchButton.click();
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled)throw Error("FIRST_BATCH_NOT_FINISHED");
+      deniedConsent("AFTER_FIRST_BATCH");
+      consent();
+      const manifestFiles=new DataTransfer();
+      manifestFiles.items.add(new File(["disposable-selected-batch-b"],"batch-b.json"));
+      manifestControl.files=manifestFiles.files;
+      manifestControl.dispatchEvent(new Event("change",{bubbles:true}));
+      deniedConsent("AFTER_MANIFEST_CHANGED");
+      consent();
+      const cekFiles=new DataTransfer();
+      cekFiles.items.add(new File(["disposable-second-cek"],"new-key.bin"));
+      cekControl.files=cekFiles.files;
+      cekControl.dispatchEvent(new Event("change",{bubbles:true}));
+      deniedConsent("AFTER_CEKS_CHANGED");
+      consent();
+      manifestPin.value="offline-pin-for-disposable-second-batch";
+      manifestPin.dispatchEvent(new Event("input",{bubbles:true}));
+      deniedConsent("AFTER_PIN_CHANGED");
+      consent();
+      batchButton.click();
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled)throw Error("SECOND_BATCH_NOT_FINISHED");
+      deniedConsent("AFTER_SECOND_BATCH");
       const id="AAAAAAAAAAAAAAAAAAAAAA";
       const malicious="<img src=x onerror=alert(1)> secret-local-only";
       let active=true;
@@ -81,6 +157,62 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       list.replaceChildren();
       button.click();
       if(target.value!==""||revision.value!=="")throw Error("DETACHED_RESULT_SELECTED");
+      const pageOne={name:"history-0000",objectId:id,revision:7,epoch:2,
+        logicalTrashCandidate:false};
+      const pageTwo={name:"history-0100",objectId:id,revision:8,epoch:2,
+        logicalTrashCandidate:false};
+      let pageReads=0;
+      const readPage=async(offset)=>{
+        if(offset!==100)throw Error("UNEXPECTED_PAGE_OFFSET");
+        pageReads++;
+        return {entries:[pageTwo],offset,totalMatches:101,pageSize:100,
+          hasNext:false,hasPrevious:true,plaintextSentToServer:false,
+          independentlySignedCatalog:true,authorizesMutation:false};
+      };
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,hasNext:true,hasPrevious:false,readPage});
+      const next=list.querySelector('[data-zk1-page="next"]');
+      if(!next||next.type!=="button")throw Error("MISSING_NEXT_PAGE");
+      next.click();
+      for(let i=0;i<100&&!list.textContent.includes("history-0100");i++)await sleep(10);
+      if(pageReads!==1||!list.textContent.includes("history-0100")
+        ||list.textContent.includes("history-0000"))throw Error("PAGE_NAVIGATION_FAILED");
+      const previous=list.querySelector('[data-zk1-page="previous"]');
+      if(!previous)throw Error("MISSING_PREVIOUS_PAGE");
+      active=false;
+      previous.click();
+      await sleep(40);
+      if(pageReads!==1)throw Error("STALE_PAGE_NAVIGATION");
+      active=true;
+      let rejectObsolete, staleDenials=0, currentSummary="old query";
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,readPage:()=>new Promise((_,reject)=>{rejectObsolete=reject;}),
+          onDenied:()=>{staleDenials++;currentSummary="old denied";}});
+      const obsoleteNext=list.querySelector('[data-zk1-page="next"]');
+      obsoleteNext.click();
+      if(typeof rejectObsolete!=="function")throw Error("OLD_PAGE_NOT_PENDING");
+      const fresh={...pageOne,name:"fresh authenticated query"};
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[fresh],target,verify,revision);
+      currentSummary="fresh query";
+      rejectObsolete(Error("OLD_CAS_REVOKED"));
+      await sleep(20);
+      if(!list.textContent.includes("fresh authenticated query")
+        ||staleDenials!==0||currentSummary!=="fresh query")
+        throw Error("STALE_REJECTION_ERASED_NEW_QUERY");
+      let rejectCurrent, currentDenials=0;
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,readPage:()=>new Promise((_,reject)=>{rejectCurrent=reject;}),
+          onDenied:()=>{currentDenials++;}});
+      list.querySelector('[data-zk1-page="next"]').click();
+      rejectCurrent(Error("CURRENT_GRANT_REVOKED"));
+      await sleep(20);
+      if(list.childNodes.length!==0||currentDenials!==1)
+        throw Error("CURRENT_REVOKED_PAGE_WAS_NOT_CLEARED");
+      list.replaceChildren();
       getButton.click();
       for(let i=0;i<100;i++){
         if(dialog.querySelector('[data-zk1-field="status"]').textContent
@@ -141,6 +273,79 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!batchPane)throw Error("MISSING_LOCAL_BATCH_RESULTS");
       batchPane.textContent=found.matches[0].excerpt;
       if(batchPane.querySelector("img"))throw Error("BATCH_PREVIEW_XSS");
+      const nine=[];
+      const signed=new Map();
+      for(let index=0;index<9;index++){
+        const oid=b64(crypto.getRandomValues(new Uint8Array(16)));
+        const rec={...metadata,object_id:oid};
+        const keyRaw=crypto.getRandomValues(new Uint8Array(32));
+        const key=await window.RootarkZk1FileContent.importFileCek(keyRaw);
+        const cipher=await window.RootarkZk1FileContent.encryptFile({cek:key,
+          metadata:rec,name:"doc-"+index+".txt",mediaType:"text/plain",
+          data:new TextEncoder().encode("local-window secret-local-only "+index)});
+        const exact={objectId:oid,revision:7,epoch:2,
+          ciphertextDigestBase64:b64(new Uint8Array(
+            await crypto.subtle.digest("SHA-256",cipher)))};
+        nine.push({selected:exact,metadata:rec,cekFile:"key-"+index,
+          cekSha256Pin:b64(new Uint8Array(
+            await crypto.subtle.digest("SHA-256",keyRaw)))});
+        signed.set("key-"+index,{keyRaw,checked:{...exact,
+          ciphertextBase64:b64(cipher),verifiedCiphertext:true,
+          plaintextAvailable:false,authorizesMutation:false}});
+      }
+      const multiple={...scope,device_id:"device",current_epoch:2,
+        manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null};
+      const batchBaseline={head:{sequence:11,digest:ownerDigest},
+        entries:nine.map(row=>row.selected)};
+      const progressCalls=[];
+      const completed=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"secret-local-only",items:nine,grant:multiple,
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:batchBaseline,assertLive:()=>true,
+        getChecked:async(oid,rev)=>signed.get(nine.find(item=>
+          item.selected.objectId===oid&&item.selected.revision===rev)?.cekFile)?.checked,
+        readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+        onProgress:({completed,total})=>progressCalls.push(completed+"/"+total),
+        isCancelled:()=>false
+      });
+      if(completed.totalSearched!==9||completed.totalMatches!==9
+        ||progressCalls.join()!=="8/9,9/9")
+        throw Error("EDGE_MULTI_WINDOW_WRONG");
+      const allTerms=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"SECRET-LOCAL-ONLY local-window",matchMode:"all-terms",
+        items:nine,grant:multiple,
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:batchBaseline,assertLive:()=>true,
+        getChecked:async(oid,rev)=>signed.get(nine.find(item=>
+          item.selected.objectId===oid&&item.selected.revision===rev)?.cekFile)?.checked,
+        readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+        isCancelled:()=>false
+      });
+      if(allTerms.totalMatches!==9||allTerms.totalSearched!==9
+        ||allTerms.plaintextSentToServer!==false)
+        throw Error("EDGE_ALL_TERMS_FAILED");
+      batchPane.textContent=completed.matches.map(item=>item.excerpt).join(String.fromCharCode(10));
+      if(batchPane.querySelector("img"))throw Error("MULTI_WINDOW_HTML_LEAK");
+      const abortProgress=[];
+      let stopped=false, getCount=0;
+      let rejected=false;
+      try{
+        await window.RootarkZk1ProtectedTextBatch.search({
+          query:"secret-local-only",items:nine,grant:multiple,
+          ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+          baseline:batchBaseline,assertLive:()=>true,
+          getChecked:async(oid,rev)=>{
+            getCount++;
+            return signed.get(nine.find(item=>item.selected.objectId===oid
+              &&item.selected.revision===rev)?.cekFile)?.checked;
+          },
+          readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+          onProgress:({completed})=>{abortProgress.push(completed);stopped=true;},
+          isCancelled:()=>stopped
+        });
+      }catch(error){rejected=error.message==="ZK_BATCH_TEXT_SEARCH_DENIED";}
+      if(!rejected||getCount!==8||abortProgress.join()!=="8")
+        throw Error("EDGE_CANCEL_RELEASED_PARTIAL");
       target.dispatchEvent(new Event("input",{bubbles:true}));
       if(pane.textContent!==""||batchPane.textContent!=="")
         throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
@@ -165,7 +370,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
         : request.url === "/probe.js" ? probe
         : ["rootark-zk1-authenticated-workspace", "rootark-zk1-protected-local-search",
           "rootark-zk1-file-content", "rootark-zk1-selected-local-preview",
-          "rootark-zk1-protected-text-batch"]
+          "rootark-zk1-protected-text-batch", "rootark-zk1-protected-revision-index"]
             .includes(file) ? fs.readFileSync(path.join(root, file + ".js"), "utf8") : null;
     response.writeHead(content === null ? 404 : 200, {
       "Content-Type": request.url === "/" ? "text/html; charset=utf-8"
@@ -185,7 +390,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     "--dump-dom", "http://127.0.0.1:" + server.address().port + "/"], {
     timeout: 35000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
   });
-  assert.match(response.stdout, /EDGE_PROTECTED_SELECT_PASS/);
-  assert.doesNotMatch(response.stdout, /EDGE_PROTECTED_SELECT_FAIL/);
+  const result = response.stdout.match(/<output id="edge-result">([^<]*)<\/output>/)?.[1] || "MISSING";
+  assert.match(result, /EDGE_PROTECTED_SELECT_PASS/);
+  assert.doesNotMatch(result, /EDGE_PROTECTED_SELECT_FAIL/);
   assert.equal(sensitiveRequests, 0);
 });
