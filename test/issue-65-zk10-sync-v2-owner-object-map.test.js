@@ -385,6 +385,74 @@ test("P2: pinned native Set add/delete/size ignore later same-realm prototype ch
   }
 });
 
+test("P2: signed ZK target and 256-slot Merkle proof retain invocation-time bytes across async source verification", async () => {
+  const f = await fixture();
+  const verifier = () => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  });
+  const originalProof = f.proof.siblings.slice();
+  const alteredTarget = { ...f.target,
+    ciphertext: Buffer.from("unsubmitted-foreign-ciphertext").toString("base64url") };
+  const alteredProof = originalProof.slice();
+  alteredProof[0] = hex(9);
+  assert.notEqual(alteredProof[0], originalProof[0]);
+  const pending = verifier()({ ...f.input, zkObject: alteredTarget,
+    zkMembershipProof: alteredProof });
+  Object.assign(alteredTarget, f.target);
+  alteredProof.splice(0, alteredProof.length, ...originalProof);
+  await assert.rejects(pending, deny,
+    "a caller cannot replace originally invalid signed target/proof after first await");
+
+  const proofOnly = originalProof.slice();
+  proofOnly[0] = hex(10);
+  assert.notEqual(proofOnly[0], originalProof[0]);
+  const pendingProof = verifier()({ ...f.input, zkMembershipProof: proofOnly });
+  proofOnly.splice(0, proofOnly.length, ...originalProof);
+  await assert.rejects(pendingProof, deny,
+    "an invalid proof alone cannot be repaired by a late caller mutation");
+  const accepted = await verifier()(f.input);
+  assert.equal(accepted.ownerMappingVerified, true,
+    "genuinely Ed25519-signed and unmodified 256-sibling evidence remains valid");
+  assert.equal(accepted.authorizesIo, false);
+});
+
+test("P2: late hostile Array iterator cannot substitute signed 256-slot Merkle proof", async () => {
+  const f = await fixture();
+  const genuineSiblings = f.proof.siblings.slice();
+  const invalidSiblings = genuineSiblings.slice();
+  invalidSiblings[0] = hex(11);
+  assert.notEqual(invalidSiblings[0], genuineSiblings[0]);
+  const verifier = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  });
+  const pending = verifier({ ...f.input, zkMembershipProof: invalidSiblings });
+  const originalIterator = Array.prototype[Symbol.iterator];
+  let forgedReads = 0;
+  Array.prototype[Symbol.iterator] = function hostileSiblingIterator() {
+    if (this.length === 256 && this[0] === invalidSiblings[0]) {
+      forgedReads += 1;
+      return Reflect.apply(originalIterator, genuineSiblings, []);
+    }
+    return Reflect.apply(originalIterator, this, []);
+  };
+  try {
+    await assert.rejects(pending, deny,
+      "a poisoned global iterator must not replace the actual 256 bound sibling bytes");
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+  }
+  // This oracle is intentionally conditional: a native-index verifier never
+  // invokes the hostile iterator, while a vulnerable for-of verifier does.
+  assert.ok(forgedReads <= 1, "no repeated trusted proof reads via caller iterator");
+  const valid = await createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  })(f.input);
+  assert.equal(valid.zkSignedInventoryMembershipVerified, true);
+});
+
 test("P2: invalid source provision is rejected before executing caller-owned KeyObject getters", async () => {
   const f = await fixture();
   const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
