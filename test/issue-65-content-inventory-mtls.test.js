@@ -1223,6 +1223,117 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(poisonedResults, 0, "verified snapshot internals must never assimilate plain objects");
   });
 
+  await t.test("P2 mapped HTTPS result cannot swap genuine signed ABSENT and PRESENT", async (child) => {
+    const h = await harness(child);
+    const floor = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: floor.root });
+    const minimum = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const signer = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(signer)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle, "native Ed25519 getter must run during actual signed verification");
+    const poisoned = Object.create(signer);
+    const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+    let armed = false, keyReads = 0, mappedReads = 0, forgedCalls = 0;
+    Object.defineProperty(poisoned, handle, { get() {
+      keyReads++;
+      if (armed) Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (!Object.hasOwn(this, "serializedSnapshot")
+            || this.status !== "VERIFIED_NONAUTHORIZING"
+            || !["ABSENT", "PRESENT"].includes(this.outcome)) return undefined;
+          mappedReads++;
+          const mapped = this;
+          return function replaceSignedResult(resolve) {
+            forgedCalls++;
+            resolve(Object.assign(Object.create(null), mapped, {
+              outcome: mapped.outcome === "ABSENT" ? "PRESENT" : "ABSENT",
+            }));
+          };
+        },
+      });
+      return signer[handle];
+    } });
+    const client = h.makeClient("reader", { inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      const absent = await client.getSnapshot({ scope: h.scope,
+        nonce: crypto.randomBytes(32), requested: requested(operation), minimumHead: floor });
+      assert.equal(absent.status, "VERIFIED_NONAUTHORIZING");
+      assert.equal(absent.outcome, "ABSENT", "genuine signed genesis must stay ABSENT");
+      assert.equal((await h.ledger.append(operation)).status, "committed");
+      const present = await client.getSnapshot({ scope: h.scope,
+        nonce: crypto.randomBytes(32), requested: requested(operation), minimumHead: floor,
+        minimumSnapshot: minimum.bytes });
+      assert.equal(present.status, "VERIFIED_NONAUTHORIZING");
+      assert.equal(present.outcome, "PRESENT", "genuine signed inclusion must stay PRESENT");
+    } finally {
+      if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+      else delete Object.prototype.then;
+    }
+    assert.ok(keyReads >= 2, "real KeyObject getter must execute in both verifications");
+    assert.equal(mappedReads, 0, "mapped HTTPS security result cannot reach an inherited then getter");
+    assert.equal(forgedCalls, 0, "no forged signed snapshot outcome may be assimilated");
+  });
+
+  await t.test("P2 rejected signed receipt cannot become a forged successful bothVerified outcome", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: floor.root });
+    const minimum = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const committedHead = await h.ledger.readLocalHead();
+    const genuine = await h.ledger.getOperationStatus(operation.operation_id);
+    const goodStatus = await h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation,
+    });
+    assert.equal(goodStatus.status, "committed");
+    assert.equal(goodStatus.independentPhysicalAttestationVerified, true,
+      "independently signed PG proof is a real positive control");
+    const corrupt = Buffer.from(genuine.proof);
+    corrupt[corrupt.length - 1] ^= 1;
+    h.ledger.getOperationStatus = async () => ({ ...genuine, proof: corrupt });
+    const signer = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(signer)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle);
+    const fakeChecked = { inventoryReceipt: { sequence: committedHead.sequence,
+      root: Buffer.from(committedHead.root), outcome: "COMMITTED_IN_SIGNED_LEDGER",
+      authorizesIo: false }, receiptDigest: Buffer.alloc(32, 0x41), authorizesIo: false };
+    const poisoned = Object.create(signer);
+    const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+    let armed = false, getterReads = 0, outcomeReads = 0, forgedCalls = 0;
+    Object.defineProperty(poisoned, handle, { get() {
+      getterReads++;
+      if (armed) Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (!Object.hasOwn(this, "ok") || this.ok !== false
+            || !Object.hasOwn(this, "error")) return undefined;
+          outcomeReads++;
+          return function replaceFailedReceipt(resolve) {
+            forgedCalls++;
+            resolve(Object.assign(Object.create(null), { ok: true, value: fakeChecked }));
+          };
+        },
+      });
+      return signer[handle];
+    } });
+    const writer = h.makeClient("writer", { inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      await assert.rejects(writer.append({ scope: h.scope, operation,
+        nonce: crypto.randomBytes(32), minimumHead: floor, minimumSnapshot: minimum.bytes }),
+      { code: "INVENTORY_HTTP_UNAVAILABLE" },
+      "a tampered Ed25519 receipt plus genuine PG proof must NOT become COMMITTED");
+    } finally {
+      if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+      else delete Object.prototype.then;
+    }
+    assert.ok(getterReads > 0, "actual Ed25519 getter must execute");
+    assert.equal(outcomeReads, 0, "failed receipt outcome must never reach inherited then");
+    assert.equal(forgedCalls, 0, "an invalid inventory receipt cannot become a signed commit");
+  });
+
   await t.test("HTTP 200 status cannot reuse a valid receipt under another operation ID", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();

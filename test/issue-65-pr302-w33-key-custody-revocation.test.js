@@ -124,6 +124,87 @@ function immediateKeySwap(publicB, publicA) {
   return { pin, get changed() { return changed; } };
 }
 
+test("P2 direct public inventory verifySnapshot, receipt and terminal await cannot forge signed success", async (t) => {
+  for (const kind of ["snapshot", "receipt", "terminal"]) {
+    await t.test(kind, async () => {
+      const f = fixture();
+      let genuine, verify, outcome;
+      if (kind === "snapshot") {
+        const root = await inventory.computeRoot(f.scope, 0, null, []);
+        genuine = await inventory.createSignedSnapshot({ signerKeyId: f.signerKeyId,
+          privateKey: f.signer.privateKey, scope: f.scope, sequence: 0,
+          previousRoot: null, entries: [], nonce: f.nonce });
+        verify = (serialized, pin) => inventory.verifySnapshot({ serialized,
+          pinnedPublicKey: pin, pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope,
+          requested: { object_id: f.operation.object_id, revision: 1,
+            epoch: 1, ciphertext_sha256: f.operation.ciphertext_sha256 },
+          minimumHead: { sequence: 0, root }, nonce: f.nonce });
+        outcome = "ABSENT";
+      } else if (kind === "receipt") {
+        genuine = await committed(f);
+        verify = (serialized, pin) => inventory.verifyCommittedEntryProof(
+          commitOptions(f, serialized, pin));
+        outcome = "COMMITTED_IN_SIGNED_LEDGER";
+      } else {
+        genuine = await inventory.createTerminalProof({ signerKeyId: f.signerKeyId,
+          privateKey: f.signer.privateKey, scope: f.scope, operation: f.operation,
+          observedSequence: 1, observedRoot: crypto.randomBytes(32),
+          priorRevision: 0, priorEpoch: 0, reason: "EXPECTED_HEAD_CHANGED",
+          blockingOperationId: null });
+        verify = (serialized, pin) => inventory.verifyTerminalProof({ serialized,
+          pinnedPublicKey: pin, pinnedSignerKeyId: f.signerKeyId,
+          expectedScope: f.scope, operation: f.operation });
+        outcome = "NOT_COMMITTED_FINAL";
+      }
+      assert.equal((await verify(genuine, f.signer.publicKey)).outcome, outcome,
+        "genuine Ed25519 proof must be accepted by the public export");
+      const invalid = Buffer.from(genuine);
+      invalid[invalid.length - 1] ^= 1;
+      const hostile = Object.create(f.signer.publicKey);
+      const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+      const originalThen = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
+      const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+      const nativeThen = Promise.prototype.then;
+      let pending, getters = 0, forgedCalls = 0, speciesCalls = 0;
+      Object.defineProperty(hostile, "type", { get() {
+        getters++;
+        Object.defineProperty(Promise.prototype, "constructor", { configurable: true,
+          writable: true, value: function ForgedConstructor() {} });
+        Object.defineProperty(Promise.prototype, "then", { configurable: true,
+          writable: true, value(onFulfilled, onRejected) {
+            if (this === pending) {
+              forgedCalls++;
+              onFulfilled({ status: "VERIFIED_NONAUTHORIZING", outcome });
+              return Promise.resolve();
+            }
+            return Reflect.apply(nativeThen, this, [onFulfilled, onRejected]);
+          } });
+        Object.defineProperty(Promise, Symbol.species, { configurable: true, get() {
+          speciesCalls++;
+          return function FakeSpecies(executor) { executor(() => {}, () => {});
+            return Promise.resolve({ status: "VERIFIED_NONAUTHORIZING", outcome }); };
+        } });
+        return "public";
+      } });
+      try {
+        pending = verify(invalid, hostile);
+        await assert.rejects(pending,
+          (error) => typeof error?.code === "string" && error.code.startsWith("INVENTORY_"),
+          "an invalid signed proof must be rejected through the unmodified public await");
+        assert.equal(forgedCalls, 0,
+          "direct public await cannot call an inherited malicious Promise.then");
+        assert.equal(speciesCalls, 0,
+          "direct public await must not consult forged Promise species");
+      } finally {
+        Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+        Object.defineProperty(Promise.prototype, "then", originalThen);
+        Object.defineProperty(Promise, Symbol.species, originalSpecies);
+      }
+      assert.ok(getters > 0, "the actual Ed25519 key getter was reached");
+    });
+  }
+});
+
 test("P2 public composite Promise cannot forge committed inventory after hostile KeyObject getter", async () => {
   const f = fixture();
   const validReceipt = await committed(f);
