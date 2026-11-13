@@ -12469,7 +12469,7 @@ app.post("/share/c/exchange", shareRateLimit, requireSameOriginPublicShareMutati
     }
     const token = req.body.token;
     let links = loadPublicLinks();
-    let link = links[token];
+    let link = Object.hasOwn(links, token) ? links[token] : null;
     if (!link || link.shareKind !== "capability-v1"
       || new Date(link.expiresAt).getTime() <= Date.now()
       || !shareCapabilityPageAvailable(link, token)) {
@@ -12481,7 +12481,7 @@ app.post("/share/c/exchange", shareRateLimit, requireSameOriginPublicShareMutati
       return res.status(404).json({ error: "Capacidade indisponivel" });
     }
     links = loadPublicLinks();
-    link = links[token];
+    link = Object.hasOwn(links, token) ? links[token] : null;
     const linkExpiry = new Date(link?.expiresAt).getTime();
     if (!link || link.shareKind !== "capability-v1"
       || !Number.isFinite(linkExpiry) || linkExpiry <= Date.now()
@@ -12526,8 +12526,11 @@ app.post("/share/c/exchange", shareRateLimit, requireSameOriginPublicShareMutati
         alias, { hash: capabilitySessionHash(alias, cookie), expiresAt },
       ]]);
       Object.setPrototypeOf(sessions, null);
-      link.capabilitySessions = sessions;
-      savePublicLinks(links);
+      // Never mutate an object selected through a bearer-controlled property
+      // lookup. Build an independent own-property map for the JSON fallback.
+      savePublicLinks(Object.fromEntries([...Object.entries(links), [token, {
+        ...link, capabilitySessions: sessions,
+      }]]));
     }
     res.cookie(`rootark_cap_${alias}`, cookie, {
       httpOnly: true, sameSite: "strict", secure: req.secure,
