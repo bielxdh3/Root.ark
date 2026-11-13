@@ -6221,9 +6221,9 @@ function registerExperimentalP2p() {
       if (!validFile(pathname) || !sameVersion(opened, pathname)
         || (windowsPrecheck && !sameVersion(windowsPrecheck, pathname))
         || !await directoryStillTrusted()) return null;
-      const hash = crypto.createHash("sha256");
       const bytes = Buffer.allocUnsafe(512 * 1024);
-      try {
+      const digestHandle = async () => {
+        const hash = crypto.createHash("sha256");
         for (let offset = 0; offset < expectedSize;) {
           const { bytesRead } = await handle.read(bytes, 0,
             Math.min(bytes.length, expectedSize - offset), offset);
@@ -6231,15 +6231,25 @@ function registerExperimentalP2p() {
           hash.update(bytes.subarray(0, bytesRead));
           offset += bytesRead;
         }
+        return hash.digest("hex");
+      };
+      let first;
+      let second;
+      try {
+        first = await digestHandle();
+        if (!first) return null;
+        // Re-hash the pinned FD so same-tick overwrites without stat deltas fail closed.
+        second = await digestHandle();
       } finally {
         bytes.fill(0);
       }
+      if (!second || first !== second) return null;
       const after = await handle.stat({ bigint: true });
       const current = await fs.promises.lstat(source, { bigint: true });
       if (!validFile(after) || !validFile(current)
         || !sameVersion(opened, after) || !sameVersion(after, current)
         || !await directoryStillTrusted()) return null;
-      return { bytes: expectedSize, sha256: hash.digest("hex") };
+      return { bytes: expectedSize, sha256: first };
     } catch { return null; }
     finally { if (handle) await handle.close(); }
   }

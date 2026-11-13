@@ -149,6 +149,31 @@ test("mutation during pinned hashing cannot inherit signed object fingerprint", 
   assert.equal(changed, true);
 });
 
+test("same-tick overwrite without stat timestamp delta cannot inherit signed object fingerprint", async t => {
+  let changed = false;
+  let frozen = null;
+  const f = await setup(t, process.platform, {
+    lstat: async (...args) => {
+      const value = await fsp.lstat(...args);
+      if (!frozen) frozen = value;
+      return frozen;
+    },
+    open: async (...args) => pinnedHandle(await fsp.open(...args), {
+      stat: () => async () => frozen,
+      read: target => async (...data) => {
+        const result = await target.read(...data);
+        if (!changed) {
+          changed = true;
+          await fsp.writeFile(args[0], Buffer.alloc(4096, 0x55));
+        }
+        return result;
+      },
+    }),
+  });
+  assert.equal(await f.current("root", "signed-ciphertext.bin", f.bytes.length), null);
+  assert.equal(changed, true);
+});
+
 test("symlink and extra hardlink do not prove signed ciphertext", async t => {
   const f = await setup(t);
   const alias = path.join(f.directory, "foreign-hardlink.bin");
