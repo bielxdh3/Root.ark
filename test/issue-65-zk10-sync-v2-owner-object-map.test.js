@@ -96,7 +96,7 @@ function sourceProvisioning() {
   return { provisioning, digest };
 }
 
-async function fixture(overrides = {}) {
+async function fixture(overrides = {}, { coveredCompartments = [id(9)] } = {}) {
   const source = protocol.createOperation({ operation: "create", objectId: "source-object-4",
     fileId: "source-file-4", versionId: "source-version-4", operationId: "op-123",
     deviceId: "source-device-4", compartmentId: identity.compartmentId,
@@ -113,7 +113,7 @@ async function fixture(overrides = {}) {
   const cutover = signOwnerCutover({ type: "rootark-zk10-owner-account-cutover/v1",
     immutable_account_id: immutableId, zk_account_id: zkAccountId, generation: 1,
     previous_cutover_digest: null, inventory_head: proof.root,
-    complete_corpus: true, covered_compartments: [id(9)],
+    complete_corpus: true, covered_compartments: coveredCompartments,
     legacy_egress_scope: "all", reference_disposition: "fully_accounted",
     migration_disposition: "closed", grant: "protected_enforced", grants: [],
     suite: "zk1-v2", nonce: Buffer.alloc(32, 7).toString("base64url"),
@@ -165,6 +165,71 @@ async function fixture(overrides = {}) {
     input: { sourceOperation: source, zkObject: target,
       zkMembershipProof: proof.siblings, ownerMapping: mapping } };
 }
+
+test("P2: reentrant source KeyObjects cannot change any pinned role after provisioning verification", async () => {
+  const f = await fixture();
+  for (const [role, pair] of [
+    ["provisionerPublicKey", keys.source],
+    ["witnessPublicKey", keys.witness],
+    ["casPublicKey", keys.cas],
+  ]) {
+    const handle = Object.getOwnPropertySymbols(pair.publicKey)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle, "real Node22 Ed25519 native handle required");
+    const substituted = Object.create(pair.publicKey);
+    let provisionReads = 0;
+    let separationReads = 0;
+    Object.defineProperty(substituted, handle, { get() {
+      // Both keys are genuine Ed25519. A malicious native getter may hand A
+      // to the provision verifier and unrelated B to the later independence
+      // check if the same caller-owned KeyObject is inspected twice.
+      if (String(new Error().stack).includes("pinnedProvisionerKey")) {
+        provisionReads += 1;
+        return pair.publicKey[handle];
+      }
+      separationReads += 1;
+      return keys.attacker.publicKey[handle];
+    } });
+    assert.throws(() => createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, [role]: substituted },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: {
+        ...f.authority, pinnedPublicKey: pair.publicKey,
+        readCurrentHead: async (challenge) => signCurrentMappingHead({
+          type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+          sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+          mapping_sequence: f.payload.mapping_sequence, mapping_digest: f.mappingDigest,
+        }, pair.privateKey),
+      },
+    }), deny, `the true ${role} signer A cannot be its own CURRENT authority`);
+    assert.ok(provisionReads + separationReads > 0,
+      `real inherited native handle substitution must execute for ${role}`);
+  }
+  const valid = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: f.authority,
+  });
+  assert.equal((await valid(f.input)).authorizesIo, false);
+});
+
+test("P2: genuine signed owner cutovers accept 100 to 128 covered compartments", async () => {
+  for (const count of [100, 128]) {
+    const covered = Array.from({ length: count }, (_, index) => id(index + 1)).sort();
+    const f = await fixture({}, { coveredCompartments: covered });
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+      mappingAuthority: f.authority,
+    });
+    const result = await verify(f.input);
+    assert.equal(result.authorizesIo, false);
+    assert.equal(result.ownerMappingVerified, true);
+    assert.equal(result.independentCustodyProven, false);
+  }
+  const overLimit = Array.from({ length: 129 }, (_, index) => id(index + 1)).sort();
+  await assert.rejects(fixture({}, { coveredCompartments: overLimit }),
+    /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
+    "an unsigned or oversized corpus cannot silently raise the 128-compartment limit");
+});
 
 test("P2 review: owner map for provisioned compartment A cannot certify device-signed operation B", async () => {
   const f = await fixture();
