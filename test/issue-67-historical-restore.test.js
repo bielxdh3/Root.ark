@@ -643,7 +643,11 @@ test("#67 P2: failed POSIX directory fsync after link cannot authorize push on r
   fsp.open = async (name, flags, ...rest) => {
     const handle = await originalOpen(name, flags, ...rest);
     if (linked && name === f.local
-      && flags === fs.constants.O_RDONLY && injectionsRemaining > 0) {
+      && typeof flags === "number"
+      && (flags & (fs.constants.O_DIRECTORY || 0)) !== 0
+      && (flags & (fs.constants.O_NOFOLLOW || 0)) !== 0
+      && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) === fs.constants.O_RDONLY
+      && injectionsRemaining > 0) {
       Object.defineProperty(handle, "sync", { value: async () => {
         injectionsRemaining -= 1;
         throw Object.assign(new Error("disposable directory durability EIO"), { code: "EIO" });
@@ -671,8 +675,8 @@ test("#67 P2: failed POSIX directory fsync after link cannot authorize push on r
       verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
     }).open();
     await assert.rejects(reopened.syncOnce(),
-      (error) => error.code === "EIO",
-      "the real POSIX retry must propagate its directory fsync failure");
+      (error) => error.code === "restore_local_materialization_missing",
+      "the real POSIX retry must fail closed when directory fsync fails");
     assert.equal(injectionsRemaining, 0, "second EIO must strike missing-witness retry directory fsync");
     assert.equal(f.pushes(), 0, "the server must not receive the restore after either fsync EIO");
     assert.equal((await reopened.journal.recover()).length, 1);
