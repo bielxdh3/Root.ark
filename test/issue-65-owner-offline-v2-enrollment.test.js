@@ -984,6 +984,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertext_digest: bundleSecondDigest, nonce: crypto.randomBytes(32) };
     const bundleSecondGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
       authorization: bundleSecondAuth };
+    const bundleSecondMessage = await shareGrantMessageV1(bundleSecondGrantInput);
+    const bundleSecondSignature = b64(crypto.sign(null, bundleSecondMessage, originalActor));
     const bundleSecondAck = await fetch(origin + "/zk-1/v1/share/grant", {
       method: "POST", headers: { "content-type": "application/json",
         "x-fixture-session": "owner" }, body: JSON.stringify({
@@ -995,12 +997,30 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
           .map(([key, value]) => [key, value instanceof Uint8Array ? b64(value) : value])),
         signatureBase64: b64(crypto.sign(null,
           await contentAuthorizationMessageV1(bundleSecondAuth), originalActor)),
-        shareSignatureBase64: b64(crypto.sign(null,
-          await shareGrantMessageV1(bundleSecondGrantInput), originalActor)),
+        shareSignatureBase64: bundleSecondSignature,
       }),
     });
     assert.equal(bundleSecondAck.status, 201, "second object has a genuine owner-issued grant");
-    const bundleSecondGrant = await bundleSecondAck.json();
+    const bundleSecondObservedAck = await bundleSecondAck.json();
+    // A successful HTTP ACK is not a source of owner grant authority. Build
+    // the fixture from the owner's original Ed25519-signed bytes, then verify
+    // the returned server JSON matches that original exactly before use.
+    const bundleSecondGrant = Object.freeze({
+      grantId: bundleSecondGrantInput.grantId,
+      expiresAt: bundleSecondGrantInput.expiresAt,
+      shareStatementBase64: b64(bundleSecondMessage.subarray(
+        Buffer.byteLength("Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: bundleSecondSignature,
+    });
+    assertAuthenticOwnerGrantAck(bundleSecondObservedAck, bundleSecondGrant,
+      bundleSecondMessage, crypto.createPublicKey(originalActor));
+    assert.equal(JSON.stringify(bundleSecondObservedAck), JSON.stringify(bundleSecondGrant),
+      "second HTTP ACK bytes must equal the independently signed owner fixture");
+    assert.throws(() => assertAuthenticOwnerGrantAck({ ...bundleSecondObservedAck,
+      shareSignatureBase64: b64(crypto.randomBytes(64)) }, bundleSecondGrant,
+    bundleSecondMessage, crypto.createPublicKey(originalActor)),
+    /ZK_SHARE_GRANT_ACK_UNVERIFIED/,
+    "a forged second server ACK may never become a private owner fixture");
     const bundleSecondOffer = await createProtectedRecipientShareOffer({
       ...ownerOfferArgs, grant: bundleSecondGrant, metadata: bundleSecondMeta,
       ownerHeldCek: Buffer.from(bundleSecondCek), ciphertext: Buffer.from(bundleSecondCipher),
