@@ -58,7 +58,7 @@ function args(argv) {
     if (Object.hasOwn(result, key)) throw new Error(`Invalid Sync v2 duplicate --${key}`);
     if (key === "once" && separator < 0) {
       const next = argv[index + 1];
-      result.once = next === "true" || next === "false" ? (index++, next) : true;
+      result.once = next === "true" || next === "false" ? (index++, next === "true") : true;
     } else if (valuedOptions.has(key)) {
       const value = separator < 0 ? argv[index + 1] : item.slice(separator + 1);
       if (!value || (separator < 0 && value.startsWith("--"))) {
@@ -422,5 +422,5 @@ if (require.main === module) {
     + "Files On-Demand: node sync-client/rootark-sync-v2.js browse|hydrate|evict|pin|unpin|status --config <private-config> [--path relative/file]");
 }
 
-module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
+module.exports = { args, fileKeyResolver, normalizeTrustedDevicePolicy,
   trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity, start };

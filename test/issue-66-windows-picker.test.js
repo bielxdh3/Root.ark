@@ -71,7 +71,7 @@ test("issue 66 Windows: Explorer picker pages metadata then reveals only a verif
   assert.equal(trace.split(/\r?\n/).filter((line) => line.includes("|hydrate|")).length, 1);
   assert.match(trace, /--path=docs\/verified\.txt/);
   assert.equal(launch.process.toLowerCase().endsWith("explorer.exe"), true);
-  assert.equal(launch.arguments.join(" ").includes(path.join(local, "docs", "verified.txt")), true);
+  assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
   assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
 });
 

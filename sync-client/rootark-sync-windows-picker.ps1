@@ -76,7 +76,7 @@ if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) 
   -not (Test-Path -LiteralPath $target -PathType Leaf)) {
   throw 'Hydrated file is missing or outside the local sync folder.'
 }
-Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList @('/select,', ('"' + $target + '"')) | Out-Null
+Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList @(('/select,"' + $target + '"')) | Out-Null
 } finally {
   [Console]::OutputEncoding = $previousOutputEncoding
 }
