@@ -79,6 +79,7 @@ const MAX_GLOBAL_PENDING_HEAD_READS = 64;
 const NATIVE_SET_TIMEOUT = setTimeout;
 const NATIVE_CLEAR_TIMEOUT = clearTimeout;
 const NATIVE_HRTIME_BIGINT = process.hrtime.bigint.bind(process.hrtime);
+const NATIVE_PUBLIC_PROMISE = Promise;
 const NATIVE_BIGINT = BigInt;
 const NATIVE_ABORT_CONTROLLER = AbortController;
 const NATIVE_ABORT_SIGNAL = AbortSignal;
@@ -393,7 +394,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       }
     }
     let lastAcceptedSequence = 0;
-    return async function verifyOwnerSignedMapping(input, control) {
+    async function verifyOwnerSignedMappingInternal(input, control) {
       try {
         const signal = control === undefined ? undefined : exact(control, ["signal"]).signal;
         if (signal !== undefined && !(signal instanceof NATIVE_ABORT_SIGNAL)) deny();
@@ -486,6 +487,16 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           historicalLegacyCompletenessProven: false,
         });
       } catch (_) { deny(); }
+    }
+    return function verifyOwnerSignedMapping(input, control) {
+      const pending = verifyOwnerSignedMappingInternal(input, control);
+      // A hostile CURRENT callback can replace Promise.prototype.constructor
+      // before consumers await this exported verifier. Bind the real native
+      // constructor to the actual rejected or fulfilled Promise instance.
+      NATIVE_DEFINE_PROPERTY(pending, "constructor", {
+        value: NATIVE_PUBLIC_PROMISE, configurable: false, writable: false,
+      });
+      return pending;
     };
   } catch (_) { deny(); }
 }
