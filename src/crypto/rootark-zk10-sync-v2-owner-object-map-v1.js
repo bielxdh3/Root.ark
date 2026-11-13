@@ -72,6 +72,14 @@ const HEAD_FIELDS = NATIVE_FREEZE([
 const DEFAULT_HEAD_TIMEOUT_MS = 1500;
 const DEFAULT_MAX_PENDING_HEAD_READS = 16;
 const MAX_GLOBAL_PENDING_HEAD_READS = 64;
+// Caller-owned native KeyObject getters can replace same-realm timers and the
+// JS monotonic clock before CURRENT head reads start. Pin the original timeout,
+// cancellation and clock primitives before touching those hostile keys.
+const NATIVE_SET_TIMEOUT = setTimeout;
+const NATIVE_CLEAR_TIMEOUT = clearTimeout;
+const NATIVE_HRTIME_BIGINT = process.hrtime.bigint.bind(process.hrtime);
+const NATIVE_ABORT_CONTROLLER = AbortController;
+const NATIVE_ABORT_SIGNAL = AbortSignal;
 // Timeout/cancellation returns control to JS, but a noncooperative external
 // adapter still owns its underlying promise until it actually settles.
 const globalPendingHeadReads = NATIVE_SET_CREATE();
@@ -318,13 +326,13 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     async function boundedCurrentHead(challenge, signal) {
       if (signal?.aborted || NATIVE_SET_SIZE.call(pendingHeadReads) >= maxPendingHeadReads
         || NATIVE_SET_SIZE.call(globalPendingHeadReads) >= MAX_GLOBAL_PENDING_HEAD_READS) deny();
-      const controller = new AbortController();
+      const controller = new NATIVE_ABORT_CONTROLLER();
       // Timers can run late if an adapter blocks the JS event loop. Reject a
       // result even if its microtask beats an overdue timeout callback.
-      const expiresAt = process.hrtime.bigint() + BigInt(headTimeoutMs) * 1000000n;
+      const expiresAt = NATIVE_HRTIME_BIGINT() + BigInt(headTimeoutMs) * 1000000n;
       let timer, onCancel;
       const deadline = NATIVE_PROMISE_CREATE((resolve) => {
-        timer = setTimeout(() => {
+        timer = NATIVE_SET_TIMEOUT(() => {
           controller.abort();
           resolve({ settled: false });
         }, headTimeoutMs);
@@ -354,13 +362,13 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           NATIVE_PROMISE_THEN.call(pending, (value) => value,
             () => ({ settled: false })), deadline, cancelled);
         if (!result.settled || controller.signal.aborted || signal?.aborted
-          || process.hrtime.bigint() >= expiresAt) {
+          || NATIVE_HRTIME_BIGINT() >= expiresAt) {
           controller.abort();
           deny();
         }
         return result.value;
       } finally {
-        clearTimeout(timer);
+        NATIVE_CLEAR_TIMEOUT(timer);
         if (onCancel) signal.removeEventListener("abort", onCancel);
       }
     }
@@ -368,7 +376,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     return async function verifyOwnerSignedMapping(input, control) {
       try {
         const signal = control === undefined ? undefined : exact(control, ["signal"]).signal;
-        if (signal !== undefined && !(signal instanceof AbortSignal)) deny();
+        if (signal !== undefined && !(signal instanceof NATIVE_ABORT_SIGNAL)) deny();
         if (signal?.aborted) deny();
         const r = exact(input, INPUT_FIELDS);
         const { payload, signature } = unpackMap(r.ownerMapping);

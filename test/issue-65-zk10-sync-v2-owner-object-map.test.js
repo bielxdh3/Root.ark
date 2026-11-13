@@ -436,6 +436,82 @@ test("P2: hostile Promise species cannot redirect native reactions or disable ge
     "real signed authority does not depend on poisoned global species");
 });
 
+test("P2: hostile Ed25519 getter cannot disable CURRENT head's native timeout", async () => {
+  const f = await fixture();
+  const nativeSetTimeout = setTimeout;
+  const originalSetTimeout = global.setTimeout;
+  const injected = Object.create(keys.source.publicKey);
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "Node22 real native Ed25519 handle is required");
+  let getterReads = 0, poisonedTimerCalls = 0;
+  Object.defineProperty(injected, handle, { get() {
+    getterReads++;
+    global.setTimeout = () => { poisonedTimerCalls++; return undefined; };
+    return keys.source.publicKey[handle];
+  } });
+  const calls = [];
+  let pending;
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...f.authority, readCurrentHead: (challenge, { signal }) =>
+        new Promise((resolve) => calls.push({ resolve, challenge, signal })) },
+    }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+    assert.ok(getterReads > 0, "genuine source key getter executed");
+    pending = verify(f.input);
+    const settled = await Promise.race([
+      pending.then(() => "accepted", () => "denied"),
+      new Promise((resolve) => nativeSetTimeout(() => resolve("deadline_missing"), 200)),
+    ]);
+    assert.equal(calls.length, 1, "external read was actually dispatched");
+    assert.equal(settled, "denied",
+      "a missing ambient setTimeout must never suppress the pinned 20ms deadline");
+    assert.equal(calls[0].signal.aborted, true,
+      "the real native AbortController must cancel expired work");
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    for (const call of calls) call.resolve(signedHead(f, call.challenge));
+    if (pending) await Promise.race([pending.catch(() => {}),
+      new Promise((resolve) => nativeSetTimeout(resolve, 150))]);
+  }
+  assert.equal(poisonedTimerCalls, 0,
+    "never consult the replaced global setTimeout after source key callbacks");
+});
+
+test("P2: hostile Ed25519 getter cannot rewind the CURRENT head monotonic deadline", async () => {
+  const f = await fixture();
+  const clock = process.hrtime.bigint;
+  const injected = Object.create(keys.source.publicKey);
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "Node22 real native Ed25519 handle is required");
+  let getterReads = 0, actualReads = 0;
+  Object.defineProperty(injected, handle, { get() {
+    getterReads++;
+    process.hrtime.bigint = () => 0n;
+    return keys.source.publicKey[handle];
+  } });
+  let startedAt;
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...f.authority, readCurrentHead: (challenge) => {
+        actualReads++;
+        startedAt = Date.now();
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 45);
+        return signedHead(f, challenge);
+      } },
+    }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+    assert.ok(getterReads > 0);
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  } finally { process.hrtime.bigint = clock; }
+  assert.equal(actualReads, 1, "genuinely signed readback executed");
+  assert.ok(Date.now() - startedAt >= 20, "external callback blocked longer than expiry");
+});
+
 test("P2: pinned native Set add/delete/size ignore later same-realm prototype changes", () => {
   const { newNativeSet, setAdd, setDelete, setSize } =
     require("../src/crypto/rootark-zk10-native-intrinsics-v1");
