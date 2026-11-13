@@ -103,6 +103,10 @@ async function startFixture(t, mode, extraEnv = {}) {
   const port = await getUnusedPort();
   const swapAfterOpen = extraEnv.ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN === "1";
   const swapFile = path.join(sandbox, "uploads", FILE_NAME);
+  const foreignFdPath = `${swapFile}.foreign-descriptor`;
+  if (swapAfterOpen && extraEnv.ROOTARK_TEST_SHARE_FOREIGN_FD_ONLY === "1") {
+    fs.writeFileSync(foreignFdPath, "FOREIGN_DESCRIPTOR_BYTES_NOT_AUTHORIZED\n");
+  }
   const child = spawn(process.execPath, [
     ...(swapAfterOpen ? ["--require", path.join(ROOT, "test", "support", "issue-68-share-after-open-swap.js")] : []),
     SERVER,
@@ -115,6 +119,7 @@ async function startFixture(t, mode, extraEnv = {}) {
         ROOTARK_TEST_SHARE_SWAP_FILE: swapFile,
         ROOTARK_TEST_SHARE_SWAP_SAVED_FILE: `${swapFile}.granted`,
         ROOTARK_TEST_SHARE_SWAP_MARKER: path.join(sandbox, "swap-after-open.marker"),
+        ROOTARK_TEST_SHARE_FOREIGN_FD_PATH: foreignFdPath,
       } : {}),
     },
     stdio: "ignore",
@@ -262,6 +267,50 @@ for (const mode of ["json", "sqlite"]) {
     assert.equal(downloads || 0, 0,
       "foreign descriptor refusal must preserve download quota despite generation revocation");
   });
+}
+
+for (const mode of ["json", "sqlite"]) {
+  test(`download rejects foreign descriptor even when original pathname identity is unchanged (${mode})`,
+    { timeout: 60_000 }, async (t) => {
+      const { authed, publicPost, dataDir } = await startFixture(t, mode, {
+        ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve",
+        ROOTARK_TEST_SHARE_PAUSE_MS: "1800",
+        ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN: "1",
+        ROOTARK_TEST_SHARE_FOREIGN_FD_ONLY: "1",
+      });
+      const created = await authed("/share/capabilities", {
+        name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+        permissions: ["download"], maxDownloads: 1,
+      });
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      const viewer = await publicPost(token, "view");
+      assert.equal(viewer.status, 200, viewer.body);
+
+      const originalPath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
+      const before = fs.statSync(originalPath);
+      const pending = publicPost(token, "download", viewerCookieFrom(viewer));
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const marker = path.join(path.dirname(dataDir), "swap-after-open.marker");
+      fs.writeFileSync(marker, "substitute only the opened file descriptor");
+      const refused = await pending;
+      assert.equal(fs.existsSync(marker), false,
+        "test must reach the actual already-verified-open handle substitution");
+      const after = fs.statSync(originalPath);
+      assert.equal(after.ino, before.ino, "path inode must not change during descriptor test");
+      assert.equal(after.ctimeMs, before.ctimeMs,
+        "path generation must remain authorized: denial must come from opened descriptor");
+      assert.equal(fs.readFileSync(originalPath, "utf8"), FILE_CONTENT);
+      assert.equal(refused.status, 404,
+        "a foreign opened descriptor must be refused despite a still-authorized pathname");
+      assert.equal(refused.body.includes("FOREIGN_DESCRIPTOR_BYTES_NOT_AUTHORIZED"), false);
+
+      const retry = await publicPost(token, "download", viewerCookieFrom(viewer));
+      assert.equal(retry.status, 200,
+        "the prior denied foreign handle must not invalidate a real authorized download");
+      assert.equal(retry.body, FILE_CONTENT,
+        "genuine authorized descriptor must return the original file bytes");
+    });
 }
 
 test("SQLite exchange cannot revoke a new share or lose a parallel alias after its stale read", { timeout: 60_000 }, async (t) => {
