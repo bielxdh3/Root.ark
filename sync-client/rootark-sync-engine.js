@@ -505,6 +505,10 @@ class SyncEngine {
     if (options.selectedPaths != null && !Array.isArray(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
     this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
     this.excludedPaths = normalizeExcludedPaths(options.excludedPaths);
+    this.filesOnDemand = options.filesOnDemand === true;
+    if (this.filesOnDemand && typeof this.adapter.listInventory !== "function") {
+      fail("Files On-Demand requires a metadata inventory adapter", "inventory_unavailable");
+    }
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
     this.snapshotDiskRevision = null;
     this.opened = false;
@@ -734,6 +738,34 @@ class SyncEngine {
         ...record, selectedOnDevice: this.operationDestinationIsSelected(record),
       })),
     };
+  }
+
+  async scanOnDemandInventory(requestedPath = null) {
+    let cursor = null;
+    let available = 0;
+    let matching = null;
+    const seenCursors = new Set();
+    for (let pageNumber = 0; pageNumber < 1024; pageNumber += 1) {
+      const page = await this.browseRemoteInventory({ limit: 64, cursor });
+      if (page.objects.length > 64 || (page.objects.length === 0 && page.nextCursor !== null)) {
+        fail("Invalid metadata inventory page", "invalid_inventory");
+      }
+      for (const entry of page.objects) {
+        const remotePath = protocol.safeRelativePath(entry.metadata?.path, "path");
+        if (!this.isSelected(remotePath)) continue;
+        if (!entry.tombstone && entry.metadata?.contentType !== "inode/directory") available += 1;
+        if (requestedPath !== null && !entry.tombstone && pathsEqual(remotePath, requestedPath)) {
+          if (matching) fail("More than one remote object matches this path", "remote_object_ambiguous");
+          matching = entry;
+        }
+      }
+      if (page.nextCursor === null) return { available, matching };
+      if (typeof page.nextCursor !== "string" || !page.nextCursor
+        || seenCursors.has(page.nextCursor)) fail("Repeated or invalid metadata cursor", "invalid_inventory");
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+    fail("Metadata inventory exceeds the supported page bound", "invalid_inventory");
   }
 
   rememberRemoteOnly(operation, reason, options = {}) {
@@ -1536,9 +1568,47 @@ class SyncEngine {
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
+        if (this.filesOnDemand && operation.operation === "create") {
+          // A metadata-only pull cannot establish that a new local path is free remotely.
+          // Recheck EVERY pending CREATE immediately before push, including old outbox
+          // entries replayed after a crash/offline interval. Never treat the mutable
+          // local snapshot (or a previous successful inventory read) as a path lock.
+          let inventory;
+          try {
+            inventory = await this.scanOnDemandInventory(operation.metadata.path);
+          } catch (error) {
+            // A 409 on metadata paging signals a stale inventory cursor, NOT
+            // a rejected outgoing push. Never run remote-wins conflict recovery
+            // or mark a pending local CREATE seen because metadata changed.
+            if (error?.status === 409 || error?.code === "sync_conflict"
+              || error instanceof SyncConflictError) {
+              fail("Metadata inventory changed during CREATE preflight", "inventory_changed");
+            }
+            throw error;
+          }
+          if (inventory.matching) {
+            // A server can echo the exact genuine Ed25519 CREATE without ever
+            // committing it. A signed request is proof of authorship, NOT
+            // independent physical admission. Preserve the pending outbox
+            // until a non-colluding durable admission receipt is available.
+            const candidate = inventory.matching;
+            if (candidate.objectId === operation.objectId
+              && candidate.fileId === operation.fileId
+              && candidate.operationId === operation.operationId) {
+              fail("Exact signed CREATE echo does not prove physical admission",
+                "remote_admission_unproven");
+            }
+            fail("A remote object already owns the Files On-Demand CREATE path",
+              "remote_path_collision");
+          }
+        }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
+          if (result.status === 409 && (result.code === "remote_path_collision"
+            || result.payload?.code === "remote_path_collision")) {
+            fail("A protected remote CREATE path was occupied after preflight", "remote_path_collision");
+          }
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
           throw new SyncConflictError(result);
         }
@@ -1563,6 +1633,10 @@ class SyncEngine {
         await this.journal.markSeen(operation.operationId, acknowledgedDigest);
         summary.pushed += 1;
       } catch (error) {
+        if (error?.code === "remote_path_collision"
+          || error?.payload?.code === "remote_path_collision") {
+          fail("A protected remote CREATE path was occupied after preflight", "remote_path_collision");
+        }
         // A local authorization failure is never an HTTP conflict. Even a
         // callback that throws status:409 must not consume a pending journal
         // operation or trigger remote-wins recovery without a real response.
@@ -1647,7 +1721,7 @@ class SyncEngine {
     return this.withMutationLock(() => this._apply(operation, summary));
   }
 
-  async _apply(operation, summary = null) {
+  async _apply(operation, summary = null, beforeHydrationWrite = null) {
     operation = envelopeCopy(operation);
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
@@ -1716,6 +1790,7 @@ class SyncEngine {
       if (!sourceExists && movePayload === null) fail("Moved file is unavailable and the operation has no recovery payload", "move_source_missing");
       await fsp.mkdir(path.dirname(target), { recursive: true });
       await containedAbsolute(this.rootDir, path.dirname(target), false);
+      if (beforeHydrationWrite) await beforeHydrationWrite();
       let hash;
       if (sourceExists) {
         if (source !== target) {
@@ -1739,6 +1814,7 @@ class SyncEngine {
     } else {
       await fsp.mkdir(path.dirname(target), { recursive: true });
       await containedAbsolute(this.rootDir, path.dirname(target), false);
+      if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
         const sourcePath = operation.operation === "update" ? activeIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         let relocated = false;
@@ -2080,6 +2156,7 @@ class SyncEngine {
     if (!this.opened) await this._open();
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     if (!this.isSelected(safePath)) fail("Remote-only path is outside the selected scope", "path_not_selected");
+    if (this.filesOnDemand) return this._materializeOnDemand(safePath);
     const matches = Object.values(this.snapshot.remoteOnly).filter((item) => pathsEqual(item.path, safePath));
     const activeMatches = matches.filter((item) => !item.deleted);
     if (activeMatches.length > 1) fail("More than one remote-only object matches this path", "remote_object_ambiguous");
@@ -2101,6 +2178,127 @@ class SyncEngine {
     }
     const appliedDigest = await this._apply(operation);
     await this.journal.markSeen(operation.operationId, verifiedFreshDigest || appliedDigest);
+    return true;
+  }
+
+  async _materializeOnDemand(safePath) {
+    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
+      fail("Cannot hydrate while a signed atomic sync batch is pending", "sync_atomic_batch_indeterminate");
+    }
+    const { matching } = await this.scanOnDemandInventory(safePath);
+    if (!matching) fail("Remote object is not in the metadata inventory", "remote_object_unavailable");
+    if (matching.tombstone) fail("Remote object has been deleted", "remote_object_deleted");
+
+    const prior = this.snapshot.files[safePath];
+    const target = await contained(this.rootDir, safePath, true);
+    const evicted = this.snapshot.remoteOnly[matching.objectId];
+    const checkLocalCache = async () => {
+      const present = await exists(target);
+      if (prior && !prior.deleted && (prior.objectId !== matching.objectId
+        || prior.fileId !== matching.fileId || !present)) {
+        fail("Tracked local file changed or disappeared", "local_changes_pending");
+      }
+      if (present) {
+        if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) {
+          fail("Untracked local file cannot be overwritten by hydration", "local_changes_pending");
+        }
+        const before = await fsp.lstat(target, { bigint: true });
+        const bytes = await readContainedFile(this.rootDir, safePath, before);
+        if (crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash) {
+          fail("Local file changed since its last sync", "local_changes_pending");
+        }
+      } else if (evicted) {
+        // Eviction pins an object identity/revision, not an immutable pathname.
+        // A later authenticated MOVE can rename that evicted object before the
+        // device reconnects. Do not deny the new path merely because the
+        // marker still records the old one. The full envelope must still
+        // match inventory and pass normal verification before any write.
+        const relocated = !pathsEqual(evicted.path, safePath);
+        if (evicted.deleted || (relocated && (
+          matching.operation !== "move" || matching.fileId !== evicted.fileId
+          || !matching.metadata?.sourcePath
+          || protocol.compareRevisions(matching.revision, evicted.revision) <= 0))) {
+          fail("Evicted file no longer matches this path", "remote_object_changed");
+        }
+      }
+    };
+    await checkLocalCache();
+    const pending = await this.journal.recover();
+    if (pending.some((operation) => operation.objectId === matching.objectId
+      || operation.metadata?.path === safePath || operation.metadata?.sourcePath === safePath)) {
+      fail("Pending local sync prevents hydration", "sync_operation_pending");
+    }
+
+    const result = await this.adapter.list(matching.objectId);
+    const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
+    if (records.length !== 1) fail("Remote object is not available", "remote_object_unavailable");
+    const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
+    if (operation.objectId !== matching.objectId || operation.fileId !== matching.fileId
+      || operation.versionId !== matching.versionId || operation.operationId !== matching.operationId
+      || operation.tombstone !== matching.tombstone || operation.operation !== matching.operation
+      || operation.keyEpoch !== matching.keyEpoch || operation.compartmentId !== matching.compartmentId
+      || operation.deviceId !== matching.deviceId || operation.protocolVersion !== matching.protocolVersion
+      || protocol.canonicalJson(operation.baseRevision) !== protocol.canonicalJson(matching.baseRevision)
+      || protocol.canonicalJson(operation.revision) !== protocol.canonicalJson(matching.revision)
+      || protocol.canonicalJson(operation.metadata) !== protocol.canonicalJson(matching.metadata)) {
+      fail("Remote object changed since metadata inventory", "inventory_changed");
+    }
+    if (operation.metadata.contentType === "inode/directory") {
+      fail("Files On-Demand materializes regular files only", "cache_entry_unavailable");
+    }
+    const moveKey = operation.operation === "move" ? await this.keyFor(operation) : null;
+    const movePayload = moveKey
+      ? protocol.decodeMovePayload(protocol.decryptPayload(operation, moveKey), moveKey) : null;
+    if (moveKey && movePayload === null) {
+      fail("Remote MOVE has no verified recovery payload", "move_source_missing");
+    }
+    const assertNoSignedInventoryRollback = () => {
+      // A server can replay an internally consistent inventory page and its
+      // ORIGINAL, genuinely signed old ciphertext. Authentication alone does
+      // not prove freshness. Never let that response lower a locally durable
+      // object revision, including when the object was evicted or moved.
+      // This local floor is not independent anti-rollback custody: restoring
+      // the entire snapshot also requires a separate monotonic authority.
+      const known = [...Object.values(this.snapshot.files),
+        this.snapshot.remoteOnly[operation.objectId]];
+      for (const previous of known) {
+        if (!previous || previous.objectId !== operation.objectId
+          || !previous.revision) continue;
+        const order = protocol.compareRevisions(operation.revision, previous.revision);
+        if (order < 0 || (order === 0 && previous.versionId
+          && previous.versionId !== operation.versionId)) {
+          fail("Older signed inventory cannot roll back local cache", "remote_rollback_detected");
+        }
+      }
+    };
+    const checkBeforeWrite = async () => {
+      assertNoSignedInventoryRollback();
+      await checkLocalCache();
+      if (!moveKey) return;
+      // A signed UPDATE may change fileId without changing objectId. Until
+      // the local old identity is reconciled, its missing bytes may be an
+      // unsynced deletion. The MOVE must not bypass that pending local state.
+      if (Object.entries(this.snapshot.files).some(([trackedPath, tracked]) =>
+        !pathsEqual(trackedPath, safePath) && tracked && !tracked.deleted
+          && tracked.objectId === operation.objectId
+          && tracked.fileId !== operation.fileId)) {
+        fail("Tracked local object identity requires reconciliation", "local_changes_pending");
+      }
+      const sourcePath = activeFileIdentityPath(this.snapshot.files, operation, safePath);
+      if (!sourcePath) return;
+      const source = await contained(this.rootDir, sourcePath, true);
+      if (!(await exists(source))) fail("Tracked moved source was removed locally", "local_changes_pending");
+      const tracked = this.snapshot.files[sourcePath];
+      const bytes = await readContainedFile(this.rootDir, sourcePath);
+      const hash = crypto.createHash("sha256").update(bytes).digest("hex");
+      if (!tracked || hash !== tracked.hash
+        || !bytes.equals(movePayload)) {
+        fail("Moved source has uncommitted local changes", "local_changes_pending");
+      }
+    };
+    await checkBeforeWrite();
+    const verifiedFreshDigest = await this._apply(operation, null, checkBeforeWrite);
+    await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
     return true;
   }
 
@@ -2282,7 +2480,16 @@ class SyncEngine {
     if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
     await this._pushPending(summary);
-    if (!summary.offline) await this._pullRemote(summary);
+    if (!summary.offline) {
+      if (this.filesOnDemand) {
+        try {
+          summary.available = (await this.scanOnDemandInventory()).available;
+        } catch (error) {
+          if (transient(error)) summary.offline = true;
+          else throw error;
+        }
+      } else await this._pullRemote(summary);
+    }
     return summary;
   }
 }
