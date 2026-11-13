@@ -8,6 +8,7 @@ const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY, mathAbs: NATIVE_MATH_ABS,
   sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
   getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY } =
   require("./rootark-zk10-native-intrinsics-v1");
+const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const z = require("./rootark-zk-1");
 // A caller-owned KeyObject getter may run during key() and mutate exports.
 // Keep the real codec entry points used for the signed bytes fixed from load.
@@ -141,7 +142,10 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
       || (typeof SharedArrayBuffer !== "undefined"
         && raw.buffer instanceof SharedArrayBuffer)) deny();
     const serialized = NATIVE_BUFFER_FROM(raw);
-    const pin = key(options.pinnedPublicKey, "public");
+    // Never use the caller-owned KeyObject across an await. Its inherited
+    // kHandle getter can switch from pinned key B to signing key A after
+    // validation while keeping a genuine Ed25519 signature on A.
+    const pin = pinNativeEd25519PublicKey(options.pinnedPublicKey);
     const proof = await NATIVE_DECODE_DETERMINISTIC(serialized);
     exact(proof, ALL_FIELDS);
     const { signature, ...unsigned } = proof;

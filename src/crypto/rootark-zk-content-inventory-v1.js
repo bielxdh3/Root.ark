@@ -21,6 +21,7 @@ const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
 // after the original signed bytes have already been independently pinned.
 // Retain our own immutable codec facade before consulting any such getter.
 const codec = require("./rootark-zk-1");
+const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const z = Object.freeze({
   encodeDeterministic: codec.encodeDeterministic,
   decodeDeterministic: codec.decodeDeterministic,
@@ -313,7 +314,7 @@ async function verifyTerminalProof(input) {
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const expectedScope = normalizeScope(raw.expectedScope);
   const operation = normalizeTerminalOperation(raw.operation);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  const publicKey = detachedPublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); } catch (_) { fail("INVENTORY_ENCODING"); }
   // The signed terminal claim must correspond to the original received wire,
@@ -402,7 +403,7 @@ async function verifyCommittedEntryProof(input) {
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const scope = normalizeScope(raw.expectedScope);
   const operation = normalizeTerminalOperation(raw.operation);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  const publicKey = detachedPublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); }
   catch (_) { fail("INVENTORY_ENCODING"); }
@@ -518,10 +519,13 @@ function validatePrivateKey(value) {
   return value;
 }
 
-function validatePublicKey(value) {
-  if (!(value instanceof NATIVE_KEY_OBJECT)
-    || value.type !== "public" || value.asymmetricKeyType !== "ed25519") fail("INVENTORY_SIGNER_KEY");
-  return value;
+function detachedPublicKey(value) {
+  // Native .type/.asymmetricKeyType and the subsequent Ed25519 operation can
+  // otherwise observe different kHandle values on a caller-owned KeyObject.
+  // Import exactly one SPKI snapshot into a new, non-caller-owned native key.
+  try {
+    return pinNativeEd25519PublicKey(value);
+  } catch (_) { fail("INVENTORY_SIGNER_KEY"); }
 }
 
 async function createSignedSnapshot(input) {
@@ -728,7 +732,7 @@ async function verifySnapshot(input) {
     ? null : copyBytes(raw.minimumSnapshot, 1, MAX_SNAPSHOT_BYTES);
   const chain = raw.committedProofChain === undefined || raw.committedProofChain === null
     ? null : normalizeCommittedProofChain(raw.committedProofChain);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  const publicKey = detachedPublicKey(raw.pinnedPublicKey);
 
   const current = await parseAndVerifySnapshot(serialized, publicKey, pinnedSignerKeyId, expectedScope);
   if (!sameBytes(current.nonce, nonce)) fail("INVENTORY_NONCE");

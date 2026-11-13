@@ -10,6 +10,8 @@ const crypto = require("node:crypto");
 // A native Ed25519 KeyObject getter runs before later local policy snapshots.
 // Define own array data slots instead of consulting mutable Array.push.
 const NATIVE_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
+const { arrayIncludes: NATIVE_ARRAY_INCLUDES } =
+  require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const protocol = require("./rootark-sync-protocol");
 const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
   require("./rootark-sync-authorization");
@@ -328,7 +330,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     if (live.username !== bound.envelope.authorization.username
       || live.trustedDevicePublicKeys[bound.envelope.deviceId]
         !== bound.envelope.authorization.publicKey
-      || live.revokedDeviceIds.includes(bound.envelope.deviceId)) deny();
+      || NATIVE_ARRAY_INCLUDES.call(live.revokedDeviceIds, bound.envelope.deviceId)) deny();
     return Object.freeze({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
       envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,

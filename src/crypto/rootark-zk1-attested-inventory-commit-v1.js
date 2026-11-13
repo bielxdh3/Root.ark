@@ -6,6 +6,9 @@
 // Require BOTH independently pinned identities on the exact operation and a
 // fresh, caller-owned nonce. Non-authorizing and not a cloud fsync receipt.
 const crypto = require("node:crypto");
+const { keyEquals: NATIVE_KEY_EQUALS } =
+  require("./rootark-zk10-native-intrinsics-v1");
+const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const inventory = require("./rootark-zk-content-inventory-v1");
 const { verifyCommittedPhysicalReadback } =
   require("./rootark-zk-pg-physical-attestation-v1");
@@ -35,8 +38,9 @@ function rawBytes(value, min, max) {
   return Buffer.from(value);
 }
 function publicKey(value) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== "public"
-    || value.asymmetricKeyType !== "ed25519") deny();
+  // The exact KeyObject checked for independent role separation is the one
+  // used by both signed proofs, even if the caller's native kHandle changes.
+  return pinNativeEd25519PublicKey(value);
 }
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest(); }
 function derivePhysicalChainPageNonce(chainNonce, afterSequence) {
@@ -74,28 +78,24 @@ async function verifyAttestedInventoryCommit(input) {
     exact(input, ["receipt", "physicalAttestation", "scope", "operation", "nonce",
       "pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
       "pinnedPhysicalAttestorPublicKey", "nowSeconds"]);
-    // The exact KeyObject references used for separation MUST also verify
-    // both signatures. A top-level Proxy can otherwise serve separate keys
-    // to this comparison then replace the attestor with the writer key.
-    const inventoryKey = input.pinnedInventoryPublicKey;
-    const attestorKey = input.pinnedPhysicalAttestorPublicKey;
+    // Detach trusted expectations before invoking ANY caller-owned native
+    // KeyObject getter. Such a getter can rewrite even already-validated
+    // buffers in this same realm, then restore B after an async signature.
     const nowSeconds = input.nowSeconds;
-    publicKey(inventoryKey);
-    publicKey(attestorKey);
-    // The public KeyObject's .export() is an overridable own property.
-    // Compare native cryptographic key identities with the intrinsic method,
-    // not caller-supplied DER from an attacker-controlled export override.
-    if (crypto.KeyObject.prototype.equals.call(inventoryKey, attestorKey)) deny();
     const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
     const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
     const nonce = rawBytes(input.nonce, 32, 32);
-    // Both signature parsers have asynchronous CBOR boundaries. If they read
-    // the caller's mutable operation/scope independently, a hostile Proxy can
-    // present a valid ledger operation A and a valid physical readback B.
-    // Detach exactly ONCE before either parser awaits any promise.
     const scope = inventory.normalizeScope(input.scope);
     const operation = snapshotOperation(input.operation);
     const signerId = rawBytes(input.pinnedInventorySignerKeyId, 16, 16);
+    // Reimport immutable native SPKI while each caller-controlled key is
+    // observed, then test independence on those same verifier identities.
+    const inventoryKey = publicKey(input.pinnedInventoryPublicKey);
+    const attestorKey = publicKey(input.pinnedPhysicalAttestorPublicKey);
+    // The public KeyObject's .export() is an overridable own property.
+    // Compare native cryptographic key identities with the intrinsic method,
+    // not caller-supplied DER from an attacker-controlled export override.
+    if (NATIVE_KEY_EQUALS.call(inventoryKey, attestorKey)) deny();
     const [signedReceipt, physical] = await Promise.all([
       inventory.verifyCommittedEntryProof({ serialized: receipt,
         pinnedPublicKey: inventoryKey,

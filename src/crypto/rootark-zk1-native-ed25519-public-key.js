@@ -4,6 +4,9 @@
 // overridable .export method. Capture Node's intrinsic PublicKeyObject method
 // once, without generating or retaining any private key.
 const crypto = require("node:crypto");
+const { createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL } =
+  require("./rootark-zk10-native-intrinsics-v1");
 // After a caller-owned KeyObject.type getter, even PUBLIC_EXPORT.call(...) is
 // not native authority: Function.prototype.call may have been replaced.
 const SAFE_APPLY = Reflect.apply.bind(Reflect);
@@ -31,4 +34,19 @@ function nativeEd25519Spki(publicKey) {
   return raw;
 }
 
-module.exports = { nativeEd25519Spki };
+function pinNativeEd25519PublicKey(publicKey) {
+  // Observe the native handle BEFORE any overridable KeyObject.type getter.
+  // A malicious getter can synchronously swap B for A, and an async decode
+  // can swap it again before verification. Require stable native SPKI across
+  // the getter boundary, then verify only with our own fresh native key.
+  const before = SAFE_BUFFER_FROM(SAFE_APPLY(PUBLIC_EXPORT, publicKey, [{
+    type: "spki", format: "der",
+  }]));
+  const after = nativeEd25519Spki(publicKey);
+  if (before.length !== after.length || !NATIVE_TIMING_SAFE_EQUAL(before, after)) {
+    throw new TypeError("ED25519_PUBLIC_KEY_REQUIRED");
+  }
+  return NATIVE_CREATE_PUBLIC_KEY({ key: before, type: "spki", format: "der" });
+}
+
+module.exports = { nativeEd25519Spki, pinNativeEd25519PublicKey };
