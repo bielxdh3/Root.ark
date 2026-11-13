@@ -79,6 +79,7 @@ const MAX_GLOBAL_PENDING_HEAD_READS = 64;
 const NATIVE_SET_TIMEOUT = setTimeout;
 const NATIVE_CLEAR_TIMEOUT = clearTimeout;
 const NATIVE_HRTIME_BIGINT = process.hrtime.bigint.bind(process.hrtime);
+const NATIVE_BIGINT = BigInt;
 const NATIVE_ABORT_CONTROLLER = AbortController;
 const NATIVE_ABORT_SIGNAL = AbortSignal;
 const NATIVE_ABORT = NATIVE_ABORT_CONTROLLER.prototype.abort;
@@ -345,19 +346,19 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       const controllerSignal = NATIVE_APPLY(NATIVE_CONTROLLER_SIGNAL, controller, []);
       // Timers can run late if an adapter blocks the JS event loop. Reject a
       // result even if its microtask beats an overdue timeout callback.
-      const expiresAt = NATIVE_HRTIME_BIGINT() + BigInt(headTimeoutMs) * 1000000n;
+      const expiresAt = NATIVE_HRTIME_BIGINT() + NATIVE_BIGINT(headTimeoutMs) * 1000000n;
       let timer, onCancel;
       const deadline = NATIVE_PROMISE_CREATE((resolve) => {
         timer = NATIVE_SET_TIMEOUT(() => {
           nativeAbort(controller);
-          resolve({ settled: false });
+          resolve(false);
         }, headTimeoutMs);
       });
       const cancelled = NATIVE_PROMISE_CREATE((resolve) => {
         if (signal) {
           onCancel = () => {
             nativeAbort(controller);
-            resolve({ settled: false });
+            resolve(false);
           };
           NATIVE_APPLY(NATIVE_EVENT_ADD, signal, ["abort", onCancel, { once: true }]);
         }
@@ -376,8 +377,8 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       try {
         const result = await NATIVE_PROMISE_RACE(
           NATIVE_PROMISE_THEN.call(pending, (value) => value,
-            () => ({ settled: false })), deadline, cancelled);
-        if (!result.settled || nativeAborted(controllerSignal) || nativeAborted(signal)
+            () => false), deadline, cancelled);
+        if (result === false || !result.settled || nativeAborted(controllerSignal) || nativeAborted(signal)
           || NATIVE_HRTIME_BIGINT() >= expiresAt) {
           nativeAbort(controller);
           deny();
