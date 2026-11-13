@@ -231,6 +231,28 @@ test("P2: genuine signed owner cutovers accept 100 to 128 covered compartments",
     "an unsigned or oversized corpus cannot silently raise the 128-compartment limit");
 });
 
+test("P2: invalid source provision is rejected before executing caller-owned KeyObject getters", async () => {
+  const f = await fixture();
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "Node22 physical native key required");
+  const hostile = Object.create(keys.source.publicKey);
+  let reads = 0;
+  Object.defineProperty(hostile, handle, { get() {
+    reads += 1;
+    return keys.source.publicKey[handle];
+  } });
+  const badIdentity = { ...identity,
+    accountId: "33333333-3333-4333-8333-333333333333" };
+  assert.throws(() => createOwnerObjectMapVerifier({
+    sourceAuthority: { ...f.sourceAuthority, identity: badIdentity,
+      provisionerPublicKey: hostile },
+    zkAuthority: f.zkAuthority, mappingAuthority: f.authority,
+  }), deny);
+  assert.equal(reads, 0,
+    "an invalid signed source identity must fail before any attacker-owned key callback");
+});
+
 test("P2 review: owner map for provisioned compartment A cannot certify device-signed operation B", async () => {
   const f = await fixture();
   // Rebuild the whole encrypted operation with real compartment B AAD; only

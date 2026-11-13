@@ -113,10 +113,14 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
   NATIVE_HASH_UPDATE.call(hash, DOMAIN + NATIVE_CANONICAL_SORTED_JSON(detached), "utf8");
   const digest = NATIVE_HASH_DIGEST.call(hash, "hex");
   if (digest !== expectedDigest) throw deny();
+  // Expose the SAME newly-imported native signer identities used for the
+  // signed provisioning check. Consumers must never revisit a caller-owned
+  // KeyObject after this verification (its inherited kHandle can change).
   return NATIVE_FREEZE({ identity: NATIVE_FREEZE({
     accountId: statement.accountId, storeId: statement.storeId,
     username: statement.username, compartmentId: statement.compartmentId,
-  }), publicKey: pin, provisioning: NATIVE_FREEZE({
+  }), publicKey: pin, witnessPublicKey: witness, casPublicKey: cas,
+  provisioning: NATIVE_FREEZE({
     statement: NATIVE_FREEZE(statement), signature: detached.signature,
   }) });
 }

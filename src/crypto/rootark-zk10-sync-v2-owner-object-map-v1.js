@@ -244,18 +244,18 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     const floor = { sequence: number(retained.sequence), digest: hex(retained.digest) };
     const sourceIdentity = exact(s.identity,
       ["accountId", "storeId", "username", "compartmentId"]);
-    // KeyObjects supplied by the caller may have an inherited Symbol(kHandle)
-    // getter. Reimport every source role ONCE, then pass those pinned native
-    // identities both to provisioning verification and separation checks.
-    // Never export the original caller-owned role again after verification.
-    const sourceProvisioner = nativePublic(s.provisionerPublicKey);
-    const sourceWitness = nativePublic(s.witnessPublicKey);
-    const sourceCas = nativePublic(s.casPublicKey);
-    const identity = verifyPinnedAtomicOwnerProvision({ identity: sourceIdentity,
+    // Validate signed source provisioning BEFORE running any attacker-owned
+    // KeyObject getter. The verifier returns the very native signer identities
+    // used for its Ed25519 checks; never re-export source roles afterward.
+    const verifiedSource = verifyPinnedAtomicOwnerProvision({ identity: sourceIdentity,
       scope: s.scope, provisioning: s.provisioning,
-      provisionerPublicKey: sourceProvisioner,
+      provisionerPublicKey: s.provisionerPublicKey,
       expectedDigest: s.provisioningDigest,
-      witnessPublicKey: sourceWitness, casPublicKey: sourceCas }).identity;
+      witnessPublicKey: s.witnessPublicKey, casPublicKey: s.casPublicKey });
+    const identity = verifiedSource.identity;
+    const sourceProvisioner = verifiedSource.publicKey;
+    const sourceWitness = verifiedSource.witnessPublicKey;
+    const sourceCas = verifiedSource.casPublicKey;
     const localPolicy = snapshotLocalDevicePolicy(s.pinnedDevicePolicy);
     if (typeof s.currentDevicePolicy !== "function" || localPolicy.username !== identity.username
       || identity.compartmentId !== id(identity.compartmentId)) deny();
