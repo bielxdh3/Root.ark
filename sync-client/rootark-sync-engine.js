@@ -788,6 +788,19 @@ class SyncEngine {
     if (existing && !existing.deleted && (existing.objectId !== objectId || existing.fileId !== current.fileId)) {
       fail("Historical restore would overwrite a different local object", "restore_local_conflict");
     }
+    const assertNoStaleLocalIdentity = () => {
+      // A remote MOVE may be signed and current while our local snapshot still
+      // tracks the same file at its old path. Restoring directly to the new
+      // path would duplicate that identity instead of reconciling the MOVE.
+      // fileId is not immutable across signed updates, so an old tracked
+      // revision can retain the same objectId with a DIFFERENT fileId.
+      if (Object.entries(this.snapshot.files).some(([trackedPath, prior]) =>
+        trackedPath !== relative && prior && !prior.deleted
+          && prior.objectId === objectId)) {
+        fail("Historical restore requires local MOVE reconciliation", "restore_local_conflict");
+      }
+    };
+    assertNoStaleLocalIdentity();
     const destination = await contained(this.rootDir, relative, true);
     const assertCleanDestination = async () => {
       const present = await exists(destination);
@@ -830,6 +843,7 @@ class SyncEngine {
     // Signing may await an external key provider. Recheck after that boundary,
     // before the signed outbox can cause a later remote write.
     await assertCleanDestination();
+    assertNoStaleLocalIdentity();
     // The outbox is durable BEFORE local materialization. Failure to send is
     // recoverable by the existing signed journal; no old operation is replayed.
     await this.assertOutgoingAuthorized(restored, () => this.journal.enqueue(restored));

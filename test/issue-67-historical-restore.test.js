@@ -14,6 +14,18 @@ const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
+async function restoreRecoveredBytesOnlyIfVacant(target, bytes) {
+  // This helper is deliberately test-only. Recovery must never overwrite a
+  // path another writer creates after the earlier existence assertion.
+  const file = await fsp.open(target, "wx", 0o600);
+  try {
+    await file.writeFile(bytes);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
+
 test("#67: restore CLI rejects an incomplete request before reading private credentials", () => {
   const command = spawnSync(process.execPath, [path.join(__dirname, "../sync-client/rootark-sync-v2.js"),
     "restore", "--config", "missing-private-config", "--object-id", "file-1"], { encoding: "utf8", windowsHide: true });
@@ -130,6 +142,89 @@ test("#67: historical MOVE restores authenticated file bytes, not the encrypted 
   assert.equal(outcome.pushed, true);
   assert.equal(await fsp.readFile(path.join(f.local, "moved.txt"), "utf8"), "historical move content");
   assert.equal(f.current().revision.counter, 4);
+});
+
+test("#67 P2: stale tracked source cannot restore after an authenticated remote MOVE", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.local, "document.txt");
+  const destination = path.join(f.local, "moved.txt");
+  const originalBytes = Buffer.from("original authenticated bytes");
+  await fsp.writeFile(source, originalBytes);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(originalBytes).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const moved = await f.sign({ operation: "move", operationId: "trusted-move-op",
+    versionId: "trusted-move-version", revision: { counter: 2, deviceId: "device-a" },
+    baseRevision: f.original.revision,
+    metadata: { path: "moved.txt", sourcePath: "document.txt" },
+    plaintext: protocol.encodeMovePayload(originalBytes, f.privateFileKey),
+  });
+  assert.equal(await verifyAuthorizationProof(moved.authorization, moved, f.trusted), true);
+  f.versions.splice(1, 1, moved);
+  f.setCurrent(moved);
+
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_conflict",
+    "restore must not duplicate a signed identity at stale and current paths");
+  assert.deepEqual(await fsp.readFile(source), originalBytes);
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+
+  // The fixture's historical `list(objectId)` returns a single record;
+  // the ordinary sync pull uses `list()` and expects a record collection.
+  const historyList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? historyList(objectId) : [await historyList()];
+  const synced = await f.engine.syncOnce();
+  assert.equal(synced.offline, false);
+  assert.equal(fs.existsSync(source), false, "verified MOVE reconciles the old name");
+  assert.deepEqual(await fsp.readFile(destination), originalBytes);
+  const result = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(result.pushed, true, "normal restore succeeds after reconciling the signed MOVE");
+  assert.equal(f.current().revision.counter, 3);
+  assert.equal(fs.existsSync(source), false);
+  assert.deepEqual(await fsp.readFile(destination), originalBytes);
+});
+
+test("#67 P2: a signed fileId rotation cannot hide the old tracked objectId during MOVE restore", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.local, "document.txt");
+  const destination = path.join(f.local, "moved.txt");
+  const originalBytes = Buffer.from("original authenticated bytes");
+  await fsp.writeFile(source, originalBytes);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "first",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(originalBytes).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+  const rotated = await f.sign({ operation: "update", fileId: "rotated-file-id",
+    operationId: "signed-id-rotation", versionId: "rotated-version",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: f.original.revision,
+    metadata: { path: "document.txt" }, plaintext: originalBytes,
+  });
+  const moved = await f.sign({ operation: "move", fileId: "rotated-file-id",
+    operationId: "signed-rotated-move", versionId: "moved-rotated-version",
+    revision: { counter: 3, deviceId: "device-a" }, baseRevision: rotated.revision,
+    metadata: { path: "moved.txt", sourcePath: "document.txt" },
+    plaintext: protocol.encodeMovePayload(originalBytes, f.privateFileKey),
+  });
+  assert.equal(await verifyAuthorizationProof(rotated.authorization, rotated, f.trusted), true);
+  assert.equal(await verifyAuthorizationProof(moved.authorization, moved, f.trusted), true);
+  f.versions.splice(1, 1, rotated, moved);
+  f.setCurrent(moved);
+
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", rotated.versionId),
+    (error) => error.code === "restore_local_conflict",
+    "the old tracked object cannot be hidden by a newly signed fileId");
+  assert.deepEqual(await fsp.readFile(source), originalBytes);
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 0);
 });
 
 test("#67: restore never overwrites untracked local data or accepts a cross-object current head", async (t) => {
@@ -301,7 +396,20 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), old);
   // Explicit recovery is possible without a new signature: materialize the
   // exact authenticated pending bytes, then let the existing CAS path resume.
-  await fsp.writeFile(target, protocol.decryptPayload(f.original, f.privateFileKey));
+  const recoveredBytes = protocol.decryptPayload(f.original, f.privateFileKey);
+  try {
+    // Simulate a competing writer recreating the missing path after the
+    // absence check. Recovery must refuse and preserve those exact bytes.
+    const competingBytes = Buffer.from("rival local edit before explicit recovery");
+    await fsp.writeFile(target, competingBytes, { flag: "wx" });
+    await assert.rejects(() => restoreRecoveredBytesOnlyIfVacant(target, recoveredBytes),
+      (error) => error.code === "EEXIST");
+    assert.deepEqual(await fsp.readFile(target), competingBytes);
+    await fsp.unlink(target);
+    await restoreRecoveredBytesOnlyIfVacant(target, recoveredBytes);
+  } finally {
+    recoveredBytes.fill(0);
+  }
   const resumed = await reopened.syncOnce();
   assert.equal(resumed.pushed, 1);
   assert.equal(f.pushes(), 1);
