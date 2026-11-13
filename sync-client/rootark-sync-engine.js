@@ -1695,6 +1695,25 @@ class SyncEngine {
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
           const current = error.current
             ? envelopeCopy(protocol.validateStoredOperation(error.current)) : null;
+          // A bare HTTP 409 is not a signed remote admission receipt. Without
+          // an authenticated, specific winner, remote-wins would discard our
+          // pending signed operation even if the server never committed it.
+          if (!current) {
+            fail("Unsigned conflict response has no verifiable remote winner",
+              "remote_authorization_rejected");
+          }
+          // A valid device signature authenticates *an operation*, not the
+          // server's claim that it won THIS object's HTTP 409. A compromised
+          // transport may replay a genuine, unrelated signed object and make
+          // remote-wins discard our still-pending local outbox. Require the
+          // same immutable object, file and compartment before any local
+          // recovery files, summary updates or durable journal ACKs.
+          if (current.objectId !== operation.objectId
+            || current.fileId !== operation.fileId
+            || current.compartmentId !== operation.compartmentId) {
+            fail("Unrelated remote winner cannot acknowledge pending operation",
+              "remote_authorization_rejected");
+          }
           if (current?.operationId === operation?.operationId
             && signedEnvelopeDigest(current) !== signedEnvelopeDigest(operation)) {
             fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
@@ -1717,8 +1736,25 @@ class SyncEngine {
               }
             }
           }
-          if (current && !this.operationDestinationIsSelected(current)) {
+          // ALL 409 `current` envelopes are attacker-controlled until Ed25519
+          // device/roster verification, including destinations inside selected
+          // paths. In particular, recoverConflict writes decrypted pending
+          // plaintext under .rootark-conflicts and must never run for B.
+          // No durable admission is created until after pin preflight.
+          await this.verifyIncomingOperation(current, { preObserve: false });
+          if (!this.operationDestinationIsSelected(current)) {
             this.preflightOutOfScopeMove(current);
+          }
+          // A device signature alone cannot certify that the remote server
+          // actually committed CURRENT. A malicious 409 may echo our OWN
+          // freshly signed pending operation or replay an old same-object
+          // signature. Neither is an independent admission receipt. Until a
+          // separately trusted current-state/CAS witness is available, strict
+          // sync must preserve its pending outbox for explicit reconciliation
+          // instead of writing recovery plaintext or silently marking it seen.
+          if (this.requireAuthorization) {
+            fail("Signed 409 winner lacks independent durable admission evidence",
+              "remote_admission_unproven");
           }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
@@ -1727,7 +1763,15 @@ class SyncEngine {
             if (this.operationDestinationIsSelected(current)) {
               verifiedFreshDigest = await this._apply(current, summary);
             } else {
-              verifiedFreshDigest = await this.verifyIncomingOperation(current);
+              // Recheck current revocation/identity after asynchronous local
+              // conflict recovery. Only now may a successfully preflighted
+              // exact signed envelope reserve a durable journal observation.
+              verifiedFreshDigest = await this.verifyIncomingOperation(current,
+                { preObserve: false });
+              this.preflightOutOfScopeMove(current);
+              if (verifiedFreshDigest) {
+                await this.journal.observeAdmission(current.operationId, verifiedFreshDigest);
+              }
               const reconciled = await this.reconcileOutOfScopeMove(current, summary, {
                 preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
               });
@@ -1821,8 +1865,30 @@ class SyncEngine {
           && entry.fileId === operation.fileId) affectedPaths.push(relativePath);
       }
     }
-    if (protectedPaths.some((pin) => affectedPaths.some((candidate) =>
-      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)))) {
+    const pinnedDescendant = protectedPaths.some((pin) => affectedPaths.some((candidate) =>
+      pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)));
+    // A signed CREATE can register an existing directory after child hydration
+    // without replacing it. Never allow a case-distinct alias, conflicting
+    // tracked identity or non-directory target to bypass pin protection.
+    let existingAncestorCreate = false;
+    if (pinnedDescendant && operation.operation === "create"
+      && !operation.tombstone && !metadata.sourcePath
+      && metadata.contentType === "inode/directory") {
+      const ancestorPrefix = `${metadata.path}/`;
+      const sameSpelling = protectedPaths.every((pin) =>
+        !pin.path.toLowerCase().startsWith(ancestorPrefix.toLowerCase())
+        || pin.path.startsWith(ancestorPrefix));
+      const existing = Object.entries(this.snapshot.files).find(([relative]) =>
+        relative.toLowerCase() === metadata.path.toLowerCase());
+      if (sameSpelling && (!existing || (!existing[1].deleted && existing[1].directory
+        && existing[1].objectId === operation.objectId && existing[1].fileId === operation.fileId))) {
+        let stats;
+        try { stats = await fsp.lstat(target); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        existingAncestorCreate = Boolean(stats?.isDirectory() && !stats.isSymbolicLink());
+      }
+    }
+    if (pinnedDescendant && !existingAncestorCreate) {
       fail("A pinned file is inside a directory affected by the signed operation", "file_pinned");
     }
     if (operation.operation === "delete"
@@ -1832,7 +1898,8 @@ class SyncEngine {
     if (["create", "update", "move"].includes(operation.operation)
       && protectedPaths.some((pin) =>
         pin.path.toLowerCase() === metadata.path.toLowerCase()
-        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId))) {
+        && (pin.objectId !== operation.objectId || pin.fileId !== operation.fileId
+          || metadata.contentType === "inode/directory"))) {
       // Guard the destination BEFORE the first journal observation, mkdir,
       // stageExisting or rename. Signed operations from another object can
       // never replace a device-pinned target, even via direct apply() or
@@ -1904,6 +1971,12 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
+        if (existingAncestorCreate) {
+          const still = await fsp.lstat(target);
+          if (!still.isDirectory() || still.isSymbolicLink()) {
+            fail("Pinned ancestor directory changed during admission", "file_pinned");
+          }
+        }
         const sourcePath = operation.operation === "update" ? activeIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         let relocated = false;
         if (sourcePath) {
@@ -1917,7 +1990,7 @@ class SyncEngine {
             relocated = true;
           }
         }
-        if (!relocated) {
+        if (!relocated && !existingAncestorCreate) {
           try {
             await fsp.mkdir(target, { recursive: false });
           } catch (error) {
@@ -2024,6 +2097,15 @@ class SyncEngine {
     for (const [relative, file] of Object.entries(scanned)) {
       const canonical = process.platform === "win32" ? snapshotPathByKey.get(pathKey(relative)) || relative : relative;
       current[canonical] = file;
+    }
+    // A local directory at the path of a pinned regular file is not an
+    // authorized edit to its identity. Fail before journal/snapshot mutation.
+    const currentByPortablePath = new Map(Object.entries(current)
+      .map(([relative, entry]) => [relative.toLowerCase(), entry]));
+    for (const pin of Object.values(this.snapshot.pinnedFiles || {})) {
+      if (currentByPortablePath.get(pin.path.toLowerCase())?.directory) {
+        fail("Pinned regular file cannot become a directory", "file_pinned");
+      }
     }
     const evictedByPath = new Map();
     for (const item of Object.values(this.snapshot.remoteOnly)) {
@@ -2231,15 +2313,15 @@ class SyncEngine {
   async pinStatus(relativePath = null) {
     return this.withMutationLock(async () => {
       if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
-      const status = async (safePath) => {
-        const pin = Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
+      const status = async (safePath, knownPin = null) => {
+        const pin = knownPin || Object.values(this.snapshot.pinnedFiles || {}).find((entry) => pathsEqual(entry.path, safePath));
         const target = await contained(this.rootDir, safePath, true);
         const present = await exists(target);
         return { path: safePath, pinned: Boolean(pin), localPresent: present, objectId: pin?.objectId || null };
       };
       if (relativePath !== null) return status(await canonicalRelativePath(this.rootDir, relativePath));
       const all = Object.values(this.snapshot.pinnedFiles || {}).sort((a, b) => a.path.localeCompare(b.path));
-      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path))) };
+      return { localOnly: true, files: await Promise.all(all.map((item) => status(item.path, item))) };
     });
   }
 
@@ -2543,10 +2625,17 @@ class SyncEngine {
     };
     for (const operation of inspected) {
       if (!this.operationDestinationIsSelected(operation)) {
-        // A refused pinned origin must not consume the finite, durable
-        // observed[] window before reconciliation rejects its signed MOVE.
+        // Authenticity must precede even a side-effect-free local pin oracle:
+        // an untrusted LIST entry cannot force file_pinned before its Ed25519
+        // device/roster proof is checked. Defer durable observation until the
+        // pin preflight accepts this exact verified envelope, so a genuine
+        // refused MOVE cannot exhaust the finite observed[] window either.
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation,
+          { preObserve: false });
         this.preflightOutOfScopeMove(operation);
-        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
+        if (verifiedFreshDigest) {
+          await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+        }
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
         observedRemoteOnly.push({ operation, verifiedFreshDigest });
