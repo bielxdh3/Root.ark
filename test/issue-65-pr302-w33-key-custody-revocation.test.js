@@ -281,6 +281,131 @@ test("P2 composite pins physical attestor reference before inventory key getter 
   assert.ok(replaced > 0, "real inventory KeyObject callback executed");
 });
 
+test("P2 composite cannot accept unsigned inventory after a native key getter replaces its verifier", async () => {
+  const f = fixture();
+  const physicalAttestation = await physical(f);
+  const unsignedInventory = Buffer.from([0x01, 0x02, 0x03]);
+  const base = compositeOptions(f, unsignedInventory, physicalAttestation);
+  await assert.rejects(verifyAttestedInventoryCommit(base),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "unsigned inventory cannot be committed even with a genuine PG signature");
+  const originalVerify = inventory.verifyCommittedEntryProof;
+  const injected = Object.create(f.signer.publicKey);
+  let getterCalls = 0, forgedCalls = 0;
+  Object.defineProperty(injected, "type", { get() {
+    getterCalls++;
+    inventory.verifyCommittedEntryProof = async () => {
+      forgedCalls++;
+      return { outcome: "COMMITTED_IN_SIGNED_LEDGER",
+        operationId: Buffer.from(f.operation.operation_id), authorizesIo: false };
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(verifyAttestedInventoryCommit({ ...base,
+      pinnedInventoryPublicKey: injected }),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "a getter-swapped verifier must not impersonate genuine Ed25519 inventory verification");
+  } finally { inventory.verifyCommittedEntryProof = originalVerify; }
+  assert.ok(getterCalls > 0, "real key getter executed");
+  assert.equal(forgedCalls, 0, "composite must call the verifier pinned before native key callbacks");
+});
+
+test("P2 composite cannot accept unsigned inventory after key getter forges Promise.all", async () => {
+  const f = fixture();
+  const physicalAttestation = await physical(f);
+  const legitimatePhysical = await pg.verifyCommittedPhysicalReadback(physicalAttestation,
+    physicalOptions(f, f.attestor.publicKey));
+  const unsignedInventory = Buffer.from([0x01, 0x02, 0x03]);
+  const originalAll = Promise.all;
+  const originalVerify = inventory.verifyCommittedEntryProof;
+  const injected = Object.create(f.signer.publicKey);
+  let getterCalls = 0, forgedAllCalls = 0, verificationAttempts = 0;
+  Object.defineProperty(injected, "type", { get() {
+    getterCalls++;
+    inventory.verifyCommittedEntryProof = () => {
+      verificationAttempts++;
+      return new Promise(() => {});
+    };
+    Promise.all = () => {
+      forgedAllCalls++;
+      return Promise.resolve([{
+        outcome: "COMMITTED_IN_SIGNED_LEDGER",
+        operationId: Buffer.from(f.operation.operation_id), authorizesIo: false,
+      }, legitimatePhysical]);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(verifyAttestedInventoryCommit(compositeOptions(f,
+      unsignedInventory, physicalAttestation, injected)),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "forged Promise.all must never replace two independently signed verifications");
+  } finally {
+    Promise.all = originalAll;
+    inventory.verifyCommittedEntryProof = originalVerify;
+  }
+  assert.ok(getterCalls > 0);
+  assert.equal(forgedAllCalls, 0, "composite must not consult untrusted Promise.all");
+  assert.equal(verificationAttempts, 0, "late mutable module verifier must not be consulted");
+});
+
+test("P2 composite compares signed operation IDs with pinned native timingSafeEqual", async () => {
+  const f = fixture();
+  const receipt = await committed(f);
+  const physicalAttestation = await physical(f);
+  const original = crypto.timingSafeEqual;
+  const injected = Object.create(f.signer.publicKey);
+  let getterCalls = 0, poisonedCalls = 0;
+  Object.defineProperty(injected, "type", { get() {
+    getterCalls++;
+    crypto.timingSafeEqual = () => { poisonedCalls++; return false; };
+    return "public";
+  } });
+  let result;
+  try {
+    result = await verifyAttestedInventoryCommit(compositeOptions(f,
+      receipt, physicalAttestation, injected));
+  } finally { crypto.timingSafeEqual = original; }
+  assert.ok(getterCalls > 0);
+  assert.equal(poisonedCalls, 0, "untrusted same-realm reassignment must not decide signed identity");
+  assert.equal(result.status, "VERIFIED_COMPOSITE_NONAUTHORIZING");
+  assert.equal(result.authorizesIo, false);
+});
+
+test("P2 composite native key getter cannot forge nonauthorizing return via Object.freeze", async () => {
+  const f = fixture();
+  const receipt = await committed(f);
+  const physicalAttestation = await physical(f);
+  const originalFreeze = Object.freeze;
+  const poisoned = Object.create(f.signer.publicKey);
+  let getters = 0, forged = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    getters++;
+    Object.freeze = (value) => {
+      if (value?.status === "VERIFIED_COMPOSITE_NONAUTHORIZING") {
+        forged++;
+        return { ...value, authorizesIo: true,
+          externalDurabilityProven: true, independentlyAnchoredFloorProven: true };
+      }
+      return originalFreeze(value);
+    };
+    return "public";
+  } });
+  let result;
+  try {
+    result = await verifyAttestedInventoryCommit(compositeOptions(f,
+      receipt, physicalAttestation, poisoned));
+  } finally { Object.freeze = originalFreeze; }
+  assert.ok(getters > 0, "native getter executed before final evidence was returned");
+  assert.equal(forged, 0, "composite cannot delegate signed security flags to injected Object.freeze");
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(result.status, "VERIFIED_COMPOSITE_NONAUTHORIZING");
+  assert.equal(result.authorizesIo, false);
+  assert.equal(result.externalDurabilityProven, false);
+  assert.equal(result.independentlyAnchoredFloorProven, false);
+});
+
 const hash64 = (value) => crypto.createHash("sha256").update(value).digest("base64url");
 
 async function historicalFixture() {
@@ -401,4 +526,162 @@ test("P2 historical signed READ cannot replace a revoked device via poisoned des
   assert.equal(spoofedDescriptors, 0, "revocation slots must be read via pinned native descriptor");
   assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args))
     .authorizesHistoricalRead, true, "genuine signed historical READ remains allowed");
+});
+
+test("P2 real historical signed READ cannot erase a live revocation via descriptor poisoning", async () => {
+  const { witness, args, initialPolicy } = await historicalFixture();
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args))
+    .authorizesHistoricalRead, true, "real positive signed inventory/PG/witness/device control");
+  const revoked = { ...initialPolicy, revokedDeviceIds: ["device-revoke"] };
+  const denied = { ...args, trustedCurrentDevicePolicyProvider: () => revoked };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(denied),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/);
+  const originalDescriptor = Object.getOwnPropertyDescriptor;
+  const poisoned = Object.create(witness.publicKey);
+  let callbackReads = 0, substituted = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    callbackReads++;
+    Object.getOwnPropertyDescriptor = function substituteRevocation(obj, name) {
+      const descriptor = Reflect.apply(originalDescriptor, Object, [obj, name]);
+      if (obj === revoked.revokedDeviceIds && name === "0" && descriptor) {
+        substituted++;
+        return { ...descriptor, value: "other-device" };
+      }
+      return descriptor;
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission({
+      ...denied, pinnedWitnessPublicKey: poisoned,
+    }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "a late fake descriptor must not remove genuine live revoked device");
+  } finally { Object.getOwnPropertyDescriptor = originalDescriptor; }
+  assert.ok(callbackReads > 0, "real native public key callback executed");
+  assert.equal(substituted, 0, "no unauthenticated descriptor read after hostile key callback");
+  assert.equal(revoked.revokedDeviceIds[0], "device-revoke", "actual backing policy stayed revoked");
+});
+
+test("P2 historical signed floor B cannot verify authentic A via a poisoned Object.fromEntries", async () => {
+  const { witness, args } = await historicalFixture();
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesHistoricalRead,
+    true, "real signed A proof is valid");
+  const floorAUnsigned = { ...args.freshFloor };
+  delete floorAUnsigned.signature;
+  const admissionAUnsigned = { ...args.admission };
+  delete admissionAUnsigned.signature;
+  const bHash = crypto.randomBytes(32).toString("hex");
+  assert.notEqual(bHash, args.freshFloor.lastHash);
+  const floorB = { ...args.freshFloor, lastHash: bHash };
+  const admissionB = { ...args.admission, witnessLastHash: bHash };
+  const expectedB = { ...args, freshFloor: floorB, admission: admissionB,
+    trustedMinimumFloor: { ...args.trustedMinimumFloor, lastHash: bHash } };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(expectedB),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/, "B is not signed by witness A");
+  const original = Object.fromEntries;
+  const poisoned = Object.create(witness.publicKey);
+  let getterReads = 0, signedBytesSubstitutions = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    getterReads++;
+    Object.fromEntries = (tuples) => {
+      const unsigned = Reflect.apply(original, Object, [tuples]);
+      if (unsigned.type === floorAUnsigned.type && unsigned.lastHash === bHash) {
+        signedBytesSubstitutions++;
+        return floorAUnsigned;
+      }
+      if (unsigned.type === admissionAUnsigned.type && unsigned.witnessLastHash === bHash) {
+        signedBytesSubstitutions++;
+        return admissionAUnsigned;
+      }
+      return unsigned;
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission({
+      ...expectedB, pinnedWitnessPublicKey: poisoned,
+    }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "a genuine A Ed25519 signature cannot be reassigned to uncommitted B floor/admission");
+  } finally { Object.fromEntries = original; }
+  assert.ok(getterReads > 0);
+  assert.equal(signedBytesSubstitutions, 0,
+    "unsigned fields must be built without the mutated global fromEntries");
+});
+
+test("P2 historical signed floor B cannot verify authentic A via a poisoned Buffer.from", async () => {
+  const { witness, args } = await historicalFixture();
+  const floorAUnsigned = { ...args.freshFloor };
+  delete floorAUnsigned.signature;
+  const admissionAUnsigned = { ...args.admission };
+  delete admissionAUnsigned.signature;
+  const bHash = crypto.randomBytes(32).toString("hex");
+  assert.notEqual(bHash, args.freshFloor.lastHash);
+  const floorB = { ...args.freshFloor, lastHash: bHash };
+  const admissionB = { ...args.admission, witnessLastHash: bHash };
+  const expectedB = { ...args, freshFloor: floorB, admission: admissionB,
+    trustedMinimumFloor: { ...args.trustedMinimumFloor, lastHash: bHash } };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(expectedB),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/);
+  const original = Buffer.from;
+  const poisoned = Object.create(witness.publicKey);
+  let getterReads = 0, substituted = 0;
+  const floorBUnsigned = { ...floorB };
+  delete floorBUnsigned.signature;
+  const admissionBUnsigned = { ...admissionB };
+  delete admissionBUnsigned.signature;
+  const fakeSignatures = new Map([
+    [JSON.stringify(floorBUnsigned), JSON.stringify(floorAUnsigned)],
+    [JSON.stringify(admissionBUnsigned), JSON.stringify(admissionAUnsigned)],
+  ]);
+  Object.defineProperty(poisoned, "type", { get() {
+    getterReads++;
+    Buffer.from = function replacedSignedBytes(input, ...rest) {
+      if (typeof input === "string" && fakeSignatures.has(input)) {
+        substituted++;
+        return Reflect.apply(original, Buffer, [fakeSignatures.get(input), ...rest]);
+      }
+      return Reflect.apply(original, Buffer, [input, ...rest]);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission({
+      ...expectedB, pinnedWitnessPublicKey: poisoned,
+    }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "late Buffer.from poisoning cannot turn checked B into authentically signed A bytes");
+  } finally { Buffer.from = original; }
+  assert.ok(getterReads > 0);
+  assert.equal(substituted, 0, "signed wire serialization must use captured native Buffer.from");
+});
+
+test("P2 historical read cannot forge authorizesIo by poisoning Object.freeze after witness key getter", async () => {
+  const { witness, args } = await historicalFixture();
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesIo,
+    false, "genuine signed evidence is strictly nonauthorizing for I/O");
+  const originalFreeze = Object.freeze;
+  const poisoned = Object.create(witness.publicKey);
+  let getterReads = 0, forgedReturns = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    getterReads++;
+    Object.freeze = (value) => {
+      if (value && value.status === "SYNC_V2_HISTORICAL_WITNESS_VERIFIED") {
+        forgedReturns++;
+        return { ...value, authorizesIo: true, externalDurabilityProven: true };
+      }
+      return originalFreeze(value);
+    };
+    return "public";
+  } });
+  let result;
+  try {
+    result = await binding.verifySyncV2HistoricalWitnessAdmission({
+      ...args, pinnedWitnessPublicKey: poisoned,
+    });
+  } finally { Object.freeze = originalFreeze; }
+  assert.ok(getterReads > 0, "native witness getter was exercised");
+  assert.equal(forgedReturns, 0, "no late global freeze may rewrite security flags");
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(result.authorizesHistoricalRead, true);
+  assert.equal(result.authorizesIo, false);
+  assert.equal(result.externalDurabilityProven, false);
 });
