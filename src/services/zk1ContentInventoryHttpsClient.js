@@ -11,7 +11,7 @@ const { types: { isPromise, isProxy } } = require("node:util");
 const { defineProperty: NATIVE_DEFINE_PROPERTY, apply: NATIVE_APPLY,
   ownDescriptor: NATIVE_OWN_DESCRIPTOR, ownKeys: NATIVE_OWN_KEYS,
   objectCreate: NATIVE_OBJECT_CREATE, getPrototype: NATIVE_GET_PROTOTYPE,
-  hasOwn: NATIVE_HAS_OWN } =
+  hasOwn: NATIVE_HAS_OWN, bufferFrom: NATIVE_BUFFER_FROM } =
   require("../crypto/rootark-zk10-native-intrinsics-v1");
 // A native caller-owned KeyObject getter may run during verification and
 // replace writable CommonJS exports. Capture the complete inventory facade
@@ -56,6 +56,21 @@ function inertHttpResult(value) {
   }
   return result;
 }
+function appendVerifiedArrayItem(target, item) {
+  // The native Ed25519 KeyObject getter runs BEFORE the physical proof is
+  // appended. Array.prototype.push and Array.prototype[index] setters may now
+  // be attacker-controlled. Define a real own element by index instead.
+  NATIVE_DEFINE_PROPERTY(target, target.length, {
+    value: item, enumerable: true, configurable: true, writable: true,
+  });
+}
+function copyVerifiedBytes(items) {
+  const copied = [];
+  for (let index = 0; index < items.length; index += 1) {
+    appendVerifiedArrayItem(copied, NATIVE_BUFFER_FROM(items[index]));
+  }
+  return copied;
+}
 function nativeVerificationThen(onFulfilled, onRejected) {
   const pending = this;
   async function settle() {
@@ -65,6 +80,26 @@ function nativeVerificationThen(onFulfilled, onRejected) {
     if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
     if (typeof onRejected !== "function") throw value;
     return onRejected(value);
+  }
+  return pinnedVerification(settle());
+}
+
+function nativeVerificationFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (isProxy(cleanup)) fail();
+      if (isPromise(cleanup)) await pinnedVerification(cleanup);
+      else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")) {
+        fail(); // Never assimilate an untrusted or inherited thenable.
+      }
+    }
+    if (!fulfilled) throw value;
+    return value;
   }
   return pinnedVerification(settle());
 }
@@ -81,16 +116,21 @@ function pinnedVerification(pending) {
     // with its own safe then/catch. Replacing it would throw and leave the
     // actual verifier rejection unobserved.
     const existingCatch = NATIVE_OWN_DESCRIPTOR(pending, "catch");
+    const existingFinally = NATIVE_OWN_DESCRIPTOR(pending, "finally");
     if (typeof alreadyPinnedThen.value !== "function" || alreadyPinnedThen.writable !== false
       || alreadyPinnedThen.configurable !== false || !existingCatch
       || typeof existingCatch.value !== "function" || existingCatch.writable !== false
-      || existingCatch.configurable !== false) fail();
+      || existingCatch.configurable !== false || !existingFinally
+      || typeof existingFinally.value !== "function" || existingFinally.writable !== false
+      || existingFinally.configurable !== false) fail();
   } else {
     NATIVE_DEFINE_PROPERTY(pending, "then", { value: nativeVerificationThen,
       configurable: false, writable: false });
     NATIVE_DEFINE_PROPERTY(pending, "catch", { value(onRejected) {
       return NATIVE_APPLY(nativeVerificationThen, pending, [undefined, onRejected]);
     }, configurable: false, writable: false });
+    NATIVE_DEFINE_PROPERTY(pending, "finally", { value: nativeVerificationFinally,
+      configurable: false, writable: false });
   }
   return pending;
 }
@@ -461,7 +501,7 @@ function createZk1ContentInventoryHttpsClient({
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
               nowSeconds: Math.floor(Date.now() / 1000) }));
-            physicalProofs.push(physicalAttestation);
+            appendVerifiedArrayItem(physicalProofs, physicalAttestation);
           }
         }
         // Transport delivery is NOT a signed floor or a verified chain.
@@ -509,10 +549,14 @@ function createZk1ContentInventoryHttpsClient({
         if (page.status !== "transport_unverified" || page.afterSequence !== cursor
           || page.nextSequence - cursor !== page.proofs.length
           || (page.nextSequence === cursor && page.headSequenceReported !== cursor)) fail();
-        committedProofChain.push(...page.proofs);
+        for (let i = 0; i < page.proofs.length; i += 1) {
+          appendVerifiedArrayItem(committedProofChain, page.proofs[i]);
+        }
         if (physicalAttestorPublicKey) {
           if (page.physicalProofs.length !== page.proofs.length) fail();
-          physicalProofChain.push(...page.physicalProofs);
+          for (let i = 0; i < page.physicalProofs.length; i += 1) {
+            appendVerifiedArrayItem(physicalProofChain, page.physicalProofs[i]);
+          }
         }
         cursor = page.nextSequence;
         if (page.headSequenceReported === cursor) break;
@@ -526,9 +570,9 @@ function createZk1ContentInventoryHttpsClient({
       return inertHttpResult({ ...verified,
         ...(physicalAttestorPublicKey ? { independentPhysicalChainVerified: true } : {}),
         ...(raw.includeVerifiedProofChain === true ? {
-          authenticatedProofChain: committedProofChain.map((proof) => Buffer.from(proof)),
+          authenticatedProofChain: copyVerifiedBytes(committedProofChain),
           ...(physicalAttestorPublicKey ? {
-            authenticatedPhysicalProofChain: physicalProofChain.map((proof) => Buffer.from(proof)),
+            authenticatedPhysicalProofChain: copyVerifiedBytes(physicalProofChain),
           } : {}),
         } : {}),
       });

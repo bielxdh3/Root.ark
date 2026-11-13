@@ -30,6 +30,28 @@ const VERIFY_COMMITTED_ENTRY = inventory.verifyCommittedEntryProof;
 const VERIFY_PHYSICAL_READBACK = verifyCommittedPhysicalReadback;
 const NATIVE_PROMISE_CONSTRUCTOR = Promise;
 
+function verifiedNativeFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (isProxy(cleanup)) deny();
+      if (isPromise(cleanup)) await verifiedNativePromise(cleanup);
+      else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")) {
+        // Foreign thenables can inherit forged Object.prototype.then after a
+        // native KeyObject getter. Never assimilate them across this boundary.
+        deny();
+      }
+    }
+    if (!fulfilled) throw value;
+    return value;
+  }
+  return verifiedNativePromise(settle());
+}
+
 function inertComposite(fields) {
   const result = NATIVE_OBJECT_CREATE(null);
   const keys = NATIVE_OWN_KEYS(fields);
@@ -52,10 +74,13 @@ function verifiedNativePromise(promise) {
   const existingThen = NATIVE_DESCRIPTOR(promise, "then");
   if (existingThen) {
     const existingCatch = NATIVE_DESCRIPTOR(promise, "catch");
+    const existingFinally = NATIVE_DESCRIPTOR(promise, "finally");
     if (existingThen.configurable !== false || existingThen.writable !== false
       || typeof existingThen.value !== "function" || !existingCatch
       || existingCatch.configurable !== false || existingCatch.writable !== false
-      || typeof existingCatch.value !== "function") deny();
+      || typeof existingCatch.value !== "function" || !existingFinally
+      || existingFinally.configurable !== false || existingFinally.writable !== false
+      || typeof existingFinally.value !== "function") deny();
     // The captured inventory verifier already supplies a fully pinned native
     // Promise. Never redefine its nonconfigurable own methods.
     return promise;
@@ -74,6 +99,8 @@ function verifiedNativePromise(promise) {
   NATIVE_DEFINE_PROPERTY(promise, "catch", { value(onRejected) {
     return promise.then(undefined, onRejected);
   }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(promise, "finally", { value: verifiedNativeFinally,
+    configurable: false, writable: false });
   return promise;
 }
 

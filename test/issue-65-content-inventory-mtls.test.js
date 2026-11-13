@@ -1068,6 +1068,77 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     }
   });
 
+  await t.test("P2 signed PG physical chain bytes survive hostile Array.push and Array.map", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const minimumSnapshot = (await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) })).bytes;
+    const operation = newOperation({ root: floor.root });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const signer = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(signer)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle, "genuine native Ed25519 KeyObject needed");
+    const hostile = Object.create(signer);
+    const originalPush = Array.prototype.push;
+    const originalMap = Array.prototype.map;
+    const fakePhysical = Buffer.from("FORGED_PHYSICAL_PROOF_WITHOUT_PG_SIGNATURE");
+    let armed = false, getterReads = 0, forgedPushes = 0, forgedMaps = 0;
+    let genuinePhysical = null;
+    const originalAttestation = h.physicalAttestorClient.requestAttestation;
+    h.physicalAttestorClient.requestAttestation = async (...args) => {
+      const bytes = await originalAttestation(...args);
+      genuinePhysical = Buffer.from(bytes);
+      return bytes;
+    };
+    const isTheVerifiedPhysicalProof = (candidate) =>
+      genuinePhysical !== null && Buffer.isBuffer(candidate)
+      && candidate.length === genuinePhysical.length
+      && crypto.timingSafeEqual(candidate, genuinePhysical);
+    Object.defineProperty(hostile, handle, { get() {
+      getterReads++;
+      if (armed) {
+        Array.prototype.push = function poisonedPush(...items) {
+          if (items.length === 1 && isTheVerifiedPhysicalProof(items[0])
+            && this.length === 0) {
+            forgedPushes++;
+            return Reflect.apply(originalPush, this, [fakePhysical]);
+          }
+          return Reflect.apply(originalPush, this, items);
+        };
+        Array.prototype.map = function poisonedMap(fn, thisArg) {
+          if (this.length === 1 && isTheVerifiedPhysicalProof(this[0])
+            && String(fn).includes("Buffer.from")) {
+            forgedMaps++;
+            return [fakePhysical];
+          }
+          return Reflect.apply(originalMap, this, [fn, thisArg]);
+        };
+      }
+      return signer[handle];
+    } });
+    const client = h.makeClient("status-reader", { inventoryPublicKey: hostile });
+    armed = true;
+    try {
+      const chain = await client.getVerifiedSnapshotWithChain({
+        scope: h.scope, nonce: crypto.randomBytes(32),
+        requested: requested(operation), minimumHead: floor, minimumSnapshot,
+        includeVerifiedProofChain: true,
+      });
+      assert.equal(chain.status, "VERIFIED_NONAUTHORIZING");
+      assert.equal(chain.outcome, "PRESENT");
+      assert.equal(chain.independentPhysicalChainVerified, true);
+      assert.equal(chain.authenticatedPhysicalProofChain.length, 1);
+      assert.notDeepEqual(chain.authenticatedPhysicalProofChain[0], fakePhysical,
+        "an unattested physical byte string cannot become authenticated chain evidence");
+      assert.equal(forgedPushes, 0, "verified physical evidence must not use post-getter Array.push");
+      assert.equal(forgedMaps, 0, "verified physical evidence must not use post-getter Array.map");
+      assert.ok(getterReads > 0, "the native getter must execute on real signed bytes");
+    } finally {
+      Array.prototype.push = originalPush;
+      Array.prototype.map = originalMap;
+    }
+  });
+
   await t.test("P2 hostile native key getter cannot turn invalid HTTPS snapshot into success via inherited catch", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();
@@ -1084,12 +1155,13 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       return { ...snapshot, bytes: tampered };
     };
     const originalCatch = Object.getOwnPropertyDescriptor(Promise.prototype, "catch");
+    const originalFinally = Object.getOwnPropertyDescriptor(Promise.prototype, "finally");
     const signer = h.signer.publicKey;
     const handle = Object.getOwnPropertySymbols(signer)
       .find((symbol) => symbol.description === "kHandle");
     assert.ok(handle);
     const poisoned = Object.create(signer);
-    let reads = 0, forgedCatch = 0, armed = false, getterReached;
+    let reads = 0, forgedCatch = 0, forgedFinally = 0, armed = false, getterReached;
     const getterRan = new Promise((resolve) => { getterReached = resolve; });
     Object.defineProperty(poisoned, handle, { get() {
       reads++;
@@ -1098,6 +1170,12 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         Object.defineProperty(Promise.prototype, "catch", { configurable: true,
           writable: true, value() {
             forgedCatch++;
+            return Promise.resolve({ status: "VERIFIED_NONAUTHORIZING", outcome: "PRESENT",
+              root: Buffer.from(genesis.root), authorizesIo: false });
+          } });
+        Object.defineProperty(Promise.prototype, "finally", { configurable: true,
+          writable: true, value() {
+            forgedFinally++;
             return Promise.resolve({ status: "VERIFIED_NONAUTHORIZING", outcome: "PRESENT",
               root: Buffer.from(genesis.root), authorizesIo: false });
           } });
@@ -1116,8 +1194,13 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       }
       assert.equal(rejected, true, "unsigned snapshot cannot satisfy signed PRESENT");
       assert.equal(forgedCatch, 0, "security verification cannot consult inherited catch");
+      await assert.rejects(pending.finally(() => {}),
+        { code: "INVENTORY_HTTP_UNAVAILABLE" },
+        "external .finally cannot turn an invalid signed HTTPS snapshot into PRESENT");
+      assert.equal(forgedFinally, 0, "HTTPS public Promise cannot inherit a forged finally");
     } finally {
       Object.defineProperty(Promise.prototype, "catch", originalCatch);
+      Object.defineProperty(Promise.prototype, "finally", originalFinally);
     }
     assert.ok(reads > 0, "a native Ed25519 KeyObject callback must trigger the poison");
   });

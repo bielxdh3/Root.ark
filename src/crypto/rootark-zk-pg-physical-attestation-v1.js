@@ -4,10 +4,12 @@
 // PostgreSQL attestor AFTER it has verified bytes and a WAL flush barrier.
 // Neither this signature nor an mTLS ACK proves external/cloud durability.
 const crypto = require("node:crypto");
+const { types: { isProxy: NATIVE_IS_PROXY, isPromise: NATIVE_IS_PROMISE } } = require("node:util");
 const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY, mathAbs: NATIVE_MATH_ABS,
   sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
   getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY,
-  objectCreate: NATIVE_OBJECT_CREATE, defineProperty: NATIVE_DEFINE_PROPERTY } =
+  objectCreate: NATIVE_OBJECT_CREATE, defineProperty: NATIVE_DEFINE_PROPERTY,
+  apply: NATIVE_APPLY } =
   require("./rootark-zk10-native-intrinsics-v1");
 const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const z = require("./rootark-zk-1");
@@ -15,6 +17,62 @@ const z = require("./rootark-zk-1");
 // Keep the real codec entry points used for the signed bytes fixed from load.
 const NATIVE_ENCODE_DETERMINISTIC = z.encodeDeterministic.bind(z);
 const NATIVE_DECODE_DETERMINISTIC = z.decodeDeterministic.bind(z);
+const PG_PROMISE = Promise;
+
+function pgPromiseThen(onFulfilled, onRejected) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+    if (typeof onRejected !== "function") throw value;
+    return onRejected(value);
+  }
+  return pinnedPgPromise(settle());
+}
+
+function pgPromiseFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (NATIVE_IS_PROXY(cleanup)) deny();
+      if (NATIVE_IS_PROMISE(cleanup)) await pinnedPgPromise(cleanup);
+      else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")) {
+        // Unknown thenables may inherit a forged Object.prototype.then.
+        deny();
+      }
+    }
+    if (!fulfilled) throw value;
+    return value;
+  }
+  return pinnedPgPromise(settle());
+}
+
+function pinnedPgPromise(pending) {
+  if (NATIVE_IS_PROXY(pending) || !NATIVE_IS_PROMISE(pending)) deny();
+  NATIVE_DEFINE_PROPERTY(pending, "constructor", {
+    value: PG_PROMISE, configurable: false, writable: false,
+  });
+  const existing = NATIVE_DESCRIPTOR(pending, "then");
+  if (existing) {
+    if (existing.configurable !== false || existing.writable !== false
+      || typeof existing.value !== "function") deny();
+    return pending;
+  }
+  NATIVE_DEFINE_PROPERTY(pending, "then", { value: pgPromiseThen,
+    configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "catch", { value(onRejected) {
+    return NATIVE_APPLY(pgPromiseThen, this, [undefined, onRejected]);
+  }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "finally", { value: pgPromiseFinally,
+    configurable: false, writable: false });
+  return pending;
+}
 
 function signedResult(fields) {
   // A hostile signer KeyObject getter may install Object.prototype.then;
@@ -135,7 +193,7 @@ async function signCommittedPhysicalReadback(request, attestorPrivateKey) {
   } catch (_) { deny(); }
 }
 
-async function verifyCommittedPhysicalReadback(raw, options = {}) {
+async function verifyCommittedPhysicalReadbackInternal(raw, options = {}) {
   try {
     exact(options, ["scope", "operation", "expected", "nonce", "pinnedPublicKey", "nowSeconds"]);
     const expected = options.expected;
@@ -196,6 +254,12 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
       operationId: NATIVE_BUFFER_FROM(op.operation_id), authorizesIo: false,
       provesIndependentOperator: false });
   } catch (_) { deny(); }
+}
+
+function verifyCommittedPhysicalReadback(raw, options) {
+  // The caller awaits only after its native pinned-key getter may have
+  // replaced Promise.prototype.constructor, .then, .catch and .finally.
+  return pinnedPgPromise(verifyCommittedPhysicalReadbackInternal(raw, options));
 }
 
 module.exports = { signCommittedPhysicalReadback, verifyCommittedPhysicalReadback,

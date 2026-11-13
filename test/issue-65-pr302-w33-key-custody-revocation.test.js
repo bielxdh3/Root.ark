@@ -314,6 +314,96 @@ test("P2 public composite then/catch cannot accept forged success after native k
     receipt, physicalBytes))).status, "VERIFIED_COMPOSITE_NONAUTHORIZING");
 });
 
+test("P2 composite public finally cannot replace a denied Ed25519 receipt with forged success", async () => {
+  const f = fixture();
+  const genuine = await committed(f);
+  const invalid = Buffer.from(genuine);
+  invalid[invalid.length - 1] ^= 1;
+  const signedPhysical = await physical(f);
+  const signer = f.signer.publicKey;
+  const handle = Object.getOwnPropertySymbols(signer)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  const hostile = Object.create(signer);
+  const originalFinally = Object.getOwnPropertyDescriptor(Promise.prototype, "finally");
+  const nativeThen = Promise.prototype.then;
+  let reads = 0, forgedCalls = 0;
+  Object.defineProperty(hostile, handle, { get() {
+    reads++;
+    Promise.prototype.finally = function forgedFinally() {
+      forgedCalls++;
+      return Promise.resolve({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
+        independentPhysicalAttestationVerified: true, authorizesIo: false });
+    };
+    return signer[handle];
+  } });
+  try {
+    const pending = verifyAttestedInventoryCommit(compositeOptions(f,
+      invalid, signedPhysical, hostile));
+    Reflect.apply(nativeThen, pending, [undefined, () => {}]);
+    let rejected = false;
+    try { await pending.finally(() => {}); }
+    catch (error) { rejected = error?.code === "ZK_ATTESTED_INVENTORY_COMMIT_DENIED"; }
+    assert.equal(rejected, true, "invalid receipt must reject even after a hostile .finally");
+    assert.equal(forgedCalls, 0, "public Promise must not inherit forged finally");
+  } finally {
+    Object.defineProperty(Promise.prototype, "finally", originalFinally);
+  }
+  assert.ok(reads > 0, "the real native KeyObject getter must execute");
+  assert.equal((await verifyAttestedInventoryCommit(compositeOptions(f,
+    genuine, signedPhysical)).finally(() => Promise.resolve())).status,
+  "VERIFIED_COMPOSITE_NONAUTHORIZING",
+  "a genuine composite signature must survive native async finally cleanup");
+});
+
+test("P2 public PG verifier cannot forge signed physical admission through Promise reactions", async () => {
+  const f = fixture();
+  const signed = await physical(f);
+  const tampered = Buffer.from(signed);
+  tampered[tampered.length - 1] ^= 1;
+  const signer = f.attestor.publicKey;
+  const handle = Object.getOwnPropertySymbols(signer)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  const hostile = Object.create(signer);
+  const nativeThen = Promise.prototype.then;
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
+  let pending, reads = 0, forgedCalls = 0;
+  Object.defineProperty(hostile, handle, { get() {
+    reads++;
+    Promise.prototype.constructor = function FakeConstructor() {};
+    Promise.prototype.then = function forgedThen(onFulfilled, onRejected) {
+      if (this === pending) {
+        forgedCalls++;
+        if (typeof onFulfilled === "function") onFulfilled({
+          status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+          walFlushConfirmed: true, authorizesIo: false,
+        });
+        return Promise.resolve();
+      }
+      return Reflect.apply(nativeThen, this, [onFulfilled, onRejected]);
+    };
+    return signer[handle];
+  } });
+  try {
+    pending = pg.verifyCommittedPhysicalReadback(tampered, physicalOptions(f, hostile));
+    Reflect.apply(nativeThen, pending, [undefined, () => {}]);
+    let rejected = false;
+    try { await pending; }
+    catch (error) { rejected = error?.code === "ZK_PHYSICAL_ATTESTATION_DENIED"; }
+    assert.equal(rejected, true, "invalid signed PG bytes cannot return a verified status");
+    assert.equal(forgedCalls, 0, "public PG await must not invoke poisoned inherited then");
+  } finally {
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+    Object.defineProperty(Promise.prototype, "then", originalThen);
+  }
+  assert.ok(reads > 0, "physical attestor native getter must execute");
+  assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
+    physicalOptions(f, signer)).finally(() => Promise.resolve())).verified, true,
+  "a genuine physical attestation must survive native async finally cleanup");
+});
+
 test("P2 native Promise species cannot substitute composite rejection with forged signed success", async () => {
   const f = fixture();
   const receipt = await committed(f);
