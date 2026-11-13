@@ -685,3 +685,179 @@ test("P2 historical read cannot forge authorizesIo by poisoning Object.freeze af
   assert.equal(result.authorizesIo, false);
   assert.equal(result.externalDurabilityProven, false);
 });
+
+test("P2 genuine PG nonce B cannot use a witness-signed stale nonce A through poisoned Buffer.toString", async () => {
+  const { f, witness, args } = await historicalFixture();
+  const nonceA = Buffer.from(args.nonce);
+  const nonceB = crypto.randomBytes(32);
+  assert.notDeepEqual(nonceA, nonceB);
+  const physicalB = await physical({ ...f, nonce: nonceB });
+  const swapped = { ...args, nonce: nonceB, physicalAttestation: physicalB };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(swapped),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "authentic signed floor for A cannot answer the independent fresh B challenge");
+  const original = Buffer.prototype.toString;
+  const originalB64A = Reflect.apply(original, nonceA, ["base64url"]);
+  const hostile = Object.create(witness.publicKey);
+  let getterCalls = 0, forgedNonceReads = 0;
+  Object.defineProperty(hostile, "type", { get() {
+    getterCalls++;
+    Buffer.prototype.toString = function poisonedNonceString(encoding, ...rest) {
+      if (encoding === "base64url" && this.length === nonceB.length
+        && crypto.timingSafeEqual(this, nonceB)) {
+        forgedNonceReads++;
+        return originalB64A;
+      }
+      return Reflect.apply(original, this, [encoding, ...rest]);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission({
+      ...swapped, pinnedWitnessPublicKey: hostile,
+    }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "signed floor A must not bind to nonce B through a poisoned byte-to-string method");
+  } finally { Buffer.prototype.toString = original; }
+  assert.ok(getterCalls > 0, "genuine witness key callback executed");
+  assert.equal(forgedNonceReads, 0, "nonce matching must never consult poisoned Buffer.toString");
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesHistoricalRead,
+    true, "authentic signed floor and PG both for A remain positive");
+});
+
+test("P2 signed PG freshness cannot be extended by Math.abs poisoning after a real slow read", async () => {
+  const { f, args } = await historicalFixture();
+  const signedOlderPg = await physical({ ...f,
+    now: Math.floor(Date.now() / 1000) - 28 });
+  const unsignedRead = {
+    envelope: args.envelope, scope: args.scope,
+    expectedSequence: args.expectedSequence, expectedRoot: args.expectedRoot,
+    receipt: args.receipt, physicalAttestation: signedOlderPg,
+    nonce: args.nonce, pinnedInventoryPublicKey: args.pinnedInventoryPublicKey,
+    pinnedInventorySignerKeyId: args.pinnedInventorySignerKeyId,
+    pinnedPhysicalAttestorPublicKey: args.pinnedPhysicalAttestorPublicKey,
+    localTrustedDevicePolicy: args.localTrustedDevicePolicy,
+  };
+  assert.equal((await binding.verifySyncV2PhysicalEnvelopeEvidence(unsignedRead)).localPgReadbackVerified,
+    true, "a real Ed25519 PG signature 28 seconds old passes without a late stall");
+  const nativeAbs = Math.abs;
+  const poisoned = Object.create(f.signer.publicKey);
+  let getterCalls = 0, poisonedClockReads = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    getterCalls++;
+    Math.abs = () => { poisonedClockReads++; return 0; };
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4200);
+    return "public";
+  } });
+  const started = process.hrtime.bigint();
+  try {
+    await assert.rejects(binding.verifySyncV2PhysicalEnvelopeEvidence({
+      ...unsignedRead, pinnedInventoryPublicKey: poisoned,
+    }), /SYNC_ZK1_PHYSICAL_BINDING_DENIED/,
+    "signed PG must be rechecked with native clock after verification exceeds 30 seconds");
+  } finally { Math.abs = nativeAbs; }
+  assert.ok(getterCalls > 0, "real inventory key getter performed a blocking stall");
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 >= 4000,
+    "the callback genuinely stalled after the verifier entered the signed PG path");
+  assert.equal(poisonedClockReads, 0, "no dynamic Math.abs after an Ed25519 callback");
+});
+
+test("P2 physical verifier cannot adopt fake success from poisoned native Promise constructor and then", async () => {
+  const { f, args } = await historicalFixture();
+  const invalid = {
+    envelope: args.envelope, scope: args.scope, expectedSequence: args.expectedSequence,
+    expectedRoot: args.expectedRoot, receipt: args.receipt,
+    physicalAttestation: Buffer.from([0x01, 0x02, 0x03]), nonce: args.nonce,
+    pinnedInventoryPublicKey: args.pinnedInventoryPublicKey,
+    pinnedInventorySignerKeyId: args.pinnedInventorySignerKeyId,
+    pinnedPhysicalAttestorPublicKey: args.pinnedPhysicalAttestorPublicKey,
+    localTrustedDevicePolicy: args.localTrustedDevicePolicy,
+  };
+  await assert.rejects(binding.verifySyncV2PhysicalEnvelopeEvidence(invalid),
+    /SYNC_ZK1_PHYSICAL_BINDING_DENIED/, "invalid physical signed bytes deny normally");
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Promise.prototype.then;
+  const fakeComposite = { status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
+    authorizesIo: false, physicalReadback: { issuedAt: Math.floor(Date.now() / 1000) },
+    receiptDigest: Buffer.alloc(32) };
+  const poisoned = Object.create(f.signer.publicKey);
+  const nativePromiseConstructor = Promise;
+  let getterCalls = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    getterCalls++;
+    Object.defineProperty(Promise.prototype, "constructor", {
+      configurable: true, writable: true, value: function ForgedPromise() {},
+    });
+    Promise.prototype.then = function fakeNativePromiseReaction(onFulfilled, onRejected) {
+      if (typeof onFulfilled === "function" && typeof onRejected === "function") {
+        return Reflect.apply(originalThen, this, [onFulfilled,
+          () => onFulfilled(fakeComposite)]);
+      }
+      return Reflect.apply(originalThen, this, [onFulfilled, onRejected]);
+    };
+    return "public";
+  } });
+  try {
+    const pending = binding.verifySyncV2PhysicalEnvelopeEvidence({
+      ...invalid, pinnedInventoryPublicKey: poisoned,
+    });
+    // The oracle must observe the actual Promise internal state, not the
+    // exact same hostile Promise.prototype.constructor injected into product.
+    Object.defineProperty(pending, "constructor", { value: nativePromiseConstructor,
+      enumerable: false, configurable: false, writable: false });
+    await assert.rejects(pending, /SYNC_ZK1_PHYSICAL_BINDING_DENIED/,
+    "actual bad PG bytes cannot become a verified physical receipt by fake native then");
+  } finally {
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+    Promise.prototype.then = originalThen;
+  }
+  assert.ok(getterCalls > 0, "hostile KeyObject getter executed inside composite");
+  // A nested verifier may still consult a poisoned reaction and fail closed.
+  // The only safety oracle is that invalid PG bytes never yield physical proof;
+  // the test itself pins the returned Promise so its own await cannot be forged.
+});
+
+test("P2 historical signed witness cannot admit invalid PG after hostile Promise reactions", async () => {
+  const { witness, args } = await historicalFixture();
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesHistoricalRead,
+    true, "real Ed25519 witness, inventory, PG and device signatures are positive");
+  const invalid = { ...args, physicalAttestation: Buffer.from([0x01, 0x02, 0x03]) };
+  await assert.rejects(binding.verifySyncV2HistoricalWitnessAdmission(invalid),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/, "invalid physical proof cannot authorize normally");
+  const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+  const originalThen = Promise.prototype.then;
+  const nativeConstructor = Promise;
+  const fake = { status: "VERIFIED_COMPOSITE_NONAUTHORIZING", authorizesIo: false,
+    localPgReadbackVerified: true, physicalReadback: { issuedAt: Math.floor(Date.now() / 1000) },
+    receiptDigest: Buffer.alloc(32) };
+  const poisoned = Object.create(witness.publicKey);
+  let getterCalls = 0;
+  Object.defineProperty(poisoned, "type", { get() {
+    getterCalls++;
+    Object.defineProperty(Promise.prototype, "constructor", {
+      configurable: true, writable: true, value: function ForgedPromise() {},
+    });
+    Promise.prototype.then = function fakeRejectionToProof(onFulfilled, onRejected) {
+      if (typeof onFulfilled === "function" && typeof onRejected === "function") {
+        return Reflect.apply(originalThen, this, [onFulfilled,
+          () => onFulfilled(fake)]);
+      }
+      return Reflect.apply(originalThen, this, [onFulfilled, onRejected]);
+    };
+    return "public";
+  } });
+  try {
+    const pending = binding.verifySyncV2HistoricalWitnessAdmission({
+      ...invalid, pinnedWitnessPublicKey: poisoned,
+    });
+    Object.defineProperty(pending, "constructor", { value: nativeConstructor,
+      enumerable: false, configurable: false, writable: false });
+    await assert.rejects(pending, /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+      "genuine witness signatures never replace the missing PG readback");
+  } finally {
+    Promise.prototype.then = originalThen;
+    Object.defineProperty(Promise.prototype, "constructor", originalConstructor);
+  }
+  assert.ok(getterCalls > 0, "native witness getter poisoned the Promise prototype");
+  assert.equal((await binding.verifySyncV2HistoricalWitnessAdmission(args)).authorizesIo,
+    false, "normal nonauthorizing positive continues to work after restored globals");
+});

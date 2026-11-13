@@ -7,11 +7,13 @@
 // success flag is never evidence of such a write. An admission timestamp,
 // witness/CAS floor, and external cloud durability are NOT proven here.
 const crypto = require("node:crypto");
-const { types: { isProxy } } = require("node:util");
+const { types: { isProxy, isPromise } } = require("node:util");
 // A native Ed25519 KeyObject getter runs before later local policy snapshots.
 // Define own array data slots instead of consulting mutable Array.push.
 const NATIVE_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const NATIVE_OBJECT_PROTOTYPE = Object.prototype;
+const NATIVE_PROMISE = Promise;
+const NATIVE_IS_SAFE_INTEGER = Number.isSafeInteger.bind(Number);
 const { arrayIncludes: NATIVE_ARRAY_INCLUDES,
   arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
   getPrototype: NATIVE_GET_PROTOTYPE,
@@ -21,6 +23,7 @@ const { arrayIncludes: NATIVE_ARRAY_INCLUDES,
   objectCreate: NATIVE_OBJECT_CREATE,
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
   jsonStringify: NATIVE_JSON_STRINGIFY,
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
   createHash: NATIVE_CREATE_HASH,
@@ -31,7 +34,8 @@ const { arrayIncludes: NATIVE_ARRAY_INCLUDES,
   keyEquals: NATIVE_KEY_EQUALS,
   freeze: NATIVE_FREEZE,
   dateNow: NATIVE_DATE_NOW,
-  mathFloor: NATIVE_MATH_FLOOR } =
+  mathFloor: NATIVE_MATH_FLOOR,
+  mathAbs: NATIVE_MATH_ABS } =
   require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { pinNativeEd25519PublicKey } =
   require("../src/crypto/rootark-zk1-native-ed25519-public-key");
@@ -67,6 +71,17 @@ function deny() {
   const error = new Error("SYNC_ZK1_PHYSICAL_BINDING_DENIED");
   error.code = error.message;
   throw error;
+}
+function pinnedNativeAwait(value) {
+  // Await normally reads Promise.prototype.constructor and assimilates `.then`
+  // when those properties no longer identify the native constructor. A hostile
+  // KeyObject getter could otherwise turn a rejected PG/device verifier into
+  // an attacker-supplied successful result after the Ed25519 check was skipped.
+  if (isProxy(value) || !isPromise(value)) deny();
+  NATIVE_DEFINE_PROPERTY(value, "constructor", {
+    value: NATIVE_PROMISE, enumerable: false, configurable: false, writable: false,
+  });
+  return value;
 }
 function strict(raw, fields) {
   if (!raw || typeof raw !== "object" || isProxy(raw) || NATIVE_ARRAY_IS_ARRAY(raw)) deny();
@@ -204,9 +219,9 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
     // Ed25519 device authorization and revocation before being handed to any
     // gate/writer. Mere structural envelopeBinding() is never an IO grant.
     const policy = snapshotLocalDevicePolicy(localTrustedDevicePolicy);
-    if (await verifyAuthorizationProof(bound.envelope.authorization,
-      bound.envelope, policy) !== true
-      || bound.envelope.authorization.expiresAt <= Date.now()) deny();
+    if (await pinnedNativeAwait(verifyAuthorizationProof(bound.envelope.authorization,
+      bound.envelope, policy)) !== true
+      || bound.envelope.authorization.expiresAt <= NATIVE_DATE_NOW()) deny();
     // This is exactly the API accepted by Zk1PgPhysicalInventoryBridge
     // .putAndAttest(). Never attach a signer-controlled success flag to it.
     // The gate's 32-byte digest comes from the independently trusted current
@@ -241,25 +256,25 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
     const inventoryKey = v.pinnedInventoryPublicKey;
     const physicalKey = v.pinnedPhysicalAttestorPublicKey;
     const policy = snapshotLocalDevicePolicy(v.localTrustedDevicePolicy);
-    if (await verifyHistoricalAuthorizationProof(bound.envelope.authorization,
-      bound.envelope, policy) !== true) deny();
-    const result = await verifyAttestedInventoryCommit({
+    if (await pinnedNativeAwait(verifyHistoricalAuthorizationProof(bound.envelope.authorization,
+      bound.envelope, policy)) !== true) deny();
+    const result = await pinnedNativeAwait(verifyAttestedInventoryCommit({
       receipt, physicalAttestation: attestation, scope: bound.scope,
       operation: bound.operation, nonce,
       pinnedInventoryPublicKey: inventoryKey,
       pinnedInventorySignerKeyId: signerKeyId,
       pinnedPhysicalAttestorPublicKey: physicalKey,
       nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
-    });
+    }));
     const completedAtSeconds = NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000);
     if (result.status !== "VERIFIED_COMPOSITE_NONAUTHORIZING"
       || result.authorizesIo !== false
       // A proof may cross the ±30 s physical freshness window while CBOR and
       // Ed25519 verification await. Recheck the SIGNED issuance timestamp
       // rather than relying only on the pre-await wall-clock sample.
-      || !Number.isSafeInteger(result.physicalReadback?.issuedAt)
-      || !Number.isSafeInteger(completedAtSeconds) || completedAtSeconds < 1
-      || Math.abs(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
+      || !NATIVE_IS_SAFE_INTEGER(result.physicalReadback?.issuedAt)
+      || !NATIVE_IS_SAFE_INTEGER(completedAtSeconds) || completedAtSeconds < 1
+      || NATIVE_MATH_ABS(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
     return NATIVE_FREEZE({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
       operationId: NATIVE_BUFFER_FROM(bound.operation.operation_id),
       ciphertextSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
@@ -290,8 +305,8 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const challenge = checkedBytes(v.nonce, 32);
     const committedInventoryReceipt = checkedBytes(v.receipt, 1,
       inventory.MAX_COMMITTED_PROOF_BYTES);
-    const witnessId = checkedBytes(v.witnessKeyId, 16).toString("base64url");
-    const statusId = checkedBytes(v.statusKeyId, 16).toString("base64url");
+    const witnessId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.witnessKeyId, 16), "base64url");
+    const statusId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.statusKeyId, 16), "base64url");
     // Bind every caller-owned expected byte, record and device identity BEFORE
     // any KeyObject getter can rewrite ambient factories or the input graph.
     const floor = strict(v.freshFloor, FLOOR_FIELDS);
@@ -317,7 +332,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const HEX = /^[a-f0-9]{64}$/;
     if (floor.type !== "rootark-zk1-witness-cas-physical-floor/v2"
       || floor.witnessKeyId !== witnessId || floor.statusKeyId !== statusId
-      || floor.nonce !== challenge.toString("base64url")
+      || floor.nonce !== NATIVE_BUFFER_TO_STRING.call(challenge, "base64url")
       || !Number.isSafeInteger(floor.sequence) || floor.sequence < 1
       || floor.sequence > 100000 || !HEX.test(floor.lastHash)
       || !HEX.test(floor.physicalFenceDigest)
@@ -334,12 +349,14 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const digest = nativeDigest;
     if (admission.type !== "rootark-sync-v2-historical-witness-admission/v1"
       || admission.envelopeSha256 !== digest(bound.canonicalEnvelope)
-      || admission.operationId !== bound.operation.operation_id.toString("base64url")
+      || admission.operationId !== NATIVE_BUFFER_TO_STRING.call(
+        bound.operation.operation_id, "base64url")
       || admission.deviceId !== bound.envelope.deviceId
       || admission.deviceSpkiSha256 !== digest(deviceSpki)
       || admission.epoch !== bound.operation.epoch
       || admission.checkpointSequence !== bound.operation.expected_sequence
-      || admission.checkpointRoot !== bound.operation.expected_root.toString("base64url")
+      || admission.checkpointRoot !== NATIVE_BUFFER_TO_STRING.call(
+        bound.operation.expected_root, "base64url")
       || !Number.isSafeInteger(admission.admittedAtMs) || admission.admittedAtMs < 1
       || admission.admittedAtMs >= bound.envelope.authorization.expiresAt
       || admission.admittedAtMs > NATIVE_DATE_NOW()
@@ -351,7 +368,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     canonicalSignature(admission.signature))) deny();
     // Both cryptographic verifications above happen before the asynchronous
     // PG/inventory proof check; all attacker-controlled values were detached.
-    const physical = await verifySyncV2PhysicalEnvelopeEvidence({
+    const physical = await pinnedNativeAwait(verifySyncV2PhysicalEnvelopeEvidence({
       envelope: bound.envelope, scope: bound.scope,
       expectedSequence: bound.operation.expected_sequence,
       expectedRoot: bound.operation.expected_root,
@@ -361,7 +378,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       pinnedInventorySignerKeyId: inventorySignerKeyId,
       pinnedPhysicalAttestorPublicKey: attestorKey,
       localTrustedDevicePolicy: initialDevicePolicy,
-    });
+    }));
     // Bind the immutable inventory receipt rather than the fresh PG readback
     // signature: its nonce cannot be known when the *historical* admission is
     // signed. The current PG attestor signature is independently challenged.
