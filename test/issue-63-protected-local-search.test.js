@@ -219,3 +219,80 @@ test("search cap, scope fence and malformed full listing fail closed", async () 
     "a client for one account must not populate another account's cache");
   assert.equal(f.opened, 2);
 });
+
+test("multi-revision signed catalog indexes only latest revision per object and never resurrects trashed names", async () => {
+  const database = indexedDBMemory();
+  const scope = {
+    account_id: crypto.randomBytes(16).toString("base64url"),
+    compartment_id: Buffer.from("fixture-compartment").toString("base64url"),
+    keyring_id: crypto.randomBytes(16).toString("base64url"),
+  };
+  const ownerDigest = crypto.randomBytes(32).toString("base64url");
+  const grant = { ...scope, device_id: "device-current", revoked_at_epoch: null,
+    manifest_revision: 7, manifest_digest: ownerDigest, current_epoch: 2 };
+  const trashedId = crypto.randomBytes(16).toString("base64url");
+  const renamedId = crypto.randomBytes(16).toString("base64url");
+  const rawEntries = [
+    { objectId: trashedId, revision: 1, epoch: 2, name: "deleted-report.txt", logicalTrashCandidate: false },
+    { objectId: renamedId, revision: 1, epoch: 2, name: "old-draft.txt", logicalTrashCandidate: false },
+    { objectId: trashedId, revision: 2, epoch: 2, name: null, logicalTrashCandidate: true },
+    { objectId: renamedId, revision: 2, epoch: 2, name: "current-report.txt", logicalTrashCandidate: false },
+  ];
+  // Mirror COS #257's latestByObject deduplication from readPrivateListing:
+  const latestMap = new Map();
+  for (const row of rawEntries) {
+    const prev = latestMap.get(row.objectId);
+    if (!prev || row.revision > prev.revision) {
+      latestMap.delete(row.objectId);
+      latestMap.set(row.objectId, row);
+    }
+  }
+  const latest = [...latestMap.values()];
+  const baseline = {
+    head: { sequence: 14, digest: crypto.randomBytes(32).toString("base64url") },
+    entries: rawEntries.map(({ objectId, revision, epoch }) => ({ objectId, revision, epoch })),
+  };
+  let opened = 0;
+  const client = {
+    async verifyPrivateListingHead() { return { head: baseline.head, scope }; },
+    async readPrivateListing(_prev, _key, term) {
+      assert.equal(term, "");
+      opened++;
+      return { head: baseline.head, scope, entries: latest, totalMatches: latest.length,
+        plaintextSentToServer: false, independentlySignedCatalog: true, authorizesMutation: false };
+    },
+  };
+  const key = crypto.randomBytes(32);
+  const baseInput = { indexedDBImpl: database, client, baseline, grant,
+    ownerRevision: 7, ownerEpoch: 2, ownerDigest, metadataRaw: key, assertLive() {} };
+
+  const currentMatch = await search.search({ ...baseInput, term: "current-report" });
+  assert.equal(currentMatch.totalMatches, 1);
+  assert.equal(currentMatch.entries[0].objectId, renamedId);
+  assert.equal(currentMatch.entries[0].revision, 2);
+
+  // Cached reuse must succeed on multi-revision catalogs and exclude superseded/trashed names:
+  const cachedResurrect = await search.search({ ...baseInput, term: "deleted-report" });
+  assert.equal(cachedResurrect.reusedIndex, true);
+  assert.equal(cachedResurrect.totalMatches, 0);
+  const cachedOldName = await search.search({ ...baseInput, term: "old-draft" });
+  assert.equal(cachedOldName.reusedIndex, true);
+  assert.equal(cachedOldName.totalMatches, 0);
+  const unfiltered = await search.search({ ...baseInput, term: "" });
+  assert.equal(unfiltered.totalMatches, 2);
+  assert.equal(unfiltered.entries.length, 2);
+  assert.equal(opened, 1);
+
+  // Adversarial: forged opening returning superseded revision 1 instead of revision 2 must deny.
+  database.rows.clear();
+  const forgedClient = {
+    async verifyPrivateListingHead() { return { head: baseline.head, scope }; },
+    async readPrivateListing() {
+      return { head: baseline.head, scope,
+        entries: [rawEntries[0], rawEntries[3]], totalMatches: 2,
+        plaintextSentToServer: false, independentlySignedCatalog: true, authorizesMutation: false };
+    },
+  };
+  await assert.rejects(search.search({ ...baseInput, client: forgedClient, term: "deleted" }),
+    /ZK_LOCAL_SEARCH_DENIED/);
+});

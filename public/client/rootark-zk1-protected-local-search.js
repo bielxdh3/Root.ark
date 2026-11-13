@@ -121,12 +121,30 @@
   function cacheKey(scope) {
     return JSON.stringify([scope.account_id, scope.compartment_id, scope.keyring_id]);
   }
-  function validRows(rows, baseline) {
-    if (!Array.isArray(rows) || rows.length !== baseline.entries.length
+  function latestEntries(baseline) {
+    const latest = new Map();
+    const seen = new Set();
+    for (const entry of baseline.entries) {
+      if (!entry || !id.test(entry.objectId)
+        || !Number.isSafeInteger(entry.revision) || entry.revision < 1
+        || !Number.isSafeInteger(entry.epoch) || entry.epoch < 1) deny();
+      const key = entry.objectId + ":" + entry.revision;
+      if (seen.has(key)) deny();
+      seen.add(key);
+      const prev = latest.get(entry.objectId);
+      if (!prev || entry.revision > prev.revision) {
+        latest.delete(entry.objectId);
+        latest.set(entry.objectId, entry);
+      }
+    }
+    return [...latest.values()];
+  }
+  function validRows(rows, expected) {
+    if (!Array.isArray(rows) || rows.length !== expected.length
       || rows.length > 4096) deny();
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      const signed = baseline.entries[i];
+      const signed = expected[i];
       if (!row || !signed || !id.test(row.objectId)
         || row.objectId !== signed.objectId || row.revision !== signed.revision
         || row.epoch !== signed.epoch || !Number.isSafeInteger(row.revision)
@@ -139,14 +157,15 @@
     return rows;
   }
   function verifyOpening(opened, contextValue, baseline) {
+    const expected = latestEntries(baseline);
     if (opened?.independentlySignedCatalog !== true
       || opened.plaintextSentToServer !== false
       || opened.authorizesMutation !== false
       || !sameScope(opened.scope, contextValue.scope)
       || opened.head?.sequence !== contextValue.head.sequence
       || opened.head.digest !== contextValue.head.digest
-      || opened.totalMatches !== baseline.entries.length) deny();
-    return validRows(opened.entries, baseline);
+      || opened.totalMatches !== expected.length) deny();
+    return validRows(opened.entries, expected);
   }
   function filtered(rows, term, head, persisted) {
     const query = term.trim().normalize("NFC").toLowerCase();
@@ -227,7 +246,7 @@
         secret, decode64(record.ciphertext, 16, 4 * 1024 * 1024 + 16));
         live(input.assertLive);
         if (opened.byteLength > 4 * 1024 * 1024) deny();
-        rows = validRows(JSON.parse(decoder.decode(opened)), input.baseline);
+        rows = validRows(JSON.parse(decoder.decode(opened)), latestEntries(input.baseline));
         usedCache = true;
       } else {
         const sourceKey = await webCrypto.subtle.importKey("raw", input.metadataRaw,
