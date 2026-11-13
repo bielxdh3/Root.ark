@@ -363,6 +363,51 @@ test("P2: native key callback cannot invoke Promise.then cleanup before CURRENT 
   }
 });
 
+test("P2: exported CURRENT verifier cannot become a forged success through its outer Promise", async () => {
+  const f = await fixture();
+  const originalThen = Promise.prototype.then;
+  const originalConstructor = Promise.prototype.constructor;
+  let pending, poisons = 0, forgedThenCalls = 0;
+  let reportPoison;
+  const poisoned = new Promise((resolve) => { reportPoison = resolve; });
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: () => {
+      poisons += 1;
+      Promise.prototype.constructor = function ForgedConstructor() {};
+      Promise.prototype.then = function poisonedThen(accept, reject) {
+        if (this === pending) {
+          forgedThenCalls += 1;
+          if (typeof accept === "function") accept({ ownerMappingVerified: true,
+            status: "VERIFIED_SIGNED_SYNC_V2_ZK10_MAPPING_NONAUTHORIZING" });
+          return Promise.resolve();
+        }
+        return Reflect.apply(originalThen, this, [accept, reject]);
+      };
+      reportPoison();
+      return Promise.resolve({ invalid: "not a signed CURRENT head" });
+    } },
+  }, { headTimeoutMs: 1000, maxPendingHeadReads: 1 });
+  try {
+    pending = verify(f.input);
+    // Do not await until AFTER the genuine external callback has poisoned the
+    // realm. Observe a rejection with the captured native function first so
+    // the event loop cannot mistake a rejection for an unhandled test error.
+    Reflect.apply(originalThen, pending, [undefined, () => {}]);
+    await poisoned;
+    let accepted = false, rejected = false;
+    try { const value = await pending; accepted = value?.ownerMappingVerified === true; }
+    catch (error) { rejected = error?.code === "ZK10_SYNC_V2_MAP_UNVERIFIED"; }
+    assert.equal(poisons, 1, "the hostile read callback must actually run");
+    assert.equal(rejected, true, "bad signed CURRENT must reject at the public await boundary");
+    assert.equal(accepted, false, "the real caller must not see a forged success");
+    assert.equal(forgedThenCalls, 0, "the public await must bypass inherited then");
+  } finally {
+    Promise.prototype.then = originalThen;
+    Promise.prototype.constructor = originalConstructor;
+  }
+});
+
 test("P2: cross-realm native Promise keeps its true outstanding read slot until settlement", async () => {
   const f = await fixture();
   const ForeignPromise = vm.runInNewContext("Promise");
