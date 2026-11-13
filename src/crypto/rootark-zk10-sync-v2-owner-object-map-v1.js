@@ -383,7 +383,10 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
           nativeAbort(controller);
           deny();
         }
-        return result.value;
+        // Keep the inert null-prototype envelope across this async return.
+        // Returning its unboxed caller wire would re-assimilate an inherited
+        // Object.prototype.then AFTER the deadline check and timer cleanup.
+        return result;
       } finally {
         NATIVE_CLEAR_TIMEOUT(timer);
         if (onCancel) NATIVE_APPLY(NATIVE_EVENT_REMOVE, signal, ["abort", onCancel]);
@@ -454,7 +457,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         // Generate the challenge here. A signed old head with an old nonce is
         // not acceptable after a restart, even if its Ed25519 signature is valid.
         const challenge = NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(32), "base64url");
-        const wire = exact(await boundedCurrentHead(challenge, signal),
+        const wire = exact((await boundedCurrentHead(challenge, signal)).value,
           [...HEAD_FIELDS, "signature"]);
         const head = currentHeadPayload(NATIVE_PICK_SIGNED_FIELDS(wire, HEAD_FIELDS));
         if (head.challenge !== challenge || head.mapping_digest !== digest

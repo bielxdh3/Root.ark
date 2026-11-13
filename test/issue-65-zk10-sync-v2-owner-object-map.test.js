@@ -583,6 +583,48 @@ test("P2: inherited poisoned Object.then cannot swallow CURRENT timeout settleme
     "settlement values must not inherit arbitrary Object.prototype.then");
 });
 
+test("P2: signed CURRENT head cannot be re-assimilated through inherited then after readback", async () => {
+  const f = await fixture();
+  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  let trapReads = 0, genuineHead;
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: (challenge) => {
+      genuineHead = signedHead(f, challenge);
+      // The native Promise already owns the genuine signed head BEFORE
+      // its external callback poisons future ordinary-object then lookups.
+      const settled = Promise.resolve(genuineHead);
+      Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (this === genuineHead) {
+            trapReads += 1;
+            return function hangReassimilation() {};
+          }
+          return undefined;
+        },
+      });
+      return settled;
+    } },
+  }, { headTimeoutMs: 1000, maxPendingHeadReads: 1 });
+  const pending = verify(f.input);
+  try {
+    const outcome = await Promise.race([
+      pending.then((value) => value.ownerMappingVerified === true ? "accepted" : "bad_result",
+        () => "denied"),
+      new Promise((resolve) => setTimeout(() => resolve("signed_head_hung"), 200)),
+    ]);
+    assert.equal(outcome, "accepted",
+      "genuinely signed native readback must not hang at an extra async return boundary");
+    assert.equal(trapReads, 0,
+      "verified CURRENT head must be consumed without inherited then assimilation");
+  } finally {
+    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+    else delete Object.prototype.then;
+    await Promise.race([pending.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 100))]);
+  }
+});
+
 test("P2: hostile Ed25519 getter cannot suppress actual caller AbortSignal cancellation", async () => {
   const f = await fixture();
   const caller = new AbortController();
