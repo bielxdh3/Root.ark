@@ -182,7 +182,7 @@
       persistedIndex: persisted, plaintextSentToServer: false,
       independentlySignedCatalog: true, authorizesMutation: false });
   }
-  function renderVerifiedResults(container, entries, selectedInput, assertLive) {
+  function renderVerifiedResults(container, entries, selectedInput, assertLive, revisionInput) {
     if (!container?.ownerDocument || typeof container.replaceChildren !== "function"
       || !selectedInput || typeof assertLive !== "function"
       || !Array.isArray(entries) || entries.length > 4096) deny();
@@ -205,6 +205,7 @@
         try {
           if (!container.contains(button) || assertLive() === false) return;
           selectedInput.value = entry.objectId;
+          if (revisionInput) revisionInput.value = String(entry.revision);
           selectedInput.focus();
         } catch (_) { /* Logout/session switch invalidates this local selection. */ }
       });

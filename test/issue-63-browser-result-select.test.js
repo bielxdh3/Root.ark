@@ -48,30 +48,42 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!dialog?.open)throw Error("NO_AUTH_DIALOG");
       const list=dialog.querySelector('[data-zk1-field="catalog-delta-private-list"]');
       const target=dialog.querySelector('[data-zk1-field="catalog-write-id"]');
-      if(!list||!target)throw Error("MISSING_SEARCH_TARGET");
+      const revision=dialog.querySelector('[data-zk1-field="catalog-delta-read-revision"]');
+      const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
+      if(!list||!target||!revision||!getButton||getButton.type!=="button")
+        throw Error("MISSING_EXPLICIT_PROTECTED_GET");
       const id="AAAAAAAAAAAAAAAAAAAAAA";
       const malicious="<img src=x onerror=alert(1)> secret-local-only";
       let active=true;
       const verify=()=>active;
       window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
         list,[{name:malicious,objectId:id,revision:7,epoch:2,
-          logicalTrashCandidate:false}],target,verify);
+          logicalTrashCandidate:false}],target,verify,revision);
       const button=list.querySelector("button");
       if(!button||button.type!=="button"||button.textContent!=="Selecionar objeto")
         throw Error("NOT_SELECTABLE");
       if(list.querySelector("img")||!list.textContent.includes(malicious))
         throw Error("HTML_UNSAFE");
       button.click();
-      if(target.value!==id||document.activeElement!==target)
+      if(target.value!==id||revision.value!=="7"||document.activeElement!==target)
         throw Error("OPAQUE_SELECTION_FAILED");
       target.value="";
+      revision.value="";
       active=false;
       button.click();
-      if(target.value!=="")throw Error("STALE_RESULT_SELECTED");
+      if(target.value!==""||revision.value!=="")throw Error("STALE_RESULT_SELECTED");
       active=true;
       list.replaceChildren();
       button.click();
-      if(target.value!=="")throw Error("DETACHED_RESULT_SELECTED");
+      if(target.value!==""||revision.value!=="")throw Error("DETACHED_RESULT_SELECTED");
+      getButton.click();
+      for(let i=0;i<100;i++){
+        if(dialog.querySelector('[data-zk1-field="status"]').textContent
+          .includes("Operação recusada"))break;
+        await sleep(25);
+      }
+      if(!dialog.querySelector('[data-zk1-field="status"]').textContent
+        .includes("Operação recusada"))throw Error("MISSING_AUTH_DENIAL");
       out.textContent="EDGE_PROTECTED_SELECT_PASS";
     }catch(error){out.textContent="EDGE_PROTECTED_SELECT_FAIL:"+error.message;}
   });`;
