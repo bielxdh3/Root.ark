@@ -343,8 +343,8 @@ function safeName(name) {
   return path.basename(String(name || ""));
 }
 
-// On case-insensitive Windows filesystems, an alias may name a live file with
-// different spelling. Metadata and SQL tombstones use the physical leaf name.
+// Resolve Windows aliases by the actual filesystem entry, not JS Unicode case
+// folding: an NTFS directory may be case-sensitive or have distinct hardlinks.
 function resolvePhysicalFileName(directory, name) {
   const requested = safeName(name);
   if (process.platform !== "win32") return requested;
@@ -354,14 +354,19 @@ function resolvePhysicalFileName(directory, name) {
     if (error.code === "ENOENT") return requested;
     throw error;
   }
-  const matches = names.filter((entry) => entry.toLowerCase() === requested.toLowerCase());
-  if (matches.length !== 1) {
-    // Reject ambiguous aliases or filesystem case folds not handled by JS.
-    if (matches.length || fs.existsSync(path.join(directory, requested))) {
-      throw new Error("Nome fisico ambiguo para exclusao");
-    }
-    return requested;
+  if (names.includes(requested)) return requested;
+  let identity;
+  try { identity = fs.lstatSync(path.join(directory, requested), { bigint: true }); }
+  catch (error) {
+    if (error.code === "ENOENT") return requested;
+    throw error;
   }
+  if (identity.ino === 0n) throw new Error("Identidade fisica indisponivel");
+  const matches = names.filter((entry) => {
+    const actual = fs.lstatSync(path.join(directory, entry), { bigint: true });
+    return actual.dev === identity.dev && actual.ino === identity.ino;
+  });
+  if (matches.length !== 1) throw new Error("Nome fisico ambiguo para exclusao");
   return matches[0];
 }
 
@@ -417,7 +422,7 @@ function buildFileMetadata(context) {
   };
 }
 
-function removeFileMetadata(context) {
+function removeFileMetadata(context, capabilityAliases = []) {
   const { folder, fileName, loaders } = context;
   const key = `${folder.id}/${fileName}`;
   for (const [load, save] of [
@@ -433,8 +438,9 @@ function removeFileMetadata(context) {
   }
 
   const publicLinks = loaders.loadPublicLinks();
+  const revokedNames = new Set([fileName, ...capabilityAliases]);
   for (const [token, link] of Object.entries(publicLinks)) {
-    if ((link.folderId || "root") === folder.id && link.fileName === fileName) {
+    if ((link.folderId || "root") === folder.id && revokedNames.has(link.fileName)) {
       delete publicLinks[token];
     }
   }
@@ -442,7 +448,7 @@ function removeFileMetadata(context) {
   // concurrent exchange may have minted it after the read. Explicit trash
   // revocation must name the resource, even when the snapshot was empty.
   loaders.savePublicLinks(publicLinks, {
-    capabilityRevocation: { folderId: folder.id, fileName },
+    capabilityRevocation: { folderId: folder.id, fileName, aliases: capabilityAliases },
   });
 }
 
@@ -503,9 +509,49 @@ function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonic
   const trashPath = path.join(TRASH_STORAGE_DIR, "files", id, cleanName);
   const metadata = buildFileMetadata({ folder, fileName: cleanName, loaders });
   const size = fs.statSync(sourcePath).size;
+  // The old database may contain valid grants under a filename alias. Prove
+  // each alias resolves to THIS live NTFS entry before moving the source; after
+  // rename there is no pathname evidence left to classify Unicode spellings.
+  const capabilityAliases = [];
+  if (process.platform === "win32") {
+    // Enumerate once. Each legacy grant is checked against the requested
+    // pathname using OS file identity, not a per-grant full directory scan.
+    const physicalNames = fs.readdirSync(folder.uploadDir);
+    const exactNames = new Set(physicalNames);
+    const sourceIdentity = fs.lstatSync(sourcePath, { bigint: true });
+    if (sourceIdentity.ino === 0n) throw new Error("Identidade fisica indisponivel");
+    const aliases = new Set();
+    for (const link of Object.values(loaders.loadPublicLinks())) {
+      if ((link.folderId || "root") !== folder.id
+        || typeof link.fileName !== "string" || link.fileName === cleanName
+        || safeName(link.fileName) !== link.fileName
+        || exactNames.has(link.fileName) || aliases.has(link.fileName)) continue;
+      let candidate;
+      try { candidate = fs.lstatSync(path.join(folder.uploadDir, link.fileName), { bigint: true }); }
+      catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (candidate.dev === sourceIdentity.dev && candidate.ino === sourceIdentity.ino) {
+        aliases.add(link.fileName);
+      }
+    }
+    if (aliases.size) {
+      // Multiple real directory entries may be hardlinks to the same inode.
+      // A non-exact alias cannot safely select one of them for revocation.
+      const identityEntries = physicalNames.filter((name) => {
+        const entry = fs.lstatSync(path.join(folder.uploadDir, name), { bigint: true });
+        return entry.dev === sourceIdentity.dev && entry.ino === sourceIdentity.ino;
+      });
+      if (identityEntries.length !== 1 || identityEntries[0] !== cleanName) {
+        throw new Error("Nome fisico ambiguo para exclusao");
+      }
+      capabilityAliases.push(...aliases);
+    }
+  }
 
   movePath(sourcePath, trashPath);
-  removeFileMetadata({ folder, fileName: cleanName, loaders });
+  removeFileMetadata({ folder, fileName: cleanName, loaders }, capabilityAliases);
 
   return trashRepository.saveTrashItem({
     id,
