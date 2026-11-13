@@ -251,6 +251,95 @@ test("P2: genuine signed owner cutovers accept 100 to 128 covered compartments",
     "an unsigned or oversized corpus cannot silently raise the 128-compartment limit");
 });
 
+test("P2: native source key callback cannot erase a pinned device revocation", async () => {
+  const f = await fixture();
+  const revoked = f.sourceAuthority.pinnedDevicePolicy.revokedDeviceIds;
+  revoked.push(f.source.deviceId);
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "real Node22 Ed25519 native handle required");
+  const injected = Object.create(keys.source.publicKey);
+  let reads = 0;
+  Object.defineProperty(injected, handle, { get() {
+    reads += 1;
+    revoked.splice(0, revoked.length);
+    return keys.source.publicKey[handle];
+  } });
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+    zkAuthority: f.zkAuthority, mappingAuthority: f.authority,
+  });
+  assert.ok(reads > 0, "native callback must actually mutate caller policy");
+  assert.equal(revoked.length, 0, "the input policy was actually poisoned");
+  await assert.rejects(verify(f.input), deny,
+    "a valid signed operation by previously revoked A remains denied after callback poisoning");
+  const good = await fixture();
+  const valid = createOwnerObjectMapVerifier({
+    sourceAuthority: good.sourceAuthority, zkAuthority: good.zkAuthority,
+    mappingAuthority: good.authority,
+  });
+  assert.equal((await valid(good.input)).ownerMappingVerified, true,
+    "the same genuine Ed25519 A operation succeeds when never revoked");
+});
+
+test("P2: hostile CURRENT authority cannot erase noncooperative Set readback quota", async () => {
+  const f = await fixture();
+  const originalSize = Object.getOwnPropertyDescriptor(Set.prototype, "size");
+  assert.ok(originalSize?.get && originalSize.configurable,
+    "native Set.size descriptor must exist for the adversarial oracle");
+  const calls = [];
+  const authority = { ...f.authority, readCurrentHead: (challenge, { signal }) =>
+    new Promise((resolve) => {
+      calls.push({ challenge, signal, resolve });
+      if (calls.length === 1) {
+        // The first read was already added to the local/global Sets. A
+        // hostile callback now replaces the inherited size getter so the
+        // vulnerable next check sees zero occupied slots.
+        Object.defineProperty(Set.prototype, "size", { configurable: true,
+          get() { return 0; } });
+      }
+    }) };
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: authority,
+  }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+  try {
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+    assert.equal(calls.length, 1, "first genuine signed mapping reached the external adapter");
+    assert.equal(calls[0].signal.aborted, true);
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+    assert.equal(calls.length, 1,
+      "a timed-out, still-unsettled authority read must occupy its native slot");
+  } finally {
+    Object.defineProperty(Set.prototype, "size", originalSize);
+    for (const call of calls) call.resolve(signedHead(f, call.challenge));
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  }
+});
+
+test("P2: pinned native Set add/delete/size ignore later same-realm prototype changes", () => {
+  const { newNativeSet, setAdd, setDelete, setSize } =
+    require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+  const originalAdd = Set.prototype.add;
+  const originalDelete = Set.prototype.delete;
+  const originalSize = Object.getOwnPropertyDescriptor(Set.prototype, "size");
+  try {
+    Set.prototype.add = function forgedAdd() { return this; };
+    Set.prototype.delete = function forgedDelete() { return false; };
+    Object.defineProperty(Set.prototype, "size", { configurable: true, get() { return 0; } });
+    const native = newNativeSet();
+    const token = {};
+    setAdd.call(native, token);
+    assert.equal(setSize.call(native), 1, "native add and size use real internal slots");
+    assert.equal(setDelete.call(native, token), true);
+    assert.equal(setSize.call(native), 0, "native delete reclaims the original slot");
+  } finally {
+    Set.prototype.add = originalAdd;
+    Set.prototype.delete = originalDelete;
+    Object.defineProperty(Set.prototype, "size", originalSize);
+  }
+});
+
 test("P2: invalid source provision is rejected before executing caller-owned KeyObject getters", async () => {
   const f = await fixture();
   const handle = Object.getOwnPropertySymbols(keys.source.publicKey)

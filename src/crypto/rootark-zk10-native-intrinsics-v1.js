@@ -37,6 +37,14 @@ const OBJECT_CREATE = Object.create.bind(Object);
 const SET_PROTOTYPE = Object.setPrototypeOf.bind(Object);
 const DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const OBJECT_FREEZE = Object.freeze.bind(Object);
+// A caller-owned Ed25519 KeyObject getter may replace Set and its prototype
+// before a noncooperative CURRENT authority read settles. Keep the constructor,
+// methods and internal-slot size getter pinned alongside the other intrinsics.
+const SET_CONSTRUCTOR = Set;
+const SET_ADD = SET_CONSTRUCTOR.prototype.add;
+const SET_DELETE = SET_CONSTRUCTOR.prototype.delete;
+const SET_SIZE = OWN_DESCRIPTOR(SET_CONSTRUCTOR.prototype, "size").get;
+function newNativeSet() { return new SET_CONSTRUCTOR(); }
 
 const createPublicKey = crypto.createPublicKey.bind(crypto);
 const createHash = crypto.createHash.bind(crypto);
@@ -171,6 +179,10 @@ module.exports = Object.freeze({
   hasOwn: HAS_OWN,
   objectCreate: OBJECT_CREATE,
   defineProperty: DEFINE_PROPERTY,
+  newNativeSet,
+  setAdd: withSafeCall(SET_ADD),
+  setDelete: withSafeCall(SET_DELETE),
+  setSize: withSafeCall(SET_SIZE),
   hashUpdate: withSafeCall(OWN_DESCRIPTOR(prototype, "update").value),
   hashDigest: withSafeCall(OWN_DESCRIPTOR(prototype, "digest").value),
   publicExport: withSafeCall(OWN_DESCRIPTOR(publicPrototype, "export").value),
