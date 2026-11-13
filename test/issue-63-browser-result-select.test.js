@@ -23,6 +23,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     + "<script defer src='/bootstrap.js'></script>"
     + "<script defer src='/client/rootark-zk1-authenticated-workspace.js'></script>"
     + "<script defer src='/client/rootark-zk1-protected-local-search.js'></script>"
+    + "<script defer src='/client/rootark-zk1-file-content.js'></script>"
+    + "<script defer src='/client/rootark-zk1-selected-local-preview.js'></script>"
     + "<script defer src='/probe.js'></script>";
   const bootstrap = "window.RootarkApi={get:async()=>({enabled:true,"
     + "securityVersion:2,signedHistoryRequired:true,opaqueCatalogV1:true})};";
@@ -84,6 +86,41 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       }
       if(!dialog.querySelector('[data-zk1-field="status"]').textContent
         .includes("Operação recusada"))throw Error("MISSING_AUTH_DENIAL");
+      const b64=bytes=>btoa(String.fromCharCode(...bytes))
+        .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");
+      const scope={account_id:id,compartment_id:id,keyring_id:id};
+      const metadata={...scope,object_id:id,version_id:id,
+        parent_version_id:null,epoch:2,kind:"file"};
+      const raw=crypto.getRandomValues(new Uint8Array(32));
+      const cek=await window.RootarkZk1FileContent.importFileCek(raw);
+      const content=new TextEncoder().encode("<img src=x onerror=alert(1)> secret-local-only");
+      const sealed=await window.RootarkZk1FileContent.encryptFile({cek,metadata,
+        name:"local.txt",mediaType:"text/plain",data:content});
+      const hash=b64(new Uint8Array(await crypto.subtle.digest("SHA-256",raw)));
+      const ciphertextDigestBase64=b64(new Uint8Array(
+        await crypto.subtle.digest("SHA-256",sealed)));
+      const selected={objectId:id,revision:7,epoch:2,ciphertextDigestBase64};
+      const ownerDigest=b64(crypto.getRandomValues(new Uint8Array(32)));
+      const checked={...selected,ciphertextBase64:b64(sealed),
+        verifiedCiphertext:true,plaintextAvailable:false,authorizesMutation:false};
+      const opened=await window.RootarkZk1SelectedLocalPreview.open({
+        selected,checked,metadata,rawCek:raw,cekSha256Pin:hash,
+        grant:{...scope,device_id:"device",current_epoch:2,
+          manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null},
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:{head:{sequence:11,digest:ownerDigest},entries:[selected]},
+        assertLive:()=>true
+      });
+      const pane=dialog.querySelector('[data-zk1-field="catalog-delta-preview"]');
+      if(!pane||!opened.text.includes("secret-local-only"))throw Error("PREVIEW_DENIED");
+      pane.textContent=opened.text;
+      if(pane.querySelector("img"))throw Error("PREVIEW_XSS");
+      target.dispatchEvent(new Event("input",{bubbles:true}));
+      if(pane.textContent!=="")throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
+      pane.textContent=opened.text;
+      window.dispatchEvent(new Event("rootark:logout"));
+      if(pane.textContent!=="")throw Error("PREVIEW_NOT_ZEROED_ON_LOGOUT");
+      raw.fill(0);
       out.textContent="EDGE_PROTECTED_SELECT_PASS";
     }catch(error){out.textContent="EDGE_PROTECTED_SELECT_FAIL:"+error.message;}
   });`;
@@ -97,7 +134,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
     const content = request.url === "/" ? html
       : request.url === "/bootstrap.js" ? bootstrap
         : request.url === "/probe.js" ? probe
-          : ["rootark-zk1-authenticated-workspace", "rootark-zk1-protected-local-search"]
+        : ["rootark-zk1-authenticated-workspace", "rootark-zk1-protected-local-search",
+          "rootark-zk1-file-content", "rootark-zk1-selected-local-preview"]
             .includes(file) ? fs.readFileSync(path.join(root, file + ".js"), "utf8") : null;
     response.writeHead(content === null ? 404 : 200, {
       "Content-Type": request.url === "/" ? "text/html; charset=utf-8"
