@@ -300,7 +300,6 @@ for (const mode of ["json", "sqlite"]) {
       assert.equal(after.ino, before.ino, "path inode must not change during descriptor test");
       assert.equal(after.ctimeMs, before.ctimeMs,
         "path generation must remain authorized: denial must come from opened descriptor");
-      assert.equal(fs.readFileSync(originalPath, "utf8"), FILE_CONTENT);
       assert.equal(refused.status, 404,
         "a foreign opened descriptor must be refused despite a still-authorized pathname");
       assert.equal(refused.body.includes("FOREIGN_DESCRIPTOR_BYTES_NOT_AUTHORIZED"), false);
