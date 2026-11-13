@@ -719,6 +719,23 @@ class SyncEngine {
     return typeof operation.metadata?.path === "string" && this.isSelected(operation.metadata.path);
   }
 
+  async browseRemoteInventory({ limit = 64, cursor = null } = {}) {
+    if (typeof this.adapter.listInventory !== "function") {
+      fail("Metadata inventory is not supported by this sync adapter", "inventory_unavailable");
+    }
+    // Browsing is read-only and advisory. No remote-only pins, journal entries
+    // or local files may be created from metadata without fetching and
+    // independently verifying the complete signed envelope.
+    const page = await this.adapter.listInventory({ limit, cursor });
+    if (!page || !Array.isArray(page.objects)) fail("Invalid metadata inventory page", "invalid_inventory");
+    return {
+      ...page, advisory: true,
+      objects: page.objects.map((record) => ({
+        ...record, selectedOnDevice: this.operationDestinationIsSelected(record),
+      })),
+    };
+  }
+
   rememberRemoteOnly(operation, reason, options = {}) {
     const pathName = operation.metadata?.path;
     if (!pathName) return;
