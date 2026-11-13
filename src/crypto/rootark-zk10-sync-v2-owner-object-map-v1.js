@@ -5,7 +5,7 @@
 // must be provisioned independently of SyncV2 config, the storage server, JWT,
 // or the owner-selected mapping. No current runtime wires these dependencies.
 const crypto = require("node:crypto");
-const { types: { isProxy } } = require("node:util");
+const { types: { isProxy, isPromise } } = require("node:util");
 const {
   createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
   createHash: NATIVE_CREATE_HASH,
@@ -146,6 +146,29 @@ function safeMappingPromiseThen(onFulfilled, onRejected) {
   }
   return safeMappingPromise(settle());
 }
+function safeMappingPromiseFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let value, fulfilled = false;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (isPromise(cleanup) && !isProxy(cleanup)) {
+        NATIVE_DEFINE_PROPERTY(cleanup, "constructor", { value: NATIVE_PUBLIC_PROMISE,
+          configurable: false, writable: false });
+        await cleanup;
+      } else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")
+        && typeof cleanup.then === "function") {
+        // Do not assimilate an untrusted foreign thenable under a poisoned realm.
+        deny();
+      }
+    }
+    if (fulfilled) return value;
+    throw value;
+  }
+  return safeMappingPromise(settle());
+}
 function safeMappingPromise(pending) {
   // Never call inherited .then/.catch after a CURRENT authority callback.
   // Native await reads this genuine Promise's own constructor fast path.
@@ -158,6 +181,8 @@ function safeMappingPromise(pending) {
   NATIVE_DEFINE_PROPERTY(pending, "catch", { value(onRejected) {
     return NATIVE_APPLY(safeMappingPromiseThen, this, [undefined, onRejected]);
   }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "finally", { value: safeMappingPromiseFinally,
+    configurable: false, writable: false });
   return pending;
 }
 function number(value) {
