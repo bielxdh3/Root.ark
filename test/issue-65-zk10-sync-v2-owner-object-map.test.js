@@ -4,7 +4,8 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
-const { DOMAIN: SOURCE_DOMAIN } = require("../sync-client/rootark-sync-atomic-owner-provision");
+const { DOMAIN: SOURCE_DOMAIN, verifyPinnedAtomicOwnerProvision } =
+  require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { signOwnerCutover, digestOwnerCutover, signOwnerRotation, spkiHash,
   verifyOwnerRotationKeys } =
@@ -176,22 +177,41 @@ test("P2: reentrant source KeyObjects cannot change any pinned role after provis
     const handle = Object.getOwnPropertySymbols(pair.publicKey)
       .find((symbol) => symbol.description === "kHandle");
     assert.ok(handle, "real Node22 Ed25519 native handle required");
-    const substituted = Object.create(pair.publicKey);
-    let provisionReads = 0;
-    let separationReads = 0;
-    Object.defineProperty(substituted, handle, { get() {
-      // Both keys are genuine Ed25519. A malicious native getter may hand A
-      // to the provision verifier and unrelated B to the later independence
-      // check if the same caller-owned KeyObject is inspected twice.
-      if (String(new Error().stack).includes("pinnedProvisionerKey")) {
-        provisionReads += 1;
-        return pair.publicKey[handle];
-      }
-      separationReads += 1;
-      return keys.attacker.publicKey[handle];
-    } });
+    const controlledHandle = (acceptedReads = Infinity) => {
+      const substituted = Object.create(pair.publicKey);
+      let reads = 0;
+      Object.defineProperty(substituted, handle, { get() {
+        // A native KeyObject import may read kHandle more than once for
+        // type/algorithm/export. Count a full successful provisioning first;
+        // after that boundary, any re-read supplies unrelated real key B.
+        // No stack-trace branch or method-name inference is involved.
+        reads += 1;
+        return reads <= acceptedReads
+          ? pair.publicKey[handle] : keys.attacker.publicKey[handle];
+      } });
+      return { substituted, reads: () => reads };
+    };
+    const admission = controlledHandle();
+    const admitted = verifyPinnedAtomicOwnerProvision({
+      identity: f.sourceAuthority.identity,
+      scope: f.sourceAuthority.scope,
+      provisioning: f.sourceAuthority.provisioning,
+      expectedDigest: f.sourceAuthority.provisioningDigest,
+      provisionerPublicKey: role === "provisionerPublicKey"
+        ? admission.substituted : f.sourceAuthority.provisionerPublicKey,
+      witnessPublicKey: role === "witnessPublicKey"
+        ? admission.substituted : f.sourceAuthority.witnessPublicKey,
+      casPublicKey: role === "casPublicKey"
+        ? admission.substituted : f.sourceAuthority.casPublicKey,
+    });
+    assert.equal(admitted.identity.accountId, identity.accountId,
+      `first genuine ${role} A key must pass real signed provisioning`);
+    const verifiedReadCount = admission.reads();
+    assert.ok(verifiedReadCount > 0,
+      `genuine ${role} A must be read by the real native provisioning verifier`);
+    const attack = controlledHandle(verifiedReadCount);
     assert.throws(() => createOwnerObjectMapVerifier({
-      sourceAuthority: { ...f.sourceAuthority, [role]: substituted },
+      sourceAuthority: { ...f.sourceAuthority, [role]: attack.substituted },
       zkAuthority: f.zkAuthority,
       mappingAuthority: {
         ...f.authority, pinnedPublicKey: pair.publicKey,
@@ -202,8 +222,8 @@ test("P2: reentrant source KeyObjects cannot change any pinned role after provis
         }, pair.privateKey),
       },
     }), deny, `the true ${role} signer A cannot be its own CURRENT authority`);
-    assert.ok(provisionReads + separationReads > 0,
-      `real inherited native handle substitution must execute for ${role}`);
+    assert.equal(attack.reads(), verifiedReadCount,
+      `the verified ${role} A native key must be reused without ever reading B`);
   }
   const valid = createOwnerObjectMapVerifier({
     sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
