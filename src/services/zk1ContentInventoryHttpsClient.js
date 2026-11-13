@@ -11,7 +11,10 @@ const { types: { isPromise, isProxy } } = require("node:util");
 const { defineProperty: NATIVE_DEFINE_PROPERTY, apply: NATIVE_APPLY,
   ownDescriptor: NATIVE_OWN_DESCRIPTOR, ownKeys: NATIVE_OWN_KEYS,
   objectCreate: NATIVE_OBJECT_CREATE, getPrototype: NATIVE_GET_PROTOTYPE,
-  hasOwn: NATIVE_HAS_OWN, bufferFrom: NATIVE_BUFFER_FROM } =
+  hasOwn: NATIVE_HAS_OWN, bufferFrom: NATIVE_BUFFER_FROM,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+  dateNow: NATIVE_DATE_NOW, mathFloor: NATIVE_MATH_FLOOR,
+  randomBytes: NATIVE_RANDOM_BYTES } =
   require("../crypto/rootark-zk10-native-intrinsics-v1");
 // A native caller-owned KeyObject getter may run during verification and
 // replace writable CommonJS exports. Capture the complete inventory facade
@@ -454,7 +457,7 @@ function createZk1ContentInventoryHttpsClient({
           ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) fail();
       if (!physicalAttestorPublicKey && raw.pageNonce !== undefined) fail();
       const pageNonce = physicalAttestorPublicKey
-        ? (raw.pageNonce === undefined ? crypto.randomBytes(32)
+        ? (raw.pageNonce === undefined ? NATIVE_RANDOM_BYTES(32)
           : copyBytes(raw.pageNonce, 32)) : null;
       return thenVerified(call("/v1/inventory/chain", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
@@ -500,7 +503,9 @@ function createZk1ContentInventoryHttpsClient({
               scope, operation, nonce, pinnedInventoryPublicKey: inventoryPublicKey,
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
-              nowSeconds: Math.floor(Date.now() / 1000) }));
+              // The inventory KeyObject getter already ran while checking
+              // this signed receipt. Do not trust a late-bound JS wall clock.
+              nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000) }));
             appendVerifiedArrayItem(physicalProofs, physicalAttestation);
           }
         }
@@ -655,7 +660,7 @@ function createZk1ContentInventoryHttpsClient({
               pinnedInventoryPublicKey: inventoryPublicKey,
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
-              nowSeconds: Math.floor(Date.now() / 1000),
+              nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
             })
             : inventory.verifyCommittedEntryProof({ serialized: receiptBytes,
               pinnedPublicKey: inventoryPublicKey,
@@ -673,11 +678,11 @@ function createZk1ContentInventoryHttpsClient({
           }), receiptVerification), ({ verification, checked }) => {
             const receipt = physicalAttestorPublicKey ? checked.inventoryReceipt : checked;
             if (verification.sequence !== committed.headSequence
-              || !crypto.timingSafeEqual(verification.root, headRoot)
+              || !NATIVE_TIMING_SAFE_EQUAL(verification.root, headRoot)
               || verification.outcome !== "PRESENT"
               || receipt.sequence > verification.sequence
               || (receipt.sequence === verification.sequence
-                && !crypto.timingSafeEqual(receipt.root, verification.root))) fail();
+                && !NATIVE_TIMING_SAFE_EQUAL(receipt.root, verification.root))) fail();
             // The entry proves the exact operation committed in this signed
             // inventory ledger. It does NOT attest physical ciphertext I/O,
             // independent operation, remote durability or release permission.
@@ -689,13 +694,13 @@ function createZk1ContentInventoryHttpsClient({
               verifiedReceipt: receipt,
               externalDurabilityProven: false,
               sequence: verification.sequence,
-              root: Buffer.from(verification.root),
+              root: NATIVE_BUFFER_FROM(verification.root),
               verification,
-              serializedSnapshot: Buffer.from(snapshot),
+              serializedSnapshot: NATIVE_BUFFER_FROM(snapshot),
               authorizesIo: false,
               ...(physicalAttestorPublicKey ? {
                 independentPhysicalAttestationVerified: true,
-                physicalAttestationReceiptDigest: Buffer.from(checked.receiptDigest),
+                physicalAttestationReceiptDigest: NATIVE_BUFFER_FROM(checked.receiptDigest),
               } : {}),
             };
           });
@@ -707,7 +712,7 @@ function createZk1ContentInventoryHttpsClient({
       const raw = exact(input, ["scope", "operation"]);
       const scope = inventory.normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
-      const nonce = physicalAttestorPublicKey ? crypto.randomBytes(32) : null;
+      const nonce = physicalAttestorPublicKey ? NATIVE_RANDOM_BYTES(32) : null;
       const response = call("/v1/inventory/operation", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
@@ -744,7 +749,7 @@ function createZk1ContentInventoryHttpsClient({
               pinnedInventoryPublicKey: inventoryPublicKey,
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
-              nowSeconds: Math.floor(Date.now() / 1000),
+              nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
             })
             : inventory.verifyCommittedEntryProof({ serialized,
               pinnedPublicKey: inventoryPublicKey,
@@ -753,11 +758,11 @@ function createZk1ContentInventoryHttpsClient({
           return thenVerified(verifiedPromise, (checked) => {
             const verified = physicalAttestorPublicKey ? checked.inventoryReceipt : checked;
             if (verified.sequence !== committed.sequence
-              || !crypto.timingSafeEqual(verified.root, expectedRoot)) fail();
+              || !NATIVE_TIMING_SAFE_EQUAL(verified.root, expectedRoot)) fail();
             return {
               status: "committed",
               sequence: verified.sequence,
-              root: Buffer.from(verified.root),
+              root: NATIVE_BUFFER_FROM(verified.root),
               verifiedReceipt: verified,
               signedLedgerOperationCommitted: true,
               transportReportedCommittedOnly: false,
@@ -765,7 +770,7 @@ function createZk1ContentInventoryHttpsClient({
               authorizesIo: false,
               ...(physicalAttestorPublicKey ? {
                 independentPhysicalAttestationVerified: true,
-                physicalAttestationReceiptDigest: Buffer.from(checked.receiptDigest),
+                physicalAttestationReceiptDigest: NATIVE_BUFFER_FROM(checked.receiptDigest),
               } : {}),
             };
           });
@@ -789,7 +794,7 @@ function createZk1ContentInventoryHttpsClient({
         if (before.status !== "committed") return inertHttpResult({ ...before,
           verifiedChainContinuation: false, independentlyAnchoredFloorProven: false });
         const chain = await publicClient.getVerifiedSnapshotWithChain({ scope,
-          nonce: crypto.randomBytes(32), requested: operationEntry(operation),
+          nonce: NATIVE_RANDOM_BYTES(32), requested: operationEntry(operation),
           minimumHead, minimumSnapshot, includeVerifiedProofChain: true });
         if (chain.status !== "VERIFIED_NONAUTHORIZING" || chain.outcome !== "PRESENT"
           || chain.independentPhysicalChainVerified !== true
@@ -799,7 +804,7 @@ function createZk1ContentInventoryHttpsClient({
           || chain.sequence < before.sequence) fail();
         const offset = before.verifiedReceipt.sequence - minimumHead.sequence - 1;
         if (offset === -1) {
-          if (!crypto.timingSafeEqual(before.root, minimumHead.root)) fail();
+          if (!NATIVE_TIMING_SAFE_EQUAL(before.root, minimumHead.root)) fail();
         } else {
           if (!Number.isSafeInteger(offset) || offset < 0
             || offset >= chain.authenticatedProofChain.length) fail();
@@ -809,13 +814,13 @@ function createZk1ContentInventoryHttpsClient({
             pinnedSignerKeyId: signerKeyId, expectedScope: scope, operation,
           }));
           if (member.sequence !== before.sequence
-            || !crypto.timingSafeEqual(member.root, before.root)) fail();
+            || !NATIVE_TIMING_SAFE_EQUAL(member.root, before.root)) fail();
         }
         // A later physical readback prevents a stale PG response from being
         // accepted merely because the ledger ancestry was checked afterward.
         const after = await publicClient.getOperationStatus({ scope, operation });
         if (after.status !== "committed" || after.sequence !== before.sequence
-          || !crypto.timingSafeEqual(after.root, before.root)
+          || !NATIVE_TIMING_SAFE_EQUAL(after.root, before.root)
           || after.independentPhysicalAttestationVerified !== true) fail();
         return inertHttpResult({ ...after, verifiedChainContinuation: true,
           independentlyAnchoredFloorProven: false });
@@ -839,7 +844,7 @@ function createZk1ContentInventoryHttpsClient({
 function sameOperationId(encoded, expected) {
   try {
     const decoded = decode(encoded, 16, 16);
-    return crypto.timingSafeEqual(decoded, expected);
+    return NATIVE_TIMING_SAFE_EQUAL(decoded, expected);
   } catch (_) { return false; }
 }
 

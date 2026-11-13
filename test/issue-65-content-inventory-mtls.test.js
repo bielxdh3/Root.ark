@@ -20,6 +20,8 @@ const { createPrivateAuthorityFixture } =
   require("./support/issue-65-private-authority-fixture");
 const { signCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
+const { derivePhysicalChainNonce } =
+  require("../src/crypto/rootark-zk1-attested-inventory-commit-v1");
 
 const SCOPE = Object.freeze({
   account_id: Buffer.alloc(16, 0x11),
@@ -1415,6 +1417,138 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.ok(getterReads > 0, "actual Ed25519 getter must execute");
     assert.equal(outcomeReads, 0, "failed receipt outcome must never reach inherited then");
     assert.equal(forgedCalls, 0, "an invalid inventory receipt cannot become a signed commit");
+  });
+
+  await t.test("P2 signed operation status cannot trust spoofed post-key timingSafeEqual", async (child) => {
+    const h = await harness(child);
+    const head = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: head.root });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const originalGet = h.ledger.getOperationStatus.bind(h.ledger);
+    const signed = await originalGet(operation.operation_id);
+    const wrongRoot = Buffer.alloc(32, 0x7b);
+    assert.notDeepEqual(wrongRoot, signed.root);
+    assert.equal((await h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation })).status, "committed",
+    "genuine Ed25519 entry must pass before hostile HTTP root substitution");
+    h.ledger.getOperationStatus = async (...args) => {
+      const status = await originalGet(...args);
+      return status.status === "committed" ? { ...status, root: wrongRoot } : status;
+    };
+    await assert.rejects(h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation }), { code: "INVENTORY_HTTP_UNAVAILABLE" },
+    "a wrong unsigned transport root must fail with genuine Ed25519 proof");
+
+    const originalEqual = crypto.timingSafeEqual;
+    const poisoned = Object.create(h.signer.publicKey);
+    let armed = false, getterReads = 0, forgedEqualsCalls = 0;
+    Object.defineProperty(poisoned, "type", { get() {
+      getterReads++;
+      if (armed) crypto.timingSafeEqual = () => { forgedEqualsCalls++; return true; };
+      return "public";
+    } });
+    const client = h.makeClient("status-reader", { inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      await assert.rejects(client.getOperationStatus({ scope: h.scope, operation }),
+        { code: "INVENTORY_HTTP_UNAVAILABLE" },
+        "native signed-root comparison cannot be rewritten by a public KeyObject getter");
+    } finally {
+      crypto.timingSafeEqual = originalEqual;
+    }
+    assert.ok(getterReads > 0, "real signed verification must reach the hostile key getter");
+    assert.equal(forgedEqualsCalls, 0,
+      "the pinned client must not call a late-mutated crypto.timingSafeEqual");
+  });
+
+  await t.test("P2 genuine stale signed PG chain cannot borrow a forged post-key wall clock", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const head = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: head.root });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const committed = await h.ledger.getOperationStatus(operation.operation_id);
+    const pageNonce = crypto.randomBytes(32);
+    const nonce = derivePhysicalChainNonce(pageNonce, 1, operation.operation_id);
+    const currentSeconds = Math.floor(Date.now() / 1000);
+    const staleSeconds = currentSeconds - 180;
+    const readback = {
+      status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+      walFlushConfirmed: true, authorizesIo: false, provesIndependentOperator: false,
+      generation: 3, admissionId: crypto.randomBytes(16),
+      operationId: operation.operation_id, revision: operation.revision,
+      epoch: operation.epoch, expectedInventorySequence: operation.expected_sequence,
+      expectedInventoryRoot: operation.expected_root,
+      ciphertextSha256: operation.ciphertext_sha256, digest: crypto.randomBytes(32),
+      root: crypto.randomBytes(32), chunkCount: 1,
+    };
+    const signedAt = (issuedAt) => signCommittedPhysicalReadback({
+      scope: h.scope, operation, nonce, issuedAt, readback,
+    }, h.attestor.privateKey);
+    const freshSigned = await signedAt(currentSeconds);
+    const staleSigned = await signedAt(staleSeconds);
+    let serveStale = false, realRequests = 0;
+    const replayServer = https.createServer({
+      key: tls.serverKey, cert: tls.serverCert, ca: tls.ca,
+      requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3",
+    }, (request, response) => {
+      const chunks = [];
+      request.on("data", (part) => chunks.push(part));
+      request.on("end", () => {
+        realRequests++;
+        const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        assert.equal(request.url, "/v1/inventory/chain");
+        assert.equal(input.afterSequence, 0);
+        assert.equal(input.nonce, pageNonce.toString("base64url"));
+        const wire = Buffer.from(JSON.stringify({
+          status: "chain_page", afterSequence: 0, nextSequence: 1, headSequence: 1,
+          proofsBase64: [committed.proof.toString("base64url")],
+          physicalAttestationsBase64: [(serveStale ? staleSigned : freshSigned)
+            .toString("base64url")],
+        }));
+        response.writeHead(200, { "content-type": "application/json",
+          "content-length": String(wire.length) });
+        response.end(wire);
+      });
+    });
+    const port = await listen(replayServer);
+    child.after(() => drainZk1ContentInventoryHttpsServer(replayServer));
+    const request = { scope: h.scope, afterSequence: 0, limit: 1, pageNonce };
+    const valid = await h.makeClient("status-reader", { port }).getProofPage(request);
+    assert.equal(valid.status, "transport_unverified");
+    assert.equal(valid.proofs.length, 1);
+    assert.equal(valid.physicalProofs.length, 1,
+      "a genuine separately signed fresh PG proof must pass the same TLS test endpoint");
+    serveStale = true;
+    await assert.rejects(h.makeClient("status-reader", { port }).getProofPage(request),
+      { code: "INVENTORY_HTTP_UNAVAILABLE" },
+      "a genuine but expired PG signature must be denied without getter interference");
+
+    const poisoned = Object.create(h.signer.publicKey);
+    const originalNow = Date.now;
+    const originalFloor = Math.floor;
+    let armed = false, getterReads = 0, poisonedClockCalls = 0;
+    Object.defineProperty(poisoned, "type", { get() {
+      getterReads++;
+      if (armed) {
+        Date.now = () => { poisonedClockCalls++; return staleSeconds * 1000; };
+        Math.floor = (value) => { poisonedClockCalls++; return originalFloor(value); };
+      }
+      return "public";
+    } });
+    const attacked = h.makeClient("status-reader", { port, inventoryPublicKey: poisoned });
+    armed = true;
+    try {
+      await assert.rejects(attacked.getProofPage(request),
+        { code: "INVENTORY_HTTP_UNAVAILABLE" },
+        "genuine expired physical proof cannot use a signer-getter-rebound JS clock");
+    } finally {
+      Date.now = originalNow;
+      Math.floor = originalFloor;
+    }
+    assert.ok(getterReads > 0, "native public-key verification must execute the getter");
+    assert.equal(poisonedClockCalls, 0,
+      "cryptographic freshness must use clock intrinsics captured before the key getter");
+    assert.ok(realRequests >= 3, "positive, stale and hostile requests reached real TLS");
   });
 
   await t.test("HTTP 200 status cannot reuse a valid receipt under another operation ID", async (child) => {
