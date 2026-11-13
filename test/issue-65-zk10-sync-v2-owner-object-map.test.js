@@ -440,6 +440,36 @@ test("P2: caller .then on exported CURRENT verifier cannot forge failed signatur
   }
 });
 
+test("P2: exported CURRENT Promise.finally cannot forge failed signature", async () => {
+  const f = await fixture();
+  const nativeThen = Promise.prototype.then;
+  const originalFinally = Promise.prototype.finally;
+  let getterReached;
+  const getterRan = new Promise((resolve) => { getterReached = resolve; });
+  let forgedCalls = 0;
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: () => {
+      Promise.prototype.finally = function forgedFinally() {
+        forgedCalls++;
+        return Promise.resolve({ ownerMappingVerified: true, authorizesIo: true });
+      };
+      getterReached();
+      return Promise.resolve({ invalid: "unsigned CURRENT" });
+    } },
+  });
+  try {
+    const pending = verify(f.input);
+    Reflect.apply(nativeThen, pending, [undefined, () => {}]);
+    await getterRan;
+    let rejected = false;
+    try { await pending.finally(() => {}); }
+    catch (error) { rejected = error?.code === "ZK10_SYNC_V2_MAP_UNVERIFIED"; }
+    assert.equal(rejected, true, "failed CURRENT cannot become an authorized .finally result");
+    assert.equal(forgedCalls, 0, "no inherited Promise.prototype.finally is consulted");
+  } finally { Promise.prototype.finally = originalFinally; }
+});
+
 test("P2: signed CURRENT result must never assimilate an inherited forged success", async () => {
   const f = await fixture();
   const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
