@@ -15,6 +15,7 @@ const MAX_OBSERVATIONS = 10000;
 const MAX_SIGNED_RECEIPTS = MAX_PENDING + MAX_OBSERVATIONS;
 const VALID_OPERATION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const VALID_DIGEST = /^[0-9a-f]{64}$/;
+const VALID_RESTORE_STAGE_SUFFIX = /^[1-9][0-9]*-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
 const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 
@@ -32,6 +33,28 @@ function signedEnvelopeDigest(operation) {
   if (!operation || typeof operation !== "object"
     || !Object.hasOwn(operation, "authorization")) return null;
   return crypto.createHash("sha256").update(canonicalJson(operation)).digest("hex");
+}
+
+function invalidRestoreStaging(staging, pending) {
+  if (!staging || typeof staging !== "object" || Array.isArray(staging)
+    || Object.keys(staging).length > MAX_PENDING) return true;
+  const byId = new Map(pending.map((entry) => [entry.operationId, entry]));
+  return Object.entries(staging).some(([id, proof]) => {
+    const operation = byId.get(id);
+    const base = typeof operation?.metadata?.path === "string"
+      ? path.posix.basename(operation.metadata.path) : null;
+    const prefix = base ? `${base}.tmp-` : "";
+    return !id.startsWith("histrestore-") || !VALID_OPERATION_ID.test(id)
+      || !operation || !base || !proof || typeof proof !== "object"
+      || Array.isArray(proof) || Object.keys(proof).length !== 4
+      || typeof proof.digest !== "string" || !VALID_DIGEST.test(proof.digest)
+      || signedEnvelopeDigest(operation) !== proof.digest
+      || typeof proof.name !== "string" || !proof.name.startsWith(prefix)
+      || !VALID_RESTORE_STAGE_SUFFIX.test(proof.name.slice(prefix.length))
+      || !((proof.dev === null && proof.ino === null)
+        || (typeof proof.dev === "string" && /^[0-9]{1,30}$/.test(proof.dev)
+          && typeof proof.ino === "string" && /^[1-9][0-9]{0,29}$/.test(proof.ino)));
+  });
 }
 
 function signedWebDavEventId(operation) {
@@ -218,7 +241,8 @@ class SyncJournal {
     this.filePath = path.resolve(filePath);
     this.state = { version: JOURNAL_VERSION, pending: [], seen: [],
       admitted: Object.create(null), observed: Object.create(null),
-      committedSigned: Object.create(null), atomicSignedGroups: Object.create(null) };
+      committedSigned: Object.create(null), atomicSignedGroups: Object.create(null),
+      materializedRestore: Object.create(null), restoreStaging: Object.create(null) };
     this.queue = Promise.resolve();
   }
 
@@ -252,11 +276,25 @@ class SyncJournal {
       if (this.state.observed === undefined) this.state.observed = Object.create(null);
       if (this.state.committedSigned === undefined) this.state.committedSigned = Object.create(null);
       if (this.state.atomicSignedGroups === undefined) this.state.atomicSignedGroups = Object.create(null);
+      if (this.state.materializedRestore === undefined) this.state.materializedRestore = Object.create(null);
+      if (this.state.restoreStaging === undefined) this.state.restoreStaging = Object.create(null);
       if (invalidAtomicSignedGroups(this.state.atomicSignedGroups, this.state.pending, this.state.seen)) {
         throw new Error("Invalid atomic signed WebDAV journal group");
       }
       const pendingById = new Map(this.state.pending.map((entry) =>
         [entry.operationId, entry]));
+      if (!this.state.materializedRestore || typeof this.state.materializedRestore !== "object"
+        || Array.isArray(this.state.materializedRestore)
+        || Object.entries(this.state.materializedRestore).length > MAX_PENDING
+        || Object.entries(this.state.materializedRestore).some(([id, digest]) =>
+          !id.startsWith("histrestore-") || !VALID_OPERATION_ID.test(id)
+          || !VALID_DIGEST.test(digest)
+          || signedEnvelopeDigest(pendingById.get(id)) !== digest)) {
+        throw new Error("Invalid durable restore materialization evidence");
+      }
+      if (invalidRestoreStaging(this.state.restoreStaging, this.state.pending)) {
+        throw new Error("Invalid durable restore staging intent");
+      }
       if (!this.state.committedSigned || typeof this.state.committedSigned !== "object"
         || Array.isArray(this.state.committedSigned)
         || Object.entries(this.state.committedSigned).length > MAX_SIGNED_RECEIPTS
@@ -302,7 +340,9 @@ class SyncJournal {
         admitted: Object.assign(Object.create(null), this.state.admitted),
         observed: Object.assign(Object.create(null), this.state.observed),
         committedSigned: Object.assign(Object.create(null), this.state.committedSigned),
-        atomicSignedGroups: Object.assign(Object.create(null), this.state.atomicSignedGroups) };
+        atomicSignedGroups: Object.assign(Object.create(null), this.state.atomicSignedGroups),
+        materializedRestore: Object.assign(Object.create(null), this.state.materializedRestore),
+        restoreStaging: Object.assign(Object.create(null), this.state.restoreStaging) };
       await mutator(next);
       // Pending mutations are durable work. Silently keeping the newest items
       // would permanently discard the oldest unsigned or signed operation.
@@ -340,6 +380,22 @@ class SyncJournal {
         throw new Error("Invalid atomic signed WebDAV journal group");
       }
       const pendingById = new Map(next.pending.map((entry) => [entry.operationId, entry]));
+      for (const id of Object.keys(next.materializedRestore)) {
+        if (!pendingById.has(id)) delete next.materializedRestore[id];
+      }
+      for (const id of Object.keys(next.restoreStaging)) {
+        if (!pendingById.has(id)) delete next.restoreStaging[id];
+      }
+      if (Object.entries(next.materializedRestore).length > MAX_PENDING
+        || Object.entries(next.materializedRestore).some(([id, digest]) =>
+          !id.startsWith("histrestore-") || !VALID_OPERATION_ID.test(id)
+          || !VALID_DIGEST.test(digest)
+          || signedEnvelopeDigest(pendingById.get(id)) !== digest)) {
+        throw new Error("Invalid committed restore materialization evidence");
+      }
+      if (invalidRestoreStaging(next.restoreStaging, next.pending)) {
+        throw new Error("Invalid committed restore staging intent");
+      }
       if (Object.entries(next.committedSigned).length > MAX_SIGNED_RECEIPTS
         || Object.entries(next.committedSigned).some(([id, digest]) =>
         !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest)
@@ -351,6 +407,15 @@ class SyncJournal {
       // later caller mutations must not change memory-only pending bytes while
       // the on-disk journal and the signed-receipt digest remain unchanged.
       const persisted = JSON.parse(JSON.stringify(next));
+      // Preserve the exact on-disk bytes of legacy (or fully acknowledged)
+      // journals. The optional evidence field exists on disk only while an
+      // independently materialized historical restore remains pending.
+      if (!Object.keys(persisted.materializedRestore).length) {
+        delete persisted.materializedRestore;
+      }
+      if (!Object.keys(persisted.restoreStaging).length) {
+        delete persisted.restoreStaging;
+      }
       try {
         await durableWrite(this.filePath, persisted);
       } catch (error) {
@@ -406,6 +471,7 @@ class SyncJournal {
         throw new Error("Cannot discard an ineligible signed outbox operation");
       }
       next.pending.splice(index, 1);
+      delete next.restoreStaging[operation.operationId];
       delete next.committedSigned[operation.operationId];
       delete next.observed[operation.operationId];
     });
@@ -479,6 +545,8 @@ class SyncJournal {
         throw new Error("Atomic signed WebDAV pair requires markSeenMany");
       }
       next.pending = next.pending.filter((item) => item.operationId !== operationId);
+      delete next.materializedRestore[operationId];
+      delete next.restoreStaging[operationId];
       if (!next.seen.includes(operationId)) next.seen.push(operationId);
       if (admittedDigest !== null) {
         const previous = Object.hasOwn(next.admitted, operationId)
@@ -582,6 +650,115 @@ class SyncJournal {
   }
   hasDurableSignedReceipt(operationId) {
     return this.durableSignedReceiptDigest(operationId) !== null;
+  }
+  async recordRestoreMaterialization(operation) {
+    const id = operation?.operationId;
+    const digest = signedEnvelopeDigest(operation);
+    if (typeof id !== "string" || !id.startsWith("histrestore-")
+      || !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest || "")) {
+      throw new Error("Signed historical restore is required for materialization");
+    }
+    // Only the caller that has already completed _apply and its durable sync
+    // snapshot may persist this LOCAL physical-materialization observation.
+    // It is not new authorization, remote receipt or independent custody.
+    await this.commit((next) => {
+      const pending = next.pending.find((entry) => entry.operationId === id);
+      if (!pending || signedEnvelopeDigest(pending) !== digest
+        || !Object.hasOwn(next.committedSigned, id)
+        || next.committedSigned[id] !== digest || next.seen.includes(id)
+        || (Object.hasOwn(next.materializedRestore, id)
+          && next.materializedRestore[id] !== digest)) {
+        throw new Error("Restore materialization has no exact durable signed outbox");
+      }
+      next.materializedRestore[id] = digest;
+      delete next.restoreStaging[id];
+    });
+  }
+
+  async recordRestoreStagingIntent(operation, name) {
+    const id = operation?.operationId;
+    const digest = signedEnvelopeDigest(operation);
+    if (typeof id !== "string" || !id.startsWith("histrestore-")
+      || !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest || "")) {
+      throw new Error("Signed historical restore required for durable staging intent");
+    }
+    await this.commit((next) => {
+      const pending = next.pending.find((entry) => entry.operationId === id);
+      const previous = Object.hasOwn(next.restoreStaging, id)
+        ? next.restoreStaging[id] : null;
+      if (!pending || signedEnvelopeDigest(pending) !== digest
+        || next.committedSigned[id] !== digest || next.seen.includes(id)
+        || Object.hasOwn(next.materializedRestore, id)
+        || previous) {
+        throw new Error("Restore staging has no exact durable signed outbox");
+      }
+      next.restoreStaging[id] = { digest, name, dev: null, ino: null };
+    });
+  }
+  async bindRestoreStagingIdentity(operation, name, identity) {
+    const id = operation?.operationId;
+    const digest = signedEnvelopeDigest(operation);
+    if (typeof id !== "string" || !id.startsWith("histrestore-")
+      || !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest || "")
+      || !identity || typeof identity.dev !== "string" || typeof identity.ino !== "string") {
+      throw new Error("Invalid historical restore staging physical identity");
+    }
+    await this.commit((next) => {
+      const intent = next.restoreStaging[id];
+      const pending = next.pending.find((entry) => entry.operationId === id);
+      if (!intent || intent.digest !== digest || intent.name !== name
+        || intent.dev !== null || intent.ino !== null
+        || signedEnvelopeDigest(pending) !== digest
+        || next.committedSigned[id] !== digest || next.seen.includes(id)
+        || Object.hasOwn(next.materializedRestore, id)) {
+        throw new Error("Historical restore staging identity has no durable intent");
+      }
+      next.restoreStaging[id] = { digest, name, dev: identity.dev, ino: identity.ino };
+    });
+  }
+  async recordLinkedRestoreStagingIdentity(operation, name, before, linked) {
+    const id = operation?.operationId;
+    const digest = signedEnvelopeDigest(operation);
+    if (typeof id !== "string" || !id.startsWith("histrestore-")
+      || !VALID_OPERATION_ID.test(id) || !VALID_DIGEST.test(digest || "")
+      || !before || !linked || before.dev !== linked.dev
+      || typeof before.dev !== "string" || typeof before.ino !== "string"
+      || typeof linked.ino !== "string") {
+      throw new Error("Invalid linked historical restore stage identity");
+    }
+    await this.commit((next) => {
+      const old = next.restoreStaging[id];
+      const pending = next.pending.find((entry) => entry.operationId === id);
+      if (!old || old.digest !== digest || old.name !== name
+        || old.dev !== before.dev || old.ino !== before.ino
+        || signedEnvelopeDigest(pending) !== digest
+        || next.committedSigned[id] !== digest
+        || Object.hasOwn(next.materializedRestore, id) || next.seen.includes(id)) {
+        throw new Error("Linked staging identity is not bound to exact signed outbox");
+      }
+      next.restoreStaging[id] = { digest, name, dev: linked.dev, ino: linked.ino };
+    });
+  }
+  restoreStagingInfo(operation) {
+    const id = operation?.operationId;
+    const digest = signedEnvelopeDigest(operation);
+    if (typeof id !== "string" || !VALID_OPERATION_ID.test(id)
+      || !VALID_DIGEST.test(digest || "")
+      || this.durableSignedReceiptDigest(id) !== digest
+      || this.hasMaterializedRestore(operation)) return null;
+    const staging = Object.hasOwn(this.state.restoreStaging || {}, id)
+      ? this.state.restoreStaging[id] : null;
+    return staging?.digest === digest && typeof staging.name === "string"
+      ? Object.freeze({ name: staging.name, dev: staging.dev, ino: staging.ino }) : null;
+  }
+  hasMaterializedRestore(operation) {
+    const id = operation?.operationId;
+    const digest = signedEnvelopeDigest(operation);
+    return typeof id === "string" && id.startsWith("histrestore-")
+      && VALID_OPERATION_ID.test(id) && VALID_DIGEST.test(digest || "")
+      && Object.hasOwn(this.state.materializedRestore || {}, id)
+      && this.state.materializedRestore[id] === digest
+      && this.durableSignedReceiptDigest(id) === digest;
   }
   assertCompatibleAdmission(operationId, digest) {
     if (!VALID_OPERATION_ID.test(operationId) || !VALID_DIGEST.test(digest)) {
