@@ -2264,10 +2264,19 @@ class SyncEngine {
       assertNoSignedInventoryRollback();
       await checkLocalCache();
       if (!moveKey) return;
+      // A signed UPDATE may change fileId without changing objectId. Until
+      // the local old identity is reconciled, its missing bytes may be an
+      // unsynced deletion. The MOVE must not bypass that pending local state.
+      if (Object.entries(this.snapshot.files).some(([trackedPath, tracked]) =>
+        !pathsEqual(trackedPath, safePath) && tracked && !tracked.deleted
+          && tracked.objectId === operation.objectId
+          && tracked.fileId !== operation.fileId)) {
+        fail("Tracked local object identity requires reconciliation", "local_changes_pending");
+      }
       const sourcePath = activeFileIdentityPath(this.snapshot.files, operation, safePath);
       if (!sourcePath) return;
       const source = await contained(this.rootDir, sourcePath, true);
-      if (!(await exists(source))) return;
+      if (!(await exists(source))) fail("Tracked moved source was removed locally", "local_changes_pending");
       const tracked = this.snapshot.files[sourcePath];
       const bytes = await readContainedFile(this.rootDir, sourcePath);
       const hash = crypto.createHash("sha256").update(bytes).digest("hex");

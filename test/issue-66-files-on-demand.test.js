@@ -11,6 +11,7 @@ const { createAuthorizationProof, verifyAuthorizationProof } =
   require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 async function setup(t, files) {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-on-demand-"));
@@ -389,6 +390,160 @@ test("issue 66: a remote MOVE must not relocate unsynced local source bytes", as
   assert.equal(await fsp.readFile(path.join(root, "docs", "original.txt"), "utf8"), "unsynced edits");
   assert.equal(await exists(path.join(root, "docs", "renamed.txt")), false);
 });
+
+test("issue 66 P2 signed MOVE: fileId rotation cannot erase an unsynced local deletion", async (t) => {
+  const dir = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA, "rootark-signed-move-rotation-" + crypto.randomBytes(8).toString("hex"))
+    : await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-signed-move-rotation-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(dir);
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const root = path.join(dir, "client");
+  const store = await new SyncObjectStore(path.join(dir, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  const key = crypto.randomBytes(32);
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trust = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [] };
+  await store.enrollDevice({ username: "alice", deviceId: "device-a", publicKey, expectedEpoch: 0 });
+  const sign = async (op) => {
+    const signed = { ...op, authorization: await createAuthorizationProof(op, {
+      username: "alice", publicKey, privateKey: signer.privateKey,
+      expiresAt: Date.now() + 60_000,
+    }) };
+    assert.equal(await verifyAuthorizationProof(signed.authorization, signed, trust), true);
+    return signed;
+  };
+  const objectId = "obj-" + crypto.randomUUID();
+  const fileId = "file-old-" + crypto.randomUUID();
+  const create = await sign(protocol.createOperation({
+    operation: "create", objectId, fileId, versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "docs/source.txt" }, plaintext: Buffer.from("cached A"),
+    fileKey: key,
+  }));
+  assert.equal((await store.put("alice", create)).kind, "stored");
+  const adapter = {
+    async push(operation) { return (await store.put("alice", operation)).record; },
+    async list(objectId = "") { return store.list("alice", objectId || null); },
+    async listInventory() {
+      const objects = store.list("alice").map(
+        ({ ciphertext, nonce, tag, aad, authorization, ...record }) => record);
+      return { protocolVersion: 2, view: "metadata", objects, nextCursor: null };
+    },
+  };
+  let verified = 0;
+  const client = await new SyncEngine({
+    rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: async (op) => {
+      const accepted = await verifyAuthorizationProof(op.authorization, op, trust);
+      if (accepted) verified += 1;
+      return accepted;
+    },
+  }).open();
+  assert.equal(await client.materializeRemote("docs/source.txt"), true);
+  assert.ok(verified >= 1, "real signed CREATE must pass through strict verification");
+  await fsp.unlink(path.join(root, "docs", "source.txt"));
+  assert.equal(client.snapshot.files["docs/source.txt"].fileId, fileId);
+
+  const nextFileId = "file-new-" + crypto.randomUUID();
+  const update = await sign(protocol.createOperation({
+    operation: "update", objectId, fileId: nextFileId, versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", baseRevision: create.revision,
+    revision: { counter: 2, deviceId: "device-a" },
+    metadata: { path: "docs/source.txt" }, plaintext: Buffer.from("remote B"),
+    fileKey: key,
+  }));
+  assert.equal((await store.put("alice", update)).kind, "stored",
+    "real atomic device registry must accept the signed fileId rotation");
+  const move = await sign(protocol.createOperation({
+    operation: "move", objectId, fileId: nextFileId, versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", baseRevision: update.revision,
+    revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "docs/moved.txt", sourcePath: "docs/source.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("remote B"), key), fileKey: key,
+  }));
+  assert.equal((await store.put("alice", move)).kind, "stored",
+    "MOVE must be signed and admitted after signed UPDATE under real atomic registry");
+  await assert.rejects(client.materializeRemote("docs/moved.txt"),
+    { code: "local_changes_pending" },
+    "a stale tracked objectId may not lose an unsynced deletion via fileId rotation");
+  assert.equal(await exists(path.join(root, "docs", "moved.txt")), false);
+  assert.equal(client.snapshot.files["docs/source.txt"].fileId, fileId);
+  assert.equal(client.snapshot.files["docs/moved.txt"], undefined);
+  assert.deepEqual(await client.journal.recover(), []);
+  assert.equal(store.list("alice", objectId)[0].operationId, move.operationId);
+});
+
+for (const explicitlyEvicted of [false, true]) {
+test("issue 66 P2 signed MOVE: " + (explicitlyEvicted ? "explicit eviction can move" : "missing tracked source preserves local deletion"), async (t) => {
+  const content = Buffer.from("genuine Ed25519 signed MOVE payload");
+  const { root, adapter, store, key } = await setup(t, { "docs/source.txt": content });
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trust = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [] };
+  const signed = new Map();
+  const sign = async (op) => {
+    if (!signed.has(op.operationId)) {
+      signed.set(op.operationId, { ...op, authorization: await createAuthorizationProof(op,
+        { username: "alice", publicKey, privateKey: signer.privateKey, expiresAt: Date.now() + 60000 }) });
+    }
+    return signed.get(op.operationId);
+  };
+  const strictAdapter = { ...adapter,
+    list: async (objectId) => Promise.all((await adapter.list(objectId)).map(sign)) };
+  let verified = 0;
+  const client = await new SyncEngine({
+    rootDir: root, adapter: strictAdapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: async (op) => {
+      const result = await verifyAuthorizationProof(op.authorization, op, trust);
+      if (result) verified++;
+      return result;
+    },
+  }).open();
+  assert.equal(await client.materializeRemote("docs/source.txt"), true);
+  const prior = store.list("alice")[0];
+  if (explicitlyEvicted) {
+    assert.equal(await client.evictLocal("docs/source.txt"), true);
+    assert.equal(client.snapshot.remoteOnly[prior.objectId].reason, "evicted");
+  } else {
+    await fsp.unlink(path.join(root, "docs", "source.txt"));
+    assert.equal(client.snapshot.files["docs/source.txt"].objectId, prior.objectId);
+  }
+  const moved = protocol.createOperation({
+    operation: "move", objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/moved.txt", sourcePath: "docs/source.txt" },
+    plaintext: protocol.encodeMovePayload(content, key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  assert.equal(await verifyAuthorizationProof((await sign(moved)).authorization,
+    await sign(moved), trust), true, "genuine owner-signed MOVE proof");
+  if (explicitlyEvicted) {
+    assert.equal(await client.materializeRemote("docs/moved.txt"), true);
+    assert.deepEqual(await fsp.readFile(path.join(root, "docs", "moved.txt")), content);
+  } else {
+    await assert.rejects(client.materializeRemote("docs/moved.txt"),
+      { code: "local_changes_pending" });
+    assert.equal(await exists(path.join(root, "docs", "moved.txt")), false);
+    assert.equal(client.snapshot.files["docs/source.txt"].objectId, prior.objectId);
+    assert.equal(client.snapshot.files["docs/moved.txt"], undefined);
+    assert.deepEqual(await client.journal.recover(), []);
+  }
+  assert.ok(verified >= (explicitlyEvicted ? 2 : 1), "strict Ed25519 verifier must authenticate every operation reaching admission");
+});
+}
 
 test("issue 66: a clean cached source can be hydrated through a verified remote MOVE", async (t) => {
   const { root, open, store, key } = await setup(t, { "docs/original.txt": "signed move bytes" });
