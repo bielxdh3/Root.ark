@@ -6,6 +6,15 @@ try {
   if (error?.code !== "ENOENT") throw error;
 }
 
+// Refuse explicitly invalid rate-limit storage before importing the service
+// dependency graph. Invalid configuration is a startup security boundary,
+// not something that may wait on background initialization or external I/O.
+const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
+  ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
+if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
+  throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
+}
+
 if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
@@ -197,11 +206,6 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
-const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
-  ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
-if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
-  throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
-}
 const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
