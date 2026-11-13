@@ -159,7 +159,10 @@ test("same-tick overwrite without stat timestamp delta cannot inherit signed obj
       return frozen;
     },
     open: async (...args) => pinnedHandle(await fsp.open(...args), {
-      stat: () => async () => frozen,
+      stat: (target) => async (...statArgs) => {
+        if (!frozen) frozen = await target.stat(...statArgs);
+        return frozen;
+      },
       read: target => async (...data) => {
         const result = await target.read(...data);
         if (!changed) {
@@ -170,6 +173,36 @@ test("same-tick overwrite without stat timestamp delta cannot inherit signed obj
       },
     }),
   });
+  frozen = await fsp.lstat(f.file, { bigint: true });
+  assert.equal(await f.current("root", "signed-ciphertext.bin", f.bytes.length), null);
+  assert.equal(changed, true);
+});
+
+test("POSIX: same-tick overwrite without stat timestamp delta cannot inherit signed object fingerprint", async t => {
+  let changed = false;
+  let frozen = null;
+  const f = await setup(t, "linux", {
+    lstat: async (...args) => {
+      const value = await fsp.lstat(...args);
+      if (!frozen) frozen = value;
+      return frozen;
+    },
+    open: async (...args) => pinnedHandle(await fsp.open(...args), {
+      stat: (target) => async (...statArgs) => {
+        if (!frozen) frozen = await target.stat(...statArgs);
+        return frozen;
+      },
+      read: target => async (...data) => {
+        const result = await target.read(...data);
+        if (!changed) {
+          changed = true;
+          await fsp.writeFile(args[0], Buffer.alloc(4096, 0x55));
+        }
+        return result;
+      },
+    }),
+  });
+  frozen = await fsp.lstat(f.file, { bigint: true });
   assert.equal(await f.current("root", "signed-ciphertext.bin", f.bytes.length), null);
   assert.equal(changed, true);
 });
