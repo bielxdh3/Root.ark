@@ -343,6 +343,28 @@ function safeName(name) {
   return path.basename(String(name || ""));
 }
 
+// On case-insensitive Windows filesystems, an alias may name a live file with
+// different spelling. Metadata and SQL tombstones use the physical leaf name.
+function resolvePhysicalFileName(directory, name) {
+  const requested = safeName(name);
+  if (process.platform !== "win32") return requested;
+  let names;
+  try { names = fs.readdirSync(directory); }
+  catch (error) {
+    if (error.code === "ENOENT") return requested;
+    throw error;
+  }
+  const matches = names.filter((entry) => entry.toLowerCase() === requested.toLowerCase());
+  if (matches.length !== 1) {
+    // Reject ambiguous aliases or filesystem case folds not handled by JS.
+    if (matches.length || fs.existsSync(path.join(directory, requested))) {
+      throw new Error("Nome fisico ambiguo para exclusao");
+    }
+    return requested;
+  }
+  return matches[0];
+}
+
 function ensureInside(base, target) {
   const resolvedBase = path.resolve(base);
   const resolvedTarget = path.resolve(target);
@@ -468,9 +490,12 @@ function restoreFileMetadata(context, metadata, restoredName) {
   }
 }
 
-function moveFileToTrash({ folder, fileName, deletedBy, loaders }) {
+function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonicalName = null }) {
   ensureTrashStorage();
-  const cleanName = safeName(fileName);
+  const cleanName = resolvePhysicalFileName(folder.uploadDir, fileName);
+  if (expectedCanonicalName !== null && cleanName !== expectedCanonicalName) {
+    throw new Error("Arquivo mudou de identidade antes da exclusao");
+  }
   const sourcePath = ensureInside(folder.uploadDir, path.join(folder.uploadDir, cleanName));
   if (!fs.existsSync(sourcePath)) throw new Error("Arquivo nao encontrado");
   const id = crypto.randomUUID();
@@ -854,6 +879,7 @@ function summary() {
 }
 
 module.exports = {
+  resolvePhysicalFileName,
   moveFileToTrash,
   moveFolderToTrash,
   permanentlyDelete,

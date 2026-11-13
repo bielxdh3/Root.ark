@@ -665,3 +665,60 @@ for (const mode of ["json", "sqlite"]) {
       assert.equal(oldSession.body.includes(FILE_CONTENT), false);
     });
 }
+
+
+test("issue 68 P2 Windows: mixed-case deletion revokes the physical file capability", { timeout: 60_000 }, async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows case-insensitive filesystem regression");
+  const { authed, port, origin, dataDir } = await startFixture(t, "sqlite");
+  const actualName = "Documento.txt";
+  const diskFile = path.join(path.dirname(dataDir), "uploads", actualName);
+  fs.writeFileSync(diskFile, "physical case-sensitive metadata binding");
+  const created = await authed("/share/capabilities", {
+    name: actualName, folderId: "root", permissions: ["download"],
+    expiresInMinutes: 60, maxDownloads: 3,
+  });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+  assert.match(token, /^C[a-f0-9]{47}$/);
+  // The live API rejects new case-aliased issuance, but older SQLite rows
+  // may already contain another spelling for this same NTFS inode. Seed that
+  // exact legacy DB state independently of the current server-side snapshot.
+  const aliasToken = `C${"b".repeat(47)}`;
+  const legacyDb = new (require("better-sqlite3"))(path.join(dataDir, "rootark.sqlite"));
+  try {
+    const insert = legacyDb.prepare(`INSERT INTO public_links
+      (token, folder_id, file_name, created_by, created_at, expires_at,
+       max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      SELECT ?, folder_id, ?, created_by, created_at, expires_at,
+             max_views, views, password_hash, metadata_json, permissions_json, revoked_at
+        FROM public_links WHERE token = ?`);
+    assert.equal(insert.run(aliasToken, "documento.txt", token).changes, 1);
+  } finally { legacyDb.close(); }
+  const exchange = () => request(port, "/share/c/exchange", {
+    method: "POST", headers: { origin, "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  assert.equal((await exchange()).status, 200, "real SQLite bearer was active before trash");
+  const sqlRow = (whichToken = token) => {
+    const db = new (require("better-sqlite3"))(path.join(dataDir, "rootark.sqlite"),
+      { readonly: true, fileMustExist: true });
+    try {
+      return db.prepare("SELECT file_name, revoked_at FROM public_links WHERE token = ?").get(whichToken);
+    } finally { db.close(); }
+  };
+  assert.equal(sqlRow()?.file_name, actualName,
+    "SQLite must have the original-cased grant before a case-aliased deletion");
+  assert.equal(sqlRow()?.revoked_at, null, "the grant is initially active");
+  assert.equal(sqlRow(aliasToken)?.file_name, "documento.txt");
+  assert.equal(sqlRow(aliasToken)?.revoked_at, null);
+  assert.equal(fs.existsSync(path.join(path.dirname(dataDir), "uploads", "documento.txt")), true,
+    "Windows accepted a case-aliased physical path before trash");
+  const deleted = await authed("/delete/documento.txt?folderId=root", {});
+  assert.ok([200, 202].includes(deleted.status), deleted.body);
+  assert.equal(fs.existsSync(diskFile), false, "actual original-cased file moved into trash");
+  assert.ok(sqlRow()?.revoked_at, "SQLite must durably tombstone the exact original-cased grant");
+  assert.ok(sqlRow(aliasToken)?.revoked_at,
+    "SQLite must also revoke the case-alias bearer for that same Windows inode");
+  assert.equal((await exchange()).status, 404,
+    "post-trash exchange cannot reactivate the revoked original-cased capability");
+});
