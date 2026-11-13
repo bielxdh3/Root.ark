@@ -29,6 +29,8 @@ const { openProtectedRecipientShareFile, createProtectedRecipientShareOffer,
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
 const { Zk1ProtectedCiphertextSharing } =
   require("../src/services/zk1ProtectedCiphertextSharing");
+const { assertAuthenticOwnerGrantAck } =
+  require("./support/issue-68-owner-grant-ack-fixture");
 const portableCli = (() => {
   try { return require("../scripts/zk1-recipient-offer-local"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -803,7 +805,20 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(actualGrantAck.status, 201,
       "genuine server share/grant persists an owner-signed, recipient-scoped grant");
     const grant = await actualGrantAck.json();
-    assert.equal(grant.shareSignatureBase64, shareSignatureBase64);
+    // The signed grant exported to the owner-private CLI fixture must be
+    // reconstructed from owner-held inputs. Never write network JSON to disk:
+    // even a 201 response is not an independent owner authority.
+    const ownerSignedGrantAck = Object.freeze({
+      grantId: grantInput.grantId,
+      expiresAt: grantInput.expiresAt,
+      shareStatementBase64: b64(message.subarray(
+        Buffer.byteLength("Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64,
+    });
+    assertAuthenticOwnerGrantAck(grant, ownerSignedGrantAck, message,
+      crypto.createPublicKey(originalActor));
+    assert.ok(JSON.stringify(grant) === JSON.stringify(ownerSignedGrantAck),
+      "HTTP ACK bytes must exactly match the owner-signed fixture JSON");
     const readIndependentAuthority = async () => ({ scope,
       head: { revision: currentManifest.revision, epoch: currentManifest.current_epoch,
         digest: Uint8Array.from(currentDigest) },
@@ -919,7 +934,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       'module.exports = (role, input) => globalThis['
       + JSON.stringify(testContextId) + '](role, input);\n',
       { mode: 0o600, flag: "wx" });
-    fs.writeFileSync(path.join(dir, "grant-ack.json"), JSON.stringify(grant),
+    fs.writeFileSync(path.join(dir, "grant-ack.json"), JSON.stringify(ownerSignedGrantAck),
       { mode: 0o600, flag: "wx" });
     const runOwnerExport = (grantFile, outputFile) => portableCli.run([
       "export", "--owned-dir", dir, "--context-module", "trusted-share.js",

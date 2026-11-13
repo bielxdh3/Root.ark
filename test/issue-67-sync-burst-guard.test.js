@@ -132,13 +132,14 @@ const TEST_TOTP_KEY = crypto.randomBytes(32);
 
 // Account state persists through load/save like the users file does, so replay state and consumed
 // recovery codes are real. Each load returns a fresh copy.
-async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt, accountUsers = null, totpKey = TEST_TOTP_KEY, atomicResumeAvailable = true }) {
+async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt, accountUsers = null, totpKey = TEST_TOTP_KEY, atomicResumeAvailable = true, username = "alice", allowListFiles = true }) {
   const accountState = { users: accountUsers || [{ username: "alice", password: ALICE_HASH }] };
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
   // Route tests exercise legitimately authorized deletes, then assert burst fencing.
-  const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user", permissions: { delete: true } }; next(); };
-  const requirePermission = () => (_req, _res, next) => next();
+  const authenticate = (req, _res, next) => { req.user = { username, role: "user", permissions: { delete: true } }; next(); };
+  const requirePermission = (permission) => (_req, res, next) => permission === "listFiles" && !allowListFiles
+    ? res.status(403).json({ error: "Not authorized" }) : next();
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
   const loadUsers = () => JSON.parse(JSON.stringify(accountState.users));
   const saveUsers = (users) => { accountState.users = JSON.parse(JSON.stringify(users)); };
@@ -225,6 +226,51 @@ test("issue 67 route: destructive burst pauses the device with 423 while reads a
 
   // Another device of the same user is not paused.
   assert.equal((await jsonRequest(port, "/sync/v1/objects/object-4", "DELETE", deleteFor(4, created[3], key, "device-b"))).status, 200);
+});
+
+test("issue 67 route: recoverable ciphertext history is readable by its owner only", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-history-http-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const { port } = await startServer(t, { storagePath });
+  const key = crypto.randomBytes(32);
+  const first = createFor(1, key);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", first)).status, 201);
+  const second = protocol.createOperation({
+    operation: "update", objectId: "object-1", fileId: "file-1", versionId: "version-1-2", operationId: "update-history-2",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: first.revision,
+    metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from("new data"), fileKey: key,
+  });
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", second)).status, 201);
+
+  const ownerResponse = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-1/history`);
+  assert.equal(ownerResponse.status, 200, "the authorized owner can enumerate retained versions");
+  const ownerHistory = await ownerResponse.json();
+  assert.deepEqual(ownerHistory.versions.map((record) => record.versionId), [first.versionId, second.versionId]);
+  assert.equal(ownerHistory.versions[0].ciphertext, first.ciphertext);
+  assert.equal(ownerHistory.versions[0].nonce, first.nonce);
+  assert.equal(ownerHistory.versions[0].tag, first.tag);
+  assert.equal(JSON.stringify(ownerHistory).includes("new data"), false, "plaintext never appears in the response");
+
+  const deleted = protocol.createOperation({
+    operation: "delete", objectId: "object-1", fileId: "file-1", versionId: "version-1-3", operationId: "delete-history-3",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 3, deviceId: "device-a" }, baseRevision: second.revision,
+    metadata: { path: "f1.txt" }, fileKey: key,
+  });
+  assert.equal((await jsonRequest(port, "/sync/v1/objects/object-1", "DELETE", deleted)).status, 200);
+  const afterDelete = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-1/history`);
+  assert.equal(afterDelete.status, 200, "delete cannot hide the surviving recovery history");
+  const deletedHistory = await afterDelete.json();
+  assert.equal(deletedHistory.versions[0].versionId, first.versionId);
+  assert.equal(deletedHistory.versions.at(-1).operation, "delete");
+  assert.equal((await fetch(`http://127.0.0.1:${port}/sync/v1/objects/no-such-object/history`)).status, 404);
+
+  const { port: otherPort } = await startServer(t, { storagePath, username: "bob" });
+  assert.equal((await fetch(`http://127.0.0.1:${otherPort}/sync/v1/objects/object-1/history`)).status, 404);
+  const { port: forbiddenPort } = await startServer(t, { storagePath, allowListFiles: false });
+  assert.equal((await fetch(`http://127.0.0.1:${forbiddenPort}/sync/v1/objects/object-1/history`)).status, 403);
 });
 
 test("issue 67 route: pause survives restart and resume lifts it without touching data", async (t) => {

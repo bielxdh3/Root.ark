@@ -197,6 +197,11 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
+const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
+  ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
+if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
+  throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
+}
 const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
@@ -6065,7 +6070,7 @@ const createRouteRateLimit = () => rateLimit({
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
 // UPLOAD_CHUNK_RATE_LIMIT_STORE=sqlite shares the chunk limiter across processes on one host only.
-const uploadChunkRateLimitStore = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === "sqlite"
+const uploadChunkRateLimitStore = UPLOAD_CHUNK_RATE_LIMIT_STORE === "sqlite"
   ? new SqliteSlidingWindowStore(path.join(CHUNK_UPLOAD_DIR, ".rate-limit.sqlite"), ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX)
   : new UploadChunkSlidingWindowStore(ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX);
 const uploadChunkRateLimit = rateLimit({

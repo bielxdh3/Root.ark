@@ -3,6 +3,14 @@
 O protocolo v2 e o uploader legado de desenvolvimento sao clientes diferentes.
 O `sync:init` legado **nao** provisiona as chaves ou a politica de confianca exigidas pelo v2.
 
+No protocolo `/sync/v1`, `GET /sync/v1/objects/:objectId/history` permite ao
+usuario autenticado com `listFiles` consultar as versoes cifradas ainda retidas,
+inclusive depois de um DELETE logico. Outra conta, falta de permissao ou
+historico inexistente nao revelam os registros. Essa rota nao descriptografa,
+nao restaura automaticamente e nao altera a politica de retencao; a recuperacao
+efetiva continua exigindo uma operacao autorizada do cliente. Ela nao concede
+acesso aos objetos protegidos do ZK-1 por outro protocolo nem encerra a issue #67.
+
 ## Comandos
 
 ```powershell
@@ -23,6 +31,77 @@ subpastas. Por isso, se duas subpastas contiverem arquivos com o mesmo nome
 renomeie os arquivos para evitar sobrescrita sem sinalizacao.
 
 Para o **Sync v2**, use `npm run sync:start -- --config <config-v2-privado> --once` depois do provisionamento independente da identidade e politica dos dispositivos e das chaves mantidas apenas em memoria. O v2 recusa uma configuracao sem `trustedDevicePublicKeys` e `revokedDeviceIds`; nao reutilize a configuracao do uploader legado. O arquivo v2 deve estar em pasta privada e protegido contra substituicao local.
+
+### Inventario remoto paginado (issue #66, parcial)
+
+Clientes v2 autenticados com permissao `listFiles` podem consultar
+`GET /sync/v1/objects?view=metadata&limit=64` e seguir `nextCursor`
+usando `&cursor=<cursor>`. As paginas tem no maximo 64 registros e 128 KiB
+de resposta JSON. Cada registro inclui identificadores, revisao, operacao,
+metadados e estado de exclusao, mas omite ciphertext, nonce, tag e AAD.
+`GET /sync/v1/objects` e `GET /sync/v1/objects/:objectId` continuam
+retornando os envelopes completos para clientes existentes.
+
+O cliente pode usar `adapter.listInventory({ limit, cursor })` ou
+`engine.browseRemoteInventory({ limit, cursor })` para navegar sem baixar
+conteudo cifrado. `selectedOnDevice` e apenas a politica local dessa
+instancia do engine; o inventario e **informativo, sem verificacao de assinatura**.
+Antes de materializar, reconciliar ou admitir operacoes protegidas, o cliente
+continua usando a leitura completa por `objectId` com validacao independente
+de assinatura, dispositivo e revogacao. O fluxo normal `syncOnce` preserva
+essas garantias e ainda utiliza o LIST completo.
+
+Os cursores sao vinculados ao conjunto atual de metadados da conta autenticada;
+se o conjunto mudar durante a navegacao, a proxima pagina retorna HTTP 409 e
+o cliente deve recomeçar pela primeira pagina. Cursor e limite invalidos
+retornam HTTP 400. Esta etapa ainda nao implementa placeholder nativo,
+eviction contra escritor externo com arquivo aberto ou a migracao automatica
+do `syncOnce` para inventarios por pagina.
+
+Para evitar reler o arquivo de objetos inteiro em cada pagina, o servidor
+guarda em LRU **ate dois indices positivos de contas por instancia**, com
+limite individual de **32 MiB** e total de **64 MiB de registros JSON
+serializados**, sem manter ciphertext nesse cache. Alternar paginas entre
+duas contas nao exige revalidacao completa de todo o JSON a cada acesso.
+Uma terceira conta pode expulsar a menos recentemente usada; essa conta
+precisara de nova leitura na proxima consulta.
+O teto mede os registros serializados, **nao o RSS total do processo**:
+um volume maior de objetos ou metadados pode atingir o teto. Se o indice
+da conta exceder 32 MiB, a rota retorna **HTTP 507** com codigo estavel
+`metadata_index_too_large`, em vez de voltar a reler o JSON a cada pagina.
+O servidor memoriza apenas um marcador de excesso por conta e revisao
+duravel, evitando reprocessamento em tentativas subsequentes.
+Os marcadores de excesso ficam num LRU separado, com no maximo
+**32 contas por instancia**: a consulta de uma conta pequena nao
+descarta o marcador de uma conta grande. Uma conta evictada do LRU
+pode exigir uma nova validacao integral quando consultar novamente.
+Cada requisicao confere o lock
+do escritor, a politica de armazenamento privado quando aplicavel e a
+identidade duravel do arquivo (dispositivo, inode, tamanho, mtime e ctime
+com precisao de nanossegundos). Escritas atomicas de outro processo
+invalidam o indice antes da pagina seguinte; o cursor antigo recebe 409.
+O limite e por **tamanho do indice**, nao por numero fixo de arquivos:
+bibliotecas que o excedam precisam de um mecanismo de indexacao separado
+antes de poderem usar esta API paginada. As rotas legadas nao mudam.
+
+Benchmark reproduzivel local, Windows Node 24.14.1, 10 mil operacoes
+cifradas v2 com historico de uma versao cada (78,29 MiB em JSON):
+no baseline as primeiras 10 paginas levaram 23.595 ms; com o indice,
+as 157 paginas dos 10 mil itens levaram 2.625 ms no total (primeira
+pagina 2.337 ms, 156 paginas seguintes 288 ms). O primeiro carregamento
+ainda precisa validar o estado completo; nao e um indice persistido ou
+uma API de buscas em plaintext no servidor.
+
+Teste adicional com **10 mil objetos** com metadados longos
+(nome e content-type de 500 caracteres, caminho de quase 500 caracteres
+e parentId de 160): estado cifrado com historico de 149,62 MiB,
+indice serializado de 20,50 MiB. Todas as 167 paginas, limitadas por
+bytes, retornaram em 4.288 ms: primeira 3.586 ms, demais 702 ms.
+Uma regressao com teto artificialmente baixo garante que o estouro
+retorne 507, sem repetir a leitura pesada, e que uma escrita externa
+invalide o marcador de excesso. Ela tambem testa a sequencia
+conta A grande (507), conta A novamente (507), conta B pequena (200),
+conta A novamente (507): B nao deve causar nova leitura da conta A.
 
 ## Opcoes
 
