@@ -512,6 +512,77 @@ test("P2: hostile Ed25519 getter cannot rewind the CURRENT head monotonic deadli
   assert.ok(Date.now() - startedAt >= 20, "external callback blocked longer than expiry");
 });
 
+test("P2: hostile Ed25519 getter cannot stretch CURRENT deadline by replacing global BigInt", async () => {
+  const f = await fixture();
+  const nativeBigInt = BigInt;
+  const injected = Object.create(keys.source.publicKey);
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle);
+  let getterReads = 0, changedCalls = 0, actualReads = 0;
+  Object.defineProperty(injected, handle, { get() {
+    getterReads += 1;
+    global.BigInt = function poisonedBigInt(value) {
+      if (value === 20) { changedCalls += 1; return 999999999999999999n; }
+      return nativeBigInt(value);
+    };
+    return keys.source.publicKey[handle];
+  } });
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: injected },
+      zkAuthority: f.zkAuthority,
+      mappingAuthority: { ...f.authority, readCurrentHead: (challenge) => {
+        actualReads += 1;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 45);
+        return signedHead(f, challenge);
+      } },
+    }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+    await withinHeadDeadline(assert.rejects(verify(f.input), deny));
+  } finally { global.BigInt = nativeBigInt; }
+  assert.ok(getterReads > 0 && actualReads === 1);
+  assert.equal(changedCalls, 0,
+    "untrusted global BigInt must never be consulted for the deadline");
+});
+
+test("P2: inherited poisoned Object.then cannot swallow CURRENT timeout settlement", async () => {
+  const f = await fixture();
+  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  const readerCalls = [];
+  let inheritedThenCalls = 0;
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, readCurrentHead: (challenge) => {
+      Object.defineProperty(Object.prototype, "then", { configurable: true,
+        get() {
+          if (this && Object.hasOwn(this, "settled")) {
+            inheritedThenCalls += 1;
+            return function neverSettleSentinel() {};
+          }
+          return undefined;
+        },
+      });
+      return new Promise((resolve) => readerCalls.push({ resolve, challenge }));
+    } },
+  }, { headTimeoutMs: 20, maxPendingHeadReads: 1 });
+  const pending = verify(f.input);
+  try {
+    const outcome = await Promise.race([
+      pending.then(() => "accepted", () => "denied"),
+      new Promise((resolve) => setTimeout(() => resolve("timeout_swallowed"), 200)),
+    ]);
+    assert.equal(outcome, "denied", "native deadline must settle despite poisoned Object.then");
+  } finally {
+    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+    else delete Object.prototype.then;
+    for (const call of readerCalls) call.resolve(signedHead(f, call.challenge));
+    await Promise.race([pending.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 100))]);
+  }
+  assert.equal(inheritedThenCalls, 0,
+    "settlement values must not inherit arbitrary Object.prototype.then");
+});
+
 test("P2: hostile Ed25519 getter cannot suppress actual caller AbortSignal cancellation", async () => {
   const f = await fixture();
   const caller = new AbortController();

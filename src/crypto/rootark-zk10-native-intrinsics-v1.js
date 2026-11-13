@@ -83,6 +83,15 @@ function nativePromiseRace(first, second, third) {
     observe(third);
   });
 }
+function nativeSettledRead(value) {
+  // A hostile CURRENT adapter can poison Object.prototype.then before
+  // promise settlement. A null-prototype box cannot be assimilated as a
+  // forged inherited thenable by the native resolver or await.
+  const result = OBJECT_CREATE(null);
+  DEFINE_PROPERTY(result, "settled", { value: true, enumerable: true });
+  DEFINE_PROPERTY(result, "value", { value, enumerable: true });
+  return result;
+}
 function invokeNativeRead(callback) {
   return newNativePromise((resolve, reject) => {
     // Wait one genuine microtask before entering the external adapter; caller
@@ -100,7 +109,7 @@ function invokeNativeRead(callback) {
       if (outcome !== null && (typeof outcome === "object" || typeof outcome === "function")) {
         if (isPromise(outcome) && !isProxy(outcome)) {
           try { pinNativePromise(outcome); } catch (_) { return; }
-          try { resolve({ settled: true, value: await outcome }); }
+          try { resolve(nativeSettledRead(await outcome)); }
           catch (error) { reject(error); }
           return;
         }
@@ -111,7 +120,7 @@ function invokeNativeRead(callback) {
         try { then = outcome.then; } catch (_) { return; }
         if (typeof then === "function") return;
       }
-      resolve({ settled: true, value: outcome });
+      resolve(nativeSettledRead(outcome));
     })();
   });
 }
