@@ -27,6 +27,10 @@ const {
   hasOwn: NATIVE_HAS_OWN,
   objectCreate: NATIVE_OBJECT_CREATE,
   defineProperty: NATIVE_DEFINE_PROPERTY,
+  newNativeSet: NATIVE_SET_CREATE,
+  setAdd: NATIVE_SET_ADD,
+  setDelete: NATIVE_SET_DELETE,
+  setSize: NATIVE_SET_SIZE,
   freeze: NATIVE_FREEZE,
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
 } = require("./rootark-zk10-native-intrinsics-v1");
@@ -66,7 +70,7 @@ const DEFAULT_MAX_PENDING_HEAD_READS = 16;
 const MAX_GLOBAL_PENDING_HEAD_READS = 64;
 // Timeout/cancellation returns control to JS, but a noncooperative external
 // adapter still owns its underlying promise until it actually settles.
-const globalPendingHeadReads = new Set();
+const globalPendingHeadReads = NATIVE_SET_CREATE();
 const SOURCE_FIELDS = NATIVE_FREEZE([
   "identity", "provisioning", "provisionerPublicKey", "provisioningDigest",
   "witnessPublicKey", "casPublicKey", "scope", "pinnedDevicePolicy", "currentDevicePolicy",
@@ -244,6 +248,9 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     const floor = { sequence: number(retained.sequence), digest: hex(retained.digest) };
     const sourceIdentity = exact(s.identity,
       ["accountId", "storeId", "username", "compartmentId"]);
+    // An inherited native KeyObject getter can modify the caller-owned
+    // enrollment/revocation policy. Pin its data BEFORE importing those keys.
+    const localPolicy = snapshotLocalDevicePolicy(s.pinnedDevicePolicy);
     // Validate signed source provisioning BEFORE running any attacker-owned
     // KeyObject getter. The verifier returns the very native signer identities
     // used for its Ed25519 checks; never re-export source roles afterward.
@@ -256,7 +263,6 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     const sourceProvisioner = verifiedSource.publicKey;
     const sourceWitness = verifiedSource.witnessPublicKey;
     const sourceCas = verifiedSource.casPublicKey;
-    const localPolicy = snapshotLocalDevicePolicy(s.pinnedDevicePolicy);
     if (typeof s.currentDevicePolicy !== "function" || localPolicy.username !== identity.username
       || identity.compartmentId !== id(identity.compartmentId)) deny();
     decode(z.immutableAccountId, 16);
@@ -287,10 +293,10 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
     checkIndependent(sourceWitness);
     checkIndependent(sourceCas);
     if (typeof a.readCurrentHead !== "function") deny();
-    const pendingHeadReads = new Set();
+    const pendingHeadReads = NATIVE_SET_CREATE();
     async function boundedCurrentHead(challenge, signal) {
-      if (signal?.aborted || pendingHeadReads.size >= maxPendingHeadReads
-        || globalPendingHeadReads.size >= MAX_GLOBAL_PENDING_HEAD_READS) deny();
+      if (signal?.aborted || NATIVE_SET_SIZE.call(pendingHeadReads) >= maxPendingHeadReads
+        || NATIVE_SET_SIZE.call(globalPendingHeadReads) >= MAX_GLOBAL_PENDING_HEAD_READS) deny();
       const controller = new AbortController();
       // Timers can run late if an adapter blocks the JS event loop. Reject a
       // result even if its microtask beats an overdue timeout callback.
@@ -317,11 +323,11 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
         if (controller.signal.aborted) deny();
         return a.readCurrentHead(challenge, { signal: controller.signal });
       });
-      pendingHeadReads.add(pending);
-      globalPendingHeadReads.add(pending);
+      NATIVE_SET_ADD.call(pendingHeadReads, pending);
+      NATIVE_SET_ADD.call(globalPendingHeadReads, pending);
       void pending.then(
-        () => { pendingHeadReads.delete(pending); globalPendingHeadReads.delete(pending); },
-        () => { pendingHeadReads.delete(pending); globalPendingHeadReads.delete(pending); });
+        () => { NATIVE_SET_DELETE.call(pendingHeadReads, pending); NATIVE_SET_DELETE.call(globalPendingHeadReads, pending); },
+        () => { NATIVE_SET_DELETE.call(pendingHeadReads, pending); NATIVE_SET_DELETE.call(globalPendingHeadReads, pending); });
       try {
         const result = await Promise.race([
           pending.then((value) => ({ settled: true, value }),
