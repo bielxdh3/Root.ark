@@ -15,31 +15,40 @@
   };
   const toHex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
-  const inRootark = location.pathname.startsWith('/p2p/');
+  const inRootark = Boolean(location.pathname?.startsWith('/p2p/'));
   $('rootarkReturn').hidden = !inRootark;
+  $('boundObjectControls').hidden = !inRootark;
   const wsUrl = location.origin.replace(/^http/, 'ws') + (inRootark ? '/ws' : '/signal');
   const fileWire = window.P2PFileWire;
   const MAX_FILE = fileWire ? fileWire.MAX_FILE : (32 * 1024 * 1024);
   const BUFFER_HIGH = 256 * 1024;
   let preparingFile = false;
-  let ws, roomId, hostKey, selfId, role;
+  let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
+  let roomIntent = 0;
+  let protectedRoomRequired = false;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
-  function connect(credentials) {
+  function retireRoom() {
     const oldSocket = ws;
-    ws = null; // old callbacks must not retain authority over the new room.
+    ws = null; // Ignore callbacks from the previous room immediately.
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
-    for (const p of peers.values()) closePeer(p);
+    // A room switch must not reuse peer channels, offers or invitations from
+    // the previous authenticated room while its old socket is still closing.
+    for (const peer of peers.values()) closePeer(peer);
     peers.clear();
     invites.clear();
-    $('peers').replaceChildren();
     $('invites').replaceChildren();
+    $('peers').replaceChildren();
     $('incoming').replaceChildren();
     selfId = null;
     role = null;
+    activeBoundObject = null;
     $('invite').disabled = true;
+  }
+  function connect(credentials) {
+    retireRoom();
     ws = new WebSocket(wsUrl);
     const eventSocket = ws;
     ws.onopen = () => {
@@ -53,6 +62,11 @@
       if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
+        activeBoundObject = inRootark && m.boundObject &&
+          fileWire.validDigest(m.boundObject.sha256) &&
+          Number.isSafeInteger(m.boundObject.size) &&
+          m.boundObject.size > 0 && m.boundObject.size <= MAX_FILE
+          ? m.boundObject : null;
         $('invite').disabled = role !== 'host';
         log('Entrou na sala como ' + role + (m.username ? ' (' + m.username + ')' : ''));
       } else if (m.type === 'invited') {
@@ -120,12 +134,13 @@
             await p.pc.setRemoteDescription(m.signal.sdp);
             await flushIce(p);
             await p.pc.setLocalDescription(await p.pc.createAnswer());
+            if (ws !== eventSocket) return;
             wire({ type: 'signal', to: p.id, signal: { kind: 'answer', sdp: p.pc.localDescription } });
           } else if (m.signal.kind === 'answer') {
             await p.pc.setRemoteDescription(m.signal.sdp);
             await flushIce(p);
           }
-        } catch (e) { log('Negociação falhou: ' + e.name); }
+        } catch (e) { if (ws === eventSocket) log('Negociação falhou: ' + e.name); }
       } else if (m.type === 'peer-left') {
         const p = peers.get(m.peerId);
         if (p) closePeer(p);
@@ -139,6 +154,7 @@
     ws.onclose = () => {
       if (ws !== eventSocket) return;
       $('invite').disabled = true;
+      activeBoundObject = null;
       for (const p of peers.values()) closePeer(p);
       peers.clear();
       log('Conexão de sinalização encerrada');
@@ -165,7 +181,7 @@
     return p;
   }
   function sendControl(p, message) {
-    if (p.dc?.readyState !== 'open') return;
+    if (peers.get(p.id) !== p || p.dc?.readyState !== 'open') return;
     try { p.dc.send(JSON.stringify(message)); } catch { resetTransfers(p); }
   }
   function clearPending(p) {
@@ -265,6 +281,7 @@
       log('Arquivo rejeitado: ' + code);
     }
     dc.onmessage = async event => {
+      if (peers.get(p.id) !== p || p.dc !== dc) return;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
         if (!rx) { record(diagnostics.rejected, 'UNEXPECTED_CHUNK'); return; }
@@ -287,6 +304,10 @@
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
       if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      if (m.type === 'text' && activeBoundObject) {
+        record(diagnostics.rejected, 'BOUND_ROOM_TEXT');
+        return;
+      }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
         if (hash === m.digest) {
@@ -311,6 +332,12 @@
             );
         if (!isValid) {
           record(diagnostics.rejected, 'BAD_OFFER'); return;
+        }
+        if (activeBoundObject && (m.name !== activeBoundObject.fileName ||
+          m.size !== activeBoundObject.size || m.digest !== activeBoundObject.sha256)) {
+          record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
+          sendControl(p, { type: 'decline-file', id: m.id });
+          return;
         }
         if (p.incoming || p.pendingOffer) {
           sendControl(p, { type: 'decline-file', id: m.id }); return;
@@ -435,17 +462,36 @@
     if (notify) sendControl(p, { type: 'cancel-file', id: tx.id });
   }
   async function sendFile(file) {
+    if (protectedRoomRequired && !activeBoundObject) {
+      record(diagnostics.rejected, 'ROOM_CHANGED');
+      return log('Aguarde a confirmação da sala vinculada');
+    }
     if (!file || file.size === 0 || file.size > MAX_FILE || preparingFile) {
       return log('Selecione arquivo de até 32 MiB');
     }
+    if (activeBoundObject && (file.name !== activeBoundObject.fileName ||
+      file.size !== activeBoundObject.size)) {
+      record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
+      return log('O arquivo selecionado não corresponde ao objeto vinculado');
+    }
     const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing);
     if (!receivers.length) return log('Nenhum par disponível');
+    const sendingIntent = roomIntent;
     preparingFile = true;
     try {
       const digest = await sha(await file.arrayBuffer());
+      if (sendingIntent !== roomIntent || (protectedRoomRequired && !activeBoundObject)) {
+        record(diagnostics.rejected, 'ROOM_CHANGED');
+        return log('Envio de arquivo cancelado após troca de sala');
+      }
+      if (activeBoundObject && digest !== activeBoundObject.sha256) {
+        record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
+        return log('O SHA-256 não corresponde ao ciphertext da sala');
+      }
       const name = file.name.slice(0, 100) || 'arquivo.bin';
       for (const p of receivers) {
-        if (p.dc?.readyState !== 'open' || p.outgoing) continue;
+        if (sendingIntent !== roomIntent) break;
+        if (peers.get(p.id) !== p || p.dc?.readyState !== 'open' || p.outgoing) continue;
         const id = crypto.randomUUID().replace(/-/g, '');
         const tx = { id, name, size: file.size, digest, file, phase: 'offered',
           abort: new AbortController(), timer: null };
@@ -463,35 +509,68 @@
     finally { preparingFile = false; }
   }
   async function sendText(value) {
+    if (protectedRoomRequired || activeBoundObject) {
+      return log('Sala vinculada aceita somente ciphertext do arquivo selecionado');
+    }
     if (!value || value.length > 1000) return;
+    const sendingSocket = ws;
+    const sendingRoom = roomId;
+    const sendingPeerId = selfId;
+    const sendingRole = role;
+    const sendingIntent = roomIntent;
+    const receivers = [...peers.values()].map(peer => ({ peer, dc: peer.dc }));
+    const sameRoom = () => ws === sendingSocket && roomId === sendingRoom &&
+      selfId === sendingPeerId && role === sendingRole &&
+      roomIntent === sendingIntent && !protectedRoomRequired && !activeBoundObject;
     const digest = await sha(new TextEncoder().encode(value));
+    if (!sameRoom()) {
+      record(diagnostics.rejected, 'ROOM_CHANGED');
+      return log('Envio de texto cancelado após troca de sala');
+    }
     let count = 0;
-    for (const p of peers.values()) if (p.dc?.readyState === 'open') {
-      p.dc.send(JSON.stringify({ type: 'text', text: value, digest }));
+    for (const { peer, dc } of receivers) {
+      if (!sameRoom()) break;
+      if (peers.get(peer.id) !== peer || peer.dc !== dc || dc?.readyState !== 'open') continue;
+      dc.send(JSON.stringify({ type: 'text', text: value, digest }));
       count++;
     }
     log('Texto enviado a ' + count + ' destinatário(s)');
   }
-  async function createRoom() {
+  async function createRoom(boundObject = null) {
+    const intent = ++roomIntent;
+    protectedRoomRequired = Boolean(boundObject);
+    if (protectedRoomRequired) retireRoom();
     const headers = {};
     if (inRootark) {
       const csrf = document.cookie.split(';').map(value => value.trim())
         .find(value => value.startsWith('rootark_csrf='));
       if (csrf) headers['X-CSRF-Token'] = csrf.slice('rootark_csrf='.length);
+      if (boundObject) headers['Content-Type'] = 'application/json';
     }
+    const body = inRootark && boundObject ? JSON.stringify({ boundObject }) : undefined;
     const response = await fetch(inRootark ? '/p2p/rooms' : '/rooms',
-      { method: 'POST', headers, credentials: 'same-origin' });
+      { method: 'POST', headers, body, credentials: 'same-origin' });
+    if (intent !== roomIntent) return;
     if (!response.ok) throw new Error('room creation failed');
     const result = await response.json();
+    if (intent !== roomIntent) return;
     ({ roomId, hostKey } = result);
     $('room').textContent = roomId;
+    if (result.boundObject) log('Sala vinculada à ACL e SHA-256: ' +
+      result.boundObject.folderId + '/' + result.boundObject.fileName);
     connect({ hostKey });
   }
   function joinRoom(room, invitation) {
+    ++roomIntent;
+    protectedRoomRequired = false;
     roomId = room; $('room').textContent = roomId;
     connect({ invitation });
   }
   $('create').onclick = () => createRoom().catch(e => log(e.message));
+  $('createObjectRoom').onclick = () => createRoom({
+    folderId: $('objectFolderInput').value.trim(),
+    fileName: $('objectFileInput').value.trim(),
+  }).catch(() => log('A autorização do arquivo foi negada'));
   $('invite').onclick = () => wire({ type: 'invite', recipient: $('recipientInput').value.trim() });
   $('join').onclick = () => joinRoom($('roomInput').value, $('inviteInput').value);
   $('sendFile').onclick = () => sendFile($('fileInput').files[0]);
@@ -503,7 +582,8 @@
     invitations: () => [...invites.values()],
     // Exposed only for disposable Edge CDP adversarial regression tests.
     testChannel: index => [...peers.values()][index]?.dc,
-    snapshot: () => ({ roomId, role, peerId: selfId, peers: [...peers.values()].map(p => ({
+    snapshot: () => ({ roomId, role, peerId: selfId, boundObject: activeBoundObject,
+      peers: [...peers.values()].map(p => ({
       id: p.id, channel: p.dc?.readyState || 'none',
       incomingChunks: p.incoming?.chunks.length ?? 0,
       incomingBytes: p.incoming?.chunksSize ?? 0,

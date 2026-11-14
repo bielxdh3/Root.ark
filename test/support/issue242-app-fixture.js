@@ -71,6 +71,7 @@ async function fixture({ enabled = true } = {}) {
   async function request(path, { method = 'GET', session = null, body = null,
     csrf = true, requestOrigin = origin } = {}) {
     const headers = { ...(session ? { Cookie: session.cookie } : {}) };
+    if (body !== null) headers['Content-Type'] = 'application/json';
     if (method !== 'GET') {
       headers.Origin = requestOrigin;
       if (session && csrf) headers['X-CSRF-Token'] = session.csrf;

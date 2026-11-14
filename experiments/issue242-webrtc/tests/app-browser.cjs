@@ -2,7 +2,8 @@
 // Real Root.ark HTTP + cookie session + /ws + WebRTC in one disposable Edge.
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const { mkdtempSync, rmSync, existsSync, writeFileSync } = require('node:fs');
+const { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } = require('node:fs');
+const { createHash } = require('node:crypto');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { fixture } = require('../../../test/support/issue242-app-fixture');
@@ -38,6 +39,14 @@ async function run() {
       pages.push(page);
       await page.call('Page.enable');
       await page.call('Network.enable');
+      if (username === 'alice') {
+        // Capture real Edge sockets before the protected page loads, then
+        // deterministically deliver a delayed event from the prior room.
+        await page.call('Page.addScriptToEvaluateOnNewDocument', { source:
+          'window.__testSockets=[]; const NativeSocket=WebSocket; ' +
+          'window.WebSocket=class extends NativeSocket { constructor(...args) { super(...args); window.__testSockets.push(this); } };'
+        });
+      }
       for (const cookie of session.cookie.split('; ')) {
         const [name, value] = cookie.split('=');
         await page.call('Network.setCookie', { name, value, url: f.origin,
@@ -103,7 +112,65 @@ async function run() {
       'revoked Root.ark session left live P2P peer', 8_000);
     await until(() => alice.evaluate('window.__poc.snapshot().peers.length===1'),
       'revoked peer not removed from real server', 8_000);
-    console.log('PASS real Root.ark app Edge: signed-cookie login, ACL recipient gate, /ws peer consent, 1:N 2MiB SHA-256 and session revocation');
+    // Protected-object mode reads the actual locally retained *ciphertext*
+    // bytes for the expected SHA-256 and rechecks the authoritative file ACL.
+    const ciphertext = Buffer.from(Array.from({ length: 92 }, (_, i) => i + 11));
+    mkdirSync(join(f.directory, 'uploads'), { recursive: true });
+    writeFileSync(join(f.directory, 'uploads', 'sealed.bin'), ciphertext);
+    const objectMetadata = {
+      fileName: 'sealed.bin', folderId: 'root', uploadedAt: '2026-11-06T12:00:00.000Z',
+      size: 64, encryptedSize: ciphertext.length, encryptionLevel: 'user-key',
+      algorithm: 'aes-256-gcm', layers: [{ type: 'user', iv: '0011', authTag: '0022' }],
+      accessControl: { owner: 'alice', authorizedUsers: ['alice', 'bob'], expiresAt: null },
+    };
+    const saveObject = () => writeFileSync(join(f.directory, 'data', 'encrypted-files.json'),
+      JSON.stringify({ 'root/sealed.bin': objectMetadata }));
+    saveObject();
+    writeFileSync(join(f.directory, 'data', 'file-permissions.json'),
+      JSON.stringify({ 'root/sealed.bin': { owner: 'alice', public: false,
+        users: { bob: { read: true, edit: false } } } }));
+    const expectedDigest = createHash('sha256').update(ciphertext).digest('hex');
+    assert.equal(await alice.evaluate('document.getElementById("boundObjectControls").hidden'), false);
+    await alice.evaluate('window.__poc.createRoom({folderId:"root",fileName:"sealed.bin"})');
+    const boundRoom = await until(() => alice.evaluate(
+      'window.__poc.snapshot().boundObject?.sha256 && window.__poc.snapshot().roomId'),
+    'ciphertext ACL room not opened', 12_000);
+    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject.sha256'), expectedDigest);
+    await alice.evaluate('window.__testSockets[0].onmessage({data:JSON.stringify({type:"joined",role:"guest",peerId:"old-room"})})');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject?.sha256'), expectedDigest,
+      'stale unbound join stripped the current signed ciphertext room policy');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), 'host');
+    await alice.evaluate('window.__poc.invite("carol")');
+    await until(() => alice.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_ACCESS_DENIED")'),
+    'unlisted account received an object grant');
+    const invitationsBefore = await alice.evaluate('window.__poc.invitations().length');
+    await alice.evaluate('window.__poc.invite("bob")');
+    const boundInvitation = await until(() => alice.evaluate(
+      'window.__poc.invitations().length>' + invitationsBefore +
+      ' && window.__poc.invitations().at(-1)?.recipient==="bob" && window.__poc.invitations().at(-1)?.invitation'),
+    'authorized object recipient did not get an invitation');
+    const refreshedBob = await pageFor('bob');
+    await refreshedBob.evaluate('window.__poc.joinRoom(' + JSON.stringify(boundRoom) + ',' +
+      JSON.stringify(boundInvitation) + ')');
+    await until(() => refreshedBob.evaluate('window.__poc.snapshot().boundObject?.sha256===' +
+      JSON.stringify(expectedDigest)), 'guest did not receive trusted ciphertext SHA-256');
+    await until(() => refreshedBob.evaluate('Boolean(document.querySelector("[data-testid=accept-peer]"))'),
+      'object peer consent missing');
+    await refreshedBob.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
+    // No shared mutation-serialized ACL authority exists in this legacy app.
+    // The broker must close the bound room rather than relay the WebRTC offer.
+    // peers.length===0 can be TRUE before any signaling is processed. Require
+    // BOTH affirmative server ROOM_CLOSED and the socket-close side effect,
+    // which clears the pinned object on the real browser client.
+    await until(() => refreshedBob.evaluate(
+      'window.__poc.snapshot().diagnostics.rejected.includes("ROOM_CLOSED")' +
+      ' && window.__poc.snapshot().boundObject===null' +
+      ' && window.__poc.snapshot().peers.length===0'),
+    'broker did not affirmatively close bound signaling without all-party authority', 20_000);
+    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 0,
+      'no bound ciphertext transfer can be received without snapshot authority');
+    console.log('PASS real Root.ark Edge: signed-cookie manual 1:N transfer, bound owner ACL/digest admission, and bound signaling fail-closed without atomic authority');
   } finally {
     for (const page of pages) page.close();
     child.kill();

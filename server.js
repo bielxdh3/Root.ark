@@ -6175,6 +6175,173 @@ function registerExperimentalP2p() {
   const p2pAuthenticator = createRealtimeAuthenticator({
     jwt, jwtSecret: JWT_SECRET, loadUser: p2pUser, normalizeUserPermissions,
   });
+  const MAX_P2P_CIPHERTEXT = 32 * 1024 * 1024;
+  async function currentP2pCiphertext(folderId, fileName, expectedSize) {
+    // This remains local-only and dev/test-only: no reads from cloud caches,
+    // no symlinks, no hardlinked aliases and never decrypt any stored bytes.
+    let handle;
+    try {
+      if (!Number.isSafeInteger(expectedSize) || expectedSize < 1
+        || expectedSize > MAX_P2P_CIPHERTEXT) return null;
+      const directory = getFolderStoragePath("./uploads", folderId);
+      const source = path.resolve(directory, fileName);
+      if (!isSafeChildPath("./uploads", directory) ||
+        !isSafeFolderChildPath(directory, source)) return null;
+      const expectedDirectory = path.normalize(directory);
+      const directoryStillTrusted = async () => {
+        const real = path.normalize(await fs.promises.realpath(directory));
+        return process.platform === "win32"
+          ? real.toLowerCase() === expectedDirectory.toLowerCase()
+          : real === expectedDirectory;
+      };
+      if (!await directoryStillTrusted()) return null;
+      const expectedBytes = BigInt(expectedSize);
+      const validFile = (stats) => stats.isFile() && !stats.isSymbolicLink()
+        && stats.ino !== 0n && stats.nlink === 1n && stats.size === expectedBytes;
+      const sameVersion = (a, b) => a.dev === b.dev && a.ino === b.ino
+        && a.size === b.size && a.nlink === b.nlink
+        && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
+        && a.birthtimeNs === b.birthtimeNs && a.mode === b.mode;
+      // Windows Node has no O_NOFOLLOW: deny a preexisting reparse point
+      // BEFORE open. This precheck alone is NOT an atomic native no-reparse
+      // guarantee against a privileged concurrent filesystem attacker.
+      let windowsPrecheck = null;
+      if (process.platform === "win32") {
+        windowsPrecheck = await fs.promises.lstat(source, { bigint: true });
+        if (!validFile(windowsPrecheck)) return null;
+      }
+      // POSIX opens the pinned FD FIRST (O_NOFOLLOW also rejects a symlink
+      // atomically). O_NONBLOCK prevents blocking on a hostile FIFO before
+      // fstat can reject its type.
+      handle = await fs.promises.open(source, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+      const opened = await handle.stat({ bigint: true });
+      if (!validFile(opened)) return null;
+      const pathname = await fs.promises.lstat(source, { bigint: true });
+      if (!validFile(pathname) || !sameVersion(opened, pathname)
+        || (windowsPrecheck && !sameVersion(windowsPrecheck, pathname))
+        || !await directoryStillTrusted()) return null;
+      const bytes = Buffer.allocUnsafe(512 * 1024);
+      const digestHandle = async () => {
+        const hash = crypto.createHash("sha256");
+        for (let offset = 0; offset < expectedSize;) {
+          const { bytesRead } = await handle.read(bytes, 0,
+            Math.min(bytes.length, expectedSize - offset), offset);
+          if (bytesRead <= 0) return null;
+          hash.update(bytes.subarray(0, bytesRead));
+          offset += bytesRead;
+        }
+        return hash.digest("hex");
+      };
+      let first;
+      let second;
+      try {
+        first = await digestHandle();
+        if (!first) return null;
+        // Re-hash the pinned FD so same-tick overwrites without stat deltas fail closed.
+        second = await digestHandle();
+      } finally {
+        bytes.fill(0);
+      }
+      if (!second || first !== second) return null;
+      const after = await handle.stat({ bigint: true });
+      const current = await fs.promises.lstat(source, { bigint: true });
+      if (!validFile(after) || !validFile(current)
+        || !sameVersion(opened, after) || !sameVersion(after, current)
+        || !await directoryStillTrusted()) return null;
+      return { bytes: expectedSize, sha256: first };
+    } catch { return null; }
+    finally { if (handle) await handle.close(); }
+  }
+  // This gate deliberately uses the existing, explicit per-file encrypted ACL.
+  // It is NOT a ZK owner-signed capability: no grant from another branch or
+  // decryption key is accepted. Exact folder+filename and object metadata are
+  // pinned to each room so replacing an object cannot inherit an old invite.
+  const authorizeP2pObject = async ({ owner, recipient, boundObject, pin }) => {
+    const { folderId, fileName } = boundObject || {};
+    if (typeof folderId !== "string" || typeof fileName !== "string"
+      || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderId)
+      || fileName.length < 1 || fileName.length > 100
+      || path.basename(fileName) !== fileName
+      || /[/\\\x00-\x1f\x7f]/.test(fileName) || isCloudStorageEnabled()) return null;
+    // Cheap, synchronous deny BEFORE touching up to 32 MiB of ciphertext.
+    // A non-owner or unlisted recipient must never induce a disk hash; the
+    // complete fresh ACL/metadata check below still runs AFTER the awaited
+    // ciphertext read, so revocation during hashing remains fail closed.
+    const prior = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const earlyOwner = p2pUser(owner);
+    const earlyRecipient = recipient === null ? null : p2pUser(recipient);
+    const earlyFolder = getFolderById(folderId);
+    const earlyAcl = prior?.accessControl;
+    const earlyFileEntry = getFilePermissionEntry(folderId, fileName, loadFilePermissions());
+    const earlyFileAcl = earlyFileEntry && normalizeFilePermissionEntry(earlyFileEntry);
+    if (!earlyOwner || earlyOwner.disabled || normalizeUserPermissions(earlyOwner).listFiles !== true
+      || (recipient !== null && (!earlyRecipient || earlyRecipient.disabled
+        || normalizeUserPermissions(earlyRecipient).listFiles !== true))
+      || !earlyFolder || !isFolderAvailable(folderId)
+      || isFileExpired(folderId, fileName) || isFileInTrash(folderId, fileName)
+      || isStoredVersionFile(folderId, fileName)
+      || restoreProviderOrphans.isSuppressed(folderId, fileName, "uploads")
+      || !prior || prior.folderId !== folderId || prior.fileName !== fileName
+      || !["user-key", "dual"].includes(prior.encryptionLevel)
+      || prior.algorithm !== "aes-256-gcm"
+      || !Number.isSafeInteger(prior.encryptedSize) || prior.encryptedSize < 1
+      || !earlyAcl || earlyAcl.owner !== owner || !Array.isArray(earlyAcl.authorizedUsers)
+      || !earlyAcl.authorizedUsers.includes(owner)
+      || (recipient !== null && !earlyAcl.authorizedUsers.includes(recipient))
+      || (earlyAcl.expiresAt !== null && earlyAcl.expiresAt !== undefined
+        && (!Number.isFinite(Date.parse(earlyAcl.expiresAt)) || Date.parse(earlyAcl.expiresAt) <= Date.now()))
+      || !earlyFileEntry || earlyFileEntry.public !== false || earlyFileAcl?.owner !== owner
+      || (recipient !== null && !earlyFileAcl.users?.[recipient]?.read)
+      || !hasFolderAccess({ user: earlyOwner }, earlyFolder)
+      || !hasFileAccess({ user: earlyOwner }, earlyFolder, fileName)
+      || (recipient !== null && (!hasFolderAccess({ user: earlyRecipient }, earlyFolder)
+        || !hasFileAccess({ user: earlyRecipient }, earlyFolder, fileName)))) return null;
+    // No path/mtime cache can substitute for the current ciphertext SHA-256.
+    const ciphertext = await currentP2pCiphertext(folderId, fileName, prior?.encryptedSize);
+    if (!ciphertext) return null;
+    const ownerUser = p2pUser(owner);
+    const recipientUser = recipient === null ? null : p2pUser(recipient);
+    if (!ownerUser || ownerUser.disabled || normalizeUserPermissions(ownerUser).listFiles !== true
+      || (recipient !== null && (!recipientUser || recipientUser.disabled
+        || normalizeUserPermissions(recipientUser).listFiles !== true))) return null;
+    const folder = getFolderById(folderId);
+    if (!folder || !isFolderAvailable(folderId) || isFileExpired(folderId, fileName)
+      || isFileInTrash(folderId, fileName) || isStoredVersionFile(folderId, fileName)
+      || restoreProviderOrphans.isSuppressed(folderId, fileName, "uploads")) return null;
+    const metadata = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const acl = metadata?.accessControl;
+    // Legacy hasFileAccess defaults an absent file-permissions record to
+    // public. A protected room may not treat missing/failed ACL storage as an
+    // affirmative recipient grant: require the private explicit owner ACL.
+    const fileAclEntry = getFilePermissionEntry(folderId, fileName, loadFilePermissions());
+    const fileAcl = fileAclEntry && normalizeFilePermissionEntry(fileAclEntry);
+    if (!metadata || metadata.folderId !== folderId || metadata.fileName !== fileName
+      || !["user-key", "dual"].includes(metadata.encryptionLevel)
+      || metadata.algorithm !== "aes-256-gcm"
+      || !Number.isSafeInteger(metadata.encryptedSize) || metadata.encryptedSize < 1
+      || !Number.isSafeInteger(metadata.size) || metadata.size < 1
+      || !Array.isArray(metadata.layers) || metadata.layers.length < 1
+      || typeof metadata.uploadedAt !== "string" || !Number.isFinite(Date.parse(metadata.uploadedAt))
+      || !acl || acl.owner !== owner || !Array.isArray(acl.authorizedUsers)
+      || !acl.authorizedUsers.includes(owner)
+      || !fileAclEntry || fileAclEntry.public !== false || fileAcl?.owner !== owner
+      || (recipient !== null && !fileAcl.users[recipient]?.read)
+      || (acl.expiresAt !== null && acl.expiresAt !== undefined &&
+        (!Number.isFinite(Date.parse(acl.expiresAt)) || Date.parse(acl.expiresAt) <= Date.now()))) return null;
+    const permitted = (user) => hasFolderAccess({ user }, folder) &&
+      hasFileAccess({ user }, folder, fileName);
+    if (!permitted(ownerUser) || (recipient !== null &&
+      (!acl.authorizedUsers.includes(recipient) || !permitted(recipientUser)))) return null;
+    if (metadata.encryptedSize !== ciphertext.bytes) return null;
+    // Ignore only mutable ACL membership and its timestamp. Every other
+    // security-relevant metadata field must remain byte-for-byte stable.
+    const { accessControl: _acl, updatedAt: _updatedAt, ...pinnedMetadata } = metadata;
+    const fingerprint = crypto.createHash("sha256")
+      .update(JSON.stringify(pinnedMetadata)).update(ciphertext.sha256).digest("hex");
+    if (pin !== null && fingerprint !== pin) return null;
+    return { fingerprint, ...ciphertext };
+  };
   const p2pBroker = makeBroker({
     sharedWss: wss,
     authenticateSession: (req) => {
@@ -6186,6 +6353,7 @@ function registerExperimentalP2p() {
       return recipient && !recipient.disabled && normalizeUserPermissions(recipient).listFiles === true
         ? { username: recipient.username, sessionVersion: recipient.sessionVersion || 0 } : null;
     },
+    authorizeObject: authorizeP2pObject,
   });
   const p2pDir = path.join(__dirname, "experiments", "issue242-webrtc");
   const p2pCsp = [
@@ -6205,14 +6373,20 @@ function registerExperimentalP2p() {
     app.get("/p2p/" + asset, authenticate, requirePermission("listFiles"), (_req, res) =>
       p2pHeaders(res).type("application/javascript").send(fs.readFileSync(path.join(p2pDir, asset))));
   }
-  app.post("/p2p/rooms", authenticate, requirePermission("listFiles"), (req, res) => {
+  app.post("/p2p/rooms", authenticate, requirePermission("listFiles"), async (req, res) => {
     if (req.get("origin") !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
       return res.status(403).json({ error: "Origin denied" });
     }
-    const result = p2pBroker.createRoom(req);
+    let result;
+    try { result = await p2pBroker.createRoom(req, res); }
+    catch {
+      if (res.destroyed) return;
+      return res.status(403).json({ error: "Sala indisponivel" });
+    }
+    if (res.destroyed) return;
     if (result.status !== 200) return res.status(result.status).json({ error: "Sala indisponivel" });
-    const { roomId, hostKey, expires } = result;
-    return p2pHeaders(res).json({ roomId, hostKey, expires });
+    const { roomId, hostKey, expires, boundObject } = result;
+    return p2pHeaders(res).json({ roomId, hostKey, expires, ...(boundObject ? { boundObject } : {}) });
   });
   server.once("close", () => { void p2pBroker.close(); });
 }
