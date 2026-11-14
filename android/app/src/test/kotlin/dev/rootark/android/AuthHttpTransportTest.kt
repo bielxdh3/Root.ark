@@ -264,7 +264,7 @@ class AuthHttpTransportTest {
 
         val jsonHuge = createValidSyncListing()
         jsonHuge.getJSONArray("objects").getJSONObject(0).getJSONObject("metadata").put("size", hugePositive)
-        assertFailsWith<SyncListingValidationException> {
+        assertThrows(SyncListingValidationException::class.java) {
             transport.projectList(jsonHuge)
         }
     }
