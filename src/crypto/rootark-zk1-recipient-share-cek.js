@@ -73,6 +73,8 @@ function snapshotAuthority(value) {
   const h = Object.getOwnPropertyDescriptors(headValue);
   if (["revision", "epoch", "digest"].some((key) =>
     !Object.hasOwn(h[key], "value"))
+    || !Number.isSafeInteger(h.revision.value) || h.revision.value < 0
+    || !Number.isSafeInteger(h.epoch.value) || h.epoch.value < 0
     || !(h.digest.value instanceof Uint8Array)
     || h.digest.value.length !== 32) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
@@ -85,7 +87,11 @@ function snapshotAuthority(value) {
     const d = Object.getOwnPropertyDescriptors(device);
     if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
-      || d.authorizationPublicKey.value.length !== 32) denyOffer();
+      || d.authorizationPublicKey.value.length !== 32
+      || !Number.isSafeInteger(d.enrolledEpoch.value) || d.enrolledEpoch.value < 0
+      || !(d.revokedAtEpoch.value === null
+        || (Number.isSafeInteger(d.revokedAtEpoch.value)
+          && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
     return { deviceId: d.deviceId.value,
       authorizationPublicKey: Buffer.from(d.authorizationPublicKey.value),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
@@ -169,6 +175,7 @@ async function createProtectedRecipientShareOffer(input) {
       || !same(Buffer.from(statement.grant_id || []), from64(grant.grantId, 32))
       || statement.expires_at !== grant.expiresAt
       || !Number.isSafeInteger(statement.issued_at) || statement.issued_at < 1
+      || statement.issued_at > d.nowSeconds.value + 30
       || !Number.isSafeInteger(statement.expires_at)
       || statement.expires_at <= Math.max(d.nowSeconds.value, statement.issued_at)
       || statement.expires_at - statement.issued_at > 86400
@@ -184,7 +191,7 @@ async function createProtectedRecipientShareOffer(input) {
       if (metadata[field] !== b64(statement[field])) denyOffer();
     }
     const signature = from64(grant.shareSignatureBase64, 64);
-    await verifyOfferAuthority(d.readIndependentAuthority.value,
+    const preAuthority = await verifyOfferAuthority(d.readIndependentAuthority.value,
       statement, statementBytes, signature, pin, issuerPin);
     // Existing owner ceremony verifies an independent owner pin, an authentic
     // V2 approval + PoP, witness receipt, matching signed X25519 roster key,
@@ -203,8 +210,10 @@ async function createProtectedRecipientShareOffer(input) {
       || envelope.core.owner_digest !== b64(statement.manifest_digest)
       || envelope.core.owner_epoch !== statement.epoch
       || envelope.core.epoch !== statement.epoch) denyOffer();
-    await verifyOfferAuthority(d.readIndependentAuthority.value,
+    const postAuthority = await verifyOfferAuthority(d.readIndependentAuthority.value,
       statement, statementBytes, signature, pin, issuerPin);
+    if (postAuthority.head.revision < preAuthority.head.revision
+      || postAuthority.head.epoch < preAuthority.head.epoch) denyOffer();
     // The independently verified second authority read can outlast the
     // owner-approved HPKE envelope even while the share grant remains valid.
     // Neither lease may expire before releasing the portable CEK offer.
@@ -359,10 +368,18 @@ async function openPortableProtectedRecipientShareFile(input) {
       || offer.authorizesProductionIo !== false
       || offer.externalCustodyProven !== false) deny();
     const grant = snapshot(offer.grant, GRANT);
-    const expectedGrant = snapshot(input.redeemInput?.grant, GRANT);
+    const redeemInput = inputDescriptors.redeemInput.value;
+    if (!redeemInput || typeof redeemInput !== "object") deny();
+    const redeemDescriptors = Object.getOwnPropertyDescriptors(redeemInput);
+    if (!["grant", "recipientUsername", "recipientDeviceId"].every((key) =>
+      Object.hasOwn(redeemDescriptors, key) && Object.hasOwn(redeemDescriptors[key], "value"))) deny();
+    const expectedGrant = snapshot(redeemDescriptors.grant.value, GRANT);
+    const recipientUsername = redeemDescriptors.recipientUsername.value;
+    const recipientDeviceId = redeemDescriptors.recipientDeviceId.value;
+    if (typeof recipientUsername !== "string" || typeof recipientDeviceId !== "string") deny();
     if (GRANT.some((key) => grant[key] !== expectedGrant[key])
-      || offer.recipientUsername !== input.redeemInput.recipientUsername
-      || offer.recipientDeviceId !== input.redeemInput.recipientDeviceId) deny();
+      || offer.recipientUsername !== recipientUsername
+      || offer.recipientDeviceId !== recipientDeviceId) deny();
     return await openProtectedRecipientShareFile({
       redeemInput: input.redeemInput, envelope: offer.envelope,
       authority: input.authority,
