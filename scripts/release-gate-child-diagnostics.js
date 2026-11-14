@@ -141,7 +141,21 @@ function summarizeFailedChildTests(child = {}) {
   }
   if (cursor < stdout.length) incomplete = true;
   tracker.finish();
-  if (!tracker.state.failures) return "";
+  if (!tracker.state.failures) {
+    // An abruptly terminated npm TAP child can exit 1 before emitting either
+    // a `not ok` record or aggregate footer. Existing failure-only telemetry
+    // then gives only a numeric progress ordinal. Preserve hashes of the last
+    // OBSERVED subtest/result (not a claim of the culprit) for safe comparison
+    // against the same repository revision. Never print child names/paths.
+    if (tracker.state.results > 0 && !tracker.state.plan) {
+      return (`CHILD_TAIL_HASH_V1 observed=${tracker.state.results}`
+        + ` subtests=${tracker.state.subtests}`
+        + ` lastResultSha256=${tracker.state.lastResultHash}`
+        + ` lastSubtestSha256=${tracker.state.lastSubtestHash}`
+        + " hintOnly=1").slice(0, 180);
+    }
+    return "";
+  }
   return (`CHILD_FAIL_HASH_V1 observed=${tracker.state.failures}`
     + ` hints=${safe.length} incomplete=${incomplete ? 1 : 0}\n`
     + safe.join("\n")).slice(0, 3000);
