@@ -9,6 +9,9 @@ const { join } = require('node:path');
 const net = require('node:net');
 const WebSocket = require('ws');
 const { makeBroker } = require('../server.cjs');
+const { createRealtimeAuthenticator, parseCookies } = require('../../../src/middlewares/auth');
+const jwt = require('jsonwebtoken');
+const { randomBytes } = require('node:crypto');
 const edge = process.env.EDGE_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const deadline = ms => Date.now() + ms;
@@ -76,6 +79,7 @@ async function run() {
   const profile = mkdtempSync(join(tmpdir(), 'rootark-242-edge-'));
   const debugPort = await port();
   const pages = [];
+  let sessionBroker;
   const edgeProcess = spawn(edge, [
     '--headless=new', '--disable-gpu', '--disable-extensions', '--no-first-run',
     '--no-default-browser-check', '--disable-background-networking',
@@ -196,6 +200,84 @@ async function run() {
     console.log('PASS Edge P2 flood: 256 zero-byte frames rejected and transfer aborted, 129 tiny chunks aborted, 257 verified text events bounded');
     console.log('Flood evidence:', JSON.stringify({ maxDiagnosticEntries: Math.max(...Object.values(afterFlood.lengths)),
       logLines: afterFlood.lines, logCharacters: afterFlood.characters, incomingChunksAfterAbort: postTiny.peers[0].incomingChunks }));
+    // RED/GREEN: real Root.ark JWT verifier, disposable users and three separate
+    // headless Edge cookie jars. No production secrets, accounts or storage.
+    const secret = randomBytes(48).toString('hex');
+    const users = new Map(['alice', 'bob', 'carol', 'eve'].map(username =>
+      [username, { username, role: 'user', sessionVersion: 1, totpEnabled: true, permissions: {} }]));
+    const verifier = createRealtimeAuthenticator({
+      jwt, jwtSecret: secret, loadUser: username => users.get(username),
+      normalizeUserPermissions: user => user.permissions
+    });
+    sessionBroker = makeBroker({ authenticateSession: req =>
+      verifier(parseCookies(req.headers.cookie).get('rootark_session')) });
+    const authOrigin = await sessionBroker.listen();
+    const version = await (await fetch(base + '/json/version')).json();
+    const browser = await new Cdp(version.webSocketDebuggerUrl).connect();
+    pages.push(browser);
+    const contexts = [];
+    async function signedPage(username) {
+      const { browserContextId } = await browser.call('Target.createBrowserContext');
+      contexts.push(browserContextId);
+      const { targetId } = await browser.call('Target.createTarget', {
+        url: 'about:blank', browserContextId
+      });
+      const target = await until(async () => {
+        const items = await (await fetch(base + '/json/list')).json();
+        return items.find(item => item.id === targetId);
+      }, 'isolated auth tab not found');
+      const page = await new Cdp(target.webSocketDebuggerUrl).connect();
+      pages.push(page);
+      await page.call('Network.enable');
+      await page.call('Network.setCookie', {
+        name: 'rootark_session', value: jwt.sign({ username, sessionVersion: 1 },
+          secret, { algorithm: 'HS256', expiresIn: '5m' }),
+        url: authOrigin, httpOnly: true, sameSite: 'Lax'
+      });
+      await page.call('Page.enable');
+      await page.call('Page.navigate', { url: authOrigin });
+      await until(() => page.evaluate('Boolean(document.readyState==="complete" && window.__poc)'), 'auth page not loaded');
+      return page;
+    }
+    const alice = await signedPage('alice');
+    const bob = await signedPage('bob');
+    const carol = await signedPage('carol');
+    const eve = await signedPage('eve');
+    await alice.evaluate('window.__poc.createRoom()');
+    const roomId = await until(() => alice.evaluate('window.__poc.snapshot().role==="host" && window.__poc.snapshot().roomId'), 'signed host not joined');
+    async function signedInvite(recipient) {
+      await alice.evaluate('window.__poc.invite(' + JSON.stringify(recipient) + ')');
+      return until(() => alice.evaluate('window.__poc.invitations().at(-1)?.recipient===' +
+        JSON.stringify(recipient) + ' && window.__poc.invitations().at(-1)?.invitation'), 'targeted invite not issued');
+    }
+    const bobInvite = await signedInvite('bob');
+    await eve.evaluate('window.__poc.joinRoom(' + JSON.stringify(roomId) + ',' + JSON.stringify(bobInvite) + ')');
+    await until(() => eve.evaluate('window.__poc.snapshot().diagnostics.rejected.includes("INVALID_INVITE")'), 'wrong signed identity accepted');
+    async function signedJoin(page, invitation, username, expectedCount) {
+      await page.evaluate('window.__poc.joinRoom(' + JSON.stringify(roomId) + ',' + JSON.stringify(invitation) + ')');
+      await until(() => page.evaluate('window.__poc.snapshot().role==="guest"'), username + ' session not joined');
+      await until(() => page.evaluate('Boolean(document.querySelector("[data-testid=accept-peer]"))'), username + ' peer consent missing');
+      assert.equal(await page.evaluate('window.__poc.snapshot().peers.length'), 0, 'consent must precede RTC offer');
+      await page.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
+      await until(() => page.evaluate('window.__poc.snapshot().peers.some(x=>x.channel==="open")'), username + ' DataChannel failed', 18000);
+      await until(() => alice.evaluate('window.__poc.snapshot().peers.filter(x=>x.channel==="open").length===' + expectedCount),
+        'signed host missing channel', 18000);
+    }
+    await signedJoin(bob, bobInvite, 'bob', 1);
+    const carolInvite = await signedInvite('carol');
+    await signedJoin(carol, carolInvite, 'carol', 2);
+    await alice.evaluate('window.__poc.sendFile(new File([Uint8Array.from({length:32768},(_,i)=>i%239)],"scoped.bin"))');
+    for (const page of [bob, carol]) {
+      await until(() => page.evaluate('Boolean(document.querySelector("[data-testid=accept-file]"))'), 'scoped file consent missing');
+      await page.evaluate('document.querySelector("[data-testid=accept-file]").click()');
+      await until(() => page.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.some(x=>x.name==="scoped.bin")'),
+        'signed file digest mismatch', 18000);
+    }
+    users.get('bob').sessionVersion = 2;
+    await until(() => bob.evaluate('window.__poc.snapshot().peers.length===0'), 'revoked user RTC not closed', 6000);
+    await until(() => alice.evaluate('window.__poc.snapshot().peers.length===1'), 'revoked peer remains in host', 6000);
+    console.log('PASS Edge signed-session 1:N: cross-user invite denial, per-guest consent, 2 SHA-256 files, live session revocation');
+    for (const id of contexts) await browser.call('Target.disposeBrowserContext', { browserContextId: id });
     console.log('PASS Edge actual WebRTC DataChannel: 1:1 and 1:2, per-guest consent, text SHA-256 and 32KiB fixture SHA-256');
     console.log('Evidence:', JSON.stringify({ browser: 'Microsoft Edge headless', guests: 2,
       channelOpen: 2, verifiedTexts: 2, verifiedFiles: 2, fileBytesPerGuest: 32768,
@@ -203,6 +285,7 @@ async function run() {
   } finally {
     for (const page of pages) page.close();
     edgeProcess.kill();
+    if (sessionBroker) await sessionBroker.close();
     await broker.close();
     // Process may own the transient profile briefly while Chromium child processes close.
     try { rmSync(profile, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }); }
