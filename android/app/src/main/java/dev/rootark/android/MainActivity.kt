@@ -31,15 +31,22 @@ class MainActivity : Activity() {
     private var securePreviewText: TextView? = null
     private var sessionCanListFiles = false
     @Volatile private var generation = 0
+    @Volatile private var isForeground = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(null)
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         showLogin()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isForeground = true
     }
 
     override fun onStop() {
         super.onStop()
+        isForeground = false
         generation++
         clearSensitiveState()
         showLogin()
@@ -208,19 +215,25 @@ class MainActivity : Activity() {
             text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
         } else {
             button(layout, "Abrir texto verificado") {
-                val requestGeneration = generation + 1
-                runRequest({
-                    preview.open(origin, session, objectId) { generation == requestGeneration }
+                runRequest({ stillActive ->
+                    preview.open(origin, session, objectId, stillActive)
                 }) { characters, failure ->
                     if (characters != null) {
                         try {
                             val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")
-                            securePreviewText = text(view, String(characters)).apply {
+                            securePreviewText = TextView(this).apply {
+                                setText(characters, 0, characters.size)
                                 isSaveEnabled = false
                                 importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
                                 setTextIsSelectable(false)
+                                setPadding(0, 0, 0, (16 * resources.displayMetrics.density).toInt())
                             }
-                            button(view, "Fechar conteúdo") { showSession() }
+                            view.addView(securePreviewText)
+                            button(view, "Fechar conteúdo") {
+                                securePreviewText?.text = ""
+                                securePreviewText = null
+                                showSession()
+                            }
                         } finally {
                             characters.fill('\u0000')
                         }
@@ -235,25 +248,29 @@ class MainActivity : Activity() {
         button(layout, "Voltar") { showSession() }
     }
 
-    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) {
-        val started = ++generation
+    private fun <T> runRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
+        val startedGeneration = ++generation
+        val stillActive = { isForeground && generation == startedGeneration && !isFinishing && !isDestroyed }
         screen("Conectando", "Aguardando resposta do servidor...")
         Thread {
             var response: T? = null
             var failure: Exception? = null
             try {
-                response = operation()
+                response = operation(stillActive)
             } catch (caught: Throwable) {
                 failure = if (caught is Exception) caught else RuntimeException(caught)
             }
             val completedResponse = response
             val completedFailure = failure
             runOnUiThread {
-                if (generation == started && !isFinishing && !isDestroyed) done(completedResponse, completedFailure)
+                if (stillActive()) done(completedResponse, completedFailure)
                 else if (completedResponse is CharArray) completedResponse.fill('\u0000')
             }
         }.start()
     }
+
+    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) =
+        runRequest({ _ -> operation() }, done)
 
     private fun errorText(error: Exception?): String = when ((error as? RootArkApiException)?.statusCode) {
         401, 400 -> "Credenciais ou código inválidos."
