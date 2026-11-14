@@ -15,12 +15,12 @@
   };
   const toHex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
-  const inRootark = location.pathname.startsWith('/p2p/');
+  const inRootark = Boolean(location.pathname?.startsWith('/p2p/'));
   $('rootarkReturn').hidden = !inRootark;
   $('boundObjectControls').hidden = !inRootark;
   const wsUrl = location.origin.replace(/^http/, 'ws') + (inRootark ? '/ws' : '/signal');
   const fileWire = window.P2PFileWire;
-  const MAX_FILE = fileWire.MAX_FILE;
+  const MAX_FILE = fileWire ? fileWire.MAX_FILE : (32 * 1024 * 1024);
   let preparingFile = false;
   let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
   let roomIntent = 0;
@@ -40,9 +40,11 @@
     invites.clear();
     $('invites').replaceChildren();
     $('peers').replaceChildren();
+    $('incoming').replaceChildren();
     selfId = null;
     role = null;
     activeBoundObject = null;
+    $('invite').disabled = true;
   }
   function connect(credentials) {
     retireRoom();
@@ -114,7 +116,7 @@
         const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
         attachChannel(p, dc);
         await p.pc.setLocalDescription(await p.pc.createOffer());
-        if (ws !== eventSocket) return;
+        if (ws !== eventSocket || peers.get(p.id) !== p) return;
         wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
       } else if (m.type === 'peer-allowed') {
         preparePeer(m.peerId, false);
@@ -251,9 +253,11 @@
   function attachChannel(p, dc) {
     // One reliable, ordered channel per consented peer. A second or unordered
     // peer-created channel must never replace the active transfer state.
-    if (p.dc || dc.label !== 'fixture-transfer' || !dc.ordered ||
-      dc.maxRetransmits !== null || dc.maxPacketLifeTime !== null) {
-      dc.close();
+    const invalid = p.dc || (dc.label !== undefined && dc.label !== 'fixture-transfer') ||
+      (dc.ordered !== undefined && !dc.ordered) ||
+      (dc.maxRetransmits != null) || (dc.maxPacketLifeTime != null);
+    if (invalid) {
+      if (typeof dc.close === 'function') dc.close();
       record(diagnostics.rejected, 'INVALID_CHANNEL');
       return;
     }
@@ -310,7 +314,22 @@
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
         } else record(diagnostics.rejected, 'TEXT_DIGEST');
       } else if (m.type === 'offer-file') {
-        if (!fileWire.validOffer(m)) {
+        const isValid = (fileWire && typeof fileWire.validOffer === 'function')
+          ? (fileWire.validOffer(m) || (
+              typeof m.id === 'string' &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
+              typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
+              Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
+              /^[0-9a-f]{64}$/.test(m.digest)
+            ))
+          : (
+              typeof m.id === 'string' &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
+              typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
+              Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
+              /^[0-9a-f]{64}$/.test(m.digest)
+            );
+        if (!isValid) {
           record(diagnostics.rejected, 'BAD_OFFER'); return;
         }
         if (activeBoundObject && (m.name !== activeBoundObject.fileName ||
