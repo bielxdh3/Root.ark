@@ -1,6 +1,91 @@
 # Root.ark Android client (paged metadata + trust-gated protected text prototype)
 
-Status: **native HTTPS login + 2FA, bounded metadata-only pagination, temporary session-scoped offline metadata browsing, and a per-row trust-gated protected-text action.** The offline screen can display up to eight previously fetched, authenticated HTTPS pages when connectivity fails. It explicitly marks them as historical, unsigned, advisory metadata; it never offers a cached protected-content action. The snapshot exists only in process memory, uses an independently generated login nonce for account/origin/session binding, and is cleared on logout, session rejection, or backgrounding. It is not available after restart. Pagination uses the separate PR #255 server endpoint, and the app only attempts Ed25519/AES-GCM verification when an independently trusted grant/CEK has been provisioned. No such provider is installed: the actual UI shows the protected viewer as **blocked**. This is an incremental prototype, not an Android production release. No emulator/physical Android runtime or hardware Keystore verification has been performed; device enrollment, CEK delivery, recovery and sync writes remain out of scope. The architecture gates in `docs/architecture/android-client-architecture.md` remain open.
+Status: **native HTTPS login + 2FA, bounded metadata-only pagination, temporary session-scoped offline metadata browsing, one-object encrypted ciphertext staging, and a per-row trust-gated protected-text action.** The offline screen can display up to eight previously fetched, authenticated HTTPS metadata pages when connectivity fails. They are explicitly historical, unsigned, advisory metadata. The optional ciphertext action downloads a single signed-envelope candidate (maximum 4 MiB over authenticated HTTPS) and encrypts the exact bytes with Android Keystore AES-256-GCM in the app's private, excluded-from-backup directory. Local SHA-256, GCM authentication, manifest/ciphertext digests, account, origin, per-login nonce, claimed device/revision/epoch, and object/version binding prevent local corruption and cross-session reuse. **The transport's signature, claimed device/epoch and current grant are NOT independently verified; no ciphertext is exposed for offline decrypt or rendered as plaintext.** There is no trusted Android CEK/device enrollment provider installed. The cache has room for one object and can be replaced by another; it is wiped with the Keystore key on logout, 401/403, relevant 409, app backgrounding and next startup. It is unavailable after restart. No hardware Keystore assurance has been measured. This remains an incremental, unreleased Android prototype. The architecture gates in `docs/architecture/android-client-architecture.md` remain open.
+
+## Bounded owner-pinned CEK admission (development library, not UI enrollment)
+
+The pure JVM OwnerPinnedOfflineAdmission verifies a separately pinned
+Ed25519 owner SPKI, an exact owner revision/digest imported through an
+independent operator channel, a signed owner device-revocation head, and a
+separately signed single-object CEK read grant. The grant binds HTTPS origin,
+account, local reader device, issuer device SPKI, object/file/version,
+compartment, epoch, a 32-byte CEK digest, nonce, and a maximum five-minute
+validity window. A revoked reader or issuer is denied. The disposable CEK is
+wiped on every path; unsigned login and sync HTTP records cannot bootstrap
+trust. Kotlin verifies real Node-issued Ed25519 fixture bytes.
+
+OwnerPinnedOfflineImport parses two bounded strict RFC 8259 JSON files and
+rejects duplicate or unexpected keys before signature verification.
+OwnerOfflineFloorStore seals the latest seen owner revision/digest/clock
+under injected AES-GCM. A persistent cross-process file lock serializes
+floor read/compare/atomic write; file and directory sync are mandatory, and
+an unavailable lock or filesystem sync fails closed. The sealed `OFLOOR2`
+record binds the owner revision/digest/clock to the stable OS lock-file
+identity (dev/inode on Android/Linux). **Pathname-only identity is not proof
+of the identity of a held FileChannel**: under an attacker-controlled
+transient A→B→A rename during `open`, both path stats can report A even
+while a second process successfully locks inode B. For the Android adapter
+the lock must therefore be opened with Android `Os.open` using
+`O_NOFOLLOW|O_CLOEXEC` (and `O_CREAT|O_EXCL` on first enrollment), with
+the same open descriptor bound to its `Os.fstat` dev/inode **before** floor
+decryption and CEK consumption. Missing or unequal descriptor identity
+denies; the file channel holding the lock is derived from that descriptor.
+No further asynchronous pathname check is treated as descriptor evidence.
+Android's `FileOutputStream(FileDescriptor)` wrapper does **not** own the
+descriptor returned by `Os.open`. After the OS lock and FileChannel are
+released, the adapter explicitly calls `Os.close` once; early open/fstat
+failures also close the raw FD. The JVM lifecycle tests count native-close
+callbacks and inject wrapper failures but do **not** constitute Android
+runtime FD-leak or EMFILE instrumentation.
+
+The default pure-JVM `FileChannel.open` compatibility path has **no
+descriptor identity proof**. It is suitable only for a **non-hostile,
+app-private directory** whose pathnames cannot be unlinked or replaced by
+an adversary during an admission; it is **NOT** safe under the hostile
+same-UID/local-filesystem rename threat. The standalone two-process
+adversarial test creates a genuine A→B→A replacement while a separate JVM
+holds A and verifies the descriptor-attested admission refuses B. That
+test uses a controlled captured B identity, **not native Android fstat**;
+there is no Android device, SELinux, filesystem isolation, or native
+fstat/Keystore instrumentation proof. A real Android integration release
+still requires those checks and independent owner monotonic custody;
+neither this JVM test nor hardware AES-GCM provides rollback resistance.
+Old `OFLOOR1` records lack an authenticated lock identity and are
+**not implicitly migrated**: they require explicit operator reprovisioning.
+A single
+first-write privilege is available only when the Android adapter creates a
+**new** hardware-backed Keystore key with no existing floor; existing
+Keystore key + missing floor and missing key + existing floor both deny.
+Hardware KeyInfo must also confirm user authentication and a bounded validity
+window. This rejects routine stale/revoked grants, removed or replaced lock
+state, concurrent writers and corrupted state without exposing the CEK. A
+two-process JDK 17 test holds a lock on the old inode while removing and
+replacing its pathname and verifies no new authority or floor regression.
+JVM tests
+use a disposable software key and explicit first-write privilege; no CEK or
+private signing key is persisted.
+
+**Important boundary:** MainActivity still keeps TrustedContentGrantProvider
+absent and does not enable protected offline plaintext. The signer and reader
+enrollment, current owner head/pins, Keystore level, user presence, lease
+duration, Android API 29 compatibility, device revocation propagation and
+physical custody still require independent operator/device validation. A
+saved AES-GCM floor and inode identity are **not** a hardware rollback-resistant monotonic
+counter: restoring a previously valid sealed floor together with an old
+externally held owner pin, or restoring the whole Keystore/OS snapshot, remains
+outside this local guarantee and requires independently retained monotonic
+owner-head evidence. Lost local state cannot silently re-enroll; explicit
+operator re-provisioning and physical acceptance remain prerequisites.
+A device that stays offline cannot discover a later revocation; expired or
+missing external head authority must be rejected. This library cannot turn
+a self-asserted server head into trusted enrollment.
+
+Interop fixtures: run
+node scripts/issue-64-owner-pinned-grant-fixture.js --write to generate
+signed public-only test vectors (no private signing key or raw CEK).
+node --test test/issue-64-owner-pinned-grant-http.test.js exercises disposable
+signed HTTP replies. JDK 17 and Android Gradle tests are normal build gates;
+scripts/issue-64-owner-pin-jvm-smoke.sh is a disposable WSL JVM fallback.
 
 ## Layout
 
