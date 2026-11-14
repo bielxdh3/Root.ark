@@ -12,8 +12,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
+import dev.rootark.core.sync.InventoryPage
+import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
-import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.RootArkApiException
 
 /** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
@@ -147,31 +148,67 @@ class MainActivity : Activity() {
         text(layout, "Listagem de metadados. Conteúdo protegido só é aberto após verificação local e autorização independente.")
         if (message != null) text(layout, message)
         if (sessionCanListFiles) {
-            button(layout, "Listar arquivos (somente leitura)") { loadFileList() }
+            button(layout, "Listar arquivos (somente leitura)") { loadInventoryPage() }
         } else {
             text(layout, "Esta conta não possui permissão listFiles.")
         }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
-    private fun loadFileList() {
+    data class InventoryPagingTracker(
+        val cursor: String? = null,
+        val pageNumber: Int = 1,
+        val usedCursors: Set<String> = emptySet(),
+    ) {
+        fun advance(nextCursor: String?): InventoryPagingTracker {
+            val updatedUsed = if (cursor != null) usedCursors + cursor else usedCursors
+            return InventoryPagingTracker(
+                cursor = nextCursor,
+                pageNumber = pageNumber + 1,
+                usedCursors = updatedUsed,
+            )
+        }
+
+        fun isValid(): Boolean {
+            val currentCursor = cursor ?: return pageNumber == 1
+            if (pageNumber <= 1 || pageNumber > 100_000) return false
+            return runCatching { PagedInventoryPolicy.checkCursor(currentCursor, usedCursors) }.isSuccess
+        }
+    }
+
+    private fun loadInventoryPage(tracker: InventoryPagingTracker = InventoryPagingTracker()) {
         if (!sessionCanListFiles) return
         val origin = activeOrigin ?: return
         val token = sessionToken ?: return
-        runRequest({ transport.listSyncObjects(origin, token) }) { rows, failure ->
-            if (rows != null) {
-                showFileList(rows)
+        if (!tracker.isValid()) {
+            showSession("Cursor de inventário inválido. Reinicie a listagem.")
+            return
+        }
+        val currentCursor = tracker.cursor
+        val used = tracker.usedCursors
+        runRequest({ transport.listInventoryPage(origin, token, currentCursor, used) }) { page, failure ->
+            if (page != null) {
+                val nextTracker = tracker.advance(page.nextCursor)
+                val next = page.nextCursor
+                if (next != null && runCatching {
+                    PagedInventoryPolicy.checkCursor(next, nextTracker.usedCursors)
+                }.isFailure) {
+                    showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
+                } else {
+                    showInventoryPage(page, tracker.pageNumber, nextTracker)
+                }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                 403 -> showSession("Servidor negou acesso à lista (403).")
+                409 -> showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
                 else -> {
                     val message = when (failure) {
                         is SyncListingLimitException ->
-                            "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
+                            "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
                         is SyncListingValidationException ->
-                            "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+                            "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
                         else ->
-                            "Não foi possível carregar a lista. A resposta pode exceder o limite do protótipo (1 MiB / 128 registros)."
+                            "Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros)."
                     }
                     showSession(message)
                 }
@@ -179,10 +216,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showFileList(rows: List<ReadOnlyFileRow>) {
-        val layout = screen("Arquivos · somente leitura", "${rows.size} registro(s) de sincronização. Nenhum conteúdo descriptografado.")
-        if (rows.isEmpty()) text(layout, "Nenhum registro disponível.")
-        for (row in rows) {
+    private fun showInventoryPage(page: InventoryPage, pageNumber: Int, nextTracker: InventoryPagingTracker) {
+        val layout = screen("Inventário · página $pageNumber", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
+        if (page.rows.isEmpty()) text(layout, "Nenhum registro disponível.")
+        for (row in page.rows) {
             text(layout, row.name + if (row.deleted) " (excluído)" else "")
             val details = listOfNotNull(
                 row.path?.let { "Caminho: $it" },
@@ -190,9 +227,13 @@ class MainActivity : Activity() {
                 row.contentType?.let { "Tipo: $it" },
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
-            if (!row.deleted) button(layout, "Conteúdo protegido") { showProtectedObject(row.objectId) }
+            if (!row.deleted) button(layout, "Conteúdo protegido") {
+                showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, nextTracker) }
+            }
         }
-        button(layout, "Atualizar lista") { loadFileList() }
+        val next = nextTracker.cursor
+        if (next != null) button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
+        button(layout, "Atualizar desde o início") { loadInventoryPage() }
         button(layout, "Voltar") { showSession() }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
@@ -205,7 +246,7 @@ class MainActivity : Activity() {
      */
     private fun independentlyProvisionedGrantProvider(): TrustedContentGrantProvider? = null
 
-    private fun showProtectedObject(objectId: String) {
+    private fun showProtectedObject(objectId: String, backToPage: () -> Unit) {
         val origin = activeOrigin ?: return showLogin()
         val session = authenticatedSession ?: return showLogin()
         if (!sessionCanListFiles) return showSession("Sem permissão para ler arquivos.")
@@ -232,7 +273,7 @@ class MainActivity : Activity() {
                             button(view, "Fechar conteúdo") {
                                 securePreviewText?.text = ""
                                 securePreviewText = null
-                                showSession()
+                                backToPage()
                             }
                         } finally {
                             characters.fill('\u0000')
@@ -245,7 +286,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        button(layout, "Voltar") { showSession() }
+        button(layout, "Voltar") { backToPage() }
     }
 
     private fun <T> runCheckedRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
