@@ -56,9 +56,15 @@ function args(argv) {
     const separator = item.indexOf("=");
     const key = item.slice(2, separator < 0 ? undefined : separator);
     if (Object.hasOwn(result, key)) throw new Error(`Invalid Sync v2 duplicate --${key}`);
-    if (key === "once" && separator < 0) {
-      const next = argv[index + 1];
-      result.once = next === "true" || next === "false" ? (index++, next === "true") : true;
+    if (key === "once") {
+      if (separator < 0) {
+        const next = argv[index + 1];
+        result.once = next === "true" || next === "false" ? (index++, next === "true") : true;
+      } else {
+        const value = item.slice(separator + 1);
+        if (value !== "true" && value !== "false") throw new Error("Invalid Sync v2 --once value");
+        result.once = value === "true";
+      }
     } else if (valuedOptions.has(key)) {
       const value = separator < 0 ? argv[index + 1] : item.slice(separator + 1);
       if (!value || (separator < 0 && value.startsWith("--"))) {
@@ -85,7 +91,7 @@ async function readConfig(filePath) {
   const privateKeyBytes = process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY ? Buffer.from(process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY, "base64url") : null;
   const publicKey = process.env.ROOTARK_SYNC_DEVICE_PUBLIC_KEY || "";
   if (!privateKeyBytes || !publicKey) throw new Error("Sync v2 requires device signing keys held only in memory");
-  return { ...config, ...policy, serverUrl: normalizeTrustedSyncServerUrl(config.serverUrl), localFolder: path.resolve(config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
+  return { ...config, ...policy, serverUrl: normalizeTrustedSyncServerUrl(config.serverUrl), localFolder: path.resolve(path.dirname(filePath), config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
 }
 
 function fileKeyResolver(master, fallbackEpoch) {
