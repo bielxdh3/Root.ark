@@ -10,6 +10,23 @@ const test = require("node:test");
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
 
+function assertOnlyHeaderSharePrefix(source) {
+  const shareMountDeclarations = [...source.matchAll(/app\.use\(\s*["']\/share["']\s*,/g)];
+  assert.equal(shareMountDeclarations.length, 1,
+    "a second share prefix mount must fail even when formatted differently");
+  const shareMounts = [...source.matchAll(/app\.use\("\/share",\s*([\s\S]*?\n\}\);)/g)];
+  assert.equal(shareMounts.length, 1,
+    "exactly one header-only share prefix middleware is permitted");
+  const actual = shareMounts[0][1].replace(/\/\/[^\n]*/g, "").replace(/\s+/g, "");
+  assert.equal(actual, '(req,res,next)=>{'
+    + 'res.setHeader("Cache-Control","no-store");'
+    + 'res.setHeader("Pragma","no-cache");'
+    + 'res.setHeader("Referrer-Policy","no-referrer");'
+    + 'res.setHeader("X-Robots-Tag","noindex,nofollow,noarchive");'
+    + 'next();});',
+  "share prefix mount must never apply a rate limiter or other request middleware");
+}
+
 test("rate limits are passed directly to each protected route handler", () => {
   const source = fs.readFileSync(SERVER, "utf8");
   const routeMiddleware = [
@@ -52,7 +69,24 @@ test("rate limits are passed directly to each protected route handler", () => {
     ["/open-file", ['app.get("/open-file/:token/:name", openFileRedemptionRateLimit,']],
   ];
   for (const [mountPath, handlers] of routeMiddleware) {
-    assert.equal(source.includes(`app.use("${mountPath}",`), false, `${mountPath} must not use a prefix mount`);
+    if (mountPath === "/share") {
+      // A /share prefix middleware is allowed ONLY for constant response
+      // security headers. A prefix rate limiter would collapse the separate
+      // route counters; every sensitive endpoint must retain its own handler.
+      assertOnlyHeaderSharePrefix(source);
+      for (const forbidden of [
+        'app.use("/share", shareRateLimit);',
+        "app.use('/share', shareRateLimit);",
+        "app.use( '/share', shareRateLimit);",
+      ]) {
+        assert.throws(() => assertOnlyHeaderSharePrefix(`${source}\n${forbidden}`),
+          /a second share prefix mount/,
+          `a hidden prefix limiter must not pass the source-level oracle: ${forbidden}`);
+      }
+    } else {
+      assert.equal(source.includes(`app.use("${mountPath}",`), false,
+        `${mountPath} must not use a prefix mount`);
+    }
     for (const handler of handlers) assert.ok(source.includes(handler), `missing direct middleware on ${handler}`);
   }
 });
