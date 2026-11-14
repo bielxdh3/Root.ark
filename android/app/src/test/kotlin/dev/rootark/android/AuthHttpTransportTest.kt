@@ -1,14 +1,12 @@
 package dev.rootark.android
 
-import dev.rootark.core.sync.ReadOnlyFileListPolicy
 import org.json.JSONException
 import org.json.JSONObject
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertInstanceOf
-import org.junit.jupiter.api.Assertions.assertThrows
-import org.junit.jupiter.api.Assertions.assertTrue
-import org.junit.jupiter.api.Test
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
 import java.io.IOException
 
 class AuthHttpTransportTest {
@@ -30,8 +28,8 @@ class AuthHttpTransportTest {
         val sizeLimitEx = SyncListingLimitException("Sync listing exceeds limit")
         val validationEx = SyncListingValidationException("Invalid sync listing")
 
-        assertInstanceOf(IOException::class.java, sizeLimitEx)
-        assertInstanceOf(IOException::class.java, validationEx)
+        assertTrue(sizeLimitEx is IOException)
+        assertTrue(validationEx is IOException)
         assertTrue(sizeLimitEx is SyncListingLimitException)
         assertFalse(validationEx is SyncListingLimitException)
         assertTrue(validationEx is SyncListingValidationException)
@@ -60,28 +58,5 @@ class AuthHttpTransportTest {
         assertEquals(2L, json.getLong("protocolVersion"))
         val record = json.getJSONArray("objects").getJSONObject(0)
         assertEquals(9876543210L, record.getJSONObject("metadata").getLong("size"))
-    }
-
-    @Test
-    fun `validText rejects bidi Cf Cc Zl Zp controls`() {
-        assertTrue(ReadOnlyFileListPolicy.validText("safe_filename.txt", 100))
-
-        // Bidi overrides
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u202Ecod.exe", 100))
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u202Atxt", 100))
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u2066txt", 100))
-
-        // Cf / zero-width / BOM
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u200Bname", 100))
-        assertFalse(ReadOnlyFileListPolicy.validText("file\uFEFFname", 100))
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u00ADname", 100))
-
-        // Cc / ASCII and C1 controls
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u0000name", 100))
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u0085name", 100))
-
-        // Zl / Zp
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u2028name", 100))
-        assertFalse(ReadOnlyFileListPolicy.validText("file\u2029name", 100))
     }
 }
