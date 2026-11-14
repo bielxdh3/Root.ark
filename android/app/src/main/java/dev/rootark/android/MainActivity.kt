@@ -166,7 +166,17 @@ class MainActivity : Activity() {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                 403 -> showSession("Servidor negou acesso à lista (403).")
                 409 -> showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
-                else -> showSession("Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros).")
+                else -> {
+                    val message = when (failure) {
+                        is SyncListingLimitException ->
+                            "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
+                        is SyncListingValidationException ->
+                            "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
+                        else ->
+                            "Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros)."
+                    }
+                    showSession(message)
+                }
             }
         }
     }
@@ -198,8 +208,8 @@ class MainActivity : Activity() {
             var failure: Exception? = null
             try {
                 response = operation()
-            } catch (caught: Exception) {
-                failure = caught
+            } catch (caught: Throwable) {
+                failure = if (caught is Exception) caught else RuntimeException(caught)
             }
             runOnUiThread {
                 if (generation == started && !isFinishing && !isDestroyed) done(response, failure)
