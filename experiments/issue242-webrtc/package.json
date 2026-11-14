@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.cjs",
     "test": "node --test tests/signal.test.cjs tests/session.test.cjs tests/transfer.test.cjs",
-    "test:browser": "node tests/browser.cjs"
+    "test:browser": "node tests/browser.cjs",
+    "test:app-browser": "node tests/app-browser.cjs"
   },
   "dependencies": {
     "jsonwebtoken": "9.0.3",

@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>#242 | Disposable WebRTC Room</title>
+<title>Transferência experimental · Root.ark</title>
 <style>
   body{font:16px system-ui,Arial;max-width:750px;margin:2rem auto;padding:0 1rem;color:#171717;background:#fafafa}
   button,input{font:inherit;padding:.5rem;margin:.2rem;max-width:95%}
@@ -11,8 +11,9 @@
   #events{white-space:pre-wrap;overflow-wrap:anywhere;min-height:80px}
   small{color:#555}
 </style>
-<h1>WebRTC room experiment #242</h1>
-<p>Somente loopback, dados de teste selecionados pelo navegador, sem Root.ark storage. Credenciais nunca entram no link.</p>
+<h1>Transferência direta experimental</h1>
+<p id="rootarkReturn" hidden><a href="/index.html">Voltar aos arquivos Root.ark</a></p>
+<p>Sem STUN/TURN: conexão fora do mesmo host não é garantida. Selecione apenas arquivos que deseja compartilhar; nenhum arquivo armazenado no Root.ark é carregado automaticamente. Credenciais nunca entram no link.</p>
 <fieldset>
   <legend>Sala temporária</legend>
   <button id="create">Criar sala (host)</button>
@@ -45,6 +46,6 @@
 <p id="state">Sem conexão</p>
 <pre id="events" aria-live="polite"></pre>
 <small>O destinatário deve aceitar o arquivo. Baixe somente após SHA-256 OK. O limite é 32 MiB por arquivo, em memória; não testa TURN, NAT externo, retomada nem armazenamento permanente. Autenticação Root.ark somente no modo de sessão assinado.</small>
-<script src="/transfer-protocol.js"></script>
-<script src="/client.js"></script>
+<script src="transfer-protocol.js"></script>
+<script src="client.js"></script>
 </html>

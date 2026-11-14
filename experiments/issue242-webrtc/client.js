@@ -15,7 +15,9 @@
   };
   const toHex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
-  const wsUrl = location.origin.replace(/^http/, 'ws') + '/signal';
+  const inRootark = location.pathname.startsWith('/p2p/');
+  $('rootarkReturn').hidden = !inRootark;
+  const wsUrl = location.origin.replace(/^http/, 'ws') + (inRootark ? '/ws' : '/signal');
   const fileWire = window.P2PFileWire;
   const MAX_FILE = fileWire ? fileWire.MAX_FILE : (32 * 1024 * 1024);
   const BUFFER_HIGH = 256 * 1024;
@@ -471,7 +473,14 @@
     log('Texto enviado a ' + count + ' destinatário(s)');
   }
   async function createRoom() {
-    const response = await fetch('/rooms', { method: 'POST' });
+    const headers = {};
+    if (inRootark) {
+      const csrf = document.cookie.split(';').map(value => value.trim())
+        .find(value => value.startsWith('rootark_csrf='));
+      if (csrf) headers['X-CSRF-Token'] = csrf.slice('rootark_csrf='.length);
+    }
+    const response = await fetch(inRootark ? '/p2p/rooms' : '/rooms',
+      { method: 'POST', headers, credentials: 'same-origin' });
     if (!response.ok) throw new Error('room creation failed');
     const result = await response.json();
     ({ roomId, hostKey } = result);

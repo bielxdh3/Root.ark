@@ -66,7 +66,7 @@ function clientFixture() {
     TextDecoder,
     Uint8Array,
     ArrayBuffer,
-    location: { origin: 'http://127.0.0.1:1234' },
+    location: { origin: 'http://127.0.0.1:1234', pathname: '/' },
     setTimeout,
     console
   };

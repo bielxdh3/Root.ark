@@ -9,17 +9,22 @@ const WebSocket = require('ws');
 
 const MAX_MEMBERS = 4;
 const ROOM_TTL_MS = 5 * 60_000;
+const UNJOINED_ROOM_TTL_MS = 15_000;
+const MAX_ACTIVE_ROOMS_PER_OWNER = 2;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
 const token = () => randomBytes(32).toString('hex');
 const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-peer', 'consent', 'signal']);
 
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
-  authenticateSession = null } = {}) {
+  authenticateSession = null, sharedWss = null, authorizeRecipient = null } = {}) {
   const rooms = new Map();
   const participants = new Map();
-  const wss = new WebSocket.WebSocketServer({ noServer: true, maxPayload: MAX_SIGNAL_BYTES, perMessageDeflate: false });
+  const wss = sharedWss || new WebSocket.WebSocketServer({
+    noServer: true, maxPayload: MAX_SIGNAL_BYTES, perMessageDeflate: false
+  });
   const authenticated = typeof authenticateSession === 'function';
   let origin = '';
   let listener;
@@ -36,7 +41,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   function sessionCurrent(ws) {
     if (!authenticated) return true;
     const user = identify(ws.upgradeRequest);
-    if (user && user.username === ws.identity.username &&
+    if (user && ws.identity && user.username === ws.identity.username &&
       user.sessionVersion === ws.identity.sessionVersion) return true;
     ws.close(1008, 'session revoked');
     removePeer(ws);
@@ -63,7 +68,10 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     room.allowed.clear();
   }
   function validRoom(room) {
-    if (!room || now() >= room.expires) {
+    // A room reserved by HTTP but never activated by its signed-session host
+    // must not consume scarce global capacity for the full five-minute TTL.
+    if (!room || now() >= room.expires ||
+      (!room.hostJoined && now() >= room.hostJoinDeadline)) {
       if (room) expireRoom(room);
       return false;
     }
@@ -102,7 +110,9 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       } else {
         const invite = typeof message.invitation === 'string' && room.invites.get(message.invitation);
         if (!invite || invite.used || invite.expires <= now() ||
-          (authenticated && invite.recipient !== ws.identity.username)) return error(ws, 'INVALID_INVITE');
+          (authenticated && (invite.recipient !== ws.identity.username ||
+            (Number.isSafeInteger(invite.recipientSessionVersion) &&
+              invite.recipientSessionVersion !== ws.identity.sessionVersion)))) return error(ws, 'INVALID_INVITE');
         room.invites.delete(message.invitation); // One-time join, never eligible for replay.
         role = 'guest';
       }
@@ -110,6 +120,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       const peer = { id, role, roomId: room.id, ws, username: ws.identity?.username };
       participants.set(ws, peer);
       room.members.set(id, peer);
+      if (role === 'host') room.hostJoined = true;
       send(ws, { type: 'joined', peerId: id, role, username: peer.username,
         members: [...room.members.values()].filter(p => p.id !== id).map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
       for (const other of room.members.values()) if (other.id !== id) send(other.ws, { type: 'peer-joined', peerId: id, role, username: peer.username });
@@ -118,57 +129,102 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     const room = roomOf(ws);
     if (!validRoom(room)) return error(ws, 'ROOM_CLOSED');
     const target = typeof message.to === 'string' && room.members.get(message.to);
-    if (message.type === 'invite' && current.role === 'host') {
-      const recipient = message.recipient;
-      if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
-        recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
-        recipient === current.username)) return error(ws, 'BAD_RECIPIENT');
-      for (const [key, invite] of room.invites) if (invite.expires <= now()) room.invites.delete(key);
-      const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
-      if (outstanding + room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
-      const invitation = token();
-      const id = shortId();
-      const expires = now() + inviteTtlMs;
-      room.invites.set(invitation, { id, expires, used: false, recipient: authenticated ? recipient : null });
-      send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
-    } else if (message.type === 'revoke' && current.role === 'host' && typeof message.inviteId === 'string') {
-      for (const [k, i] of room.invites) if (i.id === message.inviteId) room.invites.delete(k);
-      send(ws, { type: 'revoked', inviteId: message.inviteId });
-    } else if (message.type === 'kick' && current.role === 'host' && target && target.role === 'guest') {
-      error(target.ws, 'REVOKED');
-      target.ws.close(1000, 'revoked');
-      removePeer(target.ws);
-    } else if (message.type === 'request-peer' && current.role === 'host' && target && target.role === 'guest' && !room.allowed.has(pair(current.id, target.id))) {
-      if (room.pending.size >= MAX_MEMBERS) return error(ws, 'FULL');
-      const requestId = shortId();
-      room.pending.set(requestId, { from: current.id, to: target.id });
-      send(target.ws, { type: 'peer-request', peerId: current.id, username: current.username, requestId });
-    } else if (message.type === 'consent' && typeof message.requestId === 'string' && typeof message.accept === 'boolean') {
-      const pending = room.pending.get(message.requestId);
-      if (!pending || pending.to !== current.id || !room.members.has(pending.from)) return error(ws, 'FORBIDDEN');
-      room.pending.delete(message.requestId);
-      const host = room.members.get(pending.from);
-      if (message.accept) {
-        room.allowed.add(pair(current.id, host.id));
-        send(ws, { type: 'peer-allowed', peerId: host.id });
-        send(host.ws, { type: 'peer-accepted', peerId: current.id });
-      } else {
-        send(host.ws, { type: 'peer-declined', peerId: current.id });
+    switch (message.type) {
+      case 'invite': {
+        if (current.role !== 'host') return error(ws, 'FORBIDDEN');
+        const recipient = message.recipient;
+        if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
+          recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
+          recipient === current.username)) return error(ws, 'BAD_RECIPIENT');
+        let recipientSessionVersion = null;
+        if (typeof authorizeRecipient === 'function') {
+          let authority = null;
+          try { authority = authorizeRecipient(current.username, recipient); } catch { /* fail closed */ }
+          if (object(authority) && authority.username === recipient &&
+            Number.isSafeInteger(authority.sessionVersion) && authority.sessionVersion >= 0) {
+            recipientSessionVersion = authority.sessionVersion;
+          } else if (authority !== true) return error(ws, 'BAD_RECIPIENT');
+        }
+        for (const [key, invite] of room.invites) if (invite.expires <= now()) room.invites.delete(key);
+        const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
+        if (outstanding + room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
+        const invitation = token();
+        const id = shortId();
+        const expires = now() + inviteTtlMs;
+        room.invites.set(invitation, { id, expires, used: false,
+          recipient: authenticated ? recipient : null, recipientSessionVersion });
+        send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
+        break;
       }
-    } else if (message.type === 'signal' && target && room.allowed.has(pair(current.id, target.id)) &&
-      object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
-      JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256) {
-      send(target.ws, { type: 'signal', peerId: current.id, signal: message.signal });
-    } else {
-      error(ws, 'FORBIDDEN');
+      case 'revoke': {
+        if (current.role !== 'host' || typeof message.inviteId !== 'string') return error(ws, 'FORBIDDEN');
+        for (const [k, i] of room.invites) if (i.id === message.inviteId) room.invites.delete(k);
+        send(ws, { type: 'revoked', inviteId: message.inviteId });
+        break;
+      }
+      case 'kick': {
+        if (current.role !== 'host' || !target || target.role !== 'guest') return error(ws, 'FORBIDDEN');
+        error(target.ws, 'REVOKED');
+        target.ws.close(1000, 'revoked');
+        removePeer(target.ws);
+        break;
+      }
+      case 'request-peer': {
+        if (current.role !== 'host' || !target || target.role !== 'guest' || room.allowed.has(pair(current.id, target.id))) {
+          return error(ws, 'FORBIDDEN');
+        }
+        if (room.pending.size >= MAX_MEMBERS) return error(ws, 'FULL');
+        const requestId = shortId();
+        room.pending.set(requestId, { from: current.id, to: target.id });
+        send(target.ws, { type: 'peer-request', peerId: current.id, username: current.username, requestId });
+        break;
+      }
+      case 'consent': {
+        if (typeof message.requestId !== 'string' || typeof message.accept !== 'boolean') return error(ws, 'FORBIDDEN');
+        const pending = room.pending.get(message.requestId);
+        if (!pending || pending.to !== current.id || !room.members.has(pending.from)) return error(ws, 'FORBIDDEN');
+        room.pending.delete(message.requestId);
+        const host = room.members.get(pending.from);
+        if (message.accept) {
+          room.allowed.add(pair(current.id, host.id));
+          send(ws, { type: 'peer-allowed', peerId: host.id });
+          send(host.ws, { type: 'peer-accepted', peerId: current.id });
+        } else {
+          send(host.ws, { type: 'peer-declined', peerId: current.id });
+        }
+        break;
+      }
+      case 'signal': {
+        if (!target || !room.allowed.has(pair(current.id, target.id)) ||
+          !object(message.signal) || !['offer', 'answer', 'ice'].includes(message.signal.kind) ||
+          JSON.stringify(message.signal).length > MAX_SIGNAL_BYTES - 256) {
+          return error(ws, 'FORBIDDEN');
+        }
+        send(target.ws, { type: 'signal', peerId: current.id, signal: message.signal });
+        break;
+      }
+      default:
+        error(ws, 'FORBIDDEN');
     }
   }
-  wss.on('connection', ws => {
+  function onConnection(ws, req) {
+    if (sharedWss) {
+      ws.upgradeRequest = req;
+      ws.identity = identify(req);
+    }
     let count = 0;
     let windowStart = now();
     // ws emits an error before closing an oversized frame; keep the broker alive.
     ws.on('error', () => {});
-    ws.on('message', raw => {
+    ws.on('message', (raw, binary) => {
+      if (sharedWss) {
+        // Reuse Root.ark's established /ws socket. Ignore the application's
+        // ordinary event envelopes; only our explicit room protocol participates.
+        if (binary || raw.length > MAX_SIGNAL_BYTES) return;
+        let message;
+        try { message = JSON.parse(raw.toString()); } catch { return; }
+        if (!object(message) || !roomMessageTypes.has(message.type)) return;
+      }
       if (now() - windowStart >= 10_000) {
         windowStart = now();
         count = 0;
@@ -177,22 +233,37 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       onMessage(ws, raw);
     });
     ws.on('close', () => removePeer(ws));
-  });
-  const server = createHttpServer((req, res) => {
+  }
+  wss.on('connection', onConnection);
+  function createRoom(req) {
+    const user = identify(req);
+    if (authenticated && !user) return { status: 401 };
+    // Reclaim immediately at the HTTP boundary too (do not wait for the
+    // background sweep) so an unused reservation cannot block a new owner.
+    for (const room of rooms.values()) validRoom(room);
+    if (authenticated && [...rooms.values()].filter(room => room.owner === user.username).length
+      >= MAX_ACTIVE_ROOMS_PER_OWNER) return { status: 429 };
+    if (rooms.size >= 16) return { status: 429 };
+    const timestamp = now();
+    const room = { id: shortId(), hostKey: token(), expires: timestamp + roomTtlMs,
+      hostJoinDeadline: timestamp + (authenticated ? Math.min(roomTtlMs, UNJOINED_ROOM_TTL_MS) : roomTtlMs),
+      hostJoined: false,
+      owner: user?.username, ownerSessionVersion: user?.sessionVersion,
+      members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
+    rooms.set(room.id, room);
+    return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires };
+  }
+  const server = sharedWss ? null : createHttpServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws://127.0.0.1:*; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'");
     if (req.method === 'POST' && url.pathname === '/rooms' && req.headers.origin === origin) {
-      const user = identify(req);
-      if (authenticated && !user) { res.writeHead(401).end(); return; }
-      if (rooms.size >= 16) { res.writeHead(429).end(); return; }
-      const room = { id: shortId(), hostKey: token(), expires: now() + roomTtlMs,
-        owner: user?.username, ownerSessionVersion: user?.sessionVersion,
-        members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
-      rooms.set(room.id, room);
+      const result = createRoom(req);
+      if (result.status !== 200) { res.writeHead(result.status).end(); return; }
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ roomId: room.id, hostKey: room.hostKey, expires: room.expires }));
+      const { roomId, hostKey, expires } = result;
+      res.end(JSON.stringify({ roomId, hostKey, expires }));
       return;
     }
     const route = req.method === 'GET' && {
@@ -203,7 +274,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       res.end(readFileSync(join(__dirname, route)));
     } else res.writeHead(404).end();
   });
-  server.on('upgrade', (req, socket, head) => {
+  if (server) server.on('upgrade', (req, socket, head) => {
     if (req.url !== '/signal' || req.headers.origin !== origin || wss.clients.size >= 32) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       socket.destroy();
@@ -223,11 +294,13 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   });
   const expirySweep = setInterval(() => {
     for (const room of rooms.values()) validRoom(room);
-    if (authenticated) for (const ws of wss.clients) sessionCurrent(ws);
+    if (authenticated) for (const ws of participants.keys()) sessionCurrent(ws);
   }, 1000);
   expirySweep.unref();
   return {
+    createRoom,
     async listen() {
+      if (!server) throw new Error('Room broker is mounted on an existing Root.ark server');
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       listener = server.address().port;
       origin = `http://127.0.0.1:${listener}`;
@@ -235,8 +308,13 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     },
     async close() {
       clearInterval(expirySweep);
-      for (const ws of wss.clients) ws.terminate();
-      await new Promise(resolve => server.close(resolve));
+      if (sharedWss) {
+        wss.removeListener('connection', onConnection);
+        for (const ws of participants.keys()) ws.close(1000, 'room stopped');
+      } else {
+        for (const ws of wss.clients) ws.terminate();
+        await new Promise(resolve => server.close(resolve));
+      }
     },
     get origin() { return origin; }
   };

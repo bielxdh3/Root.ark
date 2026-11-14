@@ -7,7 +7,7 @@ const WebSocket = require('ws');
 const { createRealtimeAuthenticator, parseCookies } = require('../../../src/middlewares/auth');
 const { makeBroker } = require('../server.cjs');
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const secret = randomBytes(48).toString('hex');
   const users = new Map(['alice', 'bob', 'eve'].map(username => [
     username, { username, role: 'user', sessionVersion: 1, disabled: false, totpEnabled: true, permissions: {} }
@@ -17,7 +17,7 @@ async function fixture(t) {
     normalizeUserPermissions: user => user.permissions
   });
   const auth = req => verify(parseCookies(req.headers.cookie).get('rootark_session'));
-  const broker = makeBroker({ authenticateSession: auth });
+  const broker = makeBroker({ authenticateSession: auth, ...options });
   const origin = await broker.listen();
   const sockets = [];
   t.after(async () => {
@@ -178,4 +178,37 @@ test('signal is never delivered to a recipient whose session was just revoked', 
   assert.equal(await closed, 1008);
   assert.deepEqual(deliveries, [], 'live revocation must be checked before forwarding signaling');
   assert.equal(hp.username, 'alice');
+});
+
+test('unjoined same-owner rooms are reclaimed at 15 seconds without ending joined sessions', async t => {
+  let time = Date.now();
+  const f = await fixture(t, { now: () => time });
+  const alice = f.cookie('alice');
+  const bob = f.cookie('bob');
+  const first = (await f.createRoom(alice)).data;
+  const second = (await f.createRoom(alice)).data;
+  assert.equal((await f.createRoom(alice)).status, 429);
+  assert.equal((await f.createRoom(bob)).status, 200);
+
+  const host = await f.connect(alice);
+  host.send({ type: 'join', roomId: first.roomId, hostKey: first.hostKey });
+  assert.equal((await host.next('joined')).role, 'host');
+  time += 15_001;
+  // "second" was never hosted; it must expire. The joined first room must
+  // retain its original 5-minute lifetime and remain usable for invites.
+  const replacement = await f.createRoom(alice);
+  assert.equal(replacement.status, 200);
+  const unused = await f.connect(alice);
+  unused.send({ type: 'join', roomId: second.roomId, hostKey: second.hostKey });
+  assert.equal((await unused.next('error')).code, 'INVALID_INVITE');
+  host.send({ type: 'invite', recipient: 'bob' });
+  assert.equal((await host.next('invited')).recipient, 'bob');
+  assert.equal((await f.createRoom(alice)).status, 429);
+
+  time += 15_001;
+  assert.equal((await f.createRoom(alice)).status, 200,
+    'second idle room must also release owner capacity');
+  host.send({ type: 'invite', recipient: 'bob' });
+  assert.equal((await host.next('invited')).recipient, 'bob');
+  assert.notEqual(first.roomId, second.roomId);
 });
