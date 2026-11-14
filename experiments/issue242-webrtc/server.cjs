@@ -345,65 +345,88 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     if (!await recheckBoundRoom(room) || participants.get(ws) !== current ||
       !activePeer(room, current)) return;
     const target = typeof message.to === 'string' && room.members.get(message.to);
-    if (message.type === 'invite' && current.role === 'host') {
-      const recipient = message.recipient;
-      if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
-        recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
-        recipient === current.username)) return error(ws, 'BAD_RECIPIENT');
-      let recipientSessionVersion = null;
-      if (typeof authorizeRecipient === 'function') {
-        let authority = null;
-        try { authority = authorizeRecipient(current.username, recipient); } catch { /* fail closed */ }
-        if (object(authority) && authority.username === recipient &&
-          Number.isSafeInteger(authority.sessionVersion) && authority.sessionVersion >= 0) {
-          recipientSessionVersion = authority.sessionVersion;
-        } else if (authority !== true) return error(ws, 'BAD_RECIPIENT');
+    switch (message.type) {
+      case 'invite': {
+        if (current.role !== 'host') return error(ws, 'FORBIDDEN');
+        const recipient = message.recipient;
+        if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
+          recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
+          recipient === current.username)) return error(ws, 'BAD_RECIPIENT');
+        let recipientSessionVersion = null;
+        if (typeof authorizeRecipient === 'function') {
+          let authority = null;
+          try { authority = authorizeRecipient(current.username, recipient); } catch { /* fail closed */ }
+          if (object(authority) && authority.username === recipient &&
+            Number.isSafeInteger(authority.sessionVersion) && authority.sessionVersion >= 0) {
+            recipientSessionVersion = authority.sessionVersion;
+          } else if (authority !== true) return error(ws, 'BAD_RECIPIENT');
+        }
+        if (!await objectAllowed(room, recipient) || !sessionCurrent(ws) ||
+          !validRoom(room)) return error(ws, 'OBJECT_ACCESS_DENIED');
+        for (const [key, invite] of room.invites) if (invite.expires <= now()) room.invites.delete(key);
+        const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
+        if (outstanding + room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
+        const invitation = token();
+        const id = shortId();
+        const expires = now() + inviteTtlMs;
+        room.invites.set(invitation, { id, expires, used: false,
+          recipient: authenticated ? recipient : null, recipientSessionVersion });
+        send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
+        break;
       }
-      if (!await objectAllowed(room, recipient) || !sessionCurrent(ws) ||
-        !validRoom(room)) return error(ws, 'OBJECT_ACCESS_DENIED');
-      for (const [key, invite] of room.invites) if (invite.expires <= now()) room.invites.delete(key);
-      const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
-      if (outstanding + room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
-      const invitation = token();
-      const id = shortId();
-      const expires = now() + inviteTtlMs;
-      room.invites.set(invitation, { id, expires, used: false,
-        recipient: authenticated ? recipient : null, recipientSessionVersion });
-      send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
-    } else if (message.type === 'revoke' && current.role === 'host' && typeof message.inviteId === 'string') {
-      const match = [...room.invites].find(([, invite]) =>
-        invite.id === message.inviteId && invite.expires > now());
-      if (!match) return error(ws, 'FORBIDDEN');
-      room.invites.delete(match[0]);
-      send(ws, { type: 'revoked', inviteId: message.inviteId });
-    } else if (message.type === 'kick' && current.role === 'host' && target && target.role === 'guest') {
-      error(target.ws, 'REVOKED');
-      target.ws.close(1000, 'revoked');
-      removePeer(target.ws);
-    } else if (message.type === 'request-peer' && current.role === 'host' && target && target.role === 'guest' &&
-      !room.allowed.has(pair(current.id, target.id))) {
-      if (room.pending.size >= MAX_MEMBERS) return error(ws, 'FULL');
-      const requestId = shortId();
-      room.pending.set(requestId, { from: current.id, to: target.id });
-      send(target.ws, { type: 'peer-request', peerId: current.id, username: current.username, requestId });
-    } else if (message.type === 'consent' && typeof message.requestId === 'string' && typeof message.accept === 'boolean') {
-      const pending = room.pending.get(message.requestId);
-      if (!pending || pending.to !== current.id || !room.members.has(pending.from)) return error(ws, 'FORBIDDEN');
-      room.pending.delete(message.requestId);
-      const host = room.members.get(pending.from);
-      if (message.accept) {
-        room.allowed.add(pair(current.id, host.id));
-        send(ws, { type: 'peer-allowed', peerId: host.id });
-        send(host.ws, { type: 'peer-accepted', peerId: current.id });
-      } else {
-        send(host.ws, { type: 'peer-declined', peerId: current.id });
+      case 'revoke': {
+        if (current.role !== 'host' || typeof message.inviteId !== 'string') return error(ws, 'FORBIDDEN');
+        const match = [...room.invites].find(([, invite]) =>
+          invite.id === message.inviteId && invite.expires > now());
+        if (!match) return error(ws, 'FORBIDDEN');
+        room.invites.delete(match[0]);
+        send(ws, { type: 'revoked', inviteId: message.inviteId });
+        break;
       }
-    } else if (message.type === 'signal' && target && room.allowed.has(pair(current.id, target.id)) &&
-      object(message.signal) && ['offer', 'answer', 'ice'].includes(message.signal.kind) &&
-      JSON.stringify(message.signal).length <= MAX_SIGNAL_BYTES - 256) {
-      await forwardLiveSignal(room, current, target, message.signal);
-    } else {
-      error(ws, 'FORBIDDEN');
+      case 'kick': {
+        if (current.role !== 'host' || !target || target.role !== 'guest') return error(ws, 'FORBIDDEN');
+        error(target.ws, 'REVOKED');
+        target.ws.close(1000, 'revoked');
+        removePeer(target.ws);
+        break;
+      }
+      case 'request-peer': {
+        if (current.role !== 'host' || !target || target.role !== 'guest' ||
+          room.allowed.has(pair(current.id, target.id))) {
+          return error(ws, 'FORBIDDEN');
+        }
+        if (room.pending.size >= MAX_MEMBERS) return error(ws, 'FULL');
+        const requestId = shortId();
+        room.pending.set(requestId, { from: current.id, to: target.id });
+        send(target.ws, { type: 'peer-request', peerId: current.id, username: current.username, requestId });
+        break;
+      }
+      case 'consent': {
+        if (typeof message.requestId !== 'string' || typeof message.accept !== 'boolean') return error(ws, 'FORBIDDEN');
+        const pending = room.pending.get(message.requestId);
+        if (!pending || pending.to !== current.id || !room.members.has(pending.from)) return error(ws, 'FORBIDDEN');
+        room.pending.delete(message.requestId);
+        const host = room.members.get(pending.from);
+        if (message.accept) {
+          room.allowed.add(pair(current.id, host.id));
+          send(ws, { type: 'peer-allowed', peerId: host.id });
+          send(host.ws, { type: 'peer-accepted', peerId: current.id });
+        } else {
+          send(host.ws, { type: 'peer-declined', peerId: current.id });
+        }
+        break;
+      }
+      case 'signal': {
+        if (!target || !room.allowed.has(pair(current.id, target.id)) ||
+          !object(message.signal) || !['offer', 'answer', 'ice'].includes(message.signal.kind) ||
+          JSON.stringify(message.signal).length > MAX_SIGNAL_BYTES - 256) {
+          return error(ws, 'FORBIDDEN');
+        }
+        await forwardLiveSignal(room, current, target, message.signal);
+        break;
+      }
+      default:
+        error(ws, 'FORBIDDEN');
     }
   }
   function onConnection(ws, req) {

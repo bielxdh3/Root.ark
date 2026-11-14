@@ -36,7 +36,7 @@ function clientFixture() {
   }
   const ctx = { document, window: {}, WebSocket: FakeSocket, RTCPeerConnection: FakePeer,
     crypto: crypto.webcrypto, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
-    location: { origin: 'http://127.0.0.1:1234' }, setTimeout, console };
+    location: { origin: 'http://127.0.0.1:1234', pathname: '/' }, setTimeout, console };
   vm.createContext(ctx);
   vm.runInContext(source, ctx);
   async function incoming(socket, value) {
