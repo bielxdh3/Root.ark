@@ -35,4 +35,7 @@ kotlin {
 
 dependencies {
     implementation(project(":core"))
+    testImplementation(kotlin("test"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.0")
+    testImplementation("org.json:json:20240303")
 }
