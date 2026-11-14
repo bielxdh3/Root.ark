@@ -1,6 +1,21 @@
 "use strict";
 
-const crypto = require("node:crypto");
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN,
+  randomBytes: NATIVE_RANDOM_BYTES,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+  arraySome: NATIVE_ARRAY_SOME,
+  arrayIncludes: NATIVE_ARRAY_INCLUDES,
+  dateNow: NATIVE_DATE_NOW,
+} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const zk = require("../src/crypto/rootark-zk-1");
 
 const PROOF_FIELDS = Object.freeze([
@@ -8,6 +23,14 @@ const PROOF_FIELDS = Object.freeze([
   "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch",
   "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest",
   "expiresAt", "replayId", "idempotencyKey", "publicKey", "signature",
+]);
+// This comparison runs after caller-owned native KeyObject callbacks in some
+// historical proof paths. Array.prototype[Symbol.iterator] can be replaced by
+// those callbacks; keep the exact binding field order and iterate own slots.
+const ENVELOPE_BINDING_FIELDS = Object.freeze([
+  "protocolVersion", "deviceId", "operationId", "objectId", "fileId",
+  "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
+  "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest",
 ]);
 
 function fail(message, code = "invalid_device_authorization") {
@@ -29,7 +52,7 @@ function isValidIdempotencyKey(value) {
 }
 
 function generateIdempotencyKey() {
-  return crypto.randomBytes(GENERATED_IDEMPOTENCY_KEY_BYTES).toString("base64url");
+  return NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(GENERATED_IDEMPOTENCY_KEY_BYTES), "base64url");
 }
 
 function text(value, name) {
@@ -39,20 +62,28 @@ function text(value, name) {
 
 function digest(value, name) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) fail(`Invalid authorization ${name}`);
-  const bytes = Buffer.from(value, "base64url");
-  if (bytes.length !== 32 || bytes.toString("base64url") !== value) fail(`Invalid authorization ${name}`);
+  const bytes = NATIVE_BUFFER_FROM(value, "base64url");
+  if (bytes.length !== 32 || NATIVE_BUFFER_TO_STRING.call(bytes, "base64url") !== value) fail(`Invalid authorization ${name}`);
   return bytes;
 }
 
 function exact(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !PROOF_FIELDS.includes(key)) || PROOF_FIELDS.some((key) => !Object.hasOwn(value, key))) fail("Invalid authorization schema");
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || NATIVE_ARRAY_SOME.call(Object.keys(value), (key) => !NATIVE_ARRAY_INCLUDES.call(PROOF_FIELDS, key))
+    || NATIVE_ARRAY_SOME.call(PROOF_FIELDS, (key) => !Object.hasOwn(value, key))) fail("Invalid authorization schema");
+}
+
+function hashDigest(value) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, NATIVE_BUFFER_FROM(value, "base64url"));
+  return NATIVE_BUFFER_TO_STRING.call(NATIVE_HASH_DIGEST.call(hash), "base64url");
 }
 
 function proofCore(operation, options, requireFresh = true) {
-  const expiresAt = options.expiresAt === undefined ? Date.now() + 5 * 60 * 1000 : options.expiresAt;
+  const expiresAt = options.expiresAt === undefined ? NATIVE_DATE_NOW() + 5 * 60 * 1000 : options.expiresAt;
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0
-    || (requireFresh && expiresAt <= Date.now())) fail("Authorization expired");
-  const replayId = options.replayId || crypto.randomBytes(16).toString("base64url");
+    || (requireFresh && expiresAt <= NATIVE_DATE_NOW())) fail("Authorization expired");
+  const replayId = options.replayId || NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(16), "base64url");
   const idempotencyKey = options.idempotencyKey === undefined ? generateIdempotencyKey() : options.idempotencyKey;
   if (!isValidIdempotencyKey(idempotencyKey)) fail("Invalid device authorization");
   return {
@@ -72,10 +103,10 @@ function proofCore(operation, options, requireFresh = true) {
     keyEpoch: text(operation.keyEpoch, "keyEpoch"),
     compartmentId: text(operation.compartmentId, "compartmentId"),
     metadata: operation.metadata,
-    aadDigest: crypto.createHash("sha256").update(Buffer.from(operation.aad, "base64url")).digest().toString("base64url"),
-    ciphertextDigest: crypto.createHash("sha256").update(Buffer.from(operation.ciphertext, "base64url")).digest().toString("base64url"),
-    nonceDigest: crypto.createHash("sha256").update(Buffer.from(operation.nonce, "base64url")).digest().toString("base64url"),
-    tagDigest: crypto.createHash("sha256").update(Buffer.from(operation.tag, "base64url")).digest().toString("base64url"),
+    aadDigest: hashDigest(operation.aad),
+    ciphertextDigest: hashDigest(operation.ciphertext),
+    nonceDigest: hashDigest(operation.nonce),
+    tagDigest: hashDigest(operation.tag),
     expiresAt,
     replayId,
     idempotencyKey,
@@ -86,13 +117,15 @@ function proofCore(operation, options, requireFresh = true) {
 
 async function signedBytes(core) {
   const { signature: _signature, ...unsigned } = core;
-  return Buffer.concat([Buffer.from(zk.ASCII.AUTHORIZATION, "ascii"), Buffer.from([0]), await zk.encodeDeterministic(unsigned)]);
+  return NATIVE_BUFFER_CONCAT([NATIVE_BUFFER_FROM(zk.ASCII.AUTHORIZATION, "ascii"),
+    NATIVE_BUFFER_FROM([0]), await zk.encodeDeterministic(unsigned)]);
 }
 
 async function createAuthorizationProof(operation, options = {}) {
   if (!options.privateKey || !options.publicKey) fail("Authorization key material is required");
   const core = proofCore(operation, options);
-  core.signature = crypto.sign(null, await signedBytes(core), options.privateKey).toString("base64url");
+  core.signature = NATIVE_BUFFER_TO_STRING.call(
+    NATIVE_SIGN(null, await signedBytes(core), options.privateKey), "base64url");
   return core;
 }
 
@@ -109,10 +142,9 @@ function assertAuthorizationEnvelopeBinding(proof, operation) {
     expiresAt: proof.expiresAt, replayId: proof.replayId,
     idempotencyKey: proof.idempotencyKey,
   }, false);
-  for (const field of ["protocolVersion", "deviceId", "operationId", "objectId", "fileId",
-    "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
-    "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
-    if (JSON.stringify(proof[field]) !== JSON.stringify(expectedCore[field])) {
+  for (let index = 0; index < ENVELOPE_BINDING_FIELDS.length; index += 1) {
+    const field = ENVELOPE_BINDING_FIELDS[index];
+    if (NATIVE_JSON_STRINGIFY(proof[field]) !== NATIVE_JSON_STRINGIFY(expectedCore[field])) {
       fail("Authorization envelope binding mismatch", "authorization_scope");
     }
   }
@@ -125,7 +157,7 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
   if (!isValidIdempotencyKey(normalized.idempotencyKey)) fail("Invalid device authorization");
   if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
   if (!Number.isSafeInteger(normalized.expiresAt) || normalized.expiresAt <= 0) fail("Invalid authorization expiry");
-  if (requireFresh && normalized.expiresAt <= Date.now()) fail("Authorization expired", "authorization_expired");
+  if (requireFresh && normalized.expiresAt <= NATIVE_DATE_NOW()) fail("Authorization expired", "authorization_expired");
   if (normalized.protocolVersion !== operation.protocolVersion || normalized.username !== expected.username || normalized.deviceId !== operation.deviceId) fail("Authorization scope mismatch", "authorization_scope");
   const pins = expected.trustedDevicePublicKeys;
   const pinned = pins && typeof pins === "object" && !Array.isArray(pins)
@@ -138,12 +170,13 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
     fail("Device signing key is not trusted", "authorization_device_untrusted");
   }
   if (!Array.isArray(expected.revokedDeviceIds)
-    || expected.revokedDeviceIds.includes(normalized.deviceId)) {
+    || NATIVE_ARRAY_INCLUDES.call(expected.revokedDeviceIds, normalized.deviceId)) {
     fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
   }
   assertAuthorizationEnvelopeBinding(normalized, operation);
-  const key = crypto.createPublicKey({ key: Buffer.from(normalized.publicKey, "base64url"), format: "der", type: "spki" });
-  if (!crypto.verify(null, await signedBytes(normalized), key, Buffer.from(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
+  const key = NATIVE_CREATE_PUBLIC_KEY({ key: NATIVE_BUFFER_FROM(normalized.publicKey, "base64url"), format: "der", type: "spki" });
+  if (!NATIVE_VERIFY(null, await signedBytes(normalized), key,
+    NATIVE_BUFFER_FROM(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
   return true;
 }
 

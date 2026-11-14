@@ -49,6 +49,42 @@ test("hash matching retains the existing fixed ACL cases without trusting caller
   }), null);
 });
 
+test("local fixture crash failure stages are pinned to the actual test and do not disclose child stderr", async () => {
+  const title = "repeated crashes before and after initial journal link ignore unrelated pre-link orphan";
+  const filePath = "test/issue-65-local-fixture-migration-journal.test.js";
+  const stages = ["FIXTURE_READY", "PRELINK_CHILD_EXIT", "PRELINK_JOURNAL",
+    "POSTLINK_CHILD_EXIT", "POSTLINK_JOURNAL", "RECOVERY", "FINAL_BYTES"];
+  const verified = { nameHash: hash(title), pathHash: hash(filePath) };
+  const printed = [];
+  const tracker = createTapProgressRecorder((message) => printed.push(message));
+  for (const stage of stages) {
+    const diagnostic = `# ROOTARK_ACL_V1 case=LOCAL_FIXTURE_CRASH stage=${stage} code=ASSERTION trust=UNKNOWN`;
+    assert.deepEqual(parseAclFailureDiagnostic(diagnostic, verified), {
+      stage, code: "ASSERTION", trust: "UNKNOWN",
+    });
+    assert.equal(parseAclFailureDiagnostic(diagnostic, { ...verified, pathHash: "0".repeat(24) }), null);
+  }
+  const diagnostic = "# ROOTARK_ACL_V1 case=LOCAL_FIXTURE_CRASH stage=PRELINK_CHILD_EXIT code=ASSERTION trust=UNKNOWN";
+  for (const line of [
+    `not ok 1257 - ${title}`,
+    String.raw`  location: 'D:\a\Root.ark\Root.ark\test\issue-65-local-fixture-migration-journal.test.js:400:1'`,
+    "  failureType: 'testCodeFailure'", "  code: 'ERR_ASSERTION'", diagnostic,
+  ]) tracker.accept(line);
+  tracker.finish();
+  assert.match(printed.join("\n"), /aclStage=PRELINK_CHILD_EXIT aclError=ASSERTION aclTrust=UNKNOWN/);
+  assert.doesNotMatch(printed.join("\n"), /repeated crashes|D:\\|ROOTARK_SYNTHETIC_PLAN|password=/);
+  assert.equal(parseAclFailureDiagnostic(diagnostic.replace("PRELINK_CHILD_EXIT", "SECRET_PATH"), verified), null);
+  const produced = [];
+  const diagnosticProducer = createAclFailureDiagnostic({ diagnostic: (value) => produced.push(value) },
+    "LOCAL_FIXTURE_CRASH");
+  diagnosticProducer.stage("PRELINK_CHILD_EXIT");
+  await assert.rejects(diagnosticProducer.run(() => {
+    throw Object.assign(new Error("synthetic child status mismatch"), { code: "ERR_ASSERTION" });
+  }), /synthetic child status mismatch/);
+  if (process.platform === "win32") assert.deepEqual(produced, [diagnostic.slice(2)]);
+  else assert.deepEqual(produced, []);
+});
+
 test("canonical TAP recorder reveals bounded cold-ACL categories but no raw title/path/secret", () => {
   for (const stage of ["INSUFFICIENT_TICKS", "EVENT_LOOP_STALL"]) {
     const printed = [];

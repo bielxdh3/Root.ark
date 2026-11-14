@@ -16,6 +16,7 @@ const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-r
 const { canonicalTestTempEnvironment } = require("./support/issue-65-canonical-temp-fixture");
 const { writeExistingFixtureFileSync } = require("./support/pinned-fixture-file");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
+const { createAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
 
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const bytes = Buffer.from("synthetic encrypted ciphertext, never plaintext/user material\x00", "utf8");
@@ -398,35 +399,44 @@ test("unexpected hardlink to initial journal fails closed rather than removing f
 });
 
 test("repeated crashes before and after initial journal link ignore unrelated pre-link orphan", (t) => {
-  const f = fixture(t);
-  function crash(afterLink, code) {
-    const script = `const fs = require("node:fs");
-      const link = fs.linkSync;
-      fs.linkSync = (...args) => { if (${afterLink}) link(...args); process.exit(${code}); };
-      const api = require("./src/services/zk1LocalFixtureMigrationJournal");
-      api.runLocalFixtureCiphertextMigration(JSON.parse(process.env.ROOTARK_SYNTHETIC_PLAN));`;
-    const child = spawnSync(process.execPath, ["-e", script], {
-      cwd: path.resolve(__dirname, ".."),
-      env: { ...process.env, ROOTARK_SYNTHETIC_PLAN: JSON.stringify(f.plan) },
-      windowsHide: true, encoding: "utf8",
-    });
-    assert.equal(child.status, code, child.stderr);
-  }
-  crash(false, 72);
-  const dir = path.join(f.dir, "journal");
-  const old = fs.readdirSync(dir);
-  assert.equal(old.length, 1, "first failed publication left an inert pre-link temp");
-  assert.equal(fs.existsSync(f.journal), false);
-  crash(true, 71);
-  const current = fs.readdirSync(dir);
-  assert.equal(current.length, 3, "published journal, its own temp link and an unrelated prior orphan");
-  assert.equal(fs.statSync(f.journal).nlink, 2);
-  assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
-  assert.equal(fs.statSync(f.journal).nlink, 1);
-  assert.equal(fs.existsSync(path.join(dir, old[0])), true,
-    "recovery must not delete the unrelated orphan or other evidence");
-  assert.deepEqual(fs.readFileSync(f.target), bytes);
-  assert.deepEqual(fs.readFileSync(f.source), bytes);
+  const diagnostic = createAclFailureDiagnostic(t, "LOCAL_FIXTURE_CRASH");
+  return diagnostic.run(() => {
+    const f = fixture(t);
+    diagnostic.stage("FIXTURE_READY");
+    function crash(afterLink, code) {
+      diagnostic.stage(afterLink ? "POSTLINK_CHILD_EXIT" : "PRELINK_CHILD_EXIT");
+      const script = `const fs = require("node:fs");
+        const link = fs.linkSync;
+        fs.linkSync = (...args) => { if (${afterLink}) link(...args); process.exit(${code}); };
+        const api = require("./src/services/zk1LocalFixtureMigrationJournal");
+        api.runLocalFixtureCiphertextMigration(JSON.parse(process.env.ROOTARK_SYNTHETIC_PLAN));`;
+      const child = spawnSync(process.execPath, ["-e", script], {
+        cwd: path.resolve(__dirname, ".."),
+        env: { ...process.env, ROOTARK_SYNTHETIC_PLAN: JSON.stringify(f.plan) },
+        windowsHide: true, encoding: "utf8",
+      });
+      assert.equal(child.status, code, "crash child must reach the injected publication phase");
+    }
+    crash(false, 72);
+    diagnostic.stage("PRELINK_JOURNAL");
+    const dir = path.join(f.dir, "journal");
+    const old = fs.readdirSync(dir);
+    assert.equal(old.length, 1, "first failed publication left an inert pre-link temp");
+    assert.equal(fs.existsSync(f.journal), false);
+    crash(true, 71);
+    diagnostic.stage("POSTLINK_JOURNAL");
+    const current = fs.readdirSync(dir);
+    assert.equal(current.length, 3, "published journal, its own temp link and an unrelated prior orphan");
+    assert.equal(fs.statSync(f.journal).nlink, 2);
+    diagnostic.stage("RECOVERY");
+    assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
+    assert.equal(fs.statSync(f.journal).nlink, 1);
+    assert.equal(fs.existsSync(path.join(dir, old[0])), true,
+      "recovery must not delete the unrelated orphan or other evidence");
+    diagnostic.stage("FINAL_BYTES");
+    assert.deepEqual(fs.readFileSync(f.target), bytes);
+    assert.deepEqual(fs.readFileSync(f.source), bytes);
+  });
 });
 
 test("orphan and replacement symlinks and unexpected stage after commit block without deleting data", (t) => {

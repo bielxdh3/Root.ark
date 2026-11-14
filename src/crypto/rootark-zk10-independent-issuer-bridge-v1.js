@@ -5,21 +5,36 @@
 // MUST arrive from independent provisioning/custody, never the HTTP caller,
 // owner-controlled corpus, JWT or local database. No route is enabled here.
 const crypto = require("node:crypto");
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  createHash: NATIVE_CREATE_HASH,
+  verify: NATIVE_VERIFY,
+  sign: NATIVE_SIGN,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  publicExport: NATIVE_PUBLIC_EXPORT,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  freeze: NATIVE_FREEZE,
+  pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+} = require("./rootark-zk10-native-intrinsics-v1");
 const { exact, decode, hex, key } = require("./rootark-zk10-account-cutover-v1");
 const { FIELDS: OBJECT_BINDING_FIELDS, verifyAnonymousObjectBinding } =
   require("./rootark-zk10-anonymous-object-binding-v1");
 
 const DOMAIN = Buffer.from("Root.ark/zk10/independent-issuer-provisioning/v1\0", "ascii");
-const FIELDS = Object.freeze([
+const FIELDS = NATIVE_FREEZE([
   "type", "immutable_account_id", "zk_account_id", "owner_root_spki",
   "owner_generation", "owner_cutover_digest", "inventory_head",
   "object_id", "object_revision", "ciphertext_sha256",
   "grant", "complete_corpus", "nonce",
 ]);
-const CONFIG_FIELDS = Object.freeze([
+const CONFIG_FIELDS = NATIVE_FREEZE([
   "trustedIssuerPublicKey", "immutableAccountId", "independentlyRetainedProvisioningDigest",
 ]);
-const INPUT_FIELDS = Object.freeze([
+const INPUT_FIELDS = NATIVE_FREEZE([
   "issuerProvisioning", "statement", "ownerCutoverHistory",
   "ownerRotations", "objectMembershipProof", "expectedKind", "expectedToken",
 ]);
@@ -31,9 +46,8 @@ function deny() {
 }
 function ownerPublicKey(spki) {
   const bytes = decode(spki, 44);
-  const result = crypto.createPublicKey({ key: bytes, format: "der", type: "spki" });
-  key(result, "public");
-  if (!result.export({ type: "spki", format: "der" }).equals(bytes)) deny();
+  const result = key(NATIVE_CREATE_PUBLIC_KEY({ key: bytes, format: "der", type: "spki" }), "public");
+  if (!NATIVE_PUBLIC_EXPORT.call(result, { type: "spki", format: "der" }).equals(bytes)) deny();
   return result;
 }
 function canonical(payload) {
@@ -53,26 +67,28 @@ function canonical(payload) {
   return p;
 }
 function signedBytes(body) {
-  return Buffer.concat([DOMAIN, Buffer.from(JSON.stringify(body), "utf8")]);
+  return NATIVE_BUFFER_CONCAT([DOMAIN, NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(body), "utf8")]);
 }
 function unpack(wire) {
   const signed = exact(wire, [...FIELDS, "signature"]);
   // exact() reads each data descriptor once and rejects accessors. Keep the
   // resulting plain, immutable copy: a Proxy may change descriptors between
   // reads, so signature, digest and owner/object binding must share this body.
-  const body = Object.freeze(canonical(Object.fromEntries(
-    FIELDS.map((field) => [field, signed[field]]))));
-  return Object.freeze({ body, signature: decode(signed.signature, 64) });
+  const body = NATIVE_FREEZE(canonical(NATIVE_PICK_SIGNED_FIELDS(signed, FIELDS)));
+  return NATIVE_FREEZE({ body, signature: decode(signed.signature, 64) });
 }
 function digestSnapshot(bytes, signature) {
-  return crypto.createHash("sha256").update(bytes)
-    .update(signature).digest("hex");
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, bytes);
+  NATIVE_HASH_UPDATE.call(hash, signature);
+  return NATIVE_HASH_DIGEST.call(hash, "hex");
 }
 function signIssuerProvisioning(unsigned, issuerPrivateKey) {
   try {
     const body = canonical(unsigned);
-    const signature = crypto.sign(null, signedBytes(body), key(issuerPrivateKey, "private"));
-    return Object.freeze({ ...body, signature: signature.toString("base64url") });
+    const signature = NATIVE_SIGN(null, signedBytes(body), key(issuerPrivateKey, "private"));
+    return NATIVE_FREEZE({ ...body,
+      signature: NATIVE_BUFFER_TO_STRING.call(signature, "base64url") });
   } catch (_) { deny(); }
 }
 function digestIssuerProvisioning(wire) {
@@ -98,11 +114,11 @@ function createIssuerProvisionedObjectVerifier(config) {
         const signedMessage = signedBytes(body);
         if (digestSnapshot(signedMessage, signature) !== retainedDigest
           || body.immutable_account_id !== c.immutableAccountId
-          || !crypto.verify(null, signedMessage, issuer, signature)) deny();
+          || !NATIVE_VERIFY(null, signedMessage, issuer, signature)) deny();
         const ownerRoot = ownerPublicKey(body.owner_root_spki);
         // The anonymous owner statement has the same Proxy TOCTOU hazard:
         // downstream verification must see exactly the fields compared here.
-        const statement = Object.freeze(exact(r.statement,
+        const statement = NATIVE_FREEZE(exact(r.statement,
           [...OBJECT_BINDING_FIELDS, "signature"]));
         const verified = verifyAnonymousObjectBinding({
           statement,
@@ -124,7 +140,7 @@ function createIssuerProvisionedObjectVerifier(config) {
           || statement.zk_account_id !== body.zk_account_id
           || statement.inventory_head !== body.inventory_head
           || verified.ownerCutoverDigest !== body.owner_cutover_digest) deny();
-        return Object.freeze({
+        return NATIVE_FREEZE({
           ...verified,
           status: "VERIFIED_ISSUER_PROVISIONED_OBJECT_NONAUTHORIZING",
           issuerProvisioningVerified: true,

@@ -1,20 +1,34 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { types: { isProxy: NATIVE_IS_PROXY } } = require("node:util");
+// Load the shared native snapshot before any caller-owned KeyObject getter.
+const { verify: NATIVE_VERIFY, sign: NATIVE_SIGN,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, createHash: NATIVE_CREATE_HASH,
+  bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM,
+  hashUpdate: NATIVE_HASH_UPDATE, hashDigest: NATIVE_HASH_DIGEST,
+  bufferCompare: NATIVE_BUFFER_COMPARE, ownDescriptor: NATIVE_DESCRIPTOR,
+  ownKeys: NATIVE_OWN_KEYS, getPrototype: NATIVE_GET_PROTOTYPE,
+  objectCreate: NATIVE_OBJECT_CREATE, hasOwn: NATIVE_HAS_OWN,
+  defineProperty: NATIVE_DEFINE_PROPERTY, arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  apply: NATIVE_APPLY } =
+  require("./rootark-zk10-native-intrinsics-v1");
 const z = require("./rootark-zk-1");
+// Capture sorting before a caller-owned native KeyObject getter can rebind it.
+const NATIVE_ARRAY_SORT = Array.prototype.sort;
 
 const SNAPSHOT_TYPE = "rootark-content-inventory-snapshot/v1";
 const VERSION = 1;
-const ROOT_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-root/v1\0", "ascii");
-const SNAPSHOT_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-snapshot/v1\0", "ascii");
+const ROOT_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-root/v1\0", "ascii");
+const SNAPSHOT_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-snapshot/v1\0", "ascii");
 const TERMINAL_TYPE = "rootark-content-inventory-terminal/v1";
-const TERMINAL_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-terminal/v1\0", "ascii");
+const TERMINAL_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-terminal/v1\0", "ascii");
 const MAX_ENTRIES = 4096;
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_TERMINAL_PROOF_BYTES = 4096;
 const MAX_COMMITTED_PROOF_BYTES = 4096;
 const ENTRY_TYPE = "rootark-content-inventory-entry/v1";
-const ENTRY_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0", "ascii");
+const ENTRY_DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/content-inventory-entry/v1\0", "ascii");
 const COMMITTED_FIELDS = Object.freeze([
   "type", "version", "signer_key_id", "scope", "sequence", "previous_root", "root",
   "operation_id", "expected_sequence", "expected_root", "request_digest", "entry", "signature",
@@ -50,7 +64,7 @@ function copyBytes(value, min, max = min) {
   }
   const length = value.byteLength;
   if (!Number.isSafeInteger(length) || length < min || length > max) fail("INVENTORY_LIMIT");
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
 
 function exactObject(value, names, code = "INVENTORY_FIELDS") {
@@ -58,16 +72,16 @@ function exactObject(value, names, code = "INVENTORY_FIELDS") {
   let proto;
   let keys;
   try {
-    proto = Object.getPrototypeOf(value);
-    keys = Reflect.ownKeys(value);
+    proto = NATIVE_GET_PROTOTYPE(value);
+    keys = NATIVE_OWN_KEYS(value);
   } catch (_) { fail(code); }
   if ((proto !== Object.prototype && proto !== null)
     || keys.length !== names.length
     || names.some((name) => !keys.includes(name))) fail(code);
-  const result = Object.create(null);
+  const result = NATIVE_OBJECT_CREATE(null);
   for (const name of names) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail(code);
+    const descriptor = NATIVE_DESCRIPTOR(value, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail(code);
     result[name] = descriptor.value;
   }
   return result;
@@ -78,20 +92,20 @@ function objectWithOptional(value, required, optional, code) {
   let proto;
   let keys;
   try {
-    proto = Object.getPrototypeOf(value);
-    keys = Reflect.ownKeys(value);
+    proto = NATIVE_GET_PROTOTYPE(value);
+    keys = NATIVE_OWN_KEYS(value);
   } catch (_) { fail(code); }
   if ((proto !== Object.prototype && proto !== null)
     || required.some((name) => !keys.includes(name))
     || keys.some((name) => !required.includes(name) && !optional.includes(name))) fail(code);
-  const result = Object.create(null);
+  const result = NATIVE_OBJECT_CREATE(null);
   for (const name of [...required, ...optional]) {
     if (!keys.includes(name)) {
       result[name] = undefined;
       continue;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail(code);
+    const descriptor = NATIVE_DESCRIPTOR(value, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail(code);
     result[name] = descriptor.value;
   }
   return result;
@@ -126,16 +140,19 @@ function normalizeEntries(value) {
   const length = value.length;
   if (length > MAX_ENTRIES) fail("INVENTORY_LIMIT");
   let keys;
-  try { keys = Reflect.ownKeys(value); } catch (_) { fail("INVENTORY_ENTRIES"); }
+  try { keys = NATIVE_OWN_KEYS(value); } catch (_) { fail("INVENTORY_ENTRIES"); }
   if (keys.length !== length + 1 || !keys.includes("length")) fail("INVENTORY_ENTRIES");
-  const entries = new Array(length);
+  // The global Array constructor is mutable after an inherited native
+  // KeyObject getter. A literal cannot be redirected into an attacker Proxy.
+  const entries = [];
+  entries.length = length;
   let previous = null;
   for (let i = 0; i < length; i += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, String(i));
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail("INVENTORY_ENTRIES");
+    const descriptor = NATIVE_DESCRIPTOR(value, i);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_ENTRIES");
     const entry = normalizeEntry(descriptor.value);
     if (previous) {
-      const objectOrder = Buffer.compare(previous.object_id, entry.object_id);
+      const objectOrder = NATIVE_BUFFER_COMPARE(previous.object_id, entry.object_id);
       if (objectOrder > 0) fail("INVENTORY_ORDER");
       if (objectOrder === 0) {
         if (entry.revision === previous.revision) fail("INVENTORY_DUPLICATE");
@@ -146,7 +163,13 @@ function normalizeEntries(value) {
     } else if (entry.revision !== 1) {
       fail("INVENTORY_ORDER");
     }
-    entries[i] = entry;
+    // A caller-owned KeyObject callback may install inherited numeric Array
+    // setters before decoding. Normalized signed entries must own their DATA
+    // slots, not inherit a getter that changes from A at signature time to B
+    // at requested-item lookup.
+    NATIVE_DEFINE_PROPERTY(entries, i, {
+      value: entry, enumerable: true, configurable: true, writable: true,
+    });
     previous = entry;
   }
   return entries;
@@ -243,7 +266,7 @@ async function createTerminalProof(input) {
     signerKeyId, scope, reason: raw.reason, requestDigest: hash(encodedOperation),
     observedSequence, observedRoot, priorRevision, priorEpoch, blockingOperationId,
   }, operation);
-  const signature = crypto.sign(null, Buffer.concat([
+  const signature = NATIVE_SIGN(null, NATIVE_BUFFER_CONCAT([
     TERMINAL_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), privateKey);
@@ -257,10 +280,10 @@ async function verifyTerminalProof(input) {
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "operation",
   ], "INVENTORY_TERMINAL_VERIFY_INPUT");
   const serialized = copyBytes(raw.serialized, 1, MAX_TERMINAL_PROOF_BYTES);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const expectedScope = normalizeScope(raw.expectedScope);
   const operation = normalizeTerminalOperation(raw.operation);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); } catch (_) { fail("INVENTORY_ENCODING"); }
   const fields = [
@@ -312,7 +335,7 @@ async function verifyTerminalProof(input) {
   delete unsigned.signature;
   let valid = false;
   try {
-    valid = crypto.verify(null, Buffer.concat([
+    valid = NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([
       TERMINAL_DOMAIN,
       await z.encodeDeterministic(unsigned),
     ]), publicKey, signature);
@@ -323,9 +346,9 @@ async function verifyTerminalProof(input) {
     outcome: "NOT_COMMITTED_FINAL",
     reason: proof.reason,
     operationId,
-    expectedHead: { sequence: operation.expected_sequence, root: Buffer.from(operation.expected_root) },
-    observedHead: { sequence: observedSequence, root: Buffer.from(observedRoot) },
-    blockingOperationId: blockingOperationId === null ? null : Buffer.from(blockingOperationId),
+    expectedHead: { sequence: operation.expected_sequence, root: NATIVE_BUFFER_FROM(operation.expected_root) },
+    observedHead: { sequence: observedSequence, root: NATIVE_BUFFER_FROM(observedRoot) },
+    blockingOperationId: blockingOperationId === null ? null : NATIVE_BUFFER_FROM(blockingOperationId),
   };
 }
 
@@ -339,10 +362,12 @@ async function verifyCommittedEntryProof(input) {
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "operation",
   ], "INVENTORY_COMMIT_VERIFY_INPUT");
   const serialized = copyBytes(raw.serialized, 1, MAX_COMMITTED_PROOF_BYTES);
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  // Snapshot every externally expected value before the KeyObject's property
+  // getters can rewrite caller-owned trusted scope/operation B into signed A.
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const scope = normalizeScope(raw.expectedScope);
   const operation = normalizeTerminalOperation(raw.operation);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
   let decoded;
   try { decoded = await z.decodeDeterministic(serialized); }
   catch (_) { fail("INVENTORY_ENCODING"); }
@@ -382,16 +407,16 @@ async function verifyCommittedEntryProof(input) {
   if (!sameBytes(serialized, await z.encodeDeterministic({ ...unsigned, signature }))) {
     fail("INVENTORY_ENCODING");
   }
-  if (!crypto.verify(null, Buffer.concat([ENTRY_DOMAIN,
+  if (!NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([ENTRY_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), publicKey, signature)) fail("INVENTORY_SIGNATURE");
   return {
     status: "VERIFIED_NONAUTHORIZING",
     outcome: "COMMITTED_IN_SIGNED_LEDGER",
-    operationId: Buffer.from(operationId),
-    sequence, root: Buffer.from(root),
-    tuple: { object_id: Buffer.from(entry.object_id), revision: entry.revision,
-      epoch: entry.epoch, ciphertext_sha256: Buffer.from(entry.ciphertext_sha256) },
+    operationId: NATIVE_BUFFER_FROM(operationId),
+    sequence, root: NATIVE_BUFFER_FROM(root),
+    tuple: { object_id: NATIVE_BUFFER_FROM(entry.object_id), revision: entry.revision,
+      epoch: entry.epoch, ciphertext_sha256: NATIVE_BUFFER_FROM(entry.ciphertext_sha256) },
     authorizesIo: false,
   };
 }
@@ -419,11 +444,13 @@ async function readVerifiedCommittedOperation({ serialized, pinnedPublicKey,
 
 function sameBytes(a, b) {
   return Buffer.isBuffer(a) && Buffer.isBuffer(b)
-    && a.length === b.length && crypto.timingSafeEqual(a, b);
+    && a.length === b.length && NATIVE_TIMING_SAFE_EQUAL(a, b);
 }
 
 function hash(value) {
-  return crypto.createHash("sha256").update(value).digest();
+  const digest = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(digest, value);
+  return NATIVE_HASH_DIGEST.call(digest);
 }
 
 function rootBody(scope, sequence, previousRoot, entries) {
@@ -445,7 +472,7 @@ async function computeRoot(scopeValue, sequenceValue, previousRootValue, entries
   if (sequence !== entries.length) fail("INVENTORY_SEQUENCE");
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
   const canonical = await z.encodeDeterministic(rootBody(scope, sequence, previousRoot, entries));
-  return hash(Buffer.concat([ROOT_DOMAIN, canonical]));
+  return hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, canonical]));
 }
 
 function validatePrivateKey(value) {
@@ -475,14 +502,14 @@ async function createSignedSnapshot(input) {
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
 
   const body = rootBody(scope, sequence, previousRoot, entries);
-  const root = hash(Buffer.concat([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
+  const root = hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
   const unsigned = {
     ...body,
     signer_key_id: signerKeyId,
     root,
     nonce,
   };
-  const signature = crypto.sign(null, Buffer.concat([
+  const signature = NATIVE_SIGN(null, NATIVE_BUFFER_CONCAT([
     SNAPSHOT_DOMAIN,
     await z.encodeDeterministic(unsigned),
   ]), privateKey);
@@ -513,12 +540,12 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
   if (sequence === 0 && entries.length !== 0) fail("INVENTORY_GENESIS");
 
   const body = rootBody(scope, sequence, previousRoot, entries);
-  const calculatedRoot = hash(Buffer.concat([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
+  const calculatedRoot = hash(NATIVE_BUFFER_CONCAT([ROOT_DOMAIN, await z.encodeDeterministic(body)]));
   if (!sameBytes(root, calculatedRoot)) fail("INVENTORY_ROOT");
   const unsigned = { ...body, signer_key_id: signerKeyId, root, nonce };
   let valid = false;
   try {
-    valid = crypto.verify(null, Buffer.concat([
+    valid = NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([
       SNAPSHOT_DOMAIN,
       await z.encodeDeterministic(unsigned),
     ]), publicKey, signature);
@@ -528,36 +555,58 @@ async function parseAndVerifySnapshot(serializedValue, publicKey, pinnedSignerKe
 }
 
 function assertSuperset(currentEntries, previousEntries) {
-  const current = new Map(currentEntries.map((entry) => [
-    `${entry.object_id.toString("hex")}:${entry.revision}`,
-    entry,
-  ]));
-  for (const previous of previousEntries) {
-    const key = `${previous.object_id.toString("hex")}:${previous.revision}`;
-    const entry = current.get(key);
-    if (!entry) fail("INVENTORY_REMOVED");
-    if (entry.epoch !== previous.epoch || !sameBytes(entry.ciphertext_sha256, previous.ciphertext_sha256)) {
+  // Both arrays were normalized in canonical (object_id, revision) order.
+  // A public KeyObject getter may replace Array.prototype[Symbol.iterator],
+  // Array.prototype.map or Map.prototype.get after verification. Compare the
+  // own indexed entries directly so it cannot hide a previously signed row.
+  let cursor = 0;
+  for (let index = 0; index < previousEntries.length; index += 1) {
+    const previous = previousEntries[index];
+    let match = null;
+    while (cursor < currentEntries.length) {
+      const candidate = currentEntries[cursor];
+      const order = NATIVE_BUFFER_COMPARE(candidate.object_id, previous.object_id)
+        || candidate.revision - previous.revision;
+      if (order < 0) {
+        cursor += 1;
+        continue;
+      }
+      if (order > 0) fail("INVENTORY_REMOVED");
+      match = candidate;
+      cursor += 1;
+      break;
+    }
+    if (!match) fail("INVENTORY_REMOVED");
+    if (match.epoch !== previous.epoch
+      || !sameBytes(match.ciphertext_sha256, previous.ciphertext_sha256)) {
       fail("INVENTORY_MUTATED");
     }
   }
 }
 
 function normalizeCommittedProofChain(input) {
-  if (!Array.isArray(input) || input.length > MAX_ENTRIES) fail("INVENTORY_CHAIN");
-  const keys = Reflect.ownKeys(input);
+  // A Proxy(Array) satisfies Array.isArray, but its traps can replace
+  // Array.prototype.push before proof bytes are copied. The same realm may
+  // also retain a poisoned push from a previous native KeyObject callback.
+  if (NATIVE_IS_PROXY(input) || !NATIVE_ARRAY_IS_ARRAY(input)
+    || input.length > MAX_ENTRIES) fail("INVENTORY_CHAIN");
+  const keys = NATIVE_OWN_KEYS(input);
   if (keys.length !== input.length + 1 || !keys.includes("length")) fail("INVENTORY_CHAIN");
   const result = [];
   let total = 0;
   for (let i = 0; i < input.length; i += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(input, String(i));
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail("INVENTORY_CHAIN");
+    const descriptor = NATIVE_DESCRIPTOR(input, i);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail("INVENTORY_CHAIN");
     const value = descriptor.value;
     if (!isBytes(value) || (typeof SharedArrayBuffer !== "undefined"
       && value.buffer instanceof SharedArrayBuffer)
       || value.byteLength < 1 || value.byteLength > MAX_COMMITTED_PROOF_BYTES
       || total > MAX_SNAPSHOT_BYTES - value.byteLength) fail("INVENTORY_LIMIT");
     total += value.byteLength;
-    result.push(Buffer.from(value));
+    NATIVE_DEFINE_PROPERTY(result, i, {
+      value: NATIVE_BUFFER_FROM(value), enumerable: true,
+      configurable: true, writable: true,
+    });
   }
   return result;
 }
@@ -567,9 +616,16 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
   const delta = current.sequence - previous.sequence;
   if (receipts.length !== delta || delta < 1) fail("INVENTORY_CHAIN");
   let sequence = previous.sequence;
-  let root = Buffer.from(previous.root);
-  let entries = previous.entries.slice();
-  for (const serialized of receipts) {
+  let root = NATIVE_BUFFER_FROM(previous.root);
+  // The signed bytes were copied before the caller-owned key getter ran.
+  // Never revisit a mutable iterator/slice/spread/sort after that callback.
+  let entries = [];
+  for (let i = 0; i < previous.entries.length; i += 1) {
+    NATIVE_DEFINE_PROPERTY(entries, i, { value: previous.entries[i],
+      enumerable: true, configurable: true, writable: true });
+  }
+  for (let receiptIndex = 0; receiptIndex < receipts.length; receiptIndex += 1) {
+    const serialized = receipts[receiptIndex];
     let decoded;
     try { decoded = await z.decodeDeterministic(serialized); }
     catch (_) { fail("INVENTORY_ENCODING"); }
@@ -590,8 +646,16 @@ async function verifyInterveningProofChain({ receipts, previous, current, scope,
     if (verified.sequence !== sequence + 1
       || row.expected_sequence !== sequence
       || !sameBytes(copyBytes(row.expected_root, 32), root)) fail("INVENTORY_CHAIN");
-    entries = normalizeEntries([...entries, verified.tuple].sort((a, b) =>
-      Buffer.compare(a.object_id, b.object_id) || a.revision - b.revision));
+    const nextEntries = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      NATIVE_DEFINE_PROPERTY(nextEntries, index, { value: entries[index],
+        enumerable: true, configurable: true, writable: true });
+    }
+    NATIVE_DEFINE_PROPERTY(nextEntries, entries.length, { value: verified.tuple,
+      enumerable: true, configurable: true, writable: true });
+    NATIVE_APPLY(NATIVE_ARRAY_SORT, nextEntries, [(a, b) =>
+      NATIVE_BUFFER_COMPARE(a.object_id, b.object_id) || a.revision - b.revision]);
+    entries = normalizeEntries(nextEntries);
     const calculated = await computeRoot(scope, verified.sequence, root, entries);
     if (!sameBytes(calculated, verified.root)) fail("INVENTORY_CHAIN");
     sequence = verified.sequence;
@@ -608,7 +672,8 @@ async function verifySnapshot(input) {
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "requested",
     "minimumHead", "nonce",
   ], ["minimumSnapshot", "committedProofChain"], "INVENTORY_VERIFY_INPUT");
-  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  // These expected bytes belong to the external caller, not the signing key.
+  // Never read them after invoking a caller-owned native KeyObject getter.
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const expectedScope = normalizeScope(raw.expectedScope);
   const requested = normalizeRequested(raw.requested);
@@ -619,6 +684,7 @@ async function verifySnapshot(input) {
     ? null : copyBytes(raw.minimumSnapshot, 1, MAX_SNAPSHOT_BYTES);
   const chain = raw.committedProofChain === undefined || raw.committedProofChain === null
     ? null : normalizeCommittedProofChain(raw.committedProofChain);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
 
   const current = await parseAndVerifySnapshot(serialized, publicKey, pinnedSignerKeyId, expectedScope);
   if (!sameBytes(current.nonce, nonce)) fail("INVENTORY_NONCE");
@@ -648,8 +714,12 @@ async function verifySnapshot(input) {
   }
 
   let matched = null;
-  for (const entry of current.entries) {
-    const order = Buffer.compare(entry.object_id, requested.object_id);
+  // The signed snapshot has already been verified, but a public KeyObject
+  // getter may have replaced Array.prototype[Symbol.iterator]. Index the
+  // verified own entries; never accept an iterator-supplied unsigned member.
+  for (let index = 0; index < current.entries.length; index += 1) {
+    const entry = current.entries[index];
+    const order = NATIVE_BUFFER_COMPARE(entry.object_id, requested.object_id);
     if (order > 0) break;
     if (order === 0 && entry.revision === requested.revision) {
       if (entry.epoch !== requested.epoch
@@ -662,17 +732,17 @@ async function verifySnapshot(input) {
     status: "VERIFIED_NONAUTHORIZING",
     outcome: matched ? "PRESENT" : "ABSENT",
     sequence: current.sequence,
-    root: Buffer.from(current.root),
+    root: NATIVE_BUFFER_FROM(current.root),
     scope: {
-      account_id: Buffer.from(current.scope.account_id),
-      compartment_id: Buffer.from(current.scope.compartment_id),
-      keyring_id: Buffer.from(current.scope.keyring_id),
+      account_id: NATIVE_BUFFER_FROM(current.scope.account_id),
+      compartment_id: NATIVE_BUFFER_FROM(current.scope.compartment_id),
+      keyring_id: NATIVE_BUFFER_FROM(current.scope.keyring_id),
     },
     tuple: matched ? {
-      object_id: Buffer.from(matched.object_id),
+      object_id: NATIVE_BUFFER_FROM(matched.object_id),
       revision: matched.revision,
       epoch: matched.epoch,
-      ciphertext_sha256: Buffer.from(matched.ciphertext_sha256),
+      ciphertext_sha256: NATIVE_BUFFER_FROM(matched.ciphertext_sha256),
     } : null,
     verifiedInterveningReceipts: chain ? chain.length : 0,
   };

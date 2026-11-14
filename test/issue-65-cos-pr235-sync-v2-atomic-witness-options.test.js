@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const protocol = require("../sync-client/rootark-sync-protocol");
-const { DOMAIN: OWNER_PROVISION_DOMAIN } =
+const { DOMAIN: OWNER_PROVISION_DOMAIN, verifyPinnedAtomicOwnerProvision } =
   require("../sync-client/rootark-sync-atomic-owner-provision");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { trustedAtomicBatchWitnessOptions,
@@ -54,7 +54,171 @@ function resignOwnerCertificate(base, statement) {
     ownerProvisionDigest: sha256(OWNER_PROVISION_DOMAIN + protocol.canonicalJson(ownerProvisioning)) };
 }
 
-test("atomic witness accepts an independently pinned Ed25519 public KeyObject without reimport", () => {
+test("P2: authentic owner provision cannot certify one physical Ed25519 witness as CAS", () => {
+  const base = trustedFixture();
+  const witness = crypto.createPublicKey({ key: base.pinnedPublicKey, format: "der", type: "spki" });
+  const sameCas = crypto.createPublicKey({ key: base.pinnedPublicKey, format: "der", type: "spki" });
+  const coverSpki = crypto.generateKeyPairSync("ed25519").publicKey
+    .export({ type: "spki", format: "der" });
+  const nativeEquals = crypto.KeyObject.prototype.equals;
+  assert.equal(nativeEquals.call(witness, sameCas), true, "same native material, independent JS objects");
+  const withCasSpki = (casSpki) => resignOwnerCertificate(base, {
+    ...base.ownerProvisioning.statement, casSpki,
+  });
+  const makeDirect = (owner, cas) => verifyPinnedAtomicOwnerProvision({
+    identity: owner.ownerIdentity, scope: owner.scope,
+    provisionerPublicKey: owner.ownerProvisionerPublicKey,
+    witnessPublicKey: witness, casPublicKey: cas,
+    provisioning: owner.ownerProvisioning, expectedDigest: owner.ownerProvisionDigest,
+  });
+  const makeEngine = (owner) => {
+    const configured = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: owner }, true);
+    return new SyncEngine({ ...configured,
+      adapter: { list: async () => ({ objects: [] }), push: async () => null },
+    });
+  };
+  const makeDirectEngine = (owner) => new SyncEngine({
+    adapter: { list: async () => ({ objects: [] }), push: async () => null },
+    atomicBatchWitnessPublicKey: owner.pinnedPublicKey,
+    atomicBatchCasFloorPublicKey: owner.casPinnedPublicKey,
+    atomicBatchWitnessReadback: owner.readback,
+    atomicBatchCasFloorReadback: owner.casReadback,
+    atomicBatchWitnessScope: owner.scope,
+    atomicBatchOwnerIdentity: owner.ownerIdentity,
+    atomicBatchOwnerProvisionerPublicKey: owner.ownerProvisionerPublicKey,
+    atomicBatchOwnerProvisioning: owner.ownerProvisioning,
+    atomicBatchOwnerProvisionDigest: owner.ownerProvisionDigest,
+  });
+  // Genuine independent roles and a valid externally pinned signed digest work.
+  const distinct = withCasSpki(base.ownerProvisioning.statement.casSpki);
+  assert.ok(makeDirect(distinct, base.casPinnedPublicKey));
+  const goodEngine = makeEngine(distinct);
+  assert.equal(crypto.KeyObject.prototype.equals.call(goodEngine.atomicBatchWitnessPublicKey,
+    goodEngine.atomicBatchCasFloorPublicKey), false);
+  assert.ok(makeDirectEngine(distinct));
+  assert.ok(makeDirectEngine({ ...distinct,
+    pinnedPublicKey: base.pinnedPublicKey.toString("base64url"),
+    casPinnedPublicKey: base.casPinnedPublicKey.toString("base64url"),
+    ownerProvisionerPublicKey: base.ownerProvisionerPublicKey.toString("base64url") }),
+  "legacy canonical base64url pins remain supported alongside raw DER buffers");
+  const unmasked = withCasSpki(base.ownerProvisioning.statement.witnessSpki);
+  assert.throws(() => makeDirect(unmasked, sameCas), { code: "authorization_required" });
+  assert.throws(() => makeEngine({ ...unmasked, pinnedPublicKey: witness,
+    casPinnedPublicKey: sameCas }), { code: "authorization_required" });
+  assert.throws(() => makeDirectEngine({ ...unmasked, pinnedPublicKey: witness,
+    casPinnedPublicKey: sameCas }), { code: "authorization_required" });
+  // Same native key, but fake CAS instance .export claims an unrelated SPKI;
+  // this formerly passed BOTH the certificate verifier and SyncEngine.
+  Object.defineProperty(sameCas, "export", { value: () => coverSpki });
+  const masked = withCasSpki(coverSpki.toString("base64url"));
+  assert.throws(() => makeDirect(masked, sameCas), { code: "authorization_required" });
+  assert.throws(() => makeEngine({ ...masked, pinnedPublicKey: witness,
+    casPinnedPublicKey: sameCas }), { code: "authorization_required" });
+  assert.throws(() => makeDirectEngine({ ...masked, pinnedPublicKey: witness,
+    casPinnedPublicKey: sameCas }), { code: "authorization_required" });
+
+  // A genuinely signed provisioning statement also cannot make the SOURCE
+  // owner/provisioner itself impersonate EITHER of its two independent roles.
+  for (const [role, field] of [["witness", "witnessSpki"], ["cas", "casSpki"]]) {
+    const ownerAsRole = crypto.createPublicKey({ key: base.ownerProvisionerPublicKey,
+      format: "der", type: "spki" });
+    Object.defineProperty(ownerAsRole, "export", { value: () => coverSpki });
+    const signed = resignOwnerCertificate(base, {
+      ...base.ownerProvisioning.statement, [field]: coverSpki.toString("base64url"),
+    });
+    const overridden = { ...signed,
+      [role === "witness" ? "pinnedPublicKey" : "casPinnedPublicKey"]: ownerAsRole };
+    assert.throws(() => makeDirectEngine(overridden), { code: "authorization_required" },
+      `native provisioner and ${role} identity must be pairwise distinct`);
+    assert.throws(() => makeEngine(overridden), { code: "authorization_required" });
+  }
+
+  // Shadowed instance metadata must not reject truly DISTINCT native keys.
+  const independentCas = crypto.createPublicKey({ key: base.casPinnedPublicKey,
+    format: "der", type: "spki" });
+  const independentProvisioner = crypto.createPublicKey({ key: base.ownerProvisionerPublicKey,
+    format: "der", type: "spki" });
+  for (const key of [witness, independentCas, independentProvisioner]) {
+    Object.defineProperties(key, {
+      type: { value: "private" }, asymmetricKeyType: { value: "rsa" },
+      export: { value: () => { throw Error("caller export must never execute"); } },
+    });
+  }
+  const independent = { ...distinct, pinnedPublicKey: witness,
+    casPinnedPublicKey: independentCas, ownerProvisionerPublicKey: independentProvisioner };
+  assert.ok(verifyPinnedAtomicOwnerProvision({ identity: independent.ownerIdentity,
+    scope: independent.scope, provisionerPublicKey: independentProvisioner,
+    witnessPublicKey: witness, casPublicKey: independentCas,
+    provisioning: independent.ownerProvisioning, expectedDigest: independent.ownerProvisionDigest }));
+  const accepted = makeEngine(independent);
+  assert.equal(nativeEquals.call(accepted.atomicBatchWitnessPublicKey,
+    accepted.atomicBatchCasFloorPublicKey), false);
+  assert.notEqual(accepted.atomicBatchCasFloorPublicKey, independentCas,
+    "engine retains a canonical native clone, not caller's mutable object");
+
+  assert.throws(() => makeEngine({ ...distinct,
+    casPinnedPublicKey: new Proxy(independentCas, {}) }),
+  { code: "authorization_required" });
+});
+
+test("P2: inherited witness key getter cannot retarget canonical owner A bytes to certify identity B", () => {
+  const base = trustedFixture();
+  const original = base.ownerProvisioning;
+  const alteredIdentity = { ...base.ownerIdentity, username: "mallory" };
+  const forged = { ...original, statement: {
+    ...original.statement, username: alteredIdentity.username,
+  } };
+  assert.notEqual(forged.statement.username, original.statement.username);
+  assert.notEqual(protocol.canonicalJson(forged), protocol.canonicalJson(original));
+  assert.equal(crypto.createHash("sha256").update(
+    OWNER_PROVISION_DOMAIN + protocol.canonicalJson(original)).digest("hex"),
+  base.ownerProvisionDigest, "independently pinned digest belongs to signed owner A");
+
+  const witness = crypto.createPublicKey({ key: base.pinnedPublicKey,
+    format: "der", type: "spki" });
+  const nativeHandle = Object.getOwnPropertySymbols(witness)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(nativeHandle, "Node22 native-handle getter required");
+  const inherited = Object.create(witness);
+  const saved = protocol.canonicalJson;
+  let getterReads = 0, retargetedBytes = 0;
+  Object.defineProperty(inherited, nativeHandle, { get() {
+    getterReads++;
+    protocol.canonicalJson = (value) => {
+      if (value?.type === "atomic-owner-provisioning"
+        && value.username === alteredIdentity.username) {
+        retargetedBytes++;
+        return saved(original.statement);
+      }
+      if (value?.statement?.username === alteredIdentity.username
+        && value.signature === original.signature) {
+        retargetedBytes++;
+        return saved(original);
+      }
+      return saved(value);
+    };
+    return witness[nativeHandle];
+  } });
+  try {
+    assert.throws(() => verifyPinnedAtomicOwnerProvision({
+      identity: alteredIdentity, scope: base.scope,
+      provisionerPublicKey: base.ownerProvisionerPublicKey,
+      witnessPublicKey: inherited, casPublicKey: base.casPinnedPublicKey,
+      provisioning: forged, expectedDigest: base.ownerProvisionDigest,
+    }), { code: "authorization_required" },
+    "signed owner A cannot authenticate unowned identity B with retained digest A");
+  } finally { protocol.canonicalJson = saved; }
+  assert.ok(getterReads > 0, "genuine inherited KeyObject handle getter executed");
+  assert.equal(retargetedBytes, 0, "authority does not dispatch to mutable protocol export after getter");
+  assert.ok(verifyPinnedAtomicOwnerProvision({
+    identity: base.ownerIdentity, scope: base.scope,
+    provisionerPublicKey: base.ownerProvisionerPublicKey,
+    witnessPublicKey: base.pinnedPublicKey, casPublicKey: base.casPinnedPublicKey,
+    provisioning: original, expectedDigest: base.ownerProvisionDigest,
+  }), "legitimate signed A still verifies under independent pinned digest A");
+});
+
+test("atomic witness accepts a pinned Ed25519 KeyObject and retains canonical native material", () => {
   // PR236 additionally requires owner-signed provision and a separate CAS
   // floor. Preserve that full authority chain while testing KeyObject input.
   const witness = trustedFixture();
@@ -67,8 +231,9 @@ test("atomic witness accepts an independently pinned Ed25519 public KeyObject wi
     adapter: { push: async () => null, list: async () => [] },
     atomicBatchWitnessPublicKey,
   });
-  assert.equal(makeEngine(configured.atomicBatchWitnessPublicKey).atomicBatchWitnessPublicKey,
-    publicKey);
+  const held = makeEngine(configured.atomicBatchWitnessPublicKey).atomicBatchWitnessPublicKey;
+  assert.notEqual(held, publicKey, "never retain caller-owned mutable KeyObject");
+  assert.equal(crypto.KeyObject.prototype.equals.call(held, publicKey), true);
   assert.equal(makeEngine(publicKey.export({ type: "spki", format: "der" }))
     .atomicBatchWitnessPublicKey.asymmetricKeyType, "ed25519");
   assert.throws(() => makeEngine(crypto.generateKeyPairSync("rsa", {

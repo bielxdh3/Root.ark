@@ -345,6 +345,67 @@ test("an async witness cannot repin the CAS signer, owner scope or readback call
   assert.deepEqual(await (await f.reread()).recover(), []);
 });
 
+test("P2: late native KeyObject getter cannot replay a pre-signed witness and CAS nonce through Buffer.toString", {
+  timeout: 120000,
+}, async (t) => {
+  const attackerOwned = crypto.generateKeyPairSync("ed25519");
+  const handle = Object.getOwnPropertySymbols(attackerOwned.publicKey)
+    .find((s) => s.description === "kHandle");
+  assert.ok(handle, "Node22 native handle required");
+  const root = Object.create(attackerOwned.publicKey);
+  const nativeExport = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(attackerOwned.publicKey), "export").value;
+  const realToString = Buffer.prototype.toString;
+  const oldNonce = Buffer.alloc(32, 99).toString("base64url");
+  let getterReads = 0, interceptedNonces = 0;
+  Object.defineProperty(root, handle, { get() {
+    getterReads++;
+    Buffer.prototype.toString = function(encoding, ...rest) {
+      if (Buffer.isBuffer(this) && this.length === 32 && encoding === "base64url") {
+        interceptedNonces++;
+        return oldNonce;
+      }
+      return Reflect.apply(realToString, this, [encoding, ...rest]);
+    };
+    return attackerOwned.publicKey[handle];
+  } });
+  let staleCas, observedWitnessNonce, observedFloorNonce;
+  const f = await fixture(t, {
+    onWitnessChallenge: (challenge) => { observedWitnessNonce = challenge.nonce; },
+    witnessResponse: (challenge, ctx) => {
+      const signedWitness = ctx.receiptFor([ctx.deleted, ctx.moved],
+        { nonce: challenge.nonce });
+      // Make an OLD, independently signed CAS response *before* arming the
+      // adversarial native getter. No fake signature or synthetic digest.
+      staleCas = f.casFloorFor(signedWitness, oldNonce);
+      const der = nativeExport.call(root, { type: "spki", format: "der" });
+      assert.equal(der.length, 44, "native inherited getter must execute");
+      return signedWitness;
+    },
+    casResponse: (challenge) => {
+      observedFloorNonce = challenge.nonce;
+      return staleCas;
+    },
+  });
+  let denialReason;
+  try {
+    await assert.rejects(f.engine._pushPending(f.summary()), (error) => {
+      denialReason = error.message;
+      return error.code === "sync_atomic_batch_indeterminate";
+    },
+      "previously signed witness+CAS attestations cannot satisfy a new fresh nonce");
+  } finally { Buffer.prototype.toString = realToString; }
+  assert.deepEqual(f.events.map((entry) => entry.kind), ["batch"],
+    "nonce check must be reached after the real atomic batch transport");
+  assert.ok(getterReads > 0);
+  assert.equal(interceptedNonces, 0,
+    "fresh CAS floor challenge must bypass the attacker-rebound Buffer.toString");
+  assert.ok(observedWitnessNonce, `must reach witness challenge; stopped: ${denialReason}`);
+  assert.ok(observedFloorNonce, `must reach CAS floor challenge; stopped: ${denialReason}`);
+  assert.notEqual(observedFloorNonce, oldNonce);
+  await f.assertBothPending();
+});
+
 test("signed pair plus separate pinned synthetic admission witness ACKs both in one transaction", {
   timeout: 120000,
 }, async (t) => {
