@@ -547,6 +547,7 @@ function activeFileIdentityPath(files, operation, exceptPath) {
 
 class SyncEngine {
   constructor(options = {}) {
+    this.options = options;
     if (!options.adapter || typeof options.adapter.push !== "function" || typeof options.adapter.list !== "function") {
       fail("Sync adapter with push and list is required");
     }
@@ -2874,6 +2875,9 @@ class SyncEngine {
         }
         try {
           if (historicalRestoreHash !== undefined) {
+            if (this.options?.requireNativeRootSession) {
+              fail("Native root session required for historical restore", "restore_local_conflict");
+            }
             const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
             try {
               // Atomic no-replace materialization; do not clobber files
@@ -2885,15 +2889,39 @@ class SyncEngine {
               if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
               throw error;
             }
-            let targetStat;
+            let targetHandle;
+            let verified = false;
             try {
-              targetStat = await fsp.lstat(target, { bigint: true });
-            } catch (statError) {
-              await fsp.unlink(target).catch(() => {});
-              throw statError;
+              targetHandle = await fsp.open(target, fs.constants.O_RDONLY
+                | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+              try {
+                const openedStat = await targetHandle.stat({ bigint: true });
+                const pathStat = await fsp.lstat(target, { bigint: true });
+                if (openedStat.isFile() && !openedStat.isSymbolicLink()
+                  && pathStat.isFile() && !pathStat.isSymbolicLink()
+                  && openedStat.nlink >= 2n
+                  && sameFileVersion(openedStat, pathStat)
+                  && sameFileIdentity(tempStat, openedStat)
+                  && openedStat.size === BigInt(plaintext.length)) {
+                  const materializedBytes = await targetHandle.readFile();
+                  try {
+                    const endStat = await targetHandle.stat({ bigint: true });
+                    if (sameFileVersion(openedStat, endStat)
+                      && crypto.createHash("sha256").update(materializedBytes).digest("hex")
+                        === crypto.createHash("sha256").update(plaintext).digest("hex")) {
+                      verified = true;
+                    }
+                  } finally {
+                    materializedBytes.fill(0);
+                  }
+                }
+              } finally {
+                await targetHandle.close();
+              }
+            } catch {
+              /* Reject on descriptor open, stat, or read failure */
             }
-            if (!sameFileIdentity(tempStat, targetStat) || targetStat.nlink < 2n) {
-              await fsp.unlink(target).catch(() => {});
+            if (!verified) {
               fail("Historical restore materialization identity mismatch", "restore_local_conflict");
             }
           } else {

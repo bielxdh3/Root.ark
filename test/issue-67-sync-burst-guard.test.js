@@ -273,6 +273,60 @@ test("issue 67 route: recoverable ciphertext history is readable by its owner on
   assert.equal((await fetch(`http://127.0.0.1:${forbiddenPort}/sync/v1/objects/object-1/history`)).status, 403);
 });
 
+test("issue 67 route: oversized history rejects unpaginated reads with 413 and paginates safely with cursor", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-history-page-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const key = crypto.randomBytes(32);
+  const bigPlaintext = Buffer.alloc(6 * 1024 * 1024, "A");
+  const versions = [1, 2, 3].map((n) => protocol.createOperation({
+    operation: n === 1 ? "create" : "update",
+    objectId: "object-big",
+    fileId: "file-big",
+    versionId: `ver-${n}`,
+    operationId: `op-${n}`,
+    deviceId: "device-a",
+    keyEpoch: "epoch-1",
+    compartmentId: "private",
+    revision: { counter: n, deviceId: "device-a" },
+    ...(n > 1 ? { baseRevision: { counter: n - 1, deviceId: "device-a" } } : {}),
+    metadata: { path: "big.bin", name: "big.bin", size: bigPlaintext.length },
+    plaintext: bigPlaintext,
+    fileKey: key,
+  }));
+  await fsp.writeFile(storagePath, JSON.stringify({
+    version: 1,
+    users: { alice: { objects: { "object-big": versions[2] }, versions: { "object-big": versions } } },
+  }), "utf8");
+  const { port } = await startServer(t, { storagePath });
+
+  const unpaginated = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history`);
+  assert.equal(unpaginated.status, 413);
+  assert.equal((await unpaginated.json()).code, "SYNC_HISTORY_TOO_LARGE");
+
+  const page1Res = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?limit=1`);
+  assert.equal(page1Res.status, 200);
+  const page1 = await page1Res.json();
+  assert.deepEqual(page1.versions.map((v) => v.versionId), ["ver-1"]);
+  assert.equal(typeof page1.nextCursor, "string");
+
+  const page2Res = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?limit=5&cursor=${encodeURIComponent(page1.nextCursor)}`);
+  assert.equal(page2Res.status, 200);
+  const page2 = await page2Res.json();
+  // Response byte cap (~16 MiB) admits 2 ~6 MiB entries and leaves ver-3 for next page even though limit=5.
+  assert.deepEqual(page2.versions.map((v) => v.versionId), ["ver-2"]);
+  assert.equal(typeof page2.nextCursor, "string");
+
+  const page3Res = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?cursor=${encodeURIComponent(page2.nextCursor)}`);
+  assert.equal(page3Res.status, 200);
+  const page3 = await page3Res.json();
+  assert.deepEqual(page3.versions.map((v) => v.versionId), ["ver-3"]);
+  assert.equal(page3.nextCursor, null);
+
+  assert.equal((await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?limit=0`)).status, 400);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?cursor=bad`)).status, 400);
+});
+
 test("issue 67 route: pause survives restart and resume lifts it without touching data", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-resume-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

@@ -222,11 +222,60 @@ test("GREEN: _apply history rejects substituted foreign temporary and never publ
   }
   try {
     assert.equal(triggered, true, "the original historical publication path was exercised");
-    assert.equal(fs.existsSync(target), false, "target must not exist with foreign bytes");
     assert.equal(await fsp.readFile(retained, "utf8"), "AUTHENTICATED RESTORE BYTES");
     assert.equal(f.getPushed(), 0, "the existing signed outbound digest gate MUST stay effective");
+    assert.equal(f.engine.snapshot.files["document.txt"], undefined, "no corrupt snapshot entry is persisted");
   } finally {
     if (originalFd) await originalFd.close();
     if (foreignFd) await foreignFd.close();
+  }
+});
+
+test("GREEN: in-place modification of temporary bytes (r+) preserving dev/ino/nlink is rejected fail-closed with restore_local_conflict and persists zero snapshot/outbox", async (t) => {
+  const f = await signedRestoreFixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalLink = fsp.link;
+  let triggered = false;
+  try {
+    fsp.link = async (from, to, ...rest) => {
+      if (to === target && from.includes(".tmp-")) {
+        triggered = true;
+        const handle = await fsp.open(from, "r+");
+        try {
+          await handle.write(Buffer.from("CORRUPTED SAME-INODE IN-PLACE BYTES"), 0);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      }
+      return originalLink(from, to, ...rest);
+    };
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_local_conflict");
+  } finally {
+    fsp.link = originalLink;
+  }
+  assert.equal(triggered, true, "the in-place modification interceptor was exercised");
+  assert.equal(f.getPushed(), 0, "persists zero outbox pushes");
+  assert.equal(f.engine.snapshot.files["document.txt"], undefined, "persists zero snapshot entries");
+  assert.equal((await f.engine.journal.recover()).length, 0, "zero journal outbox persisted");
+});
+
+test("GREEN: requireNativeRootSession option fails closed before mutable-path publication", async (t) => {
+  const f = await signedRestoreFixture(t);
+  f.engine.options.requireNativeRootSession = true;
+  let linkAttempted = false;
+  const originalLink = fsp.link;
+  try {
+    fsp.link = async (...args) => {
+      linkAttempted = true;
+      return originalLink(...args);
+    };
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_local_conflict");
+    assert.equal(linkAttempted, false, "mutable-path link must not be attempted when requireNativeRootSession is set");
+    assert.equal(f.getPushed(), 0, "zero pushes");
+  } finally {
+    fsp.link = originalLink;
   }
 });
