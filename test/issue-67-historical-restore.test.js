@@ -416,6 +416,553 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   assert.equal((await reopened.journal.recover()).length, 0);
 });
 
+test("#67 P2: offline materialized restore survives later local edit and pushes before the edit", async (t) => {
+  const f = await fixture(t);
+  const actualPush = f.adapter.push;
+  let offline = true;
+  f.adapter.push = async (operation) => {
+    if (offline) throw Object.assign(new Error("disposable offline"), { code: "offline" });
+    return actualPush(operation);
+  };
+  const result = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(result.restored, true);
+  assert.equal(result.pushed, false);
+  assert.equal(result.pending, true);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 1);
+  const target = path.join(f.local, "document.txt");
+  assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+  const materialized = f.engine.snapshot.files["document.txt"];
+  assert.equal(materialized.versionId, result.versionId);
+  assert.equal(materialized.hash,
+    crypto.createHash("sha256").update("original authenticated bytes").digest("hex"));
+
+  // This is a legitimate LOCAL edit to a restore already durably written to
+  // the filesystem and sync snapshot. The restore's signed parent must commit
+  // before the edit is assigned a subsequent CAS revision.
+  const edited = Buffer.from("locally edited after successful materialization");
+  await fsp.writeFile(target, edited);
+  offline = false;
+  const historyList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? historyList(objectId) : [await historyList(objectId)];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  const committedRestore = await reopened.syncOnce();
+  assert.equal(committedRestore.pushed, 1,
+    "durably materialized restore must not strand the entire outbox on later user edits");
+  assert.equal(f.pushes(), 1);
+  assert.equal((await reopened.journal.recover()).length, 0);
+  assert.deepEqual(await fsp.readFile(target), edited, "signed restore ACK cannot erase local edits");
+  assert.equal(f.current().versionId, result.versionId);
+  const after = await reopened.syncOnce();
+  assert.equal(after.pushed, 1, "later local edit is independently signed after restore CAS");
+  assert.equal(f.pushes(), 2);
+  assert.deepEqual(protocol.decryptPayload(f.current(), f.privateFileKey), edited);
+  assert.deepEqual(await fsp.readFile(target), edited);
+});
+
+test("#67 P2: forged persisted snapshot alone cannot authorize a never-materialized restore", async (t) => {
+  const f = await fixture(t);
+  const stage = f.engine.stageHistoricalRestore.bind(f.engine);
+  f.engine.stageHistoricalRestore = async (...args) => {
+    await stage(...args);
+    throw new Error("disposable crash before restoring target bytes");
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    /disposable crash before restoring target bytes/);
+  const queued = await f.engine.journal.recover();
+  assert.equal(queued.length, 1);
+  const signed = queued[0];
+  assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
+  const payload = protocol.decryptPayload(signed, f.privateFileKey);
+  try {
+    // Simulate a local attacker altering the untrusted snapshot JSON without
+    // changing the signed journal or materializing the file's actual bytes.
+    f.engine.snapshot.files["document.txt"] = {
+      objectId: signed.objectId, fileId: signed.fileId, versionId: signed.versionId,
+      revision: signed.revision, hash: crypto.createHash("sha256").update(payload).digest("hex"),
+      deleted: false, directory: false,
+    };
+    await f.engine.persistSnapshot();
+  } finally { payload.fill(0); }
+  assert.equal(fs.existsSync(path.join(f.local, "document.txt")), false);
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+  const resumed = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  await assert.rejects(resumed.syncOnce(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0);
+  assert.equal((await resumed.journal.recover()).length, 1);
+});
+
+test("#67 P2: deletion after durable offline restore remains a later signed delete", async (t) => {
+  const f = await fixture(t);
+  const actualPush = f.adapter.push;
+  let offline = true;
+  f.adapter.push = async (operation) => {
+    if (offline) throw Object.assign(new Error("disposable offline"), { code: "offline" });
+    return actualPush(operation);
+  };
+  const pending = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(pending.pending, true);
+  const target = path.join(f.local, "document.txt");
+  assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+  await fsp.unlink(target);
+  offline = false;
+  const historyList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? historyList(objectId) : [await historyList(objectId)];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  const restored = await reopened.syncOnce();
+  assert.equal(restored.pushed, 1);
+  assert.equal(f.current().versionId, pending.versionId);
+  assert.equal(fs.existsSync(target), false, "remote restore ACK cannot re-create the deleted local file");
+  const deletion = await reopened.syncOnce();
+  assert.equal(deletion.pushed, 1);
+  assert.equal(f.current().operation, "delete");
+  assert.equal(f.current().tombstone, true);
+  assert.equal(fs.existsSync(target), false);
+  assert.deepEqual(await reopened.journal.recover(), []);
+});
+
+test("#67 P2: failing physical file fsync cannot certify a restore as materialized", async (t) => {
+  const f = await fixture(t);
+  const originalOpen = fsp.open;
+  let injected = 0;
+  fsp.open = async (name, ...rest) => {
+    const handle = await originalOpen(name, ...rest);
+    if (String(name).includes("document.txt.tmp-")) {
+      Object.defineProperty(handle, "sync", {
+        value: async () => {
+          injected += 1;
+          throw Object.assign(new Error("disposable file fsync refused"), { code: "EIO" });
+        }, configurable: true,
+      });
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "EIO");
+  } finally { fsp.open = originalOpen; }
+  assert.equal(injected, 1, "the fsync injection must hit the REAL plaintext file handle");
+  assert.equal(f.pushes(), 0);
+  assert.equal(fs.existsSync(path.join(f.local, "document.txt")), false,
+    "failure before link must not create a supposed restored file");
+  const pending = await f.engine.journal.recover();
+  assert.equal(pending.length, 1, "the signed outbox cannot be silently cleared");
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending[0]), false,
+    "the journal must not witness bytes that were never physically flushed");
+  assert.equal(f.engine.snapshot.files["document.txt"], undefined);
+});
+
+test("#67 P2: a recovered restore without witness cannot push if retry file fsync fails", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const stage = f.engine.stageHistoricalRestore.bind(f.engine);
+  f.engine.stageHistoricalRestore = async (...args) => {
+    await stage(...args);
+    throw new Error("disposable halt before durable materialization");
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    /disposable halt before durable materialization/);
+  const [signed] = await f.engine.journal.recover();
+  assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
+  assert.equal(f.engine.journal.hasMaterializedRestore(signed), false);
+  const bytes = protocol.decryptPayload(signed, f.privateFileKey);
+  try { await restoreRecoveredBytesOnlyIfVacant(target, bytes); }
+  finally { bytes.fill(0); }
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  const originalOpen = fsp.open;
+  let injected = 0;
+  fsp.open = async (name, flags, ...rest) => {
+    const handle = await originalOpen(name, flags, ...rest);
+    if (name === target && typeof flags === "number" && (flags & fs.constants.O_RDWR)) {
+      Object.defineProperty(handle, "sync", { value: async () => {
+        injected += 1;
+        throw Object.assign(new Error("disposable recovered file fsync EIO"), { code: "EIO" });
+      }, configurable: true });
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(reopened.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
+  } finally { fsp.open = originalOpen; }
+  assert.equal(injected, 1, "retry must fsync the exact recovered file descriptor");
+  assert.equal(f.pushes(), 0, "failed retry fsync must never authorize remote POST");
+  assert.equal((await reopened.journal.recover()).length, 1);
+  assert.equal(reopened.journal.hasMaterializedRestore(signed), false);
+  assert.deepEqual(await fsp.readFile(target), Buffer.from("original authenticated bytes"));
+  const resumed = await reopened.syncOnce();
+  assert.equal(resumed.pushed, 1, "a fresh successful physical sync permits a safe retry");
+  assert.equal(f.pushes(), 1);
+});
+
+test("#67 P2: failed POSIX directory fsync after link cannot authorize push on retry", {
+  skip: process.platform === "win32" ? "directory FileHandle.sync is not available on Windows" : false,
+}, async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalOpen = fsp.open;
+  const originalLink = fsp.link;
+  let linked = false;
+  let injectionsRemaining = 2;
+  fsp.link = async (source, destination) => {
+    const result = await originalLink(source, destination);
+    if (destination === target && source.startsWith(`${target}.tmp-`)) linked = true;
+    return result;
+  };
+  fsp.open = async (name, flags, ...rest) => {
+    const handle = await originalOpen(name, flags, ...rest);
+    if (linked && name === f.local
+      && typeof flags === "number"
+      && (flags & (fs.constants.O_DIRECTORY || 0)) !== 0
+      && (flags & (fs.constants.O_NOFOLLOW || 0)) !== 0
+      && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) === fs.constants.O_RDONLY
+      && injectionsRemaining > 0) {
+      Object.defineProperty(handle, "sync", { value: async () => {
+        injectionsRemaining -= 1;
+        throw Object.assign(new Error("disposable directory durability EIO"), { code: "EIO" });
+      }, configurable: true });
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "EIO");
+    assert.equal(injectionsRemaining, 1, "first EIO must strike directory sync after physical link");
+    assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+    const [signed] = await f.engine.journal.recover();
+    assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
+    assert.equal(f.engine.journal.hasMaterializedRestore(signed), false);
+    assert.equal(f.pushes(), 0);
+    const originalList = f.adapter.list;
+    f.adapter.list = async (objectId) => objectId
+      ? originalList(objectId) : [await originalList(objectId)];
+    const reopened = await new SyncEngine({
+      rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+      keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+      fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+      authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+      verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    }).open();
+    await assert.rejects(reopened.syncOnce(),
+      (error) => error.code === "restore_local_materialization_missing",
+      "the real POSIX retry must fail closed when directory fsync fails");
+    assert.equal(injectionsRemaining, 0, "second EIO must strike missing-witness retry directory fsync");
+    assert.equal(f.pushes(), 0, "the server must not receive the restore after either fsync EIO");
+    assert.equal((await reopened.journal.recover()).length, 1);
+    assert.equal(reopened.journal.hasMaterializedRestore(signed), false);
+    const result = await reopened.syncOnce();
+    assert.equal(result.pushed, 1, "physical fsync on the real retry permits subsequent admission");
+    assert.equal(f.pushes(), 1);
+    assert.equal((await reopened.journal.recover()).length, 0);
+  } finally { fsp.open = originalOpen; fsp.link = originalLink; }
+});
+
+test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed on changed identity", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalUnlink = fsp.unlink;
+  const originalRemove = fsp.rm;
+  let interruptedCleanup = 0;
+  let suppressedCleanup = 0;
+  fsp.unlink = async (name, ...args) => {
+    if (String(name).startsWith(`${target}.tmp-`)) {
+      interruptedCleanup += 1;
+      throw new Error("disposable hard crash after linked staging identity was committed");
+    }
+    return originalUnlink(name, ...args);
+  };
+  fsp.rm = async (name, ...args) => {
+    if (String(name).startsWith(`${target}.tmp-`)) {
+      suppressedCleanup += 1;
+      return;
+    }
+    return originalRemove(name, ...args);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      /disposable hard crash after linked staging identity was committed/);
+  } finally { fsp.unlink = originalUnlink; fsp.rm = originalRemove; }
+  assert.equal(interruptedCleanup, 1, "real target link and exact bound identity precede failed unlink");
+  assert.equal(suppressedCleanup, 1, "simulated kill must bypass only the stage unlink cleanup");
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(await verifyAuthorizationProof(pending.authorization, pending, f.trusted), true);
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending), false);
+  const staging = f.engine.journal.restoreStagingInfo(pending);
+  assert.ok(staging, "crash recovery needs a durable exact staged inode/name bound to signed envelope");
+  const orphan = path.join(f.local, staging.name);
+  assert.equal(fs.existsSync(orphan), true, "the original producer-created temporary hardlink remains");
+  assert.equal((await fsp.lstat(target)).nlink, 2);
+  assert.equal((await fsp.lstat(orphan)).ino, (await fsp.lstat(target)).ino);
+  const current = await fsp.lstat(target, { bigint: true });
+  const idMatches = current.ino.toString() === staging.ino
+    && current.dev.toString() === staging.dev;
+  // Win32 filesystem index exposure can change across link creation. If it
+  // does, a pre-crash journal identity MUST NOT authorize guessed cleanup.
+  // This is safe manual-recovery NO-GO, not a falsely claimed auto-repair.
+  if (!idMatches) {
+    assert.equal(process.platform, "win32", "POSIX inode identity must remain stable");
+  }
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  if (!idMatches) {
+    await assert.rejects(reopened.syncOnce(),
+      (error) => error.code === "restore_local_materialization_missing");
+    assert.equal(f.pushes(), 0);
+    assert.equal(fs.existsSync(orphan), true, "mismatched staged identity cannot be deleted");
+    assert.equal((await reopened.journal.recover()).length, 1);
+    assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+    return;
+  }
+  const result = await reopened.syncOnce();
+  assert.equal(result.pushed, 1, "a verified original restore may safely resume after cleanup");
+  assert.equal(f.pushes(), 1);
+  assert.equal(fs.existsSync(orphan), false, "remove only the authenticated temporary second hardlink");
+  assert.equal((await fsp.lstat(target)).nlink, 1);
+  assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+  assert.deepEqual(await reopened.journal.recover(), []);
+});
+
+test("#67 P2: foreign hardlink cannot be misidentified as restore temp and deleted", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const stage = f.engine.stageHistoricalRestore.bind(f.engine);
+  f.engine.stageHistoricalRestore = async (...args) => {
+    await stage(...args);
+    throw new Error("disposable stop before materialization");
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /disposable stop/);
+  const [pending] = await f.engine.journal.recover();
+  const bytes = protocol.decryptPayload(pending, f.privateFileKey);
+  try { await restoreRecoveredBytesOnlyIfVacant(target, bytes); }
+  finally { bytes.fill(0); }
+  // A user can legitimately create a hardlink whose name merely resembles
+  // the engine's staging suffix. It has NO durable journal staging intent.
+  // Matching the suffix, inode and payload hash must not suffice to unlink it.
+  const foreignName = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  await fsp.link(target, foreignName);
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+  const countBefore = f.pushes();
+  await assert.rejects(f.engine.syncOnce(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), countBefore);
+  assert.equal((await fsp.lstat(target)).nlink, 2);
+  assert.equal(fs.existsSync(foreignName), true, "never remove an arbitrary user hardlink");
+  assert.equal((await f.engine.journal.recover()).length, 1);
+});
+
+test("#67 P2: pre-link crash cannot silently upload the durable staging temp", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const stage = f.engine.stageHistoricalRestore.bind(f.engine);
+  const originalRemove = fsp.rm;
+  let skippedCleanup = 0;
+  f.engine.stageHistoricalRestore = async (...args) => {
+    await stage(...args);
+    throw new Error("disposable crash before hardlink to target");
+  };
+  fsp.rm = async (name, ...args) => {
+    if (String(name).startsWith(`${target}.tmp-`)) {
+      skippedCleanup += 1;
+      return;
+    }
+    return originalRemove(name, ...args);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      /disposable crash before hardlink to target/);
+  } finally { fsp.rm = originalRemove; }
+  assert.equal(skippedCleanup, 1, "injected process kill must preserve producer's exact staging temp");
+  const [signed] = await f.engine.journal.recover();
+  assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
+  const intent = f.engine.journal.restoreStagingInfo(signed);
+  assert.ok(intent, "signed outbox must preserve its physically pinned staging intent");
+  const staged = path.join(f.local, intent.name);
+  assert.equal((await fsp.lstat(staged, { bigint: true })).ino.toString(), intent.ino);
+  assert.equal(fs.existsSync(target), false);
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  await assert.rejects(reopened.syncOnce(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0, "a staged but never linked file must not create remote content");
+  assert.equal(fs.existsSync(staged), true, "manual recovery must still have the original bytes");
+  assert.equal((await reopened.journal.recover()).length, 1);
+});
+
+test("#67 P2: crash after staging name intent but before inode bind cannot upload orphan", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalBind = f.engine.journal.bindRestoreStagingIdentity.bind(f.engine.journal);
+  const originalRemove = fsp.rm;
+  let injected = 0;
+  f.engine.journal.bindRestoreStagingIdentity = async () => {
+    injected += 1;
+    throw new Error("disposable kill after file data fsync before inode intent bind");
+  };
+  fsp.rm = async (name, ...args) => {
+    if (String(name).startsWith(`${target}.tmp-`)) return;
+    return originalRemove(name, ...args);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      /disposable kill after file data fsync before inode intent bind/);
+  } finally {
+    fsp.rm = originalRemove;
+    f.engine.journal.bindRestoreStagingIdentity = originalBind;
+  }
+  assert.equal(injected, 1);
+  const [signed] = await f.engine.journal.recover();
+  assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
+  const intent = f.engine.journal.restoreStagingInfo(signed);
+  assert.ok(intent && intent.name && intent.dev === null && intent.ino === null);
+  const staged = path.join(f.local, intent.name);
+  assert.equal((await fsp.lstat(staged)).nlink, 1);
+  assert.equal(fs.existsSync(target), false);
+  const originalList = f.adapter.list;
+  f.adapter.list = async (id) => id ? originalList(id) : [await originalList(id)];
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  await assert.rejects(reopened.syncOnce(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0);
+  assert.equal(fs.existsSync(staged), true, "cannot discard or upload the unbound exact-stage bytes");
+  assert.equal((await reopened.journal.recover()).length, 1);
+});
+
+test("#67 P2: O_EXCL staging collision cannot delete another user's file", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalOpen = fsp.open;
+  const foreign = Buffer.from("FOREIGN_STAGING_COLLISION_MUST_SURVIVE");
+  let collided = null;
+  fsp.open = async (name, flags, ...args) => {
+    if (!collided && typeof name === "string" && name.startsWith(`${target}.tmp-`)
+      && typeof flags === "number" && (flags & fs.constants.O_EXCL)) {
+      collided = name;
+      await fsp.writeFile(name, foreign, { flag: "wx" });
+    }
+    return originalOpen(name, flags, ...args);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "EEXIST");
+  } finally { fsp.open = originalOpen; }
+  assert.ok(collided, "the collision must occur after durable signed name intent");
+  assert.deepEqual(await fsp.readFile(collided), foreign,
+    "finally must never delete the foreign file when exclusive creation failed");
+  assert.equal(f.pushes(), 0);
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(await verifyAuthorizationProof(pending.authorization, pending, f.trusted), true);
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending), false);
+});
+
+test("#67 P2: staging bytes changed immediately before signed hardlink cannot gain witness", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalLink = fsp.link;
+  const foreign = Buffer.from("FOREIGN_EDIT_REPLACES_AUTHENTICATED_STAGED_BYTES");
+  let edited = 0;
+  fsp.link = async (source, destination) => {
+    if (destination === target && source.startsWith(`${target}.tmp-`)) {
+      edited += 1;
+      // Genuine on-disk edit through the same pathname after the outbox
+      // bound its name/inode but immediately before the filesystem link.
+      await fsp.writeFile(source, foreign);
+    }
+    return originalLink(source, destination);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_local_materialization_missing");
+  } finally { fsp.link = originalLink; }
+  assert.equal(edited, 1, "the adversarial edit must strike the real hardlink path");
+  assert.equal(f.pushes(), 0, "mutated bytes must not be presented as signed materialization");
+  const [signed] = await f.engine.journal.recover();
+  assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
+  assert.equal(f.engine.journal.hasMaterializedRestore(signed), false);
+  assert.equal(f.engine.snapshot.files["document.txt"], undefined);
+  assert.deepEqual(await fsp.readFile(target), foreign,
+    "a conflicting local file must remain for manual recovery, not be silently removed");
+});
+
+test("#67 P2: witnessed offline restore never removes a user's matching-suffix hardlink", async (t) => {
+  const f = await fixture(t);
+  const actualPush = f.adapter.push;
+  f.adapter.push = async () => {
+    throw Object.assign(new Error("disposable offline"), { code: "offline" });
+  };
+  try {
+    const result = await f.engine.restoreHistoricalVersion("file-1", "first");
+    assert.equal(result.pending, true);
+    const [signed] = await f.engine.journal.recover();
+    assert.equal(f.engine.journal.hasMaterializedRestore(signed), true);
+    assert.equal(f.engine.journal.restoreStagingInfo(signed), null);
+    const target = path.join(f.local, "document.txt");
+    const userLink = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+    await fsp.link(target, userLink);
+    await assert.rejects(f.engine.syncOnce(),
+      (error) => error.code === "unsafe_path" || error.code === "restore_local_materialization_missing");
+    assert.equal(fs.existsSync(userLink), true,
+      "a valid local restore witness must NEVER authorize cleanup of a later user alias");
+    assert.equal((await fsp.lstat(userLink)).nlink, 2);
+    assert.equal((await f.engine.journal.recover()).length, 1);
+    assert.equal(f.pushes(), 0);
+  } finally { f.adapter.push = actualPush; }
+});
+
 test("#67: hardlink permission failure preserves local bytes and blocks remote restore", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
