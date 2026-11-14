@@ -170,9 +170,9 @@ class MainActivity : Activity() {
         }
 
         fun isValid(): Boolean {
-            if (cursor == null) return pageNumber == 1
+            val currentCursor = cursor ?: return pageNumber == 1
             if (pageNumber <= 1 || pageNumber > 100_000) return false
-            return runCatching { PagedInventoryPolicy.checkCursor(cursor, usedCursors) }.isSuccess
+            return runCatching { PagedInventoryPolicy.checkCursor(currentCursor, usedCursors) }.isSuccess
         }
     }
 
