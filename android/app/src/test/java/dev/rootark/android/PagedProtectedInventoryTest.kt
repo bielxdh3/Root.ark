@@ -180,5 +180,11 @@ class PagedProtectedInventoryTest {
             }
             assertTrue(response.disconnected)
         }
+
+        // Repeated cursor must be rejected by AuthHttpTransport
+        val adapter = AuthHttpTransport { url -> SecureResponse(url, payload = raw.toByteArray()) }
+        assertThrows(IllegalArgumentException::class.java) {
+            adapter.listInventoryPage(origin, "fixture-token", cursor = "already_used", usedCursors = setOf("already_used"))
+        }
     }
 }

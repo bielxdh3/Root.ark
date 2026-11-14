@@ -98,6 +98,39 @@ class ReadOnlyFileListPolicyTest {
         assertThrows(IllegalArgumentException::class.java) { row(objectId = "") }
     }
 
+    @Test
+    fun `validText rejects format control line separator paragraph separator and bidi characters`() {
+        assertTrue(ReadOnlyFileListPolicy.validText("valid-file_name.123", 512))
+        assertTrue(ReadOnlyFileListPolicy.validText("Simple text", 50))
+
+        // Cc: ASCII controls and C1 controls
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u0000text", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u001Ftext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u007Ftext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u0080text", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u0085text", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u009Ftext", 50))
+
+        // Cf: Unicode format, soft hyphen, zero-width chars, BOM
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u00ADtext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u200Btext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u200Ctext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u200Dtext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u200Etext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u200Ftext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\uFEFFtext", 50))
+
+        // Bidi overrides and isolates
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u202Atext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u202Etext", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u2066text", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u2069text", 50))
+
+        // Zl / Zp: line and paragraph separators
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u2028text", 50))
+        assertFalse(ReadOnlyFileListPolicy.validText("bad\u2029text", 50))
+    }
+
     private fun row(
         protocol: Int = 2, objectId: String = "file-1", operation: String = "create",
         deleted: Boolean = false, name: String = "hello.txt", path: String = "docs/hello.txt", size: Long = 1,

@@ -37,15 +37,22 @@ class MainActivity : Activity() {
     private var offlineSession: OfflineSession? = null
     private var offlineInventory: SessionOfflineInventory? = null
     @Volatile private var generation = 0
+    @Volatile private var isForeground = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(null)
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         showLogin()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isForeground = true
     }
 
     override fun onStop() {
         super.onStop()
+        isForeground = false
         generation++
         clearSensitiveState()
         showLogin()
@@ -173,31 +180,53 @@ class MainActivity : Activity() {
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
-    private fun loadInventoryPage(cursor: String? = null, pageNumber: Int = 1, usedCursors: Set<String> = emptySet()) {
+    data class InventoryPagingTracker(
+        val cursor: String? = null,
+        val pageNumber: Int = 1,
+        val usedCursors: Set<String> = emptySet(),
+    ) {
+        fun advance(nextCursor: String?): InventoryPagingTracker {
+            val updatedUsed = if (cursor != null) usedCursors + cursor else usedCursors
+            return InventoryPagingTracker(
+                cursor = nextCursor,
+                pageNumber = pageNumber + 1,
+                usedCursors = updatedUsed,
+            )
+        }
+
+        fun isValid(): Boolean {
+            if (cursor == null) return pageNumber == 1
+            if (pageNumber <= 1 || pageNumber > 100_000) return false
+            return runCatching { PagedInventoryPolicy.checkCursor(cursor, usedCursors) }.isSuccess
+        }
+    }
+
+    private fun loadInventoryPage(tracker: InventoryPagingTracker = InventoryPagingTracker()) {
         if (!sessionCanListFiles) return
         val origin = activeOrigin ?: return
         val token = sessionToken ?: return
-        if (cursor != null && (pageNumber <= 1 || pageNumber > 100_000 ||
-                runCatching { PagedInventoryPolicy.checkCursor(cursor, usedCursors) }.isFailure)) {
+        if (!tracker.isValid()) {
             showSession("Cursor de inventário inválido. Reinicie a listagem.")
             return
         }
-        runRequest({ transport.listInventoryPage(origin, token, cursor) }) { page, failure ->
+        val currentCursor = tracker.cursor
+        val used = tracker.usedCursors
+        runRequest({ transport.listInventoryPage(origin, token, currentCursor, used) }) { page, failure ->
             if (page != null) {
-                val used = usedCursors + listOfNotNull(cursor)
+                val nextTracker = tracker.advance(page.nextCursor)
                 val next = page.nextCursor
                 if (next != null && runCatching {
-                    PagedInventoryPolicy.checkCursor(next, used)
+                    PagedInventoryPolicy.checkCursor(next, nextTracker.usedCursors)
                 }.isFailure) {
                     showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
                 } else {
                     val binding = offlineSession
                     val cache = offlineInventory
                     if (binding != null && cache != null &&
-                        runCatching { cache.capture(binding, pageNumber, page) }.isFailure) {
+                        runCatching { cache.capture(binding, tracker.pageNumber, page) }.isFailure) {
                         cache.clear()
                     }
-                    showInventoryPage(page, pageNumber, used)
+                    showInventoryPage(page, tracker.pageNumber, nextTracker)
                 }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
@@ -206,12 +235,22 @@ class MainActivity : Activity() {
                     offlineInventory?.clear()
                     showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
                 }
-                else -> showSession("Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros).")
+                else -> {
+                    val message = when (failure) {
+                        is SyncListingLimitException ->
+                            "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
+                        is SyncListingValidationException ->
+                            "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
+                        else ->
+                            "Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros)."
+                    }
+                    showSession(message)
+                }
             }
         }
     }
 
-    private fun showInventoryPage(page: InventoryPage, pageNumber: Int, usedCursors: Set<String>) {
+    private fun showInventoryPage(page: InventoryPage, pageNumber: Int, nextTracker: InventoryPagingTracker) {
         val layout = screen("Inventário · página $pageNumber", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
         if (page.rows.isEmpty()) text(layout, "Nenhum registro disponível.")
         for (row in page.rows) {
@@ -223,11 +262,11 @@ class MainActivity : Activity() {
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
             if (!row.deleted) button(layout, "Conteúdo protegido") {
-                showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, usedCursors) }
+                showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, nextTracker) }
             }
         }
-        val next = page.nextCursor
-        if (next != null) button(layout, "Próxima página") { loadInventoryPage(next, pageNumber + 1, usedCursors) }
+        val next = nextTracker.cursor
+        if (next != null) button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
         val binding = offlineSession
         val cache = offlineInventory
         if (binding != null && cache != null && cache.pages(binding).isNotEmpty()) {
@@ -290,19 +329,29 @@ class MainActivity : Activity() {
             text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
         } else {
             button(layout, "Abrir texto verificado") {
-                val requestGeneration = generation + 1
-                runRequest({
-                    preview.open(origin, session, objectId) { generation == requestGeneration }
+                runRequest({ stillActive ->
+                    preview.open(origin, session, objectId, stillActive)
                 }) { characters, failure ->
                     if (characters != null) {
                         try {
                             val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")
-                            securePreviewText = text(view, String(characters)).apply {
+                            securePreviewText = TextView(this).apply {
+                                setText(characters, 0, characters.size)
                                 isSaveEnabled = false
                                 importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
                                 setTextIsSelectable(false)
+                                setPadding(0, 0, 0, (16 * resources.displayMetrics.density).toInt())
                             }
+                            view.addView(securePreviewText)
+                            button(view, "Fechar conteúdo") {
+                                securePreviewText?.text = ""
+                                securePreviewText = null
+                                showSession()
+                            }
+<<<<<<< HEAD
                             button(view, "Fechar conteúdo") { backToPage() }
+=======
+>>>>>>> 64dedcb0f5405fd26cf98c41342231f4174d38a9
                         } finally {
                             characters.fill('\u0000')
                         }
@@ -317,25 +366,29 @@ class MainActivity : Activity() {
         button(layout, "Voltar") { backToPage() }
     }
 
-    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) {
-        val started = ++generation
+    private fun <T> runRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
+        val startedGeneration = ++generation
+        val stillActive = { isForeground && generation == startedGeneration && !isFinishing && !isDestroyed }
         screen("Conectando", "Aguardando resposta do servidor...")
         Thread {
             var response: T? = null
             var failure: Exception? = null
             try {
-                response = operation()
-            } catch (caught: Exception) {
-                failure = caught
+                response = operation(stillActive)
+            } catch (caught: Throwable) {
+                failure = if (caught is Exception) caught else RuntimeException(caught)
             }
             val completedResponse = response
             val completedFailure = failure
             runOnUiThread {
-                if (generation == started && !isFinishing && !isDestroyed) done(completedResponse, completedFailure)
+                if (stillActive()) done(completedResponse, completedFailure)
                 else if (completedResponse is CharArray) completedResponse.fill('\u0000')
             }
         }.start()
     }
+
+    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) =
+        runRequest({ _ -> operation() }, done)
 
     private fun errorText(error: Exception?): String = when ((error as? RootArkApiException)?.statusCode) {
         401, 400 -> "Credenciais ou código inválidos."

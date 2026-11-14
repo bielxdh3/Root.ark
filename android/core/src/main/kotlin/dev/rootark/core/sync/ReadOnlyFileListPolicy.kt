@@ -52,6 +52,24 @@ object ReadOnlyFileListPolicy {
         )
     }
 
-    private fun validText(value: String, maxLength: Int): Boolean =
-        value.length <= maxLength && value.none { it.code < 32 || it.code == 127 }
+    internal fun validText(value: String, maxLength: Int): Boolean {
+        if (value.length > maxLength) return false
+        val iterator = value.codePoints().iterator()
+        while (iterator.hasNext()) {
+            val cp = iterator.nextInt()
+            if (isDisallowedChar(cp)) return false
+        }
+        return true
+    }
+
+    private fun isDisallowedChar(cp: Int): Boolean {
+        if (cp < 32 || cp == 127) return true
+        if (cp in 0x80..0x9F) return true
+        if (cp in 0x202A..0x202E || cp in 0x2066..0x2069 || cp in 0x200B..0x200F || cp == 0xFEFF) return true
+        val type = Character.getType(cp).toByte()
+        return type == Character.FORMAT ||
+               type == Character.CONTROL ||
+               type == Character.LINE_SEPARATOR ||
+               type == Character.PARAGRAPH_SEPARATOR
+    }
 }
