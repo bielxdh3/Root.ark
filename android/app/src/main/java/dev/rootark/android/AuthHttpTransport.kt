@@ -130,11 +130,7 @@ internal class AuthHttpTransport {
         } catch (_: ArithmeticException) {
             null
         }
-        is BigDecimal -> try {
-            if (value.stripTrailingZeros().scale() <= 0) value.intValueExact() else null
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigDecimal -> exactBigDecimalInt(value)
         is Double, is Float -> null
         else -> null
     }
@@ -150,16 +146,7 @@ internal class AuthHttpTransport {
         } catch (_: ArithmeticException) {
             null
         }
-        is BigDecimal -> try {
-            if (value.stripTrailingZeros().scale() <= 0) {
-                val l = value.longValueExact()
-                if (l >= 0L) l else null
-            } else {
-                null
-            }
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigDecimal -> exactBigDecimalLong(value)?.takeIf { it >= 0L }
         is Double, is Float -> null
         else -> null
     }
@@ -175,16 +162,7 @@ internal class AuthHttpTransport {
         } catch (_: ArithmeticException) {
             null
         }
-        is BigDecimal -> try {
-            if (value.stripTrailingZeros().scale() <= 0) {
-                val i = value.intValueExact()
-                if (i > 0) i else null
-            } else {
-                null
-            }
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigDecimal -> exactBigDecimalInt(value)?.takeIf { it > 0 }
         is Double, is Float -> null
         else -> null
     }
@@ -208,19 +186,27 @@ internal class AuthHttpTransport {
             } catch (_: ArithmeticException) {
                 throw SyncListingValidationException("Invalid sync listing")
             }
-            is BigDecimal -> try {
-                if (value.stripTrailingZeros().scale() <= 0) {
-                    value.longValueExact()
-                } else {
-                    throw SyncListingValidationException("Invalid sync listing")
-                }
-            } catch (_: ArithmeticException) {
-                throw SyncListingValidationException("Invalid sync listing")
-            }
+            is BigDecimal -> exactBigDecimalLong(value)
+                ?: throw SyncListingValidationException("Invalid sync listing")
             is Double, is Float -> throw SyncListingValidationException("Invalid sync listing")
             else -> throw SyncListingValidationException("Invalid sync listing")
         }
     }
+
+    private fun exactBigDecimalLong(value: BigDecimal): Long? {
+        if (value.signum() == 0) return 0L
+        if (value.scale() !in -19..64) return null
+        val intDigits = value.precision().toLong() - value.scale().toLong()
+        if (intDigits < 1L || intDigits > 19L) return null
+        return try {
+            value.longValueExact()
+        } catch (_: ArithmeticException) {
+            null
+        }
+    }
+
+    private fun exactBigDecimalInt(value: BigDecimal): Int? =
+        exactBigDecimalLong(value)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
 
     private fun authenticated(json: JSONObject): LoginOutcome.Authenticated {
         val rawPermissions = json.optJSONObject("permissions") ?: throw IOException("Unexpected authentication response")
