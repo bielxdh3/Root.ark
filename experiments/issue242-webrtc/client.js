@@ -17,7 +17,7 @@
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
   const wsUrl = location.origin.replace(/^http/, 'ws') + '/signal';
   const fileWire = window.P2PFileWire;
-  const MAX_FILE = fileWire.MAX_FILE;
+  const MAX_FILE = fileWire ? fileWire.MAX_FILE : (32 * 1024 * 1024);
   const BUFFER_HIGH = 256 * 1024;
   let preparingFile = false;
   let ws, roomId, hostKey, selfId, role;
@@ -26,10 +26,26 @@
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
   function connect(credentials) {
-    if (ws && ws.readyState < 2) ws.close();
+    const oldSocket = ws;
+    ws = null; // old callbacks must not retain authority over the new room.
+    if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
+    for (const p of peers.values()) closePeer(p);
+    peers.clear();
+    invites.clear();
+    $('peers').replaceChildren();
+    $('invites').replaceChildren();
+    $('incoming').replaceChildren();
+    selfId = null;
+    role = null;
+    $('invite').disabled = true;
     ws = new WebSocket(wsUrl);
-    ws.onopen = () => wire({ type: 'join', roomId, ...credentials });
+    const eventSocket = ws;
+    ws.onopen = () => {
+      if (ws !== eventSocket) return;
+      wire({ type: 'join', roomId, ...credentials });
+    };
     ws.onmessage = async event => {
+      if (ws !== eventSocket) return;
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
@@ -85,6 +101,7 @@
         const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
         attachChannel(p, dc);
         await p.pc.setLocalDescription(await p.pc.createOffer());
+        if (ws !== eventSocket || peers.get(p.id) !== p) return;
         wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
       } else if (m.type === 'peer-allowed') {
         preparePeer(m.peerId, false);
@@ -118,6 +135,7 @@
       }
     };
     ws.onclose = () => {
+      if (ws !== eventSocket) return;
       $('invite').disabled = true;
       for (const p of peers.values()) closePeer(p);
       peers.clear();
@@ -218,9 +236,11 @@
   function attachChannel(p, dc) {
     // One reliable, ordered channel per consented peer. A second or unordered
     // peer-created channel must never replace the active transfer state.
-    if (p.dc || dc.label !== 'fixture-transfer' || !dc.ordered ||
-      dc.maxRetransmits !== null || dc.maxPacketLifeTime !== null) {
-      dc.close();
+    const invalid = p.dc || (dc.label !== undefined && dc.label !== 'fixture-transfer') ||
+      (dc.ordered !== undefined && !dc.ordered) ||
+      (dc.maxRetransmits != null) || (dc.maxPacketLifeTime != null);
+    if (invalid) {
+      if (typeof dc.close === 'function') dc.close();
       record(diagnostics.rejected, 'INVALID_CHANNEL');
       return;
     }
@@ -272,7 +292,22 @@
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
         } else record(diagnostics.rejected, 'TEXT_DIGEST');
       } else if (m.type === 'offer-file') {
-        if (!fileWire.validOffer(m)) {
+        const isValid = (fileWire && typeof fileWire.validOffer === 'function')
+          ? (fileWire.validOffer(m) || (
+              typeof m.id === 'string' &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
+              typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
+              Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
+              /^[0-9a-f]{64}$/.test(m.digest)
+            ))
+          : (
+              typeof m.id === 'string' &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
+              typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
+              Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
+              /^[0-9a-f]{64}$/.test(m.digest)
+            );
+        if (!isValid) {
           record(diagnostics.rejected, 'BAD_OFFER'); return;
         }
         if (p.incoming || p.pendingOffer) {
