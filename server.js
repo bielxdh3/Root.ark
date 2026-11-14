@@ -1205,7 +1205,7 @@ function loadPublicLinks() {
   return JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
 }
 
-function savePublicLinks(entries = {}) {
+function savePublicLinks(entries = {}, options = {}) {
   const nextEntries = entries && typeof entries === "object" ? entries : {};
   let removedFallbackEntries = {};
   if (shouldUseDatabase() && shouldReadJsonFallback() && fs.existsSync(PUBLIC_LINKS_FILE)) {
@@ -1215,7 +1215,11 @@ function savePublicLinks(entries = {}) {
     );
   }
   if (shouldUseDatabase()) {
-    publicLinksRepository.savePublicLinks(nextEntries, { removedEntries: removedFallbackEntries });
+    publicLinksRepository.savePublicLinks(nextEntries, {
+      removedEntries: removedFallbackEntries,
+      ...(options.capabilityRevocation
+        ? { capabilityRevocation: options.capabilityRevocation } : {}),
+    });
   }
   if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(nextEntries, null, 2));
   broadcastDataChanged("shares");
@@ -1829,8 +1833,14 @@ function hasSharePassword(link) {
   return Boolean(link?.passwordHash || link?.password_hash);
 }
 
-function getSharePasswordCookieName(token) {
-  return `rootark_share_pwd_${token}`;
+function shareCookieId(req, token) {
+  // Capability HTTP requests identify only the public routing alias. The
+  // original bearer must never enter Cookie names, paths or response headers.
+  return req?.capabilityAlias || token;
+}
+
+function getSharePasswordCookieName(token, req = null) {
+  return `rootark_share_pwd_${shareCookieId(req, token)}`;
 }
 
 function getSharePasswordSessionMac(token, passwordHash, expiresAtMs) {
@@ -1851,9 +1861,9 @@ function setSharePasswordCookie(req, res, token, link) {
   if (!passwordHash || !Number.isFinite(linkExpiresAtMs) || expiresAtMs <= Date.now()) return;
 
   const mac = getSharePasswordSessionMac(token, passwordHash, expiresAtMs).toString("base64url");
-  res.cookie(getSharePasswordCookieName(token), `v1.${expiresAtMs}.${mac}`, {
+  res.cookie(getSharePasswordCookieName(token, req), `v1.${expiresAtMs}.${mac}`, {
     httpOnly: true,
-    sameSite: "lax",
+    sameSite: req.capabilityAlias ? "strict" : "lax",
     secure: req.secure,
     expires: new Date(expiresAtMs),
   });
@@ -1864,7 +1874,7 @@ function hasValidSharePasswordSession(req, token, link) {
 
   let cookieValue = "";
   try {
-    cookieValue = getCookieValue(req, getSharePasswordCookieName(token));
+    cookieValue = getCookieValue(req, getSharePasswordCookieName(token, req));
   } catch {
     return false;
   }
@@ -1980,7 +1990,7 @@ function getCookieValue(req, name) {
 
 function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
   const maxAge = Math.max(1, Math.min(SHARE_VIEW_SESSION_MS, expiresAt - Date.now()));
-  res.cookie(`rootark_share_${token}`, viewerId, {
+  res.cookie(`rootark_share_${shareCookieId(req, token)}`, viewerId, {
     httpOnly: true,
     sameSite: "strict",
     secure: req.secure,
@@ -1989,17 +1999,21 @@ function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
 }
 
 function setShareDownloadReceiptCookie(req, res, token) {
-  res.cookie(`rootark_share_dl_${token}`, crypto.randomBytes(16).toString("base64url"), {
+  const alias = shareCookieId(req, token);
+  res.cookie(`rootark_share_dl_${alias}`, crypto.randomBytes(16).toString("base64url"), {
     httpOnly: false,
     sameSite: "strict",
     secure: req.secure,
     maxAge: 5 * 60 * 1000,
-    path: `/share/${token}`,
+    // The fragment landing page stays at /share/c after the exchange. Its
+    // JavaScript must be able to observe the receipt; an alias-only cookie
+    // path would be invisible there and leave the download UI blocked.
+    path: req.capabilityAlias ? "/share/c" : `/share/${alias}`,
   });
 }
 
-function renderPublicSharePage(token, scriptNonce) {
-  const safeToken = String(token).replace(/[^a-f0-9]/gi, "");
+function renderPublicSharePage(token, scriptNonce, capabilityLanding = false) {
+  const safeToken = capabilityLanding ? "" : String(token).replace(/[^a-f0-9]/gi, "");
 
   return `<!doctype html>
 <html lang="pt-BR">
@@ -2241,7 +2255,13 @@ function renderPublicSharePage(token, scriptNonce) {
       </section>
     </main>
     <script nonce="${scriptNonce}">
-      const token = "${safeToken}";
+      let token = "${safeToken}";
+      const capabilityLanding = ${capabilityLanding ? "true" : "false"};
+      // Only volatile memory retains the original fragment for Copy / QR.
+      // The request target and every subsequent Cookie use an unrelated
+      // server-generated alias; never persist the bearer in Web Storage.
+      let originalShareUrl = window.location.href;
+      let capabilitySecret = "";
       const fileName = document.getElementById("fileName");
       const status = document.getElementById("status");
       const passwordBox = document.getElementById("passwordBox");
@@ -2324,7 +2344,9 @@ function renderPublicSharePage(token, scriptNonce) {
           if (data.remainingDownloads === 0) status.textContent = "Limite de downloads atingido.";
         } catch {
           downloadButton.disabled = true;
-          status.textContent = "Nao foi possivel atualizar os limites. Recarregue a pagina.";
+          status.textContent = capabilityLanding
+            ? "A sessao temporaria expirou. Abra novamente o link original."
+            : "Nao foi possivel atualizar os limites. Recarregue a pagina.";
         }
       }
 
@@ -2436,30 +2458,121 @@ function renderPublicSharePage(token, scriptNonce) {
         }
       });
 
-      qrButton.addEventListener("click", () => {
+      qrButton.addEventListener("click", async () => {
         qrBox.classList.toggle("hidden");
         if (!qrBox.dataset.loaded) {
-          qrBox.innerHTML = '<img alt="QR Code do link" src="/share/' + token + '/qr" />';
-          qrBox.dataset.loaded = "1";
+          if (capabilityLanding) {
+            if (!capabilitySecret) return;
+            try {
+              const response = await fetch("/share/c/qr", {
+                method: "POST", credentials: "same-origin", cache: "no-store",
+                redirect: "error", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ token: capabilitySecret }),
+              });
+              if (!response.ok || !String(response.headers.get("content-type") || "")
+                .startsWith("image/png")) throw new Error("QR unavailable");
+              const blob = await response.blob();
+              const objectUrl = URL.createObjectURL(blob);
+              const image = document.createElement("img");
+              image.alt = "QR Code do link";
+              image.onload = () => URL.revokeObjectURL(objectUrl);
+              image.onerror = () => URL.revokeObjectURL(objectUrl);
+              image.src = objectUrl;
+              qrBox.replaceChildren(image);
+              qrBox.dataset.loaded = "1";
+            } catch {
+              status.textContent = "Nao foi possivel criar o QR Code.";
+            }
+          } else {
+            qrBox.innerHTML = '<img alt="QR Code do link" src="/share/' + token + '/qr" />';
+            qrBox.dataset.loaded = "1";
+          }
         }
       });
 
       copyButton.addEventListener("click", async () => {
         try {
-          await navigator.clipboard.writeText(window.location.href);
+          await navigator.clipboard.writeText(originalShareUrl);
           status.textContent = "Link copiado.";
         } catch {
           status.textContent = "Nao foi possivel copiar automaticamente.";
         }
       });
 
-      accessShare();
+      if (capabilityLanding) {
+        const secret = window.location.hash.slice(1);
+        // Strip the secret immediately, before any fetch/iframe/QR request.
+        window.history.replaceState(null, "", "/share/c");
+        if (!/^C[a-f0-9]{47}$/.test(secret)) {
+          fileName.textContent = "Link indisponivel";
+          status.textContent = "Abra novamente o link original para acessar este compartilhamento.";
+        } else {
+          capabilitySecret = secret;
+          originalShareUrl = window.location.origin + "/share/c#" + secret;
+          fetch("/share/c/exchange", {
+            method: "POST", credentials: "same-origin", cache: "no-store",
+            redirect: "error", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token: secret }),
+          }).then(async (response) => {
+            if (!response.ok) throw new Error("capability unavailable");
+            const data = await response.json();
+            if (!/^[a-f0-9]{32}$/.test(data.handle)) throw new Error("invalid handle");
+            token = data.handle;
+            downloadForm.action = "/share/" + token + "/download";
+            await accessShare();
+          }).catch(() => {
+            fileName.textContent = "Link indisponivel";
+            status.textContent = "Nao foi possivel ativar este compartilhamento.";
+          });
+        }
+      } else {
+        accessShare();
+      }
     </script>
   </body>
 </html>`;
 }
 function buildPublicShareUrl(req, token) {
   return `${req.protocol}://${req.get("host")}/share/${token}`;
+}
+function isDirectLoopbackShareRequest(req) {
+  return ["::1", "127.0.0.1", "::ffff:127.0.0.1"]
+    .includes(String(req.socket?.remoteAddress || ""))
+    && ["localhost", "127.0.0.1", "[::1]"]
+      .includes(String(req.hostname || "").toLowerCase());
+}
+function capabilityPublicOrigin(req) {
+  const configured = String(process.env.ROOTARK_CAPABILITY_PUBLIC_ORIGIN || "").trim();
+  if (configured) {
+    try {
+      const url = new URL(configured);
+      // A canonical, operator-configured dedicated HTTPS origin avoids Host
+      // poisoning and prevents old host-only Csecret cookies from following
+      // newly generated capability links to the separate host.
+      if (url.protocol !== "https:" || url.username || url.password
+        || url.pathname !== "/" || url.search || url.hash
+        || !url.hostname || ![url.origin, `${url.origin}/`].includes(configured)) return null;
+      return url.origin;
+    } catch { return null; }
+  }
+  // Local disposable fixtures and loopback development only. Do not issue
+  // capabilities on an unconfigured public production host.
+  if (isDirectLoopbackShareRequest(req)) {
+    return getExpectedOrigin(req, app.get("trust proxy fn"));
+  }
+  return null;
+}
+function capabilityStoreAvailable() {
+  // JSON public-links maps have no cross-process CAS or durable tombstone.
+  // A stale load+save racing revoke could resurrect a capability. Keep JSON
+  // fixtures in the explicit test sandbox only; real self-hosted capabilities
+  // require the local transactional SQLite repository (no cloud dependency).
+  return shouldUseDatabase() || NODE_ENV === "test";
+}
+function buildPublicCapabilityUrl(req, token) {
+  const origin = capabilityPublicOrigin(req);
+  if (!origin) throw new Error("Canonical capability origin unavailable");
+  return `${origin}/share/c#${token}`;
 }
 
 function redactShareTokenFromAuditValue(value, token) {
@@ -2519,7 +2632,11 @@ function shareFileIdentity(filePath, openedStats = null) {
   let handle;
   try {
     const stats = openedStats || (handle = openReadHandle(filePath)).stats;
-    const values = [stats.dev, stats.ino, stats.size, stats.birthtimeMs, stats.mtimeMs];
+    // ctime is not caller-restorable with ordinary fs.utimes; binding only to
+    // inode/size/birth/mtime allowed same-inode same-size rewrites followed by
+    // an mtime reset to silently replace an issued capability's bytes.
+    const values = [stats.dev, stats.ino, stats.size,
+      stats.birthtimeMs, stats.mtimeMs, stats.ctimeMs];
     if (values.some((value) => !Number.isFinite(value))) return null;
     return crypto.createHash("sha256").update(JSON.stringify(values)).digest("hex");
   } catch {
@@ -2534,7 +2651,9 @@ function shareCapabilityMatches(link, fileInfo, token, openedStats = null) {
   // loss of metadata_json, so corrupt capability records cannot downgrade.
   if (!token.startsWith("C") && link.shareKind === undefined) return true;
   const binding = link.resourceBinding;
-  if (link.shareKind !== "capability-v1" || binding?.version !== 1
+  // Earlier v1 identities without ctime cannot prove the pinned generation.
+  // Fail closed; owners must reissue rather than silently upgrading trust.
+  if (link.shareKind !== "capability-v1" || binding?.version !== 2
     || binding.folderId !== fileInfo.folderId || binding.fileName !== fileInfo.fileName
     || typeof binding.identity !== "string" || !/^[a-f0-9]{64}$/.test(binding.identity)) return false;
   const currentIdentity = shareFileIdentity(fileInfo.filePath, openedStats);
@@ -2571,7 +2690,7 @@ function getPublicShareCanPreview(fileName) {
 
 function getActiveShareViewer(req, token, link) {
   const { viewers } = cleanupShareViewers(link);
-  const viewerId = getCookieValue(req, `rootark_share_${token}`);
+  const viewerId = getCookieValue(req, `rootark_share_${shareCookieId(req, token)}`);
   if (!isShareViewerId(viewerId) || !Object.prototype.hasOwnProperty.call(viewers, viewerId)) return null;
   return { id: viewerId, viewer: viewers[viewerId] };
 }
@@ -2603,9 +2722,57 @@ function getShareLimitState(link) {
   };
 }
 
-function validateShareToken(rawToken) {
+const CAPABILITY_SESSION_MS = 5 * 60 * 1000;
+const MAX_CAPABILITY_SESSIONS = 8;
+function capabilitySessionHash(alias, cookie) {
+  return crypto.createHash("sha256").update("rootark:capability-http-session:v1\0")
+    .update(alias).update("\0").update(cookie).digest("hex");
+}
+
+function activeCapabilitySession(req, alias) {
+  if (!capabilityStoreAvailable()) return null;
+  if (!/^[a-f0-9]{32}$/.test(alias)) return null;
+  // Duplicate cookies are ambiguous across Path/Domain; reject rather than
+  // letting an attacker influence which credential the parser selects.
+  const cookieName = `rootark_cap_${alias}`;
+  const matches = String(req.headers.cookie || "").split(";").map((part) => part.trim())
+    .filter((part) => part.startsWith(`${cookieName}=`));
+  if (matches.length !== 1) return null;
+  const cookie = matches[0].slice(cookieName.length + 1);
+  if (!/^[a-f0-9]{64}$/.test(cookie)) return null;
+  const links = loadPublicLinks();
+  for (const [token, link] of Object.entries(links)) {
+    if (!/^C[a-f0-9]{47}$/.test(token) || link?.shareKind !== "capability-v1") continue;
+    const session = link.capabilitySessions?.[alias];
+    if (!session || !/^[a-f0-9]{64}$/.test(session.hash || "")) continue;
+    const validUntil = new Date(session.expiresAt).getTime();
+    const linkExpiry = new Date(link.expiresAt).getTime();
+    if (!Number.isFinite(validUntil) || validUntil <= Date.now()
+      || !Number.isFinite(linkExpiry) || linkExpiry <= Date.now()
+      || validUntil > linkExpiry) return null;
+    const received = Buffer.from(capabilitySessionHash(alias, cookie), "hex");
+    const expected = Buffer.from(session.hash, "hex");
+    if (!crypto.timingSafeEqual(received, expected)) return null;
+    const info = getShareFileInfo(link);
+    if (!info || !shareCapabilityMatches(link, info, token)) return null;
+    return { token, alias };
+  }
+  return null;
+}
+
+function validateShareToken(rawToken, req = null) {
   const token = String(rawToken || "");
-  return /^[a-f0-9]{48}$/i.test(token) ? token : "";
+  // Old lower-case 48-hex shares remain compatible. Reserved uppercase C
+  // capabilities MUST NOT be retrievable by their original bearer pathname.
+  if (/^[a-f0-9]{48}$/.test(token)) return token;
+  if (req && /^[a-f0-9]{32}$/.test(token)) {
+    const session = activeCapabilitySession(req, token);
+    if (session) {
+      req.capabilityAlias = session.alias;
+      return session.token;
+    }
+  }
+  return "";
 }
 
 function requireSameOriginPublicShareMutation(req, res, next) {
@@ -2636,10 +2803,25 @@ function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) 
 // Test-only pause points (NODE_ENV=test) used to race a permission change against an in-flight request.
 async function pauseShareAccessForTest(point) {
   if (process.env.NODE_ENV !== "test" || process.env.ROOTARK_TEST_SHARE_PAUSE_POINT !== point) return;
+  if (point === "exchange-commit" && process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER) {
+    fs.writeFileSync(process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER, "snapshot-read-before-admission");
+    if (process.env.ROOTARK_TEST_SHARE_PAUSE_RELEASE) {
+      const release = process.env.ROOTARK_TEST_SHARE_PAUSE_RELEASE;
+      const deadline = Date.now() + 15_000;
+      while (!fs.existsSync(release)) {
+        if (Date.now() >= deadline) throw new Error("Test exchange-commit release barrier expired");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return;
+    }
+  }
   await new Promise((resolve) => setTimeout(resolve, Number(process.env.ROOTARK_TEST_SHARE_PAUSE_MS) || 0));
 }
 
 async function resolveShareAccess(req, res, token, options = {}) {
+  const liveCapabilitySession = () => !req.capabilityAlias
+    || activeCapabilitySession(req, req.capabilityAlias)?.token === token;
+  if (!liveCapabilitySession()) return { status: 404, error: "Capacidade indisponivel" };
   const links = loadPublicLinks();
   const link = links[token];
   if (!link) return { status: 404, error: "Link indisponivel." };
@@ -2704,6 +2886,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   await pauseShareAccessForTest("reload");
   let currentLinks = loadPublicLinks();
   let currentLink = currentLinks[token];
+  if (!liveCapabilitySession()) return { status: 404, error: "Capacidade indisponivel" };
   if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
     return { status: 404, error: "Link indisponivel." };
   }
@@ -2818,6 +3001,9 @@ async function resolveShareAccess(req, res, token, options = {}) {
   // Run synchronously as close as possible to streaming the bytes. The link
   // may change while the file lookup and authorization requests are awaited.
   const revalidateStreamAccess = (readHandle = null) => {
+    if (!liveCapabilitySession()) {
+      return { status: 404, error: "Capacidade indisponivel" };
+    }
     const latestLinks = loadPublicLinks();
     const latestLink = latestLinks[token];
     if (!latestLink || latestLink.fileName !== currentLink.fileName
@@ -6164,6 +6350,18 @@ const WORKSPACE_CONTENT_SECURITY_POLICY = independentCatalogConnectOrigins.lengt
   : APP_CONTENT_SECURITY_POLICY;
 app.use((req, res, next) => {
   const isWorkspace = req.path === "/" || req.path === "/index.html";
+  // One-way migration of legacy capability cookies that carried the Csecret
+  // in their NAME on the old main host. We cannot undo the browser's first
+  // request header (operators must redact proxy Cookie logs), but deleting
+  // only these names avoids logging out unrelated authenticated users and
+  // stops their propagation on subsequent requests. New capabilities must be
+  // issued on a dedicated canonical origin, never this legacy cookie host.
+  const oldCapabilityCookieNames = [...new Set(String(req.headers.cookie || "")
+    .split(";").map((part) => part.trim().split("=", 1)[0])
+    .filter((name) => /^rootark_share_(?:pwd_)?C[a-f0-9]{47}$/.test(name)))].slice(0, 16);
+  for (const name of oldCapabilityCookieNames) {
+    res.clearCookie(name, { path: "/" });
+  }
   res.setHeader("Content-Security-Policy",
     isWorkspace ? WORKSPACE_CONTENT_SECURITY_POLICY : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
@@ -12039,6 +12237,15 @@ registerTrashRoutes(app, {
 
 const createPublicShare = async (req, res) => {
   const isCapability = req.route.path === "/share/capabilities";
+  if (isCapability && !capabilityStoreAvailable()) {
+    return res.status(503).json({ error: "Capacidades exigem armazenamento transacional" });
+  }
+  if (isCapability && !capabilityPublicOrigin(req)) {
+    return res.status(503).json({ error: "Origem publica HTTPS de capacidades nao configurada" });
+  }
+  if (isCapability && !req.secure && !isDirectLoopbackShareRequest(req)) {
+    return res.status(403).json({ error: "HTTPS obrigatorio para capacidades" });
+  }
   // A capability must never silently ignore a requested broader operation,
   // recipient restriction, or client-provided decryption material.
   if (isCapability && (!req.body || typeof req.body !== "object" || Array.isArray(req.body)
@@ -12137,15 +12344,15 @@ const createPublicShare = async (req, res) => {
   const resourceBinding = isCapability ? (() => {
     const info = getShareFileInfo({ folderId: finalFolder.id, fileName: name });
     const identity = info && shareFileIdentity(info.filePath);
-    return identity ? { version: 1, folderId: finalFolder.id, fileName: name, identity } : null;
+    return identity ? { version: 2, folderId: finalFolder.id, fileName: name, identity } : null;
   })() : null;
   if (isCapability && !resourceBinding) return res.status(404).json({ error: "Arquivo nao encontrado" });
-  const links = cleanupExpiredPublicLinks();
+  const links = isCapability && shouldUseDatabase() ? null : cleanupExpiredPublicLinks();
   const shareToken = isCapability
     ? `C${crypto.randomBytes(24).toString("hex").slice(1)}`
     : crypto.randomBytes(24).toString("hex");
   const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
-  links[shareToken] = {
+  const newLink = {
     fileName: name,
     folderId: finalFolder.id,
     createdAt: new Date().toISOString(),
@@ -12160,7 +12367,18 @@ const createPublicShare = async (req, res) => {
     ...(isCapability ? { shareKind: "capability-v1", resourceBinding } : {}),
     activeViewers: {},
   };
-  savePublicLinks(links);
+  if (isCapability && shouldUseDatabase()) {
+    // Capability creation is one INSERT under SQLite's writer transaction.
+    // Do not reconcile (and inadvertently revoke) other processes' links.
+    const inserted = publicLinksRepository.createCapability(shareToken, newLink);
+    if (inserted.status !== "ok") {
+      return res.status(503).json({ error: "Criacao de capacidade indisponivel" });
+    }
+    broadcastDataChanged("shares");
+  } else {
+    links[shareToken] = newLink;
+    savePublicLinks(links);
+  }
   addActionHistory(isCapability ? "share_capability_created" : "share_created",
     isCapability ? "" : name, req.user.username, {
     expiresAt,
@@ -12182,7 +12400,8 @@ const createPublicShare = async (req, res) => {
   });
   res.status(201).json({
     token: shareToken,
-    url: buildPublicShareUrl(req, shareToken),
+    url: isCapability ? buildPublicCapabilityUrl(req, shareToken)
+      : buildPublicShareUrl(req, shareToken),
     fileName: name,
     expiresAt,
     views: 0,
@@ -12198,12 +12417,176 @@ const createPublicShare = async (req, res) => {
   }, res);
 };
 
+app.use("/share", (req, res, next) => {
+  // Neither an access-URL fragment nor a resulting session/preview may be
+  // cached or sent as a referrer. Apply before all share endpoints, including
+  // streamed bytes and unsuccessful responses.
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+  next();
+});
+
+app.get("/share/c", shareRateLimit, (req, res) => {
+  if (!capabilityStoreAvailable()) return res.status(503).send("Capacidade indisponivel");
+  if (!capabilityPublicOrigin(req)
+    || capabilityPublicOrigin(req) !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+    return res.status(403).type("text/plain").send("Origem de capacidade negada");
+  }
+  if (!req.secure && !isDirectLoopbackShareRequest(req)) {
+    return res.status(403).type("text/plain").send("HTTPS obrigatorio");
+  }
+  const nonce = crypto.randomBytes(16).toString("base64");
+  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY.replace(
+    "script-src 'self'", `script-src 'self' 'nonce-${nonce}'`));
+  res.type("html").send(renderPublicSharePage("", nonce, true));
+});
+
+app.post("/share/c/exchange", shareRateLimit, requireSameOriginPublicShareMutation,
+  async (req, res) => {
+    if (!capabilityStoreAvailable()) {
+      return res.status(503).json({ error: "Capacidades exigem armazenamento transacional" });
+    }
+    if (!capabilityPublicOrigin(req)
+      || capabilityPublicOrigin(req) !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+      return res.status(403).json({ error: "Origem de capacidade negada" });
+    }
+    // The bearer is accepted *only* as a JSON body on this exchange endpoint;
+    // it never becomes a request target, response URL, Cookie key or log field.
+    if (!req.is("application/json") || !req.body
+      || typeof req.body !== "object" || Array.isArray(req.body)
+      || Object.keys(req.body).length !== 1
+      || !/^C[a-f0-9]{47}$/.test(req.body.token || "")) {
+      return res.status(404).json({ error: "Capacidade indisponivel" });
+    }
+    const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+      return res.status(403).json({ error: "Origem negada" });
+    }
+    if (!req.secure && !isDirectLoopbackShareRequest(req)) {
+      return res.status(403).json({ error: "HTTPS obrigatorio" });
+    }
+    const token = req.body.token;
+    let links = loadPublicLinks();
+    let link = Object.hasOwn(links, token) ? links[token] : null;
+    if (!link || link.shareKind !== "capability-v1"
+      || new Date(link.expiresAt).getTime() <= Date.now()
+      || !shareCapabilityPageAvailable(link, token)) {
+      return res.status(404).json({ error: "Capacidade indisponivel" });
+    }
+    // File/provider checks can await; re-read the authoritative capability
+    // and inode binding immediately before persisting the session.
+    if (!await ensureShareFileAvailable(link)) {
+      return res.status(404).json({ error: "Capacidade indisponivel" });
+    }
+    links = loadPublicLinks();
+    link = Object.hasOwn(links, token) ? links[token] : null;
+    const linkExpiry = new Date(link?.expiresAt).getTime();
+    if (!link || link.shareKind !== "capability-v1"
+      || !Number.isFinite(linkExpiry) || linkExpiry <= Date.now()
+      || !shareCapabilityPageAvailable(link, token)) {
+      return res.status(404).json({ error: "Capacidade indisponivel" });
+    }
+    const until = Math.min(Date.now() + CAPABILITY_SESSION_MS, linkExpiry);
+    const alias = crypto.randomBytes(16).toString("hex");
+    const cookie = crypto.randomBytes(32).toString("hex");
+    // Deliberately pause AFTER the snapshot read in disposable test mode, so
+    // a second process can create/revoke a link and reproduce stale-snapshot
+    // lost updates against the old savePublicLinks(links) implementation.
+    await pauseShareAccessForTest("exchange-commit");
+    const expiresAt = new Date(until).toISOString();
+    if (shouldUseDatabase()) {
+      const admission = publicLinksRepository.addCapabilitySession(token, {
+        alias, hash: capabilitySessionHash(alias, cookie), expiresAt,
+        expectedResourceBinding: link.resourceBinding,
+        expectedFileName: link.fileName,
+        expectedFolderId: link.folderId || ROOT_FOLDER_ID,
+        maxSessions: MAX_CAPABILITY_SESSIONS,
+      });
+      if (admission.status !== "ok") {
+        return res.status(404).json({ error: "Capacidade indisponivel" });
+      }
+    } else {
+      // Isolated NODE_ENV=test JSON compatibility fixtures only. Production
+      // never uses unversioned whole-map writes for capability sessions.
+      const previous = Object.entries(link.capabilitySessions || {})
+        .filter(([id, item]) => /^[a-f0-9]{32}$/.test(id)
+          && /^[a-f0-9]{64}$/.test(item?.hash || "")
+          && new Date(item.expiresAt).getTime() > Date.now())
+        .sort((a, b) => new Date(b[1].expiresAt).getTime() - new Date(a[1].expiresAt).getTime())
+        .slice(0, MAX_CAPABILITY_SESSIONS - 1);
+      // Construct an own-property-only, prototype-less session dictionary.
+      // Even legacy JSON with hostile keys must never turn a dynamic key into
+      // a prototype setter; persisted session IDs are independently checked.
+      // Object.fromEntries defines own data properties without interpreting
+      // "__proto__" as a setter. Detach the resulting dictionary prototype
+      // before persistence; no untrusted key is ever dynamically assigned.
+      const sessions = Object.fromEntries([...previous, [
+        alias, { hash: capabilitySessionHash(alias, cookie), expiresAt },
+      ]]);
+      Object.setPrototypeOf(sessions, null);
+      // Never mutate an object selected through a bearer-controlled property
+      // lookup. Build an independent own-property map for the JSON fallback.
+      savePublicLinks(Object.fromEntries([...Object.entries(links), [token, {
+        ...link, capabilitySessions: sessions,
+      }]]));
+    }
+    res.cookie(`rootark_cap_${alias}`, cookie, {
+      httpOnly: true, sameSite: "strict", secure: req.secure,
+      path: "/share", expires: new Date(until),
+    });
+    return res.status(200).json({ handle: alias });
+  });
+
+app.post("/share/c/qr", shareRateLimit, requireSameOriginPublicShareMutation,
+  async (req, res) => {
+    if (!capabilityStoreAvailable()) return res.status(503).send("Capacidade indisponivel");
+    // A short-lived alias+cookie must NEVER be able to recover the original
+    // long-lived bearer. Rendering a QR requires the raw fragment still kept
+    // in the browser's volatile memory, transmitted only in a POST body.
+    const token = req.body?.token;
+    const link = /^C[a-f0-9]{47}$/.test(token || "")
+      && req.is("application/json") && Object.keys(req.body).length === 1
+      ? loadPublicLinks()[token] : null;
+    if (!link || link.shareKind !== "capability-v1"
+      || !Number.isFinite(new Date(link.expiresAt).getTime())
+      || new Date(link.expiresAt).getTime() <= Date.now()
+      || !shareCapabilityPageAvailable(link, token)
+      || capabilityPublicOrigin(req) !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+      return res.status(404).send("Capacidade indisponivel");
+    }
+    try {
+      const png = await QRCode.toBuffer(buildPublicCapabilityUrl(req, token), {
+        type: "png", margin: 1, width: 320,
+        color: { dark: "#044879", light: "#ffffff" },
+      });
+      res.setHeader("Content-Type", "image/png");
+      return res.status(200).send(png);
+    } catch {
+      return res.status(503).send("QR indisponivel");
+    }
+  });
+
 app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), createPublicShare);
 app.post("/share/capabilities", shareRateLimit, authenticate, requirePermission("listFiles"), createPublicShare);
 
-app.delete("/share/capabilities/:token", shareRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
-  const token = validateShareToken(req.params.token);
+app.delete("/share/capabilities/revoke", shareRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+  const token = typeof req.body?.token === "string" && /^C[a-f0-9]{47}$/.test(req.body.token)
+    && Object.keys(req.body).length === 1 ? req.body.token : "";
   if (!token) return res.status(404).json({ error: "Capacidade indisponivel" });
+  if (shouldUseDatabase()) {
+    // A transaction checks ownership and tombstones this ONE token. Neither
+    // its read nor its write may revoke another concurrently inserted grant.
+    const revoked = publicLinksRepository.revokeCapability(token, req.user.username);
+    if (revoked.status === "forbidden") return res.status(403).json({ error: "Acesso negado" });
+    if (revoked.status !== "ok") return res.status(404).json({ error: "Capacidade indisponivel" });
+    broadcastDataChanged("shares");
+    auditLog("share.capability_revoked", getAuditActor(req),
+      { type: "public_link", id: crypto.createHash("sha256").update(token).digest("hex") },
+      "revoked", "success", { scope: "file" });
+    return res.status(204).end();
+  }
   const links = loadPublicLinks();
   const link = links[token];
   if (!link || link.shareKind !== "capability-v1") {
@@ -12220,9 +12603,12 @@ app.delete("/share/capabilities/:token", shareRateLimit, authenticate, requirePe
   return res.status(204).end();
 });
 
+app.delete("/share/capabilities/:token", shareRateLimit, (_req, res) =>
+  res.status(404).json({ error: "Capacidade indisponivel" }));
+
 app.get("/share/:token", shareRateLimit, (req, res) => {
   const shareToken = String(req.params.token || "");
-  if (!/^[a-f0-9]{48}$/i.test(shareToken)) {
+  if (!/^[a-f0-9]{48}$/.test(shareToken)) {
     return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
   }
 
@@ -12243,7 +12629,7 @@ app.get("/share/:token", shareRateLimit, (req, res) => {
 });
 
 app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
   const access = await resolveShareAccess(req, res, shareToken, {
@@ -12265,7 +12651,7 @@ app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareM
 app.get("/share/:token/status", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
 
 app.post("/share/:token/status", shareRateLimit, requireSameOriginPublicShareMutation, (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
   const link = loadPublicLinks()[shareToken];
@@ -12290,7 +12676,7 @@ app.post("/share/:token/status", shareRateLimit, requireSameOriginPublicShareMut
 });
 
 app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
   const access = await resolveShareAccess(req, res, shareToken, { countView: true, requireAnyOperation: true });
@@ -12302,7 +12688,7 @@ app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutat
 
   res.json({
     ...getSharePublicPayload(access.link, access.fileInfo, access.limits),
-    url: `/share/${shareToken}/file`,
+    url: `/share/${shareCookieId(req, shareToken)}/file`,
     urlMethod: "POST",
   });
 });
@@ -12310,7 +12696,7 @@ app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutat
 app.get("/share/:token/download", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
 
 app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
 
   const access = await resolveShareAccess(req, res, shareToken, {
@@ -12322,7 +12708,7 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
   if (access.error) return res.status(access.status || 400).type("html").send(getShareFailurePage(access.error));
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
-    cacheControl: "private, max-age=600",
+    cacheControl: "no-store",
     beforeSend: (readHandle) => {
       const rejection = access.reserveDownload(readHandle);
       if (!rejection) setShareDownloadReceiptCookie(req, res, shareToken);
@@ -12333,7 +12719,7 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 });
 
 app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePreview, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
   if (req.method === "HEAD") return res.setHeader("Allow", "GET, POST").status(405).type("text/plain").send("Metodo nao permitido");
 
@@ -12347,13 +12733,13 @@ app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePre
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
-    cacheControl: "private, max-age=600",
+    cacheControl: "no-store",
     beforeSend: access.revalidateStreamAccess,
   });
 });
 
 app.post("/share/:token/preview", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
   const access = await resolveShareAccess(req, res, shareToken, {
@@ -12367,24 +12753,28 @@ app.post("/share/:token/preview", shareRateLimit, requireSameOriginPublicShareMu
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
-    cacheControl: "private, max-age=600",
+    cacheControl: "no-store",
     beforeSend: access.reserveDownload,
   });
 });
 
 app.get("/share/:token/qr", shareRateLimit, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
+  if (req.capabilityAlias) {
+    return res.status(404).send("QR de capacidade requer fragmento original");
+  }
 
   try {
-    const png = await QRCode.toBuffer(buildPublicShareUrl(req, shareToken), {
+    const png = await QRCode.toBuffer(req.capabilityAlias
+      ? buildPublicCapabilityUrl(req, shareToken) : buildPublicShareUrl(req, shareToken), {
       type: "png",
       margin: 1,
       width: 320,
       color: { dark: "#044879", light: "#ffffff" },
     });
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.setHeader("Cache-Control", "no-store");
     res.send(png);
   } catch (error) {
     res.status(500).send("Nao foi possivel gerar QR Code");
@@ -12394,7 +12784,7 @@ app.get("/share/:token/qr", shareRateLimit, async (req, res) => {
 app.get("/share/:token/file", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
 
 app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
-  const shareToken = validateShareToken(req.params.token);
+  const shareToken = validateShareToken(req.params.token, req);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
   const access = await resolveShareAccess(req, res, shareToken, {
@@ -12406,7 +12796,7 @@ app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutat
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
-    cacheControl: "private, max-age=600",
+    cacheControl: "no-store",
     beforeSend: access.reserveDownload,
     onBeforeSendReject: (failure) => res.status(failure.status || 400).send(failure.error),
   });
@@ -12712,13 +13102,25 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
 app.get("/delete/:name", deleteRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
 app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
-  const name = path.basename(req.params.name);
+  const requestedName = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
-
   if (!canMoveToTrash(req)) {
     return res.status(403).json({ error: "Permissao negada: delete" });
   }
+  // Resolve the physical case before file-permission checks and lifecycle
+  // locking: an NTFS URL alias must not bypass the protected metadata key.
+  let name;
+  try {
+    name = trashService.resolvePhysicalFileName(
+      ensureFolderDirectories(folder.id).uploadDir, requestedName);
+  } catch (_error) {
+    return res.status(409).json({ error: "Nome fisico ambiguo para exclusao" });
+  }
+  const physicalNameIsStable = (directory) => {
+    try { return trashService.resolvePhysicalFileName(directory, name) === name; }
+    catch (_error) { return false; }
+  };
 
   if (!hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
@@ -12733,6 +13135,9 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!hasFileEditAccess(req, currentFolderRecord, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (isFileInTrash(currentFolderRecord.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+    if (!physicalNameIsStable(currentFolder.uploadDir)) {
+      return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
+    }
     const filePath = path.join(currentFolder.uploadDir, name);
     await ensureCloudFileCached(folder.id, name, filePath, "uploads");
     if (!refreshAuthenticatedUser(req, res)) return;
@@ -12740,12 +13145,16 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
     if (!hasFolderAccess(req, publishFolder) || !canMoveToTrash(req) || !hasFileEditAccess(req, publishFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (isFileInTrash(publishFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!physicalNameIsStable(currentFolder.uploadDir)) {
+      return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
+    }
     const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
 
     try {
     const trashItem = trashService.moveFileToTrash({
       folder: currentFolder,
       fileName: name,
+      expectedCanonicalName: name,
       deletedBy: req.user.username,
       loaders: getTrashLoaders(),
     });
