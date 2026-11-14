@@ -126,8 +126,6 @@ internal class AuthHttpTransport {
             throw SyncListingValidationException("Invalid or oversized inventory page")
         }
     }
-        }
-    }
 
     private fun parseProtocolVersion(value: Any?): Int? = when (value) {
         is Int -> value
