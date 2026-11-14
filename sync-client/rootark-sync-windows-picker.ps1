@@ -5,6 +5,36 @@ param(
   [string]$Config
 )
 
+function Resolve-RootArkPath([string]$base, [string]$target) {
+  if ([string]::IsNullOrWhiteSpace($target)) { return $base }
+  $cleanTarget = $target.Replace('/', '\')
+  $isFullyQualified = if ([type]::GetType('System.IO.Path').GetMethod('IsPathFullyQualified')) {
+    [IO.Path]::IsPathFullyQualified($cleanTarget)
+  } else {
+    $cleanTarget -match '^[A-Za-z]:\\' -or $cleanTarget -match '^\\\\'
+  }
+  if ($isFullyQualified) {
+    return [IO.Path]::GetFullPath($cleanTarget)
+  }
+  if ($cleanTarget -match '^\\') {
+    $driveRoot = [IO.Path]::GetPathRoot($base)
+    if ([string]::IsNullOrEmpty($driveRoot)) { $driveRoot = '\' }
+    return [IO.Path]::GetFullPath((Join-Path $driveRoot $cleanTarget.TrimStart('\')))
+  }
+  if ($cleanTarget -match '^([A-Za-z]:)(.*)$') {
+    $drive = $Matches[1]
+    $relativePart = $Matches[2].TrimStart('\')
+    $baseDrive = if ($base -match '^([A-Za-z]:)') { $Matches[1] } else { '' }
+    if ($baseDrive -and $drive.Equals($baseDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return [IO.Path]::GetFullPath((Join-Path $base $relativePart))
+    }
+    return [IO.Path]::GetFullPath("$drive\$relativePart")
+  }
+  return [IO.Path]::GetFullPath((Join-Path $base $cleanTarget))
+}
+
+$Config = Resolve-RootArkPath (Get-Location).ProviderPath $Config
+
 $ErrorActionPreference = 'Stop'
 $previousOutputEncoding = [Console]::OutputEncoding
 try {
@@ -65,12 +95,8 @@ if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydra
 # Reveal only. Opening an associated app automatically could execute remote content.
 $localFolder = [string]((Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json).localFolder)
 if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
-$configDir = Split-Path -Parent ([IO.Path]::GetFullPath($Config))
-$root = if ([IO.Path]::IsPathRooted($localFolder)) {
-  [IO.Path]::GetFullPath($localFolder)
-} else {
-  [IO.Path]::GetFullPath((Join-Path $configDir $localFolder))
-}
+$configDir = Split-Path -Parent $Config
+$root = Resolve-RootArkPath $configDir $localFolder
 $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$chosen[0].Path -replace '/', '\')))
 $rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
