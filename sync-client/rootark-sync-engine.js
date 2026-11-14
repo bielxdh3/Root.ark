@@ -29,6 +29,11 @@ function signedEnvelopeDigest(operation) {
 // owner-provisioned account/store namespace and MUST NOT authorize new ACKs.
 const ATOMIC_ADMISSION_DOMAIN = "rootark-sync-atomic-batch-witness-v2\0";
 const ATOMIC_CAS_FLOOR_DOMAIN = "rootark-sync-atomic-batch-external-cas-floor-v2\0";
+// A standalone historical UPDATE has different semantics from the protected
+// two-member WebDAV DELETE+MOVE transaction. Never reuse the pair signature
+// domain to admit a singleton or accept a server-supplied receipt.
+const RESTORE_ADMISSION_DOMAIN = "rootark-sync-historical-restore-physical-witness-v1\0";
+const RESTORE_CAS_FLOOR_DOMAIN = "rootark-sync-historical-restore-physical-current-v1\0";
 const ATOMIC_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 function pinnedAtomicOwnerIdentity(value) {
   if (value == null) return null;
@@ -74,11 +79,16 @@ function pinnedAtomicWitnessKey(value) {
   }
   return key;
 }
-function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope, identity) {
+function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope, identity,
+  historicalRestore = false) {
   // Client-signed envelopes echoed by the server are NOT evidence that the
   // server committed them. Only a separate pinned witness can attest the
   // exact physical store head AFTER the two operations become durable.
-  if (!trustedWitnessKey) fail("Independent atomic batch witness is unavailable",
+  if (!trustedWitnessKey || !Array.isArray(operations)
+    || (historicalRestore
+      ? operations.length !== 1 || operations[0]?.operation !== "update"
+        || !operations[0]?.operationId?.startsWith("histrestore-")
+      : operations.length !== 2)) fail("Independent atomic batch witness is unavailable",
     "sync_atomic_batch_indeterminate");
   const receipt = response?.atomicAdmission;
   const statement = receipt?.statement;
@@ -101,8 +111,8 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     || typeof statement.commitId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(statement.commitId)
     || typeof statement.storeHeadSha256 !== "string"
     || !/^[a-f0-9]{64}$/.test(statement.storeHeadSha256)
-    || !Array.isArray(statement.operationIds) || statement.operationIds.length !== 2
-    || !Array.isArray(statement.envelopeDigests) || statement.envelopeDigests.length !== 2
+    || !Array.isArray(statement.operationIds) || statement.operationIds.length !== operations.length
+    || !Array.isArray(statement.envelopeDigests) || statement.envelopeDigests.length !== operations.length
     || operations.some((operation, index) =>
       operation.authorization?.username !== identity.username
       || operation.compartmentId !== identity.compartmentId
@@ -116,14 +126,14 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
   const signature = Buffer.from(receipt.signature, "base64url");
   if (signature.length !== 64
     || signature.toString("base64url") !== receipt.signature
-    || !crypto.verify(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
+    || !crypto.verify(null, Buffer.from((historicalRestore ? RESTORE_ADMISSION_DOMAIN : ATOMIC_ADMISSION_DOMAIN)
       + protocol.canonicalJson(statement), "utf8"), trustedWitnessKey, signature)) {
     fail("Independent atomic batch witness signature invalid",
       "sync_atomic_batch_indeterminate");
   }
 }
 function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
-  trustedScope, expectedNonce, identity) {
+  trustedScope, expectedNonce, identity, historicalRestore = false) {
   // An independent, off-host CAS reader must attest the CURRENT retained
   // physical head with a separate pinned signer. A new witness nonce alone
   // cannot distinguish a re-signed stale head after physical rollback.
@@ -158,7 +168,7 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
   }
   const signature = Buffer.from(detached.signature, "base64url");
   if (signature.length !== 64 || signature.toString("base64url") !== detached.signature
-    || !crypto.verify(null, Buffer.from(ATOMIC_CAS_FLOOR_DOMAIN
+    || !crypto.verify(null, Buffer.from((historicalRestore ? RESTORE_CAS_FLOOR_DOMAIN : ATOMIC_CAS_FLOOR_DOMAIN)
       + protocol.canonicalJson(statement), "utf8"), trustedCasKey, signature)) {
     fail("External CAS current floor signature invalid",
       "sync_atomic_batch_indeterminate");
@@ -789,6 +799,9 @@ class SyncEngine {
     if (!this.opened) await this._open();
     const validId = (value) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value);
     if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
+    // Without separately provisioned physical witness and CURRENT CAS, do
+    // not start a restore that could stage local bytes and strand its outbox.
+    this.assertHistoricalRestorePhysicalAuthority();
     if (typeof this.adapter.history !== "function") fail("Sync history is unavailable", "history_unavailable");
     if ((await this.journal.recover()).length) fail("Sync pending writes must be settled before restore", "sync_operation_pending");
     const result = await this.adapter.history(objectId);
@@ -888,12 +901,9 @@ class SyncEngine {
     await this._pushPending(summary);
     if (summary.offline) return { restored: true, pushed: false, pending: true,
       objectId, sourceVersionId: versionId, versionId: restored.versionId };
-    const readback = await this.adapter.list(objectId);
-    const committed = Array.isArray(readback) ? readback[0]
-      : Array.isArray(readback?.objects) ? readback.objects[0] : readback;
-    if (!committed || signedEnvelopeDigest(protocol.validateStoredOperation(committed)) !== signedEnvelopeDigest(restored)) {
-      fail("Historical restore could not verify the committed revision", "restore_commit_unverified");
-    }
+    // _pushPending has authenticated the physical CURRENT and committed our
+    // local journal/snapshot. A server-controlled LIST cannot add evidence;
+    // rejecting or accepting an ACK on LIST would reintroduce the same bug.
     return { restored: true, pushed: true, objectId, sourceVersionId: versionId,
       versionId: restored.versionId, operationId: restored.operationId };
   }
@@ -1491,6 +1501,68 @@ class SyncEngine {
     return this.withMutationLock(() => this._pushPending(summary));
   }
 
+  assertHistoricalRestorePhysicalAuthority() {
+    if (!this.requireAuthorization || !this.atomicBatchWitnessPublicKey
+      || !this.atomicBatchWitnessReadback || !this.atomicBatchWitnessScope
+      || !this.atomicBatchOwnerIdentity || !this.atomicBatchOwnerProvisionerPublicKey
+      || !this.atomicBatchCasFloorPublicKey || !this.atomicBatchCasFloorReadback) {
+      fail("Historical restore requires independently provisioned physical CURRENT authority",
+        "restore_remote_admission_unproven");
+    }
+  }
+
+  async confirmHistoricalRestorePhysicalAdmission(operation) {
+    this.assertHistoricalRestorePhysicalAuthority();
+    // A client Ed25519 signature authenticates the request, not its fsync.
+    // A fresh challenge goes directly to an independently pinned witness,
+    // then a second nonce to a separate physical CURRENT CAS signer.
+    let entry;
+    try { entry = protocol.validateStoredOperation(operation); }
+    catch { fail("Historical restore has no exact authenticated envelope",
+      "restore_remote_admission_unproven"); }
+    if (entry.operation !== "update" || !entry.operationId.startsWith("histrestore-")
+      || !entry.authorization) {
+      fail("Historical restore operation identity is invalid",
+        "restore_remote_admission_unproven");
+    }
+    const witnessNonce = crypto.randomBytes(32).toString("base64url");
+    let signedWitness;
+    try {
+      signedWitness = JSON.parse(protocol.canonicalJson(await this.atomicBatchWitnessReadback({
+        scope: this.atomicBatchWitnessScope,
+        accountId: this.atomicBatchOwnerIdentity.accountId,
+        storeId: this.atomicBatchOwnerIdentity.storeId,
+        nonce: witnessNonce,
+        operationIds: [entry.operationId],
+        envelopeDigests: [signedEnvelopeDigest(entry)],
+      })));
+      if (signedWitness?.statement?.nonce !== witnessNonce) throw new Error("Witness replay");
+      verifyAtomicBatchAdmission({ atomicAdmission: signedWitness }, [entry],
+        this.atomicBatchWitnessPublicKey, this.atomicBatchWitnessScope,
+        this.atomicBatchOwnerIdentity, true);
+    } catch {
+      fail("Historical restore has no independently signed physical admission",
+        "restore_remote_admission_unproven");
+    }
+    const physical = signedWitness.statement;
+    const casNonce = crypto.randomBytes(32).toString("base64url");
+    try {
+      const floor = await this.atomicBatchCasFloorReadback({
+        scope: this.atomicBatchWitnessScope,
+        accountId: this.atomicBatchOwnerIdentity.accountId,
+        storeId: this.atomicBatchOwnerIdentity.storeId,
+        nonce: casNonce, commitId: physical.commitId,
+        storeHeadSha256: physical.storeHeadSha256,
+        fencingEpoch: physical.fencingEpoch,
+      });
+      verifyAtomicBatchCasFloor(floor, physical, this.atomicBatchCasFloorPublicKey,
+        this.atomicBatchWitnessScope, casNonce, this.atomicBatchOwnerIdentity, true);
+    } catch {
+      fail("Historical restore has no independently signed CURRENT physical head",
+        "restore_remote_admission_unproven");
+    }
+  }
+
   async pushAtomicSignedOverwritePair(pending, summary) {
     if (!this.requireAuthorization || !this.requireCurrentOutgoingAuthorization
       || typeof this.currentDeviceAuthorization !== "function"
@@ -1822,7 +1894,34 @@ class SyncEngine {
           }
         }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
-        const result = await this.retryPush(operation);
+        const historicalRestore = operation.operationId.startsWith("histrestore-");
+        let result;
+        if (historicalRestore) {
+          this.assertHistoricalRestorePhysicalAuthority();
+          let uncertain = null;
+          try { result = await this.retryPush(operation); }
+          catch (error) {
+            if (transient(error) || error?.status === 409
+              || ["authorization_rejected", "authorization_required", "sync_conflict"].includes(error?.code)) {
+              // A lost ACK may be followed by 409, an offline retry, or an
+              // expired grant. None of those responses proves the exact
+              // restore is durable. The independent read is still allowed.
+              uncertain = error;
+            } else throw error;
+          }
+          if (result?.status === 409) uncertain = new SyncConflictError(result);
+          if (result?.status >= 400 && result.status !== 409) {
+            fail("Historical restore HTTP admission rejected", "restore_remote_admission_unproven");
+          }
+          try { await this.confirmHistoricalRestorePhysicalAdmission(operation); }
+          catch (error) {
+            // A disconnected readback cannot prove a lost transport ACK. Keep
+            // the exact signed operation queued for a later independent read.
+            if (uncertain && transient(uncertain)) { summary.offline = true; continue; }
+            throw error;
+          }
+          result = null;
+        } else result = await this.retryPush(operation);
         if (result?.status >= 400) {
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
           throw new SyncConflictError(result);
@@ -1842,9 +1941,10 @@ class SyncEngine {
           this.rememberOperation(operation, hash);
           await this.persistSnapshot();
         }
-        // HTTP 2xx is not an independently signed admission receipt. Pin only
-        // our locally signed exact envelope if the response echoes every byte.
-        // Unknown ACKs and conflict results remain seen-only.
+        // For ordinary operations an HTTP 2xx still does not pin admission:
+        // only our locally signed exact echo can carry a fresh local digest.
+        // Historical restores reached here only after an independently
+        // signed physical witness and a second CURRENT CAS confirmation.
         await this.journal.markSeen(operation.operationId, acknowledgedDigest);
         summary.pushed += 1;
       } catch (error) {

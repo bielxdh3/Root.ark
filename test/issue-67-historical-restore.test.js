@@ -12,7 +12,91 @@ const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
+const { DOMAIN: OWNER_PROVISION_DOMAIN } =
+  require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+
+const RESTORE_WITNESS_DOMAIN = "rootark-sync-historical-restore-physical-witness-v1\0";
+const RESTORE_CURRENT_DOMAIN = "rootark-sync-historical-restore-physical-current-v1\0";
+
+// Test-only simulated custody: separate signing keys verify an on-disk file
+// reopened on every challenge. This is NOT an independently deployed operator.
+// A dedicated production-store test below additionally uses SyncObjectStore.
+function simulatedRestorePhysicalAuthority(root) {
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const cas = crypto.generateKeyPairSync("ed25519");
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const spki = (pair) => pair.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
+  const signing = (pair, domain, statement) => ({ statement,
+    signature: crypto.sign(null, Buffer.from(domain + protocol.canonicalJson(statement)),
+      pair.privateKey).toString("base64url") });
+  const scope = "alice:historical-restore";
+  const identity = { accountId: crypto.randomUUID(), storeId: crypto.randomUUID(),
+    username: "alice", compartmentId: "private" };
+  const provisioning = signing(owner, OWNER_PROVISION_DOMAIN, {
+    type: "atomic-owner-provisioning", version: 1, scope, ...identity,
+    witnessSpki: spki(witness), casSpki: spki(cas), sequence: 1,
+  });
+  const digest = crypto.createHash("sha256")
+    .update(OWNER_PROVISION_DOMAIN + protocol.canonicalJson(provisioning)).digest("hex");
+  const statePath = path.join(root, "witness-store-current.json");
+  let sequence = 0;
+  const reopen = async () => JSON.parse(await fsp.readFile(statePath, "utf8"));
+  let currentPhysicalRead = reopen;
+  const physicalStoreCommitted = async (operation) => {
+    const state = { operation, commitId: crypto.randomBytes(24).toString("base64url"),
+      fencingEpoch: ++sequence };
+    state.storeHeadSha256 = crypto.createHash("sha256")
+      .update(protocol.canonicalJson(operation)).digest("hex");
+    const temporary = `${statePath}.tmp-${crypto.randomUUID()}`;
+    const handle = await fsp.open(temporary, "wx", 0o600);
+    try { await handle.writeFile(protocol.canonicalJson(state)); await handle.sync(); }
+    finally { await handle.close(); }
+    await fsp.rename(temporary, statePath);
+    if (process.platform !== "win32") {
+      const directory = await fsp.open(root, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0));
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+  };
+  const options = {
+    atomicBatchWitnessScope: scope,
+    atomicBatchOwnerIdentity: identity,
+    atomicBatchOwnerProvisionerPublicKey: spki(owner),
+    atomicBatchOwnerProvisioning: provisioning,
+    atomicBatchOwnerProvisionDigest: digest,
+    atomicBatchWitnessPublicKey: spki(witness),
+    atomicBatchCasFloorPublicKey: spki(cas),
+    async atomicBatchWitnessReadback({ nonce, operationIds, envelopeDigests }) {
+      const disk = await currentPhysicalRead();
+      assert.deepEqual(operationIds, [disk.operation.operationId]);
+      assert.deepEqual(envelopeDigests, [crypto.createHash("sha256")
+        .update(protocol.canonicalJson(disk.operation)).digest("hex")]);
+      return signing(witness, RESTORE_WITNESS_DOMAIN, {
+        version: 2, scope, ...identity, nonce, operationIds, envelopeDigests,
+        commitId: disk.commitId, storeHeadSha256: disk.storeHeadSha256,
+        fencingEpoch: disk.fencingEpoch, physicalDurable: true,
+      });
+    },
+    async atomicBatchCasFloorReadback({ nonce, commitId, storeHeadSha256, fencingEpoch }) {
+      const disk = await currentPhysicalRead();
+      assert.equal(disk.commitId, commitId);
+      assert.equal(disk.storeHeadSha256, storeHeadSha256);
+      assert.equal(disk.fencingEpoch, fencingEpoch);
+      assert.equal(crypto.createHash("sha256")
+        .update(protocol.canonicalJson(disk.operation)).digest("hex"), storeHeadSha256);
+      return signing(cas, RESTORE_CURRENT_DOMAIN, {
+        version: 2, scope, accountId: identity.accountId, storeId: identity.storeId,
+        nonce, commitId, storeHeadSha256, fencingEpoch, sequence: disk.fencingEpoch,
+        current: true,
+      });
+    },
+  };
+  return { physicalStoreCommitted, options,
+    // Test-only: bind both signing callbacks to a fresh reopening of the real
+    // SyncObjectStore disk image. No new trust source is exposed in production.
+    useReopenedPhysicalSource(reader) { currentPhysicalRead = reader; },
+  };
+}
 
 async function restoreRecoveredBytesOnlyIfVacant(target, bytes) {
   // This helper is deliberately test-only. Recovery must never overwrite a
@@ -61,6 +145,7 @@ async function fixture(t) {
   let current = deleted;
   const versions = [original, deleted];
   let pushes = 0;
+  const physical = simulatedRestorePhysicalAuthority(root);
   const adapter = {
     history: async () => ({ protocolVersion: 2, versions: versions.map((record) => structuredClone(record)) }),
     list: async () => structuredClone(current),
@@ -75,6 +160,7 @@ async function fixture(t) {
       }
       current = structuredClone(operation);
       versions.push(current);
+      await physical.physicalStoreCommitted(current);
       return structuredClone(current);
     },
   };
@@ -86,10 +172,11 @@ async function fixture(t) {
     authorizationFactory: (operation) => createAuthorizationProof(operation, {
       username: "alice", privateKey, publicKey: publicKeySpki,
     }),
+    ...physical.options,
   }).open();
   return { root, local, engine, original, deleted, versions, trusted, adapter, sign, privateFileKey, publicKeySpki,
     setCurrent: (value) => { current = value; },
-    pushes: () => pushes, current: () => current };
+    physical, pushes: () => pushes, current: () => current };
 }
 
 test("#67: restoring a deleted historical ciphertext creates a fresh signed revision and real local bytes", async (t) => {
@@ -110,6 +197,92 @@ test("#67: restoring a deleted historical ciphertext creates a fresh signed revi
   assert.equal(restored.revision.counter, 3);
   assert.equal(await verifyAuthorizationProof(restored.authorization, restored, f.trusted), true);
   assert.equal(protocol.decryptPayload(restored, f.engine.fileKeyResolver(restored)).toString(), "original authenticated bytes");
+});
+
+for (const echo of [false, true]) {
+  test(`#67 P1: HTTP 200 ${echo ? "exact signed echo" : "empty ACK"} without physical CURRENT never consumes a historical restore`, async (t) => {
+    const f = await fixture(t);
+    let acceptedSigned = null;
+    f.adapter.push = async (operation) => {
+      assert.equal(await verifyAuthorizationProof(operation.authorization, operation, f.trusted), true);
+      assert.match(operation.operationId, /^histrestore-/);
+      acceptedSigned = structuredClone(operation);
+      return echo ? structuredClone(operation) : { status: 200 };
+    };
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_remote_admission_unproven",
+      "HTTP and a valid client signature must not impersonate independently durable CURRENT");
+    assert.ok(acceptedSigned, "the malicious server received an actual Ed25519 signed restore");
+    const [pending] = await f.engine.journal.recover();
+    assert.equal(pending.operationId, acceptedSigned.operationId,
+      "the exact signed outbox must remain after a forged remote ACK");
+    assert.equal((await f.engine.journal.recover()).length, 1);
+    assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
+      "original authenticated bytes", "local materialization must survive unproven ACK");
+    assert.equal(f.versions.length, 2, "the server must not create a physical historical version");
+  });
+}
+
+test("#67 P1: 409 with server-controlled exact signed restore echo cannot clear the outbox", async (t) => {
+  const f = await fixture(t);
+  let signedRequest = null;
+  f.adapter.push = async (operation) => {
+    signedRequest = structuredClone(operation);
+    assert.equal(await verifyAuthorizationProof(operation.authorization, operation, f.trusted), true);
+    throw Object.assign(new Error("server claims the restore already exists"),
+      { code: "sync_conflict", status: 409, current: structuredClone(operation) });
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_remote_admission_unproven");
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(pending.operationId, signedRequest.operationId);
+  assert.equal(f.versions.length, 2, "a server-controlled conflict cannot fabricate a physical commit");
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
+    "original authenticated bytes");
+});
+
+test("#67 P1: absent independent owner-witness-CAS authority rejects restore before staging", async (t) => {
+  const f = await fixture(t);
+  const engine = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming,
+    authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  await assert.rejects(engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_remote_admission_unproven");
+  assert.equal(f.pushes(), 0, "missing physical authority must not send signed restore");
+  assert.deepEqual(await engine.journal.recover(), [], "no unserviceable outbox entry is created");
+  assert.equal(fs.existsSync(path.join(f.local, "document.txt")), false);
+});
+
+test("#67 P1: signed physical witness alone cannot ACK without genuine CAS CURRENT", async (t) => {
+  const f = await fixture(t);
+  const originalCas = f.physical.options.atomicBatchCasFloorReadback;
+  const engine = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    ...f.physical.options,
+    atomicBatchCasFloorReadback: async (challenge) => {
+      const signed = await originalCas(challenge);
+      // Even a correctly signed *previous* physical witness cannot confer
+      // CURRENT when the independent floor is substituted after signing.
+      return { ...signed, statement: { ...signed.statement, current: false } };
+    },
+  }).open();
+  await assert.rejects(engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_remote_admission_unproven");
+  assert.equal(f.pushes(), 1, "server has actually committed once");
+  assert.equal(f.versions.length, 3, "remote operation exists but cannot fabricate CURRENT");
+  assert.equal((await engine.journal.recover()).length, 1,
+    "local signed outbox must survive a substituted CAS floor");
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
+    "original authenticated bytes");
 });
 
 test("#67: invalid historical signature, unknown version and revoked signer fail before any new write", async (t) => {
@@ -385,7 +558,7 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   await assert.rejects(reopened.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
   assert.equal(f.pushes(), 0, "an unmaterialized local restore must never be pushed after restart");
@@ -451,7 +624,7 @@ test("#67 P2: offline materialized restore survives later local edit and pushes 
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   const committedRestore = await reopened.syncOnce();
   assert.equal(committedRestore.pushed, 1,
@@ -500,7 +673,7 @@ test("#67 P2: forged persisted snapshot alone cannot authorize a never-materiali
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   await assert.rejects(resumed.syncOnce(),
     (error) => error.code === "restore_local_materialization_missing");
@@ -530,7 +703,7 @@ test("#67 P2: deletion after durable offline restore remains a later signed dele
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   const restored = await reopened.syncOnce();
   assert.equal(restored.pushed, 1);
@@ -599,7 +772,7 @@ test("#67 P2: a recovered restore without witness cannot push if retry file fsyn
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   const originalOpen = fsp.open;
   let injected = 0;
@@ -672,7 +845,7 @@ test("#67 P2: failed POSIX directory fsync after link cannot authorize push on r
       keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
       fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
       authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-      verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+      verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
     }).open();
     await assert.rejects(reopened.syncOnce(),
       (error) => error.code === "restore_local_materialization_missing",
@@ -741,7 +914,7 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   if (!idMatches) {
     await assert.rejects(reopened.syncOnce(),
@@ -828,7 +1001,7 @@ test("#67 P2: pre-link crash cannot silently upload the durable staging temp", a
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   await assert.rejects(reopened.syncOnce(),
     (error) => error.code === "restore_local_materialization_missing");
@@ -873,7 +1046,7 @@ test("#67 P2: crash after staging name intent but before inode bind cannot uploa
     keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
     fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
     authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
-    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory, ...f.physical.options,
   }).open();
   await assert.rejects(reopened.syncOnce(),
     (error) => error.code === "restore_local_materialization_missing");
@@ -1007,7 +1180,8 @@ test("#67: an untracked file created after enqueue is never replaced by restore"
   assert.equal((await f.engine.journal.recover()).length, 0);
 });
 
-test("#67: real atomic device registry durably admits a newly signed historical restore", async (t) => {
+for (const lostAck of [false, true]) {
+test(`#67 P1: real atomic device registry ${lostAck ? "recovers lost ACK plus 409" : "admits"} historical restore only after physical CURRENT`, async (t) => {
   const f = await fixture(t);
   const storagePath = path.join(f.root, "physical-store.json");
   const store = await new SyncObjectStore(storagePath, { atomicDeviceRegistry: true }).open();
@@ -1017,14 +1191,41 @@ test("#67: real atomic device registry durably admits a newly signed historical 
   assert.equal((await store.put("alice", f.deleted)).kind, "stored");
   f.adapter.history = async (id) => ({ protocolVersion: 2, versions: store.history("alice", id) });
   f.adapter.list = async (id) => store.list("alice", id)[0];
+  // Read CURRENT from the actual reopened, durable atomic registry. Signing
+  // keys live separately in the test authority; neither signer receives the
+  // server's HTTP response as evidence of physical persistence.
+  f.physical.useReopenedPhysicalSource(async () => {
+    const bytes = await fsp.readFile(storagePath);
+    const reopened = await new SyncObjectStore(storagePath, { atomicDeviceRegistry: true }).open();
+    const [operation] = reopened.list("alice", "file-1");
+    const physicalHead = crypto.createHash("sha256").update(bytes).digest("hex");
+    const contentHead = crypto.createHash("sha256")
+      .update(protocol.canonicalJson(operation)).digest("hex");
+    return { operation, storeHeadSha256: contentHead,
+      commitId: Buffer.from(physicalHead, "hex").toString("base64url"),
+      fencingEpoch: reopened.atomicRegistryEpoch() };
+  });
+  let attempts = 0;
   f.adapter.push = async (operation) => {
+    attempts++;
+    if (attempts > 1 && lostAck) {
+      throw Object.assign(new Error("Already applied signed CAS revision"),
+        { status: 409, code: "sync_conflict" });
+    }
     const admitted = await store.put("alice", operation);
     assert.equal(admitted.kind, "stored");
+    if (lostAck) {
+      throw Object.assign(new Error("HTTP ACK lost after fsynced store commit"),
+        { code: "offline" });
+    }
     return admitted.record;
   };
   const before = await fsp.readFile(storagePath, "utf8");
   const restored = await f.engine.restoreHistoricalVersion("file-1", "first");
   assert.equal(restored.pushed, true);
+  assert.equal((await f.engine.journal.recover()).length, 0,
+    "only verified physical CURRENT can consume the exact signed pending restore");
+  assert.equal(attempts, lostAck ? 2 : 1);
   assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"), "original authenticated bytes");
   assert.equal(store.history("alice", "file-1").length, 3);
   const durable = JSON.parse(await fsp.readFile(storagePath, "utf8"));
@@ -1033,3 +1234,4 @@ test("#67: real atomic device registry durably admits a newly signed historical 
   const reopened = await new SyncObjectStore(storagePath, { atomicDeviceRegistry: true }).open();
   assert.equal(reopened.list("alice", "file-1")[0].versionId, restored.versionId);
 });
+}
