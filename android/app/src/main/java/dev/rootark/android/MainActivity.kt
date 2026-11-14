@@ -215,7 +215,7 @@ class MainActivity : Activity() {
             text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
         } else {
             button(layout, "Abrir texto verificado") {
-                runRequest({ stillActive ->
+                runCheckedRequest({ stillActive ->
                     preview.open(origin, session, objectId, stillActive)
                 }) { characters, failure ->
                     if (characters != null) {
@@ -248,7 +248,7 @@ class MainActivity : Activity() {
         button(layout, "Voltar") { showSession() }
     }
 
-    private fun <T> runRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
+    private fun <T> runCheckedRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
         val startedGeneration = ++generation
         val stillActive = { isForeground && generation == startedGeneration && !isFinishing && !isDestroyed }
         screen("Conectando", "Aguardando resposta do servidor...")
@@ -270,7 +270,7 @@ class MainActivity : Activity() {
     }
 
     private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) =
-        runRequest({ _ -> operation() }, done)
+        runCheckedRequest({ _ -> operation() }, done)
 
     private fun errorText(error: Exception?): String = when ((error as? RootArkApiException)?.statusCode) {
         401, 400 -> "Credenciais ou código inválidos."
