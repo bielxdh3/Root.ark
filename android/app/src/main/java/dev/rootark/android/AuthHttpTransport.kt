@@ -2,6 +2,7 @@ package dev.rootark.android
 
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
+import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.InventoryPage
 import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.LoginOutcome
