@@ -346,12 +346,8 @@ class MainActivity : Activity() {
                             button(view, "Fechar conteúdo") {
                                 securePreviewText?.text = ""
                                 securePreviewText = null
-                                showSession()
+                                backToPage()
                             }
-<<<<<<< HEAD
-                            button(view, "Fechar conteúdo") { backToPage() }
-=======
->>>>>>> 64dedcb0f5405fd26cf98c41342231f4174d38a9
                         } finally {
                             characters.fill('\u0000')
                         }
