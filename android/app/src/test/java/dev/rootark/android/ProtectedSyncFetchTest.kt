@@ -344,6 +344,7 @@ class ProtectedSyncFetchTest {
         )
         val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
         val gateway = ProtectedSyncFetch { fake }
+        val previewKey = cek.copyOf()
         var observed: ByteArray? = null
         var observedReference: ByteArray? = null
         gateway.withVerifiedContent(
@@ -357,6 +358,77 @@ class ProtectedSyncFetchTest {
         assertTrue(observedReference!!.all { it == 0.toByte() })
         assertTrue(cek.all { it == 0.toByte() })
         assertTrue(fake.disconnected)
+
+        // The same real Ed25519/AES-GCM signed HTTP fixture reaches the user
+        // interaction only through an independently supplied context and CEK.
+        val viewer = VerifiedTextPreview(
+            TrustedContentGrantProvider { username, id ->
+                assertEquals("alice", username)
+                assertEquals("fixture-object-1", id)
+                ProtectedContentGrant(context, previewKey)
+            },
+            ProtectedSyncFetch {
+                SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
+            },
+        )
+        assertTrue(viewer.available)
+        val text = viewer.open(origin, session, "fixture-object-1")
+        try {
+            assertEquals("hello", String(text))
+        } finally {
+            text.fill('\u0000')
+        }
+        assertTrue(previewKey.all { it == 0.toByte() })
+
+        val invalid = JSONObject(record.toString()).put("ciphertext", "AAAA")
+        val corruptedKey = ByteArray(32) { 11 }
+        val corruptedViewer = VerifiedTextPreview(
+            TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, corruptedKey) },
+            ProtectedSyncFetch {
+                SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = invalid.toString().toByteArray())
+            },
+        )
+        assertThrows(ProtectedSyncException::class.java) {
+            corruptedViewer.open(origin, session, "fixture-object-1")
+        }
+        assertTrue(corruptedKey.all { it == 0.toByte() })
+
+        for (status in listOf(401, 403)) {
+            val deniedKey = ByteArray(32) { 7 }
+            val deniedViewer = VerifiedTextPreview(
+                TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, deniedKey) },
+                ProtectedSyncFetch {
+                    SecureResponse(origin.syncObjectUrl("fixture-object-1"), status = status)
+                },
+            )
+            val denied = assertThrows(RootArkApiException::class.java) {
+                deniedViewer.open(origin, session, "fixture-object-1")
+            }
+            assertEquals(status, denied.statusCode)
+            assertTrue(deniedKey.all { it == 0.toByte() })
+        }
+
+        // Simulates onStop while the bounded HTTPS request is in flight.
+        // A consumed grant is erased, and no AES-GCM decrypt/preview runs
+        // after foreground generation changes.
+        val backgroundKey = ByteArray(32) { 17 }
+        var checks = 0
+        var networkOpens = 0
+        val pausedViewer = VerifiedTextPreview(
+            TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(context, backgroundKey) },
+            ProtectedSyncFetch {
+                networkOpens++
+                SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = record.toString().toByteArray())
+            },
+        )
+        assertThrows(ProtectedSyncException::class.java) {
+            pausedViewer.open(origin, session, "fixture-object-1") {
+                checks++
+                checks == 1
+            }
+        }
+        assertEquals(1, networkOpens)
+        assertTrue(backgroundKey.all { it == 0.toByte() })
     }
 
     @Test
