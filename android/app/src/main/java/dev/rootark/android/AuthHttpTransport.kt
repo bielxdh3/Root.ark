@@ -7,6 +7,8 @@ import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.RootArkApiException
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.math.BigDecimal
+import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.nio.charset.StandardCharsets
 import org.json.JSONException
@@ -80,7 +82,7 @@ internal class AuthHttpTransport {
         }
     }
 
-    private fun projectList(response: JSONObject): List<ReadOnlyFileRow> {
+    internal fun projectList(response: JSONObject): List<ReadOnlyFileRow> {
         val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid sync listing")
         if (objects.length() > ReadOnlyFileListPolicy.MAX_ENTRIES) {
             throw SyncListingLimitException("Sync listing exceeds maximum entry limit")
@@ -98,14 +100,14 @@ internal class AuthHttpTransport {
                 val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
                 val counter = parseNonNegativeLong(revision.opt("counter"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
-                if (requiredString(revision, "deviceId").length > 256) {
+                if (requiredListingString(revision, "deviceId").length > 256) {
                     throw SyncListingValidationException("Invalid sync listing")
                 }
 
                 ReadOnlyFileListPolicy.project(
                     protocolVersion = recordVersion,
-                    objectId = requiredString(record, "objectId"),
-                    operation = requiredString(record, "operation"),
+                    objectId = requiredListingString(record, "objectId"),
+                    operation = requiredListingString(record, "operation"),
                     tombstone = deleted,
                     name = optionalString(metadata, "name"),
                     path = optionalString(metadata, "path"),
@@ -118,33 +120,72 @@ internal class AuthHttpTransport {
         }
     }
 
-    private fun parseProtocolVersion(value: Any?): Int? = when (value) {
+    internal fun parseProtocolVersion(value: Any?): Int? = when (value) {
         is Int -> value
+        is Short -> value.toInt()
+        is Byte -> value.toInt()
         is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
-        is Number -> {
-            val i = value.toInt()
-            if (value.toDouble() == i.toDouble()) i else null
+        is BigInteger -> try {
+            value.intValueExact()
+        } catch (_: ArithmeticException) {
+            null
         }
+        is BigDecimal -> try {
+            if (value.stripTrailingZeros().scale() <= 0) value.intValueExact() else null
+        } catch (_: ArithmeticException) {
+            null
+        }
+        is Double, is Float -> null
         else -> null
     }
 
-    private fun parseNonNegativeLong(value: Any?): Long? = when (value) {
+    internal fun parseNonNegativeLong(value: Any?): Long? = when (value) {
         is Int -> if (value >= 0) value.toLong() else null
         is Long -> if (value >= 0L) value else null
-        is Number -> {
-            val l = value.toLong()
-            if (l >= 0L && value.toDouble() == l.toDouble()) l else null
+        is Short -> if (value >= 0) value.toLong() else null
+        is Byte -> if (value >= 0) value.toLong() else null
+        is BigInteger -> try {
+            val l = value.longValueExact()
+            if (l >= 0L) l else null
+        } catch (_: ArithmeticException) {
+            null
         }
+        is BigDecimal -> try {
+            if (value.stripTrailingZeros().scale() <= 0) {
+                val l = value.longValueExact()
+                if (l >= 0L) l else null
+            } else {
+                null
+            }
+        } catch (_: ArithmeticException) {
+            null
+        }
+        is Double, is Float -> null
         else -> null
     }
 
-    private fun parsePositiveInt(value: Any?): Int? = when (value) {
+    internal fun parsePositiveInt(value: Any?): Int? = when (value) {
         is Int -> if (value > 0) value else null
+        is Short -> if (value > 0) value.toInt() else null
+        is Byte -> if (value > 0) value.toInt() else null
         is Long -> if (value in 1..Int.MAX_VALUE) value.toInt() else null
-        is Number -> {
-            val i = value.toInt()
-            if (i > 0 && value.toDouble() == i.toDouble()) i else null
+        is BigInteger -> try {
+            val i = value.intValueExact()
+            if (i > 0) i else null
+        } catch (_: ArithmeticException) {
+            null
         }
+        is BigDecimal -> try {
+            if (value.stripTrailingZeros().scale() <= 0) {
+                val i = value.intValueExact()
+                if (i > 0) i else null
+            } else {
+                null
+            }
+        } catch (_: ArithmeticException) {
+            null
+        }
+        is Double, is Float -> null
         else -> null
     }
 
@@ -154,16 +195,29 @@ internal class AuthHttpTransport {
         return value as? String ?: throw SyncListingValidationException("Invalid sync listing")
     }
 
-    private fun optionalLong(json: JSONObject, key: String): Long? {
+    internal fun optionalLong(json: JSONObject, key: String): Long? {
         val value = json.opt(key)
         if (value == null || value == JSONObject.NULL) return null
         return when (value) {
             is Int -> value.toLong()
             is Long -> value
-            is Number -> {
-                val l = value.toLong()
-                if (value.toDouble() == l.toDouble()) l else throw SyncListingValidationException("Invalid sync listing")
+            is Short -> value.toLong()
+            is Byte -> value.toLong()
+            is BigInteger -> try {
+                value.longValueExact()
+            } catch (_: ArithmeticException) {
+                throw SyncListingValidationException("Invalid sync listing")
             }
+            is BigDecimal -> try {
+                if (value.stripTrailingZeros().scale() <= 0) {
+                    value.longValueExact()
+                } else {
+                    throw SyncListingValidationException("Invalid sync listing")
+                }
+            } catch (_: ArithmeticException) {
+                throw SyncListingValidationException("Invalid sync listing")
+            }
+            is Double, is Float -> throw SyncListingValidationException("Invalid sync listing")
             else -> throw SyncListingValidationException("Invalid sync listing")
         }
     }
@@ -183,6 +237,9 @@ internal class AuthHttpTransport {
 
     private fun requiredString(json: JSONObject, name: String): String =
         (json.opt(name) as? String)?.takeIf { it.isNotBlank() } ?: throw IOException("Unexpected authentication response")
+
+    private fun requiredListingString(json: JSONObject, name: String): String =
+        (json.opt(name) as? String)?.takeIf { it.isNotBlank() } ?: throw SyncListingValidationException("Invalid sync listing")
 
     private fun requiredPositiveInt(json: JSONObject, name: String): Int =
         parsePositiveInt(json.opt(name)) ?: throw IOException("Unexpected authentication response")
