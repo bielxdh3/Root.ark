@@ -86,6 +86,7 @@ function childSource(localCrash = false) {
     require.cache[cloudPath]={id:cloudPath,filename:cloudPath,loaded:true,exports:{createCloudStorage:()=>fake}};
     ${localCrash ? `const originalRename=fs.renameSync; fs.renameSync=(from,to)=>{const result=originalRename(from,to); if(process.env.LOCAL_CRASH_TO&&String(from).includes(".rootark-move-")&&String(from).endsWith(".source")&&path.resolve(to)===path.resolve(process.env.LOCAL_CRASH_TO)) process.kill(process.pid,"SIGKILL"); return result;};` : ""}
     if(process.env.CLAIM_SWAP_LOCK_PATH){const lockPath=path.resolve(process.env.CLAIM_SWAP_LOCK_PATH);const evidencePath=path.resolve(process.env.CLAIM_SWAP_EVIDENCE_PATH);const originalRename=fs.renameSync;const originalOpenSync=fs.openSync;const originalReadSync=fs.readSync;let evidenceFd=null;let swapped=false;let completionQueued=false;fs.renameSync=(from,to)=>{if(!swapped&&path.resolve(String(from))===lockPath&&path.resolve(String(to))===evidencePath){swapped=true;fs.writeFileSync(lockPath,process.env.CLAIM_SWAP_CONTENTS);const result=originalRename(from,to);fs.writeFileSync(process.env.CLAIM_SWAP_OBSERVED,"swapped");return result;}return originalRename(from,to);};fs.openSync=(file,...args)=>{const fd=originalOpenSync(file,...args);if(path.resolve(String(file))===evidencePath)evidenceFd=fd;return fd;};fs.readSync=(fd,...args)=>{const result=originalReadSync(fd,...args);if(swapped&&!completionQueued&&fd===evidenceFd&&result>0){completionQueued=true;setImmediate(()=>fs.writeFileSync(process.env.CLAIM_SWAP_COMPLETED,"verified"));}return result;};}
+    if(process.env.CHILD_EXIT_BEFORE_SERVER_REQUIRE==="true") process.exit(77);
     require(${JSON.stringify(SERVER)});
     if(process.env.CLAIM_PAUSE_POST_START) setImmediate(installPause); else if(installPause) installPause();
   `;
@@ -111,14 +112,28 @@ function serverEnv(dir, port, extra = {}) {
   };
 }
 
-function startServer(dir, extra = {}, localCrash = false) {
-  return freePort().then((port) => {
-    const child = spawn(process.execPath, ["-e", childSource(localCrash)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+function startServer(dir, extra = {}, localCrash = false, { onSpawn = null, occupiedPort = null } = {}) {
+  return (occupiedPort === null ? freePort() : Promise.resolve(occupiedPort)).then(async (port) => {
+    const child = spawn(process.execPath, ["-e", childSource(localCrash)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    if (onSpawn) onSpawn(child);
     let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    // The free-port probe necessarily closes its socket before child spawn.
+    // Under parallel CI another listener may bind that port and answer the
+    // static /login.html request. Only the spawned child can confirm that it
+    // successfully bound the expected port; a foreign HTTP 200 is not ready.
+    let stdout = "";
+    const childListening = new Promise((resolve) => {
+      child.stdout.on("data", (chunk) => {
+        stdout = (stdout + chunk.toString()).slice(-8192);
+        if (stdout.split(/\r?\n/).some((line) =>
+          line.trim().startsWith("Servidor rodando em http://")
+          && line.trim().endsWith(`:${port}`))) resolve();
+      });
+    });
     const ready = (async () => { for (let i = 0; i < 150; i += 1) { try { await request(port, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 40)); } } throw new Error("server did not start"); })();
     const exited = new Promise((_, reject) => child.once("exit", (code, signal) => reject(new Error(`server exited before readiness: ${code || signal}; stderr=${stderr}`))));
-    return Promise.race([ready, exited]).then(() => ({ child, port, stderr: () => stderr }));
+    return Promise.race([Promise.all([ready, childListening]), exited]).then(() => ({ child, port, stderr: () => stderr }));
   });
 }
 
@@ -144,6 +159,39 @@ test("stop rejects when a process does not close after termination", { timeout: 
   Object.assign(child, { exitCode: null, signalCode: null, stdio: [null, null, null], pid: "not-a-pid" });
   child.kill = () => true;
   await assert.rejects(stop(child, 5), /did not close within 5ms/);
+});
+
+test("foreign HTTP listener cannot impersonate a freshly spawned WebDAV server", { timeout: 25_000 }, async () => {
+  const f = fixture();
+  let foreign;
+  let spawned;
+  try {
+    // Retain the actual foreign listener's bound port. No freePort close/rebind
+    // gap or assumption about IPv4/IPv6 port exclusivity is involved.
+    foreign = http.createServer((_req, res) => res.writeHead(200).end("foreign"));
+    await new Promise((resolve, reject) => {
+      foreign.once("error", reject);
+      foreign.listen(0, "127.0.0.1", resolve);
+    });
+    const port = foreign.address().port;
+    const foreignResponse = await request(port, "/login.html");
+    assert.equal(foreignResponse.status, 200);
+    assert.equal(foreignResponse.body, "foreign");
+
+    // A genuine spawned child exits before requiring the server. A HTTP-only
+    // readiness check would accept the foreign 200, but child-owned stdout
+    // can never confirm that this process started the WebDAV listener.
+    await assert.rejects(startServer(f.dir, { CHILD_EXIT_BEFORE_SERVER_REQUIRE: "true" }, false, {
+      occupiedPort: port,
+      onSpawn: (child) => { spawned = child; },
+    }), /server exited before readiness: 77;/);
+    assert.ok(spawned, "the negative case must spawn a real child process");
+    assert.equal(spawned.exitCode, 77, "the child must exit before loading the application");
+  } finally {
+    if (spawned) await stop(spawned);
+    if (foreign) await new Promise((resolve) => foreign.close(resolve));
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
 });
 
 function fixture() {
@@ -322,8 +370,22 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
     let second;
     try {
       first = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-delete" });
-      try { await move(f.dir, first.port); } catch {}
-      await waitFor(() => readJournal(f.dir)?.cloud?.state === "source_delete_uncertain");
+      const moveOutcome = await move(f.dir, first.port).then(
+        ({ status }) => ({ status }),
+        (error) => ({ transportCode: String(error?.code || "TRANSPORT_ERROR") }));
+      if (Number.isInteger(moveOutcome.status)) {
+        assert.ok([201, 202, 204].includes(moveOutcome.status),
+          `unexpected MOVE status before durable intent: ${moveOutcome.status}`);
+      }
+      await waitFor(() => readJournal(f.dir)?.cloud?.state === "source_delete_uncertain")
+        .catch((error) => {
+          const journal = readJournal(f.dir);
+          const operationCounts = calls(f.dir).reduce((counts, entry) => {
+            counts[entry.operation] = (counts[entry.operation] || 0) + 1;
+            return counts;
+          }, {});
+          throw new Error(`${error.message}; moveOutcome=${JSON.stringify(moveOutcome)}; childExit=${String(first.child.exitCode ?? first.child.signalCode)}; journalPhase=${String(journal?.phase || "absent")}; journalCloudState=${String(journal?.cloud?.state || "absent")}; providerOperations=${JSON.stringify(operationCounts)}; stderrTail=${first.stderr().slice(-1000)}`);
+        });
       await stop(first.child);
       const journal = readJournal(f.dir);
       assert.equal(journal.cloud.state, "source_delete_uncertain");

@@ -653,8 +653,9 @@ class SyncClient {
       this.activeRemoteBasenames.set(basename, relativePath);
       this.activeKinds.set(key, kind);
       this.activeSyncTasks++;
+      let acknowledgedName;
       try {
-        await this.syncOne(fullPath, relativePath, reason).catch((error) => {
+        acknowledgedName = await this.syncOne(fullPath, relativePath, reason).catch((error) => {
           this.syncFailures++;
           log(`ERRO ${relativePath}: ${error.message}`);
         });
@@ -669,6 +670,13 @@ class SyncClient {
           this.schedule(relativePath, "after-active");
         }
         this.resolveIdleIfNeeded();
+      }
+      // Publish success only after the HTTP operation, state fsync, sync slot
+      // and active-task accounting are all finished. An operator may send
+      // SIGINT as soon as this log is observed; it must not turn a fully
+      // acknowledged upload into a falsely uncertain stale process lock.
+      if (acknowledgedName !== undefined) {
+        log(`OK ${relativePath} -> ${acknowledgedName}${this.config.autoApprove ? " (aprovado)" : " (pendente)"}`);
       }
     }, this.config.debounceMs));
   }
@@ -821,8 +829,7 @@ class SyncClient {
           lastUploadedAt: nowIso(),
         };
         await this.saveState();
-        log(`OK ${relativePath} -> ${uploaded.remoteFileName}${this.config.autoApprove ? " (aprovado)" : " (pendente)"}`);
-        return;
+        return uploaded.remoteFileName;
       } catch (error) {
         // A failed/aborted mutating request may still be durable remotely;
         // even after this local task ends, do not allow a new uploader to

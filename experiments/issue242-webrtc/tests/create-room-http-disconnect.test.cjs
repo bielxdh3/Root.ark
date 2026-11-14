@@ -24,6 +24,12 @@ async function actualHttpFixture(t, { authorizeObject, beforeRespond = async () 
       username: req.headers['x-owner'], sessionVersion: 1, expiresAt: Date.now() + 60_000,
     }),
     authorizeObject,
+    // Explicit synthetic authorities exercise response-close/finish races.
+    // Root.ark's real adapter deliberately supplies neither capability.
+    authorizeImmutableVersion: input => Object.freeze({
+      ...input, boundObject: { ...input.boundObject }, versionId: 'test-immutable-v1',
+    }),
+    authorizeSignalSnapshot: () => null,
   });
   const closed = deferred();
   const processed = deferred();
@@ -93,7 +99,7 @@ test('completed HTTP POST followed by socket destroy must not create orphan room
     assert.equal((await fixture.broker.createRoom(ownerRequest())).status, 200,
       'the disconnected request must leave no active room or pending reservation');
     assert.equal((await fixture.broker.createRoom(ownerRequest())).status, 429);
-    assert.equal(checks, 3, 'the overflow request must not rehash ciphertext');
+    assert.equal(checks, 6, 'the overflow request must not rehash ciphertext');
   });
 
 test('response disconnected after room allocation but before send releases orphan capacity',
