@@ -13,9 +13,10 @@ test("#275 viewer is reachable from each #273 metadata-only page without an unbo
   assert.match(screen, /showInventoryPage/);
   assert.match(screen, /showProtectedObject\(row\.objectId\)/);
   assert.match(screen, /independentlyProvisionedGrantProvider\(\).*null/);
-  assert.match(screen, /409\s*->\s*showSession/);
+  assert.match(screen, /409\s*->\s*\{\s*offlineInventory\?\.clear\(\)\s*showSession/);
   assert.match(screen, /401\s*->\s*showLogin/);
-  assert.match(screen, /403\s*->\s*showSession/);
+  assert.match(screen, /403\s*->\s*showLogin/);
+  assert.match(screen, /private fun clearSensitiveState\(\)\s*\{\s*offlineInventory\?\.clear\(\)/);
   assert.match(screen, /onStop\(\)/);
   assert.match(transport, /listInventoryPage/);
   assert.doesNotMatch(transport, /fun listSyncObjects\(/);
