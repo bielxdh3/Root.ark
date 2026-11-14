@@ -15,6 +15,7 @@ const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
+const HISTORICAL_RESTORE_TEMP_SUFFIX = /\.tmp-[1-9][0-9]*-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
@@ -256,7 +257,7 @@ function isWithinPath(root, target) {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-async function readContainedFile(rootDir, relativePath, expectedStats = null) {
+async function readContainedFile(rootDir, relativePath, expectedStats = null, syncPhysical = false) {
   const root = path.resolve(rootDir);
   const target = await contained(root, relativePath, false);
   const before = expectedStats || await fsp.lstat(target, { bigint: true });
@@ -266,7 +267,12 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
     fail("Sync file must be a regular file with a stable identity", "unsafe_path");
   }
 
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+  // A pending historical restore without a committed materialization witness
+  // must re-flush its *actual opened file* and parent directory before POST.
+  // A pathname hash alone cannot prove crash-durable bytes after a failed
+  // materialization, including a failed directory fsync after hardlink().
+  const flags = (syncPhysical ? fs.constants.O_RDWR : fs.constants.O_RDONLY)
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
   const handle = await fsp.open(target, flags);
   try {
     const opened = await handle.stat({ bigint: true });
@@ -283,21 +289,165 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
     }
 
     const data = await handle.readFile();
-    const openedAfterRead = await handle.stat({ bigint: true });
-    const pathAfterRead = await fsp.lstat(target, { bigint: true });
-    if (!sameFileVersion(opened, openedAfterRead) || openedAfterRead.nlink !== 1n
-      || !sameFileIdentity(openedAfterRead, pathAfterRead)
-      || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink() || pathAfterRead.nlink !== 1n) {
-      fail("Sync file changed while reading", "unsafe_path");
+    try {
+      const openedAfterRead = await handle.stat({ bigint: true });
+      const pathAfterRead = await fsp.lstat(target, { bigint: true });
+      if (!sameFileVersion(opened, openedAfterRead) || openedAfterRead.nlink !== 1n
+        || !sameFileIdentity(openedAfterRead, pathAfterRead)
+        || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink() || pathAfterRead.nlink !== 1n) {
+        fail("Sync file changed while reading", "unsafe_path");
+      }
+      await containedAbsolute(root, target, false);
+      const finalRoot = await fsp.realpath(root);
+      const finalTarget = await fsp.realpath(target);
+      if (!isWithinPath(finalRoot, finalTarget)) fail("Sync file escaped root", "unsafe_path");
+      if (syncPhysical) {
+        await handle.sync();
+        await syncDirectoryChain(root, path.dirname(target));
+        // Verify both the FD generation and pathname once more after the
+        // durable file+directory barrier. A concurrent replacement must not
+        // turn our fsync of A into authorization of a pathname now holding B.
+        const afterSync = await handle.stat({ bigint: true });
+        const linkedAfterSync = await fsp.lstat(target, { bigint: true });
+        if (!sameFileVersion(opened, afterSync)
+          || !sameFileVersion(afterSync, linkedAfterSync)
+          || afterSync.nlink !== 1n || !linkedAfterSync.isFile()
+          || linkedAfterSync.isSymbolicLink()) {
+          fail("Sync file changed while durably flushing", "unsafe_path");
+        }
+        await containedAbsolute(root, target, false);
+        const syncedRoot = await fsp.realpath(root);
+        const syncedTarget = await fsp.realpath(target);
+        if (!isWithinPath(syncedRoot, syncedTarget)) fail("Sync file escaped root", "unsafe_path");
+      }
+      return data;
+    } catch (error) {
+      data.fill(0);
+      throw error;
     }
-    await containedAbsolute(root, target, false);
-    const finalRoot = await fsp.realpath(root);
-    const finalTarget = await fsp.realpath(target);
-    if (!isWithinPath(finalRoot, finalTarget)) fail("Sync file escaped root", "unsafe_path");
-    return data;
   } finally {
     await handle.close();
   }
+}
+
+async function hashPinnedRestoredFile(handle, length) {
+  // Never hash a path for restore materialization. The writer's original FD
+  // stays open through link(target), so a swapped temporary pathname cannot
+  // promote unrelated bytes into a durable signed restore witness.
+  const initial = await handle.stat({ bigint: true });
+  if (!initial.isFile() || initial.size !== BigInt(length)) {
+    fail("Restore staging physical length changed", "restore_local_materialization_missing");
+  }
+  const block = Buffer.alloc(Math.min(length, 64 * 1024));
+  const digest = crypto.createHash("sha256");
+  let offset = 0;
+  try {
+    while (offset < length) {
+      const { bytesRead } = await handle.read(block, 0,
+        Math.min(block.length, length - offset), offset);
+      if (!bytesRead || bytesRead > block.length) {
+        fail("Restore staging FD truncated while reading", "restore_local_materialization_missing");
+      }
+      digest.update(block.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (!sameFileVersion(initial, after)) {
+      fail("Restore staging FD changed while verifying signed bytes", "restore_local_materialization_missing");
+    }
+    return digest.digest("hex");
+  } finally { block.fill(0); }
+}
+
+async function syncDirectoryChain(rootDir, directoryName) {
+  if (process.platform === "win32") return; // No portable directory fsync via Node/NTFS.
+  const root = path.resolve(rootDir);
+  let current = path.resolve(directoryName);
+  if (!isWithinPath(root, current)) {
+    fail("Restore durability directory escaped root", "unsafe_path");
+  }
+  while (true) {
+    await containedAbsolute(root, current, false);
+    const fd = await fsp.open(current, fs.constants.O_RDONLY
+      | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0));
+    try {
+      const checked = await fd.stat({ bigint: true });
+      if (!checked.isDirectory() || checked.isSymbolicLink()) {
+        fail("Restore durability parent is not a directory", "unsafe_path");
+      }
+      await fd.sync();
+    } finally { await fd.close(); }
+    if (current === root) break;
+    current = path.dirname(current);
+  }
+}
+
+async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedHash, staging) {
+  // Never infer staging ownership from a filename pattern, content digest or
+  // same-inode hardlink alone: a regular user can create all three. Require
+  // the exact temp name + physical identity fsynced in the signed outbox
+  // BEFORE the engine linked its private staging file into the target.
+  if (!staging) return;
+  const target = await contained(rootDir, relativePath, false);
+  const current = await fsp.lstat(target, { bigint: true });
+  if (!current.isFile() || current.isSymbolicLink() || current.ino === 0n
+    || current.nlink !== 2n) return;
+  const prefix = `${path.basename(target)}.tmp-`;
+  if (!staging.name.startsWith(prefix)
+    || !HISTORICAL_RESTORE_TEMP_SUFFIX.test(staging.name.slice(path.basename(target).length))
+    || current.dev.toString() !== staging.dev
+    || current.ino.toString() !== staging.ino) {
+    fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
+  }
+  const directoryName = path.dirname(target);
+  const staged = path.join(directoryName, staging.name);
+  await containedAbsolute(rootDir, staged, false);
+  const stagedStats = await fsp.lstat(staged, { bigint: true }).catch((error) => {
+    if (error?.code === "ENOENT") {
+      fail("Recorded historical restore staging file missing", "restore_local_materialization_missing");
+    }
+    throw error;
+  });
+  if (!stagedStats.isFile() || stagedStats.isSymbolicLink()
+    || !sameFileVersion(current, stagedStats) || stagedStats.nlink !== 2n
+    || stagedStats.dev.toString() !== staging.dev
+    || stagedStats.ino.toString() !== staging.ino) {
+    fail("Recorded historical restore staging file changed", "restore_local_materialization_missing");
+  }
+  const handle = await fsp.open(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!sameFileVersion(current, opened) || opened.nlink !== 2n) {
+      fail("Historical restore hardlink identity changed", "restore_local_materialization_missing");
+    }
+    const data = await handle.readFile();
+    try {
+      if (crypto.createHash("sha256").update(data).digest("hex") !== expectedHash) {
+        fail("Historical restore hardlink bytes differ from signed operation", "restore_local_materialization_missing");
+      }
+    } finally { data.fill(0); }
+    const afterRead = await handle.stat({ bigint: true });
+    const liveTarget = await fsp.lstat(target, { bigint: true });
+    const liveStaged = await fsp.lstat(staged, { bigint: true });
+    if (!sameFileVersion(opened, afterRead)
+      || !sameFileVersion(afterRead, liveTarget)
+      || !sameFileVersion(afterRead, liveStaged)
+      || afterRead.nlink !== 2n || liveTarget.nlink !== 2n) {
+      fail("Historical restore hardlink changed during recovery", "restore_local_materialization_missing");
+    }
+    await containedAbsolute(rootDir, target, false);
+    await containedAbsolute(rootDir, staged, false);
+    const canonicalRoot = await fsp.realpath(rootDir);
+    for (const location of [target, staged]) {
+      if (!isWithinPath(canonicalRoot, await fsp.realpath(location))) {
+        fail("Historical restore hardlink escaped root", "unsafe_path");
+      }
+    }
+    await fsp.unlink(staged);
+  } finally { await handle.close(); }
+  await syncDirectoryChain(rootDir, directoryName);
+  // The caller now reopens and physically flushes target as nlink=1, and
+  // rechecks its signed bytes and pathname *after* this recovery barrier.
 }
 
 async function canonicalRelativePath(rootDir, relativePath) {
@@ -853,6 +1003,10 @@ class SyncEngine {
       if (error?.code === "restore_local_conflict") await this.journal.discardUnsent(restored);
       throw error;
     }
+    // The already-fsynced physical materialization and snapshot precede a
+    // separate exact-envelope durable journal observation. A later user edit
+    // is NOT proof that this earlier signed restore was never materialized.
+    await this.journal.recordRestoreMaterialization(restored);
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
     await this._pushPending(summary);
     if (summary.offline) return { restored: true, pushed: false, pending: true,
@@ -1759,19 +1913,35 @@ class SyncEngine {
         if (!this.operationIsSelected(operation)) continue;
         if (operation.operationId.startsWith("histrestore-")) {
           // The signed outbox can survive a crash between staging and local
-          // materialization. Never dispatch that restore without actual bytes.
+          // materialization. An exact signed-envelope journal observation is
+          // recorded only AFTER _apply has durably persisted restored local
+          // bytes and its snapshot. Never trust a replaceable snapshot alone
+          // as evidence; a local edit or deletion after successful restore
+          // must still be reconciled in a later signed CAS revision.
           const expected = await this.hashPendingPayload(operation);
-          let observed;
-          try {
-            const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
-            const local = await readContainedFile(this.rootDir, relative);
-            try { observed = crypto.createHash("sha256").update(local).digest("hex"); }
-            finally { local.fill(0); }
-          } catch {
-            fail("Historical restore was not materialized locally", "restore_local_materialization_missing");
-          }
-          if (observed !== expected) {
-            fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
+          const snapshot = this.snapshot.files[operation.metadata.path];
+          const durablyMaterialized = this.journal.hasMaterializedRestore(operation)
+            && snapshot && !snapshot.deleted && !snapshot.directory
+            && snapshot.objectId === operation.objectId
+            && snapshot.fileId === operation.fileId
+            && snapshot.versionId === operation.versionId
+            && snapshot.hash === expected
+            && protocol.canonicalJson(snapshot.revision) === protocol.canonicalJson(operation.revision);
+          if (!durablyMaterialized) {
+            let observed;
+            try {
+              const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
+                this.journal.restoreStagingInfo(operation));
+              const local = await readContainedFile(this.rootDir, relative, null, true);
+              try { observed = crypto.createHash("sha256").update(local).digest("hex"); }
+              finally { local.fill(0); }
+            } catch {
+              fail("Historical restore was not materialized locally", "restore_local_materialization_missing");
+            }
+            if (observed !== expected) {
+              fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
+            }
           }
         }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
@@ -2077,14 +2247,104 @@ class SyncEngine {
         }
       } else {
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
+        let restoreHandle = null;
+        let restoreTempCreated = false;
         try {
+          if (historicalRestoreHash !== undefined) {
+            // A signed historical restore must not acquire a durable
+            // "materialized" witness for a file that only reached the OS
+            // page cache. Flush the exact plaintext before linking it into
+            // the visible directory and before persisting snapshot/journal.
+            // Record the exact random pathname BEFORE creating ANY plaintext
+            // staging file. A process kill before binding its inode now fails
+            // closed on restart instead of treating the temp as a user CREATE.
+            await this.journal.recordRestoreStagingIntent(operation, path.basename(temporary));
+            restoreHandle = await fsp.open(temporary,
+              fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL
+                | (fs.constants.O_SYNC || 0), 0o600);
+            restoreTempCreated = true;
+            await restoreHandle.writeFile(plaintext);
+            await restoreHandle.sync();
+            const physical = await restoreHandle.stat({ bigint: true });
+            if (!physical.isFile() || physical.isSymbolicLink()
+              || physical.ino === 0n || physical.nlink !== 1n) {
+              fail("Historical restore staging file identity is invalid", "unsafe_path");
+            }
+            const named = await fsp.lstat(temporary, { bigint: true });
+            if (!sameFileVersion(physical, named)) {
+              fail("Historical restore staging pathname changed", "unsafe_path");
+            }
+            await this.journal.bindRestoreStagingIdentity(operation,
+              path.basename(temporary), {
+                dev: physical.dev.toString(), ino: physical.ino.toString(),
+              });
+          } else {
+            await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
+          }
           if (historicalRestoreHash !== undefined) {
             const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
             try {
+              if (staged) {
+                // The old revision is recoverable in trash only after the
+                // trash entry and every newly-created ancestor is durable.
+                // Flushing the target parent alone cannot prove rollback.
+                await syncDirectoryChain(this.rootDir, path.dirname(staged));
+                await syncDirectoryChain(this.rootDir, path.dirname(target));
+              }
               // Atomic no-replace materialization; do not clobber files
               // created by another process after the last restore preflight.
+              const recordedStage = this.journal.restoreStagingInfo(operation);
+              if (!recordedStage || recordedStage.name !== path.basename(temporary)) {
+                fail("Restore staging has no durable signed provenance", "restore_local_materialization_missing");
+              }
+              const beforeLink = await restoreHandle.stat({ bigint: true });
+              const namedBeforeLink = await fsp.lstat(temporary, { bigint: true });
+              if (!sameFileVersion(beforeLink, namedBeforeLink) || beforeLink.nlink !== 1n
+                || beforeLink.dev.toString() !== recordedStage.dev
+                || beforeLink.ino.toString() !== recordedStage.ino) {
+                fail("Restore staged pathname replaced before linking", "restore_local_materialization_missing");
+              }
               await fsp.link(temporary, target);
+              const linkedStage = await fsp.lstat(temporary, { bigint: true });
+              const linkedTarget = await fsp.lstat(target, { bigint: true });
+              const openedLinked = await restoreHandle.stat({ bigint: true });
+              if (!linkedStage.isFile() || linkedStage.isSymbolicLink()
+                || linkedStage.nlink !== 2n || !linkedTarget.isFile()
+                || linkedTarget.isSymbolicLink() || linkedTarget.nlink !== 2n
+                || !sameFileVersion(linkedStage, linkedTarget)
+                || !sameFileVersion(openedLinked, linkedTarget)
+                || linkedStage.dev.toString() !== recordedStage.dev) {
+                fail("Linked restore physical identity changed", "restore_local_materialization_missing");
+              }
+              // historicalRestoreHash identifies the PREVIOUS local bytes;
+              // the new payload must match the authenticated decrypted
+              // signed operation's plaintext, not that prior local hash.
+              if (await hashPinnedRestoredFile(restoreHandle, plaintext.length)
+                !== crypto.createHash("sha256").update(plaintext).digest("hex")) {
+                fail("Linked restore FD differs from signed historical content",
+                  "restore_local_materialization_missing");
+              }
+              // Some Windows filesystems can report a new file index when a
+              // second hardlink is created. The exact two-name linked inode
+              // must become journal-durable before the alias can be cleaned.
+              if (linkedStage.ino.toString() !== recordedStage.ino) {
+                await this.journal.recordLinkedRestoreStagingIdentity(operation,
+                  recordedStage.name, recordedStage, {
+                    dev: linkedStage.dev.toString(), ino: linkedStage.ino.toString(),
+                  });
+              }
+              // Close the verified original FD before unlinking, including on
+              // Windows where unlinking an open file can be disallowed.
+              await restoreHandle.close();
+              restoreHandle = null;
+              // Remove the temporary hardlink before the durable parent-dir
+              // barrier. Without this, a crash can resurrect an unflushed
+              // tmp name and strand an otherwise valid signed outbox on nlink=2.
+              await fsp.unlink(temporary);
+              // Both the target link and temporary unlink, as well as any
+              // freshly created nested parent chain, must become durable
+              // before independently committed restore evidence is allowed.
+              await syncDirectoryChain(this.rootDir, path.dirname(target));
             } catch (error) {
               if (staged) await this.replaceStagedIfVacant(staged, target);
               if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
@@ -2094,7 +2354,30 @@ class SyncEngine {
             if (await exists(target)) await this.stageExisting(target);
             await fsp.rename(temporary, target);
           }
-        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+        } finally {
+          // A durable intent is NOT proof of file ownership: O_EXCL may
+          // collide with a user-created file after the intent was persisted.
+          // Never delete that foreign pathname (or a substituted name).
+          let owned = null;
+          if (restoreHandle) {
+            try { owned = await restoreHandle.stat({ bigint: true }); }
+            finally { await restoreHandle.close(); }
+          }
+          if (historicalRestoreHash === undefined) {
+            await fsp.rm(temporary, { force: true }).catch(() => {});
+          } else if (restoreTempCreated) {
+            const current = await fsp.lstat(temporary, { bigint: true })
+              .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+            const pinned = owned || this.journal.restoreStagingInfo(operation);
+            const matchesPinned = pinned && current && current.isFile()
+              && !current.isSymbolicLink()
+              && current.dev.toString() === (owned ? owned.dev.toString() : pinned.dev)
+              && current.ino.toString() === (owned ? owned.ino.toString() : pinned.ino);
+            if (matchesPinned) {
+              await fsp.rm(temporary, { force: true }).catch(() => {});
+            }
+          }
+        }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
@@ -2170,6 +2453,43 @@ class SyncEngine {
   }
 
   async _reconcileLocal() {
+    for (const operation of await this.journal.recover()) {
+      if (typeof operation.operationId !== "string"
+        || !operation.operationId.startsWith("histrestore-")
+        || typeof operation.metadata?.path !== "string") continue;
+      const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+      const staging = this.journal.restoreStagingInfo(operation);
+      if (!staging) continue;
+      const restoreTarget = await contained(this.rootDir, relative, true);
+      const recordedPath = path.join(path.dirname(restoreTarget), staging.name);
+      await containedAbsolute(this.rootDir, recordedPath, true);
+      const stagedStats = await fsp.lstat(recordedPath, { bigint: true })
+        .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+      if (stagedStats && (staging.dev === null || staging.ino === null)) {
+        // The durable name intent preceded file creation, but no physical FD
+        // binding ever committed. Never turn that orphan into a user CREATE.
+        fail("Unbound historical restore staging requires explicit recovery",
+          "restore_local_materialization_missing");
+      }
+      if (stagedStats && stagedStats.dev.toString() === staging.dev
+        && stagedStats.ino.toString() === staging.ino
+        && stagedStats.nlink === 1n) {
+        // The producer's fsynced temp survived a kill BEFORE link(target).
+        // Do not mistake that plaintext staging file for a user CREATE in
+        // scanFiles. Explicit recovery must choose a safe destination.
+        fail("Unlinked historical restore staging requires explicit recovery",
+          "restore_local_materialization_missing");
+      }
+      // A kill between link(temp,target) and unlink(temp) leaves a legitimate
+      // signed restore with nlink=2. Only the physically recorded exact
+      // inode/name may be cleaned; never hide a filename by its suffix.
+      try {
+        const expected = await this.hashPendingPayload(operation);
+        await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
     const scanned = await this.scanFiles();
     const current = {};
     const snapshotPathByKey = new Map();
