@@ -65,10 +65,11 @@ if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydra
 # Reveal only. Opening an associated app automatically could execute remote content.
 $localFolder = [string]((Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json).localFolder)
 if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
+$configDir = Split-Path -Parent ([IO.Path]::GetFullPath($Config))
 $root = if ([IO.Path]::IsPathRooted($localFolder)) {
   [IO.Path]::GetFullPath($localFolder)
 } else {
-  [IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $localFolder))
+  [IO.Path]::GetFullPath((Join-Path $configDir $localFolder))
 }
 $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$chosen[0].Path -replace '/', '\')))
 $rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
