@@ -20,6 +20,11 @@ const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
+const { openProtectedRecipientShareFile } = (() => {
+  try { return require("../src/crypto/rootark-zk1-recipient-share-cek"); }
+  catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
+})();
+const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
 const z = require("../src/crypto/rootark-zk-1");
 const manifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const verify = require("../src/crypto/rootark-zk-recovery-history-v2");
@@ -726,6 +731,10 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "test must reach actual HPKE decrypt before the clock changes");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
+    assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
+      envelope.core.expires_at, issued.approval.expires_at,
+      signedCommittedHead.expires_at),
+    "owner CEK opener returns the signed owner/approval/witness expiration actually verified");
     const decrypted = await content.decryptFile({
       cek: await content.importFileCek(bCek.cek), metadata,
       envelopeBytes: recoveredCiphertext,
@@ -733,6 +742,138 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(decrypted.data), bytes,
       "B independently decrypts exact SQLite-reopened HTTP bytes without receiving A recoverySecret");
     bCek.cek.fill(0); decrypted.data.fill(0);
+    // The existing #276 share GET is HTTP-tested separately. Exercise its
+    // signed grant/recipient-client protocol against the real retained file
+    // and the existing owner-approved HPKE transfer, without minting a key.
+    assert.equal(typeof openProtectedRecipientShareFile, "function",
+      "recipient must be able to combine the authenticated share with owner CEK custody");
+    const shareAuthorization = { ...state.scope, device_id: originalDevice.device_id,
+      operation: "get", object_id: metadata.object_id, expected_object_revision: 1,
+      manifest_revision: currentManifest.revision, manifest_digest: currentDigest,
+      epoch: currentManifest.current_epoch, nonce: crypto.randomBytes(32),
+      issued_at: now + 9, expires_at: now + 39, ciphertext_digest: digest };
+    const grantInput = { authorization: shareAuthorization, grantId: b64(crypto.randomBytes(32)),
+      recipientUsername: "recipient", recipientDeviceId: fresh.request.device_id,
+      expiresAt: now + 129 };
+    const message = await shareGrantMessageV1(grantInput);
+    const grant = { grantId: grantInput.grantId, expiresAt: grantInput.expiresAt,
+      shareStatementBase64: b64(message.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, message, originalActor)) };
+    const readIndependentAuthority = async () => ({ scope,
+      head: { revision: currentManifest.revision, epoch: currentManifest.current_epoch,
+        digest: Uint8Array.from(currentDigest) },
+      devices: currentManifest.devices.map((device) => ({
+        deviceId: device.device_id,
+        authorizationPublicKey: Uint8Array.from(device.authorization_public_key),
+        enrolledEpoch: device.enrolled_epoch, revokedAtEpoch: device.revoked_at_epoch,
+      })) });
+    const recipientShareInput = { origin, grant, recipientUsername: "recipient",
+      recipientDeviceId: fresh.request.device_id, signerKey: newPrivate,
+      readIndependentAuthority, nowSeconds: () => now + 9,
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: metadata.object_id, revision: 1, epoch: metadata.epoch,
+        ciphertextBase64: b64(recoveredCiphertext),
+        shareStatementBase64: grant.shareStatementBase64,
+        shareSignatureBase64: grant.shareSignatureBase64,
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    };
+    const bridgeArgs = { redeemInput: recipientShareInput, envelope,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      metadata, deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 };
+    const shared = await openProtectedRecipientShareFile(bridgeArgs);
+    assert.deepEqual(Buffer.from(shared.data), bytes);
+    assert.equal(shared.authorizesProductionIo, false);
+    shared.data.fill(0);
+    // P2: the independently verified owner HPKE CEK is still valid when B
+    // starts file AEAD, but its owner approval/witness expires DURING the
+    // final file decrypt. Share grant expires later, so checking only the
+    // share expiry at return is a false-green authorization boundary.
+    const longGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      expiresAt: Math.max(envelope.core.expires_at,
+        issued.approval.expires_at, signedCommittedHead.expires_at) + 120 };
+    const longMessage = await shareGrantMessageV1(longGrantInput);
+    const longGrant = { grantId: longGrantInput.grantId,
+      expiresAt: longGrantInput.expiresAt,
+      shareStatementBase64: b64(longMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, longMessage, originalActor)) };
+    const longShareInput = { ...recipientShareInput, grant: longGrant,
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: metadata.object_id, revision: 1, epoch: metadata.epoch,
+        ciphertextBase64: b64(recoveredCiphertext),
+        shareStatementBase64: longGrant.shareStatementBase64,
+        shareSignatureBase64: longGrant.shareSignatureBase64,
+      }), { status: 200, headers: { "content-type": "application/json" } }) };
+    const firstExpiry = Math.min(envelope.core.expires_at,
+      issued.approval.expires_at, signedCommittedHead.expires_at);
+    assert.ok(longGrant.expiresAt > firstExpiry + 2,
+      "the genuinely signed share must still be live after owner/witness expiration");
+    const encodedFile = JSON.parse(recoveredCiphertext.toString("utf8"));
+    const fileAeadCipherLength = Buffer.from(encodedFile.ciphertext, "base64url").length;
+    assert.notEqual(fileAeadCipherLength, 48,
+      "genuine file AEAD must be distinguishable from the 48-byte owner HPKE CEK ciphertext");
+    const originalFinalDecrypt = subtle.decrypt;
+    const originalFinalNow = Date.now;
+    let finalAeadCompleted = false;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await originalFinalDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) {
+        finalAeadCompleted = true;
+        Date.now = () => (firstExpiry + 2) * 1000;
+      }
+      return openedFile;
+    };
+    try {
+      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: longShareInput }), /ZK_SHARE_FILE_OPEN_DENIED/,
+      "B must not return decrypted file after signed owner approval or witness expiry");
+    } finally {
+      delete subtle.decrypt;
+      Date.now = originalFinalNow;
+    }
+    assert.equal(finalAeadCompleted, true,
+      "oracle must complete genuine file AEAD before expiring owner authority");
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, grant: { ...grant,
+        shareSignatureBase64: b64(crypto.randomBytes(64)) } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "a forged share proof cannot be rescued by a valid CEK");
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      envelope: { ...envelope, core: { ...envelope.core,
+        ciphertext_sha256: b64(crypto.randomBytes(32)) } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "a valid recipient key cannot cross a ciphertext digest");
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      envelope: { ...envelope, core: { ...envelope.core,
+        device_id: "other-device" } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "no recipient-device substitution");
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      metadata: { ...metadata, account_id: b64(crypto.randomBytes(16)) },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "owner-approved CEK cannot cross tenant");
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      envelope: { ...envelope, core: { ...envelope.core, object_revision: 2 } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "a CEK transfer for a different revision is not share access");
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => ({
+        ...await readIndependentAuthority(), head: {
+          ...(await readIndependentAuthority()).head, epoch: metadata.epoch + 1 },
+      }) },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "advanced independent epoch blocks local file release");
+    let authorityReads = 0;
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++authorityReads === 3) {
+          current.devices.find((device) =>
+            device.deviceId === originalDevice.device_id).revokedAtEpoch = metadata.epoch;
+        }
+        return current;
+      } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "issuer revoked during HPKE/file AEAD awaits cannot yield plaintext");
+    assert.equal(authorityReads, 3,
+      "additional current authority check must occur after owner CEK and file AEAD");
     // This proof covers the three explicitly owner-selected versions, never
     // unknown historical versions or externally held backup copies.
     assert.equal(typeof cekBatch.sealOwnerAuthorizedVersionedCeks, "function",
