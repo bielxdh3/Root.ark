@@ -24,10 +24,26 @@
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
   function connect(credentials) {
-    if (ws && ws.readyState < 2) ws.close();
+    const oldSocket = ws;
+    ws = null; // old callbacks must not retain authority over the new room.
+    if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
+    for (const p of peers.values()) p.pc.close();
+    peers.clear();
+    invites.clear();
+    $('peers').replaceChildren();
+    $('invites').replaceChildren();
+    $('incoming').replaceChildren();
+    selfId = null;
+    role = null;
+    $('invite').disabled = true;
     ws = new WebSocket(wsUrl);
-    ws.onopen = () => wire({ type: 'join', roomId, ...credentials });
+    const eventSocket = ws;
+    ws.onopen = () => {
+      if (ws !== eventSocket) return;
+      wire({ type: 'join', roomId, ...credentials });
+    };
     ws.onmessage = async event => {
+      if (ws !== eventSocket) return;
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
@@ -83,6 +99,7 @@
         const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
         attachChannel(p, dc);
         await p.pc.setLocalDescription(await p.pc.createOffer());
+        if (ws !== eventSocket || peers.get(p.id) !== p) return;
         wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
       } else if (m.type === 'peer-allowed') {
         preparePeer(m.peerId, false);
@@ -116,6 +133,7 @@
       }
     };
     ws.onclose = () => {
+      if (ws !== eventSocket) return;
       $('invite').disabled = true;
       for (const p of peers.values()) p.pc.close();
       peers.clear();
@@ -181,6 +199,7 @@
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
         } else record(diagnostics.rejected, 'TEXT_DIGEST');
       } else if (m.type === 'offer-file' && typeof m.id === 'string' &&
+        /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
         typeof m.name === 'string' && m.name.length <= 100 &&
         Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
         /^[0-9a-f]{64}$/.test(m.digest) && !p.incoming && !p.pendingOffer) {
