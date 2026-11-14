@@ -122,6 +122,32 @@ const INVENTORY_CACHE_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
 const INVENTORY_CACHE_MAX_TENANTS = 2;
 const INVENTORY_OVERFLOW_MARKERS_MAX_TENANTS = 32;
 
+const HISTORY_MAX_PAGE_ITEMS = 32;
+const HISTORY_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const HISTORY_MAX_CURSOR_CHARS = 1024;
+
+function parseHistoryCursor(value) {
+  if (typeof value !== "string" || !value || value.length > HISTORY_MAX_CURSOR_CHARS
+    || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  let cursor;
+  try {
+    const binary = Buffer.from(value, "base64url");
+    if (binary.toString("base64url") !== value) return null;
+    cursor = JSON.parse(binary.toString("utf8"));
+  } catch { return null; }
+  if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)
+    || Object.keys(cursor).sort().join(",") !== "after,version"
+    || cursor.version !== 1 || typeof cursor.after !== "string"
+    || !cursor.after || cursor.after.length > 160) {
+    return null;
+  }
+  return cursor;
+}
+
+function historyCursor(after) {
+  return Buffer.from(JSON.stringify({ version: 1, after }), "utf8").toString("base64url");
+}
+
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
   const directory = path.dirname(filePath);
   if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
@@ -1348,6 +1374,62 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (!objects.length) return errorResponse(res, 404, "Sync object not found");
     lease?.assertActive();
     res.json(objects[0]);
+  }));
+  app.get("/sync/v1/objects/:objectId/history", authenticate, requirePermission("listFiles"), fenceLegacySync("read", async (req, res, lease) => {
+    await ready;
+    if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
+    if (Object.keys(req.query || {}).some((key) => !["limit", "cursor"].includes(key))
+      || (req.query?.limit !== undefined && (typeof req.query.limit !== "string"
+        || !/^[1-9][0-9]*$/.test(req.query.limit)))) {
+      return errorResponse(res, 400, "Invalid sync history request");
+    }
+    let versions;
+    try { versions = store.history(req.user.username, req.params.objectId); }
+    catch { return errorResponse(res, 503, "Sync history unavailable"); }
+    if (!versions.length) return errorResponse(res, 404, "Sync object not found");
+    const isPaginated = req.query?.limit !== undefined || req.query?.cursor !== undefined;
+    if (!isPaginated) {
+      let totalBytes = 1024;
+      for (const entry of versions) {
+        totalBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+        if (totalBytes > HISTORY_MAX_RESPONSE_BYTES) {
+          return errorResponse(res, 413, "Sync history exceeds response limit; pagination required", {
+            code: "SYNC_HISTORY_TOO_LARGE",
+          });
+        }
+      }
+      lease?.assertActive();
+      return res.json({ protocolVersion: PROTOCOL_VERSION, versions });
+    }
+    let start = 0;
+    if (req.query.cursor !== undefined) {
+      const parsed = parseHistoryCursor(req.query.cursor);
+      if (!parsed) return errorResponse(res, 400, "Invalid sync history cursor");
+      const index = versions.findIndex((entry) => entry.versionId === parsed.after);
+      if (index === -1) return errorResponse(res, 400, "Invalid sync history cursor");
+      start = index + 1;
+    }
+    const limit = Math.min(req.query.limit === undefined ? HISTORY_MAX_PAGE_ITEMS : Number(req.query.limit), HISTORY_MAX_PAGE_ITEMS);
+    const page = [];
+    let pageBytes = 1024;
+    while (page.length < limit && start + page.length < versions.length) {
+      const entry = versions[start + page.length];
+      const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+      if (pageBytes + entryBytes > HISTORY_MAX_RESPONSE_BYTES) {
+        if (!page.length) {
+          return errorResponse(res, 413, "Sync history entry exceeds response limit", {
+            code: "SYNC_HISTORY_TOO_LARGE",
+          });
+        }
+        break;
+      }
+      page.push(entry);
+      pageBytes += entryBytes;
+    }
+    const nextIndex = start + page.length;
+    const nextCursor = nextIndex < versions.length ? historyCursor(page[page.length - 1].versionId) : null;
+    lease?.assertActive();
+    return res.json({ protocolVersion: PROTOCOL_VERSION, versions: page, nextCursor });
   }));
   app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"),
     fenceLegacySync("write", (req, res, lease) => write(req, res, undefined, lease)));

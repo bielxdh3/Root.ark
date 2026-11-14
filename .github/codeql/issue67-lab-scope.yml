@@ -1,0 +1,13 @@
+# CodeQL interpreted-language analysis boundary for deliberately vulnerable
+# opt-in, disposable Issue #67 filesystem-race experiments.
+#
+# DO NOT weaken security-extended queries, exclude src/, sync-client/, test/,
+# scripts/ or any production directory. Only these lab files deliberately
+# execute pathname-based race examples as NEGATIVE evidence, so automated
+# detection there does not imply a product-code vulnerability was fixed.
+# Each lab remains separately reviewable and runnable via its explicit tests.
+# The GHAS PR alert check and required CI must still be inspected on the
+# resulting exact SHA. A successful CodeQL workflow alone is not clearance.
+name: Root.ark Issue 67 adversarial laboratory source boundary
+paths-ignore:
+  - 'experiments/issue-67-pr298-unbound-name-evidence/**'

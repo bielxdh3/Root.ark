@@ -154,6 +154,36 @@ function pathIdentityKey(value) {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
+function assertSyncHistoryArchiveCoverage() {
+  // The signed SyncObjectStore history is backed up by one canonical file.
+  // Reject external, ambiguous, or case-aliased names rather than certify a
+  // complete ZIP which silently omitted its historical revisions.
+  const configured = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json";
+  const canonicalName = "sync-objects.json";
+  const invalid = () => {
+    throw Object.assign(new Error("Signed sync history must use the physical canonical data/sync-objects.json filename"), {
+      code: "SYNC_HISTORY_NOT_ARCHIVED",
+    });
+  };
+  if (pathIdentityKey(configured) !== pathIdentityKey(resolveRuntimePath("data", canonicalName))
+    || path.basename(path.resolve(configured)) !== canonicalName) invalid();
+  const dataDir = resolveRuntimePath("data");
+  let root;
+  try { root = fs.lstatSync(dataDir); }
+  catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!root.isDirectory() || root.isSymbolicLink()) invalid();
+  const physical = fs.readdirSync(dataDir)
+    .filter((name) => name.toLowerCase() === canonicalName);
+  if (physical.length > 1 || physical.some((name) => name !== canonicalName)) invalid();
+  if (!physical.length) return false;
+  const history = fs.lstatSync(path.join(dataDir, canonicalName));
+  if (!history.isFile() || history.isSymbolicLink() || history.nlink !== 1) invalid();
+  return true;
+}
+
 function fileIdentity(stat) {
   return stat?.isFile?.() && stat.ino ? `${stat.dev}:${stat.ino}` : null;
 }
@@ -326,9 +356,19 @@ function createVerifiedArchiveStream(file) {
 }
 
 function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
-  if (!fs.existsSync(rootPath)) return [];
   const rootAbsolute = path.resolve(rootPath);
-  if (fs.lstatSync(rootAbsolute).isSymbolicLink()) return [];
+  // An absent optional root is different from an existing dangling symlink.
+  // A configured archive source may NOT be marked complete after silently
+  // omitting a symlinked/junction root or an unsupported source entry.
+  let rootStat;
+  try { rootStat = fs.lstatSync(rootAbsolute, { bigint: true }); }
+  catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error("Backup source root is not a real directory");
+  }
   const archiveRoot = archiveRootInfo(rootAbsolute);
   const excludedPaths = (options.excludePaths || []).filter(Boolean).map((excludedPath) => {
     const absolute = path.resolve(excludedPath);
@@ -344,14 +384,19 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     if (identity && options.excludeFileIdentities?.has(identity)) return true;
     return Boolean(options.excludePredicate?.(absolute, stat));
   };
-  const rootStat = fs.lstatSync(rootAbsolute, { bigint: true });
-  if (rootStat.isSymbolicLink() || isExcluded(rootAbsolute, rootStat)) return [];
+  if (isExcluded(rootAbsolute, rootStat)) return [];
   const files = [];
   const stack = [{ absolutePath: rootAbsolute, entryPath: entryPrefix }];
   while (stack.length) {
     const current = stack.pop();
     const stat = fs.lstatSync(current.absolutePath, { bigint: true });
-    if (stat.isSymbolicLink() || isExcluded(current.absolutePath, stat)) continue;
+    if (isExcluded(current.absolutePath, stat)) continue;
+    // Explicit security-policy exclusions above are intentional. Every
+    // remaining unsafe inode is evidence of INCOMPLETE archive coverage, not
+    // a file that may be quietly absent from included_files and a success ZIP.
+    if (stat.isSymbolicLink()) {
+      throw new Error("Backup source contains a symbolic link or junction");
+    }
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
         if (options.excludeNamePrefixes?.some((prefix) => name.startsWith(prefix))) continue;
@@ -363,7 +408,9 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
       }
       continue;
     }
-    if (!stat.isFile()) continue;
+    if (!stat.isFile()) {
+      throw new Error("Backup source contains an unsupported filesystem entry");
+    }
     const identity = fileIdentity(stat);
     if (options.maxBytes && stat.size > options.maxBytes) continue;
     files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: Number(stat.size), archiveRoot, sourceStat: stat });
@@ -399,14 +446,13 @@ async function collectBackupFiles(options = {}) {
     const absolutePath = path.join(dataDir, name);
     const entryPath = normalizeEntryPath(path.posix.join("data", name));
     if (isSensitivePath(entryPath)) continue;
+    if (!(name.endsWith(".json") || name === "README.md")) continue;
     const stat = fs.lstatSync(absolutePath, { bigint: true });
-    if (stat.isSymbolicLink()) continue;
-    if (stat.isFile() && (
-      name.endsWith(".json") ||
-      name === "README.md"
-    ) && !quarantineExclusions.isPayloadPath(absolutePath, stat)) {
-      files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
-    }
+    if (quarantineExclusions.isPayloadPath(absolutePath, stat)) continue;
+    // An eligible data entry cannot silently disappear from a successful ZIP.
+    if (stat.isSymbolicLink()) throw new Error("Backup data source contains a symbolic link or junction");
+    if (!stat.isFile()) throw new Error("Backup data source is not a regular file");
+    files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
   }
   if (options.jsonArchiveSnapshotPath) {
     // The runtime keeps an immutable legacy JSON archive plus a FULL/WAL
@@ -491,25 +537,50 @@ async function collectBackupFiles(options = {}) {
   });
 
   const syncFile = unsuppressedFiles.find((file) => file.entryPath === "data/sync-objects.json");
+  if (assertSyncHistoryArchiveCoverage() && !syncFile) {
+    throw Object.assign(new Error("Signed sync object history was omitted from backup inventory"), {
+      code: "SYNC_HISTORY_NOT_ARCHIVED",
+    });
+  }
   if (syncFile) attestCiphertextOnlyFile(syncFile.absolutePath);
+
+  // ZIP restore rejects case-folded destination collisions on every platform.
+  // Check locally collected entries even when cloud inventory is disabled;
+  // otherwise POSIX case-distinct files can create a success ZIP that cannot
+  // be restored as a complete, unambiguous selection.
+  const collisions = new Map();
+  for (const file of unsuppressedFiles) {
+    const key = collisionKey(file.entryPath);
+    if (collisions.has(key) && collisions.get(key) !== file.entryPath) throw new Error("Backup entry collision");
+    collisions.set(key, file.entryPath);
+  }
 
   if (!cloudStorage?.enabled()) return unsuppressedFiles.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 
   const stageDir = options.stageDir;
   if (!stageDir) throw new Error("Cloud backup staging is required");
   const known = new Map();
-  const collisions = new Map();
   for (const file of unsuppressedFiles) {
-    const key = collisionKey(file.entryPath);
-    if (collisions.has(key) && collisions.get(key) !== file.entryPath) throw new Error("Backup entry collision");
-    collisions.set(key, file.entryPath);
     known.set(file.entryPath, file);
   }
-  const areas = ["uploads", ...(includeTemp || includePending ? ["temp"] : [])];
+  const areas = [...(includeUploads ? ["uploads"] : []), ...(includeTemp || includePending ? ["temp"] : [])];
   const remoteIdentities = new Set();
   let stageRootInfo = null;
   if (typeof cloudStorage.inventory !== "function") throw new Error("Authoritative cloud inventory is required");
-  const remotes = await cloudStorage.inventory();
+  const remotes = await cloudStorage.inventory({ backupComplete: true });
+  // The archive has one destination per logical path, not per provider ID.
+  // Reject duplicates from any adapter BEFORE staging a single cloud object,
+  // even if its own inventory implementation missed two physical Drive IDs.
+  const remotePaths = new Set();
+  for (const remote of remotes) {
+    if (!areas.includes(remote.area)) continue;
+    const folderId = String(remote.folderId || "");
+    const name = String(remote.name || "");
+    const entryPath = normalizeEntryPath(path.posix.join(remote.area, folderId === "root" ? "" : folderId, name));
+    const key = collisionKey(entryPath);
+    if (remotePaths.has(key)) throw new Error("Cloud backup inventory contains a duplicate logical path");
+    remotePaths.add(key);
+  }
   for (const remote of remotes) {
     if (!areas.includes(remote.area)) continue;
     const folderId = String(remote.folderId || "");
@@ -519,6 +590,8 @@ async function collectBackupFiles(options = {}) {
     remoteIdentities.add(identity);
     if (!folderId || folderId === "." || folderId === ".." || /[\\\\/]/.test(folderId)) throw new Error("Cloud backup inventory contains an unsafe folder");
     if (!name || name !== path.basename(name) || /[\\/]/.test(name) || isSensitivePath(`${remote.area}/${folderId}/${name}`)) throw new Error("Cloud backup inventory contains an unsafe path");
+    if (name === "." || name === "..") throw new Error("Cloud backup inventory contains an unsafe path");
+    if (process.platform === "win32" && name.includes(":")) throw new Error("Cloud backup inventory contains an unsafe path");
     const entryPath = normalizeEntryPath(path.posix.join(remote.area, folderId === "root" ? "" : folderId, name));
     if (restoreProviderOrphans.isSuppressed(folderId, name, remote.area, suppressionSnapshot)) continue;
     const key = collisionKey(entryPath);
@@ -527,7 +600,25 @@ async function collectBackupFiles(options = {}) {
     const staged = path.resolve(stageDir, entryPath);
     if (!staged.startsWith(`${path.resolve(stageDir)}${path.sep}`)) throw new Error("Cloud backup staging escaped its boundary");
     fs.mkdirSync(path.dirname(staged), { recursive: true });
-    if (!await cloudStorage.download(folderId, name, staged, remote.area)) throw new Error("Cloud backup object is unavailable");
+    // Bind the ZIP download to the same provider object representation that
+    // was enumerated. Drive pins its physical ID; S3 uses conditional ETag
+    // plus the listed byte count because ListObjectsV2 has no version ID.
+    let backupInventoryPin;
+    if (remote.provider === "gdrive") {
+      const physicalId = remote.providerIdentity || remote.id;
+      if (typeof physicalId !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(physicalId)
+        || (remote.id != null && remote.id !== physicalId)) {
+        throw new Error("Cloud backup Drive inventory identity is invalid");
+      }
+      backupInventoryPin = { providerFileId: physicalId };
+    } else if (remote.provider === "s3"
+      && (remote.providerEtag !== undefined || remote.providerSize !== undefined)) {
+      backupInventoryPin = { etag: remote.providerEtag, size: remote.providerSize };
+    }
+    if (!await cloudStorage.download(folderId, name, staged, remote.area,
+      undefined, undefined, backupInventoryPin)) {
+      throw new Error("Cloud backup object is unavailable");
+    }
     const local = known.get(entryPath);
     if (local) {
       if (await calculateBackupEntryHash(local) !== await calculateFileHash(staged)) throw new Error("Cloud and local backup objects differ");
@@ -539,7 +630,9 @@ async function collectBackupFiles(options = {}) {
       known.set(entryPath, { absolutePath: staged, entryPath, size: Number(sourceStat.size), cloudOnly: true, archiveRoot: stageRootInfo, sourceStat });
     }
   }
-  options.cloudComplete = true;
+  // A partial selection cannot certify a whole-upload restore baseline.
+  // Excluding local uploads must exclude provider uploads as well.
+  options.cloudComplete = includeUploads;
   return [...known.values()].sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 }
 
@@ -1500,6 +1593,7 @@ async function createBackup(options = {}) {
   let outcomeError = null;
 
   try {
+    assertSyncHistoryArchiveCoverage();
     if (options.backupId != null && backupRepository.getBackup(id)) {
       throw Object.assign(new Error("Backup ID already exists"), { code: "BACKUP_ID_COLLISION" });
     }
@@ -1767,6 +1861,7 @@ function latestStatus() {
 }
 
 module.exports = {
+  assertSyncHistoryArchiveCoverage,
   BACKUPS_DIR,
   LOCK_FILE,
   LOCK_TAKEOVER_DIR,

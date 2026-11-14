@@ -65,11 +65,13 @@ async function runBackup(objects = [], options = {}) {
   }
   const cloud = {
     enabled: () => options.enabled !== false,
-    inventory: async () => {
+    inventory: async (...args) => {
       if (options.failInventory) throw new Error("inventory unavailable");
+      if (options.inventory) return options.inventory(...args);
       return objects;
     },
     download: async (_folderId, name, target, area) => {
+      options.onDownload?.();
       if (options.failDownload) throw new Error("download unavailable");
       const remote = objects.find((entry) => entry.name === name && entry.area === area);
       if (!remote) return false;
@@ -129,13 +131,160 @@ function syncBackup(entries) {
 test("authoritative cloud backup and restore matrix", async (t) => {
   await t.test("S3 global pagination", async () => {
     let page = 0;
-    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => page++ === 0 ? { Contents: [{ Key: "rootark/uploads/root/a.txt" }], NextContinuationToken: "next" } : { Contents: [{ Key: "rootark/uploads/orphan/b.txt" }] } }) });
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => page++ === 0 ? { IsTruncated: true, Contents: [{ Key: "rootark/uploads/root/a.txt" }], NextContinuationToken: "next" } : { IsTruncated: false, Contents: [{ Key: "rootark/uploads/orphan/b.txt" }] } }) });
     assert.equal((await storage.inventory()).length, 2);
+  });
+  await t.test("S3 repeated pagination token fails closed instead of looping", async () => {
+    let pages = 0;
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => {
+        pages += 1;
+        return { IsTruncated: true, NextContinuationToken: "same-token", Contents: [] };
+      } }) });
+    await assert.rejects(storage.inventory(), (error) => error.code === "provider_error");
+    assert.equal(pages, 2, "a repeated provider token must not trigger unlimited pagination");
+  });
+  await t.test("S3 truncated page without continuation cannot certify a complete ZIP", async () => {
+    let pages = 0;
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => {
+        pages += 1;
+        return { IsTruncated: true, Contents: [{ Key: "rootark/uploads/root/present.txt" }] };
+      } }) });
+    const result = await runBackup([object("present.txt")], { inventory: () => storage.inventory() });
+    assert.equal(pages, 1);
+    assert.equal(result.ok, false, "a partial provider page must never produce success/cloud_complete");
+    assert.equal(result.error.code, "provider_error", "incomplete inventory must use the retryable provider error boundary");
+    assert.deepEqual(result.zips, [], "no incomplete ZIP may survive");
+    assert.equal(result.history.some((entry) => entry.status === "success"), false);
+    assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+  });
+  for (const [label, truncated] of [
+    ["missing", undefined], ["null", null], ["string-true", "true"], ["integer-one", 1],
+  ]) {
+    await t.test(`S3 ${label} IsTruncated cannot certify a complete backup ZIP`, async () => {
+      let pages = 0;
+      const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+        createS3Client: async () => ({ send: async () => {
+          pages += 1;
+          return { IsTruncated: truncated, Contents: [{ Key: "rootark/uploads/root/present.txt" }] };
+        } }) });
+      const result = await runBackup([object("present.txt")], { inventory: () => storage.inventory() });
+      assert.equal(pages, 1);
+      assert.equal(result.ok, false, "nonboolean provider response must never certify cloud_complete");
+      assert.equal(result.error.code, "provider_error");
+      assert.deepEqual(result.zips, [], "incomplete inventory must leave no ZIP");
+      assert.equal(result.history.some((entry) => entry.status === "success"), false);
+      assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+    });
+  }
+  for (const [label, contents] of [
+    ["number-zero", 0], ["empty-string", ""], ["null", null], ["object", {}],
+  ]) {
+    await t.test(`S3 non-array Contents ${label} cannot certify a complete backup ZIP`, async () => {
+      let pages = 0;
+      const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+        createS3Client: async () => ({ send: async () => {
+          pages += 1;
+          return { IsTruncated: false, Contents: contents };
+        } }) });
+      const result = await runBackup([], { inventory: () => storage.inventory() });
+      assert.equal(pages, 1);
+      assert.equal(result.ok, false, "malformed provider Contents must not produce a success ZIP");
+      assert.equal(result.error.code, "provider_error");
+      assert.deepEqual(result.zips, [], "unverified cloud inventory must not leave a ZIP");
+      assert.equal(result.history.some((entry) => entry.status === "success"), false);
+      assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+    });
+  }
+  await t.test("S3 valid final empty inventory page may omit Contents", async () => {
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => ({ IsTruncated: false }) }) });
+    const result = await runBackup([], { inventory: () => storage.inventory() });
+    assert.equal(result.ok, true);
+    assert.equal(result.manifest.cloud_complete, true);
+  });
+  await t.test("S3 valid final empty inventory page accepts empty Contents array", async () => {
+    const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" },
+      createS3Client: async () => ({ send: async () => ({ IsTruncated: false, Contents: [] }) }) });
+    const result = await runBackup([], { inventory: () => storage.inventory() });
+    assert.equal(result.ok, true);
+    assert.equal(result.manifest.cloud_complete, true);
   });
   await t.test("Drive configured-namespace pagination", async () => {
     let page = 0;
     const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" }, createGoogleDriveClient: async () => ({ files: { list: async () => page++ === 0 ? { data: { files: [{ id: "a", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/root/a.txt", rootArkFolderId: "root", rootArkArea: "uploads" } }], nextPageToken: "next" } } : { data: { files: [{ id: "b", parents: ["drive-root"], appProperties: { rootArkKey: "rootark/uploads/orphan/b.txt", rootArkFolderId: "orphan", rootArkArea: "uploads" } }] } } } }) });
     assert.equal((await storage.inventory()).length, 2);
+  });
+  for (const splitPages of [false, true]) {
+    await t.test(`Drive duplicate logical key across ${splitPages ? "pages" : "physical IDs"} cannot certify whole backup ZIP`, async () => {
+      const physical = [
+        object("dup.txt", "good", { provider: "gdrive", providerIdentity: "a" }),
+        object("dup.txt", "evil", { provider: "gdrive", providerIdentity: "b" }),
+      ];
+      const rows = physical.map((entry) => ({
+        id: entry.providerIdentity, parents: ["drive-root"], appProperties: {
+          rootArkKey: entry.key, rootArkFolderId: entry.folderId, rootArkArea: entry.area,
+        },
+      }));
+      let pages = 0;
+      const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" },
+        createGoogleDriveClient: async () => ({ files: { list: async (request) => {
+          pages += 1;
+          assert.match(request.q, /'drive-root' in parents/);
+          if (!splitPages) return { data: { files: rows } };
+          return request.pageToken === "second"
+            ? { data: { files: [rows[1]] } }
+            : { data: { files: [rows[0]], nextPageToken: "second" } };
+        } } }) });
+      let downloads = 0;
+      // The backup's logical-key downloader resolves both physical IDs to
+      // the first bytes ("good"). The equal local copy lets the resulting
+      // ZIP succeed while omitting the second physical ID's "evil" bytes.
+      const result = await runBackup(physical, {
+        inventory: (...args) => storage.inventory(...args),
+        local: { name: "dup.txt", content: "good" },
+        onDownload: () => { downloads += 1; },
+      });
+      assert.equal(pages, splitPages ? 2 : 1);
+      assert.equal(result.ok, false, "two physical Drive objects cannot be certified by one logical ZIP entry");
+      assert.equal(result.error.code, "duplicate_inventory_identity");
+      assert.equal(downloads, 0, "duplicate identity must be denied before cloud staging");
+      assert.deepEqual(result.zips, [], "a false-complete ZIP must never be retained");
+      assert.equal(result.history.some((entry) => entry.status === "success"), false);
+      assert.equal(result.history.some((entry) => entry.status === "failed"), true);
+    });
+  }
+  await t.test("Drive distinct keys on separate pages produce a complete ZIP", async () => {
+    const physical = [
+      object("a.txt", "good", { provider: "gdrive", providerIdentity: "a" }),
+      object("b.txt", "evil", { provider: "gdrive", providerIdentity: "b" }),
+    ];
+    const rows = physical.map((entry) => ({
+      id: entry.providerIdentity, parents: ["drive-root"], appProperties: {
+        rootArkKey: entry.key, rootArkFolderId: entry.folderId, rootArkArea: entry.area,
+      },
+    }));
+    const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "drive-root" },
+      createGoogleDriveClient: async () => ({ files: { list: async ({ pageToken }) => pageToken
+        ? { data: { files: [rows[1]] } }
+        : { data: { files: [rows[0]], nextPageToken: "next" } } } }) });
+    const result = await runBackup(physical, { inventory: (...args) => storage.inventory(...args) });
+    assert.equal(result.ok, true);
+    assert.equal(result.manifest.cloud_complete, true);
+    assert.ok(result.entries.includes("uploads/a.txt"));
+    assert.ok(result.entries.includes("uploads/b.txt"));
+  });
+  await t.test("backup rejects duplicate remote logical paths even if a provider adapter returns them", async () => {
+    const result = await runBackup([
+      object("dup.txt", "good", { providerIdentity: "a" }),
+      object("dup.txt", "evil", { providerIdentity: "b" }),
+    ], { local: { name: "dup.txt", content: "good" } });
+    assert.equal(result.ok, false, "two remote objects sharing a path must not certify a complete ZIP");
+    assert.match(result.error.message, /duplicate logical path/);
+    assert.deepEqual(result.zips, []);
+    assert.equal(result.history.some((entry) => entry.status === "success"), false);
+    assert.equal(result.history.some((entry) => entry.status === "failed"), true);
   });
   await t.test("cloud-only unknown folder", async () => { const result = await runBackup([object("orphan.txt", "orphan", { folderId: "orphan" })]); assert.ok(result.entries.includes("uploads/orphan/orphan.txt")); });
   await t.test("cloud-only root upload", async () => { const result = await runBackup([object("root.txt")]); assert.ok(result.entries.includes("uploads/root.txt")); });
@@ -152,7 +301,7 @@ test("authoritative cloud backup and restore matrix", async (t) => {
   await t.test("Unicode object", async () => { const result = await runBackup([object("ação-測試.txt")]); assert.ok(result.entries.includes("uploads/ação-測試.txt")); });
   await t.test("traversal key", async () => { const result = await runBackup([object("bad.txt", "x", { folderId: ".." })]); assert.equal(result.ok, false); });
   await t.test("absolute key", async () => { const result = await runBackup([object("bad.txt", "x", { folderId: "/root" })]); assert.equal(result.ok, false); });
-  await t.test("foreign prefix", async () => { const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => ({ Contents: [{ Key: "foreign/uploads/root/a.txt" }] }) }) }); await assert.rejects(storage.inventory(), /outside the configured prefix/); });
+  await t.test("foreign prefix", async () => { const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async () => ({ IsTruncated: false, Contents: [{ Key: "foreign/uploads/root/a.txt" }] }) }) }); await assert.rejects(storage.inventory(), /outside the configured prefix/); });
   await t.test("malformed Drive appProperties", async () => { const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "root" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [{ id: "x", parents: ["root"], appProperties: { rootArkKey: "rootark/uploads/root/x.txt", rootArkFolderId: "wrong", rootArkArea: "uploads" } }] } }) } }) }); await assert.rejects(storage.inventory(), /does not match/); const normalized = normalizeProviderError(Object.assign(new Error("provider detail"), { code: "invalid_inventory_metadata" })); assert.equal(normalized.code, "invalid_inventory_metadata"); assert.match(normalized.message, /does not match/); });
   await t.test("missing Drive key", async () => { const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "root" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [{ id: "x", parents: ["root"], appProperties: {} }] } }) } }) }); await assert.rejects(storage.inventory()); });
   await t.test("Drive file outside configured parent is ignored", async () => { const storage = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "root" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: [{ id: "x", parents: ["foreign"], appProperties: { rootArkKey: "rootark/uploads/root/x.txt", rootArkFolderId: "root", rootArkArea: "uploads" } }] } }) } }) }); assert.deepEqual(await storage.inventory(), []); });

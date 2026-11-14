@@ -47,6 +47,16 @@ BACKUP_COMPRESS=true
 - `<runtime-root>/uploads`, se `BACKUP_INCLUDE_UPLOADS=true`.
 - metadados importantes em `<runtime-root>/data`.
 
+Quando `BACKUP_INCLUDE_UPLOADS=false`, a seleção também exclui os objetos
+`uploads/` do provedor cloud, sem baixá-los para o ZIP. Mesmo com inventário
+cloud disponível, o manifesto registra `cloud_complete: false`: esse backup
+parcial não é um baseline completo para reconciliação de uploads no restore.
+
+Se uma página do inventário S3 não informar IsTruncated como booleano real,
+informar outra página sem token de continuação válido ou repetir um token,
+a criação do backup falha fechada: uma lista parcial
+de objetos não pode certificar `cloud_complete: true` nem gerar um ZIP de sucesso.
+
 ## O que não entra
 
 - `node_modules`
@@ -61,6 +71,23 @@ BACKUP_COMPRESS=true
 - uploads temporários incompletos em `temp/.chunks` e `temp/.incoming`
 
 Essas exclusões são por caminho/nome; o backup não inspeciona o conteúdo de arquivos arbitrários em busca de credenciais. A criação do backup e a reconciliação do inventário cloud falham fechadas se um arquivo elegível tiver hardlinks, para impedir que um nome comum contorne a exclusão de outro caminho.
+
+**Cobertura das fontes selecionadas:** quando BACKUP_INCLUDE_UPLOADS ou
+BACKUP_INCLUDE_TEMP habilita uma árvore, o coletor recusa a criação de um
+ZIP marcado como success se encontrar um symlink/junction na raiz ou em
+uma entrada elegível, ou um arquivo especial que não seja diretório ou arquivo
+regular. Anteriormente essas entradas eram ignoradas silenciosamente e
+sumiam tanto do ZIP quanto da lista included_files, ocultando a incompletude.
+Mesmo sem cloud habilitado, entradas locais com caminhos distintos apenas
+por maiúsculas/minúsculas interrompem o backup: o restore rejeita essa colisão
+e não conseguiria recuperar o ZIP integralmente.
+As exclusões sensíveis e de quarentena definidas acima continuam explícitas
+e não entram nesse requisito. A ausência de uma árvore opcional permanece
+permitida e **não é prova de que todos os arquivos de uma conta existem na
+origem**. Essa verificação de coleta local não substitui inventário cloud
+autenticado, retenção imutável, manifestos globais assinados pelo dono nem
+custódia independente R1. Nenhum ZIP local concede autorização para restaurar
+conteúdo protegido sob ZK10.
 
 ## Backup manual
 

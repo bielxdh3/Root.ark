@@ -11,7 +11,7 @@ const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 
-async function fixture(t) {
+async function fixture(t, signedPath = "docs/a.txt") {
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-device-pin-"));
   t.after(() => fsp.rm(tmp, { recursive: true, force: true }));
   const rootDir = path.join(tmp, "device");
@@ -39,7 +39,7 @@ async function fixture(t) {
     state.records.set(objectId, op);
     return op;
   }
-  await remote("create", "object-a", "docs/a.txt", "authenticated remote bytes");
+  await remote("create", "object-a", signedPath, "authenticated remote bytes");
   const adapter = {
     async listInventory() {
       if (state.offline) throw Object.assign(new Error("offline"), { code: "offline" });
@@ -759,6 +759,113 @@ test("issue 66 #278 P2: local regular-to-directory replacement cannot corrupt pi
   await fsp.writeFile(path.join(rootDir, "docs/a.txt"), original);
   assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true,
     "durable index remains valid after safe local repair and restart");
+});
+
+test("issue 66 POSIX: directory replacing pinned A.txt plus casefold alias a.txt cannot corrupt journal or snapshot", async (t) => {
+  if (process.platform === "win32") return t.skip("real case-distinct files require POSIX");
+  const { rootDir, open, state } = await fixture(t, "docs/A.txt");
+  await (await open()).pinLocal("docs/A.txt");
+  const client = await open([], true, false);
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  await fsp.unlink(path.join(rootDir, "docs/A.txt"));
+  await fsp.mkdir(path.join(rootDir, "docs/A.txt"));
+  await fsp.writeFile(path.join(rootDir, "docs/a.txt"), "untrusted casefold alias");
+  assert.equal((await fsp.stat(path.join(rootDir, "docs/A.txt"))).isDirectory(), true);
+  assert.equal((await fsp.stat(path.join(rootDir, "docs/a.txt"))).isFile(), true);
+  await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore,
+    "casefold alias must not persist a directory for pinned A.txt");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
+    "reject before journal enqueue/observation");
+  assert.equal(state.pushes, 0, "no outgoing operation may be dispatched");
+  await fsp.unlink(path.join(rootDir, "docs/a.txt"));
+  await fsp.rmdir(path.join(rootDir, "docs/A.txt"));
+  await fsp.writeFile(path.join(rootDir, "docs/A.txt"), "authenticated remote bytes");
+  assert.equal((await (await open()).pinStatus("docs/A.txt")).pinned, true);
+});
+
+test("issue 66 POSIX: filtered scans cannot hide a replaced pinned directory behind a case alias", async (t) => {
+  if (process.platform === "win32") return t.skip("real case-distinct files require POSIX");
+  for (const scenario of [
+    { name: "only alias selected", selectedPaths: ["docs/a.txt"], excludedPaths: [] },
+    { name: "pinned path excluded", selectedPaths: ["docs"], excludedPaths: ["docs/A.txt"] },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const { rootDir, open, state } = await fixture(t, "docs/A.txt");
+      await (await open()).pinLocal("docs/A.txt");
+      const client = await open(scenario.excludedPaths, true, false, scenario.selectedPaths);
+      const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+      const snapshotBefore = await fsp.readFile(snapshotFile);
+      const journalBefore = await fsp.readFile(client.journal.filePath);
+      await fsp.unlink(path.join(rootDir, "docs/A.txt"));
+      await fsp.mkdir(path.join(rootDir, "docs/A.txt"));
+      await fsp.writeFile(path.join(rootDir, "docs/a.txt"), "untrusted alias");
+      const scanned = await client.scanFiles();
+      assert.ok(scanned["docs/a.txt"] && !scanned["docs/a.txt"].directory);
+      assert.equal(scanned["docs/A.txt"], undefined, "filtered scan conceals the replaced pin");
+      await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+      assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+      assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+      assert.equal(state.pushes, 0);
+      await fsp.unlink(path.join(rootDir, "docs/a.txt"));
+      await fsp.rmdir(path.join(rootDir, "docs/A.txt"));
+      await fsp.writeFile(path.join(rootDir, "docs/A.txt"), "authenticated remote bytes");
+      assert.equal((await (await open()).pinStatus("docs/A.txt")).pinned, true);
+    });
+  }
+});
+
+test("issue 66: an excluded pinned directory or symlink is rejected before the journal changes", async (t) => {
+  const { rootDir, open, state } = await fixture(t, "docs/A.txt");
+  await (await open()).pinLocal("docs/A.txt");
+  const client = await open(["docs/A.txt"], true, false, ["docs"]);
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  await fsp.unlink(path.join(rootDir, "docs/A.txt"));
+  await fsp.mkdir(path.join(rootDir, "docs/A.txt"));
+  assert.equal((await client.scanFiles())["docs/A.txt"], undefined);
+  await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+  assert.equal(state.pushes, 0);
+  await fsp.rmdir(path.join(rootDir, "docs/A.txt"));
+  if (process.platform !== "win32") {
+    await fsp.symlink(rootDir, path.join(rootDir, "docs/A.txt"), "dir");
+    await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+    assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+    assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+    await fsp.unlink(path.join(rootDir, "docs/A.txt"));
+  }
+  await fsp.writeFile(path.join(rootDir, "docs/A.txt"), "authenticated remote bytes");
+  assert.equal((await (await open()).pinStatus("docs/A.txt")).pinned, true);
+});
+
+test("issue 66: scanned mixed-case pinned bucket rejects directory or file alias before mutation", async (t) => {
+  const { rootDir, open, state } = await fixture(t, "docs/A.txt");
+  await (await open()).pinLocal("docs/A.txt");
+  const client = await open([], true, false);
+  const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
+  const snapshotBefore = await fsp.readFile(snapshotFile);
+  const journalBefore = await fsp.readFile(client.journal.filePath);
+  const originalScan = client.scanFiles.bind(client);
+  const originalEntries = await originalScan();
+  const pinnedFile = originalEntries["docs/A.txt"];
+  assert.ok(pinnedFile && !pinnedFile.directory);
+  const emptyHash = crypto.createHash("sha256").update("").digest("hex");
+  for (const pair of [
+    [["docs/A.txt", { hash: emptyHash, size: 0, directory: true }],
+      ["docs/a.txt", pinnedFile]],
+    [["docs/A.txt", pinnedFile], ["docs/a.txt", pinnedFile]],
+  ]) {
+    client.scanFiles = async () => ({ ...originalEntries, ...Object.fromEntries(pair) });
+    await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+    assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
+    assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
+    assert.equal(state.pushes, 0);
+  }
 });
 
 test("issue 66 #278 P2: signed CREATE of existing matching ancestor directory preserves pinned child", async (t) => {

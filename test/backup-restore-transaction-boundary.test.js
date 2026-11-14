@@ -4802,7 +4802,7 @@ test("successful migrations before listener acknowledgement preserve the restore
     CLOUD_STORAGE_PROVIDER: "local",
     PORT: "0",
     BACKUP_ENABLED: "true",
-    BACKUP_INCLUDE_UPLOADS: "false",
+    BACKUP_INCLUDE_UPLOADS: "true",
     BACKUP_INCLUDE_TEMP: "false",
     BACKUP_RETENTION_COUNT: "20",
   };

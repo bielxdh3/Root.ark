@@ -104,6 +104,8 @@ interoperability and a destructive legacy cutover are not established by CI or
 disposable fixtures. See the [migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md)
 and [residual metadata/trust register](docs/issue-65-zk1-runtime-leakage-register.md).
 
+**Issue #67 (draft, not merged):** the Sync v2 client can restore a retained encrypted file version through `node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id>`. It verifies signed history and AES-GCM locally, creates a new authorized CAS revision, and restores local bytes through the guarded sync engine. Strict historical admission beyond fresh proofs still requires independent physical witness provisioning; see [the scoped restoration evidence](docs/validation/2026-11-06-issue67-historical-restore.md). This does not change deployment or ZK cutover status.
+
 **Recent merged progress (2026-10-18–19; not a release-readiness claim):**
 
 - File-name FTS5 search for non-protected data, Android client scaffolding, selective-sync exclusion/rollback, ransomware-burst detection with device pause, and per-operation sharing permissions were merged in PRs [#211](https://github.com/bielxdh3/Root.ark/pull/211), [#212](https://github.com/bielxdh3/Root.ark/pull/212), [#214](https://github.com/bielxdh3/Root.ark/pull/214), [#215](https://github.com/bielxdh3/Root.ark/pull/215), and [#216](https://github.com/bielxdh3/Root.ark/pull/216).
