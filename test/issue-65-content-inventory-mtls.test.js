@@ -708,6 +708,105 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(status.authorizesIo, false);
   });
 
+  await t.test("P2 signed HTTPS snapshot bytes cannot be replaced after real Ed25519 verification", async (child) => {
+    const h = await harness(child);
+    const floor = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: floor.root });
+    const nonce = crypto.randomBytes(32);
+    const realGetSnapshot = h.ledger.getSnapshot.bind(h.ledger);
+    const originalFrom = Buffer.from;
+    let originalWire, getterReads = 0, substituted = 0, armed = false;
+    h.ledger.getSnapshot = async (...args) => {
+      const result = await realGetSnapshot(...args);
+      if (result.status === "snapshot") originalWire = originalFrom.call(Buffer, result.bytes);
+      return result;
+    };
+    const key = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(key)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle, "actual native Ed25519 key handle is required");
+    const poisonedKey = Object.create(key);
+    Object.defineProperty(poisonedKey, handle, { get() {
+      getterReads++;
+      if (armed) Buffer.from = function postKeyBufferSubstitution(...args) {
+        if (originalWire && Buffer.isBuffer(args[0])
+          && Buffer.compare(args[0], originalWire) === 0) {
+          substituted++;
+          return Buffer.alloc(originalWire.length, 0x5b);
+        }
+        return Reflect.apply(originalFrom, Buffer, args);
+      };
+      return key[handle];
+    } });
+    const client = h.makeClient("reader", { inventoryPublicKey: poisonedKey });
+    armed = true;
+    let result;
+    try {
+      result = await client.getSnapshot({ scope: h.scope, nonce,
+        requested: requested(operation), minimumHead: { sequence: 0, root: floor.root } });
+    } finally {
+      Buffer.from = originalFrom;
+    }
+    assert.ok(originalWire && originalWire.length > 64, "server must send genuine signed CBOR");
+    assert.ok(getterReads > 0, "attacker must reach a native verification key getter");
+    assert.equal(result.status, "VERIFIED_NONAUTHORIZING");
+    assert.equal(result.outcome, "ABSENT", "genuine signed genesis must verify");
+    assert.equal(Buffer.compare(result.serializedSnapshot, originalWire), 0,
+      "returning a different raw signed snapshot after checking A is a security failure");
+    assert.equal(substituted, 0, "post-key attacker Buffer.from must not copy signed output bytes");
+  });
+
+  await t.test("P2 signed HTTPS terminal proof cannot be replaced after real Ed25519 verification", async (child) => {
+    const h = await harness(child);
+    const floor = await h.ledger.readLocalHead();
+    const invalid = newOperation({ root: floor.root, revision: 2 });
+    const rejected = await h.makeClient("writer").append({ scope: h.scope,
+      operation: invalid, nonce: crypto.randomBytes(32),
+      minimumHead: { sequence: 0, root: floor.root } });
+    assert.equal(rejected.status, "not_committed_final",
+      "a real signed negative ledger decision must exist before status readback");
+    const realStatus = h.ledger.getOperationStatus.bind(h.ledger);
+    const originalFrom = Buffer.from;
+    let originalProof, getterReads = 0, substituted = 0, armed = false;
+    h.ledger.getOperationStatus = async (...args) => {
+      const result = await realStatus(...args);
+      if (result.status === "not_committed_final") originalProof = originalFrom.call(Buffer, result.proof);
+      return result;
+    };
+    const key = h.signer.publicKey;
+    const handle = Object.getOwnPropertySymbols(key)
+      .find((symbol) => symbol.description === "kHandle");
+    assert.ok(handle, "actual native Ed25519 key handle is required");
+    const poisonedKey = Object.create(key);
+    Object.defineProperty(poisonedKey, handle, { get() {
+      getterReads++;
+      if (armed) Buffer.from = function postKeyBufferSubstitution(...args) {
+        if (originalProof && Buffer.isBuffer(args[0])
+          && Buffer.compare(args[0], originalProof) === 0) {
+          substituted++;
+          return Buffer.alloc(originalProof.length, 0x5b);
+        }
+        return Reflect.apply(originalFrom, Buffer, args);
+      };
+      return key[handle];
+    } });
+    const client = h.makeClient("status-reader", { inventoryPublicKey: poisonedKey });
+    armed = true;
+    let result;
+    try {
+      result = await client.getOperationStatus({ scope: h.scope, operation: invalid });
+    } finally {
+      Buffer.from = originalFrom;
+    }
+    assert.ok(originalProof && originalProof.length > 64, "real signed terminal proof required");
+    assert.ok(getterReads > 0, "attacker must reach a native verification key getter");
+    assert.equal(result.status, "not_committed_final");
+    assert.equal(result.verified, true, "genuine signed terminal proof must verify");
+    assert.equal(Buffer.compare(result.proof, originalProof), 0,
+      "terminal proof must be the exact signed bytes independently verified");
+    assert.equal(substituted, 0, "post-key attacker Buffer.from must not copy signed terminal bytes");
+  });
+
   await t.test("pending intent remains pending and nonauthorizing on snapshot and status routes", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();
@@ -1506,6 +1605,104 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.ok(getterReads > 0, "real signed verification must reach the hostile key getter");
     assert.equal(forgedEqualsCalls, 0,
       "the pinned client must not call a late-mutated crypto.timingSafeEqual");
+  });
+
+  await t.test("P2 independently signed PG nonce cannot replay after a hostile inventory key getter", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const head = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: head.root });
+    assert.equal((await h.ledger.append(operation)).status, "committed");
+    const committed = await h.ledger.getOperationStatus(operation.operation_id);
+    assert.equal(committed.status, "committed");
+    const previousPageNonce = crypto.randomBytes(32);
+    const freshPageNonce = crypto.randomBytes(32);
+    assert.notDeepEqual(previousPageNonce, freshPageNonce);
+    const previousChallenge = derivePhysicalChainNonce(previousPageNonce, 1, operation.operation_id);
+    const readback = {
+      status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+      walFlushConfirmed: true, authorizesIo: false, provesIndependentOperator: false,
+      generation: 3, admissionId: crypto.randomBytes(16),
+      operationId: operation.operation_id, revision: operation.revision,
+      epoch: operation.epoch, expectedInventorySequence: operation.expected_sequence,
+      expectedInventoryRoot: operation.expected_root,
+      ciphertextSha256: operation.ciphertext_sha256, digest: crypto.randomBytes(32),
+      root: crypto.randomBytes(32), chunkCount: 1,
+    };
+    const genuinePrevious = await signCommittedPhysicalReadback({
+      scope: h.scope, operation, nonce: previousChallenge,
+      issuedAt: Math.floor(Date.now() / 1000), readback,
+    }, h.attestor.privateKey);
+    let requests = 0;
+    const server = https.createServer({
+      key: tls.serverKey, cert: tls.serverCert, ca: tls.ca,
+      requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3",
+    }, (request, response) => {
+      const chunks = [];
+      request.on("data", (part) => chunks.push(part));
+      request.on("end", () => {
+        requests++;
+        const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        assert.equal(request.url, "/v1/inventory/chain");
+        assert.equal(input.afterSequence, 0);
+        assert.ok([previousPageNonce.toString("base64url"),
+          freshPageNonce.toString("base64url")].includes(input.nonce));
+        // Real inventory Ed25519 entry and a real separately signed PG receipt,
+        // but the PG attestor signed only the PREVIOUS challenge.
+        const body = Buffer.from(JSON.stringify({
+          status: "chain_page", afterSequence: 0, nextSequence: 1, headSequence: 1,
+          proofsBase64: [committed.proof.toString("base64url")],
+          physicalAttestationsBase64: [genuinePrevious.toString("base64url")],
+        }));
+        response.writeHead(200, { "content-type": "application/json",
+          "content-length": String(body.length) });
+        response.end(body);
+      });
+    });
+    const port = await listen(server);
+    child.after(() => drainZk1ContentInventoryHttpsServer(server));
+    const previous = { scope: h.scope, afterSequence: 0, limit: 1,
+      pageNonce: previousPageNonce };
+    const fresh = { ...previous, pageNonce: freshPageNonce };
+    const normal = h.makeClient("status-reader", { port });
+    const authentic = await normal.getProofPage(previous);
+    assert.equal(authentic.status, "transport_unverified");
+    assert.equal(authentic.physicalProofs.length, 1,
+      "genuine separate physical attestor signed the previous nonce");
+    await assert.rejects(normal.getProofPage(fresh),
+      { code: "INVENTORY_HTTP_UNAVAILABLE" },
+      "valid old physical signature must fail the new challenge without attacker mutation");
+
+    const originalFrom = Buffer.from;
+    const key = h.signer.publicKey;
+    const poisoned = Object.create(key);
+    let armed = false, getterReads = 0, replacements = 0;
+    Object.defineProperty(poisoned, "type", { get() {
+      getterReads++;
+      if (armed) Buffer.from = function hostilePostKeyBufferCopy(value, ...options) {
+        if (Buffer.isBuffer(value) && value.length === 32
+          && Buffer.compare(value, freshPageNonce) === 0) {
+          replacements++;
+          return Reflect.apply(originalFrom, Buffer, [previousPageNonce]);
+        }
+        return Reflect.apply(originalFrom, Buffer, [value, ...options]);
+      };
+      return "public";
+    } });
+    const attacked = h.makeClient("status-reader", {
+      port, inventoryPublicKey: poisoned,
+    });
+    armed = true;
+    try {
+      await assert.rejects(attacked.getProofPage(fresh),
+        { code: "INVENTORY_HTTP_UNAVAILABLE" },
+        "hostile post-Ed25519 buffer copies cannot rebind a fresh physical challenge");
+    } finally {
+      Buffer.from = originalFrom;
+    }
+    assert.ok(requests >= 3, "the actual TLS endpoint must process a fresh replay request");
+    assert.ok(getterReads > 0, "a real Ed25519 KeyObject getter must run in the verifier");
+    assert.equal(replacements, 0,
+      "derive and composite verification must not consult late-mutated Buffer.from");
   });
 
   await t.test("P2 genuine stale signed PG chain cannot borrow a forged post-key wall clock", async (child) => {

@@ -14,6 +14,7 @@ const { keyEquals: NATIVE_KEY_EQUALS,
   hashDigest: NATIVE_HASH_DIGEST,
   bufferFrom: NATIVE_BUFFER_FROM,
   bufferConcat: NATIVE_BUFFER_CONCAT,
+  apply: NATIVE_APPLY,
   freeze: NATIVE_FREEZE,
   defineProperty: NATIVE_DEFINE_PROPERTY, objectCreate: NATIVE_OBJECT_CREATE,
   ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
@@ -29,6 +30,12 @@ const { verifyCommittedPhysicalReadback } =
 const VERIFY_COMMITTED_ENTRY = inventory.verifyCommittedEntryProof;
 const VERIFY_PHYSICAL_READBACK = verifyCommittedPhysicalReadback;
 const NATIVE_PROMISE_CONSTRUCTOR = Promise;
+// A real inventory Ed25519 KeyObject getter can rewrite mutable Buffer APIs
+// before HTTPS derives the fresh physical challenge or snapshots composite
+// verification inputs. Pin the nonce encoder before any such callback.
+const NATIVE_BUFFER_ALLOC = Buffer.alloc.bind(Buffer);
+const NATIVE_WRITE_BIG_UINT64_BE = Buffer.prototype.writeBigUInt64BE;
+const NATIVE_BIGINT = BigInt;
 
 function verifiedNativeFinally(onFinally) {
   const pending = this;
@@ -126,7 +133,7 @@ function rawBytes(value, min, max) {
     || value.length < min || value.length > max
     || (typeof SharedArrayBuffer !== "undefined"
       && value.buffer instanceof SharedArrayBuffer)) deny();
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
 function publicKey(value) {
   // The exact KeyObject checked for independent role separation is the one
@@ -142,17 +149,17 @@ function derivePhysicalChainPageNonce(chainNonce, afterSequence) {
   const nonce = rawBytes(chainNonce, 32, 32);
   if (!Number.isSafeInteger(afterSequence) || afterSequence < 0
     || afterSequence > inventory.MAX_ENTRIES) deny();
-  const seq = Buffer.alloc(8);
-  seq.writeBigUInt64BE(BigInt(afterSequence));
-  return sha(Buffer.concat([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
+  const seq = NATIVE_BUFFER_ALLOC(8);
+  NATIVE_APPLY(NATIVE_WRITE_BIG_UINT64_BE, seq, [NATIVE_BIGINT(afterSequence)]);
+  return sha(NATIVE_BUFFER_CONCAT([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
 }
 function derivePhysicalChainNonce(pageNonce, sequence, operationId) {
   const nonce = rawBytes(pageNonce, 32, 32);
   const id = rawBytes(operationId, 16, 16);
   if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > inventory.MAX_ENTRIES) deny();
-  const seq = Buffer.alloc(8);
-  seq.writeBigUInt64BE(BigInt(sequence));
-  return sha(Buffer.concat([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
+  const seq = NATIVE_BUFFER_ALLOC(8);
+  NATIVE_APPLY(NATIVE_WRITE_BIG_UINT64_BE, seq, [NATIVE_BIGINT(sequence)]);
+  return sha(NATIVE_BUFFER_CONCAT([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
 }
 function snapshotOperation(value) {
   exact(value, ["operation_id", "expected_sequence", "expected_root", "object_id",
