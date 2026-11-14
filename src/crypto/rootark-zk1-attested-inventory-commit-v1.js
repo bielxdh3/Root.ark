@@ -6,9 +6,110 @@
 // Require BOTH independently pinned identities on the exact operation and a
 // fresh, caller-owned nonce. Non-authorizing and not a cloud fsync receipt.
 const crypto = require("node:crypto");
+const { types: { isPromise, isProxy } } = require("node:util");
+const { keyEquals: NATIVE_KEY_EQUALS,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  apply: NATIVE_APPLY,
+  freeze: NATIVE_FREEZE,
+  defineProperty: NATIVE_DEFINE_PROPERTY, objectCreate: NATIVE_OBJECT_CREATE,
+  ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
+  hasOwn: NATIVE_HAS_OWN } =
+  require("./rootark-zk10-native-intrinsics-v1");
+const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const inventory = require("./rootark-zk-content-inventory-v1");
 const { verifyCommittedPhysicalReadback } =
   require("./rootark-zk-pg-physical-attestation-v1");
+// Capture the actual signed inventory verifier before any caller-provided
+// KeyObject can execute a same-realm getter. The mutable exports object is not
+// an authority boundary after that point.
+const VERIFY_COMMITTED_ENTRY = inventory.verifyCommittedEntryProof;
+const VERIFY_PHYSICAL_READBACK = verifyCommittedPhysicalReadback;
+const NATIVE_PROMISE_CONSTRUCTOR = Promise;
+// A real inventory Ed25519 KeyObject getter can rewrite mutable Buffer APIs
+// before HTTPS derives the fresh physical challenge or snapshots composite
+// verification inputs. Pin the nonce encoder before any such callback.
+const NATIVE_BUFFER_ALLOC = Buffer.alloc.bind(Buffer);
+const NATIVE_WRITE_BIG_UINT64_BE = Buffer.prototype.writeBigUInt64BE;
+const NATIVE_BIGINT = BigInt;
+
+function verifiedNativeFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (isProxy(cleanup)) deny();
+      if (isPromise(cleanup)) await verifiedNativePromise(cleanup);
+      else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")) {
+        // Foreign thenables can inherit forged Object.prototype.then after a
+        // native KeyObject getter. Never assimilate them across this boundary.
+        deny();
+      }
+    }
+    if (!fulfilled) throw value;
+    return value;
+  }
+  return verifiedNativePromise(settle());
+}
+
+function inertComposite(fields) {
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let i = 0; i < keys.length; i += 1) {
+    const descriptor = NATIVE_DESCRIPTOR(fields, keys[i]);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, keys[i], { value: descriptor.value,
+      writable: false, enumerable: true, configurable: false });
+  }
+  return NATIVE_FREEZE(result);
+}
+
+function verifiedNativePromise(promise) {
+  if (isProxy(promise) || !isPromise(promise)) deny();
+  // Async functions return native Promises. Their inherited constructor can be
+  // replaced after a malicious KeyObject getter; pin an own native constructor
+  // so await reads the true internal state without consulting a forged .then.
+  NATIVE_DEFINE_PROPERTY(promise, "constructor", { value: NATIVE_PROMISE_CONSTRUCTOR,
+    enumerable: false, configurable: false, writable: false });
+  const existingThen = NATIVE_DESCRIPTOR(promise, "then");
+  if (existingThen) {
+    const existingCatch = NATIVE_DESCRIPTOR(promise, "catch");
+    const existingFinally = NATIVE_DESCRIPTOR(promise, "finally");
+    if (existingThen.configurable !== false || existingThen.writable !== false
+      || typeof existingThen.value !== "function" || !existingCatch
+      || existingCatch.configurable !== false || existingCatch.writable !== false
+      || typeof existingCatch.value !== "function" || !existingFinally
+      || existingFinally.configurable !== false || existingFinally.writable !== false
+      || typeof existingFinally.value !== "function") deny();
+    // The captured inventory verifier already supplies a fully pinned native
+    // Promise. Never redefine its nonconfigurable own methods.
+    return promise;
+  }
+  NATIVE_DEFINE_PROPERTY(promise, "then", { value(onFulfilled, onRejected) {
+    async function settle() {
+      let fulfilled = false, value;
+      try { value = await promise; fulfilled = true; }
+      catch (error) { value = error; }
+      if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+      if (typeof onRejected !== "function") throw value;
+      return onRejected(value);
+    }
+    return verifiedNativePromise(settle());
+  }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(promise, "catch", { value(onRejected) {
+    return promise.then(undefined, onRejected);
+  }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(promise, "finally", { value: verifiedNativeFinally,
+    configurable: false, writable: false });
+  return promise;
+}
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/attested-inventory-commit/v1\0");
 const CHAIN_NONCE_DOMAIN = Buffer.from("Root.ark/zk-1/physical-chain-nonce/v1\0");
@@ -32,28 +133,33 @@ function rawBytes(value, min, max) {
     || value.length < min || value.length > max
     || (typeof SharedArrayBuffer !== "undefined"
       && value.buffer instanceof SharedArrayBuffer)) deny();
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
 function publicKey(value) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== "public"
-    || value.asymmetricKeyType !== "ed25519") deny();
+  // The exact KeyObject checked for independent role separation is the one
+  // used by both signed proofs, even if the caller's native kHandle changes.
+  return pinNativeEd25519PublicKey(value);
 }
-function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest(); }
+function sha(bytes) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, bytes);
+  return NATIVE_HASH_DIGEST.call(hash);
+}
 function derivePhysicalChainPageNonce(chainNonce, afterSequence) {
   const nonce = rawBytes(chainNonce, 32, 32);
   if (!Number.isSafeInteger(afterSequence) || afterSequence < 0
     || afterSequence > inventory.MAX_ENTRIES) deny();
-  const seq = Buffer.alloc(8);
-  seq.writeBigUInt64BE(BigInt(afterSequence));
-  return sha(Buffer.concat([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
+  const seq = NATIVE_BUFFER_ALLOC(8);
+  NATIVE_APPLY(NATIVE_WRITE_BIG_UINT64_BE, seq, [NATIVE_BIGINT(afterSequence)]);
+  return sha(NATIVE_BUFFER_CONCAT([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
 }
 function derivePhysicalChainNonce(pageNonce, sequence, operationId) {
   const nonce = rawBytes(pageNonce, 32, 32);
   const id = rawBytes(operationId, 16, 16);
   if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > inventory.MAX_ENTRIES) deny();
-  const seq = Buffer.alloc(8);
-  seq.writeBigUInt64BE(BigInt(sequence));
-  return sha(Buffer.concat([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
+  const seq = NATIVE_BUFFER_ALLOC(8);
+  NATIVE_APPLY(NATIVE_WRITE_BIG_UINT64_BE, seq, [NATIVE_BIGINT(sequence)]);
+  return sha(NATIVE_BUFFER_CONCAT([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
 }
 function snapshotOperation(value) {
   exact(value, ["operation_id", "expected_sequence", "expected_root", "object_id",
@@ -69,59 +175,70 @@ function snapshotOperation(value) {
     ciphertext_sha256: rawBytes(value.ciphertext_sha256, 32, 32) };
 }
 
-async function verifyAttestedInventoryCommit(input) {
+async function verifyAttestedInventoryCommitInternal(input) {
   try {
     exact(input, ["receipt", "physicalAttestation", "scope", "operation", "nonce",
       "pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
       "pinnedPhysicalAttestorPublicKey", "nowSeconds"]);
-    // The exact KeyObject references used for separation MUST also verify
-    // both signatures. A top-level Proxy can otherwise serve separate keys
-    // to this comparison then replace the attestor with the writer key.
-    const inventoryKey = input.pinnedInventoryPublicKey;
-    const attestorKey = input.pinnedPhysicalAttestorPublicKey;
+    // Detach trusted expectations before invoking ANY caller-owned native
+    // KeyObject getter. Such a getter can rewrite even already-validated
+    // buffers in this same realm, then restore B after an async signature.
     const nowSeconds = input.nowSeconds;
-    publicKey(inventoryKey);
-    publicKey(attestorKey);
-    // The public KeyObject's .export() is an overridable own property.
-    // Compare native cryptographic key identities with the intrinsic method,
-    // not caller-supplied DER from an attacker-controlled export override.
-    if (crypto.KeyObject.prototype.equals.call(inventoryKey, attestorKey)) deny();
     const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
     const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
     const nonce = rawBytes(input.nonce, 32, 32);
-    // Both signature parsers have asynchronous CBOR boundaries. If they read
-    // the caller's mutable operation/scope independently, a hostile Proxy can
-    // present a valid ledger operation A and a valid physical readback B.
-    // Detach exactly ONCE before either parser awaits any promise.
     const scope = inventory.normalizeScope(input.scope);
     const operation = snapshotOperation(input.operation);
     const signerId = rawBytes(input.pinnedInventorySignerKeyId, 16, 16);
-    const [signedReceipt, physical] = await Promise.all([
-      inventory.verifyCommittedEntryProof({ serialized: receipt,
+    // Preserve the two independently supplied signer references BEFORE either
+    // key can invoke a hostile .type / inherited-kHandle getter. This retains
+    // the remote e536 attestor-provisioning boundary during integration.
+    const inventoryPin = input.pinnedInventoryPublicKey;
+    const physicalPin = input.pinnedPhysicalAttestorPublicKey;
+    // Reimport immutable native SPKI while each caller-controlled key is
+    // observed, then test independence on those same verifier identities.
+    const inventoryKey = publicKey(inventoryPin);
+    const attestorKey = publicKey(physicalPin);
+    // The public KeyObject's .export() is an overridable own property.
+    // Compare native cryptographic key identities with the intrinsic method,
+    // not caller-supplied DER from an attacker-controlled export override.
+    if (NATIVE_KEY_EQUALS.call(inventoryKey, attestorKey)) deny();
+    // Do not consult Promise.all or module exports after the key getters.
+    // A forged Promise.all can synthesize a COMMITTED inventory result without
+    // ever checking its Ed25519 signature, even with a genuine PG attestation.
+    const signedReceipt = await verifiedNativePromise(
+      VERIFY_COMMITTED_ENTRY({ serialized: receipt,
         pinnedPublicKey: inventoryKey,
         pinnedSignerKeyId: signerId,
-        expectedScope: scope, operation }),
-      verifyCommittedPhysicalReadback(physicalBytes, { scope,
+        expectedScope: scope, operation }));
+    const physical = await verifiedNativePromise(
+      VERIFY_PHYSICAL_READBACK(physicalBytes, { scope,
         operation, expected: undefined, nonce,
         pinnedPublicKey: attestorKey,
-        nowSeconds }),
-    ]);
+        nowSeconds }));
     if (signedReceipt.outcome !== "COMMITTED_IN_SIGNED_LEDGER"
       || physical.status !== "PHYSICALLY_REREAD_PG_COMMITTED"
       || physical.verified !== true || physical.walFlushConfirmed !== true
-      || !crypto.timingSafeEqual(signedReceipt.operationId, physical.operationId)
+      || !NATIVE_TIMING_SAFE_EQUAL(signedReceipt.operationId, physical.operationId)
       || physical.authorizesIo !== false || signedReceipt.authorizesIo !== false) deny();
     // Digest is an explicitly NON-DURABLE evidence-bundle fingerprint, not a
     // replacement for an externally anchored CAS/FLOOR or a recovery ticket.
-    const receiptDigest = sha(Buffer.concat([DOMAIN, sha(receipt), sha(physicalBytes)]));
-    return Object.freeze({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
+    const receiptDigest = sha(NATIVE_BUFFER_CONCAT([DOMAIN, sha(receipt), sha(physicalBytes)]));
+    return inertComposite({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
       inventoryReceipt: signedReceipt,
       physicalReadback: physical,
       receiptDigest,
-      nonce: Buffer.from(nonce),
+      nonce: NATIVE_BUFFER_FROM(nonce),
       authorizesIo: false, externalDurabilityProven: false,
       independentlyAnchoredFloorProven: false });
   } catch (_) { deny(); }
+}
+
+function verifyAttestedInventoryCommit(input) {
+  // The two caller-owned KeyObjects may poison Promise.prototype while the
+  // internal verifier runs. Never expose its mutable inherited constructor to
+  // an external await that treats the composite as a security admission gate.
+  return verifiedNativePromise(verifyAttestedInventoryCommitInternal(input));
 }
 
 module.exports = { verifyAttestedInventoryCommit, derivePhysicalChainNonce,

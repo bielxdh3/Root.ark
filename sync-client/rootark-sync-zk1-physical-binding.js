@@ -7,6 +7,38 @@
 // success flag is never evidence of such a write. An admission timestamp,
 // witness/CAS floor, and external cloud durability are NOT proven here.
 const crypto = require("node:crypto");
+const { types: { isProxy, isPromise } } = require("node:util");
+// A native Ed25519 KeyObject getter runs before later local policy snapshots.
+// Define own array data slots instead of consulting mutable Array.push.
+const NATIVE_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
+const NATIVE_OBJECT_PROTOTYPE = Object.prototype;
+const NATIVE_PROMISE = Promise;
+const NATIVE_IS_SAFE_INTEGER = Number.isSafeInteger.bind(Number);
+const { arrayIncludes: NATIVE_ARRAY_INCLUDES,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  getPrototype: NATIVE_GET_PROTOTYPE,
+  ownKeys: NATIVE_OWN_KEYS,
+  ownDescriptor: NATIVE_OWN_DESCRIPTOR,
+  hasOwn: NATIVE_HAS_OWN,
+  objectCreate: NATIVE_OBJECT_CREATE,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferConcat: NATIVE_BUFFER_CONCAT,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+  jsonStringify: NATIVE_JSON_STRINGIFY,
+  pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  verify: NATIVE_VERIFY,
+  keyEquals: NATIVE_KEY_EQUALS,
+  freeze: NATIVE_FREEZE,
+  dateNow: NATIVE_DATE_NOW,
+  mathFloor: NATIVE_MATH_FLOOR,
+  mathAbs: NATIVE_MATH_ABS } =
+  require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+const { pinNativeEd25519PublicKey } =
+  require("../src/crypto/rootark-zk1-native-ed25519-public-key");
 const protocol = require("./rootark-sync-protocol");
 const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
   require("./rootark-sync-authorization");
@@ -20,6 +52,18 @@ const OPERATION_DOMAIN = Buffer.from("Root.ark/sync-v2/zk1-operation-id/v1\0", "
 const OBJECT_DOMAIN = Buffer.from("Root.ark/sync-v2/zk1-object-id/v1\0", "utf8");
 const HISTORICAL_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0");
+const FLOOR_UNSIGNED_FIELDS = NATIVE_FREEZE(["type", "witnessKeyId", "statusKeyId",
+  "sequence", "lastHash", "physicalFenceDigest", "nonce"]);
+const FLOOR_FIELDS = NATIVE_FREEZE(["type", "witnessKeyId", "statusKeyId",
+  "sequence", "lastHash", "physicalFenceDigest", "nonce", "signature"]);
+const ADMISSION_UNSIGNED_FIELDS = NATIVE_FREEZE(["type", "envelopeSha256", "operationId",
+  "deviceId", "deviceSpkiSha256", "epoch", "checkpointSequence", "checkpointRoot",
+  "inventoryReceiptSha256", "admittedAtMs", "witnessSequence", "witnessLastHash",
+  "witnessPhysicalFenceDigest"]);
+const ADMISSION_FIELDS = NATIVE_FREEZE(["type", "envelopeSha256", "operationId",
+  "deviceId", "deviceSpkiSha256", "epoch", "checkpointSequence", "checkpointRoot",
+  "inventoryReceiptSha256", "admittedAtMs", "witnessSequence", "witnessLastHash",
+  "witnessPhysicalFenceDigest", "signature"]);
 const MAX_CANONICAL_ENVELOPE_BYTES = 9 * 1024 * 1024;
 const PG_CHUNK_BYTES = 1024 * 1024;
 
@@ -28,16 +72,48 @@ function deny() {
   error.code = error.message;
   throw error;
 }
+function pinnedNativeAwait(value) {
+  // Await normally reads Promise.prototype.constructor and assimilates `.then`
+  // when those properties no longer identify the native constructor. A hostile
+  // KeyObject getter could otherwise turn a rejected PG/device verifier into
+  // an attacker-supplied successful result after the Ed25519 check was skipped.
+  if (isProxy(value) || !isPromise(value)) deny();
+  NATIVE_DEFINE_PROPERTY(value, "constructor", {
+    value: NATIVE_PROMISE, enumerable: false, configurable: false, writable: false,
+  });
+  return value;
+}
+function ownNonThenableResult(fields, frozen = false) {
+  // Async PromiseResolve reads an *inherited* Object.prototype.then on a
+  // returned ordinary object. A native Ed25519 getter can install that
+  // property after a genuine signed check, replacing the entire result and
+  // even its hardcoded authorizesIo:false. Snapshot our own data properties
+  // into a null-prototype object BEFORE returning from any async boundary.
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let index = 0; index < keys.length; index += 1) {
+    const name = keys[index];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(fields, name);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, name, {
+      value: descriptor.value, enumerable: true,
+      configurable: !frozen, writable: !frozen,
+    });
+  }
+  return frozen ? NATIVE_FREEZE(result) : result;
+}
 function strict(raw, fields) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(raw))
-    || Reflect.ownKeys(raw).length !== fields.length
-    || fields.some((field) => !Object.hasOwn(raw, field))) deny();
-  const result = Object.create(null);
-  for (const field of fields) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw, field);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
-    result[field] = descriptor.value;
+  if (!raw || typeof raw !== "object" || isProxy(raw) || NATIVE_ARRAY_IS_ARRAY(raw)) deny();
+  const prototype = NATIVE_GET_PROTOTYPE(raw);
+  if ((prototype !== NATIVE_OBJECT_PROTOTYPE && prototype !== null)
+    || NATIVE_OWN_KEYS(raw).length !== fields.length) deny();
+  const result = NATIVE_OBJECT_CREATE(null);
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(raw, field);
+    if (typeof field !== "string" || !descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, field, { value: descriptor.value,
+      enumerable: true, configurable: true, writable: true });
   }
   return result;
 }
@@ -45,7 +121,17 @@ function checkedBytes(value, min, max = min) {
   if ((!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
     || value.length < min || value.length > max
     || (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer)) deny();
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
+}
+function nativeDigest(value) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, value);
+  return NATIVE_HASH_DIGEST.call(hash, "base64url");
+}
+function signedWire(domain, snapshot, fields) {
+  return NATIVE_BUFFER_CONCAT([domain,
+    NATIVE_BUFFER_FROM(NATIVE_JSON_STRINGIFY(
+      NATIVE_PICK_SIGNED_FIELDS(snapshot, fields)), "utf8")]);
 }
 function lengthPrefixed(bytes) {
   const value = Buffer.from(bytes);
@@ -57,36 +143,45 @@ function snapshotLocalDevicePolicy(input) {
   const raw = strict(input, ["username", "trustedDevicePublicKeys", "revokedDeviceIds"]);
   if (typeof raw.username !== "string" || !raw.username || raw.username.length > 512
     || !raw.trustedDevicePublicKeys || typeof raw.trustedDevicePublicKeys !== "object"
-    || Array.isArray(raw.trustedDevicePublicKeys)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(raw.trustedDevicePublicKeys))
-    || !Array.isArray(raw.revokedDeviceIds)
+    || isProxy(raw.trustedDevicePublicKeys) || isProxy(raw.revokedDeviceIds)
+    || NATIVE_ARRAY_IS_ARRAY(raw.trustedDevicePublicKeys)
+    || (NATIVE_GET_PROTOTYPE(raw.trustedDevicePublicKeys) !== NATIVE_OBJECT_PROTOTYPE
+      && NATIVE_GET_PROTOTYPE(raw.trustedDevicePublicKeys) !== null)
+    || !NATIVE_ARRAY_IS_ARRAY(raw.revokedDeviceIds)
     || raw.revokedDeviceIds.length > 10000) deny();
-  const pins = Object.create(null);
-  const pinKeys = Reflect.ownKeys(raw.trustedDevicePublicKeys);
+  const pins = NATIVE_OBJECT_CREATE(null);
+  const pinKeys = NATIVE_OWN_KEYS(raw.trustedDevicePublicKeys);
   if (pinKeys.length < 1 || pinKeys.length > 10000) deny();
-  for (const deviceId of pinKeys) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw.trustedDevicePublicKeys, deviceId);
+  for (let index = 0; index < pinKeys.length; index += 1) {
+    const deviceId = pinKeys[index];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(raw.trustedDevicePublicKeys, deviceId);
     if (typeof deviceId !== "string" || !descriptor || !descriptor.enumerable
-      || !Object.hasOwn(descriptor, "value")) deny();
+      || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const spki = descriptor.value;
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)
       || typeof spki !== "string" || spki.length > 160
       || !/^[A-Za-z0-9_-]+$/.test(spki)) deny();
-    pins[deviceId] = spki;
+    NATIVE_DEFINE_PROPERTY(pins, deviceId, { value: spki,
+      enumerable: true, configurable: true, writable: true });
   }
   // Never call an untrusted Array's overridable `.map`. A forged own `map`
   // function can silently discard revocations while leaving Array.isArray true.
-  if (Reflect.ownKeys(raw.revokedDeviceIds).length !== raw.revokedDeviceIds.length + 1) deny();
+  if (NATIVE_OWN_KEYS(raw.revokedDeviceIds).length !== raw.revokedDeviceIds.length + 1) deny();
   const revoked = [];
+  const seen = NATIVE_OBJECT_CREATE(null);
   for (let index = 0; index < raw.revokedDeviceIds.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(raw.revokedDeviceIds, String(index));
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    const descriptor = NATIVE_OWN_DESCRIPTOR(raw.revokedDeviceIds, String(index));
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const deviceId = descriptor.value;
     if (typeof deviceId !== "string"
-      || !/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)) deny();
-    revoked.push(deviceId);
+      || !/^[A-Za-z0-9._:-]{1,160}$/.test(deviceId)
+      || NATIVE_HAS_OWN(seen, deviceId)) deny();
+    NATIVE_DEFINE_PROPERTY(seen, deviceId, { value: true,
+      enumerable: true, configurable: true, writable: false });
+    NATIVE_DEFINE_PROPERTY(revoked, String(index), {
+      value: deviceId, enumerable: true, writable: true, configurable: true,
+    });
   }
-  if (new Set(revoked).size !== revoked.length) deny();
   return { username: raw.username, trustedDevicePublicKeys: pins,
     revokedDeviceIds: revoked };
 }
@@ -143,9 +238,9 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
     // Ed25519 device authorization and revocation before being handed to any
     // gate/writer. Mere structural envelopeBinding() is never an IO grant.
     const policy = snapshotLocalDevicePolicy(localTrustedDevicePolicy);
-    if (await verifyAuthorizationProof(bound.envelope.authorization,
-      bound.envelope, policy) !== true
-      || bound.envelope.authorization.expiresAt <= Date.now()) deny();
+    if (await pinnedNativeAwait(verifyAuthorizationProof(bound.envelope.authorization,
+      bound.envelope, policy)) !== true
+      || bound.envelope.authorization.expiresAt <= NATIVE_DATE_NOW()) deny();
     // This is exactly the API accepted by Zk1PgPhysicalInventoryBridge
     // .putAndAttest(). Never attach a signer-controlled success flag to it.
     // The gate's 32-byte digest comes from the independently trusted current
@@ -158,14 +253,14 @@ async function physicalWriteRequest(envelope, scope, expectedSequence, expectedR
     }
     if (!chunks.length || chunks.some((chunk) => chunk.length < 1
       || chunk.length > PG_CHUNK_BYTES)) deny();
-    return { scope: bound.scope, operation: bound.operation,
+    return ownNonThenableResult({ scope: bound.scope, operation: bound.operation,
       digest: gateDigest,
       expectedRootHash: computeZk1CiphertextRoot(chunks),
-      expectedChunkCount: chunks.length, chunks };
+      expectedChunkCount: chunks.length, chunks });
   } catch (_) { deny(); }
 }
 
-async function verifySyncV2PhysicalEnvelopeEvidence(input) {
+async function verifySyncV2PhysicalEnvelopeEvidenceInternal(input) {
   try {
     const v = strict(input, ["envelope", "scope", "expectedSequence", "expectedRoot",
       "receipt", "physicalAttestation", "nonce", "pinnedInventoryPublicKey",
@@ -180,33 +275,33 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
     const inventoryKey = v.pinnedInventoryPublicKey;
     const physicalKey = v.pinnedPhysicalAttestorPublicKey;
     const policy = snapshotLocalDevicePolicy(v.localTrustedDevicePolicy);
-    if (await verifyHistoricalAuthorizationProof(bound.envelope.authorization,
-      bound.envelope, policy) !== true) deny();
-    const result = await verifyAttestedInventoryCommit({
+    if (await pinnedNativeAwait(verifyHistoricalAuthorizationProof(bound.envelope.authorization,
+      bound.envelope, policy)) !== true) deny();
+    const result = await pinnedNativeAwait(verifyAttestedInventoryCommit({
       receipt, physicalAttestation: attestation, scope: bound.scope,
       operation: bound.operation, nonce,
       pinnedInventoryPublicKey: inventoryKey,
       pinnedInventorySignerKeyId: signerKeyId,
       pinnedPhysicalAttestorPublicKey: physicalKey,
-      nowSeconds: Math.floor(Date.now() / 1000),
-    });
-    const completedAtSeconds = Math.floor(Date.now() / 1000);
+      nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
+    }));
+    const completedAtSeconds = NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000);
     if (result.status !== "VERIFIED_COMPOSITE_NONAUTHORIZING"
       || result.authorizesIo !== false
       // A proof may cross the ±30 s physical freshness window while CBOR and
       // Ed25519 verification await. Recheck the SIGNED issuance timestamp
       // rather than relying only on the pre-await wall-clock sample.
-      || !Number.isSafeInteger(result.physicalReadback?.issuedAt)
-      || !Number.isSafeInteger(completedAtSeconds) || completedAtSeconds < 1
-      || Math.abs(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
-    return Object.freeze({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
-      operationId: Buffer.from(bound.operation.operation_id),
-      ciphertextSha256: Buffer.from(bound.operation.ciphertext_sha256),
-      receiptDigest: Buffer.from(result.receiptDigest),
+      || !NATIVE_IS_SAFE_INTEGER(result.physicalReadback?.issuedAt)
+      || !NATIVE_IS_SAFE_INTEGER(completedAtSeconds) || completedAtSeconds < 1
+      || NATIVE_MATH_ABS(completedAtSeconds - result.physicalReadback.issuedAt) > 30) deny();
+    return ownNonThenableResult({ status: "SYNC_ZK1_PHYSICAL_ENVELOPE_VERIFIED_NONAUTHORIZING",
+      operationId: NATIVE_BUFFER_FROM(bound.operation.operation_id),
+      ciphertextSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
+      receiptDigest: NATIVE_BUFFER_FROM(result.receiptDigest),
       localPgReadbackVerified: true,
       historicalServerAdmissionProven: false,
       independentlyAnchoredFloorProven: false,
-      externalDurabilityProven: false, authorizesIo: false });
+      externalDurabilityProven: false, authorizesIo: false }, true);
   } catch (_) { deny(); }
 }
 
@@ -216,7 +311,7 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
 // AND answer a fresh challenge with the exact externally pinned physical
 // witness head. The equality rule deliberately rejects advancing histories
 // until an authenticated ancestry protocol is available.
-async function verifySyncV2HistoricalWitnessAdmission(input) {
+async function verifySyncV2HistoricalWitnessAdmissionInternal(input) {
   try {
     const v = strict(input, ["envelope", "scope", "expectedSequence", "expectedRoot",
       "receipt", "physicalAttestation", "nonce", "pinnedInventoryPublicKey",
@@ -229,31 +324,34 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const challenge = checkedBytes(v.nonce, 32);
     const committedInventoryReceipt = checkedBytes(v.receipt, 1,
       inventory.MAX_COMMITTED_PROOF_BYTES);
-    const witnessId = checkedBytes(v.witnessKeyId, 16).toString("base64url");
-    const statusId = checkedBytes(v.statusKeyId, 16).toString("base64url");
-    const witness = v.pinnedWitnessPublicKey;
-    if (!(witness instanceof crypto.KeyObject) || witness.type !== "public"
-      || witness.asymmetricKeyType !== "ed25519") deny();
-    const deviceSpki = checkedBytes(Buffer.from(bound.envelope.authorization.publicKey,
-      "base64url"), 44);
-    const deviceKey = crypto.createPublicKey({ key: deviceSpki,
-      type: "spki", format: "der" });
-    // Witness and all signers must be independently provisioned principals.
-    for (const pin of [v.pinnedInventoryPublicKey, v.pinnedPhysicalAttestorPublicKey,
-      deviceKey]) {
-      if (!(pin instanceof crypto.KeyObject) || pin.type !== "public"
-        || pin.asymmetricKeyType !== "ed25519"
-        || crypto.KeyObject.prototype.equals.call(witness, pin)) deny();
-    }
-    const floorFields = ["type", "witnessKeyId", "statusKeyId", "sequence",
-      "lastHash", "physicalFenceDigest", "nonce", "signature"];
-    const floor = strict(v.freshFloor, floorFields);
+    const witnessId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.witnessKeyId, 16), "base64url");
+    const statusId = NATIVE_BUFFER_TO_STRING.call(checkedBytes(v.statusKeyId, 16), "base64url");
+    // Bind every caller-owned expected byte, record and device identity BEFORE
+    // any KeyObject getter can rewrite ambient factories or the input graph.
+    const floor = strict(v.freshFloor, FLOOR_FIELDS);
     const minimum = strict(v.trustedMinimumFloor,
       ["sequence", "lastHash", "physicalFenceDigest"]);
+    const admission = strict(v.admission, ADMISSION_FIELDS);
+    const physicalAttestation = checkedBytes(v.physicalAttestation, 1, 2048);
+    const inventorySignerKeyId = checkedBytes(v.pinnedInventorySignerKeyId, 16);
+    const initialDevicePolicy = snapshotLocalDevicePolicy(v.localTrustedDevicePolicy);
+    const deviceSpki = checkedBytes(NATIVE_BUFFER_FROM(
+      bound.envelope.authorization.publicKey, "base64url"), 44);
+    const deviceKey = NATIVE_CREATE_PUBLIC_KEY({ key: deviceSpki,
+      type: "spki", format: "der" });
+    // A native key getter can retarget its inherited kHandle. Reimport stable
+    // SPKI identities and compare only native, independent verifier keys.
+    const witness = pinNativeEd25519PublicKey(v.pinnedWitnessPublicKey);
+    const inventoryKey = pinNativeEd25519PublicKey(v.pinnedInventoryPublicKey);
+    const attestorKey = pinNativeEd25519PublicKey(v.pinnedPhysicalAttestorPublicKey);
+    const roles = [inventoryKey, attestorKey, deviceKey];
+    for (let index = 0; index < roles.length; index += 1) {
+      if (NATIVE_KEY_EQUALS.call(witness, roles[index])) deny();
+    }
     const HEX = /^[a-f0-9]{64}$/;
     if (floor.type !== "rootark-zk1-witness-cas-physical-floor/v2"
       || floor.witnessKeyId !== witnessId || floor.statusKeyId !== statusId
-      || floor.nonce !== challenge.toString("base64url")
+      || floor.nonce !== NATIVE_BUFFER_TO_STRING.call(challenge, "base64url")
       || !Number.isSafeInteger(floor.sequence) || floor.sequence < 1
       || floor.sequence > 100000 || !HEX.test(floor.lastHash)
       || !HEX.test(floor.physicalFenceDigest)
@@ -262,53 +360,44 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       || minimum.physicalFenceDigest !== floor.physicalFenceDigest) deny();
     const canonicalSignature = (encoded) => {
       if (typeof encoded !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(encoded)) deny();
-      return checkedBytes(Buffer.from(encoded, "base64url"), 64);
+      return checkedBytes(NATIVE_BUFFER_FROM(encoded, "base64url"), 64);
     };
-    const floorUnsigned = Object.fromEntries(floorFields.slice(0, -1)
-      .map((field) => [field, floor[field]]));
-    if (!crypto.verify(null, Buffer.concat([PHYSICAL_FLOOR_DOMAIN,
-      Buffer.from(JSON.stringify(floorUnsigned))]), witness,
-    canonicalSignature(floor.signature))) deny();
+    if (!NATIVE_VERIFY(null, signedWire(PHYSICAL_FLOOR_DOMAIN,
+      floor, FLOOR_UNSIGNED_FIELDS), witness, canonicalSignature(floor.signature))) deny();
 
-    const admissionFields = ["type", "envelopeSha256", "operationId", "deviceId",
-      "deviceSpkiSha256", "epoch", "checkpointSequence", "checkpointRoot",
-      "inventoryReceiptSha256", "admittedAtMs", "witnessSequence", "witnessLastHash",
-      "witnessPhysicalFenceDigest", "signature"];
-    const admission = strict(v.admission, admissionFields);
-    const digest = (data) => crypto.createHash("sha256").update(data)
-      .digest("base64url");
+    const digest = nativeDigest;
     if (admission.type !== "rootark-sync-v2-historical-witness-admission/v1"
       || admission.envelopeSha256 !== digest(bound.canonicalEnvelope)
-      || admission.operationId !== bound.operation.operation_id.toString("base64url")
+      || admission.operationId !== NATIVE_BUFFER_TO_STRING.call(
+        bound.operation.operation_id, "base64url")
       || admission.deviceId !== bound.envelope.deviceId
       || admission.deviceSpkiSha256 !== digest(deviceSpki)
       || admission.epoch !== bound.operation.epoch
       || admission.checkpointSequence !== bound.operation.expected_sequence
-      || admission.checkpointRoot !== bound.operation.expected_root.toString("base64url")
+      || admission.checkpointRoot !== NATIVE_BUFFER_TO_STRING.call(
+        bound.operation.expected_root, "base64url")
       || !Number.isSafeInteger(admission.admittedAtMs) || admission.admittedAtMs < 1
       || admission.admittedAtMs >= bound.envelope.authorization.expiresAt
-      || admission.admittedAtMs > Date.now()
+      || admission.admittedAtMs > NATIVE_DATE_NOW()
       || admission.witnessSequence !== floor.sequence
       || admission.witnessLastHash !== floor.lastHash
       || admission.witnessPhysicalFenceDigest !== floor.physicalFenceDigest) deny();
-    const admissionUnsigned = Object.fromEntries(admissionFields.slice(0, -1)
-      .map((field) => [field, admission[field]]));
-    if (!crypto.verify(null, Buffer.concat([HISTORICAL_DOMAIN,
-      Buffer.from(JSON.stringify(admissionUnsigned))]), witness,
+    if (!NATIVE_VERIFY(null, signedWire(HISTORICAL_DOMAIN,
+      admission, ADMISSION_UNSIGNED_FIELDS), witness,
     canonicalSignature(admission.signature))) deny();
     // Both cryptographic verifications above happen before the asynchronous
     // PG/inventory proof check; all attacker-controlled values were detached.
-    const physical = await verifySyncV2PhysicalEnvelopeEvidence({
+    const physical = await pinnedNativeAwait(verifySyncV2PhysicalEnvelopeEvidence({
       envelope: bound.envelope, scope: bound.scope,
       expectedSequence: bound.operation.expected_sequence,
       expectedRoot: bound.operation.expected_root,
       receipt: committedInventoryReceipt,
-      physicalAttestation: checkedBytes(v.physicalAttestation, 1, 2048), nonce: challenge,
-      pinnedInventoryPublicKey: v.pinnedInventoryPublicKey,
-      pinnedInventorySignerKeyId: checkedBytes(v.pinnedInventorySignerKeyId, 16),
-      pinnedPhysicalAttestorPublicKey: v.pinnedPhysicalAttestorPublicKey,
-      localTrustedDevicePolicy: snapshotLocalDevicePolicy(v.localTrustedDevicePolicy),
-    });
+      physicalAttestation, nonce: challenge,
+      pinnedInventoryPublicKey: inventoryKey,
+      pinnedInventorySignerKeyId: inventorySignerKeyId,
+      pinnedPhysicalAttestorPublicKey: attestorKey,
+      localTrustedDevicePolicy: initialDevicePolicy,
+    }));
     // Bind the immutable inventory receipt rather than the fresh PG readback
     // signature: its nonce cannot be known when the *historical* admission is
     // signed. The current PG attestor signature is independently challenged.
@@ -323,12 +412,12 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     if (live.username !== bound.envelope.authorization.username
       || live.trustedDevicePublicKeys[bound.envelope.deviceId]
         !== bound.envelope.authorization.publicKey
-      || live.revokedDeviceIds.includes(bound.envelope.deviceId)) deny();
-    return Object.freeze({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
-      envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
+      || NATIVE_ARRAY_INCLUDES.call(live.revokedDeviceIds, bound.envelope.deviceId)) deny();
+    return ownNonThenableResult({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
+      envelopeSha256: NATIVE_BUFFER_FROM(bound.operation.ciphertext_sha256),
       historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,
       localPgReadbackVerified: true, externalDurabilityProven: false,
-      authorizesHistoricalRead: true, authorizesIo: false });
+      authorizesHistoricalRead: true, authorizesIo: false }, true);
   } catch (_) {
     const error = new Error("SYNC_ZK1_HISTORICAL_ADMISSION_DENIED");
     error.code = error.message;
@@ -336,6 +425,14 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
   }
 }
 
+// Pin the OUTER returned native Promise too. The consumer's own await must not
+// assimilate an attacker-installed Promise.prototype.then after a KeyObject getter.
+function verifySyncV2PhysicalEnvelopeEvidence(input) {
+  return pinnedNativeAwait(verifySyncV2PhysicalEnvelopeEvidenceInternal(input));
+}
+function verifySyncV2HistoricalWitnessAdmission(input) {
+  return pinnedNativeAwait(verifySyncV2HistoricalWitnessAdmissionInternal(input));
+}
 module.exports = { envelopeBinding, physicalWriteRequest,
   snapshotLocalDevicePolicy, verifySyncV2PhysicalEnvelopeEvidence,
   verifySyncV2HistoricalWitnessAdmission };

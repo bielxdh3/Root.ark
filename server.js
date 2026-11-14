@@ -6147,8 +6147,32 @@ if ((NODE_ENV === "development" || NODE_ENV === "test")
       { dotfiles: "allow" }));
 }
 app.use(express.static("./public"));
+const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
+const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseError: true }).find((user) => user.username === username);
+const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
+const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
+const requestedZk10LegacyHttpStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
+const strictZk10LegacyHttpEgress = requestedZk10LegacyHttpStrict !== ""
+  && requestedZk10LegacyHttpStrict !== "0" && requestedZk10LegacyHttpStrict !== "off";
+// DEV-OFF owner-original-byte ingress fence. It is intentionally deny-only:
+// neither a JWT nor multipart owner-signature fields can establish a signed
+// pre-upload digest, a current independent issuer, or an off-host floor.
+// Keep the existing in-memory peer/API rate limits ahead of authentication,
+// then deny BEFORE body parsing, folder preparation or Multer can stage bytes.
+// The account-scoped chunk limiter (possibly SQLite) is deliberately later.
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
+app.use((req, res, next) => {
+  if (!strictZk10LegacyHttpEgress) return next();
+  const simple = (req.method === "POST" || req.method === "PUT")
+    && /^\/upload\/?$/i.test(req.path);
+  const chunk = req.method === "POST" && /^\/upload-chunk\/?$/i.test(req.path);
+  if (!simple && !chunk) return next();
+  return authenticate(req, res, () => res.status(503).set("Cache-Control", "no-store").json({
+    error: "ZK10 independent owner-signed original-byte ingress authority unavailable",
+    code: "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE",
+  }));
+});
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (shouldDeferZk1JsonParsing(req, {
@@ -6157,19 +6181,11 @@ app.use((req, res, next) => {
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
   return express.json()(req, res, next);
 });
-const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
-const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseError: true }).find((user) => user.username === username);
-const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
-const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
-
 // DEV-OFF deny-only guard for authenticated legacy HTTP reads. JWT proves a
 // session, NOT an independently signed immutable owner/account cutover state.
 // There is no off-host monotonic floor or external authority in this process.
 // Install before the route handlers so HEAD, If-None-Match, Range and file
 // streams cannot produce legacy metadata, 304s or bytes under strict cutover.
-const requestedZk10LegacyHttpStrict = String(process.env.ROOTARK_ZK10_SYNC_CUTOVER_STRICT || "").trim();
-const strictZk10LegacyHttpEgress = requestedZk10LegacyHttpStrict !== ""
-  && requestedZk10LegacyHttpStrict !== "0" && requestedZk10LegacyHttpStrict !== "off";
 const legacyAuthenticatedHttpReadPaths = [
   /^\/files\/(?:search|[^/]+)\/?$/i,
   /^\/list\/?$/i,
