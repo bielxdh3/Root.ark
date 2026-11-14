@@ -1,5 +1,6 @@
 package dev.rootark.core.auth
 
+import dev.rootark.core.sync.PagedInventoryPolicy
 import java.net.URI
 import java.net.URL
 import java.util.Locale
@@ -11,6 +12,13 @@ class ServerOrigin private constructor(private val origin: String) {
     fun twoFactorUrl(): URL = URL("$origin/auth/login/2fa")
 
     fun syncListUrl(): URL = URL("$origin/sync/v1/objects")
+
+    /** Issue #66: metadata-only, bounded, snapshot-cursor inventory (never full ciphertext list). */
+    fun syncInventoryUrl(cursor: String? = null): URL {
+        if (cursor != null) PagedInventoryPolicy.checkCursor(cursor, emptySet())
+        return URL("$origin/sync/v1/objects?view=metadata&limit=64" +
+            (if (cursor == null) "" else "&cursor=$cursor"))
+    }
 
     companion object {
         fun parse(input: String): ServerOrigin {

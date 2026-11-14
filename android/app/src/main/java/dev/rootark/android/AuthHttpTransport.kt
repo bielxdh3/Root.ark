@@ -3,6 +3,8 @@ package dev.rootark.android
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
 import dev.rootark.core.sync.ReadOnlyFileRow
+import dev.rootark.core.sync.InventoryPage
+import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.RootArkApiException
 import java.io.ByteArrayOutputStream
@@ -42,10 +44,10 @@ internal class AuthHttpTransport {
         return authenticated(json)
     }
 
-    /** The server returns ciphertext in the unpaginated listing; never return it to UI callers. */
-    fun listSyncObjects(origin: ServerOrigin, token: String): List<ReadOnlyFileRow> {
+    /** The issue #66 endpoint returns metadata only; one page is retained at a time. */
+    fun listInventoryPage(origin: ServerOrigin, token: String, cursor: String? = null): InventoryPage {
         require(token.isNotBlank() && token.length <= 4096)
-        val connection = origin.syncListUrl().openConnection() as HttpURLConnection
+        val connection = origin.syncInventoryUrl(cursor).openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "GET"
             connection.instanceFollowRedirects = false
@@ -65,8 +67,8 @@ internal class AuthHttpTransport {
                     val count = stream.read(buffer)
                     if (count < 0) break
                     total += count
-                    if (total > ReadOnlyFileListPolicy.MAX_RESPONSE_BYTES) {
-                        throw SyncListingLimitException("Sync listing exceeds limit")
+                    if (total > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
+                        throw SyncListingLimitException("Inventory page exceeds limit")
                     }
                     out.write(buffer, 0, count)
                 }
@@ -76,9 +78,55 @@ internal class AuthHttpTransport {
                     throw SyncListingValidationException("Malformed JSON in sync listing", e)
                 }
             }
-            return projectList(json)
+            return projectInventoryPage(json)
         } finally {
             connection.disconnect()
+        }
+    }
+
+    internal fun projectInventoryPage(response: JSONObject): InventoryPage {
+        val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid inventory page")
+        if (objects.length() > PagedInventoryPolicy.MAX_ENTRIES) {
+            throw SyncListingLimitException("Inventory page exceeds maximum entry limit")
+        }
+        val version = parseProtocolVersion(response.opt("protocolVersion"))
+            ?: throw SyncListingValidationException("Invalid inventory page")
+        val view = response.opt("view") as? String ?: throw SyncListingValidationException("Invalid inventory page")
+        if (!response.has("nextCursor")) throw SyncListingValidationException("Invalid inventory page")
+        val nextCursor = when (val value = response.opt("nextCursor")) {
+            JSONObject.NULL -> null
+            is String -> value
+            else -> throw SyncListingValidationException("Invalid inventory cursor")
+        }
+        try {
+            PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor)
+            val rows = (0 until objects.length()).map { index ->
+                val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
+                val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
+                val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
+                val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
+                val counter = parseNonNegativeLong(revision.opt("counter"))
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                if (requiredListingString(revision, "deviceId").length > 256) {
+                    throw SyncListingValidationException("Invalid sync listing")
+                }
+
+                ReadOnlyFileListPolicy.project(
+                    protocolVersion = recordVersion,
+                    objectId = requiredListingString(record, "objectId"),
+                    operation = requiredListingString(record, "operation"),
+                    tombstone = deleted,
+                    name = optionalString(metadata, "name"),
+                    path = optionalString(metadata, "path"),
+                    size = optionalLong(metadata, "size"),
+                    contentType = optionalString(metadata, "contentType"),
+                )
+            }
+            return InventoryPage(rows, nextCursor)
+        } catch (_: IllegalArgumentException) {
+            throw SyncListingValidationException("Invalid or oversized inventory page")
         }
     }
 
