@@ -1675,17 +1675,20 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const originalFrom = Buffer.from;
     const key = h.signer.publicKey;
     const poisoned = Object.create(key);
-    let armed = false, getterReads = 0, replacements = 0;
+    let armed = false, getterReads = 0, armedGetterReads = 0, replacements = 0;
     Object.defineProperty(poisoned, "type", { get() {
       getterReads++;
-      if (armed) Buffer.from = function hostilePostKeyBufferCopy(value, ...options) {
-        if (Buffer.isBuffer(value) && value.length === 32
-          && Buffer.compare(value, freshPageNonce) === 0) {
-          replacements++;
-          return Reflect.apply(originalFrom, Buffer, [previousPageNonce]);
-        }
-        return Reflect.apply(originalFrom, Buffer, [value, ...options]);
-      };
+      if (armed) {
+        armedGetterReads++;
+        Buffer.from = function hostilePostKeyBufferCopy(value, ...options) {
+          if (Buffer.isBuffer(value) && value.length === 32
+            && Buffer.compare(value, freshPageNonce) === 0) {
+            replacements++;
+            return Reflect.apply(originalFrom, Buffer, [previousPageNonce]);
+          }
+          return Reflect.apply(originalFrom, Buffer, [value, ...options]);
+        };
+      }
       return "public";
     } });
     const attacked = h.makeClient("status-reader", {
@@ -1701,6 +1704,8 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     }
     assert.ok(requests >= 3, "the actual TLS endpoint must process a fresh replay request");
     assert.ok(getterReads > 0, "a real Ed25519 KeyObject getter must run in the verifier");
+    assert.ok(armedGetterReads > 0,
+      "the hostile native getter must run AFTER the signed request begins, not only at enrollment");
     assert.equal(replacements, 0,
       "derive and composite verification must not consult late-mutated Buffer.from");
   });
