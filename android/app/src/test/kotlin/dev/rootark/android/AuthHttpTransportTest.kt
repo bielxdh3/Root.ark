@@ -245,4 +245,27 @@ class AuthHttpTransportTest {
         assertNull(transport.parsePositiveInt(BigDecimal("1.5")))
         assertNull(transport.parsePositiveInt(BigInteger("99999999999999999999")))
     }
+
+    @Test
+    fun `extreme-scale BigDecimal values reject cleanly without stripTrailingZeros DoS`() {
+        val transport = AuthHttpTransport()
+        val hugePositive = BigDecimal("1e100000000")
+        val tinyNegativeScale = BigDecimal("1e-100000000")
+        val zeroHugeScale = BigDecimal("0e-100000000")
+
+        assertNull(transport.parseProtocolVersion(hugePositive))
+        assertNull(transport.parseProtocolVersion(tinyNegativeScale))
+        assertEquals(0, transport.parseProtocolVersion(zeroHugeScale))
+        assertNull(transport.parseNonNegativeLong(hugePositive))
+        assertNull(transport.parseNonNegativeLong(tinyNegativeScale))
+        assertEquals(0L, transport.parseNonNegativeLong(zeroHugeScale))
+        assertNull(transport.parsePositiveInt(hugePositive))
+        assertNull(transport.parsePositiveInt(zeroHugeScale))
+
+        val jsonHuge = createValidSyncListing()
+        jsonHuge.getJSONArray("objects").getJSONObject(0).getJSONObject("metadata").put("size", hugePositive)
+        assertFailsWith<SyncListingValidationException> {
+            transport.projectList(jsonHuge)
+        }
+    }
 }
