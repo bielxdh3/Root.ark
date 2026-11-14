@@ -238,11 +238,11 @@
   function attachChannel(p, dc) {
     // One reliable, ordered channel per consented peer. A second or unordered
     // peer-created channel must never replace the active transfer state.
-    const invalid = p.dc || (dc.label !== undefined && dc.label !== 'fixture-transfer') ||
-      (dc.ordered !== undefined && !dc.ordered) ||
-      (dc.maxRetransmits != null) || (dc.maxPacketLifeTime != null);
+    const invalid = p.dc || !dc || dc.label !== 'fixture-transfer' ||
+      dc.ordered !== true ||
+      dc.maxRetransmits !== null || dc.maxPacketLifeTime !== null;
     if (invalid) {
-      if (typeof dc.close === 'function') dc.close();
+      if (dc && typeof dc.close === 'function') dc.close();
       record(diagnostics.rejected, 'INVALID_CHANNEL');
       return;
     }
@@ -295,7 +295,7 @@
         } else record(diagnostics.rejected, 'TEXT_DIGEST');
       } else if (m.type === 'offer-file') {
         const isValid = (fileWire && typeof fileWire.validOffer === 'function')
-          ? (fileWire.validOffer(m) || (
+          ? (fileWire.validOffer(m) && (
               typeof m.id === 'string' &&
               /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
               typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
