@@ -2891,12 +2891,14 @@ class SyncEngine {
             }
             let targetHandle;
             let verified = false;
+            let openedStat = null;
+            let pathStat = null;
             try {
               targetHandle = await fsp.open(target, fs.constants.O_RDONLY
                 | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
               try {
-                const openedStat = await targetHandle.stat({ bigint: true });
-                const pathStat = await fsp.lstat(target, { bigint: true });
+                openedStat = await targetHandle.stat({ bigint: true });
+                pathStat = await fsp.lstat(target, { bigint: true });
                 if (openedStat.isFile() && !openedStat.isSymbolicLink()
                   && pathStat.isFile() && !pathStat.isSymbolicLink()
                   && openedStat.nlink >= 2n
@@ -2922,6 +2924,13 @@ class SyncEngine {
               /* Reject on descriptor open, stat, or read failure */
             }
             if (!verified) {
+              if (openedStat && pathStat && sameFileIdentity(openedStat, pathStat)) {
+                try {
+                  await fsp.unlink(target);
+                } catch (unlinkError) {
+                  if (unlinkError?.code !== "ENOENT") throw unlinkError;
+                }
+              }
               fail("Historical restore materialization identity mismatch", "restore_local_conflict");
             }
           } else {

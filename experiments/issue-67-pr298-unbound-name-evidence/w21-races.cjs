@@ -222,6 +222,7 @@ test("GREEN: _apply history rejects substituted foreign temporary and never publ
   }
   try {
     assert.equal(triggered, true, "the original historical publication path was exercised");
+    assert.equal(fs.existsSync(target), false, "unauthenticated substituted target must not be left behind on disk");
     assert.equal(await fsp.readFile(retained, "utf8"), "AUTHENTICATED RESTORE BYTES");
     assert.equal(f.getPushed(), 0, "the existing signed outbound digest gate MUST stay effective");
     assert.equal(f.engine.snapshot.files["document.txt"], undefined, "no corrupt snapshot entry is persisted");
@@ -256,6 +257,7 @@ test("GREEN: in-place modification of temporary bytes (r+) preserving dev/ino/nl
     fsp.link = originalLink;
   }
   assert.equal(triggered, true, "the in-place modification interceptor was exercised");
+  assert.equal(fs.existsSync(target), false, "corrupted in-place target must not be left behind on disk");
   assert.equal(f.getPushed(), 0, "persists zero outbox pushes");
   assert.equal(f.engine.snapshot.files["document.txt"], undefined, "persists zero snapshot entries");
   assert.equal((await f.engine.journal.recover()).length, 0, "zero journal outbox persisted");
