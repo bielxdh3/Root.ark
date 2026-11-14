@@ -16,11 +16,11 @@ object PagedInventoryPolicy {
         return true
     }
 
-    fun checkEnvelope(protocolVersion: Int, view: String, count: Int, nextCursor: String?) {
+    fun checkEnvelope(protocolVersion: Int, view: String, count: Int, nextCursor: String?, previouslyUsedCursors: Set<String> = emptySet()) {
         require(protocolVersion == SYNC_PROTOCOL_VERSION && view == "metadata") { "Invalid inventory view" }
         require(count in 0..MAX_ENTRIES) { "Oversized inventory page" }
         if (nextCursor != null) {
-            checkCursor(nextCursor, emptySet())
+            checkCursor(nextCursor, previouslyUsedCursors)
             require(count > 0) { "Non-advancing inventory page" }
         }
     }

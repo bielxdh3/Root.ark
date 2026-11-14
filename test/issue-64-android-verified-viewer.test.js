@@ -23,6 +23,11 @@ test("native protected text view requires provisioned trust, authenticated fetch
   assert.match(activity, /showProtectedObject/);
   assert.match(activity, /onStop\(/);
   assert.match(activity, /securePreviewText/);
-  assert.match(activity, /FLAG_SECURE/);
+  assert.match(activity, /setFlags\(WindowManager\.LayoutParams\.FLAG_SECURE,\s*WindowManager\.LayoutParams\.FLAG_SECURE\)/, "must set FLAG_SECURE via setFlags");
+  assert.match(activity, /isForeground = true/, "onStart must set isForeground = true");
+  assert.match(activity, /isForeground = false/, "onStop must set isForeground = false");
+  assert.match(activity, /stillActive = \{ isForeground && generation == startedGeneration/, "stillActive must verify isForeground and atomic startedGeneration");
+  assert.match(activity, /setText\(characters,\s*0,\s*characters\.size\)/, "must use CharArray setText without immutable String heap copy");
+  assert.doesNotMatch(activity, /text\(view,\s*String\(characters\)\)/, "must not wrap characters in String");
   assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.tag|\.aad|\.authorization|SharedPreferences|ClipboardManager|WebView/);
 });

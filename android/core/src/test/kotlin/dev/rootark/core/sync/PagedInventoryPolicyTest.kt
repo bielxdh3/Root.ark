@@ -29,6 +29,10 @@ class PagedInventoryPolicyTest {
         assertThrows(IllegalArgumentException::class.java) { PagedInventoryPolicy.checkEnvelope(2, "metadata", 1, "a&x=1") }
         assertThrows(IllegalArgumentException::class.java) { PagedInventoryPolicy.checkEnvelope(2, "metadata", 1, "c".repeat(1025)) }
         assertThrows(IllegalArgumentException::class.java) { PagedInventoryPolicy.checkCursor("cursor", setOf("cursor")) }
+        assertThrows(IllegalArgumentException::class.java) {
+            PagedInventoryPolicy.checkEnvelope(2, "metadata", 1, "repeated_cursor", setOf("repeated_cursor"))
+        }
+        PagedInventoryPolicy.checkEnvelope(2, "metadata", 1, "new_cursor", setOf("old_cursor"))
         assertTrue(PagedInventoryPolicy.checkCursor("fresh", setOf("old")))
     }
 }
