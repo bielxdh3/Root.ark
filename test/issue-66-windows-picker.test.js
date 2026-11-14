@@ -203,3 +203,19 @@ test("issue 66 Windows: root-relative localFolder (e.g. \\sync) resolves against
   assert.deepEqual(launchData.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
 });
 
+test("issue 66 Windows: Resolve-RootArkPath handles bare root (\\\\) and bare drive (C:) cleanly", { skip: process.platform !== "win32" }, async () => {
+  const pickerSource = await fs.readFile(picker, "utf8");
+  const fnMatch = pickerSource.match(/function Resolve-RootArkPath[\s\S]*?\r?\n\}/);
+  assert.ok(fnMatch, "Resolve-RootArkPath helper should be defined in picker");
+  const script = `${fnMatch[0]}
+@((Resolve-RootArkPath 'C:\\work\\cfg' '\\'), (Resolve-RootArkPath 'C:\\work\\cfg' '/'), (Resolve-RootArkPath 'C:\\work\\cfg' 'C:'), (Resolve-RootArkPath 'C:\\work\\cfg' 'D:')) -join '|'`;
+  const runPs5 = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 15000 });
+  assert.equal(runPs5.status, 0, `${runPs5.stdout} ${runPs5.stderr}`);
+  assert.equal(runPs5.stdout.trim(), "C:\\|C:\\|C:\\work\\cfg|D:\\");
+  const pwshCheck = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 15000 });
+  if (!pwshCheck.error) {
+    assert.equal(pwshCheck.status, 0, `${pwshCheck.stdout} ${pwshCheck.stderr}`);
+    assert.equal(pwshCheck.stdout.trim(), "C:\\|C:\\|C:\\work\\cfg|D:\\");
+  }
+});
+

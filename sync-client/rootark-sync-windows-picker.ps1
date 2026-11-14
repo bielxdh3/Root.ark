@@ -8,7 +8,7 @@ param(
 function Resolve-RootArkPath([string]$base, [string]$target) {
   if ([string]::IsNullOrWhiteSpace($target)) { return $base }
   $cleanTarget = $target.Replace('/', '\')
-  $isFullyQualified = if ([type]::GetType('System.IO.Path').GetMethod('IsPathFullyQualified')) {
+  $isFullyQualified = if ($null -ne [IO.Path].GetMethod('IsPathFullyQualified', [type[]]@([string]))) {
     [IO.Path]::IsPathFullyQualified($cleanTarget)
   } else {
     $cleanTarget -match '^[A-Za-z]:\\' -or $cleanTarget -match '^\\\\'
@@ -19,18 +19,18 @@ function Resolve-RootArkPath([string]$base, [string]$target) {
   if ($cleanTarget -match '^\\') {
     $driveRoot = [IO.Path]::GetPathRoot($base)
     if ([string]::IsNullOrEmpty($driveRoot)) { $driveRoot = '\' }
-    return [IO.Path]::GetFullPath((Join-Path $driveRoot $cleanTarget.TrimStart('\')))
+    return [IO.Path]::GetFullPath([IO.Path]::Combine($driveRoot, $cleanTarget.TrimStart('\')))
   }
   if ($cleanTarget -match '^([A-Za-z]:)(.*)$') {
     $drive = $Matches[1]
     $relativePart = $Matches[2].TrimStart('\')
     $baseDrive = if ($base -match '^([A-Za-z]:)') { $Matches[1] } else { '' }
     if ($baseDrive -and $drive.Equals($baseDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
-      return [IO.Path]::GetFullPath((Join-Path $base $relativePart))
+      return [IO.Path]::GetFullPath([IO.Path]::Combine($base, $relativePart))
     }
-    return [IO.Path]::GetFullPath("$drive\$relativePart")
+    return [IO.Path]::GetFullPath([IO.Path]::Combine("$drive\", $relativePart))
   }
-  return [IO.Path]::GetFullPath((Join-Path $base $cleanTarget))
+  return [IO.Path]::GetFullPath([IO.Path]::Combine($base, $cleanTarget))
 }
 
 $Config = Resolve-RootArkPath (Get-Location).ProviderPath $Config
