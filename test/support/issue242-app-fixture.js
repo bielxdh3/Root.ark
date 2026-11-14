@@ -97,7 +97,7 @@ async function fixture({ enabled = true } = {}) {
     socket.on('message', raw => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
-      const idx = waiters.findIndex(w => w.match(msg));
+      const idx = waiters.findIndex(w => w.acceptsEvent(msg));
       if (idx >= 0) waiters.splice(idx, 1)[0].resolve(msg);
       else events.push(msg);
     });
@@ -111,7 +111,7 @@ async function fixture({ enabled = true } = {}) {
       next: (type, timeoutMs = 4_000) => new Promise((resolveNext, reject) => {
         const idx = events.findIndex(e => e.type === type);
         if (idx >= 0) return resolveNext(events.splice(idx, 1)[0]);
-        const waiter = { match: e => e.type === type,
+        const waiter = { acceptsEvent: e => e.type === type,
           resolve: e => { clearTimeout(timer); resolveNext(e); } };
         const timer = setTimeout(() => {
           const pos = waiters.indexOf(waiter);
