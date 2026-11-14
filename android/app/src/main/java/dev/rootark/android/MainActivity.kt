@@ -157,7 +157,17 @@ class MainActivity : Activity() {
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                 403 -> showSession("Servidor negou acesso à lista (403).")
-                else -> showSession("Não foi possível carregar a lista. A resposta pode exceder o limite do protótipo (1 MiB / 128 registros).")
+                else -> {
+                    val message = when (failure) {
+                        is SyncListingLimitException ->
+                            "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
+                        is SyncListingValidationException ->
+                            "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+                        else ->
+                            "Não foi possível carregar a lista. A resposta pode exceder o limite do protótipo (1 MiB / 128 registros)."
+                    }
+                    showSession(message)
+                }
             }
         }
     }
@@ -233,8 +243,8 @@ class MainActivity : Activity() {
             var failure: Exception? = null
             try {
                 response = operation()
-            } catch (caught: Exception) {
-                failure = caught
+            } catch (caught: Throwable) {
+                failure = if (caught is Exception) caught else RuntimeException(caught)
             }
             val completedResponse = response
             val completedFailure = failure

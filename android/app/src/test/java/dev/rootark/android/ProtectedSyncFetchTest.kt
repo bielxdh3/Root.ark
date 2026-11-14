@@ -430,4 +430,51 @@ class ProtectedSyncFetchTest {
         assertEquals(1, networkOpens)
         assertTrue(backgroundKey.all { it == 0.toByte() })
     }
+
+    @Test
+    fun fileKeyIsWipedOnAllExitPathsIncludingInvalidContextAndFetchFailure() {
+        val now = System.currentTimeMillis()
+        val badKey = ByteArray(32) { 0x42.toByte() }
+        val badContext = PinnedSyncReadContext(
+            username = "wrong-user", objectId = "fixture-object-1",
+            fileId = "fixture-file-1", versionId = "fixture-version-1",
+            compartmentId = "private", keyEpoch = "epoch-1",
+            trustedDevicePublicKeys = emptyMap(),
+            revokedDeviceIds = emptySet(),
+            snapshotObtainedAtMillis = now - 1000L,
+            snapshotValidUntilMillis = now + 10_000L,
+        )
+        val gateway = ProtectedSyncFetch { error("Should not fetch") }
+        try {
+            gateway.withVerifiedContent(
+                origin, session, "fixture-object-1",
+                TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(badContext, badKey) },
+            ) {}
+            fail("Expected ProtectedSyncException")
+        } catch (_: ProtectedSyncException) {
+            // Expected
+        }
+        assertTrue("Key must be zeroized on invalid context", badKey.all { it == 0.toByte() })
+
+        val wrongSizeKey = ByteArray(16) { 0x55.toByte() }
+        val validContext = PinnedSyncReadContext(
+            username = "alice", objectId = "fixture-object-1",
+            fileId = "fixture-file-1", versionId = "fixture-version-1",
+            compartmentId = "private", keyEpoch = "epoch-1",
+            trustedDevicePublicKeys = mapOf("dev" to "key"),
+            revokedDeviceIds = emptySet(),
+            snapshotObtainedAtMillis = now - 1000L,
+            snapshotValidUntilMillis = now + 10_000L,
+        )
+        try {
+            gateway.withVerifiedContent(
+                origin, session, "fixture-object-1",
+                TrustedContentGrantProvider { _, _ -> ProtectedContentGrant(validContext, wrongSizeKey) },
+            ) {}
+            fail("Expected ProtectedSyncException")
+        } catch (_: ProtectedSyncException) {
+            // Expected
+        }
+        assertTrue("Wrong-size key must be zeroized", wrongSizeKey.all { it == 0.toByte() })
+    }
 }

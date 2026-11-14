@@ -9,7 +9,12 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.nio.charset.StandardCharsets
+import org.json.JSONException
 import org.json.JSONObject
+
+open class SyncListingException(message: String, cause: Throwable? = null) : IOException(message, cause)
+class SyncListingLimitException(message: String) : SyncListingException(message)
+class SyncListingValidationException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport {
@@ -59,11 +64,15 @@ internal class AuthHttpTransport {
                     if (count < 0) break
                     total += count
                     if (total > ReadOnlyFileListPolicy.MAX_RESPONSE_BYTES) {
-                        throw IOException("Sync listing exceeds limit")
+                        throw SyncListingLimitException("Sync listing exceeds limit")
                     }
                     out.write(buffer, 0, count)
                 }
-                JSONObject(String(out.toByteArray(), StandardCharsets.UTF_8))
+                try {
+                    JSONObject(String(out.toByteArray(), StandardCharsets.UTF_8))
+                } catch (e: JSONException) {
+                    throw SyncListingValidationException("Malformed JSON in sync listing", e)
+                }
             }
             return projectList(json)
         } finally {
@@ -72,19 +81,26 @@ internal class AuthHttpTransport {
     }
 
     private fun projectList(response: JSONObject): List<ReadOnlyFileRow> {
-        val objects = response.optJSONArray("objects") ?: throw IOException("Invalid sync listing")
-        val version = response.opt("protocolVersion") as? Int ?: throw IOException("Invalid sync listing")
+        val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid sync listing")
+        if (objects.length() > ReadOnlyFileListPolicy.MAX_ENTRIES) {
+            throw SyncListingLimitException("Sync listing exceeds maximum entry limit")
+        }
+        val version = parseProtocolVersion(response.opt("protocolVersion"))
+            ?: throw SyncListingValidationException("Invalid sync listing")
         try {
             ReadOnlyFileListPolicy.checkEnvelope(version, objects.length())
             return (0 until objects.length()).map { index ->
-                val record = objects.optJSONObject(index) ?: throw IOException("Invalid sync listing")
-                val metadata = record.optJSONObject("metadata") ?: throw IOException("Invalid sync listing")
-                val deleted = record.opt("tombstone") as? Boolean ?: throw IOException("Invalid sync listing")
-                val recordVersion = record.opt("protocolVersion") as? Int ?: throw IOException("Invalid sync listing")
-                val revision = record.optJSONObject("revision") ?: throw IOException("Invalid sync listing")
-                val counter = revision.opt("counter")
-                if ((counter !is Int && counter !is Long) || (counter as Number).toLong() < 0L ||
-                    requiredString(revision, "deviceId").length > 256) throw IOException("Invalid sync listing")
+                val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
+                val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
+                val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
+                val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
+                val counter = parseNonNegativeLong(revision.opt("counter"))
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                if (requiredString(revision, "deviceId").length > 256) {
+                    throw SyncListingValidationException("Invalid sync listing")
+                }
 
                 ReadOnlyFileListPolicy.project(
                     protocolVersion = recordVersion,
@@ -98,14 +114,44 @@ internal class AuthHttpTransport {
                 )
             }
         } catch (_: IllegalArgumentException) {
-            throw IOException("Invalid or oversized sync listing")
+            throw SyncListingValidationException("Invalid sync listing")
         }
+    }
+
+    private fun parseProtocolVersion(value: Any?): Int? = when (value) {
+        is Int -> value
+        is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
+        is Number -> {
+            val i = value.toInt()
+            if (value.toDouble() == i.toDouble()) i else null
+        }
+        else -> null
+    }
+
+    private fun parseNonNegativeLong(value: Any?): Long? = when (value) {
+        is Int -> if (value >= 0) value.toLong() else null
+        is Long -> if (value >= 0L) value else null
+        is Number -> {
+            val l = value.toLong()
+            if (l >= 0L && value.toDouble() == l.toDouble()) l else null
+        }
+        else -> null
+    }
+
+    private fun parsePositiveInt(value: Any?): Int? = when (value) {
+        is Int -> if (value > 0) value else null
+        is Long -> if (value in 1..Int.MAX_VALUE) value.toInt() else null
+        is Number -> {
+            val i = value.toInt()
+            if (i > 0 && value.toDouble() == i.toDouble()) i else null
+        }
+        else -> null
     }
 
     private fun optionalString(json: JSONObject, key: String): String? {
         val value = json.opt(key)
         if (value == null || value == JSONObject.NULL) return null
-        return value as? String ?: throw IOException("Invalid sync listing")
+        return value as? String ?: throw SyncListingValidationException("Invalid sync listing")
     }
 
     private fun optionalLong(json: JSONObject, key: String): Long? {
@@ -114,7 +160,11 @@ internal class AuthHttpTransport {
         return when (value) {
             is Int -> value.toLong()
             is Long -> value
-            else -> throw IOException("Invalid sync listing")
+            is Number -> {
+                val l = value.toLong()
+                if (value.toDouble() == l.toDouble()) l else throw SyncListingValidationException("Invalid sync listing")
+            }
+            else -> throw SyncListingValidationException("Invalid sync listing")
         }
     }
 
@@ -135,7 +185,7 @@ internal class AuthHttpTransport {
         (json.opt(name) as? String)?.takeIf { it.isNotBlank() } ?: throw IOException("Unexpected authentication response")
 
     private fun requiredPositiveInt(json: JSONObject, name: String): Int =
-        (json.opt(name) as? Int)?.takeIf { it > 0 } ?: throw IOException("Unexpected authentication response")
+        parsePositiveInt(json.opt(name)) ?: throw IOException("Unexpected authentication response")
 
     private fun post(url: java.net.URL, body: JSONObject): Pair<Int, JSONObject> {
         val connection = url.openConnection() as HttpURLConnection
@@ -165,7 +215,11 @@ internal class AuthHttpTransport {
                     if (total > 16 * 1024) throw IOException("Authentication response exceeds limit")
                     output.write(chunk, 0, count)
                 }
-                JSONObject(String(output.toByteArray(), StandardCharsets.UTF_8))
+                try {
+                    JSONObject(String(output.toByteArray(), StandardCharsets.UTF_8))
+                } catch (e: JSONException) {
+                    throw IOException("Malformed JSON in authentication response", e)
+                }
             }
             return status to json
         } finally {
