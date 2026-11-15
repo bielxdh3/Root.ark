@@ -199,6 +199,7 @@ function createTapProgressRecorder(write) {
         if (line === "  ---" && !pending.moduleYamlSeen) {
           pending.moduleYamlSeen = true;
           pending.moduleYamlOpen = true;
+          pending.code = "unknown"; // Discard pre-YAML code before collecting module evidence.
         } else if (line === "  ...") {
           pending.moduleYamlOpen = false;
         }

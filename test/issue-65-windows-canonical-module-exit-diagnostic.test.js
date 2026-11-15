@@ -91,3 +91,22 @@ test("post-YAML failure type, code and location cannot combine with a prior proc
   assert.doesNotMatch(report, /moduleExitCode=137/);
   assert.doesNotMatch(report, /testCodeFailure|ERR_TEST_FAILURE|backup-restore-transaction|\/private\//);
 });
+
+test("pre-YAML code cannot combine with later module exit evidence", () => {
+  const diagnostic = [];
+  const tracker = createTapProgressRecorder((line) => diagnostic.push(line));
+  for (const line of [
+    "not ok 1 - ordinary failed test",
+    "  code: 'ERR_TEST_FAILURE'",
+    "  ---",
+    "  failureType: 'testCodeFailure'",
+    "  error: 'test failed'",
+    "  exitCode: 137",
+    "  ...",
+    "ok 2 - unaffected test",
+  ]) tracker.accept(line);
+  tracker.finish();
+  const report = diagnostic.join("\n");
+  assert.equal(tracker.state.failures, 1);
+  assert.doesNotMatch(report, /moduleExitCode=137/);
+});
