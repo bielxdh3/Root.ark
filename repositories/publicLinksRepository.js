@@ -72,6 +72,20 @@ function getRecordedPublicLinkTokens(tokens = []) {
 function savePublicLinks(entries = {}, options = {}) {
   const db = getDb();
   const now = nowIso();
+  // A stale legacy snapshot is never evidence of capability revocation. An
+  // explicit trash lifecycle supplies the affected resource separately; the
+  // SQLite transaction revokes ALL matching C-tokens, including grants added
+  // after the caller loaded its snapshot.
+  const revocation = options.capabilityRevocation;
+  if (revocation !== undefined && (!revocation || typeof revocation !== "object"
+    || !/^[A-Za-z0-9._:-]{1,160}$/.test(revocation.folderId || "")
+    || (revocation.fileName !== undefined
+      && (!basename(revocation.fileName) || basename(revocation.fileName) !== revocation.fileName))
+    || (revocation.aliases !== undefined
+      && (revocation.fileName === undefined || !Array.isArray(revocation.aliases)
+        || revocation.aliases.some((name) => !basename(name) || basename(name) !== name))))) {
+    throw new Error("Invalid explicit capability trash revocation scope");
+  }
   db.transaction(() => {
     ensureRootFolder(db);
     const existingRows = db.prepare(`
@@ -105,6 +119,17 @@ function savePublicLinks(entries = {}, options = {}) {
       ensureFolderId(db, link.folderId || "root");
       const existing = existingByToken.get(token);
       const existingLink = existing ? rowToLink(existing) : null;
+      // The stored capability policy is immutable under legacy whole-map
+      // reconciliation. A stale or malformed JSON snapshot cannot replace
+      // the binding or silently downgrade an active C-prefixed grant.
+      if (existingLink?.shareKind === "capability-v1"
+        && (link.shareKind !== "capability-v1"
+          || JSON.stringify(existingLink.resourceBinding) !== JSON.stringify(link.resourceBinding)
+          || existingLink.fileName !== fileName
+          || existingLink.folderId !== (link.folderId || "root"))) {
+        activeTokens.add(token);
+        continue;
+      }
       const views = Math.max(Number(link.views) || 0, Number(existing?.views) || 0);
       const downloads = Math.max(Number(link.downloads) || 0, Number(existingLink?.downloads) || 0);
       const activeViewers = {};
@@ -134,6 +159,13 @@ function savePublicLinks(entries = {}, options = {}) {
         ...(existingLink?.lastDownloadedAt && (!link.lastDownloadedAt || existingLink.lastDownloadedAt > link.lastDownloadedAt)
           ? { lastDownloadedAt: existingLink.lastDownloadedAt }
           : {}),
+        // Capability aliases are managed by addCapabilitySession under a
+        // dedicated IMMEDIATE transaction. Always preserve the newest DB
+        // session set rather than replacing it with a stale legacy snapshot.
+        ...(link.shareKind === "capability-v1"
+          ? { capabilitySessions: existingLink?.shareKind === "capability-v1"
+            ? (existingLink.capabilitySessions || {}) : {} }
+          : {}),
       };
       activeTokens.add(token);
       insert.run(
@@ -154,7 +186,30 @@ function savePublicLinks(entries = {}, options = {}) {
     const revoke = db.prepare("UPDATE public_links SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL");
     for (const row of existingRows) {
       if (activeTokens.has(row.token)) continue;
+      // Only the explicit single-token revokeCapability operation can revoke
+      // an UNEXPIRED C-prefixed capability. Absence from a legacy snapshot
+      // may mean another process created it after our read. Expired rows can
+      // still be tombstoned by routine cleanup to bound metadata retention.
+      if (/^C[a-f0-9]{47}$/.test(row.token)
+        && new Date(row.expires_at).getTime() > Date.now()) continue;
       revoke.run(now, row.token);
+    }
+
+    if (revocation) {
+      if (revocation.fileName !== undefined) {
+        // Aliases are explicit directory-entry identities verified against the
+        // live file BEFORE trash rename, never guessed using Unicode casefold.
+        const revokeNamed = db.prepare(`UPDATE public_links SET revoked_at = ?
+          WHERE revoked_at IS NULL AND folder_id = ?
+            AND token GLOB 'C*' AND LENGTH(token) = 48 AND file_name = ?`);
+        for (const fileName of new Set([revocation.fileName, ...(revocation.aliases || [])])) {
+          revokeNamed.run(now, revocation.folderId, fileName);
+        }
+      } else {
+        db.prepare(`UPDATE public_links SET revoked_at = ?
+          WHERE revoked_at IS NULL AND folder_id = ?
+            AND token GLOB 'C*' AND LENGTH(token) = 48`).run(now, revocation.folderId);
+      }
     }
 
     const insertRevoked = db.prepare(`
@@ -183,6 +238,49 @@ function savePublicLinks(entries = {}, options = {}) {
   }).immediate();
 }
 
+function createCapability(token, link) {
+  if (!/^C[a-f0-9]{47}$/.test(token || "") || link?.shareKind !== "capability-v1"
+    || link?.resourceBinding?.version !== 2
+    || !/^[a-f0-9]{64}$/.test(link.resourceBinding.identity || "")
+    || !basename(link.fileName) || basename(link.fileName) !== link.fileName
+    || !link.createdBy || new Date(link.expiresAt).getTime() <= Date.now()) {
+    return { status: "invalid" };
+  }
+  const db = getDb();
+  return db.transaction(() => {
+    ensureRootFolder(db);
+    ensureFolderId(db, link.folderId || "root");
+    const result = db.prepare(`INSERT OR IGNORE INTO public_links
+      (token, folder_id, file_name, created_by, created_at, expires_at,
+       max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`).run(
+      token, link.folderId || "root", link.fileName, link.createdBy,
+      link.createdAt || nowIso(), link.expiresAt, Number(link.maxViews) || 0,
+      0, link.passwordHash || null,
+      jsonStringify({ ...link, capabilitySessions: {} }), permissionsToColumn(link.permissions));
+    return { status: result.changes === 1 ? "ok" : "collision" };
+  }).immediate();
+}
+
+function revokeCapability(token, username) {
+  if (!/^C[a-f0-9]{47}$/.test(token || "")) return { status: "missing" };
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT created_by, metadata_json FROM public_links
+      WHERE token = ? AND revoked_at IS NULL`).get(token);
+    if (!row) return { status: "missing" };
+    const metadata = safeJsonParse(row.metadata_json, {});
+    if (metadata.shareKind !== "capability-v1") return { status: "missing" };
+    const owner = String(row.created_by || metadata.createdBy || "").trim().toLowerCase();
+    if (!owner || owner !== String(username || "").trim().toLowerCase()) {
+      return { status: "forbidden" };
+    }
+    const outcome = db.prepare(`UPDATE public_links SET revoked_at = ?
+      WHERE token = ? AND revoked_at IS NULL`).run(nowIso(), token);
+    return { status: outcome.changes === 1 ? "ok" : "missing" };
+  }).immediate();
+}
+
 function incrementPublicLinkViews(token, link) {
   const db = getDb();
   const update = () => {
@@ -201,6 +299,53 @@ function incrementPublicLinkViews(token, link) {
   const updated = db.inTransaction ? update() : db.transaction(update)();
 
   return updated;
+}
+
+// Mutate precisely ONE capability under SQLite's cross-process writer lock.
+// savePublicLinks() intentionally reconciles an entire legacy snapshot and
+// would revoke unrelated shares or overwrite another exchange's sessions if
+// used after awaiting a filesystem/provider read.
+function addCapabilitySession(token, options = {}) {
+  const { alias, hash, expiresAt, expectedResourceBinding, maxSessions = 8 } = options;
+  if (!/^C[a-f0-9]{47}$/.test(token || "") || !/^[a-f0-9]{32}$/.test(alias || "")
+    || !/^[a-f0-9]{64}$/.test(hash || "") || !Number.isSafeInteger(maxSessions)
+    || maxSessions < 1 || maxSessions > 64) return { status: "invalid" };
+
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(`
+      SELECT token, folder_id, file_name, created_by, created_at, expires_at,
+        max_views, views, password_hash, metadata_json, permissions_json
+      FROM public_links WHERE token = ? AND revoked_at IS NULL
+    `).get(token);
+    if (!row) return { status: "missing" };
+    const link = rowToLink(row);
+    const expiry = new Date(row.expires_at).getTime();
+    const sessionExpiry = new Date(expiresAt).getTime();
+    const now = Date.now();
+    if (link.shareKind !== "capability-v1" || link.resourceBinding?.version !== 2
+      || JSON.stringify(link.resourceBinding) !== JSON.stringify(expectedResourceBinding)
+      || (options.expectedFileName !== undefined && link.fileName !== options.expectedFileName)
+      || (options.expectedFolderId !== undefined && link.folderId !== options.expectedFolderId)
+      || !Number.isFinite(expiry) || expiry <= now
+      || !Number.isFinite(sessionExpiry) || sessionExpiry <= now || sessionExpiry > expiry
+      || sessionExpiry > now + 5 * 60_000) return { status: "changed" };
+
+    const sessions = Object.entries(link.capabilitySessions || {})
+      .filter(([id, item]) => /^[a-f0-9]{32}$/.test(id)
+        && /^[a-f0-9]{64}$/.test(item?.hash || "")
+        && Number.isFinite(new Date(item.expiresAt).getTime())
+        && new Date(item.expiresAt).getTime() > now
+        && new Date(item.expiresAt).getTime() <= expiry)
+      .sort((a, b) => new Date(b[1].expiresAt).getTime() - new Date(a[1].expiresAt).getTime())
+      .slice(0, maxSessions - 1);
+    if (sessions.some(([id]) => id === alias)) return { status: "collision" };
+    link.capabilitySessions = Object.fromEntries([...sessions, [alias, { hash, expiresAt }]]);
+    const updated = db.prepare(`UPDATE public_links SET metadata_json = ?
+      WHERE token = ? AND revoked_at IS NULL`).run(jsonStringify(link), token);
+    if (updated.changes !== 1) return { status: "missing" };
+    return { status: "ok", expiresAt };
+  }).immediate();
 }
 
 function consumePublicLinkQuota(token, options = {}) {
@@ -316,9 +461,12 @@ function consumePublicLinkQuota(token, options = {}) {
 }
 
 module.exports = {
+  addCapabilitySession,
+  createCapability,
   consumePublicLinkQuota,
   getRecordedPublicLinkTokens,
   incrementPublicLinkViews,
   loadPublicLinks,
+  revokeCapability,
   savePublicLinks,
 };
