@@ -122,7 +122,7 @@ async function physicalReceipt(f) {
   const now = Math.floor(Date.now() / 1000);
   const nonce = Buffer.alloc(32, 29);
   const digest = Buffer.alloc(32, 30);
-  const signed = await pg.signCommittedPhysicalReadback({
+  const request = {
     scope: f.scope, operation: f.operation, nonce, issuedAt: now,
     readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
       walFlushConfirmed: true, generation: 1, admissionId: Buffer.alloc(16, 31),
@@ -131,8 +131,10 @@ async function physicalReceipt(f) {
       expectedInventoryRoot: f.operation.expected_root, chunkCount: 1,
       root: Buffer.alloc(32, 32), ciphertextSha256: f.operation.ciphertext_sha256,
       authorizesIo: false, provesIndependentOperator: false },
-  }, (f.pgSigner || f.signer).privateKey);
-  return { signed, now, nonce, digest };
+  };
+  const signed = await pg.signCommittedPhysicalReadback(request,
+    (f.pgSigner || f.signer).privateKey);
+  return { signed, now, nonce, digest, request };
 }
 
 test("P2 PG: native getter cannot substitute signature verification or byte comparison", async () => {
@@ -573,6 +575,44 @@ test("P2 PG: hostile CBOR Object.keys cannot transiently sign A while returning 
   assert.equal(accepted, undefined,
     "genuine signed A cannot authenticate the unsigned generation B");
   assert.equal((await verify(f.signer.publicKey, signed)).generation, 1);
+});
+
+test("P2 PG signer refuses fabricated Uint8Array nonce without a native byte view", async () => {
+  const f = fixture();
+  const { request, signed } = await physicalReceipt(f);
+  const impostor = Object.create(Uint8Array.prototype);
+  Object.defineProperties(impostor, { length: { value: 32 },
+    buffer: { value: new ArrayBuffer(32) } });
+  for (let index = 0; index < 32; index += 1) impostor[index] = request.nonce[index];
+  assert.equal(impostor instanceof Uint8Array, true);
+  assert.equal(ArrayBuffer.isView(impostor), false);
+  assert.deepEqual(Buffer.from(impostor), request.nonce,
+    "array-like impostor is copyable despite lacking typed-array internal slots");
+  await assert.rejects(pg.signCommittedPhysicalReadback({ ...request, nonce: impostor },
+    f.signer.privateKey), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+  assert.equal((await pg.verifyCommittedPhysicalReadback(signed, {
+    scope: f.scope, operation: f.operation, nonce: request.nonce,
+    expected: undefined, pinnedPublicKey: f.signer.publicKey,
+    nowSeconds: request.issuedAt,
+  })).verified, true);
+});
+
+test("P2 PG verifier refuses SharedArrayBuffer-backed proof with spoofed .buffer", async () => {
+  const f = fixture();
+  const { signed, now, nonce } = await physicalReceipt(f);
+  const shared = new Uint8Array(new SharedArrayBuffer(signed.length));
+  shared.set(signed);
+  Object.defineProperty(shared, "buffer", { value: new ArrayBuffer(signed.length) });
+  assert.equal(shared.buffer instanceof SharedArrayBuffer, false,
+    "the existing public .buffer check can be fooled");
+  await assert.rejects(pg.verifyCommittedPhysicalReadback(shared, {
+    scope: f.scope, operation: f.operation, nonce, expected: undefined,
+    pinnedPublicKey: f.signer.publicKey, nowSeconds: now,
+  }), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+  assert.equal((await pg.verifyCommittedPhysicalReadback(signed, {
+    scope: f.scope, operation: f.operation, nonce, expected: undefined,
+    pinnedPublicKey: f.signer.publicKey, nowSeconds: now,
+  })).verified, true);
 });
 
 test("P2 PG: Set.prototype.has after native KeyObject getter cannot sign A but return forged B", async () => {

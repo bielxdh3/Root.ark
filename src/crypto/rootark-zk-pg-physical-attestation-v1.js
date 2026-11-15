@@ -4,7 +4,9 @@
 // PostgreSQL attestor AFTER it has verified bytes and a WAL flush barrier.
 // Neither this signature nor an mTLS ACK proves external/cloud durability.
 const crypto = require("node:crypto");
-const { types: { isProxy: NATIVE_IS_PROXY, isPromise: NATIVE_IS_PROMISE } } = require("node:util");
+const { types: { isProxy: NATIVE_IS_PROXY, isPromise: NATIVE_IS_PROMISE,
+  isUint8Array: NATIVE_IS_UINT8_ARRAY,
+  isSharedArrayBuffer: NATIVE_IS_SHARED_ARRAY_BUFFER } } = require("node:util");
 const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY, mathAbs: NATIVE_MATH_ABS,
   sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
   getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY,
@@ -18,6 +20,16 @@ const z = require("./rootark-zk-1");
 const NATIVE_ENCODE_DETERMINISTIC = z.encodeDeterministic.bind(z);
 const NATIVE_DECODE_DETERMINISTIC = z.decodeDeterministic.bind(z);
 const PG_PROMISE = Promise;
+// TypedArray.prototype intrinsic accessors read the actual view slots. An
+// object may inherit Uint8Array.prototype without being a view, and a genuine
+// view may shadow .buffer/.length after a hostile KeyObject getter runs.
+const NATIVE_TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const NATIVE_VIEW_BUFFER = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE, "buffer").get;
+const NATIVE_VIEW_OFFSET = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE, "byteOffset").get;
+const NATIVE_VIEW_LENGTH = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE, "length").get;
 
 function pgPromiseThen(onFulfilled, onRejected) {
   const pending = this;
@@ -124,10 +136,20 @@ function hasSignedFields(unsigned) {
     if (!NATIVE_HAS_OWN(unsigned, FIELDS[i])) return false;
   }
   return true;
-}function bytes(v, length) {
-  if ((!Buffer.isBuffer(v) && !(v instanceof Uint8Array)) || v.length !== length
-    || (typeof SharedArrayBuffer !== "undefined" && v.buffer instanceof SharedArrayBuffer)) deny();
-  return NATIVE_BUFFER_FROM(v);
+}
+function boundedBytes(v, minimum, maximum) {
+  if (!NATIVE_IS_UINT8_ARRAY(v)) deny();
+  const length = NATIVE_APPLY(NATIVE_VIEW_LENGTH, v, []);
+  if (length < minimum || length > maximum) deny();
+  const backing = NATIVE_APPLY(NATIVE_VIEW_BUFFER, v, []);
+  if (NATIVE_IS_SHARED_ARRAY_BUFFER(backing)) deny();
+  const offset = NATIVE_APPLY(NATIVE_VIEW_OFFSET, v, []);
+  // Buffer.from(ArrayBuffer) makes a view; copy it once more so subsequent
+  // asynchronous verification cannot observe changes to the caller's bytes.
+  return NATIVE_BUFFER_FROM(NATIVE_BUFFER_FROM(backing, offset, length));
+}
+function bytes(v, length) {
+  return boundedBytes(v, length, length);
 }
 function count(n, minimum) {
   if (!Number.isSafeInteger(n) || n < minimum) deny();
@@ -143,11 +165,9 @@ function key(value, kind) {
 }
 function scopeOf(scope) {
   exact(scope, ["account_id", "compartment_id", "keyring_id"]);
-  const compartment = scope.compartment_id;
-  if ((!Buffer.isBuffer(compartment) && !(compartment instanceof Uint8Array))
-    || compartment.length < 1 || compartment.length > 128) deny();
   return { account_id: bytes(scope.account_id, 16),
-    compartment_id: NATIVE_BUFFER_FROM(compartment), keyring_id: bytes(scope.keyring_id, 16) };
+    compartment_id: boundedBytes(scope.compartment_id, 1, 128),
+    keyring_id: bytes(scope.keyring_id, 16) };
 }
 function operationOf(op) {
   exact(op, ["operation_id", "expected_sequence", "expected_root", "object_id",
@@ -211,11 +231,7 @@ async function verifyCommittedPhysicalReadbackInternal(raw, options = {}) {
     // Validate the untrusted transport value *before* any Buffer.from coercion.
     // A foreign object may have an attacker-supplied iterator/valueOf; an
     // enormous typed array must never be copied merely to measure its size.
-    if ((!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array))
-      || raw.length < 1 || raw.length > 2048
-      || (typeof SharedArrayBuffer !== "undefined"
-        && raw.buffer instanceof SharedArrayBuffer)) deny();
-    const serialized = NATIVE_BUFFER_FROM(raw);
+    const serialized = boundedBytes(raw, 1, 2048);
     // Never use the caller-owned KeyObject across an await. Its inherited
     // kHandle getter can switch from pinned key B to signing key A after
     // validation while keeping a genuine Ed25519 signature on A.
