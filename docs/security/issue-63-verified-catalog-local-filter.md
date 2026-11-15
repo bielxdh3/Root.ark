@@ -45,3 +45,30 @@ users reimport their offline 32-byte metadata key. Corpus remains filenames
 of current catalog versions only: no content full-text, cross-device transfer
 of index artifacts, search ranking or historical backup search. Issue #63
 continues beyond this bounded filename index.
+
+## Follow-up: explicit, locally pinned text preview of one signed version
+
+After manual owner/witness/CAS anchoring and filename selection, the owner may
+choose **one** catalog revision and import three artifacts held separately
+from the Root.ark server: the exact canonical content metadata JSON, its
+32-byte per-version CEK, and a separately pinned SHA-256 digest of that CEK.
+The browser rechecks the current device grant and independent owner floor,
+performs the existing authenticated signed ciphertext GET, and verifies the
+exact catalog object ID, revision, epoch and ciphertext SHA-256. Only then
+does the existing file-content AES-GCM primitive authenticate the supplied
+metadata and decrypt the envelope locally. The preview renders UTF-8 text
+with DOM textContent, limited to 64 KiB and four passive MIME types; nontext
+and oversized content are rejected. The browser clears the preview on input,
+selection change, dialog close, logout and pagehide and zeroes temporary
+Uint8Array secret/plaintext buffers after each operation.
+
+**Trust limitation:** the separately supplied CEK hash is a comparison pin,
+not an owner signature or a verified CEK distribution protocol. The owner
+must independently authenticate its provenance and the offline metadata/CEK.
+An arbitrary digest typed from the same untrusted CEK source proves nothing.
+Without all imported material and a live signed GET, the preview remains
+locked. The application server never receives the CEK, metadata document,
+search term or plaintext. No persistent plaintext cache, automatic grant
+redemption, encrypted key transfer, cross-device CEK provisioning or
+production recovery guarantee is introduced; the separate #68 key-transfer
+work is not changed.
