@@ -51,6 +51,26 @@ The opt-in Node `createProtectedRecipientShareOffer` helper accepts a four-field
 
 The recipient can import that JSON through `openPortableProtectedRecipientShareFile`, supplying their already authenticated share GET session, nonexportable device signing key, independently pinned owner/V2 approval and witness history, recipient HPKE private key, and monotonic sequence floor. It verifies the offer identity and grant before invoking the existing ciphertext redemption, HPKE and file AEAD checks. A grant revoked or expired before the HTTP read fails at server admission or at the client's signed-expiry check. The local offer is not itself revocable after the recipient has obtained the ciphertext and CEK. The helper does not automatically distribute the offer, authorize new accounts or devices, discover contact keys, independently prove a revocation ledger, or produce a browser UI. All flags remain DEV-OFF. Real independent custody, identity enrollment for accounts outside the owner's V2 roster, and a reviewed delivery channel remain external prerequisites.
 
+### Local owner→recipient CLI using existing trust (DEV-OFF)
+
+`scripts/zk1-recipient-offer-local.js` is a small CommonJS **file I/O shell around those existing reviewed helpers**, not a key manager, identity provider, grant issuer, verifier for external custody, account onboarding tool or production CLI. It does not create or discover trust, keys, server sessions, signed grants, owner recovery approvals or an external authority. The owner must first obtain the real authenticated four-field `/zk-1/v1/share/grant` ACK and independently pin the issuer and intended recipient. Both machines must independently provision the required current V2/witness/roster authority and keys. No example or fallback test authority is installed.
+
+On the owner's workstation, put `grant-ack.json` and a **privately provisioned, trusted** `trusted-share.js` in an existing owner-only directory, then run:
+
+```sh
+node scripts/zk1-recipient-offer-local.js export --owned-dir /absolute/private-owner-dir --context-module trusted-share.js --grant grant-ack.json --offer portable-offer.json
+```
+
+The owner explicitly delivers only `portable-offer.json` through a separately trusted channel into the recipient's own preprotected directory. The recipient's **separate** trusted module and authenticated HTTP session then run:
+
+```sh
+node scripts/zk1-recipient-offer-local.js redeem --owned-dir /absolute/private-recipient-dir --context-module trusted-share.js --offer portable-offer.json --output recovered-private.bin
+```
+
+The private CommonJS module exports one async function `buildTrusted(role, artifact)`. In `export` mode `artifact` is the untrusted ACK and the module must return **only** the 11 existing helper inputs `{ recipientPin, issuerPin, readIndependentAuthority, ownerPrivateKey, ownerHeldCek, metadata, objectRevision, ciphertext, ciphertextRoot, authority, nowSeconds }`, all from the operator's already independently authenticated local sources, **never** from the proposed grant. In `redeem` mode `artifact` is the untrusted portable offer and the module returns **only** `{ redeemInput, authority, operatorMinimumSequence, deviceHpkePrivateKey, nowSeconds }`. `redeemInput` must contain the recipient's real account/device identity, a **nonexportable Ed25519 private signing CryptoKey**, `origin`, `grant: artifact.grant`, a real `readIndependentAuthority` provider and an **already authenticated** `fetchImpl` for the signed `/share/read` endpoint. The other fields are the real externally pinned owner/V2/witness proof and recipient X25519 key. The CLI delegates signature, HPKE, AEAD, current head, epoch and expiration verification to the existing modules; supplying no proven authority fails closed. A copied offer alone does not supply authentication.
+
+The CLI accepts only basenames inside the preexisting owner-only directory; uses the existing local owner-workflow private directory, trusted module and native NTFS/POSIX checks; refuses overwrites and symlink outputs; creates the offer or recovered plaintext as a new owner-only file; clears the opened plaintext buffer; and prints **only** fixed status tokens. It never prints a username, filename, key, plaintext or server response. A write failure may leave a partial artifact in the *private* directory rather than unlinking an attacker-replaced pathname; inspect/remove that private artifact before retrying. The recipient retains any successfully recovered plaintext, so later revocation cannot revoke that already-released copy; future signed HTTP GETs remain subject to live server revocation. This DEV-OFF workflow is not automatic public sharing and is not enabled without an operator-supplied genuine authority.
+
 ## Current evidence and boundary
 
 The existing public-link system still uses bearer links in `server.js` and `public-links.json`/`public_links`. The separate authenticated DEV-only ciphertext grant is bounded to a pre-enrolled device and has no independent recipient key delivery, so full public Zero-Knowledge sharing remains incomplete. Existing links remain explicitly legacy until separately reviewed compatibility or migration is approved.

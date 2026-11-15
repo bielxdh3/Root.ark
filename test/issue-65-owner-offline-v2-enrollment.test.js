@@ -7,7 +7,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const express = require("express");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
-const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
+const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
+  require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const protectedClient = require("../public/client/rootark-zk1-protected-http-client");
 const content = require("../public/client/rootark-zk1-file-content");
@@ -26,6 +27,12 @@ const { openProtectedRecipientShareFile, createProtectedRecipientShareOffer,
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
+const { assertAuthenticOwnerGrantAck } =
+  require("./support/issue-68-owner-grant-ack-fixture");
+const portableCli = (() => {
+  try { return require("../scripts/zk1-recipient-offer-local"); }
+  catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
+})();
 const z = require("../src/crypto/rootark-zk-1");
 const manifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const verify = require("../src/crypto/rootark-zk-recovery-history-v2");
@@ -135,7 +142,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     epoch: former.current_epoch,
   };
   const fresh = await newDeviceRequest();
-  const now = Math.floor(Date.now() / 1000);
+  let now = Math.floor(Date.now() / 1000);
   const priorCommitment = signReceipt({ revision: former.revision,
     digest: externalCurrentHead.digest, epoch: former.current_epoch,
     sequence: 10, issued_at: now, expires_at: now + 600 });
@@ -386,11 +393,22 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     trustedPriorCommitment: priorCommitment, nowSeconds: now - 60,
   }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/, "caller clock rollback cannot extend PoP");
 
-  await t.test("DEV-OFF: owner-signed file CEK rewrap lets independent B decrypt signed HTTP after real SQLite restart", async (sub) => {
+  for (const [payloadLabel, bytes] of [
+    ["zero-byte", Buffer.alloc(0)],
+    ["nonempty", Buffer.from("distinct-B-HPKE-signed-http-sqlite-restart-evidence")],
+  ]) await t.test(`DEV-OFF: owner-signed ${payloadLabel} file CEK rewrap decrypts signed HTTP after real SQLite restart`, async (sub) => {
+    // Each independent fixture starts with a fresh wall-clock window.
+    now = Math.floor(Date.now() / 1000);
     const dir = createPrivateAuthorityFixture("zk65-distinct-b-restore-");
     const filename = path.join(dir, "protected.sqlite");
     const currentManifest = candidate.manifest;
     const currentDigest = await manifest.recoveryManifestDigestV2(currentManifest);
+    const currentVerifiedHistory = await verify.verifyRecoveryHistoryPublicV2({
+      expectedScope: state.scope, baseManifest: state.baseManifest,
+      baseReceipt: state.baseReceipt, pinnedWitness: state.pinnedWitness,
+      transitions: [...state.transitions, Buffer.from(await z.encodeDeterministic(currentManifest))],
+      packageEnvelopes: state.packageEnvelopes, now: 1400,
+    });
     const freshWitnessKeyId = crypto.randomBytes(16);
     const witnessProvider = {
       async freshHead({ nonce }) {
@@ -409,6 +427,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     };
     const storeArgs = { trustedScope: state.scope, bootstrapNew: true,
       admissionRequired: true, witnessProvider,
+      signedHistoryRequired: true,
+      signedHistoryGenesisDigest: await manifest.recoveryManifestDigestV2(state.baseManifest),
+      verifiedHistoryProvider: async () => currentVerifiedHistory,
       witnessPinned: { keyId: freshWitnessKeyId, publicKey: witness.publicKey },
       minimumHead: { revision: 1, witnessSequence: 1,
         digest: await manifest.recoveryManifestDigestV2(state.baseManifest) },
@@ -417,8 +438,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     let store = new Zk1ProtectedObjectStore(filename, storeArgs);
     const app = express();
     const authenticated = (req, res, next) => {
-      if (req.get("x-fixture-session") !== "owner") return res.sendStatus(401);
-      req.user = { username: "owner" }; next();
+      const username = req.get("x-fixture-session");
+      if (!["owner", "recipient"].includes(username)) return res.sendStatus(401);
+      req.user = { username, sessionVersion: 1 }; next();
     };
     const liveStore = { put: (...args) => store.put(...args),
       get: (...args) => store.get(...args),
@@ -458,7 +480,6 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       epoch: currentManifest.current_epoch, kind: "file" };
     const ownerHeldCek = crypto.randomBytes(32);
     const originalCek = await content.importFileCek(ownerHeldCek);
-    const bytes = Buffer.from("distinct-B-HPKE-signed-http-sqlite-restart-evidence");
     const sealed = await content.encryptFile({ cek: originalCek, metadata,
       name: "private.txt", mediaType: "text/plain", data: bytes });
     const put = await protectedClient.signProtectedContentOperation({
@@ -469,10 +490,17 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(puts, 1);
     store.close();
     store = new Zk1ProtectedObjectStore(filename, { ...storeArgs, bootstrapNew: false });
+    // Mount the real signed-history-backed share routes only on the reopened
+    // native store, not the mutable content-store proxy used across restart.
+    const shareRouter = express.Router();
+    registerZk1ProtectedObjectRoutes({ app: shareRouter, store,
+      authenticate: authenticated, requirePermission: () => (_req, _res, next) => next(),
+      resolveTrustedScope: (user) => user.username === "owner" ? state.scope : null });
+    app.use(shareRouter);
     const persisted = store.db.prepare("SELECT revision, ciphertext FROM zk_content_object WHERE id=?")
       .get(metadata.object_id);
     assert.equal(persisted.revision, 1, "physical SQLite reopened with committed ciphertext");
-    assert.equal(Buffer.from(persisted.ciphertext).includes(bytes), false,
+    if (bytes.length) assert.equal(Buffer.from(persisted.ciphertext).includes(bytes), false,
       "protected SQLite must never contain file plaintext");
     assert.equal(Buffer.from(persisted.ciphertext).equals(Buffer.from(sealed)), true);
     const currentEpoch = currentManifest.epochs.find((row) => row.epoch === metadata.epoch);
@@ -757,10 +785,38 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       recipientUsername: "recipient", recipientDeviceId: fresh.request.device_id,
       expiresAt: now + 129 };
     const message = await shareGrantMessageV1(grantInput);
-    const grant = { grantId: grantInput.grantId, expiresAt: grantInput.expiresAt,
-      shareStatementBase64: b64(message.subarray(Buffer.byteLength(
-        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
-      shareSignatureBase64: b64(crypto.sign(null, message, originalActor)) };
+    const shareSignatureBase64 = b64(crypto.sign(null, message, originalActor));
+    const shareAuthorizationWire = Object.fromEntries(
+      Object.entries(shareAuthorization).map(([key, value]) =>
+        [key, value instanceof Uint8Array ? b64(value) : value]));
+    const actualGrantAck = await fetch(origin + "/zk-1/v1/share/grant", {
+      method: "POST", headers: { "content-type": "application/json",
+        "x-fixture-session": "owner" }, body: JSON.stringify({
+        grantId: grantInput.grantId, recipientUsername: grantInput.recipientUsername,
+        recipientDeviceId: grantInput.recipientDeviceId, expiresAt: grantInput.expiresAt,
+        authorization: shareAuthorizationWire,
+        signatureBase64: b64(crypto.sign(null,
+          await contentAuthorizationMessageV1(shareAuthorization), originalActor)),
+        shareSignatureBase64,
+      }),
+    });
+    assert.equal(actualGrantAck.status, 201,
+      "genuine server share/grant persists an owner-signed, recipient-scoped grant");
+    const grant = await actualGrantAck.json();
+    // The signed grant exported to the owner-private CLI fixture must be
+    // reconstructed from owner-held inputs. Never write network JSON to disk:
+    // even a 201 response is not an independent owner authority.
+    const ownerSignedGrantAck = Object.freeze({
+      grantId: grantInput.grantId,
+      expiresAt: grantInput.expiresAt,
+      shareStatementBase64: b64(message.subarray(
+        Buffer.byteLength("Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64,
+    });
+    assertAuthenticOwnerGrantAck(grant, ownerSignedGrantAck, message,
+      crypto.createPublicKey(originalActor));
+    assert.ok(JSON.stringify(grant) === JSON.stringify(ownerSignedGrantAck),
+      "HTTP ACK bytes must exactly match the owner-signed fixture JSON");
     const readIndependentAuthority = async () => ({ scope,
       head: { revision: currentManifest.revision, epoch: currentManifest.current_epoch,
         digest: Uint8Array.from(currentDigest) },
@@ -769,15 +825,16 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         authorizationPublicKey: Uint8Array.from(device.authorization_public_key),
         enrolledEpoch: device.enrolled_epoch, revokedAtEpoch: device.revoked_at_epoch,
       })) });
+    let realShareReads = 0;
     const recipientShareInput = { origin, grant, recipientUsername: "recipient",
       recipientDeviceId: fresh.request.device_id, signerKey: newPrivate,
       readIndependentAuthority, nowSeconds: () => now + 9,
-      fetchImpl: async () => new Response(JSON.stringify({
-        id: metadata.object_id, revision: 1, epoch: metadata.epoch,
-        ciphertextBase64: b64(recoveredCiphertext),
-        shareStatementBase64: grant.shareStatementBase64,
-        shareSignatureBase64: grant.shareSignatureBase64,
-      }), { status: 200, headers: { "content-type": "application/json" } }),
+      fetchImpl: (url, options) => {
+        if (url.endsWith("/share/read")) realShareReads++;
+        return fetch(url, { ...options, headers: {
+          ...options.headers, "x-fixture-session": "recipient",
+        } });
+      },
     };
     const bridgeArgs = { redeemInput: recipientShareInput, envelope,
       authority: { ...linked, nowSeconds: now + 9 },
@@ -813,6 +870,143 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(openedOffer.data), bytes,
       "a separately authenticated recipient account/device opens the real AEAD bytes");
     openedOffer.data.fill(0);
+    assert.ok(realShareReads >= 1,
+      "recipient actually made a signed HTTP share/read request to the disposable SQLite server");
+    assert.equal(typeof portableCli.run, "function",
+      "missing owner-export/recipient-redeem local CLI for existing trusted contexts");
+    // A real owner/recipient trust adapter supplies the already pinned keys and
+    // independently verified V2 proof in memory. Nothing writes key bytes to
+    // disk, CLI args or logs. The CLI must not mint authority itself.
+    const testContextId = "__rootarkShareContext" + crypto.randomBytes(8).toString("hex");
+    let issuerRevokedInClient = false;
+    let swapHttpObject = false;
+    let withoutTrustedAuthority = false;
+    let withoutIssuerPin = false;
+    let withoutRecipientSession = false;
+    globalThis[testContextId] = async (role, input) => {
+      if (role === "export") {
+        const { grant: unusedGrant, ...trusted } = ownerOfferArgs;
+        return { ...trusted,
+          issuerPin: withoutIssuerPin ? null : trusted.issuerPin,
+          readIndependentAuthority: withoutTrustedAuthority
+            ? null : trusted.readIndependentAuthority,
+          ownerHeldCek: Buffer.from(ownerHeldCek),
+          ciphertext: Buffer.from(sealed) };
+      }
+      if (role === "redeem") {
+        const originalFetch = recipientShareInput.fetchImpl;
+        return { redeemInput: {
+          ...recipientShareInput, grant: input.grant,
+          readIndependentAuthority: withoutTrustedAuthority ? null
+            : issuerRevokedInClient ? async () => {
+            const snapshot = await readIndependentAuthority();
+            snapshot.devices.find((entry) =>
+              entry.deviceId === issuerPin.deviceId).revokedAtEpoch = metadata.epoch;
+            return snapshot;
+          } : readIndependentAuthority,
+          fetchImpl: withoutRecipientSession ? fetch
+            : swapHttpObject ? async (url, options) => {
+            const response = await originalFetch(url, options);
+            if (response.status !== 200) return response;
+            const body = await response.json();
+            body.id = b64(crypto.randomBytes(16));
+            return new Response(JSON.stringify(body), { status: 200,
+              headers: { "content-type": "application/json" } });
+          } : originalFetch,
+        }, authority: { ...linked, nowSeconds: now + 9 },
+        operatorMinimumSequence: signedCommittedHead.sequence,
+        deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 };
+      }
+      throw Error("UNTRUSTED_MODE");
+    };
+    sub.after(() => { delete globalThis[testContextId]; });
+    fs.writeFileSync(path.join(dir, "trusted-share.js"),
+      'module.exports = (role, input) => globalThis['
+      + JSON.stringify(testContextId) + '](role, input);\n',
+      { mode: 0o600, flag: "wx" });
+    fs.writeFileSync(path.join(dir, "grant-ack.json"), JSON.stringify(ownerSignedGrantAck),
+      { mode: 0o600, flag: "wx" });
+    const runOwnerExport = (grantFile, outputFile) => portableCli.run([
+      "export", "--owned-dir", dir, "--context-module", "trusted-share.js",
+      "--grant", grantFile, "--offer", outputFile,
+    ]);
+    const runRecipientRedeem = (offerFile, outputFile) => portableCli.run([
+      "redeem", "--owned-dir", dir, "--context-module", "trusted-share.js",
+      "--offer", offerFile, "--output", outputFile,
+    ]);
+    assert.equal(await runOwnerExport("grant-ack.json", "portable-offer.json"),
+      "ZK_RECIPIENT_OFFER_EXPORTED");
+    const diskOffer = JSON.parse(fs.readFileSync(path.join(dir, "portable-offer.json"), "utf8"));
+    assert.equal(diskOffer.schema, offer.schema);
+    assert.equal(JSON.stringify(diskOffer).includes(b64(ownerHeldCek)), false);
+    assert.equal(await runRecipientRedeem("portable-offer.json", "recipient-open.bin"),
+      "ZK_RECIPIENT_FILE_REDEEMED");
+    assert.deepEqual(fs.readFileSync(path.join(dir, "recipient-open.bin")), bytes,
+      "CLI owner export -> recipient signed real HTTP GET -> HPKE/AEAD open bytes");
+    assert.ok(realShareReads >= 2, "CLI recipient performs a fresh signed HTTP GET");
+    if (bytes.length === 0) {
+      assert.equal(fs.statSync(path.join(dir, "recipient-open.bin")).size, 0,
+        "owner-granted empty ciphertext decrypts to an actual zero-byte recipient file");
+      await assert.rejects(runRecipientRedeem("portable-offer.json", "recipient-open.bin"),
+        /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+        "exclusive output cannot overwrite an existing empty recipient file");
+      assert.equal(fs.statSync(path.join(dir, "recipient-open.bin")).size, 0);
+      ownerHeldCek.fill(0);
+      return;
+    }
+    withoutTrustedAuthority = true;
+    await assert.rejects(runOwnerExport("grant-ack.json", "no-authority-offer.json"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "no independent owner authority must stop CLI offer creation");
+    await assert.rejects(runRecipientRedeem("portable-offer.json", "no-authority-open.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "no independent recipient authority must stop signed HTTP redemption");
+    withoutTrustedAuthority = false;
+    withoutIssuerPin = true;
+    await assert.rejects(runOwnerExport("grant-ack.json", "no-issuer-offer.json"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "no separately owner-pinned issuer means no exported CEK offer");
+    withoutIssuerPin = false;
+    withoutRecipientSession = true;
+    await assert.rejects(runRecipientRedeem("portable-offer.json", "no-session-open.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "possessing portable offer alone cannot replace authenticated recipient HTTP session");
+    withoutRecipientSession = false;
+    for (const output of ["no-authority-offer.json", "no-authority-open.bin",
+      "no-issuer-offer.json", "no-session-open.bin"]) {
+      assert.equal(fs.existsSync(path.join(dir, output)), false);
+    }
+    await assert.rejects(runRecipientRedeem("portable-offer.json", "recipient-open.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "CLI must never overwrite an earlier decrypted output");
+    const fakeOffer = { ...diskOffer, grant: { ...diskOffer.grant,
+      shareSignatureBase64: b64(crypto.randomBytes(64)) } };
+    fs.writeFileSync(path.join(dir, "forged-offer.json"), JSON.stringify(fakeOffer),
+      { mode: 0o600, flag: "wx" });
+    await assert.rejects(runRecipientRedeem("forged-offer.json", "forged-output.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "fabricated owner grant is denied before releasing recipient output");
+    assert.equal(fs.existsSync(path.join(dir, "forged-output.bin")), false);
+    swapHttpObject = true;
+    await assert.rejects(runRecipientRedeem("portable-offer.json", "swapped-output.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "an authenticated HTTP response that substitutes another object cannot decrypt");
+    assert.equal(fs.existsSync(path.join(dir, "swapped-output.bin")), false);
+    swapHttpObject = false;
+    issuerRevokedInClient = true;
+    await assert.rejects(runRecipientRedeem("portable-offer.json", "revoked-issuer.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "independent owner-issued grant signer revocation rejects local CLI import");
+    assert.equal(fs.existsSync(path.join(dir, "revoked-issuer.bin")), false);
+    issuerRevokedInClient = false;
+    const beforeOfferExpiryClock = Date.now;
+    try {
+      Date.now = () => (offer.envelope.core.expires_at + 2) * 1000;
+      await assert.rejects(runRecipientRedeem("portable-offer.json", "expired-open.bin"),
+        /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+        "owner HPKE authorization expiration prevents delayed CLI plaintext release");
+    } finally { Date.now = beforeOfferExpiryClock; }
+    assert.equal(fs.existsSync(path.join(dir, "expired-open.bin")), false);
     for (const [label, changes] of [
       ["wrong cross-account user", { recipientPin: { ...recipientPin,
         recipientUsername: "attacker" } }],
@@ -860,6 +1054,13 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
       shareSignatureBase64: b64(crypto.sign(null, fakeGrantMessage,
         fresh.signer.privateKey)) };
+    fs.writeFileSync(path.join(dir, "recipient-forged-ack.json"), JSON.stringify(fakeGrant),
+      { mode: 0o600, flag: "wx" });
+    await assert.rejects(
+      runOwnerExport("recipient-forged-ack.json", "recipient-forged-export.json"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "owner CLI cannot export CEK based on recipient-signed fake ACK");
+    assert.equal(fs.existsSync(path.join(dir, "recipient-forged-export.json")), false);
     await assert.rejects(createProtectedRecipientShareOffer({
       ...ownerOfferArgs, grant: fakeGrant,
     }), /ZK_SHARE_OFFER_DENIED/,
@@ -1251,6 +1452,16 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     corrupt[corrupt.length - 1] ^= 1;
     await assert.rejects(open({ ciphertext: corrupt }), /ZK_OWNER_FILE_CEK_DENIED/,
       "protected HTTP ciphertext tamper cannot receive CEK");
+    const revokeAck = await fetch(origin + "/zk-1/v1/share/revoke", {
+      method: "POST", headers: { "content-type": "application/json",
+        "x-fixture-session": "owner" },
+      body: JSON.stringify({ grantId: grant.grantId }),
+    });
+    assert.equal(revokeAck.status, 200, "real durable server share revocation succeeds");
+    await assert.rejects(runRecipientRedeem("portable-offer.json", "revoke-http.bin"),
+      /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "server-revoked grant cannot pass authenticated signed HTTP read");
+    assert.equal(fs.existsSync(path.join(dir, "revoke-http.bin")), false);
     ownerHeldCek.fill(0);
   });
 });
