@@ -289,13 +289,31 @@ async function submit(f, method, route, parts, authenticated = true) {
   }, body.body);
 }
 
+// Client `end` can precede the server response `finish` cleanup of its
+// per-request lease. Require bounded quiescence before asserting that the
+// ENTIRE private storage tree matches its pre-request snapshot; never hide
+// an unexpected upload, pending record, or a lease that fails to drain.
+async function storedSnapshotAfterLeaseDrain(dir) {
+  const leases = path.join(dir, "data", ".rootark-active-requests");
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(leases)) {
+    const stat = fs.lstatSync(leases);
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink(),
+      "active-request lease path must remain a real directory");
+    if (fs.readdirSync(leases).length === 0) break;
+    assert.ok(Date.now() < deadline, "active-request lease failed to drain after HTTP response");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return storedSnapshot(dir);
+}
+
 test("strict ZK10 rejects authenticated legacy POST, PUT and chunk multipart before any disk or cloud intent", {
   timeout: 90000,
 }, async (t) => {
   const f = await fixture(t, true);
   const anonymous = await submit(f, "POST", "/upload?folderId=root", uploadParts("anonymous.txt"), false);
   assert.equal(anonymous.status, 401, "strict cannot bypass JWT authentication");
-  const before = storedSnapshot(f.dir);
+  const before = await storedSnapshotAfterLeaseDrain(f.dir);
   const paths = [
     ["POST", "/upload?folderId=root", uploadParts("simple.txt")],
     ["PUT", "/upload?folderId=root", [...uploadParts("strict-put.txt", true),
@@ -315,7 +333,7 @@ test("strict ZK10 rejects authenticated legacy POST, PUT and chunk multipart bef
     assert.equal(response.status, 503, `${method} ${route}: ${response.status} ${response.body.slice(0, 150)}`);
     assert.equal(response.headers["cache-control"], "no-store");
     assert.equal(JSON.parse(response.body).code, "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE");
-    assert.deepEqual(storedSnapshot(f.dir), before,
+    assert.deepEqual(await storedSnapshotAfterLeaseDrain(f.dir), before,
       `${method} ${route} must not open incoming bytes or write pending, version or cloud records`);
   }
   let throttled = false;
@@ -326,7 +344,7 @@ test("strict ZK10 rejects authenticated legacy POST, PUT and chunk multipart bef
     assert.equal(response.status, 503, response.body);
   }
   assert.equal(throttled, true, "the existing peer limiter must still bound strict ingress before JWT work");
-  assert.deepEqual(storedSnapshot(f.dir), before, "strict rate limiting cannot create chunk SQLite or upload files");
+  assert.deepEqual(await storedSnapshotAfterLeaseDrain(f.dir), before, "strict rate limiting cannot create chunk SQLite or upload files");
 });
 
 test("strict OFF preserves real authenticated POST, PUT and chunk uploads", {
