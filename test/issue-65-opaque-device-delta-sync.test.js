@@ -86,6 +86,44 @@ test("local filename filter caps display, counts all matches, and rejects a corr
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "a corrupt row past the cap must fail the whole listing");
 });
 
+test("cached local search requires fresh signed catalog and never decrypts on a matching head", async () => {
+  const head = { sequence: 3, digest: new Uint8Array(32).fill(4) };
+  let requested = 0, opened = 0;
+  const rows = [{ object_id: "opaque-current", revision: 1, epoch: 2,
+    ciphertext_digest: new Uint8Array(32).fill(9),
+    metadata_ciphertext: new Uint8Array(284).fill(8) }];
+  const snapshot = { head, rows };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: {
+      createClient: () => ({ readAll: async () => { requested++; return snapshot; } }),
+      openMetadata: async () => { opened++; return "private.txt"; },
+    },
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: { account_id: "a", compartment_id: "c", keyring_id: "k" },
+      pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "csrf", isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const verified = await client.verifyPrivateListingHead(baseline);
+  assert.equal(verified.head.sequence, 3);
+  assert.equal(verified.scope.compartment_id, "c");
+  assert.equal(requested, 2);
+  assert.equal(opened, 0, "ciphertext stays sealed when the local index is valid");
+  snapshot.head = { ...head, sequence: 4 };
+  await assert.rejects(client.verifyPrivateListingHead(baseline), /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  snapshot.head = head;
+  snapshot.rows = [{ ...rows[0], revision: 2 }];
+  await assert.rejects(client.verifyPrivateListingHead(baseline), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "a same-head but altered signed row must not release cached plaintext");
+});
+
 test("P2 review: signed historical names cannot resurrect a trashed object's search hit", async () => {
   const row = (object_id, revision) => ({ object_id, revision, epoch: 1,
     ciphertext_digest: new Uint8Array(32).fill(8),
