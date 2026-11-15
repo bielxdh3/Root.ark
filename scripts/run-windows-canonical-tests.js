@@ -97,7 +97,13 @@ function createTapProgressRecorder(write) {
         ? ` aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}` : "";
       const edge = pending.edge
         ? ` edgeStage=${pending.edge.stage} edgeError=${pending.edge.code}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${acl}${edge}`);
+      // Node 22 reports a failed test-file process as an ERR_TEST_FAILURE
+      // under the file's escaped TAP label. Its numeric exit status is the
+      // only safe additional clue about this aggregate failure.
+      const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
+        && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
+        ? ` moduleExitCode=${pending.moduleExitCode}` : "";
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -168,7 +174,8 @@ function createTapProgressRecorder(write) {
             const nameHash = hash(result[3]);
             write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
             pending = { index: result[2], nameHash, pathHash: "none",
-              failureType: "unknown", code: "unknown" };
+              failureType: "unknown", code: "unknown", moduleExitCode: null,
+              fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -186,14 +193,40 @@ function createTapProgressRecorder(write) {
         }
       }
       if (pending) {
-        const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
-        if (location) {
-          pending.pathHash = fileLocation(location[1]);
+        // The failed test's YAML can end before unrelated output is emitted.
+        // An exitCode after "  ..." is NOT evidence about that test module.
+        // Never reopen an already consumed YAML block for the same result.
+        if (line === "  ---" && !pending.moduleYamlSeen) {
+          pending.moduleYamlSeen = true;
+          pending.moduleYamlOpen = true;
+          pending.code = "unknown"; // Discard pre-YAML code before collecting module evidence.
+        } else if (line === "  ...") {
+          pending.moduleYamlOpen = false;
         }
-        const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
-        if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
-        const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
-        if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+        // Treat module status, failure type, code, and location as ONE YAML
+        // record. Accepting type/code/path outside that record lets later
+        // untrusted TAP output combine with an earlier exitCode, forging an
+        // apparent failed test-file process. Do not reopen a consumed block.
+        if (pending.moduleYamlOpen) {
+          const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
+          if (location) pending.pathHash = fileLocation(location[1]);
+          const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
+          if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
+          const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
+          if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+          // Keep only bounded, allowlisted process evidence; never print
+          // raw YAML, paths, stack traces, or failure text.
+          if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
+          const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
+          if (moduleExit && Number(moduleExit[1]) <= 255)
+            pending.moduleExitCode = Number(moduleExit[1]);
+        }
+        // Legacy bounded TAP code breadcrumbs can occur without YAML; they
+        // never establish test-file process identity or a module exit code.
+        if (!pending.moduleYamlSeen) {
+          const standaloneCode = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
+          if (standaloneCode && SAFE_CODES.has(standaloneCode[1])) pending.code = standaloneCode[1];
+        }
         const acl = parseAclFailureDiagnostic(line, pending);
         if (acl) pending.acl = acl;
         const edge = parseEdgeFailureDiagnostic(line, pending);
