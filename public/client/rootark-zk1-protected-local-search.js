@@ -10,6 +10,7 @@
   const DB = "rootark-zk1-protected-local-search-v1";
   const STORE = "catalogs";
   const FORMAT = "rootark-zk1-protected-local-search/v1";
+  const PAGE_SIZE = 100;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const id = /^[A-Za-z0-9_-]{22}$/;
@@ -167,25 +168,45 @@
       || opened.totalMatches !== expected.length) deny();
     return validRows(opened.entries, expected);
   }
-  function filtered(rows, term, head, persisted) {
+  function checkedOffset(offset) {
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 4000
+      || offset % PAGE_SIZE !== 0) deny();
+    return offset;
+  }
+  function filtered(rows, term, head, persisted, offset = 0) {
+    checkedOffset(offset);
     const query = term.trim().normalize("NFC").toLowerCase();
     let totalMatches = 0;
     const entries = [];
     for (const row of rows) {
       if (!query || row.logicalTrashCandidate !== true
         && row.name.normalize("NFC").toLowerCase().includes(query)) {
+        if (totalMatches >= offset && entries.length < PAGE_SIZE) entries.push(row);
         totalMatches++;
-        if (!query || entries.length < 100) entries.push(row);
       }
     }
-    return Object.freeze({ head, entries, totalMatches,
+    if (offset !== 0 && offset >= totalMatches) deny();
+    return Object.freeze({ head, entries: Object.freeze(entries), totalMatches,
+      offset, pageSize: PAGE_SIZE, hasPrevious: offset > 0,
+      hasNext: offset + entries.length < totalMatches,
       persistedIndex: persisted, plaintextSentToServer: false,
       independentlySignedCatalog: true, authorizesMutation: false });
   }
-  function renderVerifiedResults(container, entries, selectedInput, assertLive, revisionInput) {
+  function renderVerifiedResults(container, entries, selectedInput, assertLive,
+    revisionInput, paging) {
     if (!container?.ownerDocument || typeof container.replaceChildren !== "function"
       || !selectedInput || typeof assertLive !== "function"
       || !Array.isArray(entries) || entries.length > 4096) deny();
+    if (paging !== undefined) {
+      if (!paging || !Number.isSafeInteger(paging.totalMatches)
+        || paging.totalMatches < entries.length || paging.totalMatches > 4096
+        || paging.offset + entries.length > paging.totalMatches
+        || paging.pageSize !== PAGE_SIZE || entries.length > PAGE_SIZE
+        || typeof paging.readPage !== "function"
+        || (paging.onPage !== undefined && typeof paging.onPage !== "function")
+        || (paging.onDenied !== undefined && typeof paging.onDenied !== "function")) deny();
+      checkedOffset(paging.offset);
+    }
     const fragment = container.ownerDocument.createDocumentFragment();
     for (const entry of entries) {
       if (!entry || !id.test(entry.objectId)
@@ -211,6 +232,50 @@
       });
       item.append(button);
       fragment.append(item);
+    }
+    if (paging && paging.totalMatches > PAGE_SIZE) {
+      const navigation = container.ownerDocument.createElement("div");
+      navigation.className = "zk1-workspace-actions";
+      const label = container.ownerDocument.createElement("span");
+      label.textContent = "Resultados " + (paging.offset + 1) + "–"
+        + (paging.offset + entries.length) + " de " + paging.totalMatches;
+      navigation.append(label);
+      const addButton = (direction, offset, title) => {
+        const button = container.ownerDocument.createElement("button");
+        button.type = "button";
+        button.className = "button button-quiet";
+        button.dataset.zk1Page = direction;
+        button.textContent = title;
+        button.addEventListener("click", async () => {
+          try {
+            if (!container.contains(button) || assertLive() === false) return;
+            button.disabled = true;
+            const page = await paging.readPage(offset);
+            if (!container.contains(button) || assertLive() === false) return;
+            if (page?.offset !== offset || page.totalMatches !== paging.totalMatches
+              || page.plaintextSentToServer !== false
+              || page.independentlySignedCatalog !== true
+              || page.authorizesMutation !== false) deny();
+            renderVerifiedResults(container, page.entries, selectedInput,
+              assertLive, revisionInput, { ...page, readPage: paging.readPage,
+                onPage: paging.onPage, onDenied: paging.onDenied });
+            paging.onPage?.(page);
+          } catch (_) {
+            // Only the still-mounted page may clear results on denial.
+            // An older pending request must never erase a newer verified search.
+            if (container.contains(button)) {
+              container.replaceChildren();
+              try { paging.onDenied?.(); } catch (_) { /* Fail closed. */ }
+            }
+          } finally { button.disabled = false; }
+        });
+        navigation.append(button);
+      };
+      if (paging.offset > 0)
+        addButton("previous", paging.offset - PAGE_SIZE, "Anterior");
+      if (paging.offset + entries.length < paging.totalMatches)
+        addButton("next", paging.offset + PAGE_SIZE, "Próxima");
+      fragment.append(navigation);
     }
     container.replaceChildren(fragment);
   }
@@ -274,8 +339,30 @@
           live(input.assertLive);
         }
       }
-      return Object.freeze({ ...filtered(rows, input.term, pinned.head, Boolean(database)),
-        reusedIndex: usedCache });
+      // The initial action can release and zero its imported metadata key.
+      // Keep only the authenticated in-memory rows for page navigation.
+      rows = Object.freeze(rows.map((row) => Object.freeze({
+        objectId: row.objectId, revision: row.revision, epoch: row.epoch,
+        name: row.name, logicalTrashCandidate: row.logicalTrashCandidate,
+      })));
+      const { client, baseline, assertLive, term } = input;
+      const persisted = Boolean(database);
+      const readPage = async (offset) => {
+        try {
+          checkedOffset(offset);
+          live(assertLive);
+          // Every page requires a fresh independent CAS/witness/grant check.
+          // No page fetch sends its term, any name, or the metadata key.
+          const verified = await client.verifyPrivateListingHead(baseline);
+          live(assertLive);
+          if (!sameScope(verified?.scope, pinned.scope)
+            || verified.head?.sequence !== pinned.head.sequence
+            || verified.head.digest !== pinned.head.digest) deny();
+          return filtered(rows, term, pinned.head, persisted, offset);
+        } catch (_) { deny(); }
+      };
+      return Object.freeze({ ...filtered(rows, term, pinned.head, persisted),
+        readPage, reusedIndex: usedCache });
     } catch (_) { deny(); }
   }
   async function clear(input) {

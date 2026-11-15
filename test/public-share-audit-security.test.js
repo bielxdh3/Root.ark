@@ -9,6 +9,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const vm = require("node:vm");
 const test = require("node:test");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -292,7 +293,15 @@ async function waitForServer(port) {
 }
 
 test("public-share audit logs correlate by token digest without storing the bearer token", { timeout: 30_000 }, async (t) => {
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-audit-"));
+  // The JSON audit journal is ACL-protected on Windows. A generic TEMP root
+  // can give untrusted inherited principals DELETE_CHILD, and the server must
+  // refuse to start rather than weaken the audit authority. Create this
+  // disposable fixture with the real native ACL creator under LOCALAPPDATA.
+  const sandbox = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA,
+      `rootark-share-audit-${crypto.randomBytes(8).toString("hex")}`)
+    : fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-audit-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(sandbox);
   const token = crypto.randomBytes(24).toString("hex");
   const expiredViewerToken = crypto.randomBytes(24).toString("hex");
   const expiredPasswordViewerId = crypto.randomBytes(16).toString("hex");

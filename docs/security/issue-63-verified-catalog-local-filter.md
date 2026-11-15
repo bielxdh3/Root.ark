@@ -76,21 +76,42 @@ work is not changed.
 ## Follow-up: bounded local text search across owner-selected versions
 
 The DEV workspace now offers an explicit **Search inside selected versions**
-action. It examines **1–8** exact object/revision pairs in a freshly signed
+action. It examines **1–128** exact object/revision pairs in a freshly signed
 current catalog, with a nonempty NFC/case-insensitive literal text query
 (maximum 120 UTF-16 units). Each version gets its own fresh signed GET,
 current independent owner/head/CAS and device grant checks, matching
 ciphertext digest, separately pinned owner-held CEK SHA-256 and local AEAD/UTF-8
-opening using the existing single-version preview. Supported text is bounded
-to 64 KiB per file; matches show at most a 160-character local excerpt.
+opening using the existing single-version preview, **sequentially in windows
+of eight at most** (only one active GET/CEK/plaintext per iteration). Supported
+text is bounded to 64 KiB per file; matches show at most a 160-character local
+excerpt. The sole cross-window collection is up to 128 verified excerpts,
+not a persistent or aggregate full-text cache.
 A single revoked, tampered, malformed or wrong-key version aborts the **whole**
-batch without revealing even earlier matches. No plaintext/query/CEK is sent
+batch without revealing even earlier matches. Progress reports the count
+of revisions verified (0/128, 8/128, etc.), never matches/names/terms.
+An optional **Todas as palavras (AND)** checkbox switches from the default
+contiguous literal phrase to a conjunction of **2–4 distinct literal tokens**,
+independent of order. The entire query remains at most 120 UTF-16 code units;
+each token is 1–40 UTF-16 code units. NFC normalization and locale lowercase
+apply before local matching; Unicode whitespace separates tokens (multiple
+spaces collapse), while C0/C1 controls, DEL and Unicode line separators are
+rejected. Repeated tokens after normalization/case-folding are rejected rather
+than silently collapsed; punctuation is literal, not a regex or search operator.
+Every token must appear somewhere in the **same** verified UTF-8 version;
+the excerpt anchors to the earliest occurrence of any required token, and
+matching does not trigger extra HTTP requests, keys, catalog reads or indexing.
+Invalid input fails before any signed GET. The unchecked default preserves
+the original single-phrase behavior, including embedded spaces.
+An explicit cancel button remains enabled during verification; cancellation
+stops subsequent windows and drops the result atomically, although an already
+in-flight signed GET may complete before the final cancellation check.
+No plaintext/query/CEK is sent
 to Root.ark, and no persistent plaintext/content index, PUT, rollback, server
 search, automatic key delivery, off-host custody or production release is
 claimed.
 
-The user imports a JSON manifest no larger than 16 KiB. It has exactly
-`schema: "rootark-zk1-local-text-batch/v1"` and `entries` (1–8 records).
+The user imports a JSON manifest no larger than 64 KiB. It has exactly
+`schema: "rootark-zk1-local-text-batch/v1"` and `entries` (1–128 records).
 Each entry has exactly `objectId` (opaque 16-byte base64url), positive
 `revision`, the canonical eight-field `metadata` document from the
 original protected version, `cekFile` (local filename), and `cekSha256Pin`
@@ -101,12 +122,55 @@ The opt-in checkbox is an operator assertion of independent verification,
 not server-provided proof. Obtaining that pin from the same untrusted source
 as the manifest would offer no provenance.
 
-All CEK Uint8Array buffers imported by the dialog are zeroed in a finally
-block, and ephemeral search results are cleared on input change, logout,
+For a multi-window search, only one CEK is read into a Uint8Array **after**
+that revision's authenticated ciphertext GET; it is zeroed in a per-file
+`finally` before another CEK is read. The older 1–8 caller path remains
+compatible, but larger selections must use disposable CEKs via `readCek`.
+Ephemeral search results are cleared on input change, cancellation, logout,
 dialog close and pagehide. Browser-managed JavaScript strings cannot
 promise deterministic memory scrubbing. Real signed two-device HTTP GET,
-local AES-GCM, two-file matching, tamper of the second entry (no partial
+local AES-GCM, 64-file lazy-window processing and CEK erasure,
+signed disposable nine-version HTTP with forged final response (no partial
 results), grant/scope/epoch negative cases, bounded input and real Edge CSP
-`textContent`/logout tests cover the slice. General protected content
+`textContent`, explicit cancellation and logout tests cover the slice.
+The independent authority source/pins and owner-held CEKs remain mandatory;
+the test HTTP adapter is disposable, not a production authority.
+General protected content
 indexing, persistence, safe key provisioning and external acceptance remain
 unresolved Issue #63 scope.
+
+## Explicit rotation of an existing protected revision index
+
+When the encrypted device-local index holds 128 selected revisions, the owner
+can explicitly opt to **replace** the previous selection using a new,
+independently pinned, fully verified 1–128-revision batch. Replacement requires
+both the normal persistence checkbox and a separate unchecked replacement
+checkbox. Older selected plaintext is not decrypted or retained. One
+conditional IndexedDB transaction replaces the AES-GCM snapshot; invalid
+inputs, an expired grant/session, concurrent scoped clear, or exceeding the
+4 MiB JSON limit deny the replacement write. A concurrent clear retains its
+durable tombstone; no rejected operation resurrects the previous plaintext.
+Old search pages are invalidated by the new snapshot nonce. Ordinary append
+still rejects overflow. This feature does not provide a complete historical
+index or increase the 128-revision resident limit.
+
+The offline-selection confirmation, persistence consent and replacement consent
+are consumed synchronously when each search is submitted, and cleared on both
+success and failure. Editing the query, manifest, manifest SHA-256 pin, CEK
+files, metadata key or other workspace source field also clears these three
+checkboxes. A subsequent selection must be authorized independently; an
+unchecked replacement defaults to ordinary append and preserves the older
+encrypted index when the new selection would exceed its capacity. Real Edge
+same-window tests cover full batch A, batch B denied without fresh replacement
+consent, batch B accepted after fresh opt-in, and invalidation of old pages.
+
+Native Escape on a `<dialog>` follows `cancel`/`close`, bypassing the explicit
+Close button's form reset. The `close` event now also consumes all three
+consents before a reopened dialog can accept a different selection. Edge may
+emit a noncancelable `cancel` event during an in-flight verified batch: a
+resulting native close explicitly marks the batch cancelled, while its live
+session/modal checks prevent any partial encrypted-index commit. The real
+Edge regression sends Escape through browser keyboard input during a pending
+signed GET and again while idle, then reopens the same dialog before the next
+owner-selected manifest. It verifies no stale replacement permission or
+partial persisted index survives either transition.

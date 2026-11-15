@@ -140,6 +140,121 @@ test("full 4096-row signed catalog is indexed, returns a bounded 100-hit UI page
   assert.equal(f.opened, 1, "persistent cache covers maximum signed catalog size");
 });
 
+test("signed 4096-revision history pages locally without retaining the metadata key", async () => {
+  const database = indexedDBMemory();
+  const names = Array.from({ length: 4096 }, (_, i) => "history-" + String(i).padStart(4, "0"));
+  const f = fixture(database, names);
+  const key = crypto.randomBytes(32);
+  const first = await search.search(f.input(key, ""));
+  assert.equal(first.totalMatches, 4096);
+  assert.equal(first.entries.length, 100, "unfiltered listing must also be bounded");
+  assert.equal(first.entries[0].name, "history-0000");
+  assert.equal(first.hasNext, true);
+  assert.equal(first.offset, 0);
+  key.fill(0); // The workspace zeroizes the local key immediately after its action.
+
+  const readsBeforePage = f.remoteReads;
+  const second = await first.readPage(100);
+  assert.equal(f.remoteReads, readsBeforePage + 1, "each page rechecks signed CAS");
+  assert.equal(second.entries.length, 100);
+  assert.equal(second.entries[0].name, "history-0100");
+  assert.equal(second.offset, 100);
+  assert.equal(second.totalMatches, 4096);
+  assert.equal(f.opened, 1, "page requests must not re-import the CEK or re-fetch plaintext");
+
+  const last = await first.readPage(4000);
+  assert.equal(last.entries.length, 96);
+  assert.equal(last.entries.at(-1).name, "history-4095");
+  assert.equal(last.hasNext, false);
+  assert.equal(f.opened, 1);
+  await assert.rejects(first.readPage(-100), /ZK_LOCAL_SEARCH_DENIED/);
+  await assert.rejects(first.readPage(4096), /ZK_LOCAL_SEARCH_DENIED/);
+  await assert.rejects(first.readPage(12), /ZK_LOCAL_SEARCH_DENIED/);
+  f.baseline.head.digest = crypto.randomBytes(32).toString("base64url");
+  await assert.rejects(first.readPage(200), /ZK_LOCAL_SEARCH_DENIED/,
+    "a changed signed head invalidates every old in-memory page");
+  f.revoke();
+  await assert.rejects(first.readPage(200), /ZK_LOCAL_SEARCH_DENIED/,
+    "a revoked session must never reveal another cached page");
+});
+
+test("rejected old page cannot clear a newer authenticated search, but current page denial clears", async () => {
+  // Minimal browser DOM with real parentage, so replaceChildren() detaches old controls.
+  const doc = {};
+  const makeNode = (tag) => ({
+    tag, ownerDocument: doc, parent: null, children: [], dataset: {},
+    listeners: {}, textContent: "", value: "",
+    addEventListener(type, callback) { this.listeners[type] = callback; },
+    click() { return this.listeners.click?.(); },
+    append(...children) {
+      for (const child of children) { child.parent = this; this.children.push(child); }
+    },
+    replaceChildren(...children) {
+      for (const child of this.children) child.parent = null;
+      this.children = [];
+      for (const child of children) {
+        if (child.tag === "fragment") {
+          this.append(...child.children);
+          child.children = [];
+        } else this.append(child);
+      }
+    },
+    contains(target) {
+      for (let current = target; current; current = current.parent)
+        if (current === this) return true;
+      return false;
+    },
+    focus() {},
+  });
+  doc.createDocumentFragment = () => makeNode("fragment");
+  doc.createElement = (tag) => makeNode(tag);
+  const container = makeNode("section");
+  const selected = makeNode("input");
+  const revision = makeNode("input");
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children) {
+      const match = find(child, predicate);
+      if (match) return match;
+    }
+    return null;
+  };
+  const row = (name) => ({ name, objectId: "AAAAAAAAAAAAAAAAAAAAAA", revision: 1,
+    logicalTrashCandidate: false });
+  const page = (readPage, onDenied) => ({ offset: 0, totalMatches: 101,
+    pageSize: 100, readPage, onDenied });
+  let rejectOld, deniedOld = 0, summary = "old-query";
+  search.renderVerifiedResults(container, [row("old-query")], selected, () => true,
+    revision, page(() => new Promise((_, reject) => { rejectOld = reject; }),
+      () => { deniedOld++; summary = "old-denied"; }));
+  const oldNext = find(container, (node) => node.dataset.zk1Page === "next");
+  assert.ok(oldNext);
+  const pendingOld = oldNext.click();
+  assert.equal(typeof rejectOld, "function");
+  search.renderVerifiedResults(container, [row("new-authorized-result")], selected,
+    () => true, revision);
+  summary = "new-query";
+  rejectOld(Error("STALE_SIGNED_CAS"));
+  await pendingOld;
+  assert.ok(find(container, (node) => node.textContent.includes("new-authorized-result")),
+    "old async failure must preserve newer verified result nodes");
+  assert.equal(deniedOld, 0, "stale callback must not issue denial for newer query");
+  assert.equal(summary, "new-query", "stale callback must not overwrite newer summary");
+
+  let rejectCurrent, deniedCurrent = 0;
+  search.renderVerifiedResults(container, [row("current-revoked")], selected,
+    () => true, revision, page(() => new Promise((_, reject) => {
+      rejectCurrent = reject;
+    }), () => { deniedCurrent++; }));
+  const currentNext = find(container, (node) => node.dataset.zk1Page === "next");
+  const pendingCurrent = currentNext.click();
+  rejectCurrent(Error("GRANT_REVOKED"));
+  await pendingCurrent;
+  assert.equal(container.children.length, 0,
+    "rejected current generation must still clear sensitive results");
+  assert.equal(deniedCurrent, 1, "current revocation must call denial handler");
+});
+
 test("explicit local invalidation deletes only the scoped encrypted index", async () => {
   const database = indexedDBMemory();
   const f = fixture(database);
