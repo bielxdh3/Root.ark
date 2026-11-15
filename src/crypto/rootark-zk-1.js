@@ -321,7 +321,11 @@ function validateCborValue(value, seen = new NativeSet(), budget = { nodes: 0 },
 // Authorization encoding must snapshot before its first await. Shared but
 // acyclic CBOR maps are legal; cloning an aliased binary DAG without a budget
 // otherwise expands a few input objects into exponentially many copies.
-const CBOR_SNAPSHOT_MAX_NODES = 32768;
+// The supported maximum keyring manifest contains 256 devices x 64 epochs
+// (16,384 wraps), which needs about 118k snapshot nodes. Keep that supported
+// shape below a finite bound while retaining the independent 64 MiB byte and
+// 64-level depth limits against oversized or adversarial CBOR values.
+const CBOR_SNAPSHOT_MAX_NODES = 131072;
 const CBOR_SNAPSHOT_MAX_DEPTH = 64;
 const CBOR_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 
@@ -1004,6 +1008,7 @@ async function sealAuthorizationEnvelopeV2(input) {
 }
 
 async function openAuthorizationEnvelopeV2(input) {
+  if (input === null || input === undefined) fail("INVALID_AUTHORIZATION_INPUT");
   const inputMap = safeMap(input);
   const manifestInput = snapshotCborValue(inputMap.manifest);
   const signature = bytes(inputMap.signature, "INVALID_SIGNATURE", 64, 64, 64);

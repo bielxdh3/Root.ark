@@ -1330,8 +1330,13 @@ function normalizeExcludedPaths(value) {
   if (value == null) return [];
   if (!nativeArrayIsArray(value)) fail("Excluded paths must be an array", "invalid_excluded_paths");
   const snapshot = snapshotArrayOfData(value, "invalid_excluded_paths");
-  const normalized = nativeReflectApply(nativeArrayMap, snapshot,
-    [(item) => protocol.safeRelativePath(item, "excludedPath")]);
+  const normalized = nativeReflectApply(nativeArrayMap, snapshot, [(item) => {
+    try {
+      return protocol.safeRelativePath(item, "excludedPath");
+    } catch {
+      fail("Excluded sync path is unsafe", "unsafe_path");
+    }
+  }]);
   const seen = new NativeSet();
   const unique = [];
   for (let index = 0; index < normalized.length; index += 1) {

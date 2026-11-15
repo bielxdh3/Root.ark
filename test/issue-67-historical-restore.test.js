@@ -13,7 +13,7 @@ const express = require("express");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const zk = require("../src/crypto/rootark-zk-1");
-const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { SyncEngine, normalizeExcludedPaths } = require("../sync-client/rootark-sync-engine");
 const { safeJsonStringify } = require("../sync-client/rootark-sync-journal");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
@@ -25,6 +25,37 @@ const usersRepository = require("../repositories/usersRepository");
 const { DOMAIN: OWNER_PROVISION_DOMAIN } =
   require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+
+test("#262 P2: bounded CBOR snapshot admits the supported 16,384-wrap history shape", async () => {
+  const keyRef = Buffer.alloc(32, 1);
+  const wrapId = Buffer.alloc(16, 2);
+  const enc = Buffer.alloc(32, 3);
+  const ciphertext = Buffer.alloc(48, 4);
+  const wraps = new Array(16_384);
+  for (let index = 0; index < wraps.length; index += 1) {
+    wraps[index] = {
+      device_id: `device-${String(index % 256).padStart(3, "0")}`,
+      epoch: (index % 64) + 1,
+      key_ref: keyRef,
+      wrap_id: wrapId,
+      enc,
+      ciphertext,
+    };
+  }
+  const serialized = await zk.encodeDeterministic({ wraps });
+  assert.ok(serialized.byteLength < 8 * 1024 * 1024);
+});
+
+test("#262 P2: v2 envelope opener classifies absent input before map validation", async () => {
+  await assert.rejects(zk.openAuthorizationEnvelopeV2(null),
+    { code: "INVALID_AUTHORIZATION_INPUT" });
+  await assert.rejects(zk.openAuthorizationEnvelopeV2(undefined),
+    { code: "INVALID_AUTHORIZATION_INPUT" });
+});
+
+test("#262 P2: excluded path traversal has a stable unsafe_path classification", () => {
+  assert.throws(() => normalizeExcludedPaths(["../escape"]), { code: "unsafe_path" });
+});
 
 const RESTORE_WITNESS_DOMAIN = "rootark-sync-historical-restore-physical-witness-v1\0";
 const RESTORE_CURRENT_DOMAIN = "rootark-sync-historical-restore-physical-current-v1\0";
