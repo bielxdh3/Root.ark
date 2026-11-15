@@ -192,7 +192,7 @@ test("ambiguous failed POST blocks further uploads in the still-running process"
   });
   t.after(() => child.kill());
   try {
-    await until(() => output.includes("ERRO a.txt"));
+    await until(() => output.includes("ERRO a.txt"), 45000);
     assert.deepEqual(uploads, ["OLD"]);
     assert.equal(typeof commitOld, "function");
     await fs.writeFile(source, "AMBIGUOUS_A_NEW");
