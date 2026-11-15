@@ -67,8 +67,10 @@ test("local fixture crash failure stages are pinned to the actual test and do no
   const diagnostic = "# ROOTARK_ACL_V1 case=LOCAL_FIXTURE_CRASH stage=PRELINK_CHILD_EXIT code=ASSERTION trust=UNKNOWN";
   for (const line of [
     `not ok 1257 - ${title}`,
+    "  ---",
     String.raw`  location: 'D:\a\Root.ark\Root.ark\test\issue-65-local-fixture-migration-journal.test.js:400:1'`,
-    "  failureType: 'testCodeFailure'", "  code: 'ERR_ASSERTION'", diagnostic,
+    "  failureType: 'testCodeFailure'", "  code: 'ERR_ASSERTION'",
+    "  ...", diagnostic,
   ]) tracker.accept(line);
   tracker.finish();
   assert.match(printed.join("\n"), /aclStage=PRELINK_CHILD_EXIT aclError=ASSERTION aclTrust=UNKNOWN/);
