@@ -29,6 +29,34 @@ test("invalid or explicitly empty chunk limiter store configuration fails closed
   }
 });
 
+test("invalid chunk limiter mode rejects before loading Express or storage dependencies", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "issue-94-early-env-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const preload = path.join(directory, "block-express-before-config.js");
+  fs.writeFileSync(preload, [
+    'const Module = require("node:module");',
+    'const original = Module._load;',
+    'Module._load = function(request, ...rest) {',
+    '  if (request === "express") throw new Error("MODULE_LOADED_BEFORE_VALIDATION");',
+    '  return original.call(this, request, ...rest);',
+    '};',
+  ].join("\n"), { mode: 0o600, flag: "wx" });
+  const child = spawnSync(process.execPath, ["--require", preload, path.resolve(__dirname, "../server.js")], {
+    cwd: directory,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 10_000,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      UPLOAD_CHUNK_RATE_LIMIT_STORE: "misconfigured",
+    },
+  });
+  assert.equal(child.status, 1, "invalid mode must terminate without loading dependencies");
+  assert.match(child.stderr, /Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE/);
+  assert.doesNotMatch(child.stderr, /MODULE_LOADED_BEFORE_VALIDATION/);
+});
 function withClock(t, start) {
   const originalNow = Date.now;
   const clock = { now: start };
