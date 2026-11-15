@@ -124,6 +124,68 @@ test("cached local search requires fresh signed catalog and never decrypts on a 
     "a same-head but altered signed row must not release cached plaintext");
 });
 
+test("selected protected object GET is exact, ciphertext-only and fenced before and after transport", async () => {
+  const objectId = Buffer.alloc(16, 3).toString("base64url");
+  const ciphertext = Buffer.alloc(64, 11);
+  const digest = crypto.createHash("sha256").update(ciphertext).digest();
+  const row = { object_id: objectId, revision: 2, epoch: 4,
+    ciphertext_digest: digest, metadata_ciphertext: new Uint8Array(284).fill(3) };
+  const base = { head: { sequence: 2, digest: new Uint8Array(32).fill(7) },
+    rows: [row] };
+  let current = base, reads = 0, gets = 0, onGet = null;
+  const writer = {
+    async readAll() { reads++; return current; },
+    async readVerifiedCiphertext(snapshot, id, revision) {
+      gets++;
+      assert.equal(snapshot, base, "use the internally verified signed snapshot");
+      assert.equal(id, objectId);
+      assert.equal(revision, 2);
+      onGet?.();
+      return { objectId: id, revision, epoch: row.epoch,
+        ciphertextDigestBase64: Buffer.from(digest).toString("base64url"),
+        ciphertextBase64: ciphertext.toString("base64url") };
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: { createClient: () => writer },
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  let active = true;
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: { account_id: "a", compartment_id: "b",
+        keyring_id: "c" }, pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "valid-csrf",
+      isSessionCurrent: () => true },
+    assertLive: () => { if (!globalTestActive) throw Error("STALE"); },
+  })`, Object.assign(context, { globalTestActive: true }));
+  const baseline = await client.readCurrent();
+  assert.equal(typeof client.readSelectedCiphertext, "function");
+  const output = await client.readSelectedCiphertext(baseline, objectId, 2);
+  assert.equal(output.ciphertextBase64, ciphertext.toString("base64url"));
+  assert.equal(output.ciphertextDigestBase64, digest.toString("base64url"));
+  assert.equal(output.plaintextAvailable, false);
+  assert.equal(output.verifiedCiphertext, true);
+  assert.equal(JSON.stringify(output).includes("metadata"), false);
+  assert.equal(gets, 1);
+  assert.ok(reads >= 3, "signed catalog must be re-read around GET");
+  await assert.rejects(client.readSelectedCiphertext(baseline,
+    Buffer.alloc(16, 9).toString("base64url"), 2), /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  await assert.rejects(client.readSelectedCiphertext(baseline, objectId, 1),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  assert.equal(gets, 1, "non-matching object or revision never reaches GET");
+  onGet = () => { current = { ...base, head: { ...base.head, sequence: 3 } }; };
+  await assert.rejects(client.readSelectedCiphertext(baseline, objectId, 2),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "head advancing during GET blocks content release");
+  current = base; onGet = null;
+  context.globalTestActive = false;
+  await assert.rejects(client.readSelectedCiphertext(baseline, objectId, 2),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "logout must block every release");
+});
+
 test("P2 review: signed historical names cannot resurrect a trashed object's search hit", async () => {
   const row = (object_id, revision) => ({ object_id, revision, epoch: 1,
     ciphertext_digest: new Uint8Array(32).fill(8),

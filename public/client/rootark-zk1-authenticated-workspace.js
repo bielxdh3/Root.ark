@@ -837,9 +837,12 @@
       + '<label>Chave NOVA de metadados do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-metadata"></label>'
       + '<label>Busca por nome (índice local AES-GCM; vazio lista todos)<input type="search" data-zk1-field="catalog-delta-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
       + '<p class="muted">O catálogo assinado é revalidado a cada busca. O índice cifrado fica no armazenamento deste navegador, até uma mudança do catálogo ou limpeza dos dados do site. Nome e consulta não são enviados ao servidor.</p>'
+      + '<label>Revisão protegida selecionada para GET cifrado<input type="number" min="1" step="1" data-zk1-field="catalog-delta-read-revision" readonly></label>'
+      + '<p class="muted">Selecione um resultado e confirme o GET assinado. O download é somente ciphertext: sem a CEK do arquivo, a prévia do conteúdo permanece bloqueada. Nenhum texto claro é enviado ao servidor.</p>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Buscar / listar nomes localmente (AES-GCM)</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-get">GET assinado do ciphertext selecionado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-trash-inspect">Conferir tombstone assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button>'
@@ -979,7 +982,7 @@
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
-      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
+      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
     busy = true;
@@ -1117,7 +1120,7 @@
       }
       const trust = await grantAndOwner();
       assertLive();
-      if (["catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
+      if (["catalog-delta-list", "catalog-delta-get", "catalog-delta-pull", "catalog-delta-import",
         "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
         "catalog-delta-restore"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
@@ -1144,7 +1147,7 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
-        if (action !== "catalog-delta-list")
+        if (!["catalog-delta-list", "catalog-delta-get"].includes(action))
           field("catalog-delta-private-list")?.replaceChildren();
         if (["catalog-delta-trash", "catalog-delta-trash-inspect",
           "catalog-delta-restore"].includes(action)) {
@@ -1314,7 +1317,7 @@
             list, opened.entries, field("catalog-write-id"), () => {
               assertLive();
               return !busy && verifiedOpaqueDelta === held;
-            });
+            }, field("catalog-delta-read-revision"));
           field("catalog-delta-summary").textContent = term.trim()
             ? "Busca local: " + opened.totalMatches + " correspondência(s), "
               + opened.entries.length + " exibida(s) (máximo 100) · CAS #" + opened.head.sequence
@@ -1324,6 +1327,32 @@
             ? opened.reusedIndex ? "índice cifrado reutilizado." : "índice local cifrado atualizado."
             : "listagem local sem armazenamento persistente.")
             + " Nenhum nome, chave ou consulta enviado ao servidor.");
+          return;
+        }
+        if (action === "catalog-delta-get") {
+          const objectId = field("catalog-write-id")?.value.trim();
+          const revision = Number(field("catalog-delta-read-revision")?.value);
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)
+            || !Number.isSafeInteger(revision) || revision < 1) fail();
+          const selected = held.baseline.entries.filter((entry) =>
+            entry.objectId === objectId && entry.revision === revision);
+          if (selected.length !== 1 || !held.client.readSelectedCiphertext) fail();
+          const checked = await held.client.readSelectedCiphertext(
+            held.baseline, objectId, revision);
+          assertLive();
+          if (checked.verifiedCiphertext !== true || checked.plaintextAvailable !== false
+            || checked.authorizesMutation !== false
+            || checked.objectId !== objectId || checked.revision !== revision
+            || checked.epoch !== selected[0].epoch
+            || checked.ciphertextDigestBase64 !== selected[0].ciphertextDigestBase64) fail();
+          const sealed = contentFrom64(checked.ciphertextBase64);
+          try {
+            downloadLocal("zk1-" + objectId + "-v" + revision + ".ciphertext",
+              sealed, "application/octet-stream", assertLive);
+          } finally { sealed.fill(0); }
+          status("GET Ed25519/CAS e SHA-256 conferidos: objeto " + objectId
+            + " · revisão " + revision + ". Ciphertext salvo localmente; "
+            + "prévia bloqueada sem CEK confiável. Nenhum plaintext saiu do dispositivo.");
           return;
         }
         if (action === "catalog-delta-publish") {
