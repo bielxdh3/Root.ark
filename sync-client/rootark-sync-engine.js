@@ -170,6 +170,19 @@ function envelopeCopy(operation) {
   return JSON.parse(protocol.canonicalJson(operation));
 }
 
+function assertInventoryMatchesEnvelope(operation, inventory) {
+  if (operation.objectId !== inventory.objectId || operation.fileId !== inventory.fileId
+    || operation.versionId !== inventory.versionId || operation.operationId !== inventory.operationId
+    || operation.tombstone !== inventory.tombstone || operation.operation !== inventory.operation
+    || operation.keyEpoch !== inventory.keyEpoch || operation.compartmentId !== inventory.compartmentId
+    || operation.deviceId !== inventory.deviceId || operation.protocolVersion !== inventory.protocolVersion
+    || protocol.canonicalJson(operation.baseRevision) !== protocol.canonicalJson(inventory.baseRevision)
+    || protocol.canonicalJson(operation.revision) !== protocol.canonicalJson(inventory.revision)
+    || protocol.canonicalJson(operation.metadata) !== protocol.canonicalJson(inventory.metadata)) {
+    fail("Remote object changed since metadata inventory", "inventory_changed");
+  }
+}
+
 function signedWebDavEventId(operation) {
   // Only an exact deterministic WebDAV operation ID can group two pending
   // signed envelopes. Never infer batch ownership from adjacent array order
@@ -744,6 +757,15 @@ class SyncEngine {
     let cursor = null;
     let available = 0;
     let matching = null;
+    const tombstones = [];
+    const tracked = new Map();
+    for (const [relativePath, entry] of Object.entries(this.snapshot.files)) {
+      if (entry && !entry.deleted && !entry.directory && this.isSelected(relativePath)) {
+        const existing = tracked.get(entry.objectId) || [];
+        existing.push(relativePath);
+        tracked.set(entry.objectId, existing);
+      }
+    }
     const seenCursors = new Set();
     for (let pageNumber = 0; pageNumber < 1024; pageNumber += 1) {
       const page = await this.browseRemoteInventory({ limit: 64, cursor });
@@ -752,14 +774,20 @@ class SyncEngine {
       }
       for (const entry of page.objects) {
         const remotePath = protocol.safeRelativePath(entry.metadata?.path, "path");
-        if (!this.isSelected(remotePath)) continue;
-        if (!entry.tombstone && entry.metadata?.contentType !== "inode/directory") available += 1;
-        if (requestedPath !== null && !entry.tombstone && pathsEqual(remotePath, requestedPath)) {
+        const tombstone = Boolean(entry.tombstone || entry.operation === "delete");
+        const localPaths = tracked.get(entry.objectId) || [];
+        const cachedTombstone = tombstone && localPaths.length > 0;
+        if (!this.isSelected(remotePath) && !cachedTombstone) continue;
+        if (!tombstone && entry.metadata?.contentType !== "inode/directory") available += 1;
+        if (cachedTombstone) tombstones.push(entry);
+        const requestedMatch = requestedPath !== null && (pathsEqual(remotePath, requestedPath)
+          || (cachedTombstone && localPaths.some((relativePath) => pathsEqual(relativePath, requestedPath))));
+        if (requestedMatch && (!tombstone || cachedTombstone)) {
           if (matching) fail("More than one remote object matches this path", "remote_object_ambiguous");
           matching = entry;
         }
       }
-      if (page.nextCursor === null) return { available, matching };
+      if (page.nextCursor === null) return { available, matching, tombstones };
       if (typeof page.nextCursor !== "string" || !page.nextCursor
         || seenCursors.has(page.nextCursor)) fail("Repeated or invalid metadata cursor", "invalid_inventory");
       seenCursors.add(page.nextCursor);
@@ -1717,11 +1745,73 @@ class SyncEngine {
     return trashTarget;
   }
 
+  async stageCleanTrackedFile(relativePath, tracked) {
+    // Checking a path before stageExisting is insufficient: a local writer
+    // may change it before the rename. Verify the staged inode and bytes too,
+    // restoring the changed file instead of admitting a remote overwrite.
+    if (!tracked || !/^[a-f0-9]{64}$/.test(tracked.hash || "")) {
+      fail("Tracked cache has no verified content hash", "local_changes_pending");
+    }
+    const source = await contained(this.rootDir, relativePath, true);
+    const before = await fsp.lstat(source, { bigint: true }).catch((error) => {
+      if (error.code === "ENOENT") fail("Tracked local source disappeared", "local_changes_pending");
+      throw error;
+    });
+    const contents = await readContainedFile(this.rootDir, relativePath, before);
+    if (crypto.createHash("sha256").update(contents).digest("hex") !== tracked.hash) {
+      fail("Tracked local source has unsynced changes", "local_changes_pending");
+    }
+    const staged = await this.stageExisting(source);
+    if (!staged) fail("Tracked local source disappeared during staging", "local_changes_pending");
+    try {
+      await containedAbsolute(this.rootDir, staged, false);
+      const stagedStats = await fsp.lstat(staged, { bigint: true });
+      if (!stagedStats.isFile() || stagedStats.isSymbolicLink() || stagedStats.nlink !== 1n
+        || !sameFileIdentity(before, stagedStats)) {
+        fail("Tracked local source changed during staging", "local_changes_pending");
+      }
+      const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+      const handle = await fsp.open(staged, flags);
+      try {
+        const opened = await handle.stat({ bigint: true });
+        if (!sameFileVersion(stagedStats, opened)) {
+          fail("Tracked local source changed during staging", "local_changes_pending");
+        }
+        const stagedBytes = await handle.readFile();
+        const openedAfterRead = await handle.stat({ bigint: true });
+        const stagedAfterRead = await fsp.lstat(staged, { bigint: true });
+        if (!sameFileVersion(opened, openedAfterRead)
+          || !sameFileIdentity(openedAfterRead, stagedAfterRead)
+          || crypto.createHash("sha256").update(stagedBytes).digest("hex") !== tracked.hash) {
+          fail("Tracked local source changed during staging", "local_changes_pending");
+        }
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      await this.restoreStagedTrackedFile(relativePath, staged);
+      fail("Tracked local source changed during staging", "local_changes_pending");
+    }
+    return staged;
+  }
+
+  async restoreStagedTrackedFile(relativePath, staged) {
+    const source = await contained(this.rootDir, relativePath, true);
+    // A concurrently recreated path belongs to the local writer. Keep its
+    // predecessor in trash for recovery instead of overwriting new user bytes.
+    if (await exists(source)) fail("Local source was recreated; staged copy retained", "local_changes_pending");
+    try {
+      await fsp.rename(staged, source);
+    } catch {
+      fail("Cannot restore staged local source; recoverable copy retained", "local_changes_pending");
+    }
+  }
+
   async apply(operation, summary = null) {
     return this.withMutationLock(() => this._apply(operation, summary));
   }
 
-  async _apply(operation, summary = null, beforeHydrationWrite = null) {
+  async _apply(operation, summary = null, beforeHydrationWrite = null, tombstoneSourceOverride = null) {
     operation = envelopeCopy(operation);
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
@@ -1760,9 +1850,16 @@ class SyncEngine {
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
         && priorAtTarget.objectId === operation.objectId && priorAtTarget.fileId === operation.fileId;
-      const sourcePath = targetMatchesIdentity ? metadata.path
+      // Only the verified on-demand tombstone path can bypass fileId equality:
+      // an authenticated successor can legitimately rotate F0 -> F1.
+      if (tombstoneSourceOverride && (!beforeHydrationWrite
+        || this.snapshot.files[tombstoneSourceOverride]?.objectId !== operation.objectId
+        || this.snapshot.files[tombstoneSourceOverride]?.deleted)) {
+        fail("Tracked tombstone source changed", "local_changes_pending");
+      }
+      const sourcePath = tombstoneSourceOverride || (targetMatchesIdentity ? metadata.path
         : (activeIdentityPath(this.snapshot.files, operation, metadata.path)
-          || activeFileIdentityPath(this.snapshot.files, operation, metadata.path));
+          || activeFileIdentityPath(this.snapshot.files, operation, metadata.path)));
       if (!sourcePath) {
         delete this.snapshot.remoteOnly[operation.objectId];
         await this.persistSnapshot();
@@ -1773,7 +1870,12 @@ class SyncEngine {
         && (priorAtTarget.objectId !== operation.objectId || priorAtTarget.fileId !== operation.fileId);
       const tombstonePath = pathOccupiedByOther ? sourcePath : metadata.path;
       const deleteTarget = await contained(this.rootDir, sourcePath, true);
-      await this.stageExisting(deleteTarget);
+      if (beforeHydrationWrite) await beforeHydrationWrite();
+      if (tombstoneSourceOverride) {
+        await this.stageCleanTrackedFile(sourcePath, this.snapshot.files[sourcePath]);
+      } else {
+        await this.stageExisting(deleteTarget);
+      }
       this.rememberOperation({ ...operation, metadata: { ...metadata, path: tombstonePath } }, undefined, sourcePath);
     } else if (operation.operation === "move") {
       if (!metadata.sourcePath) fail("Move source path is required", "unsafe_path");
@@ -1841,16 +1943,34 @@ class SyncEngine {
           }
         }
       } else {
+        // For an explicitly verified on-demand UPDATE, the same file identity
+        // may still be cached at the pathname preceding a remote MOVE.
+        const relocatedSource = beforeHydrationWrite && operation.operation === "update"
+          ? activeFileIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
         await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
+        let stagedSource = null;
         try {
+          // Stage AND verify the old identity before publishing the new path.
+          // A racing local edit/removal must never leave a destination orphan.
+          if (relocatedSource && !pathsEqual(relocatedSource, metadata.path)) {
+            stagedSource = await this.stageCleanTrackedFile(
+              relocatedSource, this.snapshot.files[relocatedSource]);
+          }
           if (await exists(target)) await this.stageExisting(target);
           await fsp.rename(temporary, target);
-        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+          if (stagedSource) cleanupPath = relocatedSource;
+        } catch (error) {
+          if (stagedSource) await this.restoreStagedTrackedFile(relocatedSource, stagedSource);
+          throw error;
+        } finally {
+          await fsp.rm(temporary, { force: true }).catch(() => {});
+        }
       }
-      this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
+      this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
+        cleanupPath || undefined);
     }
-    if (operation.operation === "move" && cleanupPath) {
+    if ((operation.operation === "move" || operation.operation === "update") && cleanupPath) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath, true)));
     } else if (operation.operation === "delete" || operation.tombstone) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.path, true)));
@@ -2187,7 +2307,10 @@ class SyncEngine {
     }
     const { matching } = await this.scanOnDemandInventory(safePath);
     if (!matching) fail("Remote object is not in the metadata inventory", "remote_object_unavailable");
-    if (matching.tombstone) fail("Remote object has been deleted", "remote_object_deleted");
+    if (matching.tombstone || matching.operation === "delete") {
+      await this._reconcileOnDemandTombstone(matching);
+      return false;
+    }
 
     const prior = this.snapshot.files[safePath];
     const target = await contained(this.rootDir, safePath, true);
@@ -2233,16 +2356,7 @@ class SyncEngine {
     const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
     if (records.length !== 1) fail("Remote object is not available", "remote_object_unavailable");
     const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
-    if (operation.objectId !== matching.objectId || operation.fileId !== matching.fileId
-      || operation.versionId !== matching.versionId || operation.operationId !== matching.operationId
-      || operation.tombstone !== matching.tombstone || operation.operation !== matching.operation
-      || operation.keyEpoch !== matching.keyEpoch || operation.compartmentId !== matching.compartmentId
-      || operation.deviceId !== matching.deviceId || operation.protocolVersion !== matching.protocolVersion
-      || protocol.canonicalJson(operation.baseRevision) !== protocol.canonicalJson(matching.baseRevision)
-      || protocol.canonicalJson(operation.revision) !== protocol.canonicalJson(matching.revision)
-      || protocol.canonicalJson(operation.metadata) !== protocol.canonicalJson(matching.metadata)) {
-      fail("Remote object changed since metadata inventory", "inventory_changed");
-    }
+    assertInventoryMatchesEnvelope(operation, matching);
     if (operation.metadata.contentType === "inode/directory") {
       fail("Files On-Demand materializes regular files only", "cache_entry_unavailable");
     }
@@ -2274,6 +2388,25 @@ class SyncEngine {
     const checkBeforeWrite = async () => {
       assertNoSignedInventoryRollback();
       await checkLocalCache();
+      if (operation.operation === "update") {
+        const candidates = Object.entries(this.snapshot.files).filter(([relativePath, tracked]) =>
+          !pathsEqual(relativePath, safePath) && tracked && !tracked.deleted
+          && tracked.objectId === operation.objectId);
+        if (candidates.length > 1 || candidates.some(([, tracked]) =>
+          tracked.directory || tracked.fileId !== operation.fileId)
+          || candidates.some(([relativePath]) => !this.isSelected(relativePath))) {
+          fail("Tracked local object identity requires reconciliation", "local_changes_pending");
+        }
+        if (candidates.length === 1) {
+          const [sourcePath, tracked] = candidates[0];
+          const source = await contained(this.rootDir, sourcePath, true);
+          if (!(await exists(source))) fail("Tracked local source was removed", "local_changes_pending");
+          const bytes = await readContainedFile(this.rootDir, sourcePath);
+          if (!tracked.hash || crypto.createHash("sha256").update(bytes).digest("hex") !== tracked.hash) {
+            fail("Tracked local source has unsynced changes", "local_changes_pending");
+          }
+        }
+      }
       if (!moveKey) return;
       // A signed UPDATE may change fileId without changing objectId. Until
       // the local old identity is reconciled, its missing bytes may be an
@@ -2299,6 +2432,55 @@ class SyncEngine {
     await checkBeforeWrite();
     const verifiedFreshDigest = await this._apply(operation, null, checkBeforeWrite);
     await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+    return true;
+  }
+
+  async _reconcileOnDemandTombstone(inventory, summary = null) {
+    // Inventory is advisory. It may only select an already tracked identity;
+    // deletion requires the complete matching envelope and normal verifier.
+    const matches = Object.entries(this.snapshot.files).filter(([relativePath, entry]) =>
+      entry && !entry.deleted && !entry.directory && this.isSelected(relativePath)
+      && entry.objectId === inventory.objectId);
+    if (!matches.length) return false;
+    if (matches.length !== 1) fail("Ambiguous tracked object identity", "remote_object_ambiguous");
+    const [sourcePath, currentPrior] = matches[0];
+    const prior = { ...currentPrior };
+    const checkBeforeWrite = async () => {
+      const current = this.snapshot.files[sourcePath];
+      if (!current || current.deleted || current.directory
+        || current.objectId !== inventory.objectId || current.fileId !== prior.fileId
+        || current.versionId !== prior.versionId || current.hash !== prior.hash
+        || !/^[a-f0-9]{64}$/.test(current.hash || "")) {
+        fail("Tracked local cache changed", "local_changes_pending");
+      }
+      const pending = await this.journal.recover();
+      if (pending.some((item) => item.objectId === inventory.objectId
+        || item.metadata?.path === sourcePath || item.metadata?.sourcePath === sourcePath)) {
+        fail("Pending local sync prevents tombstone reconciliation", "sync_operation_pending");
+      }
+      const source = await contained(this.rootDir, sourcePath, true);
+      if (!(await exists(source))) fail("Tracked local cache was removed", "local_changes_pending");
+      const bytes = await readContainedFile(this.rootDir, sourcePath);
+      if (crypto.createHash("sha256").update(bytes).digest("hex") !== current.hash) {
+        fail("Tracked local cache has unsynced changes", "local_changes_pending");
+      }
+    };
+    await checkBeforeWrite();
+    const result = await this.adapter.list(inventory.objectId);
+    const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
+    if (records.length !== 1) fail("Remote tombstone is unavailable", "remote_object_unavailable");
+    const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
+    assertInventoryMatchesEnvelope(operation, inventory);
+    if (!operation.tombstone && operation.operation !== "delete") {
+      fail("Remote tombstone is not a delete operation", "inventory_changed");
+    }
+    if (!prior.revision || protocol.compareRevisions(operation.revision, prior.revision) <= 0) {
+      fail("Old signed tombstone cannot delete newer local cache", "remote_rollback_detected");
+    }
+    await checkBeforeWrite();
+    const verifiedFreshDigest = await this._apply(operation, summary, checkBeforeWrite, sourcePath);
+    await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+    if (summary) summary.pulled += 1;
     return true;
   }
 
@@ -2483,7 +2665,11 @@ class SyncEngine {
     if (!summary.offline) {
       if (this.filesOnDemand) {
         try {
-          summary.available = (await this.scanOnDemandInventory()).available;
+          const inventory = await this.scanOnDemandInventory();
+          summary.available = inventory.available;
+          for (const tombstone of inventory.tombstones) {
+            await this._reconcileOnDemandTombstone(tombstone, summary);
+          }
         } catch (error) {
           if (transient(error)) summary.offline = true;
           else throw error;

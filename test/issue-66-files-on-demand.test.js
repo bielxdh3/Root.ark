@@ -668,3 +668,251 @@ test(`issue 66 #263 P2: signed old inventory cannot roll back newer object with 
     "replayed old inventory cannot lower the durable local revision");
 });
 }
+
+test("issue 66 #263 P2: UPDATE after remote MOVE retires the old clean cached path", async (t) => {
+  const { root, open, store, key } = await setup(t, { "docs/old.txt": "initial bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/old.txt"), true);
+  const original = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: original.revision,
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt", sourcePath: "docs/old.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("initial bytes"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const updated = protocol.createOperation({
+    operation: "update", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: moved.revision,
+    revision: { counter: moved.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt" },
+    plaintext: Buffer.from("new bytes"), fileKey: key,
+  });
+  assert.equal((await store.put("alice", updated)).kind, "stored");
+  assert.equal(await client.materializeRemote("docs/new.txt"), true);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "new.txt"), "utf8"), "new bytes");
+  assert.equal(await exists(path.join(root, "docs", "old.txt")), false);
+  assert.equal(client.snapshot.files["docs/old.txt"], undefined);
+  assert.equal(client.snapshot.files["docs/new.txt"].objectId, original.objectId);
+  assert.deepEqual(await client.journal.recover(), []);
+});
+
+for (const localChange of ["dirty", "missing"]) {
+test(`issue 66 #263 P2: relocated UPDATE preserves ${localChange} source`, async (t) => {
+  const { root, open, store, key } = await setup(t, { "docs/old.txt": "initial bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/old.txt");
+  const original = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: original.revision,
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt", sourcePath: "docs/old.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("initial bytes"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const updated = protocol.createOperation({
+    operation: "update", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: moved.revision,
+    revision: { counter: moved.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt" },
+    plaintext: Buffer.from("new bytes"), fileKey: key,
+  });
+  assert.equal((await store.put("alice", updated)).kind, "stored");
+  if (localChange === "dirty") await fsp.writeFile(path.join(root, "docs", "old.txt"), "local edit");
+  else await fsp.unlink(path.join(root, "docs", "old.txt"));
+  await assert.rejects(client.materializeRemote("docs/new.txt"), { code: "local_changes_pending" });
+  assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
+  assert.equal(client.snapshot.files["docs/old.txt"].objectId, original.objectId);
+  assert.equal(await exists(path.join(root, "docs", "old.txt")), localChange === "dirty");
+  if (localChange === "dirty") assert.equal(await fsp.readFile(path.join(root, "docs", "old.txt"), "utf8"), "local edit");
+});
+}
+
+test("issue 66 #263 P2: verified remote tombstone invalidates a clean hydrated cache", async (t) => {
+  const { root, open, store, key, state } = await setup(t, { "docs/gone.txt": "cached bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/gone.txt"), true);
+  const prior = store.list("alice")[0];
+  const deleted = protocol.createOperation({
+    operation: "delete", objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/gone.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", deleted)).kind, "stored");
+  const summary = await client.syncOnce();
+  assert.equal(summary.available, 0);
+  assert.equal(state.pushes, 0);
+  assert.equal(await exists(path.join(root, "docs", "gone.txt")), false);
+  assert.equal(client.snapshot.files["docs/gone.txt"]?.deleted, true);
+  assert.deepEqual(await client.journal.recover(), []);
+});
+
+for (const localChange of ["dirty", "missing"]) {
+test(`issue 66 #263 P2: ${localChange} cache refuses remote tombstone even on explicit refresh`, async (t) => {
+  const { root, open, store, key } = await setup(t, { "docs/gone.txt": "cached bytes" });
+  const client = await open();
+  await client.materializeRemote("docs/gone.txt");
+  const prior = store.list("alice")[0];
+  const deleted = protocol.createOperation({
+    operation: "delete", objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/gone.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", deleted)).kind, "stored");
+  if (localChange === "dirty") await fsp.writeFile(path.join(root, "docs", "gone.txt"), "unsynced local edit");
+  else await fsp.unlink(path.join(root, "docs", "gone.txt"));
+  await assert.rejects(client.materializeRemote("docs/gone.txt"), { code: "local_changes_pending" });
+  assert.equal(await exists(path.join(root, "docs", "gone.txt")), localChange === "dirty");
+  if (localChange === "dirty") assert.equal(await fsp.readFile(path.join(root, "docs", "gone.txt"), "utf8"), "unsynced local edit");
+  assert.equal(client.snapshot.files["docs/gone.txt"].objectId, prior.objectId);
+});
+}
+
+test("issue 66 #263 P2: forged tombstone inventory cannot evict an authentic cached object", async (t) => {
+  const { root, open, store, adapter } = await setup(t, { "docs/preserved.txt": "live authenticated ciphertext" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/preserved.txt"), true);
+  const prior = store.list("alice")[0];
+  const actualInventory = adapter.listInventory;
+  adapter.listInventory = async (options) => {
+    const page = await actualInventory(options);
+    return { ...page, objects: page.objects.map((entry) => entry.objectId === prior.objectId
+      ? { ...entry, tombstone: true, operation: "delete" } : entry) };
+  };
+  await assert.rejects(client.syncOnce(), { code: "inventory_changed" });
+  assert.equal(await fsp.readFile(path.join(root, "docs", "preserved.txt"), "utf8"), "live authenticated ciphertext");
+  assert.equal(client.snapshot.files["docs/preserved.txt"].deleted, false);
+});
+
+for (const mutation of ["dirty", "missing"]) {
+test(`issue 66 #263 reviewer P2 A: UPDATE relocation source becomes ${mutation} during staging`, async (t) => {
+  const { root, open, store, key } = await setup(t, { "docs/old.txt": "cached pre-move" });
+  const client = await open();
+  await client.materializeRemote("docs/old.txt");
+  const first = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: first.objectId, fileId: first.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: first.revision, revision: { counter: first.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt", sourcePath: "docs/old.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("cached pre-move"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const updated = protocol.createOperation({
+    operation: "update", objectId: first.objectId, fileId: first.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: moved.revision, revision: { counter: moved.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt" }, plaintext: Buffer.from("remote update"), fileKey: key,
+  });
+  assert.equal((await store.put("alice", updated)).kind, "stored");
+  const sourcePath = path.join(root, "docs", "old.txt");
+  const destinationPath = path.join(root, "docs", "new.txt");
+  const actualStage = client.stageExisting.bind(client);
+  let destinationPresentWhenSourceStaged = null;
+  client.stageExisting = async (target) => {
+    if (target === sourcePath) {
+      destinationPresentWhenSourceStaged = await exists(destinationPath);
+      if (mutation === "dirty") await fsp.writeFile(sourcePath, "local racing edit");
+      else await fsp.unlink(sourcePath);
+    }
+    return actualStage(target);
+  };
+  await assert.rejects(client.materializeRemote("docs/new.txt"), { code: "local_changes_pending" });
+  assert.equal(destinationPresentWhenSourceStaged, false, "source must be staged before publishing destination");
+  assert.equal(await exists(destinationPath), false, "failed reconciliation cannot leave orphan destination");
+  assert.equal(await exists(sourcePath), mutation === "dirty");
+  if (mutation === "dirty") {
+    assert.equal(await fsp.readFile(sourcePath, "utf8"), "local racing edit",
+      "concurrent local changes must be restored from trash");
+  }
+  assert.equal(client.snapshot.files["docs/old.txt"].objectId, first.objectId);
+  assert.equal(client.snapshot.files["docs/new.txt"], undefined);
+  assert.equal((await client.journal.recover()).length, 0);
+});
+}
+
+test("issue 66 #263 reviewer P2 B: authenticated rotated-fileId tombstone retires cache by object identity", async (t) => {
+  const { root, adapter, store, key } = await setup(t, { "docs/rotated.txt": "original cache" });
+  const pair = crypto.generateKeyPairSync("ed25519");
+  const publicKey = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const trust = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
+  const originalList = adapter.list;
+  const authorizationExpiresAt = Date.now() + 60_000;
+  adapter.list = async (objectId) => Promise.all((await originalList(objectId)).map(async (record) => ({
+    ...record,
+    authorization: await createAuthorizationProof(record, {
+      username: "alice", publicKey, privateKey: pair.privateKey,
+      expiresAt: authorizationExpiresAt,
+    }),
+  })));
+  const client = await new SyncEngine({
+    rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key, selectedPaths: ["docs"],
+    filesOnDemand: true, requireAuthorization: true,
+    verifyIncoming: (operation) => verifyAuthorizationProof(operation.authorization, operation, trust),
+  }).open();
+  await client.materializeRemote("docs/rotated.txt");
+  const first = store.list("alice")[0];
+  const changedFileId = `file-rotated-${crypto.randomUUID()}`;
+  const deleted = protocol.createOperation({
+    operation: "delete", objectId: first.objectId, fileId: changedFileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: first.revision, revision: { counter: first.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/rotated.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", deleted)).kind, "stored");
+  assert.equal((await client.syncOnce()).available, 0);
+  assert.equal(await exists(path.join(root, "docs", "rotated.txt")), false);
+  assert.equal(client.snapshot.files["docs/rotated.txt"].deleted, true);
+  assert.equal(client.snapshot.files["docs/rotated.txt"].fileId, changedFileId);
+  assert.equal(client.journal.hasSeen(deleted.operationId), true);
+});
+
+test("issue 66 #263 reviewer P2 C: tombstone stage-time edit restores dirty cache and keeps snapshot active", async (t) => {
+  const { root, open, store, key } = await setup(t, { "docs/race-delete.txt": "cached for deletion" });
+  const client = await open();
+  await client.materializeRemote("docs/race-delete.txt");
+  const first = store.list("alice")[0];
+  const deleted = protocol.createOperation({
+    operation: "delete", objectId: first.objectId, fileId: first.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: first.revision, revision: { counter: first.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/race-delete.txt" }, fileKey: key,
+  });
+  assert.equal((await store.put("alice", deleted)).kind, "stored");
+  const sourcePath = path.join(root, "docs", "race-delete.txt");
+  const actualStage = client.stageExisting.bind(client);
+  let staged = false;
+  client.stageExisting = async (target) => {
+    if (target === sourcePath) {
+      staged = true;
+      await fsp.writeFile(sourcePath, "changed between clean hash and stage");
+    }
+    return actualStage(target);
+  };
+  await assert.rejects(client.materializeRemote("docs/race-delete.txt"), { code: "local_changes_pending" });
+  assert.equal(staged, true, "test must race the real staging call, not just the precheck");
+  assert.equal(await fsp.readFile(sourcePath, "utf8"), "changed between clean hash and stage");
+  assert.equal(client.snapshot.files["docs/race-delete.txt"].deleted, false);
+  assert.equal(client.journal.hasSeen(deleted.operationId), false);
+});
