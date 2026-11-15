@@ -2,157 +2,87 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { writeFileSync, mkdirSync } = require('node:fs');
-const { createHash } = require('node:crypto');
 const { join } = require('node:path');
+const { performance } = require('node:perf_hooks');
 const { fixture } = require('./support/issue242-app-fixture');
 
-test('real signed sessions bind ciphertext ACL but deny signaling without an atomic all-party authority', { timeout: 115_000 }, async t => {
-  const f = await fixture();
-  t.after(f.close);
-  const alice = await f.login('alice');
-  const bob = await f.login('bob');
-  const carol = await f.login('carol');
+const boundObject = { folderId: 'root', fileName: 'sealed.bin' };
+const body = JSON.stringify({ boundObject });
+function provisionDisposableLegacyObject(f, ciphertextBytes) {
   mkdirSync(join(f.directory, 'uploads'), { recursive: true });
-  const ciphertextPath = join(f.directory, 'uploads', 'sealed.bin');
-  const ciphertext = Buffer.alloc(92, 0xa5); // disposable opaque ciphertext fixture only
-  writeFileSync(ciphertextPath, ciphertext);
-  const metadataPath = join(f.directory, 'data', 'encrypted-files.json');
-  const permissionsPath = join(f.directory, 'data', 'file-permissions.json');
-  const metadata = {
-    fileName: 'sealed.bin', folderId: 'root', uploadedAt: '2026-11-06T12:00:00.000Z',
-    size: 64, encryptedSize: 92, encryptionLevel: 'user-key',
-    algorithm: 'aes-256-gcm', layers: [{ type: 'user', iv: '0011', authTag: '0022' }],
-    accessControl: { owner: 'alice', authorizedUsers: ['alice', 'bob'], expiresAt: null },
-  };
-  const stored = { 'root/sealed.bin': metadata };
-  const save = () => writeFileSync(metadataPath, JSON.stringify(stored));
-  save();
-  const boundObject = { folderId: 'root', fileName: 'sealed.bin' };
-  const create = async (session, object) => f.request('/p2p/rooms', {
-    method: 'POST', session, body: JSON.stringify({ boundObject: object }),
-  });
-  assert.equal((await create(alice, boundObject)).status, 403,
-    'missing exact private per-file ACL is not an implicit public grant');
-  const filePermissions = { 'root/sealed.bin': {
-    public: false, owner: 'alice', users: { bob: { read: true, edit: false } }
-  } };
-  writeFileSync(permissionsPath, JSON.stringify(filePermissions));
-  assert.equal((await create(bob, boundObject)).status, 403, 'recipient cannot impersonate owner');
-  assert.equal((await create(alice, { folderId: 'other', fileName: 'sealed.bin' })).status, 403,
-    'same basename in another tenant/folder does not inherit authorization');
-  assert.equal((await create(alice, { folderId: 'root', fileName: '../sealed.bin' })).status, 403);
-  const created = await create(alice, boundObject);
-  assert.equal(created.status, 200, created.text.slice(0, 180));
-  const room = JSON.parse(created.text);
-  assert.deepEqual(room.boundObject, { ...boundObject, size: ciphertext.byteLength,
-    sha256: createHash('sha256').update(ciphertext).digest('hex') },
-  'room is bound to the exact ciphertext byte digest and ACL');
-  const host = await f.connect(alice);
-  const target = await f.connect(bob);
-  const other = await f.connect(carol);
-  t.after(() => [host, target, other].forEach(c => c.socket.terminate()));
-  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
-  const hostJoined = await host.next('joined');
-  assert.deepEqual(hostJoined.boundObject, room.boundObject);
-  host.send({ type: 'invite', recipient: 'carol' });
-  assert.equal((await host.next('error')).code, 'OBJECT_ACCESS_DENIED');
-  filePermissions['root/sealed.bin'].users = {};
-  writeFileSync(permissionsPath, JSON.stringify(filePermissions));
-  host.send({ type: 'invite', recipient: 'bob' });
-  assert.equal((await host.next('error')).code, 'OBJECT_ACCESS_DENIED',
-    'an encrypted-files grant cannot override the stricter current file ACL');
-  filePermissions['root/sealed.bin'].users.bob = { read: true, edit: false };
-  writeFileSync(permissionsPath, JSON.stringify(filePermissions));
-  host.send({ type: 'invite', recipient: 'bob' });
-  const invite = (await host.next('invited')).invitation;
-  target.send({ type: 'join', roomId: room.roomId, invitation: invite });
-  const bobJoined = await target.next('joined');
-  host.send({ type: 'request-peer', to: bobJoined.peerId });
-  const offer = await target.next('peer-request');
-  target.send({ type: 'consent', requestId: offer.requestId, accept: true });
-  await host.next('peer-accepted');
-  const delivered = [];
-  host.socket.on('message', raw => {
-    if (JSON.parse(raw.toString()).type === 'signal') delivered.push(true);
-  });
-  const closed = new Promise(resolve => target.socket.once('close', resolve));
-  target.send({ type: 'signal', to: hostJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'fixture' } } });
-  assert.equal(await closed, 1000, 'legacy file ACL cannot establish a multi-principal atomic signaling fence');
-  assert.deepEqual(delivered, [], 'no signaling bytes forwarded without a coherent authority snapshot');
-  metadata.accessControl.authorizedUsers = ['alice']; // revocation in the real authoritative JSON store.
-  save();
-  const second = await create(alice, boundObject);
-  assert.equal(second.status, 200);
-  const nextRoom = JSON.parse(second.text);
-  const host2 = await f.connect(alice);
-  t.after(() => host2.socket.terminate());
-  host2.send({ type: 'join', roomId: nextRoom.roomId, hostKey: nextRoom.hostKey });
-  await host2.next('joined');
-  host2.send({ type: 'invite', recipient: 'bob' });
-  assert.equal((await host2.next('error')).code, 'OBJECT_ACCESS_DENIED');
-  metadata.accessControl.authorizedUsers.push('bob');
-  save();
-  host2.send({ type: 'invite', recipient: 'bob' });
-  const newInvite = (await host2.next('invited')).invitation;
-  writeFileSync(ciphertextPath, Buffer.alloc(92, 0xb6)); // in-place bytes change, metadata unchanged
-  const restoredBob = await f.connect(bob);
-  t.after(() => restoredBob.socket.terminate());
-  restoredBob.send({ type: 'join', roomId: nextRoom.roomId, invitation: newInvite });
-  assert.equal((await restoredBob.next('error')).code, 'INVALID_INVITE',
-    'replacement under same filename invalidates bound room grant');
-  assert.ok(other.socket.readyState <= 1);
-});
-
-test('a bounded protected-signal flood fails closed without blocking the real HTTP event loop', { timeout: 115_000 }, async t => {
-  const f = await fixture();
-  t.after(f.close);
-  const alice = await f.login('alice');
-  const bob = await f.login('bob');
-  const ciphertext = Buffer.alloc(32 * 1024 * 1024, 0xa7);
-  mkdirSync(join(f.directory, 'uploads'), { recursive: true });
-  writeFileSync(join(f.directory, 'uploads', 'load.bin'), ciphertext);
+  writeFileSync(join(f.directory, 'uploads', boundObject.fileName),
+    Buffer.alloc(ciphertextBytes, 0xa5));
   writeFileSync(join(f.directory, 'data', 'encrypted-files.json'), JSON.stringify({
-    'root/load.bin': {
-      fileName: 'load.bin', folderId: 'root', uploadedAt: '2026-11-06T12:00:00.000Z',
-      size: ciphertext.length - 28, encryptedSize: ciphertext.length,
+    'root/sealed.bin': {
+      fileName: 'sealed.bin', folderId: 'root', uploadedAt: '2026-11-06T12:00:00.000Z',
+      size: ciphertextBytes - 28, encryptedSize: ciphertextBytes,
       encryptionLevel: 'user-key', algorithm: 'aes-256-gcm',
       layers: [{ type: 'user', iv: '0011', authTag: '0022' }],
       accessControl: { owner: 'alice', authorizedUsers: ['alice', 'bob'], expiresAt: null },
     },
   }));
   writeFileSync(join(f.directory, 'data', 'file-permissions.json'), JSON.stringify({
-    'root/load.bin': { owner: 'alice', public: false, users: { bob: { read: true } } },
+    'root/sealed.bin': {
+      public: false, owner: 'alice', users: { bob: { read: true, edit: false } },
+    },
   }));
-  const created = await f.request('/p2p/rooms', { method: 'POST', session: alice,
-    body: JSON.stringify({ boundObject: { folderId: 'root', fileName: 'load.bin' } }) });
-  assert.equal(created.status, 200);
-  const room = JSON.parse(created.text);
-  const host = await f.connect(alice);
-  const guest = await f.connect(bob);
-  t.after(() => { host.socket.terminate(); guest.socket.terminate(); });
-  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
-  const hostJoined = await host.next('joined');
-  host.send({ type: 'invite', recipient: 'bob' });
-  const invitation = (await host.next('invited')).invitation;
-  guest.send({ type: 'join', roomId: room.roomId, invitation });
-  const joined = await guest.next('joined');
-  host.send({ type: 'request-peer', to: joined.peerId });
-  const request = await guest.next('peer-request');
-  guest.send({ type: 'consent', requestId: request.requestId, accept: true });
-  await host.next('peer-accepted');
-  const closed = new Promise(resolve => guest.socket.once('close', resolve));
-  for (let i = 0; i < 12; i++) guest.send({ type: 'signal', to: hostJoined.peerId,
-    signal: { kind: 'ice', candidate: { candidate: 'load-' + i } } });
-  assert.equal(await closed, 1000, 'no all-party snapshot: reject even a correctly pinned 32 MiB room');
-  const before = performance.now();
-  const heartbeat = await f.request('/login.html');
-  const elapsed = performance.now() - before;
-  assert.equal(heartbeat.status, 200);
-  assert.ok(elapsed < 700, `HTTP event loop stalled for ${Math.round(elapsed)}ms under bounded signaling load`);
-  writeFileSync(join(f.directory, 'uploads', 'load.bin'), Buffer.alloc(ciphertext.length, 0xb8));
-  const stale = await f.connect(alice);
-  t.after(() => stale.socket.terminate());
-  stale.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
-  assert.equal((await stale.next('error')).code, 'INVALID_INVITE',
-    'a room closed by missing atomic authority cannot be reactivated after file replacement');
-});
+}
+
+test('real Root.ark signed HTTP denies even a valid legacy ACL-bound ciphertext room without immutable and atomic authority',
+  { timeout: 115_000 }, async t => {
+    const f = await fixture();
+    t.after(f.close);
+    const alice = await f.login('alice');
+    const bob = await f.login('bob');
+    provisionDisposableLegacyObject(f, 92);
+    const postBound = (session, input = boundObject) => f.request('/p2p/rooms', {
+      method: 'POST', session, body: JSON.stringify({ boundObject: input }),
+    });
+
+    const before = await postBound(alice);
+    assert.equal(before.status, 403,
+      'a valid legacy owner+recipient file ACL is not an immutable signed object authority');
+    assert.ok(!before.text.includes('roomId') && !before.text.includes('hostKey'),
+      'missing trust capability cannot allocate even a temporary protected room');
+    assert.equal((await postBound(bob)).status, 403,
+      'recipient cannot claim the owner object');
+    assert.equal((await postBound(alice, {
+      ...boundObject, immutableVersionAuthority: true, mutationSerializedSnapshot: true,
+    })).status, 403, 'untrusted request flags cannot elevate trust');
+
+    const manual = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+    assert.equal(manual.status, 200, manual.text.slice(0, 180));
+    const room = JSON.parse(manual.text);
+    assert.ok(room.roomId && room.hostKey);
+    assert.equal(room.boundObject, undefined, 'manual room has no false ciphertext entitlement');
+    const host = await f.connect(alice);
+    t.after(() => host.socket.terminate());
+    host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+    assert.equal((await host.next('joined')).role, 'host');
+  });
+
+test('16 concurrent real signed bound attempts reject without starving manual rooms or the HTTP event loop',
+  { timeout: 115_000 }, async t => {
+    const f = await fixture();
+    t.after(f.close);
+    const alice = await f.login('alice');
+    const bob = await f.login('bob');
+    provisionDisposableLegacyObject(f, 32 * 1024 * 1024);
+    const start = performance.now();
+    const results = await Promise.all(Array.from({ length: 16 }, () =>
+      f.request('/p2p/rooms', { method: 'POST', session: alice, body })));
+    assert.ok(results.every(value => value.status === 403),
+      'a 32 MiB object cannot force expensive hash admission when trusted authorities are absent');
+    assert.ok(results.every(value => !value.text.includes('roomId') && !value.text.includes('hostKey')));
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed < 15_000, 'pretrust requests unexpectedly stalled for ' + Math.round(elapsed) + 'ms');
+
+    const heartbeat = await f.request('/login.html');
+    assert.equal(heartbeat.status, 200);
+    const unbound = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+    const second = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+    const ownerFull = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+    const otherOwner = await f.request('/p2p/rooms', { method: 'POST', session: bob });
+    assert.deepEqual([unbound.status, second.status, ownerFull.status, otherOwner.status],
+      [200, 200, 429, 200], 'denied bound attempts must consume no global or per-owner room slots');
+  });

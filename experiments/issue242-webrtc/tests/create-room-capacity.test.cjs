@@ -10,6 +10,12 @@ function request(owner = 'alice') {
 }
 async function brokerFixture(t, authorizeObject) {
   const broker = makeBroker({ authorizeObject,
+    // Broker capacity tests use synthetic startup-injected authorities; no
+    // production version, real signature or all-writer ACL guarantee implied.
+    authorizeImmutableVersion: input => Object.freeze({
+      ...input, boundObject: { ...input.boundObject }, versionId: 'test-immutable-v1',
+    }),
+    authorizeSignalSnapshot: () => null,
     authenticateSession: req => ({ username: req.headers['x-owner'], sessionVersion: 1,
       expiresAt: Date.now() + 60_000 }) });
   await broker.listen();
@@ -27,9 +33,9 @@ test('full owner returns 429 without reading or hashing another object', async t
   const broker = await brokerFixture(t, async () => { checks++; return grant; });
   assert.equal((await broker.createRoom(request())).status, 200);
   assert.equal((await broker.createRoom(request())).status, 200);
-  assert.equal(checks, 2);
+  assert.equal(checks, 4, 'both admitted rooms require an owner ACL recheck after version attestation');
   assert.equal((await broker.createRoom(request())).status, 429);
-  assert.equal(checks, 2, 'full owner must be rejected before costly authorization');
+  assert.equal(checks, 4, 'full owner must be rejected before costly authorization');
   assert.equal((await broker.createRoom(request('bob'))).status, 200,
     'another owner remains eligible for unused global capacity');
 });
@@ -86,7 +92,7 @@ test('deny, throw and aborted request release their pending slots without creati
   assert.equal((await broker.createRoom(request())).status, 200);
   assert.equal((await broker.createRoom(request())).status, 200);
   assert.equal((await broker.createRoom(request())).status, 429);
-  assert.equal(checks, 5, 'denied, failed and aborted requests leave no pending slot');
+  assert.equal(checks, 8, 'aborted requests cannot consume capacity even after an in-flight ACL recheck');
 });
 
 test('session revoked while hashing cannot create a stale signed room', async t => {
@@ -95,6 +101,10 @@ test('session revoked while hashing cannot create a stale signed room', async t 
   const broker = makeBroker({
     authenticateSession: req => ({ username: req.headers['x-owner'],
       sessionVersion: currentVersion, expiresAt: Date.now() + 60_000 }),
+    authorizeImmutableVersion: input => Object.freeze({
+      ...input, boundObject: { ...input.boundObject }, versionId: 'test-immutable-v1',
+    }),
+    authorizeSignalSnapshot: () => null,
     authorizeObject: async () => { await gate.promise; return grant; },
   });
   await broker.listen();

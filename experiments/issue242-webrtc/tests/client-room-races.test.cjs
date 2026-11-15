@@ -8,7 +8,8 @@ const vm = require('node:vm');
 const boundObject = { folderId: 'root', fileName: 'sealed.bin', size: 92,
   sha256: 'a'.repeat(64) };
 
-function browser({ fetch, digest = async () => new Uint8Array(32).buffer }) {
+function browser({ fetch, digest = async () => new Uint8Array(32).buffer,
+  waitForSendWindow = require('../transfer-protocol.js').waitForSendWindow }) {
   const elements = new Map();
   const sockets = [];
   const peerConnections = [];
@@ -36,6 +37,7 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer }) {
   }
   const window = { P2PFileWire: { MAX_FILE: 32 * 1024 * 1024,
     CHUNK_BYTES: 64 * 1024, validDigest: hash => /^[0-9a-f]{64}$/.test(hash),
+    waitForSendWindow,
     packFrame: (_id, _offset, bytes) => bytes.buffer.slice(0) } };
   vm.runInNewContext(readFileSync(join(__dirname, '..', 'client.js'), 'utf8'), {
     document, window, WebSocket: FakeWebSocket, RTCPeerConnection: FakeRTCPeerConnection,
@@ -63,6 +65,42 @@ function smallFile() {
     arrayBuffer: async () => bytes.buffer.slice(0),
     slice: (start, end) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }) };
 }
+
+test('1:N full sender path cancels only stalled peer; healthy sibling still receives SHA ACK', async () => {
+  let stalled;
+  const b = browser({
+    fetch: async () => ({ ok: true, json: async () => ({ roomId: 'test', hostKey: 'local' }) }),
+    waitForSendWindow: dc => dc === stalled
+      ? Promise.reject(new Error('P2P_SEND_BUFFER_STALLED')) : Promise.resolve(),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  stalled = b.channel(b.sockets[0], 'slow-peer');
+  const healthy = b.channel(b.sockets[0], 'healthy-peer');
+  await b.window.__poc.sendFile(smallFile());
+  const offered = dc => dc.sent.find(m => m.type === 'offer-file');
+  assert.ok(offered(stalled));
+  assert.ok(offered(healthy));
+  await stalled.onmessage({ data: JSON.stringify({
+    type: 'accept-file', id: offered(stalled).id,
+  }) });
+  await healthy.onmessage({ data: JSON.stringify({
+    type: 'accept-file', id: offered(healthy).id,
+  }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stalled.sent.filter(message => message instanceof ArrayBuffer).length, 0);
+  assert.ok(stalled.sent.some(message => message.type === 'cancel-file'));
+  assert.equal(healthy.sent.filter(message => message instanceof ArrayBuffer).length, 1);
+  assert.ok(healthy.sent.some(message => message.type === 'end-file'));
+  assert.deepEqual(Array.from(b.window.__poc.snapshot().peers, p => p.outgoingPhase),
+    [null, 'verifying']);
+  assert.ok(b.window.__poc.snapshot().diagnostics.rejected.includes('P2P_SEND_BUFFER_STALLED'));
+  await healthy.onmessage({ data: JSON.stringify({
+    type: 'verified-file', id: offered(healthy).id, digest: '0'.repeat(64),
+  }) });
+  assert.deepEqual(Array.from(b.window.__poc.snapshot().peers, p => p.outgoingPhase),
+    [null, null]);
+});
 
 test('pending plaintext SHA must not send into a newly joined ciphertext-bound room', async () => {
   const pendingDigests = [];

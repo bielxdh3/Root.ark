@@ -74,5 +74,5 @@ jobs:
             throw 'Microsoft Edge required for real app P2P validation'
           }
       - run: npm ci --ignore-scripts
-      - run: node --test test/issue-242-app-session.test.js test/issue-242-bound-object.test.js
+      - run: node --test --test-concurrency=1 test/issue-242-app-session.test.js test/issue-242-bound-object.test.js
       - run: node experiments/issue242-webrtc/tests/app-browser.cjs
