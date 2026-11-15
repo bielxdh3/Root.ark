@@ -813,6 +813,82 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(openedOffer.data), bytes,
       "a separately authenticated recipient account/device opens the real AEAD bytes");
     openedOffer.data.fill(0);
+    // These P2 regressions use the same genuine owner V2 approval, witness
+    // receipt, signed grant, SQLite-reopened ciphertext and AEAD/HPKE ceremony
+    // as the successful offer above. An unrelated synthetic clock or raw GCM
+    // ciphertext would reject BEFORE reaching the intended checks.
+    const offerNow = () => Math.floor(Date.now() / 1000);
+    const freshOfferArgs = (overrides = {}) => ({ ...ownerOfferArgs,
+      nowSeconds: offerNow(), ...overrides });
+    assert.ok(offerNow() < grant.expiresAt, "real signed grant remains live");
+
+    // A newly signed but future-dated grant must not reach even the first
+    // independent roster read, despite valid issuer Ed25519 provenance.
+    const futureMessage = await shareGrantMessageV1({ ...grantInput,
+      authorization: { ...shareAuthorization, issued_at: offerNow() + 50 } });
+    const futureGrant = { ...grant,
+      shareStatementBase64: b64(futureMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, futureMessage, originalActor)) };
+    let futureReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+      grant: futureGrant, readIndependentAuthority: async () => {
+        futureReads++;
+        return readIndependentAuthority();
+      },
+    })), /ZK_SHARE_OFFER_DENIED/,
+    "valid owner signature must not allow a future-dated share grant");
+    assert.equal(futureReads, 0, "future-issued grant rejected before roster trust");
+
+    // An invalid *unrelated* roster row must be caught by snapshotAuthority,
+    // not the older issuer/recipient-only active-device checks.
+    let malformedReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+      readIndependentAuthority: async () => {
+        malformedReads++;
+        const current = await readIndependentAuthority();
+        return { ...current, devices: [...current.devices, {
+          ...current.devices[0], deviceId: "unrelated-roster-device", enrolledEpoch: 1.5,
+        }] };
+      },
+    })), /ZK_SHARE_OFFER_DENIED/,
+    "even a nonparticipant's malformed enrollment epoch invalidates the authority snapshot");
+    assert.equal(malformedReads, 1,
+      "malformed roster detected on the first actual authority read");
+
+    // Reach the second read AFTER authentic owner AEAD and HPKE sealing. The
+    // currentAuthority signed-head equality also rejects this rollback, so
+    // this is a boundary-coverage check, not a fabricated old-SHA RED claim.
+    let regressionReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++regressionReads === 2) current.head.revision--;
+        return current;
+      },
+    })), /ZK_SHARE_OFFER_DENIED/,
+    "the second independent authority read must reject head rollback");
+    assert.equal(regressionReads, 2,
+      "owner AEAD/HPKE sealing must complete before the rollback oracle runs");
+
+    // Feed a valid, successfully opened portable offer to this negative case.
+    // An own getter in the recipient login must be rejected WITHOUT firing.
+    const hostileRedeem = { ...recipientShareInput };
+    let recipientGetterReads = 0;
+    Object.defineProperty(hostileRedeem, "recipientUsername", { get() {
+      recipientGetterReads++;
+      return recipientShareInput.recipientUsername;
+    } });
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)), redeemInput: hostileRedeem,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "a real portable offer must not execute caller-owned login accessors");
+    assert.equal(recipientGetterReads, 0,
+      "portable offer matching must use own data descriptors, not getters");
+
     for (const [label, changes] of [
       ["wrong cross-account user", { recipientPin: { ...recipientPin,
         recipientUsername: "attacker" } }],
