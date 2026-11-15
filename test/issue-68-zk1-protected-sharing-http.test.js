@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 const express = require("express");
 const z = require("../src/crypto/rootark-zk-1");
 const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -15,6 +16,18 @@ const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
   require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
+const { redeemProtectedCiphertextShare } = require("../public/client/rootark-zk1-recipient-share");
+
+test("#68: recipient share module loads as browser UMD without Node require", () => {
+  const sandbox = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, URL,
+    AbortController, setTimeout, clearTimeout, btoa, atob,
+    RootarkZk1ProtectedHttpClient: require("../public/client/rootark-zk1-protected-http-client") };
+  const script = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-recipient-share.js"), "utf8");
+  vm.runInNewContext(script, sandbox, { filename: "rootark-zk1-recipient-share.js" });
+  assert.equal(typeof sandbox.RootarkZk1RecipientShare?.redeemProtectedCiphertextShare,
+    "function");
+});
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
 const b64 = (value) => Buffer.from(value).toString("base64url");
@@ -151,8 +164,14 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal((await post("/zk-1/v1/share/grant", "owner",
     { ...grantBody, expiresAt: now + 1000 })).status, 403,
   "signed expiry cannot be extended by the caller");
-  assert.deepEqual((await post("/zk-1/v1/share/grant", "owner", grantBody)),
-    { status: 201, body: { grantId, expiresAt: now + 120 } });
+  const issued = await post("/zk-1/v1/share/grant", "owner", grantBody);
+  assert.equal(issued.status, 201);
+  assert.equal(issued.body.grantId, grantId);
+  assert.equal(issued.body.expiresAt, now + 120);
+  assert.equal(issued.body.shareSignatureBase64, b64(shareSignature),
+    "owner receives the exact signed grant envelope for recipient handoff");
+  assert.ok(issued.body.shareStatementBase64,
+    "grant issue must return owner-signed statement, not just opaque grant id");
   assert.equal((await post("/zk-1/v1/share/grant", "owner", grantBody)).status, 409,
     "owner request nonce cannot mint a second grant");
 
@@ -170,9 +189,11 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const validUnconsumedSignature = crypto.sign(null, await shareGrantMessageV1({
     authorization: forgedProof.authorization, ...forgedFields,
   }), forgedProof.key);
-  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+  const secondIssued = await post("/zk-1/v1/share/grant", "owner", {
     ...forgedBody, shareSignatureBase64: b64(validUnconsumedSignature),
-  })).status, 201, "bad grant signature must not consume the owner authorization nonce");
+  });
+  assert.equal(secondIssued.status, 201,
+    "bad grant signature must not consume the owner authorization nonce");
 
   const foreignScopeProof = await sign(owner, "get", id, 1, digest);
   const forgedTenantScope = { ...foreignScopeProof.authorization,
@@ -218,6 +239,139 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(independentStatement.object_id, id);
   assert.equal(independentStatement.object_revision, 1);
   assert.deepEqual(Buffer.from(independentStatement.ciphertext_digest), digest);
+  // The owner can hand the exact authenticated grant ACK (opaque CBOR +
+  // signature) to a recipient. The client MUST bring its own verified signed
+  // history and Ed25519 device key; the HTTP reply cannot provision trust.
+  const independentAuthority = async () => ({
+    scope: Object.fromEntries(Object.entries(scope).map(([name, value]) => [name, b64(value)])),
+    head: { revision: manifest.revision, epoch: manifest.current_epoch,
+      digest: new Uint8Array(await manifestV2.recoveryManifestDigestV2(manifest)) },
+    devices: manifest.devices.map((device) => ({
+      deviceId: device.device_id,
+      authorizationPublicKey: new Uint8Array(device.authorization_public_key),
+      enrolledEpoch: device.enrolled_epoch, revokedAtEpoch: device.revoked_at_epoch,
+    })),
+  });
+  const recipientKey = state.actors.get(Buffer.from(
+    recipient.authorization_key_id).toString("hex"));
+  const signerKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    recipientKey.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  const clientFetch = (url, options) => fetch(url, {
+    ...options, headers: { ...options.headers, "x-fixture-account": "recipient" },
+  });
+  const redeem = (overrides = {}) => redeemProtectedCiphertextShare({
+    origin: base, grant: issued.body, recipientUsername: "recipient",
+    recipientDeviceId: recipient.device_id, signerKey,
+    readIndependentAuthority: independentAuthority, nowSeconds: () => now,
+    fetchImpl: clientFetch, ...overrides,
+  });
+  const redeemed = await redeem();
+  assert.equal(redeemed.schema, "rootark-zk1-recipient-ciphertext-receipt/v1");
+  assert.equal(redeemed.grantId, grantId);
+  assert.equal(redeemed.revision, 1);
+  assert.equal(redeemed.ciphertextBase64, b64(ciphertext));
+  assert.equal(redeemed.ciphertextSha256Base64, b64(digest));
+  assert.equal(redeemed.ownerGrantSignatureVerified, true);
+  assert.equal(redeemed.durableCopyProven, false);
+  assert.equal(redeemed.authorizesPlaintextRelease, false);
+  assert.equal(redeemed.serverRevocationProofVerified, false);
+  // P2 review: a hostile ciphertext transport can replay an authentic owner
+  // grant and bytes while ignoring the recipient's unrelated GET signature.
+  // The client itself must bind its nonexportable Ed25519 signer to the
+  // independently pinned recipient device, before any HTTP request.
+  const rogueRecipient = await crypto.webcrypto.subtle.generateKey("Ed25519", false,
+    ["sign", "verify"]);
+  assert.equal(rogueRecipient.privateKey.extractable, false);
+  const sameAuthenticResponse = {
+    id: redeemed.objectId, revision: redeemed.revision, epoch: redeemed.epoch,
+    ciphertextBase64: redeemed.ciphertextBase64,
+    shareStatementBase64: redeemed.shareStatementBase64,
+    shareSignatureBase64: redeemed.shareSignatureBase64,
+  };
+  let untrustedHttpCalls = 0;
+  const forgedServer = async () => {
+    untrustedHttpCalls++;
+    return new Response(JSON.stringify(sameAuthenticResponse), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  const forgedInput = { signerKey: rogueRecipient.privateKey, fetchImpl: forgedServer };
+  await assert.rejects(redeem(forgedInput), /ZK_SHARE_REDEMPTION_DENIED/,
+    "a genuine owner grant must not certify an unrelated recipient Ed25519 signer");
+  assert.equal(untrustedHttpCalls, 0,
+    "recipient pin check must fail locally, before calling an untrusted server");
+  const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
+  assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
+    "positive control: the same authenticated bytes with the pinned device signer remain valid");
+  await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
+    "grant possession without recipient account session must not download ciphertext");
+  await assert.rejects(redeem({ readIndependentAuthority: null }),
+    /ZK_SHARE_REDEMPTION_DENIED/, "no external history/roster means no grant redemption");
+  await assert.rejects(redeem({ recipientUsername: "attacker" }),
+    /ZK_SHARE_REDEMPTION_DENIED/, "local account identity is bound to signed grant");
+  await assert.rejects(redeem({ recipientDeviceId: owner.device_id }),
+    /ZK_SHARE_REDEMPTION_DENIED/, "local device identity is bound to signed grant");
+  await assert.rejects(redeem({ grant: { ...issued.body, expiresAt: now + 200 } }),
+    /ZK_SHARE_REDEMPTION_DENIED/, "untrusted expiry cannot extend signed lease");
+  await assert.rejects(redeem({ grant: { ...issued.body,
+    shareSignatureBase64: b64(crypto.randomBytes(64)) } }),
+  /ZK_SHARE_REDEMPTION_DENIED/, "server-supplied forged owner signature cannot authorize read");
+  await assert.rejects(redeem({ grant: { ...issued.body,
+    shareStatementBase64: b64(crypto.randomBytes(128)) } }),
+  /ZK_SHARE_REDEMPTION_DENIED/, "malformed or unsigned CBOR grant cannot authorize read");
+  await assert.rejects(redeem({ readIndependentAuthority: async () => ({
+    ...await independentAuthority(), head: { ...(await independentAuthority()).head,
+      epoch: manifest.current_epoch + 1 },
+  }) }), /ZK_SHARE_REDEMPTION_DENIED/, "stale epoch/CAS must fail before signed GET");
+  await assert.rejects(redeem({ readIndependentAuthority: async () => ({
+    ...await independentAuthority(),
+    devices: (await independentAuthority()).devices.map((device) =>
+      device.deviceId === owner.device_id ? { ...device,
+        revokedAtEpoch: manifest.current_epoch } : device),
+  }) }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "independent owner-device revocation must override a previously valid signature");
+  await assert.rejects(redeem({ fetchImpl: async (url, options) => {
+    const response = await clientFetch(url, options);
+    const body = await response.json();
+    if (response.status !== 200) return new Response(JSON.stringify(body),
+      { status: response.status, headers: { "content-type": "application/json" } });
+    body.ciphertextBase64 = b64(crypto.randomBytes(256));
+    return new Response(JSON.stringify(body), { status: 200,
+      headers: { "content-type": "application/json" } });
+  } }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "authenticated response body substitution cannot pass content hash/CAS verification");
+  await assert.rejects(redeem({ fetchImpl: async (url, options) => {
+    const response = await clientFetch(url, options);
+    const body = await response.json();
+    body.shareSignatureBase64 = b64(crypto.randomBytes(64));
+    return new Response(JSON.stringify(body), { status: 200,
+      headers: { "content-type": "application/json" } });
+  } }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "even a 200 ciphertext response cannot replace the owner-grant proof");
+  let independentReads = 0;
+  await assert.rejects(redeem({ readIndependentAuthority: async () => {
+    const trusted = await independentAuthority();
+    if (++independentReads === 2) trusted.head.revision += 1;
+    return trusted;
+  } }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "independent head advance during HTTP awaits must deny delivery before receipt");
+  let timeAfterFetch = now;
+  await assert.rejects(redeem({ nowSeconds: () => timeAfterFetch,
+    fetchImpl: async (url, options) => {
+      const response = await clientFetch(url, options);
+      timeAfterFetch = now + 121;
+      return response;
+    },
+  }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "signed expiry reached after HTTP await cannot return a usable receipt");
+  // A separate valid grant can be permanently revoked while the issuer,
+  // recipient, epoch and object revision all remain active.
+  assert.equal((await post("/zk-1/v1/share/revoke", "owner",
+    { grantId: secondIssued.body.grantId })).status, 200);
+  await assert.rejects(redeem({ grant: secondIssued.body }),
+    /ZK_SHARE_REDEMPTION_DENIED/,
+    "durable grant tombstone rejects recipient redemption over real authenticated HTTP");
   assert.equal((await readAs("recipient", recipient,
     { authorization: wire(getOwner.authorization), signatureBase64: b64(getOwner.signature) })).status, 409,
   "owner GET nonce is already consumed by granting and cannot be replayed");
