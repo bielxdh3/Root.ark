@@ -296,6 +296,29 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(commits, beforePrivateListCommits);
   assert.equal(JSON.stringify(receiverBefore).includes("sensitive/private/account.txt"),
     false, "signed opaque snapshot still exposes no filename");
+  const matching = await receiver.readPrivateListing(receiverBefore, listingKey, "PRIVATE/ACCOUNT");
+  assert.deepEqual(matching.entries.map((entry) => entry.name), ["sensitive/private/account.txt"],
+    "manual search must match signed and locally decrypted filenames only");
+  assert.equal(matching.totalMatches, 1);
+  const missing = await receiver.readPrivateListing(receiverBefore, listingKey, "not-in-this-vault");
+  assert.deepEqual(missing.entries, [], "manual search must exclude unrelated names");
+  assert.equal(missing.totalMatches, 0);
+  const searchRequests = [];
+  const privacyReader = await syncClient(1, { fetchImpl: async (url, init) => {
+    searchRequests.push(String(url) + String(init?.body || ""));
+    return fetchImpl(url, init);
+  } });
+  const privacyBefore = await privacyReader.readCurrent();
+  await privacyReader.readPrivateListing(privacyBefore, listingKey, "not-in-this-vault");
+  assert.ok(searchRequests.length > 0, "search must still re-read its signed catalog");
+  assert.ok(searchRequests.every((wire) => !wire.includes("not-in-this-vault")),
+    "the private query must never appear in authenticated catalog HTTP requests");
+  await assert.rejects(receiver.readPrivateListing(receiverBefore, incorrectListingKey,
+    "not-in-this-vault"), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "nonmatching filter must still decrypt every signed row and reject wrong keys");
+  await assert.rejects(receiver.readPrivateListing(receiverBefore, listingKey,
+    "x".repeat(121)), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "browser search must reject unbounded terms");
   const listed = await second.readAll();
   assert.equal(listed.head.sequence, 1);
   assert.equal(listed.rows.length, 1);
@@ -523,8 +546,17 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   currentDigest = realHeadDigest;
   const listingAfterTrash = await freshTrashReader.readPrivateListing(
     latestTrash, ownerMetadataKey);
-  assert.equal(listingAfterTrash.entries[2].name, null);
-  assert.equal(listingAfterTrash.entries[2].logicalTrashCandidate, true);
+  assert.equal(listingAfterTrash.totalMatches, 1,
+    "one object with three signed revisions remains one current listing entry");
+  assert.equal(listingAfterTrash.entries.length, 1,
+    "older version names are verified but not displayed as separate live files");
+  assert.equal(listingAfterTrash.entries[0].name, null);
+  assert.equal(listingAfterTrash.entries[0].logicalTrashCandidate, true);
+  const searchedAfterTrash = await freshTrashReader.readPrivateListing(
+    latestTrash, ownerMetadataKey, "Lixeira lógica");
+  assert.equal(searchedAfterTrash.totalMatches, 0,
+    "tombstone status labels must never be searchable filenames");
+  assert.deepEqual(searchedAfterTrash.entries, []);
   const badTombstoneReader = await syncClient(1);
   const badBase = await badTombstoneReader.readCurrent();
   await assert.rejects(badTombstoneReader.readTrash({ previous: badBase, objectId,
