@@ -553,14 +553,26 @@ function sameSnapshotRevision(left, right) {
 }
 
 function normalizeHistoricalRestorePlan(requests) {
-  if (!Array.isArray(requests) || requests.length < 1 || requests.length > 32) {
+  let length;
+  try {
+    if (!Array.isArray(requests)) throw Error();
+    length = Object.getOwnPropertyDescriptor(requests, "length")?.value;
+  } catch { fail("Invalid historical restore plan array", "invalid_restore_plan"); }
+  if (!Number.isSafeInteger(length) || length < 1 || length > 32) {
     fail("Historical restore plan must contain 1 to 32 objects", "invalid_restore_plan");
   }
   const seen = new Set();
   const entries = [];
-  for (const request of requests) {
+  // A JavaScript array may override Symbol.iterator to yield more than its
+  // bounded length (or never terminate). Read only its own indexed data slots;
+  // never invoke an inherited iterator or an index accessor/getter.
+  for (let index = 0; index < length; index++) {
+    let request;
     let fields;
     try {
+      const slot = Object.getOwnPropertyDescriptor(requests, String(index));
+      if (!slot || !Object.hasOwn(slot, "value")) throw Error();
+      request = slot.value;
       if (!request || typeof request !== "object" || Array.isArray(request)) throw Error();
       fields = Object.getOwnPropertyDescriptors(request);
       const names = Reflect.ownKeys(fields);

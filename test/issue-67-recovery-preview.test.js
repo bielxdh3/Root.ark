@@ -11,7 +11,7 @@ const test = require("node:test");
 
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
-const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { SyncEngine, normalizeHistoricalRestorePlan } = require("../sync-client/rootark-sync-engine");
 const { readHistoricalRestorePlanInput } = require("../sync-client/rootark-sync-v2");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
@@ -360,6 +360,38 @@ const TWO_RESTORES = [
   { objectId: "object-1", versionId: "v1" },
   { objectId: "object-2", versionId: "second-v1" },
 ];
+
+test("#67 P2: plan length bound cannot be bypassed by a caller-supplied array iterator", async (t) => {
+  const input = [{ objectId: "object-1", versionId: "v1" }];
+  let iteratorCalled = 0;
+  input[Symbol.iterator] = function* () {
+    iteratorCalled++;
+    for (let n = 0; n < 40; n++) {
+      yield { objectId: `attacker-extra-${n}`, versionId: "v1" };
+    }
+  };
+  const selected = normalizeHistoricalRestorePlan(input);
+  assert.deepEqual(selected, [{ objectId: "object-1", versionId: "v1" }],
+    "only the single indexed array element may enter a max-32 restore plan");
+  assert.equal(iteratorCalled, 0,
+    "an infinite attacker-supplied iterator must never run synchronously on the sync worker");
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan(input);
+  assert.equal(preview.objectCount, 1, "public recovery preview must use the same bounded index validation");
+  assert.equal(preview.entries[0].objectId, "object-1");
+  assert.equal(iteratorCalled, 0);
+  assert.equal(f.pushes(), 0, "adversarial plan preview must remain read-only");
+
+  const accessor = [{ objectId: "object-1", versionId: "v1" }];
+  let getterCalled = 0;
+  Object.defineProperty(accessor, "0", { configurable: true, get() {
+    getterCalled++;
+    throw new Error("untrusted index accessor executed");
+  } });
+  assert.throws(() => normalizeHistoricalRestorePlan(accessor),
+    (error) => error.code === "invalid_restore_plan");
+  assert.equal(getterCalled, 0, "plan normalization must inspect own data descriptors only");
+});
 
 test("#67: multi-object preflight verifies two retained signed histories without writes", async (t) => {
   const f = await fixture(t);
