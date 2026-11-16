@@ -757,6 +757,7 @@ class SyncEngine {
     let cursor = null;
     let available = 0;
     let matching = null;
+    let cachedTombstoneMatch = null;
     const tombstones = [];
     const tracked = new Map();
     for (const [relativePath, entry] of Object.entries(this.snapshot.files)) {
@@ -780,14 +781,19 @@ class SyncEngine {
         if (!this.isSelected(remotePath) && !cachedTombstone) continue;
         if (!tombstone && entry.metadata?.contentType !== "inode/directory") available += 1;
         if (cachedTombstone) tombstones.push(entry);
-        const requestedMatch = requestedPath !== null && (pathsEqual(remotePath, requestedPath)
-          || (cachedTombstone && localPaths.some((relativePath) => pathsEqual(relativePath, requestedPath))));
-        if (requestedMatch && (!tombstone || cachedTombstone)) {
+        const requestedLive = requestedPath !== null && !tombstone
+          && pathsEqual(remotePath, requestedPath);
+        const requestedCachedTombstone = requestedPath !== null && cachedTombstone
+          && localPaths.some((relativePath) => pathsEqual(relativePath, requestedPath));
+        if (requestedLive) {
           if (matching) fail("More than one remote object matches this path", "remote_object_ambiguous");
           matching = entry;
+        } else if (requestedCachedTombstone) {
+          if (cachedTombstoneMatch) fail("More than one cached tombstone matches this path", "remote_object_ambiguous");
+          cachedTombstoneMatch = entry;
         }
       }
-      if (page.nextCursor === null) return { available, matching, tombstones };
+      if (page.nextCursor === null) return { available, matching: matching || cachedTombstoneMatch, tombstones };
       if (typeof page.nextCursor !== "string" || !page.nextCursor
         || seenCursors.has(page.nextCursor)) fail("Repeated or invalid metadata cursor", "invalid_inventory");
       seenCursors.add(page.nextCursor);
@@ -1868,7 +1874,10 @@ class SyncEngine {
       cleanupPath = sourcePath;
       const pathOccupiedByOther = priorAtTarget && !priorAtTarget.deleted
         && (priorAtTarget.objectId !== operation.objectId || priorAtTarget.fileId !== operation.fileId);
-      const tombstonePath = pathOccupiedByOther ? sourcePath : metadata.path;
+      // An on-demand tombstone retires only the verified selected cache name.
+      // Its signed remote path may have moved outside our selection or be
+      // occupied by a different local object since the original hydration.
+      const tombstonePath = (tombstoneSourceOverride || pathOccupiedByOther) ? sourcePath : metadata.path;
       const deleteTarget = await contained(this.rootDir, sourcePath, true);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (tombstoneSourceOverride) {
@@ -2305,11 +2314,21 @@ class SyncEngine {
     if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
       fail("Cannot hydrate while a signed atomic sync batch is pending", "sync_atomic_batch_indeterminate");
     }
-    const { matching } = await this.scanOnDemandInventory(safePath);
+    const { matching, tombstones } = await this.scanOnDemandInventory(safePath);
     if (!matching) fail("Remote object is not in the metadata inventory", "remote_object_unavailable");
     if (matching.tombstone || matching.operation === "delete") {
       await this._reconcileOnDemandTombstone(matching);
       return false;
+    }
+    // A path may have been deleted under its old objectId and recreated under
+    // a new one. Verify and retire the old cached tombstone before hydrating
+    // the new live identity, without treating the two as duplicate live paths.
+    for (const tombstone of tombstones) {
+      const priorAtPath = this.snapshot.files[safePath];
+      if (priorAtPath && !priorAtPath.deleted && priorAtPath.objectId === tombstone.objectId
+        && tombstone.objectId !== matching.objectId) {
+        await this._reconcileOnDemandTombstone(tombstone);
+      }
     }
 
     const prior = this.snapshot.files[safePath];
@@ -2399,6 +2418,11 @@ class SyncEngine {
         }
         if (candidates.length === 1) {
           const [sourcePath, tracked] = candidates[0];
+          const pendingSource = await this.journal.recover();
+          if (pendingSource.some((item) => item.objectId === operation.objectId
+            || item.metadata?.path === sourcePath || item.metadata?.sourcePath === sourcePath)) {
+            fail("Pending local sync prevents relocated hydration", "sync_operation_pending");
+          }
           const source = await contained(this.rootDir, sourcePath, true);
           if (!(await exists(source))) fail("Tracked local source was removed", "local_changes_pending");
           const bytes = await readContainedFile(this.rootDir, sourcePath);
@@ -2668,7 +2692,13 @@ class SyncEngine {
           const inventory = await this.scanOnDemandInventory();
           summary.available = inventory.available;
           for (const tombstone of inventory.tombstones) {
-            await this._reconcileOnDemandTombstone(tombstone, summary);
+            try {
+              await this._reconcileOnDemandTombstone(tombstone, summary);
+            } catch (error) {
+              // One dirty or locally pending cache must be preserved, not
+              // abort reconciliation of other independently clean tombstones.
+              if (error.code !== "local_changes_pending" && error.code !== "sync_operation_pending") throw error;
+            }
           }
         } catch (error) {
           if (transient(error)) summary.offline = true;
