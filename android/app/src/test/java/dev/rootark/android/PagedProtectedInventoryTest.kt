@@ -8,6 +8,7 @@ import dev.rootark.core.sync.OfflineSession
 import dev.rootark.core.sync.SessionOfflineInventory
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.URL
 import java.security.Principal
 import java.security.cert.Certificate
@@ -36,10 +37,11 @@ class PagedProtectedInventoryTest {
         private val mime: String? = "application/json; charset=utf-8",
         private val encoding: String? = null,
         private val declaredSize: Long = -1L,
+        private val stream: InputStream? = null,
     ) : HttpsURLConnection(url) {
         var disconnected = false
         override fun getResponseCode() = status
-        override fun getInputStream() = ByteArrayInputStream(payload)
+        override fun getInputStream() = stream ?: ByteArrayInputStream(payload)
         override fun getContentType(): String? = mime
         override fun getContentEncoding(): String? = encoding
         override fun getContentLengthLong() = declaredSize
@@ -127,6 +129,30 @@ class PagedProtectedInventoryTest {
             assertEquals(status, failure.statusCode)
             assertTrue(response.disconnected)
         }
+    }
+
+    @Test fun tricklingInventoryResponseStopsAtTotalDeadlineEvenWithinEachSocketReadTimeout() {
+        var nowNanos = 0L
+        var reads = 0
+        val trickle = object : InputStream() {
+            override fun read(): Int = throw AssertionError("Expected bulk reads")
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                // Nine seconds per byte: always below the 10-second socket idle timeout.
+                nowNanos += 9_000_000_000L
+                buffer[offset] = '{'.code.toByte()
+                return 1
+            }
+        }
+        val response = SecureResponse(origin.syncInventoryUrl(), stream = trickle)
+        val adapter = AuthHttpTransport(clockNanos = { nowNanos }) { response }
+
+        val failure = assertThrows(SyncListingException::class.java) {
+            adapter.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(failure.message.orEmpty().contains("deadline"))
+        assertEquals(4, reads)
+        assertTrue(response.disconnected)
     }
 
     @Test fun realHttpCaptureCanBeReadOfflineOnlyByOriginalLogin() {
