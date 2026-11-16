@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { AsyncLocalStorage } = require("node:async_hooks");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
@@ -418,6 +419,157 @@ function activeFileIdentityPath(files, operation, exceptPath) {
   return Object.entries(files).find(([relativePath, prior]) => relativePath !== exceptPath
     && !prior.deleted && !prior.directory
     && prior.objectId === operation.objectId && prior.fileId === operation.fileId)?.[0] || null;
+}
+
+async function windowsScopeHasNoReparsePoints(observed) {
+  // Node's fs.Stats.isSymbolicLink() does not cover all Win32 reparse tags
+  // (e.g. cloud/projection filter points). Query the native FILE_ATTRIBUTE
+  // REPARSE_POINT for every existing ancestor/leaf, without evaluating any
+  // user-controlled pathname as PowerShell source. Absent/unavailable probe
+  // means UNKNOWN, not permission to continue after a signed 409.
+  const encodedPaths = [...new Set(observed.map(({ target }) => target))]
+    .map((target) => Buffer.from(target, "utf8").toString("base64"));
+  if (!encodedPaths.length) return false;
+  const powershell = [
+    "$ErrorActionPreference = 'Stop'",
+    "try {",
+    `  foreach ($encoded in @('${encodedPaths.join("','")}')) {`,
+    "    $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))",
+    "    if (([IO.File]::GetAttributes($target) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { exit 4 }",
+    "  }",
+    "  exit 0",
+    "} catch { exit 5 }",
+  ].join("\n");
+  const script = Buffer.from(powershell, "utf16le").toString("base64");
+  const executable = path.join(process.env.SystemRoot || "C:\\Windows",
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  try {
+    await new Promise((resolve, reject) => {
+      childProcess.execFile(executable, ["-NoProfile", "-NonInteractive",
+        "-EncodedCommand", script], { windowsHide: true, timeout: 10000,
+        maxBuffer: 4096 }, (error) => error ? reject(error) : resolve());
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasDisjointSyncScope(left, right, files, rootDir) {
+  // Only continue an independent operation after a strict 409. The server's
+  // signed CURRENT is NOT admission evidence for the disputed object. Treat
+  // both path ancestors and case-folded aliases as shared local scope; a
+  // directory relocation may source its old path from the tracked snapshot.
+  if (!left || !right || typeof left.objectId !== "string"
+    || typeof right.objectId !== "string" || left.objectId === right.objectId) return false;
+  const affected = (operation) => {
+    const metadata = operation.metadata;
+    if (!metadata || typeof metadata.path !== "string" || !metadata.path
+      || (metadata.sourcePath !== undefined && typeof metadata.sourcePath !== "string")) return null;
+    const paths = [metadata.path, metadata.sourcePath].filter(Boolean);
+    for (const [relative, prior] of Object.entries(files)) {
+      // A signed update/restore can rotate fileId while retaining objectId.
+      // The old active pathname still belongs to the disputed object's
+      // physical scope even when the pending envelope names a new fileId.
+      if (prior && !prior.deleted && prior.objectId === operation.objectId) paths.push(relative);
+    }
+    return paths;
+  };
+  const leftPaths = affected(left);
+  const rightPaths = affected(right);
+  if (!leftPaths || !rightPaths || !leftPaths.every((leftPath) =>
+    rightPaths.every((rightPath) => {
+      const leftFolded = leftPath.toLowerCase();
+      const rightFolded = rightPath.toLowerCase();
+      return leftFolded !== rightFolded
+        && !leftFolded.startsWith(`${rightFolded}/`)
+        && !rightFolded.startsWith(`${leftFolded}/`);
+    }))) return false;
+  // POSIX hardlinks and Windows 8.3 names can alias the same physical inode
+  // despite distinct textual paths. Resolve existing components by volume
+  // and file ID on BOTH platforms; append textual components only after a
+  // genuinely missing parent/leaf. Any error, alias, reparse point or
+  // unstable/zero file ID is UNKNOWN: do not advance after a signed 409.
+  const root = path.resolve(rootDir);
+  const scope = async (relative) => {
+    const safe = protocol.safeRelativePath(relative, "path");
+    const rootStat = await fsp.lstat(root, { bigint: true });
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.ino === 0n) return null;
+    const canonicalRoot = await fsp.realpath(root);
+    const segments = safe.split("/");
+    const tokens = [];
+    const observed = [{ target: root, stats: rootStat }];
+    let current = root;
+    let lastExisting = root;
+    let firstMissing = segments.length;
+    let leaf = null;
+    for (let index = 0; index < segments.length; index += 1) {
+      current = path.join(current, segments[index]);
+      let stats;
+      try { stats = await fsp.lstat(current, { bigint: true }); }
+      catch (error) {
+        if (error?.code !== "ENOENT") return null;
+        firstMissing = index;
+        break;
+      }
+      if (stats.isSymbolicLink() || stats.ino === 0n
+        || (index < segments.length - 1 && !stats.isDirectory())) return null;
+      tokens.push(`i:${stats.dev}:${stats.ino}`);
+      observed.push({ target: current, stats });
+      lastExisting = current;
+      if (index === segments.length - 1) leaf = stats;
+    }
+    // JS lowercasing is not a complete oracle for Windows' filesystem
+    // Unicode name equivalence. When an unresolved suffix is non-ASCII,
+    // there is no physical identity to consult: defer instead of guessing.
+    if (process.platform === "win32"
+      && segments.slice(firstMissing).some((segment) => /[^\x20-\x7e]/.test(segment))) return null;
+    for (let index = firstMissing; index < segments.length; index += 1) {
+      tokens.push(`n:${segments[index].toLowerCase()}`);
+    }
+    const physicalBase = await fsp.realpath(lastExisting);
+    if (!isWithinPath(canonicalRoot, physicalBase)) return null;
+    const physical = path.join(physicalBase, ...segments.slice(firstMissing)).toLowerCase();
+    return { tokens, physical, observed,
+      leafId: leaf ? `${leaf.dev}:${leaf.ino}` : null };
+  };
+  try {
+    const scopes = await Promise.all([...leftPaths, ...rightPaths].map(scope));
+    if (scopes.some((entry) => !entry)) return false;
+    if (process.platform === "win32") {
+      const observed = scopes.flatMap((entry) => entry.observed);
+      if (!(await windowsScopeHasNoReparsePoints(observed))) return false;
+    }
+    // On POSIX, realpath(lastExisting) also awaits and permits a concurrent
+    // replacement AFTER the first lstat but BEFORE this decision. Revalidate
+    // every observed physical component on both platforms, not just Windows.
+    // This is a final check-time fence, not a held-handle guarantee against
+    // an external writer changing paths after the comparison.
+    for (const { target, stats } of scopes.flatMap((entry) => entry.observed)) {
+      const after = await fsp.lstat(target, { bigint: true });
+      if (!sameFileVersion(stats, after) || after.nlink !== stats.nlink
+        || after.isSymbolicLink()) return false;
+    }
+    const leftScopes = scopes.slice(0, leftPaths.length);
+    const rightScopes = scopes.slice(leftPaths.length);
+    const prefix = (first, second) => first.length <= second.length
+      && first.every((token, index) => token === second[index]);
+    return leftScopes.every((one) => rightScopes.every((two) =>
+      one.physical !== two.physical
+      && !(one.leafId && two.leafId && one.leafId === two.leafId)
+      && !prefix(one.tokens, two.tokens) && !prefix(two.tokens, one.tokens)));
+  } catch {
+    return false;
+  }
+}
+
+async function overlapsIndeterminate(indeterminate, candidates, files, rootDir) {
+  for (const blocked of indeterminate || []) {
+    for (const candidate of candidates) {
+      if (!(await hasDisjointSyncScope(blocked, candidate, files, rootDir))) return true;
+    }
+  }
+  return false;
 }
 
 class SyncEngine {
@@ -1536,7 +1688,7 @@ class SyncEngine {
     summary.pushed += 2;
   }
 
-  async _pushPending(summary) {
+  async _pushPending(summary, indeterminate = null) {
     const recovered = await this.journal.recover();
     // The journal's durable group manifest—not adjacency—is the local
     // evidence that the DELETE and MOVE entered the outbox together.
@@ -1583,13 +1735,20 @@ class SyncEngine {
       const group = groupedById.get(original.operationId);
       if (group) {
         if (pushedGroups.has(group.deleteId)) continue;
-        await this.pushAtomicSignedOverwritePair([
+        const pair = [
           pendingById.get(group.deleteId), pendingById.get(group.moveId),
-        ], summary);
+        ];
+        if (await overlapsIndeterminate(indeterminate, pair, this.snapshot.files, this.rootDir)) {
+          // Never dispatch just one side of an overlapping atomic group.
+          pushedGroups.add(group.deleteId);
+          continue;
+        }
+        await this.pushAtomicSignedOverwritePair(pair, summary);
         pushedGroups.add(group.deleteId);
         if (summary.offline) break;
         continue;
       }
+      if (await overlapsIndeterminate(indeterminate, [original], this.snapshot.files, this.rootDir)) continue;
       const next = recovered[index + 1];
       const event = signedWebDavEventId(original);
       if (event && next && signedWebDavEventId(next) === event) {
@@ -1753,6 +1912,14 @@ class SyncEngine {
           // sync must preserve its pending outbox for explicit reconciliation
           // instead of writing recovery plaintext or silently marking it seen.
           if (this.requireAuthorization) {
+            if (indeterminate) {
+              // Only syncOnce opts in: direct pushPending keeps its explicit
+              // rejection contract. Keep the signed outbox entirely unchanged
+              // and allow only disjoint later items to proceed in this cycle.
+              indeterminate.push(operation);
+              summary.indeterminate = (summary.indeterminate || 0) + 1;
+              continue;
+            }
             fail("Signed 409 winner lacks independent durable admission evidence",
               "remote_admission_unproven");
           }
@@ -2446,6 +2613,20 @@ class SyncEngine {
     return this.withMutationLock(() => this._materializeRemote(relativePath));
   }
 
+  async assertPendingMaterializationDisjoint(operation) {
+    // syncOnce's indeterminate list is only in-memory and expires at the
+    // end of that cycle. An explicit hydrate (including after restart) must
+    // NOT use signed LIST/inventory B to advance inside a pending signed A's
+    // directory, previous tracked path, or physical alias after a 409.
+    // Re-read durable pending envelopes at each pre-write boundary and use
+    // the same conservative physical/ancestor comparison as push and pull.
+    if (await overlapsIndeterminate(await this.journal.recover(), [operation],
+      this.snapshot.files, this.rootDir)) {
+      fail("Pending signed sync overlaps the requested materialization",
+        "sync_operation_pending");
+    }
+  }
+
   async _materializeRemote(relativePath) {
     if (!this.opened) await this._open();
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
@@ -2464,6 +2645,7 @@ class SyncEngine {
       fail("Remote object is outside the selected scope", "path_not_selected");
     }
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
+    await this.assertPendingMaterializationDisjoint(operation);
     if (operation.tombstone) {
       if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
       this.rememberRemoteOnly(operation, entry.reason);
@@ -2529,6 +2711,7 @@ class SyncEngine {
     if (operation.metadata.contentType === "inode/directory") {
       fail("Files On-Demand materializes regular files only", "cache_entry_unavailable");
     }
+    await this.assertPendingMaterializationDisjoint(operation);
     const moveKey = operation.operation === "move" ? await this.keyFor(operation) : null;
     const movePayload = moveKey
       ? protocol.decodeMovePayload(protocol.decryptPayload(operation, moveKey), moveKey) : null;
@@ -2537,6 +2720,7 @@ class SyncEngine {
     }
     const checkBeforeWrite = async () => {
       await checkLocalCache();
+      await this.assertPendingMaterializationDisjoint(operation);
       if (!moveKey) return;
       const sourcePath = activeFileIdentityPath(this.snapshot.files, operation, safePath);
       if (!sourcePath) return;
@@ -2560,7 +2744,7 @@ class SyncEngine {
     return this.withMutationLock(() => this._pullRemote(summary));
   }
 
-  async _pullRemote(summary) {
+  async _pullRemote(summary, indeterminate = []) {
     // A remotely visible single side of a just-committed/lost-ACK pair must
     // NOT consume that local pending ID via _apply, markSeen or the excluded-
     // path reconciliation path. Recover the atomic pair through its outbound
@@ -2624,6 +2808,11 @@ class SyncEngine {
       observedRemoteOnly.length = 0;
     };
     for (const operation of inspected) {
+      if (await overlapsIndeterminate(indeterminate, [operation], this.snapshot.files, this.rootDir)) {
+        // An untrusted LIST is not an independent CURRENT/CAS witness. Neither
+        // observe nor apply the disputed object, aliases or its ancestors.
+        continue;
+      }
       if (!this.operationDestinationIsSelected(operation)) {
         // Authenticity must precede even a side-effect-free local pin oracle:
         // an untrusted LIST entry cannot force file_pinned before its Ed25519
@@ -2748,16 +2937,21 @@ class SyncEngine {
     const excluded = await this._applyExcludedPaths();
     if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
-    await this._pushPending(summary);
+    const indeterminate = [];
+    await this._pushPending(summary, indeterminate);
     if (!summary.offline) {
       if (this.filesOnDemand) {
-        try {
-          summary.available = (await this.scanOnDemandInventory()).available;
-        } catch (error) {
-          if (transient(error)) summary.offline = true;
-          else throw error;
+        // Metadata-only inventory has no independent signed per-object
+        // materialization fence. Defer it when any 409 is unresolved.
+        if (!indeterminate.length) {
+          try {
+            summary.available = (await this.scanOnDemandInventory()).available;
+          } catch (error) {
+            if (transient(error)) summary.offline = true;
+            else throw error;
+          }
         }
-      } else await this._pullRemote(summary);
+      } else await this._pullRemote(summary, indeterminate);
     }
     return summary;
   }
