@@ -2018,8 +2018,27 @@ class SyncEngine {
             let observed;
             try {
               const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
-              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
-                this.journal.restoreStagingInfo(operation));
+              const staging = this.journal.restoreStagingInfo(operation);
+              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
+              if (staging) {
+                // pushPending is public and can bypass reconcileLocal. Before
+                // the materialization witness clears staging provenance, the
+                // exact recorded temp must no longer exist, even if an
+                // independent target already matches the signed plaintext.
+                const target = await contained(this.rootDir, relative, false);
+                const prefix = `${path.basename(target)}.tmp-`;
+                if (!staging.name.startsWith(prefix)
+                  || !HISTORICAL_RESTORE_TEMP_SUFFIX.test(staging.name.slice(path.basename(target).length))) {
+                  fail("Historical restore staging name is invalid", "restore_local_materialization_missing");
+                }
+                const staged = path.join(path.dirname(target), staging.name);
+                await containedAbsolute(this.rootDir, staged, true);
+                const remaining = await fsp.lstat(staged, { bigint: true })
+                  .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+                if (remaining) {
+                  fail("Historical restore staging remains unresolved", "restore_local_materialization_missing");
+                }
+              }
               const local = await readContainedFile(this.rootDir, relative, null, true);
               try { observed = crypto.createHash("sha256").update(local).digest("hex"); }
               finally { local.fill(0); }
@@ -2029,6 +2048,21 @@ class SyncEngine {
             if (observed !== expected) {
               fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
             }
+            // A crash may interrupt the durable snapshot or materialization
+            // witness after the restored bytes and parent directories are safe.
+            // Reestablish both before any retry can dispatch this signed POST.
+            this.rememberOperation(operation, expected);
+            await this.persistSnapshot();
+            await this.journal.recordRestoreMaterialization(operation);
+            const refreshed = (await this.journal.recover()).find((queued) =>
+              queued.operationId === operation.operationId);
+            if (!refreshed || signedEnvelopeDigest(protocol.validateStoredOperation(refreshed))
+              !== signedEnvelopeDigest(operation) || !this.journal.hasMaterializedRestore(refreshed)) {
+              fail("Recovered restore lost its exact durable signed outbox", "restore_local_materialization_missing");
+            }
+            // Witness commit replaced the journal state; use its exact
+            // persisted envelope for the following authorization and retry.
+            operation = envelopeCopy(protocol.validateStoredOperation(refreshed));
           }
         }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
@@ -2461,7 +2495,15 @@ class SyncEngine {
               && current.dev.toString() === (owned ? owned.dev.toString() : pinned.dev)
               && current.ino.toString() === (owned ? owned.ino.toString() : pinned.ino);
             if (matchesPinned) {
-              await fsp.rm(temporary, { force: true }).catch(() => {});
+              // Do not suppress an unsuccessful cleanup and then clear the
+              // exact signed staging provenance at materialization commit.
+              await fsp.rm(temporary, { force: true });
+            }
+            const remaining = await fsp.lstat(temporary, { bigint: true })
+              .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+            if (remaining) {
+              fail("Historical restore staging cleanup is incomplete; explicit recovery is required",
+                "restore_local_materialization_missing");
             }
           }
         }
@@ -2575,6 +2617,14 @@ class SyncEngine {
         await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
+      }
+      // Recovery can return early when a missing/changed target leaves its
+      // recorded staging pathname behind. Never scan that file as a CREATE.
+      const remainingStage = await fsp.lstat(recordedPath, { bigint: true })
+        .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+      if (remainingStage) {
+        fail("Unresolved historical restore staging file requires explicit recovery",
+          "restore_local_materialization_missing");
       }
     }
     const scanned = await this.scanFiles();
