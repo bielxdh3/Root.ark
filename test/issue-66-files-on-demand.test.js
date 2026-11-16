@@ -68,6 +68,157 @@ async function exists(filePath) {
   return fsp.stat(filePath).then(() => true, () => false);
 }
 
+test("issue 66 P2: successful FOD hydration removes private plaintext temporary", async (t) => {
+  const { root, open, state } = await setup(t, { "docs/hydrate.txt": "signed remote content" });
+  const consumer = await open();
+  assert.equal(await consumer.materializeRemote("docs/hydrate.txt"), true);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "hydrate.txt"), "utf8"), "signed remote content");
+  assert.deepEqual(await fsp.readdir(path.join(root, ".rootark-trash")), [],
+    "verified success must not retain a private hydration hardlink");
+  assert.deepEqual((await fsp.readdir(path.join(root, "docs"))).filter((name) => name.includes(".tmp-")), []);
+  assert.equal(state.pushes, 0, "hydration must not create a remote upload");
+});
+
+test("issue 66 P2: verified repeated FOD CREATE is idempotent without staging clean bytes", async (t) => {
+  const { root, open, state } = await setup(t, { "docs/repeat.txt": "signed creation bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/repeat.txt"), true);
+  const original = structuredClone(client.snapshot.files["docs/repeat.txt"]);
+  assert.ok(original && !original.deleted && original.objectId && original.fileId);
+  const originalBytes = await fsp.readFile(path.join(root, "docs", "repeat.txt"));
+  assert.equal(await client.materializeRemote("docs/repeat.txt"), true,
+    "a second authenticated read must not treat the clean cached pathname as an intruder");
+  assert.deepEqual(client.snapshot.files["docs/repeat.txt"], original,
+    "idempotence may not rewrite revision, object/file identity or hash");
+  assert.deepEqual(await fsp.readFile(path.join(root, "docs", "repeat.txt")), originalBytes);
+  assert.deepEqual(await fsp.readdir(path.join(root, ".rootark-trash")), [],
+    "an authenticated no-op must not stage or replace the clean cache");
+  assert.deepEqual(await client.journal.recover(), [], "no local CREATE outbox");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: first FOD CREATE cleanup failure cannot mint an untracked local CREATE", async (t) => {
+  const { root, open, state } = await setup(t, { "docs/first.txt": "authenticated remote bytes" });
+  const consumer = await open();
+  const originalRm = fsp.rm;
+  let cleanupAttempts = 0;
+  fsp.rm = async (file, ...args) => {
+    if (/^hydrate-[a-f0-9-]{36}\.tmp$/.test(path.basename(String(file)))) {
+      cleanupAttempts++;
+      throw Object.assign(new Error("simulated FOD CREATE cleanup EPERM"), { code: "EPERM" });
+    }
+    return originalRm(file, ...args);
+  };
+  try {
+    await assert.rejects(consumer.materializeRemote("docs/first.txt"),
+      (error) => error.code === "EPERM");
+  } finally { fsp.rm = originalRm; }
+  assert.equal(cleanupAttempts, 1, "must have reached the actual unlink after publication");
+  const target = path.join(root, "docs", "first.txt");
+  assert.equal(await fsp.readFile(target, "utf8"), "authenticated remote bytes");
+  assert.equal((await fsp.lstat(target)).nlink, 2,
+    "failed post-link cleanup must leave a physical hardlink guard, not an ordinary nlink=1 file");
+  assert.equal(consumer.snapshot.files["docs/first.txt"], undefined,
+    "failed publication cannot mark a fresh signed cache as admitted");
+  assert.equal((await fsp.readdir(path.join(root, "docs")))
+    .some((name) => name.includes(".tmp-")), false);
+  assert.equal((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .filter((name) => /^hydrate-[a-f0-9-]{36}\.tmp$/.test(name)).length, 1);
+  await assert.rejects(consumer.scanFiles(), (error) => error.code === "unsafe_path",
+    "hardlink remains nlink=2 until evidence is resolved; never scan it as local CREATE");
+  await assert.rejects(consumer.reconcileLocal(), (error) => error.code === "unsafe_path");
+  assert.deepEqual(await consumer.journal.recover(), [], "no synthesized local CREATE outbox");
+  assert.equal(state.pushes, 0, "no local upload may escape after cleanup failure");
+});
+
+test("issue 66 P2: hydration cleanup EPERM cannot return success or leak syncable CREATE", async (t) => {
+  const { root, source, writer, open, state } = await setup(t,
+    { "docs/cleanup.txt": "signed remote content" });
+  const consumer = await open();
+  assert.equal(await consumer.materializeRemote("docs/cleanup.txt"), true);
+  const previousSnapshot = structuredClone(consumer.snapshot.files["docs/cleanup.txt"]);
+  await fsp.writeFile(path.join(source, "docs", "cleanup.txt"), "new signed remote content");
+  await writer.syncOnce();
+  state.pushes = 0;
+  const originalRm = fsp.rm;
+  let intercepted = 0;
+  fsp.rm = async (file, ...rest) => {
+    if (path.basename(String(file)).startsWith("hydrate-")) {
+      intercepted++;
+      throw Object.assign(new Error("simulated hydration cleanup denied"), { code: "EPERM" });
+    }
+    return originalRm(file, ...rest);
+  };
+  try {
+    await assert.rejects(consumer.materializeRemote("docs/cleanup.txt"),
+      (error) => error.code === "EPERM",
+      "failing finally/unlink must propagate without falsely reporting hydration success");
+  } finally { fsp.rm = originalRm; }
+  assert.equal(intercepted, 1, "the real private cleanup call must have been reached");
+  assert.deepEqual(consumer.snapshot.files["docs/cleanup.txt"], previousSnapshot,
+    "cleanup failure cannot mark the newer remote content as durably hydrated");
+  assert.equal(state.pushes, 0);
+  assert.deepEqual((await fsp.readdir(path.join(root, "docs"))).filter((name) => name.includes(".tmp-")), []);
+  const trashDir = path.join(root, ".rootark-trash");
+  const trashNames = await fsp.readdir(trashDir);
+  assert.equal(trashNames.filter((name) => /^hydrate-[a-f0-9-]{36}\.tmp$/.test(name)).length, 1);
+  const olderCache = await Promise.all(trashNames
+    .filter((name) => !/^hydrate-[a-f0-9-]{36}\.tmp$/.test(name))
+    .map((name) => fsp.readFile(path.join(trashDir, name), "utf8")));
+  assert.ok(olderCache.includes("signed remote content"),
+    "previous clean cached bytes must remain recoverable after failed hydration cleanup");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "cleanup.txt"), "utf8"),
+    "new signed remote content", "new materialization is not destroyed on cleanup failure");
+  await assert.rejects(consumer.scanFiles(), (error) => error.code === "unsafe_path",
+    "hardlinked target with an unresolved private alias must fail closed");
+});
+
+test("issue 66 P2: interrupted FOD temp write is never scanned as ordinary CREATE", async (t) => {
+  const { root, open, state } = await setup(t, { "docs/interrupted.txt": "signed remote content" });
+  const consumer = await open();
+  const originalWrite = fsp.writeFile;
+  const originalRm = fsp.rm;
+  let intercepted = 0;
+  let cleanupSuppressed = 0;
+  // Model a process halt before its finally/unlink can complete: retaining
+  // the actual already-written temporary instead of manufacturing a fixture.
+  fsp.rm = async (file, ...rest) => {
+    if (/^(hydrate-[a-f0-9-]{36}\.tmp|interrupted\.txt\.tmp-)/
+      .test(path.basename(String(file)))) {
+      cleanupSuppressed++;
+      return;
+    }
+    return originalRm(file, ...rest);
+  };
+  fsp.writeFile = async (file, data, ...rest) => {
+    if ((/^hydrate-[a-f0-9-]{36}\.tmp$/.test(path.basename(String(file)))
+      || /^interrupted\.txt\.tmp-/.test(path.basename(String(file))))
+      && Buffer.isBuffer(data)) {
+      await originalWrite(file, data, ...rest);
+      intercepted++;
+      throw new Error("simulated interruption immediately after private temp write");
+    }
+    return originalWrite(file, data, ...rest);
+  };
+  try {
+    await assert.rejects(consumer.materializeRemote("docs/interrupted.txt"), /simulated interruption/);
+  } finally {
+    fsp.writeFile = originalWrite;
+    fsp.rm = originalRm;
+  }
+  assert.equal(intercepted, 1);
+  assert.equal(cleanupSuppressed, 1);
+  assert.equal(state.pushes, 0);
+  assert.deepEqual((await fsp.readdir(path.join(root, "docs"))).filter((name) => name.includes(".tmp-")), []);
+  assert.equal((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .filter((name) => /^hydrate-[a-f0-9-]{36}\.tmp$/.test(name)).length, 1);
+  const scanned = await consumer.scanFiles();
+  assert.equal(scanned["docs/interrupted.txt"], undefined);
+  assert.equal(Object.keys(scanned).some((name) => name.includes(".tmp-")
+    || name.startsWith(".rootark-trash")), false,
+  "uncommitted plaintext residue must be outside the sync inventory");
+});
+
 async function seedRemote(store, key, relative, objectId = `external-${crypto.randomUUID()}`) {
   const operation = protocol.createOperation({
     operation: "create", objectId, fileId: `file-${crypto.randomUUID()}`,
@@ -759,6 +910,107 @@ test("issue 66: a clean cached source can be hydrated through a verified remote 
   assert.equal(await client.materializeRemote("docs/renamed.txt"), true);
   assert.equal(await fsp.readFile(path.join(root, "docs", "renamed.txt"), "utf8"), "signed move bytes");
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
+});
+
+test("issue 66 P2: verified FOD MOVE cleanup failure cannot claim hydration success", async (t) => {
+  const { root, open, store, key, state } = await setup(t,
+    { "docs/original.txt": "signed move bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/original.txt"), true);
+  const before = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: before.objectId, fileId: before.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: before.revision, revision: {
+      counter: before.revision.counter + 1, deviceId: "device-a",
+    },
+    metadata: { path: "docs/renamed.txt", sourcePath: "docs/original.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("signed move bytes"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const originalRm = fsp.rm;
+  let intercepted = 0;
+  fsp.rm = async (file, ...rest) => {
+    if (path.basename(String(file)).startsWith(".rootark-move-")) {
+      intercepted++;
+      throw Object.assign(new Error("simulated FOD MOVE unlink denial"), { code: "EPERM" });
+    }
+    return originalRm(file, ...rest);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/renamed.txt"),
+      (error) => error.code === "EPERM");
+  } finally { fsp.rm = originalRm; }
+  assert.equal(intercepted, 1);
+  assert.equal(state.pushes, 0);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "original.txt"), "utf8"),
+    "signed move bytes", "old cached user bytes must be restored on failed move cleanup");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "renamed.txt"), "utf8"),
+    "signed move bytes", "newly linked bytes must not be silently destroyed");
+  assert.equal(client.snapshot.files["docs/renamed.txt"], undefined,
+    "no successful hydrated cache revision may be recorded");
+  assert.equal((await fsp.readdir(path.join(root, "docs")))
+    .filter((name) => name.startsWith(".rootark-move-")).length, 0,
+    "verified MOVE may not leak plaintext staging into the syncable path");
+  assert.equal((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .filter((name) => name.startsWith(".rootark-move-")).length, 1,
+    "unremoved private temp must remain outside inventory");
+});
+
+test("issue 66 P2: interrupted FOD MOVE plaintext write stays outside sync inventory", async (t) => {
+  const { root, open, store, key, state } = await setup(t,
+    { "docs/from.txt": "clean authenticated bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/from.txt"), true);
+  const prior = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/to.txt", sourcePath: "docs/from.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("clean authenticated bytes"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const originalWrite = fsp.writeFile;
+  const originalRm = fsp.rm;
+  let wrote = 0;
+  let leftBehind = 0;
+  fsp.writeFile = async (file, data, ...args) => {
+    if (path.basename(String(file)).startsWith(".rootark-move-") && Buffer.isBuffer(data)) {
+      await originalWrite(file, data, ...args);
+      wrote += 1;
+      throw new Error("simulated MOVE process death immediately after temp write");
+    }
+    return originalWrite(file, data, ...args);
+  };
+  fsp.rm = async (file, ...args) => {
+    if (path.basename(String(file)).startsWith(".rootark-move-")) {
+      leftBehind += 1;
+      return;
+    }
+    return originalRm(file, ...args);
+  };
+  try {
+    await assert.rejects(client.materializeRemote("docs/to.txt"), /simulated MOVE process death/);
+  } finally {
+    fsp.writeFile = originalWrite;
+    fsp.rm = originalRm;
+  }
+  assert.equal(wrote, 1);
+  assert.equal(leftBehind, 1);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "from.txt"), "utf8"),
+    "clean authenticated bytes", "failed MOVE must restore clean original bytes");
+  assert.equal(await exists(path.join(root, "docs", "to.txt")), false);
+  assert.equal((await fsp.readdir(path.join(root, "docs")))
+    .filter((name) => name.startsWith(".rootark-move-")).length, 0);
+  assert.equal((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .filter((name) => name.startsWith(".rootark-move-")).length, 1);
+  const scan = await client.scanFiles();
+  assert.equal(Object.keys(scan).some((name) => name.includes(".rootark-move-")), false);
+  assert.equal(state.pushes, 0);
 });
 
 test("issue 66 #263 P2: MOVE returns to a clean cached destination without treating it as untracked", async (t) => {

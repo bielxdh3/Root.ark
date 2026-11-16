@@ -1915,7 +1915,12 @@ class SyncEngine {
           sourcePath, this.snapshot.files[sourcePath]);
         try {
           if (await exists(target)) fail("Moved destination was occupied locally", "local_changes_pending");
-          const temporary = path.join(path.dirname(target), `.rootark-move-${crypto.randomUUID()}`);
+          // Keep in-flight verified MOVE plaintext outside the sync scanner,
+          // even if this process stops before the no-replace hardlink.
+          const moveTempDir = path.join(this.rootDir, ".rootark-trash");
+          await fsp.mkdir(moveTempDir, { recursive: true, mode: 0o700 });
+          await containedAbsolute(this.rootDir, moveTempDir, false);
+          const temporary = path.join(moveTempDir, `.rootark-move-${crypto.randomUUID()}`);
           try {
             await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
             // Hard-link publication is exclusive (no replace), unlike rename
@@ -1925,7 +1930,11 @@ class SyncEngine {
               if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
               throw error;
             }
-          } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+          } finally {
+            // A failed unlink after no-replace publication leaves nlink=2.
+            // The move must not be reported as hydrated in that state.
+            await fsp.rm(temporary, { force: true });
+          }
         } catch (error) {
           await this.restoreStagedTrackedFile(sourcePath, stagedSource);
           throw error;
@@ -1958,8 +1967,14 @@ class SyncEngine {
           } else if (await exists(target)) {
             await this.stageExisting(target);
           }
+          const moveTempDir = beforeHydrationWrite
+            ? path.join(this.rootDir, ".rootark-trash") : null;
+          if (moveTempDir) {
+            await fsp.mkdir(moveTempDir, { recursive: true, mode: 0o700 });
+            await containedAbsolute(this.rootDir, moveTempDir, false);
+          }
           const temporary = beforeHydrationWrite
-            ? path.join(path.dirname(target), `.rootark-move-${crypto.randomUUID()}`)
+            ? path.join(moveTempDir, `.rootark-move-${crypto.randomUUID()}`)
             : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
           try {
             await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
@@ -1972,7 +1987,10 @@ class SyncEngine {
             } else {
               await fsp.rename(temporary, target);
             }
-          } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+          } finally {
+            if (beforeHydrationWrite) await fsp.rm(temporary, { force: true });
+            else await fsp.rm(temporary, { force: true }).catch(() => {});
+          }
         } catch (error) {
           if (stagedTarget) await this.restoreStagedTrackedFile(metadata.path, stagedTarget);
           throw error;
@@ -2010,11 +2028,45 @@ class SyncEngine {
           }
         }
       } else {
+        if (beforeHydrationWrite && operation.operation === "create") {
+          // Reopening the SAME signed CREATE is an idempotent read, not a
+          // request to overwrite its clean, already-hydrated local cache.
+          // Check both the pinned snapshot and current on-disk bytes before
+          // returning; a racing user edit or a different signed revision may
+          // not be treated as a successful refresh.
+          const cached = this.snapshot.files[metadata.path];
+          if (cached && !cached.deleted && !cached.directory
+            && cached.objectId === operation.objectId && cached.fileId === operation.fileId
+            && cached.versionId === operation.versionId
+            && protocol.compareRevisions(cached.revision, operation.revision) === 0) {
+            const signedHash = crypto.createHash("sha256").update(plaintext).digest("hex");
+            const current = await readContainedFile(this.rootDir, metadata.path);
+            try {
+              if (cached.hash !== signedHash
+                || crypto.createHash("sha256").update(current).digest("hex") !== signedHash) {
+                fail("Cached CREATE no longer matches authenticated local bytes", "local_changes_pending");
+              }
+            } finally { current.fill(0); }
+            return verifiedFreshDigest;
+          }
+        }
         // For an explicitly verified on-demand UPDATE, the same file identity
         // may still be cached at the pathname preceding a remote MOVE.
         const relocatedSource = beforeHydrationWrite && operation.operation === "update"
           ? activeFileIdentityPath(this.snapshot.files, operation, metadata.path) : null;
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        // An interrupted verified hydration must never leave plaintext as a
+        // syncable sibling that the next reconcile can enqueue as CREATE.
+        // Only FOD materialization uses this private staging directory.
+        const hydrationTempDir = beforeHydrationWrite
+          ? path.join(this.rootDir, ".rootark-trash") : null;
+        if (hydrationTempDir) {
+          await fsp.mkdir(hydrationTempDir, { recursive: true, mode: 0o700 });
+          await containedAbsolute(this.rootDir, hydrationTempDir, false);
+        }
+        const temporary = hydrationTempDir
+          ? path.join(hydrationTempDir, `hydrate-${crypto.randomUUID()}.tmp`)
+          : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        if (hydrationTempDir) await containedAbsolute(this.rootDir, temporary, true);
         let stagedSource = null;
         let stagedTarget = null;
         try {
@@ -2036,13 +2088,19 @@ class SyncEngine {
             } else if (await exists(target)) {
               fail("Untracked local destination cannot be replaced", "local_changes_pending");
             }
+          } else if (beforeHydrationWrite) {
+            // A verified on-demand CREATE never has permission to stage or
+            // replace a newly appearing user-owned destination.
+            if (await exists(target)) {
+              fail("Untracked local destination cannot be replaced", "local_changes_pending");
+            }
           } else if (await exists(target)) {
             await this.stageExisting(target);
           }
-          if (beforeHydrationWrite && operation.operation === "update") {
-            // A local writer may recreate the pathname AFTER a clean stage.
-            // An exclusive hard link refuses to replace their new file;
-            // rename() can silently overwrite it on Windows and POSIX.
+          if (beforeHydrationWrite) {
+            // For both CREATE and UPDATE, publish by exclusive hardlink and
+            // unlink only after success. Rename would consume the temp and
+            // make a later unlink failure leave an untracked nlink=1 file.
             try {
               await fsp.link(temporary, target);
             } catch (error) {
@@ -2066,7 +2124,10 @@ class SyncEngine {
           }
           throw error;
         } finally {
-          await fsp.rm(temporary, { force: true }).catch(() => {});
+          // A surviving private hardlink may keep the newly materialized file
+          // at nlink=2. Do not report hydration success if cleanup failed.
+          if (hydrationTempDir) await fsp.rm(temporary, { force: true });
+          else await fsp.rm(temporary, { force: true }).catch(() => {});
         }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
