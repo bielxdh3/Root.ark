@@ -225,11 +225,15 @@
         if (database) {
           const secret = await sealingKey(input.metadataRaw, pinned.scope);
           const raw = encoder.encode(JSON.stringify(rows));
-          if (raw.byteLength > 4 * 1024 * 1024) deny();
-          const iv = webCrypto.getRandomValues(new Uint8Array(12));
-          const ciphertext = await webCrypto.subtle.encrypt({ name: "AES-GCM",
-            iv, additionalData: aad, tagLength: 128 }, secret, raw);
-          raw.fill(0);
+          let iv, ciphertext;
+          try {
+            if (raw.byteLength > 4 * 1024 * 1024) deny();
+            iv = webCrypto.getRandomValues(new Uint8Array(12));
+            ciphertext = await webCrypto.subtle.encrypt({ name: "AES-GCM",
+              iv, additionalData: aad, tagLength: 128 }, secret, raw);
+          } finally {
+            raw.fill(0);
+          }
           live(input.assertLive);
           try {
             await database.write(key, { format: FORMAT, context: JSON.stringify(pinned),

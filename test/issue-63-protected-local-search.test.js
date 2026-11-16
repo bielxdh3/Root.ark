@@ -2,6 +2,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
 const search = require("../public/client/rootark-zk1-protected-local-search");
 
 // Only IndexedDB and independent catalog I/O are substituted. AES-GCM/HKDF is real.
@@ -173,6 +176,38 @@ test("a denied IndexedDB write returns authenticated ephemeral matches without w
   assert.equal(f.opened, 2);
   f.revoke();
   await assert.rejects(search.search(f.input(key, "secret")), /ZK_LOCAL_SEARCH_DENIED/);
+});
+
+test("a failed index encryption wipes the transient plaintext catalog", async () => {
+  const database = indexedDBMemory();
+  const f = fixture(database);
+  let rawBytes, sawPrivateName = false;
+  const subtle = new Proxy(crypto.webcrypto.subtle, {
+    get(target, property) {
+      if (property === "encrypt") return async (_algorithm, _key, plaintext) => {
+        rawBytes = plaintext;
+        sawPrivateName = new TextDecoder().decode(plaintext)
+          .includes("secret-private-name.txt");
+        throw Error("FORCED_INDEX_ENCRYPT_FAILURE");
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const context = { crypto: { subtle,
+    getRandomValues: (bytes) => crypto.webcrypto.getRandomValues(bytes) },
+  TextEncoder, TextDecoder, Uint8Array, btoa, atob };
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-protected-local-search.js"), "utf8"), context);
+
+  await assert.rejects(context.RootarkZk1ProtectedLocalSearch.search(
+    f.input(crypto.randomBytes(32), "secret")), /ZK_LOCAL_SEARCH_DENIED/);
+  assert.equal(sawPrivateName, true, "fixture proves the buffer held a real private name");
+  assert.equal(f.opened, 1, "the signed catalog was opened before encryption failed");
+  assert.equal(database.rows.size, 0, "no failed index may be persisted");
+  assert.ok(rawBytes instanceof Uint8Array && rawBytes.every((byte) => byte === 0),
+    "failure must zero the exact plaintext bytes passed to WebCrypto");
 });
 
 test("wrong key, tampered ciphertext, epoch change and stale CAS cannot reveal cached names", async () => {
