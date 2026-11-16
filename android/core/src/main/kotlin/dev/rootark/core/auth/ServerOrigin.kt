@@ -13,11 +13,11 @@ class ServerOrigin private constructor(private val origin: String) {
 
     fun syncListUrl(): URL = URL("$origin/sync/v1/objects")
 
-    /** Issue #66: metadata-only, bounded, snapshot-cursor inventory (never full ciphertext list). */
-    fun syncInventoryUrl(cursor: String? = null): URL {
-        if (cursor != null) PagedInventoryPolicy.checkCursor(cursor, emptySet())
-        return URL("$origin/sync/v1/objects?view=metadata&limit=64" +
-            (if (cursor == null) "" else "&cursor=$cursor"))
+    /** A single unescaped protocol object ID, never an arbitrary path or user URL. */
+    fun syncObjectUrl(objectId: String): URL {
+        require(objectId.length in 1..160 && objectId != "." && objectId != ".." &&
+            objectId.matches(Regex("[A-Za-z0-9._:-]+"))) { "Invalid sync object ID" }
+        return URL("$origin/sync/v1/objects/$objectId")
     }
 
     companion object {
@@ -44,5 +44,12 @@ class ServerOrigin private constructor(private val origin: String) {
             val port = if (uri.port == -1) "" else ":${uri.port}"
             return ServerOrigin("https://$hostname$port")
         }
+    }
+
+    /** Issue #66: metadata-only, bounded, snapshot-cursor inventory (never full ciphertext list). */
+    fun syncInventoryUrl(cursor: String? = null): URL {
+        if (cursor != null) PagedInventoryPolicy.checkCursor(cursor, emptySet())
+        return URL("$origin/sync/v1/objects?view=metadata&limit=64" +
+            (if (cursor == null) "" else "&cursor=$cursor"))
     }
 }
