@@ -37,11 +37,31 @@ async function signed(label) {
 
 function fixture(pending) {
   const calls = { pushed: 0, incoming: 0, admissionChecks: 0 };
+  const unexpectedMutation = () => {
+    throw new Error("STRICT_BOUNDARY_FIXTURE_MUST_NOT_WRITE_JOURNAL");
+  };
+  // Exercise the real engine's complete method-capture boundary. Every
+  // mutator fails loudly: these cases test authorization denial before I/O,
+  // not durable journal persistence (covered by the real-journal suites).
   const journal = {
+    commit: unexpectedMutation,
     recover: async () => pending ? [pending] : [],
+    enqueue: unexpectedMutation,
+    discardUnsent: unexpectedMutation,
+    markSeen: unexpectedMutation,
+    markSeenMany: unexpectedMutation,
+    markSeenExact: unexpectedMutation,
+    replace: unexpectedMutation,
+    update: unexpectedMutation,
     hasSeen: () => false,
+    durableSignedReceiptDigest: () => null,
+    recordRestoreMaterialization: unexpectedMutation,
+    restoreStagingInfo: () => null,
+    hasMaterializedRestore: () => false,
+    atomicSignedGroups: () => ({}),
     assertCompatibleAdmission: () => { calls.admissionChecks += 1; },
     hasLocalAdmission: () => false,
+    observeAdmission: unexpectedMutation,
   };
   const engine = new SyncEngine({
     rootDir: process.cwd(), journal, requireAuthorization: true,

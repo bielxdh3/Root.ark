@@ -810,7 +810,7 @@ test("legacy signed WebDAV DELETE orphan after local journal group deletion must
   const evidence = await snapshotPinnedJournal(f.journalPath);
   assert.deepEqual(evidence.bytes, bytes,
     "the forged orphan DELETE must be persisted in the original journal inode");
-  f.engine.journal = await new SyncJournal(f.journalPath).open();
+  await f.engine.journal.open();
   assertSameSignedEnvelopes(f.engine.journal.pending(), [f.deleted]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
@@ -835,7 +835,7 @@ test("legacy signed WebDAV MOVE orphan after missing DELETE and group must NEVER
   const evidence = await snapshotPinnedJournal(f.journalPath);
   assert.deepEqual(evidence.bytes, bytes,
     "the forged orphan MOVE must be persisted in the original journal inode");
-  f.engine.journal = await new SyncJournal(f.journalPath).open();
+  await f.engine.journal.open();
   assertSameSignedEnvelopes(f.engine.journal.pending(), [f.moved]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
