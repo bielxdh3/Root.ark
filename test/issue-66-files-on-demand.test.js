@@ -346,11 +346,17 @@ test("issue 66 #263 P2: evicted A hydrates an authenticated MOVE then UPDATE at 
   const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
   const trust = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
   const originalList = adapter.list.bind(adapter);
-  adapter.list = async (objectId) => Promise.all((await originalList(objectId)).map(async (entry) => ({
-    ...entry, authorization: await createAuthorizationProof(entry, {
-      username: "alice", publicKey, privateKey: signer.privateKey, expiresAt: Date.now() + 60000,
-    }),
-  })));
+  const signedByOperationId = new Map();
+  adapter.list = async (objectId) => Promise.all((await originalList(objectId)).map(async (entry) => {
+    if (!signedByOperationId.has(entry.operationId)) {
+      signedByOperationId.set(entry.operationId, {
+        ...entry, authorization: await createAuthorizationProof(entry, {
+          username: "alice", publicKey, privateKey: signer.privateKey, expiresAt: Date.now() + 60000,
+        }),
+      });
+    }
+    return signedByOperationId.get(entry.operationId);
+  }));
   let verified = 0;
   const client = await new SyncEngine({
     rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
@@ -755,19 +761,73 @@ test("issue 66: a clean cached source can be hydrated through a verified remote 
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
 });
 
+test("issue 66 #263 P2: MOVE returns to a clean cached destination without treating it as untracked", async (t) => {
+  const { root, open, store, key } = await setup(t, { "docs/b.txt": "clean cached revision A" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/b.txt"), true);
+  const first = store.list("alice")[0];
+  const update = protocol.createOperation({
+    operation: "update", objectId: first.objectId, fileId: first.fileId,
+    operationId: crypto.randomUUID(), versionId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: first.revision,
+    revision: { counter: first.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/b.txt" }, plaintext: Buffer.from("revision B"), fileKey: key,
+  });
+  assert.equal((await store.put("alice", update)).kind, "stored");
+  const toC = protocol.createOperation({
+    operation: "move", objectId: first.objectId, fileId: first.fileId,
+    operationId: crypto.randomUUID(), versionId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: update.revision,
+    revision: { counter: update.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/c.txt", sourcePath: "docs/b.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("revision B"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", toC)).kind, "stored");
+  const backToB = protocol.createOperation({
+    operation: "move", objectId: first.objectId, fileId: first.fileId,
+    operationId: crypto.randomUUID(), versionId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: toC.revision,
+    revision: { counter: toC.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/b.txt", sourcePath: "docs/c.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("revision C now back at B"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", backToB)).kind, "stored");
+  assert.equal(await client.materializeRemote("docs/b.txt"), true);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "b.txt"), "utf8"),
+    "revision C now back at B");
+  assert.equal(client.snapshot.files["docs/b.txt"].versionId, backToB.versionId);
+  assert.equal(await exists(path.join(root, "docs", "c.txt")), false);
+  const oldVersions = await Promise.all((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .map(async (entry) => fsp.readFile(path.join(root, ".rootark-trash", entry), "utf8")));
+  assert.ok(oldVersions.includes("clean cached revision A"), "old clean destination must survive in trash");
+  assert.equal(await client.materializeRemote("docs/b.txt"), true,
+    "a second authenticated materialization of the same MOVE must be idempotent");
+  assert.equal(await fsp.readFile(path.join(root, "docs", "b.txt"), "utf8"),
+    "revision C now back at B");
+});
+
 test("issue 66 #263 P2: authenticated signed MOVE publishes B after remote UPDATE and preserves clean A", async (t) => {
   const { root, adapter, store, key } = await setup(t, { "docs/old.txt": "cached revision A" });
   const signer = crypto.generateKeyPairSync("ed25519");
   const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
   const trust = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] };
   const originalList = adapter.list.bind(adapter);
+  const signedByOperationId = new Map();
   let verified = 0;
-  adapter.list = async (objectId) => Promise.all((await originalList(objectId)).map(async (entry) => ({
-    ...entry, authorization: await createAuthorizationProof(entry, {
-      username: "alice", publicKey, privateKey: signer.privateKey,
-      expiresAt: Date.now() + 60000,
-    }),
-  })));
+  adapter.list = async (objectId) => Promise.all((await originalList(objectId)).map(async (entry) => {
+    if (!signedByOperationId.has(entry.operationId)) {
+      signedByOperationId.set(entry.operationId, {
+        ...entry, authorization: await createAuthorizationProof(entry, {
+          username: "alice", publicKey, privateKey: signer.privateKey,
+          expiresAt: Date.now() + 60000,
+        }),
+      });
+    }
+    return signedByOperationId.get(entry.operationId);
+  }));
   const client = await new SyncEngine({
     rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
     compartmentId: "private", fileKeyResolver: () => key,

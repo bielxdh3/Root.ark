@@ -1941,26 +1941,42 @@ class SyncEngine {
         const movedStats = await fsp.lstat(target, { bigint: true });
         if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
       } else {
-        if (beforeHydrationWrite) {
-          if (await exists(target)) fail("Untracked destination appeared during hydration", "local_changes_pending");
-        } else if (await exists(target)) {
-          await this.stageExisting(target);
-        }
-        const temporary = beforeHydrationWrite
-          ? path.join(path.dirname(target), `.rootark-move-${crypto.randomUUID()}`)
-          : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        let stagedTarget = null;
         try {
-          await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
           if (beforeHydrationWrite) {
-            try { await fsp.link(temporary, target); }
-            catch (error) {
-              if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
-              throw error;
+            const trackedTarget = this.snapshot.files[metadata.path];
+            if (trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
+              && trackedTarget.objectId === operation.objectId
+              && trackedTarget.fileId === operation.fileId) {
+              // A remote MOVE can return to an already-cached, clean path.
+              // Recheck the old local revision at the final staging boundary;
+              // it need not equal the newer authenticated MOVE payload.
+              stagedTarget = await this.stageCleanTrackedFile(metadata.path, trackedTarget);
+            } else if (await exists(target)) {
+              fail("Untracked destination appeared during hydration", "local_changes_pending");
             }
-          } else {
-            await fsp.rename(temporary, target);
+          } else if (await exists(target)) {
+            await this.stageExisting(target);
           }
-        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+          const temporary = beforeHydrationWrite
+            ? path.join(path.dirname(target), `.rootark-move-${crypto.randomUUID()}`)
+            : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+          try {
+            await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
+            if (beforeHydrationWrite) {
+              try { await fsp.link(temporary, target); }
+              catch (error) {
+                if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
+                throw error;
+              }
+            } else {
+              await fsp.rename(temporary, target);
+            }
+          } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+        } catch (error) {
+          if (stagedTarget) await this.restoreStagedTrackedFile(metadata.path, stagedTarget);
+          throw error;
+        }
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
