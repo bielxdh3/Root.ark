@@ -59,6 +59,49 @@ function snapshot(value, names) {
   }
   return Object.freeze(copy);
 }
+function ownDataDescriptors(value, required, optional = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  const allowed = new Set([...required, ...optional]);
+  if (keys.length < required.length || keys.length > allowed.size
+    || required.some((key) => !Object.hasOwn(descriptors, key))
+    || keys.some((key) => typeof key !== "string" || !allowed.has(key)
+      || !Object.hasOwn(descriptors[key], "value"))) deny();
+  return descriptors;
+}
+const REDEEM_INPUT_REQUIRED = ["origin", "grant", "recipientUsername",
+  "recipientDeviceId", "signerKey", "readIndependentAuthority"];
+const REDEEM_INPUT_OPTIONAL = ["fetchImpl", "nowSeconds"];
+function snapshotRedeemInput(value) {
+  const d = ownDataDescriptors(value, REDEEM_INPUT_REQUIRED, REDEEM_INPUT_OPTIONAL);
+  const grant = snapshot(d.grant.value, GRANT);
+  const origin = d.origin.value;
+  const recipientUsername = d.recipientUsername.value;
+  const recipientDeviceId = d.recipientDeviceId.value;
+  const signerKey = d.signerKey.value;
+  const readIndependentAuthority = d.readIndependentAuthority.value;
+  if (typeof origin !== "string" || typeof recipientUsername !== "string"
+    || typeof recipientDeviceId !== "string" || !signerKey
+    || typeof signerKey !== "object" || typeof readIndependentAuthority !== "function") deny();
+  const copy = Object.create(null);
+  copy.origin = origin;
+  copy.grant = grant;
+  copy.recipientUsername = recipientUsername;
+  copy.recipientDeviceId = recipientDeviceId;
+  copy.signerKey = signerKey;
+  copy.readIndependentAuthority = readIndependentAuthority;
+  if (Object.hasOwn(d, "fetchImpl")) {
+    if (typeof d.fetchImpl.value !== "function") deny();
+    copy.fetchImpl = d.fetchImpl.value;
+  }
+  if (Object.hasOwn(d, "nowSeconds")) {
+    if (typeof d.nowSeconds.value !== "function") deny();
+    copy.nowSeconds = d.nowSeconds.value;
+  }
+  return Object.freeze(copy);
+}
 // Recipient contact pins come from the owner's separately authenticated
 // contact/device enrollment. Neither the server response nor its grant may
 // populate them. Reject accessors before any crypto or network await.
@@ -267,13 +310,16 @@ async function openProtectedRecipientShareFile(input) {
   let opened;
   let plaintext;
   try {
-    strict(input, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
-      "metadata", "deviceHpkePrivateKey", "nowSeconds"]);
-    const metadata = snapshot(input.metadata, METADATA);
-    const envelope = safeEnvelope(input.envelope);
-    const { redeemInput, authority, operatorMinimumSequence,
-      deviceHpkePrivateKey, nowSeconds } = input;
-    if (typeof redeemInput?.readIndependentAuthority !== "function"
+    const d = ownDataDescriptors(input, ["redeemInput", "envelope", "authority",
+      "operatorMinimumSequence", "metadata", "deviceHpkePrivateKey", "nowSeconds"]);
+    const redeemInput = snapshotRedeemInput(d.redeemInput.value);
+    const metadata = snapshot(d.metadata.value, METADATA);
+    const envelope = safeEnvelope(d.envelope.value);
+    const authority = d.authority.value;
+    const operatorMinimumSequence = d.operatorMinimumSequence.value;
+    const deviceHpkePrivateKey = d.deviceHpkePrivateKey.value;
+    const nowSeconds = d.nowSeconds.value;
+    if (typeof redeemInput.readIndependentAuthority !== "function"
       || !Number.isSafeInteger(nowSeconds) || nowSeconds < 1) deny();
     const receipt = await redeemProtectedCiphertextShare(redeemInput);
     if (receipt.ownerGrantSignatureVerified !== true
@@ -320,9 +366,8 @@ async function openProtectedRecipientShareFile(input) {
     // again immediately before releasing the decrypted file to this process.
     currentAuthority(await redeemInput.readIndependentAuthority(),
       statement, shareSignature, statementBytes);
-    // Owner authority may expire after genuine HPKE/file AEAD and the final
-    // awaited independent roster read. Use the expiry from the same signed
-    // authority the CEK opener actually verified, never caller-owned fields.
+    // Preserve #296's verified release-expiry fence while applying #294's
+    // immutable redeem snapshot fix directly, without ancestry integration.
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
     if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
@@ -346,31 +391,39 @@ async function openProtectedRecipientShareFile(input) {
 
 async function openPortableProtectedRecipientShareFile(input) {
   try {
-    strict(input, ["offer", "redeemInput", "authority", "operatorMinimumSequence",
-      "deviceHpkePrivateKey", "nowSeconds"]);
-    const inputDescriptors = Object.getOwnPropertyDescriptors(input);
-    if (Object.values(inputDescriptors).some((entry) =>
-      !Object.hasOwn(entry, "value"))) deny();
+    const inputDescriptors = ownDataDescriptors(input, ["offer", "redeemInput",
+      "authority", "operatorMinimumSequence", "deviceHpkePrivateKey", "nowSeconds"]);
     const offer = inputDescriptors.offer.value;
-    strict(offer, OFFER);
-    const offerDescriptors = Object.getOwnPropertyDescriptors(offer);
-    if (Object.values(offerDescriptors).some((entry) =>
-      !Object.hasOwn(entry, "value"))) deny();
-    if (offer.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
-      || offer.authorizesProductionIo !== false
-      || offer.externalCustodyProven !== false) deny();
-    const grant = snapshot(offer.grant, GRANT);
-    const expectedGrant = snapshot(input.redeemInput?.grant, GRANT);
-    if (GRANT.some((key) => grant[key] !== expectedGrant[key])
-      || offer.recipientUsername !== input.redeemInput.recipientUsername
-      || offer.recipientDeviceId !== input.redeemInput.recipientDeviceId) deny();
-    return await openProtectedRecipientShareFile({
-      redeemInput: input.redeemInput, envelope: offer.envelope,
-      authority: input.authority,
-      operatorMinimumSequence: input.operatorMinimumSequence,
-      metadata: offer.metadata, deviceHpkePrivateKey: input.deviceHpkePrivateKey,
-      nowSeconds: input.nowSeconds,
-    });
+    const offerDescriptors = ownDataDescriptors(offer, OFFER);
+    const offerSnapshot = Object.freeze(Object.assign(Object.create(null), {
+      schema: offerDescriptors.schema.value,
+      grant: snapshot(offerDescriptors.grant.value, GRANT),
+      recipientUsername: offerDescriptors.recipientUsername.value,
+      recipientDeviceId: offerDescriptors.recipientDeviceId.value,
+      metadata: snapshot(offerDescriptors.metadata.value, METADATA),
+      envelope: safeEnvelope(offerDescriptors.envelope.value),
+      authorizesProductionIo: offerDescriptors.authorizesProductionIo.value,
+      externalCustodyProven: offerDescriptors.externalCustodyProven.value,
+    }));
+    if (offerSnapshot.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
+      || offerSnapshot.authorizesProductionIo !== false
+      || offerSnapshot.externalCustodyProven !== false
+      || typeof offerSnapshot.recipientUsername !== "string"
+      || typeof offerSnapshot.recipientDeviceId !== "string") deny();
+    const redeemInput = snapshotRedeemInput(inputDescriptors.redeemInput.value);
+    if (GRANT.some((key) => offerSnapshot.grant[key] !== redeemInput.grant[key])
+      || offerSnapshot.recipientUsername !== redeemInput.recipientUsername
+      || offerSnapshot.recipientDeviceId !== redeemInput.recipientDeviceId) deny();
+    const openInput = Object.freeze(Object.assign(Object.create(null), {
+      redeemInput,
+      envelope: offerSnapshot.envelope,
+      authority: inputDescriptors.authority.value,
+      operatorMinimumSequence: inputDescriptors.operatorMinimumSequence.value,
+      metadata: offerSnapshot.metadata,
+      deviceHpkePrivateKey: inputDescriptors.deviceHpkePrivateKey.value,
+      nowSeconds: inputDescriptors.nowSeconds.value,
+    }));
+    return await openProtectedRecipientShareFile(openInput);
   } catch (_) { deny(); }
 }
 module.exports = { openProtectedRecipientShareFile,
