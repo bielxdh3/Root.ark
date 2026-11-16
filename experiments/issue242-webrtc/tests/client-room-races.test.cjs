@@ -89,6 +89,47 @@ test('pending plaintext SHA must not send into a newly joined ciphertext-bound r
   assert.deepEqual(oldChannel.sent, [], 'stale text was sent after room switch');
 });
 
+test('incoming plaintext SHA completing after room switch cannot enter protected-room diagnostics', async () => {
+  const digests = [];
+  let created = 0;
+  const b = browser({
+    digest: () => new Promise(resolve => digests.push(resolve)),
+    fetch: async () => ({ ok: true, json: async () => created++ === 0
+      ? { roomId: 'unbound', hostKey: 'old' }
+      : { roomId: 'protected', hostKey: 'new', boundObject } }),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  const oldChannel = b.channel(b.sockets[0], 'old-guest');
+  const incoming = oldChannel.onmessage({ data: JSON.stringify({
+    type: 'text', text: 'OLD_ROOM_PLAINTEXT', digest: '0'.repeat(64),
+  }) });
+  assert.equal(digests.length, 1, 'the receive callback must wait on real async digest');
+  assert.equal(b.window.__poc.snapshot().diagnostics.verifiedTexts.length, 0);
+
+  await b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' });
+  b.joined(b.sockets[1], boundObject);
+  assert.equal(b.peerConnections[0].closed, true, 'the old peer must have been retired');
+  digests[0](new Uint8Array(32).buffer); // Exact accepted SHA-256 string in this fixture.
+  await incoming;
+  assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
+  assert.equal(b.window.__poc.snapshot().diagnostics.verifiedTexts.length, 0,
+    'a stale plaintext result must never appear as a verified text in the protected room');
+  assert.equal(b.window.__poc.snapshot().diagnostics.rejected.length, 0,
+    'stale results must not be reported as new-room digest failures either');
+
+  const live = browser({ fetch: async () => ({ ok: true, json: async () =>
+    ({ roomId: 'unbound', hostKey: 'current' }) }) });
+  await live.window.__poc.createRoom();
+  live.joined(live.sockets[0]);
+  const liveChannel = live.channel(live.sockets[0], 'current-guest');
+  await liveChannel.onmessage({ data: JSON.stringify({
+    type: 'text', text: 'CURRENT_ROOM_TEXT', digest: '0'.repeat(64),
+  }) });
+  assert.equal(live.window.__poc.snapshot().diagnostics.verifiedTexts[0].text, 'CURRENT_ROOM_TEXT',
+    'ordinary same-room verified text must continue to work');
+});
+
 test('starting a protected room intent cancels pending plaintext before HTTP completes', async () => {
   const pendingDigests = [];
   const requests = [];

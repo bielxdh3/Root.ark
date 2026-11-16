@@ -310,6 +310,9 @@
       }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
+        // Hashing yields to room switches and revocation. The old DataChannel
+        // must not publish plaintext into a later room's UI or diagnostics.
+        if (peers.get(p.id) !== p || p.dc !== dc || protectedRoomRequired || activeBoundObject) return;
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
