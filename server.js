@@ -6167,6 +6167,12 @@ const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: 
 // authoritative user/permission record for every room action and delivery.
 const ROOTARK_P2P_EXPERIMENTAL = ["development", "test"].includes(NODE_ENV)
   && process.env.ROOTARK_P2P_EXPERIMENTAL === "true";
+// Mirror the broker's explicit room protocol. Only these dev/test frames may
+// use its separate 120/10s limit; ordinary /ws events stay on the 30-frame
+// realtime budget, including malformed or oversized attempted P2P frames.
+const P2P_ROOM_MESSAGE_TYPES = new Set([
+  "join", "invite", "revoke", "kick", "request-peer", "consent", "signal",
+]);
 function registerExperimentalP2p() {
   if (!ROOTARK_P2P_EXPERIMENTAL) return;
   const { makeBroker } = require("./experiments/issue242-webrtc/server.cjs");
@@ -6523,18 +6529,25 @@ wss.on("connection", (socket, req) => {
     if (restoreService.isWholeRestoreBlocked()) return socket.close(1012, "Restore recovery required");
     if (!refreshRealtimeUser(socket)) return;
     if (isBinary) return socket.close(1003, "Quadro binario nao suportado");
-    const now = Date.now();
-    if (now - socket.realtimeRate.startedAt >= REALTIME_RATE_WINDOW_MS) socket.realtimeRate = { startedAt: now, count: 0 };
-    socket.realtimeRate.count += 1;
-    if (socket.realtimeRate.count > REALTIME_MAX_MESSAGES_PER_WINDOW) return socket.close(1008, "Limite de mensagens excedido");
     let message = {};
     try {
       message = JSON.parse(rawMessage.toString());
     } catch {
-      return;
+      message = null;
+    }
+    const p2pRoomFrame = ROOTARK_P2P_EXPERIMENTAL && rawMessage.length <= 16_384
+      && message && typeof message === "object" && !Array.isArray(message)
+      && !Object.hasOwn(message, "event") && P2P_ROOM_MESSAGE_TYPES.has(message.type);
+    if (!p2pRoomFrame) {
+      // The experimental room broker independently enforces 120/10s on P2P
+      // frames. Do not spend this separate budget on valid room signalling.
+      const now = Date.now();
+      if (now - socket.realtimeRate.startedAt >= REALTIME_RATE_WINDOW_MS) socket.realtimeRate = { startedAt: now, count: 0 };
+      socket.realtimeRate.count += 1;
+      if (socket.realtimeRate.count > REALTIME_MAX_MESSAGES_PER_WINDOW) return socket.close(1008, "Limite de mensagens excedido");
     }
 
-    if (message.event === "ping") {
+    if (message?.event === "ping") {
       sendRealtime(socket, "pong", {});
     }
   });
