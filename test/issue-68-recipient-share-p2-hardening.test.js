@@ -28,7 +28,7 @@ async function createMinimalOfferFixture() {
     compartment_id: b64(compartmentIdRaw),
     keyring_id: b64(keyringIdRaw),
   };
-  const now = 10000;
+  const now = Math.floor(Date.now() / 1000);
   const epoch = 1;
   const revision = 1;
   const digest = crypto.randomBytes(32);
@@ -146,6 +146,19 @@ async function createMinimalOfferFixture() {
 test("issue 68 P2: future-dated statement.issued_at is rejected beyond clock tolerance", async () => {
   const f = await createMinimalOfferFixture();
 
+  // This reduced fixture cannot complete the owner V2 ceremony, but a valid
+  // statement must reach the independent authority read. Prove the future
+  // variant is rejected at the earlier clock boundary instead.
+  let baselineReads = 0;
+  await assert.rejects(createProtectedRecipientShareOffer({
+    grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+    readIndependentAuthority: async () => { baselineReads++; return f.baseAuthority; },
+    ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+    metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+    ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority, nowSeconds: f.now,
+  }), /ZK_SHARE_OFFER_DENIED/);
+  assert.equal(baselineReads, 1, "a current signed grant must get past input and statement admission");
+
   // Create statement with issued_at in the future: now + 35 (> 30s clock tolerance)
   const statementBytes = Buffer.from(f.grant.shareStatementBase64, "base64url");
   const statement = await z.decodeDeterministic(statementBytes);
@@ -163,12 +176,13 @@ test("issue 68 P2: future-dated statement.issued_at is rejected beyond clock tol
     shareSignatureBase64: b64(modifiedSig),
   };
 
+  let futureReads = 0;
   await assert.rejects(
     createProtectedRecipientShareOffer({
       grant: futureGrant,
       recipientPin: f.recipientPin,
       issuerPin: f.issuerPin,
-      readIndependentAuthority: async () => f.baseAuthority,
+      readIndependentAuthority: async () => { futureReads++; return f.baseAuthority; },
       ownerPrivateKey: f.owner.privateKey,
       ownerHeldCek: f.ownerHeldCek,
       metadata: f.metadata,
@@ -180,6 +194,7 @@ test("issue 68 P2: future-dated statement.issued_at is rejected beyond clock tol
     }),
     /ZK_SHARE_OFFER_DENIED/
   );
+  assert.equal(futureReads, 0, "the future-issued statement must be denied before roster IO");
 });
 
 test("issue 68 P2: snapshotAuthority validates non-negative safe integers for revision, epoch, and device epochs", async () => {
@@ -193,12 +208,16 @@ test("issue 68 P2: snapshotAuthority validates non-negative safe integers for re
   ];
 
   for (const badHead of invalidHeads) {
+    let authorityReads = 0;
     await assert.rejects(
       createProtectedRecipientShareOffer({
         grant: f.grant,
         recipientPin: f.recipientPin,
         issuerPin: f.issuerPin,
-        readIndependentAuthority: async () => ({ ...f.baseAuthority, head: badHead }),
+        readIndependentAuthority: async () => {
+          authorityReads++;
+          return { ...f.baseAuthority, head: badHead };
+        },
         ownerPrivateKey: f.owner.privateKey,
         ownerHeldCek: f.ownerHeldCek,
         metadata: f.metadata,
@@ -210,6 +229,7 @@ test("issue 68 P2: snapshotAuthority validates non-negative safe integers for re
       }),
       /ZK_SHARE_OFFER_DENIED/
     );
+    assert.equal(authorityReads, 1, "bad head must reach authority snapshot validation");
   }
 
   const invalidDevices = [
@@ -221,15 +241,19 @@ test("issue 68 P2: snapshotAuthority validates non-negative safe integers for re
   ];
 
   for (const badDevice of invalidDevices) {
+    let authorityReads = 0;
     await assert.rejects(
       createProtectedRecipientShareOffer({
         grant: f.grant,
         recipientPin: f.recipientPin,
         issuerPin: f.issuerPin,
-        readIndependentAuthority: async () => ({
-          ...f.baseAuthority,
-          devices: [badDevice, f.baseAuthority.devices[1]],
-        }),
+        readIndependentAuthority: async () => {
+          authorityReads++;
+          return {
+            ...f.baseAuthority,
+            devices: [badDevice, f.baseAuthority.devices[1]],
+          };
+        },
         ownerPrivateKey: f.owner.privateKey,
         ownerHeldCek: f.ownerHeldCek,
         metadata: f.metadata,
@@ -241,41 +265,13 @@ test("issue 68 P2: snapshotAuthority validates non-negative safe integers for re
       }),
       /ZK_SHARE_OFFER_DENIED/
     );
+    assert.equal(authorityReads, 1, "bad device must reach authority snapshot validation");
   }
 });
 
-test("issue 68 P2: verifyOfferAuthority rejects non-monotonic post-sealing authority regression", async () => {
-  const f = await createMinimalOfferFixture();
-
-  let calls = 0;
-  await assert.rejects(
-    createProtectedRecipientShareOffer({
-      grant: f.grant,
-      recipientPin: f.recipientPin,
-      issuerPin: f.issuerPin,
-      readIndependentAuthority: async () => {
-        calls++;
-        if (calls === 2) {
-          // Regress revision in post check
-          return {
-            ...f.baseAuthority,
-            head: { ...f.baseAuthority.head, revision: f.baseAuthority.head.revision - 1 },
-          };
-        }
-        return f.baseAuthority;
-      },
-      ownerPrivateKey: f.owner.privateKey,
-      ownerHeldCek: f.ownerHeldCek,
-      metadata: f.metadata,
-      objectRevision: 1,
-      ciphertext: f.ciphertext,
-      ciphertextRoot: f.ciphertextRoot,
-      authority: f.baseAuthority,
-      nowSeconds: f.now,
-    }),
-    /ZK_SHARE_OFFER_DENIED/
-  );
-});
+// Post-sealing rollback is tested with an actual signed owner V2 witness,
+// AEAD/HPKE sealing, and regressionReads === 2 in the owner ceremony suite.
+// This reduced fixture cannot reach that boundary and must not claim it does.
 
 test("issue 68 P2: openPortableProtectedRecipientShareFile rejects getter reentrancy on redeemInput", async () => {
   const f = await createMinimalOfferFixture();

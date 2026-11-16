@@ -856,6 +856,40 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(malformedReads, 1,
       "malformed roster detected on the first actual authority read");
 
+    // The old isolated P2 fixture rejected at its unrelated synthetic-clock
+    // preflight. Cover every malformed head/device case against this valid
+    // signed V2 owner/witness ceremony instead, and prove the roster was read.
+    const invalidAuthority = [
+      ["negative head revision", (current) => ({ ...current,
+        head: { ...current.head, revision: -1 } })],
+      ["fractional head revision", (current) => ({ ...current,
+        head: { ...current.head, revision: 1.5 } })],
+      ["negative head epoch", (current) => ({ ...current,
+        head: { ...current.head, epoch: -1 } })],
+      ["text head revision", (current) => ({ ...current,
+        head: { ...current.head, revision: "1" } })],
+      ...[
+        ["negative enrollment", { enrolledEpoch: -1 }],
+        ["fractional enrollment", { enrolledEpoch: 1.5 }],
+        ["revocation before enrollment", { enrolledEpoch: 2, revokedAtEpoch: 1 }],
+        ["negative revocation", { revokedAtEpoch: -1 }],
+        ["text revocation", { revokedAtEpoch: "revoked" }],
+      ].map(([label, changes]) => [label, (current) => ({ ...current,
+        devices: [...current.devices, { ...current.devices[0],
+          deviceId: "unrelated-invalid-device", ...changes }],
+      })]),
+    ];
+    for (const [label, change] of invalidAuthority) {
+      let reads = 0;
+      await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+        readIndependentAuthority: async () => {
+          reads++;
+          return change(await readIndependentAuthority());
+        },
+      })), /ZK_SHARE_OFFER_DENIED/, label);
+      assert.equal(reads, 1, `${label} must be rejected during the genuine first authority read`);
+    }
+
     // Reach the second read AFTER authentic owner AEAD and HPKE sealing. The
     // currentAuthority signed-head equality also rejects this rollback, so
     // this is a boundary-coverage check, not a fabricated old-SHA RED claim.
@@ -1037,25 +1071,25 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     // starts file AEAD, but its owner approval/witness expires DURING the
     // final file decrypt. Share grant expires later, so checking only the
     // share expiry at return is a false-green authorization boundary.
-    const longGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+    const postDecryptGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
       expiresAt: Math.max(envelope.core.expires_at,
         issued.approval.expires_at, signedCommittedHead.expires_at) + 120 };
-    const longMessage = await shareGrantMessageV1(longGrantInput);
-    const longGrant = { grantId: longGrantInput.grantId,
-      expiresAt: longGrantInput.expiresAt,
+    const longMessage = await shareGrantMessageV1(postDecryptGrantInput);
+    const postDecryptGrant = { grantId: postDecryptGrantInput.grantId,
+      expiresAt: postDecryptGrantInput.expiresAt,
       shareStatementBase64: b64(longMessage.subarray(Buffer.byteLength(
         "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
       shareSignatureBase64: b64(crypto.sign(null, longMessage, originalActor)) };
-    const longShareInput = { ...recipientShareInput, grant: longGrant,
+    const longShareInput = { ...recipientShareInput, grant: postDecryptGrant,
       fetchImpl: async () => new Response(JSON.stringify({
         id: metadata.object_id, revision: 1, epoch: metadata.epoch,
         ciphertextBase64: b64(recoveredCiphertext),
-        shareStatementBase64: longGrant.shareStatementBase64,
-        shareSignatureBase64: longGrant.shareSignatureBase64,
+        shareStatementBase64: postDecryptGrant.shareStatementBase64,
+        shareSignatureBase64: postDecryptGrant.shareSignatureBase64,
       }), { status: 200, headers: { "content-type": "application/json" } }) };
     const firstExpiry = Math.min(envelope.core.expires_at,
       issued.approval.expires_at, signedCommittedHead.expires_at);
-    assert.ok(longGrant.expiresAt > firstExpiry + 2,
+    assert.ok(postDecryptGrant.expiresAt > firstExpiry + 2,
       "the genuinely signed share must still be live after owner/witness expiration");
     const encodedFile = JSON.parse(recoveredCiphertext.toString("utf8"));
     const fileAeadCipherLength = Buffer.from(encodedFile.ciphertext, "base64url").length;
