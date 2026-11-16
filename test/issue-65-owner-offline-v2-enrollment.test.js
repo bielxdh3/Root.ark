@@ -815,60 +815,94 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.notEqual(fileAeadCipherLength, 48,
       "genuine file AEAD must be distinguishable from the 48-byte owner HPKE CEK ciphertext");
     const originalFinalDecrypt = subtle.decrypt;
-    const originalFinalNow = Date.now;
     let finalAeadCompleted = false;
     subtle.decrypt = async function (...args) {
       const openedFile = await originalFinalDecrypt.apply(this, args);
       if (args[0]?.name === "AES-GCM"
         && args[2]?.byteLength === fileAeadCipherLength) {
         finalAeadCompleted = true;
-        Date.now = () => (firstExpiry + 2) * 1000;
       }
       return openedFile;
     };
     try {
-      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
-        redeemInput: longShareInput }), /ZK_SHARE_FILE_OPEN_DENIED/,
-      "B must not return decrypted file after signed owner approval or witness expiry");
+      const longGrantOpened = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: longShareInput });
+      assert.deepEqual(Buffer.from(longGrantOpened.data), bytes,
+        "real HPKE plus file AEAD still opens a live Ed25519 recipient share");
+      longGrantOpened.data.fill(0);
     } finally {
       delete subtle.decrypt;
-      Date.now = originalFinalNow;
     }
     assert.equal(finalAeadCompleted, true,
-      "oracle must complete genuine file AEAD before expiring owner authority");
-    // A caller-supplied independent authority callback runs AFTER the file
-    // AEAD. It may poison mutable same-realm Array methods. In particular,
-    // a forged Array.prototype.some returning false must not skip the final
-    // signed CEK expiry barrier and release authentic plaintext.
+      "positive control must complete genuine file AEAD before the expiry adversary");
+    // Sign a NEW short-lived share with the real Ed25519 owner device key.
+    // Allow its real expiration to pass ONLY after the genuine HPKE/file AEAD
+    // path has completed; the third independent-authority callback then rolls
+    // Date.now backwards. Merely mocking Date.now forwards here would not
+    // prove the pinned release clock rejects an actually expired share.
+    const physicalNow = Date.now;
+    const shortIssuedAt = Math.floor(physicalNow() / 1000) - 1;
+    const shortExpiresAt = shortIssuedAt + 15;
+    const shortInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      authorization: { ...shareAuthorization, issued_at: shortIssuedAt },
+      expiresAt: shortExpiresAt };
+    const shortMessage = await shareGrantMessageV1(shortInput);
+    const shortGrant = { grantId: shortInput.grantId, expiresAt: shortExpiresAt,
+      shareStatementBase64: b64(shortMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, shortMessage, originalActor)) };
+    const shortNowSeconds = shortIssuedAt + 1;
+    const shortShareInput = { ...recipientShareInput, grant: shortGrant,
+      nowSeconds: () => shortNowSeconds,
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: metadata.object_id, revision: 1, epoch: metadata.epoch,
+        ciphertextBase64: b64(recoveredCiphertext),
+        shareStatementBase64: shortGrant.shareStatementBase64,
+        shareSignatureBase64: shortGrant.shareSignatureBase64,
+      }), { status: 200, headers: { "content-type": "application/json" } }) };
+    const shortBridge = { ...bridgeArgs, nowSeconds: shortNowSeconds,
+      authority: { ...linked, nowSeconds: shortNowSeconds } };
     const originalSome = Array.prototype.some;
+    const originalReadNow = Date.now;
     const realFinalDecrypt = subtle.decrypt;
     let poisonInstalled = false;
     let authorityReadsWithPoison = 0, genuineAeadBeforePoison = false;
+    let realExpiryObserved = false;
     subtle.decrypt = async function (...args) {
       const result = await realFinalDecrypt.apply(this, args);
       if (args[0]?.name === "AES-GCM"
         && args[2]?.byteLength === fileAeadCipherLength) {
         genuineAeadBeforePoison = true;
-        Date.now = () => (firstExpiry + 2) * 1000;
       }
       return result;
     };
     let expiryOutcome;
     try {
-      expiryOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
-        redeemInput: { ...longShareInput, readIndependentAuthority: async () => {
+      expiryOutcome = await openProtectedRecipientShareFile({ ...shortBridge,
+        redeemInput: { ...shortShareInput, readIndependentAuthority: async () => {
           const current = await readIndependentAuthority();
           if (++authorityReadsWithPoison === 3) {
+            assert.equal(genuineAeadBeforePoison, true,
+              "the real file AEAD must complete before the malicious third read");
+            assert.ok(physicalNow() < shortExpiresAt * 1000,
+              "genuine file AEAD must finish while the short signed share is still live");
+            const remaining = shortExpiresAt * 1000 - physicalNow();
+            if (remaining > 0) await new Promise((resolve) =>
+              setTimeout(resolve, remaining + 30));
+            realExpiryObserved = physicalNow() >= shortExpiresAt * 1000;
+            assert.equal(realExpiryObserved, true,
+              "the genuine native clock, not a patched Date.now, crossed signed expiry");
             poisonInstalled = true;
             Array.prototype.some = () => false;
+            Date.now = () => shortIssuedAt * 1000;
           }
           return current;
         } },
       }).then((value) => value, (error) => error);
     } finally {
       Array.prototype.some = originalSome;
+      Date.now = originalReadNow;
       delete subtle.decrypt;
-      Date.now = originalFinalNow;
     }
     if (expiryOutcome?.data instanceof Uint8Array) expiryOutcome.data.fill(0);
     assert.equal(genuineAeadBeforePoison, true,
@@ -876,9 +910,11 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(authorityReadsWithPoison, 3,
       "the malicious method replacement occurred on the final independent authority read");
     assert.equal(poisonInstalled, true);
+    assert.equal(realExpiryObserved, true,
+      "a real deadline must pass after AES-GCM, before Date.now rolls backwards");
     assert.ok(expiryOutcome instanceof Error
       && /ZK_SHARE_FILE_OPEN_DENIED/.test(expiryOutcome.message),
-    "a genuine signed CEK expiring after file AEAD must deny despite a forged Array.some");
+    "a real expired Ed25519 share must deny despite Date.now rollback and forged Array.some");
     await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
       redeemInput: { ...recipientShareInput, grant: { ...grant,
         shareSignatureBase64: b64(crypto.randomBytes(64)) } },
