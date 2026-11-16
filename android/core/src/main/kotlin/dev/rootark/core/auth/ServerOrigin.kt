@@ -12,6 +12,13 @@ class ServerOrigin private constructor(private val origin: String) {
 
     fun syncListUrl(): URL = URL("$origin/sync/v1/objects")
 
+    /** A single unescaped protocol object ID, never an arbitrary path or user URL. */
+    fun syncObjectUrl(objectId: String): URL {
+        require(objectId.length in 1..160 && objectId != "." && objectId != ".." &&
+            objectId.matches(Regex("[A-Za-z0-9._:-]+"))) { "Invalid sync object ID" }
+        return URL("$origin/sync/v1/objects/$objectId")
+    }
+
     companion object {
         fun parse(input: String): ServerOrigin {
             require(input.length <= 2048 && input.isNotBlank() && input == input.trim()) {
