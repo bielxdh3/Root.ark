@@ -1,3 +1,13 @@
+> **Source scope — PR #273 standalone checkout:** This commit implements
+> metadata pagination, not protected-content fetch. `ProtectedSyncContent.kt`,
+> `ProtectedSyncFetch.kt`, `withVerifiedContent` and their app-JVM tests are
+> **ABSENT from this PR HEAD**; they exist only in its separately integrated
+> configured parent branch `cdx/rootark-issue64-filelist-20261106` (`83b0e147`).
+> References to those APIs, build targets, security checks and capabilities
+> below describe **the intended combined parent + child tree**, not features
+> or tests delivered by the standalone #273 checkout. No forward merge,
+> trusted-grant provisioner, device validation or deployment is claimed.
+
 # Root.ark Android client (authentication + read-only metadata prototype)
 
 Status: **native launcher with online login, 2FA and bounded, authenticated read-only sync metadata listing, plus an internal gated HTTPS ciphertext fetch/verification adapter.** The app-internal adapter calls the pure-JVM cryptographic core only when an external source supplies current independently pinned trust and a one-shot file CEK. No such trusted provider is installed; the native UI remains metadata-only. No Android device runtime validation has been performed. This is a bounded step toward issue #64; it implements no Keystore, device enrollment, recovery or sync engine, and is not an approved release. The design gates in `docs/architecture/android-client-architecture.md` remain open.
