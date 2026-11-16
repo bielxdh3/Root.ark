@@ -1333,6 +1333,11 @@ class SyncEngine {
       }
     };
     await assertCleanDestination();
+    // A stale old-version restore temp (or an ordinary same-shaped local
+    // name) must be detected BEFORE a new signed outbox is fsynced. Otherwise
+    // the later post-enqueue guard turns an otherwise clean restore into a
+    // permanently indeterminate pending operation with no dispatch.
+    await this.assertNoHistoricalRestoreLegacyTempResidue(relative);
     return { historical, current, relative, existing, versions, assertCleanDestination };
   }
 
@@ -1395,6 +1400,9 @@ class SyncEngine {
       throw error;
     }
     try {
+      // Fail before moving existing user bytes if an older attempt left
+      // unverified plaintext at the restore destination or in private trash.
+      await this.assertNoHistoricalRestoreTempResidue(restored);
       await this._apply(restored, null, existing && !existing.deleted ? existing.hash : null);
     } catch (error) {
       if (error?.code === "restore_local_conflict") {
@@ -2311,6 +2319,7 @@ class SyncEngine {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
         if (operation.operationId.startsWith("histrestore-")) {
+          await this.assertNoHistoricalRestoreTempResidue(operation);
           // The signed outbox can survive a crash between staging and local
           // materialization. Never dispatch that restore without actual bytes.
           const expected = await this.hashPendingPayload(operation);
@@ -2421,6 +2430,58 @@ class SyncEngine {
       ? protocol.decodeMovePayload(decrypted, key) || decrypted
       : decrypted;
     return crypto.createHash("sha256").update(content).digest("hex");
+  }
+
+  async assertNoHistoricalRestoreLegacyTempResidue(relativePath) {
+    // Detect old root-level temps without excluding similarly named user
+    // files from normal sync. A restore must not adopt that ambiguity.
+    const relative = await canonicalRelativePath(this.rootDir, relativePath);
+    const target = path.join(this.rootDir, ...relative.split("/"));
+    const prefix = `${path.basename(target)}.tmp-`;
+    const suffix = /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    let neighbors;
+    try { neighbors = await fsp.readdir(path.dirname(target)); }
+    catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      neighbors = [];
+    }
+    const normalizedPrefix = process.platform === "win32" ? prefix.toLowerCase() : prefix;
+    if (neighbors.some((name) => {
+      const candidate = process.platform === "win32" ? name.toLowerCase() : name;
+      return candidate.startsWith(normalizedPrefix)
+        && suffix.test(candidate.slice(normalizedPrefix.length));
+    })) {
+      fail("Historical restore has an unresolved syncable temporary", "restore_local_materialization_missing");
+    }
+  }
+
+  async assertNoHistoricalRestoreTempResidue(operation) {
+    // Recheck after enqueue and before remote POST to catch write races, plus
+    // private leftovers from this exact signed operation's prior attempt.
+    await this.assertNoHistoricalRestoreLegacyTempResidue(operation.metadata.path);
+    const trash = path.join(this.rootDir, ".rootark-trash");
+    let privateNames;
+    try {
+      await containedAbsolute(this.rootDir, trash, false);
+      privateNames = await fsp.readdir(trash);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      privateNames = [];
+    }
+    // Scope private residue to the exact signed outbox operation. A leftover
+    // for another restore must not permanently wedge unrelated pending work.
+    const privatePrefix = `restore-materialize-${crypto.createHash("sha256")
+      .update(operation.operationId).digest("hex")}.tmp-`;
+    const suffix = /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    if (privateNames.some((name) => {
+      // NTFS resolves mixed-case aliases. Neither a case-only rename nor a
+      // change to the hexadecimal UUID's case may bypass the pending gate.
+      const candidate = process.platform === "win32" ? name.toLowerCase() : name;
+      return candidate.startsWith(privatePrefix)
+        && suffix.test(candidate.slice(privatePrefix.length));
+    })) {
+      fail("Historical restore has an unresolved private temporary", "restore_local_materialization_missing");
+    }
   }
 
   async stageExisting(target) {
@@ -2629,8 +2690,22 @@ class SyncEngine {
           }
         }
       } else {
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
+        // Restore materialization is journaled before this write. A crash or
+        // failed cleanup must not leave its plaintext temp in the sync scan:
+        // that would look like an independent, unsanctioned CREATE on retry.
+        const restoreTempDir = historicalRestoreHash !== undefined
+          ? path.join(this.rootDir, ".rootark-trash") : null;
+        if (restoreTempDir) {
+          await fsp.mkdir(restoreTempDir, { recursive: true, mode: 0o700 });
+          await containedAbsolute(this.rootDir, restoreTempDir, false);
+        }
+        const temporary = restoreTempDir
+          ? path.join(restoreTempDir, `restore-materialize-${crypto.createHash("sha256")
+            .update(operation.operationId).digest("hex")}.tmp-${process.pid}-${crypto.randomUUID()}`)
+          : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        if (restoreTempDir) await containedAbsolute(this.rootDir, temporary, true);
+        await fsp.writeFile(temporary, plaintext,
+          { mode: 0o600, ...(restoreTempDir ? { flag: "wx" } : {}) });
         try {
           if (historicalRestoreHash !== undefined) {
             const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
@@ -2647,7 +2722,12 @@ class SyncEngine {
             if (await exists(target)) await this.stageExisting(target);
             await fsp.rename(temporary, target);
           }
-        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+        } finally {
+          // Do not certify a historical restore if its plaintext temp could
+          // not be removed; keep the signed outbox for explicit recovery.
+          if (restoreTempDir) await fsp.rm(temporary, { force: true });
+          else await fsp.rm(temporary, { force: true }).catch(() => {});
+        }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
@@ -2723,6 +2803,11 @@ class SyncEngine {
   }
 
   async _reconcileLocal() {
+    for (const operation of await this.journal.recover()) {
+      if (operation.operationId?.startsWith("histrestore-")) {
+        await this.assertNoHistoricalRestoreTempResidue(operation);
+      }
+    }
     const scanned = await this.scanFiles();
     const current = {};
     const snapshotPathByKey = new Map();
