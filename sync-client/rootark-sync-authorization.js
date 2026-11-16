@@ -15,6 +15,8 @@ const {
   arraySome: NATIVE_ARRAY_SOME,
   arrayIncludes: NATIVE_ARRAY_INCLUDES,
   dateNow: NATIVE_DATE_NOW,
+  keyType: NATIVE_KEY_TYPE,
+  keyAlgorithm: NATIVE_KEY_ALGORITHM,
 } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const zk = require("../src/crypto/rootark-zk-1");
 
@@ -67,15 +69,27 @@ function digest(value, name) {
   return bytes;
 }
 
+function canonicalBytes(value, name, length = null, allowEmpty = false) {
+  if (typeof value !== "string" || (!allowEmpty && value.length === 0)
+    || !/^[A-Za-z0-9_-]*$/.test(value)
+    || value.length % 4 === 1) fail(`Invalid authorization ${name}`);
+  const bytes = NATIVE_BUFFER_FROM(value, "base64url");
+  if ((length !== null && bytes.length !== length)
+    || NATIVE_BUFFER_TO_STRING.call(bytes, "base64url") !== value) {
+    fail(`Invalid authorization ${name}`);
+  }
+  return bytes;
+}
+
 function exact(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || NATIVE_ARRAY_SOME.call(Object.keys(value), (key) => !NATIVE_ARRAY_INCLUDES.call(PROOF_FIELDS, key))
     || NATIVE_ARRAY_SOME.call(PROOF_FIELDS, (key) => !Object.hasOwn(value, key))) fail("Invalid authorization schema");
 }
 
-function hashDigest(value) {
+function hashDigest(value, name) {
   const hash = NATIVE_CREATE_HASH("sha256");
-  NATIVE_HASH_UPDATE.call(hash, NATIVE_BUFFER_FROM(value, "base64url"));
+  NATIVE_HASH_UPDATE.call(hash, canonicalBytes(value, name, null, name === "ciphertext"));
   return NATIVE_BUFFER_TO_STRING.call(NATIVE_HASH_DIGEST.call(hash), "base64url");
 }
 
@@ -103,10 +117,10 @@ function proofCore(operation, options, requireFresh = true) {
     keyEpoch: text(operation.keyEpoch, "keyEpoch"),
     compartmentId: text(operation.compartmentId, "compartmentId"),
     metadata: operation.metadata,
-    aadDigest: hashDigest(operation.aad),
-    ciphertextDigest: hashDigest(operation.ciphertext),
-    nonceDigest: hashDigest(operation.nonce),
-    tagDigest: hashDigest(operation.tag),
+    aadDigest: hashDigest(operation.aad, "aad"),
+    ciphertextDigest: hashDigest(operation.ciphertext, "ciphertext"),
+    nonceDigest: hashDigest(operation.nonce, "nonce"),
+    tagDigest: hashDigest(operation.tag, "tag"),
     expiresAt,
     replayId,
     idempotencyKey,
@@ -174,9 +188,13 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
     fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
   }
   assertAuthorizationEnvelopeBinding(normalized, operation);
-  const key = NATIVE_CREATE_PUBLIC_KEY({ key: NATIVE_BUFFER_FROM(normalized.publicKey, "base64url"), format: "der", type: "spki" });
-  if (!NATIVE_VERIFY(null, await signedBytes(normalized), key,
-    NATIVE_BUFFER_FROM(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
+  const publicKeyBytes = canonicalBytes(normalized.publicKey, "public key");
+  const signatureBytes = canonicalBytes(normalized.signature, "signature", 64);
+  const key = NATIVE_CREATE_PUBLIC_KEY({ key: publicKeyBytes, format: "der", type: "spki" });
+  if (NATIVE_KEY_TYPE.call(key) !== "public" || NATIVE_KEY_ALGORITHM.call(key) !== "ed25519"
+    || !NATIVE_VERIFY(null, await signedBytes(normalized), key, signatureBytes)) {
+    fail("Authorization signature invalid", "authorization_signature");
+  }
   return true;
 }
 
