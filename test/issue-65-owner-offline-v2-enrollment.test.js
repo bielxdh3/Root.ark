@@ -813,6 +813,123 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(openedOffer.data), bytes,
       "a separately authenticated recipient account/device opens the real AEAD bytes");
     openedOffer.data.fill(0);
+    // A poisoned array can have revoked REAL entries but override .map() to
+    // return an unrelated, healthy roster. A current owner-signed grant must
+    // never rely on that caller-controlled method for live membership.
+    let poisonedRosterReads = 0;
+    let poisonedMapCalls = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        poisonedRosterReads++;
+        const current = await readIndependentAuthority();
+        const actualDevices = current.devices.map((row) =>
+          row.deviceId === fresh.request.device_id
+            ? { ...row, revokedAtEpoch: metadata.epoch } : { ...row });
+        const apparentlyHealthyDevices = current.devices.map((row) => ({ ...row }));
+        Object.defineProperty(actualDevices, "map", { value: () => {
+          poisonedMapCalls++;
+          return apparentlyHealthyDevices;
+        } });
+        return { ...current, devices: actualDevices };
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "a poisoned array method must not hide the real recipient revocation");
+    assert.equal(poisonedRosterReads, 1,
+      "the revoked physical roster must fail before CEK sealing begins");
+    assert.equal(poisonedMapCalls, 0,
+      "authority inspection may not execute a caller-supplied array method");
+    // The recipient's final independent roster read follows HTTP, HPKE and
+    // file AEAD. A shadowed .filter() must not hide a revoked recipient here.
+    // The existing HTTP signer and owner-witness ceremony remain authentic.
+    let poisonedFilterReads = 0;
+    let poisonedFilterCalls = 0;
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)),
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        poisonedFilterReads++;
+        const current = await readIndependentAuthority();
+        const actualDevices = current.devices.map((row) =>
+          row.deviceId === fresh.request.device_id
+            ? { ...row, revokedAtEpoch: metadata.epoch } : { ...row });
+        const apparentlyHealthyDevices = current.devices.map((row) => ({ ...row }));
+        Object.defineProperty(actualDevices, "filter", { value: (predicate) => {
+          poisonedFilterCalls++;
+          return apparentlyHealthyDevices.filter(predicate);
+        } });
+        return { ...current, devices: actualDevices };
+      } },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "recipient release must reject physical revocation despite an overridden filter");
+    assert.equal(poisonedFilterReads, 3,
+      "exercise both signed HTTP roster reads and the post-AEAD release read");
+    assert.equal(poisonedFilterCalls, 4,
+      "HTTP admission verifies recipient and issuer at each of its two roster reads");
+    // Array.isArray(proxy) is true. A Proxy can also fake OWN INDEX DATA
+    // DESCRIPTORS, defeating descriptor-only snapshots (not just .map).
+    // Native isProxy must reject it before inspecting any forged descriptor.
+    let proxyDescriptorReads = 0;
+    let proxyFilterCalls = 0;
+    let proxyMapCalls = 0;
+    const forgedRoster = async () => {
+      const current = await readIndependentAuthority();
+      const physical = current.devices.map((row) =>
+        row.deviceId === fresh.request.device_id
+          ? { ...row, revokedAtEpoch: metadata.epoch } : { ...row });
+      const healthy = current.devices.map((row) => ({ ...row }));
+      const masked = new Proxy(physical, {
+        get(target, field, receiver) {
+          if (field === "map") return (callback) => {
+            proxyMapCalls++;
+            return healthy.map(callback);
+          };
+          if (field === "filter") return (callback) => {
+            proxyFilterCalls++;
+            return healthy.filter(callback);
+          };
+          return Reflect.get(target, field, receiver);
+        },
+        getOwnPropertyDescriptor(target, field) {
+          const descriptor = Reflect.getOwnPropertyDescriptor(target, field);
+          if (typeof field === "string" && /^(0|[1-9]\d*)$/.test(field)) {
+            proxyDescriptorReads++;
+            return { ...descriptor, value: healthy[Number(field)] };
+          }
+          return descriptor;
+        },
+      });
+      assert.equal(Array.isArray(masked), true, "exercise a genuine array Proxy");
+      return { ...current, devices: masked };
+    };
+    let proxyOfferReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, readIndependentAuthority: async () => {
+        proxyOfferReads++;
+        return forgedRoster();
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "no signed offer may be created from a Proxy masking revoked physical indices");
+    assert.equal(proxyOfferReads, 1);
+    assert.equal(proxyDescriptorReads, 0, "never consult forged index descriptors");
+    assert.equal(proxyMapCalls, 0, "never consult forged map");
+    let proxyRedeemReads = 0;
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)),
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        proxyRedeemReads++;
+        return forgedRoster();
+      } },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "recipient plaintext release must reject Proxy-forged revocation after real AEAD");
+    assert.equal(proxyRedeemReads, 3, "exercise two HTTP reads and final post-AEAD roster read");
+    assert.equal(proxyFilterCalls, 4, "early HTTP readers were truly fooled by filter");
+    assert.equal(proxyDescriptorReads, 0, "final Node gate must deny before descriptor traps");
     // These P2 regressions use the same genuine owner V2 approval, witness
     // receipt, signed grant, SQLite-reopened ciphertext and AEAD/HPKE ceremony
     // as the successful offer above. An unrelated synthetic clock or raw GCM

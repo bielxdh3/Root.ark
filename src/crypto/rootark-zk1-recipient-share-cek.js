@@ -3,6 +3,7 @@
 // DEV-OFF recipient-side bridge. Requires separately provisioned owner/V2
 // custody and a real owner-approved, recipient-specific HPKE file CEK.
 const crypto = require("node:crypto");
+const { isProxy: isNativeProxy } = require("node:util").types;
 const z = require("./rootark-zk-1");
 const { redeemProtectedCiphertextShare } =
   require("../../public/client/rootark-zk1-recipient-share");
@@ -63,10 +64,17 @@ function snapshot(value, names) {
 // contact/device enrollment. Neither the server response nor its grant may
 // populate them. Reject accessors before any crypto or network await.
 function snapshotAuthority(value) {
+  // A Proxy over a real Array passes Array.isArray and may forge index
+  // descriptors, even when no own map/filter method is invoked. Reject it
+  // using the Node intrinsic before any user-controlled reflective access.
+  if (isNativeProxy(value)) denyOffer();
   strict(value, ["scope", "head", "devices"]);
   const fields = Object.getOwnPropertyDescriptors(value);
   if (["scope", "head", "devices"].some((key) =>
     !Object.hasOwn(fields[key], "value"))) denyOffer();
+  if (isNativeProxy(fields.scope.value)
+    || isNativeProxy(fields.head.value)
+    || isNativeProxy(fields.devices.value)) denyOffer();
   const scope = snapshot(fields.scope.value, SCOPE);
   const headValue = fields.head.value;
   strict(headValue, ["revision", "epoch", "digest"]);
@@ -75,27 +83,40 @@ function snapshotAuthority(value) {
     !Object.hasOwn(h[key], "value"))
     || !Number.isSafeInteger(h.revision.value) || h.revision.value < 0
     || !Number.isSafeInteger(h.epoch.value) || h.epoch.value < 0
+    || isNativeProxy(h.digest.value)
     || !(h.digest.value instanceof Uint8Array)
     || h.digest.value.length !== 32) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
     digest: Buffer.from(h.digest.value) };
   const sourceDevices = fields.devices.value;
   if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
-  const devices = sourceDevices.map((device) => {
+  // Do not invoke an untrusted array's own map/iterator: it can substitute a
+  // healthy roster while the actual authority entries are revoked.
+  const entries = Object.getOwnPropertyDescriptors(sourceDevices);
+  const length = entries.length?.value;
+  if (!Number.isSafeInteger(length) || length > 128
+    || Reflect.ownKeys(entries).length !== length + 1) denyOffer();
+  const devices = [];
+  for (let index = 0; index < length; ++index) {
+    const entry = entries[index];
+    if (!entry || !Object.hasOwn(entry, "value")) denyOffer();
+    const device = entry.value;
+    if (isNativeProxy(device)) denyOffer();
     strict(device, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"]);
     const d = Object.getOwnPropertyDescriptors(device);
     if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
+      || isNativeProxy(d.authorizationPublicKey.value)
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
       || d.authorizationPublicKey.value.length !== 32
       || !Number.isSafeInteger(d.enrolledEpoch.value) || d.enrolledEpoch.value < 0
       || !(d.revokedAtEpoch.value === null
         || (Number.isSafeInteger(d.revokedAtEpoch.value)
           && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
-    return { deviceId: d.deviceId.value,
+    devices[index] = { deviceId: d.deviceId.value,
       authorizationPublicKey: Buffer.from(d.authorizationPublicKey.value),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
-  });
+  }
   return { scope, head, devices };
 }
 async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
@@ -327,7 +348,7 @@ async function openProtectedRecipientShareFile(input) {
     });
     // HPKE and file AEAD await. Check the independent head and both live devices
     // again immediately before releasing the decrypted file to this process.
-    currentAuthority(await redeemInput.readIndependentAuthority(),
+    currentAuthority(snapshotAuthority(await redeemInput.readIndependentAuthority()),
       statement, shareSignature, statementBytes);
     // Only the owner CEK opener can attest which owner approval and witness
     // it ACTUALLY verified after the preceding asynchronous share redemption.
