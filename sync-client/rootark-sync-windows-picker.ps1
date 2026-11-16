@@ -76,6 +76,25 @@ if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) 
   -not (Test-Path -LiteralPath $target -PathType Leaf)) {
   throw 'Hydrated file is missing or outside the local sync folder.'
 }
+# Best-effort check-time defense: a local writer can leave a reparse point at
+# the just-hydrated leaf or an ancestor. Test-Path follows it, so inspect the
+# link itself at every path component before Explorer selection. This check
+# does NOT hold filesystem handles or close the later check-to-Explorer race;
+# it must not be used as proof of native held-handle path custody.
+$inspected = $target
+$rootBoundary = $root.TrimEnd('\', '/')
+while ($true) {
+  $entry = Get-Item -LiteralPath $inspected -Force -ErrorAction Stop
+  if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'Hydrated file path changed to a reparse point; Explorer was not opened.'
+  }
+  if ($inspected.TrimEnd('\', '/').Equals($rootBoundary, [StringComparison]::OrdinalIgnoreCase)) { break }
+  $parent = [IO.Path]::GetDirectoryName($inspected)
+  if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $inspected) {
+    throw 'Hydrated file parent path is invalid.'
+  }
+  $inspected = $parent
+}
 Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList @(('/select,"' + $target + '"')) | Out-Null
 } finally {
   [Console]::OutputEncoding = $previousOutputEncoding
