@@ -218,4 +218,3 @@ test("issue 66 Windows: Resolve-RootArkPath handles bare root (\\\\) and bare dr
     assert.equal(pwshCheck.stdout.trim(), "C:\\|C:\\|C:\\work\\cfg|D:\\");
   }
 });
-
