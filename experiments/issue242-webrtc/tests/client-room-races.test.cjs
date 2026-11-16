@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const vm = require('node:vm');
+const wire = require('../transfer-protocol.js');
 
 const boundObject = { folderId: 'root', fileName: 'sealed.bin', size: 92,
   sha256: 'a'.repeat(64) };
@@ -36,6 +37,7 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer,
     close() { this.closed = true; }
   }
   const window = { P2PFileWire: { MAX_FILE: 32 * 1024 * 1024,
+    BUFFER_HIGH: wire.BUFFER_HIGH,
     CHUNK_BYTES: 64 * 1024, validDigest: hash => /^[0-9a-f]{64}$/.test(hash),
     waitForSendWindow,
     packFrame: (_id, _offset, bytes) => bytes.buffer.slice(0) } };
@@ -50,9 +52,17 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer,
   }) });
   const channel = (socket, id) => {
     socket.onmessage({ data: JSON.stringify({ type: 'peer-allowed', peerId: id }) });
-    const dc = { label: 'fixture-transfer', ordered: true, maxRetransmits: null,
+    const dc = Object.assign(new EventTarget(), { label: 'fixture-transfer', ordered: true, maxRetransmits: null,
       maxPacketLifeTime: null, readyState: 'open', bufferedAmount: 0, sent: [],
-      send(data) { this.sent.push(typeof data === 'string' ? JSON.parse(data) : data); } };
+      send(data) { this.sent.push(typeof data === 'string' ? JSON.parse(data) : data); },
+      drain(amount) {
+        const before = this.bufferedAmount;
+        this.bufferedAmount = amount;
+        if (before > this.bufferedAmountLowThreshold && amount <= this.bufferedAmountLowThreshold) {
+          this.dispatchEvent(new Event('bufferedamountlow'));
+        }
+      },
+    });
     peerConnections.at(-1).ondatachannel({ channel: dc });
     return dc;
   };
@@ -100,6 +110,32 @@ test('1:N full sender path cancels only stalled peer; healthy sibling still rece
   }) });
   assert.deepEqual(Array.from(b.window.__poc.snapshot().peers, p => p.outgoingPhase),
     [null, null]);
+});
+
+test('P2: sender resumes after drain below send-window limit without waiting for 64 KiB', async () => {
+  const b = browser({
+    fetch: async () => ({ ok: true, json: async () => ({ roomId: 'test', hostKey: 'local' }) }),
+    waitForSendWindow: (dc, signal) => wire.waitForSendWindow(dc, signal, 150),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  const dc = b.channel(b.sockets[0], 'slow-but-draining-peer');
+  assert.equal(dc.bufferedAmountLowThreshold, wire.BUFFER_HIGH - 1,
+    'browser event must wake the same 256 KiB window used by the sender');
+  dc.bufferedAmount = wire.BUFFER_HIGH + wire.CHUNK_BYTES;
+  await b.window.__poc.sendFile(smallFile());
+  const offer = dc.sent.find(message => message.type === 'offer-file');
+  assert.ok(offer);
+  await dc.onmessage({ data: JSON.stringify({ type: 'accept-file', id: offer.id }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(dc.sent.filter(message => message instanceof ArrayBuffer).length, 0,
+    'the sender must initially wait for real channel backpressure');
+  dc.drain(wire.BUFFER_HIGH - 2);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(dc.sent.filter(message => message instanceof ArrayBuffer).length, 1,
+    'bufferedamountlow crossing 256 KiB must release the actual file sender');
+  assert.ok(dc.sent.some(message => message.type === 'end-file'));
+  assert.equal(b.window.__poc.snapshot().peers[0].outgoingPhase, 'verifying');
 });
 
 test('pending plaintext SHA must not send into a newly joined ciphertext-bound room', async () => {

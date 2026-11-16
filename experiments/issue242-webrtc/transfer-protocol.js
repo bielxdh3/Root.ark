@@ -85,7 +85,7 @@
     });
   }
 
-  const api = Object.freeze({ MAX_FILE, CHUNK_BYTES, HEADER_BYTES, MAX_CHUNKS, validOffer,
+  const api = Object.freeze({ MAX_FILE, CHUNK_BYTES, HEADER_BYTES, MAX_CHUNKS, BUFFER_HIGH, validOffer,
     packFrame, parseFrame, waitForSendWindow,
     validId: id => idPattern.test(id), validDigest: digest => digestPattern.test(digest) });
   if (typeof module === 'object' && module.exports) module.exports = api;

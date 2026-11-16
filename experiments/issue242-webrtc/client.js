@@ -263,7 +263,9 @@
     }
     p.dc = dc;
     dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 64 * 1024;
+    // bufferedamountlow fires only after crossing this threshold. Match the
+    // send-window limit so a peer that drains below 256 KiB wakes immediately.
+    dc.bufferedAmountLowThreshold = (fileWire.BUFFER_HIGH || 256 * 1024) - 1;
     dc.onopen = () => {
       record(diagnostics.channels, p.id);
       log('DataChannel aberto: ' + p.id.slice(0, 5));
