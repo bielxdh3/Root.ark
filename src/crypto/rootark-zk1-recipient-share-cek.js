@@ -10,6 +10,10 @@ const { openOwnerAuthorizedFileCek } =
   require("./rootark-zk1-owner-authorized-file-cek-transfer");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
+// Snapshot the native wall-clock entry point before any caller-supplied
+// authority callback runs. A callback may overwrite global Date.now, but it
+// must not be able to roll back the final post-AEAD release deadline.
+const nativeReleaseNow = Date.now;
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
@@ -141,7 +145,7 @@ async function openProtectedRecipientShareFile(input) {
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
     if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
-    const releaseSeconds = Math.floor(Date.now() / 1000);
+    const releaseSeconds = nativeReleaseNow() / 1000;
     // The independent authority callback just ran. Never dispatch a mutable
     // Array.prototype.some for the final plaintext-release expiry decision.
     if (releaseSeconds >= statement.expires_at
