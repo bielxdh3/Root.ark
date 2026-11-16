@@ -1041,7 +1041,8 @@ test("#263 P2: pending operation on relocated source discovered after inventory 
         versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
         deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
         revision: { counter: 1, deviceId: "device-b" },
-        metadata: { path: "docs/elsewhere.txt", sourcePath: "docs/old.txt" },
+        metadata: { path: "docs/elsewhere.txt",
+          sourcePath: process.platform === "win32" ? "DOCS/OLD.TXT" : "docs/old.txt" },
         plaintext: protocol.encodeMovePayload(Buffer.from("other bytes"), key), fileKey: key,
       }));
     }
@@ -1052,5 +1053,48 @@ test("#263 P2: pending operation on relocated source discovered after inventory 
   assert.equal(injected, true, "pending source operation must be inserted after initial preflight");
   assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
   assert.equal(await fsp.readFile(path.join(root, "docs", "old.txt"), "utf8"), "cached source");
+  assert.equal(client.snapshot.files["docs/old.txt"].objectId, original.objectId);
+});
+
+test("#263 P2: remote MOVE cannot relocate cached source with a newly pending local operation", async (t) => {
+  const { root, open, store, key, adapter } = await setup(t,
+    { "docs/old.txt": "cached source for MOVE" });
+  const client = await open();
+  await client.materializeRemote("docs/old.txt");
+  const original = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: original.objectId, fileId: original.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: original.revision,
+    revision: { counter: original.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/new.txt", sourcePath: "docs/old.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("cached source for MOVE"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const realList = adapter.list;
+  let injected = false;
+  adapter.list = async (objectId) => {
+    const records = await realList(objectId);
+    if (objectId === original.objectId && !injected) {
+      injected = true;
+      await client.journal.enqueue(protocol.createOperation({
+        operation: "move", objectId: `other-${crypto.randomUUID()}`,
+        fileId: `other-${crypto.randomUUID()}`,
+        versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+        deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+        revision: { counter: 1, deviceId: "device-b" },
+        metadata: { path: "docs/elsewhere.txt",
+          sourcePath: process.platform === "win32" ? "DOCS/OLD.TXT" : "docs/old.txt" },
+        plaintext: protocol.encodeMovePayload(Buffer.from("other bytes"), key), fileKey: key,
+      }));
+    }
+    return records;
+  };
+
+  await assert.rejects(client.materializeRemote("docs/new.txt"), { code: "sync_operation_pending" });
+  assert.equal(injected, true, "injection must happen after initial pending preflight");
+  assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
+  assert.equal(await fsp.readFile(path.join(root, "docs", "old.txt"), "utf8"), "cached source for MOVE");
   assert.equal(client.snapshot.files["docs/old.txt"].objectId, original.objectId);
 });

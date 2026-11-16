@@ -2407,6 +2407,14 @@ class SyncEngine {
     const checkBeforeWrite = async () => {
       assertNoSignedInventoryRollback();
       await checkLocalCache();
+      const assertNoPendingRelocatedSource = async (sourcePath) => {
+        const pendingSource = await this.journal.recover();
+        if (pendingSource.some((item) => item.objectId === operation.objectId
+          || (typeof item.metadata?.path === "string" && pathsEqual(item.metadata.path, sourcePath))
+          || (typeof item.metadata?.sourcePath === "string" && pathsEqual(item.metadata.sourcePath, sourcePath)))) {
+          fail("Pending local sync prevents relocated hydration", "sync_operation_pending");
+        }
+      };
       if (operation.operation === "update") {
         const candidates = Object.entries(this.snapshot.files).filter(([relativePath, tracked]) =>
           !pathsEqual(relativePath, safePath) && tracked && !tracked.deleted
@@ -2418,11 +2426,7 @@ class SyncEngine {
         }
         if (candidates.length === 1) {
           const [sourcePath, tracked] = candidates[0];
-          const pendingSource = await this.journal.recover();
-          if (pendingSource.some((item) => item.objectId === operation.objectId
-            || item.metadata?.path === sourcePath || item.metadata?.sourcePath === sourcePath)) {
-            fail("Pending local sync prevents relocated hydration", "sync_operation_pending");
-          }
+          await assertNoPendingRelocatedSource(sourcePath);
           const source = await contained(this.rootDir, sourcePath, true);
           if (!(await exists(source))) fail("Tracked local source was removed", "local_changes_pending");
           const bytes = await readContainedFile(this.rootDir, sourcePath);
@@ -2443,6 +2447,7 @@ class SyncEngine {
       }
       const sourcePath = activeFileIdentityPath(this.snapshot.files, operation, safePath);
       if (!sourcePath) return;
+      await assertNoPendingRelocatedSource(sourcePath);
       const source = await contained(this.rootDir, sourcePath, true);
       if (!(await exists(source))) fail("Tracked moved source was removed locally", "local_changes_pending");
       const tracked = this.snapshot.files[sourcePath];
