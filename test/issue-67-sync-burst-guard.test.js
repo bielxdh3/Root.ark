@@ -283,7 +283,7 @@ test("issue 67 route: oversized history rejects unpaginated reads with 413 and p
     operation: n === 1 ? "create" : "update",
     objectId: "object-big",
     fileId: "file-big",
-    versionId: `ver-${n}`,
+    versionId: n === 2 ? "ver-1" : `ver-${n}`,
     operationId: `op-${n}`,
     deviceId: "device-a",
     keyEpoch: "epoch-1",
@@ -294,27 +294,40 @@ test("issue 67 route: oversized history rejects unpaginated reads with 413 and p
     plaintext: bigPlaintext,
     fileKey: key,
   }));
+  // Legacy stores can contain repeated versionIds. The opaque cursor must
+  // identify the exact position rather than findIndex()'s first match.
   await fsp.writeFile(storagePath, JSON.stringify({
     version: 1,
     users: { alice: { objects: { "object-big": versions[2] }, versions: { "object-big": versions } } },
   }), "utf8");
-  const { port } = await startServer(t, { storagePath });
+  const { port, route } = await startServer(t, { storagePath });
+  let snapshotReads = 0;
+  const readSnapshot = route.store.readSnapshot.bind(route.store);
+  route.store.readSnapshot = () => { snapshotReads += 1; return readSnapshot(); };
 
   const unpaginated = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history`);
   assert.equal(unpaginated.status, 413);
   assert.equal((await unpaginated.json()).code, "SYNC_HISTORY_TOO_LARGE");
+  snapshotReads = 0;
 
   const page1Res = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?limit=1`);
   assert.equal(page1Res.status, 200);
   const page1 = await page1Res.json();
   assert.deepEqual(page1.versions.map((v) => v.versionId), ["ver-1"]);
   assert.equal(typeof page1.nextCursor, "string");
+  const page1Cursor = JSON.parse(Buffer.from(page1.nextCursor, "base64url").toString("utf8"));
+  assert.equal(page1Cursor.version, 3);
+  assert.equal(page1Cursor.after, "ver-1");
+  assert.equal(page1Cursor.index, 0);
+  assert.match(page1Cursor.snapshot, /^[a-f0-9]{32}$/);
+  const historyCacheEntry = route.store.historySnapshotCache.get("alice\0object-big");
+  assert.ok(historyCacheEntry, "the first page caches its snapshot digest");
 
   const page2Res = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?limit=5&cursor=${encodeURIComponent(page1.nextCursor)}`);
   assert.equal(page2Res.status, 200);
   const page2 = await page2Res.json();
-  // Response byte cap (~16 MiB) admits 2 ~6 MiB entries and leaves ver-3 for next page even though limit=5.
-  assert.deepEqual(page2.versions.map((v) => v.versionId), ["ver-2"]);
+  // Each 6 MiB plaintext expands to ~8 MiB base64 JSON, so the 16 MiB cap admits one entry despite limit=5.
+  assert.deepEqual(page2.versions.map((v) => v.versionId), ["ver-1"]);
   assert.equal(typeof page2.nextCursor, "string");
 
   const page3Res = await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?cursor=${encodeURIComponent(page2.nextCursor)}`);
@@ -322,6 +335,9 @@ test("issue 67 route: oversized history rejects unpaginated reads with 413 and p
   const page3 = await page3Res.json();
   assert.deepEqual(page3.versions.map((v) => v.versionId), ["ver-3"]);
   assert.equal(page3.nextCursor, null);
+  assert.equal(snapshotReads, 1, "the history snapshot is read/hashed once, not once per page");
+  assert.equal(route.store.historySnapshotCache.get("alice\0object-big"), historyCacheEntry,
+    "subsequent pages reuse the same bounded digest cache entry");
 
   assert.equal((await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?limit=0`)).status, 400);
   assert.equal((await fetch(`http://127.0.0.1:${port}/sync/v1/objects/object-big/history?cursor=bad`)).status, 400);

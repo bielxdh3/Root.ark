@@ -473,14 +473,9 @@ async function history(options = {}) {
       headers: { ...request.headers, Authorization: `Bearer ${config.token}` },
     }),
   });
-  const response = await adapter.history(objectId);
-  // Display only owner-readable metadata; ciphertext, proofs and credentials
-  // never enter stdout. These are remote claims, not independently verified
-  // historical admission evidence and cannot authorize a restore.
-  const summary = {
-    objectId,
-    signatureVerified: false,
-    versions: response.versions.map((record) => ({
+  const versions = [];
+  for await (const page of adapter.historyPages(objectId)) {
+    versions.push(...page.map((record) => ({
       versionId: record.versionId,
       operation: record.operation,
       revision: record.revision,
@@ -488,7 +483,15 @@ async function history(options = {}) {
       keyEpoch: record.keyEpoch,
       path: record.metadata.path,
       tombstone: record.tombstone,
-    })),
+    })));
+  }
+  // Display only owner-readable metadata; ciphertext, proofs and credentials
+  // never enter stdout. These are remote claims, not independently verified
+  // historical admission evidence and cannot authorize a restore.
+  const summary = {
+    objectId,
+    signatureVerified: false,
+    versions,
   };
   console.log(JSON.stringify(summary));
   return summary;

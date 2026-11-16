@@ -136,16 +136,51 @@ function parseHistoryCursor(value) {
     cursor = JSON.parse(binary.toString("utf8"));
   } catch { return null; }
   if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)
-    || Object.keys(cursor).sort().join(",") !== "after,version"
-    || cursor.version !== 1 || typeof cursor.after !== "string"
-    || !cursor.after || cursor.after.length > 160) {
+    || Object.keys(cursor).sort().join(",") !== "after,index,snapshot,version"
+    || cursor.version !== 3 || typeof cursor.after !== "string"
+    || !cursor.after || cursor.after.length > 160
+    || !Number.isSafeInteger(cursor.index) || cursor.index < 0
+    || typeof cursor.snapshot !== "string" || !/^[a-f0-9]{32}$/.test(cursor.snapshot)) {
     return null;
   }
   return cursor;
 }
 
-function historyCursor(after) {
-  return Buffer.from(JSON.stringify({ version: 1, after }), "utf8").toString("base64url");
+function updateHistoryDigest(digest, value) {
+  if (value === null) { digest.update("null;"); return; }
+  if (typeof value === "string") {
+    digest.update("s"); digest.update(String(value.length)); digest.update(":"); digest.update(value); digest.update(";");
+    return;
+  }
+  if (typeof value === "number") { digest.update("n"); digest.update(String(value)); digest.update(";"); return; }
+  if (typeof value === "boolean") { digest.update(value ? "b1;" : "b0;"); return; }
+  if (Array.isArray(value)) {
+    digest.update("a"); digest.update(String(value.length)); digest.update("[");
+    for (const entry of value) updateHistoryDigest(digest, entry);
+    digest.update("];");
+    return;
+  }
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    digest.update("o"); digest.update(String(keys.length)); digest.update("{");
+    for (const key of keys) {
+      updateHistoryDigest(digest, key);
+      updateHistoryDigest(digest, value[key]);
+    }
+    digest.update("};");
+    return;
+  }
+  digest.update("undefined;");
+}
+
+function historySnapshot(versions) {
+  const digest = crypto.createHash("sha256");
+  updateHistoryDigest(digest, versions);
+  return digest.digest("hex").slice(0, 32);
+}
+
+function historyCursor(after, index, snapshot) {
+  return Buffer.from(JSON.stringify({ version: 3, after, index, snapshot }), "utf8").toString("base64url");
 }
 
 async function durableWrite(filePath, value, requirePrivateStorage = false, beforeRename = null) {
@@ -385,6 +420,11 @@ class SyncObjectStore {
     // Tiny per-tenant negative LRU is independent of the positive indexes.
     // Browsing tenant B must not force a large unchanged tenant A to re-parse.
     this.inventoryOverflowMarkers = new Map();
+    // History pages reuse the already-loaded durable state and a bounded
+    // per-object snapshot digest while the atomic-rename file stamp is stable.
+    this.historySnapshotStamp = null;
+    this.historySnapshotCache = new Map();
+    this.historySnapshotCacheMaxEntries = 64;
   }
 
   // Exclusive-create on the SAME local filesystem fences independent Node
@@ -509,6 +549,8 @@ class SyncObjectStore {
           throw error;
         }
         this.state = next;
+        this.historySnapshotStamp = null;
+        this.historySnapshotCache.clear();
       });
     });
     await this.queue;
@@ -653,6 +695,10 @@ class SyncObjectStore {
       const user = this.user(next, username);
       if (ownRecord(user.seen, input.operationId)) return { kind: "replay", record: null };
       const current = ownRecord(user.objects, input.objectId) || null;
+      const previousVersions = ownRecord(user.versions, input.objectId) || [];
+      if (previousVersions.some((entry) => entry?.versionId === input.versionId)) {
+        return { kind: "version_conflict", current };
+      }
       // Destructive = delete, or any non-create operation that replaces an existing object's state.
       const destructive = Boolean(input.tombstone) || input.operation === "delete" || (input.operation !== "create" && Boolean(current));
       if (destructive && isPausedDevice(user, input.deviceId)) return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
@@ -686,7 +732,6 @@ class SyncObjectStore {
       const record = publicRecord(input);
       setOwnRecord(user.objects, input.objectId, record);
       // Legacy history without timestamps is padded with 0 (treated as older than any retention cutoff).
-      const previousVersions = ownRecord(user.versions, input.objectId) || [];
       const previousTimes = ownRecord(user.versionTimes, input.objectId) || [];
       const padding = Array(Math.max(0, previousVersions.length - previousTimes.length)).fill(0);
       const pruned = pruneObjectHistory([...previousVersions, record], [...padding, ...previousTimes, at], at - this.retentionMs, ownRecord(user, "pausedDevices") || {});
@@ -774,6 +819,10 @@ class SyncObjectStore {
           || input.authorization.expiresAt <= Date.now()) throw atomicDeviceAuthError();
         if (ownRecord(user.seen, input.operationId)) throw signedBatchFailure("replay");
         const current = ownRecord(user.objects, input.objectId) || null;
+        const previousVersions = ownRecord(user.versions, input.objectId) || [];
+        if (previousVersions.some((entry) => entry?.versionId === input.versionId)) {
+          throw signedBatchFailure("version_conflict", current);
+        }
         if (!current || !input.baseRevision
           || compareRevisions(input.baseRevision, current.revision) !== 0) {
           throw signedBatchFailure("conflict", current);
@@ -811,7 +860,6 @@ class SyncObjectStore {
         }
         const record = publicRecord(input);
         setOwnRecord(user.objects, input.objectId, record);
-        const previousVersions = ownRecord(user.versions, input.objectId) || [];
         const previousTimes = ownRecord(user.versionTimes, input.objectId) || [];
         const padding = Array(Math.max(0, previousVersions.length - previousTimes.length)).fill(0);
         const pruned = pruneObjectHistory([...previousVersions, record],
@@ -1092,6 +1140,49 @@ class SyncObjectStore {
     const versions = ownRecord(user, "versions") || {};
     return (ownRecord(versions, objectId) || []).map(publicRecord);
   }
+
+  historyPage(username, objectId, { start = 0, limit = HISTORY_MAX_PAGE_ITEMS,
+    expectedSnapshot = null, after = null } = {}) {
+    const before = this.inventoryFileStamp();
+    if (this.historySnapshotStamp !== before) {
+      const current = this.readSnapshot();
+      const afterRead = this.inventoryFileStamp();
+      if (before !== afterRead) {
+        throw Object.assign(new Error("Sync history changed while reading"), { code: "SYNC_STORE_LOCK_BUSY" });
+      }
+      this.state = current;
+      this.historySnapshotStamp = afterRead;
+      this.historySnapshotCache.clear();
+    }
+    if (this.inventoryFileStamp() !== before) {
+      throw Object.assign(new Error("Sync history changed while paging"), { code: "SYNC_STORE_LOCK_BUSY" });
+    }
+    const user = ownRecord(this.state.users, username) || { versions: {} };
+    const versions = ownRecord(ownRecord(user, "versions") || {}, objectId) || [];
+    if (!versions.length) return { kind: "not_found" };
+    const cacheKey = `${username}\0${objectId}`;
+    let cached = this.historySnapshotCache.get(cacheKey);
+    if (!cached || cached.stamp !== before) {
+      cached = { stamp: before, snapshot: historySnapshot(versions), total: versions.length };
+      this.historySnapshotCache.delete(cacheKey);
+      this.historySnapshotCache.set(cacheKey, cached);
+      while (this.historySnapshotCache.size > this.historySnapshotCacheMaxEntries) {
+        this.historySnapshotCache.delete(this.historySnapshotCache.keys().next().value);
+      }
+    } else {
+      this.historySnapshotCache.delete(cacheKey);
+      this.historySnapshotCache.set(cacheKey, cached);
+    }
+    const snapshot = cached.snapshot;
+    if (expectedSnapshot !== null && expectedSnapshot !== snapshot) return { kind: "changed" };
+    if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(limit)
+      || limit < 1 || limit > HISTORY_MAX_PAGE_ITEMS
+      || (start > 0 && versions[start - 1]?.versionId !== after)) {
+      return { kind: "invalid" };
+    }
+    return { kind: "ok", snapshot, total: cached.total,
+      versions: versions.slice(start, start + limit).map(publicRecord) };
+  }
 }
 
 const MAX_DEVICE_ID_LENGTH = 256;
@@ -1329,6 +1420,8 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (result.kind === "replay") return errorResponse(res, 409, "Replay rejected");
     if (result.kind === "path_conflict") return errorResponse(res, 409,
       "Remote path occupied by another active object", { code: "remote_path_collision" });
+    if (result.kind === "version_conflict") return errorResponse(res, 409,
+      "Sync version identifier already exists for this object", { code: "SYNC_VERSION_ID_REUSED" });
     if (result.kind === "stale") return errorResponse(res, 409, "Stale revision rejected", { currentRevision: result.current.revision, current: publicRecord(result.current) });
     if (result.kind === "conflict") return errorResponse(res, 409, "Base revision conflict", { currentRevision: result.current?.revision || null, current: result.current ? publicRecord(result.current) : null });
     return res.status(req.method === "POST" ? 201 : 200).json(publicRecord(result.record));
@@ -1383,12 +1476,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         || !/^[1-9][0-9]*$/.test(req.query.limit)))) {
       return errorResponse(res, 400, "Invalid sync history request");
     }
-    let versions;
-    try { versions = store.history(req.user.username, req.params.objectId); }
-    catch { return errorResponse(res, 503, "Sync history unavailable"); }
-    if (!versions.length) return errorResponse(res, 404, "Sync object not found");
     const isPaginated = req.query?.limit !== undefined || req.query?.cursor !== undefined;
     if (!isPaginated) {
+      let versions;
+      try { versions = store.history(req.user.username, req.params.objectId); }
+      catch { return errorResponse(res, 503, "Sync history unavailable"); }
+      if (!versions.length) return errorResponse(res, 404, "Sync object not found");
       let totalBytes = 1024;
       for (const entry of versions) {
         totalBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
@@ -1402,34 +1495,45 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       return res.json({ protocolVersion: PROTOCOL_VERSION, versions });
     }
     let start = 0;
+    let expectedSnapshot = null;
+    let after = null;
     if (req.query.cursor !== undefined) {
       const parsed = parseHistoryCursor(req.query.cursor);
       if (!parsed) return errorResponse(res, 400, "Invalid sync history cursor");
-      const index = versions.findIndex((entry) => entry.versionId === parsed.after);
-      if (index === -1) return errorResponse(res, 400, "Invalid sync history cursor");
-      start = index + 1;
+      start = parsed.index + 1;
+      expectedSnapshot = parsed.snapshot;
+      after = parsed.after;
     }
     const limit = Math.min(req.query.limit === undefined ? HISTORY_MAX_PAGE_ITEMS : Number(req.query.limit), HISTORY_MAX_PAGE_ITEMS);
-    const page = [];
+    let pageResult;
+    try {
+      pageResult = store.historyPage(req.user.username, req.params.objectId,
+        { start, limit, expectedSnapshot, after });
+    } catch { return errorResponse(res, 503, "Sync history unavailable"); }
+    if (pageResult.kind === "not_found") return errorResponse(res, 404, "Sync object not found");
+    if (pageResult.kind === "changed") return errorResponse(res, 409, "Sync history changed during pagination");
+    if (pageResult.kind !== "ok") return errorResponse(res, 400, "Invalid sync history cursor");
+    const page = pageResult.versions;
+    const boundedPage = [];
     let pageBytes = 1024;
-    while (page.length < limit && start + page.length < versions.length) {
-      const entry = versions[start + page.length];
+    for (const entry of page) {
       const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
       if (pageBytes + entryBytes > HISTORY_MAX_RESPONSE_BYTES) {
-        if (!page.length) {
+        if (!boundedPage.length) {
           return errorResponse(res, 413, "Sync history entry exceeds response limit", {
             code: "SYNC_HISTORY_TOO_LARGE",
           });
         }
         break;
       }
-      page.push(entry);
+      boundedPage.push(entry);
       pageBytes += entryBytes;
     }
-    const nextIndex = start + page.length;
-    const nextCursor = nextIndex < versions.length ? historyCursor(page[page.length - 1].versionId) : null;
+    const nextIndex = start + boundedPage.length;
+    const nextCursor = nextIndex < pageResult.total
+      ? historyCursor(boundedPage[boundedPage.length - 1].versionId, nextIndex - 1, pageResult.snapshot) : null;
     lease?.assertActive();
-    return res.json({ protocolVersion: PROTOCOL_VERSION, versions: page, nextCursor });
+    return res.json({ protocolVersion: PROTOCOL_VERSION, versions: boundedPage, nextCursor });
   }));
   app.post("/sync/v1/objects", sizeGuard, authenticate, requirePermission("upload"),
     fenceLegacySync("write", (req, res, lease) => write(req, res, undefined, lease)));
@@ -1500,6 +1604,8 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         if (error.kind === "paused") return errorResponse(res, 423, "sync_burst_paused",
           { code: "sync_burst_paused" });
         if (error.kind === "invalid") return errorResponse(res, 400, "Invalid atomic sync batch");
+        if (error.kind === "version_conflict") return errorResponse(res, 409,
+          "Sync version identifier already exists for this object", { code: "SYNC_VERSION_ID_REUSED" });
         return errorResponse(res, 409, "Atomic sync batch conflict");
       }
       if (error?.code === "SYNC_ATOMIC_DEVICE_AUTH_REJECTED"

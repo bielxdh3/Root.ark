@@ -366,6 +366,122 @@ test("#67: hardlink permission failure retains old bytes in trash and blocks rem
   assert.equal(f.pushes(), 0);
 });
 
+test("#67 P1: failed restore verification never unlinks an unrelated replacement at the target path", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const clean = Buffer.from("clean synchronized bytes before restore");
+  const unrelated = Buffer.from("unrelated file created by another local writer");
+  await fsp.writeFile(target, clean);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "newer",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(clean).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+
+  const originalLink = fsp.link;
+  const originalOpen = fsp.open;
+  const readFlags = fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+  let published = false;
+  let replaced = false;
+  fsp.link = async (source, destination) => {
+    const result = await originalLink(source, destination);
+    if (path.resolve(destination) === path.resolve(target) && source.includes(".tmp-")) {
+      published = true;
+    }
+    return result;
+  };
+  fsp.open = async (requested, flags, ...args) => {
+    if (published && !replaced && path.resolve(String(requested)) === path.resolve(target)
+      && flags === readFlags) {
+      replaced = true;
+      await fsp.unlink(target);
+      await fsp.writeFile(target, unrelated, { flag: "wx", mode: 0o600 });
+    }
+    return originalOpen(requested, flags, ...args);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_local_conflict");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.link = originalLink;
+  }
+  assert.equal(published, true, "the signed restore reached its no-replace hardlink publication");
+  assert.equal(replaced, true, "the target was replaced after publication but before descriptor verification");
+  assert.deepEqual(await fsp.readFile(target), unrelated,
+    "verification must not unlink a different inode merely because opened and pathname stats agree");
+  const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  assert.equal(trash.length, 1);
+  assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), clean);
+});
+
+test("#67 P1: replacement after restore lstat remains at the target when verification fails", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const clean = Buffer.from("clean synchronized bytes before restore");
+  const unrelated = Buffer.from("replacement racing failed verification cleanup");
+  await fsp.writeFile(target, clean);
+  f.engine.snapshot.files["document.txt"] = {
+    objectId: "file-1", fileId: "file-1", versionId: "newer",
+    revision: f.original.revision, deleted: false, directory: false,
+    hash: crypto.createHash("sha256").update(clean).digest("hex"),
+  };
+  await f.engine.persistSnapshot();
+
+  const originalLink = fsp.link;
+  const originalOpen = fsp.open;
+  const readFlags = fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+  let published = false;
+  let replaced = false;
+  fsp.link = async (source, destination) => {
+    const result = await originalLink(source, destination);
+    if (path.resolve(destination) === path.resolve(target) && source.includes(".tmp-")) {
+      published = true;
+    }
+    return result;
+  };
+  fsp.open = async (requested, flags, ...args) => {
+    const handle = await originalOpen(requested, flags, ...args);
+    if (!published || replaced || path.resolve(String(requested)) !== path.resolve(target)
+      || flags !== readFlags) return handle;
+    return new Proxy(handle, {
+      get(fileHandle, property) {
+        if (property === "readFile") {
+          return async (...readArgs) => {
+            const originalBytes = await fileHandle.readFile(...readArgs);
+            await fsp.unlink(target);
+            await fsp.writeFile(target, unrelated, { flag: "wx", mode: 0o600 });
+            replaced = true;
+            return originalBytes;
+          };
+        }
+        const value = Reflect.get(fileHandle, property, fileHandle);
+        return typeof value === "function" ? value.bind(fileHandle) : value;
+      },
+    });
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_local_conflict");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.link = originalLink;
+  }
+  assert.equal(published, true);
+  assert.equal(replaced, true, "replacement occurs after lstat but before failed-publication cleanup");
+  assert.equal(fs.existsSync(target), true, "the concurrent writer's replacement remains at its original path");
+  assert.deepEqual(await fsp.readFile(target), unrelated);
+  const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  const preserved = await Promise.all(trash.map((entry) =>
+    fsp.readFile(path.join(f.local, ".rootark-trash", entry))));
+  assert.ok(preserved.some((bytes) => bytes.equals(clean)), "the original tracked bytes remain recoverable");
+  assert.ok(!preserved.some((bytes) => bytes.equals(unrelated)),
+    "the concurrent writer's replacement is not moved into trash or otherwise touched");
+});
+
 test("#67: an untracked file created after enqueue is never replaced by restore", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");

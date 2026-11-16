@@ -17,6 +17,11 @@ const { createPrivateAuthorityFixture } = require("./support/issue-65-private-au
 
 const CLI = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 
+function jsonResponse(payload, status = 200, headers = {}) {
+  return new Response(JSON.stringify(payload), { status,
+    headers: { "content-type": "application/json", ...headers } });
+}
+
 function invokeHistoryCli(configPath, objectId) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, "history", "--config", configPath, "--object-id", objectId], {
@@ -122,14 +127,231 @@ test("#67: read-only adapter rejects cross-object and malformed history without 
   const adapter = createOpaqueSyncAdapter({ baseUrl: "https://example.invalid",
     fetchImpl: async (url, options) => {
       requests.push({ url, options });
-      return { ok: true, status: 200, json: async () => ({ protocolVersion: 2, versions: [source] }) };
+      return jsonResponse({ protocolVersion: 2, versions: [source], nextCursor: null });
     },
   });
-  await assert.rejects(adapter.history("requested-object"), /history|object/i);
+  await assert.rejects(adapter.history("requested-object"), /different object/i);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].options.redirect, "error");
   assert.equal(requests[0].options.method, undefined);
   assert.equal(requests[0].options.body, undefined);
   await assert.rejects(adapter.history("../escape"), /Invalid sync id/);
   assert.equal(requests.length, 1, "unsafe history identifiers cannot contact the server");
+});
+
+test("#67 P2: history adapter follows bounded pages through the final cursor", async () => {
+  const key = Buffer.alloc(32, 7);
+  const record = (versionId, counter) => protocol.createOperation({
+    operation: "create", objectId: "requested-object", fileId: "file-1",
+    versionId, operationId: `operation-${versionId}`, deviceId: "device-a",
+    keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter, deviceId: "device-a" }, metadata: { path: "document.txt" },
+    plaintext: Buffer.from(`historical bytes ${versionId}`), fileKey: key,
+  });
+  const records = [record("v1", 1), record("v2", 2), record("v3", 3)];
+  const cursor = (after, index) => Buffer.from(JSON.stringify({
+    version: 3, after, index, snapshot: "a".repeat(32),
+  }), "utf8").toString("base64url");
+  const cursors = [cursor("v1", 0), cursor("v2", 1)];
+  const calls = [];
+  const adapter = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      const index = calls.length - 1;
+      return jsonResponse({
+        protocolVersion: 2, versions: [records[index]], nextCursor: cursors[index] || null,
+      });
+    },
+  });
+  const result = await adapter.history("requested-object");
+  assert.deepEqual(result.versions.map((item) => item.versionId), ["v1", "v2", "v3"]);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].url, "https://sync.example.test/sync/v1/objects/requested-object/history?limit=32");
+  assert.equal(calls[1].url, `https://sync.example.test/sync/v1/objects/requested-object/history?limit=32&cursor=${encodeURIComponent(cursors[0])}`);
+  assert.equal(calls[2].url, `https://sync.example.test/sync/v1/objects/requested-object/history?limit=32&cursor=${encodeURIComponent(cursors[1])}`);
+  assert.ok(calls.every((call) => call.options.redirect === "error" && call.options.method === undefined));
+});
+
+test("#67 P2: restore stays capped at 256 while history browsing streams paused-device retention", async () => {
+  const key = Buffer.alloc(32, 9);
+  const records = Array.from({ length: 257 }, (_, index) => protocol.createOperation({
+    operation: "create", objectId: "requested-object", fileId: "file-1",
+    versionId: `bounded-v${index + 1}`, operationId: `bounded-op-${index + 1}`,
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: index + 1, deviceId: "device-a" },
+    metadata: { path: "document.txt" }, plaintext: Buffer.from(`version ${index + 1}`), fileKey: key,
+  }));
+  const cursor = (after, index) => Buffer.from(JSON.stringify({
+    version: 3, after, index, snapshot: "b".repeat(32),
+  }), "utf8").toString("base64url");
+  let calls = 0;
+  const adapter = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async (url) => {
+      calls += 1;
+      const parsed = new URL(url);
+      const prior = parsed.searchParams.get("cursor");
+      const start = prior ? JSON.parse(Buffer.from(prior, "base64url").toString("utf8")).index + 1 : 0;
+      const page = records.slice(start, start + 32);
+      return jsonResponse({
+        protocolVersion: 2, versions: page,
+        nextCursor: start + page.length < records.length
+          ? cursor(page[page.length - 1].versionId, start + page.length - 1) : null,
+      });
+    },
+  });
+  await assert.rejects(adapter.history("requested-object"), /256-version restore bound/i);
+  assert.equal(calls, 9, "the ninth page is rejected before it can exceed the engine's existing bound");
+  calls = 0;
+  let browsed = 0;
+  for await (const page of adapter.historyPages("requested-object")) browsed += page.length;
+  assert.equal(browsed, 257, "read-only browsing must retain access beyond the engine's restore bound");
+  assert.equal(calls, 9, "the streaming browse consumes the complete ninth page without accumulating ciphertext");
+});
+
+test("#67 P2: streaming history byte budget counts received whitespace, not reserialized JSON", async () => {
+  const record = protocol.createOperation({
+    operation: "create", objectId: "requested-object", fileId: "file-1",
+    versionId: "v1", operationId: "operation-v1", deviceId: "device-a",
+    keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "document.txt" },
+    plaintext: Buffer.from("history"), fileKey: Buffer.alloc(32, 3),
+  });
+  const payload = { protocolVersion: 2, versions: [record], nextCursor: null };
+  const compact = JSON.stringify(payload);
+  const raw = `${" ".repeat(2048)}${compact}`;
+  const adapter = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async () => new Response(raw, { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(async () => {
+    for await (const _page of adapter.historyPages("requested-object", {
+      maxPages: 1, maxTotalItems: 1, maxTotalBytes: Buffer.byteLength(compact) + 8,
+    })) { /* consume one page */ }
+  }, /bounded read limits/i);
+});
+
+test("#67 P2: oversized history streams are canceled best-effort without awaiting cancellation", async () => {
+  let contentLengthCanceled = false;
+  const never = new Promise(() => {});
+  const contentLengthResponse = new Response(new ReadableStream({
+    cancel() { contentLengthCanceled = true; return never; },
+  }), { status: 200, headers: { "content-length": String(16 * 1024 * 1024 + 1) } });
+  const preflight = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async () => contentLengthResponse,
+  });
+  await assert.rejects(preflight.history("requested-object"), /response limit/i);
+  assert.equal(contentLengthCanceled, true, "oversized declared bodies are canceled before reading");
+
+  let overrunCanceled = false;
+  const overrunResponse = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(16 * 1024 * 1024 + 1)); },
+    cancel() { overrunCanceled = true; return never; },
+  }), { status: 200 });
+  const overrun = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async () => overrunResponse,
+  });
+  await assert.rejects(overrun.history("requested-object"), /response limit/i);
+  assert.equal(overrunCanceled, true, "stream overruns trigger non-blocking reader cancellation");
+});
+
+test("#67 P2: store rejects reused version identifiers before they can make history cursors ambiguous", async (t) => {
+  const f = await fixture(t);
+  const before = await fsp.readFile(f.store.filePath);
+  const reused = protocol.createOperation({
+    operation: "update", objectId: "file-1", fileId: "file-1", versionId: "first",
+    operationId: "new-operation-reusing-version", deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter: 3, deviceId: "device-a" },
+    baseRevision: f.deleted.revision, metadata: { path: "document.txt" },
+    plaintext: Buffer.from("replacement bytes"), fileKey: Buffer.alloc(32, 1),
+  });
+  assert.equal((await f.store.put("alice", reused)).kind, "version_conflict");
+  assert.deepEqual(await fsp.readFile(f.store.filePath), before,
+    "reusing a versionId must not mutate the object head or retained history");
+});
+
+test("#67 P2: server rejects a history cursor when retained versions change between pages", async (t) => {
+  const f = await fixture(t);
+  await f.store.transact((next) => {
+    const user = f.store.user(next, "alice");
+    let baseRevision = f.deleted.revision;
+    for (let counter = 3; counter <= 33; counter += 1) {
+      const operation = protocol.createOperation({
+        operation: "update", objectId: "file-1", fileId: "file-1",
+        versionId: `retained-${counter}`, operationId: `retained-op-${counter}`,
+        deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+        revision: { counter, deviceId: "device-a" }, baseRevision,
+        metadata: { path: "document.txt" }, plaintext: Buffer.from(`retained ${counter}`),
+        fileKey: Buffer.alloc(32, 2),
+      });
+      user.versions["file-1"].push(operation);
+      user.versionTimes["file-1"].push(Date.now() + counter);
+      user.seen[operation.operationId] = true;
+      user.objects["file-1"] = operation;
+      user.revisions["file-1"] = operation.revision;
+      baseRevision = operation.revision;
+    }
+  });
+  let calls = 0;
+  const adapter = createOpaqueSyncAdapter({ baseUrl: f.baseUrl,
+    fetchImpl: async (url, options) => {
+      const response = await fetch(url, { ...options,
+        headers: { ...options.headers, Authorization: "Bearer only-for-test" } });
+      calls += 1;
+      if (calls === 1) {
+        await f.store.transact((next) => {
+          const user = f.store.user(next, "alice");
+          const base = user.objects["file-1"].revision;
+          const appended = protocol.createOperation({
+            operation: "update", objectId: "file-1", fileId: "file-1", versionId: "third",
+            operationId: "third-op", deviceId: "device-a", keyEpoch: "epoch-1",
+            compartmentId: "private", revision: { counter: 34, deviceId: "device-a" },
+            baseRevision: base, metadata: { path: "document.txt" },
+            plaintext: Buffer.from("new retained version"), fileKey: Buffer.alloc(32, 2),
+          });
+          user.versions["file-1"].push(appended);
+          user.versionTimes["file-1"].push(Date.now() + 34);
+          user.seen[appended.operationId] = true;
+          user.objects["file-1"] = appended;
+          user.revisions["file-1"] = appended.revision;
+        });
+      }
+      return response;
+    },
+  });
+  const received = [];
+  await assert.rejects(async () => {
+    for await (const page of adapter.historyPages("file-1")) received.push(...page);
+  }, (error) => error.status === 409 || /conflict|changed/i.test(error.message));
+  assert.equal(calls, 2, "the stale snapshot is rejected before a mixed second page is accepted");
+  assert.equal(received.length, 32, "only the first page from the original snapshot was yielded");
+});
+
+test("#67 P2: history adapter fails closed on repeated cursors and non-progressing pages", async () => {
+  const record = protocol.createOperation({
+    operation: "create", objectId: "requested-object", fileId: "file-1",
+    versionId: "v1", operationId: "operation-v1", deviceId: "device-a",
+    keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "document.txt" },
+    plaintext: Buffer.from("historical bytes"), fileKey: Buffer.alloc(32, 9),
+  });
+  const cursor = Buffer.from(JSON.stringify({
+    version: 3, after: "v1", index: 0, snapshot: "c".repeat(32),
+  }), "utf8").toString("base64url");
+  let calls = 0;
+  const repeated = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({
+        protocolVersion: 2, versions: [record], nextCursor: cursor,
+      });
+    },
+  });
+  await assert.rejects(repeated.history("requested-object"), /cursor repeated/i);
+  assert.equal(calls, 2, "a repeated cursor is detected before a third request");
+
+  const empty = createOpaqueSyncAdapter({ baseUrl: "https://sync.example.test",
+    fetchImpl: async () => jsonResponse({
+      protocolVersion: 2, versions: [], nextCursor: cursor,
+    }),
+  });
+  await assert.rejects(empty.history("requested-object"), /made no progress/i);
 });

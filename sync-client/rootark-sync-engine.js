@@ -2908,7 +2908,9 @@ class SyncEngine {
                   const materializedBytes = await targetHandle.readFile();
                   try {
                     const endStat = await targetHandle.stat({ bigint: true });
+                    const pathAfterRead = await fsp.lstat(target, { bigint: true });
                     if (sameFileVersion(openedStat, endStat)
+                      && sameFileVersion(endStat, pathAfterRead)
                       && crypto.createHash("sha256").update(materializedBytes).digest("hex")
                         === crypto.createHash("sha256").update(plaintext).digest("hex")) {
                       verified = true;
@@ -2924,13 +2926,11 @@ class SyncEngine {
               /* Reject on descriptor open, stat, or read failure */
             }
             if (!verified) {
-              if (openedStat && pathStat && sameFileIdentity(openedStat, pathStat)) {
-                try {
-                  await fsp.unlink(target);
-                } catch (unlinkError) {
-                  if (unlinkError?.code !== "ENOENT") throw unlinkError;
-                }
-              }
+              // No portable Node API can unlink or rename only if a pathname
+              // still names a previously observed inode. Even stageExisting()
+              // could move a different writer's replacement after our last
+              // lstat. The pre-restore bytes are already staged in .rootark-trash;
+              // leave the current target occupant exactly where it is.
               fail("Historical restore materialization identity mismatch", "restore_local_conflict");
             }
           } else {
