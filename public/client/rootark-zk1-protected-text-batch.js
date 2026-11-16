@@ -52,24 +52,27 @@
         || typeof input.getChecked !== "function"
         || typeof preview?.open !== "function"
         || !input.grant || !input.ownerHead || !input.baseline) deny();
+      // The signed GET is an async callback. It must not be able to replace
+      // the session guard used after that await or by the local AEAD opener.
+      const assertLive = input.assertLive.bind(input);
       const term = checkedQuery(input.query);
       const items = checkedItems(input);
       const matches = [];
-      input.assertLive();
+      assertLive();
       for (const item of items) {
-        input.assertLive();
+        assertLive();
         // This callback performs fresh signed LIST/HEAD/GET, not a cached
         // preview or server-provided plaintext. Never pass the query/CEK.
         const checked = await input.getChecked(
           item.selected.objectId, item.selected.revision);
-        input.assertLive();
+        assertLive();
         const opened = await preview.open({
           checked, selected: item.selected, metadata: item.metadata,
           rawCek: item.rawCek, cekSha256Pin: item.cekSha256Pin,
           baseline: input.baseline, grant: input.grant,
-          ownerHead: input.ownerHead, assertLive: input.assertLive,
+          ownerHead: input.ownerHead, assertLive,
         });
-        input.assertLive();
+        assertLive();
         if (!opened || opened.plaintextSentToServer !== false
           || opened.objectId !== item.selected.objectId
           || opened.revision !== item.selected.revision
@@ -87,7 +90,7 @@
           }));
         }
       }
-      input.assertLive();
+      assertLive();
       return Object.freeze({ totalSearched: items.length,
         totalMatches: matches.length, matches: Object.freeze(matches),
         plaintextSentToServer: false, authorizesMutation: false });

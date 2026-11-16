@@ -96,6 +96,32 @@ test("stale device, wrong scope, session logout and changed signed metadata deny
   await assert.rejects(search.search(i.input), /ZK_BATCH_TEXT_SEARCH_DENIED/);
 });
 
+test("P2: checked GET callback cannot replace the live-session guard after logout", async () => {
+  const positive = await fixture();
+  assert.equal((await search.search(positive.input)).totalMatches, 1,
+    "the simulated verified-row fixture and real local AEAD opener must produce a match");
+
+  const f = await fixture();
+  const originalGet = f.input.getChecked;
+  const forgedGuard = () => {};
+  let readCalls = 0;
+  f.input.getChecked = async (objectId, revision) => {
+    // This is the same simulated GET and real sealed ciphertext as the success
+    // case, but the caller logs out while the awaited read is outstanding.
+    const checked = await originalGet(objectId, revision);
+    readCalls += 1;
+    f.logout();
+    f.input.assertLive = forgedGuard;
+    return checked;
+  };
+  await assert.rejects(search.search(f.input), /ZK_BATCH_TEXT_SEARCH_DENIED/,
+    "the original live guard must deny before any private text is returned");
+  assert.equal(readCalls, 1, "the simulated checked ciphertext was obtained before logout");
+  assert.equal(f.queried.length, 1, "the first checked GET path was reached");
+  assert.equal(f.input.assertLive, forgedGuard,
+    "the attacker actually replaced the caller-owned callback during the await");
+});
+
 test("bounded explicit selection and local query reject duplicates, overflow and invalid input", async () => {
   const f = await fixture();
   for (const patch of [
