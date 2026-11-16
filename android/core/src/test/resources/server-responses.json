@@ -734,6 +734,160 @@
         "username": "carol",
         "expiresIn": 900
       }
+    },
+    "sync.list.long-metadata.200": {
+      "status": 200,
+      "body": {
+        "protocolVersion": 2,
+        "objects": [
+          {
+            "protocolVersion": 2,
+            "operationId": "fixture-op-create",
+            "objectId": "fixture-object-1",
+            "fileId": "fixture-file-1",
+            "versionId": "fixture-version-1",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "fixture-device-a"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "fixture-device-a",
+            "metadata": {
+              "compartmentId": "private",
+              "contentType": "text/plain",
+              "deviceId": "fixture-device-a",
+              "fileId": "fixture-file-1",
+              "keyEpoch": "epoch-1",
+              "name": "readme.txt",
+              "parentId": "root",
+              "path": "docs/readme.txt",
+              "size": 5,
+              "versionId": "fixture-version-1"
+            },
+            "tombstone": false,
+            "ciphertext": "ZysGRFw",
+            "nonce": "yLc3lgAOeS4PKrEj",
+            "tag": "kMcQYZqyV0U_FYTvIvPuEg",
+            "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLTEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoidGV4dC9wbGFpbiIsImRldmljZUlkIjoiZml4dHVyZS1kZXZpY2UtYSIsImZpbGVJZCI6ImZpeHR1cmUtZmlsZS0xIiwia2V5RXBvY2giOiJlcG9jaC0xIiwibmFtZSI6InJlYWRtZS50eHQiLCJwYXJlbnRJZCI6InJvb3QiLCJwYXRoIjoiZG9jcy9yZWFkbWUudHh0Iiwic2l6ZSI6NSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifSwib2JqZWN0SWQiOiJmaXh0dXJlLW9iamVjdC0xIiwib3BlcmF0aW9uIjoiY3JlYXRlIiwicHJvdG9jb2xWZXJzaW9uIjoyLCJyZXZpc2lvbiI6eyJjb3VudGVyIjoxLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEifSwidG9tYnN0b25lIjpmYWxzZSwidmVyc2lvbklkIjoiZml4dHVyZS12ZXJzaW9uLTEifQ",
+            "authorization": {
+              "aadDigest": "DFIqeuF62hAHR19-UXB3jJeF10Bf1w7yZslQI1DH7vc",
+              "baseRevision": null,
+              "ciphertextDigest": "SnoLdmH6R2F4CUmsWV5MGryw0Ay_evJ0myaMQpEEERQ",
+              "compartmentId": "private",
+              "deviceId": "fixture-device-a",
+              "expiresAt": 1793969920538,
+              "fileId": "fixture-file-1",
+              "idempotencyKey": "GRT2PGdVi-QMfoq9gu26IhS3s0vvRIYibCGjFETstjA",
+              "keyEpoch": "epoch-1",
+              "metadata": {
+                "compartmentId": "private",
+                "contentType": "text/plain",
+                "deviceId": "fixture-device-a",
+                "fileId": "fixture-file-1",
+                "keyEpoch": "epoch-1",
+                "name": "readme.txt",
+                "parentId": "root",
+                "path": "docs/readme.txt",
+                "size": 5,
+                "versionId": "fixture-version-1"
+              },
+              "nonceDigest": "BqzOjtXK4P7c3AFlpXWAkiJgtBjj5o4WkVC2vMhIQLo",
+              "objectId": "fixture-object-1",
+              "operation": "create",
+              "operationId": "fixture-op-create",
+              "protocolVersion": 2,
+              "publicKey": "MCowBQYDK2VwAyEAx06rfAfqNG_ApxAKcoU9Bzvn2llfUYi5X9Y8HcQU67I",
+              "replayId": "Y05yqK2USiOB68k-6xvo1A",
+              "revision": {
+                "counter": 1,
+                "deviceId": "fixture-device-a"
+              },
+              "schemaVersion": 1,
+              "signature": "L34jNXkQV4PvmvwCL6Hg22JSPGgW0VFLngRkxwoXihvvUkBF-IVbobPhVIoOEbVn3A4O_O2FKS3FDPLj-ouMCw",
+              "suite": "rootark-zk-1",
+              "tagDigest": "uCGfjo0mMNDMBtFHeTHzsZKrWm8ZChvkvlU0Umnbp60",
+              "type": "rootark-sync-device-authorization-v1",
+              "username": "alice",
+              "versionId": "fixture-version-1"
+            }
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "fixture-op-long-metadata",
+            "objectId": "fixture-object-long-metadata",
+            "fileId": "fixture-file-long-metadata",
+            "versionId": "fixture-version-long-metadata",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "fixture-device-a"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "fixture-device-a",
+            "metadata": {
+              "compartmentId": "private",
+              "contentType": "application/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "deviceId": "fixture-device-a",
+              "fileId": "fixture-file-long-metadata",
+              "keyEpoch": "epoch-1",
+              "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+              "path": "docs/long.txt",
+              "size": 3,
+              "versionId": "fixture-version-long-metadata"
+            },
+            "tombstone": false,
+            "ciphertext": "UiPg",
+            "nonce": "7Qz358tMCB4RlPsJ",
+            "tag": "CsufLxB1stlx33Zu4zMw6g",
+            "aad": "eyJiYXNlUmV2aXNpb24iOm51bGwsImNvbXBhcnRtZW50SWQiOiJwcml2YXRlIiwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIiwiZmlsZUlkIjoiZml4dHVyZS1maWxlLWxvbmctbWV0YWRhdGEiLCJrZXlFcG9jaCI6ImVwb2NoLTEiLCJtZXRhZGF0YSI6eyJjb21wYXJ0bWVudElkIjoicHJpdmF0ZSIsImNvbnRlbnRUeXBlIjoiYXBwbGljYXRpb24veHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJkZXZpY2VJZCI6ImZpeHR1cmUtZGV2aWNlLWEiLCJmaWxlSWQiOiJmaXh0dXJlLWZpbGUtbG9uZy1tZXRhZGF0YSIsImtleUVwb2NoIjoiZXBvY2gtMSIsIm5hbWUiOiJubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4iLCJwYXRoIjoiZG9jcy9sb25nLnR4dCIsInNpemUiOjMsInZlcnNpb25JZCI6ImZpeHR1cmUtdmVyc2lvbi1sb25nLW1ldGFkYXRhIn0sIm9iamVjdElkIjoiZml4dHVyZS1vYmplY3QtbG9uZy1tZXRhZGF0YSIsIm9wZXJhdGlvbiI6ImNyZWF0ZSIsInByb3RvY29sVmVyc2lvbiI6MiwicmV2aXNpb24iOnsiY291bnRlciI6MSwiZGV2aWNlSWQiOiJmaXh0dXJlLWRldmljZS1hIn0sInRvbWJzdG9uZSI6ZmFsc2UsInZlcnNpb25JZCI6ImZpeHR1cmUtdmVyc2lvbi1sb25nLW1ldGFkYXRhIn0",
+            "authorization": {
+              "aadDigest": "CwTAPzYjnANHr3AoHHPfhLKXxds2uOGpAvTo32IFa6E",
+              "baseRevision": null,
+              "ciphertextDigest": "JbvwgH07ZZwIF0y87O-oTnJk8f6qjzUL1vAkDub-7pw",
+              "compartmentId": "private",
+              "deviceId": "fixture-device-a",
+              "expiresAt": 1793969929883,
+              "fileId": "fixture-file-long-metadata",
+              "idempotencyKey": "NlSug2r0jjtXel425UbXUYtYZdOR8g7Ksx77uV5FYVI",
+              "keyEpoch": "epoch-1",
+              "metadata": {
+                "compartmentId": "private",
+                "contentType": "application/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "deviceId": "fixture-device-a",
+                "fileId": "fixture-file-long-metadata",
+                "keyEpoch": "epoch-1",
+                "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+                "path": "docs/long.txt",
+                "size": 3,
+                "versionId": "fixture-version-long-metadata"
+              },
+              "nonceDigest": "sESN7mayYKDSUtZZGeAOAPKfN5Qs7abUlwSklSn2e0g",
+              "objectId": "fixture-object-long-metadata",
+              "operation": "create",
+              "operationId": "fixture-op-long-metadata",
+              "protocolVersion": 2,
+              "publicKey": "MCowBQYDK2VwAyEAx06rfAfqNG_ApxAKcoU9Bzvn2llfUYi5X9Y8HcQU67I",
+              "replayId": "9yMur1NI_HTL1VyFGZsQnw",
+              "revision": {
+                "counter": 1,
+                "deviceId": "fixture-device-a"
+              },
+              "schemaVersion": 1,
+              "signature": "1Gp6TCEvIc13c-cjmlRP5gYkPvnldGG_WegibbHVZKSKVrvAoQ8CewRlhyiVsZzwpQwx9xiS1QvNNhTitl1tAg",
+              "suite": "rootark-zk-1",
+              "tagDigest": "ocJ3pvbYRx0EgCwAf42yrZJ8m_jjF6o954tNChLNSAE",
+              "type": "rootark-sync-device-authorization-v1",
+              "username": "alice",
+              "versionId": "fixture-version-long-metadata"
+            }
+          }
+        ]
+      }
     }
   },
   "classes": {
