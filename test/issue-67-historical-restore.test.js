@@ -359,6 +359,48 @@ async function fixture(t) {
     physical, pushes: () => pushes, current: () => current };
 }
 
+test("#262 P2: generic strict admission cannot replace its adapter through a callback accessor", async (t) => {
+  const f = await fixture(t);
+  const rootDir = path.join(f.root, "generic-adapter-identity");
+  const adapter = { push: async () => ({ status: 200 }), list: async () => [] };
+  const replacement = { push: async () => ({ status: 200 }), list: async () => [] };
+  let engine;
+  let callbackCalls = 0;
+  let adapterReads = 0;
+  let mutationBlocked = false;
+  engine = new SyncEngine({
+    rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    requireAuthorization: true, authorize: () => true,
+    verifyIncoming: async () => {
+      callbackCalls += 1;
+      try {
+        Object.defineProperty(engine, "adapter", {
+          configurable: true,
+          enumerable: true,
+          get() {
+            adapterReads += 1;
+            return adapterReads <= 3 ? adapter : replacement;
+          },
+        });
+      } catch { mutationBlocked = true; }
+      return true;
+    },
+  });
+  await engine.open();
+
+  await engine.verifyIncomingOperation(f.original);
+
+  assert.equal(callbackCalls, 1);
+  assert.equal(mutationBlocked, true,
+    "the adapter reference must be pinned even without owner-provision authority");
+  const descriptor = Object.getOwnPropertyDescriptor(engine, "adapter");
+  assert.equal(descriptor.configurable, false);
+  assert.equal(descriptor.writable, false);
+  assert.equal(descriptor.value, adapter);
+  assert.equal(engine.adapter, adapter);
+  assert.equal(adapterReads, 0, "a callback-installed accessor must never run");
+});
+
 test("#67 P1: SyncEngine owner provisioning rejects proxies, accessors and poisoned crypto intrinsics before verification", async (t) => {
   const f = await fixture(t);
   const makeOptions = (overrides = {}) => ({
@@ -1986,7 +2028,8 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
   };
   try {
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
-      /disposable hard crash after linked staging identity was committed/);
+      (error) => error.code === "restore_local_materialization_missing",
+      "a cleanup mock that reports success without removing the linked temp must fail closed");
   } finally { fsp.unlink = originalUnlink; fsp.rm = originalRemove; }
   assert.equal(interruptedCleanup, 1, "real target link and exact bound identity precede failed unlink");
   assert.equal(suppressedCleanup, 1, "simulated kill must bypass only the stage unlink cleanup");
@@ -2034,6 +2077,159 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
   assert.equal((await fsp.lstat(target)).nlink, 1);
   assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
   assert.deepEqual(await reopened.journal.recover(), []);
+});
+
+test("#262 P2: unresolved restore staging pathname cannot become a scanned CREATE", async (t) => {
+  const f = await fixture(t);
+  const payload = Buffer.from("orphaned restore staging bytes");
+  const operation = await f.sign({
+    operation: "update", operationId: `histrestore-${crypto.randomUUID()}`,
+    versionId: "orphaned-stage", baseRevision: f.deleted.revision,
+    revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "document.txt", name: "document.txt", size: payload.length },
+    plaintext: payload,
+  });
+  await f.engine.journal.enqueue(operation);
+  const name = `document.txt.tmp-${process.pid}-${crypto.randomUUID()}`;
+  await f.engine.journal.recordRestoreStagingIntent(operation, name);
+  const staged = path.join(f.local, name);
+  await fsp.writeFile(staged, payload, { flag: "wx", mode: 0o600 });
+  const stats = await fsp.lstat(staged, { bigint: true });
+  // The durable inode binding no longer matches this pathname. The target is
+  // absent, so recovery's target lstat raises ENOENT while plaintext remains.
+  await f.engine.journal.bindRestoreStagingIdentity(operation, name, {
+    dev: stats.dev.toString(), ino: (stats.ino + 1n).toString(),
+  });
+
+  await assert.rejects(f.engine.reconcileLocal(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.deepEqual(await fsp.readFile(staged), payload);
+  assert.equal((await f.engine.journal.recover()).length, 1,
+    "the signed outbox and staging provenance must remain for explicit recovery");
+  assert.equal(f.engine.snapshot.files[name], undefined,
+    "an unresolved staging file must never enter the ordinary CREATE snapshot");
+});
+
+test("#262 P2: recovered restore records snapshot and materialization witness before retry push", async (t) => {
+  const f = await fixture(t);
+  const recordMaterialization = f.engine.journal.recordRestoreMaterialization.bind(f.engine.journal);
+  let interruptOnce = true;
+  f.engine.journal.recordRestoreMaterialization = async (operation) => {
+    if (interruptOnce) {
+      interruptOnce = false;
+      throw new Error("simulated crash before durable restore materialization witness");
+    }
+    return recordMaterialization(operation);
+  };
+
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    /simulated crash before durable restore materialization witness/);
+  f.engine.journal.recordRestoreMaterialization = recordMaterialization;
+  const [pending] = await f.engine.journal.recover();
+  assert.ok(pending);
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending), false);
+  assert.equal(f.engine.snapshot.files["document.txt"].versionId, pending.versionId);
+
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+  const actualPush = f.adapter.push.bind(f.adapter);
+  let checkedBeforePush = false;
+  f.adapter.push = async (operation) => {
+    assert.equal(f.engine.journal.hasMaterializedRestore(operation), true,
+      "recovery must durably record materialization before the remote POST");
+    const persisted = JSON.parse(await fsp.readFile(f.engine.snapshotPath, "utf8"));
+    assert.equal(persisted.files["document.txt"].versionId, operation.versionId,
+      "the exact restore snapshot must be persisted before the journal witness");
+    checkedBeforePush = true;
+    return actualPush(operation);
+  };
+
+  const resumed = await f.engine.syncOnce();
+  assert.equal(checkedBeforePush, true);
+  assert.equal(resumed.pushed, 1);
+  assert.equal(f.pushes(), 1);
+  assert.equal((await f.engine.journal.recover()).length, 0);
+});
+
+test("#262 P2: recovery witness commit cannot bless a replaced transport method", async (t) => {
+  const f = await fixture(t);
+  const originalCommit = f.engine.journal.recordRestoreMaterialization.bind(f.engine.journal);
+  let interruptOnce = true;
+  f.engine.journal.recordRestoreMaterialization = async (operation) => {
+    if (interruptOnce) {
+      interruptOnce = false;
+      throw new Error("simulated interruption before witness");
+    }
+    return originalCommit(operation);
+  };
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    /simulated interruption before witness/);
+  const oldPush = f.adapter.push;
+  let substitutedPushCalls = 0;
+  f.engine.journal.recordRestoreMaterialization = async (operation) => {
+    await originalCommit(operation);
+    f.adapter.push = async (...args) => {
+      substitutedPushCalls += 1;
+      return oldPush(...args);
+    };
+  };
+  const originalList = f.adapter.list;
+  f.adapter.list = async (objectId) => objectId
+    ? originalList(objectId) : [await originalList(objectId)];
+
+  await assert.rejects(f.engine.syncOnce(),
+    (error) => error.code === "restore_remote_admission_unproven",
+    "the original method identity must be checked before a remote POST");
+  assert.equal(substitutedPushCalls, 0);
+  assert.equal(f.pushes(), 0);
+  assert.equal((await f.engine.journal.recover()).length, 1,
+    "the signed operation remains durably pending for explicit retry");
+});
+
+test("#262 P2: failed restore staging cleanup preserves signed provenance", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const competing = Buffer.from("competing file created before restore link");
+  const originalLink = fsp.link;
+  const originalRm = fsp.rm;
+  let temporary = null;
+  let cleanupAttempted = false;
+  fsp.link = async (source, destination) => {
+    if (destination === target && source.startsWith(`${target}.tmp-`)) {
+      temporary = source;
+      await fsp.writeFile(target, competing, { flag: "wx" });
+    }
+    return originalLink(source, destination);
+  };
+  fsp.rm = async (name, ...args) => {
+    if (temporary && name === temporary) {
+      cleanupAttempted = true;
+      throw Object.assign(new Error("disposable restore-temp cleanup denial"), { code: "EPERM" });
+    }
+    return originalRm(name, ...args);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "EPERM");
+  } finally {
+    fsp.link = originalLink;
+    fsp.rm = originalRm;
+  }
+
+  assert.equal(cleanupAttempted, true);
+  assert.ok(temporary);
+  assert.equal(fs.existsSync(temporary), true,
+    "failed cleanup must not be swallowed while plaintext staging remains");
+  assert.deepEqual(await fsp.readFile(target), competing,
+    "the competing local target must remain untouched");
+  const [pending] = await f.engine.journal.recover();
+  assert.ok(pending);
+  assert.ok(f.engine.journal.restoreStagingInfo(pending),
+    "cleanup failure must preserve the exact durable staging identity");
+  await assert.rejects(f.engine.reconcileLocal(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.deepEqual(await fsp.readFile(target), competing);
 });
 
 test("#67 P2: foreign hardlink cannot be misidentified as restore temp and deleted", async (t) => {
@@ -2085,7 +2281,8 @@ test("#67 P2: pre-link crash cannot silently upload the durable staging temp", a
   };
   try {
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
-      /disposable crash before hardlink to target/);
+      (error) => error.code === "restore_local_materialization_missing",
+      "the staged file must not survive a falsely successful cleanup unnoticed");
   } finally { fsp.rm = originalRemove; }
   assert.equal(skippedCleanup, 1, "injected process kill must preserve producer's exact staging temp");
   const [signed] = await f.engine.journal.recover();
@@ -2128,7 +2325,8 @@ test("#67 P2: crash after staging name intent but before inode bind cannot uploa
   };
   try {
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
-      /disposable kill after file data fsync before inode intent bind/);
+      (error) => error.code === "restore_local_materialization_missing",
+      "even an unbound staging intent must fail closed if cleanup leaves the temp");
   } finally {
     fsp.rm = originalRemove;
     f.engine.journal.bindRestoreStagingIdentity = originalBind;

@@ -1400,7 +1400,12 @@ class SyncEngine {
     this.rootDir = path.resolve(option("rootDir") || process.cwd());
     this.journal = journalOption || new SyncJournal(option("journalPath") || path.join(this.rootDir, ".rootark-sync-journal.json"));
     this.snapshotPath = path.resolve(option("snapshotPath") || path.join(this.rootDir, ".rootark-sync-index.json"));
-    this.adapter = adapterOption;
+    // The adapter reference is part of every authorization boundary. Keep the
+    // injected object stable even for ordinary strict engines; callers may
+    // still instrument its methods without replacing the transport identity.
+    nativeObjectDefineProperty(this, "adapter", {
+      configurable: false, enumerable: true, writable: false, value: adapterOption,
+    });
     const deviceIdOption = option("deviceId");
     const keyEpochOption = option("keyEpoch");
     const compartmentIdOption = option("compartmentId");
@@ -1609,9 +1614,6 @@ class SyncEngine {
           configurable: false, enumerable: false, writable: false, value: descriptor.value,
         });
       }
-      nativeObjectDefineProperty(this, "adapter", {
-        configurable: false, enumerable: true, writable: false, value: this.adapter,
-      });
     }
   }
 
@@ -3316,6 +3318,21 @@ class SyncEngine {
             if (observed !== expected) {
               fail("Historical restore local bytes differ from the signed outbox", "restore_local_materialization_missing");
             }
+            // A crash can occur after the physical file and parent directories
+            // were flushed but before _apply's snapshot or the journal witness
+            // became durable. Re-establish both records before any remote POST.
+            nativeReflectApply(historicalRestoreEnvelope.engineMethods.rememberOperation,
+              this, [operation, expected]);
+            await nativeReflectApply(historicalRestoreEnvelope.engineMethods.persistSnapshot, this, []);
+            assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+            await nativeReflectApply(historicalRestoreEnvelope.journalMethods.recordRestoreMaterialization,
+              journal, [operation]);
+            // The awaited witness commit must not bless a changed transport or
+            // engine/journal method when the durable pending state is recaptured.
+            assertPushRuntime();
+            // recordRestoreMaterialization commits a new journal state object;
+            // capture that exact pending envelope again before transport.
+            historicalRestoreEnvelope = captureHistoricalRestoreEnvelope(operation, this);
           }
         }
         const outboundFreshDigest = historicalRestoreEnvelope
@@ -3858,7 +3875,17 @@ class SyncEngine {
         && bigIntToString(current.dev) === (owned ? bigIntToString(owned.dev) : pinned.dev)
         && bigIntToString(current.ino) === (owned ? bigIntToString(owned.ino) : pinned.ino);
             if (matchesPinned) {
-              await nativeReflectApply(nativePromiseCatch, fsp.rm(temporary, { force: true }), [() => {}]);
+              // A failed unlink must preserve the signed staging intent. Do
+              // not swallow cleanup errors and then discard provenance while
+              // a plaintext temp file can still be discovered by scanFiles().
+              await fsp.rm(temporary, { force: true });
+            }
+            const remaining = await nativeReflectApply(nativePromiseCatch,
+              fsp.lstat(temporary, { bigint: true }), [(error) => ownDataValue(error, "code") === "ENOENT"
+                ? null : nativePromiseReject(error)]);
+            if (remaining) {
+              fail("Historical restore staging cleanup is incomplete; explicit recovery is required",
+                "restore_local_materialization_missing");
             }
           }
         }
@@ -3987,6 +4014,17 @@ class SyncEngine {
         await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
       } catch (error) {
         if (ownDataValue(error, "code") !== "ENOENT") throw error;
+      }
+      // recoverHistoricalRestoreTempLink can return early when the target is
+      // absent or no longer has the expected hardlink identity. An ENOENT
+      // target is also swallowed above. Never let a still-present recorded
+      // staging pathname reach scanFiles() as an ordinary user CREATE.
+      const remainingStage = await nativeReflectApply(nativePromiseCatch,
+        fsp.lstat(recordedPath, { bigint: true }), [(error) => ownDataValue(error, "code") === "ENOENT"
+          ? null : nativePromiseReject(error)]);
+      if (remainingStage) {
+        fail("Unresolved historical restore staging file requires explicit recovery",
+          "restore_local_materialization_missing");
       }
     }
     const scanned = await this.scanFiles();
