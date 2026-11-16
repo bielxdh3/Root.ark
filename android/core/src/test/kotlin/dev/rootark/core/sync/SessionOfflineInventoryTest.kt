@@ -44,6 +44,25 @@ class SessionOfflineInventoryTest {
         assertTrue(store.pages(alice).isEmpty())
     }
 
+    @Test fun `displayed offline page cannot mutate validated cache or bypass duplicate checks`() {
+        val store = SessionOfflineInventory(alice)
+        store.capture(alice, 1, InventoryPage(listOf(row(1)), "next-page"))
+        val displayed = store.pages(alice).single()
+        @Suppress("UNCHECKED_CAST")
+        val exposed = displayed.rows as MutableList<ReadOnlyFileRow>
+        assertThrows(UnsupportedOperationException::class.java) {
+            exposed.add(row(2))
+        }
+        assertEquals(listOf("opaque-1"), store.pages(alice).single().rows.map { it.objectId })
+        store.capture(alice, 2, InventoryPage(listOf(row(2)), null))
+        assertEquals(listOf("opaque-1", "opaque-2"),
+            store.pages(alice).flatMap { it.rows }.map { it.objectId })
+        assertThrows(IllegalArgumentException::class.java) {
+            store.capture(alice, 2, InventoryPage(listOf(row(1)), null))
+        }
+        assertEquals(2, store.pages(alice).sumOf { it.rows.size })
+    }
+
     @Test fun `only eight bounded contiguous pages are retained`() {
         val store = SessionOfflineInventory(alice)
         assertThrows(IllegalArgumentException::class.java) {
