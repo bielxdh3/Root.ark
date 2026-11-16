@@ -77,7 +77,8 @@ test("unsigned persisted queue cannot reach outgoing adapter in strict mode", as
   const unsigned = operation("unsigned-queue");
   const { engine, calls } = fixture(unsigned);
   await assert.rejects(engine._pushPending({ pushed: 0, conflicts: [] }),
-    { code: "authorization_required" });
+    { code: "authorization_expired" },
+    "missing signed grant must be denied by the strict expiry/proof boundary");
   assert.equal(calls.pushed, 0,
     "the malicious journal item must fail BEFORE a remote HTTP send");
 });

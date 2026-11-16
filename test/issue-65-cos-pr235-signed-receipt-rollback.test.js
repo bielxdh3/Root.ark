@@ -427,7 +427,7 @@ test(attack + " with BOTH local journal digests rewritten cannot ACK physical PU
     } finally { await handle.close(); }
   }
   const forged = await f.reopen();
-  assert.deepEqual(diskShape(forged.outbox.pending()), [fake],
+  assert.deepEqual(diskShape(forged.outbox.pending()), diskShape([fake]),
     "persisted signed envelope values must match after JSON prototype normalization");
   assert.deepEqual(forged.mutation.pending()[0].signedOutboxReceipts, [fakeReceipt]);
   assert.equal(forged.outbox.durableSignedReceiptDigest(f.signedId), fakeReceipt.digest);

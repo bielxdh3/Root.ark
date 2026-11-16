@@ -2960,6 +2960,14 @@ class SyncEngine {
         const members = [deleted, moved];
         for (let index = 0; index < members.length; index += 1) {
           const member = members[index];
+          // Both grants must also remain fresh under the constructor-pinned
+          // engine clock after the second asynchronous authorization. The
+          // protocol's independently pinned native clock is an additional
+          // check, not a replacement for this per-engine expiry barrier.
+          if (!nativeNumberIsSafeInteger(member.authorization.expiresAt)
+            || member.authorization.expiresAt <= this.clock()) {
+            fail("Atomic batch member expired before dispatch", "authorization_required");
+          }
           try { protocol.validateFreshSignedOperation(member); }
           catch { fail("Atomic batch member expired before dispatch", "authorization_required"); }
           let current;
