@@ -19,6 +19,7 @@ on:
       - 'test/issue-65-full-multiprovider-http-restore.test.js'
       - 'test/issue-64-android-contract.test.js'
       - 'test/issue-64-android-entry.test.js'
+      - 'test/issue-64-android-filelist.test.js'
       - 'test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js'
       - 'test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js'
       - 'src/services/zk1SyncAtomicCasFloorLedgerDevOff.js'
@@ -76,6 +77,8 @@ jobs:
         run: npm ci
       - name: Real signed remote-provider TLS, Android routes and atomic CAS floor negatives
         run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-64-android-entry.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js test/issue-65-private-fifo-open-nonblock.test.js
+      - name: Verify native read-only file-list authorization and wire shape
+        run: node --test --test-reporter=tap test/issue-64-android-filelist.test.js
       - name: Verify tests did not change repository files
         run: git diff --exit-code
       - name: Verify tests did not create untracked files

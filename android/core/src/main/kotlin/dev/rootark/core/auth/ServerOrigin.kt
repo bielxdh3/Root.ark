@@ -10,6 +10,8 @@ class ServerOrigin private constructor(private val origin: String) {
 
     fun twoFactorUrl(): URL = URL("$origin/auth/login/2fa")
 
+    fun syncListUrl(): URL = URL("$origin/sync/v1/objects")
+
     companion object {
         fun parse(input: String): ServerOrigin {
             require(input.length <= 2048 && input.isNotBlank() && input == input.trim()) {
