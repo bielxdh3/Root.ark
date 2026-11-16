@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const http = require("node:http");
 const path = require("node:path");
 const test = require("node:test");
 const { Readable } = require("node:stream");
@@ -16,7 +17,7 @@ const { createSyncBurstGuard } = require("../src/services/syncBurstGuard");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { writePrivateSyncConfig } = require("../sync-client/rootark-sync-private-config");
-const { readResumeCredentials } = require("../sync-client/rootark-sync-v2");
+const { readResumeCredentials, resume } = require("../sync-client/rootark-sync-v2");
 
 const CLI = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 const PASSWORD = "secret-resume-password";
@@ -108,6 +109,59 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   assert.equal(routes.store.pauseFence("alice", "device-a"), null);
   const again = await runResume(config, "device-a", credentials);
   assert.equal(JSON.parse(again.stdout).wasPaused, false);
+  const embedded = await resume({ config, "device-id": "device-a",
+    "credentials-stdin": true,
+    credentialsStream: Readable.from([JSON.stringify({ password: PASSWORD })]),
+  });
+  assert.equal(embedded.wasPaused, false,
+    "the exported programmatic stream contract must still work");
+});
+
+test("#67: resume CLI rejects equals-form secret flags before stdin or HTTP", async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-67-resume-argv-");
+  let requests = 0;
+  const server = http.createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(500).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const config = path.join(root, "sync-config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({
+    serverUrl: `http://127.0.0.1:${server.address().port}`,
+    username: "alice", token: "test-resume-token", deviceId: "device-b",
+  }));
+
+  for (const forbiddenArgs of [["--password=secret"], ["--code=123456"],
+    ["--credentialsStream", "secret-json-on-argv"]]) {
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [CLI, "resume", "--config", config,
+        "--device-id", "device-a", "--credentials-stdin", ...forbiddenArgs], {
+        windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      const timeout = setTimeout(() => { timedOut = true; child.kill(); }, 8000);
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      child.once("close", (status) => {
+        clearTimeout(timeout);
+        resolve({ status, stdout, stderr, timedOut });
+      });
+      // Deliberately leave stdin open: any attempt to read credentials must
+      // hang until the deadline, whereas argv validation must exit immediately.
+    });
+    assert.equal(result.timedOut, false, "invalid argv must not wait for credentials on stdin");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unsupported resume option/i);
+    assert.doesNotMatch(result.stdout + result.stderr, /secret|123456/i);
+    assert.equal(requests, 0, "invalid argv cannot contact the resume endpoint");
+  }
 });
 
 test("#67: resume adapter refuses self-resume, unsafe ids, missing password and forged success", async () => {

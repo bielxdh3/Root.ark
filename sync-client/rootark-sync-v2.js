@@ -534,6 +534,21 @@ async function readResumeCredentials(stream = process.stdin) {
 }
 
 async function resume(options = {}) {
+  assertPlainDataObject(options, "Sync resume options");
+  for (const key of nativeObjectKeys(options)) {
+    if (key !== "config" && key !== "device-id" && key !== "credentials-stdin"
+      && key !== "credentialsStream") {
+      throw new Error("Unsupported resume option; credentials must use stdin");
+    }
+  }
+  // Preserve the exported programmatic stream contract without turning a CLI
+  // --credentialsStream <secret> argument into an alternate argv transport.
+  const credentialsStream = options.credentialsStream;
+  if (credentialsStream !== undefined && (credentialsStream === null
+    || typeof credentialsStream !== "object"
+    || typeof credentialsStream[Symbol.asyncIterator] !== "function")) {
+    throw new Error("Unsupported resume option; credentials must use stdin");
+  }
   const deviceId = options["device-id"];
   // The requested device and explicit credentials transport are validated
   // before reading a private config or accepting passwords from stdin.
@@ -553,7 +568,7 @@ async function resume(options = {}) {
     throw new Error("Resume requires private Sync v2 serverUrl, username, token and deviceId");
   }
   if (deviceId === config.deviceId) throw new Error("Paused device cannot resume itself");
-  const credentials = await readResumeCredentials(options.credentialsStream || process.stdin);
+  const credentials = await readResumeCredentials(credentialsStream || process.stdin);
   const adapter = createOpaqueSyncAdapter({
     baseUrl: normalizeTrustedSyncServerUrl(config.serverUrl),
     fetchImpl: (url, request = {}) => fetch(url, { ...request,
