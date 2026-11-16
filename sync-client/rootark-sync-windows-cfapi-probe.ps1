@@ -48,8 +48,8 @@ public static class RootarkCfapiReadOnly {
     private static extern uint CfGetPlaceholderStateFromAttributeTag(uint attributes, uint tag);
 
     [DllImport("cldapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
-    private static extern int CfGetSyncRootInfoByPath(
-        string path, int infoClass, IntPtr infoBuffer, uint bufferLength, out uint returnedLength);
+    private static extern int CfGetSyncRootInfoByHandle(
+        SafeFileHandle handle, int infoClass, IntPtr infoBuffer, uint bufferLength, out uint returnedLength);
 
     [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFile(
@@ -85,7 +85,10 @@ public static class RootarkCfapiReadOnly {
                 IntPtr buffer = Marshal.AllocHGlobal(8);
                 try {
                     uint required;
-                    lookup = CfGetSyncRootInfoByPath(path, 0, buffer, 8, out required);
+                    // Use the same opened object as FileAttributeTagInfo. A
+                    // pathname lookup could race a rename/replacement and
+                    // report another file's sync-root status.
+                    lookup = CfGetSyncRootInfoByHandle(handle, 0, buffer, 8, out required);
                 } finally { Marshal.FreeHGlobal(buffer); }
             }
             return new NativeState { Attributes = tag.FileAttributes,

@@ -11,6 +11,19 @@ const script = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfap
 const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const win = process.platform === "win32";
 
+test("issue 66 CFAPI: sync-root lookup stays on the inspected open handle", async () => {
+  const source = await fs.readFile(script, "utf8");
+  // Before this fix the probe read FileAttributeTagInfo from a held handle,
+  // then queried the sync-root status by a replaceable pathname. The probe
+  // must use the same no-follow handle for both native observations.
+  assert.match(source, /FILE_FLAG_OPEN_REPARSE_POINT/);
+  assert.match(source, /GetFileInformationByHandleEx\(handle, 9, out tag, 8\)/);
+  assert.match(source, /CfGetSyncRootInfoByHandle\(\s*SafeFileHandle handle,/);
+  assert.match(source, /lookup = CfGetSyncRootInfoByHandle\(handle, 0, buffer, 8, out required\)/);
+  assert.doesNotMatch(source, /\bCfGetSyncRootInfoByPath\s*\(/,
+    "the open-handle proof must never fall back to a racy path lookup");
+});
+
 // Keep disposable probe fixtures after each run. Recursive pathname cleanup
 // could delete a foreign subtree if a concurrent same-SID process replaced
 // a scratch directory; no native retained-handle delete exists in this lab.
