@@ -8,7 +8,7 @@ const path = require("node:path");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
 
-test("real Edge: two selected 128-revision UI batches never inherit destructive replacement consent", {
+test("real Edge: selected 128-revision UI batches consume replacement consent and cancel later-window search atomically", {
   timeout: 90_000,
 }, async (t) => {
   const edge = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
@@ -93,7 +93,7 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
         entries:baseline.entries}));
       const signature=new Uint8Array(await crypto.subtle.sign("Ed25519",
         signer.privateKey,serialized));
-      let verifiedGets=0,pauseFirstGet=false;
+      let verifiedGets=0,signedGetCalls=0,pauseFirstGet=false,pauseGetAt=0;
       const client={
         async verifyPrivateListingHead() {
           if(!await crypto.subtle.verify("Ed25519",signer.publicKey,
@@ -101,15 +101,27 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
           return {scope,head:baseline.head};
         },
         async readSelectedCiphertext(_baseline,oid,rev){
+          signedGetCalls++;
           if(pauseFirstGet){
             pauseFirstGet=false;
             window.__issue63EscPhase="busy-ready";
             await new Promise(resolve=>{window.__issue63ReleaseFirstGet=resolve;});
           }
+          if(signedGetCalls===pauseGetAt){
+            window.__issue63CancelUiGetCount=signedGetCalls;
+            window.__issue63CancelUiVerifiedBeforeRelease=verifiedGets;
+            window.__issue63CancelUiPhase="ninth-get-paused";
+            await new Promise(resolve=>{window.__issue63ReleaseNinthGet=resolve;});
+          }
           const row=checked.get(oid+":"+rev);
-          if(!row||!await crypto.subtle.verify("Ed25519",signer.publicKey,
+          if(!row||row.objectId!==oid||row.revision!==rev
+            ||!await crypto.subtle.verify("Ed25519",signer.publicKey,
             signature,serialized))throw Error("SIGNED_GET_BAD");
           verifiedGets++;
+          if(signedGetCalls===pauseGetAt){
+            window.__issue63CancelUiVerifiedAfterRelease=verifiedGets;
+            window.__issue63CancelUiPhase="ninth-get-released";
+          }
           return row;
         },
       };
@@ -274,6 +286,56 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
       if(!await (async()=>{try{await first.readPage(0);return false;}
         catch(e){return e.message==="ZK_REVISION_INDEX_DENIED";}})())
         throw Error("OLD_ENCRYPTED_PAGE_SURVIVED_REPLACEMENT");
+      phase="visible-cancel-after-first-window";
+      await selection(selections.slice(0,17));
+      clickConsent(true);
+      const cancelStartGetCalls=signedGetCalls;
+      const cancelStartVerifiedGets=verifiedGets;
+      window.__issue63CancelUiStartGetCalls=cancelStartGetCalls;
+      window.__issue63CancelUiStartVerifiedGets=cancelStartVerifiedGets;
+      pauseGetAt=cancelStartGetCalls+9;
+      batchButton.click();
+      const cancelButton=action("catalog-delta-text-cancel");
+      const cancelProgress=field("catalog-batch-progress");
+      for(let i=0;i<800&&window.__issue63CancelUiPhase!=="ninth-get-paused";i++)
+        await sleep(20);
+      if(!cancelButton||!cancelProgress
+        ||window.__issue63CancelUiPhase!=="ninth-get-paused"
+        ||cancelProgress.textContent!=="8 / 17 revisões conferidas"
+        ||cancelButton.disabled||signedGetCalls-cancelStartGetCalls!==9)
+        throw Error("CANCEL_UI_NINTH_GET_NOT_PAUSED_AFTER_FIRST_WINDOW");
+      const verifiedGetsBeforeRelease=verifiedGets;
+      if(window.__issue63CancelUiVerifiedBeforeRelease!==verifiedGetsBeforeRelease)
+        throw Error("CANCEL_UI_VERIFIED_GET_PRE_RELEASE_MISMATCH");
+      for(let i=0;i<800&&window.__issue63CancelUiPhase!=="ninth-get-released";i++)
+        await sleep(20);
+      if(window.__issue63CancelUiPhase!=="ninth-get-released")
+        throw Error("CANCEL_UI_NINTH_GET_NOT_RELEASED");
+      for(let i=0;i<800&&(batchButton.disabled
+        ||!field("status").textContent.includes("Busca cancelada;"));i++)
+        await sleep(20);
+      if(batchButton.disabled||!cancelButton.disabled)
+        throw Error("CANCEL_UI_BUTTON_CLEANUP_FAILED");
+      if(field("status").textContent!=="Busca cancelada; nenhuma correspondência parcial foi exibida."
+        ||cancelProgress.textContent!=="Busca cancelada; resultados descartados.")
+        throw Error("CANCEL_UI_FINAL_STATE_MISSING");
+      if(field("catalog-delta-text-results").textContent!=="")
+        throw Error("CANCEL_UI_PARTIAL_RESULTS_SHOWN");
+      if(verifiedGets!==verifiedGetsBeforeRelease+1
+        ||window.__issue63CancelUiVerifiedAfterRelease!==verifiedGets)
+        throw Error("CANCEL_UI_VERIFIED_GET_INCREMENT_AFTER_CLEANUP");
+      await sleep(100);
+      if(signedGetCalls-cancelStartGetCalls!==9)
+        throw Error("CANCEL_UI_LATER_SIGNED_GET");
+      const preservedAfterCancel=await localIndex.search({...indexInput(),
+        query:"selected revision 0129"});
+      const absentAfterCancel=await localIndex.search({...indexInput(),
+        query:"selected revision 0001"});
+      if(preservedAfterCancel.indexedCount!==128
+        ||preservedAfterCancel.totalMatches!==1
+        ||absentAfterCancel.indexedCount!==128
+        ||absentAfterCancel.totalMatches!==0)
+        throw Error("CANCEL_UI_PARTIAL_INDEX_WRITE");
       metadataRaw.fill(0);rawCek.fill(0);
       out.textContent="EDGE_REPLACE_ONCE_PASS";
     }catch(error){out.textContent="EDGE_REPLACE_ONCE_FAIL:"+phase+":"+error.message;}
@@ -407,6 +469,45 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
       type: "keyUp", key: "Escape", code: "Escape",
       windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
     });
+    const cancelUiPaused = await waitFor(async () => {
+      const evalResult = await send("Runtime.evaluate", {
+        expression: "window.__issue63CancelUiPhase || document.getElementById('edge-result')?.textContent || null",
+        returnByValue: true,
+      });
+      const value = evalResult.result?.value;
+      return value === "ninth-get-paused" || typeof value === "string"
+        && /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(value) ? value : null;
+    });
+    assert.equal(cancelUiPaused, "ninth-get-paused");
+    const beforeExplicitCancel = await send("Runtime.evaluate", {
+      expression: "(()=>{const d=document.querySelector('dialog.zk1-workspace-dialog');const p=d?.querySelector('[data-zk1-field=\\\"catalog-batch-progress\\\"]');const b=d?.querySelector('[data-zk1-action=\\\"catalog-delta-text-cancel\\\"]');const r=d?.querySelector('[data-zk1-field=\\\"catalog-delta-text-results\\\"]');return {opened:d?.open,batchDisabled:d?.querySelector('[data-zk1-action=\\\"catalog-delta-text-search\\\"]')?.disabled,progress:p?.textContent,results:r?.textContent,cancelDisabled:b?.disabled,cancelVisible:!!b?.getClientRects().length,getDelta:window.__issue63CancelUiGetCount-window.__issue63CancelUiStartGetCalls,startVerifiedGets:window.__issue63CancelUiStartVerifiedGets,verifiedGetsBeforeRelease:window.__issue63CancelUiVerifiedBeforeRelease};})()",
+      returnByValue: true,
+    });
+    const beforeCancel = beforeExplicitCancel.result?.value;
+    assert.equal(beforeCancel?.opened, true);
+    assert.equal(beforeCancel?.batchDisabled, true);
+    assert.equal(beforeCancel?.progress, "8 / 17 revisões conferidas");
+    assert.equal(beforeCancel?.results, "",
+      "no partial text results may exist before the cancel click");
+    assert.equal(beforeCancel?.cancelDisabled, false);
+    assert.equal(beforeCancel?.cancelVisible, true);
+    assert.equal(beforeCancel?.getDelta, 9);
+    assert.equal(Number.isSafeInteger(beforeCancel?.startVerifiedGets), true);
+    assert.equal(Number.isSafeInteger(beforeCancel?.verifiedGetsBeforeRelease), true);
+    assert.equal(beforeCancel.verifiedGetsBeforeRelease-beforeCancel.startVerifiedGets, 8,
+      "the first eight GET rows must be verified before GET #9 is released");
+    const clickedCancel = await send("Runtime.evaluate", {
+      expression: "(()=>{const b=document.querySelector('[data-zk1-action=\\\"catalog-delta-text-cancel\\\"]');if(!b||b.disabled||!b.getClientRects().length)throw Error('CANCEL_BUTTON_NOT_VISIBLE');b.click();return {progress:document.querySelector('[data-zk1-field=\\\"catalog-batch-progress\\\"]').textContent,status:document.querySelector('[data-zk1-field=\\\"status\\\"]').textContent};})()",
+      returnByValue: true,
+    });
+    assert.deepEqual(clickedCancel.result?.value, {
+      progress: "Cancelando; nenhuma correspondência será exibida.",
+      status: "Cancelamento solicitado; a leitura em andamento será descartada.",
+    });
+    await send("Runtime.evaluate", {
+      expression: "window.__issue63ReleaseNinthGet?.(); true",
+      returnByValue: true,
+    });
     const result = await waitFor(async () => {
       const evalResult = await send("Runtime.evaluate", {
         expression: "document.getElementById('edge-result')?.textContent || null",
@@ -417,6 +518,14 @@ test("real Edge: two selected 128-revision UI batches never inherit destructive 
         ? value : null;
     });
     assert.equal(result, "EDGE_REPLACE_ONCE_PASS");
+    const afterCancelCleanup = await send("Runtime.evaluate", {
+      expression: "({phase:window.__issue63CancelUiPhase,verifiedGets:window.__issue63CancelUiVerifiedAfterRelease})",
+      returnByValue: true,
+    });
+    assert.equal(afterCancelCleanup.result?.value?.phase, "ninth-get-released");
+    assert.equal(afterCancelCleanup.result?.value?.verifiedGets,
+      beforeCancel.verifiedGetsBeforeRelease + 1,
+      "GET #9 must verify its object/revision and increment verifiedGets before cancellation completes");
     assert.equal(sensitiveRequests, 0);
   } finally {
     socket?.close();
