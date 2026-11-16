@@ -3105,7 +3105,7 @@ class SyncEngine {
       // hash: rememberOperation may only carry forward a previously trusted
       // snapshot hash, if one exists. Any other error still fails closed.
         if (!nativeReflectApply(nativeArrayIncludes,
-          ["authorization_rejected", "stale_key_epoch", "key_unavailable"], [ownDataValue(error, "code")])) {
+          ["authorization_rejected", "stale_key_epoch", "sync_key_epoch_mismatch", "key_unavailable"], [ownDataValue(error, "code")])) {
         throw error;
       }
       historicalKeyUnavailable = true;
