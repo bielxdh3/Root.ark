@@ -76,6 +76,30 @@ class OwnerPinnedOfflineAdmissionTest {
         assertTrue(root.resolve("owner-floor-v1.bin").toFile().isFile)
     }
 
+    @Test fun providerGeneratedFloorIvIsStoredAndRotatedAcrossWrites() {
+        val current = pin()
+        val path = root.resolve("owner-floor-v1.bin")
+        OwnerPinnedOfflineAdmission.observeHead(head(), current,
+            OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true), at)
+        val first = Files.readAllBytes(path)
+        assertTrue(first.copyOfRange(0, 7).contentEquals("OFLOOR2".toByteArray()))
+        val firstIv = first.copyOfRange(7, 19)
+
+        OwnerPinnedOfflineAdmission.observeHead(head(), current,
+            OwnerOfflineFloorStore(root.toFile(), key()), at + 1000)
+        val second = Files.readAllBytes(path)
+        assertTrue(second.copyOfRange(0, 7).contentEquals("OFLOOR2".toByteArray()))
+        assertTrue(!firstIv.contentEquals(second.copyOfRange(7, 19)),
+            "each encryption must persist a newly generated 96-bit GCM nonce")
+
+        val input = cek()
+        var consumed = false
+        OwnerPinnedOfflineAdmission.withAuthorizedCek(grant(), head(), current, input,
+            OwnerOfflineFloorStore(root.toFile(), key()), at + 2000) { _, _ -> consumed = true }
+        assertTrue(consumed && input.all { it == 0.toByte() },
+            "restarted store must decrypt the persisted provider-generated IV")
+    }
+
     @Test fun revocationAndClockFloorPersistAcrossRestart() {
         val old = pin()
         val store = OwnerOfflineFloorStore(root.toFile(), key(), allowFirstWrite = true)

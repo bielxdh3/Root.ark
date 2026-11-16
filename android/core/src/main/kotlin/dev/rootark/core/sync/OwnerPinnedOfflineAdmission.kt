@@ -14,7 +14,6 @@ import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.KeyFactory
 import java.security.MessageDigest
-import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
@@ -273,7 +272,6 @@ class OwnerOfflineFloorStore(
 ) {
     private val destination get() = File(root, "owner-floor-v1.bin")
     private val lockFile get() = File(root, "owner-floor-v1.lock")
-    private val random = SecureRandom()
     private data class Floor(val revision: Long, val digest: String,
         val seenMillis: Long, val lockIdentity: String)
     // The OS FileLock serializes floor I/O. Volatile preserves visibility for
@@ -386,9 +384,13 @@ class OwnerOfflineFloorStore(
                     if (openDescriptorBoundLock != null) {
                         check(bound.descriptorIdentity == lockedIdentity)
                     }
-                    val iv = ByteArray(12).also(random::nextBytes)
                     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                    cipher.init(Cipher.ENCRYPT_MODE, secret, GCMParameterSpec(128, iv))
+                    // AndroidKeyStore keys with randomized encryption required
+                    // reject caller-supplied GCM IVs. Let the provider generate
+                    // the nonce, then persist that exact IV in the floor envelope.
+                    cipher.init(Cipher.ENCRYPT_MODE, secret)
+                    val iv = cipher.iv
+                    check(iv != null && iv.size == 12)
                     cipher.updateAAD(aad)
                     val plaintext = "$revision\n$digest\n$nowMillis\n$lockedIdentity"
                         .toByteArray(StandardCharsets.US_ASCII)
