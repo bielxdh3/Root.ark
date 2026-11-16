@@ -162,7 +162,7 @@ test("protected HTTP ingress rejects tampered signed bytes before durable store/
     const listener = app.listen(0, "127.0.0.1", () => resolve(listener));
   });
   const port = server.address().port;
-  const signed = async (name) => {
+  const signed = async (name, expiresInMs = 60_000) => {
     const operation = createOperation({ operation: "create",
       operationId: `operation-${name}`, objectId: `object-${name}`,
       fileId: `file-${name}`, versionId: `version-${name}`,
@@ -173,12 +173,15 @@ test("protected HTTP ingress rejects tampered signed bytes before durable store/
       fileKey: crypto.randomBytes(32) });
     operation.authorization = await createAuthorizationProof(operation, {
       username: "alice", publicKey, privateKey: pair.privateKey,
-      expiresAt: Date.now() + 60_000,
+      expiresAt: Date.now() + expiresInMs,
     });
     return operation;
   };
 
-  const admitted = await signed("admitted");
+  // A short-lived but genuinely signed and persisted proof lets the final
+  // restart check observe REAL expiry without mutating the protocol's pinned
+  // Date.now or changing the production authorization implementation.
+  const admitted = await signed("admitted", 12_000);
   assert.equal((await httpPost(port, admitted)).status, 201,
     "positive control requires actual signed HTTP admission and fsynced JSON");
   assert.equal(routes.store.list("alice").length, 1);
@@ -340,19 +343,17 @@ test("protected HTTP ingress rejects tampered signed bytes before durable store/
 
   // Genuine persisted historical Ed25519 records remain verifiable even
   // after the ingress lease expires; this API must never grant fresh writes.
-  const actualNow = Date.now;
-  try {
-    Date.now = () => admitted.authorization.expiresAt + 1;
-    assert.ok(validateStoredOperation(persisted[0]));
-    assert.equal(await verifyHistoricalAuthorizationProof(
-      persisted[0].authorization, persisted[0], {
-        username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
-        revokedDeviceIds: [],
-      }), true);
-    assert.throws(() => validateFreshSignedOperation(persisted[0]),
-      { code: "authorization_expired" },
-      "expired persisted grants must never become fresh admissions");
-  } finally {
-    Date.now = actualNow;
-  }
+  await new Promise((resolve) => setTimeout(resolve,
+    Math.max(0, admitted.authorization.expiresAt - Date.now() + 25)));
+  assert.ok(Date.now() > admitted.authorization.expiresAt,
+    "real clock must pass the exact persisted signed grant expiry");
+  assert.ok(validateStoredOperation(persisted[0]));
+  assert.equal(await verifyHistoricalAuthorizationProof(
+    persisted[0].authorization, persisted[0], {
+      username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+      revokedDeviceIds: [],
+    }), true);
+  assert.throws(() => validateFreshSignedOperation(persisted[0]),
+    { code: "authorization_expired" },
+    "expired persisted grants must never become fresh admissions");
 });
