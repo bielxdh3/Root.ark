@@ -1787,7 +1787,7 @@ class SyncEngine {
         const openedAfterRead = await handle.stat({ bigint: true });
         const stagedAfterRead = await fsp.lstat(staged, { bigint: true });
         if (!sameFileVersion(opened, openedAfterRead)
-          || !sameFileIdentity(openedAfterRead, stagedAfterRead)
+          || !sameFileVersion(openedAfterRead, stagedAfterRead)
           || crypto.createHash("sha256").update(stagedBytes).digest("hex") !== tracked.hash) {
           fail("Tracked local source changed during staging", "local_changes_pending");
         }
@@ -1807,7 +1807,10 @@ class SyncEngine {
     // predecessor in trash for recovery instead of overwriting new user bytes.
     if (await exists(source)) fail("Local source was recreated; staged copy retained", "local_changes_pending");
     try {
-      await fsp.rename(staged, source);
+      // Atomic no-clobber restoration: a writer may recreate source between
+      // the check above and publication, and rename() would replace it.
+      await fsp.link(staged, source);
+      await fsp.unlink(staged).catch(() => {});
     } catch {
       fail("Cannot restore staged local source; recoverable copy retained", "local_changes_pending");
     }
@@ -1903,7 +1906,32 @@ class SyncEngine {
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       let hash;
-      if (sourceExists) {
+      if (sourceExists && beforeHydrationWrite) {
+        // The cached source may be a clean revision A, while a later signed
+        // UPDATE and MOVE already carry revision B. Preserve A in trash, then
+        // publish only the authenticated MOVE payload. Never rename A into
+        // B or overwrite a local writer's newly created destination.
+        const stagedSource = await this.stageCleanTrackedFile(
+          sourcePath, this.snapshot.files[sourcePath]);
+        try {
+          if (await exists(target)) fail("Moved destination was occupied locally", "local_changes_pending");
+          const temporary = path.join(path.dirname(target), `.rootark-move-${crypto.randomUUID()}`);
+          try {
+            await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
+            // Hard-link publication is exclusive (no replace), unlike rename
+            // on platforms where an intervening local file could be clobbered.
+            try { await fsp.link(temporary, target); }
+            catch (error) {
+              if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
+              throw error;
+            }
+          } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+        } catch (error) {
+          await this.restoreStagedTrackedFile(sourcePath, stagedSource);
+          throw error;
+        }
+        hash = crypto.createHash("sha256").update(movePayload).digest("hex");
+      } else if (sourceExists) {
         if (source !== target) {
           const sameWindowsPath = process.platform === "win32"
             && path.resolve(source).toLowerCase() === path.resolve(target).toLowerCase();
@@ -1913,11 +1941,25 @@ class SyncEngine {
         const movedStats = await fsp.lstat(target, { bigint: true });
         if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
       } else {
-        if (await exists(target)) await this.stageExisting(target);
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        if (beforeHydrationWrite) {
+          if (await exists(target)) fail("Untracked destination appeared during hydration", "local_changes_pending");
+        } else if (await exists(target)) {
+          await this.stageExisting(target);
+        }
+        const temporary = beforeHydrationWrite
+          ? path.join(path.dirname(target), `.rootark-move-${crypto.randomUUID()}`)
+          : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
         try {
           await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
-          await fsp.rename(temporary, target);
+          if (beforeHydrationWrite) {
+            try { await fsp.link(temporary, target); }
+            catch (error) {
+              if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
+              throw error;
+            }
+          } else {
+            await fsp.rename(temporary, target);
+          }
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
@@ -1957,20 +1999,55 @@ class SyncEngine {
         const relocatedSource = beforeHydrationWrite && operation.operation === "update"
           ? activeFileIdentityPath(this.snapshot.files, operation, metadata.path) : null;
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
         let stagedSource = null;
+        let stagedTarget = null;
         try {
+          await fsp.writeFile(temporary, plaintext, { mode: 0o600, flag: "wx" });
           // Stage AND verify the old identity before publishing the new path.
           // A racing local edit/removal must never leave a destination orphan.
           if (relocatedSource && !pathsEqual(relocatedSource, metadata.path)) {
             stagedSource = await this.stageCleanTrackedFile(
               relocatedSource, this.snapshot.files[relocatedSource]);
           }
-          if (await exists(target)) await this.stageExisting(target);
-          await fsp.rename(temporary, target);
+          if (beforeHydrationWrite && operation.operation === "update") {
+            const trackedTarget = this.snapshot.files[metadata.path];
+            if (trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
+              && trackedTarget.objectId === operation.objectId
+              && trackedTarget.fileId === operation.fileId) {
+              // Do not condition this on exists(target): a local deletion
+              // between preflight and stage is an unsent change too.
+              stagedTarget = await this.stageCleanTrackedFile(metadata.path, trackedTarget);
+            } else if (await exists(target)) {
+              fail("Untracked local destination cannot be replaced", "local_changes_pending");
+            }
+          } else if (await exists(target)) {
+            await this.stageExisting(target);
+          }
+          if (beforeHydrationWrite && operation.operation === "update") {
+            // A local writer may recreate the pathname AFTER a clean stage.
+            // An exclusive hard link refuses to replace their new file;
+            // rename() can silently overwrite it on Windows and POSIX.
+            try {
+              await fsp.link(temporary, target);
+            } catch (error) {
+              if (await exists(target)) fail("Local destination was recreated before publication", "local_changes_pending");
+              throw error;
+            }
+          } else {
+            await fsp.rename(temporary, target);
+          }
           if (stagedSource) cleanupPath = relocatedSource;
         } catch (error) {
-          if (stagedSource) await this.restoreStagedTrackedFile(relocatedSource, stagedSource);
+          // Attempt both recoveries even when a concurrently recreated path
+          // prevents one restore. The un-restored bytes remain in trash.
+          if (stagedSource) {
+            try { await this.restoreStagedTrackedFile(relocatedSource, stagedSource); }
+            catch (restoreError) { error = restoreError; }
+          }
+          if (stagedTarget) {
+            try { await this.restoreStagedTrackedFile(metadata.path, stagedTarget); }
+            catch (restoreError) { error = restoreError; }
+          }
           throw error;
         } finally {
           await fsp.rm(temporary, { force: true }).catch(() => {});
@@ -2351,14 +2428,14 @@ class SyncEngine {
         }
       } else if (evicted) {
         // Eviction pins an object identity/revision, not an immutable pathname.
-        // A later authenticated MOVE can rename that evicted object before the
-        // device reconnects. Do not deny the new path merely because the
-        // marker still records the old one. The full envelope must still
-        // match inventory and pass normal verification before any write.
+        // A later authenticated MOVE then UPDATE can rename an evicted object
+        // before this device reconnects. UPDATE has no sourcePath, so require
+        // stable file identity and a strictly newer revision. The full
+        // envelope must match inventory and pass verification before writing.
         const relocated = !pathsEqual(evicted.path, safePath);
         if (evicted.deleted || (relocated && (
-          matching.operation !== "move" || matching.fileId !== evicted.fileId
-          || !matching.metadata?.sourcePath
+          !["move", "update"].includes(matching.operation) || matching.fileId !== evicted.fileId
+          || (matching.operation === "move" && !matching.metadata?.sourcePath)
           || protocol.compareRevisions(matching.revision, evicted.revision) <= 0))) {
           fail("Evicted file no longer matches this path", "remote_object_changed");
         }
@@ -2453,8 +2530,7 @@ class SyncEngine {
       const tracked = this.snapshot.files[sourcePath];
       const bytes = await readContainedFile(this.rootDir, sourcePath);
       const hash = crypto.createHash("sha256").update(bytes).digest("hex");
-      if (!tracked || hash !== tracked.hash
-        || !bytes.equals(movePayload)) {
+      if (!tracked || hash !== tracked.hash) {
         fail("Moved source has uncommitted local changes", "local_changes_pending");
       }
     };
