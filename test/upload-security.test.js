@@ -50,12 +50,18 @@ function releaseGateFixtureToHost(value) {
 
 function releaseGateVmRequire(gateRequire, spawnSyncMock) {
   const protocolPath = path.join(ROOT, "sync-client", "rootark-sync-protocol");
+  const resiliencePath = path.join(ROOT, "src", "services", "deploymentResilience");
   return (name) => {
     if (name === "node:child_process") return { spawnSync: spawnSyncMock };
     const module = gateRequire(name);
-    if (name !== protocolPath) return module;
-    return { ...module, createOperation: (fixture) =>
+    if (name === protocolPath) return { ...module, createOperation: (fixture) =>
       module.createOperation(releaseGateFixtureToHost(fixture)) };
+    // The release-gate VM also creates the input array and its deliberately
+    // leaked-field object in the foreign realm. Keep the actual attestor, but
+    // reconstruct those test fixtures before its strict host-realm checks.
+    if (name === resiliencePath) return { ...module, attestCiphertextOnlyRecords: (records) =>
+      module.attestCiphertextOnlyRecords(releaseGateFixtureToHost(records)) };
+    return module;
   };
 }
 
