@@ -89,36 +89,49 @@
         || !digest.test(input.cekSha256Pin)) deny();
     }
     async function open(input) {
-      let sealed = null, opened = null;
+      let sealed = null, opened = null, rawCek = null;
       try {
-        live(input?.assertLive);
-        prepare(input);
+        const assertLive = input?.assertLive;
+        live(assertLive);
+        // A live/session callback runs after each crypto await. It may also
+        // invalidate caller-owned form state: never reread that mutable state
+        // for CEK authority, sealed bytes or the displayed signed revision.
+        const stable = {
+          selected: input.selected && { ...input.selected },
+          checked: input.checked && { ...input.checked },
+          metadata: input.metadata && { ...input.metadata },
+          grant: input.grant, ownerHead: input.ownerHead, baseline: input.baseline,
+          cekSha256Pin: input.cekSha256Pin,
+          rawCek: input.rawCek instanceof Uint8Array
+            ? (rawCek = new Uint8Array(input.rawCek)) : input.rawCek,
+        };
+        prepare(stable);
         // The fingerprint must have been independently fixed by the owner.
         const actualKeyPin = encode64(new Uint8Array(
-          await webCrypto.subtle.digest("SHA-256", input.rawCek)));
-        live(input.assertLive);
-        if (actualKeyPin !== input.cekSha256Pin) deny();
-        sealed = decode64(input.checked.ciphertextBase64, 16, MAX_WIRE);
+          await webCrypto.subtle.digest("SHA-256", stable.rawCek)));
+        live(assertLive);
+        if (actualKeyPin !== stable.cekSha256Pin) deny();
+        sealed = decode64(stable.checked.ciphertextBase64, 16, MAX_WIRE);
         const actualCipherDigest = encode64(new Uint8Array(
           await webCrypto.subtle.digest("SHA-256", sealed)));
-        live(input.assertLive);
-        if (actualCipherDigest !== input.selected.ciphertextDigestBase64) deny();
-        const cek = await fileContent.importFileCek(input.rawCek);
-        live(input.assertLive);
+        live(assertLive);
+        if (actualCipherDigest !== stable.selected.ciphertextDigestBase64) deny();
+        const cek = await fileContent.importFileCek(stable.rawCek);
+        live(assertLive);
         opened = await fileContent.decryptFile({ cek,
-          metadata: input.metadata, envelopeBytes: sealed });
-        live(input.assertLive);
+          metadata: stable.metadata, envelopeBytes: sealed });
+        live(assertLive);
         if (!permittedTypes.has(opened.mediaType)
           || !(opened.data instanceof Uint8Array)
           || opened.data.length > MAX_PREVIEW) deny();
         const text = decoder.decode(opened.data);
-        live(input.assertLive);
-        return Object.freeze({ objectId: input.selected.objectId,
-          revision: input.selected.revision, epoch: input.selected.epoch,
+        live(assertLive);
+        return Object.freeze({ objectId: stable.selected.objectId,
+          revision: stable.selected.revision, epoch: stable.selected.epoch,
           name: opened.name, mediaType: opened.mediaType, text,
           plaintextSentToServer: false });
       } catch (_) { deny(); }
-      finally { sealed?.fill(0); opened?.data?.fill(0); }
+      finally { rawCek?.fill(0); sealed?.fill(0); opened?.data?.fill(0); }
     }
     return Object.freeze({ open });
   }));
