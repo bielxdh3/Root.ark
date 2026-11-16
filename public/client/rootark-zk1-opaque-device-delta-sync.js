@@ -338,6 +338,14 @@
               if (!query || entries.length < 100) entries.push(entry);
             }
           }
+          // Every metadata AEAD open awaited above. An owner revocation or
+          // independent CAS successor during those awaits invalidates the
+          // earlier read; recheck the signed current head before local release.
+          const final = await writer.readAll();
+          assertLive();
+          if (final.head.sequence !== current.head.sequence
+            || !equal(bytes(final.head.digest, 32), bytes(current.head.digest, 32))
+            || final.rows.length !== current.rows.length) deny();
           // One bad entry/key invalidates the ENTIRE list; no partial results.
           return Object.freeze({ head: Object.freeze({ ...state.head }),
             entries: Object.freeze(entries), totalMatches,

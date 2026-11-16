@@ -10,6 +10,7 @@ const http = require("node:http");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { sealZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
+const realCatalog = require("../public/client/rootark-zk1-browser-opaque-catalog-commit");
 const sourceFile = path.join(__dirname,
   "../public/client/rootark-zk1-opaque-device-delta-sync.js");
 const probeFile = path.join(__dirname, "support/issue-65-opaque-delta-browser-probe.js");
@@ -126,6 +127,75 @@ test("P2 review: signed historical names cannot resurrect a trashed object's sea
   assert.equal(full.entries.find(x => x.objectId === 'deleted-object')?.name, null);
   assert.equal(seen.length, 6,
     'all three immutable signed rows are still decrypted and checked on each read');
+});
+
+test("P2: independent CAS changing during real filename AEAD denies all local search results", async () => {
+  const scopeBytes = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };
+  const scope = Object.fromEntries(Object.entries(scopeBytes)
+    .map(([key, value]) => [key, value.toString("base64url")]));
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const rawKey = crypto.randomBytes(32);
+  const sealedName = await sealZk1CatalogMetadataV1({ scope: scopeBytes,
+    objectId, revision: 1, epoch: 1, metadataKey: rawKey,
+    name: "private-authenticated-current.txt" });
+  const row = { object_id: objectId, revision: 1, epoch: 1,
+    ciphertext_digest: new Uint8Array(32).fill(8),
+    metadata_ciphertext: Uint8Array.from(sealedName) };
+  const old = { head: { sequence: 5, digest: new Uint8Array(32).fill(7) }, rows: [row] };
+  // A real CAS successor appends an immutable catalog row: the old row and its
+  // already-authenticated plaintext are no longer a complete current listing.
+  const advanced = { head: { sequence: 6, digest: new Uint8Array(32).fill(9) },
+    rows: [row, { ...row, object_id: crypto.randomBytes(16).toString("base64url") }] };
+  let active = old, advanceDuringAead = false, reads = 0, realOpens = 0;
+  const catalog = {
+    createClient: () => ({ readAll: async () => { reads++; return active; } }),
+    openMetadata: async (input) => {
+      // The signed-reader provider is simulated; metadata opening is genuine
+      // AES-256-GCM over the 284-byte filename envelope and exact scope AAD.
+      const name = await realCatalog.openMetadata({
+        scope: Object.fromEntries(Object.entries(input.scope)),
+        objectId: input.objectId, revision: input.revision, epoch: input.epoch,
+        metadataKey: input.metadataKey,
+        ciphertext: Uint8Array.from(input.ciphertext),
+      });
+      realOpens++;
+      if (advanceDuringAead) active = advanced;
+      return name;
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: ${JSON.stringify(scope)},
+      pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "fixture-csrf", isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey("raw", rawKey,
+    "AES-GCM", false, ["decrypt"]);
+  const positive = await client.readPrivateListing(baseline, key, "authenticated");
+  assert.equal(positive.totalMatches, 1,
+    "the same real signed-metadata AEAD must yield a valid local match before rotation");
+  assert.equal(positive.entries[0].name, "private-authenticated-current.txt");
+  assert.equal(realOpens, 1);
+
+  const before = reads;
+  advanceDuringAead = true;
+  await assert.rejects(client.readPrivateListing(baseline, key, "authenticated"),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "private names must not be released after CAS changes during an awaited AEAD open");
+  assert.equal(realOpens, 2, "the second genuine AES-GCM open must complete before CAS changes");
+  assert.equal(active, advanced, "the independent catalog head really advanced");
+  assert.equal(reads, before + 2,
+    "the final signed CAS readback must be performed after filename AEAD");
 });
 
 test("normal workspace routes historical restore through all three existing authorization gates", () => {
