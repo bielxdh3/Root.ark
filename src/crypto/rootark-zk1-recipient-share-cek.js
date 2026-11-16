@@ -142,8 +142,12 @@ async function openProtectedRecipientShareFile(input) {
     if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
     const releaseSeconds = Math.floor(Date.now() / 1000);
-    if ([statement.expires_at, verifiedReleaseExpiresAt]
-      .some((expiresAt) => releaseSeconds >= expiresAt || nowSeconds >= expiresAt)) deny();
+    // The independent authority callback just ran. Never dispatch a mutable
+    // Array.prototype.some for the final plaintext-release expiry decision.
+    if (releaseSeconds >= statement.expires_at
+      || releaseSeconds >= verifiedReleaseExpiresAt
+      || nowSeconds >= statement.expires_at
+      || nowSeconds >= verifiedReleaseExpiresAt) deny();
     const result = Object.freeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
       grantId: receipt.grantId, objectId: receipt.objectId,

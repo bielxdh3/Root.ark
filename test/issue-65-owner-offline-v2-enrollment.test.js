@@ -836,6 +836,49 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }
     assert.equal(finalAeadCompleted, true,
       "oracle must complete genuine file AEAD before expiring owner authority");
+    // A caller-supplied independent authority callback runs AFTER the file
+    // AEAD. It may poison mutable same-realm Array methods. In particular,
+    // a forged Array.prototype.some returning false must not skip the final
+    // signed CEK expiry barrier and release authentic plaintext.
+    const originalSome = Array.prototype.some;
+    const realFinalDecrypt = subtle.decrypt;
+    let poisonInstalled = false;
+    let authorityReadsWithPoison = 0, genuineAeadBeforePoison = false;
+    subtle.decrypt = async function (...args) {
+      const result = await realFinalDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) {
+        genuineAeadBeforePoison = true;
+        Date.now = () => (firstExpiry + 2) * 1000;
+      }
+      return result;
+    };
+    let expiryOutcome;
+    try {
+      expiryOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...longShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++authorityReadsWithPoison === 3) {
+            poisonInstalled = true;
+            Array.prototype.some = () => false;
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Array.prototype.some = originalSome;
+      delete subtle.decrypt;
+      Date.now = originalFinalNow;
+    }
+    if (expiryOutcome?.data instanceof Uint8Array) expiryOutcome.data.fill(0);
+    assert.equal(genuineAeadBeforePoison, true,
+      "the real encrypted file was opened before the callback poisoned Array.some");
+    assert.equal(authorityReadsWithPoison, 3,
+      "the malicious method replacement occurred on the final independent authority read");
+    assert.equal(poisonInstalled, true);
+    assert.ok(expiryOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(expiryOutcome.message),
+    "a genuine signed CEK expiring after file AEAD must deny despite a forged Array.some");
     await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
       redeemInput: { ...recipientShareInput, grant: { ...grant,
         shareSignatureBase64: b64(crypto.randomBytes(64)) } },
