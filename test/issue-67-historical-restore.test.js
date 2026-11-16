@@ -589,6 +589,43 @@ test("#262 P2: CBOR snapshot bounds expanded aliases before cloning and preserve
     await zk.encodeDeterministic({ bytes: new Uint8Array([7, 9, 11, 13]) }),
     "shadowed TypedArray properties must not change CBOR bytes");
 
+  // The snapshot owns a captured iterator method, but the returned Array
+  // Iterator still resolves `next` through its mutable prototype. Poison it
+  // after snapshot creation, during the awaited cborg() promise; the synchronous
+  // encoder must temporarily restore the captured intrinsic for its walk.
+  const expectedArrayEncoding = await zk.encodeDeterministic([1, 2]);
+  assert.notDeepEqual(expectedArrayEncoding, await zk.encodeDeterministic([]),
+    "positive control must distinguish the real two-item encoding from an empty array");
+  const arrayIteratorPrototype = Object.getPrototypeOf(Array.prototype.values.call([]));
+  const originalArrayIteratorNext = Object.getOwnPropertyDescriptor(arrayIteratorPrototype, "next");
+  let poisonedArrayIteratorNextCalls = 0;
+  const poisonedArrayIteratorNext = () => {
+    poisonedArrayIteratorNextCalls += 1;
+    return { done: true, value: undefined };
+  };
+  try {
+    const pendingArrayEncoding = zk.encodeDeterministic([1, 2]);
+    Object.defineProperty(arrayIteratorPrototype, "next", {
+      ...originalArrayIteratorNext,
+      value: poisonedArrayIteratorNext,
+    });
+    const poisonedArrayIteratorNextDescriptor = Object.getOwnPropertyDescriptor(
+      arrayIteratorPrototype, "next");
+    assert.deepEqual(Array.prototype.values.call([9]).next(),
+      { done: true, value: undefined },
+      "positive control proves the iterator-prototype poison is active");
+    assert.equal(poisonedArrayIteratorNextCalls, 1);
+    assert.deepEqual(await pendingArrayEncoding, expectedArrayEncoding,
+      "the awaited encoder must not let mutable ArrayIteratorPrototype.next replace validated array items");
+    assert.equal(poisonedArrayIteratorNextCalls, 1,
+      "only the positive control may invoke the poisoned iterator next");
+    assert.deepEqual(Object.getOwnPropertyDescriptor(arrayIteratorPrototype, "next"),
+      poisonedArrayIteratorNextDescriptor,
+      "CBOR must restore the exact caller-visible poisoned descriptor after its synchronous walk");
+  } finally {
+    Object.defineProperty(arrayIteratorPrototype, "next", originalArrayIteratorNext);
+  }
+
   const oversizedBytes = new Uint8Array(64 * 1024 * 1024 + 1);
   Object.defineProperty(oversizedBytes, "byteLength", { value: 0 });
   await assert.rejects(zk.encodeDeterministic({ bytes: oversizedBytes }),

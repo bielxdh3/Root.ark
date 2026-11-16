@@ -61,6 +61,12 @@ const nativeReflectApply = Reflect.apply;
 const nativePromiseThen = Promise.prototype.then;
 const nativePromiseCatch = Promise.prototype.catch;
 const nativePromiseResolve = Promise.resolve.bind(Promise);
+const nativeArrayIteratorPrototype = nativeObjectGetPrototypeOf(
+  nativeReflectApply(nativeArrayValues, [], []),
+);
+const nativeArrayIteratorNext = nativeObjectGetOwnPropertyDescriptor(
+  nativeArrayIteratorPrototype, "next",
+).value;
 const nativeCryptoTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
 const nativeCryptoCreateHash = crypto.createHash.bind(crypto);
 const nativeCryptoSign = crypto.sign.bind(crypto);
@@ -463,6 +469,10 @@ function invokeWithPinnedBytePrimitives(method, args) {
     // cborg dispatches on Number.isSafeInteger inside its synchronous
     // RFC 8949 encoder; a readback callback must not change this decision.
     [Number, "isSafeInteger", nativeNumberIsSafeInteger],
+    // A snapshot's own Array.prototype.values iterator still inherits its
+    // mutable `next` method from %ArrayIteratorPrototype%. Pin that method
+    // across cborg's synchronous walk after the asynchronous module import.
+    [nativeArrayIteratorPrototype, "next", nativeArrayIteratorNext],
     [NativeBuffer, "isBuffer", nativeBufferIsBufferProperty],
     [NativeBuffer, "from", nativeBufferFromProperty],
     [NativeBuffer, "concat", nativeBufferConcatProperty],
