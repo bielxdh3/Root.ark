@@ -2292,7 +2292,9 @@ test("#67 P2: foreign hardlink cannot be misidentified as restore temp and delet
     ? originalList(objectId) : [await originalList(objectId)];
   const countBefore = f.pushes();
   await assert.rejects(f.engine.syncOnce(),
-    (error) => error.code === "restore_local_materialization_missing");
+    (error) => error.code === "restore_local_materialization_missing"
+      || error.code === "unsafe_path",
+    "either the durable staging-recovery fence or the strict hardlink file-identity fence must fail closed");
   assert.equal(f.pushes(), countBefore);
   assert.equal((await fsp.lstat(target)).nlink, 2);
   assert.equal(fs.existsSync(foreignName), true, "never remove an arbitrary user hardlink");
